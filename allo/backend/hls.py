@@ -207,6 +207,8 @@ class HLSModule:
                 allo_d.emit_thls(self.module, buf)
             case "intel_hls":
                 allo_d.emit_ihls(self.module, buf)
+            case "catapult":
+                allo_d.emit_catapult(self.module, buf)
             case _:
                 allo_d.emit_vhls(self.module, buf)
         buf.seek(0)
@@ -216,7 +218,7 @@ class HLSModule:
             os.makedirs(project, exist_ok=True)
             path = os.path.dirname(__file__)
             path = os.path.join(path, "../harness/")
-            if platform in {"vivado_hls", "vitis_hls", "tapa"}:
+            if platform in {"vivado_hls", "vitis_hls", "tapa", "catapult"}:
                 os.system("cp " + path + f"{platform.split('_')[0]}/* " + project)
                 with open(f"{project}/run.tcl", "w", encoding="utf-8") as outfile:
                     outfile.write(codegen_tcl(top_func_name, configs))
@@ -260,6 +262,13 @@ class HLSModule:
                     self.top_func_name,
                     self.module,
                 )
+            elif self.platform == "catapult":
+                assert self.mode in {
+                    "csim",
+                    "csyn",
+                }, "Invalid mode for catapult"
+                self.args = []
+                self.host_code = ""
             elif self.platform == "tapa":
                 assert self.mode in {
                     "csim",
