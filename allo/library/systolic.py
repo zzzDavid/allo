@@ -331,15 +331,15 @@ def schedule_systolic(s):
     s.pipeline(data_drain_loop)
     # pipeline load in systolic
     load_A_loop = s.get_loops("systolic")["outer_tile"]["ak"]
-    # s.pipeline(load_A_loop)
-    s.unroll(load_A_loop)
+    s.pipeline(load_A_loop)
+    # s.unroll(load_A_loop)
     load_B_loop = s.get_loops("systolic")["outer_tile"]["bk"]
-    # s.pipeline(load_B_loop)
-    s.unroll(load_B_loop)
+    s.pipeline(load_B_loop)
+    # s.unroll(load_B_loop)
     # pipeline store in systolic
     store_C_loop = s.get_loops("systolic")["outer_tile"]["si"]
-    # s.pipeline(store_C_loop)
-    s.unroll(store_C_loop)
+    s.pipeline(store_C_loop)
+    # s.unroll(store_C_loop)
     pe = s.unfold(f"{tile_name}:PE", [0, 1])  # specify which are spatial loops
     s.to(MockBuffer(tile_name, "A_fifo"), pe, axis=1, depth=M0 + 1)
     s.to(MockBuffer(tile_name, "B_fifo"), pe, axis=0, depth=M1 + 1)
