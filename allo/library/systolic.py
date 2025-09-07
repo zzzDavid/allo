@@ -40,7 +40,7 @@ def PE_kernel[
 ):
     # Be careful, need to use high precision for accumulation
     v: TyC = 0
-    for k in range(K):
+    for k in dsl.grid(K, name="reduction"):
         a: TyA = A_in[k]
         b: TyB = B_in[k]
         v += a * b
@@ -167,7 +167,10 @@ def systolic[
     local_C: TyC[Mt, Nt]
 
     # k needs not be tiled, since it is temporal dimension
-    for mi, ni in dsl.grid(M // Mt, N // Nt, name="outer_tile"):
+    # for mi, ni in dsl.grid(M // Mt, N // Nt, name="outer_tile"):
+    for mn_fused in dsl.grid(M // Mt * N // Nt, name="outer_tile"):
+        mi: index = mn_fused / (N // Nt)
+        ni: index = mn_fused % (N // Nt)
         # reversed traversal, better for cascading systolic arrays with FIFOs
         # corresponds to the order of the previous `store_C_tile` output
         for ak, ai in dsl.grid(K, Mt, name="load_A_tile"):
@@ -307,17 +310,36 @@ def schedule_systolic(s):
     load_A_loop = s.get_loops(s.top_func_name)["outer_tile"]["ai"]
     if str(load_A_loop.loop.attributes["upperBoundMap"]) == "affine_map<() -> (1)>":
         load_A_loop = s.get_loops(s.top_func_name)["outer_tile"]["ak"]
-    s.pipeline(load_A_loop)
+    # s.pipeline(load_A_loop)
     load_B_loop = s.get_loops(s.top_func_name)["outer_tile"]["bj"]
     if str(load_B_loop.loop.attributes["upperBoundMap"]) == "affine_map<() -> (1)>":
         load_B_loop = s.get_loops(s.top_func_name)["outer_tile"]["bk"]
-    s.pipeline(load_B_loop)
+    # s.pipeline(load_B_loop)
     store_C_loop = s.get_loops(s.top_func_name)["outer_tile"]["si"]
     if str(store_C_loop.loop.attributes["upperBoundMap"]) == "affine_map<() -> (1)>":
         store_C_loop = s.get_loops(s.top_func_name)["outer_tile"]["sj"]
-    s.pipeline(store_C_loop)
-    tile_loop = s.get_loops(s.top_func_name)["outer_tile"]["ni"]
+    # s.pipeline(store_C_loop)
+    tile_loop = s.get_loops(s.top_func_name)["outer_tile"]["mn_fused"]
     s.dataflow(tile_loop)
+    # pipeline the PE kernel
+    reduction_loop = s.get_loops(f"PE_kernel")["reduction"]["k"]
+    s.pipeline(reduction_loop)
+    # pipeline data load and drain in systolic tile
+    data_load_loop = s.get_loops(f"{tile_name}")["data_load"]["k"]
+    s.pipeline(data_load_loop)
+    data_drain_loop = s.get_loops(f"{tile_name}")["data_drain"]["k"]
+    s.pipeline(data_drain_loop)
+    # pipeline load in systolic
+    load_A_loop = s.get_loops("systolic")["outer_tile"]["ak"]
+    # s.pipeline(load_A_loop)
+    s.unroll(load_A_loop)
+    load_B_loop = s.get_loops("systolic")["outer_tile"]["bk"]
+    # s.pipeline(load_B_loop)
+    s.unroll(load_B_loop)
+    # pipeline store in systolic
+    store_C_loop = s.get_loops("systolic")["outer_tile"]["si"]
+    # s.pipeline(store_C_loop)
+    s.unroll(store_C_loop)
     pe = s.unfold(f"{tile_name}:PE", [0, 1])  # specify which are spatial loops
     s.to(MockBuffer(tile_name, "A_fifo"), pe, axis=1, depth=M0 + 1)
     s.to(MockBuffer(tile_name, "B_fifo"), pe, axis=0, depth=M1 + 1)
