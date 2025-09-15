@@ -9,9 +9,9 @@ from allo.ir.types import float32, int32
 import allo.dataflow as df
 import numpy as np
 from allo.memory import Layout
-from allo.backend.experimental.external_kernel import ExternalModule
+from allo.backend.aie.external_kernel import ExternalModule
 
-KERNEL_LIB_PATH = "../../../../allo/backend/experimental/kernels/"
+KERNEL_LIB_PATH = "../../../../allo/library/aie/"
 
 Ly = Layout("S1S0")
 Ly_1 = Layout("S1")
@@ -83,14 +83,14 @@ def _test_masked_softmax_tiled():
     if "MLIR_AIE_INSTALL_DIR" in os.environ:
         mod = df.build(
             top,
-            target="aie-mlir",
+            target="aie",
             profile=True,
             warmup=20,
             num_iters=100,  # ! executing only once may get undefined result.
         )
         output_allo = np.zeros((SEQ_LEN_TILED, SEQ_LEN * HEAD_TILE)).astype(np.float32)
         output = output.view(SEQ_LEN_TILED, HEAD_TILE * SEQ_LEN)
-        mod(input_tensor.cpu().numpy(), np.array([0, 32]), output_allo)
+        mod(input_tensor.cpu().numpy(), np.array([0, 32]).astype(np.int32), output_allo)
         np.testing.assert_allclose(output_allo, output, rtol=1e-2)
         print("PASS!")
     else:

@@ -1,6 +1,6 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-# pylint: disable=no-name-in-module, unexpected-keyword-arg, no-value-for-parameter, global-variable-not-assigned, global-statement, broad-exception-caught, too-many-arguments
+# pylint: disable=no-name-in-module, unexpected-keyword-arg, no-value-for-parameter, global-variable-not-assigned, global-statement, broad-exception-caught, too-many-arguments, eval-used, bad-builtin, too-many-nested-blocks
 
 import functools
 import os
@@ -16,10 +16,9 @@ from ._mlir.ir import (
 )
 from ._mlir.dialects import func as func_d, allo as allo_d
 from ._mlir.passmanager import PassManager as mlir_pass_manager
-from .customize import customize as _customize
+from .customize import customize as _customize, Schedule
+from .utils import parse_kernel_name, construct_kernel_name
 from .ir.utils import get_global_vars, get_all_df_kernels
-from .backend.ai_engine import AIEModule
-
 from .backend.simulator import LLVMOMPModule
 from .ir.types import Stream
 from .passes import df_pipeline
@@ -44,13 +43,12 @@ def array(element, shape):
     return Array(element, shape)
 
 
-def move_stream_to_interface(s, with_stream_type: bool = False):
+def move_stream_to_interface(s: Schedule, with_stream_type: bool = False, unroll=True):
     stream_info = {}
     funcs = get_all_df_kernels(s)
     new_func_args = s.func_args.copy()
     if with_stream_type:
         stream_types_dict: dict[str, Type] = {}
-
     for func in funcs:
         func_name = func.attributes["sym_name"].value
         stream_ops = []
@@ -61,6 +59,18 @@ def move_stream_to_interface(s, with_stream_type: bool = False):
         out_types = func.attributes["function_type"].value.results
         s_type_str = "_" * len(in_types)
         new_args = new_func_args[func_name].copy()
+        prefix, ids = parse_kernel_name(func_name)
+        if not unroll:
+            assert s.func_instances is not None and prefix in s.func_instances
+            assert ids in s.func_instances[prefix].keys()
+            for ids_, predicate_tag in s.func_instances[prefix].items():
+                func_name_ = construct_kernel_name(prefix, ids_)
+                if (
+                    func_name_ != func_name
+                    and predicate_tag == s.func_instances[prefix][ids]
+                ):
+                    stream_info[func_name_] = []
+                    new_func_args[func_name_] = new_func_args[func_name].copy()
         for op in func.entry_block.operations:
             if isinstance(op, allo_d.StreamConstructOp):
                 stream_ops.append(op)
@@ -80,6 +90,29 @@ def move_stream_to_interface(s, with_stream_type: bool = False):
                 stream_info[func_name].append((stream_name, direction))
                 s_type_str += direction[0]
                 new_args.append(stream_name)
+                if not unroll and "symbolic_slice" in op.attributes:
+                    symbolic_name = op.attributes["symbolic_slice"].value
+                    for ids_, predicate_tag in s.func_instances[prefix].items():
+                        func_name_ = construct_kernel_name(prefix, ids_)
+                        if (
+                            func_name_ != func_name
+                            and predicate_tag == s.func_instances[prefix][ids]
+                        ):
+                            pid_map = {
+                                f"p{idx}": value for idx, value in enumerate(ids_)
+                            }
+                            slice_ = eval(symbolic_name, pid_map)
+                            if isinstance(slice_, int):
+                                slice_ = tuple([slice_])
+                            parts = stream_name.rsplit("_", len(slice_))[: -len(slice_)]
+                            stream_name_ = f"{"_".join(map(str, parts))}_{"_".join(map(str, slice_))}"
+                            if (
+                                with_stream_type
+                                and stream_name_ not in stream_types_dict
+                            ):
+                                stream_types_dict[stream_name_] = op.result.type
+                            stream_info[func_name_].append((stream_name_, direction))
+                            new_func_args[func_name_].append(stream_name_)
         # create new func to update arguments
         in_types += stream_types
         new_func_args[func_name] = new_args
@@ -103,6 +136,10 @@ def move_stream_to_interface(s, with_stream_type: bool = False):
             new_func.attributes["stypes"] = StringAttr.get(s_type_str)
             if "df.kernel" in func.attributes:
                 new_func.attributes["df.kernel"] = UnitAttr.get()
+            if "tag" in func.attributes:
+                new_func.attributes["tag"] = StringAttr.get(
+                    func.attributes["tag"].value
+                )
             # move operations from old func to new func
             cnt_stream = 0
             for op in func.entry_block.operations:
@@ -308,38 +345,30 @@ def build(
     wrap_io=True,
     opt_default=True,
     enable_tensor=False,
-    use_default_codegen: bool = False,
     mapping_primitives: list[tuple[str, list]] = None,
     profile=False,
     warmup=20,
     num_iters=100,
+    trace: list[tuple[str, tuple[int, ...]]] = None,
+    trace_size: int = 4096,
+    device_type: str = None,
 ):
+    assert not profile or target == "aie", "Profiling is only supported for AIE target"
     assert (
-        not profile or target == "aie-mlir"
-    ), "Profiling is only supported for AIE target"
+        trace is None or target == "aie"
+    ), "Trace profiling is only supported for AIE target"
+
     if target == "aie":
         global_vars = get_global_vars(func)
-        s = _customize(func, global_vars=global_vars, enable_tensor=False)
-        stream_info = move_stream_to_interface(s)
-        s = _build_top(s, stream_info, target=target)
-        mod = AIEModule(
-            s.module,
-            s.top_func_name,
-            s.func_args,
-            project,
-            stream_info,
+        # [NOTE]: set unroll = False to improve compilation efficiency
+        s: Schedule = _customize(
+            func, global_vars=global_vars, enable_tensor=False, unroll=False
         )
-        mod.build()
-        return mod
-
-    if target == "aie-mlir":
-        global_vars = get_global_vars(func)
-        s = _customize(func, global_vars=global_vars, enable_tensor=False)
         stream_info, stream_types_dict = move_stream_to_interface(
-            s, with_stream_type=True
+            s, with_stream_type=True, unroll=False
         )
         parameter_list, s = _build_top(
-            s, stream_info, target="aie", get_parameter_list=True
+            s, stream_info, target=target, get_parameter_list=True
         )
         aie_mod = AIE_MLIRModule(
             s.module,
@@ -350,36 +379,22 @@ def build(
             stream_info,
             stream_types_dict,
             s.ext_libs,
+            s.func_instances,
         )
-        if os.getenv("NPU2") == "1":
-            device_type = "npu2"
-        else:
-            device_type = "npu1_4col"
-        if use_default_codegen:
-            aie_mod.build(
-                device_type=device_type,
-                profile=profile,
-                warmup=warmup,
-                num_iters=num_iters,
-            )
-        elif mapping_primitives is not None:
-            aie_mod.build_experimental(
-                device_type=device_type,
-                enable_virtual_mapping=True,
-                mapping_primitives=mapping_primitives,
-                profile=profile,
-                warmup=warmup,
-                num_iters=num_iters,
-            )
-        else:
-            aie_mod.build_experimental(
-                device_type=device_type,
-                enable_virtual_mapping=True,
-                mapping_primitives=[],
-                profile=profile,
-                warmup=warmup,
-                num_iters=num_iters,
-            )
+        if device_type is None:
+            if os.getenv("NPU2") == "1":
+                device_type = "npu2"
+            else:
+                device_type = "npu1_4col"
+        aie_mod.build(
+            device_type=device_type,
+            mapping_primitives=mapping_primitives,
+            profile=profile,
+            warmup=warmup,
+            num_iters=num_iters,
+            trace=trace,
+            trace_size=trace_size,
+        )
         return aie_mod
 
     if target == "simulator":

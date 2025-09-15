@@ -8,7 +8,7 @@ from allo.ir.types import float32
 import allo.dataflow as df
 import numpy as np
 from allo.memory import Layout
-from allo.backend.experimental.external_kernel import ExternalModule
+from allo.backend.aie.external_kernel import ExternalModule
 from allo.ir.types import float32
 
 Ly = Layout("R")
@@ -30,7 +30,7 @@ def layernorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch
     return normalized * weight
 
 
-def _test_layer_norm():
+def _test_layer_norm(enable_trace: bool = False):
 
     norm = ExternalModule(
         top="layer_norm",
@@ -53,7 +53,15 @@ def _test_layer_norm():
     output = layernorm(input_tensor, weight)
 
     if "MLIR_AIE_INSTALL_DIR" in os.environ:
-        mod = df.build(top, target="aie-mlir")
+        if enable_trace:
+            mod = df.build(
+                top,
+                target="aie",
+                trace=[("core", (0,)), ("core", (1,))],
+                trace_size=65536,
+            )
+        else:
+            mod = df.build(top, target="aie")
         output_allo = np.zeros((seq_len, hidden_size)).astype(np.float32)
         mod(input_tensor.cpu().numpy(), weight.cpu().numpy(), output_allo)
         np.testing.assert_allclose(output_allo, output, rtol=1e-2)
@@ -97,7 +105,7 @@ def _test_rms_norm():
     output = rms_norm(input_tensor, weight)
 
     if "MLIR_AIE_INSTALL_DIR" in os.environ:
-        mod = df.build(top, target="aie-mlir")
+        mod = df.build(top, target="aie")
         output_allo = np.zeros((seq_len, hidden_size)).astype(np.float32)
         mod(input_tensor.cpu().numpy(), weight.cpu().numpy(), output_allo)
         np.testing.assert_allclose(output_allo, output, rtol=1e-2)
@@ -109,3 +117,4 @@ def _test_rms_norm():
 if __name__ == "__main__":
     _test_layer_norm()
     _test_rms_norm()
+    _test_layer_norm(enable_trace=True)

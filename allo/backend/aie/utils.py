@@ -1,4 +1,4 @@
-# pylint: disable=import-error, no-name-in-module, c-extension-no-member, too-many-nested-blocks, consider-using-enumerate, consider-using-namedtuple-or-dataclass
+# pylint: disable=import-error, no-name-in-module, c-extension-no-member, too-many-nested-blocks, consider-using-enumerate, consider-using-namedtuple-or-dataclass, too-many-branches
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -10,6 +10,7 @@ import numpy as np
 import aie.ir as aie_ir
 import allo._mlir._mlir_libs._mlir as allo_ir
 from ..utils import format_str, format_code
+from ...utils import np_read_file_types
 from ...memory import DTensor
 from .external_kernel import ExternalModule, ExternalModuleBase
 from ..._mlir.dialects import (
@@ -49,6 +50,7 @@ class Config:
 
     # https://github.com/Xilinx/mlir-aie/blob/v1.0/lib/Dialect/AIEX/IR/AIEXDialect.cpp#L233
     SHIM_DMA_HARDWARE_MAX_SIZES = [64, -1, 1024, 1024]
+    MAX_IO_BUFFER = 4  # leave one for trace (https://github.com/Xilinx/mlir-aie/blob/v1.0/programming_guide/section-3/README.md#host-code)
     # TODO: other dma size/stride constrain
 
     # fixme: some hyper-parameters, can be optimized
@@ -56,6 +58,8 @@ class Config:
     COMPUTE_TILE_WITH_SHARED_MEMORY = 2
     LOCAL_CODE_OFFSET = 100
     GLOBAL_CODE_OFFSET = 10000
+
+    TRACE_MAX_NUM = 4
 
 
 # reference: https://github.com/Xilinx/mlir-aie/blob/v1.0/docs/Devices.md
@@ -177,6 +181,9 @@ class Stream:
     def __str__(self):
         return f"Stream (name={self.name}, dtype={self.allo_element_type}, is_tensor={self.is_tensor}, src={self.src}, dst={self.dst})"
 
+    def __repr__(self):
+        return self.__str__()
+
 
 @dataclass
 class Argument:
@@ -188,7 +195,7 @@ class Argument:
     stream: Stream
 
 
-aie_ctype_map = {
+host_aie2c_type = {
     "bf16": "std::bfloat16_t",
     "f32": "float",
     "f64": "double",
@@ -204,7 +211,7 @@ aie_ctype_map = {
     "ui64": "unsigned long",
 }
 
-aie_external_kernel_ctype_map = {
+external_kernel_aie2c_type = {
     "bf16": "bfloat16",
     "f32": "float",
     "f64": "double",
@@ -225,6 +232,8 @@ aie_external_kernel_ctype_map = {
 #   - aie2 kernel: https://github.com/Xilinx/mlir-aie/blob/v1.0/aie_kernels/aie2/mm.cc
 #   - aie2p kernel: https://github.com/Xilinx/mlir-aie/blob/v1.0/aie_kernels/aie2p/mm.cc
 matmul_external_kernel_config_map = {
+    ("i4", "i8"): {"aie2": (4, 16, 8)},
+    ("i8", "i4", "i8"): {"aie2": (4, 16, 8)},  # i8xi4 -> i8
     ("i8", "i8"): {"aie2": (4, 8, 8), "aie2p": (8, 8, 8)},
     ("i8", "i16"): {"aie2": (4, 8, 8), "aie2p": (8, 8, 8)},
     ("i8", "i32"): {"aie2": (4, 8, 8), "aie2p": (8, 8, 8)},
@@ -233,32 +242,6 @@ matmul_external_kernel_config_map = {
     ("bf16", "bf16"): {"aie2": (4, 8, 4), "aie2p": (8, 8, 8)},
     ("bf16", "f32"): {"aie2": (4, 8, 4), "aie2p": (8, 8, 8)},
 }
-
-
-def parse_kernel_name(name: str):
-    match = re.match(r"(.+?)(_\d+(?:_\d+)*)$", name)
-    if not match:
-        raise ValueError(f"Invalid format: {name}")
-
-    prefix = match.group(1).rstrip("_")
-    indexs = tuple(int(n) for n in match.group(2).split("_") if n != "")
-    return prefix, indexs
-
-
-def collect_op_by_name(root, target: str) -> list:
-    collected_op = []
-
-    def collect(op):
-        if op.name == target:
-            collected_op.append(op.operation)
-            return
-        for region in op.regions:
-            for block in region.blocks:
-                for inner_op in block.operations:
-                    collect(inner_op)
-
-    collect(root)
-    return collected_op
 
 
 def inject_external_kernels(
@@ -289,11 +272,11 @@ def inject_external_kernels(
     injected_external_kernels: dict[str, ExternalModuleBase] = {}
     include_src: set[str] = set()
 
-    def inject_external_kernels_recursive(operations, df_function_name: str):
+    def inject_external_kernels_recursive(operations, df_function_tag: str):
         for op in operations:
             # 1. customized external kernel
             if isinstance(op, allo_func_d.CallOp):
-                use_external_kernels[df_function_name] = True
+                use_external_kernels[df_function_tag] = True
                 callee_name = op.callee.value
                 # register external kernel
                 if callee_name in injected_external_kernels:
@@ -307,6 +290,7 @@ def inject_external_kernels(
             input_idx, output_idx = [], []
             kernel_code, kernel_header = "", ""
             call_builtin = False
+            replace_op = True
             # fill with zero
             if op.operation.name == "linalg.fill" and isinstance(
                 op.inputs[0].owner.opview, allo_arith_d.ConstantOp
@@ -322,9 +306,9 @@ def inject_external_kernels(
                     )
                     N = op.outputs[0].type.shape[-1]
                     dtype = str(op.outputs[0].type.element_type)
-                    ctype = aie_external_kernel_ctype_map[dtype]
+                    ctype = external_kernel_aie2c_type[dtype]
                     include_src.add(f'#include "{lib_dir}/zero.cc"\n')
-                    use_external_kernels[df_function_name] = True
+                    use_external_kernels[df_function_tag] = True
                     kernel_name = f"fill_zeros_{dtype}_{M}_{N}_vector"
                     kernel_code += f"void {kernel_name}({ctype} *A)"
                     kernel_code += " {\n"
@@ -338,55 +322,152 @@ def inject_external_kernels(
                 op_name = op.operation.name.split(".")[1]
                 include_src.add(f'#include "aie2/{op_name}.cc"\n')
                 dtype = str(op.inputs[0].type.element_type)
-                ctype = aie_external_kernel_ctype_map[dtype]
-                kernel_name = f"{op_name}_{dtype}_vector"
-                use_external_kernels[df_function_name] = True
-                kernel_code += (
-                    f"void {kernel_name}({ctype} *A_in, {ctype} *B_in, {ctype} *C_out)"
-                )
-                kernel_code += " {\n"
-                kernel_code += f"  eltwise_v{op_name}<{ctype}, {ctype}, {np.prod(op.inputs[0].type.shape)}>(A_in, B_in, C_out);\n"
-                kernel_code += "}\n\n"
-                input_idx.extend([0, 1])
-                output_idx.append(2)
-                call_builtin = True
-                operands = [
-                    op.inputs[0],
-                    op.inputs[1],
-                    op.outputs[0],
-                ]
+                if dtype in external_kernel_aie2c_type:
+                    ctype = external_kernel_aie2c_type[dtype]
+                    kernel_name = f"{op_name}_{dtype}_vector"
+                    use_external_kernels[df_function_tag] = True
+                    kernel_code += f"void {kernel_name}({ctype} *A_in, {ctype} *B_in, {ctype} *C_out)"
+                    kernel_code += " {\n"
+                    kernel_code += f"  eltwise_v{op_name}<{ctype}, {ctype}, {np.prod(op.inputs[0].type.shape)}>(A_in, B_in, C_out);\n"
+                    kernel_code += "}\n\n"
+                    input_idx.extend([0, 1])
+                    output_idx.append(2)
+                    call_builtin = True
+                    operands = [
+                        op.inputs[0],
+                        op.inputs[1],
+                        op.outputs[0],
+                    ]
             # matmul
             elif op.operation.name == "linalg.matmul":
                 M, K = MemRefType(op.inputs[0].type).shape
                 _, N = MemRefType(op.inputs[1].type).shape
-                dtype = str(op.inputs[0].type.element_type)
+                dtype_a = str(op.inputs[0].type.element_type)
+                dtype_b = str(op.inputs[1].type.element_type)
                 out_dtype = str(op.outputs[0].type.element_type)
-                if (dtype, out_dtype) in matmul_external_kernel_config_map:
-                    include_src.add('#include "mm.cc"\n')
-                    use_external_kernels[df_function_name] = True
+                replace_casting = False
+                # check whether the output is quickly consumed by type casting
+                cast_op, init_op = None, None
+                if len(list(op.outputs[0].uses)) == 3:
+                    for use in op.outputs[0].uses:
+                        if (
+                            "lib" in use.owner.attributes
+                            and "fill_zeros" in use.owner.attributes["lib"].value
+                        ):
+                            init_op = use.owner
+                        elif "cast_from" in use.owner.attributes:
+                            cast_op = use.owner
+                    if cast_op is not None and init_op is not None:
+                        out_dtype = cast_op.attributes["cast_to"].value
+                        replace_casting = True
+                if dtype_a == dtype_b:
+                    if (dtype_a, out_dtype) in matmul_external_kernel_config_map:
+                        if dtype_a == "i4":
+                            include_src.add('#include "mmi4.cc"\n')
+                        else:
+                            include_src.add('#include "mm.cc"\n')
+                        use_external_kernels[df_function_tag] = True
+                        kernel_header += f"#define DIM_M {M}\n"
+                        kernel_header += f"#define DIM_N {N}\n"
+                        kernel_header += f"#define DIM_K {K}\n"
+                        kernel_header += f"#define {dtype_a}_{out_dtype}_ONLY\n"
+                        input_idx.extend([0, 1])
+                        output_idx.append(2)
+                        kernel_name = f"matmul_scalar_{dtype_a}_{out_dtype}"
+                        call_builtin = True
+                        if not replace_casting:
+                            operands = [
+                                op.inputs[0],
+                                op.inputs[1],
+                                op.outputs[0],
+                            ]
+                        else:
+                            replace_op = False
+                            operands = [
+                                op.inputs[0],
+                                op.inputs[1],
+                                cast_op.outputs[0],
+                            ]
+                            parts = init_op.attributes["lib"].value.split("_")
+                            init_M, init_N = parts[3], parts[4]
+                            ctype = external_kernel_aie2c_type[out_dtype]
+                            include_src.add(f'#include "{lib_dir}/zero.cc"\n')
+                            init_kernel_name = (
+                                f"fill_zeros_{out_dtype}_{init_M}_{init_N}_vector"
+                            )
+                            init_kernel_code = f"void {init_kernel_name}({ctype} *A)"
+                            init_kernel_code += " {\n"
+                            init_kernel_code += (
+                                f"  zero_vectorized<{ctype}, {init_M}, {init_N}>(A);\n"
+                            )
+                            init_kernel_code += "}\n\n"
+                            # register external kernel
+                            if init_kernel_name not in injected_external_kernels:
+                                injected_external_kernels[init_kernel_name] = (
+                                    ExternalModuleBase(
+                                        init_kernel_name,
+                                        [],
+                                        [0],
+                                        init_kernel_code,
+                                        "",
+                                    )
+                                )
+                                func_type = allo_func_d.FunctionType.get(
+                                    [cast_op.outputs[0].type],
+                                    [],
+                                )
+                                kernel = allo_func_d.FuncOp(
+                                    init_kernel_name,
+                                    func_type,
+                                    ip=InsertionPoint(func),
+                                )
+                                kernel.attributes["sym_visibility"] = StringAttr.get(
+                                    "private"
+                                )
+                            call_op = allo_func_d.CallOp(
+                                [],
+                                FlatSymbolRefAttr.get(kernel_name),
+                                operands,
+                                ip=InsertionPoint(cast_op),
+                            )
+                            call_op.attributes["lib"] = StringAttr.get(kernel_name)
+                            init_z_op = allo_func_d.CallOp(
+                                [],
+                                FlatSymbolRefAttr.get(init_kernel_name),
+                                [cast_op.outputs[0]],
+                                ip=InsertionPoint(call_op),
+                            )
+                            init_z_op.attributes["lib"] = StringAttr.get(
+                                init_kernel_name
+                            )
+                            for use in op.outputs[0].uses:
+                                use.owner.erase()
+                elif dtype_a == "i8" and dtype_b == "i4":
+                    include_src.add('#include "mmi4.cc"\n')
+                    use_external_kernels[df_function_tag] = True
                     kernel_header += f"#define DIM_M {M}\n"
                     kernel_header += f"#define DIM_N {N}\n"
                     kernel_header += f"#define DIM_K {K}\n"
-                    kernel_header += f"#define {dtype}_{out_dtype}_ONLY\n"
                     input_idx.extend([0, 1])
                     output_idx.append(2)
+                    kernel_name = f"matmul_scalar_{dtype_a}x{dtype_b}_{out_dtype}"
                     call_builtin = True
-                    kernel_name = f"matmul_scalar_{dtype}_{out_dtype}"
                     operands = [
                         op.inputs[0],
                         op.inputs[1],
                         op.outputs[0],
                     ]
             if call_builtin:
-                # replace operation
-                call_op = allo_func_d.CallOp(
-                    [],
-                    FlatSymbolRefAttr.get(kernel_name),
-                    operands,
-                    ip=InsertionPoint(op),
-                )
-                call_op.attributes["lib"] = StringAttr.get(kernel_name)
-                op.erase()
+                if replace_op:
+                    # replace operation
+                    call_op = allo_func_d.CallOp(
+                        [],
+                        FlatSymbolRefAttr.get(kernel_name),
+                        operands,
+                        ip=InsertionPoint(op),
+                    )
+                    call_op.attributes["lib"] = StringAttr.get(kernel_name)
+                    op.erase()
                 # register external kernel
                 if kernel_name in injected_external_kernels:
                     continue
@@ -412,7 +493,7 @@ def inject_external_kernels(
                 for region in op.regions:
                     for block in region.blocks:
                         inject_external_kernels_recursive(
-                            block.operations, df_function_name
+                            block.operations, df_function_tag
                         )
 
     with module.context, allo_ir.ir.Location.unknown():
@@ -422,10 +503,10 @@ def inject_external_kernels(
                 or func.attributes["sym_visibility"].value != "private"
             ):
                 if func.attributes["sym_name"].value != top_function_name:
-                    func_name: str = func.attributes["sym_name"].value
-                    use_external_kernels[func_name] = False
+                    func_tag: str = func.attributes["tag"].value
+                    use_external_kernels[func_tag] = False
                     for block in func.regions[0].blocks:
-                        inject_external_kernels_recursive(block.operations, func_name)
+                        inject_external_kernels_recursive(block.operations, func_tag)
     return (
         use_external_kernels,
         injected_external_kernels,
@@ -441,7 +522,7 @@ def get_df_kernels(module: allo_ir.ir.Module) -> list[allo_func_d.FuncOp]:
     return df_kernels
 
 
-def classify_aie_functions_experimental(
+def classify_aie_functions(
     module: allo_ir.ir.Module, top_function_name: str
 ) -> tuple[allo_func_d.FuncOp, list[allo_func_d.FuncOp], list[allo_func_d.FuncOp]]:
     """
@@ -472,51 +553,15 @@ def classify_aie_functions_experimental(
     return top_func, core_funcs, external_funcs
 
 
-def classify_aie_functions(
-    module: allo_ir.ir.Module, top_function_name: str
-) -> tuple[
-    allo_func_d.FuncOp, dict[str, list[allo_func_d.FuncOp]], list[allo_func_d.FuncOp]
-]:
-    """
-    Classify the functions in allo module as
-        - top
-        - compute core functions
-        - external kernel functions
-    """
-    # top function
-    top_func: allo_func_d.FuncOp = None
-    # core functions
-    core_func_groups: dict[str, list[allo_func_d.FuncOp]] = {}
-    # external functions
-    external_funcs: list[allo_func_d.FuncOp] = []
-    with module.context, allo_ir.ir.Location.unknown():
-        for func in module.body.operations:
-            if isinstance(func, allo_func_d.FuncOp):
-                if (
-                    "sym_visibility" in func.attributes
-                    and func.attributes["sym_visibility"].value == "private"
-                ):
-                    external_funcs.append(func)
-                elif func.attributes["sym_name"].value == top_function_name:
-                    top_func = func
-                else:
-                    func_name_w_id = func.attributes["sym_name"].value
-                    func_name = re.match(r"^(.*?)_\d", func_name_w_id).group(1)
-                    if func_name not in core_func_groups:
-                        core_func_groups[func_name] = []
-                    core_func_groups[func_name].append(func)
-    return top_func, core_func_groups, external_funcs
-
-
-def get_element_type(dtype_str: str) -> aie_ir.Type:
+def get_aie_mlir_dtype_from_str(dtype_str: str) -> aie_ir.Type:
     """
     Convert a string representing a data type into the corresponding AIE IR type.
     """
-    if dtype_str == "i32":
+    if dtype_str in {"i32", "ui32"}:
         return aie_ir.IntegerType.get_signless(32)
-    if dtype_str == "i16":
+    if dtype_str in {"i16", "ui16"}:
         return aie_ir.IntegerType.get_signless(16)
-    if dtype_str == "i8":
+    if dtype_str in {"i8", "ui8"}:
         return aie_ir.IntegerType.get_signless(8)
     if dtype_str == "f32":
         return aie_ir.F32Type.get()
@@ -555,6 +600,14 @@ def codegen_external_kernels(
                 mm_kernel = f.read()
                 pattern = r'#include\s+"zero\.cc"'
                 mm_kernel = re.sub(pattern, f'#include "{lib_dir}/zero.cc"', mm_kernel)
+                kernel_file_code += mm_kernel
+        elif "mmi4.cc" in src:
+            with open(
+                os.path.expandvars("$ALLO_EXTERNAL_KERNEL_DIR/matmul.cc"),
+                "r",
+                encoding="utf-8",
+            ) as f:
+                mm_kernel = f.read()
                 kernel_file_code += mm_kernel
         else:
             code += src
@@ -647,25 +700,53 @@ def simplify_matmul_accumulate(function: allo_func_d.FuncOp):
 # ############################################################
 # Run-time Utils
 # ############################################################
-np_supported_types = {
-    "bf16": np.float32,  # numpy does not support bf16
-    "f16": np.float16,
-    "f32": np.float32,
-    "f64": np.float64,
-    "i8": np.int8,
-    "i16": np.int16,
-    "i32": np.int32,
-    "i64": np.int64,
-    "ui1": np.bool_,
-    "ui8": np.uint8,
-    "ui16": np.uint16,
-    "ui32": np.uint32,
-    "ui64": np.uint64,
-}
+class RuntimeArgs:
+    def __init__(self, dtype: str, is_input: bool):
+        self.raw_dtype: str = dtype
+        self.dtype: str = dtype
+        if self.raw_dtype == "i4":
+            self.dtype = "i8"
+        self.is_input: bool = is_input
+        self.global_tensors: list[int] = []
+        self.current_size: int = 0
+
+    def inc_size(self, tensor_shape: list[int]):
+        if self.raw_dtype == "i4":
+            self.current_size += np.prod(tensor_shape) // 2
+        else:
+            self.current_size += np.prod(tensor_shape)
+
+
+def pack_int4(arr: np.ndarray) -> np.ndarray:
+    arr = arr.flatten()
+    arr_clipped = np.clip(arr, -8, 7).astype(np.int8)
+    arr_u4 = (arr_clipped.astype(np.int8) & 0x0F).astype(np.uint8)
+    if arr_u4.size % 2 != 0:
+        arr_u4 = np.append(arr_u4, 0)
+    low = arr_u4[0::2]
+    high = arr_u4[1::2] << 4
+    packed = (low | high).astype(np.uint8)
+    return packed
+
+
+def unpack_int4(packed: np.ndarray) -> np.ndarray:
+    p = packed.astype(np.uint8)
+    low = (p & 0x0F).astype(np.int8)
+    high = ((p >> 4) & 0x0F).astype(np.int8)
+    low = (low + 128) % 16 - 8
+    high = (high + 128) % 16 - 8
+    unpacked = np.empty(p.size * 2, dtype=np.int8)
+    unpacked[0::2] = low
+    unpacked[1::2] = high
+
+    return unpacked
 
 
 def read_tensor_from_file(dtype, shape, file_path):
-    arr = np.fromfile(file_path, sep="\n", dtype=np_supported_types[str(dtype)])
+    arr = np.fromfile(file_path, dtype=np_read_file_types[str(dtype)])
+    if str(dtype) == "bf16":
+        f32_arr = (arr.astype(np.uint32) << 16).view(np.float32)
+        return f32_arr.reshape(shape)
     return arr.reshape(shape)
 
 
@@ -767,87 +848,115 @@ int main(int argc, const char *argv[]) {
   auto bo_instr = xrt::bo(device, instr_v.size() * sizeof(int), XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
   void *bufInstr = bo_instr.map<void *>();
   memcpy(bufInstr, instr_v.data(), instr_v.size() * sizeof(int));
-  // output
-  std::ofstream ofile("output.data");
-  if (!ofile.is_open()) {
-      std::cerr << "Error: Could not open output file.\\n";
-      return 1;
-  }
 
   // kernel arguments
   unsigned int opcode = 3;
 """
 
-file_close_str = """  ofile.close();
-  if (verbosity >= 1)
-    std::cout << "Array has been written to output.data.\\n";
-  return 0;
-}
-"""
 
-
-def codegen_host(inputs: dict[int, DTensor], outputs: dict[int, DTensor]):
+def codegen_host(global_tensors: dict[int, DTensor], runtime_args: list[RuntimeArgs]):
     """
     Generate the C++ code for external kernels for host CPU.
     """
     code = host_header
     with format_code(indent=2):
-        # write input data
-        for i in range(len(inputs)):
-            dtensor = inputs[i]
-            shape = dtensor.shape
-            dtype = aie_ctype_map[str(dtensor.dtype)]
-            code += format_str(f'std::ifstream ifile{i}("input{i}.data");')
-            code += format_str(f"if (!ifile{i}.is_open()) {{")
-            code += format_str(
-                '  std::cerr << "Error: Could not open input file.\\n";', strip=False
-            )
-            code += format_str("  return 1;", strip=False)
-            code += format_str("}")
-            size = np.prod(shape)
-            code += format_str(
-                f"auto bo_in{i} = xrt::bo(device, {size} * sizeof({dtype}),"
-            )
-            with format_code(indent=24):
+        buffer_list = []
+        for idx, arg in enumerate(runtime_args):
+            if len(arg.global_tensors) == 0:
+                continue
+            if arg.is_input:
+                dtype = host_aie2c_type[str(arg.dtype)]
                 code += format_str(
-                    f"XRT_BO_FLAGS_HOST_ONLY, kernel.group_id({i + 3}));"
+                    f"auto bo_in{idx} = xrt::bo(device, {arg.current_size} * sizeof({dtype}),"
                 )
-            code += format_str(f"{dtype} *bufIn{i} = bo_in{i}.map<{dtype} *>();")
-            code += format_str(f"std::vector<{dtype}> srcVec{i};")
-            code += format_str(f"for (int i = 0; i < {size}; i++) {{")
-            with format_code(indent=4):
-                code += format_str(f"{dtype} num;")
-                code += format_str(f"ifile{i} >> num;")
-                code += format_str(f"srcVec{i}.push_back(num);")
-            code += format_str("}")
-            code += format_str(
-                f"memcpy(bufIn{i}, srcVec{i}.data(), (srcVec{i}.size() * sizeof({dtype})));"
-            )
-        for i in range(len(outputs)):
-            dtensor = outputs[i + len(inputs)]
-            shape = dtensor.shape
-            dtype = aie_ctype_map[str(dtensor.dtype)]
-            out_size = np.prod(shape)
-            code += format_str(
-                f"\nauto bo_out{i} = xrt::bo(device, {out_size} * sizeof({dtype}),",
-                strip=False,
-            )
-            with format_code(indent=24):
+
+                buffer_list.append(f"bo_in{idx}")
+                with format_code(indent=24):
+                    code += format_str(
+                        f"XRT_BO_FLAGS_HOST_ONLY, kernel.group_id({idx + 3}));"
+                    )
                 code += format_str(
-                    f"XRT_BO_FLAGS_HOST_ONLY, kernel.group_id({len(inputs) + 2 + i}));"
+                    f"{dtype} *bufIn{idx} = bo_in{idx}.map<{dtype} *>();"
                 )
+                code += format_str(f"std::vector<{dtype}> srcVec{idx};")
+                for dtensor_idx in arg.global_tensors:
+                    code += format_str(
+                        f'std::ifstream ifile{dtensor_idx}("input{dtensor_idx}.data");'
+                    )
+                    code += format_str(f"if (!ifile{dtensor_idx}.is_open()) {{")
+                    code += format_str(
+                        '  std::cerr << "Error: Could not open input file.\\n";',
+                        strip=False,
+                    )
+                    code += format_str("  return 1;", strip=False)
+                    code += format_str("}")
+                    size = np.prod(global_tensors[dtensor_idx].shape)
+                    if str(global_tensors[dtensor_idx].dtype) == "i4":
+                        size //= 2
+                    # check if the input file has expected bytes
+                    code += format_str(f"ifile{dtensor_idx}.seekg(0, std::ios::end);")
+                    code += format_str(
+                        f"auto ifile{dtensor_idx}_size = ifile{dtensor_idx}.tellg();"
+                    )
+                    code += format_str(f"ifile{dtensor_idx}.seekg(0, std::ios::beg);")
+                    code += format_str(
+                        f"if (ifile{dtensor_idx}_size != {size} * sizeof({dtype})) {{"
+                    )
+                    code += format_str(
+                        '  std::cerr << "Error: Invalid input file, byte number mismatch.\\n";',
+                        strip=False,
+                    )
+                    code += format_str("  return 1;", strip=False)
+                    code += format_str("}")
+                    code += format_str(
+                        f"std::vector<{dtype}> vec{dtensor_idx}({size});"
+                    )
+                    code += format_str(
+                        f"ifile{dtensor_idx}.read(reinterpret_cast<char*>(vec{dtensor_idx}.data()), {size} * sizeof({dtype}));"
+                    )
+                    code += format_str(
+                        f"srcVec{idx}.insert(srcVec{idx}.end(), vec{dtensor_idx}.begin(), vec{dtensor_idx}.end());"
+                    )
+                code += format_str(
+                    f"memcpy(bufIn{idx}, srcVec{idx}.data(), (srcVec{idx}.size() * sizeof({dtype})));"
+                )
+            else:
+                code += format_str(
+                    f"\nauto bo_out{idx} = xrt::bo(device, {arg.current_size} * sizeof({host_aie2c_type[str(arg.dtype)]}),",
+                    strip=False,
+                )
+                buffer_list.append(f"bo_out{idx}")
+                with format_code(indent=24):
+                    code += format_str(
+                        f"XRT_BO_FLAGS_HOST_ONLY, kernel.group_id({idx + 3}));"
+                    )
+        # trace
+        code += format_str(
+            "int tmp_trace_size = (trace_size > 0) ? trace_size : 1;", strip=False
+        )
+        code += format_str(
+            f"auto bo_trace = xrt::bo(device, tmp_trace_size * 4, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id({len(runtime_args) + 3}));"
+        )
         code += format_str("if (verbosity >= 1)")
         code += format_str(
             '  std::cout << "Writing data into buffer objects.\\n";', strip=False
         )
+        code += format_str("char *bufTrace = bo_trace.map<char *>();")
+        code += format_str("if (trace_size > 0)")
+        code += format_str("  memset(bufTrace, 0, trace_size);", strip=False)
+
         code += format_str("\nbo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);", strip=False)
-        for i in range(len(inputs)):
-            code += format_str(f"bo_in{i}.sync(XCL_BO_SYNC_BO_TO_DEVICE);")
+        for idx, arg in enumerate(runtime_args):
+            if len(arg.global_tensors) == 0:
+                continue
+            if arg.is_input:
+                code += format_str(f"bo_in{idx}.sync(XCL_BO_SYNC_BO_TO_DEVICE);")
+        code += format_str("if (trace_size > 0)")
+        code += format_str("  bo_trace.sync(XCL_BO_SYNC_BO_TO_DEVICE);", strip=False)
         # run kernels
         code += format_str("if (verbosity >= 1)")
         code += format_str('  std::cout << "Running Kernel.\\n";', strip=False)
-        inbufs = ", ".join([f"bo_in{i}" for i in range(len(inputs))])
-        outbufs = ", ".join([f"bo_out{i}" for i in range(len(outputs))])
+        buffers = ", ".join(buffer_list)
         code += format_str("if (!do_profile) {")
         with format_code(indent=4):
             code += format_str(
@@ -855,7 +964,7 @@ def codegen_host(inputs: dict[int, DTensor], outputs: dict[int, DTensor]):
             )
             code += format_str("// gid: (opcode, instr, instr_size, ...)")
             code += format_str(
-                f"auto run = kernel(opcode, bo_instr, instr_v.size(), {inbufs}, {outbufs});"
+                f"auto run = kernel(opcode, bo_instr, instr_v.size(), {buffers}, bo_trace);"
             )
             code += format_str("ert_cmd_state r = run.wait();")
             code += format_str(
@@ -879,7 +988,7 @@ def codegen_host(inputs: dict[int, DTensor], outputs: dict[int, DTensor]):
             code += format_str("for (size_t i = 0; i < n_warmup_iterations; i++) {")
             with format_code(indent=8):
                 code += format_str(
-                    f"auto run = kernel(opcode, bo_instr, instr_v.size(), {inbufs}, {outbufs});"
+                    f"auto run = kernel(opcode, bo_instr, instr_v.size(), {buffers}, bo_trace);"
                 )
                 code += format_str("ert_cmd_state r = run.wait();")
                 code += format_str("if (r != ERT_CMD_STATE_COMPLETED) {")
@@ -891,6 +1000,7 @@ def codegen_host(inputs: dict[int, DTensor], outputs: dict[int, DTensor]):
                 code += format_str("}")
             code += format_str("}")
             code += format_str("float total_npu_time = 0;")
+            code += format_str("float npu_time_min = 9999999;")
             code += format_str("for (size_t i = 0; i < n_test_iterations; i++) {")
             with format_code(indent=8):
                 code += format_str(
@@ -898,7 +1008,7 @@ def codegen_host(inputs: dict[int, DTensor], outputs: dict[int, DTensor]):
                     strip=False,
                 )
                 code += format_str(
-                    f"auto run = kernel(opcode, bo_instr, instr_v.size(), {inbufs}, {outbufs});"
+                    f"auto run = kernel(opcode, bo_instr, instr_v.size(), {buffers});"
                 )
                 code += format_str("run.wait();")
                 code += format_str(
@@ -909,36 +1019,62 @@ def codegen_host(inputs: dict[int, DTensor], outputs: dict[int, DTensor]):
                     "float npu_time = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();"
                 )
                 code += format_str("total_npu_time += npu_time;")
+                code += format_str(
+                    "npu_time_min = (npu_time < npu_time_min) ? npu_time : npu_time_min;"
+                )
             code += format_str("}")
             code += format_str(
                 'std::cout << "Avg NPU execution time: " << total_npu_time / n_test_iterations << "us\\n";'
             )
+            code += format_str(
+                'std::cout << "Min NPU execution time: " << npu_time_min << "us\\n";'
+            )
         code += format_str("}")
         # get results
-        for i in range(len(outputs)):
-            dtensor = outputs[i + len(inputs)]
-            shape = dtensor.shape
-            dtype = aie_ctype_map[str(dtensor.dtype)]
-            out_size = np.prod(shape)
-            code += format_str(
-                f"\nbo_out{i}.sync(XCL_BO_SYNC_BO_FROM_DEVICE);", strip=False
-            )
-            code += format_str(f"{dtype} *bufOut{i} = bo_out{i}.map<{dtype} *>();")
-            code += format_str(f"for (uint32_t i = 0; i < {out_size}; i++) {{")
-            code += format_str(f'  ofile << *(bufOut{i} + i) << "\\n";', strip=False)
-            code += format_str("}")
-        code += format_str("\n// Close files", strip=False)
-        for i in range(len(inputs)):
-            code += format_str(f"ifile{i}.close();")
-        code += file_close_str
+        for idx, arg in enumerate(runtime_args):
+            if len(arg.global_tensors) == 0:
+                continue
+            if arg.is_input:
+                for dtensor_idx in arg.global_tensors:
+                    code += format_str(f"ifile{dtensor_idx}.close();")
+            else:
+                dtype = host_aie2c_type[str(arg.dtype)]
+
+                code += format_str(
+                    f"\nbo_out{idx}.sync(XCL_BO_SYNC_BO_FROM_DEVICE);", strip=False
+                )
+                code += format_str(
+                    f"{dtype} *bufOut{idx} = bo_out{idx}.map<{dtype} *>();"
+                )
+                offset = 0
+                for dtensor_idx in arg.global_tensors:
+                    out_size = np.prod(global_tensors[dtensor_idx].shape)
+                    if str(global_tensors[dtensor_idx].dtype) == "i4":
+                        out_size //= 2
+                    code += format_str(
+                        f'std::ofstream ofile{dtensor_idx}("output{dtensor_idx}.data", std::ios::binary);'
+                    )
+                    code += format_str(
+                        f"ofile{dtensor_idx}.write(reinterpret_cast<const char*>(bufOut{idx} + {offset}), {out_size} * sizeof({dtype}));"
+                    )
+                    code += format_str(f"ofile{dtensor_idx}.close();")
+                    offset += out_size
+
+        code += format_str("if (trace_size > 0) {")
+        code += format_str("  bo_trace.sync(XCL_BO_SYNC_BO_FROM_DEVICE);", strip=False)
+        code += format_str(
+            '  test_utils::write_out_trace(((char *)bufTrace), trace_size, vm["trace_file"].as<std::string>());',
+            strip=False,
+        )
+        code += format_str("}")
+        code += format_str("return 0;")
+    code += format_str("}", indent=0)
     return code
 
 
 # ############################################################
 # Tools
 # ############################################################
-
-
 class UnionFind:
     def __init__(self):
         self.parent = {}

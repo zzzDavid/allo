@@ -50,7 +50,7 @@ import allo
 import allo.dataflow as df
 from allo.ir.types import float32, bfloat16, int32
 from allo.memory import Layout
-from allo.backend.experimental import ExternalModule
+from allo.backend.aie import ExternalModule
 
 torch.manual_seed(0)
 np.random.seed(0)
@@ -59,7 +59,7 @@ np.random.seed(0)
 # Model Configuration
 # ===============================================================================
 USE_ALL_NPU_KERNELS = True  # if False, we will offload softmax and gelu to cpu
-KERNEL_LIB_PATH = "../../../../allo/backend/experimental/kernels/"
+KERNEL_LIB_PATH = "../../../../allo/library/aie/"
 BATCH = 1  # fixme: don't care for now
 SEQ = 64
 EMBD = 768  # 64 * 12
@@ -308,20 +308,18 @@ def run(x_fp32: np.ndarray, params: dict):
     # ##############################################################
     # BUILD
     # ##############################################################
-    layer_norm_mod = df.build(layer_norm_kernel, target="aie-mlir", project="norm.prj")
+    layer_norm_mod = df.build(layer_norm_kernel, target="aie", project="norm.prj")
     linear_matmul_mod = df.build(
-        linear_matmul_kernel, target="aie-mlir", project="linear_matmul.prj"
+        linear_matmul_kernel, target="aie", project="linear_matmul.prj"
     )
     linear_accumulate_mod = df.build(
-        linear_accumulate_kernel, target="aie-mlir", project="linear_accumulate.prj"
+        linear_accumulate_kernel, target="aie", project="linear_accumulate.prj"
     )
-    attn_score_mod = df.build(
-        attn_score_kernel, target="aie-mlir", project="attn_score.prj"
-    )
+    attn_score_mod = df.build(attn_score_kernel, target="aie", project="attn_score.prj")
     masked_softmax_mod = df.build(
-        masked_softmax_kernel, target="aie-mlir", project="masked_softmax.prj"
+        masked_softmax_kernel, target="aie", project="masked_softmax.prj"
     )
-    gelu_mod = df.build(gelu_kernel, target="aie-mlir", project="gelu.prj")
+    gelu_mod = df.build(gelu_kernel, target="aie", project="gelu.prj")
 
     # ##############################################################
     # TOOL
@@ -385,12 +383,11 @@ def run(x_fp32: np.ndarray, params: dict):
                 )
 
     def masked_softmax(attention_score, attention_weight):
-        row_idx = np.array(list(range(0, SEQ, SOFTMAX_SEQ_TILE)))
+        row_idx = np.array(list(range(0, SEQ, SOFTMAX_SEQ_TILE))).astype(np.int32)
         for i in range(N_HEAD // SOFTMAX_HEAD_TILE):
             masked_softmax_mod(
                 attention_score[
-                    :,
-                    i * (SOFTMAX_HEAD_TILE * SEQ) : (i + 1) * (SOFTMAX_HEAD_TILE * SEQ),
+                    :, i * SOFTMAX_HEAD_TILE : (i + 1) * SOFTMAX_HEAD_TILE, :
                 ],
                 row_idx,
                 attention_weight[
@@ -416,7 +413,7 @@ def run(x_fp32: np.ndarray, params: dict):
     linear_projection(x, params["Wv"], value, SEQ, EMBD, EMBD)
 
     # attention score
-    attention_score = np.empty((N_HEAD, SEQ, SEQ), dtype=np.float32)
+    attention_score = np.empty((SEQ, N_HEAD, SEQ), dtype=np.float32)
     for i in range(SEQ // ATTN_SCORE_M_TILE):
         for j in range(SEQ // ATTN_SCORE_N_TILE):
             for k in range(N_HEAD):
@@ -430,8 +427,8 @@ def run(x_fp32: np.ndarray, params: dict):
                         k * HEAD_DIM : (k + 1) * HEAD_DIM,
                     ],
                     attention_score[
-                        k,
                         i * ATTN_SCORE_M_TILE : (i + 1) * ATTN_SCORE_M_TILE,
+                        k,
                         j * ATTN_SCORE_N_TILE : (j + 1) * ATTN_SCORE_N_TILE,
                     ],
                 )
@@ -442,7 +439,7 @@ def run(x_fp32: np.ndarray, params: dict):
         masked_softmax(attention_score, attn_weight)
     else:
         mask = torch.triu(torch.ones(SEQ, SEQ), 1).bool()
-        mask = np.repeat(mask[np.newaxis, :, :], N_HEAD, axis=0)
+        mask = np.repeat(mask[:, np.newaxis, :], N_HEAD, axis=1)
         attention_score[mask == 1] = -np.inf
         tensor_atten_score = torch.from_numpy(attention_score)
         attn_weight = F.softmax(tensor_atten_score, dim=-1)
@@ -455,7 +452,7 @@ def run(x_fp32: np.ndarray, params: dict):
             (
                 attn_weight[:, k * SEQ : (k + 1) * SEQ]
                 if USE_ALL_NPU_KERNELS
-                else attn_weight[k, :, :]
+                else attn_weight[:, k, :]
             ),
             value[:, k * HEAD_DIM : (k + 1) * HEAD_DIM],
             attn_value[:, k * HEAD_DIM : (k + 1) * HEAD_DIM],

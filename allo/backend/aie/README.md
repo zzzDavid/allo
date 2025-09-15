@@ -2,6 +2,14 @@
 <!--- SPDX-License-Identifier: Apache-2.0  -->
 
 # Experimental MLIR-AIE Codegen
+- [Environment Setup](#environment-setup)
+- [Usage](#usage)
+    - [Basic Examples](#example)
+    - [New Features](#new-feature)
+        - [Timing-based Profiling](#profiling)
+        - [Tracing-based Profiling](#profiling-with-trace)
+        - [Customized External Kernel](#support-for-user-defined-external-kernels)
+
 ## Environment Setup
 Please follow the [Getting Started](https://github.com/Xilinx/mlir-aie/tree/main?tab=readme-ov-file#getting-started-for-amd-ryzen-ai-on-linux) guide to install MLIR-AIE.
 
@@ -131,7 +139,7 @@ def downgrade_ir_for_peano(llvmir):
 
 ## Usage
 
-To enable the experimental MLIR-AIE codegen, specify `"aie-mlir"` as the target in the `dataflow.build` function.
+To enable the experimental MLIR-AIE codegen, specify `"aie"` as the target in the `dataflow.build` function.
 
 Currently, the supported target platforms include `XDNA1` and `XDNA2`.
 By default, the target platform is set to `XDNA1`.
@@ -166,7 +174,7 @@ def _test_vector_scalar_add():
 
     A = np.random.randint(0, 100, M).astype(np.int32)
     if "MLIR_AIE_INSTALL_DIR" in os.environ:
-        mod = df.build(top, target="aie-mlir")
+        mod = df.build(top, target="aie")
         B = np.zeros(M).astype(np.int32)
         mod(A, B)
         np.testing.assert_allclose(B, A + 1)
@@ -199,7 +207,7 @@ def _test_gemm_1D():
         def gemm(A: Ty[M, K] @ LyA, B: Ty[K, N], C: Ty[M, N] @ LyA):
             C[:, :] = allo.matmul(A, B)
 
-    mod = df.build(top, target="aie-mlir")
+    mod = df.build(top, target="aie")
     A = np.random.randint(0, 64, (M, K)).astype(np.int32)
     B = np.random.randint(0, 64, (K, N)).astype(np.int32)
     C = np.zeros((M, N)).astype(np.int32)
@@ -246,7 +254,7 @@ def test_producer_consumer():
     B = np.zeros((M, N), dtype=np.int32)
 
     if "MLIR_AIE_INSTALL_DIR" in os.environ:
-        mod = df.build(top, target="aie-mlir")
+        mod = df.build(top, target="aie")
         mod(A, B)
         np.testing.assert_allclose(A + 1, B, atol=1e-5)
         print("Passed!")
@@ -287,8 +295,8 @@ def top2():
         C[:, :] = allo.add(A, B)
 
 
-mod1 = df.build(top1, target="aie-mlir", project="top1.prj")
-mod2 = df.build(top2, target="aie-mlir", project="top2.prj")
+mod1 = df.build(top1, target="aie", project="top1.prj")
+mod2 = df.build(top2, target="aie", project="top2.prj")
 
 A = np.random.randint(0, 8, (total_M, total_K)).astype(np.int16)
 B = np.random.randint(0, 8, (total_K, total_N)).astype(np.int16)
@@ -307,9 +315,9 @@ print("PASSED!")
 
 ### New Feature
 #### Profiling
-A new profiling feature has been added to help measure the performance of the module during execution. 
+A new timing-based profiling feature has been added to help measure the performance of the module during execution. 
 
-To enable profiling, use the `do_profile` flag in the `build` method in [`dataflow.py`](../../dataflow.py):
+To enable profiling, use the `profile` flag in the `build` method in [`dataflow.py`](../../dataflow.py):
 ```python
 def build(
     func,
@@ -320,13 +328,17 @@ def build(
     wrap_io=True,
     opt_default=True,
     enable_tensor=False,
+    mapping_primitives: list[tuple[str, list]] = [],
     profile=False,
     warmup=20,
     num_iters=100,
-):
+    trace: list[tuple[str, tuple[int, ...]]] = None,
+    trace_size: int = 4096,
+    device_type: str = None,
+)
 ```
 
-**New Parameters:**
+**Related Parameters:**
 
 - `profile` (`bool`): Set to `True` to enable profiling. When enabled, the module performs extra warm-up and test iterations.
 - `warmup` (`int`): Number of initial iterations to warm up the system. These iterations are **excluded** from the timing measurements. Default is `20`.
@@ -357,7 +369,7 @@ def top1():
 
 mod = df.build(
     top1,
-    target="aie-mlir",
+    target="aie",
     profile=True,
     warmup=200,
     num_iters=1000,
@@ -368,6 +380,111 @@ C = np.zeros((M, N)).astype(np.int32)
 tmp_C = np.zeros((M, N)).astype(np.int32)
 mod(A, B, C)
 ```
+#### Profiling with Trace
+AIEs are equipped with tracing hardware that provides a cycle accurate view of hardware events. 
+This enables more precise profiling, especially for analyzing the performance of computation on each compute tile (AIE) and the associated data transfers.
+
+However, configuring the trace unit can be complex. This new feature simplifies the process, making trace-based profiling easier to use.
+
+Trace-based profiling requires configuring the compute tile and routing the trace data as packets through the shim tile to external memory. 
+This places additional pressure on the DMA ports of the shim tile, making it unsuitable for large-scale computation tasks where DMA bandwidth is already a constrained resource. 
+As a result, trace support is currently provided mainly for small-scale computations.
+
+To use trace, users can configure the options in the `build` method in [`dataflow.py`](../../dataflow.py):
+```python
+def build(
+    func,
+    target="vitis_hls",
+    mode="csim",
+    project="top.prj",
+    configs=None,
+    wrap_io=True,
+    opt_default=True,
+    enable_tensor=False,
+    mapping_primitives: list[tuple[str, list]] = [],
+    profile=False,
+    warmup=20,
+    num_iters=100,
+    trace: list[tuple[str, tuple[int, ...]]] = None,
+    trace_size: int = 4096,
+    device_type: str = None,
+):
+```
+
+**Related Parameters:**
+- `trace` is a list of tiles from the `allo.dataflow.kernel` users wishes to trace. Each element consists of the kernel’s name as a string and a tuple representing the tile index. Note that this index does not necessarily correspond to the final physical compute tile index in the 2D AIE array. Also note that due to resource constraints, tracing is enabled on a best-effort basis. If resources such as DMA ports or buffer descriptors are limited, tracing may not be applied to all specified tiles in the `trace` list.
+- `trace_size` specifies the size of the trace buffer. If a large amount of trace information is expected, users may increase trace_size accordingly.
+
+After `build`, running the generated module will produce a file named `trace.txt` under the `project` directory. 
+
+The `trace.txt` file should contain multiple lines of non-zero values.
+If all entries are zero, please first check whether the `top.mlir` file contains any `aie.packet_flow` operations.
+- If not, it indicates that tracing for the specified tiles was skipped due to resource constraints.
+- If such operations are present but entries in `trace.txt` are all zero, please submit a bug report.
+
+Users can use multiple tool to parse the `trace.txt` and convert it into a more human-readable format. 
+Some of the useful parsers can be found in the `mlir-aie` repository. For example, [`parse_trace.py`](https://github.com/Xilinx/mlir-aie/blob/v1.0/programming_examples/utils/parse_trace.py) parses it into a json file and users can use [Perfetto](http://ui.perfetto.dev) to view the timeline (check [this link](https://github.com/Xilinx/mlir-aie/blob/v1.0/programming_examples/utils/README.md#trace-parser-parse_tracepy) for more details).
+
+> **Note:** the unit of timing reported in perfetto should be interpreted as cycle count (check [this issue](https://github.com/Xilinx/mlir-aie/issues/2214) for more information).
+
+##### Example
+Tracing tile `(0, 0)` of the `allo.dataflow.kernel` named `gemm`.
+```python
+TyI, TyO = int16, int32
+M, N, K = 32, 32, 32
+P0, P1 = 2, 4
+
+@df.region()
+def top():
+    @df.kernel(mapping=[P0, P1])
+    def gemm(A: TyI[M, K] @ LyA, B: TyI[K, N] @ LyB, C: TyO[M, N] @ LyC):
+        C[:, :] = allo.matmul(A, B)
+
+# trace tile (0, 0) of gemm df.kernel
+mod = df.build(
+    top,
+    target="aie",
+    trace=[
+        ("gemm", (0, 0)),
+    ],
+    trace_size=65536,
+)
+A = np.random.randint(0, 64, (M, K)).astype(np.int16)
+B = np.random.randint(0, 64, (K, N)).astype(np.int16)
+C = np.zeros((M, N)).astype(np.int32)
+mod(A, B, C)
+np_C = A.astype(np.int32) @ B.astype(np.int32)
+np.testing.assert_allclose(C, np_C, atol=1e-5)
+print("PASSED!")
+```
+##### Using Trace to Measure the Performance of External Kernels
+Trace is useful for evaluating the performance of an external kernel running on a single compute tile. 
+This is especially important when profiling for optimizations such as vectorization of external kernels. The following example demonstrates how to use trace profiling on some [convolution kernels](./kernels/).
+
+In this case, due to the relatively small computation scale, the difference between the [vectorized](./kernels/conv_small_vector.cc) and [scalar](./kernels/conv_small_scalar.cc) versions of the kernel is not clearly observable using timing-based profiling to measure NPU time. 
+Instead, one can insert event markers, such as `event0();` and `event1();`, directly into the external C++ code and run the trace on the compute tile executing the external kernel. Sample code can be found in [`test_trace_conv.py`](../../../tests/dataflow/aie/test_trace_conv.py).
+
+Process the generated trace (in `top.prj/trace.txt`) with [`parse_trace.py`](https://github.com/Xilinx/mlir-aie/blob/v1.0/programming_examples/utils/parse_trace.py).
+```bash
+# sample processing cmds
+cd top.prj
+path/to/parse_trace.py --filename trace.txt --mlir top.mlir --colshift 1 > trace_scalar.json
+```
+And use [Perfetto](http://ui.perfetto.dev) to view the timeline.
+The timeline view reveals a clear performance difference between the two external kernel versions.
+
+- scalar version
+    
+    <img width="80%" alt="scalar" src="https://github.com/user-attachments/assets/4cc92e2b-4b4c-495d-8718-0c5d32d22c00" />
+  
+- vector version
+
+    <img width="80%" alt="vector" src="https://github.com/user-attachments/assets/4c5b558d-c84d-4c16-aef2-3c626b62bbee" />
+
+From the timeline screenshot, you can observe a clear difference in the computation cycle count between the two kernels within the regions marked by the event markers. 
+Additionally, you can see that the vectorized version makes use of vector instructions, which are absent in the scalar version.
+
+If you need more precise cycle counts or additional profiling information, you can write your own processing script to analyze the generated JSON file, or directly parse the `trace.txt`.
 
 #### Support for user-defined external kernels
 
@@ -435,7 +552,7 @@ extern "C" {
 ```
 > ⚠️ **Note:** External kernel function arguments must have fully specified constant shapes. Pointer types are not allowed.
 
-We can create an [ExternalModule](external_kernel.py) to wrap the kernel and use it in computation on AIE core.
+Users can create an [ExternalModule](external_kernel.py) to wrap the kernel and use it in computation on AIE core.
 
 Register the `ExternalModule` in the context.
 ```python
@@ -458,27 +575,3 @@ An example can be found in [`tests/dataflow/aie/test_norm.py`](../../../tests/da
 ##### Allo External Kernel Library 
 The [`kernels`](./kernels) directory contains several external kernels used in the GPT-2 block.
 Corresponding tests can be found in [`tests/dataflow/aie/gpt2`](../../../tests/dataflow/aie/gpt2/).
-
-### ⚠️ Note
-Code that previously used `"aie"` as the target in the `dataflow.build` function may no longer work correctly in this environment.
-
-This is mainly due to recent **syntax changes in `mlir-aie`**. For example, running:
-
-```
-tests/dataflow/aie/test_vector.py
-```
-
-may result in the following error:
-
-```
-Unable to parse module assembly: 
-error: "-":44:30: expected SSA operand
-```
-
-This happens because the syntax of operations like the following has changed:
-
-```
-aiex.npu.dma_memcpy_nd(0, 0, %arg0[0, 0, 0, 0][1, 1, 1, 1024][0, 0, 0, 1]) {
-  id = 0 : i64, issue_token = true, metadata = @in_shim_A
-} : memref<1024xi32>
-```

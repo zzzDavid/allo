@@ -1,4 +1,4 @@
-# pylint: disable=import-error, c-extension-no-member, too-many-nested-blocks, too-many-instance-attributes, pointless-exception-statement
+# pylint: disable=import-error, c-extension-no-member, too-many-instance-attributes
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import shutil
+import numpy as np
 
 try:
     import aie.ir as aie_ir
@@ -13,7 +14,6 @@ try:
 except ImportError:
     pass
 
-from allo._mlir.exceptions import APIWarning
 import allo._mlir._mlir_libs._mlir as allo_ir
 from allo._mlir.dialects import (
     allo as allo_d,
@@ -31,6 +31,7 @@ from allo._mlir.ir import (
 from allo._mlir.passmanager import PassManager as mlir_pass_manager
 from ...passes import analyze_read_write_patterns
 from ...memory import DTensor
+from ...utils import construct_kernel_name
 from .external_kernel import ExternalModule, ExternalModuleBase
 from .mlir_codegen import CodeGenerator
 from .utils import (
@@ -40,12 +41,13 @@ from .utils import (
     matmul_external_kernel_config_map,
     get_df_kernels,
     classify_aie_functions,
-    classify_aie_functions_experimental,
     codegen_external_kernels,
     simplify_matmul_accumulate,
     collect_lib_func_call,
+    pack_int4,
     read_tensor_from_file,
     codegen_host,
+    RuntimeArgs,
 )
 from .mapping import ComputationGraph
 
@@ -64,6 +66,7 @@ class AIE_MLIRModule:
         stream_info: dict,
         stream_types_dict: dict[str, Type],
         ext_libs: list = None,
+        func_instances: dict = None,
     ):
         """
         Note: the module is data-driven,
@@ -71,12 +74,14 @@ class AIE_MLIRModule:
             For example, launching the kernels in topological order.
         """
         # module metadata
+        self.trace_size = 0
         self.project_dir: str = project_dir
         self.allo_module: allo_ir.ir.Module = module
         self.top_func_name: str = top_func_name
         self.module_parameter_list = [
             k for k, _ in sorted(parameter_list.items(), key=lambda item: item[1])
         ]
+        self.func_instances = func_instances
 
         self.external_kernel_lib: dict[str, ExternalModule] = {}
         for ext_kernel in ext_libs:
@@ -90,8 +95,8 @@ class AIE_MLIRModule:
         self.computation_is_dag = self._init_streams(stream_info, stream_types_dict)
 
         # index in top function argument list -> DTensor
-        self.global_inputs: dict[int, DTensor] = None
-        self.global_outputs: dict[int, DTensor] = None
+        self.global_tensors: dict[int, DTensor] = None
+        self.module_runtime_args: list[RuntimeArgs] = None
         # function name -> (argument index -> (argument, is_input))
         self.core_func_args: dict[str, dict[int, tuple[Argument, bool]]] = None
 
@@ -99,7 +104,6 @@ class AIE_MLIRModule:
 
     def _init_func_args(self, func_args: dict):
         tmp_map: dict = {}
-        self.func_args: dict[str, list[Argument]] = {}
         for func_name, args in func_args.items():
             self.func_args[func_name] = []
             for arg in args:
@@ -161,49 +165,18 @@ class AIE_MLIRModule:
     # ############################################################
     # Build
     # ############################################################
-    def _init_virtual_graph(self, use_external_kernels: dict[str, bool]):
+    def init_virtual_graph(self, use_external_kernels: dict[str, bool]):
         assert (
-            self.core_func_args is not None
-            and self.global_inputs is not None
-            and self.global_outputs is not None
+            self.core_func_args is not None and self.global_tensors is not None
         ), "Analysis of kernel parameters should be done before initializing virtual graph"
-
         self.virtual_computation_graph: ComputationGraph = ComputationGraph(
             self.allo_module,
             self.top_func_name,
             self.streams,
             self.core_func_args,
             use_external_kernels,
+            self.func_instances,
         )
-
-    def assign_tag_to_kernel(self):
-        """
-        Assign tag to df kernels (serve as some kind of rerolling)
-        """
-
-        class Tagger:
-            def __init__(self) -> None:
-                self.tag_map: dict[str, str] = {}
-                self.counter = 0
-
-            def get_tag(self, key: str) -> str:
-                """Return existing tag or assign a new one if not present."""
-                if key not in self.tag_map:
-                    tag = f"tag_{self.counter}"
-                    self.tag_map[key] = tag
-                    self.counter += 1
-                return self.tag_map[key]
-
-        tagger = Tagger()
-        df_kernels = get_df_kernels(self.allo_module)
-        for kernel in df_kernels:
-            tag_key = re.sub(
-                r"func\.func\s+@[\w\d_]+(\s*\()", r"func.func\1", str(kernel.operation)
-            )
-            tag = tagger.get_tag(tag_key)
-            with kernel.context:
-                kernel.attributes["tag"] = StringAttr.get(tag)
-        return df_kernels
 
     def analyze_kernel_parameters(
         self,
@@ -215,69 +188,63 @@ class AIE_MLIRModule:
 
         Collected information:
             - self.core_func_args: function name -> (argument index -> (argument, is_input))
-            - self.global_inputs: global input argument index -> DTensor
-            - self.global_outputs: global output argument index -> DTensor
+            - self.global_tensors: global argument index -> DTensor
         """
         tag_to_read_write_pattern: dict[str, tuple[list, list]] = {}
         # init
         self.core_func_args = {}
-        self.global_inputs = {}
-        self.global_outputs = {}
+        self.global_tensors = {}
         # analyze
-        for kernel in df_kernels:
-            kernel_name = kernel.attributes["sym_name"].value
-            self.core_func_args[kernel_name] = {}
-            tag = kernel.attributes["tag"].value
-            if tag in tag_to_read_write_pattern:
-                in_idx_list, out_idx_list = tag_to_read_write_pattern[tag]
-            else:
-                # fixme: `analyze_read_write_patterns` considers parameters that are both read and written as outputs
+        tag_to_func: dict[str, allo_func_d.FuncOp] = {}
+        for func in df_kernels:
+            tag = func.attributes["tag"].value
+            if tag not in tag_to_func:
+                tag_to_func[tag] = func
                 in_idx_list, out_idx_list = analyze_read_write_patterns(
-                    kernel, injected_external_kernels
+                    func, injected_external_kernels
                 )
                 tag_to_read_write_pattern[tag] = (in_idx_list, out_idx_list)
-            for io_idx_list, io_type in (
-                (in_idx_list, "in"),
-                (out_idx_list, "out"),
-            ):
-                for io_idx in io_idx_list:
-                    argument: Argument = self.func_args[kernel_name][io_idx]
-                    self.core_func_args[kernel_name][io_idx] = (
-                        argument,
-                        io_type == "in",
-                    )
-                    if not argument.dtensor is None:
-                        argument.dtensor.set_access_pattern()
-                        argument.dtensor.type_as_param = kernel.arguments[
-                            io_idx
-                        ].type.shape
-                        global_idx = self.func_args[self.top_func_name].index(argument)
-                        argument.dtensor.set_global_id(global_idx)
-                        if io_type == "in":
-                            self.global_inputs[global_idx] = argument.dtensor
-                        else:
-                            self.global_outputs[global_idx] = argument.dtensor
-            # streams
-            for i, _ in enumerate(kernel.arguments):
-                func_arg = self.func_args[kernel_name][i]
-                if (
-                    i in self.core_func_args[kernel_name]
-                    or func_arg.stream is None  # unused
+
+        for orig_name, kernel_instance_info in self.func_instances.items():
+            for dim, predicate_tag in kernel_instance_info.items():
+                kernel_name = construct_kernel_name(orig_name, dim)
+                kernel = tag_to_func[predicate_tag]
+                self.core_func_args[kernel_name] = {}
+                in_idx_list, out_idx_list = tag_to_read_write_pattern[predicate_tag]
+                for io_idx_list, io_type in (
+                    (in_idx_list, "in"),
+                    (out_idx_list, "out"),
                 ):
-                    continue
-                self.core_func_args[kernel_name][i] = (
-                    func_arg,
-                    self.stream_info[kernel_name][func_arg.stream.name],
-                )
-        # validity check
-        for i in range(len(self.global_inputs)):
-            assert (
-                i in self.global_inputs
-            ), "inputs should be the starting arguments of the function"
-        for i in range(len(self.global_outputs)):
-            assert (
-                i + len(self.global_inputs) in self.global_outputs
-            ), "outputs should be the ending arguments of the function"
+                    for io_idx in io_idx_list:
+                        argument: Argument = self.func_args[kernel_name][io_idx]
+                        self.core_func_args[kernel_name][io_idx] = (
+                            argument,
+                            io_type == "in",
+                        )
+                        if not argument.dtensor is None:
+                            argument.dtensor.set_access_pattern()
+                            argument.dtensor.type_as_param = kernel.arguments[
+                                io_idx
+                            ].type.shape
+                            global_idx = self.func_args[self.top_func_name].index(
+                                argument
+                            )
+                            argument.dtensor.set_global_info(
+                                global_idx, io_type == "in"
+                            )
+                            self.global_tensors[global_idx] = argument.dtensor
+                # streams
+                for i, _ in enumerate(kernel.arguments):
+                    func_arg = self.func_args[kernel_name][i]
+                    if (
+                        i in self.core_func_args[kernel_name]
+                        or func_arg.stream is None  # unused
+                    ):
+                        continue
+                    self.core_func_args[kernel_name][i] = (
+                        func_arg,
+                        self.stream_info[kernel_name][func_arg.stream.name],
+                    )
 
     def allo_opt(self):
         """
@@ -300,13 +267,29 @@ class AIE_MLIRModule:
                 output = call_matmul_op.operands[-1]
                 M, K = MemRefType(input_a.type).shape
                 _, N = MemRefType(input_b.type).shape
-                dtype = str(input_a.type.element_type)
+                dtype_a = str(input_a.type.element_type)
+                dtype_b = str(input_b.type.element_type)
                 out_dtype = str(output.type.element_type)
-                matmul_configs = matmul_external_kernel_config_map[(dtype, out_dtype)]
-                if self.device == "npu1":
-                    m, n, k = matmul_configs["aie2"]
+                if dtype_a == dtype_b:
+                    assert (dtype_a, out_dtype) in matmul_external_kernel_config_map
+                    matmul_configs = matmul_external_kernel_config_map[
+                        (dtype_a, out_dtype)
+                    ]
+                    if self.device == "npu1":
+                        m, k, n = matmul_configs["aie2"]
+                    else:
+                        m, k, n = matmul_configs["aie2p"]
+                elif self.device == "npu1":
+                    if dtype_a == dtype_b:
+                        m, k, n = matmul_external_kernel_config_map[
+                            (dtype_a, out_dtype)
+                        ]["aie2"]
+                    else:
+                        m, k, n = matmul_external_kernel_config_map[
+                            (dtype_a, dtype_b, out_dtype)
+                        ]["aie2"]
                 else:
-                    m, n, k = matmul_configs["aie2p"]
+                    continue
                 with function.context, allo_ir.ir.Location.unknown():
                     new_input_0 = allo_d.transform_layout(
                         input_a.type,
@@ -502,30 +485,23 @@ class AIE_MLIRModule:
         ) as f:
             f.write(str(self.allo_module))
 
-    def build_experimental(
+    def build(
         self,
         device_type="npu1_4col",
-        enable_virtual_mapping: bool = False,
         mapping_primitives: list[tuple[str, list]] = None,
         profile: bool = False,
         warmup: int = 20,
         num_iters: int = 100,
+        trace: list[tuple[str, tuple[int, ...]]] = None,
+        trace_size: int = 4096,
     ):
         # virtual mapping can only be applied to DAG
         if not self.computation_is_dag:
-            if enable_virtual_mapping and len(mapping_primitives) > 0:
+            if mapping_primitives is not None and len(mapping_primitives) > 0:
                 raise ValueError(
                     "The input computation graph is not a DAG. Do not support virtual mapping now."
                 )
-            APIWarning(
-                "The input computation graph is not a DAG. Fallback to default build."
-            )
-            return self.build(
-                device_type=device_type,
-                profile=profile,
-                warmup=warmup,
-                num_iters=num_iters,
-            )
+
         if "npu1" in device_type:
             self.device = "npu1"
         elif "npu2" in device_type:
@@ -535,11 +511,17 @@ class AIE_MLIRModule:
         self.profile = profile
         self.warmup = warmup
         self.num_iters = num_iters
+        if trace is not None:
+            self.trace_size = trace_size
         build_dir = os.path.join(self.project_dir, "build")
         if os.path.exists(build_dir):
             shutil.rmtree(build_dir)
         os.makedirs(build_dir)
-
+        # record original allo mlir
+        with open(
+            os.path.join(self.project_dir, "raw.mlir"), "w", encoding="utf-8"
+        ) as f:
+            f.write(str(self.allo_module))
         # inject external kernels
         # (inject before virtual mapping since using external kernel may require layout transformation when transferring data)
         use_external_kernels, self.injected_external_kernels, include_src = (
@@ -550,17 +532,12 @@ class AIE_MLIRModule:
                 "aie2" if self.device == "npu1" else "aie2p",
             )
         )
-        # record original allo mlir
-        with open(
-            os.path.join(self.project_dir, "raw.mlir"), "w", encoding="utf-8"
-        ) as f:
-            f.write(str(self.allo_module))
         self.analyze_kernel_parameters(
-            self.assign_tag_to_kernel(), self.injected_external_kernels
+            get_df_kernels(self.allo_module), self.injected_external_kernels
         )
         # ------------------------- virtual mapping -------------------------
-        self._init_virtual_graph(use_external_kernels)
-        if enable_virtual_mapping:
+        self.init_virtual_graph(use_external_kernels)
+        if mapping_primitives is not None:
             for mapping in mapping_primitives:
                 primitive = mapping[0]
                 arg_list = mapping[1]
@@ -569,13 +546,13 @@ class AIE_MLIRModule:
                     self.virtual_computation_graph.chain(arg_list[0], arg_list[1])
                 if primitive == "bundle":
                     self.virtual_computation_graph.bundle(arg_list)
+        self.virtual_computation_graph.refactor()
 
         # record original allo mlir
         with open(
             os.path.join(self.project_dir, "original.mlir"), "w", encoding="utf-8"
         ) as f:
             f.write(str(self.allo_module))
-
         # ------------------------- code optimization -------------------------
         self.allo_opt()
 
@@ -586,21 +563,41 @@ class AIE_MLIRModule:
         with self.allo_module.context:
             mlir_pass_manager.parse(pipeline).run(self.allo_module.operation)
         # ------------------------- mlir-aie code generation -------------------------
-        top_func, core_funcs, external_funcs = classify_aie_functions_experimental(
+        with allo_ir.ir.Context() as ctx, allo_ir.ir.Location.unknown():
+            allo_d.register_dialect(ctx)
+            pattern = re.compile(r"memref<([\dx]+)xi4>")
+            module_str = str(self.allo_module)
+
+            def repl(match):
+                dims_str = match.group(1)
+                dims = [int(d) for d in dims_str.split("x")]
+                dims[-1] //= 2
+                new_dims_str = "x".join(str(d) for d in dims)
+                return f"memref<{new_dims_str}xi8>"
+
+            module_str = pattern.sub(repl, module_str)
+            self.allo_module = allo_ir.ir.Module.parse(module_str)
+
+        top_func, core_funcs, external_funcs = classify_aie_functions(
             self.allo_module, self.top_func_name
         )
+
         code_generator = CodeGenerator(
             device_type,
-            self.global_inputs,
-            self.global_outputs,
+            self.global_tensors,
             top_func,
             self.core_func_args,
             self.streams,
             self.virtual_computation_graph,
         )
-        self.aie_module = code_generator.aie_codegen_experimental(
+        (
+            self.aie_module,
+            self.module_runtime_args,
+        ) = code_generator.aie_codegen(
             core_funcs,
             external_funcs,
+            trace,
+            trace_size,
         )
 
         # TODO: opt passes on aie-mlir
@@ -658,7 +655,16 @@ class AIE_MLIRModule:
         path = os.path.dirname(__file__)
         path = os.path.join(path, "../../harness/aie")
         os.system(f"cp -r {path}/* {self.project_dir}")
-        host_code = codegen_host(self.global_inputs, self.global_outputs)
+        if self.module_runtime_args is None:
+            self.module_runtime_args = []
+            total_tensors = len(self.global_tensors)
+            for idx in range(total_tensors):
+                dtensor = self.global_tensors[idx]
+                runtime_arg = RuntimeArgs(dtensor.dtype, dtensor.is_input)
+                runtime_arg.global_tensors.append(idx)
+                runtime_arg.current_size += np.prod(dtensor.shape)
+                self.module_runtime_args.append(runtime_arg)
+        host_code = codegen_host(self.global_tensors, self.module_runtime_args)
         with open(
             os.path.join(self.project_dir, "test.cpp"), "w", encoding="utf-8"
         ) as f:
@@ -669,179 +675,31 @@ class AIE_MLIRModule:
         if process.returncode != 0:
             raise RuntimeError("Failed to build AIE project.")
 
-    def collect_io(
-        self,
-        func_groups: dict[str, list[allo_func_d.FuncOp]],
-    ) -> tuple[dict, dict]:
-        """
-        Analyze input/output tensors of each function in the groups.
-        Returns dictionaries of input/output DTensors for each function group and core.
-        """
-        # init
-        self.core_func_args = {}
-        self.global_inputs = {}
-        self.global_outputs = {}
-        inputs = {}
-        outputs = {}
-        for func_name, funcs in func_groups.items():
-            inputs[func_name] = {}
-            outputs[func_name] = {}
-            inputs[func_name]["_global"] = []
-            outputs[func_name]["_global"] = []
-            for func in funcs:
-                func_name_w_id = func.attributes["sym_name"].value
-                self.core_func_args[func_name_w_id] = {}
-                # [NOTE]: function name implies some kind of mapping from io tensor to 'core's
-                func_id = tuple(
-                    int(x) for x in func_name_w_id.split(func_name + "_")[-1].split("_")
-                )
-                # fixme: `analyze_read_write_patterns` considers parameters that are both read and written as outputs
-                in_idx, out_idx = analyze_read_write_patterns(
-                    func, self.external_kernel_lib
-                )
-                for io_lst, io_idx, io in (
-                    (inputs, in_idx, "in"),
-                    (outputs, out_idx, "out"),
-                ):
-                    io_lst[func_name][func_id] = []
-                    for idx in io_idx:
-                        argument: Argument = self.func_args[func_name_w_id][idx]
-                        self.core_func_args[func_name_w_id][idx] = (
-                            argument,
-                            io == "in",
-                        )
-                        if not argument.dtensor is None:
-                            argument.dtensor.set_access_pattern()
-                            argument.dtensor.type_as_param = func.arguments[
-                                idx
-                            ].type.shape
-                            if argument.dtensor not in io_lst[func_name]["_global"]:
-                                io_lst[func_name]["_global"].append(argument.dtensor)
-                                if io == "in":
-                                    self.global_inputs[
-                                        self.func_args[self.top_func_name].index(
-                                            argument
-                                        )
-                                    ] = argument.dtensor
-                                else:
-                                    self.global_outputs[
-                                        self.func_args[self.top_func_name].index(
-                                            argument
-                                        )
-                                    ] = argument.dtensor
-                            io_lst[func_name][func_id].append(argument.dtensor)
-                # streams
-                for i, _ in enumerate(func.arguments):
-                    func_arg = self.func_args[func_name_w_id][i]
-                    if (
-                        i in self.core_func_args[func_name_w_id]
-                        or func_arg.stream is None  # unused
-                    ):
-                        continue
-                    self.core_func_args[func_name_w_id][i] = (
-                        func_arg,
-                        self.stream_info[func_name_w_id][func_arg.stream.name],
-                    )
-        # validity check
-        for i in range(len(self.global_inputs)):
-            assert (
-                i in self.global_inputs
-            ), "inputs should be the starting arguments of the function"
-        for i in range(len(self.global_outputs)):
-            assert (
-                i + len(self.global_inputs) in self.global_outputs
-            ), "outputs should be the ending arguments of the function"
-
-        return inputs, outputs
-
-    def build(
-        self,
-        device_type="npu1_4col",
-        profile: bool = False,
-        warmup: int = 20,
-        num_iters: int = 100,
-    ):
-        if "npu1" in device_type:
-            self.device = "npu1"
-        elif "npu2" in device_type:
-            self.device = "npu2"
-        else:
-            raise ValueError("Unsupported device type.")
-        self.profile = profile
-        self.warmup = warmup
-        self.num_iters = num_iters
-        build_dir = os.path.join(self.project_dir, "build")
-        if os.path.exists(build_dir):
-            shutil.rmtree(build_dir)
-        os.makedirs(build_dir)
-        # TODO: maybe use other ways to capture the relationship between DTensor, function group
-        _, core_func_groups, _ = classify_aie_functions(
-            self.allo_module, self.top_func_name
-        )
-        inputs, outputs = self.collect_io(core_func_groups)
-
-        # - extract external kernels
-        use_external_kernels, injected_external_kernels, include_src = (
-            inject_external_kernels(
-                self.allo_module,
-                self.top_func_name,
-                self.external_kernel_lib,
-                "aie2" if self.device == "npu1" else "aie2p",
-            )
-        )
-        # record original allo mlir
-        with open(
-            os.path.join(self.project_dir, "original.mlir"), "w", encoding="utf-8"
-        ) as f:
-            f.write(str(self.allo_module))
-        # - lower tensor to memref with registered pass
-        passes = [
-            "func.func(convert-linalg-to-affine-loops),lower-affine",
-        ]
-        pipeline = f'builtin.module({",".join(passes)})'
-        with self.allo_module.context:
-            mlir_pass_manager.parse(pipeline).run(self.allo_module.operation)
-        top_func, core_func_groups, external_funcs = classify_aie_functions(
-            self.allo_module, self.top_func_name
-        )
-        code_generator = CodeGenerator(
-            device_type,
-            self.global_inputs,
-            self.global_outputs,
-            top_func,
-            self.core_func_args,
-            self.streams,
-        )
-        self.aie_module = code_generator.aie_codegen(
-            core_func_groups,
-            external_funcs,
-            inputs,
-            outputs,
-            use_external_kernels,
-        )
-        self.post_codegen_build(injected_external_kernels, include_src)
-        return self
-
     def help(self):
         # print the parameter list of the module
         print("Parameter reference:", self.module_parameter_list)
 
     def __call__(self, *args):
-        for i in range(len(self.global_inputs)):
-            with open(
-                os.path.join(self.project_dir, f"input{i}.data"), "w", encoding="utf-8"
-            ) as f:
-                f.write("\n".join([str(i) for i in args[i].flatten()]))
-        cmd = f"cd {self.project_dir} && ./build/top -x build/final.xclbin -i insts.txt -k MLIR_AIE {f'-p true --warmup {self.warmup} --test_iter {self.num_iters}' if self.profile else ''}"
+        for idx, dtensor in self.global_tensors.items():
+            if dtensor.is_input:
+                arg = args[idx]
+                if str(dtensor.dtype) == "i4":
+                    arg = pack_int4(arg)
+                with open(
+                    os.path.join(self.project_dir, f"input{idx}.data"), "wb"
+                ) as f:
+                    f.write(arg.tobytes())
+
+        cmd = f"cd {self.project_dir} && ./build/top -x build/final.xclbin -i insts.txt -k MLIR_AIE --trace_sz {self.trace_size} {f'-p true --warmup {self.warmup} --test_iter {self.num_iters}' if self.profile else ''}"
         with subprocess.Popen(cmd, shell=True) as process:
             process.wait()
         if process.returncode != 0:
             raise RuntimeError("Failed to execute AIE code.")
-        # TODO: need to complete multiple outputs rules
-        result = read_tensor_from_file(
-            self.global_outputs[len(args) - 1].dtype,
-            args[-1].shape,
-            f"{self.project_dir}/output.data",
-        )
-        # suppose the last argument is output
-        args[-1][:] = result
+        for idx, dtensor in self.global_tensors.items():
+            if not dtensor.is_input:
+                result = read_tensor_from_file(
+                    dtensor.dtype,
+                    args[idx].shape,
+                    f"{self.project_dir}/output{idx}.data",
+                )
+                args[idx][:] = result

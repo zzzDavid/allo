@@ -1,8 +1,9 @@
-# pylint: disable=import-error, no-name-in-module, c-extension-no-member, too-many-branches, too-many-nested-blocks, redefined-variable-type, consider-using-enumerate, too-many-instance-attributes, chained-comparison
+# pylint: disable=import-error, no-name-in-module, c-extension-no-member, too-many-branches, too-many-nested-blocks, redefined-variable-type, consider-using-enumerate, too-many-instance-attributes, chained-comparison, cell-var-from-loop
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import copy
 from collections import defaultdict
 from dataclasses import dataclass
 import numpy as np
@@ -35,16 +36,15 @@ from ...memory import (
 )
 
 from .utils import (
-    get_element_type,
-    collect_op_by_name,
+    get_aie_mlir_dtype_from_str,
     merge_token_sets,
     device_config_map,
     Argument,
     Stream,
     Config,
     string_sort_key,
+    RuntimeArgs,
 )
-from ..ai_engine import map_kernels_to_device_mesh
 from .mapping import (
     SwitchNode,
     PEInterface,
@@ -67,152 +67,6 @@ class DMATensorTile:
     stride: list
 
 
-def map_global_io(inputs, outputs) -> tuple[dict[str, list[DMATensorTile]], int, int]:
-    """
-    TODO: make use of the fifth mem tile
-    TODO: The current mapping scheme requires the matrices to be completely partitioned without remaining elements (shape should be divided by tile num).
-
-    Allocate (shim-tile, mem-tile) pairs for every DTensor that crosses the
-    NPU boundary, while respecting the per-mem-tile ObjectFIFO limits.
-
-    The algorithm tries to pack as much traffic as possible into the fewest
-    number of memory tiles, only falling back to splitting (called "parts")
-    when the requested number of FIFOs would exceed the quota per memory tile.
-
-    Current constrains:
-        - use 4 mem-shim tile pairs for io
-        - each port is assigned to one dtensor tile
-
-    Args:
-        - inputs: A dictionary mapping function names (group name + id) to lists of objects as inputs.
-        - outputs: A dictionary mapping function names (group name + id) to lists of objects as outputs.
-    Return:
-        - tile_map: dtensor name -> a list of dma tiles
-        - mem_tile_num
-        - shim_tile_num
-    """
-    MAX_MEM_TILES = 4  # Maximum number of memory tiles allowed
-
-    @dataclass
-    class Tile:
-        send_number: int
-        recv_number: int
-
-    used_tiles: list[Tile] = []
-
-    def assign_tile(send_need, recv_need) -> int:
-        """
-        Try to assign a memory tile satisfying the requirement.
-        Return the tile index.
-            -1 indicates no tile availability.
-        """
-        # 1. Attempt to use a new memory tile
-        if (
-            len(used_tiles) < MAX_MEM_TILES
-            and send_need <= Config.MEM_MAX_SEND
-            and recv_need <= Config.MEM_MAX_RECV
-        ):
-            used_tiles.append(Tile(send_need, recv_need))
-            return len(used_tiles) - 1
-        # 2. Otherwise, try to pack into an existing tile
-        for i, _ in enumerate(used_tiles):
-            if (
-                used_tiles[i].send_number + send_need <= Config.MEM_MAX_SEND
-                and used_tiles[i].recv_number + recv_need <= Config.MEM_MAX_RECV
-            ):
-                used_tiles[i].send_number += send_need
-                used_tiles[i].recv_number += recv_need
-                return i
-        # 3. No tile fits
-        return -1
-
-    def map_dtensor_to_tile(dtensor: DTensor, is_input: bool):
-        """
-        Split a DTensor into Part instances so each Part fits on some memory tile with respect to FIFO limits.
-
-        Currently, we focus on dtensor io using memory tiles.
-        Shim tiles are assigned using a one-to-one mapping from memory tiles.
-
-        DTensors are sent to or from compute cores.
-        Since memory tile is used for transfer, we assume that `receive` implies one `send` and `send` implies one `receive`.
-        """
-        assert dtensor.access_pattern_set, "Access pattern is not set for dtensor"
-        device_dims, size, stride = dtensor.shared_dims, dtensor.size, dtensor.stride
-        tensor_tiles = sorted(
-            list(dtensor.global_placement.keys())
-        )  # 'R' can use one port yet multiple destinations
-        send_need = len(tensor_tiles) if is_input else 1
-        recv_need = 1 if is_input else len(tensor_tiles)
-        mem_tile_id = assign_tile(send_need, recv_need)
-        if mem_tile_id >= 0:
-            return [
-                DMATensorTile(
-                    0,
-                    mem_tile_id,
-                    mem_tile_id,
-                    tensor_tiles,
-                    [0, 0, 0, 0],
-                    size,
-                    stride,
-                )
-            ]
-        # We failed to transfer the whole tensor with one memory tile. Try using more.
-        dma_tensor_tiles: list[DMATensorTile] = []
-        # fixme: incomplete
-        #   Currently, we may allow tensor tiles on a sharding dimension to be sent using different memory tiles
-        if len(device_dims) <= 1:
-            lose_factor, inc_factor = 1, 1
-        elif len(device_dims) == 2:
-            lose_factor = size[device_dims[0]]
-            inc_factor = size[device_dims[1]]
-        else:
-            raise ValueError("Unsupported access pattern.")
-        remaining = tensor_tiles[:]
-        start_idx = 0
-        while remaining:
-            offset = [0, 0, 0, 0]
-            chunk = remaining
-            while chunk:
-                send_need = len(chunk) if is_input else 1
-                recv_need = 1 if is_input else len(chunk)
-                mem_tile_id = assign_tile(send_need, recv_need)
-                if mem_tile_id >= 0:
-                    break
-                chunk = chunk[: (len(chunk) - lose_factor)]  # Reduce size and retry
-            if not chunk:
-                raise RuntimeError(
-                    "Failed to allocate (shim, memory) tile: per-tile FIFO limit "
-                    "exceeded or no more available tiles."
-                )
-            offset[device_dims[0]] = start_idx // inc_factor
-            size[device_dims[0]] = len(chunk) // inc_factor
-            dma_tensor_tiles.append(
-                DMATensorTile(
-                    len(dma_tensor_tiles),
-                    mem_tile_id,
-                    mem_tile_id,
-                    chunk,
-                    offset,
-                    size,
-                    stride,
-                )
-            )
-            remaining = remaining[len(chunk) :]
-            start_idx += len(chunk)
-        return dma_tensor_tiles
-
-    tile_map: dict[str, list[DMATensorTile]] = defaultdict(list)
-
-    for io_lst, is_input in ((inputs, True), (outputs, False)):
-        for _, sub in io_lst.items():
-            for dtensor in sub["_global"]:
-                tile_map[dtensor.name].extend(
-                    map_dtensor_to_tile(dtensor, is_input=is_input)
-                )
-
-    return tile_map, len(used_tiles), len(used_tiles)
-
-
 class CodeGenerator:
     """
     CodeGenerator is responsible for transforming Allo functions and their associated
@@ -224,8 +78,7 @@ class CodeGenerator:
     def __init__(
         self,
         device_type: str,
-        global_inputs: dict[int, DTensor],
-        global_outputs: dict[int, DTensor],
+        global_tensors: dict[int, DTensor],
         top_function: allo_func_d.FuncOp,
         core_func_args: dict[str, dict[int, tuple[Argument, bool]]],
         streams: dict[str, Stream],
@@ -235,8 +88,9 @@ class CodeGenerator:
         self.device_config = device_config_map[device_type]
         assert self.device_config is not None, "Unsupported device type"
 
-        self.global_inputs: dict[int, DTensor] = global_inputs
-        self.global_outputs: dict[int, DTensor] = global_outputs
+        self.global_tensors: dict[int, DTensor] = global_tensors
+        self.arg_slots_in_runtime_args: dict[int, tuple[int, int]] = {}
+        self.module_runtime_args: list[RuntimeArgs] = []
         self.top_function = top_function
         self.core_func_args = core_func_args
         self.streams = streams
@@ -251,6 +105,7 @@ class CodeGenerator:
         # ------------------------------------------------------------
         # Experimental
         # ------------------------------------------------------------
+        self.mem_tile_idx = 0
         self.used_mem_tiles: list[SwitchNode] = []
         self.used_shim_tiles: list[SwitchNode] = []
         self.paths: list[CodeGenerator.DMAPath] = []
@@ -369,132 +224,6 @@ class CodeGenerator:
         func_core: aie_d.Core,
         original_func: allo_func_d.FuncOp,
         func_args: dict[int, tuple[Argument, bool]],
-    ):
-        """
-        Generate the computation logic for the fake 'while(1)' loop body for an AIE compute core, transforming high-level Allo ops
-        into AIE MLIR.
-
-        Args:
-            - func_core (aie_d.Core): The target compute core to insert into.
-            - original_func (FuncOp): The Allo function to compile.
-            - func_args (dict): Maps argument indices to (Argument, is_output) tuples.
-        """
-        func_string = self.preporocess_dumped_core_func(original_func, func_args)
-        original_module = aie_ir.Module.parse(func_string)
-        parsed_function: aie_func_d.FuncOp = None
-        for func in original_module.body.operations:
-            if isinstance(func, aie_func_d.FuncOp):
-                if not (
-                    "sym_visibility" in func.attributes
-                    and func.attributes["sym_visibility"].value == "private"
-                ):
-                    if parsed_function is None:
-                        parsed_function = func
-                    else:
-                        raise ValueError("Too many core functions. Fail to resolve.")
-        assert not parsed_function is None
-        func_body = func_core.regions[0]
-        entry_block = aie_ir.Block.create_at_start(func_body)
-        with aie_ir.InsertionPoint(entry_block):
-            index_type = aie_ir.IndexType.get()
-            # compute core wrapper: fake while(1)
-            c0 = aie_arith_d.ConstantOp(value=0, result=index_type)
-            c1 = aie_arith_d.ConstantOp(value=1, result=index_type)
-            cmax = aie_arith_d.ConstantOp(value=9223372036854775807, result=index_type)
-            # scf.for %arg0 = %c0 to %cmax step %c1
-            loop = aie_scf_d.ForOp(lower_bound=c0, upper_bound=cmax, step=c1)
-            with aie_ir.InsertionPoint(loop.body):
-                # insert operations to get 'function parameter', acquire and subview
-                # fixme: arguments may reuse fifo (ordering and copy-release-acquire)
-                # fixme: what about the output??
-                compute_core_io = self.compute_core_io
-                io_map = (
-                    compute_core_io[parsed_function.name.value]
-                    if parsed_function.name.value in compute_core_io
-                    else {}
-                )
-
-                for i, argument in enumerate(parsed_function.arguments):
-                    if not i in func_args:
-                        continue
-                    arg_info: tuple[Argument, bool] = func_args[i]
-                    if arg_info[0].dtensor is not None:
-                        acquired = self.fifo_map[io_map[arg_info[0].dtensor]].acquire(
-                            1 if arg_info[1] else 0, 1
-                        )
-                        argument.replace_all_uses_with(acquired)
-                    else:
-                        stream: Stream = arg_info[0].stream
-                        fifo = self.fifo_map[stream.name]
-                        for use_ in argument.uses:
-                            op = use_.owner
-                            with aie_ir.InsertionPoint(op.operation):
-                                if op.name == "memref.store" or (
-                                    op.name == "memref.copy"
-                                    and argument == op.operands[1]
-                                ):  # allo.stream_put
-                                    acquired = fifo.acquire(0, 1)
-                                    op.operands[1] = acquired
-                                    new_op = op.clone()  # no use, no need to replace
-                                    fifo.release(0, 1)
-                                    op.erase()
-                                elif (
-                                    op.name == "memref.load"
-                                ):  # allo.stream_get, non-tensor
-                                    acquired = fifo.acquire(1, 1)
-                                    op.operands[0] = acquired
-                                    new_op = op.clone()
-                                    for old, new in zip(op.results, new_op.results):
-                                        old.replace_all_uses_with(new)
-                                    fifo.release(1, 1)
-                                    op.erase()
-                                elif (
-                                    op.name == "memref.copy"
-                                ):  # allo.stream_get, tensor
-                                    acquired = fifo.acquire(1, 1)
-                                    op.operands[0] = acquired
-                                    new_op = op.clone()
-                                    fifo.release(1, 1)
-                                    op.erase()
-
-                for parsed_func_block in parsed_function.body:
-                    for op in parsed_func_block.operations:
-                        if op.name == "func.return":
-                            continue
-                        new_op = op.clone()
-                        for old, new in zip(op.results, new_op.results):
-                            old.replace_all_uses_with(new)
-
-                # replace alloc with buffer
-                alloc_ops = collect_op_by_name(loop, "memref.alloc")
-                for alloc_op in alloc_ops:
-                    buffer_op = aie_d.BufferOp(
-                        buffer=alloc_op.results[0].type,
-                        tile=func_core.tile,
-                        ip=self.global_ip,
-                    )
-                    for old, new in zip(alloc_op.results, buffer_op.results):
-                        old.replace_all_uses_with(new)
-                    alloc_op.erase()
-
-                # release
-                for i, _ in enumerate(parsed_function.arguments):
-                    if not i in func_args:
-                        continue
-                    arg_info: tuple[Argument, bool] = func_args[i]
-                    if not arg_info[0].dtensor is None:
-                        self.fifo_map[io_map[arg_info[0].dtensor]].release(
-                            1 if arg_info[1] else 0, 1
-                        )
-
-                aie_scf_d.YieldOp([])
-            aie_d.EndOp()
-
-    def exp_build_core_function(
-        self,
-        func_core: aie_d.Core,
-        original_func: allo_func_d.FuncOp,
-        func_args: dict[int, tuple[Argument, bool]],
         arg_to_fifo: dict[int, FIFO],
     ):
         """
@@ -548,13 +277,18 @@ class CodeGenerator:
                         while first_use_op.parent.name != "func.func":
                             first_use_op = first_use_op.parent
                         fifo = self.fifo_map[arg_to_fifo[i].name]
-                        is_input = arg_info[0].dtensor.global_id in self.global_inputs
                         with aie_ir.InsertionPoint(first_use_op):
                             if arg_to_fifo[i].name in reused_fifo_name:
-                                fifo.release(1 if is_input else 0, 1)
+                                fifo.release(
+                                    1 if arg_info[0].dtensor.is_input else 0, 1
+                                )
                             else:
-                                reused_fifo_name[arg_to_fifo[i].name] = is_input
-                            acquired = fifo.acquire(1 if is_input else 0, 1)
+                                reused_fifo_name[arg_to_fifo[i].name] = arg_info[
+                                    0
+                                ].dtensor.is_input
+                            acquired = fifo.acquire(
+                                1 if arg_info[0].dtensor.is_input else 0, 1
+                            )
                             # incorrect
                             argument.replace_all_uses_with(acquired)
                 else:
@@ -663,26 +397,62 @@ class CodeGenerator:
         dtensor: DTensor
         size: list[int]
         offset: list[int]
+        stride: list[int]
+
+        def transfer_pattern(self):
+            offset, size, stride = (
+                list(self.offset),
+                list(self.size),
+                list(self.stride),
+            )
+            if size[0] > 1 and size[1] == 1:
+                offset[0], offset[1] = offset[1], offset[0]
+                size[0], size[1] = size[1], size[0]
+                stride[0], stride[1] = stride[1], stride[0]
+            return offset, size, stride
+
+        def print(self):
+            print(
+                self.token,
+                f"[{self.start_time, self.end_time}]",
+                self.dtensor.global_id,
+                self.offset,
+                self.size,
+            )
 
     class DMATaskWithSameToken:
         def __init__(self, task: "CodeGenerator.GlobalIODMATask"):
             self.start_time: int = task.start_time
             self.end_time: int = task.end_time
             self.tasks: list[CodeGenerator.GlobalIODMATask] = [task]
+            self.related_pes: set[str] = set()
+            for interfaces in task.io_port.connect_interface:
+                for interface in interfaces.interface_list:
+                    self.related_pes.add(interface.pe)
 
         def add(self, task: "CodeGenerator.GlobalIODMATask"):
             self.start_time = min(self.start_time, task.start_time)
             self.end_time = max(self.end_time, task.end_time)
             self.tasks.append(task)
+            for interfaces in task.io_port.connect_interface:
+                for interface in interfaces.interface_list:
+                    self.related_pes.add(interface.pe)
+
+        def print(self):
+            print("-+-")
+            print(self.related_pes)
+            for task in self.tasks:
+                task.print()
+            print("---")
 
     def map_data_transfer(self) -> dict[str, dict[int, FIFO]]:
         """
         Construct data transfer path from external memory to each (logical) compute tile.
 
-        TODO: may have influenc on DMA scheduling
+        TODO: may have influence on DMA scheduling
         """
 
-        def partition(size: Size4D) -> Size4D:
+        def partition(size: Size4D) -> tuple[int, Size4D]:
             """
             Partition the dma task into multiple sub-tasks.
             """
@@ -691,12 +461,11 @@ class CodeGenerator:
                 if size.get_dim_size(dim) > 1:
                     break
             if dim >= 3:
-
-                raise ValueError("Fail to partition")
+                raise ValueError(f"Fail to partition {size}")
             size_part = size.copy()
             partition_size = size.get_dim_size(dim) - 1
             size_part.set_dim_size(dim, partition_size)
-            return size_part
+            return dim, size_part
 
         # ------------------------------------------------------------
         MAX_MEM_TILES = self.device_config["mem_tile_num"]
@@ -714,6 +483,11 @@ class CodeGenerator:
                     node_order_tag[node] = tag
                     tagged_nodes.append(node)
             ordered_nodes.extend(tagged_nodes)
+            # cyclic graph
+            if len(tagged_nodes) == 0:
+                for node in dependencies.keys():
+                    node_order_tag[node] = tag
+                break
             for node in tagged_nodes:
                 del dependencies[node]
                 for _, deps in dependencies.items():
@@ -733,10 +507,9 @@ class CodeGenerator:
                     print("\t", arg_idx)
                     print(tiles)
             print("#############- global_tensors -#############")
-        global_dtensor: dict[int, DTensor] = dict(self.global_inputs)
-        global_dtensor.update(self.global_outputs)
+        global_dtensor = self.global_tensors
         global_tile_to_func: dict[int, DTensorTileGroup] = {
-            i: DTensorTileGroup("") for i in global_dtensor.keys()
+            i: DTensorTileGroup("") for i in self.global_tensors.keys()
         }
         for func_name, io_info in global_tensors.items():
             for arg_idx, live_dtensor_tiles in io_info.items():
@@ -788,14 +561,17 @@ class CodeGenerator:
                 return False
 
             def _contiguous_data_transfer(
-                self, other: "MulticastInterface", current_size: Size4D
-            ) -> Size4D:
+                self,
+                other: "MulticastInterface",
+                current_size: Size4D,
+                contiguous_dim: int,
+            ) -> tuple[Size4D, int]:
                 for interface in self.interface_list:
                     if interface in other.interface_list:
                         # TODO: can be relaxed
-                        return None
+                        return None, None
                 if self.sample_interface.layout != other.sample_interface.layout:
-                    return None
+                    return None, None
                 sample_global_tensors: LiveDTensorTileGroup = global_tensors[
                     self.sample_interface.pe
                 ][self.sample_interface.interface_idx]
@@ -816,6 +592,7 @@ class CodeGenerator:
                     new_token_list: list[str] = []
                     for sample_value in sample_value_list:
                         sample_matched_with_other_flag = False
+                        size_contiguous_dim = None
                         for (
                             other_token,
                             other_value,
@@ -863,7 +640,22 @@ class CodeGenerator:
                                         i * s
                                         for i, s in zip(other_offset, outer_stride)
                                     )
-                                    if other_flattened_idx - sample_flattened_idx != 1:
+                                    idx_diff = (
+                                        other_flattened_idx - sample_flattened_idx
+                                    )
+                                    for i in range(4):
+                                        if idx_diff >= outer_stride[i]:
+                                            if idx_diff % outer_stride[i] != 0:
+                                                match_flag = False
+                                                break
+                                            idx_diff //= outer_stride[i]
+                                            if idx_diff == 1:
+                                                size_contiguous_dim = i
+                                                break
+                                    if (
+                                        contiguous_dim is not None
+                                        and contiguous_dim != size_contiguous_dim
+                                    ):
                                         match_flag = False
                                         break
                                     new_size_list_ = current_size.to_list()
@@ -884,10 +676,10 @@ class CodeGenerator:
                                     sample_matched_with_other_flag = True
                                     break
                         if not sample_matched_with_other_flag:
-                            return None
+                            return None, None
                     self.tokens.add(tuple(new_token_list))
-                    return Size4D.from_list(new_size_list)
-                return None
+                    return Size4D.from_list(new_size_list), size_contiguous_dim
+                return None, None
 
             def get_pes(self) -> list[str]:
                 ret: list[str] = []
@@ -910,19 +702,31 @@ class CodeGenerator:
             ContiguousInterface always acquire adjacent memory blocks in external memory
             """
 
-            def __init__(self, offset: Offset4D, interface: MulticastInterface):
-                self.layout = interface.sample_interface.layout
-                self.current_offset: Offset4D = offset
-                self.total_size: Size4D = Size4D(1, 1, 1, 1)
-                self.interface_list: list[MulticastInterface] = [interface]
+            def __init__(self, interface: MulticastInterface = None):
+                if interface is not None:
+                    self.layout = interface.sample_interface.layout
+                    self.total_size: Size4D = Size4D(1, 1, 1, 1)
+                    self.interface_list: list[MulticastInterface] = [interface]
+                else:
+                    self.layout = None
+                    self.total_size: Size4D = None
+                    self.interface_list: list[MulticastInterface] = []
+                self.contiguous_dim = None
 
-            def append(self, offset: Offset4D, other: MulticastInterface) -> bool:
+            def append(self, other: MulticastInterface) -> bool:
                 sample = self.interface_list[-1]
-                updated_size = sample._contiguous_data_transfer(other, self.total_size)
+                updated_size, contiguous_dim = sample._contiguous_data_transfer(
+                    other, self.total_size, self.contiguous_dim
+                )
                 if updated_size is None:
                     return False
+                if (
+                    self.contiguous_dim is not None
+                    and contiguous_dim != self.contiguous_dim
+                ):
+                    return False
+                self.contiguous_dim = contiguous_dim
                 self.interface_list.append(other)
-                self.current_offset = offset
                 self.total_size = updated_size
                 return True
 
@@ -954,6 +758,8 @@ class CodeGenerator:
             send_shape: list[int] = tile_shape if is_input else coalesced_size.to_list()
             recv_shape: list[int] = coalesced_size.to_list() if is_input else tile_shape
             tile_total_size = tile_size.get_total_size()
+            if str(dtype) == "i4":
+                tile_total_size //= 2
             connected_interfaces: list[list[PEInterface]] = []
             for multicast_interface in interface_list:
                 if is_input:
@@ -976,16 +782,25 @@ class CodeGenerator:
                     name=f"{len(self.used_mem_tiles)}_mem_tile",
                     send_port_num=Config.MEM_MAX_SEND,
                     recv_port_num=Config.MEM_MAX_RECV,
+                    col_id=len(self.used_mem_tiles),
+                    row_id=1,
                 )
                 self.used_mem_tiles.append(assigned_mem_tile)
+                self.mem_tile_idx = len(self.used_mem_tiles)
             else:
                 # Attempt to use an existing memory tile
-                for mem_tile in self.used_mem_tiles:
+                for offset in range(len(self.used_mem_tiles)):
+                    mem_tile = self.used_mem_tiles[
+                        (self.mem_tile_idx + offset) % len(self.used_mem_tiles)
+                    ]
                     if (
                         len(mem_tile.send_ports) + send_need <= Config.MEM_MAX_SEND
                         and len(mem_tile.recv_ports) + recv_need <= Config.MEM_MAX_RECV
                     ):
                         assigned_mem_tile = mem_tile
+                        self.mem_tile_idx = (self.mem_tile_idx + offset + 1) % len(
+                            self.used_mem_tiles
+                        )
                         break
             # Use new ports
             if assigned_mem_tile is not None:
@@ -1075,6 +890,8 @@ class CodeGenerator:
                     name=f"{len(self.used_shim_tiles)}_shim_tile",
                     send_port_num=Config.SHIM_MAX_SEND,
                     recv_port_num=Config.SHIM_MAX_RECV,
+                    col_id=len(self.used_shim_tiles),
+                    row_id=0,
                 )
                 self.used_shim_tiles.append(assigned_shim_tile)
             else:
@@ -1116,6 +933,7 @@ class CodeGenerator:
             total_size: Size4D,
             tile_size: Size4D,
             is_input: bool,
+            tile_dtype: str,
             tile_param_type: list,
         ) -> bool:
             """
@@ -1156,7 +974,6 @@ class CodeGenerator:
                 if assigned_shim_tile is None:
                     # invalidate the intra_connect
                     assigned_mem_tile.intra_connect.pop()
-                    # raise ValueError("Fail to assign shim tile")
                 else:
                     assigned_mem_tile.send_ports.extend(send_ports)
                     assigned_mem_tile.recv_ports.extend(recv_ports)
@@ -1259,16 +1076,9 @@ class CodeGenerator:
             i: {} for i in global_tensors.keys()
         }
         global_io_port: list[CodeGenerator.GlobalIODMAPort] = []
+        global_dma_tasks: dict[int, list[ContiguousInterface]] = {}
         for idx, dtensor_tile_group in global_tile_to_func.items():
-            dtensor = global_dtensor[idx]
-            # transfer tile meta data
-            is_input = idx in self.global_inputs
-            tile_dtype = dtensor.dtype
-            tile_param_type = dtensor.type_as_param
-            tile_shape = list(dtensor.size)
-            for i in dtensor.shared_dims:
-                tile_shape[i] = 1
-            tile_size = Size4D.from_list(tile_shape)
+            dtensor = self.global_tensors[idx]
             # key: offset specific to dtensor
             unresolved_tile: dict[Offset4D, list[MulticastInterface]] = {}
             in_process: set[PEInterface] = set()
@@ -1313,7 +1123,7 @@ class CodeGenerator:
                         dtensor.offset_map[dtensor_tile.tensor_tile_label]
                     ] = multicast_list
             # coalesced access pattern on dtensor will give a hint
-            coalesced_access_pattern, coalesce_info, coalesced_multicast_interfaces = (
+            coalesced_access_pattern, _, coalesced_multicast_interfaces = (
                 coalesce_memory_access(unresolved_tile)
             )
             if os.getenv("VERBOSE") == "1":
@@ -1334,7 +1144,7 @@ class CodeGenerator:
                         if multicast_interface is not None:
                             next_flag = False
                             contiguous: ContiguousInterface = ContiguousInterface(
-                                coalesce_info[start_offset][left], multicast_interface
+                                multicast_interface
                             )
                             coalesced_interfaces[left][left_i] = None
                             right = left + 1
@@ -1346,7 +1156,6 @@ class CodeGenerator:
                                 ):
                                     if next_interface is not None:
                                         if contiguous.append(
-                                            coalesce_info[start_offset][right],
                                             next_interface,
                                         ):
                                             continue_flag = True
@@ -1361,36 +1170,128 @@ class CodeGenerator:
                 for contiguous_interface in contiguous_interfaces:
                     print(contiguous_interface)
                 print("===== contiguous_interfaces =====\n")
+            global_dma_tasks[idx] = contiguous_interfaces
+
+        # ####################
+        # # HACK: an aggressive strategy to fully utilize interface ports (may be problematic)
+        # ####################
+        if os.getenv("ENABLE_AGGRESSIVE_PORT_UTILIZATION_PATCH") == "1":
+            global_input_num, global_output_num = 0, 0
+            for idx, contiguous_interfaces in global_dma_tasks.items():
+                if self.global_tensors[idx].is_input:
+                    global_input_num += len(contiguous_interfaces)
+                else:
+                    global_output_num += len(contiguous_interfaces)
+            for idx, contiguous_interfaces in global_dma_tasks.items():
+                # fixme: MAX_SHIM_TILES (how to select better factor?) adjust base on independent workload?
+                FACTOR = int(os.getenv("FACTOR", MAX_SHIM_TILES))
+                if len(contiguous_interfaces) == 1:
+                    factor = FACTOR
+                    while factor > 1:
+                        if len(contiguous_interfaces[0].interface_list) % factor == 0:
+                            if (
+                                factor
+                                - len(contiguous_interfaces)
+                                + (
+                                    global_input_num
+                                    if self.global_tensors[idx].is_input
+                                    else global_output_num
+                                )
+                                <= 2 * FACTOR
+                            ):
+                                break
+                        factor >>= 1
+                    if factor > 1:
+                        contiguous_interface: ContiguousInterface = (
+                            contiguous_interfaces[0]
+                        )
+                        contiguous_interfaces.clear()
+                        total_tile = contiguous_interface.total_size.get_total_size()
+                        slice_size = total_tile // factor
+                        for i in range(factor):
+                            new_contiguous_interface = ContiguousInterface()
+                            new_contiguous_interface.contiguous_dim = (
+                                contiguous_interface.contiguous_dim
+                            )
+                            new_contiguous_interface.layout = (
+                                contiguous_interface.layout
+                            )
+                            new_contiguous_interface.total_size = (
+                                contiguous_interface.total_size.get_k_slice(slice_size)
+                            )
+                            new_contiguous_interface.interface_list.extend(
+                                contiguous_interface.interface_list[
+                                    i * slice_size : (i + 1) * slice_size
+                                ]
+                            )
+                            contiguous_interfaces.append(new_contiguous_interface)
+
+                        if self.global_tensors[idx].is_input:
+                            global_input_num -= 1
+                            global_input_num += len(contiguous_interfaces)
+                        else:
+                            global_output_num -= 1
+                            global_output_num += len(contiguous_interfaces)
+        # ####################
+
+        for idx, contiguous_interfaces in global_dma_tasks.items():
+            self.mem_tile_idx = 0
+            dtensor = self.global_tensors[idx]
+            tile_shape = list(dtensor.size)
+            for i in dtensor.shared_dims:
+                tile_shape[i] = 1
+            tile_size = Size4D.from_list(tile_shape)
             for contiguous_interface in contiguous_interfaces:
                 interface_list: list[MulticastInterface] = (
                     contiguous_interface.interface_list
                 )
                 size = contiguous_interface.total_size
                 transfer_layout = contiguous_interface.layout
-                while size.get_total_size() != 0:
-                    if assign_tiles(
-                        interface_list, size, tile_size, is_input, tile_param_type
-                    ):
-                        break
-                    size_cp = size.copy()
-                    # keep partitioning until success
-                    while True:
-                        partitioned_size = partition(size_cp)
-                        partitioned_interface_list = interface_list[
-                            : partitioned_size.get_total_size()
-                        ]
+
+                def transfer(size_: Size4D, interface_list_: list[MulticastInterface]):
+                    dim_ = None
+                    while size_.get_total_size() != 0:
                         if assign_tiles(
-                            partitioned_interface_list,
-                            partitioned_size,
+                            interface_list_,
+                            size_,
                             tile_size,
-                            is_input,
-                            tile_param_type,
+                            dtensor.is_input,
+                            dtensor.dtype,
+                            dtensor.type_as_param,
                         ):
                             break
-                        size_cp = partitioned_size
-                    size = Size4D.subtract(size, partitioned_size)
-                    inc = partitioned_size.get_total_size()
-                    interface_list = interface_list[inc:]
+                        size_cp = size_.copy()
+                        # keep partitioning until success
+                        while True:
+                            partitioned_dim, partitioned_size = partition(
+                                size_cp
+                            )  # partition too much, drop dim
+                            partitioned_interface_list = interface_list_[
+                                : partitioned_size.get_total_size()
+                            ]
+                            if dim_ is None:
+                                dim_ = partitioned_dim
+                            elif dim_ != partitioned_dim:
+                                transfer(
+                                    size_cp, interface_list_[: size_cp.get_total_size()]
+                                )
+                                partitioned_size = size_cp
+                                break
+                            if assign_tiles(
+                                partitioned_interface_list,
+                                partitioned_size,
+                                tile_size,
+                                dtensor.is_input,
+                                dtensor.dtype,
+                                dtensor.type_as_param,
+                            ):
+                                break
+                            size_cp = partitioned_size
+                        size_ = Size4D.subtract(size_, partitioned_size)
+                        inc = partitioned_size.get_total_size()
+                        interface_list_ = interface_list_[inc:]
+
+                transfer(size, interface_list)
 
         token_map: dict[str, str] = {}
         token_cnt = 0
@@ -1420,7 +1321,17 @@ class CodeGenerator:
             ]
             for live_tensor_tiles in tensor_tile_group.dtensor_groups.values():
                 for live_tensor_tile in live_tensor_tiles:
-                    dtensor_ = global_dtensor[live_tensor_tile.tile.dtensor_id]
+                    dtensor_ = self.global_tensors[live_tensor_tile.tile.dtensor_id]
+                    size = list(io_port.size)
+                    offset = dtensor_.offset_map[
+                        live_tensor_tile.tile.tensor_tile_label
+                    ].to_list()
+                    stride = list(io_port.stride)
+                    # fixme: patch only, find a robust way for higher dimensions??
+                    if size[0] > 1 and size[1] == 1:
+                        size[0], size[1] = size[1], size[0]
+                        offset[0], offset[1] = offset[1], offset[0]
+                        stride[0], stride[1] = stride[1], stride[0]
                     self.global_dma_trough_port.append(
                         CodeGenerator.GlobalIODMATask(
                             token=token_map[live_tensor_tile.token],
@@ -1430,10 +1341,9 @@ class CodeGenerator:
                             + Config.GLOBAL_CODE_OFFSET * io_port.order_tag,
                             io_port=io_port,
                             dtensor=dtensor_,
-                            size=io_port.size,
-                            offset=dtensor_.offset_map[
-                                live_tensor_tile.tile.tensor_tile_label
-                            ].to_list(),
+                            size=size,
+                            offset=offset,
+                            stride=stride,
                         )
                     )
         if os.getenv("VERBOSE") == "1":
@@ -1455,7 +1365,9 @@ class CodeGenerator:
     # Compute Tile
     # ------------------------------------------------------------
 
-    def map_core_func_to_physical_tiles(self) -> dict[str, tuple[int, int]]:
+    def map_core_func_to_physical_tiles(
+        self, layout_col_id_hint: dict[str, int]
+    ) -> dict[str, tuple[int, int]]:
         """
         Map the core functions to physical tiles.
         TODO:
@@ -1463,7 +1375,7 @@ class CodeGenerator:
             - careful with nodes with multiple inputs/outputs
               (if ports are exceeded, we should try to assign them to adjacent compute tiles to share local memory)
         """
-        core_fucn_mapping: dict[str, tuple[int, int]] = {}
+        core_func_mapping: dict[str, tuple[int, int]] = {}
         mesh_shape = self.device_config["mesh"]
         max_row, max_col = mesh_shape
         tile_used = np.zeros(mesh_shape, dtype=bool)
@@ -1505,8 +1417,8 @@ class CodeGenerator:
             }
             for connection in connection_info:
                 grouped_a, grouped_b = (
-                    grouped_nodes[connection[1]],
-                    grouped_nodes[connection[2]],
+                    grouped_nodes.get(connection[1]),
+                    grouped_nodes.get(connection[2]),
                 )
                 if grouped_a is None or grouped_b is None:
                     continue
@@ -1525,10 +1437,17 @@ class CodeGenerator:
                 for key in sorted(grouped_nodes.keys(), key=string_sort_key)
             ]
             assigned = set()
-            for deque in sorted_values:
-                if deque in assigned:
+            linked_nodes: list[NodeDeque] = []
+            single_nodes: list[str] = []
+            for node_deque in sorted_values:
+                if node_deque in assigned:
                     continue
-                assigned.add(deque)
+                assigned.add(node_deque)
+                if len(node_deque.nodes) == 1:
+                    single_nodes.append(node_deque.nodes[0])
+                else:
+                    linked_nodes.append(node_deque)
+            for deque in linked_nodes:
                 head = deque.nodes[0]
                 while tile_used[traverse_idx // max_col][traverse_idx % max_col]:
                     traverse_idx += 1
@@ -1536,7 +1455,7 @@ class CodeGenerator:
                         raise ValueError("Too many nodes")
                 col_idx = traverse_idx % max_col
                 row_idx = traverse_idx // max_col
-                core_fucn_mapping[head] = (row_idx, col_idx)
+                core_func_mapping[head] = (row_idx, col_idx)
                 tile_used[row_idx][col_idx] = True
                 reverse = False
                 for node in deque.nodes[1:]:
@@ -1553,28 +1472,86 @@ class CodeGenerator:
                                 row_idx = max_row - 1
                                 col_idx += 1
                                 reverse = not reverse
-                    core_fucn_mapping[node] = (row_idx, col_idx)
+                    core_func_mapping[node] = (row_idx, col_idx)
                     tile_used[row_idx][col_idx] = True
+            for node in single_nodes:
+                for col_idx in range(layout_col_id_hint[node], max_col):
+                    row_idx = 0
+                    while row_idx < max_row and tile_used[row_idx][col_idx]:
+                        row_idx += 1
+                    if row_idx < max_row:
+                        core_func_mapping[node] = (row_idx, col_idx)
+                        tile_used[row_idx][col_idx] = True
+                        break
+                if node not in core_func_mapping:
+                    for col_idx in range(0, layout_col_id_hint[node]):
+                        row_idx = 0
+                        while row_idx < max_row and tile_used[row_idx][col_idx]:
+                            row_idx += 1
+                        if row_idx < max_row:
+                            core_func_mapping[node] = (row_idx, col_idx)
+                            tile_used[row_idx][col_idx] = True
+                            break
+                if node not in core_func_mapping:
+                    raise ValueError(f"Fail to map {node}")
             if os.getenv("VERBOSE") == "1":
                 print("<<< Mapping >>>")
-                for node, (row, col) in core_fucn_mapping.items():
+                for node, (row, col) in core_func_mapping.items():
                     print(f"{node}: ({row}, {col})")
                 print()
-            return core_fucn_mapping
+            return core_func_mapping
         raise ValueError("To be implemented")
 
     # ############################################################
     # AIE Code Generation
     # ############################################################
-    def aie_codegen_experimental(
+    def aie_codegen(
         self,
         core_funcs: list[allo_func_d.FuncOp],
         external_funcs: list[allo_func_d.FuncOp],
+        trace: list[tuple[str, tuple[int, ...]]],
+        trace_size: int,
     ) -> aie_ir.Module:
         # mapping to physical/logical
         # TODO: co-designed mapping to different types of tiles
         arg_to_fifo = self.map_data_transfer()
-        core_function_mapping = self.map_core_func_to_physical_tiles()
+        core_func_connected_mem_tile: dict[str, dict[str, int]] = {}
+        for func_name in arg_to_fifo.keys():
+            core_func_connected_mem_tile[func_name] = {
+                mem_tile.name: 0 for mem_tile in self.used_mem_tiles
+            }
+        for func_name, fifo_dict in arg_to_fifo.items():
+            for fifo in fifo_dict.values():
+                if fifo.src == func_name:
+                    core_func_connected_mem_tile[func_name][fifo.dst[0]] += 1
+                else:
+                    core_func_connected_mem_tile[func_name][fifo.src] += 1
+        layout_col_id_hint: dict[str, str] = {}
+        for func_name, connections in core_func_connected_mem_tile.items():
+            heaviest: int = -1
+            heaviest_workload = -1
+            for mem_tile_name, workload in connections.items():
+                if heaviest_workload < workload:
+                    heaviest_workload = workload
+                    heaviest = int(mem_tile_name[0])  # fixme
+            layout_col_id_hint[func_name] = heaviest
+        core_function_mapping = self.map_core_func_to_physical_tiles(layout_col_id_hint)
+
+        # traced tile index
+        traced_logical_tile = set()
+        available_shim_for_trace: str = None
+        if trace is not None:
+            virtual_to_logical = {}
+            for node_name, node in self.virtual_computation_graph.nodes.items():
+                for virtual_name in node.meta_data.df_kernels:
+                    virtual_to_logical[virtual_name] = node_name
+            for traced_tile in trace:
+                func_name = (
+                    traced_tile[0] + f"_{'_'.join([str(x) for x in traced_tile[1]])}"
+                )
+                assert func_name in virtual_to_logical
+                traced_logical_tile.add(virtual_to_logical[func_name])
+
         for func in external_funcs:
             self.external_functions += format_str(str(func), indent=4)
 
@@ -1609,11 +1586,20 @@ class CodeGenerator:
 
             with aie_ir.InsertionPoint(end_op):
                 # shim tiles
-                for i, shim_tile in enumerate(self.used_shim_tiles):
-                    self.tile_map[shim_tile.name] = aie_d.TileOp(col=i, row=0)
+                for shim_tile in self.used_shim_tiles:
+                    self.tile_map[shim_tile.name] = aie_d.TileOp(
+                        col=shim_tile.col_id, row=shim_tile.row_id
+                    )
+                    if (
+                        available_shim_for_trace is None
+                        and len(shim_tile.send_ports) == 0
+                    ):
+                        available_shim_for_trace = shim_tile.name
                 # mem tiles
-                for i, mem_tile in enumerate(self.used_mem_tiles):
-                    self.tile_map[mem_tile.name] = aie_d.TileOp(col=i, row=1)
+                for mem_tile in self.used_mem_tiles:
+                    self.tile_map[mem_tile.name] = aie_d.TileOp(
+                        col=mem_tile.col_id, row=mem_tile.row_id
+                    )
                 # compute tiles
                 for func_name, (row, col) in core_function_mapping.items():
                     self.tile_map[func_name] = aie_d.TileOp(col=col, row=row + 2)
@@ -1627,7 +1613,7 @@ class CodeGenerator:
                         depth=stream.type.depth,
                         datatype=aie_ir.MemRefType.get(
                             stream.type.shape,
-                            get_element_type(str(stream.type.dtype)),
+                            get_aie_mlir_dtype_from_str(str(stream.type.dtype)),
                         ),
                     )
                 # - io fifos: shim <-> mem <-> compute
@@ -1639,7 +1625,7 @@ class CodeGenerator:
                         depth=dma_fifo.depth,
                         datatype=aie_ir.MemRefType.get(
                             dma_fifo.data_shape,
-                            get_element_type(str(dma_fifo.dtype)),
+                            get_aie_mlir_dtype_from_str(str(dma_fifo.dtype)),
                         ),
                         dimensionsToStream=dma_fifo.dimensions_to_stream,
                     )
@@ -1676,27 +1662,120 @@ class CodeGenerator:
                     )
                     if self.global_ip is None:
                         self.global_ip = aie_ir.InsertionPoint(func_core)
-                    self.exp_build_core_function(
+                    self.build_core_function(
                         func_core,
                         func,
                         self.core_func_args[func_name],
                         arg_to_fifo[func_name],
                     )
 
-                # runtime sequence
-                runtime_seq = aiex_d.RuntimeSequenceOp()
-                runtime_args = []
-                for i in range(len(self.global_inputs) + len(self.global_outputs)):
-                    arg = (
-                        self.global_inputs[i]
-                        if i in self.global_inputs
-                        else self.global_outputs[i]
+                @dataclass
+                class TraceInfo:
+                    traced_tile_idx: tuple[int]
+                    shim_tile_idx: tuple[int]
+                    packet_id: int
+
+                enabled_trace: list[TraceInfo] = []
+
+                trace_transfer_shim_tile = None
+                if available_shim_for_trace is not None:
+                    trace_transfer_shim_tile = self.tile_map[available_shim_for_trace]
+                elif len(self.used_shim_tiles) < self.device_config["shim_tile_num"]:
+                    trace_transfer_shim_tile = aie_d.TileOp(
+                        col=len(self.used_shim_tiles), row=0
                     )
-                    runtime_args.append(
-                        aie_ir.MemRefType.get(
-                            arg.shape, get_element_type(str(arg.dtype))
+                packet_id = 0
+                if (
+                    len(traced_logical_tile) > 0
+                    and trace_transfer_shim_tile is not None
+                ):
+                    max_pack_num = (
+                        Config.TRACE_MAX_NUM
+                        if available_shim_for_trace is not None
+                        else Config.DMA_MAX_BDS
+                    )
+                    # TODO: Trace, reserve how many bds for tracing
+                    for traced_tile in traced_logical_tile:
+                        packet_id += 1
+                        if packet_id > max_pack_num:
+                            break
+                        compute_tile = self.tile_map[traced_tile]
+                        aie_d.packetflow(
+                            packet_id,
+                            compute_tile,
+                            9,  # WireBundle: Trace = 9
+                            0,
+                            trace_transfer_shim_tile,
+                            1,  # WireBundle: DMA = 1
+                            1,
+                            True,
+                        )
+                        enabled_trace.append(
+                            TraceInfo(
+                                (compute_tile.col.value, compute_tile.row.value),
+                                (
+                                    trace_transfer_shim_tile.col.value,
+                                    trace_transfer_shim_tile.row.value,
+                                ),
+                                packet_id,
+                            )
+                        )
+
+                # runtime sequence
+                global_tensor_types: dict[
+                    tuple[str, bool], tuple[RuntimeArgs, list[int]]
+                ] = {}
+                for i in range(len(self.global_tensors)):
+                    arg = self.global_tensors[i]
+                    tensor_type = (arg.dtype, arg.is_input)
+                    if tensor_type not in global_tensor_types:
+                        global_tensor_types[tensor_type] = (
+                            RuntimeArgs(str(arg.dtype), arg.is_input),
+                            [],
+                        )
+                    global_tensor_types[tensor_type][0].global_tensors.append(i)
+                assert (
+                    len(global_tensor_types) <= Config.MAX_IO_BUFFER
+                ), "unable to construct buffers for arguments"
+                original_runtime_args = list(global_tensor_types.values())
+                for i in range(Config.MAX_IO_BUFFER):
+                    self.module_runtime_args.append(
+                        RuntimeArgs(
+                            str(
+                                original_runtime_args[i % len(original_runtime_args)][
+                                    0
+                                ].raw_dtype
+                            ),
+                            original_runtime_args[i % len(original_runtime_args)][
+                                0
+                            ].is_input,
                         )
                     )
+                    original_runtime_args[i % len(original_runtime_args)][1].append(i)
+                for runtime_arg_idxs, arg_slots in original_runtime_args:
+                    for i, arg_idx in enumerate(runtime_arg_idxs.global_tensors):
+                        runtime_arg = self.module_runtime_args[
+                            arg_slots[i % len(arg_slots)]
+                        ]
+                        runtime_arg.global_tensors.append(arg_idx)
+                        self.arg_slots_in_runtime_args[arg_idx] = (
+                            arg_slots[i % len(arg_slots)],
+                            runtime_arg.current_size,
+                        )
+                        runtime_arg.inc_size(self.global_tensors[arg_idx].shape)
+
+                runtime_seq = aiex_d.RuntimeSequenceOp()
+                runtime_args = []
+                for runtime_arg in self.module_runtime_args:
+                    if len(runtime_arg.global_tensors) == 0:
+                        continue
+                    runtime_args.append(
+                        aie_ir.MemRefType.get(
+                            [runtime_arg.current_size],
+                            get_aie_mlir_dtype_from_str(str(runtime_arg.dtype)),
+                        )
+                    )
+
                 # TODO: need more robust and smart DMA scheduling
                 dma_task_groups: dict[str, CodeGenerator.DMATaskWithSameToken] = {}
                 for global_dma in self.global_dma_trough_port:
@@ -1706,25 +1785,155 @@ class CodeGenerator:
                     else:
                         group = dma_task_groups[global_dma.token]
                         group.add(global_dma)
+                independent_dma_task_groups: list[
+                    tuple[set[int], list[CodeGenerator.DMATaskWithSameToken]]
+                ] = []
+                for task_group in dma_task_groups.values():
+                    inserted = False
+                    for independent_dma_task_group in independent_dma_task_groups:
+                        if not independent_dma_task_group[0].isdisjoint(
+                            task_group.related_pes
+                        ):
+                            independent_dma_task_group[0].update(task_group.related_pes)
+                            independent_dma_task_group[1].append(task_group)
+                            inserted = True
+                            break
+                    if not inserted:
+                        independent_dma_task_groups.append(
+                            (set(task_group.related_pes), [task_group])
+                        )
                 runtime_seq_entry_block = runtime_seq.body.blocks.append(*runtime_args)
                 with aie_ir.InsertionPoint(runtime_seq_entry_block):
+                    for trace_info in enabled_trace:
+                        aiex_d.npu_write32(
+                            213200,
+                            2038038528,
+                            column=trace_info.traced_tile_idx[0],
+                            row=trace_info.traced_tile_idx[1],
+                        )
+                        aiex_d.npu_write32(
+                            213204,
+                            trace_info.packet_id,
+                            column=trace_info.traced_tile_idx[0],
+                            row=trace_info.traced_tile_idx[1],
+                        )
+                        aiex_d.npu_write32(
+                            213216,
+                            1260724769,
+                            column=trace_info.traced_tile_idx[0],
+                            row=trace_info.traced_tile_idx[1],
+                        )
+                        aiex_d.npu_write32(
+                            213220,
+                            439168079,
+                            column=trace_info.traced_tile_idx[0],
+                            row=trace_info.traced_tile_idx[1],
+                        )
+                        aiex_d.npu_write32(
+                            261888,
+                            289,
+                            column=trace_info.traced_tile_idx[0],
+                            row=trace_info.traced_tile_idx[1],
+                        )
+                        aiex_d.npu_write32(
+                            261892,
+                            0,
+                            column=trace_info.traced_tile_idx[0],
+                            row=trace_info.traced_tile_idx[1],
+                        )
+                        aiex_d.npu_write32(
+                            212992,
+                            31232,
+                            column=trace_info.traced_tile_idx[0],
+                            row=trace_info.traced_tile_idx[1],
+                        )
+                        aiex_d.npu_writebd(
+                            bd_id=Config.DMA_MAX_BDS - trace_info.packet_id,
+                            buffer_length=trace_size,
+                            buffer_offset=0,
+                            enable_packet=1,
+                            out_of_order_id=0,
+                            packet_id=trace_info.packet_id,
+                            packet_type=0,
+                            column=trace_info.shim_tile_idx[0],
+                            d0_size=0,
+                            d0_stride=0,
+                            d0_zero_after=0,
+                            d0_zero_before=0,
+                            d1_size=0,
+                            d1_stride=0,
+                            d1_zero_after=0,
+                            d1_zero_before=0,
+                            d2_size=0,
+                            d2_stride=0,
+                            d2_zero_after=0,
+                            d2_zero_before=0,
+                            burst_length=64,
+                            iteration_current=0,
+                            iteration_size=0,
+                            iteration_stride=0,
+                            lock_acq_enable=0,
+                            lock_acq_id=0,
+                            lock_acq_val=0,
+                            lock_rel_id=0,
+                            lock_rel_val=0,
+                            next_bd=0,
+                            row=0,
+                            use_next_bd=0,
+                            valid_bd=1,
+                        )
+                        aiex_d.npu_address_patch(
+                            33554432 * trace_info.shim_tile_idx[0]
+                            + 119268
+                            - 32 * (trace_info.packet_id - 1),
+                            len(self.global_tensors),
+                            0,
+                        )
+                        aiex_d.npu_write32(
+                            119308,
+                            Config.DMA_MAX_BDS - trace_info.packet_id,
+                            column=trace_info.shim_tile_idx[0],
+                            row=trace_info.shim_tile_idx[1],
+                        )
+                    if len(enabled_trace) > 0:
+                        aiex_d.npu_write32(
+                            212992,
+                            32512,
+                            column=enabled_trace[0].shim_tile_idx[0],
+                            row=enabled_trace[0].shim_tile_idx[1],
+                        )
+                        aiex_d.npu_write32(
+                            213068,
+                            127,
+                            column=enabled_trace[0].shim_tile_idx[0],
+                            row=enabled_trace[0].shim_tile_idx[1],
+                        )
+                        aiex_d.npu_write32(
+                            213000,
+                            127,
+                            column=enabled_trace[0].shim_tile_idx[0],
+                            row=enabled_trace[0].shim_tile_idx[1],
+                        )
+
                     # data with same token should be transferred together
                     # fixme: if execution fails with runtime_error, possibly because the transfer order leads to 'deadlock'
-                    task_groups: list[CodeGenerator.DMATaskWithSameToken] = list(
-                        dma_task_groups.values()
-                    )
-                    task_groups.sort(key=lambda x: x.start_time)
-                    dma_bd_map: dict[str, int] = {
-                        shim_tile.name: 0 for shim_tile in self.used_shim_tiles
-                    }
-                    launched_dma_to_external: list[aie_d.object_fifo] = []
-                    # launch a group of tasks with the same token
-                    for task_group in task_groups:
-                        task_group.tasks.sort(key=lambda x: x.start_time)
+                    max_dma_task_group_size = 0
+                    for independent_dma_task_group in independent_dma_task_groups:
+                        independent_dma_task_group[1].sort(key=lambda x: x.start_time)
+                        max_dma_task_group_size = max(
+                            max_dma_task_group_size, len(independent_dma_task_group[1])
+                        )
+                    coalesced_tasks_list: list[list[CodeGenerator.GlobalIODMATask]] = []
+                    for i in range(max_dma_task_group_size):
+                        tasks = []
+                        for independent_dma_task_group in independent_dma_task_groups:
+                            if i < len(independent_dma_task_group[1]):
+                                tasks.extend(independent_dma_task_group[1][i].tasks)
+                        tasks.sort(key=lambda x: x.start_time)
                         fifo_to_tasks: dict[
                             str, list[CodeGenerator.GlobalIODMATask]
                         ] = defaultdict(list)
-                        for global_dma in task_group.tasks:
+                        for global_dma in tasks:
                             fifo_to_tasks[global_dma.io_port.fifo.name].append(
                                 global_dma
                             )
@@ -1748,14 +1957,14 @@ class CodeGenerator:
                                     right = left + 1
                                     while right < len(tasks):
                                         if tasks[left].dtensor == tasks[right].dtensor:
-                                            incomming_offset = Offset4D(
+                                            incoming_offset = Offset4D(
                                                 tasks[right].offset[0],
                                                 tasks[right].offset[1],
                                                 tasks[right].offset[2],
                                                 tasks[right].offset[3],
                                             )
                                             idx = current_offset.check_next_offset(
-                                                incomming_offset
+                                                incoming_offset
                                             )
                                             if idx >= 0 and (
                                                 inc_idx is None or inc_idx == idx
@@ -1775,7 +1984,7 @@ class CodeGenerator:
                                                     break
                                                 inc_idx = idx
                                                 base_size[idx] += 1
-                                                current_offset = incomming_offset
+                                                current_offset = incoming_offset
                                                 right += 1
                                             else:
                                                 break
@@ -1791,6 +2000,7 @@ class CodeGenerator:
                                         tasks[left].dtensor,
                                         base_size,
                                         tasks[left].offset,
+                                        tasks[left].stride,
                                     )
                                     coalesced_fifo_to_tasks[fifo].append(coalesced_task)
                                     left = right
@@ -1798,313 +2008,199 @@ class CodeGenerator:
                         coalesced_tasks: list[CodeGenerator.GlobalIODMATask] = []
                         for tasks in fifo_to_tasks.values():
                             coalesced_tasks.extend(tasks)
-                        coalesced_tasks.sort(key=lambda x: x.start_time)
-                        dma_bd_workload: dict[str, int] = {
-                            shim_tile.name: 0 for shim_tile in self.used_shim_tiles
-                        }
-                        # check buffer descriptor workload
+                        coalesced_tasks_list.append(coalesced_tasks)
+
+                    tasks_idx_left = 0
+
+                    @dataclass
+                    class DMAMemcpyGroup:
+                        dma_tasks: list[tuple[list[int], list[int], list[int]]]
+                        diff: list[int]
+                        bd_id: int
+                        dtensor_global_id: bool
+                        used_shim: str
+                        max_task_id: int
+
+                    guards = {}
+                    async_dma_tasks: list[DMAMemcpyGroup] = []
+                    dma_bd_workload: dict[str, set[int]] = {
+                        shim_tile.name: set(range(Config.DMA_MAX_BDS))
+                        for shim_tile in self.used_shim_tiles
+                    }
+                    if available_shim_for_trace is not None:
+                        dma_bd_workload[available_shim_for_trace] = set(
+                            range(Config.DMA_MAX_BDS - packet_id)
+                        )
+                    while tasks_idx_left < len(coalesced_tasks_list):
                         overload_flag = False
-                        for global_dma in coalesced_tasks:
-                            used_shim = (
-                                global_dma.io_port.fifo.src
-                                if global_dma.io_port.is_input
-                                else global_dma.io_port.fifo.dst[0]
+                        fifo_dma_tasks: dict[str, list[DMAMemcpyGroup]] = {}
+                        tasks_idx_right = tasks_idx_left
+                        while tasks_idx_right < len(coalesced_tasks_list):
+                            updated_fifo_dma_tasks: dict[str, list[DMAMemcpyGroup]] = (
+                                copy.deepcopy(fifo_dma_tasks)
                             )
-                            dma_bd_workload[used_shim] += 1
-                            if (
-                                dma_bd_workload[used_shim] + dma_bd_map[used_shim]
-                                >= Config.DMA_MAX_BDS
-                            ):
-                                overload_flag = True
+                            occupied_bd_id = {
+                                shim_tile.name: set()
+                                for shim_tile in self.used_shim_tiles
+                            }
+                            for global_dma in coalesced_tasks_list[tasks_idx_right]:
+                                offset, size, stride = global_dma.transfer_pattern()
+                                if (
+                                    global_dma.io_port.fifo.name
+                                    not in updated_fifo_dma_tasks
+                                ):
+                                    updated_fifo_dma_tasks[
+                                        global_dma.io_port.fifo.name
+                                    ] = []
+                                # else:
+                                #     prev_task: DMAMemcpyGroup = updated_fifo_dma_tasks[
+                                #         global_dma.io_port.fifo.name
+                                #     ][-1]
+                                # the same global tensor must be tiled in the same way
+                                # if (
+                                #     global_dma.dtensor.global_id
+                                #     == prev_task.dtensor_global_id
+                                #     and size[0] == 1
+                                # ):
+                                #     diff = [
+                                #         x - y
+                                #         for x, y in zip(
+                                #             offset,
+                                #             prev_task.dma_tasks[-1][0],
+                                #         )
+                                #     ]
+                                #     # fixme: can be relaxed
+                                #     if prev_task.diff is None and (
+                                #         all(x >= 0 for x in diff)
+                                #         and sum(1 for x in diff if x != 0) <= 1
+                                #     ):
+                                #         prev_task.dma_tasks.append(
+                                #             (offset, size, stride)
+                                #         )
+                                #         prev_task.diff = diff
+                                #         prev_task.max_task_id = tasks_idx_right
+                                #         continue
+                                #     if prev_task.diff == diff:
+                                #         prev_task.dma_tasks.append(
+                                #             (offset, size, stride)
+                                #         )
+                                #         prev_task.max_task_id = tasks_idx_right
+                                #         continue
+
+                                used_shim = (
+                                    global_dma.io_port.fifo.src
+                                    if global_dma.io_port.is_input
+                                    else global_dma.io_port.fifo.dst[0]
+                                )
+                                if (
+                                    len(dma_bd_workload[used_shim]) == 0
+                                    or len(
+                                        updated_fifo_dma_tasks[
+                                            global_dma.io_port.fifo.name
+                                        ]
+                                    )
+                                    == 4  # fixme: seems that transferring too much with the same fifo is invalid (magic number)
+                                ):
+                                    overload_flag = True
+                                    break
+                                bd_id = dma_bd_workload[used_shim].pop()
+                                occupied_bd_id[used_shim].add(bd_id)
+                                updated_fifo_dma_tasks[
+                                    global_dma.io_port.fifo.name
+                                ].append(
+                                    DMAMemcpyGroup(
+                                        [(offset, size, stride)],
+                                        None,
+                                        bd_id,
+                                        global_dma.dtensor.global_id,
+                                        used_shim,
+                                        tasks_idx_right,
+                                    )
+                                )
+                            if overload_flag:
+                                for (
+                                    shim_name,
+                                    occupied_bd_ids,
+                                ) in occupied_bd_id.items():
+                                    dma_bd_workload[shim_name].update(occupied_bd_ids)
                                 break
-                        # sync on output before reusing buffer descriptor (https://github.com/Xilinx/mlir-aie/blob/main/programming_guide/section-2/section-2d/DMATasks.md#best-practices-for-data-movement-and-synchronization-with-npu_dma_memcpy_nd)
-                        # TODO: better analysis to decide the 'sync point'
-                        if overload_flag:
-                            for fifo in launched_dma_to_external:
-                                aiex_d.dma_wait(fifo)
-                            launched_dma_to_external.clear()
-                            for shim_name in dma_bd_map.keys():
-                                dma_bd_map[shim_name] = 0
-                        for global_dma in coalesced_tasks:
-                            dma_fifo = self.fifo_map[global_dma.io_port.fifo.name]
-                            used_shim = (
-                                global_dma.io_port.fifo.src
-                                if global_dma.io_port.is_input
-                                else global_dma.io_port.fifo.dst[0]
-                            )
-                            bd_id = dma_bd_map[used_shim]
-                            assert (
-                                bd_id < Config.DMA_MAX_BDS
-                            ), "each shim tile have at most 16 buffer descriptor"
-                            dma_bd_map[used_shim] += 1
-                            aiex_d.NpuDmaMemcpyNd(
-                                metadata=dma_fifo,
-                                bd_id=bd_id,
-                                mem=runtime_seq_entry_block.arguments[
-                                    global_dma.dtensor.global_id
-                                ],
-                                offsets=global_dma.offset,
-                                sizes=global_dma.size,
-                                strides=global_dma.io_port.stride,
-                                issue_token=True,
-                            )
-                            if not global_dma.io_port.is_input:
-                                launched_dma_to_external.append(dma_fifo)
-                    for launched_fifo in launched_dma_to_external:
-                        aiex_d.dma_wait(launched_fifo)
-
+                            tasks_idx_right += 1
+                            fifo_dma_tasks = updated_fifo_dma_tasks
+                        # launch tasks in fifo_tasks and wait
+                        for fifo_name, fifo_infos in fifo_dma_tasks.items():
+                            for fifo_info in fifo_infos:
+                                task_list = fifo_info.dma_tasks
+                                offset, size, stride = task_list[0]
+                                total_offset = 0
+                                for i in range(4):
+                                    total_offset += offset[i] * stride[i]
+                                if fifo_info.diff is not None:
+                                    size[0] = len(task_list)
+                                    stride_0 = 0
+                                    for i in range(4):
+                                        stride_0 += fifo_info.diff[i] * stride[i]
+                                    stride[0] = stride_0
+                                offsets = (
+                                    [0, 0, 0, total_offset]
+                                    if fifo_info.diff is not None
+                                    else offset
+                                )
+                                offsets[-1] += int(
+                                    self.arg_slots_in_runtime_args[
+                                        fifo_info.dtensor_global_id
+                                    ][1]
+                                )
+                                if (
+                                    str(
+                                        self.global_tensors[
+                                            fifo_info.dtensor_global_id
+                                        ].dtype
+                                    )
+                                    == "i4"
+                                ):
+                                    offsets[-1] //= 2
+                                    size[-1] //= 2
+                                    for i in range(3):
+                                        stride[i] //= 2
+                                aiex_d.NpuDmaMemcpyNd(
+                                    metadata=self.fifo_map[fifo_name],
+                                    bd_id=fifo_info.bd_id,
+                                    mem=runtime_seq_entry_block.arguments[
+                                        self.arg_slots_in_runtime_args[
+                                            fifo_info.dtensor_global_id
+                                        ][0]
+                                    ],
+                                    offsets=offsets,
+                                    sizes=size,
+                                    strides=stride,
+                                    issue_token=True,
+                                )
+                                if not self.global_tensors[
+                                    fifo_info.dtensor_global_id
+                                ].is_input:
+                                    if fifo_info.max_task_id not in guards:
+                                        guards[fifo_info.max_task_id] = []
+                                    guards[fifo_info.max_task_id].append(
+                                        self.fifo_map[fifo_name]
+                                    )
+                            async_dma_tasks.extend(fifo_infos)
+                        tasks_idx_left = tasks_idx_right
+                        output_dma_tasks_id = min(guards.keys())
+                        output_dma_tasks = guards.pop(output_dma_tasks_id)
+                        for launched_fifo in output_dma_tasks:
+                            aiex_d.dma_wait(launched_fifo)
+                        updated_async_dma_tasks = []
+                        for async_dma_task in async_dma_tasks:
+                            if async_dma_task.max_task_id <= output_dma_tasks_id:
+                                dma_bd_workload[async_dma_task.used_shim].add(
+                                    async_dma_task.bd_id
+                                )
+                            else:
+                                updated_async_dma_tasks.append(async_dma_task)
+                        async_dma_tasks = updated_async_dma_tasks
+                    for output_dma_tasks in guards.values():
+                        for launched_fifo in output_dma_tasks:
+                            aiex_d.dma_wait(launched_fifo)
                     aie_d.EndOp()
 
-        return self.aie_module
-
-    def aie_codegen(
-        self,
-        core_func_groups: dict[str, list[allo_func_d.FuncOp]],
-        external_funcs: list[allo_func_d.FuncOp],
-        inputs,
-        outputs,
-        use_external_kernels: bool,
-    ) -> aie_ir.Module:
-        """
-        Generate an AIE MLIR module.
-        """
-        io_mapping, mem_tile_num, shim_tile_num = map_global_io(inputs, outputs)
-        wrapper_code = f"""
-            module {{
-                aie.device({self.device_type}) {{
-        """
-
-        # fixme: maybe better to resolve this using IR constructor
-        for func in external_funcs:
-            self.external_functions += format_str(str(func), indent=4)
-
-        wrapper_code += self.external_functions
-        wrapper_code += """
-                }
-            }
-        """
-        with aie_ir.Context() as ctx, aie_ir.Location.unknown():
-            # module wrapper
-            self.aie_module = aie_ir.Module.parse(wrapper_code, ctx)
-            # find device op: aie.device(device_type)
-            device_op = None
-            for op in self.aie_module.body.operations:
-                if isinstance(op, aie_d.DeviceOp):
-                    device_op = op
-                    break
-            assert device_op is not None, "aie.device not found"
-            device_body = device_op.regions[0].blocks[0]
-            # insert operations in the device body, before `aie.end``
-            end_op = None
-            for op in device_body.operations:
-                if isinstance(op, aie_d.EndOp):
-                    end_op = op
-                    break
-            assert not end_op is None
-
-            with aie_ir.InsertionPoint(end_op):
-                # shim tile
-                for shim_id in range(shim_tile_num):
-                    self.tile_map[f"shim_{shim_id}"] = aie_d.TileOp(col=shim_id, row=0)
-                # mem tiles
-                for mem_id in range(mem_tile_num):
-                    self.tile_map[f"mem_{mem_id}"] = aie_d.TileOp(col=mem_id, row=1)
-                # compute tiles
-                # 'logic' mapping for different function groups.
-                mappings = {}
-                for func_name in core_func_groups:
-                    if len(inputs[func_name]["_global"]) > 0:
-                        mappings[func_name] = inputs[func_name]["_global"][0].mapping
-                    else:
-                        mappings[func_name] = outputs[func_name]["_global"][0].mapping
-                aie_mesh = self.device_config["mesh"]
-                for func_name, tile_ids in map_kernels_to_device_mesh(
-                    mappings, aie_mesh
-                ).items():
-                    for idx, func in zip(tile_ids, core_func_groups[func_name]):
-                        func_name = func.attributes["sym_name"].value
-                        self.tile_map[f"compute_{func_name}"] = aie_d.TileOp(
-                            col=idx[0],
-                            row=idx[1] + 2,
-                        )
-
-                for io, arg_lst in (("in", inputs), ("out", outputs)):
-                    for func_name, sub_func_lst in arg_lst.items():
-                        for idx, dtensor in enumerate(sub_func_lst["_global"]):
-                            placement = dtensor.global_placement
-                            # shim <-> mem (one to one)
-                            for dma_tile in io_mapping[dtensor.name]:
-                                # define objectfifo
-                                name = f"{io}_shim_{dtensor.name}{dma_tile.dtensor_tile_id}"
-                                producer = (
-                                    self.tile_map[f"shim_{dma_tile.shim_id}"]
-                                    if io == "in"
-                                    else self.tile_map[f"mem_{dma_tile.mem_id}"]
-                                )
-                                consumer = (
-                                    [self.tile_map[f"mem_{dma_tile.mem_id}"]]
-                                    if io == "in"
-                                    else [self.tile_map[f"shim_{dma_tile.shim_id}"]]
-                                )
-                                idx_ = next(
-                                    (
-                                        i
-                                        for i, size in enumerate(dma_tile.size)
-                                        if size != 1
-                                    ),
-                                    None,
-                                )
-                                if idx_ is None:
-                                    shape = [1]
-                                else:
-                                    shape = dma_tile.size[idx_:]
-                                memref_type = aie_ir.MemRefType.get(
-                                    shape,
-                                    get_element_type(str(dtensor.dtype)),
-                                )
-                                fifo_shim = self.fifo_map[name] = aie_d.object_fifo(
-                                    name,
-                                    producer,
-                                    consumer,
-                                    depth=2,
-                                    datatype=memref_type,
-                                )
-
-                                # mem <-> compute (one to ?)
-                                fifo_mem = []
-                                mem_stride = [0]
-                                mem_tile = self.tile_map[f"mem_{dma_tile.mem_id}"]
-                                local_memref_type = aie_ir.MemRefType.get(
-                                    dtensor.type_as_param,
-                                    get_element_type(str(dtensor.dtype)),
-                                )
-                                for tensor_tile in dma_tile.tensor_tile_labels:
-                                    # distribute to placement[tensor_tile]
-                                    compute_tiles = []
-                                    name_suffix = "".join(
-                                        f"_{ele}" for ele in tensor_tile
-                                    )
-                                    name = f"{io}_mem_{dtensor.name}_{name_suffix}"
-                                    for tile in placement[tensor_tile]:
-                                        # some distributed tile do not have global output
-                                        if (
-                                            dtensor in outputs[func_name][tile]
-                                            or dtensor in inputs[func_name][tile]
-                                        ):
-                                            idx_str = "_".join([str(x) for x in tile])
-                                            # seems confusing. "sym_name" is parsed in this way
-                                            compute_tiles.append(
-                                                self.tile_map[
-                                                    f"compute_{func_name}_{idx_str}"
-                                                ]
-                                            )
-                                            self.compute_core_io.setdefault(
-                                                f"{func_name}_{idx_str}", {}
-                                            )[dtensor] = name
-                                    if io == "in":
-                                        producer = mem_tile
-                                    else:
-                                        # fixme: only one valid producer
-                                        assert len(compute_tiles) == 1
-                                        producer = compute_tiles[0]
-                                    consumer = (
-                                        compute_tiles if io == "in" else [mem_tile]
-                                    )
-                                    fifo = self.fifo_map[name] = aie_d.object_fifo(
-                                        name,
-                                        producer,
-                                        consumer,
-                                        depth=2,
-                                        datatype=local_memref_type,
-                                    )
-                                    fifo_mem.append(fifo)
-                                    mem_stride.append(
-                                        mem_stride[-1]
-                                        + np.prod(dtensor.get_local_shape())
-                                    )
-                                aie_d.object_fifo_link(
-                                    fifo_shim if io == "in" else fifo_mem,
-                                    fifo_mem if io == "in" else fifo_shim,
-                                    [] if io == "in" else mem_stride[:-1],
-                                    mem_stride[:-1] if io == "in" else [],
-                                )
-                # compute <-> compute
-                for stream_name, stream in self.streams.items():
-                    src_tile = self.tile_map[f"compute_{stream.src}"]
-                    dst_tile = [self.tile_map[f"compute_{stream.dst}"]]
-                    self.fifo_map[stream_name] = aie_d.object_fifo(
-                        stream_name,
-                        src_tile,
-                        dst_tile,
-                        depth=stream.type.depth,
-                        datatype=aie_ir.MemRefType.get(
-                            stream.type.shape,
-                            get_element_type(str(stream.type.dtype)),
-                        ),
-                    )
-
-                for func_name in core_func_groups:
-                    for func in core_func_groups[func_name]:
-                        func_name_w_id = func.attributes["sym_name"].value
-                        func_core = aie_d.Core(
-                            tile=self.tile_map[f"compute_{func_name_w_id}"],
-                            link_with=(
-                                "external.o"
-                                if use_external_kernels[func_name_w_id]
-                                else None
-                            ),
-                        )
-                        if self.global_ip is None:
-                            self.global_ip = aie_ir.InsertionPoint(func_core)
-                        self.build_core_function(
-                            func_core, func, self.core_func_args[func_name_w_id]
-                        )
-
-                # runtime sequence
-                runtime_seq = aiex_d.RuntimeSequenceOp()
-                runtime_args = []
-                for i in range(len(self.global_inputs) + len(self.global_outputs)):
-                    arg = (
-                        self.global_inputs[i]
-                        if i in self.global_inputs
-                        else self.global_outputs[i]
-                    )
-                    runtime_args.append(
-                        aie_ir.MemRefType.get(
-                            arg.shape, get_element_type(str(arg.dtype))
-                        )
-                    )
-
-                runtime_seq_entry_block = runtime_seq.body.blocks.append(*runtime_args)
-                with aie_ir.InsertionPoint(runtime_seq_entry_block):
-                    dma_tiles: list = []
-                    bd_cnt = 0
-                    for i in range(len(self.global_inputs) + len(self.global_outputs)):
-                        io = "in" if i in self.global_inputs else "out"
-                        dtensor = (
-                            self.global_inputs[i]
-                            if i in self.global_inputs
-                            else self.global_outputs[i]
-                        )
-
-                        for dma_tile in io_mapping[dtensor.name]:
-                            dma_fifo = self.fifo_map[
-                                f"{io}_shim_{dtensor.name}{dma_tile.dtensor_tile_id}"
-                            ]
-                            aiex_d.NpuDmaMemcpyNd(
-                                metadata=dma_fifo,
-                                bd_id=bd_cnt,
-                                mem=runtime_seq_entry_block.arguments[i],
-                                offsets=dma_tile.offset,
-                                sizes=dma_tile.size,
-                                strides=dma_tile.stride,
-                                issue_token=True,
-                            )
-                            bd_cnt += 1
-                            dma_tiles.append(dma_fifo)
-                    # DMA wait
-                    for dma_tile in dma_tiles:
-                        aiex_d.dma_wait(dma_tile)
-                    aie_d.EndOp()
-
-        return self.aie_module
+        return self.aie_module, self.module_runtime_args

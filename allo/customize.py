@@ -63,6 +63,7 @@ from .passes import (
     lower_linalg_and_attach_names,
     analyze_use_def,
 )
+from .utils import freeze_list
 from .backend.llvm import LLVMModule
 from .backend.hls import HLSModule
 from .library import KERNEL2SCHEDULE
@@ -118,6 +119,7 @@ class Schedule:
         ip,
         ext_libs=None,
         inst_list=None,
+        func_instances=None,
     ):
         self.module = module
         self.top_func = top_func
@@ -135,6 +137,7 @@ class Schedule:
             for func_name, _ in func_args.items():
                 if func_name not in self.func_args:
                     self.func_args[func_name] = []
+        self.func_instances = func_instances
         self.systolic = check_systolic(self)
 
     def get_loops(self, func=None):
@@ -249,14 +252,20 @@ class Schedule:
         ip = InsertionPoint.at_block_terminator(func.entry_block)
         op_hdl = allo_d.CreateOpHandleOp(band_name, ip=ip)
         loop_hdls = []
+        axes = []
         for arg in args:
             func, axis = self._get_func_and_axis(args)
             band_name, axis = find_loop_in_bands(func, arg)
             loop_hdls.append(
                 allo_d.CreateLoopHandleOp(op_hdl.result, StringAttr.get(axis), ip=ip)
             )
+            axes.append(axis)
         arg_results = [arg.result for arg in loop_hdls]
         allo_d.FuseOp(arg_results, ip=ip)
+        if isinstance(args[0], LoopWrapper):
+            name = "_".join(axes) + "_fused"
+            return LoopWrapper(f"{args[0].func}:{band_name}.{name}", None)
+        return LoopWrapper(f"{func.name.value}:{band_name}", None)
 
     @wrapped_apply
     # pylint: disable=too-many-branches
@@ -1239,7 +1248,8 @@ def customize(
     global_vars: dict = None,
     instantiate: list = None,
     context: Context = None,
-):
+    unroll: bool = True,
+) -> Schedule:
     # Get Python AST
     if isinstance(fn, str):
         src, starting_line_no = fn, 1
@@ -1260,21 +1270,30 @@ def customize(
         global_vars=global_vars.copy(),
         mlir_ctx=Context() if context is None else context,
         inst=instantiate,
+        unroll=unroll,
         enable_tensor=enable_tensor,
         verbose=verbose,
     )
     tree = TypeInferer()(ctx_type_inf, tree)
-    ctx_type_inf = None
     # Start building IR
     ctx = ASTContext(
         tree=tree,
         global_vars=global_vars,
         mlir_ctx=Context() if context is None else context,
         inst=instantiate,
+        func_predicate_tags=ctx_type_inf.func_predicate_tags,
+        unroll=unroll,
         enable_tensor=enable_tensor,
         verbose=verbose,
     )
     module = ASTTransformer()(ctx, tree, file_name)
+    func_instances = {
+        orig_name: {
+            dim: f"{orig_name}_{str(freeze_list(predicate_tag))}"
+            for dim, predicate_tag in kernel_instance_info.items()
+        }
+        for orig_name, kernel_instance_info in ctx.func_predicate_tags.items()
+    }
     if lower_linalg:
         lower_linalg_and_attach_names(module)
         ctx.top_func = find_func_in_module(module, fn.__name__)
@@ -1285,6 +1304,7 @@ def customize(
         InsertionPoint.at_block_terminator(ctx.top_func.entry_block),
         ext_libs=ctx.ext_libs,
         inst_list=instantiate,
+        func_instances=func_instances,
     )
     # Attach buffers to schedule:
     # The reason why we do not attach buffers to function is that
