@@ -90,8 +90,8 @@ public:
 
 protected:
   /// C++ component emitters.
-  void emitValue(Value val, unsigned rank = 0, bool isPtr = false,
-                 std::string name = "");
+  virtual void emitValue(Value val, unsigned rank = 0, bool isPtr = false,
+                         std::string name = "");
   virtual void emitArrayDecl(Value array, bool isFunc = false, std::string name = "");
   unsigned emitNestedLoopHead(Value val);
   void emitNestedLoopTail(unsigned rank);
