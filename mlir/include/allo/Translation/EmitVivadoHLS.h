@@ -81,7 +81,7 @@ public:
   void emitBitcast(arith::BitcastOp op);
 
   /// Stream operation emitters.
-  void emitStreamConstruct(allo::StreamConstructOp op);
+  virtual void emitStreamConstruct(allo::StreamConstructOp op);
   void emitStreamGet(allo::StreamGetOp op);
   void emitStreamPut(allo::StreamPutOp op);
 
@@ -99,10 +99,10 @@ protected:
 
   /// MLIR component and HLS C++ pragma emitters.
   void emitBlock(Block &block);
-  void emitLoopDirectives(Operation *op);
-  void emitArrayDirectives(Value memref);
+  virtual void emitLoopDirectives(Operation *op);
+  virtual void emitArrayDirectives(Value memref);
   virtual void emitFunctionDirectives(func::FuncOp func, ArrayRef<Value> portList);
-  void emitFunction(func::FuncOp func);
+  virtual void emitFunction(func::FuncOp func);
   void emitHostFunction(func::FuncOp func);
 };
 } // namespace vhls

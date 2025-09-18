@@ -400,7 +400,7 @@ def build(
     if target == "simulator":
         s = customize(func, opt_default)
         return LLVMOMPModule(s.module, s.top_func_name)
-    # FPGA backend
+    # FPGA backend (vitis_hls, vivado_hls, tapa, ihls, catapult)
     s = customize(func, opt_default, enable_tensor=enable_tensor)
     hls_mod = s.build(
         target=target,
