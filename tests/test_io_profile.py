@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import allo
+import numpy as np
 
 
 def run_io_profile_demo():
@@ -67,6 +68,25 @@ module {
         print(mod)
 
 
+def run_end_to_end_io_profile_demo():
+    mlir = r"""
+module {
+  func.func @kernel(%A: memref<4xf32>, %B: memref<4xf32>) {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %A[%c0] : memref<4xf32>
+    memref.store %v, %B[%c0] : memref<4xf32>
+    return
+  }
+}
+"""
+
+    llvm_mod = allo.LLVMModule(mlir, "kernel", io_profile=True)
+    A = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    B = np.zeros((4,), dtype=np.float32)
+    llvm_mod(A, B)
+
+
 if __name__ == "__main__":
     # run_io_profile_demo()
-    run_insert_pass_demo()
+    # run_insert_pass_demo()
+    run_end_to_end_io_profile_demo()

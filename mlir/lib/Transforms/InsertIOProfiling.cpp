@@ -73,10 +73,12 @@ struct InsertIOProfilingPass
 
     func::FuncOp countLoad = ensureDecl("countLoadBytes", TypeRange{opaquePtrTy, i64Ty}, voidTy);
     func::FuncOp countStore = ensureDecl("countStoreBytes", TypeRange{opaquePtrTy, i64Ty}, voidTy);
+    func::FuncOp reportFn = ensureDecl("reportMemrefIO", TypeRange{}, voidTy);
 
     // Collect top-level function arguments that are memrefs.
     SmallVector<func::FuncOp> funcs;
     module.walk([&](func::FuncOp f) { funcs.push_back(f); });
+    bool anyTop = llvm::any_of(funcs, [](func::FuncOp f) { return f->hasAttr("top"); });
 
     for (func::FuncOp func : funcs) {
       auto funcLoc = func.getLoc();
@@ -148,6 +150,16 @@ struct InsertIOProfilingPass
           }
         }
       });
+
+      // Insert reportMemrefIO() before returns of the top function(s).
+      if (func->hasAttr("top") || !anyTop) {
+        SmallVector<func::ReturnOp> returns;
+        func.walk([&](func::ReturnOp ret) { returns.push_back(ret); });
+        for (auto ret : returns) {
+          OpBuilder b(ret);
+          b.create<func::CallOp>(ret.getLoc(), reportFn, ValueRange{});
+        }
+      }
     }
   }
 };
