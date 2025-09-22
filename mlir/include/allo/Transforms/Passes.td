@@ -48,4 +48,9 @@ def CopyOnWrite : Pass<"copy-on-write", "ModuleOp"> {
   let constructor = "mlir::allo::createCopyOnWritePass()";
 }
 
+def InsertIOProfiling : Pass<"insert-io-profiling", "ModuleOp"> {
+  let summary = "Insert IO profiling counters for loads/stores on top-level function arguments";
+  let constructor = "mlir::allo::createInsertIOProfilingPass()";
+}
+
 #endif // ALLO_MLIR_PASSES

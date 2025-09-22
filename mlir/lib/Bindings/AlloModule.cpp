@@ -161,6 +161,11 @@ static bool lowerPrintOps(MlirModule &mlir_mod) {
   return applyLowerPrintOps(mod);
 }
 
+static bool insertIOProfiling(MlirModule &mlir_mod) {
+  auto mod = unwrap(mlir_mod);
+  return applyInsertIOProfiling(mod);
+}
+
 //===----------------------------------------------------------------------===//
 // Utility pass APIs
 //===----------------------------------------------------------------------===//
@@ -306,6 +311,7 @@ PYBIND11_MODULE(_allo, m) {
   allo_m.def("legalize_cast", &legalizeCast);
   allo_m.def("remove_stride_map", &removeStrideMap);
   allo_m.def("lower_print_ops", &lowerPrintOps);
+  allo_m.def("insert_io_profiling", &insertIOProfiling);
 
   // Utility pass APIs.
   allo_m.def("memref_dce", &memRefDCE);

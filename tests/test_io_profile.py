@@ -45,5 +45,28 @@ module {
     llvm_mod()
 
 
+def run_insert_pass_demo():
+    from allo._mlir.ir import Context, Location, Module
+    from allo._mlir.dialects import allo as allo_d, arith as arith_d, func as func_d, memref as memref_d, llvm as llvm_d, affine as affine_d
+
+    mlir = r"""
+module {
+  func.func @kernel(%A: memref<4xf32>, %B: memref<4xf32>) {
+    %c0 = arith.constant 0 : index
+    %v = memref.load %A[%c0] : memref<4xf32>
+    memref.store %v, %B[%c0] : memref<4xf32>
+    return
+  }
+}
+"""
+
+    with Context() as ctx, Location.unknown():
+        allo_d.register_dialect(ctx)
+        mod = Module.parse(mlir, ctx)
+        allo_d.insert_io_profiling(mod)
+        print(mod)
+
+
 if __name__ == "__main__":
-    run_io_profile_demo()
+    # run_io_profile_demo()
+    run_insert_pass_demo()

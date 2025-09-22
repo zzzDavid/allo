@@ -12,6 +12,7 @@ add_mlir_library(MLIRAlloPasses
     DataPlacement.cpp
     CopyOnWrite.cpp
     UnifyKernels.cpp
+    InsertIOProfiling.cpp
 
     ADDITIONAL_HEADER_DIRS
     ${PROJECT_SOURCE_DIR}/include/allo
@@ -29,4 +30,9 @@ add_mlir_library(MLIRAlloPasses
     MLIRPass
     MLIRAllo
     MLIRAlloSupport
+    MLIRMemRefDialect
+    MLIRAffineDialect
+    MLIRArithDialect
+    MLIRFuncDialect
+    MLIRLLVMDialect
 )

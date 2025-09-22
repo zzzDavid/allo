@@ -33,6 +33,9 @@ bool applyCopyOnWrite(ModuleOp &module);
 void applyCopyOnWriteOnFunction(Operation &func);
 ModuleOp applyUnifyKernels(ModuleOp &module1, ModuleOp &module2, int loop_num);
 
+std::unique_ptr<OperationPass<ModuleOp>> createInsertIOProfilingPass();
+bool applyInsertIOProfiling(ModuleOp &module);
+
 /// Registers all Allo transformation passes
 void registerAlloPasses();
 

@@ -99,6 +99,9 @@ class LLVMModule:
                 )
             func.attributes["llvm.emit_c_interface"] = UnitAttr.get()
             func.attributes["top"] = UnitAttr.get()
+            # Insert IO profiling if requested
+            if io_profile:
+                allo_d.insert_io_profiling(self.module)
             # Final lowering
             allo_d.lower_allo_to_llvm(self.module, ctx)
             pm = PassManager.parse("builtin.module(reconcile-unrealized-casts)")
