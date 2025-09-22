@@ -21,7 +21,7 @@
 using namespace mlir;
 using namespace mlir::allo;
 
-// Create or fetch a global C string and return an i8* pointer to its first char.
+// Create or fetch a global C string and return an opaque !llvm.ptr to its first char at the current insertion point.
 static Value getOrCreateGlobalCString(Location loc, OpBuilder &builder,
                                       ModuleOp module, StringRef symName,
                                       StringRef literalWithNull) {
@@ -37,15 +37,14 @@ static Value getOrCreateGlobalCString(Location loc, OpBuilder &builder,
                                             builder.getStringAttr(literalWithNull),
                                             /*alignment=*/0);
   }
-  OpBuilder b(module.getContext());
-  b.setInsertionPointToStart(module.getBody());
-  Value addr = b.create<LLVM::AddressOfOp>(loc, global);
-  Value c0_64 = b.create<LLVM::ConstantOp>(
+  // Build the address and GEP at the caller's insertion point.
+  Value addr = builder.create<LLVM::AddressOfOp>(loc, global);
+  Value c0_64 = builder.create<LLVM::ConstantOp>(
       loc, IntegerType::get(builder.getContext(), 64),
       builder.getIntegerAttr(builder.getIndexType(), 0));
-  auto i8PtrTy = LLVM::LLVMPointerType::get(builder.getContext(), 8);
-  return b.create<LLVM::GEPOp>(loc, i8PtrTy, global.getType(), addr,
-                               ArrayRef<Value>({c0_64, c0_64}));
+  auto opaquePtrTy = LLVM::LLVMPointerType::get(builder.getContext());
+  return builder.create<LLVM::GEPOp>(loc, opaquePtrTy, global.getType(), addr,
+                                     ArrayRef<Value>({c0_64, c0_64}));
 }
 
 struct InsertIOProfilingPass
@@ -80,40 +79,31 @@ struct InsertIOProfilingPass
     module.walk([&](func::FuncOp f) { funcs.push_back(f); });
 
     for (func::FuncOp func : funcs) {
-      // Map from memref argument index to opaque pointer to its name C-string.
-      DenseMap<unsigned, Value> argIndexToNamePtr;
-
       auto funcLoc = func.getLoc();
 
-      // Create or find a global string for the memref name: use format "memref_<func>_arg<idx>\00".
-      auto buildNamePtrForArg = [&](unsigned idx) -> Value {
+      auto buildNamePtrForArgAt = [&](OpBuilder &b, unsigned idx) -> Value {
         std::string base = (Twine("memref_") + func.getName() + Twine("_arg") + Twine(idx)).str();
         std::string literal = base + std::string("\0", 1);
         std::string symName = (Twine("__allo_prof_name_") + func.getName() + Twine("_arg") + Twine(idx)).str();
-        Value i8Ptr = getOrCreateGlobalCString(funcLoc, moduleBuilder, module, symName, StringRef(literal));
-        // Cast to opaque !llvm.ptr for calling func.func declarations.
-        OpBuilder b(func.getBody());
-        b.setInsertionPointToStart(&func.getBody().front());
-        return b.create<LLVM::BitcastOp>(funcLoc, opaquePtrTy, i8Ptr);
+        return getOrCreateGlobalCString(funcLoc, b, module, symName, StringRef(literal));
       };
 
-      // Identify which block arguments are memrefs and track them.
-      SmallVector<BlockArgument> memrefArgs;
+      // Identify which block arguments are memrefs.
+      DenseSet<unsigned> memrefArgIdxs;
       for (auto [idx, arg] : llvm::enumerate(func.getArguments())) {
         if (arg.getType().isa<MemRefType>()) {
-          memrefArgs.push_back(arg);
-          argIndexToNamePtr[idx] = buildNamePtrForArg(idx);
+          memrefArgIdxs.insert(idx);
         }
       }
 
-      if (memrefArgs.empty()) continue;
+      if (memrefArgIdxs.empty()) continue;
 
       func.walk([&](Operation *op) {
         Location loc = op->getLoc();
         auto insertCounter = [&](BlockArgument memrefArg, bool isLoad, int64_t bytes) {
           OpBuilder b(op);
           unsigned idx = memrefArg.getArgNumber();
-          Value namePtr = argIndexToNamePtr.lookup(idx);
+          Value namePtr = buildNamePtrForArgAt(b, idx);
           Value numBytes = b.create<arith::ConstantIntOp>(loc, bytes, 64);
           SmallVector<Value> args{namePtr, numBytes};
           b.create<func::CallOp>(loc, isLoad ? countLoad : countStore, args);
