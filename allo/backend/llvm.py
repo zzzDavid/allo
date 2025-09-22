@@ -3,6 +3,7 @@
 # pylint: disable=no-name-in-module, inconsistent-return-statements
 
 import os
+from pathlib import Path
 import ctypes
 import ml_dtypes
 import numpy as np
@@ -53,7 +54,7 @@ def invoke_mlir_parser(mod: str):
 
 
 class LLVMModule:
-    def __init__(self, mod, top_func_name, ext_libs=None):
+    def __init__(self, mod, top_func_name, ext_libs=None, io_profile=False):
         # Copy the module to avoid modifying the original one
         with Context() as ctx:
             allo_d.register_dialect(ctx)
@@ -112,6 +113,15 @@ class LLVMModule:
                     os.getenv("LLVM_BUILD_DIR"), "lib", "libmlir_c_runner_utils.so"
                 ),
             ]
+            # Add allo runtime utils shared library from repo-local mlir/build
+            if io_profile:
+                allo_root = Path(__file__).resolve().parents[2]
+                allo_runtime_utils = str(allo_root / "mlir" / "build" / "lib" / "liballo_runtime_utils.so")
+                if not os.path.exists(allo_runtime_utils):
+                    raise RuntimeError(
+                        f"Missing liballo_runtime_utils.so at {allo_runtime_utils}.\n"
+                    )
+                shared_libs.append(allo_runtime_utils)
             shared_libs += [lib.compile_shared_lib() for lib in ext_libs]
             # opt_level should be set to 2 to avoid the following issue
             # https://github.com/cornell-zhang/allo/issues/72

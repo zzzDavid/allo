@@ -8,11 +8,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unordered_map>
+#include <string>
+#include <mutex>
 
 // reference:
 // https://github.com/llvm/llvm-project/blob/bd672e2fc03823e536866da6721b9f053cfd586b/mlir/lib/ExecutionEngine/CRunnerUtils.cpp#L59
 
 #define MAX_LINE_LENGTH 4096
+
+namespace {
+struct MemrefIOCounters {
+  int64_t loadBytes = 0;
+  int64_t storeBytes = 0;
+};
+
+std::unordered_map<std::string, MemrefIOCounters> g_memrefIoCounters;
+std::mutex g_memrefIoMutex;
+}
 
 template <typename T> void readMemref(int64_t rank, void *ptr, char *str) {
   // Open the input file
@@ -129,4 +142,33 @@ extern "C" void writeMemrefF32(int64_t rank, void *ptr, char *str) {
 
 extern "C" void writeMemrefF64(int64_t rank, void *ptr, char *str) {
   writeMemref<double>(rank, ptr, str, "%.6f ");
+}
+
+extern "C" void countLoadBytes(char *memrefName, int64_t numBytes) {
+  if (memrefName == nullptr || numBytes <= 0) return;
+  std::lock_guard<std::mutex> lock(g_memrefIoMutex);
+  auto &counters = g_memrefIoCounters[std::string(memrefName)];
+  counters.loadBytes += numBytes;
+}
+
+extern "C" void countStoreBytes(char *memrefName, int64_t numBytes) {
+  if (memrefName == nullptr || numBytes <= 0) return;
+  std::lock_guard<std::mutex> lock(g_memrefIoMutex);
+  auto &counters = g_memrefIoCounters[std::string(memrefName)];
+  counters.storeBytes += numBytes;
+}
+
+extern "C" void reportMemrefIO() {
+  std::lock_guard<std::mutex> lock(g_memrefIoMutex);
+  if (g_memrefIoCounters.empty()) {
+    std::cout << "Memref I/O bytes: (no data)\n";
+    return;
+  }
+  std::cout << "Memref I/O bytes:\n";
+  for (const auto &entry : g_memrefIoCounters) {
+    const auto &name = entry.first;
+    const auto &counters = entry.second;
+    std::cout << "  " << name << ": loads=" << counters.loadBytes
+              << " bytes, stores=" << counters.storeBytes << " bytes\n";
+  }
 }

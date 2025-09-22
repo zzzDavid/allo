@@ -50,4 +50,13 @@ writeMemrefF32(int64_t rank, void *ptr, char *str);
 extern "C" ALLO_RUNTIME_UTILS_EXPORT void
 writeMemrefF64(int64_t rank, void *ptr, char *str);
 
+extern "C" ALLO_RUNTIME_UTILS_EXPORT void
+countLoadBytes(char *memrefName, int64_t numBytes);
+
+extern "C" ALLO_RUNTIME_UTILS_EXPORT void
+countStoreBytes(char *memrefName, int64_t numBytes);
+
+extern "C" ALLO_RUNTIME_UTILS_EXPORT void
+reportMemrefIO();
+
 #endif // ALLOC_SHARED_LIB_ALLO_RUNTIME_UTILS_H
