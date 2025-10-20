@@ -3,6 +3,8 @@
 
 import allo
 import numpy as np
+import pytest
+from allo.ir.types import int32, float32
 
 
 def run_io_profile_demo():
@@ -86,7 +88,31 @@ module {
     llvm_mod(A, B)
 
 
+def run_end_to_end_from_allo():
+    M = 10
+    K = 15
+    N = 20
+    A = np.float32(np.random.uniform(size=(M, K)))
+    B = np.float32(np.random.uniform(size=(K, N)))
+
+    def kernel(A: float32[M, K], B: float32[K, N]) -> float32[M, N]:
+        C: float32[M, N] = 0.0
+        D: float32[M, N] = 0.0
+        for i, j in allo.grid(M, N):
+            for k in allo.reduction(K):
+                C[i, j] += A[i, k] * B[k, j]
+        for i, j in allo.grid(M, N):
+            D[i, j] = (allo.exp(C[i, j]) + allo.log(C[i, j])) / C[i, j]
+        return D
+
+    s = allo.customize(kernel)
+    f = s.build(io_profile=True)
+    outs = np.zeros((M, N), dtype="float32")
+    outs = f(A, B)
+
+
 if __name__ == "__main__":
     # run_io_profile_demo()
     # run_insert_pass_demo()
-    run_end_to_end_io_profile_demo()
+    # run_end_to_end_io_profile_demo()
+    run_end_to_end_from_allo()
