@@ -231,21 +231,26 @@ From example_minisa_program.py:
 5. **VN-Level Computation** - GEMM at tile granularity
 6. **LLVM Compilation** - All tested components build successfully
 
-### ⚠️ Implemented But Not Yet Fully Tested
+### ⚠️ Implemented But Blocked By Allo API Issue
+
 1. **Full Dataflow Graph** - `create_feather_isa()` with `@df.region()`
-   - NEST→BIRRD→Output pipeline with streams
-   - Requires complex test infrastructure for stream-based dataflow
-   - Individual components (NEST, BIRRD) verified separately
+   - **Status**: ❌ Blocked by Allo `@df.kernel` API error
+   - **Error**: "Invalid @df.kernel decorator: 'args' length mismatch"
+   - **Impact**: Also affects existing `examples/feather/gemm.py`
+   - **Cause**: Appears to be Allo dataflow API change/incompatibility
+   - **Components**: NEST→BIRRD→Output pipeline with streams implemented
+   - **Workaround**: Individual components (NEST, BIRRD) verified separately
+   - **Test file**: `test_full_feather_dataflow.py` (test created but blocked)
 
 2. **BIRRD Multi-Stage Network**
-   - Butterfly topology implemented
+   - Butterfly topology implemented in `create_feather_isa()`
    - Inter-stage connections with bit-reversal
-   - Needs end-to-end dataflow test with multiple stages
+   - Blocked by same API issue (part of full dataflow graph)
 
 3. **MINISA SetMapping → BIRRD Config**
    - `generate_birrd_config()` function implemented
    - Mapping from SetMapping parameters to BIRRD switch settings
-   - Needs integration test
+   - Can be tested once dataflow API issue resolved
 
 ## Files Verified
 

@@ -322,6 +322,26 @@ Tests actual FEATHER architecture components:
 python test_feather_dataflow.py --AH 4 --AW 4 --verbose
 ```
 
+### Test 4: Full FEATHER Dataflow Graph
+
+Tests complete dataflow pipeline with streams (NEST→BIRRD→Output):
+- Full dataflow graph using `@df.region()` and streams
+- Multi-stage BIRRD butterfly network
+- Stream-based communication between components
+
+**Status**: ⚠️ Blocked by Allo API issue
+
+```bash
+# Test full dataflow (currently blocked)
+python test_full_feather_dataflow.py --AH 4 --AW 4 --verbose
+```
+
+**Known Issue**: `@df.kernel` decorator inside `@df.region()` has API mismatch error:
+- Error: "Invalid @df.kernel decorator: 'args' length mismatch"
+- Affects both our implementation and existing `examples/feather/gemm.py`
+- Appears to be Allo dataflow API change/incompatibility
+- Individual components (NEST, BIRRD) verified separately
+
 ### Test 3: Allo VN-level Kernel [Optional]
 
 Tests VN-level computation expressed in Allo:
