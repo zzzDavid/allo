@@ -90,9 +90,8 @@ def create_feather_isa(AH: int, AW: int, Ty=int8):
 
         @df.kernel(mapping=[1])
         def NEST(
-            input_acts: Ty[AH, AW],      # Input activations from StaB
-            weights: Ty[AH, AW, AH],      # Weights from StrB
-            nest_output: TyAccum[AH, AW]  # Output for current tile
+            input_acts: Ty[AH, AW],       # Input activations from StaB
+            weights: Ty[AH, AW, AH]       # Weights from StrB
         ):
             """
             NEST PE Array with temporal local reduction and spatial forwarding.
@@ -110,6 +109,9 @@ def create_feather_isa(AH: int, AW: int, Ty=int8):
             - Column-wise output bus (shared by PE column)
             - Pipelined execution for high throughput
             """
+
+            # Local output buffer for storing results before sending to BIRRD
+            nest_output: TyAccum[AH, AW]
 
             # Local register file for each PE (for temporal reduction)
             local_regs: TyAccum[AH, AW, AH]
