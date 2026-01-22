@@ -250,8 +250,8 @@ def create_feather_isa(AH: int, AW: int, Ty=int8):
             Load BIRRD configuration from instruction buffer.
             This is controlled by MINISA SetMapping instruction.
             """
-            for stage in range(NUM_STAGES):
-                for switch in range(SWITCHES_PER_STAGE):
+            with allo.meta_for(NUM_STAGES) as stage:
+                with allo.meta_for(SWITCHES_PER_STAGE) as switch:
                     birrd_config[stage, switch].put(instructions[stage, switch])
 
     return feather_top

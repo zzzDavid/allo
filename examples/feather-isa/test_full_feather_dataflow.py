@@ -87,27 +87,16 @@ def test_full_feather_dataflow(AH: int, AW: int, verbose: bool = True):
     # Create FEATHER dataflow
     print("\n2. Creating FEATHER dataflow graph...")
     try:
-        feather_region = create_feather_isa(AH, AW, Ty=int8)
+        feather_top = create_feather_isa(AH, AW, Ty=int8)
         print("   ✓ Dataflow graph created successfully")
 
-        # Customize with dataflow API
-        print("\n3. Customizing with Allo dataflow...")
-        s = df.customize(feather_region)
-        print("   ✓ Customization successful")
-
-        # Build
-        print("\n4. Building with LLVM backend...")
-        try:
-            mod = s.build(target="llvm")
-            print("   ✓ Build successful with LLVM")
-        except Exception as e:
-            print(f"   ⚠️  LLVM build failed: {e}")
-            print("   Trying default backend...")
-            mod = s.build()
-            print("   ✓ Build successful with default backend")
+        # Build directly with simulator (like examples/feather/gemm.py)
+        print("\n3. Building with dataflow simulator...")
+        mod = df.build(feather_top, target="simulator")
+        print("   ✓ Build successful with simulator")
 
         # Execute
-        print("\n5. Executing FEATHER dataflow...")
+        print("\n4. Executing FEATHER dataflow...")
         mod(input_acts, weights, birrd_config, output)
         print("   ✓ Execution completed")
 
@@ -116,7 +105,7 @@ def test_full_feather_dataflow(AH: int, AW: int, verbose: bool = True):
 
         # Verify: With all PASS operations, BIRRD should just route data
         # So output should match NEST output (possibly reordered by butterfly routing)
-        print("\n6. Verifying results...")
+        print("\n5. Verifying results...")
 
         # For PASS-only config, output should contain same values as NEST output
         # (but may be in different positions due to butterfly routing)
@@ -178,15 +167,9 @@ def test_feather_with_reduction(AH: int, AW: int, verbose: bool = True):
 
     print("\n2. Creating and building FEATHER dataflow...")
     try:
-        feather_region = create_feather_isa(AH, AW, Ty=int8)
-        s = df.customize(feather_region)
-
-        try:
-            mod = s.build(target="llvm")
-            print("   ✓ Built with LLVM")
-        except:
-            mod = s.build()
-            print("   ✓ Built with default backend")
+        feather_top = create_feather_isa(AH, AW, Ty=int8)
+        mod = df.build(feather_top, target="simulator")
+        print("   ✓ Built with simulator")
 
         print("\n3. Executing with reduction...")
         mod(input_acts, weights, birrd_config, output)
