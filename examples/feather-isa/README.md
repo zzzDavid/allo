@@ -291,11 +291,14 @@ python test_gemm_minisa.py --M 16 --N 16 --K 16 --AH 4 --AW 4 --verbose
 
 Tests complete FEATHER-ISA with hardware implementation:
 - Creates MINISA instruction sequence
-- Executes using VN-level hardware kernels
+- Executes using VN-level GEMM kernels
 - Verifies functional model and hardware match
 - Tests multiple PE array configurations
 
-**Status**: ✅ Functional model verified, hardware execution ready for LLVM
+**Note**: Currently tests simplified GEMM kernel for computation verification.
+Full dataflow graph with NEST→BIRRD→Output streams requires additional test infrastructure.
+
+**Status**: ✅ VN-level computation verified with LLVM
 
 ```bash
 # Single configuration
@@ -303,6 +306,20 @@ python test_feather_hardware_integration.py --M 8 --N 8 --K 8 --AH 4 --AW 4 --ve
 
 # Multiple configurations
 python test_feather_hardware_integration.py --multi
+```
+
+### Test 3: FEATHER Dataflow Components
+
+Tests actual FEATHER architecture components:
+- NEST kernel with temporal local reduction
+- BIRRD switch operations (PASS, SWAP, ADD_LEFT, ADD_RIGHT)
+- VN-level computation matching FEATHER specification
+
+**Status**: ✅ NEST kernel and BIRRD operations verified with LLVM
+
+```bash
+# Test FEATHER components
+python test_feather_dataflow.py --AH 4 --AW 4 --verbose
 ```
 
 ### Test 3: Allo VN-level Kernel [Optional]

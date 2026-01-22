@@ -132,7 +132,7 @@ Hardware Multi: ✅ PASSED
   - Butterfly bit-reversal routing
   - RIR capability for zero-latency layout switching
 
-#### VN-Level GEMM Kernel
+#### VN-Level GEMM Kernel (Simplified for Testing)
 - **Implemented:** ✅
 - **Verified:** ✅
 - **Computation:** C[AH, AW] = A[AH, AH] @ B[AH, AW]
@@ -141,6 +141,28 @@ Hardware Multi: ✅ PASSED
   - Each output computed via AH-way dot product
   - Accumulation for multi-tile reduction
   - LLVM compilation successful
+- **Note:** Simplified kernel for testing computation correctness. Full dataflow with NEST→BIRRD→Output uses `@df.region()` and requires stream infrastructure.
+
+#### NEST Kernel (Actual FEATHER Component)
+- **Implemented:** ✅ in `create_feather_isa()`
+- **Verified:** ✅ in `test_feather_dataflow.py`
+- **Computation:** Each PE performs AH-way dot product with temporal local reduction
+- **Features:**
+  - AH×AW PE array with local registers
+  - Phase 1: Temporal local reduction
+  - Phase 2: Spatial forwarding to BIRRD
+  - LLVM compilation successful
+  - Verified with test data
+
+#### BIRRD Operations
+- **Implemented:** ✅ in `create_feather_isa()`
+- **Verified:** ✅ Switch operations tested
+- **Operations:** PASS, SWAP, ADD_LEFT, ADD_RIGHT
+- **Features:**
+  - Butterfly network topology
+  - Multi-stage reduction
+  - RIR capability
+- **Note:** Switch logic verified, full dataflow graph with streams needs integration test
 
 ### MINISA Instruction Set
 
@@ -199,13 +221,40 @@ From example_minisa_program.py:
 | 8×8 | 6 | 4 | 24 |
 | 16×16 | 8 | 8 | 64 |
 
+## What Has Been Tested
+
+### ✅ Fully Verified
+1. **MINISA Instruction Set** - All 4 instructions functional
+2. **Functional Model** - Correct execution of MINISA programs
+3. **NEST Kernel** - Actual FEATHER component with temporal reduction
+4. **BIRRD Switch Operations** - All 4 operations (PASS, SWAP, ADD_LEFT, ADD_RIGHT)
+5. **VN-Level Computation** - GEMM at tile granularity
+6. **LLVM Compilation** - All tested components build successfully
+
+### ⚠️ Implemented But Not Yet Fully Tested
+1. **Full Dataflow Graph** - `create_feather_isa()` with `@df.region()`
+   - NEST→BIRRD→Output pipeline with streams
+   - Requires complex test infrastructure for stream-based dataflow
+   - Individual components (NEST, BIRRD) verified separately
+
+2. **BIRRD Multi-Stage Network**
+   - Butterfly topology implemented
+   - Inter-stage connections with bit-reversal
+   - Needs end-to-end dataflow test with multiple stages
+
+3. **MINISA SetMapping → BIRRD Config**
+   - `generate_birrd_config()` function implemented
+   - Mapping from SetMapping parameters to BIRRD switch settings
+   - Needs integration test
+
 ## Files Verified
 
 ### Implementation Files
 - ✅ `feather_isa.py` - MINISA instruction set and functional model
 - ✅ `feather_isa_hardware.py` - Complete hardware implementation with Allo
 - ✅ `test_gemm_minisa.py` - MINISA functional model test suite
-- ✅ `test_feather_hardware_integration.py` - Hardware integration test suite
+- ✅ `test_feather_hardware_integration.py` - VN-level GEMM integration tests
+- ✅ `test_feather_dataflow.py` - **NEW:** FEATHER dataflow component tests
 - ✅ `example_minisa_program.py` - Educational examples
 
 ### Documentation Files
