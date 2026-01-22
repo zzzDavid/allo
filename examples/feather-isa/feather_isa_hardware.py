@@ -263,9 +263,9 @@ def create_simplified_gemm_feather(AH: int, AW: int, Ty=int8):
     the full BIRRD network, suitable for LLVM backend testing.
 
     Implements:
-    - VN-level dot products (AH-way)
-    - Local temporal reduction
-    - Simple spatial reduction pattern
+    - Standard matrix multiplication at VN tile granularity
+    - C[AH, AW] = A[AH, AH] @ B[AH, AW]
+    - Each PE computes one output element via AH-way dot product
 
     Args:
         AH: PE array height (VN size)
@@ -277,32 +277,33 @@ def create_simplified_gemm_feather(AH: int, AW: int, Ty=int8):
     """
 
     def gemm_vn_tile(
-        input_vns: int8[AH, AW],         # Input VNs (AH rows, AW cols)
-        weight_vns: int8[AH, AW, AH],    # Weight VNs (AH output, AW cols, AH elements)
-        output_vns: int32[AH, AW]        # Output VNs (partial sums)
+        A_tile: int8[AH, AH],      # Input tile from matrix A
+        B_tile: int8[AH, AW],      # Weight tile from matrix B
+        C_tile: int32[AH, AW]      # Output tile (partial sums)
     ):
         """
-        VN-level GEMM tile implementing NEST functionality.
+        VN-level GEMM tile: C = A @ B
+
+        Standard matrix multiplication:
+        - A_tile: (AH, AH) - input activations
+        - B_tile: (AH, AW) - weights
+        - C_tile: (AH, AW) - output partial sums
 
         Computation:
-        - Each PE(i, j) computes an AH-way dot product
-        - Input column j feeds all PEs in column j
-        - Weight VN (i, j) used by PE(i, j)
-        - Output is partial sum for position (i, j)
-
-        This matches FEATHER's NEST behavior in Phase 1
-        (Local Temporal Reduction).
+        - Each output C[i, j] = sum_k A[i, k] * B[k, j]
+        - Corresponds to AH-way dot product per PE
+        - Implements NEST temporal local reduction
         """
-        # Process each PE in the array
-        for i in range(AH):  # PE rows (output channels)
-            for j in range(AW):  # PE columns (parallel compute)
+        # Standard matrix multiplication loops
+        for i in range(AH):  # Output rows
+            for j in range(AW):  # Output columns
                 # Perform AH-way dot product (one Virtual Neuron)
                 temp: int32 = 0
-                for k in range(AH):  # VN size
-                    temp += input_vns[k, j] * weight_vns[i, j, k]
+                for k in range(AH):  # Reduction dimension
+                    temp += A_tile[i, k] * B_tile[k, j]
 
-                # Accumulate to output (for multi-tile reduction)
-                output_vns[i, j] += temp
+                # Accumulate to output (for multi-tile reduction over K)
+                C_tile[i, j] += temp
 
     return gemm_vn_tile
 
@@ -439,28 +440,24 @@ if __name__ == "__main__":
     print("\n2. Testing VN-level computation...")
     # Create test data
     np.random.seed(42)
-    input_vns = np.random.randint(-4, 4, size=(AH, AW)).astype(np.int8)
-    weight_vns = np.random.randint(-4, 4, size=(AH, AW, AH)).astype(np.int8)
-    output_vns = np.zeros((AH, AW), dtype=np.int32)
+    A_tile = np.random.randint(-4, 4, size=(AH, AH)).astype(np.int8)
+    B_tile = np.random.randint(-4, 4, size=(AH, AW)).astype(np.int8)
+    C_tile = np.zeros((AH, AW), dtype=np.int32)
 
     # Build and run (using default backend since LLVM needs setup)
     try:
         mod = s.build()
-        mod(input_vns, weight_vns, output_vns)
+        mod(A_tile, B_tile, C_tile)
 
-        # Verify
-        expected = np.zeros((AH, AW), dtype=np.int32)
-        for i in range(AH):
-            for j in range(AW):
-                for k in range(AH):
-                    expected[i, j] += input_vns[k, j] * weight_vns[i, j, k]
+        # Verify: C = A @ B
+        expected = A_tile.astype(np.int32) @ B_tile.astype(np.int32)
 
-        if np.array_equal(output_vns, expected):
+        if np.array_equal(C_tile, expected):
             print("   ✓ VN-level computation correct!")
-            print(f"   Sample output: {output_vns[0, :4]}")
+            print(f"   Sample output: {C_tile[0, :4]}")
         else:
             print("   ✗ Output mismatch")
-            print(f"   Max error: {np.max(np.abs(output_vns - expected))}")
+            print(f"   Max error: {np.max(np.abs(C_tile - expected))}")
     except Exception as e:
         print(f"   ⚠  Build/execution skipped: {e}")
         print("   (This is expected if backend is not configured)")

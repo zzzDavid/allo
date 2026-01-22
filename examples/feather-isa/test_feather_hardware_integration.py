@@ -129,42 +129,34 @@ def test_hardware_integration(M: int, N: int, K: int, AH: int, AW: int, verbose:
         # Execute tiled computation
         for m_tile in range(num_m_tiles):
             for n_tile in range(num_n_tiles):
-                # Initialize output tile
-                output_tile = np.zeros((AH, AW), dtype=np.int32)
+                # Initialize output tile for this (M, N) block
+                C_tile = np.zeros((AH, AW), dtype=np.int32)
 
                 # Accumulate over K tiles
                 for k_tile in range(num_k_tiles):
-                    # Extract VN tiles from input matrices
-                    # Input VNs: A[m_tile*AH:(m_tile+1)*AH, k_tile*AH:(k_tile+1)*AH]
-                    # arranged as (AH, AW) where AW comes from broadcasting
-                    input_vns = np.zeros((AH, AW), dtype=np.int8)
-                    for col in range(AW):
-                        # Each column gets the same input VN (broadcast)
-                        input_start = k_tile * AH
-                        input_end = (k_tile + 1) * AH
-                        for row in range(AH):
-                            m_idx = m_tile * AH + row
-                            input_vns[row, col] = A[m_idx, input_start]
+                    # Extract tile from A: A[m_tile*AH:(m_tile+1)*AH, k_tile*AH:(k_tile+1)*AH]
+                    # Shape: (AH, AH)
+                    m_start = m_tile * AH
+                    m_end = (m_tile + 1) * AH
+                    k_start = k_tile * AH
+                    k_end = (k_tile + 1) * AH
+                    A_tile = A[m_start:m_end, k_start:k_end].copy()
 
-                    # Weight VNs: B[k_tile*AH:(k_tile+1)*AH, n_tile*AW:(n_tile+1)*AW]
-                    # arranged as (AH, AW, AH) where first AH is output channels
-                    weight_vns = np.zeros((AH, AW, AH), dtype=np.int8)
-                    for out_ch in range(AH):
-                        for aw in range(AW):
-                            k_start = k_tile * AH
-                            n_idx = n_tile * AW + aw
-                            for k in range(AH):
-                                weight_vns[out_ch, aw, k] = B[k_start + k, n_idx]
+                    # Extract tile from B: B[k_tile*AH:(k_tile+1)*AH, n_tile*AW:(n_tile+1)*AW]
+                    # Shape: (AH, AW)
+                    n_start = n_tile * AW
+                    n_end = (n_tile + 1) * AW
+                    B_tile = B[k_start:k_end, n_start:n_end].copy()
 
-                    # Execute VN-level computation
-                    mod(input_vns, weight_vns, output_tile)
+                    # Execute VN-level computation: C_tile += A_tile @ B_tile
+                    mod(A_tile, B_tile, C_tile)
 
                 # Store result in output matrix
                 m_start = m_tile * AH
                 m_end = (m_tile + 1) * AH
                 n_start = n_tile * AW
                 n_end = (n_tile + 1) * AW
-                C_hardware[m_start:m_end, n_start:n_end] = output_tile
+                C_hardware[m_start:m_end, n_start:n_end] = C_tile
 
         if verbose:
             print(f"   Hardware execution completed: {C_hardware.shape}")
