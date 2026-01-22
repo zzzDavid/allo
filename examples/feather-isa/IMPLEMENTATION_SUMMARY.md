@@ -271,23 +271,30 @@ For AH×AW PE array:
    - Code comments and docstrings
    - Usage examples and test instructions
 
-### ⚠️ Ready for LLVM Backend
+### ✅ LLVM Backend Tests Passing
 
-The hardware implementation is complete and ready to compile with LLVM:
+The hardware implementation is complete and all tests pass with LLVM backend:
 
 ```bash
-# Set LLVM build directory
-export LLVM_BUILD_DIR=/path/to/llvm/build
+# Set up LLVM environment
+source /work/shared/common/allo/setup-llvm-main.sh
 
 # Run tests with LLVM backend
-python test_feather_hardware_integration.py --verbose
+conda run -n py312 python test_feather_hardware_integration.py --verbose
+conda run -n py312 python test_feather_hardware_integration.py --multi
 ```
 
-**Current Status:**
-- ✅ Hardware kernels customize successfully with Allo
-- ✅ Dataflow graph structure is correct
-- ✅ VN-level computation logic verified
-- ⚠️ Build/execution requires LLVM_BUILD_DIR to be set
+**Test Results with LLVM Backend:**
+- ✅ Hardware kernels build successfully with LLVM
+- ✅ VN-level GEMM computation verified
+- ✅ Hardware matches functional model (all configurations)
+- ✅ Hardware matches NumPy reference (all configurations)
+- ✅ Multiple PE array configurations tested (4×4, 8×8)
+
+**Configurations Tested:**
+- M=8, N=8, K=8 with AH=4, AW=4: ✅ PASSED
+- M=16, N=16, K=16 with AH=4, AW=4: ✅ PASSED
+- M=16, N=16, K=16 with AH=8, AW=8: ✅ PASSED
 
 ### 🔮 Future Extensions
 
@@ -444,7 +451,8 @@ examples/feather-isa/
 
 ---
 
-**Status:** Implementation complete and verified ✅
+**Status:** Implementation complete and all tests passing with LLVM backend ✅
+**LLVM Backend:** Verified and working ✅
 **Date:** 2026-01-22
 **Authors:** Allo Development Team
 **Co-Authored-By:** Claude Sonnet 4.5 <noreply@anthropic.com>
