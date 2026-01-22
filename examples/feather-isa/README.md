@@ -108,12 +108,29 @@ c(ah, aw) = c0 + sr*ah + sc*(aw mod Gc)
   - Instruction dataclasses: `SetIVNLayout`, `SetWVNLayout`, `SetOVNLayout`, `SetMapping`
   - Helper functions for creating MINISA programs
 
+- `feather_isa_hardware.py`: Complete hardware implementation with Allo
+  - `create_feather_isa()`: Full FEATHER+ dataflow graph with NEST and BIRRD
+  - `create_simplified_gemm_feather()`: VN-level GEMM kernel for testing
+  - `generate_birrd_config()`: BIRRD configuration from MINISA instructions
+  - Hardware components: NEST, BIRRD, Output Buffer, Instruction Config
+
 - `test_gemm_minisa.py`: Test suite demonstrating MINISA programming
   - Matrix multiplication using MINISA instructions
   - VN-level Allo kernel implementation
   - Verification against reference
 
+- `test_feather_hardware_integration.py`: Integration test for hardware + MINISA
+  - End-to-end test combining MINISA instructions with hardware execution
+  - Verifies functional model and hardware implementation match
+  - Tests multiple PE array configurations
+
+- `example_minisa_program.py`: Educational examples
+  - 4 detailed examples demonstrating VN-level programming concepts
+  - Instruction footprint analysis
+  - Mapping flexibility demonstration
+
 - `MINISA.pdf`: Original paper specification
+- `feather.pdf`: FEATHER architecture documentation
 
 ## Usage
 
@@ -185,6 +202,53 @@ mapping = SetMapping(
 output = feather.execute_mapping(mapping, input_data, weight_data)
 ```
 
+## Hardware Implementation
+
+### FEATHER+ Architecture in Allo
+
+The hardware implementation (`feather_isa_hardware.py`) uses Allo's dataflow API to create a complete FEATHER+ accelerator:
+
+#### NEST (Neural Engine with Spatial forwarding and Temporal reduction)
+```python
+@df.kernel(mapping=[1])
+def NEST(input_acts: Ty[AH, AW], weights: Ty[AH, AW, AH], nest_output: TyAccum[AH, AW]):
+    # Phase 1: Local Temporal Reduction (AH-way dot product per PE)
+    # Phase 2: Interleaved Spatial Forwarding (to BIRRD)
+```
+
+**Features**:
+- AH×AW PE array, each PE has AH local registers
+- Temporal reduction: AH-way dot product in each PE
+- Spatial forwarding: Row-by-row output to BIRRD
+- Peak throughput: AH × AH × AW MACs/cycle
+
+#### BIRRD (Butterfly Interconnect for Reduction and Reordering)
+```python
+@df.kernel(mapping=[NUM_STAGES, SWITCHES_PER_STAGE])
+def BIRRD_Switch():
+    # 4 operations: PASS (=), SWAP (×), ADD_LEFT (∓), ADD_RIGHT (±)
+    # Butterfly bit-reversal for inter-stage connections
+```
+
+**Features**:
+- Multi-stage butterfly network (2×log₂(AW) stages)
+- 4 switch operations: PASS, SWAP, ADD_LEFT, ADD_RIGHT
+- RIR capability: Reorder In Reduction (zero-latency layout switching)
+- Bit-reversal routing between stages
+
+#### Stream-Based Communication
+- `nest_to_birrd`: AW streams from NEST to BIRRD input
+- `birrd_connections`: (NUM_STAGES+1) × AW streams for inter-stage data
+- `birrd_config`: NUM_STAGES × SWITCHES_PER_STAGE configuration streams
+
+#### VN-Level GEMM Kernel
+Simplified implementation for testing:
+```python
+def gemm_vn_tile(input_vns: int8[AH, AW], weight_vns: int8[AH, AW, AH], output_vns: int32[AH, AW]):
+    # Each PE(i, j) computes AH-way dot product
+    # Implements NEST Phase 1 behavior
+```
+
 ## Implementation Notes
 
 ### VN Constraint
@@ -219,7 +283,29 @@ Tests the core MINISA programming model:
 
 **Status**: ✅ Fully functional
 
-### Test 2: Allo VN-level Kernel [Optional]
+```bash
+python test_gemm_minisa.py --M 16 --N 16 --K 16 --AH 4 --AW 4 --verbose
+```
+
+### Test 2: Hardware Integration Test
+
+Tests complete FEATHER-ISA with hardware implementation:
+- Creates MINISA instruction sequence
+- Executes using VN-level hardware kernels
+- Verifies functional model and hardware match
+- Tests multiple PE array configurations
+
+**Status**: ✅ Functional model verified, hardware execution ready for LLVM
+
+```bash
+# Single configuration
+python test_feather_hardware_integration.py --M 8 --N 8 --K 8 --AH 4 --AW 4 --verbose
+
+# Multiple configurations
+python test_feather_hardware_integration.py --multi
+```
+
+### Test 3: Allo VN-level Kernel [Optional]
 
 Tests VN-level computation expressed in Allo:
 - Defines VN-level dot product kernel
