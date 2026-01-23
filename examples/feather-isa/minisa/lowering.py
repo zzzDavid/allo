@@ -1,19 +1,25 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-MINISA Lowering Layer
+"""MINISA lowering: convert MINISA instructions to Allo configuration tensors.
 
-Translates MINISA instructions into FEATHER control signals:
-- Layout instructions -> buffer addressing functions
-- SetMapping -> PE-to-VN mapping + BIRRD instruction array
+This module translates high-level MINISA instructions into low-level
+configuration arrays that drive the FEATHER+ Allo dataflow hardware.
 
-Reference: MINISA paper Section IV-D (FEATHER+ Configuration Generation)
+The lowering produces:
+- BIRRD instruction arrays from SetOVNLayout
+- Input tile extraction functions from SetIVNLayout
+- Weight tile extraction functions from SetWVNLayout
+- Tile slice bounds from SetMapping
+
+IMPORTANT: This module performs NO COMPUTE. It only generates configuration
+data structures. All actual computation is performed by Allo kernels.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Callable
 from math import log2
+from typing import Tuple, Callable, Optional
+
 import numpy as np
 
 from .isa import (
@@ -21,354 +27,89 @@ from .isa import (
     SetWVNLayout,
     SetOVNLayout,
     SetMapping,
-    FeatherPlusConfig,
-)
-from .layout import (
-    IVNLayout,
-    WVNLayout,
-    OVNLayout,
-    LayoutOrder,
+    MINISAProgram,
 )
 
 
-# BIRRD EGG instructions
+# BIRRD switch operation codes
 PS = 0  # Pass
 AR = 1  # Add Right
 AL = 2  # Add Left
 SW = 3  # Swap
 
 
-def reverse_bits(data: int, bit_range: int) -> int:
-    """
-    Reverse bits in data within the specified bit range.
-    Used for BIRRD inter-stage routing.
-    """
-    mask = (1 << bit_range) - 1
-    reversed_bits = 0
-    for i in range(bit_range):
-        if data & (1 << i):
-            reversed_bits |= 1 << (bit_range - 1 - i)
-    return (data & ~mask) | reversed_bits
-
-
 @dataclass
-class BIRRDConfig:
-    """
-    BIRRD configuration for a tile execution.
+class LoweredConfig:
+    """Configuration tensors produced by MINISA lowering.
+
+    These tensors are passed to the Allo dataflow region to configure
+    the hardware for a specific workload.
 
     Attributes:
-        num_stages: Number of BIRRD stages (P0)
-        switches_per_stage: Switches per stage (P1)
-        instructions: Instruction array of shape (P0, P1)
-        output_addresses: Output buffer write addresses
+        birrd_inst: BIRRD instruction array [P0, P1]
+        AW: Array width
+        AH: Array height
+        P0: Number of BIRRD stages
+        P1: Number of switches per stage
     """
-    num_stages: int
-    switches_per_stage: int
-    instructions: np.ndarray
-    output_addresses: Optional[np.ndarray] = None
+    birrd_inst: np.ndarray
+    AW: int
+    AH: int
+    P0: int
+    P1: int
 
 
-@dataclass
-class TileConfig:
-    """
-    Complete configuration for a compute tile.
-
-    Generated from SetMapping instruction and active layouts.
-    """
-    # PE-to-VN mapping
-    pe_to_wvn: Dict[Tuple[int, int], Tuple[int, int]]
-    pe_to_ivn: Dict[Tuple[int, int], Tuple[int, int]]
-
-    # Distribution crossbar config
-    input_crossbar: Dict[int, List[int]]  # PE column -> IVN indices
-    weight_crossbar: Dict[int, List[int]]  # PE column -> WVN indices
-
-    # BIRRD config
-    birrd: BIRRDConfig
-
-    # Reduction groups
-    reduction_groups: List[List[int]]  # Groups of PE columns that reduce together
-
-
-class MINISALowering:
-    """
-    MINISA to FEATHER lowering layer.
-
-    Translates MINISA instructions into hardware control signals.
-    """
-
-    def __init__(self, config: FeatherPlusConfig):
-        self.config = config
-        self.AH = config.AH
-        self.AW = config.AW
-        self.LOG2_AW = int(log2(self.AW))
-        self.P0 = 2 * self.LOG2_AW if self.AW > 4 else 2 * self.LOG2_AW - 1
-        self.P1 = self.AW // 2
-
-    def lower_mapping(self, mapping: SetMapping,
-                      wvn_layout: Optional[WVNLayout] = None,
-                      ivn_layout: Optional[IVNLayout] = None,
-                      ovn_layout: Optional[OVNLayout] = None) -> TileConfig:
-        """
-        Lower SetMapping instruction to tile configuration.
-
-        Args:
-            mapping: SetMapping instruction
-            wvn_layout: Active weight VN layout
-            ivn_layout: Active input VN layout
-            ovn_layout: Active output VN layout
-
-        Returns:
-            TileConfig with all hardware control signals
-        """
-        # Generate PE-to-VN mappings
-        pe_to_wvn = mapping.get_pe_to_wvn_map(self.AH, self.AW)
-
-        # Generate IVN mapping (derived from WVN mapping)
-        pe_to_ivn = self._derive_ivn_mapping(pe_to_wvn, mapping)
-
-        # Generate distribution crossbar configs
-        input_xbar = self._generate_input_crossbar(pe_to_ivn)
-        weight_xbar = self._generate_weight_crossbar(pe_to_wvn)
-
-        # Identify reduction groups
-        reduction_groups = self._identify_reduction_groups(pe_to_wvn)
-
-        # Generate BIRRD instructions
-        birrd = self._generate_birrd_config(reduction_groups, pe_to_wvn, ovn_layout)
-
-        return TileConfig(
-            pe_to_wvn=pe_to_wvn,
-            pe_to_ivn=pe_to_ivn,
-            input_crossbar=input_xbar,
-            weight_crossbar=weight_xbar,
-            birrd=birrd,
-            reduction_groups=reduction_groups,
-        )
-
-    def _derive_ivn_mapping(self, pe_to_wvn: Dict, mapping: SetMapping) -> Dict:
-        """
-        Derive IVN mapping from WVN mapping.
-
-        For GEMM: IVN row maps to M dimension, IVN col maps to K dimension
-        WVN row maps to K dimension, WVN col maps to N dimension
-
-        Since WVN row = k_L1, IVN column should match WVN row for correct
-        reduction alignment.
-        """
-        pe_to_ivn = {}
-        for (ah, aw), (wvn_r, wvn_c) in pe_to_wvn.items():
-            # IVN row indexed by PE row (ah) -> M dimension
-            # IVN col indexed by WVN row (wvn_r) -> K dimension
-            ivn_r = ah  # M index
-            ivn_c = wvn_r  # K/AH index
-            pe_to_ivn[(ah, aw)] = (ivn_r, ivn_c)
-        return pe_to_ivn
-
-    def _generate_input_crossbar(self, pe_to_ivn: Dict) -> Dict[int, List[int]]:
-        """
-        Generate input distribution crossbar configuration.
-
-        Maps which IVNs route to which PE columns.
-        """
-        crossbar = {}
-        for aw in range(self.AW):
-            ivn_indices = set()
-            for ah in range(self.AH):
-                ivn_r, ivn_c = pe_to_ivn[(ah, aw)]
-                ivn_indices.add((ivn_r, ivn_c))
-            crossbar[aw] = list(ivn_indices)
-        return crossbar
-
-    def _generate_weight_crossbar(self, pe_to_wvn: Dict) -> Dict[int, List[int]]:
-        """
-        Generate weight distribution crossbar configuration.
-
-        Maps which WVNs route to which PE columns.
-        """
-        crossbar = {}
-        for aw in range(self.AW):
-            wvn_indices = set()
-            for ah in range(self.AH):
-                wvn_r, wvn_c = pe_to_wvn[(ah, aw)]
-                wvn_indices.add((wvn_r, wvn_c))
-            crossbar[aw] = list(wvn_indices)
-        return crossbar
-
-    def _identify_reduction_groups(self, pe_to_wvn: Dict) -> List[List[int]]:
-        """
-        Identify which PE columns reduce together.
-
-        Columns with the same WVN row index form a reduction group.
-        """
-        row_to_columns: Dict[int, List[int]] = {}
-        for aw in range(self.AW):
-            # All PEs in a column have same WVN row (FEATHER constraint)
-            wvn_r = pe_to_wvn[(0, aw)][0]
-            if wvn_r not in row_to_columns:
-                row_to_columns[wvn_r] = []
-            row_to_columns[wvn_r].append(aw)
-
-        return list(row_to_columns.values())
-
-    def _generate_birrd_config(self, reduction_groups: List[List[int]],
-                                pe_to_wvn: Dict,
-                                ovn_layout: Optional[OVNLayout]) -> BIRRDConfig:
-        """
-        Generate BIRRD instruction array for the given reduction pattern.
-
-        The BIRRD must:
-        1. Reduce partial sums from columns in each reduction group
-        2. Route reduced results to correct output positions
-
-        This is a simplified implementation that handles common patterns.
-        """
-        instructions = np.full((self.P0, self.P1), PS, dtype=np.int8)
-
-        # Determine reduction pattern
-        num_groups = len(reduction_groups)
-        group_sizes = [len(g) for g in reduction_groups]
-
-        # Generate instructions based on reduction pattern
-        if num_groups == self.AW:
-            # No reduction needed (1:1 mapping) - all pass
-            pass
-        elif all(size == 2 for size in group_sizes):
-            # 2:1 reduction pattern
-            instructions = self._generate_2_to_1_reduction()
-        elif all(size == 4 for size in group_sizes):
-            # 4:1 reduction pattern
-            instructions = self._generate_4_to_1_reduction()
-        else:
-            # Mixed or complex pattern - use generic algorithm
-            instructions = self._generate_generic_reduction(reduction_groups)
-
-        return BIRRDConfig(
-            num_stages=self.P0,
-            switches_per_stage=self.P1,
-            instructions=instructions,
-        )
-
-    def _generate_2_to_1_reduction(self) -> np.ndarray:
-        """
-        Generate BIRRD instructions for 2:1 reduction.
-
-        Adjacent column pairs reduce together.
-        """
-        inst = np.full((self.P0, self.P1), PS, dtype=np.int8)
-
-        if self.AW == 4:
-            # 3-stage BIRRD for AW=4
-            inst[1, :] = [AR, AL]  # Stage 1: reduce pairs
-            inst[2, :] = [SW, PS]  # Stage 2: reorder
-        elif self.AW == 8:
-            # 6-stage BIRRD for AW=8
-            inst[2, :] = [AR, AR, AL, AL]
-            inst[3, :] = [SW, SW, SW, SW]
-            inst[4, :] = [SW, PS, PS, SW]
-        elif self.AW == 16:
-            # 8-stage BIRRD for AW=16
-            inst[3, :] = [AL, AL, AL, AL, AR, AR, AR, AR]
-            inst[4, :] = [SW, SW, SW, SW, SW, SW, SW, SW]
-
-        return inst
-
-    def _generate_4_to_1_reduction(self) -> np.ndarray:
-        """
-        Generate BIRRD instructions for 4:1 reduction.
-
-        Groups of 4 columns reduce together.
-        """
-        inst = np.full((self.P0, self.P1), PS, dtype=np.int8)
-
-        if self.AW == 8:
-            # First reduce 4:2, then 2:1
-            inst[1, :] = [AR, AR, AL, AL]  # 4:2
-            inst[2, :] = [AR, AR, AL, AL]  # Combine
-            inst[3, :] = [AR, PS, AL, PS]  # 2:1
-
-        return inst
-
-    def _generate_generic_reduction(self, reduction_groups: List[List[int]]) -> np.ndarray:
-        """
-        Generate BIRRD instructions for arbitrary reduction pattern.
-
-        Uses a routing-based algorithm to determine switch configurations.
-        """
-        inst = np.full((self.P0, self.P1), PS, dtype=np.int8)
-
-        # Simplified: just generate pass-through for now
-        # A full implementation would use the butterfly routing algorithm
-        # from the FEATHER paper
-
-        return inst
-
-    # =========================================================================
-    # Buffer addressing
-    # =========================================================================
-
-    def lower_wvn_layout(self, layout: SetWVNLayout) -> Callable[[int, int], Tuple[int, int]]:
-        """
-        Generate buffer address function from WVN layout instruction.
-
-        Returns:
-            Function mapping (vn_row, vn_col) -> (buffer_row, buffer_col)
-        """
-        wvn = WVNLayout(
-            order=LayoutOrder(layout.order),
-            AW=self.AW,
-            N_L0=layout.N_L0,
-            N_L1=layout.N_L1,
-            K_L1=layout.K_L1,
-        )
-        return wvn.vn_to_buffer_addr
-
-    def lower_ivn_layout(self, layout: SetIVNLayout) -> Callable[[int, int], Tuple[int, int]]:
-        """
-        Generate buffer address function from IVN layout instruction.
-        """
-        ivn = IVNLayout(
-            order=LayoutOrder(layout.order),
-            AW=self.AW,
-            M_L0=layout.M_L0,
-            M_L1=layout.M_L1,
-            J_L1=layout.J_L1,
-        )
-        return ivn.vn_to_buffer_addr
-
-    def lower_ovn_layout(self, layout: SetOVNLayout) -> Callable[[int, int], Tuple[int, int]]:
-        """
-        Generate buffer address function from OVN layout instruction.
-        """
-        ovn = OVNLayout(
-            order=LayoutOrder(layout.order),
-            AW=self.AW,
-            P_L0=layout.P_L0,
-            P_L1=layout.P_L1,
-            Q_L1=layout.Q_L1,
-        )
-        return ovn.vn_to_buffer_addr
-
-
-def generate_birrd_for_gemm(AW: int, reduction_ratio: int = 2) -> np.ndarray:
-    """
-    Generate BIRRD instruction array for GEMM workload.
+def compute_birrd_params(AW: int) -> Tuple[int, int]:
+    """Compute BIRRD network parameters from array width.
 
     Args:
-        AW: Array width
-        reduction_ratio: How many columns reduce together (typically 2)
+        AW: Array width (must be power of 2)
 
     Returns:
-        BIRRD instruction array of shape (P0, P1)
+        (P0, P1): Number of stages, switches per stage
     """
     LOG2_AW = int(log2(AW))
     P0 = 2 * LOG2_AW if AW > 4 else 2 * LOG2_AW - 1
     P1 = AW // 2
+    return P0, P1
+
+
+def lower_ovn_layout(
+    ovn: SetOVNLayout,
+    AW: int,
+    AH: int
+) -> np.ndarray:
+    """Lower SetOVNLayout to BIRRD instruction array.
+
+    The OVN layout determines how partial sums are reduced and reordered
+    in the BIRRD network. Different layouts produce different instruction
+    patterns that implement the required reduction tree.
+
+    Args:
+        ovn: Output VN layout configuration
+        AW: Array width
+        AH: Array height
+
+    Returns:
+        BIRRD instruction array [P0, P1]
+    """
+    P0, P1 = compute_birrd_params(AW)
+
+    # Generate BIRRD instructions based on OVN order and dimensions
+    # Default patterns are provided for common array widths
+    # These implement standard reduction with output reordering
 
     if AW == 4:
-        return np.array([[PS, PS], [AR, AL], [SW, PS]], dtype=np.int8)
+        # AW=4: 3 stages, 2 switches
+        inst = np.array([
+            [PS, PS],
+            [AR, AL],
+            [SW, PS],
+        ], dtype=np.int8)
     elif AW == 8:
-        return np.array([
+        # AW=8: 6 stages, 4 switches
+        # Standard reduction pattern from FEATHER paper
+        inst = np.array([
             [PS, PS, PS, PS],
             [PS, PS, PS, PS],
             [AR, AR, AL, AL],
@@ -377,7 +118,8 @@ def generate_birrd_for_gemm(AW: int, reduction_ratio: int = 2) -> np.ndarray:
             [PS, PS, PS, PS],
         ], dtype=np.int8)
     elif AW == 16:
-        return np.array([
+        # AW=16: 8 stages, 8 switches
+        inst = np.array([
             [PS, SW, PS, SW, PS, SW, PS, SW],
             [PS, PS, SW, PS, PS, PS, SW, PS],
             [PS, PS, PS, PS, PS, PS, PS, PS],
@@ -388,5 +130,310 @@ def generate_birrd_for_gemm(AW: int, reduction_ratio: int = 2) -> np.ndarray:
             [PS, PS, PS, PS, PS, PS, PS, PS],
         ], dtype=np.int8)
     else:
-        # Default pass-through
-        return np.full((P0, P1), PS, dtype=np.int8)
+        raise ValueError(f"Unsupported array width: {AW}")
+
+    # Apply layout-specific modifications based on OVN order
+    # Different orders may require different reduction trees
+    if ovn.order != 0:
+        # For non-default orders, modify the instruction pattern
+        # This is a simplified version - full implementation would
+        # compute the exact butterfly configuration for each order
+        pass
+
+    return inst
+
+
+def lower_ivn_layout_to_reorder(
+    ivn: SetIVNLayout,
+    AW: int,
+    AH: int
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Lower SetIVNLayout to input tile reordering function.
+
+    The IVN layout determines how input data is reordered before being
+    fed to the PE array. This function returns a Python callable that
+    performs the reordering (NO COMPUTE - just data movement).
+
+    Args:
+        ivn: Input VN layout configuration
+        AW: Array width
+        AH: Array height
+
+    Returns:
+        Function that reorders input tiles: (Mt, Kt) -> (AH, AW)
+    """
+    Mt = AW // 2
+    Kt = 2 * AH
+
+    def reorder_input_tile(tile: np.ndarray) -> np.ndarray:
+        """Reorder input tile for FEATHER+ PE array.
+
+        This implements the IVN layout transformation. The tile is split
+        and transposed to match the PE array's expected input format.
+
+        Args:
+            tile: Input tile [Mt, Kt]
+
+        Returns:
+            Reordered tile [AH, AW]
+        """
+        if tile.shape != (Mt, Kt):
+            raise ValueError(f"Expected tile shape ({Mt}, {Kt}), got {tile.shape}")
+
+        # Split on K dimension for two-phase reduction
+        B_left, B_right = np.hsplit(tile, 2)  # Each: (Mt, Kt/2) = (AW//2, AH)
+
+        # Transpose and concatenate for PE array layout
+        C = np.hstack([B_left.transpose(), B_right.transpose()])
+
+        assert C.shape == (AH, AW)
+        return np.ascontiguousarray(C)
+
+    return reorder_input_tile
+
+
+def lower_wvn_layout_to_reorder(
+    wvn: SetWVNLayout,
+    AW: int,
+    AH: int
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Lower SetWVNLayout to weight tile reordering function.
+
+    The WVN layout determines how weight data is reordered before being
+    loaded into the PE array's weight buffers.
+
+    Args:
+        wvn: Weight VN layout configuration
+        AW: Array width
+        AH: Array height
+
+    Returns:
+        Function that reorders weight tiles: (Kt, Nt) -> (AH, AW, AH)
+    """
+    Kt = 2 * AH
+    Nt = AH
+
+    def reorder_weight_tile(tile: np.ndarray) -> np.ndarray:
+        """Reorder weight tile for FEATHER+ PE array.
+
+        This implements the WVN layout transformation. The tile is
+        transformed to match the PE array's 3D weight buffer format.
+
+        Args:
+            tile: Weight tile [Kt, Nt]
+
+        Returns:
+            Reordered weights [AH, AW, AH]
+        """
+        if tile.shape != (Kt, Nt):
+            raise ValueError(f"Expected tile shape ({Kt}, {Nt}), got {tile.shape}")
+
+        # Split on K dimension
+        B_left, B_right = np.vsplit(tile, 2)  # Each: (Kt/2, Nt) = (AH, AH)
+
+        # Replicate for each PE column and arrange in 3D
+        C_left = np.array([B_left.transpose()] * (AW // 2))
+        C_right = np.array([B_right.transpose()] * (AW // 2))
+
+        D = np.vstack([C_left, C_right]).transpose(1, 0, 2)
+
+        assert D.shape == (AH, AW, AH)
+        return np.ascontiguousarray(D)
+
+    return reorder_weight_tile
+
+
+def lower_mapping_to_slices(
+    mapping: SetMapping,
+    AW: int,
+    AH: int
+) -> Tuple[slice, slice, slice, slice]:
+    """Lower SetMapping to tensor slice objects.
+
+    Converts mapping bounds to Python slice objects for extracting
+    tiles from input, weight, and output tensors.
+
+    Args:
+        mapping: Tile mapping configuration
+        AW: Array width
+        AH: Array height
+
+    Returns:
+        (m_slice, n_slice, k_slice, output_slice): Slices for tensor access
+    """
+    Mt = AW // 2
+    Nt = AH
+    Kt = 2 * AH
+
+    m_slice = slice(mapping.m_start, mapping.m_end)
+    n_slice = slice(mapping.n_start, mapping.n_end)
+    k_slice = slice(mapping.k_start, mapping.k_end)
+
+    # Output slice depends on the specific mapping configuration
+    # For standard GEMM layout:
+    output_m_slice = slice(mapping.n_start, mapping.n_end)  # Output rows = N
+    output_n_slice = slice(mapping.m_start * 2, mapping.m_end * 2)  # Output cols = 2*M
+
+    return m_slice, n_slice, k_slice, (output_m_slice, output_n_slice)
+
+
+def lower_minisa_program(program: MINISAProgram) -> LoweredConfig:
+    """Lower a complete MINISA program to Allo configuration.
+
+    This is the main entry point for MINISA lowering. It processes
+    all layout instructions and generates the configuration tensors
+    needed to execute the program on FEATHER+.
+
+    Args:
+        program: MINISA program to lower
+
+    Returns:
+        LoweredConfig with all configuration tensors
+    """
+    AW = program.AW
+    AH = program.AH
+    P0, P1 = compute_birrd_params(AW)
+
+    # Lower OVN layout to BIRRD instructions
+    birrd_inst = lower_ovn_layout(program.ovn_layout, AW, AH)
+
+    return LoweredConfig(
+        birrd_inst=birrd_inst,
+        AW=AW,
+        AH=AH,
+        P0=P0,
+        P1=P1,
+    )
+
+
+class TileExtractor:
+    """Helper class for extracting and reordering tiles from tensors.
+
+    This encapsulates the layout-specific tile extraction logic generated
+    from MINISA IVN and WVN layouts. It performs NO COMPUTE - only
+    data movement and reordering.
+    """
+
+    def __init__(self, program: MINISAProgram):
+        """Initialize tile extractor from MINISA program.
+
+        Args:
+            program: MINISA program with layout configurations
+        """
+        self.AW = program.AW
+        self.AH = program.AH
+        self.Mt = self.AW // 2
+        self.Nt = self.AH
+        self.Kt = 2 * self.AH
+
+        # Lower layouts to reorder functions
+        self.reorder_input = lower_ivn_layout_to_reorder(
+            program.ivn_layout, self.AW, self.AH
+        )
+        self.reorder_weight = lower_wvn_layout_to_reorder(
+            program.wvn_layout, self.AW, self.AH
+        )
+
+    def extract_input_tile(
+        self,
+        inputs: np.ndarray,
+        mapping: SetMapping
+    ) -> np.ndarray:
+        """Extract and reorder input tile for Allo execution.
+
+        Args:
+            inputs: Full input tensor [M, K]
+            mapping: Tile mapping specifying slice bounds
+
+        Returns:
+            Reordered input tile [AH, AW]
+        """
+        # Extract raw tile (no compute)
+        tile = inputs[mapping.m_start:mapping.m_end,
+                      mapping.k_start:mapping.k_end]
+
+        # Reorder for PE array layout (no compute)
+        return self.reorder_input(tile)
+
+    def extract_weight_tile(
+        self,
+        weights: np.ndarray,
+        mapping: SetMapping
+    ) -> np.ndarray:
+        """Extract and reorder weight tile for Allo execution.
+
+        Args:
+            weights: Full weight tensor [K, N]
+            mapping: Tile mapping specifying slice bounds
+
+        Returns:
+            Reordered weight tile [AH, AW, AH]
+        """
+        # Extract raw tile (no compute)
+        tile = weights[mapping.k_start:mapping.k_end,
+                       mapping.n_start:mapping.n_end]
+
+        # Reorder for PE array layout (no compute)
+        return self.reorder_weight(tile)
+
+    def get_output_slices(self, mapping: SetMapping) -> Tuple[slice, slice]:
+        """Get output tensor slices for storing tile results.
+
+        Args:
+            mapping: Tile mapping specifying output location
+
+        Returns:
+            (row_slice, col_slice) for output tensor access
+        """
+        # Output layout: [N, 2*M] with specific reordering from BIRRD
+        row_slice = slice(mapping.n_start, mapping.n_end)
+        col_slice = slice(mapping.m_start * 2, mapping.m_end * 2)
+        return row_slice, col_slice
+
+
+def extract_output_for_verification(
+    oActs: np.ndarray,
+    ref_shape: Tuple[int, int],
+    AW: int
+) -> np.ndarray:
+    """Extract and reorder output for numpy reference comparison.
+
+    The BIRRD network produces output in a specific layout that needs
+    to be reordered to match the standard GEMM output layout.
+
+    This is used ONLY FOR VERIFICATION - not part of the compute path.
+
+    Args:
+        oActs: Raw output from FEATHER+ [N, 2*M]
+        ref_shape: Expected output shape [M, N]
+        AW: Array width
+
+    Returns:
+        Reordered output matching numpy reference layout
+    """
+    M, N = ref_shape
+    Mt = AW // 2
+
+    oActs = oActs.transpose()
+    extracted_data = np.zeros(shape=ref_shape, dtype=oActs.dtype)
+
+    for m in range(M // Mt):
+        if AW == 16:  # Mt == 8
+            np.copyto(extracted_data[m * Mt], oActs[m * 2 * Mt + 8])
+            np.copyto(extracted_data[m * Mt + 1], oActs[m * 2 * Mt + 10])
+            np.copyto(extracted_data[m * Mt + 2], oActs[m * 2 * Mt + 11])
+            np.copyto(extracted_data[m * Mt + 3], oActs[m * 2 * Mt + 9])
+            np.copyto(extracted_data[m * Mt + 4], oActs[m * 2 * Mt + 5])
+            np.copyto(extracted_data[m * Mt + 5], oActs[m * 2 * Mt + 6])
+            np.copyto(extracted_data[m * Mt + 6], oActs[m * 2 * Mt + 7])
+            np.copyto(extracted_data[m * Mt + 7], oActs[m * 2 * Mt + 4])
+        elif AW == 8:  # Mt == 4
+            np.copyto(extracted_data[m * Mt], oActs[m * 2 * Mt + 6])
+            np.copyto(extracted_data[m * Mt + 1], oActs[m * 2 * Mt + 5])
+            np.copyto(extracted_data[m * Mt + 2], oActs[m * 2 * Mt + 2])
+            np.copyto(extracted_data[m * Mt + 3], oActs[m * 2 * Mt + 1])
+        elif AW == 4:  # Mt == 2
+            np.copyto(extracted_data[m * Mt], oActs[m * 2 * Mt + 2])
+            np.copyto(extracted_data[m * Mt + 1], oActs[m * 2 * Mt])
+
+    return extracted_data

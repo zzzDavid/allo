@@ -1,356 +1,371 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-MINISA Instruction Set Architecture
+"""MINISA Instruction Set Architecture definitions.
 
-Defines the four MINISA instructions for programming FEATHER+:
-- SetIVNLayout: Configure streaming buffer layout for input VNs
-- SetWVNLayout: Configure stationary buffer layout for weight VNs
-- SetOVNLayout: Configure output buffer layout for output VNs and clear buffer
-- SetMapping: Specify VN-level mapping and trigger tile execution
+MINISA (Minimal ISA) provides a VN-level (Virtual Neuron) programming interface
+for the FEATHER+ accelerator. It abstracts away low-level PE array details
+while enabling efficient dataflow configuration.
+
+The ISA consists of four instruction types:
+- SetIVNLayout: Configure input VN buffer layout
+- SetWVNLayout: Configure weight VN buffer layout
+- SetOVNLayout: Configure output VN buffer layout
+- SetMapping: Trigger tile execution with VN mapping
+
+These instructions are lowered to Allo configuration tensors that drive
+the FEATHER+ dataflow hardware.
 """
 
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
-from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from enum import IntEnum
+from typing import List, Optional, Tuple, Union
 
 
-class InstructionOpCode(IntEnum):
-    """MINISA instruction opcodes."""
-    SET_IVN_LAYOUT = 0b01
-    SET_WVN_LAYOUT = 0b10
-    SET_OVN_LAYOUT = 0b10  # Same opcode, different context
-    SET_MAPPING = 0b11
+class LayoutOrder(IntEnum):
+    """Layout dimension ordering for VN buffers.
 
-
-@dataclass
-class MINISAInstruction(ABC):
-    """Base class for all MINISA instructions."""
-
-    @property
-    @abstractmethod
-    def opcode(self) -> int:
-        """Return the instruction opcode."""
-        pass
-
-    @abstractmethod
-    def encode(self) -> int:
-        """Encode instruction to binary representation."""
-        pass
-
-    @abstractmethod
-    def validate(self, config: 'FeatherPlusConfig') -> bool:
-        """Validate instruction parameters against hardware config."""
-        pass
-
-
-@dataclass
-class SetIVNLayout(MINISAInstruction):
+    3-bit encoding supports 6 orderings for 3 logical dimensions.
+    The order determines how data is arranged in memory and
+    accessed by the PE array.
     """
-    Configure streaming buffer layout for input VNs.
+    ORDER_012 = 0  # Default order
+    ORDER_021 = 1
+    ORDER_102 = 2
+    ORDER_120 = 3
+    ORDER_201 = 4
+    ORDER_210 = 5
 
-    Triggers loading of input data from off-chip memory into on-chip buffer.
+
+@dataclass
+class SetIVNLayout:
+    """Set Input Virtual Neuron layout configuration.
+
+    Configures how input activations are laid out in the streaming buffer.
+    The IVN (Input VN) represents AH consecutive input elements that form
+    the input to a single VN dot product.
 
     Attributes:
-        order: 3-bit layout order permutation (0-5)
-        M_L0: Inner M dimension factor (non-reduction)
-        M_L1: Outer M dimension factor
-        J_L1: Outer J (reduction) dimension factor
+        order: Dimension ordering (3-bit encoding)
+        ML0: Inner M factor - always equals AH (VN constraint)
+        ML1: Outer M factor - M / AH tiles in M dimension
+        JL0: Inner J factor - always equals AH (VN constraint)
+        JL1: Outer J factor - J / AH tiles in J (reduction) dimension
 
-    Constraints:
-        - J_L0 = AH (VN constraint)
-        - M_L1 * J_L1 <= D_str / M_L0 (buffer capacity)
+    The layout configuration generates:
+    - Input buffer addressing patterns
+    - Crossbar select signals for input distribution
     """
-    order: int  # 3-bit (0-5)
-    M_L0: int   # Inner non-reduction factor
-    M_L1: int   # Outer non-reduction factor
-    J_L1: int   # Outer reduction factor (J_L0 = AH implicitly)
+    order: int = 0
+    ML0: int = 8   # Inner M (always = AH)
+    ML1: int = 1   # Outer M = M / AH
+    JL0: int = 8   # Inner J (always = AH)
+    JL1: int = 1   # Outer J = J / AH
 
-    @property
-    def opcode(self) -> int:
-        return InstructionOpCode.SET_IVN_LAYOUT
-
-    def encode(self) -> int:
-        """Encode to binary: [opcode:2][order:3][M_L0:?][M_L1:?][J_L1:?]"""
-        # Bit widths depend on hardware config, simplified here
-        encoded = (self.opcode << 30)
-        encoded |= (self.order & 0x7) << 27
-        # Additional fields depend on specific bitwidths
-        return encoded
-
-    def validate(self, config: 'FeatherPlusConfig') -> bool:
-        """Validate against hardware configuration."""
-        if not (0 <= self.order <= 5):
+    def validate(self, AH: int) -> bool:
+        """Validate layout against hardware constraints."""
+        if self.ML0 != AH:
             return False
-        if not (1 <= self.M_L0 <= config.AW):
+        if self.JL0 != AH:
             return False
-        if self.M_L1 * self.J_L1 > config.D_str // self.M_L0:
+        if self.order < 0 or self.order > 5:
             return False
         return True
 
+    def total_m(self) -> int:
+        """Total M dimension size."""
+        return self.ML0 * self.ML1
+
+    def total_j(self) -> int:
+        """Total J (reduction) dimension size."""
+        return self.JL0 * self.JL1
+
 
 @dataclass
-class SetWVNLayout(MINISAInstruction):
-    """
-    Configure stationary buffer layout for weight VNs.
+class SetWVNLayout:
+    """Set Weight Virtual Neuron layout configuration.
 
-    Triggers loading of weights from off-chip memory into on-chip buffer.
+    Configures how weights are laid out in the stationary buffer.
+    The WVN (Weight VN) represents AH consecutive weight elements that
+    multiply with an IVN to produce partial sums.
 
     Attributes:
-        order: 3-bit layout order permutation (0-5)
-        N_L0: Inner N dimension factor
-        N_L1: Outer N dimension factor
-        K_L1: Outer K (reduction) dimension factor
+        order: Dimension ordering (3-bit encoding)
+        KL0: Inner K factor - always equals AH (VN constraint)
+        KL1: Outer K factor - K / AH tiles in K dimension
+        NL0: Inner N factor - 1 <= NL0 <= AW (flexible)
+        NL1: Outer N factor - N / NL0 tiles in N dimension
 
-    Constraints:
-        - K_L0 = AH (VN constraint)
-        - N_L1 * K_L1 <= D_sta / N_L0 (buffer capacity)
+    The layout configuration generates:
+    - Weight buffer addressing patterns
+    - Crossbar select signals for weight distribution
     """
-    order: int  # 3-bit (0-5)
-    N_L0: int   # Inner non-reduction factor
-    N_L1: int   # Outer non-reduction factor
-    K_L1: int   # Outer reduction factor (K_L0 = AH implicitly)
+    order: int = 0
+    KL0: int = 8   # Inner K (always = AH)
+    KL1: int = 1   # Outer K = K / AH
+    NL0: int = 8   # Inner N (1 <= NL0 <= AW)
+    NL1: int = 1   # Outer N = N / NL0
 
-    @property
-    def opcode(self) -> int:
-        return InstructionOpCode.SET_WVN_LAYOUT
-
-    def encode(self) -> int:
-        """Encode to binary."""
-        encoded = (self.opcode << 30)
-        encoded |= (self.order & 0x7) << 27
-        return encoded
-
-    def validate(self, config: 'FeatherPlusConfig') -> bool:
-        """Validate against hardware configuration."""
-        if not (0 <= self.order <= 5):
+    def validate(self, AH: int, AW: int) -> bool:
+        """Validate layout against hardware constraints."""
+        if self.KL0 != AH:
             return False
-        if not (1 <= self.N_L0 <= config.AW):
+        if self.NL0 < 1 or self.NL0 > AW:
             return False
-        if self.N_L1 * self.K_L1 > config.D_sta // self.N_L0:
+        if self.order < 0 or self.order > 5:
             return False
         return True
 
+    def total_k(self) -> int:
+        """Total K dimension size."""
+        return self.KL0 * self.KL1
+
+    def total_n(self) -> int:
+        """Total N dimension size."""
+        return self.NL0 * self.NL1
+
 
 @dataclass
-class SetOVNLayout(MINISAInstruction):
-    """
-    Configure output buffer layout for output VNs.
+class SetOVNLayout:
+    """Set Output Virtual Neuron layout configuration.
 
-    Also clears (initializes) the output buffer for accumulation.
+    Configures how outputs are laid out and how reduction/reordering
+    is performed in the BIRRD network.
 
     Attributes:
-        order: 3-bit layout order permutation (0-5)
-        P_L0: Inner P dimension factor
-        P_L1: Outer P dimension factor
-        Q_L1: Outer Q dimension factor
+        order: Dimension ordering (3-bit encoding)
+        PL0: Inner P factor - always equals AH (VN constraint)
+        PL1: Outer P factor - P / AH tiles in P (output rows)
+        QL0: Inner Q factor - always equals AH (VN constraint)
+        QL1: Outer Q factor - Q / AH tiles in Q (output cols)
 
-    Constraints:
-        - Q_L0 = AH (VN constraint)
-        - P_L1 * Q_L1 <= D_str / P_L0 (buffer capacity)
+    The layout configuration generates:
+    - BIRRD instruction arrays for reduction/reordering
+    - Output buffer addressing patterns
     """
-    order: int  # 3-bit (0-5)
-    P_L0: int   # Inner non-reduction factor
-    P_L1: int   # Outer non-reduction factor
-    Q_L1: int   # Outer output dimension factor (Q_L0 = AH implicitly)
-    clear_mode: bool = True  # Whether to clear buffer
+    order: int = 0
+    PL0: int = 8   # Inner P (always = AH)
+    PL1: int = 1   # Outer P = P / AH
+    QL0: int = 8   # Inner Q (always = AH)
+    QL1: int = 1   # Outer Q = Q / AH
 
-    @property
-    def opcode(self) -> int:
-        return InstructionOpCode.SET_OVN_LAYOUT
-
-    def encode(self) -> int:
-        """Encode to binary."""
-        encoded = (self.opcode << 30)
-        encoded |= (self.order & 0x7) << 27
-        encoded |= (1 if self.clear_mode else 0) << 26
-        return encoded
-
-    def validate(self, config: 'FeatherPlusConfig') -> bool:
-        """Validate against hardware configuration."""
-        if not (0 <= self.order <= 5):
+    def validate(self, AH: int) -> bool:
+        """Validate layout against hardware constraints."""
+        if self.PL0 != AH:
             return False
-        if not (1 <= self.P_L0 <= config.AW):
+        if self.QL0 != AH:
             return False
-        if self.P_L1 * self.Q_L1 > config.D_str // self.P_L0:
+        if self.order < 0 or self.order > 5:
             return False
         return True
 
+    def total_p(self) -> int:
+        """Total P (output rows) dimension size."""
+        return self.PL0 * self.PL1
+
+    def total_q(self) -> int:
+        """Total Q (output cols) dimension size."""
+        return self.QL0 * self.QL1
+
 
 @dataclass
-class SetMapping(MINISAInstruction):
-    """
-    Specify VN-level mapping parameters and trigger tile execution.
+class SetMapping:
+    """Set VN-level mapping and trigger tile execution.
 
-    Maps Weight VNs to PEs according to parametric formula:
-        r(ah, aw) = r0 + floor(aw / G_r)  [WVN row index]
-        c(ah, aw) = c0 + s_r * ah + s_c * (aw mod G_c)  [WVN col index]
+    Specifies how Virtual Neurons map to the physical PE array and
+    triggers execution of a tile. Each SetMapping instruction results
+    in one invocation of the Allo dataflow region.
 
     Attributes:
         r0: Base WVN row index
         c0: Base WVN column index
-        G_r: Number of PE columns sharing same WVN row (reduction group)
-        G_c: Replication group size
-        s_r: Temporal stride across PE rows
-        s_c: Spatial stride within replication group
+        Gr: Replication group size for rows
+        Gc: Replication group size for columns
+        sr: Temporal stride (across rows)
+        sc: Spatial stride (across columns)
 
-    Constraints:
-        - 0 <= r0 < K/AH (number of WVN rows)
-        - 0 <= c0 < N (number of WVN columns)
-        - 1 <= G_r <= AW
-        - 1 <= G_c <= AW
-        - s_r, s_c define non-overlapping VN access
+    Mapping formula for PE at position (ah, aw):
+        r(ah, aw) = r0 + floor(aw / Gr)
+        c(ah, aw) = c0 + sr * ah + sc * (aw mod Gc)
+
+    Common mappings:
+    - Output stationary: Gr=AW, Gc=1, sr=0, sc=0
+    - Weight stationary: Gr=1, Gc=AW, sr=0, sc=1
+    - Input stationary: Gr=1, Gc=1, sr=1, sc=0
     """
-    r0: int    # Base WVN row index
-    c0: int    # Base WVN column index
-    G_r: int   # Columns sharing same WVN row
-    G_c: int   # Replication group size
-    s_r: int   # Temporal stride
-    s_c: int   # Spatial stride
+    r0: int = 0    # Base WVN row
+    c0: int = 0    # Base WVN column
+    Gr: int = 8    # Row replication group
+    Gc: int = 1    # Column replication group
+    sr: int = 0    # Temporal stride
+    sc: int = 0    # Spatial stride
 
-    @property
-    def opcode(self) -> int:
-        return InstructionOpCode.SET_MAPPING
+    # Optional: tile bounds for slicing input/weight tensors
+    m_start: int = 0
+    m_end: int = 0
+    n_start: int = 0
+    n_end: int = 0
+    k_start: int = 0
+    k_end: int = 0
 
-    def encode(self) -> int:
-        """Encode to binary."""
-        encoded = (self.opcode << 30)
-        # Simplified encoding - actual bitwidths depend on config
-        return encoded
-
-    def validate(self, config: 'FeatherPlusConfig') -> bool:
-        """Validate against hardware configuration."""
-        if not (1 <= self.G_r <= config.AW):
+    def validate(self, AH: int, AW: int) -> bool:
+        """Validate mapping against hardware constraints."""
+        if self.Gr < 1 or self.Gr > AW:
             return False
-        if not (1 <= self.G_c <= config.AW):
+        if self.Gc < 1 or self.Gc > AW:
             return False
-        # r0 and c0 bounds depend on workload, not just hardware
         return True
 
-    def get_pe_to_wvn_map(self, AH: int, AW: int) -> Dict[tuple, tuple]:
-        """
-        Compute the PE-to-WVN mapping for this instruction.
+    def get_pe_mapping(self, ah: int, aw: int) -> Tuple[int, int]:
+        """Compute WVN indices for PE at position (ah, aw).
 
         Returns:
-            Dict mapping (ah, aw) -> (wvn_row, wvn_col)
+            (r, c): WVN row and column indices
         """
-        mapping = {}
-        for ah in range(AH):
-            for aw in range(AW):
-                r = self.r0 + (aw // self.G_r)
-                c = self.c0 + self.s_r * ah + self.s_c * (aw % self.G_c)
-                mapping[(ah, aw)] = (r, c)
-        return mapping
+        r = self.r0 + (aw // self.Gr)
+        c = self.c0 + self.sr * ah + self.sc * (aw % self.Gc)
+        return (r, c)
 
 
 @dataclass
-class FeatherPlusConfig:
-    """
-    FEATHER+ hardware configuration.
+class MINISAProgram:
+    """A complete MINISA program for a workload.
+
+    Contains layout configurations and a sequence of mapping operations.
+    The program is executed by the MINISA interpreter, which lowers
+    each instruction to Allo configuration tensors and invokes the
+    FEATHER+ dataflow region.
 
     Attributes:
-        AH: Array height (PE rows, also VN size)
-        AW: Array width (PE columns, must be power of 2)
-        D_sta: Stationary buffer depth (in VN rows)
-        D_str: Streaming buffer depth (in VN rows)
+        name: Program name/identifier
+        AH: Hardware array height
+        AW: Hardware array width
+        ivn_layout: Input VN layout configuration
+        wvn_layout: Weight VN layout configuration
+        ovn_layout: Output VN layout configuration
+        mappings: Sequence of tile execution operations
     """
-    AH: int
-    AW: int
-    D_sta: int = 256  # Default stationary buffer depth
-    D_str: int = 256  # Default streaming buffer depth
+    name: str = "minisa_program"
+    AH: int = 8
+    AW: int = 8
+    ivn_layout: Optional[SetIVNLayout] = None
+    wvn_layout: Optional[SetWVNLayout] = None
+    ovn_layout: Optional[SetOVNLayout] = None
+    mappings: List[SetMapping] = field(default_factory=list)
 
     def __post_init__(self):
-        # Validate power of 2
-        assert self.AW > 0 and (self.AW & (self.AW - 1)) == 0, \
-            f"AW must be power of 2, got {self.AW}"
-        assert self.AH > 0, f"AH must be positive, got {self.AH}"
+        """Initialize default layouts if not provided."""
+        if self.ivn_layout is None:
+            self.ivn_layout = SetIVNLayout(ML0=self.AH, JL0=self.AH)
+        if self.wvn_layout is None:
+            self.wvn_layout = SetWVNLayout(KL0=self.AH, NL0=self.AW)
+        if self.ovn_layout is None:
+            self.ovn_layout = SetOVNLayout(PL0=self.AH, QL0=self.AH)
 
-    @property
-    def vn_size(self) -> int:
-        """Virtual Neuron size = AH."""
-        return self.AH
+    def add_mapping(self, mapping: SetMapping):
+        """Add a tile mapping operation to the program."""
+        self.mappings.append(mapping)
 
-    @property
-    def num_birrd_stages(self) -> int:
-        """Number of BIRRD stages."""
-        from math import log2
-        LOG2_AW = int(log2(self.AW))
-        return 2 * LOG2_AW if self.AW > 4 else 2 * LOG2_AW - 1
+    def validate(self) -> bool:
+        """Validate all instructions against hardware constraints."""
+        if not self.ivn_layout.validate(self.AH):
+            return False
+        if not self.wvn_layout.validate(self.AH, self.AW):
+            return False
+        if not self.ovn_layout.validate(self.AH):
+            return False
+        for mapping in self.mappings:
+            if not mapping.validate(self.AH, self.AW):
+                return False
+        return True
 
-    @property
-    def switches_per_stage(self) -> int:
-        """Number of EGG switches per BIRRD stage."""
-        return self.AW // 2
+    def num_tiles(self) -> int:
+        """Return number of tile operations in the program."""
+        return len(self.mappings)
 
 
-# Convenience factory functions
-def create_gemm_mapping(M: int, K: int, N: int, AH: int, AW: int) -> list:
-    """
-    Create MINISA instruction sequence for a GEMM workload.
+def create_gemm_program(
+    M: int, N: int, K: int,
+    AH: int = 8, AW: int = 8,
+    name: str = "gemm"
+) -> MINISAProgram:
+    """Create a MINISA program for GEMM: C[M,N] = A[M,K] * B[K,N].
+
+    This generates the layout configurations and tile mappings needed
+    to execute a matrix multiplication on FEATHER+.
 
     Args:
-        M, K, N: GEMM dimensions (M×K) × (K×N) = (M×N)
-        AH, AW: FEATHER+ array dimensions
+        M: Number of rows in A and C
+        N: Number of columns in B and C
+        K: Shared dimension (cols of A, rows of B)
+        AH: Hardware array height
+        AW: Hardware array width
+        name: Program name
 
     Returns:
-        List of MINISA instructions
+        MINISAProgram configured for GEMM
     """
-    instructions = []
+    # Tile sizes based on hardware dimensions
+    Mt = AW // 2   # M tile size
+    Nt = AH        # N tile size
+    Kt = 2 * AH    # K tile size (reduction dimension)
 
-    # Calculate VN dimensions
-    num_ivn_rows = M
-    num_ivn_cols = K // AH  # VN constraint
-    num_wvn_rows = K // AH  # VN constraint
-    num_wvn_cols = N
-    num_ovn_rows = M
-    num_ovn_cols = N // AH  # VN constraint for output
+    # Ensure dimensions are tileable
+    assert M % Mt == 0, f"M={M} must be divisible by Mt={Mt}"
+    assert N % Nt == 0, f"N={N} must be divisible by Nt={Nt}"
+    assert K % Kt == 0, f"K={K} must be divisible by Kt={Kt}"
 
-    # SetIVNLayout - configure input buffer
-    # Using K-major order (elements along K are contiguous)
-    ivn_layout = SetIVNLayout(
-        order=0b000,  # m_L1 -> m_L0 -> j_L1
-        M_L0=min(AW, M),
-        M_L1=(M + AW - 1) // AW,
-        J_L1=num_ivn_cols,
+    # Create program with layouts
+    program = MINISAProgram(
+        name=name,
+        AH=AH,
+        AW=AW,
+        ivn_layout=SetIVNLayout(
+            order=0,
+            ML0=AH,
+            ML1=M // AH,
+            JL0=AH,
+            JL1=K // AH,
+        ),
+        wvn_layout=SetWVNLayout(
+            order=0,
+            KL0=AH,
+            KL1=K // AH,
+            NL0=min(N, AW),
+            NL1=max(1, N // AW),
+        ),
+        ovn_layout=SetOVNLayout(
+            order=0,
+            PL0=AH,
+            PL1=M // AH,
+            QL0=AH,
+            QL1=N // AH,
+        ),
     )
-    instructions.append(ivn_layout)
 
-    # SetWVNLayout - configure weight buffer
-    wvn_layout = SetWVNLayout(
-        order=0b010,  # n_L0 -> k_L1 -> n_L1 (matches paper example)
-        N_L0=min(AW, N),
-        N_L1=(N + AW - 1) // AW,
-        K_L1=num_wvn_rows,
-    )
-    instructions.append(wvn_layout)
+    # Generate tile mappings
+    # Loop order: N tiles -> M tiles -> K tiles (reduction)
+    for n_tile in range(N // Nt):
+        for m_tile in range(M // Mt):
+            for k_tile in range(K // Kt):
+                mapping = SetMapping(
+                    r0=0,
+                    c0=0,
+                    Gr=AW,
+                    Gc=1,
+                    sr=0,
+                    sc=0,
+                    m_start=m_tile * Mt,
+                    m_end=(m_tile + 1) * Mt,
+                    n_start=n_tile * Nt,
+                    n_end=(n_tile + 1) * Nt,
+                    k_start=k_tile * Kt,
+                    k_end=(k_tile + 1) * Kt,
+                )
+                program.add_mapping(mapping)
 
-    # SetOVNLayout - configure output buffer
-    ovn_layout = SetOVNLayout(
-        order=0b010,  # p_L0 -> p_L1 -> q_L1
-        P_L0=min(AW, M),
-        P_L1=(M + AW - 1) // AW,
-        Q_L1=num_ovn_cols,
-        clear_mode=True,
-    )
-    instructions.append(ovn_layout)
+    return program
 
-    # SetMapping - trigger execution for each tile
-    # Number of tiles depends on how workload maps to array
-    num_r_tiles = (num_wvn_rows + AW - 1) // AW if num_wvn_rows > 0 else 1
-    num_c_tiles = (num_wvn_cols + AW - 1) // AW if num_wvn_cols > 0 else 1
 
-    for r_tile in range(num_r_tiles):
-        for c_tile in range(num_c_tiles):
-            mapping = SetMapping(
-                r0=r_tile * (AW // 2),  # Adjust based on reduction group
-                c0=c_tile * AW,
-                G_r=2,  # 2 columns share same WVN row (2:1 reduction)
-                G_c=AW,
-                s_r=1,
-                s_c=1,
-            )
-            instructions.append(mapping)
-
-    return instructions
+# Type alias for MINISA instruction union
+MINISAInstruction = Union[SetIVNLayout, SetWVNLayout, SetOVNLayout, SetMapping]
