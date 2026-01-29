@@ -49,6 +49,10 @@ class MINISAInterpreter:
 
     All computation is delegated to Allo - the interpreter performs
     NO mathematical operations on data.
+
+    Supports multiple build targets:
+    - "simulator": LLVM OMP-based dataflow simulator (fast, default)
+    - "vitis_hls": HLS C simulation via Vitis HLS (validates HLS code)
     """
 
     def __init__(
@@ -56,7 +60,10 @@ class MINISAInterpreter:
         AW: int = 8,
         AH: int = 8,
         Ty: AlloType = int8,
-        verbose: bool = False
+        verbose: bool = False,
+        build_target: str = "simulator",
+        build_mode: str = "csim",
+        project_dir: Optional[str] = None
     ):
         """Initialize the MINISA interpreter.
 
@@ -65,11 +72,17 @@ class MINISAInterpreter:
             AH: Array height
             Ty: Data type for computation
             verbose: Enable verbose logging
+            build_target: Build target ("simulator" or "vitis_hls")
+            build_mode: HLS mode for vitis_hls target ("csim", "csyn", etc.)
+            project_dir: Directory for HLS project files (auto-created if None)
         """
         self.AW = AW
         self.AH = AH
         self.Ty = Ty
         self.verbose = verbose
+        self.build_target = build_target
+        self.build_mode = build_mode
+        self.project_dir = project_dir
 
         # Execution statistics
         self.stats: Dict[str, Any] = {
@@ -90,13 +103,18 @@ class MINISAInterpreter:
     def _build_allo_module(self):
         """Build the FEATHER+ Allo dataflow module.
 
-        This creates the Allo simulator module that will execute all
-        tile computations. The module is cached for reuse across tiles.
+        This creates the Allo module that will execute all tile computations.
+        The module is cached for reuse across tiles.
+
+        Supports two build targets:
+        - "simulator": LLVM OMP-based dataflow simulator (fast)
+        - "vitis_hls": HLS C simulation via Vitis HLS (validates HLS code)
         """
         if self._module_built:
             return
 
-        self._log(f"Building Allo dataflow module (AW={self.AW}, AH={self.AH})")
+        self._log(f"Building Allo dataflow module (AW={self.AW}, AH={self.AH}, "
+                  f"target={self.build_target})")
 
         # Import here to avoid circular dependency
         # Handle both package and direct imports
@@ -110,9 +128,27 @@ class MINISAInterpreter:
             from feather_minisa import get_feather_minisa_top
 
         top = get_feather_minisa_top(self.AW, self.AH, self.Ty)
-        self._allo_module = df.build(top, target="simulator")
-        self._module_built = True
 
+        if self.build_target == "simulator":
+            self._allo_module = df.build(top, target="simulator")
+        elif self.build_target == "vitis_hls":
+            # Requires project directory for HLS code generation
+            if self.project_dir is None:
+                self.project_dir = os.path.join(os.path.dirname(__file__), "..", "hls_project")
+                os.makedirs(self.project_dir, exist_ok=True)
+                self._log(f"Using HLS project dir: {self.project_dir}")
+
+            self._allo_module = df.build(
+                top,
+                target="vitis_hls",
+                mode=self.build_mode,
+                project=self.project_dir
+            )
+        else:
+            raise ValueError(f"Unsupported build target: {self.build_target}. "
+                           f"Use 'simulator' or 'vitis_hls'.")
+
+        self._module_built = True
         self._log("Allo module built successfully")
 
     def execute_program(
@@ -310,6 +346,9 @@ def run_minisa_gemm(
     AW: int = 8, AH: int = 8,
     Ty: AlloType = int8,
     verbose: bool = False,
+    build_target: str = "simulator",
+    build_mode: str = "csim",
+    project_dir: Optional[str] = None,
 ) -> tuple:
     """Run a GEMM operation using MINISA on FEATHER+.
 
@@ -325,6 +364,9 @@ def run_minisa_gemm(
         AH: Array height
         Ty: Data type
         verbose: Enable verbose logging
+        build_target: Build target ("simulator" or "vitis_hls")
+        build_mode: HLS mode for vitis_hls target
+        project_dir: Directory for HLS project files
 
     Returns:
         (output, reference, passed): Results and verification status
@@ -341,7 +383,10 @@ def run_minisa_gemm(
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
     # Execute through MINISA interpreter (uses Allo for compute)
-    interpreter = MINISAInterpreter(AW=AW, AH=AH, Ty=Ty, verbose=verbose)
+    interpreter = MINISAInterpreter(
+        AW=AW, AH=AH, Ty=Ty, verbose=verbose,
+        build_target=build_target, build_mode=build_mode, project_dir=project_dir
+    )
     output_raw = interpreter.execute_program(program, A, B)
 
     # Compute numpy reference (for verification only)

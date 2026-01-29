@@ -18,6 +18,7 @@ out
 rapidjson
 project_*
 .eggs/*
+tickets/*
 
 # Downloaded files
 *.params
@@ -69,6 +70,7 @@ build
 # HLS
 *.log
 *.prj
+**/hls_project
 
 # Linear programming files
 *.lp

@@ -288,9 +288,97 @@ examples/feather-isa/
     +-- minisa_allo_verification.md
 ```
 
+## HLS Backend Support
+
+The MINISA interpreter supports multiple Allo build targets for different
+validation and synthesis flows.
+
+### Build Targets
+
+| Target | Mode | Use Case | Performance | Validation Level |
+|--------|------|----------|-------------|------------------|
+| `simulator` | N/A | Fast development | Fastest | Functional only |
+| `vitis_hls` | `csim` | HLS code validation | Slower | HLS C compile check |
+| `vitis_hls` | `csyn` | Synthesis reports | N/A (no exec) | Full HLS synthesis |
+| `vitis_hls` | `sw_emu` | Software emulation | Slow | Xilinx SW emulation |
+| `vitis_hls` | `hw_emu` | Hardware emulation | Very slow | Xilinx HW emulation |
+
+### Switching Build Target
+
+```python
+# Default: LLVM simulator (fast)
+interpreter = MINISAInterpreter(AW=8, AH=8, build_target="simulator")
+
+# HLS C simulation (validates generated code)
+interpreter = MINISAInterpreter(
+    AW=8, AH=8,
+    build_target="vitis_hls",
+    build_mode="csim",
+    project_dir="./hls_project"
+)
+
+# HLS synthesis only (no execution)
+from feather_minisa import build_feather_minisa_hls
+mod = build_feather_minisa_hls(AW=8, AH=8, Ty=int8, mode="csyn", project="./hls_project")
+print(mod.hls_code)  # Inspect generated code
+```
+
+### HLS Code Generation Flow
+
+```
+    Allo Dataflow Region (Python)
+              |
+              v
+    MLIR Representation (allo.ir)
+              |
+              v
+    HLS C Code Generation (allo_d.emit_vhls())
+              |
+              v
+    kernel.cpp + kernel.h (HLS project)
+              |
+              +---> csim: Compile via nanobind -> IPModule (executable)
+              |
+              +---> csyn: Run Vitis HLS synthesis -> HLSModule (reports)
+              |
+              +---> sw_emu/hw_emu: Xilinx emulation -> HLSModule
+```
+
+### HLS-Specific Optimizations
+
+When building for HLS targets, the following optimizations are applied:
+
+```python
+# Array partitioning for parallel access
+s.partition("top:output_buffer", dim=1, factor=AW)
+s.partition("top:iActs", dim=1, factor=AH)
+s.partition("top:weights", dim=2, factor=AW)
+s.partition("top:weights", dim=3, factor=AH)
+```
+
+These partitioning directives enable parallel array access in the NEST
+compute kernel, which is essential for achieving high throughput on FPGA.
+
+### Testing HLS Backend
+
+```bash
+# Run HLS-specific tests (requires Vitis HLS)
+cd examples/feather-isa
+python -m pytest tests/test_minisa_hls_csim.py -v
+
+# Generate HLS code for inspection
+python -c "
+from feather_minisa import get_hls_code
+from allo.ir.types import int8
+code = get_hls_code(AW=8, AH=8, Ty=int8)
+print(code)
+"
+```
+
 ## Summary
 
 - **Allo executes all compute:** NEST, BIRRD, and buffer kernels
 - **Python generates configs:** ISA lowering produces configuration tensors
 - **Python controls execution:** Interpreter loops over tiles, calling Allo
 - **Verification proves correctness:** Tests cannot pass with numpy-only compute
+- **Multiple backends:** Simulator for fast dev, HLS for synthesis validation

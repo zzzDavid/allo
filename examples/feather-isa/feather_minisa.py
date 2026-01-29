@@ -279,6 +279,70 @@ def build_feather_minisa_simulator(AW: int, AH: int, Ty: AlloType):
     return df.build(top, target="simulator")
 
 
+def build_feather_minisa_hls(
+    AW: int,
+    AH: int,
+    Ty: AlloType,
+    mode: str = "csim",
+    project: str = None
+):
+    """Build FEATHER+ MINISA for HLS target.
+
+    This function builds the FEATHER+ dataflow design for Vitis HLS,
+    applying HLS-specific optimizations including array partitioning
+    for parallel access.
+
+    Args:
+        AW: Array width (must be power of 2: 4, 8, or 16)
+        AH: Array height (number of VN elements)
+        Ty: Data type (e.g., int8, int32)
+        mode: HLS mode ("csim", "csyn", "sw_emu", "hw_emu")
+        project: Project directory for HLS files (default: ./hls_project)
+
+    Returns:
+        HLSModule or IPModule depending on mode:
+        - csim: Returns IPModule (callable for execution)
+        - csyn: Returns HLSModule (contains reports and hls_code)
+        - sw_emu/hw_emu: Returns HLSModule (for Xilinx emulation)
+    """
+    if project is None:
+        import os
+        project = os.path.join(os.path.dirname(__file__), "hls_project")
+        os.makedirs(project, exist_ok=True)
+
+    top = get_feather_minisa_top(AW, AH, Ty)
+    s = df.customize(top)
+
+    # Apply HLS-specific optimizations for parallel array access
+    # Note: We partition output_buffer and iActs on specific dimensions
+    # Weights array is partitioned completely (dim=0) to enable full parallel access
+    s.partition("top:output_buffer", dim=1, factor=AW)
+    s.partition("top:iActs", dim=1, factor=AH)
+    s.partition("top:weights", dim=0)  # Complete partition for all dimensions
+
+    return s.build(target="vitis_hls", mode=mode, project=project)
+
+
+def get_hls_code(AW: int, AH: int, Ty: AlloType, project: str = None) -> str:
+    """Get generated HLS C code for inspection.
+
+    This function generates HLS C code from the FEATHER+ dataflow design
+    without executing it. Useful for inspecting generated code or
+    debugging HLS synthesis issues.
+
+    Args:
+        AW: Array width
+        AH: Array height
+        Ty: Data type
+        project: Project directory (default: ./hls_project)
+
+    Returns:
+        Generated HLS C code as a string
+    """
+    mod = build_feather_minisa_hls(AW, AH, Ty, mode="csyn", project=project)
+    return mod.hls_code
+
+
 # Pre-computed BIRRD instruction arrays for common configurations
 # These represent standard reduction patterns and can be modified by MINISA OVN lowering
 
