@@ -296,7 +296,12 @@ def build_feather_minisa_hls(
         AW: Array width (must be power of 2: 4, 8, or 16)
         AH: Array height (number of VN elements)
         Ty: Data type (e.g., int8, int32)
-        mode: HLS mode ("csim", "csyn", "sw_emu", "hw_emu")
+        mode: HLS mode - one of:
+            - "csim": HLS C simulation via nanobind (fast validation)
+            - "csyn": HLS synthesis (generates reports, no execution)
+            - "sw_emu": Xilinx software emulation
+            - "hw_emu": Xilinx hardware emulation
+            - "hw": Full hardware synthesis and FPGA deployment
         project: Project directory for HLS files (default: ./hls_project)
 
     Returns:
@@ -304,6 +309,7 @@ def build_feather_minisa_hls(
         - csim: Returns IPModule (callable for execution)
         - csyn: Returns HLSModule (contains reports and hls_code)
         - sw_emu/hw_emu: Returns HLSModule (for Xilinx emulation)
+        - hw: Returns HLSModule (for FPGA deployment)
     """
     if project is None:
         import os

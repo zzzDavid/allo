@@ -599,6 +599,7 @@ def build(
     trace: list[tuple[str, tuple[int, ...]]] = None,
     trace_size: int = 4096,
     device_type: Union[str, None] = None,
+    bitstream=None,
 ):
     assert not profile or target == "aie", "Profiling is only supported for AIE target"
     assert (
@@ -657,5 +658,6 @@ def build(
         project=project,
         configs=configs,
         wrap_io=wrap_io,
+        bitstream=bitstream,
     )
     return hls_mod

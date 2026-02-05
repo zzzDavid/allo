@@ -1266,6 +1266,7 @@ class Schedule:
         configs=None,
         wrap_io=True,
         use_memory=False,
+        bitstream=None,
     ):
         if target is None or target == "llvm":
             target = "llvm"
@@ -1305,6 +1306,7 @@ class Schedule:
                 configs=configs,
                 func_args=self.func_args,
                 wrap_io=wrap_io,
+                bitstream=bitstream,
             )
         raise NotImplementedError(f"Target {target} is not supported")
 

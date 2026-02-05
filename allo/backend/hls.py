@@ -184,7 +184,11 @@ class HLSModule:
         configs=None,
         func_args=None,
         wrap_io=True,
+        bitstream=None,
     ):
+        # Store bitstream path for later use in __call__
+        # This allows using a pre-compiled xclbin file instead of rebuilding
+        self.bitstream = bitstream
         self.top_func_name = top_func_name
         self.mode = mode
         self.project = project
@@ -495,7 +499,9 @@ class HLSModule:
             else:
                 raise RuntimeError(f"{self.platform} does not support {self.mode} mode")
         elif self.platform == "vitis_hls":
-            assert is_available("vitis_hls"), "vitis_hls is not available"
+            # Only require vitis_hls if not using a pre-compiled bitstream
+            if self.bitstream is None:
+                assert is_available("vitis_hls"), "vitis_hls is not available"
             if self.mode == "csim":
                 mod = IPModule(
                     top=self.top_func_name,
@@ -542,37 +548,75 @@ class HLSModule:
                     if np.isscalar(arg):
                         arg = np.array(arg, dtype=np_supported_types[in_dtype])
                     f.write(arg.tobytes())
-            # check if the build folder exists
-            bitstream_folder = f"{self.project}/build_dir.{self.mode}.{os.environ['XDEVICE'].rsplit('/')[-1].split('.')[0]}"
-            if not os.path.exists(
-                os.path.join(bitstream_folder, f"{self.top_func_name}.xclbin")
-            ):
-                cmd = (
-                    f"cd {self.project}; make run TARGET={self.mode} PLATFORM=$XDEVICE"
-                )
-                print(cmd)
-                if shell:
-                    process = subprocess.Popen(cmd, shell=True)
-                else:
-                    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-                process.wait()
-                if process.returncode != 0:
-                    raise RuntimeError("Failed to build the project")
-            else:
-                print("Build folder exists, skip building")
-                # run the executable
+            # Determine xclbin path - use provided bitstream or build/find one
+            if self.bitstream is not None:
+                # Use provided pre-compiled bitstream
+                xclbin_path = os.path.abspath(self.bitstream)
+                if not os.path.exists(xclbin_path):
+                    raise FileNotFoundError(
+                        f"Provided bitstream not found: {xclbin_path}"
+                    )
+                print(f"Using pre-compiled bitstream: {xclbin_path}")
+                # Check if host executable exists
+                host_executable = f"{self.project}/{self.top_func_name}"
+                if not os.path.exists(host_executable):
+                    # Try to build host if vitis_hls is available
+                    if is_available("vitis_hls"):
+                        print("Building host executable...")
+                        build_cmd = f"cd {self.project}; make host PLATFORM=$XDEVICE"
+                        process = subprocess.Popen(build_cmd, shell=True)
+                        process.wait()
+                        if process.returncode != 0:
+                            raise RuntimeError("Failed to build host executable")
+                    else:
+                        raise FileNotFoundError(
+                            f"Host executable not found at {host_executable} and vitis_hls "
+                            "is not available to build it. Please ensure the host executable "
+                            "exists in the project directory."
+                        )
+                # Run the host executable with the bitstream
                 prefix = f"cd {self.project};"
-                if not os.path.exists(f"{self.project}/{self.top_func_name}"):
-                    prefix += " make host PLATFORM=$XDEVICE;"
                 prefix += (
                     f" XCL_EMULATION_MODE={self.mode}" if self.mode != "hw" else ""
                 )
-                cmd = f"{prefix} ./{self.top_func_name} ../{bitstream_folder}/{self.top_func_name}.xclbin"
+                cmd = f"{prefix} ./{self.top_func_name} {xclbin_path}"
                 print(cmd)
                 process = subprocess.Popen(cmd, shell=True)
                 process.wait()
                 if process.returncode != 0:
-                    raise RuntimeError("Failed to run the executable")
+                    raise RuntimeError("Failed to run the executable with provided bitstream")
+            else:
+                # Standard flow: check if build folder exists or build from scratch
+                bitstream_folder = f"{self.project}/build_dir.{self.mode}.{os.environ['XDEVICE'].rsplit('/')[-1].split('.')[0]}"
+                if not os.path.exists(
+                    os.path.join(bitstream_folder, f"{self.top_func_name}.xclbin")
+                ):
+                    cmd = (
+                        f"cd {self.project}; make run TARGET={self.mode} PLATFORM=$XDEVICE"
+                    )
+                    print(cmd)
+                    if shell:
+                        process = subprocess.Popen(cmd, shell=True)
+                    else:
+                        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+                    process.wait()
+                    if process.returncode != 0:
+                        raise RuntimeError("Failed to build the project")
+                else:
+                    print("Build folder exists, skip building")
+                    # run the executable
+                    prefix = f"cd {self.project};"
+                    if not os.path.exists(f"{self.project}/{self.top_func_name}"):
+                        prefix += " make host PLATFORM=$XDEVICE;"
+                    prefix += (
+                        f" XCL_EMULATION_MODE={self.mode}" if self.mode != "hw" else ""
+                    )
+                    cmd = f"{prefix} ./{self.top_func_name} ../{bitstream_folder}/{self.top_func_name}.xclbin"
+                    print(cmd)
+                    process = subprocess.Popen(cmd, shell=True)
+                    process.wait()
+                    if process.returncode != 0:
+                        raise RuntimeError("Failed to run the executable")
             # Read output tensors from files
             # Determine how many output files to read
             func = find_func_in_module(self.module, self.top_func_name)
@@ -665,7 +709,9 @@ class HLSModule:
                         raise RuntimeError("Failed to collect files")
                 return
         elif self.platform == "tapa":
-            assert is_available("tapa"), "tapa is not available"
+            # Only require tapa if not using a pre-compiled bitstream
+            if self.bitstream is None:
+                assert is_available("tapa"), "tapa is not available"
             # Use Makefile (sw_emu, hw_emu, hw)
             assert "XDEVICE" in os.environ, "Please set XDEVICE in your environment"
             # prepare data
@@ -686,36 +732,74 @@ class HLSModule:
                 if process.returncode != 0:
                     raise RuntimeError("Failed to run tapa executable")
                 return
-            bitstream_folder = f"{self.project}/build_dir.{self.mode}.{os.environ['XDEVICE'].rsplit('/')[-1].split('.')[0]}"
-            if not os.path.exists(
-                os.path.join(bitstream_folder, f"{self.top_func_name}.xclbin")
-            ):
-                cmd = (
-                    f"cd {self.project}; make run TARGET={self.mode} PLATFORM=$XDEVICE"
-                )
-                print(cmd)
-                if shell:
-                    process = subprocess.Popen(cmd, shell=True)
-                else:
-                    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-                process.wait()
-                if process.returncode != 0:
-                    raise RuntimeError("Failed to build the project")
-            else:
-                print("Build folder exists, skip building")
-                # run the executable
+            # Determine xclbin path - use provided bitstream or build/find one
+            if self.bitstream is not None:
+                # Use provided pre-compiled bitstream
+                xclbin_path = os.path.abspath(self.bitstream)
+                if not os.path.exists(xclbin_path):
+                    raise FileNotFoundError(
+                        f"Provided bitstream not found: {xclbin_path}"
+                    )
+                print(f"Using pre-compiled bitstream: {xclbin_path}")
+                # Check if host executable exists
+                host_executable = f"{self.project}/{self.top_func_name}"
+                if not os.path.exists(host_executable):
+                    # Try to build host if tapa is available
+                    if is_available("tapa"):
+                        print("Building host executable...")
+                        build_cmd = f"cd {self.project}; make host PLATFORM=$XDEVICE"
+                        process = subprocess.Popen(build_cmd, shell=True)
+                        process.wait()
+                        if process.returncode != 0:
+                            raise RuntimeError("Failed to build host executable")
+                    else:
+                        raise FileNotFoundError(
+                            f"Host executable not found at {host_executable} and tapa "
+                            "is not available to build it. Please ensure the host executable "
+                            "exists in the project directory."
+                        )
+                # Run the host executable with the bitstream
                 prefix = f"cd {self.project};"
-                if not os.path.exists(f"{self.project}/{self.top_func_name}"):
-                    prefix += " make host PLATFORM=$XDEVICE;"
                 prefix += (
                     f" XCL_EMULATION_MODE={self.mode}" if self.mode != "hw" else ""
                 )
-                cmd = f"{prefix} ./{self.top_func_name} ../{bitstream_folder}/{self.top_func_name}.xclbin"
+                cmd = f"{prefix} ./{self.top_func_name} {xclbin_path}"
                 print(cmd)
                 process = subprocess.Popen(cmd, shell=True)
                 process.wait()
                 if process.returncode != 0:
-                    raise RuntimeError("Failed to run the executable")
+                    raise RuntimeError("Failed to run the executable with provided bitstream")
+            else:
+                bitstream_folder = f"{self.project}/build_dir.{self.mode}.{os.environ['XDEVICE'].rsplit('/')[-1].split('.')[0]}"
+                if not os.path.exists(
+                    os.path.join(bitstream_folder, f"{self.top_func_name}.xclbin")
+                ):
+                    cmd = (
+                        f"cd {self.project}; make run TARGET={self.mode} PLATFORM=$XDEVICE"
+                    )
+                    print(cmd)
+                    if shell:
+                        process = subprocess.Popen(cmd, shell=True)
+                    else:
+                        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+                    process.wait()
+                    if process.returncode != 0:
+                        raise RuntimeError("Failed to build the project")
+                else:
+                    print("Build folder exists, skip building")
+                    # run the executable
+                    prefix = f"cd {self.project};"
+                    if not os.path.exists(f"{self.project}/{self.top_func_name}"):
+                        prefix += " make host PLATFORM=$XDEVICE;"
+                    prefix += (
+                        f" XCL_EMULATION_MODE={self.mode}" if self.mode != "hw" else ""
+                    )
+                    cmd = f"{prefix} ./{self.top_func_name} ../{bitstream_folder}/{self.top_func_name}.xclbin"
+                    print(cmd)
+                    process = subprocess.Popen(cmd, shell=True)
+                    process.wait()
+                    if process.returncode != 0:
+                        raise RuntimeError("Failed to run the executable")
             # suppose the last argument is the output tensor
             result = read_tensor_from_file(
                 inputs[-1][0], args[-1].shape, f"{self.project}/output.data"

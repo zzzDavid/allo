@@ -63,7 +63,8 @@ class MINISAInterpreter:
         verbose: bool = False,
         build_target: str = "simulator",
         build_mode: str = "csim",
-        project_dir: Optional[str] = None
+        project_dir: Optional[str] = None,
+        bitstream: Optional[str] = None
     ):
         """Initialize the MINISA interpreter.
 
@@ -75,6 +76,7 @@ class MINISAInterpreter:
             build_target: Build target ("simulator" or "vitis_hls")
             build_mode: HLS mode for vitis_hls target ("csim", "csyn", etc.)
             project_dir: Directory for HLS project files (auto-created if None)
+            bitstream: Path to pre-compiled xclbin file (skips synthesis)
         """
         self.AW = AW
         self.AH = AH
@@ -83,6 +85,7 @@ class MINISAInterpreter:
         self.build_target = build_target
         self.build_mode = build_mode
         self.project_dir = project_dir
+        self.bitstream = bitstream
 
         # Execution statistics
         self.stats: Dict[str, Any] = {
@@ -138,11 +141,15 @@ class MINISAInterpreter:
                 os.makedirs(self.project_dir, exist_ok=True)
                 self._log(f"Using HLS project dir: {self.project_dir}")
 
+            if self.bitstream:
+                self._log(f"Using pre-compiled bitstream: {self.bitstream}")
+
             self._allo_module = df.build(
                 top,
                 target="vitis_hls",
                 mode=self.build_mode,
-                project=self.project_dir
+                project=self.project_dir,
+                bitstream=self.bitstream
             )
         else:
             raise ValueError(f"Unsupported build target: {self.build_target}. "
@@ -349,6 +356,7 @@ def run_minisa_gemm(
     build_target: str = "simulator",
     build_mode: str = "csim",
     project_dir: Optional[str] = None,
+    bitstream: Optional[str] = None,
 ) -> tuple:
     """Run a GEMM operation using MINISA on FEATHER+.
 
@@ -367,6 +375,7 @@ def run_minisa_gemm(
         build_target: Build target ("simulator" or "vitis_hls")
         build_mode: HLS mode for vitis_hls target
         project_dir: Directory for HLS project files
+        bitstream: Path to pre-compiled xclbin file (skips synthesis)
 
     Returns:
         (output, reference, passed): Results and verification status
@@ -385,7 +394,8 @@ def run_minisa_gemm(
     # Execute through MINISA interpreter (uses Allo for compute)
     interpreter = MINISAInterpreter(
         AW=AW, AH=AH, Ty=Ty, verbose=verbose,
-        build_target=build_target, build_mode=build_mode, project_dir=project_dir
+        build_target=build_target, build_mode=build_mode, project_dir=project_dir,
+        bitstream=bitstream
     )
     output_raw = interpreter.execute_program(program, A, B)
 
