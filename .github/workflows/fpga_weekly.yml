@@ -15,6 +15,10 @@ jobs:
     container:
       image: zzzdavid/allo-fpga:latest
       options: >-
+        --shm-size=16g
+        --tmpfs /tmp:exec,size=32g
+        --security-opt seccomp=unconfined
+        --ulimit nofile=1048576:1048576
         -v /opt/xilinx:/opt/xilinx
     env:
       XILINXD_LICENSE_FILE: 2100@en-license-05.coecis.cornell.edu
