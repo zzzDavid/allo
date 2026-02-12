@@ -13,6 +13,12 @@ from .isa import (
     SetOVNLayout,
     SetMapping,
     MINISAProgram,
+    encode_program,
+    NUM_FIELDS,
 )
-from .lowering import lower_minisa_program
+from .lowering import (
+    lower_minisa_program,
+    compute_output_col_map,
+    compute_birrd_routing_table,
+)
 from .interpreter import MINISAInterpreter

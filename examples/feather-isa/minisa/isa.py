@@ -21,6 +21,16 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import List, Optional, Tuple, Union
 
+import numpy as np
+
+
+# Instruction encoding constants
+NUM_FIELDS = 13  # Fields per encoded instruction row
+INST_TYPE_IVN = 0
+INST_TYPE_WVN = 1
+INST_TYPE_OVN = 2
+INST_TYPE_MAPPING = 3
+
 
 class LayoutOrder(IntEnum):
     """Layout dimension ordering for VN buffers.
@@ -287,7 +297,11 @@ class MINISAProgram:
 def create_gemm_program(
     M: int, N: int, K: int,
     AH: int = 8, AW: int = 8,
-    name: str = "gemm"
+    name: str = "gemm",
+    ivn_order: int = 0,
+    wvn_order: int = 0,
+    ovn_order: int = 0,
+    dataflow: str = "output_stationary",
 ) -> MINISAProgram:
     """Create a MINISA program for GEMM: C[M,N] = A[M,K] * B[K,N].
 
@@ -301,6 +315,12 @@ def create_gemm_program(
         AH: Hardware array height
         AW: Hardware array width
         name: Program name
+        ivn_order: Input VN layout order (0-5)
+        wvn_order: Weight VN layout order (0-5)
+        ovn_order: Output VN layout order (0-5)
+        dataflow: PE mapping strategy:
+            "output_stationary" (default): Gr=AW, Gc=1, sr=0, sc=0
+            "weight_stationary": Gr=1, Gc=AW, sr=0, sc=1
 
     Returns:
         MINISAProgram configured for GEMM
@@ -315,27 +335,36 @@ def create_gemm_program(
     assert N % Nt == 0, f"N={N} must be divisible by Nt={Nt}"
     assert K % Kt == 0, f"K={K} must be divisible by Kt={Kt}"
 
+    # PE mapping based on dataflow strategy
+    if dataflow == "output_stationary":
+        Gr, Gc, sr, sc = AW, 1, 0, 0
+    elif dataflow == "weight_stationary":
+        Gr, Gc, sr, sc = 1, AW, 0, 1
+    else:
+        raise ValueError(f"Unsupported dataflow: {dataflow}. "
+                        f"Use 'output_stationary' or 'weight_stationary'.")
+
     # Create program with layouts
     program = MINISAProgram(
         name=name,
         AH=AH,
         AW=AW,
         ivn_layout=SetIVNLayout(
-            order=0,
+            order=ivn_order,
             ML0=AH,
             ML1=M // AH,
             JL0=AH,
             JL1=K // AH,
         ),
         wvn_layout=SetWVNLayout(
-            order=0,
+            order=wvn_order,
             KL0=AH,
             KL1=K // AH,
             NL0=min(N, AW),
             NL1=max(1, N // AW),
         ),
         ovn_layout=SetOVNLayout(
-            order=0,
+            order=ovn_order,
             PL0=AH,
             PL1=M // AH,
             QL0=AH,
@@ -351,10 +380,10 @@ def create_gemm_program(
                 mapping = SetMapping(
                     r0=0,
                     c0=0,
-                    Gr=AW,
-                    Gc=1,
-                    sr=0,
-                    sc=0,
+                    Gr=Gr,
+                    Gc=Gc,
+                    sr=sr,
+                    sc=sc,
                     m_start=m_tile * Mt,
                     m_end=(m_tile + 1) * Mt,
                     n_start=n_tile * Nt,
@@ -369,3 +398,51 @@ def create_gemm_program(
 
 # Type alias for MINISA instruction union
 MINISAInstruction = Union[SetIVNLayout, SetWVNLayout, SetOVNLayout, SetMapping]
+
+
+def encode_program(program: MINISAProgram) -> np.ndarray:
+    """Encode a MINISA program as a flat int32 array for Allo execution.
+
+    Converts the program's layout instructions and tile mappings into a
+    fixed-width integer array that can be passed to the full-matrix Allo
+    function for on-chip instruction decode.
+
+    Encoding format (NUM_FIELDS=13 columns per row):
+        SetIVNLayout:  [0, order, ML0, ML1, JL0, JL1, 0, 0, 0, 0, 0, 0, 0]
+        SetWVNLayout:  [1, order, KL0, KL1, NL0, NL1, 0, 0, 0, 0, 0, 0, 0]
+        SetOVNLayout:  [2, order, PL0, PL1, QL0, QL1, 0, 0, 0, 0, 0, 0, 0]
+        SetMapping:    [3, r0, c0, Gr, Gc, sr, sc, m_start, m_end, n_start, n_end, k_start, k_end]
+
+    Args:
+        program: MINISA program to encode
+
+    Returns:
+        int32 array of shape [num_inst, NUM_FIELDS]
+    """
+    num_inst = 3 + len(program.mappings)  # 3 layout instructions + mappings
+    inst = np.zeros((num_inst, NUM_FIELDS), dtype=np.int32)
+
+    # Encode SetIVNLayout
+    ivn = program.ivn_layout
+    inst[0] = [INST_TYPE_IVN, ivn.order, ivn.ML0, ivn.ML1, ivn.JL0, ivn.JL1,
+               0, 0, 0, 0, 0, 0, 0]
+
+    # Encode SetWVNLayout
+    wvn = program.wvn_layout
+    inst[1] = [INST_TYPE_WVN, wvn.order, wvn.KL0, wvn.KL1, wvn.NL0, wvn.NL1,
+               0, 0, 0, 0, 0, 0, 0]
+
+    # Encode SetOVNLayout
+    ovn = program.ovn_layout
+    inst[2] = [INST_TYPE_OVN, ovn.order, ovn.PL0, ovn.PL1, ovn.QL0, ovn.QL1,
+               0, 0, 0, 0, 0, 0, 0]
+
+    # Encode SetMapping instructions
+    for i, mapping in enumerate(program.mappings):
+        inst[3 + i] = [INST_TYPE_MAPPING, mapping.r0, mapping.c0,
+                        mapping.Gr, mapping.Gc, mapping.sr, mapping.sc,
+                        mapping.m_start, mapping.m_end,
+                        mapping.n_start, mapping.n_end,
+                        mapping.k_start, mapping.k_end]
+
+    return inst

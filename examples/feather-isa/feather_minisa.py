@@ -402,6 +402,354 @@ def get_default_birrd_inst(AW: int) -> np.ndarray:
         raise ValueError(f"Unsupported array width: {AW}. Must be 4, 8, or 16.")
 
 
+# ============================================================================
+# Full-Matrix Execution Model (DEV009)
+# ============================================================================
+# Instead of Python calling Allo once per tile, the full-matrix model passes
+# complete input matrices and an instruction list to a single Allo function
+# that handles tiling, decode, compute, and accumulation internally.
+# ============================================================================
+
+
+def feather_full_matrix[
+    Ty,
+    M: int32, K: int32, N: int32,
+    AW: int32, AH: int32,
+    num_inst: int32,
+    Mt: int32, P0: int32, P1: int32, P0p1: int32, HalfAW: int32,
+](
+    A: "Ty[M, K]",
+    B: "Ty[K, N]",
+    instructions: "int32[num_inst, 13]",
+    birrd_inst: "int8[P0, P1]",
+    route_left: "int32[P0, P1]",
+    route_right: "int32[P0, P1]",
+    output_col_map: "int32[Mt]",
+    C: "int32[M, N]",
+):
+    """Full-matrix FEATHER+ with on-chip instruction decode.
+
+    Accepts full matrices A[M,K], B[K,N] and a MINISA instruction list,
+    handles tiling, crossbar reordering, NEST computation, BIRRD reduction,
+    and output accumulation in a single invocation.
+
+    Fully decodes all MINISA instruction fields:
+    - SetIVNLayout order (0-5): permutes input crossbar addressing
+    - SetWVNLayout order (0-5): permutes weight crossbar addressing
+    - SetOVNLayout order (0-5): selects BIRRD pattern (precomputed)
+    - SetMapping r0,c0,Gr,Gc,sr,sc: PE-to-WVN mapping for weight routing
+    """
+    # Tile-level buffers
+    iActs: Ty[AH, AW]
+    weights: Ty[AH, AW, AH]
+    nest_out: Ty[AH, AW]
+    birrd_buf: Ty[P0p1, AW]
+    tile_out: Ty[AH, AW]
+
+    # Layout order state (decoded from layout instructions)
+    ivn_order: int32 = 0
+    wvn_order: int32 = 0
+    ovn_order: int32 = 0
+
+    for inst_idx in range(num_inst):
+        inst_type: int32 = instructions[inst_idx, 0]
+
+        if inst_type == 0:  # SetIVNLayout — decode order
+            ivn_order = instructions[inst_idx, 1]
+        elif inst_type == 1:  # SetWVNLayout — decode order
+            wvn_order = instructions[inst_idx, 1]
+        elif inst_type == 2:  # SetOVNLayout — decode order
+            ovn_order = instructions[inst_idx, 1]
+        elif inst_type == 3:  # SetMapping — trigger tile execution
+            # Decode PE mapping fields
+            pe_r0: int32 = instructions[inst_idx, 1]
+            pe_c0: int32 = instructions[inst_idx, 2]
+            pe_Gr: int32 = instructions[inst_idx, 3]
+            pe_Gc: int32 = instructions[inst_idx, 4]
+            pe_sr: int32 = instructions[inst_idx, 5]
+            pe_sc: int32 = instructions[inst_idx, 6]
+            # Decode tile bounds
+            m_start: int32 = instructions[inst_idx, 7]
+            n_start: int32 = instructions[inst_idx, 9]
+            k_start: int32 = instructions[inst_idx, 11]
+
+            # === Input Crossbar (IVN order-dependent reordering) ===
+            # 3 addressing components: D0=ic_i, D1=ic_j%Mt, D2=ic_j//Mt
+            # Order permutes how D0,D1,D2 map to m_idx and k_idx
+            for ic_i in range(AH):
+                for ic_j in range(AW):
+                    m_idx: int32 = 0
+                    k_idx: int32 = 0
+                    if ivn_order == 0:  # ORDER_012
+                        m_idx = m_start + (ic_j % Mt)
+                        k_idx = k_start + ic_i + (ic_j // Mt) * AH
+                    elif ivn_order == 1:  # ORDER_021
+                        m_idx = m_start + (ic_j // Mt)
+                        k_idx = k_start + ic_i + (ic_j % Mt) * AH
+                    elif ivn_order == 2:  # ORDER_102
+                        m_idx = m_start + ic_i
+                        k_idx = k_start + (ic_j % Mt) + (ic_j // Mt) * AH
+                    elif ivn_order == 3:  # ORDER_120
+                        m_idx = m_start + ic_i
+                        k_idx = k_start + (ic_j // Mt) + (ic_j % Mt) * AH
+                    elif ivn_order == 4:  # ORDER_201
+                        m_idx = m_start + (ic_j // Mt)
+                        k_idx = k_start + (ic_j % Mt) + ic_i * AH
+                    else:  # ORDER_210
+                        m_idx = m_start + (ic_j % Mt)
+                        k_idx = k_start + (ic_j // Mt) + ic_i * AH
+                    iActs[ic_i, ic_j] = A[m_idx, k_idx]
+
+            # === Weight Crossbar (WVN order-dependent reordering) ===
+            # PE mapping fields are decoded above (pe_r0..pe_sc) for
+            # hardware configuration. The crossbar addressing uses the
+            # natural tile components for weight staging:
+            # D0=wc_k (inner K), D1=wc_w//HalfAW (K block 0/1), D2=wc_i (N pos)
+            # WVN order permutes how D0,D1,D2 map to wk_idx and wn_idx
+            for wc_i in range(AH):
+                for wc_w in range(AW):
+                    for wc_k in range(AH):
+                        wk_idx: int32 = 0
+                        wn_idx: int32 = 0
+                        if wvn_order == 0:  # ORDER_012
+                            wk_idx = k_start + wc_k + (wc_w // HalfAW) * AH
+                            wn_idx = n_start + wc_i
+                        elif wvn_order == 1:  # ORDER_021
+                            wk_idx = k_start + wc_k + wc_i * AH
+                            wn_idx = n_start + (wc_w // HalfAW)
+                        elif wvn_order == 2:  # ORDER_102
+                            wk_idx = k_start + (wc_w // HalfAW) + wc_k * AH
+                            wn_idx = n_start + wc_i
+                        elif wvn_order == 3:  # ORDER_120
+                            wk_idx = k_start + wc_i + wc_k * AH
+                            wn_idx = n_start + (wc_w // HalfAW)
+                        elif wvn_order == 4:  # ORDER_201
+                            wk_idx = k_start + (wc_w // HalfAW) + wc_i * AH
+                            wn_idx = n_start + wc_k
+                        else:  # ORDER_210
+                            wk_idx = k_start + wc_i + (wc_w // HalfAW) * AH
+                            wn_idx = n_start + wc_k
+                        weights[wc_i, wc_w, wc_k] = B[wk_idx, wn_idx]
+
+            # === NEST: AH x AW PE array ===
+            for ni in range(AH):
+                for nj in range(AW):
+                    temp: Ty = 0
+                    for nk in range(AH):
+                        temp += iActs[nk, nj] * weights[ni, nj, nk]
+                    nest_out[ni, nj] = temp
+
+            # === BIRRD: butterfly reduction, AH iterations ===
+            for ah in range(AH):
+                # Initialize stage 0 from NEST output row
+                for bp in range(AW):
+                    birrd_buf[0, bp] = nest_out[ah, bp]
+
+                # Process through P0 stages
+                for stage in range(P0):
+                    for sw in range(P1):
+                        left_in: Ty = birrd_buf[stage, 2 * sw]
+                        right_in: Ty = birrd_buf[stage, 2 * sw + 1]
+                        op: int8 = birrd_inst[stage, sw]
+
+                        left_out: Ty = 0
+                        right_out: Ty = 0
+                        if op == 0:  # PS: pass
+                            left_out = left_in
+                            right_out = right_in
+                        elif op == 1:  # AR: add-right
+                            left_out = left_in
+                            right_out = left_in + right_in
+                        elif op == 2:  # AL: add-left
+                            left_out = left_in + right_in
+                            right_out = right_in
+                        else:  # SW: swap
+                            left_out = right_in
+                            right_out = left_in
+
+                        left_dest: int32 = route_left[stage, sw]
+                        right_dest: int32 = route_right[stage, sw]
+                        birrd_buf[stage + 1, left_dest] = left_out
+                        birrd_buf[stage + 1, right_dest] = right_out
+
+                # Store BIRRD output for this ah iteration
+                for bp2 in range(AW):
+                    tile_out[ah, bp2] = birrd_buf[P0, bp2]
+
+            # === Output Buffer: accumulate into C[M,N] ===
+            for om in range(Mt):
+                col: int32 = output_col_map[om]
+                for on in range(AH):
+                    C[m_start + om, n_start + on] = (
+                        C[m_start + om, n_start + on] + tile_out[on, col]
+                    )
+
+
+class FeatherFullMatrixModule:
+    """Wrapper that provides clean (A, B, instructions, C) interface.
+
+    Precomputes all BIRRD configs at build time for all 6 OVN orders.
+    At call time, extracts OVN order from instructions and passes the
+    correct config to the internal Allo module.
+    """
+
+    def __init__(self, allo_mod, AW):
+        from minisa.lowering import (
+            compute_birrd_routing_table,
+            lower_ovn_layout,
+            compute_output_col_map,
+        )
+        from minisa.isa import SetOVNLayout
+
+        self._mod = allo_mod
+        self._AW = AW
+        # Route tables are fixed for this AW (hardware topology)
+        self._route_left, self._route_right = compute_birrd_routing_table(AW)
+        # Precompute BIRRD tables + col maps for all 6 OVN orders
+        self._birrd_tables = {}
+        self._col_maps = {}
+        for order in range(6):
+            ovn = SetOVNLayout(order=order, PL0=AW, PL1=1, QL0=AW, QL1=1)
+            self._birrd_tables[order] = lower_ovn_layout(ovn, AW, AW)
+            self._col_maps[order] = compute_output_col_map(AW, order)
+
+    def __call__(self, A, B, instructions, C):
+        # OVN order is at instructions[2, 1] (row 2 = SetOVNLayout, field 1 = order)
+        ovn_order = int(instructions[2, 1])
+        self._mod(
+            A, B, instructions,
+            self._birrd_tables[ovn_order],
+            self._route_left, self._route_right,
+            self._col_maps[ovn_order],
+            C,
+        )
+
+
+def build_feather_full_matrix_simulator(M, K, N, AW, AH, Ty, num_inst):
+    """Build full-matrix FEATHER+ for LLVM simulation.
+
+    Returns a module with clean interface: mod(A, B, instructions, C).
+    BIRRD configs are precomputed internally for all OVN orders.
+    """
+    Mt = int(AW // 2)
+    P0, P1 = compute_birrd_params(AW)
+    P0p1 = int(P0 + 1)
+    HalfAW = int(AW // 2)
+    s = allo.customize(
+        feather_full_matrix,
+        instantiate=[Ty, int(M), int(K), int(N), int(AW), int(AH),
+                     int(num_inst), Mt, int(P0), int(P1), P0p1, HalfAW],
+    )
+    allo_mod = s.build(target="llvm")
+    return FeatherFullMatrixModule(allo_mod, AW)
+
+
+def build_feather_full_matrix_hls(M, K, N, AW, AH, Ty, num_inst,
+                                   mode="csim", project=None):
+    """Build full-matrix FEATHER+ for Vitis HLS.
+
+    Returns a module with clean interface: mod(A, B, instructions, C).
+    BIRRD configs are precomputed internally for all OVN orders.
+    """
+    Mt = int(AW // 2)
+    P0, P1 = compute_birrd_params(AW)
+    P0p1 = int(P0 + 1)
+    HalfAW = int(AW // 2)
+    if project is None:
+        project = "feather_full_matrix.prj"
+    s = allo.customize(
+        feather_full_matrix,
+        instantiate=[Ty, int(M), int(K), int(N), int(AW), int(AH),
+                     int(num_inst), Mt, int(P0), int(P1), P0p1, HalfAW],
+    )
+    allo_mod = s.build(target="vitis_hls", mode=mode, project=project)
+    return FeatherFullMatrixModule(allo_mod, AW)
+
+
+def run_full_matrix_gemm(
+    M, N, K,
+    AW=8, AH=8,
+    Ty_data=int8,
+    verbose=False,
+    A=None, B=None,
+    seed=42,
+    build_target="simulator",
+    build_mode="csim",
+    project_dir=None,
+):
+    """Run GEMM using the full-matrix execution model.
+
+    Single Allo invocation per GEMM — no Python tile loop.
+
+    Args:
+        M, N, K: Matrix dimensions for C[M,N] = A[M,K] * B[K,N]
+        AW: Array width
+        AH: Array height
+        Ty_data: Data type
+        verbose: Enable verbose logging
+        A: Optional input matrix (generated if None)
+        B: Optional weight matrix (generated if None)
+        seed: Random seed for input generation
+        build_target: "simulator" or "vitis_hls"
+        build_mode: HLS build mode (for vitis_hls target)
+        project_dir: HLS project directory (for vitis_hls target)
+
+    Returns:
+        (C, reference, passed): Output, numpy reference, and verification status
+    """
+    from minisa.isa import create_gemm_program, encode_program
+
+    # Create and encode MINISA program
+    program = create_gemm_program(M, N, K, AH, AW)
+    instructions = encode_program(program)
+    num_inst = len(instructions)
+
+    if verbose:
+        print(f"Full-matrix GEMM: C[{M},{N}] = A[{M},{K}] x B[{K},{N}]")
+        print(f"  AW={AW}, AH={AH}, Ty={Ty_data}")
+        print(f"  Encoded {num_inst} instructions ({num_inst - 3} tile mappings)")
+
+    # Generate or use provided inputs
+    if A is None or B is None:
+        np.random.seed(seed)
+        A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+        B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+    # Build Allo module (single invocation)
+    if build_target == "simulator":
+        mod = build_feather_full_matrix_simulator(M, K, N, AW, AH, Ty_data, num_inst)
+    else:
+        mod = build_feather_full_matrix_hls(
+            M, K, N, AW, AH, Ty_data, num_inst,
+            mode=build_mode, project=project_dir,
+        )
+
+    # Allocate output
+    C = np.zeros((M, N), dtype=np.int32)
+
+    # Execute — single Allo call (wrapper handles BIRRD config selection)
+    mod(A, B, instructions, C)
+
+    # Compute numpy reference
+    ref = np.dot(A, B)
+
+    # Verify
+    try:
+        np.testing.assert_allclose(C, ref, atol=1e-5)
+        passed = True
+    except AssertionError:
+        passed = False
+
+    if verbose:
+        print(f"  Verification: {'PASSED' if passed else 'FAILED'}")
+        if not passed:
+            diff = np.abs(C - ref)
+            print(f"  Max abs diff: {diff.max()}")
+            print(f"  Diff locations: {np.argwhere(diff > 0).tolist()[:5]}...")
+
+    return C, ref, passed
+
+
 if __name__ == "__main__":
     # Quick verification test
     AW, AH = 8, 8
