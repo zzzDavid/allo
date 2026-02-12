@@ -142,48 +142,6 @@ def test_full_matrix_single_invocation():
     return True
 
 
-def test_full_matrix_matches_old_interpreter():
-    """Cross-validate full-matrix output against old per-tile interpreter."""
-    print("\n" + "=" * 60)
-    print("Test: Cross-validation with Old Interpreter")
-    print("=" * 60)
-
-    M, N, K = 8, 8, 16
-    AW, AH = 8, 8
-
-    # Generate shared inputs
-    np.random.seed(42)
-    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
-    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
-
-    # Run new full-matrix model
-    C_new, ref, passed_new = run_full_matrix_gemm(
-        M=M, N=N, K=K, AW=AW, AH=AH, A=A.copy(), B=B.copy(), verbose=True
-    )
-
-    # Run old per-tile model
-    from minisa.interpreter import run_minisa_gemm
-    # run_minisa_gemm uses its own seed=42, so we pass matching inputs
-    output_old, ref_old, passed_old = run_minisa_gemm(
-        M=M, N=N, K=K, AW=AW, AH=AH, verbose=True
-    )
-
-    print(f"\nNew full-matrix output:\n{C_new}")
-    print(f"\nOld interpreter output:\n{output_old}")
-
-    # Both should match numpy reference
-    assert passed_new, "Full-matrix model failed numpy comparison"
-    assert passed_old, "Old interpreter failed numpy comparison"
-
-    # Both should produce same result
-    np.testing.assert_allclose(
-        C_new, output_old, atol=1e-5,
-    )
-
-    print("PASSED: Full-matrix matches old interpreter")
-    return True
-
-
 def test_layout_instruction_decode_on_chip():
     """Verify that layout order fields are read from the instruction array.
 
@@ -452,7 +410,6 @@ def run_full_matrix_tests():
         ("GEMM 16x8x32", test_full_matrix_gemm_16x8x32),
         ("GEMM 16x16x32", test_full_matrix_gemm_16x16x32),
         ("Single invocation", test_full_matrix_single_invocation),
-        ("Cross-validation", test_full_matrix_matches_old_interpreter),
         ("Layout decode on-chip", test_layout_instruction_decode_on_chip),
         ("PE mapping fields", test_pe_mapping_fields_encoded),
         ("Order 0 backward compat", test_order0_backward_compatible),

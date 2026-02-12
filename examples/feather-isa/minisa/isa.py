@@ -242,9 +242,9 @@ class MINISAProgram:
     """A complete MINISA program for a workload.
 
     Contains layout configurations and a sequence of mapping operations.
-    The program is executed by the MINISA interpreter, which lowers
-    each instruction to Allo configuration tensors and invokes the
-    FEATHER+ dataflow region.
+    The program is encoded and passed to the FEATHER+ dataflow region,
+    which decodes instructions on-chip and executes the full matrix
+    computation in a single invocation.
 
     Attributes:
         name: Program name/identifier

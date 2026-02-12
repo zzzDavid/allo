@@ -17,8 +17,7 @@ from .isa import (
     NUM_FIELDS,
 )
 from .lowering import (
-    lower_minisa_program,
     compute_output_col_map,
-    compute_birrd_routing_table,
+    lower_ovn_layout,
+    compute_birrd_params,
 )
-from .interpreter import MINISAInterpreter
