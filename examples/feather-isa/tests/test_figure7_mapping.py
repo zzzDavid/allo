@@ -222,35 +222,30 @@ def test_figure7_no_k_overlap_between_tiles():
 
 
 def test_figure7_functional_gemm():
-    """End-to-end GEMM verification using Figure 7 mapping.
+    """End-to-end GEMM verification using Figure 7 mapping through Allo FEATHER+.
 
-    Uses the parametric mapping to drive a numpy-based simulation:
-    for each tile, collect unique (r, c) pairs, gather the corresponding
-    weight VN slices, and accumulate partial K reductions into C.
-    Verifies the result matches np.dot(A, B).
+    Runs the complete Allo dataflow hardware with the Figure 7 MINISA program
+    (adaptive Gr between tiles) and verifies the result matches numpy reference.
     """
+    from allo.ir.types import int8
+    from minisa.isa import create_figure7_program, encode_program
+    from feather_minisa import build_feather_full_matrix_simulator
+
+    program = create_figure7_program()
+    instructions = encode_program(program)
+
     np.random.seed(7)
-    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int32)
-    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int32)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
-    C_mapped = np.zeros((M, N), dtype=np.int32)
+    mod = build_feather_full_matrix_simulator(
+        M, K, N, AW, AH, int8, len(instructions)
+    )
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, instructions, C)
 
-    for tile in [TILE1, TILE2]:
-        # Collect unique (r, c) pairs from this tile's mapping
-        unique_rc = set()
-        for ah in range(AH):
-            for aw in range(AW):
-                unique_rc.add(tile.get_pe_mapping(ah, aw))
-
-        # Each unique (r, c) contributes a partial K reduction to column c
-        for r, c in unique_rc:
-            k_lo = r * AH
-            k_hi = (r + 1) * AH
-            # C[:, c] += A[:, k_lo:k_hi] @ B[k_lo:k_hi, c]
-            C_mapped[:, c] += A[:, k_lo:k_hi] @ B[k_lo:k_hi, c:c + 1].flatten()
-
-    ref = A @ B
-    np.testing.assert_array_equal(C_mapped, ref)
+    ref = A.astype(np.int32) @ B.astype(np.int32)
+    np.testing.assert_array_equal(C, ref)
 
 
 def test_figure7_tile2_replication_factor():

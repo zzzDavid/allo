@@ -183,11 +183,11 @@ def test_pe_mapping_fields_encoded():
     )
     inst_os = encode_program(program_os)
     # First mapping at index 3
-    assert inst_os[3, 3] == 8, f"OS Gr should be AW=8, got {inst_os[3, 3]}"
+    assert inst_os[3, 3] == 4, f"OS Gr should be AW//2=4, got {inst_os[3, 3]}"
     assert inst_os[3, 4] == 1, f"OS Gc should be 1, got {inst_os[3, 4]}"
-    assert inst_os[3, 5] == 0, f"OS sr should be 0, got {inst_os[3, 5]}"
+    assert inst_os[3, 5] == 1, f"OS sr should be 1, got {inst_os[3, 5]}"
     assert inst_os[3, 6] == 0, f"OS sc should be 0, got {inst_os[3, 6]}"
-    print("  Output-stationary: Gr=8, Gc=1, sr=0, sc=0 encoded correctly")
+    print("  Output-stationary: Gr=4, Gc=1, sr=1, sc=0 encoded correctly")
 
     # Weight-stationary
     program_ws = create_gemm_program(

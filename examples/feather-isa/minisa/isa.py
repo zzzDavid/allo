@@ -337,7 +337,7 @@ def create_gemm_program(
 
     # PE mapping based on dataflow strategy
     if dataflow == "output_stationary":
-        Gr, Gc, sr, sc = AW, 1, 0, 0
+        Gr, Gc, sr, sc = AW // 2, 1, 1, 0
     elif dataflow == "weight_stationary":
         Gr, Gc, sr, sc = 1, AW, 0, 1
     else:
@@ -392,6 +392,74 @@ def create_gemm_program(
                     k_end=(k_tile + 1) * Kt,
                 )
                 program.add_mapping(mapping)
+
+    return program
+
+
+def create_figure7_program() -> MINISAProgram:
+    """Create the MINISA program for Figure 7: C[16,8] = A[16,12] x B[12,8] on 4x4 NEST.
+
+    Figure 7 demonstrates irregular tiling with mapping adaptation.
+    K=12 with AH=4 gives K/AH=3 WVN rows, which cannot be evenly split
+    across 2 PE-column groups. The solution uses two Gr values:
+
+      Gr=2 tiles: 2 K groups per tile, covering WVN rows 0,1 (K=[0,8))
+        - Mt=2 M positions per tile (reduced by BIRRD)
+        - Kt=8 K elements per tile
+
+      Gr=4 tiles: 1 K group per tile, covering WVN row 2 (K=[8,12))
+        - 4 M positions per tile (no BIRRD reduction, pass-through)
+        - Kt=4 K elements per tile
+
+    Returns:
+        MINISAProgram with 24 tile mappings (16 Gr=2 + 8 Gr=4)
+    """
+    AH, AW = 4, 4
+    M, K, N = 16, 12, 8
+    Nt = AH  # N per tile = 4
+
+    program = MINISAProgram(
+        name="figure7",
+        AH=AH,
+        AW=AW,
+        ivn_layout=SetIVNLayout(order=0, ML0=AH, ML1=M // AH, JL0=AH, JL1=K // AH),
+        wvn_layout=SetWVNLayout(order=0, KL0=AH, KL1=K // AH, NL0=min(N, AW), NL1=max(1, N // AW)),
+        ovn_layout=SetOVNLayout(order=0, PL0=AH, PL1=M // AH, QL0=AH, QL1=N // AH),
+    )
+
+    # Gr=2 tiles: 2 M per tile, K=[0,8)
+    Gr2_Mt = 2  # AW // 2
+    Gr2_Kt = 8  # (AW // Gr) * AH = 2 * 4
+    for n_tile in range(N // Nt):
+        for m_tile in range(M // Gr2_Mt):
+            program.add_mapping(SetMapping(
+                r0=(0 * Gr2_Kt) // AH,  # WVN row 0
+                c0=n_tile * Nt,
+                Gr=2, Gc=2, sr=1, sc=4,
+                m_start=m_tile * Gr2_Mt,
+                m_end=(m_tile + 1) * Gr2_Mt,
+                n_start=n_tile * Nt,
+                n_end=(n_tile + 1) * Nt,
+                k_start=0,
+                k_end=Gr2_Kt,
+            ))
+
+    # Gr=4 tiles: 4 M per tile, K=[8,12)
+    Gr4_Mt = 4  # AW (no reduction)
+    Gr4_Kt = 4  # (AW // Gr) * AH = 1 * 4
+    for n_tile in range(N // Nt):
+        for m_tile in range(M // Gr4_Mt):
+            program.add_mapping(SetMapping(
+                r0=Gr2_Kt // AH,  # WVN row 2
+                c0=n_tile * Nt,
+                Gr=4, Gc=2, sr=1, sc=4,
+                m_start=m_tile * Gr4_Mt,
+                m_end=(m_tile + 1) * Gr4_Mt,
+                n_start=n_tile * Nt,
+                n_end=(n_tile + 1) * Nt,
+                k_start=Gr2_Kt,
+                k_end=Gr2_Kt + Gr4_Kt,
+            ))
 
     return program
 

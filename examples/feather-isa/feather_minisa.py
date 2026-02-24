@@ -68,6 +68,11 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
     crossbar reordering, NEST computation, BIRRD reduction, and output
     accumulation through pipelined dataflow kernels.
 
+    Supports parametric mapping: the Gr field from each SetMapping instruction
+    controls K-group splitting in the crossbar. When Gr < AW, BIRRD performs
+    reduction and produces Mt=AW//2 outputs. When Gr == AW, BIRRD passes
+    through and produces AW outputs (no reduction).
+
     Args:
         M: Number of rows in A and C
         K: Shared dimension (cols of A, rows of B)
@@ -92,8 +97,9 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
         A: Ty[M, K],
         B: Ty[K, N],
         instructions: int32[num_inst, 13],
-        birrd_inst: int8[P0, P1],
-        output_col_map: int32[Mt],
+        birrd_inst: int8[num_tiles, P0, P1],
+        output_col_map: int32[num_tiles, AW],
+        output_num_m: int32[num_tiles],
         C: int32[M, N],
     ):
         """Full-matrix FEATHER+ dataflow region.
@@ -101,7 +107,7 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
         Kernels:
         1. crossbar_and_NEST: instruction decode + crossbar + NEST compute
         2. bus: unpack TyPacked to individual connection streams
-        3. inst_rw: distribute BIRRD switch instructions
+        3. inst_rw: distribute per-tile BIRRD switch instructions
         4. BIRRD[P0,P1]: butterfly reduction with compile-time routing
         5. output_accum: col-remap + accumulate tile results into C[M,N]
         """
@@ -124,7 +130,9 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
             """Instruction decode + input/weight crossbar + NEST compute.
 
             Decodes IVN/WVN layout orders from instructions, then for each
-            tile: stages inputs via crossbar, runs NEST, streams packed results.
+            tile: decodes Gr from SetMapping and stages inputs via crossbar
+            (parametric for order-0, hardcoded HalfAW for other orders),
+            runs NEST, and streams packed results.
             """
             # Decode layout orders from first 3 instructions
             ivn_order: int32 = local_instructions[0, 1]
@@ -136,19 +144,21 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
 
             for tile in range(num_tiles):
                 inst_idx: int32 = tile + 3
-                # Decode tile bounds
+                # Decode tile bounds and mapping parameter
+                Gr: int32 = local_instructions[inst_idx, 3]
                 m_start: int32 = local_instructions[inst_idx, 7]
                 n_start: int32 = local_instructions[inst_idx, 9]
                 k_start: int32 = local_instructions[inst_idx, 11]
 
                 # === Input Crossbar (IVN order-dependent reordering) ===
+                # Order-0 uses parametric Gr; other orders use HalfAW
                 for ic_i in range(AH):
                     for ic_j in range(AW):
                         m_idx: int32 = 0
                         k_idx: int32 = 0
-                        if ivn_order == 0:  # ORDER_012
-                            m_idx = m_start + (ic_j % Mt)
-                            k_idx = k_start + ic_i + (ic_j // Mt) * AH
+                        if ivn_order == 0:  # ORDER_012 (parametric)
+                            m_idx = m_start + (ic_j % Gr)
+                            k_idx = k_start + ic_i + (ic_j // Gr) * AH
                         elif ivn_order == 1:  # ORDER_021
                             m_idx = m_start + (ic_j // Mt)
                             k_idx = k_start + ic_i + (ic_j % Mt) * AH
@@ -167,13 +177,14 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
                         iActs[ic_i, ic_j] = local_A[m_idx, k_idx]
 
                 # === Weight Crossbar (WVN order-dependent reordering) ===
+                # Order-0 uses parametric Gr; other orders use HalfAW
                 for wc_i in range(AH):
                     for wc_w in range(AW):
                         for wc_k in range(AH):
                             wk_idx: int32 = 0
                             wn_idx: int32 = 0
-                            if wvn_order == 0:  # ORDER_012
-                                wk_idx = k_start + wc_k + (wc_w // HalfAW) * AH
+                            if wvn_order == 0:  # ORDER_012 (parametric)
+                                wk_idx = k_start + wc_k + (wc_w // Gr) * AH
                                 wn_idx = n_start + wc_i
                             elif wvn_order == 1:  # ORDER_021
                                 wk_idx = k_start + wc_k + wc_i * AH
@@ -216,79 +227,86 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
                     connection[0, i].put(array[i * Ty.bits : (i + 1) * Ty.bits])
 
         @df.kernel(mapping=[1], args=[birrd_inst])
-        def inst_rw(local_birrd_inst: int8[P0, P1]):
-            """Distribute BIRRD switch instructions to all stages."""
-            with allo.meta_for(P0) as i:
-                with allo.meta_for(P1) as j:
-                    inst_input[i, j].put(local_birrd_inst[i, j])
+        def inst_rw(local_birrd_inst: int8[num_tiles, P0, P1]):
+            """Distribute per-tile BIRRD switch instructions."""
+            for tile in range(num_tiles):
+                with allo.meta_for(P0) as i:
+                    with allo.meta_for(P1) as j:
+                        inst_input[i, j].put(local_birrd_inst[tile, i, j])
 
         @df.kernel(mapping=[P0, P1])
         def BIRRD():
             """BIRRD butterfly reduction/reorder network.
 
-            Each instance is one switch. Reads instruction once,
-            then processes num_tiles * AH iterations.
+            Each instance is one switch. Reads a new instruction per tile,
+            then processes AH iterations for that tile.
             Uses compile-time reverse_bits() routing.
             """
             i, j = df.get_pid()
-            inst_val = inst_input[i, j].get()
 
-            for _ in range(num_tiles * AH):
-                in_left: Ty = connection[i, 2 * j].get()
-                in_right: Ty = connection[i, 2 * j + 1].get()
+            for _tile in range(num_tiles):
+                inst_val = inst_input[i, j].get()
 
-                out_left: Ty = 0
-                out_right: Ty = 0
+                for _ in range(AH):
+                    in_left: Ty = connection[i, 2 * j].get()
+                    in_right: Ty = connection[i, 2 * j + 1].get()
 
-                if inst_val == 0:  # PS: pass
-                    out_left = in_left
-                    out_right = in_right
-                elif inst_val == 1:  # AR: add-right
-                    out_left = in_left
-                    out_right = in_left + in_right
-                elif inst_val == 2:  # AL: add-left
-                    out_left = in_left + in_right
-                    out_right = in_right
-                else:  # SW: swap
-                    out_left = in_right
-                    out_right = in_left
+                    out_left: Ty = 0
+                    out_right: Ty = 0
 
-                # Route to next stage with bit-reversal
-                with allo.meta_if(i != P0 - 1):
-                    connection[
-                        i + 1,
-                        reverse_bits(
-                            2 * j,
-                            2 if i == 0 else min(LOG2_AW, 2 + i, 2 * LOG2_AW - i),
-                        ),
-                    ].put(out_left)
-                    connection[
-                        i + 1,
-                        reverse_bits(
-                            2 * j + 1,
-                            2 if i == 0 else min(LOG2_AW, 2 + i, 2 * LOG2_AW - i),
-                        ),
-                    ].put(out_right)
-                with allo.meta_else():
-                    # Last stage: direct output
-                    connection[P0, 2 * j].put(out_left)
-                    connection[P0, 2 * j + 1].put(out_right)
+                    if inst_val == 0:  # PS: pass
+                        out_left = in_left
+                        out_right = in_right
+                    elif inst_val == 1:  # AR: add-right
+                        out_left = in_left
+                        out_right = in_left + in_right
+                    elif inst_val == 2:  # AL: add-left
+                        out_left = in_left + in_right
+                        out_right = in_right
+                    else:  # SW: swap
+                        out_left = in_right
+                        out_right = in_left
 
-        @df.kernel(mapping=[1], args=[instructions, output_col_map, C])
+                    # Route to next stage with bit-reversal
+                    with allo.meta_if(i != P0 - 1):
+                        connection[
+                            i + 1,
+                            reverse_bits(
+                                2 * j,
+                                2 if i == 0 else min(LOG2_AW, 2 + i, 2 * LOG2_AW - i),
+                            ),
+                        ].put(out_left)
+                        connection[
+                            i + 1,
+                            reverse_bits(
+                                2 * j + 1,
+                                2 if i == 0 else min(LOG2_AW, 2 + i, 2 * LOG2_AW - i),
+                            ),
+                        ].put(out_right)
+                    with allo.meta_else():
+                        # Last stage: direct output
+                        connection[P0, 2 * j].put(out_left)
+                        connection[P0, 2 * j + 1].put(out_right)
+
+        @df.kernel(mapping=[1], args=[instructions, output_col_map, output_num_m, C])
         def output_accum(
             local_instructions: int32[num_inst, 13],
-            local_output_col_map: int32[Mt],
+            local_output_col_map: int32[num_tiles, AW],
+            local_output_num_m: int32[num_tiles],
             local_C: int32[M, N],
         ):
             """Accumulate BIRRD output into C[M,N] with col remapping.
 
             For each tile: reads tile bounds from instructions, collects
             BIRRD output, remaps columns, and accumulates into C.
+            Supports both reduction mode (Gr < AW, Mt outputs) and
+            pass-through mode (Gr == AW, AW outputs).
             """
             for tile in range(num_tiles):
                 inst_idx: int32 = tile + 3
                 m_start: int32 = local_instructions[inst_idx, 7]
                 n_start: int32 = local_instructions[inst_idx, 9]
+                num_m: int32 = local_output_num_m[tile]
 
                 # Collect BIRRD output for this tile
                 tile_out: Ty[AH, AW]
@@ -297,12 +315,13 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
                         tile_out[d, aw_i] = connection[P0, aw_i].get()
 
                 # Accumulate into C with column remapping
-                for om in range(Mt):
-                    col: int32 = local_output_col_map[om]
-                    for on in range(AH):
-                        local_C[m_start + om, n_start + on] = (
-                            local_C[m_start + om, n_start + on] + tile_out[on, col]
-                        )
+                for om in range(AW):
+                    if om < num_m:
+                        col: int32 = local_output_col_map[tile, om]
+                        for on in range(AH):
+                            local_C[m_start + om, n_start + on] = (
+                                local_C[m_start + om, n_start + on] + tile_out[on, col]
+                            )
 
     return full_matrix_top
 
@@ -311,8 +330,12 @@ class FeatherFullMatrixModule:
     """Wrapper that provides clean (A, B, instructions, C) interface.
 
     Precomputes all BIRRD configs at build time for all 6 OVN orders.
-    At call time, extracts OVN order from instructions and passes the
-    correct config to the internal Allo module.
+    At call time, extracts OVN order and per-tile Gr from instructions
+    to build per-tile BIRRD instructions and output column maps.
+
+    Per-tile logic:
+    - Gr < AW (reduction mode): uses standard BIRRD reduction, Mt outputs
+    - Gr == AW (pass-through mode): all-PS BIRRD, AW outputs with identity map
 
     The dataflow BIRRD uses compile-time reverse_bits() routing, so
     route_left/route_right are not needed.
@@ -324,6 +347,9 @@ class FeatherFullMatrixModule:
 
         self._mod = allo_mod
         self._AW = AW
+        P0, P1 = compute_birrd_params(AW)
+        self._P0 = P0
+        self._P1 = P1
         # Precompute BIRRD tables + col maps for all 6 OVN orders
         self._birrd_tables = {}
         self._col_maps = {}
@@ -335,10 +361,34 @@ class FeatherFullMatrixModule:
     def __call__(self, A, B, instructions, C):
         # OVN order is at instructions[2, 1] (row 2 = SetOVNLayout, field 1 = order)
         ovn_order = int(instructions[2, 1])
+        AW = self._AW
+        Mt = AW // 2
+        P0, P1 = self._P0, self._P1
+        num_tiles = len(instructions) - 3
+
+        # Build per-tile BIRRD instructions and output mappings
+        birrd_per_tile = np.zeros((num_tiles, P0, P1), dtype=np.int8)
+        col_map_per_tile = np.zeros((num_tiles, AW), dtype=np.int32)
+        num_m_per_tile = np.zeros(num_tiles, dtype=np.int32)
+
+        for t in range(num_tiles):
+            Gr = int(instructions[3 + t, 3])
+            if Gr < AW:
+                # Reduction mode: standard BIRRD + col_map
+                birrd_per_tile[t] = self._birrd_tables[ovn_order]
+                col_map_per_tile[t, :Mt] = self._col_maps[ovn_order]
+                num_m_per_tile[t] = Mt
+            else:
+                # Pass-through mode: all-PS BIRRD + identity col_map
+                # birrd_per_tile[t] is already all zeros (PS=0)
+                col_map_per_tile[t] = np.arange(AW, dtype=np.int32)
+                num_m_per_tile[t] = AW
+
         self._mod(
             A, B, instructions,
-            self._birrd_tables[ovn_order],
-            self._col_maps[ovn_order],
+            birrd_per_tile,
+            col_map_per_tile,
+            num_m_per_tile,
             C,
         )
 
