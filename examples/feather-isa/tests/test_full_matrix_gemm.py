@@ -396,6 +396,64 @@ def test_ovn_order_all_correct():
     return True
 
 
+def test_r0_c0_tile_advancement():
+    """Verify r0/c0 advance correctly per MINISA paper equations (2)-(3).
+
+    Per the paper, SetMapping.r0 is the base WVN row index (K dimension,
+    VN granularity) and c0 is the base WVN column index (N dimension).
+    For tiled execution:
+        r0 = k_start // AH   (VN row = element row / AH)
+        c0 = n_start          (VN column = element column)
+    """
+    print("\n" + "=" * 60)
+    print("Test: r0/c0 Tile Advancement (Paper Eq. 2-3)")
+    print("=" * 60)
+
+    # Use dimensions that produce multiple tiles along both K and N
+    M, N, K, AH, AW = 8, 16, 32, 8, 8
+    Mt = AW // 2   # 4
+    Nt = AH         # 8
+    Kt = 2 * AH     # 16
+
+    program = create_gemm_program(M=M, N=N, K=K, AH=AH, AW=AW)
+    inst = encode_program(program)
+
+    # Expect N//Nt=2 n-tiles, M//Mt=2 m-tiles, K//Kt=2 k-tiles => 8 mappings
+    num_mappings = (N // Nt) * (M // Mt) * (K // Kt)
+    assert len(program.mappings) == num_mappings, \
+        f"Expected {num_mappings} mappings, got {len(program.mappings)}"
+
+    for i, mapping in enumerate(program.mappings):
+        expected_r0 = mapping.k_start // AH
+        expected_c0 = mapping.n_start
+        assert mapping.r0 == expected_r0, \
+            f"Tile {i}: r0={mapping.r0}, expected k_start//AH={expected_r0} " \
+            f"(k_start={mapping.k_start}, AH={AH})"
+        assert mapping.c0 == expected_c0, \
+            f"Tile {i}: c0={mapping.c0}, expected n_start={expected_c0}"
+
+        # Also verify encoded instruction array matches
+        inst_row = inst[3 + i]
+        assert inst_row[1] == expected_r0, \
+            f"Tile {i}: encoded r0={inst_row[1]}, expected {expected_r0}"
+        assert inst_row[2] == expected_c0, \
+            f"Tile {i}: encoded c0={inst_row[2]}, expected {expected_c0}"
+
+        print(f"  tile[{i}]: r0={mapping.r0}, c0={mapping.c0} "
+              f"(k_start={mapping.k_start}, n_start={mapping.n_start})")
+
+    # Verify r0 and c0 are not all zero (i.e., they actually advance)
+    r0_values = {m.r0 for m in program.mappings}
+    c0_values = {m.c0 for m in program.mappings}
+    assert len(r0_values) > 1, f"r0 should vary across tiles, got only {r0_values}"
+    assert len(c0_values) > 1, f"c0 should vary across tiles, got only {c0_values}"
+
+    print(f"  r0 values: {sorted(r0_values)}")
+    print(f"  c0 values: {sorted(c0_values)}")
+    print("PASSED: r0/c0 tile advancement")
+    return True
+
+
 def run_full_matrix_tests():
     """Run all full-matrix GEMM tests."""
     print("=" * 70)
@@ -417,6 +475,7 @@ def run_full_matrix_tests():
         ("IVN order affects output", test_ivn_order_affects_output),
         ("WVN order affects output", test_wvn_order_affects_output),
         ("OVN order all correct", test_ovn_order_all_correct),
+        ("r0/c0 tile advancement", test_r0_c0_tile_advancement),
     ]
 
     for name, test_fn in tests:

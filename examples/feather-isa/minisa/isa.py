@@ -378,8 +378,8 @@ def create_gemm_program(
         for m_tile in range(M // Mt):
             for k_tile in range(K // Kt):
                 mapping = SetMapping(
-                    r0=0,
-                    c0=0,
+                    r0=k_tile * Kt // AH,
+                    c0=n_tile * Nt,
                     Gr=Gr,
                     Gc=Gc,
                     sr=sr,
