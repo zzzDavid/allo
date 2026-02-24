@@ -1,7 +1,7 @@
 # Parametric Mapping and Figure 7 End-to-End Verification Report
 
 **Date:** 2026-02-24
-**Status:** VERIFIED - All 21 tests pass (13 existing + 8 Figure 7)
+**Status:** VERIFIED - All 28 tests pass (13 simulator + 8 Figure 7 mapping + 5 HLS csim + 2 Figure 7 HLS)
 
 ## Executive Summary
 
@@ -134,7 +134,50 @@ This exercises the complete dataflow path: instruction decode, parametric
 crossbar with Gr=2 and Gr=4, NEST computation, per-tile BIRRD
 (reduction/pass-through), and parametric output accumulation.
 
-### 7. Existing Test Update (`tests/test_full_matrix_gemm.py`)
+### 7. HLS Dataflow Compliance (`feather_minisa.py`)
+
+Two structural changes ensure the generated HLS kernel passes Vitis HLS dataflow
+checking without post-generation patching:
+
+**Separate instruction arrays for crossbar and output_accum:**
+HLS dataflow requires single-reader-single-writer per buffer.  The original
+design passed `instructions` to both `crossbar_and_NEST` and `output_accum`,
+creating two readers of the same buffer.  The fix precomputes `accum_m_start`
+and `accum_n_start` arrays (the only fields `output_accum` needs from
+instructions) and passes them as separate parameters.  The wrapper extracts
+these from the instruction array at call time.
+
+**Local accumulation buffer in output_accum:**
+The original `output_accum` performed read-modify-write on `C`, causing the
+HLS backend to generate both `load_buf` (to load C from memory) and
+`store_res` (to write C back).  Since `output_accum` also writes to C, this
+creates a multi-writer violation.  The fix uses a local `accum[M,N]` buffer
+(zero-initialized inside the kernel) for tile accumulation, then copies the
+final result to `local_C` in a single write pass.  This makes C output-only
+in the kernel, eliminating the load-buf process.
+
+### 8. HLS Tests (`tests/test_figure7_hls.py`)
+
+Added two HLS tests for the Figure 7 case study:
+
+- **CSim**: Builds the full FEATHER+ dataflow with `build_feather_full_matrix_hls`
+  and runs through Vitis HLS C simulation.  Verifies output matches numpy reference.
+
+- **CSynth**: Builds the dataflow in `csyn` mode, runs Vitis HLS C synthesis,
+  and parses the synthesis report to extract cycle count and resource utilization.
+
+Synthesis results (Vitis HLS 2023.2, xcu280, 3.33 ns clock):
+
+| Metric | Value |
+|--------|-------|
+| Latency (worst) | 1804 cycles |
+| Estimated clock | 2.752 ns |
+| BRAM_18K | 21 |
+| DSP | 9 |
+| FF | 45,973 |
+| LUT | 45,407 |
+
+### 9. Existing Test Update (`tests/test_full_matrix_gemm.py`)
 
 `test_pe_mapping_fields_encoded` expectations updated from `Gr=8, sr=0` to
 `Gr=4, sr=1` for output-stationary dataflow, matching the corrected ISA
@@ -143,64 +186,73 @@ parameters.
 ## Dataflow Diagram
 
 ```
-  instructions[num_inst, 13]
-         │
-         ├──────────────────────────────────────────────────────────┐
-         ▼                                                          │
-  ┌──────────────────────────────────────────┐                     │
-  │        crossbar_and_NEST                 │                     │
-  │                                          │                     │
-  │  Decode: Gr = instructions[tile+3, 3]    │                     │
-  │                                          │                     │
-  │  IVN order-0:                            │                     │
-  │    m_idx = m_start + (aw % Gr)           │                     │
-  │    k_idx = k_start + ah + (aw//Gr)*AH    │                     │
-  │                                          │                     │
-  │  WVN order-0:                            │                     │
-  │    wk_idx = k_start + wk + (ww//Gr)*AH   │                     │
-  │    wn_idx = n_start + wi                 │                     │
-  │                                          │                     │
-  │  NEST: AH x AW PE dot products          │                     │
-  └────────────────┬─────────────────────────┘                     │
-                   │ nest_out [TyPacked, AH]                       │
-                   ▼                                               │
-  ┌──────────────────────┐                                         │
-  │        bus            │                                         │
-  │  Unpack to AW streams │                                         │
-  └────────────┬─────────┘                                         │
-               │ connection[0, 0..AW-1]                            │
-               ▼                                                   │
-  ┌──────────────────────────────────────┐    birrd_inst            │
-  │  inst_rw                             │  [num_tiles, P0, P1]    │
-  │  Send per-tile BIRRD instructions    │──────┐                  │
-  └──────────────────────────────────────┘      │                  │
-                                                ▼                  │
-  ┌──────────────────────────────────────────────────┐             │
-  │  BIRRD [P0 x P1 switches]                        │             │
-  │                                                  │             │
-  │  Per tile: read inst_val, process AH iterations  │             │
-  │                                                  │             │
-  │  Gr < AW:  reduction BIRRD (AR/AL/SW/PS)         │             │
-  │  Gr == AW: pass-through BIRRD (all PS)           │             │
-  └────────────────────┬─────────────────────────────┘             │
-                       │ connection[P0, 0..AW-1]                   │
-                       ▼                                           │
-  ┌──────────────────────────────────────────────────┐             │
-  │  output_accum                                    │◄────────────┘
-  │                                                  │  instructions,
-  │  Per tile: read num_m, col_map from arrays       │  output_col_map,
-  │                                                  │  output_num_m
+  instructions[num_inst, 13]         accum_m_start[num_tiles]
+         │                           accum_n_start[num_tiles]
+         │                                    │
+         ▼                                    │
+  ┌──────────────────────────────────────────┐│
+  │        crossbar_and_NEST                 ││
+  │                                          ││
+  │  Decode: Gr = instructions[tile+3, 3]    ││
+  │                                          ││
+  │  IVN order-0:                            ││
+  │    m_idx = m_start + (aw % Gr)           ││
+  │    k_idx = k_start + ah + (aw//Gr)*AH    ││
+  │                                          ││
+  │  WVN order-0:                            ││
+  │    wk_idx = k_start + wk + (ww//Gr)*AH   ││
+  │    wn_idx = n_start + wi                 ││
+  │                                          ││
+  │  NEST: AH x AW PE dot products          ││
+  └────────────────┬─────────────────────────┘│
+                   │ nest_out [TyPacked, AH]  │
+                   ▼                          │
+  ┌──────────────────────┐                    │
+  │        bus            │                    │
+  │  Unpack to AW streams │                    │
+  └────────────┬─────────┘                    │
+               │ connection[0, 0..AW-1]       │
+               ▼                              │
+  ┌──────────────────────────────────────┐    │   birrd_inst
+  │  inst_rw                             │    │  [num_tiles, P0, P1]
+  │  Send per-tile BIRRD instructions    │────│──┐
+  └──────────────────────────────────────┘    │  │
+                                              │  ▼
+  ┌──────────────────────────────────────────────────┐
+  │  BIRRD [P0 x P1 switches]                        │
+  │                                                  │
+  │  Per tile: read inst_val, process AH iterations  │
+  │                                                  │
+  │  Gr < AW:  reduction BIRRD (AR/AL/SW/PS)         │
+  │  Gr == AW: pass-through BIRRD (all PS)           │
+  └────────────────────┬─────────────────────────────┘
+                       │ connection[P0, 0..AW-1]
+                       ▼
+  ┌──────────────────────────────────────────────────┐
+  │  output_accum                                    │◄──── accum_m_start,
+  │                                                  │      accum_n_start,
+  │  Local accum[M,N] buffer (zero-init)             │      output_col_map,
+  │  Per tile: read num_m, col_map from arrays       │      output_num_m
+  │                                                  │
   │  Reduction (num_m=Mt):                           │
-  │    C[m_start+om, n_start+on] += out[on, col[om]] │
+  │    accum[m+om, n+on] += out[on, col[om]]         │
   │                                                  │
   │  Pass-through (num_m=AW):                        │
-  │    C[m_start+om, n_start+on] += out[on, om]      │
+  │    accum[m+om, n+on] += out[on, om]              │
+  │                                                  │
+  │  Final: C[i,j] = accum[i,j]  (write-only)       │
   └──────────────────────────────────────────────────┘
 ```
 
+**HLS dataflow compliance:** The `instructions` buffer is only read by
+`crossbar_and_NEST` (single reader). The `output_accum` kernel receives
+precomputed `accum_m_start`/`accum_n_start` arrays instead of sharing
+`instructions`. The `C` output is write-only in `output_accum` (uses a
+local accumulation buffer), so no `load_buf` process is generated.
+
 ## Test Results
 
-### Existing Tests (backward compatibility): 13/13 PASSED
+### Existing Simulator Tests (backward compatibility): 13/13 PASSED
 
 ```
 tests/test_full_matrix_gemm.py::test_full_matrix_gemm_8x8x16         PASSED
@@ -218,7 +270,7 @@ tests/test_full_matrix_gemm.py::test_ovn_order_all_correct            PASSED
 tests/test_full_matrix_gemm.py::test_r0_c0_tile_advancement           PASSED
 ```
 
-### Figure 7 Tests: 8/8 PASSED
+### Figure 7 Mapping Tests: 8/8 PASSED
 
 ```
 tests/test_figure7_mapping.py::test_figure7_tile1_pe_mapping          PASSED
@@ -231,11 +283,34 @@ tests/test_figure7_mapping.py::test_figure7_functional_gemm           PASSED  <-
 tests/test_figure7_mapping.py::test_figure7_tile2_replication_factor  PASSED
 ```
 
+### Existing HLS CSim Tests: 5/5 PASSED
+
+```
+tests/test_full_matrix_hls_csim.py::test_hls_csim_gemm_8x8x16       PASSED
+tests/test_full_matrix_hls_csim.py::test_hls_csim_gemm_16x8x32      PASSED
+tests/test_full_matrix_hls_csim.py::test_hls_csim_gemm_16x16x32     PASSED
+tests/test_full_matrix_hls_csim.py::test_hls_csim_ovn_orders         PASSED
+tests/test_full_matrix_hls_csim.py::test_hls_csim_matches_simulator  PASSED
+```
+
+### Figure 7 HLS Tests: 2/2 PASSED
+
+```
+tests/test_figure7_hls.py::test_figure7_hls_csim                     PASSED
+tests/test_figure7_hls.py::test_figure7_hls_csynth                   PASSED
+```
+
+CSynth results (Vitis HLS 2023.2, xcu280-fsvh2892-2L-e, 3.33 ns clock):
+- Latency: 1804 cycles (worst case)
+- Estimated clock: 2.752 ns
+- Resources: 21 BRAM_18K, 9 DSP, 45,973 FF, 45,407 LUT
+
 ## Files Modified
 
 | File | Change |
 |------|--------|
 | `minisa/isa.py` | Fixed output-stationary Gr/sr; added `create_figure7_program()` |
-| `feather_minisa.py` | Parametric crossbar, per-tile BIRRD, parametric output_accum, wrapper |
+| `feather_minisa.py` | Parametric crossbar, per-tile BIRRD, parametric output_accum, HLS dataflow compliance, wrapper |
 | `tests/test_figure7_mapping.py` | Replaced numpy test with Allo end-to-end test |
 | `tests/test_full_matrix_gemm.py` | Updated expected Gr/sr values for output-stationary |
+| `tests/test_figure7_hls.py` | New: HLS csim (functional) and csynth (cycle count) tests |

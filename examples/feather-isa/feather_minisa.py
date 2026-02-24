@@ -100,6 +100,8 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
         birrd_inst: int8[num_tiles, P0, P1],
         output_col_map: int32[num_tiles, AW],
         output_num_m: int32[num_tiles],
+        accum_m_start: int32[num_tiles],
+        accum_n_start: int32[num_tiles],
         C: int32[M, N],
     ):
         """Full-matrix FEATHER+ dataflow region.
@@ -110,6 +112,11 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
         3. inst_rw: distribute per-tile BIRRD switch instructions
         4. BIRRD[P0,P1]: butterfly reduction with compile-time routing
         5. output_accum: col-remap + accumulate tile results into C[M,N]
+
+        Note: output_accum receives precomputed m_start/n_start arrays
+        (accum_m_start, accum_n_start) instead of reading from the shared
+        instructions array.  This avoids an HLS dataflow violation where two
+        kernels would read the same buffer.
         """
 
         # Stream from NEST to bus
@@ -288,24 +295,36 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
                         connection[P0, 2 * j].put(out_left)
                         connection[P0, 2 * j + 1].put(out_right)
 
-        @df.kernel(mapping=[1], args=[instructions, output_col_map, output_num_m, C])
+        @df.kernel(mapping=[1], args=[output_col_map, output_num_m, accum_m_start, accum_n_start, C])
         def output_accum(
-            local_instructions: int32[num_inst, 13],
             local_output_col_map: int32[num_tiles, AW],
             local_output_num_m: int32[num_tiles],
+            local_accum_m_start: int32[num_tiles],
+            local_accum_n_start: int32[num_tiles],
             local_C: int32[M, N],
         ):
             """Accumulate BIRRD output into C[M,N] with col remapping.
 
-            For each tile: reads tile bounds from instructions, collects
+            For each tile: reads precomputed m_start/n_start, collects
             BIRRD output, remaps columns, and accumulates into C.
             Supports both reduction mode (Gr < AW, Mt outputs) and
             pass-through mode (Gr == AW, AW outputs).
+
+            Uses precomputed m_start/n_start arrays instead of reading from
+            the shared instructions buffer (avoids HLS dataflow violation).
+            Uses a local accumulation buffer so that local_C is write-only
+            (avoids load_buf/output_accum multi-writer violation).
             """
+            # Local accumulation buffer — avoids read-modify-write on local_C
+            # so that the HLS backend treats C as output-only (no load_buf).
+            accum: int32[M, N]
+            for _ai in range(M):
+                for _aj in range(N):
+                    accum[_ai, _aj] = 0
+
             for tile in range(num_tiles):
-                inst_idx: int32 = tile + 3
-                m_start: int32 = local_instructions[inst_idx, 7]
-                n_start: int32 = local_instructions[inst_idx, 9]
+                m_start: int32 = local_accum_m_start[tile]
+                n_start: int32 = local_accum_n_start[tile]
                 num_m: int32 = local_output_num_m[tile]
 
                 # Collect BIRRD output for this tile
@@ -314,14 +333,19 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
                     with allo.meta_for(AW) as aw_i:
                         tile_out[d, aw_i] = connection[P0, aw_i].get()
 
-                # Accumulate into C with column remapping
+                # Accumulate into local buffer with column remapping
                 for om in range(AW):
                     if om < num_m:
                         col: int32 = local_output_col_map[tile, om]
                         for on in range(AH):
-                            local_C[m_start + om, n_start + on] = (
-                                local_C[m_start + om, n_start + on] + tile_out[on, col]
+                            accum[m_start + om, n_start + on] = (
+                                accum[m_start + om, n_start + on] + tile_out[on, col]
                             )
+
+            # Write final result to output (write-only access to local_C)
+            for _wi in range(M):
+                for _wj in range(N):
+                    local_C[_wi, _wj] = accum[_wi, _wj]
 
     return full_matrix_top
 
@@ -384,11 +408,24 @@ class FeatherFullMatrixModule:
                 col_map_per_tile[t] = np.arange(AW, dtype=np.int32)
                 num_m_per_tile[t] = AW
 
+        # Precompute m_start/n_start per tile for output_accum
+        # (avoids sharing the instructions buffer with crossbar_and_NEST)
+        m_start_per_tile = np.array(
+            [int(instructions[3 + t, 7]) for t in range(num_tiles)],
+            dtype=np.int32,
+        )
+        n_start_per_tile = np.array(
+            [int(instructions[3 + t, 9]) for t in range(num_tiles)],
+            dtype=np.int32,
+        )
+
         self._mod(
             A, B, instructions,
             birrd_per_tile,
             col_map_per_tile,
             num_m_per_tile,
+            m_start_per_tile,
+            n_start_per_tile,
             C,
         )
 
