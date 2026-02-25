@@ -13,7 +13,7 @@ jobs:
   fpga_test:
     runs-on: [brg-zhang-xcel]
     container:
-      image: zzzdavid/allo-fpga:latest
+      image: chhzh123/allo:latest
       options: >-
         -v /opt/xilinx/Vitis:/opt/xilinx/Vitis
         -v /opt/xilinx/Vitis_HLS:/opt/xilinx/Vitis_HLS
@@ -24,6 +24,10 @@ jobs:
       VITIS: /opt/xilinx/Vitis/2023.2
       HLS_INCLUDE: /opt/xilinx/Vitis_HLS/2023.2/include
       XDEVICE: /opt/xilinx/platforms/xilinx_u280_gen3x16_xdma_1_202211_1/xilinx_u280_gen3x16_xdma_1_202211_1.xpfm
+      XILINX_VITIS: /opt/xilinx/Vitis/2023.2
+      XILINX_VIVADO: /opt/xilinx/Vivado/2023.2
+      XILINX_HLS: /opt/xilinx/Vitis_HLS/2023.2
+      ALLO_HLS_MODE: csyn
       LANG: en_US.UTF-8
       LC_ALL: en_US.UTF-8
     steps:
@@ -48,13 +52,6 @@ jobs:
       run: |
         source activate allo
         export LLVM_BUILD_DIR=/root/llvm-project/build
-        # Use container's own XRT (not host-mounted) to avoid library conflicts
-        source /opt/xilinx/xrt/setup.sh
-        # Source individual tool settings (not top-level settings64.sh which
-        # references /vol/apps/xilinx/ paths that don't exist in the container)
-        source /opt/xilinx/Vivado/2023.2/.settings64-Vivado.sh
-        source /opt/xilinx/Vitis_HLS/2023.2/.settings64-Vitis_HLS.sh
-        export XILINX_VITIS=/opt/xilinx/Vitis/2023.2
-        export PATH=/opt/xilinx/Vitis/2023.2/bin:$PATH
+        export PATH=/opt/xilinx/Vitis/2023.2/bin:/opt/xilinx/Vivado/2023.2/bin:/opt/xilinx/Vitis_HLS/2023.2/bin:$PATH
         cd examples/feather
         python gemm.py
