@@ -13,9 +13,12 @@ jobs:
   fpga_test:
     runs-on: [brg-zhang-xcel]
     container:
-      image: chhzh123/allo:latest
+      image: zzzdavid/allo-fpga:latest
       options: >-
-        -v /opt/xilinx:/opt/xilinx
+        -v /opt/xilinx/Vitis:/opt/xilinx/Vitis
+        -v /opt/xilinx/Vitis_HLS:/opt/xilinx/Vitis_HLS
+        -v /opt/xilinx/Vivado:/opt/xilinx/Vivado
+        -v /opt/xilinx/platforms:/opt/xilinx/platforms
     env:
       XILINXD_LICENSE_FILE: 2100@en-license-05.coecis.cornell.edu
       VITIS: /opt/xilinx/Vitis/2023.2
@@ -24,29 +27,12 @@ jobs:
       LANG: en_US.UTF-8
       LC_ALL: en_US.UTF-8
     steps:
-    - name: Install dependencies and setup environment
+    - name: Install git and setup locale in container
       run: |
         apt-get update && apt-get -y install git locales
         sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen
         locale-gen en_US.UTF-8
         git config --global --add safe.directory "$GITHUB_WORKSPACE"
-        # Fix missing libraries for host-mounted XRT
-        # Create Boost 1.75.0 symlinks if container has a different version
-        for lib in /usr/lib/x86_64-linux-gnu/libboost_*.so.1.7*.0; do
-          [ -f "$lib" ] && ln -sf "$lib" "$(echo $lib | sed 's/\.1\.7[0-9]\.0/.1.75.0/')" 2>/dev/null || true
-        done
-        # libcrypt.so.2 - link from conda if available, or install
-        if [ -f /root/miniforge/lib/libcrypt.so.2 ]; then
-          ln -sf /root/miniforge/lib/libcrypt.so.2 /usr/lib/x86_64-linux-gnu/libcrypt.so.2
-        elif [ -f /root/miniconda3/lib/libcrypt.so.2 ]; then
-          ln -sf /root/miniconda3/lib/libcrypt.so.2 /usr/lib/x86_64-linux-gnu/libcrypt.so.2
-        fi
-        # Debug: check XRT library dependencies
-        echo "--- XRT library check ---"
-        ldd /opt/xilinx/xrt/lib/libxilinxopencl.so 2>&1 | grep "not found" || echo "libxilinxopencl deps OK"
-        ldd /opt/xilinx/xrt/lib/libxrt_hwemu.so 2>&1 | grep "not found" || echo "libxrt_hwemu deps OK"
-        /opt/xilinx/xrt/bin/unwrapped/xclbinutil --version || echo "xclbinutil check failed"
-        echo "--- End XRT check ---"
     - uses: actions/checkout@v4
       with:
         ref: main
@@ -62,8 +48,10 @@ jobs:
       run: |
         source activate allo
         export LLVM_BUILD_DIR=/root/llvm-project/build
+        # Use container's own XRT (not host-mounted) to avoid library conflicts
         source /opt/xilinx/xrt/setup.sh
-        # Source individual Xilinx tool settings (avoid top-level settings64.sh)
+        # Source individual tool settings (not top-level settings64.sh which
+        # references /vol/apps/xilinx/ paths that don't exist in the container)
         source /opt/xilinx/Vivado/2023.2/.settings64-Vivado.sh
         source /opt/xilinx/Vitis_HLS/2023.2/.settings64-Vitis_HLS.sh
         export XILINX_VITIS=/opt/xilinx/Vitis/2023.2
