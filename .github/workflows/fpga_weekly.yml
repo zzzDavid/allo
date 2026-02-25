@@ -47,4 +47,4 @@ jobs:
         source /opt/xilinx/xrt/setup.sh
         source $VITIS/settings64.sh
         cd examples/feather
-        ALLO_FPGA_HW_MODE=1 python gemm.py
+        python gemm.py
