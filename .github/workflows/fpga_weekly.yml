@@ -13,26 +13,27 @@ jobs:
   fpga_test:
     runs-on: [brg-zhang-xcel]
     container:
-      image: zzzdavid/allo-fpga:latest
+      image: chhzh123/allo:latest
       options: >-
-        -v /opt/xilinx:/opt/xilinx
+        -v /opt/xilinx/Vitis:/opt/xilinx/Vitis
+        -v /opt/xilinx/Vitis_HLS:/opt/xilinx/Vitis_HLS
+        -v /opt/xilinx/Vivado:/opt/xilinx/Vivado
+        -v /opt/xilinx/platforms:/opt/xilinx/platforms
     env:
       XILINXD_LICENSE_FILE: 2100@en-license-05.coecis.cornell.edu
       VITIS: /opt/xilinx/Vitis/2023.2
       HLS_INCLUDE: /opt/xilinx/Vitis_HLS/2023.2/include
       XDEVICE: /opt/xilinx/platforms/xilinx_u280_gen3x16_xdma_1_202211_1/xilinx_u280_gen3x16_xdma_1_202211_1.xpfm
+      XILINX_VITIS: /opt/xilinx/Vitis/2023.2
+      XILINX_VIVADO: /opt/xilinx/Vivado/2023.2
+      XILINX_HLS: /opt/xilinx/Vitis_HLS/2023.2
+      XILINX_XRT: /usr
       LANG: en_US.UTF-8
       LC_ALL: en_US.UTF-8
     steps:
-    - name: Install git and setup locale in container
+    - name: Install dependencies in container
       run: |
-        apt-get update && apt-get -y install git locales
-        # Host XRT needs Boost 1.75.0 but container has 1.74.0; create symlinks.
-        for lib in /usr/lib/x86_64-linux-gnu/libboost_*.so.1.74.0; do
-          ln -sf "$lib" "${lib%.1.74.0}.1.75.0"
-        done
-        # Verify xclbinutil loads with symlinked Boost
-        /opt/xilinx/xrt/bin/unwrapped/xclbinutil --version || true
+        apt-get update && apt-get -y install git locales ocl-icd-opencl-dev
         sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen
         locale-gen en_US.UTF-8
         git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -50,13 +51,6 @@ jobs:
       shell: bash
       run: |
         source activate allo
-        source /opt/xilinx/xrt/setup.sh
-        source $VITIS/settings64.sh
-        # Debug: verify OpenCL platform is available
-        echo "--- OpenCL debug ---"
-        cat /etc/OpenCL/vendors/xilinx.icd
-        ldd /opt/xilinx/xrt/lib/libxilinxopencl.so 2>&1 | grep "not found" || echo "All deps OK"
-        ldd /opt/xilinx/xrt/lib/libxrt_hwemu.so 2>&1 | grep "not found" || echo "hwemu deps OK"
-        echo "--- End debug ---"
+        export PATH=/opt/xilinx/Vitis/2023.2/bin:/opt/xilinx/Vivado/2023.2/bin:/opt/xilinx/Vitis_HLS/2023.2/bin:$PATH
         cd examples/feather
         python gemm.py
