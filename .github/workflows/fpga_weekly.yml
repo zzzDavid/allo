@@ -50,8 +50,12 @@ jobs:
       run: |
         source activate allo
         source /opt/xilinx/xrt/setup.sh
-        # settings64.sh references optional tools (DocNav, Model Composer)
-        # that aren't mounted; disable set -e temporarily to ignore those.
-        set +e; source $VITIS/settings64.sh 2>/dev/null; set -e
+        # Set Vitis/Vivado/HLS env vars directly (the host's settings64.sh
+        # references /vol/apps/xilinx/ paths that don't exist in the container).
+        export XILINX_VITIS=/opt/xilinx/Vitis/2023.2
+        export XILINX_VIVADO=/opt/xilinx/Vivado/2023.2
+        export XILINX_HLS=/opt/xilinx/Vitis_HLS/2023.2
+        export PATH=$XILINX_VITIS/bin:$XILINX_VIVADO/bin:$XILINX_HLS/bin:$PATH
+        export LD_LIBRARY_PATH=$XILINX_VIVADO/lib/lnx64.o:$LD_LIBRARY_PATH
         cd examples/feather
         python gemm.py
