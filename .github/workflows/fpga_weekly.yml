@@ -15,28 +15,38 @@ jobs:
     container:
       image: chhzh123/allo:latest
       options: >-
-        -v /opt/xilinx/Vitis:/opt/xilinx/Vitis
-        -v /opt/xilinx/Vitis_HLS:/opt/xilinx/Vitis_HLS
-        -v /opt/xilinx/Vivado:/opt/xilinx/Vivado
-        -v /opt/xilinx/platforms:/opt/xilinx/platforms
+        -v /opt/xilinx:/opt/xilinx
     env:
       XILINXD_LICENSE_FILE: 2100@en-license-05.coecis.cornell.edu
       VITIS: /opt/xilinx/Vitis/2023.2
       HLS_INCLUDE: /opt/xilinx/Vitis_HLS/2023.2/include
       XDEVICE: /opt/xilinx/platforms/xilinx_u280_gen3x16_xdma_1_202211_1/xilinx_u280_gen3x16_xdma_1_202211_1.xpfm
-      XILINX_VITIS: /opt/xilinx/Vitis/2023.2
-      XILINX_VIVADO: /opt/xilinx/Vivado/2023.2
-      XILINX_HLS: /opt/xilinx/Vitis_HLS/2023.2
-      XILINX_XRT: /usr
       LANG: en_US.UTF-8
       LC_ALL: en_US.UTF-8
     steps:
-    - name: Install dependencies in container
+    - name: Install dependencies and setup environment
       run: |
-        apt-get update && apt-get -y install git locales ocl-icd-opencl-dev
+        apt-get update && apt-get -y install git locales
         sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen
         locale-gen en_US.UTF-8
         git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        # Fix missing libraries for host-mounted XRT
+        # Create Boost 1.75.0 symlinks if container has a different version
+        for lib in /usr/lib/x86_64-linux-gnu/libboost_*.so.1.7*.0; do
+          [ -f "$lib" ] && ln -sf "$lib" "$(echo $lib | sed 's/\.1\.7[0-9]\.0/.1.75.0/')" 2>/dev/null || true
+        done
+        # libcrypt.so.2 - link from conda if available, or install
+        if [ -f /root/miniforge/lib/libcrypt.so.2 ]; then
+          ln -sf /root/miniforge/lib/libcrypt.so.2 /usr/lib/x86_64-linux-gnu/libcrypt.so.2
+        elif [ -f /root/miniconda3/lib/libcrypt.so.2 ]; then
+          ln -sf /root/miniconda3/lib/libcrypt.so.2 /usr/lib/x86_64-linux-gnu/libcrypt.so.2
+        fi
+        # Debug: check XRT library dependencies
+        echo "--- XRT library check ---"
+        ldd /opt/xilinx/xrt/lib/libxilinxopencl.so 2>&1 | grep "not found" || echo "libxilinxopencl deps OK"
+        ldd /opt/xilinx/xrt/lib/libxrt_hwemu.so 2>&1 | grep "not found" || echo "libxrt_hwemu deps OK"
+        /opt/xilinx/xrt/bin/unwrapped/xclbinutil --version || echo "xclbinutil check failed"
+        echo "--- End XRT check ---"
     - uses: actions/checkout@v4
       with:
         ref: main
@@ -52,6 +62,11 @@ jobs:
       run: |
         source activate allo
         export LLVM_BUILD_DIR=/root/llvm-project/build
-        export PATH=/opt/xilinx/Vitis/2023.2/bin:/opt/xilinx/Vivado/2023.2/bin:/opt/xilinx/Vitis_HLS/2023.2/bin:$PATH
+        source /opt/xilinx/xrt/setup.sh
+        # Source individual Xilinx tool settings (avoid top-level settings64.sh)
+        source /opt/xilinx/Vivado/2023.2/.settings64-Vivado.sh
+        source /opt/xilinx/Vitis_HLS/2023.2/.settings64-Vitis_HLS.sh
+        export XILINX_VITIS=/opt/xilinx/Vitis/2023.2
+        export PATH=/opt/xilinx/Vitis/2023.2/bin:$PATH
         cd examples/feather
         python gemm.py
