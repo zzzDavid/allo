@@ -27,6 +27,11 @@ jobs:
     - name: Install git and setup locale in container
       run: |
         apt-get update && apt-get -y install git locales
+        # Host XRT's xclbinutil needs Boost 1.75.0 but the container has 1.74.0.
+        # Create compatibility symlinks so the host binary can find them.
+        for lib in /usr/lib/x86_64-linux-gnu/libboost_*.so.1.74.0; do
+          ln -sf "$lib" "${lib%.1.74.0}.1.75.0"
+        done
         sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen
         locale-gen en_US.UTF-8
         git config --global --add safe.directory "$GITHUB_WORKSPACE"
