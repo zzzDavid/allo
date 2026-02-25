@@ -14,8 +14,13 @@ jobs:
     runs-on: [brg-zhang-xcel]
     container:
       image: zzzdavid/allo-fpga:latest
+      # Mount only Vitis/Vivado/platforms from the host. Do NOT mount XRT —
+      # the container has its own XRT with matching library versions.
       options: >-
-        -v /opt/xilinx:/opt/xilinx
+        -v /opt/xilinx/Vitis:/opt/xilinx/Vitis
+        -v /opt/xilinx/Vitis_HLS:/opt/xilinx/Vitis_HLS
+        -v /opt/xilinx/Vivado:/opt/xilinx/Vivado
+        -v /opt/xilinx/platforms:/opt/xilinx/platforms
     env:
       XILINXD_LICENSE_FILE: 2100@en-license-05.coecis.cornell.edu
       VITIS: /opt/xilinx/Vitis/2023.2
@@ -27,11 +32,6 @@ jobs:
     - name: Install git and setup locale in container
       run: |
         apt-get update && apt-get -y install git locales
-        # Host XRT's xclbinutil needs Boost 1.75.0 but the container has 1.74.0.
-        # Create compatibility symlinks so the host binary can find them.
-        for lib in /usr/lib/x86_64-linux-gnu/libboost_*.so.1.74.0; do
-          ln -sf "$lib" "${lib%.1.74.0}.1.75.0"
-        done
         sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen
         locale-gen en_US.UTF-8
         git config --global --add safe.directory "$GITHUB_WORKSPACE"
