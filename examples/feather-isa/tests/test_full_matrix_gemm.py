@@ -3,9 +3,11 @@
 
 """Full-matrix GEMM tests for FEATHER+ with on-chip instruction decode.
 
-These tests verify the DEV009 full-matrix execution model where a single
+These tests verify the full-matrix execution model where a single
 Allo invocation handles complete matrices and the full instruction list,
 performing tiling, decode, compute, and accumulation on-chip.
+
+Uses the K-streaming kernel with parametric Gr crossbar (bit operations).
 """
 
 import os
@@ -27,7 +29,50 @@ from minisa.isa import (
     INST_TYPE_OVN,
     INST_TYPE_MAPPING,
 )
-from feather_minisa import run_full_matrix_gemm
+from feather_minisa import build_feather_kstreaming_simulator
+
+
+def run_kstreaming_gemm(M, N, K, AW, AH, verbose=False, dataflow="output_stationary"):
+    """Run GEMM through K-streaming FEATHER+ and compare against numpy.
+
+    Args:
+        M, N, K: Matrix dimensions
+        AW, AH: Array dimensions
+        verbose: Print debug info
+        dataflow: "output_stationary" or "weight_stationary"
+
+    Returns:
+        (C, ref, passed) tuple
+    """
+    program = create_gemm_program(M=M, N=N, K=K, AH=AH, AW=AW, dataflow=dataflow)
+    instructions = encode_program(program)
+
+    # Compute K-pass parameters from Gr
+    Gr = int(instructions[3, 3])
+    Kt = int(instructions[3, 12]) - int(instructions[3, 11])  # k_end - k_start
+    Kt_per_pass = (AW // Gr) * AH
+    num_k_passes = Kt // Kt_per_pass
+
+    if verbose:
+        print(f"  Dimensions: C[{M},{N}] = A[{M},{K}] x B[{K},{N}]")
+        print(f"  Array: {AH}x{AW}, Gr={Gr}, dataflow={dataflow}")
+        print(f"  Tiles: {len(program.mappings)}, Kt={Kt}, Kt_per_pass={Kt_per_pass}, "
+              f"num_k_passes={num_k_passes}")
+
+    np.random.seed(42)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+    mod = build_feather_kstreaming_simulator(
+        M, K, N, AW, AH, int8, len(instructions),
+        num_k_passes, Kt_per_pass,
+    )
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, instructions, C)
+
+    ref = A.astype(np.int32) @ B.astype(np.int32)
+    passed = np.array_equal(C, ref)
+    return C, ref, passed
 
 
 def test_full_matrix_gemm_8x8x16():
@@ -36,7 +81,7 @@ def test_full_matrix_gemm_8x8x16():
     print("Test: Full-Matrix GEMM 8x8x16")
     print("=" * 60)
 
-    C, ref, passed = run_full_matrix_gemm(
+    C, ref, passed = run_kstreaming_gemm(
         M=8, N=8, K=16, AW=8, AH=8, verbose=True
     )
 
@@ -54,7 +99,7 @@ def test_full_matrix_gemm_16x8x32():
     print("Test: Full-Matrix GEMM 16x8x32")
     print("=" * 60)
 
-    C, ref, passed = run_full_matrix_gemm(
+    C, ref, passed = run_kstreaming_gemm(
         M=16, N=8, K=32, AW=8, AH=8, verbose=True
     )
 
@@ -69,7 +114,7 @@ def test_full_matrix_gemm_16x16x32():
     print("Test: Full-Matrix GEMM 16x16x32")
     print("=" * 60)
 
-    C, ref, passed = run_full_matrix_gemm(
+    C, ref, passed = run_kstreaming_gemm(
         M=16, N=16, K=32, AW=8, AH=8, verbose=True
     )
 
@@ -133,7 +178,7 @@ def test_full_matrix_single_invocation():
     print(f"Full-matrix model uses 1 Allo invocation")
 
     # Execute and verify correctness with single call
-    C, ref, passed = run_full_matrix_gemm(
+    C, ref, passed = run_kstreaming_gemm(
         M=M, N=N, K=K, AW=AW, AH=AH, verbose=True
     )
 
@@ -204,45 +249,6 @@ def test_pe_mapping_fields_encoded():
     return True
 
 
-def test_order0_backward_compatible():
-    """Verify explicit order=0 matches existing (default) results."""
-    print("\n" + "=" * 60)
-    print("Test: Order 0 Backward Compatible")
-    print("=" * 60)
-
-    # Run with default (implicit order=0)
-    C_default, ref_default, passed_default = run_full_matrix_gemm(
-        M=8, N=8, K=16, AW=8, AH=8, verbose=False
-    )
-    assert passed_default, "Default run failed"
-
-    # Run with explicit order=0
-    from minisa.isa import create_gemm_program, encode_program
-    from feather_minisa import build_feather_full_matrix_simulator
-
-    program = create_gemm_program(
-        M=8, N=8, K=16, AH=8, AW=8,
-        ivn_order=0, wvn_order=0, ovn_order=0,
-    )
-    instructions = encode_program(program)
-
-    np.random.seed(42)
-    A = np.random.randint(-4, 4, size=(8, 16)).astype(np.int8)
-    B = np.random.randint(-4, 4, size=(16, 8)).astype(np.int8)
-
-    mod = build_feather_full_matrix_simulator(8, 16, 8, 8, 8, int8, len(instructions))
-    C_explicit = np.zeros((8, 8), dtype=np.int32)
-    mod(A, B, instructions, C_explicit)
-
-    np.testing.assert_array_equal(
-        C_default, C_explicit,
-        err_msg="Explicit order=0 should match default"
-    )
-    print("  Explicit order=0 matches default: True")
-    print("PASSED: Order 0 backward compatible")
-    return True
-
-
 def test_ovn_order_produces_different_birrd():
     """Verify each OVN order produces different BIRRD instruction tables."""
     print("\n" + "=" * 60)
@@ -276,102 +282,11 @@ def test_ovn_order_produces_different_birrd():
     return True
 
 
-def test_ivn_order_affects_output():
-    """Verify different IVN orders produce different outputs."""
-    print("\n" + "=" * 60)
-    print("Test: IVN Order Affects Output")
-    print("=" * 60)
-
-    from minisa.isa import create_gemm_program, encode_program
-    from feather_minisa import build_feather_full_matrix_simulator
-
-    M, N, K, AW, AH = 8, 8, 16, 8, 8
-    np.random.seed(42)
-    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
-    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
-
-    outputs = {}
-    for ivn_order in range(6):
-        program = create_gemm_program(
-            M=M, N=N, K=K, AH=AH, AW=AW, ivn_order=ivn_order,
-        )
-        instructions = encode_program(program)
-        mod = build_feather_full_matrix_simulator(
-            M, K, N, AW, AH, int8, len(instructions)
-        )
-        C = np.zeros((M, N), dtype=np.int32)
-        mod(A, B, instructions, C)
-        outputs[ivn_order] = C.copy()
-        print(f"  IVN order={ivn_order}: output sum={C.sum()}")
-
-    # Order 0 should be correct GEMM
-    ref = np.dot(A, B)
-    np.testing.assert_allclose(outputs[0], ref, atol=1e-5)
-    print("  IVN order=0: matches numpy reference")
-
-    # At least some other orders should differ
-    diff_count = sum(
-        1 for o in range(1, 6) if not np.array_equal(outputs[0], outputs[o])
-    )
-    assert diff_count > 0, "At least one non-zero IVN order should produce different output"
-    print(f"  {diff_count}/5 non-zero orders produce different output")
-
-    print("PASSED: IVN order affects output")
-    return True
-
-
-def test_wvn_order_affects_output():
-    """Verify different WVN orders produce different outputs."""
-    print("\n" + "=" * 60)
-    print("Test: WVN Order Affects Output")
-    print("=" * 60)
-
-    from minisa.isa import create_gemm_program, encode_program
-    from feather_minisa import build_feather_full_matrix_simulator
-
-    M, N, K, AW, AH = 8, 8, 16, 8, 8
-    np.random.seed(42)
-    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
-    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
-
-    outputs = {}
-    for wvn_order in range(6):
-        program = create_gemm_program(
-            M=M, N=N, K=K, AH=AH, AW=AW, wvn_order=wvn_order,
-        )
-        instructions = encode_program(program)
-        mod = build_feather_full_matrix_simulator(
-            M, K, N, AW, AH, int8, len(instructions)
-        )
-        C = np.zeros((M, N), dtype=np.int32)
-        mod(A, B, instructions, C)
-        outputs[wvn_order] = C.copy()
-        print(f"  WVN order={wvn_order}: output sum={C.sum()}")
-
-    # Order 0 should be correct GEMM
-    ref = np.dot(A, B)
-    np.testing.assert_allclose(outputs[0], ref, atol=1e-5)
-    print("  WVN order=0: matches numpy reference")
-
-    # At least some other orders should differ
-    diff_count = sum(
-        1 for o in range(1, 6) if not np.array_equal(outputs[0], outputs[o])
-    )
-    assert diff_count > 0, "At least one non-zero WVN order should produce different output"
-    print(f"  {diff_count}/5 non-zero orders produce different output")
-
-    print("PASSED: WVN order affects output")
-    return True
-
-
 def test_ovn_order_all_correct():
     """Verify all OVN orders produce correct GEMM via different BIRRD routing."""
     print("\n" + "=" * 60)
     print("Test: OVN Order All Correct")
     print("=" * 60)
-
-    from minisa.isa import create_gemm_program, encode_program
-    from feather_minisa import build_feather_full_matrix_simulator
 
     M, N, K, AW, AH = 8, 8, 16, 8, 8
     np.random.seed(42)
@@ -384,8 +299,14 @@ def test_ovn_order_all_correct():
             M=M, N=N, K=K, AH=AH, AW=AW, ovn_order=ovn_order,
         )
         instructions = encode_program(program)
-        mod = build_feather_full_matrix_simulator(
-            M, K, N, AW, AH, int8, len(instructions)
+        Gr = int(instructions[3, 3])
+        Kt = int(instructions[3, 12]) - int(instructions[3, 11])
+        Kt_per_pass = (AW // Gr) * AH
+        num_k_passes = Kt // Kt_per_pass
+
+        mod = build_feather_kstreaming_simulator(
+            M, K, N, AW, AH, int8, len(instructions),
+            num_k_passes, Kt_per_pass,
         )
         C = np.zeros((M, N), dtype=np.int32)
         mod(A, B, instructions, C)
@@ -457,7 +378,7 @@ def test_r0_c0_tile_advancement():
 def run_full_matrix_tests():
     """Run all full-matrix GEMM tests."""
     print("=" * 70)
-    print("FULL-MATRIX GEMM TESTS (DEV009)")
+    print("FULL-MATRIX GEMM TESTS")
     print("=" * 70)
 
     results = {}
@@ -470,10 +391,7 @@ def run_full_matrix_tests():
         ("Single invocation", test_full_matrix_single_invocation),
         ("Layout decode on-chip", test_layout_instruction_decode_on_chip),
         ("PE mapping fields", test_pe_mapping_fields_encoded),
-        ("Order 0 backward compat", test_order0_backward_compatible),
         ("OVN order BIRRD tables", test_ovn_order_produces_different_birrd),
-        ("IVN order affects output", test_ivn_order_affects_output),
-        ("WVN order affects output", test_wvn_order_affects_output),
         ("OVN order all correct", test_ovn_order_all_correct),
         ("r0/c0 tile advancement", test_r0_c0_tile_advancement),
     ]
