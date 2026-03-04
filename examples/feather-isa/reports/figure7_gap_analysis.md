@@ -1,7 +1,7 @@
 # FEATHER+ Figure 7: Baseline Gap Analysis (1792 cycles)
 
 **Date:** 2026-03-04
-**Status:** Superseded by K-streaming optimization (see `figure7_kstreaming.md`)
+**Status:** Historical — all root causes resolved (see `figure7_rtl_comparison.md`)
 **Cosim project:** `tests/figure7_cosim.prj/`
 
 ## Workload
