@@ -117,10 +117,33 @@ instances. Uses 48 DSPs for 16 MAC units (fully unrolled 4x4 NEST per K-pass).
 | Regression (`test_full_matrix_gemm`) | PASSED |
 | Regression (`test_full_matrix_hls_csim`) | PASSED |
 
+## FIFO Depth Tuning (follow-up experiment)
+
+After K-streaming, we tested increasing inter-kernel FIFO depths to close the
+csynth→cosim gap (812 vs 1213). The hypothesis was that `depth=1` FIFOs caused
+backpressure stalls.
+
+| Stream | Before | After |
+|---|---|---|
+| `nest_out` | depth=4 (AH) | depth=8 (AH*2) |
+| `connection` (16 FIFOs) | depth=1 | depth=4 (AH) |
+| `inst_input` (6 FIFOs) | depth=1 | depth=8 (num_tiles) |
+
+**Result: 1213 → 1208 cycles** (only 5 cycles saved). The gap is structural, not
+from FIFO backpressure. The csynth estimate of 812 is optimistic for single-shot
+execution because:
+- Data loading (PIPO): ~200 cycles (A[16,12] = 192 loads is the slowest)
+- crossbar_and_NEST: 609 cycles
+- Pipeline drain + store: ~200 cycles
+- Total: ~1000-1200 cycles matches cosim
+
+Note: Vitis HLS already applies automatic PIPO double-buffering for the `buf0..buf8`
+arrays between `load_buf` and compute kernels. The csynth log confirms:
+`"Implementing PIPO full_matrix_top_buf0_RAM_AUTO_1R1W"`.
+
 ## Next Steps
 
-The remaining 8% gap (1213 vs 1120 = 93 cycles) is primarily from lack of
-**ping-pong buffering**. The RTL double-buffers crossbar data to overlap the next
-tile's data loading with the current tile's NEST compute. Adding this could save
-~8-10 cycles per tile (64-80 cycles total), potentially bringing Allo within 2-3%
-of the RTL reference.
+The remaining gap (1208 vs 1120 = 88 cycles) requires splitting crossbar_and_NEST
+into separate crossbar_load and nest_compute kernels. This would allow Vitis HLS to
+create PIPO double-buffers between them, overlapping crossbar loading with NEST
+computation across K-passes (reducing K-pass pipeline II from 14 toward ~7).

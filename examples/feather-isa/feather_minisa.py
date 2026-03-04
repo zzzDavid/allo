@@ -497,9 +497,9 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
     ):
         """K-streaming FEATHER+ dataflow region."""
 
-        nest_out: Stream[TyPacked, AH]
-        connection: Stream[TyOut, 1][P0 + 1, P1 * 2]
-        inst_input: Stream[int8, 1][P0, P1]
+        nest_out: Stream[TyPacked, AH * 2]
+        connection: Stream[TyOut, AH][P0 + 1, P1 * 2]
+        inst_input: Stream[int8, num_tiles][P0, P1]
 
         @df.kernel(mapping=[1], args=[A, B, instructions])
         def crossbar_and_NEST(
