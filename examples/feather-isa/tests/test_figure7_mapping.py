@@ -229,17 +229,20 @@ def test_figure7_functional_gemm():
     """
     from allo.ir.types import int8
     from minisa.isa import create_figure7_program, encode_program
-    from feather_minisa import build_feather_full_matrix_simulator
+    from feather_minisa import build_feather_kstreaming_simulator
 
     program = create_figure7_program()
     instructions = encode_program(program)
+    num_k_passes = K // AH  # 3
+    Kt_per_pass = AH        # 4
 
     np.random.seed(7)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
-    mod = build_feather_full_matrix_simulator(
-        M, K, N, AW, AH, int8, len(instructions)
+    mod = build_feather_kstreaming_simulator(
+        M, K, N, AW, AH, int8, len(instructions),
+        num_k_passes, Kt_per_pass,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)

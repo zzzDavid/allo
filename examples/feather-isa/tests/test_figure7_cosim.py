@@ -24,8 +24,8 @@ import allo.dataflow as df
 
 from minisa.isa import create_figure7_program, encode_program
 from feather_minisa import (
-    get_feather_full_matrix_top,
-    FeatherFullMatrixModule,
+    get_feather_full_matrix_top_kstreaming,
+    FeatherKStreamingModule,
     compute_birrd_params,
 )
 
@@ -131,7 +131,7 @@ def generate_cosim_testbench(project_dir, A, B, instructions, C_ref):
     return tb_path
 
 
-def patch_kernel_for_cosim(project_dir):
+def patch_kernel_for_cosim(project_dir, num_tiles):
     """Add depth specs to m_axi pragmas in kernel.cpp for cosim.
 
     Dynamically detects port variable names from the generated kernel
@@ -145,12 +145,12 @@ def patch_kernel_for_cosim(project_dir):
     # Ordered depths matching the 9 function arguments:
     # A, B, instructions, birrd_inst, output_col_map,
     # output_num_m, accum_m_start, accum_n_start, C
-    num_tiles = 24
     P0, _ = compute_birrd_params(AW)
+    num_inst = num_tiles + 3
     ordered_depths = [
         M * K,                        # A: int8[16,12]
         K * N,                        # B: int8[12,8]
-        27 * 13,                      # instructions: int32[27,13]
+        num_inst * 13,                # instructions: int32[num_inst,13]
         num_tiles * P0 * (AW // 2),   # birrd_inst
         num_tiles * AW,               # output_col_map
         num_tiles,                    # output_num_m
@@ -219,9 +219,15 @@ def run_figure7_cosim():
     print(f"  Workload: C[{M},{N}] = A[{M},{K}] x B[{K},{N}]")
     print(f"  NEST: {AH}x{AW}, {num_inst - 3} tile mappings")
 
+    num_tiles = num_inst - 3
+    num_k_passes = K // AH  # 3
+    Kt_per_pass = AH        # 4
+
     # Build HLS project (generates kernel.cpp, kernel.h)
     project_dir = os.path.join(TESTS_DIR, "figure7_cosim.prj")
-    top = get_feather_full_matrix_top(M, K, N, AW, AH, int8, num_inst)
+    top = get_feather_full_matrix_top_kstreaming(
+        M, K, N, AW, AH, int8, num_inst, num_k_passes, Kt_per_pass,
+    )
     s = df.customize(top)
     s.partition("full_matrix_top:C", dim=2, factor=AH)
     # Build in csyn mode just to generate the project files
@@ -229,7 +235,7 @@ def run_figure7_cosim():
 
     # Patch kernel.cpp with depth specs for cosim, write testbench and TCL
     print("  Patching kernel for cosim + generating testbench...")
-    patch_kernel_for_cosim(project_dir)
+    patch_kernel_for_cosim(project_dir, num_tiles)
     generate_cosim_testbench(project_dir, A, B, instructions, C_ref)
     generate_cosim_tcl(project_dir)
 
@@ -325,6 +331,8 @@ def run_figure7_cosim():
 if __name__ == "__main__":
     cycles = run_figure7_cosim()
     if cycles is not None:
-        print(f"\nFigure 7 RTL Cosim: {cycles} cycles")
+        print(f"\nFigure 7 RTL Cosim (K-streaming): {cycles} cycles")
+        print(f"Previous Allo (24 tiles): 1792 cycles")
         print(f"RTL reference: 1120 cycles")
-        print(f"Ratio: {cycles/1120:.2f}x")
+        print(f"Ratio vs RTL: {cycles/1120:.2f}x")
+        print(f"Speedup vs previous: {1792/cycles:.2f}x")

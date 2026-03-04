@@ -24,8 +24,8 @@ import allo.dataflow as df
 
 from minisa.isa import create_figure7_program, encode_program
 from feather_minisa import (
-    get_feather_full_matrix_top,
-    build_feather_full_matrix_hls,
+    get_feather_full_matrix_top_kstreaming,
+    build_feather_kstreaming_hls,
 )
 
 HLS_AVAILABLE = is_available("vitis_hls")
@@ -59,9 +59,13 @@ def test_figure7_hls_csim():
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
+    num_k_passes = K // AH  # 12 // 4 = 3
+    Kt_per_pass = AH        # 4
+
     project_dir = os.path.join(TESTS_DIR, "figure7_csim.prj")
-    mod = build_feather_full_matrix_hls(
+    mod = build_feather_kstreaming_hls(
         M, K, N, AW, AH, int8, num_inst,
+        num_k_passes, Kt_per_pass,
         mode="csim", project=project_dir,
     )
     C = np.zeros((M, N), dtype=np.int32)
@@ -95,9 +99,15 @@ def test_figure7_hls_csynth():
     # separate accum_m_start/accum_n_start arrays and uses a local
     # accumulation buffer, so the generated kernel.cpp is HLS-dataflow-clean
     # (no shared-buffer or multi-writer violations).
+    num_k_passes = K // AH  # 12 // 4 = 3
+    Kt_per_pass = AH        # 4
+
     project_dir = os.path.join(TESTS_DIR, "figure7_csynth.prj")
-    top = get_feather_full_matrix_top(M, K, N, AW, AH, int8, num_inst)
+    top = get_feather_full_matrix_top_kstreaming(
+        M, K, N, AW, AH, int8, num_inst, num_k_passes, Kt_per_pass,
+    )
     s = df.customize(top)
+    s.partition("full_matrix_top:C", dim=2, factor=AH)
     hls_mod = s.build(
         target="vitis_hls", mode="csyn", project=project_dir,
     )
