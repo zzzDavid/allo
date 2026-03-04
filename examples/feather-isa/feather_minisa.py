@@ -149,6 +149,16 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
             iActs: Ty[AH, AW]
             weights: Ty[AH, AW, AH]
 
+            # Weight stationarity: track previous tile's weight config
+            # using 1-element arrays (lowered to registers by HLS).
+            # Avoids re-reading instructions BRAM for comparison.
+            prev_Gr: int32[1]
+            prev_n: int32[1]
+            prev_k: int32[1]
+            prev_Gr[0] = -1
+            prev_n[0] = -1
+            prev_k[0] = -1
+
             for tile in range(num_tiles):
                 inst_idx: int32 = tile + 3
                 # Decode tile bounds and mapping parameter
@@ -184,31 +194,44 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst):
                         iActs[ic_i, ic_j] = local_A[m_idx, k_idx]
 
                 # === Weight Crossbar (WVN order-dependent reordering) ===
-                # Order-0 uses parametric Gr; other orders use HalfAW
-                for wc_i in range(AH):
-                    for wc_w in range(AW):
-                        for wc_k in range(AH):
-                            wk_idx: int32 = 0
-                            wn_idx: int32 = 0
-                            if wvn_order == 0:  # ORDER_012 (parametric)
-                                wk_idx = k_start + wc_k + (wc_w // Gr) * AH
-                                wn_idx = n_start + wc_i
-                            elif wvn_order == 1:  # ORDER_021
-                                wk_idx = k_start + wc_k + wc_i * AH
-                                wn_idx = n_start + (wc_w // HalfAW)
-                            elif wvn_order == 2:  # ORDER_102
-                                wk_idx = k_start + (wc_w // HalfAW) + wc_k * AH
-                                wn_idx = n_start + wc_i
-                            elif wvn_order == 3:  # ORDER_120
-                                wk_idx = k_start + wc_i + wc_k * AH
-                                wn_idx = n_start + (wc_w // HalfAW)
-                            elif wvn_order == 4:  # ORDER_201
-                                wk_idx = k_start + (wc_w // HalfAW) + wc_i * AH
-                                wn_idx = n_start + wc_k
-                            else:  # ORDER_210
-                                wk_idx = k_start + wc_i + (wc_w // HalfAW) * AH
-                                wn_idx = n_start + wc_k
-                            weights[wc_i, wc_w, wc_k] = local_B[wk_idx, wn_idx]
+                # Weight stationarity: skip loading when consecutive tiles
+                # share the same Gr, n_start, and k_start (identical weights).
+                # Compare with register-cached previous tile values.
+                load_w: int32 = 1
+                if prev_Gr[0] == Gr:
+                    if prev_n[0] == n_start:
+                        if prev_k[0] == k_start:
+                            load_w = 0
+                prev_Gr[0] = Gr
+                prev_n[0] = n_start
+                prev_k[0] = k_start
+
+                if load_w == 1:
+                    # Order-0 uses parametric Gr; other orders use HalfAW
+                    for wc_i in range(AH):
+                        for wc_w in range(AW):
+                            for wc_k in range(AH):
+                                wk_idx: int32 = 0
+                                wn_idx: int32 = 0
+                                if wvn_order == 0:  # ORDER_012 (parametric)
+                                    wk_idx = k_start + wc_k + (wc_w // Gr) * AH
+                                    wn_idx = n_start + wc_i
+                                elif wvn_order == 1:  # ORDER_021
+                                    wk_idx = k_start + wc_k + wc_i * AH
+                                    wn_idx = n_start + (wc_w // HalfAW)
+                                elif wvn_order == 2:  # ORDER_102
+                                    wk_idx = k_start + (wc_w // HalfAW) + wc_k * AH
+                                    wn_idx = n_start + wc_i
+                                elif wvn_order == 3:  # ORDER_120
+                                    wk_idx = k_start + wc_i + wc_k * AH
+                                    wn_idx = n_start + (wc_w // HalfAW)
+                                elif wvn_order == 4:  # ORDER_201
+                                    wk_idx = k_start + (wc_w // HalfAW) + wc_i * AH
+                                    wn_idx = n_start + wc_k
+                                else:  # ORDER_210
+                                    wk_idx = k_start + wc_i + (wc_w // HalfAW) * AH
+                                    wn_idx = n_start + wc_k
+                                weights[wc_i, wc_w, wc_k] = local_B[wk_idx, wn_idx]
 
                 # === NEST: AH x AW PE array ===
                 for ni in allo.grid(AH, name="nest"):
@@ -457,6 +480,7 @@ def build_feather_full_matrix_hls(M, K, N, AW, AH, Ty, num_inst,
     )
     s = df.customize(top)
     s.partition("full_matrix_top:C", dim=2, factor=AH)
+
     allo_mod = s.build(target="vitis_hls", mode=mode, project=project)
     return FeatherFullMatrixModule(allo_mod, AW)
 
