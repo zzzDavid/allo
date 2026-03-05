@@ -1,586 +1,411 @@
-# FEATHER+ Allo Implementation: From ISA to Silicon-Beating HLS
+# FEATHER+ Allo Implementation
 
-**15-Minute Presentation Outline**
-**Branch:** minisa | **Date:** 2026-03-04
-
----
-
-## Slide 1: Title
-
-**Implementing FEATHER+ with Allo: A VN-Level ISA for Reconfigurable Inference Accelerators**
-
-- FEATHER+: a reconfigurable accelerator supporting flexible dataflow and layout co-switching
-- MINISA: a 4-instruction ISA at the Virtual Neuron (VN) granularity
-- Allo: a Python-embedded DSL for HLS hardware generation
-- Result: Allo-generated RTL achieves **1004 cycles**, beating handwritten RTL at **1120 cycles** (0.90x)
-- Supports full dataflow switching (any power-of-2 Gr) via zero-cost bit operations
+**Branch:** minisa | **Date:** 2026-03-05
 
 ---
 
-## Slide 2: Motivation — The Control Overhead Crisis (1 min)
+## 1. Implementation Overview
 
-**Problem:** Reconfigurable AI accelerators need per-layer dataflow/layout switching, but fine-grained micro-control doesn't scale.
+The Allo implementation maps the FEATHER+ accelerator pipeline to 7 HLS dataflow kernels connected by FIFO streams. A single Allo invocation handles complete input matrices and the full MINISA instruction list, performing tiling, instruction decode, crossbar reordering, NEST computation, BIRRD reduction, and output accumulation on-chip.
 
-| Array Size | 4x4 | 8x8 | 16x16 | 32x32 | 64x64 | 128x128 |
-|---|---|---|---|---|---|---|
-| **Instruction-fetch stall** | 0% | 0% | 46.2% | 84.5% | 95.3% | 98% |
+### Dataflow Pipeline
 
-*(MINISA paper, Table I)*
+```
+crossbar_load ──(iacts_stream)──> nest_compute ──(nest_out)──> bus
+                ──(weights_stream)──>                            |
+                                                          connection[P0+1, P1*2]
+                                                                |
+                                                  inst_rw ──> BIRRD[P0, P1]
+                                                                |
+                                                          output_accum ──> C[M,N]
+```
 
-**Key numbers:**
-- At 128x128 FEATHER, micro-instructions consume **98% of cycles** just fetching control
-- MINISA reduces instruction traffic by a geometric mean of **1.9 x 10^5 x**
-- End-to-end speedup: up to **99.4x** at 128x128
+**Source:** `feather_minisa.py` — single file, ~450 lines.
 
-**Takeaway:** As accelerator arrays scale, control overhead becomes the dominant bottleneck. We need a coarser-grained ISA that preserves mapping flexibility.
+### Kernel Descriptions
 
-**Speaker notes:**
-Modern reconfigurable accelerators like FEATHER support per-layer dataflow and layout switching — essential for diverse workloads (LLMs, HE, ZKP). But programming every switch and PE at cycle granularity creates an instruction-fetch bottleneck. At 128x128 arrays, 98% of cycles are wasted waiting for instructions. MINISA solves this by raising the abstraction to Virtual Neurons.
+| # | Kernel | Role | I/O |
+|---|--------|------|-----|
+| 1 | `crossbar_load` | Decode per-tile instructions, apply input/weight crossbar index mapping with parametric Gr, pack data into UInt(128) streams | Reads A[M,K], B[K,N], instructions[num_inst,13] |
+| 2 | `nest_compute` | Unpack streams, run AHxAW NEST MAC with int32 accumulation across K-passes, stream packed result | Reads iacts_stream, weights_stream; writes nest_out |
+| 3 | `bus` | Unpack packed NEST output and distribute to BIRRD input connections | Reads nest_out; writes connection[0, :] |
+| 4 | `inst_rw` | Distribute per-tile BIRRD switch instructions to each butterfly switch | Reads birrd_inst[num_tiles, P0, P1]; writes inst_input[P0, P1] |
+| 5 | `BIRRD[P0,P1]` | Butterfly reduction/reorder network — P0 stages, P1 switches per stage | Reads connection[i,:], inst_input[i,j]; writes connection[i+1,:] |
+| 6 | `output_accum` | Column remap via output_col_map + tile accumulation into output matrix C | Reads connection[P0,:]; writes C[M,N] |
+
+### ISA Encoding
+
+MINISA instructions are encoded as rows of an `int32[num_inst, 13]` array:
+
+```
+Row 0 (SetIVNLayout):  [0, order, ML0, ML1, JL0, JL1, 0, 0, 0, 0, 0, 0, 0]
+Row 1 (SetWVNLayout):  [1, order, KL0, KL1, NL0, NL1, 0, 0, 0, 0, 0, 0, 0]
+Row 2 (SetOVNLayout):  [2, order, PL0, PL1, QL0, QL1, 0, 0, 0, 0, 0, 0, 0]
+Row 3+ (SetMapping):   [3, r0, c0, Gr, Gc, sr, sc, m_start, m_end, n_start, n_end, k_start, k_end]
+```
+
+The first 3 rows configure IVN/WVN/OVN layouts; each subsequent row triggers one tile execution.
+
+### Wrapper: `FeatherKStreamingModule`
+
+The Allo dataflow region takes 9 raw arrays. The `FeatherKStreamingModule` wrapper provides a clean `(A, B, instructions, C)` interface by:
+
+1. Precomputing BIRRD instruction tables and column maps for all 6 OVN orders at build time
+2. At call time, reading Gr per tile from instructions and selecting:
+   - **Gr < AW**: Standard BIRRD reduction (Mt = AW//2 outputs per tile, uses precomputed BIRRD table + col_map)
+   - **Gr = AW**: Pass-through BIRRD (all-PS switches, identity col_map, AW outputs per tile)
+3. Computing `accum_m_start` and `accum_n_start` arrays from tile instructions
 
 ---
 
-## Slide 3: FEATHER+ Architecture Overview (2 min)
+## 2. Key Optimizations
 
-**FEATHER+ = NEST + BIRRD + Buffers**
+### 2.1 K-Streaming with Fused K-Passes
 
-```
-                    Stationary Buffer          Streaming Buffer
-                    (Ping/Pong, Weights)       (Ping/Pong, Inputs)
-                           |                          |
-                     Weight XBar              Input XBar
-                    (All-to-All)             (All-to-All)
-                           \                        /
-                            +--- AH x AW NEST ---+
-                            |   (PE Array)        |
-                            |   Each PE: AH-way   |
-                            |   dot product        |
-                            v
-                         BIRRD
-                    (Butterfly Interconnect for
-                     Reduction & Reordering
-                     in Dataflows)
-                            |
-                      Output Buffer (OB)
-```
+Instead of issuing separate tiles for each K-slice (the original MINISA mapping uses 24 tiles for Figure 7), all K-passes for a tile are fused into an inner loop within a single tile iteration. This reduces tile count from 24 to 8 for Figure 7.
 
-**Three-level reduction:**
-1. **Temporal** (within PE): Each PE accumulates AH partial sums via local registers
-2. **Spatial** (across PE columns): BIRRD performs butterfly reduction across a row of PEs
-3. **Temporal** (across PE rows): Output Buffer accumulates partial sums from different rows
+**How it works:** Each tile covers the full K-range `[k_start, k_end)`. The kernel iterates `num_k_passes` times internally, accumulating NEST partial products in `int32` before streaming to BIRRD.
 
-**Key FEATHER+ refinements over FEATHER:**
-- **All-to-all crossbars** replace point-to-point connections (any VN to any PE column)
-- **Simplified streaming buffer** (single logical bank, VN-level access)
-- Enables **dynamic input/weight** reconfiguration (no need to pre-arrange data)
+**Key parameter:** `Kt_per_pass = (AW / Gr) * AH` — the number of K elements each K-pass covers. For Gr=AW, this equals AH; for Gr=AW//2, this equals 2*AH.
 
-**Speaker notes:**
-FEATHER+ is built around two core components. NEST is an AH x AW PE array where each PE performs an AH-element dot product — this is the "Virtual Neuron" unit. BIRRD is a multi-stage butterfly network that performs both spatial reduction and data reordering simultaneously — this is the key innovation that enables zero-cost layout switching (Reorder In Reduction). The two all-to-all crossbars are new in FEATHER+ — they replace the original point-to-point connections, removing the constraint that one operand must be pre-arranged in a stationary form.
+### 2.2 Split Crossbar/NEST Kernels (WAR Dependency Break)
 
----
+The original fused `crossbar_and_NEST` kernel wrote to `iActs`/`weights` arrays and then read from them within the same pipeline stage, creating a Write-After-Read dependency. HLS could not overlap K-passes, forcing pipeline II=14.
 
-## Slide 4: The Virtual Neuron Abstraction (1 min)
+Splitting into `crossbar_load` and `nest_compute` as separate dataflow kernels connected by UInt(128) FIFO streams eliminates this dependency. Each kernel only writes OR reads its local arrays, never both. Result: **II=14 → II=4** (3.5x improvement).
 
-**Insight:** The smallest hardware dot-product atom is the **Virtual Neuron (VN)** — an AH-element dot product performed by one PE.
-
-```
-VN = one PE's dot product = AH multiply-accumulate operations
-```
-
-**Why VN is the right abstraction level:**
-- **Coarser than VN** (e.g., row or tile level) → loses inter-PE mapping flexibility
-- **Finer than VN** (e.g., switch or wire level) → adds unnecessary control cost
-- **VN level** = the coarsest control that retains full flexibility and the finest control that avoids unnecessary overhead
-
-**Three operand-specific VNs:**
-- **I_VN** (Input): fragment of activations consumed by one PE dot product
-- **W_VN** (Weight): fragment of weights consumed by one PE dot product
-- **O_VN** (Output): partial sum produced by one PE column
-
-**Speaker notes:**
-The central insight of MINISA is that a VN — one PE's dot product — is the natural unit of control. It's the smallest software operand fragment that matches the hardware atom. Programming at this level gives us the coarsest control that still preserves inter-PE mapping flexibility, and the finest control that avoids unnecessary switch-level overhead.
-
----
-
-## Slide 5: MINISA — A 4-Instruction ISA (2 min)
-
-| Instruction | Purpose | Triggers |
-|---|---|---|
-| `SetIVNLayout` | Configure streaming buffer layout for input VNs | Load inputs from off-chip |
-| `SetWVNLayout` | Configure stationary buffer layout for weight VNs | Load weights from off-chip |
-| `SetOVNLayout` | Configure output buffer layout for output VNs | Initialize output buffer |
-| `SetMapping` | Map VNs to PEs, specify tile bounds | **Execute one compute tile** |
-
-**Program structure** (single layer):
-```
-SetIVNLayout    ←  configure input buffer (once per layer)
-SetWVNLayout    ←  configure weight buffer (once per layer)
-SetOVNLayout    ←  configure output buffer (once per layer)
-SetMapping x T  ←  execute T compute tiles
-```
-
-**SetMapping — the parametric mapping formula:**
-
-Each `SetMapping(r0, c0, Gr, Gc, sr, sc)` defines how PE (ah, aw) maps to weight VN W_VN(r, c):
-
-```
-r(ah, aw) = r0 + floor(aw / Gr)     — WVN row index
-c(ah, aw) = c0 + sr * ah + sc * (aw mod Gc)  — WVN column index
-```
-
-- `Gr` (row group): controls how many PE columns share a WVN row → determines reduction group size
-- `Gc` (col group): controls column-wise replication
-- `sr`, `sc`: temporal and spatial strides
-
-**Common dataflow patterns from SetMapping parameters:**
-- **Output stationary:** Gr=AW, Gc=1, sr=0, sc=0
-- **Weight stationary:** Gr=1, Gc=AW, sr=0, sc=1
-- **Input stationary:** Gr=1, Gc=1, sr=1, sc=0
-
-**Speaker notes:**
-MINISA uses just 4 instructions. The three layout instructions configure the on-chip buffers and trigger data loading. SetMapping is the execution trigger — it specifies a 6-parameter mapping formula that determines how each PE maps to a weight VN. The parameter Gr is particularly important: it controls the reduction group size, i.e., how many PE columns share the same WVN row and thus participate in spatial reduction via BIRRD. Different Gr values enable different dataflows — output stationary uses Gr=AW (all columns reduce together), weight stationary uses Gr=1 (each column independent).
-
----
-
-## Slide 6: Figure 7 Case Study — Mapping to Hardware (1.5 min)
-
-**Workload:** C[16,8] = A[16,12] x B[12,8] on a **4x4 NEST** (AH=AW=4)
-
-**Tiling strategy (K-streaming, Gr=AW=4):**
-
-```
-8 tiles total: 2 N-groups x 4 M-blocks
-Each tile: 3 K-passes (K=12, Kt_per_pass=AH=4)
-
-Tile layout:
-  N-group 0 (n=0..3)    N-group 1 (n=4..7)
-  ┌──────────────┐       ┌──────────────┐
-  │ Tile 0: M=0..3 │     │ Tile 4: M=0..3 │
-  │ Tile 1: M=4..7 │     │ Tile 5: M=4..7 │
-  │ Tile 2: M=8..11│     │ Tile 6: M=8..11│
-  │ Tile 3: M=12..15│    │ Tile 7: M=12..15│
-  └──────────────┘       └──────────────┘
-  All tiles: K=0..11 (3 K-passes of 4)
-```
-
-**With Gr=AW=4:**
-- All PE columns reduce together → BIRRD is pass-through (no partial sums)
-- `aw % Gr = aw % 4 = aw` → eliminates runtime dividers
-- `aw // Gr = 0` → single WVN row per tile
-- Each tile produces AW=4 complete output rows
-
-**Encoded as int32 array [11, 13]:**
-```
-Row 0: SetIVNLayout  [0, order, ML0=4, ML1=4, JL0=4, JL1=3, ...]
-Row 1: SetWVNLayout  [1, order, KL0=4, KL1=3, NL0=4, NL1=2, ...]
-Row 2: SetOVNLayout  [2, order, PL0=4, PL1=4, QL0=4, QL1=2, ...]
-Rows 3-10: SetMapping [3, r0, c0, Gr=4, Gc=2, sr=1, sc=4, m_start, m_end, n_start, n_end, k_start=0, k_end=12]
-```
-
-**Speaker notes:**
-Here's the concrete case study from the MINISA paper. We're multiplying a 16x12 by 12x8 matrix on a 4x4 NEST array. By choosing Gr=AW=4 for all tiles, we make every PE column participate in the same reduction group. This means BIRRD just passes data through (no spatial reduction needed), and crucially, the modular arithmetic ic_j % Gr becomes trivial — the compiler can eliminate runtime dividers entirely. Each tile handles 3 K-passes internally, accumulating partial products in int32 before outputting results.
-
----
-
-## Slide 7: Allo Implementation — Dataflow Pipeline (2 min)
-
-**7 dataflow kernels connected by FIFO streams:**
-
-```
-              ┌─────────────────┐   UInt(128) streams   ┌──────────────┐
-  A[M,K] ──→ │  crossbar_load  │ ─── iacts_stream ───→ │              │
-  B[K,N] ──→ │  (pack to 128b) │ ─── weights_stream ──→│ nest_compute │
-              └─────────────────┘                        │ (4x4 NEST   │
-                                                         │  MAC array) │
-  instructions ──→ ┌──────────┐                          └──────┬──────┘
-                   │ inst_rw  │                                 │
-                   └────┬─────┘                          UInt(128) packed
-                        │ switch ops                     int32 results
-                        v                                       │
-                  ┌───────────┐      ┌──────┐             ┌─────v─────┐
-                  │ BIRRD     │ ←──  │ bus  │ ←───────────│           │
-                  │ [3 stages │      │      │             │           │
-                  │  x 2 sw]  │      └──────┘             │           │
-                  └─────┬─────┘                           │           │
-                        │                                 │           │
-                  ┌─────v──────────┐                      │           │
-  C[M,N] ←────── │  output_accum  │                      │           │
-                  └────────────────┘                      └───────────┘
-```
-
-**Key Allo constructs used:**
-```python
-@df.region()           # Top-level dataflow region (Vitis HLS DATAFLOW)
-def top(...):
-    # Inter-kernel FIFO streams
-    iacts_stream: Stream[UInt(128), depth=6]      # crossbar → NEST
-    weights_stream: Stream[UInt(128), depth=24]    # crossbar → NEST
-    nest_out: Stream[UInt(128), depth=8]           # NEST → bus
-    connection: Stream[int32, depth=4][4, 4]       # bus → BIRRD → accum
-
-    @df.kernel()       # Each kernel becomes a Vitis HLS process
-    def crossbar_load(...): ...
-    def nest_compute(...): ...
-    def bus(...): ...
-    def BIRRD(...): ...
-    def output_accum(...): ...
-```
-
-**Speaker notes:**
-In Allo, we implement FEATHER+ as 7 dataflow kernels inside a `df.region()`. Each kernel becomes a Vitis HLS process, and they communicate through typed FIFO streams. The critical design choice is splitting the crossbar and NEST into separate kernels connected by UInt(128) streams. This was essential for performance — I'll explain why in the optimization slides. The streams carry packed data: 16 int8 values packed into UInt(128) for activations and weights, and 4 int32 values packed for NEST output.
-
----
-
-## Slide 8: crossbar_load — Packing Data for the NEST (1 min)
-
-**Per tile (8 tiles total), per K-pass (3 passes/tile):**
-
-```python
-# Pack 16 int8 input activations into UInt(128)
-for ic_i in range(AH):        # 4 rows
-    for ic_j in range(AW):    # 4 cols
-        packed_iacts[bit_lo:bit_hi] = A[m_start + ic_j, k_start + ic_i]
-iacts_stream.put(packed_iacts)    # 1 stream write
-
-# Pack weights: AH packets of 16 int8 each
-for wc_i in range(AH):
-    for wc_k in range(AH):
-        for wc_w in range(AW):
-            packed_weights[bit_lo:bit_hi] = B[k_start + wc_k, n_start + wc_i]
-    weights_stream.put(packed_weights)   # 4 stream writes per K-pass
-```
-
-**Data transfer protocol per K-pass:**
-- 1 x UInt(128): packed iActs[4,4] = 16 int8 values
-- 4 x UInt(128): packed weights (one per NEST row)
-- **Total: 5 stream ops/pass, 15/tile, 120 for all 8 tiles**
-
-**Why UInt(128)?** Matches exactly one VN's data: AH x AW x 8 bits = 4 x 4 x 8 = 128 bits.
-
-**Speaker notes:**
-crossbar_load reads the input and weight matrices, packs them into 128-bit words, and streams them to nest_compute. The packing scheme matches the VN abstraction — each UInt(128) holds exactly one Virtual Neuron's worth of data: a 4x4 grid of int8 values. Per K-pass, we send 1 activation packet and 4 weight packets. The stream depths (6 for iacts, 24 for weights) allow crossbar_load to run about 2 tiles ahead of nest_compute.
-
----
-
-## Slide 9: nest_compute — The 4x4 MAC Array (1 min)
-
-```python
-@df.kernel()
-def nest_compute(iacts_stream, weights_stream, nest_out, num_tiles, num_k_passes):
-    for tile in range(num_tiles):          # 8 tiles
-        nest_accum: int32[AH, AW] = 0     # reset per tile
-
-        for kp in range(num_k_passes):     # 3 K-passes
-            # Unpack iActs and weights from streams
-            packed_i = iacts_stream.get()
-            iActs[ic_i, ic_j] = packed_i[bit_lo:bit_hi]   # 16 int8
-
-            for wc_i in range(AH):
-                packed_w = weights_stream.get()
-                weights[wc_i, wc_k, wc_w] = packed_w[...]  # 16 int8 each
-
-            # 4x4 NEST MAC (fully unrolled → 48 DSPs)
-            for ic_i in range(AH):         # 4
-                for ic_j in range(AW):     # 4
-                    for wc_i in range(AH): # 4
-                        nest_accum[ic_i, ic_j] += iActs[ic_i, ic_j] * weights[wc_i, ic_i, ic_j]
-
-        # Pack and stream int32 results
-        for row in range(AH):
-            nest_out.put(pack(nest_accum[row, :]))  # 4 int32 → UInt(128)
-```
-
-**Synthesis result:** 401 cycles, K-pass pipeline **II=4** (critical path)
-
-**Speaker notes:**
-nest_compute is the heart of the design. It receives packed data, unpacks it, and runs a fully-unrolled 4x4 NEST MAC array. The inner triple loop (4x4x4 = 64 multiply-accumulates) is completely unrolled by Vitis HLS, using 48 DSPs. Critically, it accumulates across 3 K-passes in int32 before streaming results — this avoids int8 overflow and reduces downstream traffic by 3x. The K-pass pipeline achieves II=4, meaning a new K-pass starts every 4 cycles.
-
----
-
-## Slide 10: BIRRD and Output Accumulation (1 min)
-
-**BIRRD: Butterfly Interconnect for Reduction and Reordering in Dataflows**
-
-```
-For AW=4: 3 stages, 2 switches per stage
-
-Stage 0          Stage 1          Stage 2
-[Egg(0,0)] ─────[Egg(1,0)]─────[Egg(2,0)]
-[Egg(0,1)] ─────[Egg(1,1)]─────[Egg(2,1)]
-
-Each Egg has 4 operations:
-  PS (0): Pass through
-  AR (1): Add Right (out_right = in_left + in_right)
-  AL (2): Add Left  (out_left = in_left + in_right)
-  SW (3): Swap inputs
-```
-
-**In our case (Gr=AW=4):** BIRRD is all-pass-through (PS=0 everywhere).
-No spatial reduction needed — each tile produces complete output rows.
-
-**output_accum:** Collects BIRRD output and accumulates into C[M,N]:
-```python
-for tile in range(num_tiles):
-    for row in range(AH):
-        for col in range(AW):
-            C[m_start[tile] + col_map[col], n_start[tile] + row] += birrd_out[row][col]
-```
-
-**Speaker notes:**
-BIRRD is a butterfly network that performs spatial reduction and data reordering simultaneously. For our Figure 7 case with Gr=AW=4, BIRRD is in pass-through mode — all switches just forward data unchanged. This is because all 4 PE columns are in the same reduction group, so no cross-column reduction is needed. output_accum then writes the results to the correct positions in the output matrix using a column map. For the general case with Gr < AW, BIRRD would perform actual reduction using Add-Left and Add-Right operations.
-
----
-
-## Slide 11: The Critical Optimization — Why Split Kernels? (2 min)
-
-**The WAR dependency problem (fused crossbar_and_NEST):**
-
-```
-K-pass iteration (fused):
-  1. Fill iActs[4,4]    ← WRITE to iActs     (16 cycles)
-  2. Fill weights[4,4,4] ← WRITE to weights   (64 cycles)
-  3. NEST MAC            ← READ from iActs/weights (16 cycles)
-  4. Go to step 1        ← WRITE again (WAR dependency!)
-```
-
-HLS sees Write-After-Read on `iActs` and `weights` arrays → **cannot pipeline K-passes**.
-Result: K-pass pipeline **II=14** (each iteration waits for previous to finish reading).
-
-**The fix — split into two dataflow kernels:**
-
-```
-crossbar_load:                    nest_compute:
-  Fill iActs, pack → stream  ──→   Unpack → fill local arrays
-  Fill weights, pack → stream ──→   Unpack → fill local arrays
-  (No read of arrays)              NEST MAC (reads local arrays)
-                                   (No write to same arrays)
-```
-
-Each kernel has its own local arrays → **WAR dependency broken**.
-HLS can now pipeline K-passes: **II=14 → II=4** (3.5x improvement).
-
-**Impact on total cycles:**
-
-| Design | K-pass II | Cosim Cycles | vs RTL |
-|---|---|---|---|
-| Fused crossbar_and_NEST | 14 | 1213 | 1.08x |
-| Split crossbar_load + nest_compute | 4 | 1001 | 0.89x |
-| **+ Flexible Gr bit ops** | **4** | **1004** | **0.90x** |
-| RTL reference | — | 1120 | 1.0x |
-
-**Speaker notes:**
-This is the single most impactful optimization. When crossbar fill and NEST compute are in the same kernel, HLS sees that we write to iActs/weights arrays and then read from them — a Write-After-Read dependency. It cannot start filling the next K-pass's data until the current K-pass finishes reading, forcing II=14. By splitting into two kernels connected by FIFO streams, each kernel only writes OR reads its local arrays, never both. HLS can now overlap K-passes: while nest_compute processes K-pass T, crossbar_load is already loading K-pass T+1. This brought us from 1213 to 1001 cycles — crossing below the RTL reference.
-
----
-
-## Slide 12: Optimization Journey — From 1792 to 1001 Cycles (1.5 min)
-
-| Phase | Cycles | Speedup | Key Change |
-|---|---|---|---|
-| **Baseline** | 1792 | 1.0x | 24 tiles, 14 runtime dividers, sequential crossbar/NEST |
-| **K-streaming** | 1213 | 1.48x | 8 tiles (Gr=AW), eliminate dividers, fuse K-passes |
-| **FIFO tuning** | 1208 | 1.48x | Deeper FIFOs (minimal impact — not the bottleneck) |
-| **Split kernel** | 1001 | 1.79x | Break WAR dependency, II 14→4 |
-| **Flexible Gr** | **1004** | **1.78x** | Power-of-2 bit ops for any Gr (+3 cycles, full flexibility) |
-
-**Baseline root causes (1792 cycles):**
-
-1. **24 tiles vs 8 tiles (dominant):** Using adaptive Gr (Gr=2 for some tiles, Gr=4 for others) required 16 extra tiles with Gr=2. Each tile pays ~9 cycles overhead for instruction decode + pipeline flush.
-
-2. **14 runtime integer dividers:** `ic_j % Gr` and `ic_j // Gr` with runtime `Gr` compiled to multi-cycle sdiv/srem instructions. 72% of design flip-flops were just for dividers!
-   - Input crossbar: 6 dividers → II=2 (target: 1)
-   - Weight crossbar: 8 dividers → II=8 (target: 1)
-
-3. **No ping-pong buffering:** Crossbar fill and NEST compute ran sequentially. The RTL reference overlaps them with double-buffering.
-
-**Speaker notes:**
-Let me walk through the optimization journey. We started at 1792 cycles with a naive translation of the MINISA paper's approach — using adaptive Gr values and 24 tiles. The first breakthrough was realizing that by making all tiles use Gr=AW=4, we could fuse K-passes within each tile, dropping from 24 tiles to 8 and eliminating all runtime dividers. FIFO depth tuning had minimal impact because the bottleneck wasn't backpressure — it was the WAR dependency in the fused kernel. The final breakthrough was splitting crossbar and NEST into separate kernels, which achieved II=4 and brought us below the RTL reference.
-
----
-
-## Slide 13: Allo vs RTL — Final Comparison (1 min)
-
-### Cycle Count
-
-| Implementation | Cosim Cycles | Csynth Estimate |
-|---|---|---|
-| **Allo HLS (flexible Gr)** | **1004** | 770 |
-| RTL reference | 1120 | — |
-
-**Allo is 10% faster than handwritten RTL, with full dataflow flexibility.**
-
-### Resource Usage (Vitis HLS, Xilinx U280)
-
-| Resource | Used | Notes |
-|---|---|---|
-| BRAM_18K | 20 | On-chip buffers |
-| DSP | 49 | 48 for 16 fully-unrolled MACs + 1 misc |
-| FF | 18,987 | No runtime dividers (was 45,973 in baseline) |
-| LUT | 25,748 | Clean control logic + bit-op crossbar |
-
-### Per-Kernel Cycle Budget
-
-```
-Data loading (overlapped):  ~200-360 cycles  (double-buffered by Vitis HLS)
-crossbar_load:                ~200 cycles    (runs ahead of nest_compute)
-nest_compute:                 ~400 cycles    (critical path, ~50 cycles/tile)
-output_accum:                 ~400 cycles    (nearly matches nest_compute)
-Store:                       ~135 cycles
-Total: ~200 + max(400, 400) + pipeline_tail ≈ 1004 cycles
-```
-
-**Speaker notes:**
-The final result: Allo at 1004 cycles beats the handwritten RTL reference at 1120 cycles — and this is with full dataflow flexibility. The crossbar supports any power-of-2 Gr value per tile via bit operations, at a cost of only 3 extra cycles compared to the hardcoded version. The resource usage is lean — 19K flip-flops vs 46K in the baseline, because we eliminated all runtime dividers. The cycle budget shows good dataflow balance: nest_compute and output_accum are nearly matched.
-
----
-
-## Slide 14: Why Allo Beats RTL (1 min)
-
-**1. Aggressive HLS pipelining**
-- 4x4 NEST MAC fully unrolled → 48 DSPs working in parallel
-- K-pass pipeline II=4 (new K-pass every 4 cycles)
-- RTL likely processes NEST more sequentially
-
-**2. Dataflow overlap via Vitis HLS DATAFLOW**
-- 7 kernels + load/store all execute concurrently
-- Automatic PIPO (ping-pong) double-buffering on dataflow boundaries
-- RTL has a simpler, more sequential pipeline
-
-**3. Stream-based decoupling**
-- FIFO streams between crossbar_load and nest_compute mask loading latency
-- crossbar_load runs ~2 tiles ahead (stream depth = 2 tiles of data)
-- Eliminates stalls from memory access variability
-
-**Productivity advantage:**
-- Allo implementation: **~500 lines of Python** (feather_minisa.py kernel functions)
-- RTL reference: handwritten Verilog (significantly more code)
-- Full verification: simulator → HLS csim → csynth → RTL cosim, all in Python
-
-**Speaker notes:**
-Three factors explain why Allo beats RTL. First, Vitis HLS is extremely aggressive at unrolling and pipelining — it uses 48 DSPs for fully parallel MAC computation. Second, the DATAFLOW pragma enables all 7 kernels to run concurrently with automatic double-buffering. Third, the FIFO-based decoupling between crossbar and NEST masks memory access latency. The productivity story is also compelling — the entire design is about 500 lines of Python, with a unified verification flow from functional simulation through cycle-accurate RTL cosimulation.
-
----
-
-## Slide 15: Crossbar Flexibility — RESOLVED (1.5 min)
-
-**The crossbar now supports all power-of-2 Gr values per tile with zero performance cost.**
-
-FEATHER+'s core value is per-tile dataflow flexibility via the all-to-all crossbar.
-The original challenge: runtime `%`/`//` on variable Gr compiles to 14 multi-cycle integer
-dividers (1792 cycles). Hardcoding Gr=AW eliminated dividers (1001 cycles) but lost flexibility.
-
-**Solution: power-of-2 bit operations.** Since Gr always divides AW and AW=2^n, Gr is always
-a power of 2. Replace `%` and `//` with bit masks and shifts (compile to wires):
-
-```python
-# Compute log2_Gr via comparison chain (Gr is power of 2)
-log2_Gr = 0
-if Gr >= 2: log2_Gr = 1
-if Gr >= 4: log2_Gr = 2
-mask_Gr = Gr - 1
-
-# Input crossbar (zero-cost bit operations):
-m_idx = m_start + (ic_j & mask_Gr)              # ic_j % Gr → AND gate
-k_idx = k_start + ic_i + (ic_j >> log2_Gr) * AH # ic_j // Gr → shift mux
-```
-
-| Kernel | Gr support | Dividers | Cosim cycles | vs RTL |
-|---|---|---|---|---|
-| General-purpose (old) | Any Gr (runtime %) | 14 | 1792 | 1.60x |
-| K-streaming hardcoded (old) | Gr=AW only | 0 | 1001 | 0.89x |
-| **K-streaming bit ops (new)** | **All power-of-2 Gr** | **0** | **1004** | **0.90x** |
-
-The flexible crossbar adds only **3 cycles** vs the hardcoded version — essentially free.
-Verified with Gr=AW (pass-through), Gr=AW//2 (BIRRD reduction), and mixed-Gr programs.
-
-**This should give us both flexibility AND performance — matching the RTL crossbar's
-1-cycle any-to-any routing without physical muxes or integer dividers.**
-
-**Speaker notes:**
-I want to be upfront about a limitation. Our 1001-cycle result only works for Gr=AW — one specific dataflow. FEATHER+'s whole point is per-tile dataflow switching, and we've traded that away. The reason: in HLS, the crossbar is index arithmetic, and `ic_j % Gr` with a runtime Gr compiles to a 36-cycle integer divider. The RTL uses a physical mux network that routes in 1 cycle. But there's a clean fix: since Gr is always a power of 2 by architectural constraint, we can replace modulo and division with bit masks and shifts. These compile to pure combinational logic — essentially free. This should recover full flexibility without sacrificing performance.
-
----
-
-## Slide 16: Verification Flow (0.5 min)
-
-| Test | Command | What it verifies |
-|---|---|---|
-| **Simulator** | `python tests/test_figure7_mapping.py` | ISA mapping + GEMM correctness (numpy reference) |
-| **HLS C-sim** | `python tests/test_figure7_hls.py` | HLS-compiled kernel matches numpy |
-| **HLS csynth** | `python tests/test_figure7_hls.py` | Cycle estimate (770), resource usage |
-| **RTL cosim** | `python tests/test_figure7_cosim.py` | **Cycle-accurate measurement (1004)** via Verilog + xsim |
-| **Crossbar flex** | `python tests/test_crossbar_flexibility.py` | Multi-Gr correctness (Gr=AW, AW//2, mixed) |
-| **Regression** | `python tests/test_full_matrix_gemm.py` | Multi-size GEMM correctness |
-
-All tests pass across the full pipeline.
-
-**Speaker notes:**
-We verify at every level. The simulator tests ISA mapping correctness against a numpy reference. HLS csim verifies the compiled kernel produces correct results. Csynth gives cycle and resource estimates. RTL cosim runs cycle-accurate Verilog simulation through Xilinx xsim. All driven from Python test scripts.
-
----
-
-## Slide 17: Summary and Takeaways
-
-**FEATHER+** is a reconfigurable accelerator with NEST (PE array) + BIRRD (butterfly reduction network) that supports flexible dataflow and layout co-switching.
-
-**MINISA** is a 4-instruction VN-level ISA that compresses control overhead by 10^5x while preserving full mapping flexibility.
-
-**Allo implementation** maps the full FEATHER+ pipeline to 7 HLS dataflow kernels:
-```
-crossbar_load → nest_compute → bus → BIRRD[3,2] → output_accum
-```
-
-**Key optimizations:**
-1. Split crossbar/NEST breaks WAR dependency (II 14→4)
-2. UInt(128) stream packing matches VN data width
-3. K-streaming fuses K-passes within tiles
-4. Power-of-2 bit ops restore full crossbar flexibility (+3 cycles)
-
-**Result:** Allo at **1004 cycles beats handwritten RTL at 1120 cycles** (0.90x) for
-C[16,8] = A[16,12] x B[12,8] on a 4x4 NEST array, **with full dataflow flexibility**.
-
-**Remaining work:** Support Gr < AW//2 (e.g., weight stationary Gr=1) which requires
-multi-pass BIRRD reduction beyond the current 2-way pairwise butterfly.
-
-**Speaker notes:**
-To summarize: FEATHER+ solves the control overhead crisis in reconfigurable accelerators through the VN abstraction and MINISA's 4-instruction ISA. Our Allo implementation demonstrates that HLS can match and beat handwritten RTL — 1004 vs 1120 cycles — while preserving FEATHER+'s core flexibility. The key optimizations were splitting crossbar and NEST to break a WAR dependency (II 14→4) and using power-of-2 bit operations for the crossbar index arithmetic, which restored per-tile dataflow switching at a cost of only 3 extra cycles. The remaining limitation is that BIRRD's 2-way reduction only supports Gr=AW and Gr=AW//2; smaller Gr values like weight stationary (Gr=1) would need additional reduction stages.
-
----
-
-## Appendix A: File Map
-
-| File | Description |
-|---|---|
-| `feather_minisa.py` | Dataflow kernels (crossbar_load, nest_compute, bus, BIRRD, output_accum) |
-| `minisa/isa.py` | MINISA ISA definitions, `create_figure7_program()` |
-| `minisa/lowering.py` | BIRRD lowering and output column mapping |
-| `tests/test_figure7_mapping.py` | ISA mapping + functional GEMM test |
-| `tests/test_figure7_hls.py` | HLS csim + csynth test |
-| `tests/test_figure7_cosim.py` | RTL cosim test (cycle-accurate) |
-| `tests/test_crossbar_flexibility.py` | Multi-Gr crossbar tests (Gr=AW, AW//2, mixed) |
-| `tests/test_full_matrix_gemm.py` | Full-matrix GEMM regression (AW=8) |
-| `reports/figure7_rtl_comparison.md` | Detailed performance analysis |
-| `reports/figure7_gap_analysis.md` | Historical baseline gap analysis |
-| `reports/crossbar_flexibility_resolution.md` | Crossbar flexibility solution details |
-
-## Appendix B: Instruction Encoding
-
-Each instruction is one row of an int32[num_inst, 13] array:
-
-```
-SetIVNLayout:  [0, order, ML0, ML1, JL0, JL1, 0, 0, 0, 0, 0, 0, 0]
-SetWVNLayout:  [1, order, KL0, KL1, NL0, NL1, 0, 0, 0, 0, 0, 0, 0]
-SetOVNLayout:  [2, order, PL0, PL1, QL0, QL1, 0, 0, 0, 0, 0, 0, 0]
-SetMapping:    [3, r0, c0, Gr, Gc, sr, sc, m_start, m_end, n_start, n_end, k_start, k_end]
-```
-
-Figure 7 program: 3 layout instructions + 8 SetMapping instructions = 11 rows x 13 fields.
-
-## Appendix C: Stream Depths
+**Stream depths for 2-tile buffering:**
 
 | Stream | Type | Depth | Rationale |
-|---|---|---|---|
-| `iacts_stream` | UInt(128) | 6 | num_k_passes x 2 = 2 tiles of iActs buffering |
-| `weights_stream` | UInt(128) | 24 | num_k_passes x AH x 2 = 2 tiles of weights buffering |
-| `nest_out` | UInt(128) | 8 | AH x 2 = 2 tiles of NEST output buffering |
-| `connection[i,j]` | int32 | 4 | AH = 1 tile of BIRRD data |
-| `inst_input[i,j]` | int8 | 8 | num_tiles = all BIRRD instructions |
+|--------|------|-------|-----------|
+| `iacts_stream` | UInt(128) | num_k_passes * 2 | 2 tiles of iActs buffering |
+| `weights_stream` | UInt(128) | num_k_passes * AH * 2 | 2 tiles of weights buffering |
+| `nest_out` | UInt(128) | AH * 2 | 2 tiles of NEST output buffering |
+
+### 2.3 Flexible Crossbar via Power-of-2 Bit Operations
+
+FEATHER+'s crossbar routes data based on the replication group size Gr. A naive implementation uses runtime `%` and `//` on Gr, which compiles to multi-cycle integer dividers (14 dividers, 72% of design FF).
+
+Since Gr always divides AW and AW is a power of 2, Gr is always a power of 2. The implementation replaces:
+
+```python
+ic_j % Gr   →   ic_j & (Gr - 1)      # AND gate (1 LUT)
+ic_j // Gr  →   ic_j >> log2_Gr       # barrel shifter / mux
+```
+
+`log2_Gr` is computed per-tile via a comparison chain (lines 154-162 of `feather_minisa.py`):
+```python
+log2_Gr: int32 = 0
+if Gr >= 2:  log2_Gr = 1
+if Gr >= 4:  log2_Gr = 2
+if Gr >= 8:  log2_Gr = 3
+if Gr >= 16: log2_Gr = 4
+mask_Gr: int32 = Gr - 1
+```
+
+These compile to combinational logic: zero pipeline latency, no FF cost, no II degradation.
+
+### 2.4 UInt(128) Stream Packing
+
+Data between crossbar_load and nest_compute is packed into `UInt(AH * AW * Ty.bits)` = UInt(128) for int8 on a 4x4 array. This matches the VN data width and minimizes stream transaction count (1 iActs packet + AH weight packets per K-pass).
+
+### 2.5 int32 Intermediate Accumulation
+
+K-streaming accumulates partial products across multiple K-passes. With int8 inputs, products can reach `127 * 127 * AH * num_k_passes` which overflows int8/int16. All accumulation from NEST through BIRRD to output_accum uses `TyOut = int32`.
+
+---
+
+## 3. Test Cases
+
+All tests are in `tests/`. Simulator tests require only the Allo environment; HLS tests additionally require Vitis HLS 2023.2.
+
+### 3.1 test_figure7_mapping.py — ISA Mapping Correctness (8 tests)
+
+Verifies the MINISA Figure 7 mapping (C[16,8] = A[16,12] x B[12,8] on 4x4 NEST) at the ISA level — no hardware execution.
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_figure7_tile1_pe_mapping` | Exact (r,c) WVN indices for all 16 PEs in tile 1 (Gr=2, 16 unique pairs) |
+| `test_figure7_tile2_pe_mapping` | Exact (r,c) WVN indices for all 16 PEs in tile 2 (Gr=4, 8 unique pairs, 2x replication) |
+| `test_figure7_mapping_adaptation` | Gr changes from 2→4 between tiles; r0 advances; Gc/sr/sc stay constant |
+| `test_figure7_full_pe_utilization` | All 16 PEs produce useful work (within weight matrix bounds) in both tiles |
+| `test_figure7_k_coverage_per_output_column` | Union of K ranges from both tiles covers [0,K) for every output column |
+| `test_figure7_no_k_overlap_between_tiles` | Tile 1 covers WVN rows {0,1} (K=[0,8)), tile 2 covers {2} (K=[8,12)), disjoint |
+| `test_figure7_functional_gemm` | End-to-end GEMM through full Allo dataflow hardware, output matches numpy |
+| `test_figure7_tile2_replication_factor` | Each unique (r,c) in tile 2 is assigned to exactly 2 PEs (M-parallelism replication) |
+
+```bash
+source /home/nz264/.local/bin/allo-env.sh
+cd /work/shared/users/phd/nz264/allo/examples/feather-isa
+python tests/test_figure7_mapping.py
+```
+
+### 3.2 test_crossbar_flexibility.py — Multi-Gr Crossbar (4 tests)
+
+Verifies that the parametric Gr crossbar (bit operations) produces correct GEMM for different dataflow configurations.
+
+| Test | Gr | BIRRD mode | Workload | What it verifies |
+|------|----|-----------|----------|-----------------|
+| `test_gr_equals_aw` | 4 (=AW) | Pass-through | C[16,8] = A[16,12] x B[12,8] | Figure 7 regression — each PE column handles independent M row |
+| `test_gr_half_aw` | 2 (=AW//2) | Reduction | C[8,4] = A[8,8] x B[8,4] | Paired columns handle different K-stripes, BIRRD reduces partial sums |
+| `test_mixed_gr_tiles` | 2 and 4 | Mixed | C[8,4] = A[8,12] x B[12,4] | Gr=2 tiles for K=[0,8) + Gr=4 tiles for K=[8,12) in one program |
+| `test_bit_ops_equivalence` | 1,2,AW//2,AW | N/A (unit) | All j in [0,AW) | Verifies `(j & (Gr-1)) == (j % Gr)` and `(j >> log2(Gr)) == (j // Gr)` for AW=4,8,16 |
+
+```bash
+source /home/nz264/.local/bin/allo-env.sh
+cd /work/shared/users/phd/nz264/allo/examples/feather-isa
+python tests/test_crossbar_flexibility.py
+```
+
+### 3.3 test_full_matrix_gemm.py — GEMM Regression (10 tests)
+
+Verifies the full-matrix execution model on an AW=8 NEST across multiple GEMM sizes, instruction encoding correctness, OVN order variation, and tile advancement.
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_full_matrix_gemm_8x8x16` | GEMM C[8,8] = A[8,16] x B[16,8] on 8x8 array |
+| `test_full_matrix_gemm_16x8x32` | GEMM C[16,8] = A[16,32] x B[32,8] — multiple M and K tiles |
+| `test_full_matrix_gemm_16x16x32` | GEMM C[16,16] = A[16,32] x B[32,16] — multiple tiles in all dimensions |
+| `test_full_matrix_instruction_encoding` | Encoded instruction array has correct shape, types, and field values |
+| `test_full_matrix_single_invocation` | Single Allo invocation handles complete matrix (vs 16 invocations in old model) |
+| `test_layout_instruction_decode_on_chip` | Layout order fields are correctly encoded and decoded for IVN/WVN/OVN |
+| `test_pe_mapping_fields_encoded` | Output-stationary (Gr=4,Gc=1,sr=1,sc=0) and weight-stationary (Gr=1,Gc=8,sr=0,sc=1) encoded correctly |
+| `test_ovn_order_produces_different_birrd` | All 6 OVN orders produce distinct BIRRD instruction tables for AW=4,8,16 |
+| `test_ovn_order_all_correct` | All 6 OVN orders produce correct GEMM output (different BIRRD routing, same result) |
+| `test_r0_c0_tile_advancement` | r0=k_start//AH, c0=n_start — matches MINISA paper equations (2)-(3) |
+
+```bash
+source /home/nz264/.local/bin/allo-env.sh
+cd /work/shared/users/phd/nz264/allo/examples/feather-isa
+python tests/test_full_matrix_gemm.py
+```
+
+### 3.4 test_figure7_hls.py — HLS Csim + Csynth (2 tests)
+
+Requires Vitis HLS 2023.2.
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_figure7_hls_csim` | HLS C simulation produces output matching numpy reference |
+| `test_figure7_hls_csynth` | Synthesis report: cycle count, resource usage, clock estimate, pipeline II |
+
+```bash
+source /home/nz264/.local/bin/allo-env.sh
+source /opt/xilinx/Vitis_HLS/2023.2/settings64.sh
+cd /work/shared/users/phd/nz264/allo/examples/feather-isa
+python tests/test_figure7_hls.py
+```
+
+### 3.5 test_figure7_cosim.py — RTL Co-Simulation (1 test)
+
+Requires Vitis HLS 2023.2. Runs for several minutes.
+
+Generates a C testbench with Figure 7 data, patches `m_axi` depth specs into `kernel.cpp`, runs `csynth_design` + `cosim_design` via a TCL script, and extracts the cycle-accurate latency from the Verilog RTL simulation report.
+
+```bash
+source /home/nz264/.local/bin/allo-env.sh
+source /opt/xilinx/Vitis_HLS/2023.2/settings64.sh
+cd /work/shared/users/phd/nz264/allo/examples/feather-isa
+python tests/test_figure7_cosim.py
+```
+
+---
+
+## 4. Allo vs RTL: Feature Comparison
+
+### What the Allo Implementation Supports
+
+| Feature | Allo | RTL | Notes |
+|---------|------|-----|-------|
+| **NEST MAC (AHxAW)** | Yes (4x4 tested, 8x8 tested) | Yes | Fully unrolled, 48 DSPs for 4x4 |
+| **BIRRD reduction network** | Yes (P0 stages, P1 switches) | Yes | Configurable per OVN order (6 orders) |
+| **MINISA instruction decode** | Yes (on-chip decode from int32 array) | Yes | 4 instruction types: SetIVNLayout, SetWVNLayout, SetOVNLayout, SetMapping |
+| **Per-tile dataflow switching (Gr)** | Gr=AW, Gr=AW//2 | All Gr values | Allo uses bit ops; RTL uses physical mux crossbar |
+| **K-streaming** | Yes (fused K-passes per tile) | Yes | Reduces tile count, enables int32 accumulation |
+| **Double-buffering** | Yes (HLS DATAFLOW PIPO) | Yes (ping-pong buffers) | Automatic in HLS via dataflow pragma |
+| **Multi-tile programs** | Yes (loop over tiles in each kernel) | Yes | Up to num_tiles tiles per invocation |
+| **Input/weight crossbar** | Index-arithmetic (bit ops) | Physical mux network | Functionally equivalent for power-of-2 Gr |
+| **int8 input, int32 accumulation** | Yes | Yes | Prevents overflow across K-passes |
+
+### Gaps (Allo does not yet support)
+
+| Gap | Detail | Root Cause |
+|-----|--------|------------|
+| **Gr < AW//2** (e.g., Gr=1 weight stationary) | BIRRD only does pairwise reduction (column j + column j+Mt). Gr=1 needs AW-way reduction. | BIRRD butterfly network is hardwired for 2-way reduction. Supporting more requires multi-pass BIRRD or a different accumulation structure. |
+| **IVN/WVN layout orders** | Crossbar always uses ORDER_012 for input/weight index arithmetic. Other IVN/WVN orders (ORDER_021 through ORDER_210) are encoded but not applied. | Only OVN order affects BIRRD routing. Applying IVN/WVN orders requires permuting the crossbar index expressions per order, which adds 6 cases to the inner loop. |
+| **Mixed Kt_per_pass programs** | All tiles in one program must share the same `num_k_passes` and `Kt_per_pass`. | The K-pass loop bound is a compile-time constant in the HLS kernel. Mixed Kt_per_pass would require either runtime loop bounds (kills pipelining) or separate kernel invocations. |
+| **Weight stationarity** | Gr=1 with Gc=AW: each PE column holds a different weight VN. Not functional yet. | Depends on Gr < AW//2 support (see above). |
+| **Streaming buffer ping-pong** | Allo relies on HLS-inserted PIPO. RTL has explicit ping-pong buffer management. | Not a functional gap — HLS auto-inserts double-buffering for dataflow regions. |
+
+---
+
+## 5. Figure 7 Cycle Count Comparison
+
+**Workload:** C[16,8] = A[16,12] x B[12,8] on 4x4 NEST (AH=AW=4)
+
+### Results
+
+| Implementation | Cosim Cycles | Csynth Estimate | vs RTL |
+|----------------|-------------|-----------------|--------|
+| **Allo (flexible Gr)** | **1004** | 770 | **0.90x** |
+| RTL reference (Icarus Verilog) | 1120 | — | 1.00x |
+
+**Allo is 10% faster than the handwritten RTL reference.**
+
+### Per-Kernel Synthesis Breakdown
+
+From Vitis HLS csynth report (`test_figure7_hls.py` output):
+
+| Kernel | Cycles | Pipeline | Notes |
+|--------|--------|----------|-------|
+| crossbar_load | ~200 | II=8, trip=24 | Flattened tile+K-pass loop, 8 tiles x 3 K-passes |
+| nest_compute | ~400 | K-pass II=4 | 50 cycles/tile, critical path |
+| output_accum | ~400 | — | Init + accum + writeback |
+| BIRRD[P0,P1] | ~100 | II=1 | Pass-through for Gr=AW, reduction for Gr<AW |
+| bus | ~100 | II=1 | Unpacks int32 from UInt(128) |
+
+### Resource Usage (Xilinx U280, Vitis HLS 2023.2)
+
+| Resource | Used |
+|----------|------|
+| BRAM_18K | 20 |
+| DSP | 49 |
+| FF | 18,987 |
+| LUT | 25,748 |
+
+- 48 DSPs = 16 fully-unrolled MAC units in the 4x4 NEST array (+ 1 misc)
+- 0 integer dividers (was 14 in the original implementation)
+- Estimated clock: 2.792 ns
+
+### Why Allo Beats RTL
+
+1. **Aggressive HLS pipelining**: NEST MAC fully unrolled to 48 parallel DSPs, K-pass pipeline II=4
+2. **Dataflow overlap via DATAFLOW pragma**: All 7 kernels + load/store execute concurrently with automatic PIPO double-buffering
+3. **Stream-based decoupling**: FIFO streams between crossbar_load and nest_compute mask loading latency; crossbar_load runs ~2 tiles ahead
+
+---
+
+## 6. Reproducing Results
+
+### Prerequisites
+
+- Allo environment (Python 3.12 + LLVM + MLIR)
+- Vitis HLS 2023.2 (for HLS tests)
+- Server: zhang-21.ece.cornell.edu (or equivalent with Xilinx tools)
+
+### Step-by-step
+
+```bash
+# 1. Activate environments
+source /home/nz264/.local/bin/allo-env.sh
+source /opt/xilinx/Vitis_HLS/2023.2/settings64.sh
+
+# 2. Navigate to project
+cd /work/shared/users/phd/nz264/allo/examples/feather-isa
+
+# 3. Run simulator tests (no Vitis HLS required, ~30 seconds total)
+python tests/test_figure7_mapping.py        # 8 tests — ISA mapping
+python tests/test_crossbar_flexibility.py   # 4 tests — multi-Gr crossbar
+python tests/test_full_matrix_gemm.py       # 10 tests — GEMM regression
+
+# 4. Run HLS C simulation (requires Vitis HLS, ~2 minutes)
+python tests/test_figure7_hls.py
+#    Output includes:
+#      - CSim: "Output matches numpy reference"
+#      - CSynth: cycle count (770), resource table, clock estimate
+
+# 5. Run RTL co-simulation (requires Vitis HLS, ~5-10 minutes)
+python tests/test_figure7_cosim.py
+#    Output includes:
+#      - "RTL Co-Simulation Cycle Count: 1004"
+#      - Cosim report and transaction report
+```
+
+### Interpreting Results
+
+- **Simulator tests**: Print "PASSED" per test and a summary count. Any failure prints the assertion with expected/actual values.
+- **HLS csim**: Builds the Allo design through Vitis HLS C simulation. "Output matches numpy reference" confirms functional correctness.
+- **HLS csynth**: Prints synthesis report with cycle estimate, resource usage, and clock period. The csynth cycle count (770) is an estimate; cosim gives the accurate number.
+- **RTL cosim**: Generates Verilog RTL, runs cycle-accurate simulation via Xilinx xsim, and reports exact cycle count. The cosim report table shows `Verilog|Pass|NNNN` where NNNN is the cycle count.
+
+### Reproducing the RTL Reference (1120 cycles)
+
+The RTL reference is a handwritten Verilog implementation of FEATHER+ located at `/work/shared/users/phd/nz264/FEATHER_GEMM/RTL/feather_plus/`. The testbench `tb_figure7.v` runs the same workload (C[16,8] = A[16,12] x B[12,8] on a 4x4 PE array) and measures cycle count from first computation to last BIRRD output.
+
+**RTL source files** (all in `FEATHER_GEMM/RTL/feather_plus/`):
+
+| File | Description |
+|------|-------------|
+| `feather_plus_top.v` | Top module: buffers, crossbars, NEST PE array, BIRRD+, output buffer, auto-quant |
+| `crossbar.v` | Distribution crossbar (mux-tree, 2-cycle latency) |
+| `birrd_plus_cmd_flow_seq.v` | BIRRD+ butterfly network (4 stages for AW=4) |
+| `birrd_2x2_simple_cmd_flow_seq.v` | 2x2 EGG switch with command forwarding |
+| `birrd_2x2_simple_seq.v` | 2x2 EGG switch (last stage, no forwarding) |
+| `feather_pe.v` | Processing element with local weight buffer and MAC |
+| `o_bus_autopick_seq.v` | Output bus auto-picker (selects valid PE row output) |
+| `quant_post.v` | Post-quantization (combinational) |
+| `sram_dp_1r1w.v` | Dual-port SRAM (1 read, 1 write) |
+| `define.vh` | Global defines (buffer depths, opcodes) |
+| `tb_figure7.v` | Figure 7 testbench with cycle measurement |
+
+**Compile and run with Icarus Verilog:**
+
+```bash
+cd /work/shared/users/phd/nz264/FEATHER_GEMM/RTL/feather_plus
+
+# Compile
+iverilog -g2012 -I. -o tb_figure7.vvp \
+    feather_plus_top.v crossbar.v \
+    birrd_plus_cmd_flow_seq.v birrd_2x2_simple_cmd_flow_seq.v birrd_2x2_simple_seq.v \
+    feather_pe.v o_bus_autopick_seq.v quant_post.v sram_dp_1r1w.v \
+    tb_figure7.v
+
+# Run
+vvp tb_figure7.vvp
+```
+
+**Expected output** (last lines):
+
+```
+  Cycle measurement:
+    Start cycle : 105
+    End cycle   : 1224
+TOTAL CYCLES: 1120
+
+  GOLDEN MODEL COMPARISON: PASS (128 values verified)
+```
+
+**What the RTL testbench does:**
+
+1. Pads K=12 to K_pad=16 (TILE_K = WEIGHTS_DEPTH * NEST_ROW_NUM = 16)
+2. Loops: 2 N-tiles (cols 0-3, 4-7) x 1 K-tile x 4 M-batches (4 rows each)
+3. Per batch: writes weights to streaming buffer, loads into PEs, writes iacts to stationary buffer, streams through NEST + BIRRD+
+4. Timing: starts on first `pe_iacts_valid` assertion, ends on last BIRRD output capture
+5. Verifies all 128 output values against golden model (C = A x B, deterministic data)
+
+**Key differences from the Allo implementation:**
+
+| Aspect | RTL | Allo HLS |
+|--------|-----|----------|
+| Crossbar | Physical 2-cycle mux network | Index arithmetic with bit ops |
+| PE weight loading | Explicit multi-cycle SRAM→PE transfer | Implicit in crossbar_load kernel |
+| Double-buffering | Explicit ping-pong buffer management | HLS-inserted PIPO (automatic) |
+| K-pass overlap | Sequential (no K-streaming) | K-passes fused within tile, pipelined at II=4 |
+| BIRRD+ stages | 4 (hardware pipeline, 1 cycle/stage) | 3 (Allo BIRRD uses `2*LOG2_AW-1` for AW=4) |
+| Cycle count | 1120 | 1004 |
+
+---
+
+## 7. File Map
+
+| File | Description |
+|------|-------------|
+| `feather_minisa.py` | All 7 dataflow kernels + FeatherKStreamingModule wrapper + build helpers (~450 lines) |
+| `minisa/isa.py` | MINISA ISA definitions (SetIVNLayout, SetWVNLayout, SetOVNLayout, SetMapping), program creation, encoding |
+| `minisa/lowering.py` | BIRRD instruction tables for (AW, order) combinations, output column map computation |
+| `tests/test_figure7_mapping.py` | ISA-level mapping verification (8 tests) |
+| `tests/test_crossbar_flexibility.py` | Multi-Gr crossbar correctness (4 tests) |
+| `tests/test_full_matrix_gemm.py` | Full-matrix GEMM regression on AW=8 (10 tests) |
+| `tests/test_figure7_hls.py` | HLS C simulation + synthesis (2 tests) |
+| `tests/test_figure7_cosim.py` | RTL co-simulation for cycle-accurate measurement |
+| `CLAUDE.md` | Environment setup and project conventions |
