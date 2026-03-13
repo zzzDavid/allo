@@ -99,6 +99,16 @@ def generate_cosim_testbench(project_dir, A, B, instructions, C_ref):
     n_start_per_tile = np.array(
         [int(instructions[3 + t, 9]) for t in range(num_tiles)], dtype=np.int32
     )
+    # Separate arrays for nest_compute and output_accum (HLS single-reader)
+    nest_zero_points = np.array(
+        [int(instructions[0, 6]), int(instructions[1, 6])], dtype=np.int32
+    )
+    accum_quant_params = np.array(
+        [int(instructions[2, 6]), int(instructions[2, 7])], dtype=np.int32
+    )
+    accum_sr_per_tile = np.array(
+        [int(instructions[3 + t, 5]) for t in range(num_tiles)], dtype=np.int32
+    )
 
     # Write testbench
     tb_path = os.path.join(project_dir, "tb.cpp")
@@ -108,14 +118,23 @@ def generate_cosim_testbench(project_dir, A, B, instructions, C_ref):
         f.write("int main() {\n")
 
         # Flatten all arrays as 1D C arrays
-        f.write("  // Input matrices\n")
+        # Order must match Allo's kernel-grouped reordering:
+        # crossbar_load: A, B, instructions
+        # nest_compute: nest_zero_points
+        # inst_rw: birrd_inst
+        # output_accum: output_col_map, output_num_m, output_n_base,
+        #               accum_m_start, accum_n_start, accum_quant_params,
+        #               accum_sr_per_tile, C
+        f.write("  // Input matrices (crossbar_load)\n")
         f.write("  " + _c_array_1d("A", "int8_t", A.flatten()))
         f.write("  " + _c_array_1d("B", "int8_t", B.flatten()))
-        f.write("  // Instructions\n")
+        f.write("  // Instructions (crossbar_load)\n")
         f.write("  " + _c_array_1d("instructions", "int32_t", instructions.flatten()))
-        f.write("  // BIRRD per-tile instructions\n")
+        f.write("  // Zero points (nest_compute)\n")
+        f.write("  " + _c_array_1d("nest_zp", "int32_t", nest_zero_points.flatten()))
+        f.write("  // BIRRD per-tile instructions (inst_rw)\n")
         f.write("  " + _c_array_1d("birrd_inst", "int8_t", birrd_per_tile.flatten()))
-        f.write("  // Output column map\n")
+        f.write("  // Output column map (output_accum)\n")
         f.write("  " + _c_array_1d("output_col_map", "int32_t", col_map_per_tile.flatten()))
         f.write("  // Output num_m per tile\n")
         f.write("  " + _c_array_1d("output_num_m", "int32_t", num_m_per_tile.flatten()))
@@ -125,15 +144,19 @@ def generate_cosim_testbench(project_dir, A, B, instructions, C_ref):
         f.write("  " + _c_array_1d("accum_m_start", "int32_t", m_start_per_tile.flatten()))
         f.write("  // Accum n_start per tile\n")
         f.write("  " + _c_array_1d("accum_n_start", "int32_t", n_start_per_tile.flatten()))
+        f.write("  // Quant params (output_accum)\n")
+        f.write("  " + _c_array_1d("accum_qp", "int32_t", accum_quant_params.flatten()))
+        f.write("  // SR per tile (output_accum)\n")
+        f.write("  " + _c_array_1d("accum_sr", "int32_t", accum_sr_per_tile.flatten()))
         f.write("  // Output matrix (initialized to zero)\n")
         f.write(f"  int32_t C[{M * N}];\n")
         f.write(f"  memset(C, 0, sizeof(C));\n\n")
 
-        # Call top function
+        # Call top function (order matches HLS kernel-grouped reordering)
         f.write("  // Run FEATHER+ dataflow\n")
-        f.write("  full_matrix_top(A, B, instructions, birrd_inst, "
+        f.write("  full_matrix_top(A, B, instructions, nest_zp, birrd_inst, "
                 "output_col_map, output_num_m, output_n_base, "
-                "accum_m_start, accum_n_start, C);\n\n")
+                "accum_m_start, accum_n_start, accum_qp, accum_sr, C);\n\n")
 
         # Verify output
         f.write("  // Reference output\n")
@@ -165,21 +188,28 @@ def patch_kernel_for_cosim(project_dir, num_tiles):
     with open(kernel_path, "r") as f:
         code = f.read()
 
-    # Ordered depths matching the 10 function arguments:
-    # A, B, instructions, birrd_inst, output_col_map,
-    # output_num_m, output_n_base, accum_m_start, accum_n_start, C
+    # Ordered depths matching the 13 kernel-grouped function arguments:
+    # crossbar_load: A, B, instructions
+    # nest_compute: nest_zero_points
+    # inst_rw: birrd_inst
+    # output_accum: output_col_map, output_num_m, output_n_base,
+    #               accum_m_start, accum_n_start, accum_quant_params,
+    #               accum_sr_per_tile, C
     P0, _ = compute_birrd_params(AW)
     num_inst = num_tiles + 3
     ordered_depths = [
         M * K,                        # A: int8[16,12]
         K * N,                        # B: int8[12,8]
         num_inst * 13,                # instructions: int32[num_inst,13]
+        2,                            # nest_zero_points: int32[2]
         num_tiles * P0 * (AW // 2),   # birrd_inst
         num_tiles * AW,               # output_col_map
         num_tiles,                    # output_num_m
         num_tiles * AW,               # output_n_base
         num_tiles,                    # accum_m_start
         num_tiles,                    # accum_n_start
+        2,                            # accum_quant_params: int32[2]
+        num_tiles,                    # accum_sr_per_tile: int32[num_tiles]
         M * N,                        # C: int32[16,8]
     ]
 
