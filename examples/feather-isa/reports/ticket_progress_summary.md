@@ -2,7 +2,7 @@
 
 **Date**: 2026-03-13
 **Branch**: minisa
-**Status**: 8/9 tickets resolved, 1 remaining
+**Status**: 9/9 tickets resolved (TICKET-009 Phase 1 complete)
 
 ## Resolved Tickets
 
@@ -47,11 +47,13 @@ At each butterfly stage, sets AL when both switch inputs belong to the same
 reduction group. Produces full `log2(AW/Gr)` levels of tree reduction inside
 BIRRD hardware. Verified for all 12 (AW, Gr) combinations across AW=4,8,16.
 
-## Remaining Ticket
-
-### TICKET-009: Multi-Layer RIR (Run-Infer-Run) (P3, open)
-Chain multiple GEMM layers with quantized int8 output feeding the next layer's
-int8 input. Requires post-quantization (done) plus layer-to-layer buffer management.
+### TICKET-009: Multi-Layer Sequential Execution (P3, Phase 1 resolved)
+`run_sequential_gemm_layers()` chains GEMM layers with int8 intermediates.
+Each non-final layer uses post-quantization (uint8 via `& 255`), then
+reinterprets as int8 for the next layer's input. Matches RTL auto-quant pipeline:
+OB → quant_post → StaB PONG write → next layer iActs read.
+5 tests: 2-layer, 3-layer, zero points, different dataflows, AW=4.
+Phase 2 (on-chip RIR) and Phase 3 (full overlap) remain as future work.
 
 ## Test Summary
 
@@ -60,9 +62,10 @@ int8 input. Requires post-quantization (done) plus layer-to-layer buffer managem
 | test_figure7_mapping.py | 8 | PASS |
 | test_full_matrix_gemm.py | 17 | PASS |
 | test_crossbar_flexibility.py | 13 | PASS |
+| test_multi_layer.py | 5 | PASS |
 | test_parameterized_gemm.py (AW=8) | 12 | PASS |
 | test_parameterized_gemm.py (AW=4) | 12 | PASS |
-| **Total** | **62** | **ALL PASS** |
+| **Total** | **67** | **ALL PASS** |
 
 ## Architecture Overview
 
@@ -79,24 +82,4 @@ Key metrics:
 - RTL cosim: **1004 cycles** (Allo) vs 1120 (RTL reference) = **0.90x**
 - Single Allo invocation handles complete matrices (no Python-level tiling loop)
 - All operations HLS-friendly: shifts, masks, comparisons — no runtime dividers
-
-## Changes in This Commit
-
-### Files modified (7):
-- `CLAUDE.md` — Updated design decisions for multi-way BIRRD and sr/sc support
-- `feather_minisa.py` — Gc/sr/sc crossbar, output_n_base, multi-way BIRRD dispatch
-- `minisa/isa.py` — quant_scale/quant_zp in SetOVNLayout and create_gemm_program
-- `minisa/lowering.py` — Multi-way BIRRD generation algorithm + generalized simulator
-- `tests/test_crossbar_flexibility.py` — sr=0 test, multi-way BIRRD GEMM tests
-- `tests/test_figure7_cosim.py` — output_n_base port in cosim testbench
-- `tests/test_full_matrix_gemm.py` — Post-quantization tests (7 cases)
-
-### New files (6):
-- `reports/ticket_progress_summary.md` — This report
-- `tickets/TICKET-005-zero-point-subtraction.md` — Resolved
-- `tickets/TICKET-006-post-quantization.md` — Resolved
-- `tickets/TICKET-007-gc-sr-sc-crossbar.md` — Resolved
-- `tickets/TICKET-008-multi-way-birrd.md` — Resolved
-- `tickets/TICKET-009-multi-layer-rir.md` — Open (P3)
-
-### Net change: +783 lines across 7 modified files, 6 new ticket/report files
+- Multi-layer chaining: quantized int8 intermediates enable end-to-end inference

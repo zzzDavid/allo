@@ -587,3 +587,52 @@ def build_feather_kstreaming_hls(M, K, N, AW, AH, Ty, num_inst,
     s.partition("full_matrix_top:C", dim=2, factor=AH)
     allo_mod = s.build(target="vitis_hls", mode=mode, project=project)
     return FeatherKStreamingModule(allo_mod, AW)
+
+
+def run_sequential_gemm_layers(A_input, layer_weights, layer_program_kwargs,
+                                AW, AH):
+    """Execute multiple GEMM layers sequentially with int8 intermediates.
+
+    Each non-final layer must enable post-quantization (quant_scale != 0)
+    so that its int32 accumulator is quantized to uint8 via
+    (accum * scale + zp) & 255. The uint8 output is reinterpreted as
+    signed int8 for the next layer's input — matching the RTL auto-quant
+    pipeline (OB → quant_post → StaB PONG write).
+
+    Args:
+        A_input: Initial input matrix (int8, shape [M, K0])
+        layer_weights: List of weight matrices (int8), one per layer
+        layer_program_kwargs: List of dicts passed to create_gemm_program(),
+            e.g. [dict(M=8, N=8, K=16, quant_scale=1, quant_zp=128), ...]
+        AW, AH: Array dimensions
+
+    Returns:
+        List of output arrays (int32), one per layer.
+        Non-final layers contain post-quantized uint8 values (0-255) in int32.
+    """
+    from minisa.isa import create_gemm_program, encode_program
+
+    outputs = []
+    current_input = A_input
+
+    for i, (B, kwargs) in enumerate(zip(layer_weights, layer_program_kwargs)):
+        program = create_gemm_program(AH=AH, AW=AW, **kwargs)
+        instructions = encode_program(program)
+        max_kp = compute_max_k_passes(instructions, AW, AH)
+
+        M_i = current_input.shape[0]
+        K_i = current_input.shape[1]
+        N_i = B.shape[1]
+
+        mod = build_feather_kstreaming_simulator(
+            M_i, K_i, N_i, AW, AH, int8, len(instructions), max_kp,
+        )
+        C = np.zeros((M_i, N_i), dtype=np.int32)
+        mod(current_input, B, instructions, C)
+        outputs.append(C)
+
+        # Convert quantized output to int8 for next layer's input
+        if i < len(layer_weights) - 1:
+            current_input = C.astype(np.uint8).view(np.int8)
+
+    return outputs

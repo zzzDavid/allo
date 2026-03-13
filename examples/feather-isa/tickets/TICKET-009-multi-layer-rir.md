@@ -1,7 +1,7 @@
 ---
 id: TICKET-009
 title: Multi-layer execution with RIR (Reorder-In-Reduction)
-status: open
+status: resolved (Phase 1)
 priority: P3
 ---
 
@@ -93,19 +93,49 @@ for the next layer.
 - **TICKET-007** (Gc/sr/sc): Beneficial for demonstrating dataflow switching
 - **TICKET-008** (multi-way BIRRD): Beneficial for weight-stationary layers
 
+## Implementation (Phase 1)
+
+### `run_sequential_gemm_layers()` helper
+
+Added to `feather_minisa.py`. Takes initial input, list of weight matrices, and
+list of `create_gemm_program()` kwargs per layer. For each non-final layer:
+
+1. Builds a separate simulator (dimensions differ per layer)
+2. Runs GEMM with post-quantization: `(accum * scale + zp) & 255` → uint8
+3. Reinterprets uint8 output as int8 via `C.astype(np.uint8).view(np.int8)`
+4. Passes int8 as next layer's input
+
+This matches the RTL pipeline: OB → quant_post → StaB PONG → next layer iActs.
+
+### Test Suite
+
+5 tests in `tests/test_multi_layer.py`:
+
+| Test | Layers | Features |
+|------|--------|----------|
+| `test_two_layer_gemm` | 2 | Basic chaining, end-to-end golden |
+| `test_three_layer_gemm` | 3 | Two quantized intermediates |
+| `test_two_layer_with_zero_points` | 2 | Zero points + quantization |
+| `test_two_layer_different_dataflow` | 2 | OS (Gr=4) → passthrough (Gr=8) |
+| `test_two_layer_aw4` | 2 | AW=4 array |
+
 ## Relevant Code
 
-- `feather_minisa.py`: `FeatherKStreamingModule.__call__()` — currently single-layer
-- `minisa/isa.py`: `MINISAProgram` — currently single-layer program structure
+- `feather_minisa.py`: `run_sequential_gemm_layers()` — multi-layer chaining helper
+- `feather_minisa.py`: `FeatherKStreamingModule.__call__()` — per-layer execution
+- `tests/test_multi_layer.py` — 5 multi-layer tests
+- `minisa/isa.py`: `MINISAProgram` — per-layer program structure
 - FEATHER paper: Section III.B.2 (RIR), Section IV (FEATHER in action)
 - MINISA paper: Section IV.E.4 (execution model)
 
 ## Acceptance Criteria
 
 ### Phase 1 (sequential multi-layer)
-- [ ] Helper function chains layer execution with int8 intermediate values
-- [ ] 2-layer GEMM test: layer1 output (quantized int8) fed as layer2 input
-- [ ] Results match golden reference computed in numpy
+- [x] Helper function chains layer execution with int8 intermediate values
+- [x] 2-layer GEMM test: layer1 output (quantized int8) fed as layer2 input
+- [x] 3-layer GEMM test: two quantized intermediates
+- [x] Tests with zero points, different dataflows, and AW=4
+- [x] Results match golden reference computed in numpy
 
 ### Phase 2 (on-chip RIR)
 - [ ] BIRRD write addresses determined by next layer's layout

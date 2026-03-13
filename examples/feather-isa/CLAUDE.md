@@ -19,6 +19,7 @@ The second adds `vitis_hls` to PATH (required for HLS tests).
 python tests/test_figure7_mapping.py     # ISA mapping + functional GEMM
 python tests/test_full_matrix_gemm.py    # Full-matrix GEMM regression (AW=8)
 python tests/test_crossbar_flexibility.py # Multi-Gr crossbar + sr=0/sc=0 tests
+python tests/test_multi_layer.py          # Multi-layer sequential execution
 
 # Parameterized tests for any AW/AH (default 16x16)
 python tests/test_parameterized_gemm.py --aw 16 --ah 16           # simulator
@@ -39,6 +40,7 @@ python tests/test_figure7_cosim.py       # RTL cosim cycle count
   - `get_feather_full_matrix_top_kstreaming()` — supports all power-of-2 Gr values per tile via bit operations in crossbar index arithmetic (no runtime dividers)
   - `FeatherKStreamingModule` — wrapper with per-tile BIRRD configuration (reduction for Gr<AW, pass-through for Gr=AW)
   - `build_feather_kstreaming_simulator()` / `build_feather_kstreaming_hls()` — build helpers
+  - `run_sequential_gemm_layers()` — multi-layer chaining with int8 intermediates
 - `minisa/isa.py` — MINISA ISA definitions and program generation
 - `minisa/lowering.py` — BIRRD lowering and output column mapping
 - `tests/` — All test files
@@ -83,5 +85,10 @@ python tests/test_figure7_cosim.py       # RTL cosim cycle count
   In our direct-indexing model (no VN buffer), the crossbar routing is determined by
   Gr/Gc/sr/sc from SetMapping, so all 6 orders produce correct results. OVN order
   DOES affect computation via BIRRD butterfly routing (already implemented).
+- Multi-layer sequential execution: `run_sequential_gemm_layers()` chains GEMM layers with
+  int8 intermediates. Each non-final layer uses post-quantization (quant_scale != 0) to
+  produce uint8 output, which is reinterpreted as int8 for the next layer's input. Matches
+  RTL pipeline: OB → quant_post → StaB PONG write → next layer iActs read.
+  Supports different dataflows per layer (e.g., OS layer 1 → passthrough layer 2).
 - For cosim, use `mode="csyn"` to generate kernel.cpp, then manually patch m_axi depths
   and write C testbench (see `test_figure7_cosim.py` for pattern).
