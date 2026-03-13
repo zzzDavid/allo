@@ -312,6 +312,136 @@ def test_ovn_order_all_correct():
     return True
 
 
+def test_ivn_order_all_correct():
+    """Verify all 6 IVN layout orders produce correct GEMM output.
+
+    The IVN order controls VN buffer memory layout in the physical
+    architecture. In our direct-indexing model (no VN buffer), the
+    crossbar routing is determined by Gr/Gc/sr/sc from SetMapping,
+    so all 6 IVN orders produce identical, correct results.
+    """
+    print("\n" + "=" * 60)
+    print("Test: IVN Order All Correct")
+    print("=" * 60)
+
+    M, N, K, AW, AH = 8, 8, 16, 8, 8
+    np.random.seed(42)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+    ref = np.dot(A, B)
+
+    for ivn_order in range(6):
+        program = create_gemm_program(
+            M=M, N=N, K=K, AH=AH, AW=AW, ivn_order=ivn_order,
+        )
+        instructions = encode_program(program)
+        max_k_passes = compute_max_k_passes(instructions, AW, AH)
+
+        # Verify IVN order is encoded correctly
+        assert instructions[0, 1] == ivn_order, \
+            f"IVN order {ivn_order} not encoded at instructions[0,1]"
+
+        mod = build_feather_kstreaming_simulator(
+            M, K, N, AW, AH, int8, len(instructions),
+            max_k_passes,
+        )
+        C = np.zeros((M, N), dtype=np.int32)
+        mod(A, B, instructions, C)
+        np.testing.assert_array_equal(C, ref)
+        print(f"  IVN order={ivn_order}: matches numpy reference")
+
+    print("PASSED: IVN order all correct")
+    return True
+
+
+def test_wvn_order_all_correct():
+    """Verify all 6 WVN layout orders produce correct GEMM output.
+
+    The WVN order controls weight VN buffer memory layout. In our
+    direct-indexing model, the crossbar routing is independent of
+    the buffer layout, so all 6 WVN orders produce correct results.
+    """
+    print("\n" + "=" * 60)
+    print("Test: WVN Order All Correct")
+    print("=" * 60)
+
+    M, N, K, AW, AH = 8, 8, 16, 8, 8
+    np.random.seed(42)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+    ref = np.dot(A, B)
+
+    for wvn_order in range(6):
+        program = create_gemm_program(
+            M=M, N=N, K=K, AH=AH, AW=AW, wvn_order=wvn_order,
+        )
+        instructions = encode_program(program)
+        max_k_passes = compute_max_k_passes(instructions, AW, AH)
+
+        # Verify WVN order is encoded correctly
+        assert instructions[1, 1] == wvn_order, \
+            f"WVN order {wvn_order} not encoded at instructions[1,1]"
+
+        mod = build_feather_kstreaming_simulator(
+            M, K, N, AW, AH, int8, len(instructions),
+            max_k_passes,
+        )
+        C = np.zeros((M, N), dtype=np.int32)
+        mod(A, B, instructions, C)
+        np.testing.assert_array_equal(C, ref)
+        print(f"  WVN order={wvn_order}: matches numpy reference")
+
+    print("PASSED: WVN order all correct")
+    return True
+
+
+def test_mixed_layout_orders():
+    """Verify mixed non-zero IVN/WVN/OVN orders produce correct GEMM.
+
+    Tests several combinations of non-default layout orders to confirm
+    the full system handles arbitrary order combinations correctly.
+    """
+    print("\n" + "=" * 60)
+    print("Test: Mixed Layout Orders")
+    print("=" * 60)
+
+    M, N, K, AW, AH = 8, 8, 16, 8, 8
+    np.random.seed(42)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+    ref = np.dot(A, B)
+
+    # Test various non-trivial order combinations
+    test_cases = [
+        (1, 2, 3),  # all non-zero
+        (5, 4, 2),  # high orders
+        (3, 3, 3),  # all same non-zero
+        (0, 5, 0),  # only WVN non-zero
+        (5, 0, 0),  # only IVN non-zero
+    ]
+
+    for ivn_ord, wvn_ord, ovn_ord in test_cases:
+        program = create_gemm_program(
+            M=M, N=N, K=K, AH=AH, AW=AW,
+            ivn_order=ivn_ord, wvn_order=wvn_ord, ovn_order=ovn_ord,
+        )
+        instructions = encode_program(program)
+        max_k_passes = compute_max_k_passes(instructions, AW, AH)
+
+        mod = build_feather_kstreaming_simulator(
+            M, K, N, AW, AH, int8, len(instructions),
+            max_k_passes,
+        )
+        C = np.zeros((M, N), dtype=np.int32)
+        mod(A, B, instructions, C)
+        np.testing.assert_array_equal(C, ref)
+        print(f"  IVN={ivn_ord}, WVN={wvn_ord}, OVN={ovn_ord}: "
+              f"matches numpy reference")
+
+    print("PASSED: Mixed layout orders")
+    return True
+
+
 def test_r0_c0_tile_advancement():
     """Verify r0/c0 advance correctly per MINISA paper equations (2)-(3).
 
@@ -388,6 +518,9 @@ def run_full_matrix_tests():
         ("PE mapping fields", test_pe_mapping_fields_encoded),
         ("OVN order BIRRD tables", test_ovn_order_produces_different_birrd),
         ("OVN order all correct", test_ovn_order_all_correct),
+        ("IVN order all correct", test_ivn_order_all_correct),
+        ("WVN order all correct", test_wvn_order_all_correct),
+        ("Mixed layout orders", test_mixed_layout_orders),
         ("r0/c0 tile advancement", test_r0_c0_tile_advancement),
     ]
 

@@ -393,6 +393,109 @@ def test_mixed_kt_per_pass():
     np.testing.assert_array_equal(C, ref)
 
 
+def test_ivn_wvn_orders_aw4():
+    """Verify all IVN/WVN layout orders produce correct GEMM on 4x4 NEST.
+
+    Tests all 6 IVN orders and all 6 WVN orders independently, plus
+    a combined non-zero case. The crossbar routing (determined by Gr)
+    is independent of the VN buffer layout order.
+    """
+    M, K, N = 8, 8, 4
+    Gr = AW // 2  # 2
+    Mt = Gr
+
+    np.random.seed(77)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+    ref = A.astype(np.int32) @ B.astype(np.int32)
+
+    # Test all 6 IVN orders
+    for ivn_order in range(6):
+        program = MINISAProgram(
+            name=f"ivn_order_{ivn_order}", AH=AH, AW=AW,
+            ivn_layout=SetIVNLayout(order=ivn_order, ML0=AH, ML1=M // AH,
+                                     JL0=AH, JL1=K // AH),
+            wvn_layout=SetWVNLayout(order=0, KL0=AH, KL1=K // AH,
+                                     NL0=min(N, AW), NL1=max(1, N // AW)),
+            ovn_layout=SetOVNLayout(order=0, PL0=AH, PL1=M // AH,
+                                     QL0=AH, QL1=N // AH),
+        )
+        for n_tile in range(N // AH):
+            for m_tile in range(M // Mt):
+                program.add_mapping(SetMapping(
+                    r0=0, c0=n_tile * AH,
+                    Gr=Gr, Gc=2, sr=1, sc=4,
+                    m_start=m_tile * Mt, m_end=(m_tile + 1) * Mt,
+                    n_start=n_tile * AH, n_end=(n_tile + 1) * AH,
+                    k_start=0, k_end=K,
+                ))
+        instructions = encode_program(program)
+        max_k_passes = compute_max_k_passes(instructions, AW, AH)
+        mod = build_feather_kstreaming_simulator(
+            M, K, N, AW, AH, int8, len(instructions), max_k_passes,
+        )
+        C = np.zeros((M, N), dtype=np.int32)
+        mod(A, B, instructions, C)
+        np.testing.assert_array_equal(C, ref)
+
+    # Test all 6 WVN orders
+    for wvn_order in range(6):
+        program = MINISAProgram(
+            name=f"wvn_order_{wvn_order}", AH=AH, AW=AW,
+            ivn_layout=SetIVNLayout(order=0, ML0=AH, ML1=M // AH,
+                                     JL0=AH, JL1=K // AH),
+            wvn_layout=SetWVNLayout(order=wvn_order, KL0=AH, KL1=K // AH,
+                                     NL0=min(N, AW), NL1=max(1, N // AW)),
+            ovn_layout=SetOVNLayout(order=0, PL0=AH, PL1=M // AH,
+                                     QL0=AH, QL1=N // AH),
+        )
+        for n_tile in range(N // AH):
+            for m_tile in range(M // Mt):
+                program.add_mapping(SetMapping(
+                    r0=0, c0=n_tile * AH,
+                    Gr=Gr, Gc=2, sr=1, sc=4,
+                    m_start=m_tile * Mt, m_end=(m_tile + 1) * Mt,
+                    n_start=n_tile * AH, n_end=(n_tile + 1) * AH,
+                    k_start=0, k_end=K,
+                ))
+        instructions = encode_program(program)
+        max_k_passes = compute_max_k_passes(instructions, AW, AH)
+        mod = build_feather_kstreaming_simulator(
+            M, K, N, AW, AH, int8, len(instructions), max_k_passes,
+        )
+        C = np.zeros((M, N), dtype=np.int32)
+        mod(A, B, instructions, C)
+        np.testing.assert_array_equal(C, ref)
+
+    # Test combined non-zero IVN + WVN orders
+    program = MINISAProgram(
+        name="mixed_ivn_wvn", AH=AH, AW=AW,
+        ivn_layout=SetIVNLayout(order=3, ML0=AH, ML1=M // AH,
+                                 JL0=AH, JL1=K // AH),
+        wvn_layout=SetWVNLayout(order=5, KL0=AH, KL1=K // AH,
+                                 NL0=min(N, AW), NL1=max(1, N // AW)),
+        ovn_layout=SetOVNLayout(order=2, PL0=AH, PL1=M // AH,
+                                 QL0=AH, QL1=N // AH),
+    )
+    for n_tile in range(N // AH):
+        for m_tile in range(M // Mt):
+            program.add_mapping(SetMapping(
+                r0=0, c0=n_tile * AH,
+                Gr=Gr, Gc=2, sr=1, sc=4,
+                m_start=m_tile * Mt, m_end=(m_tile + 1) * Mt,
+                n_start=n_tile * AH, n_end=(n_tile + 1) * AH,
+                k_start=0, k_end=K,
+            ))
+    instructions = encode_program(program)
+    max_k_passes = compute_max_k_passes(instructions, AW, AH)
+    mod = build_feather_kstreaming_simulator(
+        M, K, N, AW, AH, int8, len(instructions), max_k_passes,
+    )
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, instructions, C)
+    np.testing.assert_array_equal(C, ref)
+
+
 def test_bit_ops_equivalence():
     """Verify bit operations match modulo/division for all valid Gr and j values.
 
@@ -422,6 +525,7 @@ if __name__ == "__main__":
         test_gr_2_aw8,
         test_gr_1_aw8,
         test_mixed_kt_per_pass,
+        test_ivn_wvn_orders_aw4,
         test_bit_ops_equivalence,
     ]
     for t in tests:

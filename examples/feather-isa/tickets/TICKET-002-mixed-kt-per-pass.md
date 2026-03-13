@@ -1,7 +1,7 @@
 ---
 id: TICKET-002
 title: Support mixed Kt_per_pass across tiles
-status: open
+status: resolved
 priority: medium
 ---
 

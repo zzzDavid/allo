@@ -60,6 +60,11 @@ python tests/test_figure7_cosim.py       # RTL cosim cycle count
 - Supported Gr values: AW and AW//2 (limited by BIRRD 2-way reduction).
   Smaller Gr values (e.g., Gr=1 weight stationary) need additional reduction stages.
 - Kt_per_pass = (AW/Gr)*AH determines how many K elements each K-pass covers.
-  All tiles in a program must share compatible num_k_passes/Kt_per_pass.
+  Mixed Kt_per_pass is supported: each tile computes its own actual_passes at
+  runtime; max_k_passes is the compile-time loop bound (padding passes stream zeros).
+- IVN/WVN layout orders (ORDER_012 through ORDER_210) control VN buffer memory layout.
+  In our direct-indexing model (no VN buffer), the crossbar routing is determined by
+  Gr/Gc/sr/sc from SetMapping, so all 6 orders produce correct results. OVN order
+  DOES affect computation via BIRRD butterfly routing (already implemented).
 - For cosim, use `mode="csyn"` to generate kernel.cpp, then manually patch m_axi depths
   and write C testbench (see `test_figure7_cosim.py` for pattern).

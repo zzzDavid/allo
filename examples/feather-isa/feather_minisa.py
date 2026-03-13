@@ -149,6 +149,15 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
             zeros (harmless to NEST: 0*x=0). Stream puts are always unconditional
             to maintain dataflow balance with nest_compute.
 
+            IVN/WVN layout orders (instructions[0,1] and instructions[1,1]):
+            These control VN buffer memory layout in the physical architecture.
+            In our direct-indexing model (no VN buffer), the crossbar routing
+            is fully determined by Gr/Gc/sr/sc from SetMapping. The index
+            formula m_idx = m_start + (ic_j & mask_Gr), k_idx = k_start +
+            ic_i + (ic_j >> log2_Gr) * AH produces correct GEMM for all 6
+            IVN/WVN orders because it maps PE positions to matrix coordinates
+            independently of the buffer memory layout.
+
             Per K-pass: 1 iActs packet (AH*AW int8 → UInt(128)) +
                         AH weights packets (AW*AH int8 each → UInt(128)).
             """
