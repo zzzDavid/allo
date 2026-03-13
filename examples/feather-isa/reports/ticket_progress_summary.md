@@ -65,7 +65,43 @@ Phase 2 (on-chip RIR) and Phase 3 (full overlap) remain as future work.
 | test_multi_layer.py | 5 | PASS |
 | test_parameterized_gemm.py (AW=8) | 12 | PASS |
 | test_parameterized_gemm.py (AW=4) | 12 | PASS |
-| **Total** | **67** | **ALL PASS** |
+| test_figure7_cosim.py | 1 | PASS |
+| **Total** | **68** | **ALL PASS** |
+
+## RTL Co-Simulation Results
+
+### Figure 7 Workload: C[16,8] = A[16,12] x B[12,8] on 4x4 NEST
+
+| Configuration | Cycles | Ratio vs RTL |
+|---------------|--------|-------------|
+| **RTL reference** (FEATHER Verilog) | **1120** | 1.00x |
+| Allo (current, with buffer split) | **1517** | 1.35x |
+| Allo (previous, shared buffer) | 1004 | 0.90x |
+| Allo (original 24-tile model) | 1792 | 1.60x |
+
+### Analysis
+
+The current Allo design runs at **1517 cycles** vs the RTL reference's **1120 cycles** (1.35x).
+
+The cycle increase from 1004→1517 is due to the HLS dataflow single-reader fix:
+zero points and quantization parameters were moved from the shared `instructions`
+buffer into separate small arrays (`nest_zero_points[2]`, `accum_quant_params[2]`,
+`accum_sr_per_tile[num_tiles]`). This adds extra DRAM load stages and serializes
+the load order across kernels.
+
+**Root cause**: Vitis HLS dataflow requires each buffer to have exactly one reader
+and one writer. The original shared `instructions` buffer was read by 3 kernels
+(crossbar_load, nest_compute, output_accum), which worked in simulation but failed
+csynth. Splitting into separate arrays fixes the HLS violation but costs ~500 extra
+cycles due to buffer duplication overhead.
+
+**Optimization opportunities**:
+1. **Stream-based parameter passing**: Instead of DRAM arrays, use streams to
+   broadcast zero points/quant params from a scatter kernel (eliminates extra loads)
+2. **Compile-time constants**: For fixed workloads, encode zero points and quant
+   params as compile-time constants rather than runtime arrays
+3. **Merge into crossbar_load**: Extract params in crossbar_load and pass via streams
+   to other kernels (single DRAM reader, stream distribution)
 
 ## Architecture Overview
 
@@ -79,7 +115,8 @@ The FEATHER+ Allo implementation uses 7 pipelined dataflow kernels:
 6. **output_accum** — Column remap + tile accumulation + post-quantization
 
 Key metrics:
-- RTL cosim: **1004 cycles** (Allo) vs 1120 (RTL reference) = **0.90x**
+- RTL cosim: **1517 cycles** (Allo) vs 1120 (RTL reference) = **1.35x**
 - Single Allo invocation handles complete matrices (no Python-level tiling loop)
 - All operations HLS-friendly: shifts, masks, comparisons — no runtime dividers
 - Multi-layer chaining: quantized int8 intermediates enable end-to-end inference
+- HLS dataflow compliant: all buffers satisfy single-reader/single-writer constraint
