@@ -90,12 +90,12 @@ def test_gr_half_aw():
         ovn_layout=SetOVNLayout(order=0, PL0=AH, PL1=M // AH, QL0=AH, QL1=N // AH),
     )
 
-    # Gr=2, Gc=2, sr=1, sc=4 (same column mapping as Figure 7 tile 1)
+    # Gr=2, Gc=1, sr=1, sc=0 (same column mapping as Figure 7 tile 1)
     for n_tile in range(N // Nt):
         for m_tile in range(M // Mt):
             program.add_mapping(SetMapping(
                 r0=0, c0=n_tile * Nt,
-                Gr=Gr, Gc=2, sr=1, sc=4,
+                Gr=Gr, Gc=1, sr=1, sc=0,
                 m_start=m_tile * Mt, m_end=(m_tile + 1) * Mt,
                 n_start=n_tile * Nt, n_end=(n_tile + 1) * Nt,
                 k_start=0, k_end=K,
@@ -145,7 +145,7 @@ def test_mixed_gr_tiles():
         for m_tile in range(M // Mt_gr2):
             program.add_mapping(SetMapping(
                 r0=0, c0=n_tile * Nt,
-                Gr=2, Gc=2, sr=1, sc=4,
+                Gr=2, Gc=1, sr=1, sc=0,
                 m_start=m_tile * Mt_gr2, m_end=(m_tile + 1) * Mt_gr2,
                 n_start=n_tile * Nt, n_end=(n_tile + 1) * Nt,
                 k_start=0, k_end=8,
@@ -156,7 +156,7 @@ def test_mixed_gr_tiles():
         for m_tile in range(M // Mt_gr4):
             program.add_mapping(SetMapping(
                 r0=2, c0=n_tile * Nt,
-                Gr=4, Gc=2, sr=1, sc=4,
+                Gr=4, Gc=1, sr=1, sc=0,
                 m_start=m_tile * Mt_gr4, m_end=(m_tile + 1) * Mt_gr4,
                 n_start=n_tile * Nt, n_end=(n_tile + 1) * Nt,
                 k_start=8, k_end=12,
@@ -357,7 +357,7 @@ def test_mixed_kt_per_pass():
     for m_tile in range(M // Mt_gr2):
         program.add_mapping(SetMapping(
             r0=0, c0=0,
-            Gr=2, Gc=2, sr=1, sc=4,
+            Gr=2, Gc=1, sr=1, sc=0,
             m_start=m_tile * Mt_gr2, m_end=(m_tile + 1) * Mt_gr2,
             n_start=0, n_end=N,
             k_start=0, k_end=16,
@@ -366,7 +366,7 @@ def test_mixed_kt_per_pass():
     # Gr=4 tile: K=[16,32), Mt=4, Kt_per_pass=(4/4)*4=4, actual_passes=16/4=4
     program.add_mapping(SetMapping(
         r0=4, c0=0,
-        Gr=4, Gc=2, sr=1, sc=4,
+        Gr=4, Gc=1, sr=1, sc=0,
         m_start=0, m_end=4,
         n_start=0, n_end=N,
         k_start=16, k_end=32,
@@ -424,7 +424,7 @@ def test_ivn_wvn_orders_aw4():
             for m_tile in range(M // Mt):
                 program.add_mapping(SetMapping(
                     r0=0, c0=n_tile * AH,
-                    Gr=Gr, Gc=2, sr=1, sc=4,
+                    Gr=Gr, Gc=1, sr=1, sc=0,
                     m_start=m_tile * Mt, m_end=(m_tile + 1) * Mt,
                     n_start=n_tile * AH, n_end=(n_tile + 1) * AH,
                     k_start=0, k_end=K,
@@ -453,7 +453,7 @@ def test_ivn_wvn_orders_aw4():
             for m_tile in range(M // Mt):
                 program.add_mapping(SetMapping(
                     r0=0, c0=n_tile * AH,
-                    Gr=Gr, Gc=2, sr=1, sc=4,
+                    Gr=Gr, Gc=1, sr=1, sc=0,
                     m_start=m_tile * Mt, m_end=(m_tile + 1) * Mt,
                     n_start=n_tile * AH, n_end=(n_tile + 1) * AH,
                     k_start=0, k_end=K,
@@ -481,7 +481,7 @@ def test_ivn_wvn_orders_aw4():
         for m_tile in range(M // Mt):
             program.add_mapping(SetMapping(
                 r0=0, c0=n_tile * AH,
-                Gr=Gr, Gc=2, sr=1, sc=4,
+                Gr=Gr, Gc=1, sr=1, sc=0,
                 m_start=m_tile * Mt, m_end=(m_tile + 1) * Mt,
                 n_start=n_tile * AH, n_end=(n_tile + 1) * AH,
                 k_start=0, k_end=K,
@@ -493,6 +493,181 @@ def test_ivn_wvn_orders_aw4():
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
+    np.testing.assert_array_equal(C, ref)
+
+
+def test_sr_zero_output_stationary():
+    """sr=0, sc=0 with Gr=AW: no temporal stride (one N column per tile).
+
+    With sr=0, all AH temporal rows see the same weight column (B[:, n_start]).
+    The sr=0 guard in output_accum prevents AH-fold duplication by only
+    accumulating the first temporal row (on=0).
+
+    Workload: C[4,4] = A[4,4] x B[4,4] on AW=4, AH=4
+    - 4 tiles (one per N column), each Gr=4 (pass-through)
+    - sr=0 means wn_idx = n_start for all weights
+    - NEST output: each PE column computes A[m_row, :] @ B[:, n_start]
+    - Verifies the sr=0 guard produces correct (not AH-duplicated) GEMM
+    """
+    M, K, N = 4, 4, 4
+    Gr = AW  # 4
+
+    program = MINISAProgram(
+        name="sr0_test", AH=AH, AW=AW,
+        ivn_layout=SetIVNLayout(order=0, ML0=AH, ML1=1, JL0=AH, JL1=1),
+        wvn_layout=SetWVNLayout(order=0, KL0=AH, KL1=1, NL0=min(N, AW), NL1=max(1, N // AW)),
+        ovn_layout=SetOVNLayout(order=0, PL0=AH, PL1=1, QL0=AH, QL1=1),
+    )
+
+    # One tile per N column: sr=0, sc=0
+    for n_col in range(N):
+        program.add_mapping(SetMapping(
+            r0=0, c0=n_col,
+            Gr=Gr, Gc=1, sr=0, sc=0,
+            m_start=0, m_end=M,
+            n_start=n_col, n_end=n_col + 1,
+            k_start=0, k_end=K,
+        ))
+
+    instructions = encode_program(program)
+    max_k_passes = compute_max_k_passes(instructions, AW, AH)
+
+    np.random.seed(555)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+    mod = build_feather_kstreaming_simulator(
+        M, K, N, AW, AH, int8, len(instructions),
+        max_k_passes,
+    )
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, instructions, C)
+
+    ref = A.astype(np.int32) @ B.astype(np.int32)
+    np.testing.assert_array_equal(C, ref)
+
+
+def test_multiway_birrd_generation():
+    """Verify BIRRD instruction generation produces valid reduction for all (AW, Gr).
+
+    Tests the algorithmic BIRRD generation from TICKET-008. For each combination,
+    checks that the generalized symbolic simulator confirms full multi-way
+    reduction at the expected output columns.
+    """
+    from minisa.lowering import (
+        generate_birrd_instructions,
+        _simulate_birrd_output_col_map_general,
+    )
+    import math
+
+    for AW_test in [4, 8, 16]:
+        for log2_gr in range(int(math.log2(AW_test)) + 1):
+            Gr = 1 << log2_gr
+            inst = generate_birrd_instructions(AW_test, Gr)
+            col_map = _simulate_birrd_output_col_map_general(inst, AW_test, Gr)
+            assert col_map is not None, (
+                f"AW={AW_test}, Gr={Gr}: generated BIRRD doesn't produce valid reduction"
+            )
+            assert len(col_map) == Gr, (
+                f"AW={AW_test}, Gr={Gr}: expected {Gr} output columns, got {len(col_map)}"
+            )
+            # Verify all output columns are distinct
+            assert len(set(col_map.tolist())) == Gr, (
+                f"AW={AW_test}, Gr={Gr}: output columns not unique: {col_map.tolist()}"
+            )
+
+
+def test_multiway_birrd_gr2_aw8_gemm():
+    """Gr=2 on AW=8 with full 4-way BIRRD reduction (TICKET-008).
+
+    Previously Gr=2 on AW=8 used 2-way BIRRD + output_accum summing.
+    With multi-way BIRRD, the full 4-way tree reduction happens inside BIRRD.
+
+    Workload: C[2,8] = A[2,32] x B[32,8]
+    """
+    AW_8, AH_8 = 8, 8
+    M, K, N = 2, 32, 8
+    Gr = 2
+    Mt = Gr
+
+    program = MINISAProgram(
+        name="multiway_gr2_aw8", AH=AH_8, AW=AW_8,
+        ivn_layout=SetIVNLayout(order=0, ML0=AH_8, ML1=1, JL0=AH_8, JL1=K // AH_8),
+        wvn_layout=SetWVNLayout(order=0, KL0=AH_8, KL1=K // AH_8, NL0=min(N, AW_8), NL1=max(1, N // AW_8)),
+        ovn_layout=SetOVNLayout(order=0, PL0=AH_8, PL1=1, QL0=AH_8, QL1=N // AH_8),
+    )
+
+    for n_tile in range(N // AH_8):
+        for m_tile in range(M // Mt):
+            program.add_mapping(SetMapping(
+                r0=0, c0=n_tile * AH_8,
+                Gr=Gr, Gc=1, sr=1, sc=0,
+                m_start=m_tile * Mt, m_end=(m_tile + 1) * Mt,
+                n_start=n_tile * AH_8, n_end=(n_tile + 1) * AH_8,
+                k_start=0, k_end=K,
+            ))
+
+    instructions = encode_program(program)
+    max_k_passes = compute_max_k_passes(instructions, AW_8, AH_8)
+
+    np.random.seed(808)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+    mod = build_feather_kstreaming_simulator(
+        M, K, N, AW_8, AH_8, int8, len(instructions), max_k_passes,
+    )
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, instructions, C)
+
+    ref = A.astype(np.int32) @ B.astype(np.int32)
+    np.testing.assert_array_equal(C, ref)
+
+
+def test_multiway_birrd_gr1_aw8_gemm():
+    """Gr=1 on AW=8 with full 8-way BIRRD reduction (TICKET-008).
+
+    All 8 PE columns handle different K-stripes for the same M row.
+    BIRRD does full 8-way tree reduction (3 levels of pairwise reduction).
+
+    Workload: C[1,8] = A[1,64] x B[64,8]
+    """
+    AW_8, AH_8 = 8, 8
+    M, K, N = 1, 64, 8
+    Gr = 1
+    Mt = Gr
+
+    program = MINISAProgram(
+        name="multiway_gr1_aw8", AH=AH_8, AW=AW_8,
+        ivn_layout=SetIVNLayout(order=0, ML0=AH_8, ML1=1, JL0=AH_8, JL1=K // AH_8),
+        wvn_layout=SetWVNLayout(order=0, KL0=AH_8, KL1=K // AH_8, NL0=min(N, AW_8), NL1=max(1, N // AW_8)),
+        ovn_layout=SetOVNLayout(order=0, PL0=AH_8, PL1=1, QL0=AH_8, QL1=N // AH_8),
+    )
+
+    for n_tile in range(N // AH_8):
+        for m_tile in range(M // Mt):
+            program.add_mapping(SetMapping(
+                r0=0, c0=n_tile * AH_8,
+                Gr=Gr, Gc=1, sr=1, sc=0,
+                m_start=m_tile * Mt, m_end=(m_tile + 1) * Mt,
+                n_start=n_tile * AH_8, n_end=(n_tile + 1) * AH_8,
+                k_start=0, k_end=K,
+            ))
+
+    instructions = encode_program(program)
+    max_k_passes = compute_max_k_passes(instructions, AW_8, AH_8)
+
+    np.random.seed(909)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+    mod = build_feather_kstreaming_simulator(
+        M, K, N, AW_8, AH_8, int8, len(instructions), max_k_passes,
+    )
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, instructions, C)
+
+    ref = A.astype(np.int32) @ B.astype(np.int32)
     np.testing.assert_array_equal(C, ref)
 
 
@@ -526,6 +701,10 @@ if __name__ == "__main__":
         test_gr_1_aw8,
         test_mixed_kt_per_pass,
         test_ivn_wvn_orders_aw4,
+        test_sr_zero_output_stationary,
+        test_multiway_birrd_generation,
+        test_multiway_birrd_gr2_aw8_gemm,
+        test_multiway_birrd_gr1_aw8_gemm,
         test_bit_ops_equivalence,
     ]
     for t in tests:

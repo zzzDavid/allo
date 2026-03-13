@@ -118,6 +118,7 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
         birrd_inst: int8[num_tiles, P0, P1],
         output_col_map: int32[num_tiles, AW],
         output_num_m: int32[num_tiles],
+        output_n_base: int32[num_tiles, AW],
         accum_m_start: int32[num_tiles],
         accum_n_start: int32[num_tiles],
         C: int32[M, N],
@@ -164,6 +165,9 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
             for tile in range(num_tiles):
                 inst_idx: int32 = tile + 3
                 Gr: int32 = local_instructions[inst_idx, 3]
+                Gc: int32 = local_instructions[inst_idx, 4]
+                sr: int32 = local_instructions[inst_idx, 5]
+                sc: int32 = local_instructions[inst_idx, 6]
                 m_start: int32 = local_instructions[inst_idx, 7]
                 n_start: int32 = local_instructions[inst_idx, 9]
                 k_start_tile: int32 = local_instructions[inst_idx, 11]
@@ -179,6 +183,7 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                 if Gr >= 16:
                     log2_Gr = 4
                 mask_Gr: int32 = Gr - 1
+                mask_Gc: int32 = Gc - 1
 
                 # Per-tile K-pass computation via shifts (no runtime dividers)
                 k_end_tile: int32 = local_instructions[inst_idx, 12]
@@ -203,30 +208,38 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                                 ] = local_A[m_idx, k_idx]
                     iacts_stream.put(packed_iacts)
 
-                    # === Weight crossbar (Gr-based bit ops) ===
+                    # === Weight crossbar (Gr/sr/sc bit ops) ===
                     for wc_i in range(AH):
                         packed_w: TyCrossbarPacked = 0
                         if k_pass < actual_passes:
                             for wc_w in range(AW):
                                 for wc_k in range(AH):
                                     wk_idx: int32 = k_start + wc_k + (wc_w >> log2_Gr) * AH
-                                    wn_idx: int32 = n_start + wc_i
+                                    wn_idx: int32 = n_start + sr * wc_i + sc * (wc_w & mask_Gc)
                                     packed_w[
                                         (wc_w * AH + wc_k) * Ty.bits :
                                         (wc_w * AH + wc_k + 1) * Ty.bits
                                     ] = local_B[wk_idx, wn_idx]
                         weights_stream.put(packed_w)
 
-        @df.kernel(mapping=[1])
-        def nest_compute():
+        @df.kernel(mapping=[1], args=[instructions])
+        def nest_compute(local_instructions: int32[num_inst, 13]):
             """Receive crossbar data, compute NEST MAC, accumulate, stream result.
 
             Receives packed iActs/weights from crossbar_load, unpacks them,
-            runs 4x4 NEST MAC with int32 accumulation across K-passes,
+            runs AH×AW NEST MAC with int32 accumulation across K-passes,
             then streams packed result to bus.
+
+            Zero point subtraction: decodes iacts_zp and weights_zp from
+            instructions and computes (iact - iacts_zp) * (weight - weights_zp),
+            matching RTL PE behavior (feather_pe.v).
             """
             iActs: Ty[AH, AW]
             weights: Ty[AH, AW, AH]
+
+            # Decode zero points (layer-level, from SetIVNLayout/SetWVNLayout)
+            iacts_zp: int32 = local_instructions[0, 6]
+            weights_zp: int32 = local_instructions[1, 6]
 
             for tile in range(num_tiles):
                 nest_accum: int32[AH, AW]
@@ -254,12 +267,14 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                                     (wc_w * AH + wc_k + 1) * Ty.bits
                                 ]
 
-                    # NEST compute + accumulate
+                    # NEST compute + accumulate (with zero point subtraction)
                     for ni in range(AH):
                         for nj in range(AW):
                             temp: int32 = 0
                             for nk in range(AH):
-                                temp += iActs[nk, nj] * weights[ni, nj, nk]
+                                a_val: int32 = iActs[nk, nj]
+                                w_val: int32 = weights[ni, nj, nk]
+                                temp += (a_val - iacts_zp) * (w_val - weights_zp)
                             nest_accum[ni, nj] = nest_accum[ni, nj] + temp
 
                 # Stream accumulated result (after all K-passes)
@@ -336,24 +351,42 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                         connection[P0, 2 * j].put(out_left)
                         connection[P0, 2 * j + 1].put(out_right)
 
-        @df.kernel(mapping=[1], args=[output_col_map, output_num_m, accum_m_start, accum_n_start, C])
+        @df.kernel(mapping=[1], args=[output_col_map, output_num_m, output_n_base, accum_m_start, accum_n_start, instructions, C])
         def output_accum(
             local_output_col_map: int32[num_tiles, AW],
             local_output_num_m: int32[num_tiles],
+            local_output_n_base: int32[num_tiles, AW],
             local_accum_m_start: int32[num_tiles],
             local_accum_n_start: int32[num_tiles],
+            local_instructions: int32[num_inst, 13],
             local_C: int32[M, N],
         ):
-            """Accumulate BIRRD output into C[M,N] with col remapping (int32)."""
+            """Accumulate BIRRD output into C[M,N] with col remapping and optional post-quantization.
+
+            N-offset uses generalized MINISA mapping:
+                n_off = sr * on + n_base[tile, col]
+            where n_base encodes sc * (original_pe_col & mask_Gc) per BIRRD output column.
+            When sr=0, only first temporal row is used (others are duplicates).
+
+            Post-quantization (when quant_scale != 0) matches RTL quant_post.v:
+                result = (sign_extend_64(data) * scale + zero_extend_64(zp))[7:0]
+            Implemented as: (accum * quant_scale + quant_zp) & 255
+            """
             accum: int32[M, N]
             for _ai in range(M):
                 for _aj in range(N):
                     accum[_ai, _aj] = 0
 
+            # Decode post-quantization params from SetOVNLayout
+            quant_scale: int32 = local_instructions[2, 6]
+            quant_zp: int32 = local_instructions[2, 7]
+
             for tile in range(num_tiles):
+                inst_idx: int32 = tile + 3
                 m_start: int32 = local_accum_m_start[tile]
                 n_start: int32 = local_accum_n_start[tile]
                 num_m: int32 = local_output_num_m[tile]
+                sr_val: int32 = local_instructions[inst_idx, 5]
 
                 tile_out: int32[AH, AW]
                 for d in range(AH):
@@ -362,15 +395,27 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
 
                 for col in range(AW):
                     m_pos: int32 = local_output_col_map[tile, col]
+                    n_base_col: int32 = local_output_n_base[tile, col]
                     if m_pos < num_m:
                         for on in range(AH):
-                            accum[m_start + m_pos, n_start + on] = (
-                                accum[m_start + m_pos, n_start + on] + tile_out[on, col]
-                            )
+                            # When sr=0, all temporal rows are identical;
+                            # only accumulate first row to avoid AH-fold duplication
+                            skip: int32 = 0
+                            if sr_val == 0:
+                                if on > 0:
+                                    skip = 1
+                            if skip == 0:
+                                n_off: int32 = sr_val * on + n_base_col
+                                accum[m_start + m_pos, n_start + n_off] = (
+                                    accum[m_start + m_pos, n_start + n_off] + tile_out[on, col]
+                                )
 
             for _wi in range(M):
                 for _wj in range(N):
-                    local_C[_wi, _wj] = accum[_wi, _wj]
+                    val: int32 = accum[_wi, _wj]
+                    if quant_scale != 0:
+                        val = (val * quant_scale + quant_zp) & 255
+                    local_C[_wi, _wj] = val
 
     return full_matrix_top
 
@@ -384,7 +429,11 @@ class FeatherKStreamingModule:
     """
 
     def __init__(self, allo_mod, AW):
-        from minisa.lowering import lower_ovn_layout, compute_col_to_m_map
+        from minisa.lowering import (
+            lower_ovn_layout, compute_col_to_m_map,
+            compute_output_col_map, _simulate_birrd_passthrough_perm,
+            generate_birrd_instructions, _simulate_birrd_output_col_map_general,
+        )
         from minisa.isa import SetOVNLayout
 
         self._mod = allo_mod
@@ -392,20 +441,44 @@ class FeatherKStreamingModule:
         P0, P1 = compute_birrd_params(AW)
         self._P0 = P0
         self._P1 = P1
-        # Precompute BIRRD tables for all 6 OVN orders
+        log2_aw = int(log2(AW))
+        valid_grs = set()
+        for i in range(log2_aw + 1):
+            valid_grs.add(1 << i)  # 1, 2, 4, ..., AW
+
+        # Precompute BIRRD tables for all (order, Gr) combinations
+        # - Gr=AW: all-PS passthrough
+        # - Gr=AW//2: hand-coded order-dependent 2-way tables
+        # - Gr<AW//2: algorithmically generated multi-way tables
         self._birrd_tables = {}
+        self._multiway_birrd = {}  # generated tables keyed by Gr
         for order in range(6):
             ovn = SetOVNLayout(order=order, PL0=AW, PL1=1, QL0=AW, QL1=1)
             self._birrd_tables[order] = lower_ovn_layout(ovn, AW, AW)
+        for gr in valid_grs:
+            if gr < AW // 2:
+                self._multiway_birrd[gr] = generate_birrd_instructions(AW, gr)
+
         # Precompute col→M maps for all (order, Gr) combinations
         self._col_to_m_maps = {}
-        valid_grs = set()
-        log2_aw = int(log2(AW))
-        for i in range(log2_aw + 1):
-            valid_grs.add(1 << i)  # 1, 2, 4, ..., AW
         for order in range(6):
             for gr in valid_grs:
                 self._col_to_m_maps[(order, gr)] = compute_col_to_m_map(AW, order, gr)
+
+        # Precompute passthrough permutation (for n_base computation)
+        self._passthrough_perm = _simulate_birrd_passthrough_perm(AW)
+        # Precompute pair→col maps for 2-way reduction n_base
+        self._pair_to_col = {}
+        for order in range(6):
+            self._pair_to_col[order] = compute_output_col_map(AW, order)
+        # Precompute m→col maps for multi-way reduction n_base
+        self._multiway_m_to_col = {}
+        for gr in valid_grs:
+            if gr < AW // 2:
+                inst = self._multiway_birrd[gr]
+                self._multiway_m_to_col[gr] = _simulate_birrd_output_col_map_general(
+                    inst, AW, gr
+                )
 
     def __call__(self, A, B, instructions, C):
         ovn_order = int(instructions[2, 1])
@@ -413,23 +486,43 @@ class FeatherKStreamingModule:
         P0, P1 = self._P0, self._P1
         num_tiles = len(instructions) - 3
 
-        # Build per-tile BIRRD instructions and output mappings
+        # Build per-tile BIRRD instructions, output mappings, and N-base offsets
         birrd_per_tile = np.zeros((num_tiles, P0, P1), dtype=np.int8)
         col_map_per_tile = np.zeros((num_tiles, AW), dtype=np.int32)
         num_m_per_tile = np.zeros(num_tiles, dtype=np.int32)
+        n_base_per_tile = np.zeros((num_tiles, AW), dtype=np.int32)
 
         for t in range(num_tiles):
             Gr = int(instructions[3 + t, 3])
-            if Gr < AW:
-                # Reduction mode: BIRRD + col→M map
+            Gc = int(instructions[3 + t, 4])
+            sc = int(instructions[3 + t, 6])
+            mask_Gc = Gc - 1
+
+            if Gr == AW:
+                # Pass-through: each column is a unique M row
+                col_map_per_tile[t] = self._col_to_m_maps[(ovn_order, AW)]
+                num_m_per_tile[t] = AW
+                for col in range(AW):
+                    orig_pe = int(self._passthrough_perm[col])
+                    n_base_per_tile[t, col] = sc * (orig_pe & mask_Gc)
+            elif Gr == AW // 2:
+                # 2-way reduction: hand-coded order-dependent BIRRD tables
                 birrd_per_tile[t] = self._birrd_tables[ovn_order]
                 col_map_per_tile[t] = self._col_to_m_maps[(ovn_order, Gr)]
                 num_m_per_tile[t] = Gr
+                pair_to_col = self._pair_to_col[ovn_order]
+                for pair_idx in range(AW // 2):
+                    col = int(pair_to_col[pair_idx])
+                    n_base_per_tile[t, col] = sc * (pair_idx & mask_Gc)
             else:
-                # Pass-through mode: all-PS BIRRD + passthrough col→M map
-                # birrd_per_tile[t] is already all zeros (PS=0)
-                col_map_per_tile[t] = self._col_to_m_maps[(ovn_order, AW)]
-                num_m_per_tile[t] = AW
+                # Multi-way reduction (Gr < AW//2): generated BIRRD tables
+                birrd_per_tile[t] = self._multiway_birrd[Gr]
+                col_map_per_tile[t] = self._col_to_m_maps[(ovn_order, Gr)]
+                num_m_per_tile[t] = Gr
+                m_to_col = self._multiway_m_to_col[Gr]
+                for m in range(Gr):
+                    col = int(m_to_col[m])
+                    n_base_per_tile[t, col] = sc * (m & mask_Gc)
 
         m_start_per_tile = np.array(
             [int(instructions[3 + t, 7]) for t in range(num_tiles)],
@@ -445,6 +538,7 @@ class FeatherKStreamingModule:
             birrd_per_tile,
             col_map_per_tile,
             num_m_per_tile,
+            n_base_per_tile,
             m_start_per_tile,
             n_start_per_tile,
             C,

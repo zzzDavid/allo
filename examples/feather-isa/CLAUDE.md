@@ -18,7 +18,7 @@ The second adds `vitis_hls` to PATH (required for HLS tests).
 # Simulator-only tests (no Vitis HLS required)
 python tests/test_figure7_mapping.py     # ISA mapping + functional GEMM
 python tests/test_full_matrix_gemm.py    # Full-matrix GEMM regression (AW=8)
-python tests/test_crossbar_flexibility.py # Multi-Gr crossbar tests (Gr=AW, AW//2, mixed)
+python tests/test_crossbar_flexibility.py # Multi-Gr crossbar + sr=0/sc=0 tests
 
 # Parameterized tests for any AW/AH (default 16x16)
 python tests/test_parameterized_gemm.py --aw 16 --ah 16           # simulator
@@ -55,13 +55,30 @@ python tests/test_figure7_cosim.py       # RTL cosim cycle count
   weights packets per K-pass. This breaks the WAR dependency that caused fused kernel's II=14.
 - For AW=16 (UInt(2048)), kernel.cpp must be patched with `#define AP_INT_MAX_W 4096`
   before `#include <ap_int.h>` (Vitis HLS default is 1024).
-- Per-tile BIRRD configuration: Gr<AW → standard BIRRD reduction with Mt=AW//2 outputs;
-  Gr=AW → all-PS pass-through with AW outputs (identity col_map).
-- Supported Gr values: AW and AW//2 (limited by BIRRD 2-way reduction).
-  Smaller Gr values (e.g., Gr=1 weight stationary) need additional reduction stages.
+- Per-tile BIRRD configuration: Gr=AW → all-PS pass-through with AW outputs;
+  Gr=AW//2 → hand-coded 2-way reduction (order-dependent);
+  Gr<AW//2 → algorithmically generated multi-way reduction via greedy forward pass.
+- All power-of-2 Gr values (1 ≤ Gr ≤ AW) produce correct GEMM. Multi-way BIRRD
+  reduction uses `generate_birrd_instructions(AW, Gr)` which greedily sets AL switches
+  when both inputs belong to the same reduction group on the butterfly topology.
+- Weight crossbar uses full MINISA mapping: `wn_idx = n_start + sr * wc_i + sc * (wc_w & mask_Gc)`.
+  When sr=1, sc=0 (output stationary), this reduces to the original `wn_idx = n_start + wc_i`.
+  When sr=0, all temporal rows see the same N column; output_accum has an sr=0 guard to
+  prevent AH-fold duplication (only on=0 is accumulated).
+- output_n_base[num_tiles, AW]: precomputed per-tile, per-output-column N-offset base that
+  encodes `sc * (original_pe_col & mask_Gc)`, accounting for BIRRD butterfly permutation.
+  Used in output_accum: `n_off = sr * on + n_base[tile, col]`.
 - Kt_per_pass = (AW/Gr)*AH determines how many K elements each K-pass covers.
   Mixed Kt_per_pass is supported: each tile computes its own actual_passes at
   runtime; max_k_passes is the compile-time loop bound (padding passes stream zeros).
+- Zero point subtraction: nest_compute decodes iacts_zp from instructions[0,6] and
+  weights_zp from instructions[1,6], computing (iact - iacts_zp) * (weight - weights_zp)
+  per PE, matching RTL feather_pe.v behavior. Set via create_gemm_program(iacts_zp=, weights_zp=).
+- Post-quantization (int32 → uint8): output_accum decodes quant_scale from instructions[2,6]
+  and quant_zp from instructions[2,7]. When quant_scale != 0, applies
+  `(accum * quant_scale + quant_zp) & 255`, matching RTL quant_post.v formula
+  `(sign_extend_64(data) * scale + zero_extend_64(zp))[7:0]`. Disabled by default (scale=0).
+  Set via create_gemm_program(quant_scale=, quant_zp=).
 - IVN/WVN layout orders (ORDER_012 through ORDER_210) control VN buffer memory layout.
   In our direct-indexing model (no VN buffer), the crossbar routing is determined by
   Gr/Gc/sr/sc from SetMapping, so all 6 orders produce correct results. OVN order

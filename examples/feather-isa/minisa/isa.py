@@ -71,6 +71,7 @@ class SetIVNLayout:
     ML1: int = 1   # Outer M = M / AH
     JL0: int = 8   # Inner J (always = AH)
     JL1: int = 1   # Outer J = J / AH
+    iacts_zp: int = 0  # Input activation zero point (for quantized inference)
 
     def validate(self, AH: int) -> bool:
         """Validate layout against hardware constraints."""
@@ -115,6 +116,7 @@ class SetWVNLayout:
     KL1: int = 1   # Outer K = K / AH
     NL0: int = 8   # Inner N (1 <= NL0 <= AW)
     NL1: int = 1   # Outer N = N / NL0
+    weights_zp: int = 0  # Weight zero point (for quantized inference)
 
     def validate(self, AH: int, AW: int) -> bool:
         """Validate layout against hardware constraints."""
@@ -158,6 +160,8 @@ class SetOVNLayout:
     PL1: int = 1   # Outer P = P / AH
     QL0: int = 8   # Inner Q (always = AH)
     QL1: int = 1   # Outer Q = Q / AH
+    quant_scale: int = 0  # Post-quantization scale (0 = disabled)
+    quant_zp: int = 0     # Post-quantization zero point
 
     def validate(self, AH: int) -> bool:
         """Validate layout against hardware constraints."""
@@ -303,6 +307,10 @@ def create_gemm_program(
     ovn_order: int = 0,
     dataflow: str = "output_stationary",
     gr: Optional[int] = None,
+    iacts_zp: int = 0,
+    weights_zp: int = 0,
+    quant_scale: int = 0,
+    quant_zp: int = 0,
 ) -> MINISAProgram:
     """Create a MINISA program for GEMM: C[M,N] = A[M,K] * B[K,N].
 
@@ -326,6 +334,8 @@ def create_gemm_program(
             Overrides the default Gr from dataflow. Determines:
             - Mt = gr (M rows per tile)
             - Kt = (AW // gr) * AH (K elements per tile, 1 K-pass)
+        iacts_zp: Input activation zero point (default 0)
+        weights_zp: Weight zero point (default 0)
 
     Returns:
         MINISAProgram configured for GEMM
@@ -366,6 +376,7 @@ def create_gemm_program(
             ML1=M // AH,
             JL0=AH,
             JL1=K // AH,
+            iacts_zp=iacts_zp,
         ),
         wvn_layout=SetWVNLayout(
             order=wvn_order,
@@ -373,6 +384,7 @@ def create_gemm_program(
             KL1=K // AH,
             NL0=min(N, AW),
             NL1=max(1, N // AW),
+            weights_zp=weights_zp,
         ),
         ovn_layout=SetOVNLayout(
             order=ovn_order,
@@ -380,6 +392,8 @@ def create_gemm_program(
             PL1=M // AH,
             QL0=AH,
             QL1=N // AH,
+            quant_scale=quant_scale,
+            quant_zp=quant_zp,
         ),
     )
 
@@ -441,7 +455,7 @@ def create_figure7_program() -> MINISAProgram:
             program.add_mapping(SetMapping(
                 r0=0,
                 c0=n_tile * Nt,
-                Gr=4, Gc=2, sr=1, sc=4,
+                Gr=4, Gc=1, sr=1, sc=0,
                 m_start=m_tile * Mt,
                 m_end=(m_tile + 1) * Mt,
                 n_start=n_tile * Nt,
@@ -465,9 +479,9 @@ def encode_program(program: MINISAProgram) -> np.ndarray:
     function for on-chip instruction decode.
 
     Encoding format (NUM_FIELDS=13 columns per row):
-        SetIVNLayout:  [0, order, ML0, ML1, JL0, JL1, 0, 0, 0, 0, 0, 0, 0]
-        SetWVNLayout:  [1, order, KL0, KL1, NL0, NL1, 0, 0, 0, 0, 0, 0, 0]
-        SetOVNLayout:  [2, order, PL0, PL1, QL0, QL1, 0, 0, 0, 0, 0, 0, 0]
+        SetIVNLayout:  [0, order, ML0, ML1, JL0, JL1, iacts_zp, 0, 0, 0, 0, 0, 0]
+        SetWVNLayout:  [1, order, KL0, KL1, NL0, NL1, weights_zp, 0, 0, 0, 0, 0, 0]
+        SetOVNLayout:  [2, order, PL0, PL1, QL0, QL1, quant_scale, quant_zp, 0, 0, 0, 0, 0]
         SetMapping:    [3, r0, c0, Gr, Gc, sr, sc, m_start, m_end, n_start, n_end, k_start, k_end]
 
     Args:
@@ -482,17 +496,17 @@ def encode_program(program: MINISAProgram) -> np.ndarray:
     # Encode SetIVNLayout
     ivn = program.ivn_layout
     inst[0] = [INST_TYPE_IVN, ivn.order, ivn.ML0, ivn.ML1, ivn.JL0, ivn.JL1,
-               0, 0, 0, 0, 0, 0, 0]
+               ivn.iacts_zp, 0, 0, 0, 0, 0, 0]
 
     # Encode SetWVNLayout
     wvn = program.wvn_layout
     inst[1] = [INST_TYPE_WVN, wvn.order, wvn.KL0, wvn.KL1, wvn.NL0, wvn.NL1,
-               0, 0, 0, 0, 0, 0, 0]
+               wvn.weights_zp, 0, 0, 0, 0, 0, 0]
 
     # Encode SetOVNLayout
     ovn = program.ovn_layout
     inst[2] = [INST_TYPE_OVN, ovn.order, ovn.PL0, ovn.PL1, ovn.QL0, ovn.QL1,
-               0, 0, 0, 0, 0, 0, 0]
+               ovn.quant_scale, ovn.quant_zp, 0, 0, 0, 0, 0]
 
     # Encode SetMapping instructions
     for i, mapping in enumerate(program.mappings):

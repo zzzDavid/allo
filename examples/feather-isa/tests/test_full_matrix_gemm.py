@@ -500,6 +500,214 @@ def test_r0_c0_tile_advancement():
     return True
 
 
+def test_zero_point_subtraction():
+    """Verify zero point subtraction matches RTL PE behavior.
+
+    The RTL PE computes (iacts - iacts_zp) * (weights - weights_zp).
+    This test verifies the Allo NEST produces correct results with
+    non-zero zero points by comparing against the numpy reference
+    computed with the same formula.
+    """
+    print("\n" + "=" * 60)
+    print("Test: Zero Point Subtraction")
+    print("=" * 60)
+
+    M, N, K, AW, AH = 8, 8, 16, 8, 8
+
+    # Test several (iacts_zp, weights_zp) combinations
+    test_cases = [
+        (0, 0, "both zero (baseline)"),
+        (3, 0, "iacts_zp=3 only"),
+        (0, 5, "weights_zp=5 only"),
+        (3, 5, "both non-zero"),
+        (-2, 4, "negative iacts_zp"),
+        (10, -3, "negative weights_zp"),
+    ]
+
+    for iacts_zp, weights_zp, desc in test_cases:
+        np.random.seed(42)
+        A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+        B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+        program = create_gemm_program(
+            M=M, N=N, K=K, AH=AH, AW=AW,
+            iacts_zp=iacts_zp, weights_zp=weights_zp,
+        )
+        instructions = encode_program(program)
+        max_k_passes = compute_max_k_passes(instructions, AW, AH)
+
+        # Verify zero points are encoded correctly
+        assert instructions[0, 6] == iacts_zp, \
+            f"iacts_zp={iacts_zp} not encoded at instructions[0,6]"
+        assert instructions[1, 6] == weights_zp, \
+            f"weights_zp={weights_zp} not encoded at instructions[1,6]"
+
+        mod = build_feather_kstreaming_simulator(
+            M, K, N, AW, AH, int8, len(instructions),
+            max_k_passes,
+        )
+        C = np.zeros((M, N), dtype=np.int32)
+        mod(A, B, instructions, C)
+
+        # Reference: (A - iacts_zp) @ (B - weights_zp) in int32
+        A_shifted = A.astype(np.int32) - iacts_zp
+        B_shifted = B.astype(np.int32) - weights_zp
+        ref = A_shifted @ B_shifted
+
+        passed = np.array_equal(C, ref)
+        assert passed, (
+            f"Zero point test '{desc}' failed.\n"
+            f"  Max diff: {np.max(np.abs(C - ref))}\n"
+            f"  C[0,:4]={C[0,:4]}, ref[0,:4]={ref[0,:4]}"
+        )
+        print(f"  {desc}: PASSED")
+
+    print("PASSED: Zero point subtraction")
+    return True
+
+
+def test_zero_point_aw4():
+    """Verify zero point subtraction on 4x4 array (Figure 7 scale)."""
+    print("\n" + "=" * 60)
+    print("Test: Zero Point Subtraction AW=4")
+    print("=" * 60)
+
+    M, N, K, AW, AH = 4, 4, 8, 4, 4
+    iacts_zp, weights_zp = 2, 3
+
+    np.random.seed(99)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+    program = create_gemm_program(
+        M=M, N=N, K=K, AH=AH, AW=AW, gr=AW,
+        iacts_zp=iacts_zp, weights_zp=weights_zp,
+    )
+    instructions = encode_program(program)
+    max_k_passes = compute_max_k_passes(instructions, AW, AH)
+
+    mod = build_feather_kstreaming_simulator(
+        M, K, N, AW, AH, int8, len(instructions),
+        max_k_passes,
+    )
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, instructions, C)
+
+    ref = (A.astype(np.int32) - iacts_zp) @ (B.astype(np.int32) - weights_zp)
+    passed = np.array_equal(C, ref)
+    assert passed, f"AW=4 zero point test failed. Max diff: {np.max(np.abs(C - ref))}"
+    print(f"  C[{M},{N}] = (A-{iacts_zp})[{M},{K}] x (B-{weights_zp})[{K},{N}]: PASSED")
+    print("PASSED: Zero point subtraction AW=4")
+    return True
+
+
+def test_post_quantization():
+    """Verify post-quantization matches RTL quant_post.v behavior.
+
+    RTL formula: result = (sign_extend_64(data) * scale + zero_extend_64(zp))[7:0]
+    Allo implementation: (accum * quant_scale + quant_zp) & 255
+
+    When quant_scale=0, quantization is disabled (pass-through int32).
+    """
+    print("\n" + "=" * 60)
+    print("Test: Post-Quantization (TICKET-006)")
+    print("=" * 60)
+
+    M, N, K, AW, AH = 8, 8, 16, 8, 8
+
+    test_cases = [
+        (0, 0, 0, 0, "no quant, no zp (baseline)"),
+        (3, 10, 0, 0, "quant scale=3 zp=10, no input zp"),
+        (3, 10, 2, 1, "quant scale=3 zp=10, iacts_zp=2 weights_zp=1"),
+        (1, 0, 0, 0, "quant scale=1 zp=0 (identity quant)"),
+        (5, 128, 0, 0, "quant scale=5 zp=128"),
+    ]
+
+    for quant_scale, quant_zp, iacts_zp, weights_zp, desc in test_cases:
+        np.random.seed(42)
+        A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+        B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+        program = create_gemm_program(
+            M=M, N=N, K=K, AH=AH, AW=AW,
+            iacts_zp=iacts_zp, weights_zp=weights_zp,
+            quant_scale=quant_scale, quant_zp=quant_zp,
+        )
+        instructions = encode_program(program)
+        max_k_passes = compute_max_k_passes(instructions, AW, AH)
+
+        # Verify quant params are encoded correctly
+        assert instructions[2, 6] == quant_scale, \
+            f"quant_scale={quant_scale} not encoded at instructions[2,6]"
+        assert instructions[2, 7] == quant_zp, \
+            f"quant_zp={quant_zp} not encoded at instructions[2,7]"
+
+        mod = build_feather_kstreaming_simulator(
+            M, K, N, AW, AH, int8, len(instructions),
+            max_k_passes,
+        )
+        C = np.zeros((M, N), dtype=np.int32)
+        mod(A, B, instructions, C)
+
+        # Reference: GEMM with zero points, then optional quantization
+        A_shifted = A.astype(np.int32) - iacts_zp
+        B_shifted = B.astype(np.int32) - weights_zp
+        ref = A_shifted @ B_shifted
+        if quant_scale != 0:
+            # Match RTL: (sign_extend_64(data) * scale + zero_extend_64(zp))[7:0]
+            ref = (ref.astype(np.int64) * quant_scale + np.int64(quant_zp)).astype(np.int32) & 255
+
+        passed = np.array_equal(C, ref)
+        assert passed, (
+            f"Post-quant test '{desc}' failed.\n"
+            f"  Max diff: {np.max(np.abs(C - ref))}\n"
+            f"  C[0,:4]={C[0,:4]}, ref[0,:4]={ref[0,:4]}"
+        )
+        print(f"  {desc}: PASSED")
+
+    print("PASSED: Post-quantization")
+    return True
+
+
+def test_post_quantization_aw4():
+    """Verify post-quantization on 4x4 array."""
+    print("\n" + "=" * 60)
+    print("Test: Post-Quantization AW=4")
+    print("=" * 60)
+
+    M, N, K, AW, AH = 4, 4, 8, 4, 4
+    quant_scale, quant_zp = 3, 10
+    iacts_zp, weights_zp = 1, 2
+
+    np.random.seed(99)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+    program = create_gemm_program(
+        M=M, N=N, K=K, AH=AH, AW=AW, gr=AW,
+        iacts_zp=iacts_zp, weights_zp=weights_zp,
+        quant_scale=quant_scale, quant_zp=quant_zp,
+    )
+    instructions = encode_program(program)
+    max_k_passes = compute_max_k_passes(instructions, AW, AH)
+
+    mod = build_feather_kstreaming_simulator(
+        M, K, N, AW, AH, int8, len(instructions),
+        max_k_passes,
+    )
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, instructions, C)
+
+    ref = (A.astype(np.int32) - iacts_zp) @ (B.astype(np.int32) - weights_zp)
+    ref = (ref.astype(np.int64) * quant_scale + np.int64(quant_zp)).astype(np.int32) & 255
+
+    passed = np.array_equal(C, ref)
+    assert passed, f"AW=4 post-quant test failed. Max diff: {np.max(np.abs(C - ref))}"
+    print(f"  scale={quant_scale}, zp={quant_zp}, iacts_zp={iacts_zp}, weights_zp={weights_zp}: PASSED")
+    print("PASSED: Post-quantization AW=4")
+    return True
+
+
 def run_full_matrix_tests():
     """Run all full-matrix GEMM tests."""
     print("=" * 70)
@@ -522,6 +730,10 @@ def run_full_matrix_tests():
         ("WVN order all correct", test_wvn_order_all_correct),
         ("Mixed layout orders", test_mixed_layout_orders),
         ("r0/c0 tile advancement", test_r0_c0_tile_advancement),
+        ("Zero point subtraction", test_zero_point_subtraction),
+        ("Zero point AW=4", test_zero_point_aw4),
+        ("Post-quantization", test_post_quantization),
+        ("Post-quantization AW=4", test_post_quantization_aw4),
     ]
 
     for name, test_fn in tests:

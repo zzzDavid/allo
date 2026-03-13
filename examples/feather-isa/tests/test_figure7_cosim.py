@@ -46,7 +46,10 @@ def _c_array_1d(name, dtype, data):
 def generate_cosim_testbench(project_dir, A, B, instructions, C_ref):
     """Write a C testbench that calls full_matrix_top with Figure 7 data."""
     from minisa.isa import SetOVNLayout
-    from minisa.lowering import lower_ovn_layout, compute_col_to_m_map
+    from minisa.lowering import (
+        lower_ovn_layout, compute_col_to_m_map,
+        compute_output_col_map, _simulate_birrd_passthrough_perm,
+    )
 
     num_inst = len(instructions)
     num_tiles = num_inst - 3
@@ -57,20 +60,38 @@ def generate_cosim_testbench(project_dir, A, B, instructions, C_ref):
 
     ovn = SetOVNLayout(order=ovn_order, PL0=AW, PL1=1, QL0=AW, QL1=1)
     birrd_table = lower_ovn_layout(ovn, AW, AW)
+    passthrough_perm = _simulate_birrd_passthrough_perm(AW)
+    pair_to_col = compute_output_col_map(AW, ovn_order)
 
     birrd_per_tile = np.zeros((num_tiles, P0, P1), dtype=np.int8)
     col_map_per_tile = np.zeros((num_tiles, AW), dtype=np.int32)
     num_m_per_tile = np.zeros(num_tiles, dtype=np.int32)
+    n_base_per_tile = np.zeros((num_tiles, AW), dtype=np.int32)
 
     for t in range(num_tiles):
         Gr = int(instructions[3 + t, 3])
-        if Gr < AW:
+        Gc = int(instructions[3 + t, 4])
+        sc = int(instructions[3 + t, 6])
+        mask_Gc = Gc - 1
+        if Gr == AW:
+            col_map_per_tile[t] = compute_col_to_m_map(AW, ovn_order, AW)
+            num_m_per_tile[t] = AW
+            for col in range(AW):
+                orig_pe = int(passthrough_perm[col])
+                n_base_per_tile[t, col] = sc * (orig_pe & mask_Gc)
+        elif Gr == 1:
+            col_map_per_tile[t] = np.zeros(AW, dtype=np.int32)
+            num_m_per_tile[t] = 1
+            for col in range(AW):
+                orig_pe = int(passthrough_perm[col])
+                n_base_per_tile[t, col] = sc * (orig_pe & mask_Gc)
+        else:
             birrd_per_tile[t] = birrd_table
             col_map_per_tile[t] = compute_col_to_m_map(AW, ovn_order, Gr)
             num_m_per_tile[t] = Gr
-        else:
-            col_map_per_tile[t] = compute_col_to_m_map(AW, ovn_order, AW)
-            num_m_per_tile[t] = AW
+            for pair_idx in range(AW // 2):
+                col = int(pair_to_col[pair_idx])
+                n_base_per_tile[t, col] = sc * (pair_idx & mask_Gc)
 
     m_start_per_tile = np.array(
         [int(instructions[3 + t, 7]) for t in range(num_tiles)], dtype=np.int32
@@ -98,6 +119,8 @@ def generate_cosim_testbench(project_dir, A, B, instructions, C_ref):
         f.write("  " + _c_array_1d("output_col_map", "int32_t", col_map_per_tile.flatten()))
         f.write("  // Output num_m per tile\n")
         f.write("  " + _c_array_1d("output_num_m", "int32_t", num_m_per_tile.flatten()))
+        f.write("  // Output n_base per tile\n")
+        f.write("  " + _c_array_1d("output_n_base", "int32_t", n_base_per_tile.flatten()))
         f.write("  // Accum m_start per tile\n")
         f.write("  " + _c_array_1d("accum_m_start", "int32_t", m_start_per_tile.flatten()))
         f.write("  // Accum n_start per tile\n")
@@ -109,7 +132,8 @@ def generate_cosim_testbench(project_dir, A, B, instructions, C_ref):
         # Call top function
         f.write("  // Run FEATHER+ dataflow\n")
         f.write("  full_matrix_top(A, B, instructions, birrd_inst, "
-                "output_col_map, output_num_m, accum_m_start, accum_n_start, C);\n\n")
+                "output_col_map, output_num_m, output_n_base, "
+                "accum_m_start, accum_n_start, C);\n\n")
 
         # Verify output
         f.write("  // Reference output\n")
@@ -141,9 +165,9 @@ def patch_kernel_for_cosim(project_dir, num_tiles):
     with open(kernel_path, "r") as f:
         code = f.read()
 
-    # Ordered depths matching the 9 function arguments:
+    # Ordered depths matching the 10 function arguments:
     # A, B, instructions, birrd_inst, output_col_map,
-    # output_num_m, accum_m_start, accum_n_start, C
+    # output_num_m, output_n_base, accum_m_start, accum_n_start, C
     P0, _ = compute_birrd_params(AW)
     num_inst = num_tiles + 3
     ordered_depths = [
@@ -153,6 +177,7 @@ def patch_kernel_for_cosim(project_dir, num_tiles):
         num_tiles * P0 * (AW // 2),   # birrd_inst
         num_tiles * AW,               # output_col_map
         num_tiles,                    # output_num_m
+        num_tiles * AW,               # output_n_base
         num_tiles,                    # accum_m_start
         num_tiles,                    # accum_n_start
         M * N,                        # C: int32[16,8]
