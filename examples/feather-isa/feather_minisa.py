@@ -190,7 +190,7 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                 for k_pass in range(max_k_passes):
                     k_start: int32 = k_start_tile + k_pass * kt_per_pass
 
-                    # === Input crossbar (ORDER_012 with bit ops) ===
+                    # === Input crossbar (Gr-based bit ops) ===
                     packed_iacts: TyCrossbarPacked = 0
                     if k_pass < actual_passes:
                         for ic_i in range(AH):
@@ -203,7 +203,7 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                                 ] = local_A[m_idx, k_idx]
                     iacts_stream.put(packed_iacts)
 
-                    # === Weight crossbar (ORDER_012 with bit ops) ===
+                    # === Weight crossbar (Gr-based bit ops) ===
                     for wc_i in range(AH):
                         packed_w: TyCrossbarPacked = 0
                         if k_pass < actual_passes:
