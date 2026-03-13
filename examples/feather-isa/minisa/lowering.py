@@ -121,6 +121,59 @@ def _simulate_birrd_output_col_map(birrd_inst, AW):
     return np.array(col_map, dtype=np.int32)
 
 
+def _simulate_birrd_passthrough_perm(AW):
+    """Simulate all-PS BIRRD to get passthrough output permutation.
+
+    When BIRRD uses all-PS (pass-through) instructions, the butterfly
+    routing network still permutes wire positions. This traces each input
+    through the network to find where it ends up.
+
+    Args:
+        AW: Array width (must be power of 2)
+
+    Returns:
+        int32 array of shape [AW] where perm[output_col] = input_position
+    """
+    from feather_minisa import reverse_bits
+
+    P0, P1 = compute_birrd_params(AW)
+    LOG2_AW = int(log2(AW))
+
+    # Compute routing tables (same structure as _simulate_birrd_output_col_map)
+    route_left_table = np.zeros((P0, P1), dtype=int)
+    route_right_table = np.zeros((P0, P1), dtype=int)
+    for stage in range(P0):
+        if stage == P0 - 1:
+            for sw in range(P1):
+                route_left_table[stage, sw] = 2 * sw
+                route_right_table[stage, sw] = 2 * sw + 1
+        else:
+            rev_bits_factor = (
+                2 if stage == 0
+                else min(LOG2_AW, 2 + stage, 2 * LOG2_AW - stage)
+            )
+            for sw in range(P1):
+                route_left_table[stage, sw] = reverse_bits(2 * sw, rev_bits_factor)
+                route_right_table[stage, sw] = reverse_bits(2 * sw + 1, rev_bits_factor)
+
+    # Trace each input through the all-PS network
+    buf = np.zeros((P0 + 1, AW), dtype=int)
+    for pos in range(AW):
+        buf[0, pos] = pos
+
+    for stage in range(P0):
+        for sw in range(P1):
+            left_in = buf[stage, 2 * sw]
+            right_in = buf[stage, 2 * sw + 1]
+            # All-PS: pass through unchanged
+            left_dest = int(route_left_table[stage, sw])
+            right_dest = int(route_right_table[stage, sw])
+            buf[stage + 1, left_dest] = left_in
+            buf[stage + 1, right_dest] = right_in
+
+    return buf[P0].astype(np.int32)
+
+
 # BIRRD instruction tables for all (AW, order) combinations.
 # Order 0: standard reduction pattern from FEATHER paper.
 # Orders 1-5: variations that produce different output permutations
@@ -330,3 +383,38 @@ def compute_output_col_map(AW: int, ovn_order: int = 0) -> np.ndarray:
             f"produce valid 2-way reduction"
         )
     return col_map
+
+
+def compute_col_to_m_map(AW: int, ovn_order: int, Gr: int) -> np.ndarray:
+    """Compute BIRRD output column → M-position mapping for any Gr value.
+
+    Maps each BIRRD output column to the local M position it contributes to.
+    Supports all power-of-2 Gr values:
+    - Gr=AW: passthrough, each column maps to its permuted input position
+    - Gr=AW//2: standard 2-way reduction, 1-to-1 pair→M mapping
+    - Gr<AW//2: multi-way reduction, multiple columns map to same M position
+
+    Unused columns (those not containing valid reduced values) get sentinel
+    value AW, which ensures they are skipped in output_accum (AW < num_m
+    is always false).
+
+    Args:
+        AW: Array width (4, 8, or 16)
+        ovn_order: OVN layout order (0-5)
+        Gr: Replication group size (power of 2, 1 ≤ Gr ≤ AW)
+
+    Returns:
+        int32 array of shape [AW] mapping output column → M position
+    """
+    if Gr == AW:
+        # Passthrough: trace through all-PS BIRRD routing
+        return _simulate_birrd_passthrough_perm(AW)
+
+    # Reduction mode: invert pair→column map to column→M
+    pair_to_col = compute_output_col_map(AW, ovn_order)  # shape [AW//2]
+    col_to_m = np.full(AW, AW, dtype=np.int32)  # sentinel for unused cols
+    for pair_idx in range(AW // 2):
+        col = int(pair_to_col[pair_idx])
+        m_pos = pair_idx % Gr
+        col_to_m[col] = m_pos
+    return col_to_m

@@ -302,6 +302,7 @@ def create_gemm_program(
     wvn_order: int = 0,
     ovn_order: int = 0,
     dataflow: str = "output_stationary",
+    gr: Optional[int] = None,
 ) -> MINISAProgram:
     """Create a MINISA program for GEMM: C[M,N] = A[M,K] * B[K,N].
 
@@ -319,22 +320,16 @@ def create_gemm_program(
         wvn_order: Weight VN layout order (0-5)
         ovn_order: Output VN layout order (0-5)
         dataflow: PE mapping strategy:
-            "output_stationary" (default): Gr=AW, Gc=1, sr=0, sc=0
+            "output_stationary" (default): Gr=AW//2, Gc=1, sr=1, sc=0
             "weight_stationary": Gr=1, Gc=AW, sr=0, sc=1
+        gr: Explicit replication group size (power of 2, 1 ≤ gr ≤ AW).
+            Overrides the default Gr from dataflow. Determines:
+            - Mt = gr (M rows per tile)
+            - Kt = (AW // gr) * AH (K elements per tile, 1 K-pass)
 
     Returns:
         MINISAProgram configured for GEMM
     """
-    # Tile sizes based on hardware dimensions
-    Mt = AW // 2   # M tile size
-    Nt = AH        # N tile size
-    Kt = 2 * AH    # K tile size (reduction dimension)
-
-    # Ensure dimensions are tileable
-    assert M % Mt == 0, f"M={M} must be divisible by Mt={Mt}"
-    assert N % Nt == 0, f"N={N} must be divisible by Nt={Nt}"
-    assert K % Kt == 0, f"K={K} must be divisible by Kt={Kt}"
-
     # PE mapping based on dataflow strategy
     if dataflow == "output_stationary":
         Gr, Gc, sr, sc = AW // 2, 1, 1, 0
@@ -343,6 +338,22 @@ def create_gemm_program(
     else:
         raise ValueError(f"Unsupported dataflow: {dataflow}. "
                         f"Use 'output_stationary' or 'weight_stationary'.")
+
+    # Override Gr if explicitly specified
+    if gr is not None:
+        assert gr >= 1 and gr <= AW, f"gr={gr} must be in [1, AW={AW}]"
+        assert (gr & (gr - 1)) == 0, f"gr={gr} must be a power of 2"
+        Gr = gr
+
+    # Tile sizes derived from Gr
+    Mt = Gr                         # M rows per tile
+    Nt = AH                         # N cols per tile
+    Kt = (AW // Gr) * AH            # K elements per tile (1 K-pass)
+
+    # Ensure dimensions are tileable
+    assert M % Mt == 0, f"M={M} must be divisible by Mt={Mt}"
+    assert N % Nt == 0, f"N={N} must be divisible by Nt={Nt}"
+    assert K % Kt == 0, f"K={K} must be divisible by Kt={Kt}"
 
     # Create program with layouts
     program = MINISAProgram(

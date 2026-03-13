@@ -66,12 +66,16 @@ def compute_birrd_params(AW: int) -> Tuple[int, int]:
 
 
 def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
-                                            num_k_passes, Kt_per_pass):
+                                            max_k_passes, Kt_per_pass=None):
     """Create FEATHER+ dataflow region with split crossbar/NEST and flexible Gr.
 
     Supports all power-of-2 Gr values per tile via bit operations in the
     crossbar index arithmetic. No runtime dividers — uses (ic_j & (Gr-1))
     for modulo and (ic_j >> log2_Gr) for division.
+
+    Supports mixed Kt_per_pass across tiles: each tile computes its own
+    actual_passes at runtime from its Gr and K-range. Padding passes
+    (beyond actual_passes) stream zeros — harmless to NEST (0*x=0).
 
     Architecture (7 dataflow kernels):
     1. crossbar_load: Read A/B with parametric Gr crossbar (bit ops),
@@ -92,18 +96,19 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
         AH: Array height
         Ty: Input data type (e.g., int8)
         num_inst: Total instruction count (3 layout + tile mappings)
-        num_k_passes: Number of K-passes per tile
-        Kt_per_pass: K elements per pass (typically AH)
+        max_k_passes: Max K-passes across all tiles (compile-time loop bound)
+        Kt_per_pass: Ignored (kept for backward compatibility)
     """
     TyOut = int32
     TyPacked = UInt(TyOut.bits * AW)       # UInt(128) for packing 4 int32
     TyCrossbarPacked = UInt(AH * AW * Ty.bits)  # UInt(128) for packing 16 int8
     LOG2_AW = int(log2(AW))
+    LOG2_AH = int(log2(AH))
     P0, P1 = compute_birrd_params(AW)
     num_tiles = num_inst - 3
     # Allow crossbar_load to run ~2 tiles ahead of nest_compute
-    xbar_i_depth = num_k_passes * 2
-    xbar_w_depth = num_k_passes * AH * 2
+    xbar_i_depth = max_k_passes * 2
+    xbar_w_depth = max_k_passes * AH * 2
 
     @df.region()
     def full_matrix_top(
@@ -140,6 +145,10 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
               ic_j % Gr  →  ic_j & (Gr - 1)    (AND with bitmask)
               ic_j // Gr →  ic_j >> log2_Gr     (right shift)
 
+            Per-tile actual_passes computed at runtime; padding passes stream
+            zeros (harmless to NEST: 0*x=0). Stream puts are always unconditional
+            to maintain dataflow balance with nest_compute.
+
             Per K-pass: 1 iActs packet (AH*AW int8 → UInt(128)) +
                         AH weights packets (AW*AH int8 each → UInt(128)).
             """
@@ -162,32 +171,41 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                     log2_Gr = 4
                 mask_Gr: int32 = Gr - 1
 
-                for k_pass in range(num_k_passes):
-                    k_start: int32 = k_start_tile + k_pass * Kt_per_pass
+                # Per-tile K-pass computation via shifts (no runtime dividers)
+                k_end_tile: int32 = local_instructions[inst_idx, 12]
+                k_range: int32 = k_end_tile - k_start_tile
+                kt_per_pass: int32 = (AW * AH) >> log2_Gr
+                log2_kt: int32 = (LOG2_AW + LOG2_AH) - log2_Gr
+                actual_passes: int32 = k_range >> log2_kt
+
+                for k_pass in range(max_k_passes):
+                    k_start: int32 = k_start_tile + k_pass * kt_per_pass
 
                     # === Input crossbar (ORDER_012 with bit ops) ===
                     packed_iacts: TyCrossbarPacked = 0
-                    for ic_i in range(AH):
-                        for ic_j in range(AW):
-                            m_idx: int32 = m_start + (ic_j & mask_Gr)
-                            k_idx: int32 = k_start + ic_i + (ic_j >> log2_Gr) * AH
-                            packed_iacts[
-                                (ic_i * AW + ic_j) * Ty.bits :
-                                (ic_i * AW + ic_j + 1) * Ty.bits
-                            ] = local_A[m_idx, k_idx]
+                    if k_pass < actual_passes:
+                        for ic_i in range(AH):
+                            for ic_j in range(AW):
+                                m_idx: int32 = m_start + (ic_j & mask_Gr)
+                                k_idx: int32 = k_start + ic_i + (ic_j >> log2_Gr) * AH
+                                packed_iacts[
+                                    (ic_i * AW + ic_j) * Ty.bits :
+                                    (ic_i * AW + ic_j + 1) * Ty.bits
+                                ] = local_A[m_idx, k_idx]
                     iacts_stream.put(packed_iacts)
 
                     # === Weight crossbar (ORDER_012 with bit ops) ===
                     for wc_i in range(AH):
                         packed_w: TyCrossbarPacked = 0
-                        for wc_w in range(AW):
-                            for wc_k in range(AH):
-                                wk_idx: int32 = k_start + wc_k + (wc_w >> log2_Gr) * AH
-                                wn_idx: int32 = n_start + wc_i
-                                packed_w[
-                                    (wc_w * AH + wc_k) * Ty.bits :
-                                    (wc_w * AH + wc_k + 1) * Ty.bits
-                                ] = local_B[wk_idx, wn_idx]
+                        if k_pass < actual_passes:
+                            for wc_w in range(AW):
+                                for wc_k in range(AH):
+                                    wk_idx: int32 = k_start + wc_k + (wc_w >> log2_Gr) * AH
+                                    wn_idx: int32 = n_start + wc_i
+                                    packed_w[
+                                        (wc_w * AH + wc_k) * Ty.bits :
+                                        (wc_w * AH + wc_k + 1) * Ty.bits
+                                    ] = local_B[wk_idx, wn_idx]
                         weights_stream.put(packed_w)
 
         @df.kernel(mapping=[1])
@@ -207,7 +225,7 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                     for _aj in range(AW):
                         nest_accum[_ai, _aj] = 0
 
-                for k_pass in range(num_k_passes):
+                for k_pass in range(max_k_passes):
                     # Unpack iActs from stream
                     packed_iacts: TyCrossbarPacked = iacts_stream.get()
                     for ic_i in range(AH):
@@ -333,12 +351,12 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                     with allo.meta_for(AW) as aw_i:
                         tile_out[d, aw_i] = connection[P0, aw_i].get()
 
-                for om in range(AW):
-                    if om < num_m:
-                        col: int32 = local_output_col_map[tile, om]
+                for col in range(AW):
+                    m_pos: int32 = local_output_col_map[tile, col]
+                    if m_pos < num_m:
                         for on in range(AH):
-                            accum[m_start + om, n_start + on] = (
-                                accum[m_start + om, n_start + on] + tile_out[on, col]
+                            accum[m_start + m_pos, n_start + on] = (
+                                accum[m_start + m_pos, n_start + on] + tile_out[on, col]
                             )
 
             for _wi in range(M):
@@ -357,7 +375,7 @@ class FeatherKStreamingModule:
     """
 
     def __init__(self, allo_mod, AW):
-        from minisa.lowering import lower_ovn_layout, compute_output_col_map
+        from minisa.lowering import lower_ovn_layout, compute_col_to_m_map
         from minisa.isa import SetOVNLayout
 
         self._mod = allo_mod
@@ -365,18 +383,24 @@ class FeatherKStreamingModule:
         P0, P1 = compute_birrd_params(AW)
         self._P0 = P0
         self._P1 = P1
-        # Precompute BIRRD tables + col maps for all 6 OVN orders
+        # Precompute BIRRD tables for all 6 OVN orders
         self._birrd_tables = {}
-        self._col_maps = {}
         for order in range(6):
             ovn = SetOVNLayout(order=order, PL0=AW, PL1=1, QL0=AW, QL1=1)
             self._birrd_tables[order] = lower_ovn_layout(ovn, AW, AW)
-            self._col_maps[order] = compute_output_col_map(AW, order)
+        # Precompute col→M maps for all (order, Gr) combinations
+        self._col_to_m_maps = {}
+        valid_grs = set()
+        log2_aw = int(log2(AW))
+        for i in range(log2_aw + 1):
+            valid_grs.add(1 << i)  # 1, 2, 4, ..., AW
+        for order in range(6):
+            for gr in valid_grs:
+                self._col_to_m_maps[(order, gr)] = compute_col_to_m_map(AW, order, gr)
 
     def __call__(self, A, B, instructions, C):
         ovn_order = int(instructions[2, 1])
         AW = self._AW
-        Mt = AW // 2
         P0, P1 = self._P0, self._P1
         num_tiles = len(instructions) - 3
 
@@ -388,14 +412,14 @@ class FeatherKStreamingModule:
         for t in range(num_tiles):
             Gr = int(instructions[3 + t, 3])
             if Gr < AW:
-                # Reduction mode: standard BIRRD + col_map
+                # Reduction mode: BIRRD + col→M map
                 birrd_per_tile[t] = self._birrd_tables[ovn_order]
-                col_map_per_tile[t, :Mt] = self._col_maps[ovn_order]
-                num_m_per_tile[t] = Mt
+                col_map_per_tile[t] = self._col_to_m_maps[(ovn_order, Gr)]
+                num_m_per_tile[t] = Gr
             else:
-                # Pass-through mode: all-PS BIRRD + identity col_map
+                # Pass-through mode: all-PS BIRRD + passthrough col→M map
                 # birrd_per_tile[t] is already all zeros (PS=0)
-                col_map_per_tile[t] = np.arange(AW, dtype=np.int32)
+                col_map_per_tile[t] = self._col_to_m_maps[(ovn_order, AW)]
                 num_m_per_tile[t] = AW
 
         m_start_per_tile = np.array(
@@ -418,26 +442,43 @@ class FeatherKStreamingModule:
         )
 
 
+def compute_max_k_passes(instructions, AW, AH):
+    """Compute max K-passes across all tiles from encoded instructions.
+
+    Each tile may have a different Kt_per_pass = (AW*AH) / Gr, so the
+    number of K-passes varies per tile. Returns the maximum, which is
+    used as the compile-time loop bound (padding passes stream zeros).
+    """
+    num_tiles = len(instructions) - 3
+    max_passes = 0
+    for t in range(num_tiles):
+        Gr = int(instructions[3 + t, 3])
+        k_range = int(instructions[3 + t, 12]) - int(instructions[3 + t, 11])
+        kt_per_pass = (AW // Gr) * AH
+        max_passes = max(max_passes, k_range // kt_per_pass)
+    return max_passes
+
+
 def build_feather_kstreaming_simulator(M, K, N, AW, AH, Ty, num_inst,
-                                        num_k_passes, Kt_per_pass):
+                                        max_k_passes, Kt_per_pass=None):
     """Build K-streaming FEATHER+ dataflow for simulation."""
     top = get_feather_full_matrix_top_kstreaming(
         int(M), int(K), int(N), int(AW), int(AH), Ty, int(num_inst),
-        int(num_k_passes), int(Kt_per_pass),
+        int(max_k_passes),
     )
     allo_mod = df.build(top, target="simulator")
     return FeatherKStreamingModule(allo_mod, AW)
 
 
 def build_feather_kstreaming_hls(M, K, N, AW, AH, Ty, num_inst,
-                                  num_k_passes, Kt_per_pass,
+                                  max_k_passes, Kt_per_pass=None,
                                   mode="csim", project=None):
     """Build K-streaming FEATHER+ dataflow for Vitis HLS."""
     if project is None:
         project = "feather_kstreaming.prj"
     top = get_feather_full_matrix_top_kstreaming(
         int(M), int(K), int(N), int(AW), int(AH), Ty, int(num_inst),
-        int(num_k_passes), int(Kt_per_pass),
+        int(max_k_passes),
     )
     s = df.customize(top)
     s.partition("full_matrix_top:C", dim=2, factor=AH)

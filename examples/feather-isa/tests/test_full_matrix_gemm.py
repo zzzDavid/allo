@@ -29,7 +29,7 @@ from minisa.isa import (
     INST_TYPE_OVN,
     INST_TYPE_MAPPING,
 )
-from feather_minisa import build_feather_kstreaming_simulator
+from feather_minisa import build_feather_kstreaming_simulator, compute_max_k_passes
 
 
 def run_kstreaming_gemm(M, N, K, AW, AH, verbose=False, dataflow="output_stationary"):
@@ -46,18 +46,16 @@ def run_kstreaming_gemm(M, N, K, AW, AH, verbose=False, dataflow="output_station
     """
     program = create_gemm_program(M=M, N=N, K=K, AH=AH, AW=AW, dataflow=dataflow)
     instructions = encode_program(program)
-
-    # Compute K-pass parameters from Gr
-    Gr = int(instructions[3, 3])
-    Kt = int(instructions[3, 12]) - int(instructions[3, 11])  # k_end - k_start
-    Kt_per_pass = (AW // Gr) * AH
-    num_k_passes = Kt // Kt_per_pass
+    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     if verbose:
+        Gr = int(instructions[3, 3])
+        Kt = int(instructions[3, 12]) - int(instructions[3, 11])
+        Kt_per_pass = (AW // Gr) * AH
         print(f"  Dimensions: C[{M},{N}] = A[{M},{K}] x B[{K},{N}]")
         print(f"  Array: {AH}x{AW}, Gr={Gr}, dataflow={dataflow}")
         print(f"  Tiles: {len(program.mappings)}, Kt={Kt}, Kt_per_pass={Kt_per_pass}, "
-              f"num_k_passes={num_k_passes}")
+              f"max_k_passes={max_k_passes}")
 
     np.random.seed(42)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -65,7 +63,7 @@ def run_kstreaming_gemm(M, N, K, AW, AH, verbose=False, dataflow="output_station
 
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        num_k_passes, Kt_per_pass,
+        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -234,9 +232,9 @@ def test_pe_mapping_fields_encoded():
     assert inst_os[3, 6] == 0, f"OS sc should be 0, got {inst_os[3, 6]}"
     print("  Output-stationary: Gr=4, Gc=1, sr=1, sc=0 encoded correctly")
 
-    # Weight-stationary
+    # Weight-stationary (Gr=1: Mt=1, Kt=(8/1)*8=64)
     program_ws = create_gemm_program(
-        M=8, N=8, K=16, AH=8, AW=8, dataflow="weight_stationary",
+        M=1, N=8, K=64, AH=8, AW=8, dataflow="weight_stationary",
     )
     inst_ws = encode_program(program_ws)
     assert inst_ws[3, 3] == 1, f"WS Gr should be 1, got {inst_ws[3, 3]}"
@@ -299,14 +297,11 @@ def test_ovn_order_all_correct():
             M=M, N=N, K=K, AH=AH, AW=AW, ovn_order=ovn_order,
         )
         instructions = encode_program(program)
-        Gr = int(instructions[3, 3])
-        Kt = int(instructions[3, 12]) - int(instructions[3, 11])
-        Kt_per_pass = (AW // Gr) * AH
-        num_k_passes = Kt // Kt_per_pass
+        max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
         mod = build_feather_kstreaming_simulator(
             M, K, N, AW, AH, int8, len(instructions),
-            num_k_passes, Kt_per_pass,
+            max_k_passes,
         )
         C = np.zeros((M, N), dtype=np.int32)
         mod(A, B, instructions, C)

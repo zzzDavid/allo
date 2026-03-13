@@ -33,7 +33,7 @@ from minisa.isa import (
     create_figure7_program,
     encode_program,
 )
-from feather_minisa import build_feather_kstreaming_simulator
+from feather_minisa import build_feather_kstreaming_simulator, compute_max_k_passes
 
 
 # Hardware parameters for 4x4 NEST
@@ -50,8 +50,7 @@ def test_gr_equals_aw():
     M, K, N = 16, 12, 8
     program = create_figure7_program()
     instructions = encode_program(program)
-    num_k_passes = K // AH  # 3
-    Kt_per_pass = AH  # 4
+    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     np.random.seed(7)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -59,7 +58,7 @@ def test_gr_equals_aw():
 
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        num_k_passes, Kt_per_pass,
+        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -83,8 +82,6 @@ def test_gr_half_aw():
     Gr = AW // 2  # 2
     Mt = Gr  # 2 M rows per tile (from crossbar: ic_j & (Gr-1))
     Nt = AH  # 4
-    Kt_per_pass = (AW // Gr) * AH  # 8
-    num_k_passes = K // Kt_per_pass  # 1
 
     program = MINISAProgram(
         name="gr2_test", AH=AH, AW=AW,
@@ -105,6 +102,7 @@ def test_gr_half_aw():
             ))
 
     instructions = encode_program(program)
+    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     np.random.seed(42)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -112,7 +110,7 @@ def test_gr_half_aw():
 
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        num_k_passes, Kt_per_pass,
+        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -133,10 +131,6 @@ def test_mixed_gr_tiles():
     """
     M, K, N = 8, 12, 4
     Nt = AH  # 4
-
-    # K-pass config: use Gr=2 stride (the larger one)
-    Kt_per_pass = (AW // 2) * AH  # 8
-    num_k_passes = 1  # both tile types complete in 1 K-pass
 
     program = MINISAProgram(
         name="mixed_gr_test", AH=AH, AW=AW,
@@ -169,6 +163,7 @@ def test_mixed_gr_tiles():
             ))
 
     instructions = encode_program(program)
+    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     np.random.seed(99)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -176,7 +171,220 @@ def test_mixed_gr_tiles():
 
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        num_k_passes, Kt_per_pass,
+        max_k_passes,
+    )
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, instructions, C)
+
+    ref = A.astype(np.int32) @ B.astype(np.int32)
+    np.testing.assert_array_equal(C, ref)
+
+
+def test_gr_1_aw4():
+    """Gr=1 on AW=4: 4-way reduction (weight-stationary-like).
+
+    Each PE column handles a different K-stripe for the same M row.
+    BIRRD does 2-way reduction, output_accum accumulates the remaining 2 pairs.
+
+    Workload: C[1,4] = A[1,16] x B[16,4]
+    - 1 tile, Gr=1, Mt=1, Kt_per_pass = (4/1)*4 = 16
+    """
+    M, K, N = 1, 16, 4
+    Gr = 1
+    Mt = Gr  # 1
+    Nt = AH  # 4
+
+    program = MINISAProgram(
+        name="gr1_aw4_test", AH=AH, AW=AW,
+        ivn_layout=SetIVNLayout(order=0, ML0=AH, ML1=M // AH if M >= AH else 1, JL0=AH, JL1=K // AH),
+        wvn_layout=SetWVNLayout(order=0, KL0=AH, KL1=K // AH, NL0=min(N, AW), NL1=max(1, N // AW)),
+        ovn_layout=SetOVNLayout(order=0, PL0=AH, PL1=1, QL0=AH, QL1=N // AH),
+    )
+
+    for n_tile in range(N // Nt):
+        for m_tile in range(M // Mt):
+            program.add_mapping(SetMapping(
+                r0=0, c0=n_tile * Nt,
+                Gr=Gr, Gc=1, sr=1, sc=0,
+                m_start=m_tile * Mt, m_end=(m_tile + 1) * Mt,
+                n_start=n_tile * Nt, n_end=(n_tile + 1) * Nt,
+                k_start=0, k_end=K,
+            ))
+
+    instructions = encode_program(program)
+    max_k_passes = compute_max_k_passes(instructions, AW, AH)
+
+    np.random.seed(123)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+    mod = build_feather_kstreaming_simulator(
+        M, K, N, AW, AH, int8, len(instructions),
+        max_k_passes,
+    )
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, instructions, C)
+
+    ref = A.astype(np.int32) @ B.astype(np.int32)
+    np.testing.assert_array_equal(C, ref)
+
+
+def test_gr_2_aw8():
+    """Gr=2 on AW=8: 4-way reduction.
+
+    Each Gr=2 group of PE columns shares M rows, 4 groups total.
+    BIRRD does 2-way, output_accum sums the 2 remaining pairs per M.
+
+    Workload: C[2,8] = A[2,32] x B[32,8]
+    - 1 tile, Gr=2, Mt=2, Kt_per_pass = (8/2)*8 = 32
+    """
+    AW_8, AH_8 = 8, 8
+    M, K, N = 2, 32, 8
+    Gr = 2
+    Mt = Gr  # 2
+    Nt = AH_8  # 8
+
+    program = MINISAProgram(
+        name="gr2_aw8_test", AH=AH_8, AW=AW_8,
+        ivn_layout=SetIVNLayout(order=0, ML0=AH_8, ML1=1, JL0=AH_8, JL1=K // AH_8),
+        wvn_layout=SetWVNLayout(order=0, KL0=AH_8, KL1=K // AH_8, NL0=min(N, AW_8), NL1=max(1, N // AW_8)),
+        ovn_layout=SetOVNLayout(order=0, PL0=AH_8, PL1=1, QL0=AH_8, QL1=N // AH_8),
+    )
+
+    for n_tile in range(N // Nt):
+        for m_tile in range(M // Mt):
+            program.add_mapping(SetMapping(
+                r0=0, c0=n_tile * Nt,
+                Gr=Gr, Gc=1, sr=1, sc=0,
+                m_start=m_tile * Mt, m_end=(m_tile + 1) * Mt,
+                n_start=n_tile * Nt, n_end=(n_tile + 1) * Nt,
+                k_start=0, k_end=K,
+            ))
+
+    instructions = encode_program(program)
+    max_k_passes = compute_max_k_passes(instructions, AW_8, AH_8)
+
+    np.random.seed(456)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+    mod = build_feather_kstreaming_simulator(
+        M, K, N, AW_8, AH_8, int8, len(instructions),
+        max_k_passes,
+    )
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, instructions, C)
+
+    ref = A.astype(np.int32) @ B.astype(np.int32)
+    np.testing.assert_array_equal(C, ref)
+
+
+def test_gr_1_aw8():
+    """Gr=1 on AW=8: 8-way reduction (full weight-stationary).
+
+    All PE columns handle different K-stripes for the same M row.
+    BIRRD does 2-way (4 pairs), output_accum sums all 4 pairs to 1 M.
+
+    Workload: C[1,8] = A[1,64] x B[64,8]
+    - 1 tile, Gr=1, Mt=1, Kt_per_pass = (8/1)*8 = 64
+    """
+    AW_8, AH_8 = 8, 8
+    M, K, N = 1, 64, 8
+    Gr = 1
+    Mt = Gr  # 1
+    Nt = AH_8  # 8
+
+    program = MINISAProgram(
+        name="gr1_aw8_test", AH=AH_8, AW=AW_8,
+        ivn_layout=SetIVNLayout(order=0, ML0=AH_8, ML1=1, JL0=AH_8, JL1=K // AH_8),
+        wvn_layout=SetWVNLayout(order=0, KL0=AH_8, KL1=K // AH_8, NL0=min(N, AW_8), NL1=max(1, N // AW_8)),
+        ovn_layout=SetOVNLayout(order=0, PL0=AH_8, PL1=1, QL0=AH_8, QL1=N // AH_8),
+    )
+
+    for n_tile in range(N // Nt):
+        for m_tile in range(M // Mt):
+            program.add_mapping(SetMapping(
+                r0=0, c0=n_tile * Nt,
+                Gr=Gr, Gc=1, sr=1, sc=0,
+                m_start=m_tile * Mt, m_end=(m_tile + 1) * Mt,
+                n_start=n_tile * Nt, n_end=(n_tile + 1) * Nt,
+                k_start=0, k_end=K,
+            ))
+
+    instructions = encode_program(program)
+    max_k_passes = compute_max_k_passes(instructions, AW_8, AH_8)
+
+    np.random.seed(789)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+    mod = build_feather_kstreaming_simulator(
+        M, K, N, AW_8, AH_8, int8, len(instructions),
+        max_k_passes,
+    )
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, instructions, C)
+
+    ref = A.astype(np.int32) @ B.astype(np.int32)
+    np.testing.assert_array_equal(C, ref)
+
+
+def test_mixed_kt_per_pass():
+    """Mixed Kt_per_pass: Gr=2 tiles (2 passes) and Gr=4 tiles (4 passes).
+
+    Workload: C[4,4] = A[4,32] x B[32,4] on AW=4, AH=4
+
+    | Tiles  | Gr | Mt | K-range  | Kt_per_pass | actual_passes |
+    |--------|----|----|----------|-------------|---------------|
+    | 2 tiles| 2  | 2  | [0,16)   | 8           | 2             |
+    | 1 tile | 4  | 4  | [16,32)  | 4           | 4             |
+
+    max_k_passes = 4. Gr=2 tiles get 2 padding passes (zeros).
+    Verifies correct GEMM with truly mixed K-pass counts.
+    """
+    M, K, N = 4, 32, 4
+    Nt = AH  # 4
+
+    program = MINISAProgram(
+        name="mixed_kt_test", AH=AH, AW=AW,
+        ivn_layout=SetIVNLayout(order=0, ML0=AH, ML1=1, JL0=AH, JL1=K // AH),
+        wvn_layout=SetWVNLayout(order=0, KL0=AH, KL1=K // AH, NL0=min(N, AW), NL1=max(1, N // AW)),
+        ovn_layout=SetOVNLayout(order=0, PL0=AH, PL1=1, QL0=AH, QL1=N // AH),
+    )
+
+    # Gr=2 tiles: K=[0,16), Mt=2, Kt_per_pass=(4/2)*4=8, actual_passes=16/8=2
+    Mt_gr2 = 2
+    for m_tile in range(M // Mt_gr2):
+        program.add_mapping(SetMapping(
+            r0=0, c0=0,
+            Gr=2, Gc=2, sr=1, sc=4,
+            m_start=m_tile * Mt_gr2, m_end=(m_tile + 1) * Mt_gr2,
+            n_start=0, n_end=N,
+            k_start=0, k_end=16,
+        ))
+
+    # Gr=4 tile: K=[16,32), Mt=4, Kt_per_pass=(4/4)*4=4, actual_passes=16/4=4
+    program.add_mapping(SetMapping(
+        r0=4, c0=0,
+        Gr=4, Gc=2, sr=1, sc=4,
+        m_start=0, m_end=4,
+        n_start=0, n_end=N,
+        k_start=16, k_end=32,
+    ))
+
+    instructions = encode_program(program)
+    max_k_passes = compute_max_k_passes(instructions, AW, AH)
+
+    # Verify mixed K-pass counts
+    assert max_k_passes == 4, f"Expected max_k_passes=4, got {max_k_passes}"
+
+    np.random.seed(202)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+    mod = build_feather_kstreaming_simulator(
+        M, K, N, AW, AH, int8, len(instructions),
+        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -210,6 +418,10 @@ if __name__ == "__main__":
         test_gr_equals_aw,
         test_gr_half_aw,
         test_mixed_gr_tiles,
+        test_gr_1_aw4,
+        test_gr_2_aw8,
+        test_gr_1_aw8,
+        test_mixed_kt_per_pass,
         test_bit_ops_equivalence,
     ]
     for t in tests:

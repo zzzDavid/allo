@@ -27,6 +27,7 @@ from feather_minisa import (
     get_feather_full_matrix_top_kstreaming,
     FeatherKStreamingModule,
     compute_birrd_params,
+    compute_max_k_passes,
 )
 
 # Figure 7 dimensions
@@ -45,19 +46,17 @@ def _c_array_1d(name, dtype, data):
 def generate_cosim_testbench(project_dir, A, B, instructions, C_ref):
     """Write a C testbench that calls full_matrix_top with Figure 7 data."""
     from minisa.isa import SetOVNLayout
-    from minisa.lowering import lower_ovn_layout, compute_output_col_map
+    from minisa.lowering import lower_ovn_layout, compute_col_to_m_map
 
     num_inst = len(instructions)
     num_tiles = num_inst - 3
     P0, P1 = compute_birrd_params(AW)
-    Mt = AW // 2
 
-    # Compute BIRRD configs (same logic as FeatherFullMatrixModule.__call__)
+    # Compute BIRRD configs (same logic as FeatherKStreamingModule.__call__)
     ovn_order = int(instructions[2, 1])
 
     ovn = SetOVNLayout(order=ovn_order, PL0=AW, PL1=1, QL0=AW, QL1=1)
     birrd_table = lower_ovn_layout(ovn, AW, AW)
-    col_map = compute_output_col_map(AW, ovn_order)
 
     birrd_per_tile = np.zeros((num_tiles, P0, P1), dtype=np.int8)
     col_map_per_tile = np.zeros((num_tiles, AW), dtype=np.int32)
@@ -67,10 +66,10 @@ def generate_cosim_testbench(project_dir, A, B, instructions, C_ref):
         Gr = int(instructions[3 + t, 3])
         if Gr < AW:
             birrd_per_tile[t] = birrd_table
-            col_map_per_tile[t, :Mt] = col_map
-            num_m_per_tile[t] = Mt
+            col_map_per_tile[t] = compute_col_to_m_map(AW, ovn_order, Gr)
+            num_m_per_tile[t] = Gr
         else:
-            col_map_per_tile[t] = np.arange(AW, dtype=np.int32)
+            col_map_per_tile[t] = compute_col_to_m_map(AW, ovn_order, AW)
             num_m_per_tile[t] = AW
 
     m_start_per_tile = np.array(
@@ -220,13 +219,12 @@ def run_figure7_cosim():
     print(f"  NEST: {AH}x{AW}, {num_inst - 3} tile mappings")
 
     num_tiles = num_inst - 3
-    num_k_passes = K // AH  # 3
-    Kt_per_pass = AH        # 4
+    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     # Build HLS project (generates kernel.cpp, kernel.h)
     project_dir = os.path.join(TESTS_DIR, "figure7_cosim.prj")
     top = get_feather_full_matrix_top_kstreaming(
-        M, K, N, AW, AH, int8, num_inst, num_k_passes, Kt_per_pass,
+        M, K, N, AW, AH, int8, num_inst, max_k_passes,
     )
     s = df.customize(top)
     s.partition("full_matrix_top:C", dim=2, factor=AH)

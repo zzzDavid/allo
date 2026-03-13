@@ -20,6 +20,12 @@ python tests/test_figure7_mapping.py     # ISA mapping + functional GEMM
 python tests/test_full_matrix_gemm.py    # Full-matrix GEMM regression (AW=8)
 python tests/test_crossbar_flexibility.py # Multi-Gr crossbar tests (Gr=AW, AW//2, mixed)
 
+# Parameterized tests for any AW/AH (default 16x16)
+python tests/test_parameterized_gemm.py --aw 16 --ah 16           # simulator
+python tests/test_parameterized_gemm.py --aw 8 --ah 8             # 8x8 regression
+python tests/test_parameterized_gemm.py --aw 16 --ah 16 --hls csim  # HLS C-sim
+python tests/test_parameterized_gemm.py --aw 16 --ah 16 --hls csyn  # HLS synthesis
+
 # HLS tests (require Vitis HLS)
 python tests/test_figure7_hls.py         # HLS csim + csynth (770 cycles)
 
@@ -45,8 +51,10 @@ python tests/test_figure7_cosim.py       # RTL cosim cycle count
   Compiles to AND gates and shift muxes (zero pipeline penalty, no integer dividers).
 - `TyOut = int32` for K-streaming intermediate type (int8 accumulation overflows with
   multiple K-passes).
-- Split-kernel packs crossbar data into UInt(128) streams: 1 iActs packet + AH weights
-  packets per K-pass. This breaks the WAR dependency that caused fused kernel's II=14.
+- Split-kernel packs crossbar data into UInt(AH*AW*Ty.bits) streams: 1 iActs packet + AH
+  weights packets per K-pass. This breaks the WAR dependency that caused fused kernel's II=14.
+- For AW=16 (UInt(2048)), kernel.cpp must be patched with `#define AP_INT_MAX_W 4096`
+  before `#include <ap_int.h>` (Vitis HLS default is 1024).
 - Per-tile BIRRD configuration: Gr<AW → standard BIRRD reduction with Mt=AW//2 outputs;
   Gr=AW → all-PS pass-through with AW outputs (identity col_map).
 - Supported Gr values: AW and AW//2 (limited by BIRRD 2-way reduction).
