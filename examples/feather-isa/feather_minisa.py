@@ -121,25 +121,24 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
         output_n_base: int32[num_tiles, AW],
         accum_m_start: int32[num_tiles],
         accum_n_start: int32[num_tiles],
-        nest_zero_points: int32[2],
-        accum_quant_params: int32[2],
-        accum_sr_per_tile: int32[num_tiles],
         C: int32[M, N],
     ):
         """K-streaming FEATHER+ dataflow region with split crossbar/NEST.
 
-        Zero points and quantization params are passed as separate arrays
-        (nest_zero_points, accum_quant_params, accum_sr_per_tile) so each
-        dataflow kernel gets its own HLS buffer — required by Vitis HLS
-        single-reader constraint on dataflow buffers. Only crossbar_load
-        reads from the main instructions array.
+        Only crossbar_load reads from DRAM instructions. It scatters zero
+        points and quantization params to other kernels via streams, keeping
+        HLS single-reader compliance without extra DRAM buffers.
         """
 
         # Intermediate streams: crossbar_load → nest_compute
         iacts_stream: Stream[TyCrossbarPacked, xbar_i_depth]
         weights_stream: Stream[TyCrossbarPacked, xbar_w_depth]
 
-        # Compute pipeline streams (unchanged from v1)
+        # Parameter scatter streams: crossbar_load → nest_compute / output_accum
+        zp_stream: Stream[int32, 2]
+        accum_param_stream: Stream[int32, 2 + num_tiles]
+
+        # Compute pipeline streams
         nest_out: Stream[TyPacked, AH * 2]
         connection: Stream[TyOut, AH][P0 + 1, P1 * 2]
         inst_input: Stream[int8, num_tiles][P0, P1]
@@ -152,6 +151,9 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
         ):
             """Load crossbar data and stream packed iActs/weights to nest_compute.
 
+            Also scatters zero points and quantization params to nest_compute
+            and output_accum via streams (single-reader compliance).
+
             Supports parametric Gr per tile via power-of-2 bit operations:
               ic_j % Gr  →  ic_j & (Gr - 1)    (AND with bitmask)
               ic_j // Gr →  ic_j >> log2_Gr     (right shift)
@@ -160,18 +162,19 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
             zeros (harmless to NEST: 0*x=0). Stream puts are always unconditional
             to maintain dataflow balance with nest_compute.
 
-            IVN/WVN layout orders (instructions[0,1] and instructions[1,1]):
-            These control VN buffer memory layout in the physical architecture.
-            In our direct-indexing model (no VN buffer), the crossbar routing
-            is fully determined by Gr/Gc/sr/sc from SetMapping. The index
-            formula m_idx = m_start + (ic_j & mask_Gr), k_idx = k_start +
-            ic_i + (ic_j >> log2_Gr) * AH produces correct GEMM for all 6
-            IVN/WVN orders because it maps PE positions to matrix coordinates
-            independently of the buffer memory layout.
-
             Per K-pass: 1 iActs packet (AH*AW int8 → UInt(128)) +
                         AH weights packets (AW*AH int8 each → UInt(128)).
             """
+            # Scatter zero points to nest_compute via stream
+            zp_stream.put(local_instructions[0, 6])  # iacts_zp
+            zp_stream.put(local_instructions[1, 6])  # weights_zp
+
+            # Scatter quant params + per-tile sr to output_accum via stream
+            accum_param_stream.put(local_instructions[2, 6])  # quant_scale
+            accum_param_stream.put(local_instructions[2, 7])  # quant_zp
+            for _st in range(num_tiles):
+                accum_param_stream.put(local_instructions[3 + _st, 5])  # sr
+
             for tile in range(num_tiles):
                 inst_idx: int32 = tile + 3
                 Gr: int32 = local_instructions[inst_idx, 3]
@@ -232,24 +235,24 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                                     ] = local_B[wk_idx, wn_idx]
                         weights_stream.put(packed_w)
 
-        @df.kernel(mapping=[1], args=[nest_zero_points])
-        def nest_compute(local_zero_points: int32[2]):
+        @df.kernel(mapping=[1])
+        def nest_compute():
             """Receive crossbar data, compute NEST MAC, accumulate, stream result.
 
             Receives packed iActs/weights from crossbar_load, unpacks them,
             runs AH×AW NEST MAC with int32 accumulation across K-passes,
             then streams packed result to bus.
 
-            Zero point subtraction: uses iacts_zp and weights_zp from
-            nest_zero_points[] to compute (iact - iacts_zp) * (weight - weights_zp),
-            matching RTL PE behavior (feather_pe.v).
+            Zero point subtraction: receives iacts_zp and weights_zp from
+            zp_stream (scattered by crossbar_load) to compute
+            (iact - iacts_zp) * (weight - weights_zp), matching RTL PE behavior.
             """
             iActs: Ty[AH, AW]
             weights: Ty[AH, AW, AH]
 
-            # Decode zero points (layer-level)
-            iacts_zp: int32 = local_zero_points[0]
-            weights_zp: int32 = local_zero_points[1]
+            # Receive zero points from crossbar_load via stream
+            iacts_zp: int32 = zp_stream.get()
+            weights_zp: int32 = zp_stream.get()
 
             for tile in range(num_tiles):
                 nest_accum: int32[AH, AW]
@@ -361,18 +364,19 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                         connection[P0, 2 * j].put(out_left)
                         connection[P0, 2 * j + 1].put(out_right)
 
-        @df.kernel(mapping=[1], args=[output_col_map, output_num_m, output_n_base, accum_m_start, accum_n_start, accum_quant_params, accum_sr_per_tile, C])
+        @df.kernel(mapping=[1], args=[output_col_map, output_num_m, output_n_base, accum_m_start, accum_n_start, C])
         def output_accum(
             local_output_col_map: int32[num_tiles, AW],
             local_output_num_m: int32[num_tiles],
             local_output_n_base: int32[num_tiles, AW],
             local_accum_m_start: int32[num_tiles],
             local_accum_n_start: int32[num_tiles],
-            local_quant_params: int32[2],
-            local_sr_per_tile: int32[num_tiles],
             local_C: int32[M, N],
         ):
             """Accumulate BIRRD output into C[M,N] with col remapping and optional post-quantization.
+
+            Receives quant params and per-tile sr from accum_param_stream
+            (scattered by crossbar_load). No extra DRAM arrays needed.
 
             N-offset uses generalized MINISA mapping:
                 n_off = sr * on + n_base[tile, col]
@@ -388,15 +392,15 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                 for _aj in range(N):
                     accum[_ai, _aj] = 0
 
-            # Decode post-quantization params
-            quant_scale: int32 = local_quant_params[0]
-            quant_zp: int32 = local_quant_params[1]
+            # Receive post-quantization params from crossbar_load via stream
+            quant_scale: int32 = accum_param_stream.get()
+            quant_zp: int32 = accum_param_stream.get()
 
             for tile in range(num_tiles):
                 m_start: int32 = local_accum_m_start[tile]
                 n_start: int32 = local_accum_n_start[tile]
                 num_m: int32 = local_output_num_m[tile]
-                sr_val: int32 = local_sr_per_tile[tile]
+                sr_val: int32 = accum_param_stream.get()
 
                 tile_out: int32[AH, AW]
                 for d in range(AH):
@@ -543,34 +547,17 @@ class FeatherKStreamingModule:
             dtype=np.int32,
         )
 
-        # Extract zero points and quant params into separate arrays
-        # so each HLS dataflow kernel has its own buffer (single-reader)
-        nest_zero_points = np.array(
-            [int(instructions[0, 6]), int(instructions[1, 6])],
-            dtype=np.int32,
-        )
-        accum_quant_params = np.array(
-            [int(instructions[2, 6]), int(instructions[2, 7])],
-            dtype=np.int32,
-        )
-        accum_sr_per_tile = np.array(
-            [int(instructions[3 + t, 5]) for t in range(num_tiles)],
-            dtype=np.int32,
-        )
-
         # Call order matches Allo's kernel-grouped reordering:
-        # crossbar_load args, nest_compute args, inst_rw args, output_accum args
+        # crossbar_load args, inst_rw args, output_accum args
+        # (nest_compute and bus have no DRAM args — they use streams only)
         self._mod(
             A, B, instructions,        # crossbar_load
-            nest_zero_points,           # nest_compute
             birrd_per_tile,             # inst_rw
             col_map_per_tile,           # output_accum
             num_m_per_tile,
             n_base_per_tile,
             m_start_per_tile,
             n_start_per_tile,
-            accum_quant_params,
-            accum_sr_per_tile,
             C,
         )
 
@@ -615,6 +602,9 @@ def build_feather_kstreaming_hls(M, K, N, AW, AH, Ty, num_inst,
     )
     s = df.customize(top)
     s.partition("full_matrix_top:C", dim=2, factor=AH)
+    # Partition A and B to reduce crossbar_load II (32→8)
+    s.partition("full_matrix_top:A", dim=2, factor=K)
+    s.partition("full_matrix_top:B", dim=2, factor=N)
     allo_mod = s.build(target="vitis_hls", mode=mode, project=project)
     return FeatherKStreamingModule(allo_mod, AW)
 

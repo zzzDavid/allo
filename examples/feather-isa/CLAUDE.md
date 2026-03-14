@@ -73,14 +73,19 @@ python tests/test_figure7_cosim.py       # RTL cosim cycle count
 - Kt_per_pass = (AW/Gr)*AH determines how many K elements each K-pass covers.
   Mixed Kt_per_pass is supported: each tile computes its own actual_passes at
   runtime; max_k_passes is the compile-time loop bound (padding passes stream zeros).
-- Zero point subtraction: nest_compute decodes iacts_zp from instructions[0,6] and
-  weights_zp from instructions[1,6], computing (iact - iacts_zp) * (weight - weights_zp)
-  per PE, matching RTL feather_pe.v behavior. Set via create_gemm_program(iacts_zp=, weights_zp=).
-- Post-quantization (int32 → uint8): output_accum decodes quant_scale from instructions[2,6]
-  and quant_zp from instructions[2,7]. When quant_scale != 0, applies
-  `(accum * quant_scale + quant_zp) & 255`, matching RTL quant_post.v formula
-  `(sign_extend_64(data) * scale + zero_extend_64(zp))[7:0]`. Disabled by default (scale=0).
-  Set via create_gemm_program(quant_scale=, quant_zp=).
+- Stream-based parameter scatter: crossbar_load is the sole reader of the `instructions`
+  DRAM buffer. It scatters zero points via `zp_stream` to nest_compute and quant params +
+  per-tile sr via `accum_param_stream` to output_accum. This maintains HLS dataflow
+  single-reader compliance without extra DRAM arrays. Top function has 10 DRAM parameters.
+- Zero point subtraction: nest_compute receives iacts_zp and weights_zp from zp_stream
+  (scattered by crossbar_load from instructions[0,6] and instructions[1,6]), computing
+  (iact - iacts_zp) * (weight - weights_zp) per PE, matching RTL feather_pe.v behavior.
+  Set via create_gemm_program(iacts_zp=, weights_zp=).
+- Post-quantization (int32 → uint8): output_accum receives quant_scale and quant_zp from
+  accum_param_stream (scattered by crossbar_load from instructions[2,6] and [2,7]).
+  When quant_scale != 0, applies `(accum * quant_scale + quant_zp) & 255`, matching
+  RTL quant_post.v formula `(sign_extend_64(data) * scale + zero_extend_64(zp))[7:0]`.
+  Disabled by default (scale=0). Set via create_gemm_program(quant_scale=, quant_zp=).
 - IVN/WVN layout orders (ORDER_012 through ORDER_210) control VN buffer memory layout.
   In our direct-indexing model (no VN buffer), the crossbar routing is determined by
   Gr/Gc/sr/sc from SetMapping, so all 6 orders produce correct results. OVN order
@@ -90,5 +95,10 @@ python tests/test_figure7_cosim.py       # RTL cosim cycle count
   produce uint8 output, which is reinterpreted as int8 for the next layer's input. Matches
   RTL pipeline: OB → quant_post → StaB PONG write → next layer iActs read.
   Supports different dataflows per layer (e.g., OS layer 1 → passthrough layer 2).
+- Array partitioning: `s.partition("full_matrix_top:A", dim=2, factor=K)` and
+  `s.partition("full_matrix_top:B", dim=2, factor=N)` completely partition A and B along
+  their column dimensions. This reduces crossbar_load pipeline II from 32→8 (4x) by
+  exposing more BRAM read ports, cutting crossbar_load latency from 798→223 cycles.
+  RTL cosim: 1052 cycles (0.94x of RTL reference's 1120).
 - For cosim, use `mode="csyn"` to generate kernel.cpp, then manually patch m_axi depths
   and write C testbench (see `test_figure7_cosim.py` for pattern).

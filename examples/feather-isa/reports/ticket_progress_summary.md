@@ -2,7 +2,7 @@
 
 **Date**: 2026-03-13
 **Branch**: minisa
-**Status**: 9/9 tickets resolved (TICKET-009 Phase 1 complete)
+**Status**: 10/10 tickets resolved
 
 ## Resolved Tickets
 
@@ -26,14 +26,14 @@ AW=16 synthesis with `AP_INT_MAX_W 4096` patch. Parameterized GEMM test supports
 arbitrary AW/AH with optional HLS csim/csynth modes.
 
 ### TICKET-005: Zero Point Subtraction (P0, resolved)
-NEST compute decodes `iacts_zp` and `weights_zp` from instructions, computing
+NEST compute receives `iacts_zp` and `weights_zp` via stream scatter, computing
 `(iact - iacts_zp) * (weight - weights_zp)` per PE. Matches RTL `feather_pe.v`.
 6 test cases including negative zero points.
 
 ### TICKET-006: Post-Quantization int32 → int8 (P0, resolved)
-Output accumulator applies `(accum * quant_scale + quant_zp) & 255` when
-`quant_scale != 0`. Matches RTL `quant_post.v` formula
-`(sign_extend_64(data) * scale + zero_extend_64(zp))[7:0]`.
+Output accumulator receives `quant_scale` and `quant_zp` via stream scatter.
+When `quant_scale != 0`, applies `(accum * quant_scale + quant_zp) & 255`,
+matching RTL `quant_post.v` formula.
 7 test cases including combined zero points + quantization on AW=4 and AW=8.
 
 ### TICKET-007: Gc/sr/sc Crossbar for Full Dataflow Flexibility (P1, resolved)
@@ -55,6 +55,14 @@ OB → quant_post → StaB PONG write → next layer iActs read.
 5 tests: 2-layer, 3-layer, zero points, different dataflows, AW=4.
 Phase 2 (on-chip RIR) and Phase 3 (full overlap) remain as future work.
 
+### TICKET-010: Cosim Cycle Regression (P0, resolved)
+Two-phase fix restored and exceeded pre-regression performance:
+1. **Stream scatter**: Replaced 3 DRAM arrays with crossbar_load stream scatter
+   (zp_stream → nest_compute, accum_param_stream → output_accum). Saved 16 cycles.
+2. **A/B array partitioning**: Complete partition of A (dim=K) and B (dim=N)
+   reduces crossbar_load II from 32→8 (4x). Saved 449 cycles.
+Result: **1052 cycles** — beats RTL reference (1120) by 6%.
+
 ## Test Summary
 
 | Test File | Tests | Status |
@@ -75,48 +83,48 @@ Phase 2 (on-chip RIR) and Phase 3 (full overlap) remain as future work.
 | Configuration | Cycles | Ratio vs RTL |
 |---------------|--------|-------------|
 | **RTL reference** (FEATHER Verilog) | **1120** | 1.00x |
-| Allo (current, with buffer split) | **1517** | 1.35x |
-| Allo (previous, shared buffer) | 1004 | 0.90x |
+| **Allo (current, stream scatter + partition)** | **1052** | **0.94x** |
+| Allo (stream scatter, no partition) | 1501 | 1.34x |
+| Allo (buffer split) | 1517 | 1.35x |
+| Allo (pre-zp/quant features) | 1004 | 0.90x |
 | Allo (original 24-tile model) | 1792 | 1.60x |
 
-### Analysis
+### CSynth Pipeline Analysis
 
-The current Allo design runs at **1517 cycles** vs the RTL reference's **1120 cycles** (1.35x).
+| Kernel | Latency | Pipeline II | Bottleneck? |
+|--------|---------|-------------|-------------|
+| crossbar_load | 223 | II=8 | No (A/B partition fixed) |
+| nest_compute | 386 | II=4 | No |
+| output_accum | 527 | II=32 (tile loop) | Yes — internal accum array |
+| bus | 34 | — | No |
+| BIRRD (×6) | 35 each | — | No |
 
-The cycle increase from 1004→1517 is due to the HLS dataflow single-reader fix:
-zero points and quantization parameters were moved from the shared `instructions`
-buffer into separate small arrays (`nest_zero_points[2]`, `accum_quant_params[2]`,
-`accum_sr_per_tile[num_tiles]`). This adds extra DRAM load stages and serializes
-the load order across kernels.
+### Remaining Optimization Opportunities
 
-**Root cause**: Vitis HLS dataflow requires each buffer to have exactly one reader
-and one writer. The original shared `instructions` buffer was read by 3 kernels
-(crossbar_load, nest_compute, output_accum), which worked in simulation but failed
-csynth. Splitting into separate arrays fixes the HLS violation but costs ~500 extra
-cycles due to buffer duplication overhead.
+1. **output_accum II=32**: Caused by `accum[M,N]` internal array read-modify-write
+   with data-dependent addressing. Cannot partition via `s.partition()` (internal).
+   Cannot accumulate into `local_C` directly (HLS dataflow violation).
+   Potential fix: restructure output_accum to use tile-local buffers + merge stage.
 
-**Optimization opportunities**:
-1. **Stream-based parameter passing**: Instead of DRAM arrays, use streams to
-   broadcast zero points/quant params from a scatter kernel (eliminates extra loads)
-2. **Compile-time constants**: For fixed workloads, encode zero points and quant
-   params as compile-time constants rather than runtime arrays
-3. **Merge into crossbar_load**: Extract params in crossbar_load and pass via streams
-   to other kernels (single DRAM reader, stream distribution)
+2. **RTL overhead**: CSynth estimates 905 cycles vs 1052 RTL (147 cycles AXI overhead).
+   10 m_axi ports. Packing small config arrays could reduce to ~6 ports.
 
 ## Architecture Overview
 
 The FEATHER+ Allo implementation uses 7 pipelined dataflow kernels:
 
-1. **crossbar_load** — Parametric Gr/Gc/sr/sc crossbar with bit operations
-2. **nest_compute** — AH×AW NEST MAC with zero point subtraction
+1. **crossbar_load** — Parametric Gr/Gc/sr/sc crossbar + stream scatter (A/B partitioned)
+2. **nest_compute** — AH×AW NEST MAC with zero point subtraction (via stream)
 3. **bus** — Unpack NEST output to BIRRD connections
 4. **inst_rw** — Distribute per-tile BIRRD switch instructions
 5. **BIRRD** — Butterfly reduction/reorder (2-way or multi-way per tile)
-6. **output_accum** — Column remap + tile accumulation + post-quantization
+6. **output_accum** — Column remap + tile accumulation + post-quantization (via stream)
 
 Key metrics:
-- RTL cosim: **1517 cycles** (Allo) vs 1120 (RTL reference) = **1.35x**
+- RTL cosim: **1052 cycles** (Allo) vs 1120 (RTL reference) = **0.94x (6% faster)**
 - Single Allo invocation handles complete matrices (no Python-level tiling loop)
 - All operations HLS-friendly: shifts, masks, comparisons — no runtime dividers
 - Multi-layer chaining: quantized int8 intermediates enable end-to-end inference
 - HLS dataflow compliant: all buffers satisfy single-reader/single-writer constraint
+- Stream-based parameter scatter: single DRAM reader for instructions, 10 top-level ports
+- Array partitioning: A (complete dim K), B (complete dim N) for 4x crossbar II reduction
