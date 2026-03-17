@@ -1,0 +1,14 @@
+{
+  "type": "minisa_manual",
+  "FEATHER_spec": {"AH": 4, "AW": 4},
+  "gemm": {"M": 4, "K": 4, "N": 4},
+  "ivn_order": 0, "wvn_order": 0, "ovn_order": 0,
+  "tiles": [
+    {"Gr": 4, "Gc": 1, "sr": 0, "sc": 0, "m_start": 0, "m_end": 4, "n_start": 0, "n_end": 1, "k_start": 0, "k_end": 4},
+    {"Gr": 4, "Gc": 1, "sr": 0, "sc": 0, "m_start": 0, "m_end": 4, "n_start": 1, "n_end": 2, "k_start": 0, "k_end": 4},
+    {"Gr": 4, "Gc": 1, "sr": 0, "sc": 0, "m_start": 0, "m_end": 4, "n_start": 2, "n_end": 3, "k_start": 0, "k_end": 4},
+    {"Gr": 4, "Gc": 1, "sr": 0, "sc": 0, "m_start": 0, "m_end": 4, "n_start": 3, "n_end": 4, "k_start": 0, "k_end": 4}
+  ],
+  "seed": 555,
+  "description": "Output-stationary dataflow with sr=0: 4 tiles each covering 1 N-column on 4x4 array"
+}

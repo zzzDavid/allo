@@ -1,0 +1,13 @@
+{
+  "type": "minisa",
+  "FEATHER_spec": {"AH": 8, "AW": 8},
+  "program": {
+    "M": 1, "K": 64, "N": 8,
+    "gr": 1,
+    "ivn_order": 0, "wvn_order": 0, "ovn_order": 0,
+    "iacts_zp": 0, "weights_zp": 0,
+    "quant_scale": 0, "quant_zp": 0
+  },
+  "seed": 789,
+  "description": "1x64x8 GEMM with Gr=1 (no reduction) on 8x8 array, M=1 edge case"
+}

@@ -1,0 +1,10 @@
+{
+  "type": "minisa_multi_layer",
+  "FEATHER_spec": {"AH": 8, "AW": 8},
+  "layers": [
+    {"M": 8, "K": 16, "N": 8, "quant_scale": 1, "quant_zp": 128},
+    {"M": 8, "K": 8, "N": 8, "gr": 8}
+  ],
+  "seed": 42,
+  "description": "2-layer inference on 8x8 array: layer 1 with quantization (scale=1, zp=128), layer 2 raw output"
+}

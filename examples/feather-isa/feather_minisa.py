@@ -11,14 +11,12 @@ NEST computation, BIRRD reduction, and output accumulation on-chip.
 Supports all Gr values (1, 2, ..., AW) per tile via power-of-2 bit operations,
 enabling full dataflow switching (output/weight/input stationary and mixed).
 
-Architecture (7 pipelined dataflow kernels):
-1. crossbar_load: Read A/B with parametric Gr crossbar (bit ops), pack into
-   UInt(128), stream to nest_compute
-2. nest_compute: Unpack, run NEST MAC, accumulate across K-passes
-3. bus: Unpack packed NEST output to BIRRD connection streams
-4. inst_rw: Distribute BIRRD switch instructions
-5. BIRRD[P0,P1]: Butterfly reduction/reorder (per-tile configuration)
-6. output_accum: Column remap + tile accumulation into output matrix
+Architecture (5 pipelined dataflow kernels):
+1. dram_loader: Sole DRAM reader — loads on-chip buffers, streams to pe_array
+2. pe_array[AH+1,AW]: Compute PEs (rows 0..AH-1) + gather (row AH)
+3. inst_rw: Distribute BIRRD switch instructions
+4. BIRRD[P0,P1]: Butterfly reduction/reorder (per-tile configuration)
+5. output_accum: Column remap + tile accumulation into output matrix
 
 The MINISA instructions (SetIVNLayout, SetWVNLayout, SetOVNLayout, SetMapping)
 are encoded as an int32 array and decoded on-chip by the dataflow kernels.
@@ -65,30 +63,23 @@ def compute_birrd_params(AW: int) -> Tuple[int, int]:
     return P0, P1
 
 
-def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
-                                            max_k_passes, Kt_per_pass=None):
-    """Create FEATHER+ dataflow region with split crossbar/NEST and flexible Gr.
+def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst):
+    """Create FEATHER+ dataflow region with unified PE array.
 
-    Supports all power-of-2 Gr values per tile via bit operations in the
-    crossbar index arithmetic. No runtime dividers — uses (ic_j & (Gr-1))
-    for modulo and (ic_j >> log2_Gr) for division.
+    Uses dram_loader(mapping=[1]) as sole DRAM reader with on-chip streaming
+    and stationary buffers, plus pe_array(mapping=[AH+1, AW]): rows 0..AH-1 =
+    compute PEs (AH*AW instances), row AH = gather (AW instances). Parallelism
+    is structural (guaranteed by construction).
 
-    Supports mixed Kt_per_pass across tiles: each tile computes its own
-    actual_passes at runtime from its Gr and K-range. Padding passes
-    (beyond actual_passes) stream zeros — harmless to NEST (0*x=0).
+    Architecture (5 dataflow kernels):
+    1. dram_loader(1): Sole DRAM reader with on-chip buffers, streams to PEs
+    2. pe_array[AH+1,AW]: Compute PEs + per-column gather
+    3. inst_rw(1): Distribute BIRRD switch instructions
+    4. BIRRD[P0,P1]: Butterfly reduction/reorder (per-tile configuration)
+    5. output_accum(1): Column remap + tile accumulation into output matrix
 
-    Architecture (7 dataflow kernels):
-    1. crossbar_load: Read A/B with parametric Gr crossbar (bit ops),
-       pack into UInt(128), stream to nest_compute
-    2. nest_compute: Unpack, run NEST MAC, accumulate across K-passes
-    3. bus: Unpack packed NEST output to BIRRD connections
-    4. inst_rw: Distribute BIRRD switch instructions
-    5. BIRRD[P0,P1]: Butterfly reduction/reorder (per-tile configuration)
-    6. output_accum: Column remap + tile accumulation into C
-
-    Data transfer protocol per K-pass:
-      crossbar_load sends 1 iActs packet + AH weights packets via streams
-      nest_compute receives and unpacks them, runs NEST MAC, accumulates
+    Each tile covers exactly Kt = (AW // Gr) * AH K-elements (one pass).
+    K-decomposition is handled at the ISA level, not inside the PE.
 
     Args:
         M, K, N: Matrix dimensions
@@ -96,94 +87,70 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
         AH: Array height
         Ty: Input data type (e.g., int8)
         num_inst: Total instruction count (3 layout + tile mappings)
-        max_k_passes: Max K-passes across all tiles (compile-time loop bound)
-        Kt_per_pass: Ignored (kept for backward compatibility)
     """
     TyOut = int32
-    TyPacked = UInt(TyOut.bits * AW)       # UInt(128) for packing 4 int32
-    TyCrossbarPacked = UInt(AH * AW * Ty.bits)  # UInt(128) for packing 16 int8
     LOG2_AW = int(log2(AW))
     LOG2_AH = int(log2(AH))
     P0, P1 = compute_birrd_params(AW)
     num_tiles = num_inst - 3
-    # Allow crossbar_load to run ~2 tiles ahead of nest_compute
-    xbar_i_depth = max_k_passes * 2
-    xbar_w_depth = max_k_passes * AH * 2
+
+    num_accum_params = 2 + num_tiles  # quant_scale, quant_zp, sr[0..num_tiles-1]
 
     @df.region()
     def full_matrix_top(
-        A: Ty[M, K],
-        B: Ty[K, N],
-        instructions: int32[num_inst, 13],
+        A_pe: int32[M, K],
+        B_pe: int32[K, N],
+        inst_pe: int32[num_inst, 13],
         birrd_inst: int8[num_tiles, P0, P1],
         output_col_map: int32[num_tiles, AW],
         output_num_m: int32[num_tiles],
         output_n_base: int32[num_tiles, AW],
         accum_m_start: int32[num_tiles],
         accum_n_start: int32[num_tiles],
+        accum_params: int32[num_accum_params],
         C: int32[M, N],
     ):
-        """K-streaming FEATHER+ dataflow region with split crossbar/NEST.
+        """Unified PE array FEATHER+ dataflow region.
 
-        Only crossbar_load reads from DRAM instructions. It scatters zero
-        points and quantization params to other kernels via streams, keeping
-        HLS single-reader compliance without extra DRAM buffers.
+        dram_loader is the sole reader of A_pe, B_pe, inst_pe.
+        output_accum reads quant/sr params from accum_params DRAM array.
+        Each DRAM buffer has exactly one reader kernel (HLS compliant).
         """
 
-        # Intermediate streams: crossbar_load → nest_compute
-        iacts_stream: Stream[TyCrossbarPacked, xbar_i_depth]
-        weights_stream: Stream[TyCrossbarPacked, xbar_w_depth]
+        # dram_loader → pe_array streams (row 0..AH-1 compute PEs)
+        pe_a_in: Stream[int32, AH][AH, AW]
+        pe_w_in: Stream[int32, AH][AH, AW]
 
-        # Parameter scatter streams: crossbar_load → nest_compute / output_accum
-        zp_stream: Stream[int32, 2]
-        accum_param_stream: Stream[int32, 2 + num_tiles]
+        # pe_array internal streams: rows 0..AH-1 → row AH (gather)
+        pe_out: Stream[int32, num_tiles][AH, AW]
 
-        # Compute pipeline streams
-        nest_out: Stream[TyPacked, AH * 2]
+        # BIRRD streams
         connection: Stream[TyOut, AH][P0 + 1, P1 * 2]
         inst_input: Stream[int8, num_tiles][P0, P1]
 
-        @df.kernel(mapping=[1], args=[A, B, instructions])
-        def crossbar_load(
-            local_A: Ty[M, K],
-            local_B: Ty[K, N],
-            local_instructions: int32[num_inst, 13],
+        @df.kernel(mapping=[1], args=[A_pe, B_pe, inst_pe])
+        def dram_loader(
+            local_A: int32[M, K],
+            local_B: int32[K, N],
+            local_inst: int32[num_inst, 13],
         ):
-            """Load crossbar data and stream packed iActs/weights to nest_compute.
+            """Sole DRAM reader. Loads A/B/inst into on-chip buffers, streams to PEs.
 
-            Also scatters zero points and quantization params to nest_compute
-            and output_accum via streams (single-reader compliance).
-
-            Supports parametric Gr per tile via power-of-2 bit operations:
-              ic_j % Gr  →  ic_j & (Gr - 1)    (AND with bitmask)
-              ic_j // Gr →  ic_j >> log2_Gr     (right shift)
-
-            Per-tile actual_passes computed at runtime; padding passes stream
-            zeros (harmless to NEST: 0*x=0). Stream puts are always unconditional
-            to maintain dataflow balance with nest_compute.
-
-            Per K-pass: 1 iActs packet (AH*AW int8 → UInt(128)) +
-                        AH weights packets (AW*AH int8 each → UInt(128)).
+            Per-column streaming buffer (iacts_buf) and stationary buffer (weight_buf)
+            are loaded per tile, then streamed to all AH×AW PEs via meta_for.
             """
-            # Scatter zero points to nest_compute via stream
-            zp_stream.put(local_instructions[0, 6])  # iacts_zp
-            zp_stream.put(local_instructions[1, 6])  # weights_zp
-
-            # Scatter quant params + per-tile sr to output_accum via stream
-            accum_param_stream.put(local_instructions[2, 6])  # quant_scale
-            accum_param_stream.put(local_instructions[2, 7])  # quant_zp
-            for _st in range(num_tiles):
-                accum_param_stream.put(local_instructions[3 + _st, 5])  # sr
+            iacts_zp: int32 = local_inst[0, 6]
+            weights_zp: int32 = local_inst[1, 6]
 
             for tile in range(num_tiles):
                 inst_idx: int32 = tile + 3
-                Gr: int32 = local_instructions[inst_idx, 3]
-                Gc: int32 = local_instructions[inst_idx, 4]
-                sr: int32 = local_instructions[inst_idx, 5]
-                sc: int32 = local_instructions[inst_idx, 6]
-                m_start: int32 = local_instructions[inst_idx, 7]
-                n_start: int32 = local_instructions[inst_idx, 9]
-                k_start_tile: int32 = local_instructions[inst_idx, 11]
+                Gr: int32 = local_inst[inst_idx, 3]
+                Gc: int32 = local_inst[inst_idx, 4]
+                sr: int32 = local_inst[inst_idx, 5]
+                sc: int32 = local_inst[inst_idx, 6]
+                m_start: int32 = local_inst[inst_idx, 7]
+                n_start: int32 = local_inst[inst_idx, 9]
+                k_start_tile: int32 = local_inst[inst_idx, 11]
 
                 # Compute log2_Gr via comparison chain (Gr is power of 2)
                 log2_Gr: int32 = 0
@@ -198,116 +165,58 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                 mask_Gr: int32 = Gr - 1
                 mask_Gc: int32 = Gc - 1
 
-                # Per-tile K-pass computation via shifts (no runtime dividers)
-                k_end_tile: int32 = local_instructions[inst_idx, 12]
-                k_range: int32 = k_end_tile - k_start_tile
-                kt_per_pass: int32 = (AW * AH) >> log2_Gr
-                log2_kt: int32 = (LOG2_AW + LOG2_AH) - log2_Gr
-                actual_passes: int32 = k_range >> log2_kt
+                # For each column, load buffers and stream to PEs
+                with allo.meta_for(AW) as nj:
+                    # --- Streaming buffer: load activations ---
+                    iacts_buf: int32[AH]
+                    m_idx: int32 = m_start + (nj & mask_Gr)
+                    for nk in range(AH):
+                        k_idx: int32 = k_start_tile + nk + (nj >> log2_Gr) * AH
+                        iacts_buf[nk] = local_A[m_idx, k_idx] - iacts_zp
 
-                for k_pass in range(max_k_passes):
-                    k_start: int32 = k_start_tile + k_pass * kt_per_pass
+                    # --- Stationary buffer: load weights ---
+                    weight_buf: int32[AH, AH]
+                    for nk in range(AH):
+                        k_idx_w: int32 = k_start_tile + nk + (nj >> log2_Gr) * AH
+                        for pe_row_rt in range(AH):
+                            wn_idx: int32 = n_start + sr * pe_row_rt + sc * (nj & mask_Gc)
+                            weight_buf[pe_row_rt, nk] = local_B[k_idx_w, wn_idx] - weights_zp
 
-                    # === Input crossbar (Gr-based bit ops) ===
-                    packed_iacts: TyCrossbarPacked = 0
-                    if k_pass < actual_passes:
-                        for ic_i in range(AH):
-                            for ic_j in range(AW):
-                                m_idx: int32 = m_start + (ic_j & mask_Gr)
-                                k_idx: int32 = k_start + ic_i + (ic_j >> log2_Gr) * AH
-                                packed_iacts[
-                                    (ic_i * AW + ic_j) * Ty.bits :
-                                    (ic_i * AW + ic_j + 1) * Ty.bits
-                                ] = local_A[m_idx, k_idx]
-                    iacts_stream.put(packed_iacts)
+                    # --- Stream from on-chip buffers to PEs ---
+                    for nk in range(AH):
+                        with allo.meta_for(AH) as pe_row:
+                            pe_a_in[pe_row, nj].put(iacts_buf[nk])
+                            pe_w_in[pe_row, nj].put(weight_buf[pe_row, nk])
 
-                    # === Weight crossbar (Gr/sr/sc bit ops) ===
-                    for wc_i in range(AH):
-                        packed_w: TyCrossbarPacked = 0
-                        if k_pass < actual_passes:
-                            for wc_w in range(AW):
-                                for wc_k in range(AH):
-                                    wk_idx: int32 = k_start + wc_k + (wc_w >> log2_Gr) * AH
-                                    wn_idx: int32 = n_start + sr * wc_i + sc * (wc_w & mask_Gc)
-                                    packed_w[
-                                        (wc_w * AH + wc_k) * Ty.bits :
-                                        (wc_w * AH + wc_k + 1) * Ty.bits
-                                    ] = local_B[wk_idx, wn_idx]
-                        weights_stream.put(packed_w)
+        @df.kernel(mapping=[AH + 1, AW])
+        def pe_array():
+            """Compute PEs (rows 0..AH-1) + gather (row AH). Stream-only, no DRAM args.
 
-        @df.kernel(mapping=[1])
-        def nest_compute():
-            """Receive crossbar data, compute NEST MAC, accumulate, stream result.
-
-            Receives packed iActs/weights from crossbar_load, unpacks them,
-            runs AH×AW NEST MAC with int32 accumulation across K-passes,
-            then streams packed result to bus.
-
-            Zero point subtraction: receives iacts_zp and weights_zp from
-            zp_stream (scattered by crossbar_load) to compute
-            (iact - iacts_zp) * (weight - weights_zp), matching RTL PE behavior.
+            Rows 0..AH-1 (AH*AW instances): Simple MAC units. Read from
+                pe_a_in/pe_w_in, accumulate per tile, output to pe_out.
+            Row AH (AW instances): Collects PE results from its column,
+                sends to BIRRD input connections.
             """
-            iActs: Ty[AH, AW]
-            weights: Ty[AH, AW, AH]
+            ni, nj = df.get_pid()
 
-            # Receive zero points from crossbar_load via stream
-            iacts_zp: int32 = zp_stream.get()
-            weights_zp: int32 = zp_stream.get()
+            with allo.meta_if(ni == AH):
+                # === ROW AH: GATHER (AW parallel instances) ===
+                for _tile in range(num_tiles):
+                    buf: int32[AH]
+                    with allo.meta_for(AH) as pe_row:
+                        buf[pe_row] = pe_out[pe_row, nj].get()
+                    for row in range(AH):
+                        connection[0, nj].put(buf[row])
 
-            for tile in range(num_tiles):
-                nest_accum: int32[AH, AW]
-                for _ai in range(AH):
-                    for _aj in range(AW):
-                        nest_accum[_ai, _aj] = 0
-
-                for k_pass in range(max_k_passes):
-                    # Unpack iActs from stream
-                    packed_iacts: TyCrossbarPacked = iacts_stream.get()
-                    for ic_i in range(AH):
-                        for ic_j in range(AW):
-                            iActs[ic_i, ic_j] = packed_iacts[
-                                (ic_i * AW + ic_j) * Ty.bits :
-                                (ic_i * AW + ic_j + 1) * Ty.bits
-                            ]
-
-                    # Unpack weights from stream (AH gets)
-                    for wc_i in range(AH):
-                        packed_w: TyCrossbarPacked = weights_stream.get()
-                        for wc_w in range(AW):
-                            for wc_k in range(AH):
-                                weights[wc_i, wc_w, wc_k] = packed_w[
-                                    (wc_w * AH + wc_k) * Ty.bits :
-                                    (wc_w * AH + wc_k + 1) * Ty.bits
-                                ]
-
-                    # NEST compute + accumulate (with zero point subtraction)
-                    for ni in range(AH):
-                        for nj in range(AW):
-                            temp: int32 = 0
-                            for nk in range(AH):
-                                a_val: int32 = iActs[nk, nj]
-                                w_val: int32 = weights[ni, nj, nk]
-                                temp += (a_val - iacts_zp) * (w_val - weights_zp)
-                            nest_accum[ni, nj] = nest_accum[ni, nj] + temp
-
-                # Stream accumulated result (after all K-passes)
-                for ni in allo.grid(AH, name="nest_stream"):
-                    local_result: TyPacked = 0
-                    for nj in range(AW):
-                        local_result[
-                            nj * TyOut.bits : (nj + 1) * TyOut.bits
-                        ] = nest_accum[ni, nj]
-                    nest_out.put(local_result)
-
-        @df.kernel(mapping=[1])
-        def bus():
-            """Unpack packed NEST output and distribute to BIRRD input stage."""
-            for _ in range(num_tiles * AH):
-                array: TyPacked = nest_out.get()
-                with allo.meta_for(AW) as i:
-                    connection[0, i].put(
-                        array[i * TyOut.bits : (i + 1) * TyOut.bits]
-                    )
+            with allo.meta_else():
+                # === ROWS 0..AH-1: COMPUTE PEs (AH*AW instances) ===
+                for tile in range(num_tiles):
+                    tile_accum: int32 = 0
+                    for nk in range(AH):
+                        a_val: int32 = pe_a_in[ni, nj].get()
+                        w_val: int32 = pe_w_in[ni, nj].get()
+                        tile_accum += a_val * w_val
+                    pe_out[ni, nj].put(tile_accum)
 
         @df.kernel(mapping=[1], args=[birrd_inst])
         def inst_rw(local_birrd_inst: int8[num_tiles, P0, P1]):
@@ -364,19 +273,20 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                         connection[P0, 2 * j].put(out_left)
                         connection[P0, 2 * j + 1].put(out_right)
 
-        @df.kernel(mapping=[1], args=[output_col_map, output_num_m, output_n_base, accum_m_start, accum_n_start, C])
+        @df.kernel(mapping=[1], args=[output_col_map, output_num_m, output_n_base, accum_m_start, accum_n_start, accum_params, C])
         def output_accum(
             local_output_col_map: int32[num_tiles, AW],
             local_output_num_m: int32[num_tiles],
             local_output_n_base: int32[num_tiles, AW],
             local_accum_m_start: int32[num_tiles],
             local_accum_n_start: int32[num_tiles],
+            local_accum_params: int32[num_accum_params],
             local_C: int32[M, N],
         ):
             """Accumulate BIRRD output into C[M,N] with col remapping and optional post-quantization.
 
-            Receives quant params and per-tile sr from accum_param_stream
-            (scattered by crossbar_load). No extra DRAM arrays needed.
+            Reads quant params and per-tile sr directly from accum_params DRAM
+            array: [quant_scale, quant_zp, sr[0], sr[1], ...].
 
             N-offset uses generalized MINISA mapping:
                 n_off = sr * on + n_base[tile, col]
@@ -392,15 +302,15 @@ def get_feather_full_matrix_top_kstreaming(M, K, N, AW, AH, Ty, num_inst,
                 for _aj in range(N):
                     accum[_ai, _aj] = 0
 
-            # Receive post-quantization params from crossbar_load via stream
-            quant_scale: int32 = accum_param_stream.get()
-            quant_zp: int32 = accum_param_stream.get()
+            # Read post-quantization params from DRAM array
+            quant_scale: int32 = local_accum_params[0]
+            quant_zp: int32 = local_accum_params[1]
 
             for tile in range(num_tiles):
                 m_start: int32 = local_accum_m_start[tile]
                 n_start: int32 = local_accum_n_start[tile]
                 num_m: int32 = local_output_num_m[tile]
-                sr_val: int32 = accum_param_stream.get()
+                sr_val: int32 = local_accum_params[2 + tile]
 
                 tile_out: int32[AH, AW]
                 for d in range(AH):
@@ -473,7 +383,7 @@ class FeatherKStreamingModule:
             if gr < AW // 2:
                 self._multiway_birrd[gr] = generate_birrd_instructions(AW, gr)
 
-        # Precompute col→M maps for all (order, Gr) combinations
+        # Precompute col->M maps for all (order, Gr) combinations
         self._col_to_m_maps = {}
         for order in range(6):
             for gr in valid_grs:
@@ -481,11 +391,11 @@ class FeatherKStreamingModule:
 
         # Precompute passthrough permutation (for n_base computation)
         self._passthrough_perm = _simulate_birrd_passthrough_perm(AW)
-        # Precompute pair→col maps for 2-way reduction n_base
+        # Precompute pair->col maps for 2-way reduction n_base
         self._pair_to_col = {}
         for order in range(6):
             self._pair_to_col[order] = compute_output_col_map(AW, order)
-        # Precompute m→col maps for multi-way reduction n_base
+        # Precompute m->col maps for multi-way reduction n_base
         self._multiway_m_to_col = {}
         for gr in valid_grs:
             if gr < AW // 2:
@@ -547,64 +457,74 @@ class FeatherKStreamingModule:
             dtype=np.int32,
         )
 
+        # Prepare accum_params: [quant_scale, quant_zp, sr[0], sr[1], ...]
+        accum_params = np.zeros(2 + num_tiles, dtype=np.int32)
+        accum_params[0] = int(instructions[2, 6])  # quant_scale
+        accum_params[1] = int(instructions[2, 7])  # quant_zp
+        for t in range(num_tiles):
+            accum_params[2 + t] = int(instructions[3 + t, 5])  # sr
+
         # Call order matches Allo's kernel-grouped reordering:
-        # crossbar_load args, inst_rw args, output_accum args
-        # (nest_compute and bus have no DRAM args — they use streams only)
+        # pe_array args (A_pe, B_pe, inst_pe), inst_rw args, output_accum args
+        # (BIRRD has no DRAM args — streams only)
         self._mod(
-            A, B, instructions,        # crossbar_load
+            A.astype(np.int32),         # pe_array: A_pe (int32 for spatial PE)
+            B.astype(np.int32),         # pe_array: B_pe (int32 for spatial PE)
+            instructions,               # pe_array: inst_pe
             birrd_per_tile,             # inst_rw
             col_map_per_tile,           # output_accum
             num_m_per_tile,
             n_base_per_tile,
             m_start_per_tile,
             n_start_per_tile,
+            accum_params,               # output_accum: quant + sr params
             C,
         )
 
 
-def compute_max_k_passes(instructions, AW, AH):
-    """Compute max K-passes across all tiles from encoded instructions.
-
-    Each tile may have a different Kt_per_pass = (AW*AH) / Gr, so the
-    number of K-passes varies per tile. Returns the maximum, which is
-    used as the compile-time loop bound (padding passes stream zeros).
-    """
-    num_tiles = len(instructions) - 3
-    max_passes = 0
-    for t in range(num_tiles):
-        Gr = int(instructions[3 + t, 3])
-        k_range = int(instructions[3 + t, 12]) - int(instructions[3 + t, 11])
-        kt_per_pass = (AW // Gr) * AH
-        max_passes = max(max_passes, k_range // kt_per_pass)
-    return max_passes
-
-
-def build_feather_kstreaming_simulator(M, K, N, AW, AH, Ty, num_inst,
-                                        max_k_passes, Kt_per_pass=None):
-    """Build K-streaming FEATHER+ dataflow for simulation."""
+def build_feather_kstreaming_simulator(M, K, N, AW, AH, Ty, num_inst):
+    """Build FEATHER+ dataflow for simulation."""
     top = get_feather_full_matrix_top_kstreaming(
         int(M), int(K), int(N), int(AW), int(AH), Ty, int(num_inst),
-        int(max_k_passes),
     )
     allo_mod = df.build(top, target="simulator")
     return FeatherKStreamingModule(allo_mod, AW)
 
 
+def schedule_feather_hls(s, K, AH, AW=None):
+    """Apply HLS scheduling optimizations to FEATHER+ dataflow.
+
+    With unified PE array kernel (mapping=[AH+2, AW]), parallelism is structural —
+    no pipeline/unroll scheduling needed. Array partitions enable parallel
+    reads in pe_array's AW row-0 data loader instances.
+
+    Args:
+        s: Allo schedule object from df.customize()
+        K: K dimension (for array partitioning)
+        AH: Array height (for C partitioning)
+        AW: Array width (for A/B partitioning, optional)
+    """
+    # Partition C along N (dim=2) for parallel output writes
+    s.partition("full_matrix_top:C", dim=2, factor=AH)
+    # Partition A_pe and B_pe to enable parallel reads in pe_array's
+    # AW row-0 instances — AW parallel column reads of A and B
+    if AW is not None:
+        # A_pe[M,K]: partition K dimension for parallel reads across nj groups
+        s.partition("full_matrix_top:A_pe", dim=2, factor=K)
+        # B_pe[K,N]: partition N dimension for parallel reads across nj columns
+        s.partition("full_matrix_top:B_pe", dim=2, factor=AW * AH)
+
+
 def build_feather_kstreaming_hls(M, K, N, AW, AH, Ty, num_inst,
-                                  max_k_passes, Kt_per_pass=None,
                                   mode="csim", project=None):
-    """Build K-streaming FEATHER+ dataflow for Vitis HLS."""
+    """Build FEATHER+ dataflow for Vitis HLS."""
     if project is None:
         project = "feather_kstreaming.prj"
     top = get_feather_full_matrix_top_kstreaming(
         int(M), int(K), int(N), int(AW), int(AH), Ty, int(num_inst),
-        int(max_k_passes),
     )
     s = df.customize(top)
-    s.partition("full_matrix_top:C", dim=2, factor=AH)
-    # Partition A and B to reduce crossbar_load II (32→8)
-    s.partition("full_matrix_top:A", dim=2, factor=K)
-    s.partition("full_matrix_top:B", dim=2, factor=N)
+    schedule_feather_hls(s, int(K), int(AH))
     allo_mod = s.build(target="vitis_hls", mode=mode, project=project)
     return FeatherKStreamingModule(allo_mod, AW)
 
@@ -617,7 +537,7 @@ def run_sequential_gemm_layers(A_input, layer_weights, layer_program_kwargs,
     so that its int32 accumulator is quantized to uint8 via
     (accum * scale + zp) & 255. The uint8 output is reinterpreted as
     signed int8 for the next layer's input — matching the RTL auto-quant
-    pipeline (OB → quant_post → StaB PONG write).
+    pipeline (OB -> quant_post -> StaB PONG write).
 
     Args:
         A_input: Initial input matrix (int8, shape [M, K0])
@@ -638,14 +558,13 @@ def run_sequential_gemm_layers(A_input, layer_weights, layer_program_kwargs,
     for i, (B, kwargs) in enumerate(zip(layer_weights, layer_program_kwargs)):
         program = create_gemm_program(AH=AH, AW=AW, **kwargs)
         instructions = encode_program(program)
-        max_kp = compute_max_k_passes(instructions, AW, AH)
 
         M_i = current_input.shape[0]
         K_i = current_input.shape[1]
         N_i = B.shape[1]
 
         mod = build_feather_kstreaming_simulator(
-            M_i, K_i, N_i, AW, AH, int8, len(instructions), max_kp,
+            M_i, K_i, N_i, AW, AH, int8, len(instructions),
         )
         C = np.zeros((M_i, N_i), dtype=np.int32)
         mod(current_input, B, instructions, C)

@@ -231,11 +231,8 @@ def test_figure7_functional_gemm():
     from minisa.isa import create_figure7_program, encode_program
     from feather_minisa import build_feather_kstreaming_simulator
 
-    from feather_minisa import compute_max_k_passes
-
     program = create_figure7_program()
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     np.random.seed(7)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -243,7 +240,6 @@ def test_figure7_functional_gemm():
 
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)

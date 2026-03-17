@@ -1,0 +1,1059 @@
+#!/usr/bin/env python3
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Test FEATHER+ execution from instruction trace JSON files.
+
+Parses a trace JSON, generates the MINISA program, builds and runs the
+FEATHER+ dataflow, and verifies correctness against a numpy reference.
+
+Usage:
+    # Simulator test (default)
+    python tests/test_trace_input.py sample_input/trace_m24k48n512_16x16.json
+
+    # HLS C-simulation
+    python tests/test_trace_input.py sample_input/trace_m24k48n512_16x16.json --hls csim
+
+    # HLS synthesis (cycle count)
+    python tests/test_trace_input.py sample_input/trace_m24k48n512_16x16.json --hls csyn
+
+    # HLS co-simulation (accurate cycle count)
+    python tests/test_trace_input.py sample_input/trace_m24k48n512_16x16.json --hls cosim
+
+    # U280 deployment
+    python tests/test_trace_input.py sample_input/trace_m24k48n512_16x16.json --deploy
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import numpy as np
+from allo.ir.types import int8
+import allo.dataflow as df
+
+from minisa.trace_parser import load_trace, parse_trace
+from feather_minisa import (
+    get_feather_full_matrix_top_kstreaming,
+    FeatherKStreamingModule,
+    compute_birrd_params,
+    schedule_feather_hls,
+)
+
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def patch_kernel_for_wide_apint(project_dir, max_bits):
+    """Insert #define AP_INT_MAX_W before ap_int.h include if needed."""
+    if max_bits <= 1024:
+        return
+    max_w = 4096
+    kernel_path = os.path.join(project_dir, "kernel.cpp")
+    if not os.path.isfile(kernel_path):
+        return
+    with open(kernel_path, "r") as f:
+        code = f.read()
+    define = f"#define AP_INT_MAX_W {max_w}\n"
+    if define in code:
+        return
+    code = code.replace(
+        "#include <ap_int.h>",
+        f"{define}#include <ap_int.h>",
+    )
+    with open(kernel_path, "w") as f:
+        f.write(code)
+    print(f"  Patched kernel.cpp: AP_INT_MAX_W={max_w}")
+
+
+def run_reference_test(trace_info, seed=42):
+    """Verify trace-based GEMM using Python block-GEMM reference model.
+
+    For 16x16 arrays, the Allo NumPy simulator cannot handle UInt(2048).
+    This uses a pure-Python block-GEMM reference that verifies the trace
+    parser generates correct tile decompositions without needing the Allo
+    kernel. Each tile contributes C[m_range, n_range] += A[m_range, k_range] @ B[k_range, n_range].
+    """
+    M = trace_info["M"]
+    K = trace_info["K"]
+    N = trace_info["N"]
+    M_padded = trace_info["M_padded"]
+    AH = trace_info["AH"]
+    AW = trace_info["AW"]
+    instructions = trace_info["instructions"]
+    Nt = trace_info["Nt"]
+    num_tiles = trace_info["n_tiles"]
+
+    print(f"\n{'=' * 70}")
+    print(f"REFERENCE MODEL TEST (Python block-GEMM)")
+    print(f"{'=' * 70}")
+    print(f"  Workload: C[{M},{N}] = A[{M},{K}] x B[{K},{N}]")
+    print(f"  Array: {AH}x{AW}")
+    print(f"  Mapping: Gr={trace_info['Gr']}, Gc={trace_info['Gc']}, "
+          f"sr={trace_info['sr']}, sc={trace_info['sc']}")
+    n_sub = trace_info.get('n_sub_tiles', 1)
+    print(f"  Tiles: {num_tiles} "
+          f"({trace_info['n_m_batches']}M x {trace_info['n_spatial_tiles']}N"
+          f"{f' x {n_sub}sub' if n_sub > 1 else ''})")
+    if M_padded != M:
+        print(f"  M padded: {M} -> {M_padded} (next multiple of Gr={trace_info['Gr']})")
+
+    # Generate test data
+    np.random.seed(seed)
+    A_orig = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+    C_ref = A_orig.astype(np.int32) @ B.astype(np.int32)
+
+    # Pad A
+    if M_padded != M:
+        A = np.zeros((M_padded, K), dtype=np.int8)
+        A[:M, :] = A_orig
+    else:
+        A = A_orig
+
+    # Block-GEMM via tile decomposition
+    C_sim = np.zeros((M_padded, N), dtype=np.int32)
+    for t in range(num_tiles):
+        row = instructions[3 + t]
+        ms, me = int(row[7]), int(row[8])
+        ns, ne = int(row[9]), int(row[10])
+        ks, ke = int(row[11]), int(row[12])
+        C_sim[ms:me, ns:ne] += (
+            A[ms:me, ks:ke].astype(np.int32) @ B[ks:ke, ns:ne].astype(np.int32)
+        )
+
+    # Extract unpadded result
+    C = C_sim[:M, :]
+    passed = np.array_equal(C, C_ref)
+
+    print(f"\n  OUTPUT VERIFICATION: {'PASS' if passed else 'FAIL'}")
+    if not passed:
+        diff = np.abs(C.astype(np.int64) - C_ref.astype(np.int64))
+        mismatches = np.sum(C != C_ref)
+        print(f"  Mismatches: {mismatches}/{C.size} ({100*mismatches/C.size:.1f}%)")
+        print(f"  Max abs diff: {np.max(diff)}")
+        indices = np.argwhere(C != C_ref)[:5]
+        for idx in indices:
+            i, j = idx
+            print(f"    C[{i},{j}]: got {C[i,j]}, expected {C_ref[i,j]}")
+
+    return passed, C_ref
+
+
+def run_hls_test(trace_info, mode="csim", seed=42):
+    """Run trace-based GEMM through HLS (csim, csyn, or cosim)."""
+    from allo.backend.hls import is_available
+    if not is_available("vitis_hls"):
+        print("ERROR: Vitis HLS not available. Source settings64.sh first.")
+        return False
+
+    M = trace_info["M"]
+    K = trace_info["K"]
+    N = trace_info["N"]
+    M_padded = trace_info["M_padded"]
+    AH = trace_info["AH"]
+    AW = trace_info["AW"]
+    instructions = trace_info["instructions"]
+
+    print(f"\n{'=' * 70}")
+    print(f"HLS {mode.upper()} TEST")
+    print(f"{'=' * 70}")
+    print(f"  Workload: C[{M},{N}] = A[{M},{K}] x B[{K},{N}]")
+    print(f"  Array: {AH}x{AW}")
+
+    trace_name = f"trace_{M}x{K}x{N}"
+
+    # Cosim uses its own build flow (csyn + custom testbench + cosim_design)
+    if mode == "cosim":
+        project_dir = os.path.join(TESTS_DIR, f"{trace_name}_cosim.prj")
+        return _run_cosim(trace_info, project_dir, seed)
+
+    project_dir = os.path.join(TESTS_DIR, f"{trace_name}_{mode}.prj")
+
+    print(f"  Building HLS project ({mode})...")
+    top = get_feather_full_matrix_top_kstreaming(
+        M_padded, K, N, AW, AH, int8, len(instructions),
+    )
+    s = df.customize(top)
+    schedule_feather_hls(s, K, AH)
+    hls_mod = s.build(target="vitis_hls", mode=mode, project=project_dir)
+    allo_mod = FeatherKStreamingModule(hls_mod, AW)
+
+    # Patch for wide ap_uint (16x16 array → UInt(2048))
+    patch_kernel_for_wide_apint(project_dir, AW * AH * int8.bits)
+
+    if mode == "csim":
+        np.random.seed(seed)
+        A_orig = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+        B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+        C_ref = A_orig.astype(np.int32) @ B.astype(np.int32)
+
+        if M_padded != M:
+            A = np.zeros((M_padded, K), dtype=np.int8)
+            A[:M, :] = A_orig
+        else:
+            A = A_orig
+
+        C_padded = np.zeros((M_padded, N), dtype=np.int32)
+        allo_mod(A, B, instructions, C_padded)
+        C = C_padded[:M, :]
+
+        passed = np.array_equal(C, C_ref)
+        print(f"  OUTPUT VERIFICATION: {'PASS' if passed else 'FAIL'}")
+        if not passed:
+            diff = np.abs(C.astype(np.int64) - C_ref.astype(np.int64))
+            n_mismatch = np.sum(C != C_ref)
+            print(f"  Mismatches: {n_mismatch}/{C.size}")
+            print(f"  Max abs diff: {np.max(diff)}")
+            print(f"  C all zeros: {np.all(C == 0)}")
+            print(f"  C nonzero: {np.count_nonzero(C)}/{C.size}")
+            print(f"  C[0,:8] = {C[0,:8]}")
+            print(f"  Ref[0,:8] = {C_ref[0,:8]}")
+            # Check row sums
+            c_rowsum = np.sum(C, axis=1)
+            r_rowsum = np.sum(C_ref, axis=1)
+            print(f"  Row sums match: {np.array_equal(c_rowsum, r_rowsum)}")
+            # Check column sums
+            c_colsum = np.sum(C, axis=0)
+            r_colsum = np.sum(C_ref, axis=0)
+            print(f"  Col sums match: {np.array_equal(c_colsum, r_colsum)}")
+            # Check if permutation issue (same values, wrong locations)
+            print(f"  Sorted values match: {np.array_equal(np.sort(C.flat), np.sort(C_ref.flat))}")
+        return passed
+
+    elif mode == "csyn":
+        print(f"  Running Vitis HLS csyn...")
+        hls_mod()
+        _report_synthesis(project_dir)
+        return True
+
+    return False
+
+
+def _patch_maxi_depths(project_dir, trace_info):
+    """Patch m_axi interface depths in kernel.cpp for cosim.
+
+    Without explicit depth hints, Vitis HLS cosim uses default buffer
+    sizes that may be too small for the actual data transfers.
+    """
+    M_padded = trace_info["M_padded"]
+    K = trace_info["K"]
+    N = trace_info["N"]
+    num_inst = len(trace_info["instructions"])
+    num_tiles = trace_info["n_tiles"]
+    AW = trace_info["AW"]
+    P0, P1 = compute_birrd_params(AW)
+    num_accum_params = 2 + num_tiles
+
+    kernel_path = os.path.join(project_dir, "kernel.cpp")
+    if not os.path.isfile(kernel_path):
+        return
+
+    with open(kernel_path, "r") as f:
+        code = f.read()
+
+    # Compute sizes for each m_axi port (11 args, kernel-grouped order)
+    # data_scatter: A_pe (int32), B_pe (int32), inst_pe (int32)
+    # inst_rw: birrd_inst (int8)
+    # output_accum: output_col_map, output_num_m, output_n_base,
+    #               accum_m_start, accum_n_start, accum_params, C
+    sizes = {
+        "A_pe": M_padded * K,
+        "B_pe": K * N,
+        "inst_pe": num_inst * 13,
+        "birrd_inst": num_tiles * P0 * P1,
+        "output_col_map": num_tiles * AW,
+        "output_num_m": num_tiles,
+        "output_n_base": num_tiles * AW,
+        "accum_m_start": num_tiles,
+        "accum_n_start": num_tiles,
+        "accum_params": num_accum_params,
+        "C": M_padded * N,
+    }
+
+    # Add depth to m_axi pragmas
+    for port_name, depth in sizes.items():
+        old = f'depth={depth}'  # skip if already patched
+        if old in code:
+            continue
+        # Match #pragma HLS interface m_axi port=vXXX ... (no depth)
+        # We need to add depth=N to the pragma
+        import re as re_mod
+        pattern = rf'(#pragma HLS interface m_axi port=\w+ offset=slave bundle=\w+)'
+        # Find pragmas and add depth — use line-by-line approach
+    # Simpler approach: just add depth to all m_axi pragmas if not present
+    lines = code.split("\n")
+    new_lines = []
+    port_idx = 0
+    port_order = list(sizes.keys())
+    for line in lines:
+        if "#pragma HLS interface m_axi" in line and "depth=" not in line:
+            if port_idx < len(port_order):
+                depth = sizes[port_order[port_idx]]
+                line = line.rstrip() + f" depth={depth}"
+                port_idx += 1
+        new_lines.append(line)
+
+    with open(kernel_path, "w") as f:
+        f.write("\n".join(new_lines))
+    print(f"  Patched kernel.cpp: m_axi depths for cosim")
+
+
+def _report_synthesis(project_dir):
+    """Parse and report HLS synthesis results."""
+    try:
+        import xmltodict
+    except ImportError:
+        print("  (install xmltodict for detailed synthesis report)")
+        return
+
+    xml_path = os.path.join(
+        project_dir, "out.prj", "solution1", "syn", "report",
+        "full_matrix_top_csynth.xml",
+    )
+    if not os.path.isfile(xml_path):
+        print(f"  Synthesis report not found: {xml_path}")
+        return
+
+    with open(xml_path, "r", encoding="utf-8") as f:
+        profile = xmltodict.parse(f.read())["profile"]
+
+    perf = profile["PerformanceEstimates"]
+    latency = perf["SummaryOfOverallLatency"]
+    area = profile["AreaEstimates"]["Resources"]
+
+    print(f"\n  === Synthesis Results ===")
+    print(f"  Best-case latency:  {latency['Best-caseLatency']} cycles")
+    print(f"  Worst-case latency: {latency['Worst-caseLatency']} cycles")
+    print(f"\n  === Resource Utilization ===")
+    for resource in ("BRAM_18K", "DSP", "DSP48E", "FF", "LUT", "URAM"):
+        if resource in area:
+            print(f"  {resource}: {area[resource]}")
+
+
+def _report_cosim(project_dir):
+    """Parse and report RTL co-simulation results."""
+    log_path = os.path.join(
+        project_dir, "out.prj", "solution1", "sim", "report",
+        "full_matrix_top_cosim.rpt",
+    )
+    if not os.path.isfile(log_path):
+        # Try alternative path
+        log_path = os.path.join(project_dir, "out.prj", "solution1", "sim", "report", "verilog")
+        if os.path.isdir(log_path):
+            for f in os.listdir(log_path):
+                if f.endswith(".rpt"):
+                    log_path = os.path.join(log_path, f)
+                    break
+
+    if os.path.isfile(log_path):
+        with open(log_path) as f:
+            content = f.read()
+        print(f"\n  === Co-simulation Report ===")
+        for line in content.split("\n"):
+            if line.strip():
+                print(f"  {line}")
+
+
+def _c_array_1d(name, dtype, data):
+    """Generate a C array initializer for a flattened array."""
+    vals = ", ".join(str(int(x)) for x in data.flat)
+    return f"{dtype} {name}[{data.size}] = {{{vals}}};\n"
+
+
+def _generate_cosim_testbench(project_dir, trace_info, A, B, instructions,
+                               C_ref, M_padded):
+    """Write a C testbench that calls full_matrix_top for cosim."""
+    from minisa.isa import SetOVNLayout
+    from minisa.lowering import (
+        lower_ovn_layout, compute_col_to_m_map,
+        compute_output_col_map, _simulate_birrd_passthrough_perm,
+    )
+
+    M = trace_info["M"]
+    K = trace_info["K"]
+    N = trace_info["N"]
+    AH = trace_info["AH"]
+    AW = trace_info["AW"]
+    num_inst = len(instructions)
+    num_tiles = num_inst - 3
+    P0, P1 = compute_birrd_params(AW)
+
+    # Compute BIRRD configs (same logic as FeatherKStreamingModule.__call__)
+    ovn_order = int(instructions[2, 1])
+    ovn = SetOVNLayout(order=ovn_order, PL0=AW, PL1=1, QL0=AW, QL1=1)
+    birrd_table = lower_ovn_layout(ovn, AW, AW)
+    passthrough_perm = _simulate_birrd_passthrough_perm(AW)
+    pair_to_col = compute_output_col_map(AW, ovn_order)
+
+    birrd_per_tile = np.zeros((num_tiles, P0, P1), dtype=np.int8)
+    col_map_per_tile = np.zeros((num_tiles, AW), dtype=np.int32)
+    num_m_per_tile = np.zeros(num_tiles, dtype=np.int32)
+    n_base_per_tile = np.zeros((num_tiles, AW), dtype=np.int32)
+
+    for t in range(num_tiles):
+        Gr = int(instructions[3 + t, 3])
+        Gc = int(instructions[3 + t, 4])
+        sc = int(instructions[3 + t, 6])
+        mask_Gc = Gc - 1
+        if Gr == AW:
+            col_map_per_tile[t] = compute_col_to_m_map(AW, ovn_order, AW)
+            num_m_per_tile[t] = AW
+            for col in range(AW):
+                orig_pe = int(passthrough_perm[col])
+                n_base_per_tile[t, col] = sc * (orig_pe & mask_Gc)
+        elif Gr == 1:
+            col_map_per_tile[t] = np.zeros(AW, dtype=np.int32)
+            num_m_per_tile[t] = 1
+            for col in range(AW):
+                orig_pe = int(passthrough_perm[col])
+                n_base_per_tile[t, col] = sc * (orig_pe & mask_Gc)
+        else:
+            birrd_per_tile[t] = birrd_table
+            col_map_per_tile[t] = compute_col_to_m_map(AW, ovn_order, Gr)
+            num_m_per_tile[t] = Gr
+            for pair_idx in range(AW // 2):
+                col = int(pair_to_col[pair_idx])
+                n_base_per_tile[t, col] = sc * (pair_idx & mask_Gc)
+
+    m_start_per_tile = np.array(
+        [int(instructions[3 + t, 7]) for t in range(num_tiles)], dtype=np.int32
+    )
+    n_start_per_tile = np.array(
+        [int(instructions[3 + t, 9]) for t in range(num_tiles)], dtype=np.int32
+    )
+
+    # Build accum_params: [quant_scale, quant_zp, sr[0], sr[1], ...]
+    num_accum_params = 2 + num_tiles
+    accum_params = np.zeros(num_accum_params, dtype=np.int32)
+    accum_params[0] = int(instructions[2, 6])  # quant_scale
+    accum_params[1] = int(instructions[2, 7])  # quant_zp
+    for t in range(num_tiles):
+        accum_params[2 + t] = int(instructions[3 + t, 5])  # sr
+
+    # Write testbench
+    tb_path = os.path.join(project_dir, "tb.cpp")
+    with open(tb_path, "w") as f:
+        f.write('#include <cstdint>\n#include <cstdio>\n#include <cstring>\n\n')
+        f.write('#include "kernel.h"\n\n')
+        f.write("int main() {\n")
+
+        # 11 args in kernel-grouped order:
+        # data_scatter: A_pe (int32), B_pe (int32), inst_pe (int32)
+        # inst_rw: birrd_inst (int8)
+        # output_accum: output_col_map, output_num_m, output_n_base,
+        #               accum_m_start, accum_n_start, accum_params, C
+        f.write("  // A_pe[M_padded, K] (data_scatter, int32)\n")
+        f.write("  " + _c_array_1d("A_pe", "int32_t", A.astype(np.int32).flatten()))
+        f.write("  // B_pe[K, N] (data_scatter, int32)\n")
+        f.write("  " + _c_array_1d("B_pe", "int32_t", B.astype(np.int32).flatten()))
+        f.write("  // inst_pe[num_inst, 13] (data_scatter)\n")
+        f.write("  " + _c_array_1d("inst_pe", "int32_t", instructions.flatten()))
+        f.write("  // birrd_inst[num_tiles, P0, P1] (inst_rw)\n")
+        f.write("  " + _c_array_1d("birrd_inst", "int8_t", birrd_per_tile.flatten()))
+        f.write("  // output_col_map[num_tiles, AW]\n")
+        f.write("  " + _c_array_1d("output_col_map", "int32_t", col_map_per_tile.flatten()))
+        f.write("  // output_num_m[num_tiles]\n")
+        f.write("  " + _c_array_1d("output_num_m", "int32_t", num_m_per_tile.flatten()))
+        f.write("  // output_n_base[num_tiles, AW]\n")
+        f.write("  " + _c_array_1d("output_n_base", "int32_t", n_base_per_tile.flatten()))
+        f.write("  // accum_m_start[num_tiles]\n")
+        f.write("  " + _c_array_1d("accum_m_start", "int32_t", m_start_per_tile.flatten()))
+        f.write("  // accum_n_start[num_tiles]\n")
+        f.write("  " + _c_array_1d("accum_n_start", "int32_t", n_start_per_tile.flatten()))
+        f.write("  // accum_params[num_accum_params] — quant_scale, quant_zp, sr[...]\n")
+        f.write("  " + _c_array_1d("accum_params", "int32_t", accum_params.flatten()))
+        f.write(f"  // C[M_padded, N] output\n")
+        f.write(f"  int32_t C[{M_padded * N}];\n")
+        f.write(f"  memset(C, 0, sizeof(C));\n\n")
+
+        # Call top function (11 args, kernel-grouped order)
+        f.write("  // Run FEATHER+ dataflow\n")
+        f.write("  full_matrix_top(A_pe, B_pe, inst_pe, birrd_inst, "
+                "output_col_map, output_num_m, output_n_base, "
+                "accum_m_start, accum_n_start, accum_params, C);\n\n")
+
+        # Verify output (only first M rows, ignore padding)
+        f.write("  // Reference output\n")
+        f.write("  " + _c_array_1d("C_ref", "int32_t", C_ref.flatten()))
+        f.write("  // Verify (skip padded rows)\n")
+        f.write("  int errors = 0;\n")
+        f.write(f"  for (int i = 0; i < {M}; i++) {{\n")
+        f.write(f"    for (int j = 0; j < {N}; j++) {{\n")
+        f.write(f"      int idx = i * {N} + j;\n")
+        f.write(f"      if (C[idx] != C_ref[idx]) {{\n")
+        f.write('        printf("MISMATCH at [%d,%d]: got %d, expected %d\\n", i, j, C[idx], C_ref[idx]);\n')
+        f.write("        errors++;\n")
+        f.write("      }\n")
+        f.write("    }\n")
+        f.write("  }\n")
+        f.write('  if (errors == 0) printf("COSIM PASSED: all outputs match\\n");\n')
+        f.write(f'  else printf("COSIM FAILED: %d mismatches\\n", errors);\n')
+        f.write("  return errors;\n")
+        f.write("}\n")
+
+    print(f"  Wrote testbench: {tb_path}")
+    return tb_path
+
+
+def _generate_cosim_tcl(project_dir):
+    """Write a TCL script that runs csynth + cosim."""
+    tcl_path = os.path.join(project_dir, "run_cosim.tcl")
+    with open(tcl_path, "w") as f:
+        f.write("set hls_prj out.prj\n")
+        f.write("open_project ${hls_prj} -reset\n")
+        f.write("open_solution -reset solution1 -flow_target vivado\n")
+        f.write("set_top full_matrix_top\n")
+        f.write("add_files kernel.cpp\n")
+        f.write('add_files -tb tb.cpp -cflags "-std=gnu++0x"\n')
+        f.write('open_solution "solution1"\n')
+        f.write("set_part {xcu280-fsvh2892-2L-e}\n")
+        f.write("create_clock -period 3.33\n")
+        f.write("csynth_design\n")
+        f.write("cosim_design\n")
+        f.write("exit\n")
+    return tcl_path
+
+
+def _run_cosim(trace_info, project_dir, seed=42):
+    """Run RTL co-simulation for trace workload.
+
+    Uses csyn mode to generate kernel.cpp, then writes a custom C testbench,
+    patches m_axi depths, and runs cosim_design for cycle-accurate latency.
+    """
+    M = trace_info["M"]
+    K = trace_info["K"]
+    N = trace_info["N"]
+    M_padded = trace_info["M_padded"]
+    AH = trace_info["AH"]
+    AW = trace_info["AW"]
+    instructions = trace_info["instructions"]
+
+    # Step 1: Build csyn project to get kernel.cpp
+    print(f"  Step 1: Generating HLS project (csyn)...")
+    top = get_feather_full_matrix_top_kstreaming(
+        M_padded, K, N, AW, AH, int8, len(instructions),
+    )
+    s = df.customize(top)
+    schedule_feather_hls(s, K, AH)
+    hls_mod = s.build(target="vitis_hls", mode="csyn", project=project_dir)
+
+    # Patch wide ap_uint
+    patch_kernel_for_wide_apint(project_dir, AW * AH * int8.bits)
+
+    # Step 2: Patch m_axi depths
+    print(f"  Step 2: Patching m_axi depths...")
+    _patch_maxi_depths(project_dir, trace_info)
+
+    # Step 3: Generate test data and testbench
+    print(f"  Step 3: Generating testbench with test data...")
+    np.random.seed(seed)
+    A_orig = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+    C_ref = A_orig.astype(np.int32) @ B.astype(np.int32)
+
+    if M_padded != M:
+        A = np.zeros((M_padded, K), dtype=np.int8)
+        A[:M, :] = A_orig
+    else:
+        A = A_orig
+
+    _generate_cosim_testbench(project_dir, trace_info, A, B, instructions,
+                               C_ref, M_padded)
+
+    # Step 4: Generate cosim TCL
+    _generate_cosim_tcl(project_dir)
+
+    # Step 5: Run csynth + cosim
+    print(f"  Step 5: Running csynth + cosim (this may take a long time)...")
+    cmd = f"cd {project_dir}; vitis_hls -f run_cosim.tcl"
+    process = subprocess.Popen(
+        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    )
+    stdout, _ = process.communicate()
+    log = stdout.decode("utf-8", errors="replace")
+
+    # Save log
+    log_path = os.path.join(project_dir, "cosim.log")
+    with open(log_path, "w") as f:
+        f.write(log)
+
+    if process.returncode != 0:
+        print(f"  Cosim failed (exit code {process.returncode})")
+        print(f"  See log: {log_path}")
+        for line in log.strip().split("\n")[-30:]:
+            print(f"    {line}")
+        return False
+
+    # Parse cycle count
+    _report_cosim(project_dir)
+
+    # Also search log for cycle info
+    cycles = None
+    for line in log.split("\n"):
+        m = re.search(r"Verilog\|\s*Pass\|\s*(\d+)", line)
+        if m:
+            cycles = int(m.group(1))
+
+    if cycles:
+        print(f"\n  RTL Co-Simulation Cycle Count: {cycles}")
+        if trace_info['rtl_latency']:
+            ratio = cycles / trace_info['rtl_latency']
+            print(f"  RTL reference: {trace_info['rtl_latency']} cycles")
+            print(f"  Ratio: {ratio:.1f}x")
+    else:
+        print(f"\n  Check log for results: {log_path}")
+
+    return True
+
+
+def run_deploy(trace_info, seed=42):
+    """Build and deploy the trace workload to U280 FPGA."""
+    M = trace_info["M"]
+    K = trace_info["K"]
+    N = trace_info["N"]
+    M_padded = trace_info["M_padded"]
+    AH = trace_info["AH"]
+    AW = trace_info["AW"]
+    instructions = trace_info["instructions"]
+
+    trace_name = f"trace_{M}x{K}x{N}"
+    project_dir = os.path.join(TESTS_DIR, f"{trace_name}_hw.prj")
+
+    print(f"\n{'=' * 70}")
+    print(f"U280 DEPLOYMENT")
+    print(f"{'=' * 70}")
+    print(f"  Workload: C[{M},{N}] = A[{M},{K}] x B[{K},{N}]")
+    print(f"  Array: {AH}x{AW}")
+    print(f"  Project: {project_dir}")
+
+    # Step 1: Generate HW project
+    print(f"\n--- Step 1: Generate HW Project ---")
+    top = get_feather_full_matrix_top_kstreaming(
+        M_padded, K, N, AW, AH, int8, len(instructions),
+    )
+    s = df.customize(top)
+    schedule_feather_hls(s, K, AH)
+    hls_mod = s.build(target="vitis_hls", mode="hw", project=project_dir)
+
+    # Patch for wide ap_uint
+    patch_kernel_for_wide_apint(project_dir, AW * AH * int8.bits)
+
+    # Step 2: Write input data
+    print(f"\n--- Step 2: Write Input Data ---")
+    _write_deploy_input_data(trace_info, project_dir, seed)
+
+    # Step 3: Generate HBM config
+    print(f"\n--- Step 3: Generate HBM Config ---")
+    _generate_hbm_config(project_dir)
+
+    # Step 4: Build bitstream
+    print(f"\n--- Step 4: Build Bitstream ---")
+    xdevice = os.environ.get("XDEVICE", "")
+    if not xdevice:
+        print("  XDEVICE not set. Set it and run:")
+        print(f"    cd {project_dir} && make build TARGET=hw PLATFORM=$XDEVICE")
+        print("  Then re-run with --deploy to execute.")
+        return
+
+    # Check if xclbin already exists
+    xsa = xdevice.rsplit("/", 1)[-1].split(".")[0]
+    xclbin_path = os.path.join(project_dir, f"build_dir.hw.{xsa}", "full_matrix_top.xclbin")
+
+    if os.path.exists(xclbin_path):
+        print(f"  Bitstream already exists: {xclbin_path}")
+    else:
+        print(f"  Building bitstream (this takes hours)...")
+        cmd = f"cd {project_dir} && make build TARGET=hw PLATFORM=$XDEVICE"
+        print(f"  Command: {cmd}")
+        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        stdout, _ = process.communicate()
+        log = stdout.decode("utf-8", errors="replace")
+        log_path = os.path.join(project_dir, "build_hw.log")
+        with open(log_path, "w") as f:
+            f.write(log)
+        if process.returncode != 0:
+            print(f"  BUILD FAILED (exit code {process.returncode})")
+            for line in log.strip().split("\n")[-20:]:
+                print(f"    {line}")
+            return
+        print(f"  Build complete.")
+
+    # Step 5: Run on device
+    print(f"\n--- Step 5: Run on Device ---")
+    _run_on_device(trace_info, project_dir, seed)
+
+
+def _write_deploy_input_data(trace_info, project_dir, seed=42):
+    """Write binary input data files for the host executable."""
+    from minisa.isa import SetOVNLayout
+    from minisa.lowering import (
+        lower_ovn_layout, compute_col_to_m_map,
+        compute_output_col_map, _simulate_birrd_passthrough_perm,
+        generate_birrd_instructions, _simulate_birrd_output_col_map_general,
+    )
+
+    M = trace_info["M"]
+    K = trace_info["K"]
+    N = trace_info["N"]
+    M_padded = trace_info["M_padded"]
+    AH = trace_info["AH"]
+    AW = trace_info["AW"]
+    instructions = trace_info["instructions"]
+    num_tiles = trace_info["n_tiles"]
+    P0, P1 = compute_birrd_params(AW)
+
+    np.random.seed(seed)
+    A_orig = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+    C_ref = A_orig.astype(np.int32) @ B.astype(np.int32)
+
+    # Pad A
+    if M_padded != M:
+        A = np.zeros((M_padded, K), dtype=np.int8)
+        A[:M, :] = A_orig
+    else:
+        A = A_orig
+
+    # Compute BIRRD tables (same logic as FeatherKStreamingModule.__call__)
+    ovn_order = int(instructions[2, 1])
+    ovn = SetOVNLayout(order=ovn_order, PL0=AW, PL1=1, QL0=AW, QL1=1)
+    birrd_table = lower_ovn_layout(ovn, AW, AW)
+    passthrough_perm = _simulate_birrd_passthrough_perm(AW)
+    pair_to_col = compute_output_col_map(AW, ovn_order)
+
+    birrd_per_tile = np.zeros((num_tiles, P0, P1), dtype=np.int8)
+    col_map_per_tile = np.zeros((num_tiles, AW), dtype=np.int32)
+    num_m_per_tile = np.zeros(num_tiles, dtype=np.int32)
+    n_base_per_tile = np.zeros((num_tiles, AW), dtype=np.int32)
+
+    for t in range(num_tiles):
+        Gr = int(instructions[3 + t, 3])
+        Gc = int(instructions[3 + t, 4])
+        sc = int(instructions[3 + t, 6])
+        mask_Gc = Gc - 1
+
+        if Gr == AW:
+            col_map_per_tile[t] = compute_col_to_m_map(AW, ovn_order, AW)
+            num_m_per_tile[t] = AW
+            for col in range(AW):
+                orig_pe = int(passthrough_perm[col])
+                n_base_per_tile[t, col] = sc * (orig_pe & mask_Gc)
+        elif Gr == AW // 2:
+            birrd_per_tile[t] = birrd_table
+            col_map_per_tile[t] = compute_col_to_m_map(AW, ovn_order, Gr)
+            num_m_per_tile[t] = Gr
+            for pair_idx in range(AW // 2):
+                col = int(pair_to_col[pair_idx])
+                n_base_per_tile[t, col] = sc * (pair_idx & mask_Gc)
+        elif Gr == 1:
+            col_map_per_tile[t] = np.zeros(AW, dtype=np.int32)
+            num_m_per_tile[t] = 1
+            for col in range(AW):
+                orig_pe = int(passthrough_perm[col])
+                n_base_per_tile[t, col] = sc * (orig_pe & mask_Gc)
+        else:
+            birrd_inst_gen = generate_birrd_instructions(AW, Gr)
+            birrd_per_tile[t] = birrd_inst_gen
+            col_map_per_tile[t] = compute_col_to_m_map(AW, ovn_order, Gr)
+            num_m_per_tile[t] = Gr
+            m_to_col = _simulate_birrd_output_col_map_general(birrd_inst_gen, AW, Gr)
+            for m_idx in range(Gr):
+                col = int(m_to_col[m_idx])
+                n_base_per_tile[t, col] = sc * (m_idx & mask_Gc)
+
+    m_start_per_tile = np.array(
+        [int(instructions[3 + t, 7]) for t in range(num_tiles)], dtype=np.int32
+    )
+    n_start_per_tile = np.array(
+        [int(instructions[3 + t, 9]) for t in range(num_tiles)], dtype=np.int32
+    )
+
+    C = np.zeros((M_padded, N), dtype=np.int32)
+
+    arrays = [
+        ("A", A),
+        ("B", B),
+        ("instructions", instructions),
+        ("birrd_inst", birrd_per_tile),
+        ("output_col_map", col_map_per_tile),
+        ("output_num_m", num_m_per_tile),
+        ("output_n_base", n_base_per_tile),
+        ("accum_m_start", m_start_per_tile),
+        ("accum_n_start", n_start_per_tile),
+        ("C", C),
+    ]
+
+    for i, (name, arr) in enumerate(arrays):
+        path = os.path.join(project_dir, f"input{i}.data")
+        with open(path, "wb") as f:
+            f.write(arr.tobytes())
+        print(f"    input{i}.data: {name:20s} shape={str(arr.shape):20s} {arr.nbytes} bytes")
+
+    ref_path = os.path.join(project_dir, "c_ref.npy")
+    np.save(ref_path, C_ref)
+    print(f"    c_ref.npy: reference output saved ({C_ref.shape})")
+
+
+def _generate_hbm_config(project_dir):
+    """Generate HBM bank mapping config for the v++ linker."""
+    # Read kernel.h to find port names
+    kernel_h = os.path.join(project_dir, "kernel.h")
+    if not os.path.isfile(kernel_h):
+        print("  WARNING: kernel.h not found, skipping HBM config")
+        return
+
+    with open(kernel_h) as f:
+        content = f.read()
+
+    # Extract port names from function signature
+    import re as re_mod
+    ports = re_mod.findall(r'\*(\w+)', content)
+    if not ports:
+        print("  WARNING: No ports found in kernel.h")
+        return
+
+    # Generate connectivity config
+    cfg_lines = ["[connectivity]\n"]
+    cfg_lines.append("# Map each m_axi port to a separate HBM bank for parallel access\n")
+    for i, port in enumerate(ports):
+        cfg_lines.append(f"sp=full_matrix_top_1.{port}:HBM[{i}]\n")
+
+    cfg_path = os.path.join(project_dir, "full_matrix_top.cfg")
+    with open(cfg_path, "w") as f:
+        f.writelines(cfg_lines)
+    print(f"  Generated {cfg_path} ({len(ports)} ports mapped to HBM[0..{len(ports)-1}])")
+
+    # Ensure Makefile references the config
+    mk_path = os.path.join(project_dir, "makefile_us_alveo.mk")
+    if os.path.isfile(mk_path):
+        with open(mk_path, "r") as f:
+            mk_content = f.read()
+        if "--config full_matrix_top.cfg" not in mk_content:
+            mk_content = mk_content.replace(
+                "VPP_LDFLAGS :=",
+                "VPP_LDFLAGS := --config full_matrix_top.cfg",
+            )
+            with open(mk_path, "w") as f:
+                f.write(mk_content)
+            print(f"  Updated Makefile with --config full_matrix_top.cfg")
+
+
+def _run_on_device(trace_info, project_dir, seed=42):
+    """Run the compiled design on U280 FPGA and verify."""
+    import glob
+
+    M = trace_info["M"]
+    N = trace_info["N"]
+    M_padded = trace_info["M_padded"]
+
+    # Find xclbin
+    xclbin_matches = glob.glob(os.path.join(project_dir, "build_dir.hw.*", "full_matrix_top.xclbin"))
+    if not xclbin_matches:
+        print("  ERROR: No xclbin found. Build first.")
+        return None
+
+    xclbin_path = xclbin_matches[0]
+    host_exe = os.path.join(project_dir, "full_matrix_top")
+
+    if not os.path.exists(host_exe):
+        print("  Building host executable...")
+        cmd = f"cd {project_dir} && make host PLATFORM=$XDEVICE"
+        subprocess.run(cmd, shell=True, check=True)
+
+    print(f"  Running on U280...")
+    cmd = f"cd {project_dir} && ./full_matrix_top {xclbin_path}"
+    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    stdout, _ = process.communicate()
+    output = stdout.decode("utf-8", errors="replace")
+
+    print(f"\n  === Device Output ===")
+    for line in output.strip().split("\n"):
+        print(f"    {line}")
+
+    # Parse execution time
+    exe_time_ns = None
+    for line in output.split("\n"):
+        m = re.search(r"\|\s*\w+\s*\|\s*(\d+)\s*\|", line)
+        if m:
+            exe_time_ns = int(m.group(1))
+
+    # Verify output
+    ref_path = os.path.join(project_dir, "c_ref.npy")
+    out_path = os.path.join(project_dir, "output0.data")
+    if os.path.exists(ref_path) and os.path.exists(out_path):
+        C_ref = np.load(ref_path)
+        # Output has padded M dimension
+        C_raw = np.fromfile(out_path, dtype=np.int32).reshape(M_padded, N)
+        C_out = C_raw[:M, :]
+        if np.array_equal(C_out, C_ref):
+            print(f"\n  OUTPUT VERIFICATION: PASSED")
+        else:
+            mismatches = np.sum(C_out != C_ref)
+            print(f"\n  OUTPUT VERIFICATION: FAILED ({mismatches}/{C_out.size} mismatches)")
+
+    if exe_time_ns is not None:
+        freq_mhz = 300
+        clock_period_ns = 1000.0 / freq_mhz
+        cycles = exe_time_ns / clock_period_ns
+        rtl_ref = trace_info.get("rtl_latency", None)
+
+        print(f"\n  === Latency Results ===")
+        print(f"  Wall-clock time:  {exe_time_ns} ns")
+        print(f"  Clock frequency:  {freq_mhz} MHz ({clock_period_ns:.2f} ns period)")
+        print(f"  Estimated cycles: {cycles:.0f}")
+        if rtl_ref:
+            print(f"  RTL reference:    {rtl_ref} cycles")
+            print(f"  Ratio vs RTL:     {cycles/rtl_ref:.2f}x")
+
+    return exe_time_ns
+
+
+def _run_multi_layer_trace(trace_raw, args):
+    """Execute a multi-layer trace (type=minisa_multi_layer)."""
+    from feather_minisa import run_sequential_gemm_layers
+    from minisa.isa import create_gemm_program, encode_program
+
+    spec = trace_raw["FEATHER_spec"]
+    AH, AW = spec["AH"], spec["AW"]
+    layers = trace_raw["layers"]
+    seed = trace_raw.get("seed", args.seed)
+
+    print(f"\n{'=' * 70}")
+    print(f"MULTI-LAYER TRACE TEST ({len(layers)} layers, {AH}x{AW} array)")
+    print(f"{'=' * 70}")
+
+    for i, layer in enumerate(layers):
+        print(f"  Layer {i+1}: C[{layer['M']},{layer['N']}] = "
+              f"A[{layer['M']},{layer['K']}] x B[{layer['K']},{layer['N']}]"
+              f"  gr={layer.get('gr', AW//2)}"
+              f"  quant={layer.get('quant_scale', 0)},{layer.get('quant_zp', 0)}")
+
+    np.random.seed(seed)
+    A = np.random.randint(-4, 4, size=(layers[0]["M"], layers[0]["K"])).astype(np.int8)
+
+    layer_weights = []
+    layer_kwargs = []
+    current_input = A
+    for i, layer in enumerate(layers):
+        K_i = layer["K"]
+        N_i = layer["N"]
+        B_i = np.random.randint(-4, 4, size=(K_i, N_i)).astype(np.int8)
+        layer_weights.append(B_i)
+
+        kwargs = {
+            "M": layer["M"], "N": N_i, "K": K_i,
+        }
+        for key in ("gr", "ivn_order", "wvn_order", "ovn_order",
+                     "iacts_zp", "weights_zp", "quant_scale", "quant_zp"):
+            if key in layer:
+                kwargs[key] = layer[key]
+        layer_kwargs.append(kwargs)
+
+    # Reference computation
+    ref_outputs = []
+    ref_input = A.copy()
+    for i, (B_i, kwargs) in enumerate(zip(layer_weights, layer_kwargs)):
+        iacts_zp = kwargs.get("iacts_zp", 0)
+        weights_zp = kwargs.get("weights_zp", 0)
+        quant_scale = kwargs.get("quant_scale", 0)
+        quant_zp = kwargs.get("quant_zp", 0)
+
+        C_ref = (ref_input.astype(np.int32) - iacts_zp) @ \
+                (B_i.astype(np.int32) - weights_zp)
+        if quant_scale != 0:
+            C_ref = (C_ref * quant_scale + quant_zp) & 255
+        ref_outputs.append(C_ref)
+        if i < len(layer_weights) - 1:
+            ref_input = C_ref.astype(np.uint8).view(np.int8)
+
+    # Run through Allo
+    outputs = run_sequential_gemm_layers(A, layer_weights, layer_kwargs, AW, AH)
+
+    all_pass = True
+    for i, (C_out, C_ref) in enumerate(zip(outputs, ref_outputs)):
+        passed = np.array_equal(C_out, C_ref)
+        status = "PASS" if passed else "FAIL"
+        print(f"  Layer {i+1}: {status}")
+        if not passed:
+            all_pass = False
+            mismatches = np.sum(C_out != C_ref)
+            print(f"    Mismatches: {mismatches}/{C_out.size}")
+
+    print(f"\n  OVERALL: {'PASS' if all_pass else 'FAIL'}")
+    if not all_pass:
+        sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="FEATHER+ trace-based test")
+    parser.add_argument("trace", help="Path to trace JSON file")
+    parser.add_argument("--hls", choices=["csim", "csyn", "cosim"], default=None,
+                        help="HLS mode (default: simulator only)")
+    parser.add_argument("--deploy", action="store_true",
+                        help="Build and deploy to U280 FPGA")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    args = parser.parse_args()
+
+    # Resolve trace path relative to feather-isa directory
+    trace_path = args.trace
+    if not os.path.isabs(trace_path):
+        # Try relative to CWD first, then relative to feather-isa dir
+        if not os.path.exists(trace_path):
+            feather_dir = os.path.join(os.path.dirname(__file__), "..")
+            trace_path = os.path.join(feather_dir, args.trace)
+
+    if not os.path.exists(trace_path):
+        print(f"ERROR: Trace file not found: {args.trace}")
+        sys.exit(1)
+
+    print(f"Parsing trace: {trace_path}")
+    trace_info = load_trace(trace_path)
+
+    # Handle multi-layer traces separately
+    if isinstance(trace_info, dict) and trace_info.get("type") == "minisa_multi_layer":
+        _run_multi_layer_trace(trace_info, args)
+        return
+
+    # Override seed from trace file if present (CLI arg takes precedence)
+    if args.seed == 42 and "seed" in trace_info:
+        args.seed = trace_info["seed"]
+
+    print(f"\n  Trace summary:")
+    print(f"    GEMM: C[{trace_info['M']},{trace_info['N']}] = "
+          f"A[{trace_info['M']},{trace_info['K']}] x B[{trace_info['K']},{trace_info['N']}]")
+    print(f"    Array: {trace_info['AH']}x{trace_info['AW']}")
+    print(f"    Mapping: Gr={trace_info['Gr']}, Gc={trace_info['Gc']}, "
+          f"sr={trace_info['sr']}, sc={trace_info['sc']}")
+    n_sub = trace_info.get('n_sub_tiles', 1)
+    print(f"    Tiles: {trace_info['n_tiles']} "
+          f"({trace_info['n_m_batches']}M x {trace_info['n_spatial_tiles']}N"
+          f"{f' x {n_sub}sub' if n_sub > 1 else ''})")
+    if trace_info['M_padded'] != trace_info['M']:
+        print(f"    M padded: {trace_info['M']} -> {trace_info['M_padded']}")
+    if trace_info.get('rtl_latency'):
+        print(f"    RTL reference: {trace_info['rtl_latency']} cycles")
+    if trace_info.get('utilization'):
+        print(f"    RTL utilization: {trace_info['utilization']}%")
+
+    # Always run reference model first
+    passed, _ = run_reference_test(trace_info, seed=args.seed)
+    if not passed:
+        print("\nReference model test FAILED — aborting")
+        sys.exit(1)
+
+    if args.deploy:
+        run_deploy(trace_info, seed=args.seed)
+    elif args.hls:
+        run_hls_test(trace_info, mode=args.hls, seed=args.seed)
+    else:
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

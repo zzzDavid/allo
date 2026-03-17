@@ -29,7 +29,7 @@ from minisa.isa import (
     INST_TYPE_OVN,
     INST_TYPE_MAPPING,
 )
-from feather_minisa import build_feather_kstreaming_simulator, compute_max_k_passes
+from feather_minisa import build_feather_kstreaming_simulator
 
 
 def run_kstreaming_gemm(M, N, K, AW, AH, verbose=False, dataflow="output_stationary"):
@@ -46,16 +46,13 @@ def run_kstreaming_gemm(M, N, K, AW, AH, verbose=False, dataflow="output_station
     """
     program = create_gemm_program(M=M, N=N, K=K, AH=AH, AW=AW, dataflow=dataflow)
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     if verbose:
         Gr = int(instructions[3, 3])
         Kt = int(instructions[3, 12]) - int(instructions[3, 11])
-        Kt_per_pass = (AW // Gr) * AH
         print(f"  Dimensions: C[{M},{N}] = A[{M},{K}] x B[{K},{N}]")
         print(f"  Array: {AH}x{AW}, Gr={Gr}, dataflow={dataflow}")
-        print(f"  Tiles: {len(program.mappings)}, Kt={Kt}, Kt_per_pass={Kt_per_pass}, "
-              f"max_k_passes={max_k_passes}")
+        print(f"  Tiles: {len(program.mappings)}, Kt={Kt}")
 
     np.random.seed(42)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -63,7 +60,6 @@ def run_kstreaming_gemm(M, N, K, AW, AH, verbose=False, dataflow="output_station
 
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -297,11 +293,8 @@ def test_ovn_order_all_correct():
             M=M, N=N, K=K, AH=AH, AW=AW, ovn_order=ovn_order,
         )
         instructions = encode_program(program)
-        max_k_passes = compute_max_k_passes(instructions, AW, AH)
-
         mod = build_feather_kstreaming_simulator(
             M, K, N, AW, AH, int8, len(instructions),
-            max_k_passes,
         )
         C = np.zeros((M, N), dtype=np.int32)
         mod(A, B, instructions, C)
@@ -335,15 +328,12 @@ def test_ivn_order_all_correct():
             M=M, N=N, K=K, AH=AH, AW=AW, ivn_order=ivn_order,
         )
         instructions = encode_program(program)
-        max_k_passes = compute_max_k_passes(instructions, AW, AH)
-
         # Verify IVN order is encoded correctly
         assert instructions[0, 1] == ivn_order, \
             f"IVN order {ivn_order} not encoded at instructions[0,1]"
 
         mod = build_feather_kstreaming_simulator(
             M, K, N, AW, AH, int8, len(instructions),
-            max_k_passes,
         )
         C = np.zeros((M, N), dtype=np.int32)
         mod(A, B, instructions, C)
@@ -376,15 +366,12 @@ def test_wvn_order_all_correct():
             M=M, N=N, K=K, AH=AH, AW=AW, wvn_order=wvn_order,
         )
         instructions = encode_program(program)
-        max_k_passes = compute_max_k_passes(instructions, AW, AH)
-
         # Verify WVN order is encoded correctly
         assert instructions[1, 1] == wvn_order, \
             f"WVN order {wvn_order} not encoded at instructions[1,1]"
 
         mod = build_feather_kstreaming_simulator(
             M, K, N, AW, AH, int8, len(instructions),
-            max_k_passes,
         )
         C = np.zeros((M, N), dtype=np.int32)
         mod(A, B, instructions, C)
@@ -426,11 +413,8 @@ def test_mixed_layout_orders():
             ivn_order=ivn_ord, wvn_order=wvn_ord, ovn_order=ovn_ord,
         )
         instructions = encode_program(program)
-        max_k_passes = compute_max_k_passes(instructions, AW, AH)
-
         mod = build_feather_kstreaming_simulator(
             M, K, N, AW, AH, int8, len(instructions),
-            max_k_passes,
         )
         C = np.zeros((M, N), dtype=np.int32)
         mod(A, B, instructions, C)
@@ -534,8 +518,6 @@ def test_zero_point_subtraction():
             iacts_zp=iacts_zp, weights_zp=weights_zp,
         )
         instructions = encode_program(program)
-        max_k_passes = compute_max_k_passes(instructions, AW, AH)
-
         # Verify zero points are encoded correctly
         assert instructions[0, 6] == iacts_zp, \
             f"iacts_zp={iacts_zp} not encoded at instructions[0,6]"
@@ -544,7 +526,6 @@ def test_zero_point_subtraction():
 
         mod = build_feather_kstreaming_simulator(
             M, K, N, AW, AH, int8, len(instructions),
-            max_k_passes,
         )
         C = np.zeros((M, N), dtype=np.int32)
         mod(A, B, instructions, C)
@@ -584,11 +565,8 @@ def test_zero_point_aw4():
         iacts_zp=iacts_zp, weights_zp=weights_zp,
     )
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW, AH)
-
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -634,7 +612,6 @@ def test_post_quantization():
             quant_scale=quant_scale, quant_zp=quant_zp,
         )
         instructions = encode_program(program)
-        max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
         # Verify quant params are encoded correctly
         assert instructions[2, 6] == quant_scale, \
@@ -644,7 +621,6 @@ def test_post_quantization():
 
         mod = build_feather_kstreaming_simulator(
             M, K, N, AW, AH, int8, len(instructions),
-            max_k_passes,
         )
         C = np.zeros((M, N), dtype=np.int32)
         mod(A, B, instructions, C)
@@ -689,11 +665,8 @@ def test_post_quantization_aw4():
         quant_scale=quant_scale, quant_zp=quant_zp,
     )
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW, AH)
-
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)

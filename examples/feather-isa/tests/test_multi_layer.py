@@ -23,7 +23,6 @@ from allo.ir.types import int8
 from minisa.isa import create_gemm_program, encode_program
 from feather_minisa import (
     build_feather_kstreaming_simulator,
-    compute_max_k_passes,
     run_sequential_gemm_layers,
 )
 
@@ -57,9 +56,8 @@ def test_two_layer_gemm():
     layer1_kwargs = dict(M=8, N=8, K=16, quant_scale=quant_scale, quant_zp=quant_zp)
     program1 = create_gemm_program(AH=AH, AW=AW, **layer1_kwargs)
     inst1 = encode_program(program1)
-    max_kp1 = compute_max_k_passes(inst1, AW, AH)
 
-    mod1 = build_feather_kstreaming_simulator(8, 16, 8, AW, AH, int8, len(inst1), max_kp1)
+    mod1 = build_feather_kstreaming_simulator(8, 16, 8, AW, AH, int8, len(inst1))
     C1 = np.zeros((8, 8), dtype=np.int32)
     mod1(A, B1, inst1, C1)
 
@@ -77,9 +75,8 @@ def test_two_layer_gemm():
     layer2_kwargs = dict(M=8, N=8, K=8, gr=AW)
     program2 = create_gemm_program(AH=AH, AW=AW, **layer2_kwargs)
     inst2 = encode_program(program2)
-    max_kp2 = compute_max_k_passes(inst2, AW, AH)
 
-    mod2 = build_feather_kstreaming_simulator(8, 8, 8, AW, AH, int8, len(inst2), max_kp2)
+    mod2 = build_feather_kstreaming_simulator(8, 8, 8, AW, AH, int8, len(inst2))
     C2 = np.zeros((8, 8), dtype=np.int32)
     mod2(C1_int8, B2, inst2, C2)
 

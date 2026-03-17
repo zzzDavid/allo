@@ -1,0 +1,13 @@
+{
+  "type": "minisa",
+  "FEATHER_spec": {"AH": 8, "AW": 8},
+  "program": {
+    "M": 8, "K": 16, "N": 8,
+    "gr": 4,
+    "ivn_order": 0, "wvn_order": 2, "ovn_order": 0,
+    "iacts_zp": 0, "weights_zp": 0,
+    "quant_scale": 0, "quant_zp": 0
+  },
+  "seed": 42,
+  "description": "8x16x8 GEMM with WVN order 2"
+}

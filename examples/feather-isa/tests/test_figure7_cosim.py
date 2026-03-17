@@ -27,7 +27,6 @@ from feather_minisa import (
     get_feather_full_matrix_top_kstreaming,
     FeatherKStreamingModule,
     compute_birrd_params,
-    compute_max_k_passes,
 )
 
 # Figure 7 dimensions
@@ -252,12 +251,11 @@ def run_figure7_cosim():
     print(f"  NEST: {AH}x{AW}, {num_inst - 3} tile mappings")
 
     num_tiles = num_inst - 3
-    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     # Build HLS project (generates kernel.cpp, kernel.h)
     project_dir = os.path.join(TESTS_DIR, "figure7_cosim.prj")
     top = get_feather_full_matrix_top_kstreaming(
-        M, K, N, AW, AH, int8, num_inst, max_k_passes,
+        M, K, N, AW, AH, int8, num_inst,
     )
     s = df.customize(top)
     s.partition("full_matrix_top:C", dim=2, factor=AH)

@@ -31,6 +31,18 @@ INST_TYPE_WVN = 1
 INST_TYPE_OVN = 2
 INST_TYPE_MAPPING = 3
 
+# Corrected TABLE_II from RTL implementation (differs from original MINISA paper).
+# Maps order index → outer-to-inner loop nesting for each VN type.
+# Key property: same order index gives same structural layout for IVN and WVN.
+TABLE_II_OUTER_TO_INNER = {
+    0: {"W": ("kL1", "nL0", "nL1"), "I": ("jL1", "mL0", "mL1"), "O": ("pL1", "pL0", "qL1")},
+    1: {"W": ("kL1", "nL1", "nL0"), "I": ("jL1", "mL1", "mL0"), "O": ("pL1", "qL1", "pL0")},
+    2: {"W": ("nL0", "kL1", "nL1"), "I": ("mL0", "jL1", "mL1"), "O": ("pL0", "pL1", "qL1")},
+    3: {"W": ("nL0", "nL1", "kL1"), "I": ("mL0", "mL1", "jL1"), "O": ("pL0", "qL1", "pL1")},
+    4: {"W": ("nL1", "kL1", "nL0"), "I": ("mL1", "jL1", "mL0"), "O": ("qL1", "pL1", "pL0")},
+    5: {"W": ("nL1", "nL0", "kL1"), "I": ("mL1", "mL0", "jL1"), "O": ("qL1", "pL0", "pL1")},
+}
+
 
 class LayoutOrder(IntEnum):
     """Layout dimension ordering for VN buffers.
@@ -38,6 +50,15 @@ class LayoutOrder(IntEnum):
     3-bit encoding supports 6 orderings for 3 logical dimensions.
     The order determines how data is arranged in memory and
     accessed by the PE array.
+
+    Each VN type has 3 canonical dimensions (see TABLE_II_OUTER_TO_INNER):
+      IVN: dim0=jL1 (K outer), dim1=mL0 (M inner), dim2=mL1 (M outer)
+      WVN: dim0=kL1 (K outer), dim1=nL0 (N inner), dim2=nL1 (N outer)
+      OVN: dim0=pL1 (P outer), dim1=pL0 (P inner), dim2=qL1 (Q outer)
+
+    ORDER_XYZ places dimX outermost, dimY middle, dimZ innermost.
+    The corrected encoding (vs the original paper) ensures the same order
+    index gives the same structural loop nesting for IVN and WVN.
     """
     ORDER_012 = 0  # Default order
     ORDER_021 = 1
@@ -424,21 +445,18 @@ def create_gemm_program(
 def create_figure7_program() -> MINISAProgram:
     """Create the MINISA program for Figure 7: C[16,8] = A[16,12] x B[12,8] on 4x4 NEST.
 
-    Uses K-streaming: all tiles use Gr=AW=4 with full K-range [0,12).
-    The kernel handles 3 K-passes internally per tile (Kt_per_pass=AH=4).
-    This reduces tile count from 24 to 8 and eliminates runtime dividers
-    (ic_j % Gr and ic_j // Gr simplify to constants when Gr=AW).
-
-    Tile structure: 4 M-blocks x 2 N-groups = 8 tiles.
-    Each tile: Gr=4, Mt=4, covers 4 M rows x 4 N cols x 12 K elements.
+    Each tile uses Gr=AW=4, Kt=(AW/Gr)*AH=4. K=12 decomposes into 3 K-tiles
+    per (M-block, N-group): K=[0,4), [4,8), [8,12).
+    Total tiles: 2 N-groups x 4 M-blocks x 3 K-tiles = 24 tiles.
 
     Returns:
-        MINISAProgram with 8 tile mappings (all Gr=4, K=[0,12))
+        MINISAProgram with 24 tile mappings (all Gr=4, Kt=4)
     """
     AH, AW = 4, 4
     M, K, N = 16, 12, 8
     Nt = AH  # N per tile = 4
     Mt = AW  # M per tile = 4 (Gr=AW, no BIRRD reduction)
+    Kt = AH  # K per tile = (AW/Gr)*AH = 1*4 = 4
 
     program = MINISAProgram(
         name="figure7",
@@ -449,20 +467,20 @@ def create_figure7_program() -> MINISAProgram:
         ovn_layout=SetOVNLayout(order=0, PL0=AH, PL1=M // AH, QL0=AH, QL1=N // AH),
     )
 
-    # All Gr=4 tiles: 4 M per tile, full K=[0,12)
     for n_tile in range(N // Nt):       # 2 N-groups
         for m_tile in range(M // Mt):   # 4 M-blocks
-            program.add_mapping(SetMapping(
-                r0=0,
-                c0=n_tile * Nt,
-                Gr=4, Gc=1, sr=1, sc=0,
-                m_start=m_tile * Mt,
-                m_end=(m_tile + 1) * Mt,
-                n_start=n_tile * Nt,
-                n_end=(n_tile + 1) * Nt,
-                k_start=0,
-                k_end=K,  # Full K-range
-            ))
+            for k_tile in range(K // Kt):  # 3 K-tiles
+                program.add_mapping(SetMapping(
+                    r0=k_tile,
+                    c0=n_tile * Nt,
+                    Gr=4, Gc=1, sr=1, sc=0,
+                    m_start=m_tile * Mt,
+                    m_end=(m_tile + 1) * Mt,
+                    n_start=n_tile * Nt,
+                    n_end=(n_tile + 1) * Nt,
+                    k_start=k_tile * Kt,
+                    k_end=(k_tile + 1) * Kt,
+                ))
 
     return program
 

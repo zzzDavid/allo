@@ -1,0 +1,13 @@
+{
+  "type": "minisa",
+  "FEATHER_spec": {"AH": 4, "AW": 4},
+  "program": {
+    "M": 4, "K": 8, "N": 4,
+    "gr": 4,
+    "ivn_order": 0, "wvn_order": 0, "ovn_order": 0,
+    "iacts_zp": 1, "weights_zp": 2,
+    "quant_scale": 3, "quant_zp": 10
+  },
+  "seed": 99,
+  "description": "4x8x4 GEMM on 4x4 array with combined zero-points (iacts=1, weights=2) and quantization (scale=3, zp=10)"
+}

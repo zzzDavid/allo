@@ -33,7 +33,7 @@ from minisa.isa import (
     create_figure7_program,
     encode_program,
 )
-from feather_minisa import build_feather_kstreaming_simulator, compute_max_k_passes
+from feather_minisa import build_feather_kstreaming_simulator
 
 
 # Hardware parameters for 4x4 NEST
@@ -45,12 +45,11 @@ def test_gr_equals_aw():
     """Gr=AW=4: pass-through BIRRD mode (Figure 7 regression).
 
     Each PE column handles a distinct M row. No BIRRD reduction needed.
-    All tiles use Gr=4 with K-streaming across 3 K-passes.
+    All tiles use Gr=4 with K-streaming across 3 K-tiles.
     """
     M, K, N = 16, 12, 8
     program = create_figure7_program()
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     np.random.seed(7)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -58,7 +57,6 @@ def test_gr_equals_aw():
 
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -102,7 +100,6 @@ def test_gr_half_aw():
             ))
 
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     np.random.seed(42)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -110,7 +107,6 @@ def test_gr_half_aw():
 
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -125,9 +121,6 @@ def test_mixed_gr_tiles():
     Workload: C[8,4] = A[8,12] x B[12,4]
     - Gr=2 tiles for K=[0,8): 4 tiles (M/Mt=4), BIRRD reduction, Mt=2
     - Gr=4 tiles for K=[8,12): 2 tiles (M/Mt=2), pass-through, Mt=4
-
-    All tiles share Kt_per_pass=8 (max stride needed for Gr=2).
-    Gr=4 tiles only read 4 of 8 K-elements per pass (ic_j >> 2 = 0).
     """
     M, K, N = 8, 12, 4
     Nt = AH  # 4
@@ -163,7 +156,6 @@ def test_mixed_gr_tiles():
             ))
 
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     np.random.seed(99)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -171,7 +163,6 @@ def test_mixed_gr_tiles():
 
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -212,7 +203,6 @@ def test_gr_1_aw4():
             ))
 
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     np.random.seed(123)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -220,7 +210,6 @@ def test_gr_1_aw4():
 
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -262,7 +251,6 @@ def test_gr_2_aw8():
             ))
 
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW_8, AH_8)
 
     np.random.seed(456)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -270,7 +258,6 @@ def test_gr_2_aw8():
 
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW_8, AH_8, int8, len(instructions),
-        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -312,7 +299,6 @@ def test_gr_1_aw8():
             ))
 
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW_8, AH_8)
 
     np.random.seed(789)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -320,71 +306,6 @@ def test_gr_1_aw8():
 
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW_8, AH_8, int8, len(instructions),
-        max_k_passes,
-    )
-    C = np.zeros((M, N), dtype=np.int32)
-    mod(A, B, instructions, C)
-
-    ref = A.astype(np.int32) @ B.astype(np.int32)
-    np.testing.assert_array_equal(C, ref)
-
-
-def test_mixed_kt_per_pass():
-    """Mixed Kt_per_pass: Gr=2 tiles (2 passes) and Gr=4 tiles (4 passes).
-
-    Workload: C[4,4] = A[4,32] x B[32,4] on AW=4, AH=4
-
-    | Tiles  | Gr | Mt | K-range  | Kt_per_pass | actual_passes |
-    |--------|----|----|----------|-------------|---------------|
-    | 2 tiles| 2  | 2  | [0,16)   | 8           | 2             |
-    | 1 tile | 4  | 4  | [16,32)  | 4           | 4             |
-
-    max_k_passes = 4. Gr=2 tiles get 2 padding passes (zeros).
-    Verifies correct GEMM with truly mixed K-pass counts.
-    """
-    M, K, N = 4, 32, 4
-    Nt = AH  # 4
-
-    program = MINISAProgram(
-        name="mixed_kt_test", AH=AH, AW=AW,
-        ivn_layout=SetIVNLayout(order=0, ML0=AH, ML1=1, JL0=AH, JL1=K // AH),
-        wvn_layout=SetWVNLayout(order=0, KL0=AH, KL1=K // AH, NL0=min(N, AW), NL1=max(1, N // AW)),
-        ovn_layout=SetOVNLayout(order=0, PL0=AH, PL1=1, QL0=AH, QL1=N // AH),
-    )
-
-    # Gr=2 tiles: K=[0,16), Mt=2, Kt_per_pass=(4/2)*4=8, actual_passes=16/8=2
-    Mt_gr2 = 2
-    for m_tile in range(M // Mt_gr2):
-        program.add_mapping(SetMapping(
-            r0=0, c0=0,
-            Gr=2, Gc=1, sr=1, sc=0,
-            m_start=m_tile * Mt_gr2, m_end=(m_tile + 1) * Mt_gr2,
-            n_start=0, n_end=N,
-            k_start=0, k_end=16,
-        ))
-
-    # Gr=4 tile: K=[16,32), Mt=4, Kt_per_pass=(4/4)*4=4, actual_passes=16/4=4
-    program.add_mapping(SetMapping(
-        r0=4, c0=0,
-        Gr=4, Gc=1, sr=1, sc=0,
-        m_start=0, m_end=4,
-        n_start=0, n_end=N,
-        k_start=16, k_end=32,
-    ))
-
-    instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW, AH)
-
-    # Verify mixed K-pass counts
-    assert max_k_passes == 4, f"Expected max_k_passes=4, got {max_k_passes}"
-
-    np.random.seed(202)
-    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
-    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
-
-    mod = build_feather_kstreaming_simulator(
-        M, K, N, AW, AH, int8, len(instructions),
-        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -430,9 +351,8 @@ def test_ivn_wvn_orders_aw4():
                     k_start=0, k_end=K,
                 ))
         instructions = encode_program(program)
-        max_k_passes = compute_max_k_passes(instructions, AW, AH)
         mod = build_feather_kstreaming_simulator(
-            M, K, N, AW, AH, int8, len(instructions), max_k_passes,
+            M, K, N, AW, AH, int8, len(instructions),
         )
         C = np.zeros((M, N), dtype=np.int32)
         mod(A, B, instructions, C)
@@ -459,9 +379,8 @@ def test_ivn_wvn_orders_aw4():
                     k_start=0, k_end=K,
                 ))
         instructions = encode_program(program)
-        max_k_passes = compute_max_k_passes(instructions, AW, AH)
         mod = build_feather_kstreaming_simulator(
-            M, K, N, AW, AH, int8, len(instructions), max_k_passes,
+            M, K, N, AW, AH, int8, len(instructions),
         )
         C = np.zeros((M, N), dtype=np.int32)
         mod(A, B, instructions, C)
@@ -487,9 +406,8 @@ def test_ivn_wvn_orders_aw4():
                 k_start=0, k_end=K,
             ))
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW, AH)
     mod = build_feather_kstreaming_simulator(
-        M, K, N, AW, AH, int8, len(instructions), max_k_passes,
+        M, K, N, AW, AH, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -530,7 +448,6 @@ def test_sr_zero_output_stationary():
         ))
 
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     np.random.seed(555)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -538,7 +455,6 @@ def test_sr_zero_output_stationary():
 
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        max_k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -608,14 +524,13 @@ def test_multiway_birrd_gr2_aw8_gemm():
             ))
 
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW_8, AH_8)
 
     np.random.seed(808)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
     mod = build_feather_kstreaming_simulator(
-        M, K, N, AW_8, AH_8, int8, len(instructions), max_k_passes,
+        M, K, N, AW_8, AH_8, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -655,14 +570,13 @@ def test_multiway_birrd_gr1_aw8_gemm():
             ))
 
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW_8, AH_8)
 
     np.random.seed(909)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
     mod = build_feather_kstreaming_simulator(
-        M, K, N, AW_8, AH_8, int8, len(instructions), max_k_passes,
+        M, K, N, AW_8, AH_8, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -699,7 +613,6 @@ if __name__ == "__main__":
         test_gr_1_aw4,
         test_gr_2_aw8,
         test_gr_1_aw8,
-        test_mixed_kt_per_pass,
         test_ivn_wvn_orders_aw4,
         test_sr_zero_output_stationary,
         test_multiway_birrd_generation,

@@ -37,7 +37,6 @@ from feather_minisa import (
     build_feather_kstreaming_simulator,
     build_feather_kstreaming_hls,
     get_feather_full_matrix_top_kstreaming,
-    compute_max_k_passes,
 )
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,12 +46,11 @@ def create_passthrough_program(M, N, K, AW, AH):
     """Create GEMM program with Gr=AW (pass-through, no BIRRD reduction).
 
     With Gr=AW, each PE column maps to a distinct M row.
-    Mt=AW, Kt_per_pass=AH (one K-stripe per pass).
+    Mt=AW, Kt=AH (one K-stripe per tile).
     """
     Mt = AW
     Nt = AH
     Kt = AH  # single K-stripe per tile
-    num_k_passes = K // Kt
 
     assert M % Mt == 0, f"M={M} must be divisible by Mt={Mt} for pass-through"
     assert N % Nt == 0, f"N={N} must be divisible by Nt={Nt}"
@@ -76,11 +74,10 @@ def create_passthrough_program(M, N, K, AW, AH):
                     k_start=k_tile * Kt, k_end=(k_tile + 1) * Kt,
                 ))
 
-    return program, num_k_passes, Kt
+    return program
 
 
-def run_gemm_test(name, M, N, K, AW, AH, program=None, max_k_passes=None,
-                  num_k_passes=None, Kt_per_pass=None, seed=42, verbose=True):
+def run_gemm_test(name, M, N, K, AW, AH, program=None, seed=42, verbose=True):
     """Run a single GEMM test through the simulator.
 
     Returns (passed, info_dict).
@@ -89,19 +86,11 @@ def run_gemm_test(name, M, N, K, AW, AH, program=None, max_k_passes=None,
         program = create_gemm_program(M=M, N=N, K=K, AH=AH, AW=AW)
 
     instructions = encode_program(program)
-
-    if max_k_passes is None:
-        if num_k_passes is not None:
-            max_k_passes = num_k_passes
-        else:
-            max_k_passes = compute_max_k_passes(instructions, AW, AH)
-
     num_tiles = len(instructions) - 3
 
     if verbose:
         print(f"  {name}: C[{M},{N}] = A[{M},{K}] x B[{K},{N}]")
-        print(f"    Array: {AH}x{AW}, tiles={num_tiles}, "
-              f"max_k_passes={max_k_passes}")
+        print(f"    Array: {AH}x{AW}, tiles={num_tiles}")
 
     np.random.seed(seed)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
@@ -110,7 +99,6 @@ def run_gemm_test(name, M, N, K, AW, AH, program=None, max_k_passes=None,
     t0 = time.time()
     mod = build_feather_kstreaming_simulator(
         M, K, N, AW, AH, int8, len(instructions),
-        max_k_passes,
     )
     build_time = time.time() - t0
 
@@ -132,19 +120,12 @@ def run_gemm_test(name, M, N, K, AW, AH, program=None, max_k_passes=None,
     }
 
 
-def run_hls_csim_test(name, M, N, K, AW, AH, program=None, max_k_passes=None,
-                      num_k_passes=None, Kt_per_pass=None, seed=42, verbose=True):
+def run_hls_csim_test(name, M, N, K, AW, AH, program=None, seed=42, verbose=True):
     """Run a single GEMM test through HLS C-simulation."""
     if program is None:
         program = create_gemm_program(M=M, N=N, K=K, AH=AH, AW=AW)
 
     instructions = encode_program(program)
-
-    if max_k_passes is None:
-        if num_k_passes is not None:
-            max_k_passes = num_k_passes
-        else:
-            max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     if verbose:
         print(f"  {name}: C[{M},{N}] = A[{M},{K}] x B[{K},{N}] (HLS csim)")
@@ -156,7 +137,6 @@ def run_hls_csim_test(name, M, N, K, AW, AH, program=None, max_k_passes=None,
     project_dir = os.path.join(TESTS_DIR, f"param_{AW}x{AH}_{name}_csim.prj")
     mod = build_feather_kstreaming_hls(
         M, K, N, AW, AH, int8, len(instructions),
-        max_k_passes,
         mode="csim", project=project_dir,
     )
 
@@ -187,14 +167,13 @@ def run_hls_csynth(AW, AH, verbose=True):
 
     program = create_gemm_program(M=M, N=N, K=K, AH=AH, AW=AW)
     instructions = encode_program(program)
-    max_k_passes = compute_max_k_passes(instructions, AW, AH)
 
     if verbose:
         print(f"  CSynth: C[{M},{N}] = A[{M},{K}] x B[{K},{N}] on {AH}x{AW}")
 
     project_dir = os.path.join(TESTS_DIR, f"param_{AW}x{AH}_csynth.prj")
     top = get_feather_full_matrix_top_kstreaming(
-        M, K, N, AW, AH, int8, len(instructions), max_k_passes,
+        M, K, N, AW, AH, int8, len(instructions),
     )
     s = df.customize(top)
     s.partition("full_matrix_top:C", dim=2, factor=AH)

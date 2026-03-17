@@ -1,0 +1,10 @@
+{
+  "type": "minisa_multi_layer",
+  "FEATHER_spec": {"AH": 8, "AW": 8},
+  "layers": [
+    {"M": 8, "K": 16, "N": 8, "iacts_zp": 2, "weights_zp": 1, "quant_scale": 1, "quant_zp": 128},
+    {"M": 8, "K": 8, "N": 8, "gr": 8}
+  ],
+  "seed": 77,
+  "description": "2-layer inference with zero-points on layer 1 (iacts=2, weights=1) and quantization"
+}
