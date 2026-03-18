@@ -72,7 +72,8 @@ def compute_birrd_params(AW: int) -> Tuple[int, int]:
 
 
 def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
-                                            n_inner=1, k_passes=1):
+                                            n_inner=1, k_passes=1,
+                                            Nt_local=None):
     """Create FEATHER+ dataflow region with unified PE array.
 
     Uses dram_loader(mapping=[1]) as sole DRAM reader with on-chip streaming
@@ -104,8 +105,12 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
         k_passes: Number of K-decomposition tiles per output block (default 1).
             Consecutive k_passes tiles share the same (m_start, n_start) and
             are accumulated in a local register buffer before flushing to C.
-            For Figure 7: k_passes=3 (K=12, Kt=4).
+        Nt_local: N-dimension of local accumulation buffer (default AH).
+            Must be >= max N-coverage per tile. For sc>0 mappings (e.g.,
+            Figure 7 with sc=4, Gc=2), Nt_local = sr*(AH-1)+sc*(Gc-1)+1.
     """
+    if Nt_local is None:
+        Nt_local = AH
     TyOut = int32
     LOG2_AW = int(log2(AW))
     LOG2_AH = int(log2(AH))
@@ -332,12 +337,12 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
 
             # Phase 2: Block-level accumulation with local register buffer
             # Each block = k_passes consecutive tiles sharing same (m_start, n_start)
-            local_acc: int32[AW, AH]
+            local_acc: int32[AW, Nt_local]
 
             for block in range(num_blocks):
                 # Zero local_acc
                 for _i0 in range(AW):
-                    for _j0 in range(AH):
+                    for _j0 in range(Nt_local):
                         local_acc[_i0, _j0] = 0
 
                 base_tile: int32 = block * k_passes
@@ -369,15 +374,17 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
                                     + all_tile_out[op_idx, on, col] * col_mask * sr_mask
                                 )
 
-                # Flush to C with optional post-quantization
+                # Flush to C with additive accumulation (supports mixed-Gr tiles)
                 m_start: int32 = local_accum_m_start[base_tile * n_inner]
                 n_start: int32 = local_accum_n_start[base_tile * n_inner]
                 for mi in range(AW):
-                    for ni in range(AH):
+                    for ni in range(Nt_local):
                         val: int32 = local_acc[mi, ni]
                         if quant_scale != 0:
                             val = (val * quant_scale + quant_zp) & 255
-                        local_C[m_start + mi, n_start + ni] = val
+                        local_C[m_start + mi, n_start + ni] = (
+                            local_C[m_start + mi, n_start + ni] + val
+                        )
 
     return full_matrix_top
 
@@ -549,11 +556,11 @@ class FeatherModule:
 
 
 def build_feather_simulator(M, K, N, AW, AH, Ty, num_inst,
-                                        n_inner=1, k_passes=1):
+                                        n_inner=1, k_passes=1, Nt_local=None):
     """Build FEATHER+ dataflow for simulation."""
     top = get_feather_full_matrix_top(
         int(M), int(K), int(N), int(AW), int(AH), Ty, int(num_inst),
-        int(n_inner), int(k_passes),
+        int(n_inner), int(k_passes), Nt_local=Nt_local,
     )
     allo_mod = df.build(top, target="simulator")
     return FeatherModule(allo_mod, AW, n_inner)
@@ -586,13 +593,14 @@ def schedule_feather_hls(s, K, AH, AW):
 
 
 def build_feather_hls(M, K, N, AW, AH, Ty, num_inst,
-                                  mode="csim", project=None, n_inner=1, k_passes=1):
+                                  mode="csim", project=None, n_inner=1,
+                                  k_passes=1, Nt_local=None):
     """Build FEATHER+ dataflow for Vitis HLS."""
     if project is None:
         project = "feather.prj"
     top = get_feather_full_matrix_top(
         int(M), int(K), int(N), int(AW), int(AH), Ty, int(num_inst),
-        int(n_inner), int(k_passes),
+        int(n_inner), int(k_passes), Nt_local=Nt_local,
     )
     s = df.customize(top)
     schedule_feather_hls(s, int(K), int(AH), int(AW))

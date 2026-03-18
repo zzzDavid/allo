@@ -2,26 +2,31 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Test FEATHER+ execution from instruction trace JSON files.
+"""Unified FEATHER+ test runner for instruction trace JSON files.
 
-Parses a trace JSON, generates the MINISA program, builds and runs the
-FEATHER+ dataflow, and verifies correctness against a numpy reference.
+Parses an RTL trace JSON, generates the MINISA program, and runs through
+one of four test modes: functional correctness, HLS csynth, RTL cosim,
+or U280 FPGA deployment.
+
+Traces:
+    instr_trace/figure7_16x12x8_4x4.json   — 4x4 array, mixed Gr (fast)
+    instr_trace/trace_m24k48n512_16x16.json — 16x16 array, full workload
 
 Usage:
-    # Simulator test (default)
-    python tests/test_trace_input.py sample_input/trace_m24k48n512_16x16.json
+    # Functional correctness (reference model, no HLS)
+    python tests/test_trace_input.py instr_trace/figure7_16x12x8_4x4.json
 
     # HLS C-simulation
-    python tests/test_trace_input.py sample_input/trace_m24k48n512_16x16.json --hls csim
+    python tests/test_trace_input.py instr_trace/figure7_16x12x8_4x4.json --hls csim
 
-    # HLS synthesis (cycle count)
-    python tests/test_trace_input.py sample_input/trace_m24k48n512_16x16.json --hls csyn
+    # HLS C-synthesis (cycle count + resource report)
+    python tests/test_trace_input.py instr_trace/figure7_16x12x8_4x4.json --hls csyn
 
-    # HLS co-simulation (accurate cycle count)
-    python tests/test_trace_input.py sample_input/trace_m24k48n512_16x16.json --hls cosim
+    # RTL co-simulation (cycle-accurate)
+    python tests/test_trace_input.py instr_trace/figure7_16x12x8_4x4.json --hls cosim
 
-    # U280 deployment
-    python tests/test_trace_input.py sample_input/trace_m24k48n512_16x16.json --deploy
+    # U280 FPGA deployment
+    python tests/test_trace_input.py instr_trace/figure7_16x12x8_4x4.json --deploy
 """
 
 import argparse
@@ -38,7 +43,7 @@ import numpy as np
 from allo.ir.types import int8
 import allo.dataflow as df
 
-from minisa.trace_parser import load_trace, parse_trace
+from minisa.trace_parser import load_trace
 from feather_minisa import (
     get_feather_full_matrix_top,
     FeatherModule,
@@ -963,82 +968,6 @@ def _run_on_device(trace_info, project_dir, seed=42):
     return exe_time_ns
 
 
-def _run_multi_layer_trace(trace_raw, args):
-    """Execute a multi-layer trace (type=minisa_multi_layer)."""
-    from feather_minisa import run_sequential_gemm_layers
-    from minisa.isa import create_gemm_program, encode_program
-
-    spec = trace_raw["FEATHER_spec"]
-    AH, AW = spec["AH"], spec["AW"]
-    layers = trace_raw["layers"]
-    seed = trace_raw.get("seed", args.seed)
-
-    print(f"\n{'=' * 70}")
-    print(f"MULTI-LAYER TRACE TEST ({len(layers)} layers, {AH}x{AW} array)")
-    print(f"{'=' * 70}")
-
-    for i, layer in enumerate(layers):
-        print(f"  Layer {i+1}: C[{layer['M']},{layer['N']}] = "
-              f"A[{layer['M']},{layer['K']}] x B[{layer['K']},{layer['N']}]"
-              f"  gr={layer.get('gr', AW//2)}"
-              f"  quant={layer.get('quant_scale', 0)},{layer.get('quant_zp', 0)}")
-
-    np.random.seed(seed)
-    A = np.random.randint(-4, 4, size=(layers[0]["M"], layers[0]["K"])).astype(np.int8)
-
-    layer_weights = []
-    layer_kwargs = []
-    current_input = A
-    for i, layer in enumerate(layers):
-        K_i = layer["K"]
-        N_i = layer["N"]
-        B_i = np.random.randint(-4, 4, size=(K_i, N_i)).astype(np.int8)
-        layer_weights.append(B_i)
-
-        kwargs = {
-            "M": layer["M"], "N": N_i, "K": K_i,
-        }
-        for key in ("gr", "ivn_order", "wvn_order", "ovn_order",
-                     "iacts_zp", "weights_zp", "quant_scale", "quant_zp"):
-            if key in layer:
-                kwargs[key] = layer[key]
-        layer_kwargs.append(kwargs)
-
-    # Reference computation
-    ref_outputs = []
-    ref_input = A.copy()
-    for i, (B_i, kwargs) in enumerate(zip(layer_weights, layer_kwargs)):
-        iacts_zp = kwargs.get("iacts_zp", 0)
-        weights_zp = kwargs.get("weights_zp", 0)
-        quant_scale = kwargs.get("quant_scale", 0)
-        quant_zp = kwargs.get("quant_zp", 0)
-
-        C_ref = (ref_input.astype(np.int32) - iacts_zp) @ \
-                (B_i.astype(np.int32) - weights_zp)
-        if quant_scale != 0:
-            C_ref = (C_ref * quant_scale + quant_zp) & 255
-        ref_outputs.append(C_ref)
-        if i < len(layer_weights) - 1:
-            ref_input = C_ref.astype(np.uint8).view(np.int8)
-
-    # Run through Allo
-    outputs = run_sequential_gemm_layers(A, layer_weights, layer_kwargs, AW, AH)
-
-    all_pass = True
-    for i, (C_out, C_ref) in enumerate(zip(outputs, ref_outputs)):
-        passed = np.array_equal(C_out, C_ref)
-        status = "PASS" if passed else "FAIL"
-        print(f"  Layer {i+1}: {status}")
-        if not passed:
-            all_pass = False
-            mismatches = np.sum(C_out != C_ref)
-            print(f"    Mismatches: {mismatches}/{C_out.size}")
-
-    print(f"\n  OVERALL: {'PASS' if all_pass else 'FAIL'}")
-    if not all_pass:
-        sys.exit(1)
-
-
 def main():
     parser = argparse.ArgumentParser(description="FEATHER+ trace-based test")
     parser.add_argument("trace", help="Path to trace JSON file")
@@ -1063,15 +992,6 @@ def main():
 
     print(f"Parsing trace: {trace_path}")
     trace_info = load_trace(trace_path)
-
-    # Handle multi-layer traces separately
-    if isinstance(trace_info, dict) and trace_info.get("type") == "minisa_multi_layer":
-        _run_multi_layer_trace(trace_info, args)
-        return
-
-    # Override seed from trace file if present (CLI arg takes precedence)
-    if args.seed == 42 and "seed" in trace_info:
-        args.seed = trace_info["seed"]
 
     print(f"\n  Trace summary:")
     print(f"    GEMM: C[{trace_info['M']},{trace_info['N']}] = "

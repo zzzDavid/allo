@@ -226,6 +226,9 @@ def test_figure7_functional_gemm():
 
     Runs the complete Allo dataflow hardware with the Figure 7 MINISA program
     (adaptive Gr between tiles) and verifies the result matches numpy reference.
+
+    Uses output-stationary mapping (sr=1, sc=0) with N temporal iteration.
+    24 tiles: 16 Gr=2 (K[0:8]) + 8 Gr=4 (K[8:12]).
     """
     from allo.ir.types import int8
     from minisa.isa import create_figure7_program, encode_program
@@ -274,6 +277,95 @@ def test_figure7_tile2_replication_factor():
         assert len(aw_vals) == 2, f"W_VN{rc}: replicas at same column {pes}"
 
 
+def test_figure7_trace_parser():
+    """Verify that parse_trace() correctly handles the mixed-Gr Figure 7 trace.
+
+    Parses the RTL-format JSON trace with 2 ExecuteMapping instructions
+    (Gr=2 and Gr=4) and verifies the generated MINISA program matches
+    create_figure7_program().
+    """
+    from minisa.trace_parser import load_trace
+    from minisa.isa import create_figure7_program, encode_program
+
+    trace_path = os.path.join(
+        os.path.dirname(__file__), "..", "instr_trace", "figure7_16x12x8_4x4.json"
+    )
+    trace_info = load_trace(trace_path)
+
+    # Verify dimensions
+    assert trace_info["M"] == M
+    assert trace_info["K"] == K
+    assert trace_info["N"] == N
+    assert trace_info["AH"] == AH
+    assert trace_info["AW"] == AW
+
+    # Verify mixed-Gr handling
+    assert trace_info.get("mixed_gr", False), "Should detect mixed Gr"
+    assert trace_info["k_passes"] == 1, "k_passes should be 1 for mixed-Gr"
+    assert trace_info["n_inner"] == 1, "n_inner should be 1 for mixed-Gr"
+
+    # Verify tile count matches create_figure7_program()
+    # 24 tiles: 16 Gr=2 (2 N-passes × 8 M-batches) + 8 Gr=4 (2 × 4)
+    assert trace_info["n_tiles"] == 24, f"Expected 24 tiles, got {trace_info['n_tiles']}"
+
+    # Verify tile decomposition matches create_figure7_program()
+    ref_program = create_figure7_program()
+    ref_instructions = encode_program(ref_program)
+    trace_instructions = trace_info["instructions"]
+
+    assert len(trace_instructions) == len(ref_instructions), (
+        f"Instruction count mismatch: trace={len(trace_instructions)}, "
+        f"ref={len(ref_instructions)}"
+    )
+
+    # Verify each tile's K-range and Gr
+    for t in range(24):
+        trace_tile = trace_instructions[3 + t]
+        ref_tile = ref_instructions[3 + t]
+        # Gr, k_start, k_end must match
+        assert trace_tile[3] == ref_tile[3], (
+            f"Tile {t} Gr mismatch: trace={trace_tile[3]}, ref={ref_tile[3]}"
+        )
+        assert trace_tile[11] == ref_tile[11], (
+            f"Tile {t} k_start mismatch: trace={trace_tile[11]}, ref={ref_tile[11]}"
+        )
+        assert trace_tile[12] == ref_tile[12], (
+            f"Tile {t} k_end mismatch: trace={trace_tile[12]}, ref={ref_tile[12]}"
+        )
+
+
+def test_figure7_trace_functional():
+    """End-to-end GEMM verification using trace-parsed Figure 7 program.
+
+    Parses the trace JSON, builds the simulator with trace-derived parameters,
+    and verifies the result matches numpy reference.
+    """
+    from allo.ir.types import int8
+    from minisa.trace_parser import load_trace
+    from feather_minisa import build_feather_simulator
+
+    trace_path = os.path.join(
+        os.path.dirname(__file__), "..", "instr_trace", "figure7_16x12x8_4x4.json"
+    )
+    trace_info = load_trace(trace_path)
+
+    Nt_local = trace_info.get("Nt_local", AH)
+    instructions = trace_info["instructions"]
+
+    np.random.seed(7)
+    A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
+    B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
+
+    mod = build_feather_simulator(
+        M, K, N, AW, AH, int8, len(instructions), Nt_local=Nt_local,
+    )
+    C = np.zeros((M, N), dtype=np.int32)
+    mod(A, B, instructions, C)
+
+    ref = A.astype(np.int32) @ B.astype(np.int32)
+    np.testing.assert_array_equal(C, ref)
+
+
 if __name__ == "__main__":
     tests = [
         test_figure7_tile1_pe_mapping,
@@ -284,6 +376,8 @@ if __name__ == "__main__":
         test_figure7_no_k_overlap_between_tiles,
         test_figure7_functional_gemm,
         test_figure7_tile2_replication_factor,
+        test_figure7_trace_parser,
+        test_figure7_trace_functional,
     ]
     for t in tests:
         print(f"  {t.__name__} ... ", end="")

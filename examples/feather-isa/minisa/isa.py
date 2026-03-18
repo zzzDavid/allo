@@ -445,18 +445,24 @@ def create_gemm_program(
 def create_figure7_program() -> MINISAProgram:
     """Create the MINISA program for Figure 7: C[16,8] = A[16,12] x B[12,8] on 4x4 NEST.
 
-    Each tile uses Gr=AW=4, Kt=(AW/Gr)*AH=4. K=12 decomposes into 3 K-tiles
-    per (M-block, N-group): K=[0,4), [4,8), [8,12).
-    Total tiles: 2 N-groups x 4 M-blocks x 3 K-tiles = 24 tiles.
+    Implements the paper's Figure 7 adaptive-Gr mapping:
+      EM1: Gr=2 → K[0:8] (2 WVN rows), Kt=(4/2)*4=8, M_batches=8
+      EM2: Gr=4 → K[8:12] (1 WVN row), Kt=(4/4)*4=4, M_batches=4
+
+    Each EM uses output-stationary mapping (sr=1, sc=0, Gc=1) covering
+    Nt=AH=4 N-columns per pass. N=8 requires 2 N-passes per M-batch.
+    Total tiles: (8+4) M-batches × 2 N-passes = 24 tiles.
+
+    The paper's original mapping uses sc=4, Gc=2 (covering all 8 N columns
+    per pass via crossbar reordering), but our direct-B-access architecture
+    uses output-stationary mapping with N temporal iteration instead.
 
     Returns:
-        MINISAProgram with 24 tile mappings (all Gr=4, Kt=4)
+        MINISAProgram with 24 tile mappings (mixed Gr=2 and Gr=4)
     """
     AH, AW = 4, 4
     M, K, N = 16, 12, 8
-    Nt = AH  # N per tile = 4
-    Mt = AW  # M per tile = 4 (Gr=AW, no BIRRD reduction)
-    Kt = AH  # K per tile = (AW/Gr)*AH = 1*4 = 4
+    Nt = AH  # N columns per tile pass
 
     program = MINISAProgram(
         name="figure7",
@@ -467,20 +473,36 @@ def create_figure7_program() -> MINISAProgram:
         ovn_layout=SetOVNLayout(order=0, PL0=AH, PL1=M // AH, QL0=AH, QL1=N // AH),
     )
 
-    for n_tile in range(N // Nt):       # 2 N-groups
-        for m_tile in range(M // Mt):   # 4 M-blocks
-            for k_tile in range(K // Kt):  # 3 K-tiles
-                program.add_mapping(SetMapping(
-                    r0=k_tile,
-                    c0=n_tile * Nt,
-                    Gr=4, Gc=1, sr=1, sc=0,
-                    m_start=m_tile * Mt,
-                    m_end=(m_tile + 1) * Mt,
-                    n_start=n_tile * Nt,
-                    n_end=(n_tile + 1) * Nt,
-                    k_start=k_tile * Kt,
-                    k_end=(k_tile + 1) * Kt,
-                ))
+    # Output-stationary mapping for direct-B-access architecture
+    sr, sc, Gc = 1, 0, 1
+
+    # EM1: Gr=2 — covers K[0:8], 2-way BIRRD reduction
+    Gr1 = 2
+    Kt1 = (AW // Gr1) * AH  # 8
+    for n_pass in range(N // Nt):
+        for m_batch in range(M // Gr1):
+            program.add_mapping(SetMapping(
+                r0=0, c0=n_pass * Nt,
+                Gr=Gr1, Gc=Gc, sr=sr, sc=sc,
+                m_start=m_batch * Gr1,
+                m_end=(m_batch + 1) * Gr1,
+                n_start=n_pass * Nt, n_end=(n_pass + 1) * Nt,
+                k_start=0, k_end=Kt1,
+            ))
+
+    # EM2: Gr=4 — covers K[8:12], passthrough (Gr=AW)
+    Gr2 = 4
+    Kt2 = (AW // Gr2) * AH  # 4
+    for n_pass in range(N // Nt):
+        for m_batch in range(M // Gr2):
+            program.add_mapping(SetMapping(
+                r0=Kt1 // AH, c0=n_pass * Nt,
+                Gr=Gr2, Gc=Gc, sr=sr, sc=sc,
+                m_start=m_batch * Gr2,
+                m_end=(m_batch + 1) * Gr2,
+                n_start=n_pass * Nt, n_end=(n_pass + 1) * Nt,
+                k_start=Kt1, k_end=Kt1 + Kt2,
+            ))
 
     return program
 
