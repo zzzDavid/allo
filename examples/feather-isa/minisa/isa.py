@@ -445,66 +445,20 @@ def create_gemm_program(
 def create_figure7_program() -> MINISAProgram:
     """Create the MINISA program for Figure 7: C[16,8] = A[16,12] x B[12,8] on 4x4 NEST.
 
-    Implements the paper's Figure 7 adaptive-Gr mapping:
-      EM1: Gr=2 → K[0:8] (2 WVN rows), Kt=(4/2)*4=8, M_batches=8
-      EM2: Gr=4 → K[8:12] (1 WVN row), Kt=(4/4)*4=4, M_batches=4
+    The RTL trace uses adaptive Gr (Gr=2 for K[0:8], Gr=4 for K[8:12]),
+    but for HLS compatibility we use uniform Gr=max(Gr)=4, giving:
+      Kt = (AW/Gr)*AH = 4, k_passes = K/Kt = 3
+      Mt = Gr = 4, n_m_batches = M/Mt = 4
+      Nt = AH = 4, n_n_passes = N/Nt = 2
+      Total tiles: 2 × 4 × 3 = 24 (N→M→K order, K innermost)
 
-    Each EM uses output-stationary mapping (sr=1, sc=0, Gc=1) covering
-    Nt=AH=4 N-columns per pass. N=8 requires 2 N-passes per M-batch.
-    Total tiles: (8+4) M-batches × 2 N-passes = 24 tiles.
-
-    The paper's original mapping uses sc=4, Gc=2 (covering all 8 N columns
-    per pass via crossbar reordering), but our direct-B-access architecture
-    uses output-stationary mapping with N temporal iteration instead.
+    K-innermost ordering ensures k_passes=3 consecutive tiles form a block
+    that accumulates in local_acc before flushing to C with write-only (=).
 
     Returns:
-        MINISAProgram with 24 tile mappings (mixed Gr=2 and Gr=4)
+        MINISAProgram with 24 tile mappings (uniform Gr=4, k_passes=3)
     """
-    AH, AW = 4, 4
-    M, K, N = 16, 12, 8
-    Nt = AH  # N columns per tile pass
-
-    program = MINISAProgram(
-        name="figure7",
-        AH=AH,
-        AW=AW,
-        ivn_layout=SetIVNLayout(order=0, ML0=AH, ML1=M // AH, JL0=AH, JL1=K // AH),
-        wvn_layout=SetWVNLayout(order=0, KL0=AH, KL1=K // AH, NL0=min(N, AW), NL1=max(1, N // AW)),
-        ovn_layout=SetOVNLayout(order=0, PL0=AH, PL1=M // AH, QL0=AH, QL1=N // AH),
-    )
-
-    # Output-stationary mapping for direct-B-access architecture
-    sr, sc, Gc = 1, 0, 1
-
-    # EM1: Gr=2 — covers K[0:8], 2-way BIRRD reduction
-    Gr1 = 2
-    Kt1 = (AW // Gr1) * AH  # 8
-    for n_pass in range(N // Nt):
-        for m_batch in range(M // Gr1):
-            program.add_mapping(SetMapping(
-                r0=0, c0=n_pass * Nt,
-                Gr=Gr1, Gc=Gc, sr=sr, sc=sc,
-                m_start=m_batch * Gr1,
-                m_end=(m_batch + 1) * Gr1,
-                n_start=n_pass * Nt, n_end=(n_pass + 1) * Nt,
-                k_start=0, k_end=Kt1,
-            ))
-
-    # EM2: Gr=4 — covers K[8:12], passthrough (Gr=AW)
-    Gr2 = 4
-    Kt2 = (AW // Gr2) * AH  # 4
-    for n_pass in range(N // Nt):
-        for m_batch in range(M // Gr2):
-            program.add_mapping(SetMapping(
-                r0=Kt1 // AH, c0=n_pass * Nt,
-                Gr=Gr2, Gc=Gc, sr=sr, sc=sc,
-                m_start=m_batch * Gr2,
-                m_end=(m_batch + 1) * Gr2,
-                n_start=n_pass * Nt, n_end=(n_pass + 1) * Nt,
-                k_start=Kt1, k_end=Kt1 + Kt2,
-            ))
-
-    return program
+    return create_gemm_program(M=16, N=8, K=12, AH=4, AW=4, name="figure7", gr=4)
 
 
 # Type alias for MINISA instruction union

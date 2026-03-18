@@ -225,10 +225,9 @@ def test_figure7_functional_gemm():
     """End-to-end GEMM verification using Figure 7 mapping through Allo FEATHER+.
 
     Runs the complete Allo dataflow hardware with the Figure 7 MINISA program
-    (adaptive Gr between tiles) and verifies the result matches numpy reference.
+    (uniform Gr=4, k_passes=3) and verifies the result matches numpy reference.
 
-    Uses output-stationary mapping (sr=1, sc=0) with N temporal iteration.
-    24 tiles: 16 Gr=2 (K[0:8]) + 8 Gr=4 (K[8:12]).
+    24 tiles: 2 N-passes × 4 M-batches × 3 K-passes, all Gr=4.
     """
     from allo.ir.types import int8
     from minisa.isa import create_figure7_program, encode_program
@@ -237,12 +236,15 @@ def test_figure7_functional_gemm():
     program = create_figure7_program()
     instructions = encode_program(program)
 
+    # k_passes = K / Kt where Kt = (AW/Gr)*AH = 4
+    k_passes = K // ((AW // 4) * AH)  # 3
+
     np.random.seed(7)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
     mod = build_feather_simulator(
-        M, K, N, AW, AH, int8, len(instructions),
+        M, K, N, AW, AH, int8, len(instructions), k_passes=k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)
@@ -299,13 +301,13 @@ def test_figure7_trace_parser():
     assert trace_info["AH"] == AH
     assert trace_info["AW"] == AW
 
-    # Verify mixed-Gr handling
+    # Verify mixed-Gr handling (converted to uniform max-Gr)
     assert trace_info.get("mixed_gr", False), "Should detect mixed Gr"
-    assert trace_info["k_passes"] == 1, "k_passes should be 1 for mixed-Gr"
+    assert trace_info["k_passes"] == 3, "k_passes should be 3 (K=12 / Kt=4)"
     assert trace_info["n_inner"] == 1, "n_inner should be 1 for mixed-Gr"
+    assert trace_info["Gr"] == 4, "Should use uniform Gr=max(Gr)=4"
 
-    # Verify tile count matches create_figure7_program()
-    # 24 tiles: 16 Gr=2 (2 N-passes × 8 M-batches) + 8 Gr=4 (2 × 4)
+    # Verify tile count: 2 N-passes × 4 M-batches × 3 K-passes = 24 tiles
     assert trace_info["n_tiles"] == 24, f"Expected 24 tiles, got {trace_info['n_tiles']}"
 
     # Verify tile decomposition matches create_figure7_program()
@@ -349,15 +351,15 @@ def test_figure7_trace_functional():
     )
     trace_info = load_trace(trace_path)
 
-    Nt_local = trace_info.get("Nt_local", AH)
     instructions = trace_info["instructions"]
+    k_passes = trace_info.get("k_passes", 1)
 
     np.random.seed(7)
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
     mod = build_feather_simulator(
-        M, K, N, AW, AH, int8, len(instructions), Nt_local=Nt_local,
+        M, K, N, AW, AH, int8, len(instructions), k_passes=k_passes,
     )
     C = np.zeros((M, N), dtype=np.int32)
     mod(A, B, instructions, C)

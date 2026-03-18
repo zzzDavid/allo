@@ -228,36 +228,31 @@ def parse_trace(trace_path: str) -> Dict[str, Any]:
         }
 
     else:
-        # === MIXED Gr: EMs have different mapping parameters ===
-        # Each EM covers a different K-slice with its own Gr.
-        # The paper's sc/Gc mapping requires VN buffer support for temporal
-        # N-column swapping. Our direct-B-access architecture uses output-
-        # stationary mapping (sr=1, sc=0, Gc=1) with N temporal iteration.
-        # Generate one tile per (M-batch, N-pass, EM) with k_passes=1.
+        # === MIXED Gr: use uniform max-Gr for HLS compatibility ===
+        # Mixed-Gr tiles require += on C (read-modify-write), which violates
+        # HLS single-writer constraint. Instead, use Gr=max(all Gr) uniformly
+        # with k_passes = K / ((AW/Gr)*AH). All K contributions accumulate
+        # in local_acc before flushing with write-only (=).
+        Gr = max(em["G_r"] for em in ems)
+        Gc, sr, sc = 1, 1, 0  # output-stationary
 
-        # M padding: use the smallest Gr (most restrictive for M divisibility)
-        min_Gr = min(em["G_r"] for em in ems)
-        M_padded = M if M % min_Gr == 0 else ((M // min_Gr) + 1) * min_Gr
-
-        # Build per-EM K ranges
-        k_offset = 0
-        em_k_ranges = []
-        for em in ems:
-            Gr_em = em["G_r"]
-            Kt_em = (AW // Gr_em) * AH
-            em_k_ranges.append((k_offset, k_offset + Kt_em, Gr_em))
-            k_offset += Kt_em
-        assert k_offset == K, (
-            f"EM K-ranges sum to {k_offset}, expected K={K}"
+        # Verify K-tileability with uniform Gr
+        Kt_per_pass = (AW // Gr) * AH
+        assert K % Kt_per_pass == 0, (
+            f"K={K} must be divisible by Kt_per_pass={Kt_per_pass} "
+            f"(AW={AW}, Gr={Gr}, AH={AH})"
         )
+        k_passes = K // Kt_per_pass
 
-        # Output-stationary: Nt_local = AH, N-passes needed for N > AH
-        Nt_isa = AH  # N columns per tile in output-stationary mapping
-        n_n_passes = max(1, N // Nt_isa)
+        # M padding
+        Mt = Gr
+        M_padded = M if M % Mt == 0 else ((M // Mt) + 1) * Mt
+        n_m_batches = M_padded // Mt
+
+        # N-dimension tiling
+        Nt_isa = AH
+        n_n_passes = N // Nt_isa
         assert N % Nt_isa == 0, f"N={N} must be divisible by Nt_isa={Nt_isa}"
-
-        # Total tiles and M-batches (first EM's for reporting)
-        n_m_batches_first = M_padded // em_k_ranges[0][2]
 
         # Create MINISA program
         program = MINISAProgram(
@@ -287,25 +282,25 @@ def parse_trace(trace_path: str) -> Dict[str, Any]:
             ),
         )
 
-        # Generate tiles with output-stationary mapping (sr=1, sc=0, Gc=1).
-        # Ordered by EM → N-pass → M-batch.
-        for k_start, k_end, Gr_em in em_k_ranges:
-            n_m = M_padded // Gr_em
-            for n_pass in range(n_n_passes):
-                for m_batch in range(n_m):
+        # Generate tiles: N→M→K order (K innermost for block accumulation).
+        # k_passes consecutive tiles share the same (m,n) region and
+        # accumulate in local_acc before flushing to C.
+        for n_pass in range(n_n_passes):
+            for m_batch in range(n_m_batches):
+                for k_tile in range(k_passes):
                     program.add_mapping(SetMapping(
-                        r0=k_start // AH,
+                        r0=k_tile * Kt_per_pass // AH,
                         c0=n_pass * Nt_isa,
-                        Gr=Gr_em,
+                        Gr=Gr,
                         Gc=1,
                         sr=1,
                         sc=0,
-                        m_start=m_batch * Gr_em,
-                        m_end=min((m_batch + 1) * Gr_em, M_padded),
+                        m_start=m_batch * Mt,
+                        m_end=min((m_batch + 1) * Mt, M_padded),
                         n_start=n_pass * Nt_isa,
                         n_end=(n_pass + 1) * Nt_isa,
-                        k_start=k_start,
-                        k_end=k_end,
+                        k_start=k_tile * Kt_per_pass,
+                        k_end=(k_tile + 1) * Kt_per_pass,
                     ))
 
         instructions = encode_program(program)
@@ -320,17 +315,17 @@ def parse_trace(trace_path: str) -> Dict[str, Any]:
             "program": program,
             "instructions": instructions,
             "rtl_latency": rtl_latency,
-            "Gr": Gr_first,
+            "Gr": Gr,
             "Gc": 1,
             "sr": 1,
             "sc": 0,
             "Nt": Nt_isa,
-            "n_spatial_tiles": n_spatial_tiles,
-            "n_m_batches": n_m_batches_first,
+            "n_spatial_tiles": n_n_passes,
+            "n_m_batches": n_m_batches,
             "n_sub_tiles": 1,
             "n_inner": 1,
             "n_tiles": program.num_tiles(),
-            "k_passes": 1,
+            "k_passes": k_passes,
             "mixed_gr": True,
             "utilization": search.get("utilization", None),
         }

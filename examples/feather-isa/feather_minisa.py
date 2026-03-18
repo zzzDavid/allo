@@ -374,7 +374,7 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
                                     + all_tile_out[op_idx, on, col] * col_mask * sr_mask
                                 )
 
-                # Flush to C with additive accumulation (supports mixed-Gr tiles)
+                # Flush to C (write-only — all K contributions accumulated in local_acc)
                 m_start: int32 = local_accum_m_start[base_tile * n_inner]
                 n_start: int32 = local_accum_n_start[base_tile * n_inner]
                 for mi in range(AW):
@@ -382,9 +382,7 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
                         val: int32 = local_acc[mi, ni]
                         if quant_scale != 0:
                             val = (val * quant_scale + quant_zp) & 255
-                        local_C[m_start + mi, n_start + ni] = (
-                            local_C[m_start + mi, n_start + ni] + val
-                        )
+                        local_C[m_start + mi, n_start + ni] = val
 
     return full_matrix_top
 

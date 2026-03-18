@@ -183,13 +183,14 @@ def run_hls_test(trace_info, mode="csim", seed=42):
     project_dir = os.path.join(TESTS_DIR, f"{trace_name}_{mode}.prj")
 
     n_inner = trace_info.get('n_inner', 1)
+    k_passes = trace_info.get('k_passes', 1)
 
     print(f"  Building HLS project ({mode})...")
     top = get_feather_full_matrix_top(
-        M_padded, K, N, AW, AH, int8, len(instructions), n_inner,
+        M_padded, K, N, AW, AH, int8, len(instructions), n_inner, k_passes,
     )
     s = df.customize(top)
-    schedule_feather_hls(s, K, AH)
+    schedule_feather_hls(s, K, AH, AW)
     hls_mod = s.build(target="vitis_hls", mode=mode, project=project_dir)
     allo_mod = FeatherModule(hls_mod, AW, n_inner)
 
@@ -568,14 +569,15 @@ def _run_cosim(trace_info, project_dir, seed=42):
     instructions = trace_info["instructions"]
 
     n_inner = trace_info.get('n_inner', 1)
+    k_passes = trace_info.get('k_passes', 1)
 
     # Step 1: Build csyn project to get kernel.cpp
     print(f"  Step 1: Generating HLS project (csyn)...")
     top = get_feather_full_matrix_top(
-        M_padded, K, N, AW, AH, int8, len(instructions), n_inner,
+        M_padded, K, N, AW, AH, int8, len(instructions), n_inner, k_passes,
     )
     s = df.customize(top)
-    schedule_feather_hls(s, K, AH)
+    schedule_feather_hls(s, K, AH, AW)
     hls_mod = s.build(target="vitis_hls", mode="csyn", project=project_dir)
 
     # Patch wide ap_uint
@@ -675,7 +677,7 @@ def run_deploy(trace_info, seed=42):
         M_padded, K, N, AW, AH, int8, len(instructions), n_inner,
     )
     s = df.customize(top)
-    schedule_feather_hls(s, K, AH)
+    schedule_feather_hls(s, K, AH, AW)
     hls_mod = s.build(target="vitis_hls", mode="hw", project=project_dir)
 
     # Patch for wide ap_uint
