@@ -312,9 +312,9 @@ class Schedule:
             for item in self.partitioned_arrays[target_key]:
                 if item[0] == Partition.Complete and item[1] == 0:
                     return  # Already completely partitioned
-                raise AlloValueError(
-                    f"Cannot partition the same array twice: {target_key}"
-                )
+                # raise AlloValueError(
+                #     f"Cannot partition the same array twice: {target_key}"
+                # )
 
         # Collect all buffers that need partitioning via propagation
         buffers_to_partition = self._collect_partition_targets(target)

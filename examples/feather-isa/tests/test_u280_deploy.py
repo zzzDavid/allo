@@ -36,8 +36,8 @@ import allo.dataflow as df
 
 from minisa.isa import create_figure7_program, encode_program
 from feather_minisa import (
-    get_feather_full_matrix_top_kstreaming,
-    FeatherKStreamingModule,
+    get_feather_full_matrix_top,
+    FeatherModule,
     compute_birrd_params,
 )
 
@@ -64,7 +64,7 @@ def generate_hw_project():
     print(f"  Project: {PROJECT_DIR}")
 
     # Build with mode="hw" — generates kernel.cpp, host.cpp, Makefile
-    top = get_feather_full_matrix_top_kstreaming(
+    top = get_feather_full_matrix_top(
         M, K, N, AW, AH, int8, num_inst,
     )
     s = df.customize(top)
@@ -103,7 +103,7 @@ def write_input_data():
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
     C_ref = A.astype(np.int32) @ B.astype(np.int32)
 
-    # Compute BIRRD tables (same as FeatherKStreamingModule.__call__)
+    # Compute BIRRD tables (same as FeatherModule.__call__)
     ovn_order = int(instructions[2, 1])
     ovn = SetOVNLayout(order=ovn_order, PL0=AW, PL1=1, QL0=AW, QL1=1)
     birrd_table = lower_ovn_layout(ovn, AW, AW)

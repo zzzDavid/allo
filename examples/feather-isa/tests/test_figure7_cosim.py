@@ -24,8 +24,8 @@ import allo.dataflow as df
 
 from minisa.isa import create_figure7_program, encode_program
 from feather_minisa import (
-    get_feather_full_matrix_top_kstreaming,
-    FeatherKStreamingModule,
+    get_feather_full_matrix_top,
+    FeatherModule,
     compute_birrd_params,
 )
 
@@ -54,7 +54,7 @@ def generate_cosim_testbench(project_dir, A, B, instructions, C_ref):
     num_tiles = num_inst - 3
     P0, P1 = compute_birrd_params(AW)
 
-    # Compute BIRRD configs (same logic as FeatherKStreamingModule.__call__)
+    # Compute BIRRD configs (same logic as FeatherModule.__call__)
     ovn_order = int(instructions[2, 1])
 
     ovn = SetOVNLayout(order=ovn_order, PL0=AW, PL1=1, QL0=AW, QL1=1)
@@ -254,7 +254,7 @@ def run_figure7_cosim():
 
     # Build HLS project (generates kernel.cpp, kernel.h)
     project_dir = os.path.join(TESTS_DIR, "figure7_cosim.prj")
-    top = get_feather_full_matrix_top_kstreaming(
+    top = get_feather_full_matrix_top(
         M, K, N, AW, AH, int8, num_inst,
     )
     s = df.customize(top)

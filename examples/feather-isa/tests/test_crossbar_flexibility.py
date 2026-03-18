@@ -33,7 +33,7 @@ from minisa.isa import (
     create_figure7_program,
     encode_program,
 )
-from feather_minisa import build_feather_kstreaming_simulator
+from feather_minisa import build_feather_simulator
 
 
 # Hardware parameters for 4x4 NEST
@@ -55,7 +55,7 @@ def test_gr_equals_aw():
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW, AH, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
@@ -105,7 +105,7 @@ def test_gr_half_aw():
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW, AH, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
@@ -161,7 +161,7 @@ def test_mixed_gr_tiles():
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW, AH, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
@@ -208,7 +208,7 @@ def test_gr_1_aw4():
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW, AH, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
@@ -256,7 +256,7 @@ def test_gr_2_aw8():
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW_8, AH_8, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
@@ -304,7 +304,7 @@ def test_gr_1_aw8():
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW_8, AH_8, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
@@ -351,7 +351,7 @@ def test_ivn_wvn_orders_aw4():
                     k_start=0, k_end=K,
                 ))
         instructions = encode_program(program)
-        mod = build_feather_kstreaming_simulator(
+        mod = build_feather_simulator(
             M, K, N, AW, AH, int8, len(instructions),
         )
         C = np.zeros((M, N), dtype=np.int32)
@@ -379,7 +379,7 @@ def test_ivn_wvn_orders_aw4():
                     k_start=0, k_end=K,
                 ))
         instructions = encode_program(program)
-        mod = build_feather_kstreaming_simulator(
+        mod = build_feather_simulator(
             M, K, N, AW, AH, int8, len(instructions),
         )
         C = np.zeros((M, N), dtype=np.int32)
@@ -406,7 +406,7 @@ def test_ivn_wvn_orders_aw4():
                 k_start=0, k_end=K,
             ))
     instructions = encode_program(program)
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW, AH, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
@@ -453,7 +453,7 @@ def test_sr_zero_output_stationary():
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW, AH, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
@@ -529,7 +529,7 @@ def test_multiway_birrd_gr2_aw8_gemm():
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW_8, AH_8, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
@@ -575,7 +575,7 @@ def test_multiway_birrd_gr1_aw8_gemm():
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW_8, AH_8, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)

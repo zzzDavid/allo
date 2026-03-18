@@ -62,11 +62,11 @@ python tests/test_figure7_cosim.py       # RTL cosim cycle count
 
 ## Key Design Decisions
 
-- `dram_loader` (mapping=[1]) is the sole reader of A_pe, B_pe, inst_pe. Per-column
-  streaming buffer (iacts_buf[AH]) and stationary buffer (weight_buf[AH,AH]) are loaded
-  per tile, then streamed to PEs via meta_for(AW) × meta_for(AH). A and B passed as int32
-  (int8 causes LLVM crashes in spatial kernels); `FeatherKStreamingModule.__call__()`
-  converts via `.astype(np.int32)`.
+- `dram_loader` (mapping=[1]) is the sole reader of A_pe, B_pe, inst_pe, loader_m_start,
+  loader_n_start. Per-column streaming buffer (iacts_buf[AH]) and stationary buffer
+  (weight_buf[AH,AH]) are loaded per sub-operation, then streamed to PEs via
+  meta_for(AW) × meta_for(AH). A and B passed as int32 (int8 causes LLVM crashes in
+  spatial kernels); `FeatherKStreamingModule.__call__()` converts via `.astype(np.int32)`.
 - `pe_array` (mapping=[AH+1, AW]) is stream-only (no DRAM args). Rows 0..AH-1 = AH*AW
   compute PEs (each doing 1 MAC/cycle). Row AH = AW gather instances. Uses `meta_if` on
   `get_pid()` for row specialization. Parallelism is structural (guaranteed by construction).
@@ -74,6 +74,10 @@ python tests/test_figure7_cosim.py       # RTL cosim cycle count
   and puts result on pe_out[ni,nj]. The multiply maps to 3 DSP48E2 slices.
 - 5 dataflow kernels: dram_loader(1) → pe_array[AH+1,AW] → BIRRD[P0,P1] → output_accum,
   plus inst_rw. Each DRAM buffer has exactly one reader kernel (HLS single-reader compliance).
+  13 DRAM args total: A_pe, B_pe, inst_pe, loader_m_start, loader_n_start (dram_loader);
+  birrd_inst (inst_rw); output_col_map, output_num_m, output_n_base, accum_m_start,
+  accum_n_start, accum_params, C (output_accum). loader_m/n and accum_m/n are separate
+  copies of the same per-op data (single-reader compliance).
 - Row AH (gather): each column instance reads AH PE outputs via meta_for(AH) into
   local buf[AH], then writes sequentially to connection[0, nj]. AW-way parallel (no
   single-instance bottleneck).
@@ -97,6 +101,15 @@ python tests/test_figure7_cosim.py       # RTL cosim cycle count
 - Each tile processes exactly one K-slice (k_start to k_end). The ISA decomposes K
   at the tile level — there is no multi-pass K accumulation within a tile.
   Kt = (AW/Gr)*AH elements per tile. K > Kt is handled by multiple tiles.
+- Temporal N-iteration and M-batching (n_inner > 1): matches RTL's VN temporal iteration
+  where each ExecuteMapping covers all M-batches and N-sub-tiles internally. Instead of
+  creating n_spatial * n_m_batches * n_sub_tiles separate ISA tiles, these are folded into
+  n_inner sub-operations per tile. Only K-decomposition creates separate tiles.
+  Per-sub-op m_start/n_start stored in DRAM lookup tables (loader_m_start, loader_n_start
+  for dram_loader; accum_m_start, accum_n_start for output_accum). PE/gather/BIRRD loop
+  over total_ops = num_tiles * n_inner (transparent to tile/inner boundary). inst_rw repeats
+  each tile's BIRRD instruction n_inner times. For RTL trace M=24,K=48,N=512 on 16x16:
+  192 tiles → 3 tiles × 64 inner iterations (same 192 total ops, ~3K target cycles vs 946K).
 - output_accum reads quant params and per-tile sr from `accum_params` DRAM array:
   `[quant_scale, quant_zp, sr[0], sr[1], ...]`. This replaced the old stream-based
   parameter scatter (crossbar_load → accum_param_stream) to maintain one-reader-per-DRAM
@@ -134,4 +147,6 @@ python tests/test_figure7_cosim.py       # RTL cosim cycle count
   (2) type="minisa" — simple GEMM params, maps to create_gemm_program();
   (3) type="minisa_manual" — explicit tile specifications (mixed Gr, sr=0);
   (4) type="minisa_multi_layer" — sequential GEMM layers with int8 intermediates.
-  RTL trace N-decomposition: Nt into n_sub_tiles = Nt/AH sub-tiles of AH columns with sc=0.
+  RTL trace: K-only tile decomposition (k_passes tiles) with temporal M/N folded into
+  n_inner = n_spatial_tiles * n_m_batches * n_sub_tiles sub-operations per tile.
+  Returns inner_m_starts/inner_n_starts arrays for per-sub-op DRAM lookup tables.

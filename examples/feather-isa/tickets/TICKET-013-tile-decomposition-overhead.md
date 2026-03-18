@@ -1,6 +1,34 @@
 # TICKET-013: Excessive tile decomposition — 192 tiles instead of 3
 
-## Status: OPEN
+## Status: RESOLVED
+
+## Resolution
+
+Implemented Option A — inner N-loop and M-batching inside the tile. Key changes:
+
+1. **feather_minisa.py**: Added `n_inner` parameter to `get_feather_full_matrix_top_kstreaming()`.
+   When n_inner > 1, each ISA tile contains n_inner sub-operations with different
+   (m_start, n_start) stored in DRAM lookup tables (loader_m_start, loader_n_start for
+   dram_loader; accum_m_start, accum_n_start for output_accum — separate buffers for
+   HLS single-reader compliance). All 5 kernels updated:
+   - dram_loader: outer tile loop + inner n_inner loop, reads per-op m/n from DRAM
+   - pe_array: loop bound = total_ops (num_tiles * n_inner), transparent to inner structure
+   - inst_rw: repeats each tile's BIRRD instruction n_inner times
+   - BIRRD: loop bound = total_ops, same switch config per tile's sub-operations
+   - output_accum: outer tile loop + inner n_inner loop, per-tile col_map/num_m/n_base
+
+2. **trace_parser.py**: `parse_trace()` now produces only k_passes tiles (3 for this
+   workload) instead of 192. Temporal M/N iteration is folded into n_inner = n_spatial_tiles
+   * n_m_batches * n_sub_tiles = 64. Each tile's instruction covers the full M and N range
+   (for the reference test's block-GEMM). Per-op lookup tables generated for m_start/n_start.
+
+3. **test_trace_input.py**: Updated HLS build paths, cosim testbench, and deploy data
+   generation to pass n_inner and inner_params through.
+
+Backward compatible: n_inner defaults to 1. All existing tests (create_gemm_program,
+parse_minisa_trace, parse_manual_trace, Figure 7, crossbar flexibility) unchanged.
+
+Result: 192 tiles → 3 tiles with 64 inner iterations each (same 192 total compute ops)
 
 ## Problem
 

@@ -29,10 +29,10 @@ from minisa.isa import (
     INST_TYPE_OVN,
     INST_TYPE_MAPPING,
 )
-from feather_minisa import build_feather_kstreaming_simulator
+from feather_minisa import build_feather_simulator
 
 
-def run_kstreaming_gemm(M, N, K, AW, AH, verbose=False, dataflow="output_stationary"):
+def run_gemm(M, N, K, AW, AH, verbose=False, dataflow="output_stationary"):
     """Run GEMM through K-streaming FEATHER+ and compare against numpy.
 
     Args:
@@ -58,7 +58,7 @@ def run_kstreaming_gemm(M, N, K, AW, AH, verbose=False, dataflow="output_station
     A = np.random.randint(-4, 4, size=(M, K)).astype(np.int8)
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW, AH, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
@@ -75,7 +75,7 @@ def test_full_matrix_gemm_8x8x16():
     print("Test: Full-Matrix GEMM 8x8x16")
     print("=" * 60)
 
-    C, ref, passed = run_kstreaming_gemm(
+    C, ref, passed = run_gemm(
         M=8, N=8, K=16, AW=8, AH=8, verbose=True
     )
 
@@ -93,7 +93,7 @@ def test_full_matrix_gemm_16x8x32():
     print("Test: Full-Matrix GEMM 16x8x32")
     print("=" * 60)
 
-    C, ref, passed = run_kstreaming_gemm(
+    C, ref, passed = run_gemm(
         M=16, N=8, K=32, AW=8, AH=8, verbose=True
     )
 
@@ -108,7 +108,7 @@ def test_full_matrix_gemm_16x16x32():
     print("Test: Full-Matrix GEMM 16x16x32")
     print("=" * 60)
 
-    C, ref, passed = run_kstreaming_gemm(
+    C, ref, passed = run_gemm(
         M=16, N=16, K=32, AW=8, AH=8, verbose=True
     )
 
@@ -172,7 +172,7 @@ def test_full_matrix_single_invocation():
     print(f"Full-matrix model uses 1 Allo invocation")
 
     # Execute and verify correctness with single call
-    C, ref, passed = run_kstreaming_gemm(
+    C, ref, passed = run_gemm(
         M=M, N=N, K=K, AW=AW, AH=AH, verbose=True
     )
 
@@ -293,7 +293,7 @@ def test_ovn_order_all_correct():
             M=M, N=N, K=K, AH=AH, AW=AW, ovn_order=ovn_order,
         )
         instructions = encode_program(program)
-        mod = build_feather_kstreaming_simulator(
+        mod = build_feather_simulator(
             M, K, N, AW, AH, int8, len(instructions),
         )
         C = np.zeros((M, N), dtype=np.int32)
@@ -332,7 +332,7 @@ def test_ivn_order_all_correct():
         assert instructions[0, 1] == ivn_order, \
             f"IVN order {ivn_order} not encoded at instructions[0,1]"
 
-        mod = build_feather_kstreaming_simulator(
+        mod = build_feather_simulator(
             M, K, N, AW, AH, int8, len(instructions),
         )
         C = np.zeros((M, N), dtype=np.int32)
@@ -370,7 +370,7 @@ def test_wvn_order_all_correct():
         assert instructions[1, 1] == wvn_order, \
             f"WVN order {wvn_order} not encoded at instructions[1,1]"
 
-        mod = build_feather_kstreaming_simulator(
+        mod = build_feather_simulator(
             M, K, N, AW, AH, int8, len(instructions),
         )
         C = np.zeros((M, N), dtype=np.int32)
@@ -413,7 +413,7 @@ def test_mixed_layout_orders():
             ivn_order=ivn_ord, wvn_order=wvn_ord, ovn_order=ovn_ord,
         )
         instructions = encode_program(program)
-        mod = build_feather_kstreaming_simulator(
+        mod = build_feather_simulator(
             M, K, N, AW, AH, int8, len(instructions),
         )
         C = np.zeros((M, N), dtype=np.int32)
@@ -524,7 +524,7 @@ def test_zero_point_subtraction():
         assert instructions[1, 6] == weights_zp, \
             f"weights_zp={weights_zp} not encoded at instructions[1,6]"
 
-        mod = build_feather_kstreaming_simulator(
+        mod = build_feather_simulator(
             M, K, N, AW, AH, int8, len(instructions),
         )
         C = np.zeros((M, N), dtype=np.int32)
@@ -565,7 +565,7 @@ def test_zero_point_aw4():
         iacts_zp=iacts_zp, weights_zp=weights_zp,
     )
     instructions = encode_program(program)
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW, AH, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)
@@ -619,7 +619,7 @@ def test_post_quantization():
         assert instructions[2, 7] == quant_zp, \
             f"quant_zp={quant_zp} not encoded at instructions[2,7]"
 
-        mod = build_feather_kstreaming_simulator(
+        mod = build_feather_simulator(
             M, K, N, AW, AH, int8, len(instructions),
         )
         C = np.zeros((M, N), dtype=np.int32)
@@ -665,7 +665,7 @@ def test_post_quantization_aw4():
         quant_scale=quant_scale, quant_zp=quant_zp,
     )
     instructions = encode_program(program)
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW, AH, int8, len(instructions),
     )
     C = np.zeros((M, N), dtype=np.int32)

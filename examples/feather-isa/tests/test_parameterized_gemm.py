@@ -34,9 +34,9 @@ from minisa.isa import (
     SetMapping,
 )
 from feather_minisa import (
-    build_feather_kstreaming_simulator,
-    build_feather_kstreaming_hls,
-    get_feather_full_matrix_top_kstreaming,
+    build_feather_simulator,
+    build_feather_hls,
+    get_feather_full_matrix_top,
 )
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -97,7 +97,7 @@ def run_gemm_test(name, M, N, K, AW, AH, program=None, seed=42, verbose=True):
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
     t0 = time.time()
-    mod = build_feather_kstreaming_simulator(
+    mod = build_feather_simulator(
         M, K, N, AW, AH, int8, len(instructions),
     )
     build_time = time.time() - t0
@@ -135,7 +135,7 @@ def run_hls_csim_test(name, M, N, K, AW, AH, program=None, seed=42, verbose=True
     B = np.random.randint(-4, 4, size=(K, N)).astype(np.int8)
 
     project_dir = os.path.join(TESTS_DIR, f"param_{AW}x{AH}_{name}_csim.prj")
-    mod = build_feather_kstreaming_hls(
+    mod = build_feather_hls(
         M, K, N, AW, AH, int8, len(instructions),
         mode="csim", project=project_dir,
     )
@@ -172,7 +172,7 @@ def run_hls_csynth(AW, AH, verbose=True):
         print(f"  CSynth: C[{M},{N}] = A[{M},{K}] x B[{K},{N}] on {AH}x{AW}")
 
     project_dir = os.path.join(TESTS_DIR, f"param_{AW}x{AH}_csynth.prj")
-    top = get_feather_full_matrix_top_kstreaming(
+    top = get_feather_full_matrix_top(
         M, K, N, AW, AH, int8, len(instructions),
     )
     s = df.customize(top)

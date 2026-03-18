@@ -40,8 +40,8 @@ import allo.dataflow as df
 
 from minisa.trace_parser import load_trace, parse_trace
 from feather_minisa import (
-    get_feather_full_matrix_top_kstreaming,
-    FeatherKStreamingModule,
+    get_feather_full_matrix_top,
+    FeatherModule,
     compute_birrd_params,
     schedule_feather_hls,
 )
@@ -97,9 +97,11 @@ def run_reference_test(trace_info, seed=42):
     print(f"  Mapping: Gr={trace_info['Gr']}, Gc={trace_info['Gc']}, "
           f"sr={trace_info['sr']}, sc={trace_info['sc']}")
     n_sub = trace_info.get('n_sub_tiles', 1)
+    n_inner = trace_info.get('n_inner', 1)
     print(f"  Tiles: {num_tiles} "
           f"({trace_info['n_m_batches']}M x {trace_info['n_spatial_tiles']}N"
-          f"{f' x {n_sub}sub' if n_sub > 1 else ''})")
+          f"{f' x {n_sub}sub' if n_sub > 1 else ''}"
+          f"{f', n_inner={n_inner}' if n_inner > 1 else ''})")
     if M_padded != M:
         print(f"  M padded: {M} -> {M_padded} (next multiple of Gr={trace_info['Gr']})")
 
@@ -175,14 +177,16 @@ def run_hls_test(trace_info, mode="csim", seed=42):
 
     project_dir = os.path.join(TESTS_DIR, f"{trace_name}_{mode}.prj")
 
+    n_inner = trace_info.get('n_inner', 1)
+
     print(f"  Building HLS project ({mode})...")
-    top = get_feather_full_matrix_top_kstreaming(
-        M_padded, K, N, AW, AH, int8, len(instructions),
+    top = get_feather_full_matrix_top(
+        M_padded, K, N, AW, AH, int8, len(instructions), n_inner,
     )
     s = df.customize(top)
     schedule_feather_hls(s, K, AH)
     hls_mod = s.build(target="vitis_hls", mode=mode, project=project_dir)
-    allo_mod = FeatherKStreamingModule(hls_mod, AW)
+    allo_mod = FeatherModule(hls_mod, AW, n_inner)
 
     # Patch for wide ap_uint (16x16 array → UInt(2048))
     patch_kernel_for_wide_apint(project_dir, AW * AH * int8.bits)
@@ -200,7 +204,13 @@ def run_hls_test(trace_info, mode="csim", seed=42):
             A = A_orig
 
         C_padded = np.zeros((M_padded, N), dtype=np.int32)
-        allo_mod(A, B, instructions, C_padded)
+        inner_params = None
+        if 'inner_m_starts' in trace_info:
+            inner_params = {
+                'm_starts': trace_info['inner_m_starts'],
+                'n_starts': trace_info['inner_n_starts'],
+            }
+        allo_mod(A, B, instructions, C_padded, inner_params=inner_params)
         C = C_padded[:M, :]
 
         passed = np.array_equal(C, C_ref)
@@ -247,6 +257,8 @@ def _patch_maxi_depths(project_dir, trace_info):
     num_inst = len(trace_info["instructions"])
     num_tiles = trace_info["n_tiles"]
     AW = trace_info["AW"]
+    n_inner = trace_info.get("n_inner", 1)
+    total_ops = num_tiles * n_inner
     P0, P1 = compute_birrd_params(AW)
     num_accum_params = 2 + num_tiles
 
@@ -257,8 +269,9 @@ def _patch_maxi_depths(project_dir, trace_info):
     with open(kernel_path, "r") as f:
         code = f.read()
 
-    # Compute sizes for each m_axi port (11 args, kernel-grouped order)
-    # data_scatter: A_pe (int32), B_pe (int32), inst_pe (int32)
+    # Compute sizes for each m_axi port (13 args, kernel-grouped order)
+    # dram_loader: A_pe (int32), B_pe (int32), inst_pe (int32),
+    #              loader_m_start (int32), loader_n_start (int32)
     # inst_rw: birrd_inst (int8)
     # output_accum: output_col_map, output_num_m, output_n_base,
     #               accum_m_start, accum_n_start, accum_params, C
@@ -266,12 +279,14 @@ def _patch_maxi_depths(project_dir, trace_info):
         "A_pe": M_padded * K,
         "B_pe": K * N,
         "inst_pe": num_inst * 13,
+        "loader_m_start": total_ops,
+        "loader_n_start": total_ops,
         "birrd_inst": num_tiles * P0 * P1,
         "output_col_map": num_tiles * AW,
         "output_num_m": num_tiles,
         "output_n_base": num_tiles * AW,
-        "accum_m_start": num_tiles,
-        "accum_n_start": num_tiles,
+        "accum_m_start": total_ops,
+        "accum_n_start": total_ops,
         "accum_params": num_accum_params,
         "C": M_padded * N,
     }
@@ -382,9 +397,11 @@ def _generate_cosim_testbench(project_dir, trace_info, A, B, instructions,
     AW = trace_info["AW"]
     num_inst = len(instructions)
     num_tiles = num_inst - 3
+    n_inner = trace_info.get("n_inner", 1)
+    total_ops = num_tiles * n_inner
     P0, P1 = compute_birrd_params(AW)
 
-    # Compute BIRRD configs (same logic as FeatherKStreamingModule.__call__)
+    # Compute BIRRD configs (same logic as FeatherModule.__call__)
     ovn_order = int(instructions[2, 1])
     ovn = SetOVNLayout(order=ovn_order, PL0=AW, PL1=1, QL0=AW, QL1=1)
     birrd_table = lower_ovn_layout(ovn, AW, AW)
@@ -421,12 +438,17 @@ def _generate_cosim_testbench(project_dir, trace_info, A, B, instructions,
                 col = int(pair_to_col[pair_idx])
                 n_base_per_tile[t, col] = sc * (pair_idx & mask_Gc)
 
-    m_start_per_tile = np.array(
-        [int(instructions[3 + t, 7]) for t in range(num_tiles)], dtype=np.int32
-    )
-    n_start_per_tile = np.array(
-        [int(instructions[3 + t, 9]) for t in range(num_tiles)], dtype=np.int32
-    )
+    # Per-sub-operation m_start/n_start
+    if 'inner_m_starts' in trace_info:
+        m_start_per_op = trace_info['inner_m_starts']
+        n_start_per_op = trace_info['inner_n_starts']
+    else:
+        m_start_per_op = np.array(
+            [int(instructions[3 + t, 7]) for t in range(num_tiles)], dtype=np.int32
+        )
+        n_start_per_op = np.array(
+            [int(instructions[3 + t, 9]) for t in range(num_tiles)], dtype=np.int32
+        )
 
     # Build accum_params: [quant_scale, quant_zp, sr[0], sr[1], ...]
     num_accum_params = 2 + num_tiles
@@ -443,17 +465,22 @@ def _generate_cosim_testbench(project_dir, trace_info, A, B, instructions,
         f.write('#include "kernel.h"\n\n')
         f.write("int main() {\n")
 
-        # 11 args in kernel-grouped order:
-        # data_scatter: A_pe (int32), B_pe (int32), inst_pe (int32)
+        # 13 args in kernel-grouped order:
+        # dram_loader: A_pe (int32), B_pe (int32), inst_pe (int32),
+        #              loader_m_start (int32), loader_n_start (int32)
         # inst_rw: birrd_inst (int8)
         # output_accum: output_col_map, output_num_m, output_n_base,
         #               accum_m_start, accum_n_start, accum_params, C
-        f.write("  // A_pe[M_padded, K] (data_scatter, int32)\n")
+        f.write("  // A_pe[M_padded, K] (dram_loader, int32)\n")
         f.write("  " + _c_array_1d("A_pe", "int32_t", A.astype(np.int32).flatten()))
-        f.write("  // B_pe[K, N] (data_scatter, int32)\n")
+        f.write("  // B_pe[K, N] (dram_loader, int32)\n")
         f.write("  " + _c_array_1d("B_pe", "int32_t", B.astype(np.int32).flatten()))
-        f.write("  // inst_pe[num_inst, 13] (data_scatter)\n")
+        f.write("  // inst_pe[num_inst, 13] (dram_loader)\n")
         f.write("  " + _c_array_1d("inst_pe", "int32_t", instructions.flatten()))
+        f.write("  // loader_m_start[total_ops] (dram_loader)\n")
+        f.write("  " + _c_array_1d("loader_m_start", "int32_t", m_start_per_op.flatten()))
+        f.write("  // loader_n_start[total_ops] (dram_loader)\n")
+        f.write("  " + _c_array_1d("loader_n_start", "int32_t", n_start_per_op.flatten()))
         f.write("  // birrd_inst[num_tiles, P0, P1] (inst_rw)\n")
         f.write("  " + _c_array_1d("birrd_inst", "int8_t", birrd_per_tile.flatten()))
         f.write("  // output_col_map[num_tiles, AW]\n")
@@ -462,19 +489,20 @@ def _generate_cosim_testbench(project_dir, trace_info, A, B, instructions,
         f.write("  " + _c_array_1d("output_num_m", "int32_t", num_m_per_tile.flatten()))
         f.write("  // output_n_base[num_tiles, AW]\n")
         f.write("  " + _c_array_1d("output_n_base", "int32_t", n_base_per_tile.flatten()))
-        f.write("  // accum_m_start[num_tiles]\n")
-        f.write("  " + _c_array_1d("accum_m_start", "int32_t", m_start_per_tile.flatten()))
-        f.write("  // accum_n_start[num_tiles]\n")
-        f.write("  " + _c_array_1d("accum_n_start", "int32_t", n_start_per_tile.flatten()))
+        f.write("  // accum_m_start[total_ops]\n")
+        f.write("  " + _c_array_1d("accum_m_start", "int32_t", m_start_per_op.flatten()))
+        f.write("  // accum_n_start[total_ops]\n")
+        f.write("  " + _c_array_1d("accum_n_start", "int32_t", n_start_per_op.flatten()))
         f.write("  // accum_params[num_accum_params] — quant_scale, quant_zp, sr[...]\n")
         f.write("  " + _c_array_1d("accum_params", "int32_t", accum_params.flatten()))
         f.write(f"  // C[M_padded, N] output\n")
         f.write(f"  int32_t C[{M_padded * N}];\n")
         f.write(f"  memset(C, 0, sizeof(C));\n\n")
 
-        # Call top function (11 args, kernel-grouped order)
+        # Call top function (13 args, kernel-grouped order)
         f.write("  // Run FEATHER+ dataflow\n")
-        f.write("  full_matrix_top(A_pe, B_pe, inst_pe, birrd_inst, "
+        f.write("  full_matrix_top(A_pe, B_pe, inst_pe, "
+                "loader_m_start, loader_n_start, birrd_inst, "
                 "output_col_map, output_num_m, output_n_base, "
                 "accum_m_start, accum_n_start, accum_params, C);\n\n")
 
@@ -534,10 +562,12 @@ def _run_cosim(trace_info, project_dir, seed=42):
     AW = trace_info["AW"]
     instructions = trace_info["instructions"]
 
+    n_inner = trace_info.get('n_inner', 1)
+
     # Step 1: Build csyn project to get kernel.cpp
     print(f"  Step 1: Generating HLS project (csyn)...")
-    top = get_feather_full_matrix_top_kstreaming(
-        M_padded, K, N, AW, AH, int8, len(instructions),
+    top = get_feather_full_matrix_top(
+        M_padded, K, N, AW, AH, int8, len(instructions), n_inner,
     )
     s = df.customize(top)
     schedule_feather_hls(s, K, AH)
@@ -632,10 +662,12 @@ def run_deploy(trace_info, seed=42):
     print(f"  Array: {AH}x{AW}")
     print(f"  Project: {project_dir}")
 
+    n_inner = trace_info.get('n_inner', 1)
+
     # Step 1: Generate HW project
     print(f"\n--- Step 1: Generate HW Project ---")
-    top = get_feather_full_matrix_top_kstreaming(
-        M_padded, K, N, AW, AH, int8, len(instructions),
+    top = get_feather_full_matrix_top(
+        M_padded, K, N, AW, AH, int8, len(instructions), n_inner,
     )
     s = df.customize(top)
     schedule_feather_hls(s, K, AH)
@@ -720,7 +752,7 @@ def _write_deploy_input_data(trace_info, project_dir, seed=42):
     else:
         A = A_orig
 
-    # Compute BIRRD tables (same logic as FeatherKStreamingModule.__call__)
+    # Compute BIRRD tables (same logic as FeatherModule.__call__)
     ovn_order = int(instructions[2, 1])
     ovn = SetOVNLayout(order=ovn_order, PL0=AW, PL1=1, QL0=AW, QL1=1)
     birrd_table = lower_ovn_layout(ovn, AW, AW)
@@ -767,25 +799,42 @@ def _write_deploy_input_data(trace_info, project_dir, seed=42):
                 col = int(m_to_col[m_idx])
                 n_base_per_tile[t, col] = sc * (m_idx & mask_Gc)
 
-    m_start_per_tile = np.array(
-        [int(instructions[3 + t, 7]) for t in range(num_tiles)], dtype=np.int32
-    )
-    n_start_per_tile = np.array(
-        [int(instructions[3 + t, 9]) for t in range(num_tiles)], dtype=np.int32
-    )
+    # Per-sub-operation m_start/n_start
+    if 'inner_m_starts' in trace_info:
+        m_start_per_op = trace_info['inner_m_starts']
+        n_start_per_op = trace_info['inner_n_starts']
+    else:
+        m_start_per_op = np.array(
+            [int(instructions[3 + t, 7]) for t in range(num_tiles)], dtype=np.int32
+        )
+        n_start_per_op = np.array(
+            [int(instructions[3 + t, 9]) for t in range(num_tiles)], dtype=np.int32
+        )
+
+    # Build accum_params for deploy
+    num_accum_params = 2 + num_tiles
+    deploy_accum_params = np.zeros(num_accum_params, dtype=np.int32)
+    deploy_accum_params[0] = int(instructions[2, 6])
+    deploy_accum_params[1] = int(instructions[2, 7])
+    for t in range(num_tiles):
+        deploy_accum_params[2 + t] = int(instructions[3 + t, 5])
 
     C = np.zeros((M_padded, N), dtype=np.int32)
 
+    # 13 arrays in kernel-grouped order (matching full_matrix_top signature)
     arrays = [
         ("A", A),
         ("B", B),
         ("instructions", instructions),
+        ("loader_m_start", m_start_per_op),
+        ("loader_n_start", n_start_per_op),
         ("birrd_inst", birrd_per_tile),
         ("output_col_map", col_map_per_tile),
         ("output_num_m", num_m_per_tile),
         ("output_n_base", n_base_per_tile),
-        ("accum_m_start", m_start_per_tile),
-        ("accum_n_start", n_start_per_tile),
+        ("accum_m_start", m_start_per_op),
+        ("accum_n_start", n_start_per_op),
+        ("accum_params", deploy_accum_params),
         ("C", C),
     ]
 
@@ -1031,9 +1080,11 @@ def main():
     print(f"    Mapping: Gr={trace_info['Gr']}, Gc={trace_info['Gc']}, "
           f"sr={trace_info['sr']}, sc={trace_info['sc']}")
     n_sub = trace_info.get('n_sub_tiles', 1)
+    n_inner_main = trace_info.get('n_inner', 1)
     print(f"    Tiles: {trace_info['n_tiles']} "
           f"({trace_info['n_m_batches']}M x {trace_info['n_spatial_tiles']}N"
-          f"{f' x {n_sub}sub' if n_sub > 1 else ''})")
+          f"{f' x {n_sub}sub' if n_sub > 1 else ''}"
+          f"{f', n_inner={n_inner_main}' if n_inner_main > 1 else ''})")
     if trace_info['M_padded'] != trace_info['M']:
         print(f"    M padded: {trace_info['M']} -> {trace_info['M_padded']}")
     if trace_info.get('rtl_latency'):
