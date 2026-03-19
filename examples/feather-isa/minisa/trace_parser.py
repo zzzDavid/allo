@@ -100,7 +100,7 @@ def parse_trace(trace_path: str) -> Dict[str, Any]:
 
     if uniform_mapping:
         # === UNIFORM Gr: all EMs share same mapping params ===
-        Gr, Gc, sr, sc = Gr_first, Gc_first, sr_first, sc_first
+        Gr = Gr_first
 
         # Compute K-passes
         Kt_per_pass = (AW // Gr) * AH
@@ -114,28 +114,20 @@ def parse_trace(trace_path: str) -> Dict[str, Any]:
             f"but trace has n_EMs={n_EMs}"
         )
 
-        # Compute M padding (Gr rows per tile; pad if M not divisible)
+        # Output-stationary mapping (sr=1, sc=0, Gc=1) with explicit tiles.
+        # The trace may use sc/Gc for N-column mapping via crossbar reordering,
+        # but our kernel uses output-stationary with N temporal iteration.
+        Gc, sr, sc = 1, 1, 0
+
+        # M padding
         Mt = Gr
         M_padded = M if M % Mt == 0 else ((M // Mt) + 1) * Mt
         n_m_batches = M_padded // Mt
 
-        # Verify trace consistency: N coverage per ExecuteMapping
-        max_n_offset = sr * (AH - 1) + sc * ((AW - 1) & (Gc - 1))
-        tile_n_coverage = max_n_offset + 1
-        assert tile_n_coverage == Nt, (
-            f"Tile N coverage {tile_n_coverage} != trace Nt={Nt}"
-        )
-
-        # N-dimension temporal iteration: the trace's sc/sr mapping covers Nt
-        # N-columns per ExecuteMapping via WVN temporal iteration (N_L1 = Nt/AH
-        # iterations per EM). Instead of creating n_sub_tiles * n_m_batches
-        # separate tiles, we fold them into inner iterations within each tile.
-        # Only K-decomposition creates separate ISA tiles (matching the RTL's EMs).
-        n_sub_tiles = Nt // AH
-        assert Nt % AH == 0, f"Nt={Nt} must be divisible by AH={AH}"
-
-        # Inner iterations per tile: temporal N-iteration * M-batching * spatial N
-        n_inner = n_spatial_tiles * n_m_batches * n_sub_tiles
+        # N-dimension tiling: AH columns per tile
+        Nt_isa = AH
+        n_n_passes = N // Nt_isa
+        assert N % Nt_isa == 0, f"N={N} must be divisible by Nt_isa={Nt_isa}"
 
         # Create MINISA program
         program = MINISAProgram(
@@ -165,42 +157,28 @@ def parse_trace(trace_path: str) -> Dict[str, Any]:
             ),
         )
 
-        # Generate tiles: only K-decomposition creates separate ISA tiles.
-        # Each tile covers the full M and N range; temporal M/N iteration
-        # is handled by n_inner sub-operations within the tile.
-        for k_tile in range(k_passes):
-            program.add_mapping(SetMapping(
-                r0=k_tile * Kt_per_pass // AH,
-                c0=0,
-                Gr=Gr,
-                Gc=1,
-                sr=1,
-                sc=0,
-                m_start=0,
-                m_end=M_padded,
-                n_start=0,
-                n_end=N,
-                k_start=k_tile * Kt_per_pass,
-                k_end=(k_tile + 1) * Kt_per_pass,
-            ))
+        # Generate tiles: N→M→K order (K innermost for block accumulation).
+        # k_passes consecutive tiles share the same (m,n) region and
+        # accumulate in local_acc before flushing to C.
+        for n_pass in range(n_n_passes):
+            for m_batch in range(n_m_batches):
+                for k_tile in range(k_passes):
+                    program.add_mapping(SetMapping(
+                        r0=k_tile * Kt_per_pass // AH,
+                        c0=n_pass * Nt_isa,
+                        Gr=Gr,
+                        Gc=1,
+                        sr=1,
+                        sc=0,
+                        m_start=m_batch * Mt,
+                        m_end=min((m_batch + 1) * Mt, M_padded),
+                        n_start=n_pass * Nt_isa,
+                        n_end=(n_pass + 1) * Nt_isa,
+                        k_start=k_tile * Kt_per_pass,
+                        k_end=(k_tile + 1) * Kt_per_pass,
+                    ))
 
         instructions = encode_program(program)
-
-        # Generate per-sub-operation m_start/n_start lookup tables.
-        # Inner iteration order: n_spatial -> m_batch -> n_sub (matches RTL VN).
-        total_ops = k_passes * n_inner
-        inner_m_starts = np.zeros(total_ops, dtype=np.int32)
-        inner_n_starts = np.zeros(total_ops, dtype=np.int32)
-
-        for k_tile in range(k_passes):
-            op_base = k_tile * n_inner
-            op_idx = 0
-            for n_tile in range(n_spatial_tiles):
-                for m_batch in range(n_m_batches):
-                    for n_sub in range(n_sub_tiles):
-                        inner_m_starts[op_base + op_idx] = m_batch * Mt
-                        inner_n_starts[op_base + op_idx] = n_tile * Nt + n_sub * AH
-                        op_idx += 1
 
         return {
             "M": M,
@@ -213,17 +191,16 @@ def parse_trace(trace_path: str) -> Dict[str, Any]:
             "instructions": instructions,
             "rtl_latency": rtl_latency,
             "Gr": Gr,
-            "Gc": Gc,
-            "sr": sr,
-            "sc": sc,
-            "Nt": Nt,
-            "n_spatial_tiles": n_spatial_tiles,
+            "Gc": 1,
+            "sr": 1,
+            "sc": 0,
+            "Nt": Nt_isa,
+            "n_spatial_tiles": n_n_passes,
             "n_m_batches": n_m_batches,
-            "n_sub_tiles": n_sub_tiles,
-            "n_inner": n_inner,
+            "n_sub_tiles": 1,
+            "n_inner": 1,
             "n_tiles": program.num_tiles(),
-            "inner_m_starts": inner_m_starts,
-            "inner_n_starts": inner_n_starts,
+            "k_passes": k_passes,
             "utilization": search.get("utilization", None),
         }
 

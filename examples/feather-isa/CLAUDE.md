@@ -65,15 +65,16 @@ python tests/test_trace_input.py instr_trace/figure7_16x12x8_4x4.json --hls csyn
 ## Key Design Decisions
 
 - `dram_loader` (mapping=[1]) is the sole reader of A_pe, B_pe, inst_pe, loader_m_start,
-  loader_n_start. Per-column streaming buffer (iacts_buf[AH]) and stationary buffer
-  (weight_buf[AH,AH]) are loaded per sub-operation, then streamed to PEs via
-  meta_for(AW) × meta_for(AH). A and B passed as int32 (int8 causes LLVM crashes in
-  spatial kernels); `FeatherModule.__call__()` converts via `.astype(np.int32)`.
+  loader_n_start. Column-streaming: sends to AW column heads only (col_a_in[AW],
+  col_w_in[AW]), not to every PE. Uses meta_for(AW) only (not AW×AH), reducing
+  compile instructions 16× for 16×16 arrays. A and B passed as int32 (int8 causes
+  LLVM crashes in spatial kernels); `FeatherModule.__call__()` converts via `.astype(np.int32)`.
 - `pe_array` (mapping=[AH+1, AW]) is stream-only (no DRAM args). Rows 0..AH-1 = AH*AW
-  compute PEs (each doing 1 MAC/cycle). Row AH = AW gather instances. Uses `meta_if` on
-  `get_pid()` for row specialization. Parallelism is structural (guaranteed by construction).
-- Each compute PE reads from pe_a_in[ni,nj] and pe_w_in[ni,nj], does `a * w` + accumulate,
-  and puts result on pe_out[ni,nj]. The multiply maps to 3 DSP48E2 slices.
+  compute PEs with column-streaming (W broadcast). Row AH = AW gather instances.
+  Uses nested `meta_if` on `get_pid()` for row specialization.
+- Column-streaming: Row 0 reads from col_a_in/col_w_in. Rows 1+ read from
+  pe_a_down/pe_w_down (inter-PE streams). W broadcast: each PE reads all AH W values,
+  selects its own (index ni), forwards all to PE below.
 - 5 dataflow kernels: dram_loader(1) → pe_array[AH+1,AW] → BIRRD[P0,P1] → output_accum,
   plus inst_rw. Each DRAM buffer has exactly one reader kernel (HLS single-reader compliance).
   13 DRAM args total: A_pe, B_pe, inst_pe, loader_m_start, loader_n_start (dram_loader);

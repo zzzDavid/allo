@@ -12,8 +12,8 @@ Supports all Gr values (1, 2, ..., AW) per tile via power-of-2 bit operations,
 enabling full dataflow switching (output/weight/input stationary and mixed).
 
 Architecture (5 pipelined dataflow kernels):
-1. dram_loader: Sole DRAM reader — loads on-chip buffers, streams to pe_array
-2. pe_array[AH+1,AW]: Compute PEs (rows 0..AH-1) + gather (row AH)
+1. dram_loader: Sole DRAM reader — column-streams to AW column heads
+2. pe_array[AH+1,AW]: Compute PEs (rows 0..AH-1, column-streaming) + gather (row AH)
 3. inst_rw: Distribute BIRRD switch instructions
 4. BIRRD[P0,P1]: Butterfly reduction/reorder (per-tile configuration)
 5. output_accum: Column remap + tile accumulation into output matrix
@@ -76,14 +76,14 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
                                             Nt_local=None):
     """Create FEATHER+ dataflow region with unified PE array.
 
-    Uses dram_loader(mapping=[1]) as sole DRAM reader with on-chip streaming
-    and stationary buffers, plus pe_array(mapping=[AH+1, AW]): rows 0..AH-1 =
-    compute PEs (AH*AW instances), row AH = gather (AW instances). Parallelism
-    is structural (guaranteed by construction).
+    Uses dram_loader(mapping=[1]) as sole DRAM reader, column-streaming to
+    AW column heads. Data flows down through inter-PE streams. pe_array
+    (mapping=[AH+1, AW]): rows 0..AH-1 = compute PEs with column-streaming
+    (W broadcast), row AH = gather (AW instances).
 
     Architecture (5 dataflow kernels):
-    1. dram_loader(1): Sole DRAM reader with on-chip buffers, streams to PEs
-    2. pe_array[AH+1,AW]: Compute PEs + per-column gather
+    1. dram_loader(1): Sole DRAM reader, column-streams to AW column heads
+    2. pe_array[AH+1,AW]: Column-streaming compute PEs + per-column gather
     3. inst_rw(1): Distribute BIRRD switch instructions
     4. BIRRD[P0,P1]: Butterfly reduction/reorder (per-tile configuration)
     5. output_accum(1): Column remap + block accumulation into output matrix
@@ -145,9 +145,12 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
         one reader kernel (HLS single-reader compliance).
         """
 
-        # dram_loader -> pe_array streams (row 0..AH-1 compute PEs)
-        pe_a_in: Stream[int32, AH][AH, AW]
-        pe_w_in: Stream[int32, AH][AH, AW]
+        # Column input streams: dram_loader -> row 0 of each column
+        col_a_in: Stream[int32, AH][AW]
+        col_w_in: Stream[int32, AH * AH][AW]
+        # Inter-PE column streams: data forwarded down columns
+        pe_a_down: Stream[int32, AH][AH, AW]
+        pe_w_down: Stream[int32, AH * AH][AH, AW]
 
         # pe_array internal streams: rows 0..AH-1 -> row AH (gather)
         pe_out: Stream[int32, total_ops][AH, AW]
@@ -164,11 +167,11 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
             local_loader_m_start: int32[total_ops],
             local_loader_n_start: int32[total_ops],
         ):
-            """Sole DRAM reader. Streams A/B directly to PEs (no on-chip buffers).
+            """Sole DRAM reader. Column-streaming: sends to AW column heads only.
 
-            Single merged nk loop reads A and B from DRAM and puts directly to
-            PE streams. When n_inner > 1, each tile has multiple inner iterations
-            with different (m_start, n_start) from DRAM lookup tables.
+            Streams one A value and AH W values per column per nk cycle.
+            Data flows down through inter-PE streams, reducing dram_loader
+            from AW*AH parallel paths to AW paths (16x for 16x16 array).
             """
             iacts_zp: int32 = local_inst[0, 6]
             weights_zp: int32 = local_inst[1, 6]
@@ -199,24 +202,27 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
                     m_start: int32 = local_loader_m_start[op_idx]
                     n_start: int32 = local_loader_n_start[op_idx]
 
-                    # Stream A/B directly to PEs (no on-chip buffers)
+                    # Column-streaming: AW parallel paths (not AW*AH)
                     for nk in range(AH):
                         with allo.meta_for(AW) as nj:
                             m_idx: int32 = m_start + (nj & mask_Gr)
                             k_idx: int32 = k_start_tile + nk + (nj >> log2_Gr) * AH
                             a_val: int32 = local_A[m_idx, k_idx] - iacts_zp
-                            with allo.meta_for(AH) as pe_row:
+                            col_a_in[nj].put(a_val)
+                            for pe_row in range(AH):
                                 wn_idx: int32 = n_start + sr * pe_row + sc * (nj & mask_Gc)
                                 w_val: int32 = local_B[k_idx, wn_idx] - weights_zp
-                                pe_a_in[pe_row, nj].put(a_val)
-                                pe_w_in[pe_row, nj].put(w_val)
+                                col_w_in[nj].put(w_val)
 
         @df.kernel(mapping=[AH + 1, AW])
         def pe_array():
-            """Compute PEs (rows 0..AH-1) + gather (row AH). Stream-only, no DRAM args.
+            """Column-streaming compute PEs (rows 0..AH-1) + gather (row AH).
 
-            Rows 0..AH-1 (AH*AW instances): Simple MAC units. Read from
-                pe_a_in/pe_w_in, accumulate per sub-operation, output to pe_out.
+            Rows 0..AH-1 (AH*AW instances): Column-streaming MAC units.
+                Row 0 reads from col_a_in/col_w_in (column head streams).
+                Rows 1+ read from pe_a_down/pe_w_down (inter-PE streams).
+                W broadcast: each PE reads all AH W values, selects its own
+                (index ni), forwards all to PE below.
             Row AH (AW instances): Collects PE results from its column,
                 sends to BIRRD input connections.
 
@@ -235,12 +241,34 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
                         connection[0, nj].put(buf[row])
 
             with allo.meta_else():
-                # === ROWS 0..AH-1: COMPUTE PEs (AH*AW instances) ===
+                # === ROWS 0..AH-1: COMPUTE PEs (column streaming) ===
                 for _op in range(total_ops):
                     tile_accum: int32 = 0
                     for nk in range(AH):
-                        a_val: int32 = pe_a_in[ni, nj].get()
-                        w_val: int32 = pe_w_in[ni, nj].get()
+                        # Read A: row 0 from column input, others from PE above
+                        a_val: int32 = 0
+                        with allo.meta_if(ni == 0):
+                            a_val = col_a_in[nj].get()
+                        with allo.meta_else():
+                            a_val = pe_a_down[ni - 1, nj].get()
+
+                        # Read all AH W values, keep own (index ni)
+                        w_val: int32 = 0
+                        for row in range(AH):
+                            w_candidate: int32 = 0
+                            with allo.meta_if(ni == 0):
+                                w_candidate = col_w_in[nj].get()
+                            with allo.meta_else():
+                                w_candidate = pe_w_down[ni - 1, nj].get()
+                            if row == ni:
+                                w_val = w_candidate
+                            with allo.meta_if(ni < AH - 1):
+                                pe_w_down[ni, nj].put(w_candidate)
+
+                        # Forward A down (not last row)
+                        with allo.meta_if(ni < AH - 1):
+                            pe_a_down[ni, nj].put(a_val)
+
                         tile_accum += a_val * w_val
                     pe_out[ni, nj].put(tile_accum)
 
@@ -577,17 +605,28 @@ def schedule_feather_hls(s, K, AH, AW):
         AH: Array height (for C partitioning)
         AW: Array width (for A/B partitioning, optional)
     """
-    # Pipeline the dram_loader tile loop for II=1
-    s.pipeline("dram_loader_0:tile")
-    # Partition C along N (dim=2) for parallel output writes
+    # Pipeline pe_row (innermost W-distribution loop) in dram_loader.
+    # Prevents HLS from flattening tile*nk and trying to pipeline the full body
+    # (256 BRAM reads per stage). With pe_row pipelined, each stage has only 16
+    # meta_for reads (to the same bank for Gr=AW), achieving II=8 per stage.
+    # s.pipeline("dram_loader_0:pe_row")
+    s.pipeline("dram_loader_0:inner")
+    # Partition C along N (dim=2) — Complete for parallel output writes
+    # (C is small relative to dram_loader arrays, so Complete is safe)
     s.partition("full_matrix_top:C", dim=2, factor=AH)
-    # Partition A and B inside dram_loader for AW parallel reads
-    s.partition("dram_loader_0:local_A", dim=2, factor=K)
-    s.partition("dram_loader_0:local_B", dim=0)
-    # Fully partition local_acc[AW,AH] — only 16 registers, eliminates all
-    # memory port contention for data-dependent indexing
+    # Partition A along M (dim=1) for AW parallel row reads
+    s.partition("dram_loader_0:local_A", dim=1, factor=AW, partition_type=Partition.Cyclic)
+    # Partition B along N (dim=2) for cyclic column reads (AH banks)
+    # Cyclic (not Complete) avoids 512-way MUX explosion for large N dimensions
+    s.partition("dram_loader_0:local_B", dim=2, factor=AH, partition_type=Partition.Cyclic)
+    # Partition local_acc for output accumulation.
+    # dim=1 Complete: AH independent row banks (always safe).
+    # dim=2 Complete: only for small arrays (AH*AW <= 64); for large arrays,
+    # 256-entry fully-partitioned local_acc[16][16] with variable indexing creates
+    # a 256-way mux that makes the HLS scheduler intractable (30+ min on one loop).
     s.partition("output_accum_0:local_acc", dim=1, partition_type=Partition.Complete)
-    s.partition("output_accum_0:local_acc", dim=2, partition_type=Partition.Complete)
+    if AH * AW <= 64:
+        s.partition("output_accum_0:local_acc", dim=2, partition_type=Partition.Complete)
 
 
 def build_feather_hls(M, K, N, AW, AH, Ty, num_inst,
