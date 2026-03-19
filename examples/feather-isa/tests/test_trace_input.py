@@ -190,7 +190,7 @@ def run_hls_test(trace_info, mode="csim", seed=42):
         M_padded, K, N, AW, AH, int8, len(instructions), n_inner, k_passes,
     )
     s = df.customize(top)
-    schedule_feather_hls(s, K, AH, AW)
+    schedule_feather_hls(s, K, N, AH, AW)
     hls_mod = s.build(target="vitis_hls", mode=mode, project=project_dir)
     allo_mod = FeatherModule(hls_mod, AW, n_inner)
 
@@ -275,17 +275,18 @@ def _patch_maxi_depths(project_dir, trace_info):
     with open(kernel_path, "r") as f:
         code = f.read()
 
-    # Compute sizes for each m_axi port (13 args, kernel-grouped order)
-    # dram_loader: A_pe (int32), B_pe (int32), inst_pe (int32),
-    #              loader_m_start (int32), loader_n_start (int32)
+    # Compute sizes for each m_axi port (14 args, kernel-grouped order)
+    # a_loader: A_pe (int32), inst_pe (int32), loader_m_start (int32)
+    # w_loader: B_pe (int32), inst_w (int32), loader_n_start (int32)
     # inst_rw: birrd_inst (int8)
     # output_accum: output_col_map, output_num_m, output_n_base,
     #               accum_m_start, accum_n_start, accum_params, C
     sizes = {
         "A_pe": M_padded * K,
-        "B_pe": K * N,
         "inst_pe": num_inst * 13,
         "loader_m_start": total_ops,
+        "B_pe": K * N,
+        "inst_w": num_inst * 13,
         "loader_n_start": total_ops,
         "birrd_inst": num_tiles * P0 * P1,
         "output_col_map": num_tiles * AW,
@@ -471,21 +472,23 @@ def _generate_cosim_testbench(project_dir, trace_info, A, B, instructions,
         f.write('#include "kernel.h"\n\n')
         f.write("int main() {\n")
 
-        # 13 args in kernel-grouped order:
-        # dram_loader: A_pe (int32), B_pe (int32), inst_pe (int32),
-        #              loader_m_start (int32), loader_n_start (int32)
+        # 14 args in kernel-grouped order:
+        # a_loader: A_pe (int32), inst_pe (int32), loader_m_start (int32)
+        # w_loader: B_pe (int32), inst_w (int32), loader_n_start (int32)
         # inst_rw: birrd_inst (int8)
         # output_accum: output_col_map, output_num_m, output_n_base,
         #               accum_m_start, accum_n_start, accum_params, C
-        f.write("  // A_pe[M_padded, K] (dram_loader, int32)\n")
+        f.write("  // A_pe[M_padded, K] (a_loader, int32)\n")
         f.write("  " + _c_array_1d("A_pe", "int32_t", A.astype(np.int32).flatten()))
-        f.write("  // B_pe[K, N] (dram_loader, int32)\n")
-        f.write("  " + _c_array_1d("B_pe", "int32_t", B.astype(np.int32).flatten()))
-        f.write("  // inst_pe[num_inst, 13] (dram_loader)\n")
+        f.write("  // inst_pe[num_inst, 13] (a_loader)\n")
         f.write("  " + _c_array_1d("inst_pe", "int32_t", instructions.flatten()))
-        f.write("  // loader_m_start[total_ops] (dram_loader)\n")
+        f.write("  // loader_m_start[total_ops] (a_loader)\n")
         f.write("  " + _c_array_1d("loader_m_start", "int32_t", m_start_per_op.flatten()))
-        f.write("  // loader_n_start[total_ops] (dram_loader)\n")
+        f.write("  // B_pe[K, N] (w_loader, int32)\n")
+        f.write("  " + _c_array_1d("B_pe", "int32_t", B.astype(np.int32).flatten()))
+        f.write("  // inst_w[num_inst, 13] (w_loader, separate instruction copy)\n")
+        f.write("  " + _c_array_1d("inst_w", "int32_t", instructions.flatten()))
+        f.write("  // loader_n_start[total_ops] (w_loader)\n")
         f.write("  " + _c_array_1d("loader_n_start", "int32_t", n_start_per_op.flatten()))
         f.write("  // birrd_inst[num_tiles, P0, P1] (inst_rw)\n")
         f.write("  " + _c_array_1d("birrd_inst", "int8_t", birrd_per_tile.flatten()))
@@ -505,10 +508,10 @@ def _generate_cosim_testbench(project_dir, trace_info, A, B, instructions,
         f.write(f"  int32_t C[{M_padded * N}];\n")
         f.write(f"  memset(C, 0, sizeof(C));\n\n")
 
-        # Call top function (13 args, kernel-grouped order)
+        # Call top function (14 args, kernel-grouped order)
         f.write("  // Run FEATHER+ dataflow\n")
-        f.write("  full_matrix_top(A_pe, B_pe, inst_pe, "
-                "loader_m_start, loader_n_start, birrd_inst, "
+        f.write("  full_matrix_top(A_pe, inst_pe, loader_m_start, "
+                "B_pe, inst_w, loader_n_start, birrd_inst, "
                 "output_col_map, output_num_m, output_n_base, "
                 "accum_m_start, accum_n_start, accum_params, C);\n\n")
 
@@ -577,7 +580,7 @@ def _run_cosim(trace_info, project_dir, seed=42):
         M_padded, K, N, AW, AH, int8, len(instructions), n_inner, k_passes,
     )
     s = df.customize(top)
-    schedule_feather_hls(s, K, AH, AW)
+    schedule_feather_hls(s, K, N, AH, AW)
     hls_mod = s.build(target="vitis_hls", mode="csyn", project=project_dir)
 
     # Patch wide ap_uint
@@ -677,7 +680,7 @@ def run_deploy(trace_info, seed=42):
         M_padded, K, N, AW, AH, int8, len(instructions), n_inner,
     )
     s = df.customize(top)
-    schedule_feather_hls(s, K, AH, AW)
+    schedule_feather_hls(s, K, N, AH, AW)
     hls_mod = s.build(target="vitis_hls", mode="hw", project=project_dir)
 
     # Patch for wide ap_uint
@@ -828,12 +831,13 @@ def _write_deploy_input_data(trace_info, project_dir, seed=42):
 
     C = np.zeros((M_padded, N), dtype=np.int32)
 
-    # 13 arrays in kernel-grouped order (matching full_matrix_top signature)
+    # 14 arrays in kernel-grouped order (matching full_matrix_top signature)
     arrays = [
         ("A", A),
-        ("B", B),
         ("instructions", instructions),
         ("loader_m_start", m_start_per_op),
+        ("B", B),
+        ("inst_w", instructions.copy()),
         ("loader_n_start", n_start_per_op),
         ("birrd_inst", birrd_per_tile),
         ("output_col_map", col_map_per_tile),
