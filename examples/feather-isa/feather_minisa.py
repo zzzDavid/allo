@@ -154,7 +154,7 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
 
         # Column input streams: a_loader -> PE row 0 (A), w_loader -> w_broadcast (W)
         col_a_in: Stream[int32, AH][AW]
-        col_w_in: Stream[int32, AH * AH][AW]  # w_loader -> w_broadcast
+        col_w_in: Stream[int32, AH][AH, AW]  # w_loader -> w_broadcast (per pe_row)
         # Per-row W streams: w_broadcast -> PE[row, col]
         pe_w_in: Stream[int32, AH][AH, AW]
         # Inter-PE column streams: A forwarded down columns
@@ -214,10 +214,11 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
             local_inst_w: int32[num_inst, 13],
             local_loader_n_start: int32[total_ops],
         ):
-            """Reads W from DRAM, sends to col_w_in. Runs parallel with a_loader.
+            """Reads W from DRAM, sends to col_w_in[pe_row, nj]. Runs parallel with a_loader.
 
             Decodes its own instruction copy (no FIFO dependency on a_loader).
-            Fused nk*pe_row loop: 1 B read per meta_for copy per iteration.
+            Split nk + meta_for(AH) pe_row: each pe_row writes to its own FIFO,
+            reducing per-FIFO writes from AH*AH to AH per pipeline iteration.
             """
             weights_zp: int32 = local_inst_w[1, 6]
 
@@ -244,30 +245,27 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
                     op_idx: int32 = tile * n_inner + inner
                     n_start: int32 = local_loader_n_start[op_idx]
 
-                    for nk_row in range(AH * AH):
+                    for nk in range(AH):
                         with allo.meta_for(AW) as nj:
-                            nk_val: int32 = nk_row >> LOG2_AH
-                            pe_row_val: int32 = nk_row & (AH - 1)
-                            k_idx: int32 = k_start_tile + nk_val + (nj >> log2_Gr) * AH
-                            wn_idx: int32 = n_start + sr * pe_row_val + sc * (nj & mask_Gc)
-                            w_val: int32 = local_B[k_idx, wn_idx] - weights_zp
-                            col_w_in[nj].put(w_val)
+                            with allo.meta_for(AH) as pe_row:
+                                k_idx: int32 = k_start_tile + nk + (nj >> log2_Gr) * AH
+                                wn_idx: int32 = n_start + sr * pe_row + sc * (nj & mask_Gc)
+                                w_val: int32 = local_B[k_idx, wn_idx] - weights_zp
+                                col_w_in[pe_row, nj].put(w_val)
 
         @df.kernel(mapping=[AW])
         def w_broadcast():
             """Distributes W values from col_w_in to per-row pe_w_in FIFOs.
 
-            Reads AH W values per nk cycle from col_w_in[nj] (written by
-            w_loader for pe_row 0..AH-1), and routes each to the
-            corresponding pe_w_in[row, nj]. Trivial FIFO-to-FIFO kernel
-            with no BRAM access — keeps w_loader at AW code paths
-            while giving each PE its own dedicated W input FIFO.
+            Each row reads from its own col_w_in[row, nj] FIFO (written by
+            w_loader per pe_row), and forwards to pe_w_in[row, nj].
+            Trivial FIFO-to-FIFO kernel with no BRAM access.
             """
             nj = df.get_pid()
             for _op in range(total_ops):
                 for nk in range(AH):
                     with allo.meta_for(AH) as row:
-                        w_val: int32 = col_w_in[nj].get()
+                        w_val: int32 = col_w_in[row, nj].get()
                         pe_w_in[row, nj].put(w_val)
 
         @df.kernel(mapping=[AH + 1, AW])
