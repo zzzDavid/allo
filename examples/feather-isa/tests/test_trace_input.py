@@ -476,6 +476,27 @@ def _patch_load_bufs_for_throughput(project_dir):
             )
         break  # only one store_res expected
 
+    # Step 5: Add DEPENDENCE pragma to output_accum block loop
+    # The output_accum writes to C with runtime-computed indices, causing HLS
+    # to assume inter-iteration dependence on C (II=16). Different blocks write
+    # to non-overlapping regions, so inter-iteration dependence is false.
+    oa_match = re.search(
+        r'void output_accum_0\([^)]+\) \{[^}]*?'
+        r'#pragma HLS array_partition variable=(\w+) complete dim=2',
+        code,
+        re.DOTALL,
+    )
+    if oa_match:
+        c_var = oa_match.group(1)
+        block_loop = re.search(
+            r'(l_S_block_0_block: for \([^)]+\) \{[^\n]*\n)',
+            code,
+        )
+        if block_loop:
+            pragma = f'  #pragma HLS DEPENDENCE variable={c_var} type=inter false\n'
+            insert_pos = block_loop.end()
+            code = code[:insert_pos] + pragma + code[insert_pos:]
+
     with open(kernel_path, "w") as f:
         f.write(code)
     print(f"  Patched kernel.cpp: widened m_axi + optimized load_buf/store throughput")

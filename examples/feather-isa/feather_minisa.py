@@ -641,8 +641,7 @@ def schedule_feather_hls(s, K, N, AH, AW):
     # a_loader and w_loader run in parallel (separate instruction copies).
     # w_broadcast distributes col_w_in -> per-row pe_w_in FIFOs.
     s.pipeline("w_loader_0:tile")
-    # Partition C along N (dim=2) — Complete for parallel output writes
-    # (enables meta_for on writeback col loop in output_accum)
+    # Partition C dim=2 (N-dimension) — Complete for parallel column writes.
     s.partition("full_matrix_top:C", dim=2, partition_type=Partition.Complete)
     # Partition A along M (dim=1) for AW parallel row reads
     s.partition("a_loader_0:local_A", dim=1, factor=AW, partition_type=Partition.Cyclic)
