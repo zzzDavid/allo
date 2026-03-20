@@ -278,11 +278,12 @@ def _patch_load_bufs_for_throughput(project_dir):
         code,
     )
 
-    # Step 2: Rewrite instruction load_bufs (load_buf1, load_buf4) to use
-    # wide pointers (ap_uint<COLS*32>) for row-at-a-time reads.
-    # Original: int32_t in[ROWS*COLS] → int32_t out[ROWS][COLS], 1 read/cycle
+    # Step 2: Rewrite 2D load_bufs to use wide pointers (ap_uint<COLS*32>)
+    # for row-at-a-time reads. Applies to any load_buf with signature:
+    #   void load_bufN(int32_t in[FLAT], int32_t out[ROWS][COLS])
     # Rewrite: ap_uint<COLS*32> in_wide[ROWS] → extract 32-bit fields, 1 row/cycle
-    for buf_id in (1, 4):
+    # Key targets: load_buf0 (A matrix), load_buf1/4 (instructions), load_buf3 (B)
+    for buf_id in range(13):
         fn = f'load_buf{buf_id}'
         # Match: void load_bufN(\n  int32_t INVAR[FLAT],\n  int32_t OUTVAR[R][C]\n) {
         sig = re.search(
@@ -331,9 +332,63 @@ def _patch_load_bufs_for_throughput(project_dir):
 
         code = code[:sig.start()] + new_func + code[func_end:]
 
-    # Step 3: Update top-level parameter types for inst ports (gmem1, gmem4)
-    # Change int32_t *vNNNN to ap_uint<WIDE> *vNNNN for instruction ports
-    for buf_id, gmem_id in ((1, 1), (4, 4)):
+    # Step 2b: Rewrite 3D int8 load_bufs (e.g., birrd_inst[D0][D1][D2])
+    # Read D1*D2 int8 values per cycle using ap_uint<D1*D2*8>
+    for buf_id in range(13):
+        fn = f'load_buf{buf_id}'
+        sig = re.search(
+            rf'void {fn}\(\s*\n'
+            rf'\s*int8_t\s+(\w+)\[(\d+)\],\s*\n'
+            rf'\s*int8_t\s+(\w+)\[(\d+)\]\[(\d+)\]\[(\d+)\]\s*\n'
+            rf'\) \{{',
+            code,
+        )
+        if not sig:
+            continue
+        in_var, flat_sz = sig.group(1), int(sig.group(2))
+        out_var = sig.group(3)
+        d0, d1, d2 = int(sig.group(4)), int(sig.group(5)), int(sig.group(6))
+        inner_elems = d1 * d2
+        wide_bits = inner_elems * 8
+
+        # Find function end
+        brace_depth, func_end = 0, sig.start()
+        for idx in range(sig.start(), len(code)):
+            if code[idx] == '{':
+                brace_depth += 1
+            elif code[idx] == '}':
+                brace_depth -= 1
+                if brace_depth == 0:
+                    func_end = idx + 1
+                    break
+
+        new_func = (
+            f'void {fn}(\n'
+            f'  ap_uint<{wide_bits}> {in_var}[{d0}],\n'
+            f'  int8_t {out_var}[{d0}][{d1}][{d2}]\n'
+            f') {{\t//\n'
+            f'  #pragma HLS array_partition variable={out_var} complete dim=2\n'
+            f'  #pragma HLS array_partition variable={out_var} complete dim=3\n'
+            f'  l_S_{fn}_{fn}_l_0: for (int {fn}_l_0 = 0;'
+            f' {fn}_l_0 < {d0}; {fn}_l_0++) {{\t//\n'
+            f'  #pragma HLS pipeline II=1 rewind\n'
+            f'    ap_uint<{wide_bits}> row = {in_var}[{fn}_l_0];\t//\n'
+        )
+        for i1 in range(d1):
+            for i2 in range(d2):
+                bit_idx = (i1 * d2 + i2) * 8
+                lo, hi = bit_idx, bit_idx + 7
+                new_func += (
+                    f'    {out_var}[{fn}_l_0][{i1}][{i2}] ='
+                    f' (int8_t)row.range({hi}, {lo});\t//\n'
+                )
+        new_func += '  }\n}\n'
+        code = code[:sig.start()] + new_func + code[func_end:]
+
+    # Step 3: Update top-level parameter types for all widened load_bufs
+    # Change int32_t/int8_t *vNNNN to ap_uint<WIDE> *vNNNN for widened ports
+    for buf_id in range(13):
+        gmem_id = buf_id
         fn = f'load_buf{buf_id}'
         # Find the function to get the wide_bits value
         sig = re.search(rf'void {fn}\(\s*\n\s*ap_uint<(\d+)>', code)
@@ -350,18 +405,80 @@ def _patch_load_bufs_for_throughput(project_dir):
             continue
         port_var = pm.group(2)
         # Change parameter type in full_matrix_top signature
-        code = code.replace(
-            f'  int32_t *{port_var}',
-            f'  ap_uint<{wide_bits}> *{port_var}',
-            1,
+        for base_type in ('int32_t', 'int8_t'):
+            old_decl = f'  {base_type} *{port_var}'
+            new_decl = f'  ap_uint<{wide_bits}> *{port_var}'
+            if old_decl in code:
+                code = code.replace(old_decl, new_decl, 1)
+                break
+
+    # Step 4: Widen store_res functions (2D local → 1D DRAM)
+    # Pattern: void store_resN(int32_t local[R][C], int32_t dram[FLAT])
+    # Rewrite: pack C int32 values per row into ap_uint<C*32>, write 1 row/cycle
+    for match in re.finditer(
+        r'void (store_res\d+)\(\s*\n'
+        r'\s*int32_t\s+(\w+)\[(\d+)\]\[(\d+)\],\s*\n'
+        r'\s*int32_t\s+(\w+)\[(\d+)\]\s*\n'
+        r'\) \{',
+        code,
+    ):
+        fn = match.group(1)
+        local_var, rows, cols = match.group(2), int(match.group(3)), int(match.group(4))
+        dram_var, flat_sz = match.group(5), int(match.group(6))
+        wide_bits = cols * 32
+
+        brace_depth, func_end = 0, match.start()
+        for idx in range(match.start(), len(code)):
+            if code[idx] == '{':
+                brace_depth += 1
+            elif code[idx] == '}':
+                brace_depth -= 1
+                if brace_depth == 0:
+                    func_end = idx + 1
+                    break
+
+        new_func = (
+            f'void {fn}(\n'
+            f'  int32_t {local_var}[{rows}][{cols}],\n'
+            f'  ap_uint<{wide_bits}> {dram_var}[{rows}]\n'
+            f') {{\t//\n'
+            f'  #pragma HLS array_partition variable={local_var} complete dim=2\n'
+            f'  l_S_{fn}_{fn}_l_0: for (int {fn}_l_0 = 0;'
+            f' {fn}_l_0 < {rows}; {fn}_l_0++) {{\t//\n'
+            f'  #pragma HLS pipeline II=1 rewind\n'
+            f'    ap_uint<{wide_bits}> row = 0;\t//\n'
         )
-        # Also change the buf declaration and load_buf call
-        # buf1[27][13] stays int32_t, but the DRAM pointer type changes
-        # The load_buf call passes the m_axi pointer directly
+        for j in range(cols):
+            lo, hi = j * 32, j * 32 + 31
+            new_func += (
+                f'    row.range({hi}, {lo}) ='
+                f' (ap_uint<32>){local_var}[{fn}_l_0][{j}];\t//\n'
+            )
+        new_func += f'    {dram_var}[{fn}_l_0] = row;\t//\n'
+        new_func += '  }\n}\n'
+        code = code[:match.start()] + new_func + code[func_end:]
+
+        # Update top-level parameter type for the store port
+        # Find gmem for this store_res by looking at its DRAM port in the top function
+        # The store_res buf number is in the function name
+        store_num = re.search(r'store_res(\d+)', fn).group(1)
+        gmem_pattern = (
+            rf'#pragma HLS interface m_axi port=(\w+) offset=slave'
+            rf' bundle=gmem{store_num}'
+        )
+        sm = re.search(gmem_pattern, code)
+        if sm:
+            port_var = sm.group(1)
+            code = code.replace(
+                f'  int32_t *{port_var}',
+                f'  ap_uint<{wide_bits}> *{port_var}',
+                1,
+            )
+        break  # only one store_res expected
 
     with open(kernel_path, "w") as f:
         f.write(code)
-    print(f"  Patched kernel.cpp: widened m_axi + optimized load_buf throughput")
+    print(f"  Patched kernel.cpp: widened m_axi + optimized load_buf/store throughput")
 
 
 def _patch_maxi_depths(project_dir, trace_info):

@@ -401,8 +401,8 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
             tile_acc: int32[AW, AH]
 
             for block in range(num_blocks):
-                # Zero tile_acc
-                for _i0 in range(AW):
+                # Zero tile_acc (meta_for on outer dim for AW-parallel zeroing)
+                with allo.meta_for(AW) as _i0:
                     for _j0 in range(AH):
                         tile_acc[_i0, _j0] = 0
 
@@ -642,9 +642,14 @@ def schedule_feather_hls(s, K, N, AH, AW):
     # w_broadcast distributes col_w_in -> per-row pe_w_in FIFOs.
     s.pipeline("w_loader_0:tile")
     # Partition C along N (dim=2) — Complete for parallel output writes
-    s.partition("full_matrix_top:C", dim=2, factor=AH)
+    # (enables meta_for on writeback col loop in output_accum)
+    s.partition("full_matrix_top:C", dim=2, partition_type=Partition.Complete)
     # Partition A along M (dim=1) for AW parallel row reads
     s.partition("a_loader_0:local_A", dim=1, factor=AW, partition_type=Partition.Cyclic)
+    # Partition A along K (dim=2) — Complete for parallel column reads.
+    # Eliminates BRAM port conflicts when Gr<AW (different meta_for instances
+    # access different k_idx values that may collide in the same bank).
+    s.partition("a_loader_0:local_A", dim=2, partition_type=Partition.Complete)
     # Partition B for parallel reads across unrolled nk_row iterations.
     # Small arrays: Complete partition (registers) eliminates BRAM port conflicts
     # that arise from runtime-dependent addresses (Gr, sr, sc from instructions).
