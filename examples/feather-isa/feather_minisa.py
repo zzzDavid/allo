@@ -154,9 +154,13 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
 
         # Column input streams: a_loader -> PE row 0 (A), w_loader -> w_broadcast (W)
         col_a_in: Stream[int32, AH][AW]
-        col_w_in: Stream[int32, AH][AH, AW]  # w_loader -> w_broadcast (per pe_row)
+        col_w_in: Stream[int32, total_ops][AH, AW]  # w_loader -> w_broadcast
         # Per-row W streams: w_broadcast -> PE[row, col]
-        pe_w_in: Stream[int32, AH][AH, AW]
+        # Depth total_ops: w_broadcast writes all rows atomically (meta_for),
+        # so if bottom row's FIFO is full, all row writes stall → cascade
+        # deadlock. Load_buf startup latency difference between A and W paths
+        # plus column-streaming cascade delay requires deep buffering.
+        pe_w_in: Stream[int32, total_ops][AH, AW]
         # Inter-PE column streams: A forwarded down columns
         pe_a_down: Stream[int32, AH][AH, AW]
 
