@@ -243,12 +243,125 @@ def run_hls_test(trace_info, mode="csim", seed=42):
         return passed
 
     elif mode == "csyn":
+        _patch_load_bufs_for_throughput(project_dir)
         print(f"  Running Vitis HLS csyn...")
         hls_mod()
         _report_synthesis(project_dir)
         return True
 
     return False
+
+
+def _patch_load_bufs_for_throughput(project_dir):
+    """Optimize load_buf DRAM loaders: widen m_axi + partition + pipeline outer.
+
+    Auto-generated load_buf functions read from DRAM one element per cycle.
+    For 2D+ output arrays, we can read multiple elements per cycle by:
+    1. Widening m_axi ports to 512 bits (16 int32 per AXI beat)
+    2. Partitioning inner dims of output arrays (enable parallel writes)
+    3. Moving pipeline from inner to outer loop (inner gets fully unrolled)
+
+    This reduces load_buf latencies from O(D0*D1) to O(D0).
+    """
+    kernel_path = os.path.join(project_dir, "kernel.cpp")
+    if not os.path.isfile(kernel_path):
+        return
+
+    with open(kernel_path, "r") as f:
+        code = f.read()
+
+    # Step 1: Widen all m_axi ports for burst reads
+    code = re.sub(
+        r'(#pragma HLS interface m_axi port=\w+ offset=slave bundle=\w+)'
+        r'(?!\s+max_widen_bitwidth)',
+        r'\1 max_widen_bitwidth=512',
+        code,
+    )
+
+    # Step 2: Rewrite instruction load_bufs (load_buf1, load_buf4) to use
+    # wide pointers (ap_uint<COLS*32>) for row-at-a-time reads.
+    # Original: int32_t in[ROWS*COLS] → int32_t out[ROWS][COLS], 1 read/cycle
+    # Rewrite: ap_uint<COLS*32> in_wide[ROWS] → extract 32-bit fields, 1 row/cycle
+    for buf_id in (1, 4):
+        fn = f'load_buf{buf_id}'
+        # Match: void load_bufN(\n  int32_t INVAR[FLAT],\n  int32_t OUTVAR[R][C]\n) {
+        sig = re.search(
+            rf'void {fn}\(\s*\n'
+            rf'\s*int32_t\s+(\w+)\[(\d+)\],\s*\n'
+            rf'\s*int32_t\s+(\w+)\[(\d+)\]\[(\d+)\]\s*\n'
+            rf'\) \{{',
+            code,
+        )
+        if not sig:
+            continue
+        in_var, flat_sz, out_var = sig.group(1), int(sig.group(2)), sig.group(3)
+        rows, cols = int(sig.group(4)), int(sig.group(5))
+        wide_bits = cols * 32
+
+        # Find the end of this function (matching closing brace)
+        brace_depth, func_end = 0, sig.start()
+        for idx in range(sig.start(), len(code)):
+            if code[idx] == '{':
+                brace_depth += 1
+            elif code[idx] == '}':
+                brace_depth -= 1
+                if brace_depth == 0:
+                    func_end = idx + 1
+                    break
+
+        # Build replacement function with wide pointer
+        new_func = (
+            f'void {fn}(\n'
+            f'  ap_uint<{wide_bits}> {in_var}[{rows}],\n'
+            f'  int32_t {out_var}[{rows}][{cols}]\n'
+            f') {{\t//\n'
+            f'  #pragma HLS array_partition variable={out_var} complete dim=2\n'
+            f'  l_S_{fn}_{fn}_l_0: for (int {fn}_l_0 = 0;'
+            f' {fn}_l_0 < {rows}; {fn}_l_0++) {{\t//\n'
+            f'  #pragma HLS pipeline II=1 rewind\n'
+            f'    ap_uint<{wide_bits}> row = {in_var}[{fn}_l_0];\t//\n'
+        )
+        for j in range(cols):
+            lo, hi = j * 32, j * 32 + 31
+            new_func += (
+                f'    {out_var}[{fn}_l_0][{j}] ='
+                f' (int32_t)row.range({hi}, {lo});\t//\n'
+            )
+        new_func += '  }\n}\n'
+
+        code = code[:sig.start()] + new_func + code[func_end:]
+
+    # Step 3: Update top-level parameter types for inst ports (gmem1, gmem4)
+    # Change int32_t *vNNNN to ap_uint<WIDE> *vNNNN for instruction ports
+    for buf_id, gmem_id in ((1, 1), (4, 4)):
+        fn = f'load_buf{buf_id}'
+        # Find the function to get the wide_bits value
+        sig = re.search(rf'void {fn}\(\s*\n\s*ap_uint<(\d+)>', code)
+        if not sig:
+            continue
+        wide_bits = sig.group(1)
+        # Find the m_axi pragma for this gmem
+        pragma_pattern = (
+            rf'(#pragma HLS interface m_axi port=(\w+) offset=slave'
+            rf' bundle=gmem{gmem_id})'
+        )
+        pm = re.search(pragma_pattern, code)
+        if not pm:
+            continue
+        port_var = pm.group(2)
+        # Change parameter type in full_matrix_top signature
+        code = code.replace(
+            f'  int32_t *{port_var}',
+            f'  ap_uint<{wide_bits}> *{port_var}',
+            1,
+        )
+        # Also change the buf declaration and load_buf call
+        # buf1[27][13] stays int32_t, but the DRAM pointer type changes
+        # The load_buf call passes the m_axi pointer directly
+
+    with open(kernel_path, "w") as f:
+        f.write(code)
+    print(f"  Patched kernel.cpp: widened m_axi + optimized load_buf throughput")
 
 
 def _patch_maxi_depths(project_dir, trace_info):

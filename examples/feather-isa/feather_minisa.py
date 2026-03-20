@@ -383,75 +383,62 @@ def get_feather_full_matrix_top(M, K, N, AW, AH, Ty, num_inst,
             local_accum_params: int32[num_accum_params],
             local_C: int32[M, N],
         ):
-            """Accumulate BIRRD output into C[M,N] with block-level register accumulation.
+            """Fused BIRRD read + accumulate into C[M,N].
 
-            Uses a small local_acc[AW,AH] register buffer (fully partitioned) instead
-            of a large accum[M,N] buffer. Consecutive k_passes tiles form a "block"
-            targeting the same output region — their partial K-sums are accumulated
-            in local_acc, then flushed to C once per block.
+            Reads BIRRD outputs and accumulates per-block into tile_acc[AW,AH]
+            using fixed compile-time indices (col from meta_for, d from loop).
+            Eliminates the all_tile_out[total_ops,AH,AW] intermediate buffer
+            and the two-phase sequential bottleneck.
 
-            This eliminates data-dependent scatter into a large array, replacing it
-            with a 16-register buffer that HLS can fully partition without memory
-            port contention.
+            Within each block, all k_passes tiles share the same col→m mapping
+            (only k_start differs), so tile_acc[col, d] is a 1-to-1 mapping
+            to unique (m_pos, n_off) output positions.
             """
             quant_scale: int32 = local_accum_params[0]
             quant_zp: int32 = local_accum_params[1]
 
-            # Phase 1: Communication — read all BIRRD outputs into buffer
-            all_tile_out: int32[total_ops, AH, AW]
-            for op in range(total_ops):
-                for d in range(AH):
-                    with allo.meta_for(AW) as aw_i:
-                        all_tile_out[op, d, aw_i] = connection[P0, aw_i].get()
-
-            # Phase 2: Block-level accumulation with local register buffer
-            # Each block = k_passes consecutive tiles sharing same (m_start, n_start)
-            local_acc: int32[AW, Nt_local]
+            # Accumulator indexed by (col, d) — fixed indices for II=1
+            tile_acc: int32[AW, AH]
 
             for block in range(num_blocks):
-                # Zero local_acc
+                # Zero tile_acc
                 for _i0 in range(AW):
-                    for _j0 in range(Nt_local):
-                        local_acc[_i0, _j0] = 0
+                    for _j0 in range(AH):
+                        tile_acc[_i0, _j0] = 0
 
                 base_tile: int32 = block * k_passes
+
+                # Fused: read from BIRRD streams + accumulate with fixed indices
+                for k in range(k_passes):
+                    for inner in range(n_inner):
+                        for d in range(AH):
+                            with allo.meta_for(AW) as col:
+                                tile_acc[col, d] = tile_acc[col, d] + connection[P0, col].get()
+
+                # Writeback: apply col→m mapping and write to C
                 num_m: int32 = local_output_num_m[base_tile]
                 sr_val: int32 = local_accum_params[2 + base_tile]
-
-                # Accumulate k_passes tiles into local_acc
-                for k in range(k_passes):
-                    tile: int32 = base_tile + k
-                    for inner in range(n_inner):
-                        op_idx: int32 = tile * n_inner + inner
-                        for col in range(AW):
-                            m_pos: int32 = local_output_col_map[tile, col]
-                            n_base_col: int32 = local_output_n_base[tile, col]
-                            col_mask: int32 = 0
-                            m_safe: int32 = 0
-                            if m_pos < num_m:
-                                col_mask = 1
-                                m_safe = m_pos
-                            for on in range(AH):
-                                sr_mask: int32 = 0
-                                if sr_val != 0:
-                                    sr_mask = 1
-                                if on == 0:
-                                    sr_mask = 1
-                                n_off: int32 = sr_val * on + n_base_col
-                                local_acc[m_safe, n_off] = (
-                                    local_acc[m_safe, n_off]
-                                    + all_tile_out[op_idx, on, col] * col_mask * sr_mask
-                                )
-
-                # Flush to C (write-only — all K contributions accumulated in local_acc)
                 m_start: int32 = local_accum_m_start[base_tile * n_inner]
                 n_start: int32 = local_accum_n_start[base_tile * n_inner]
-                for mi in range(AW):
-                    for ni in range(Nt_local):
-                        val: int32 = local_acc[mi, ni]
+                for col in range(AW):
+                    m_pos: int32 = local_output_col_map[base_tile, col]
+                    n_base_col: int32 = local_output_n_base[base_tile, col]
+                    col_mask: int32 = 0
+                    m_safe: int32 = 0
+                    if m_pos < num_m:
+                        col_mask = 1
+                        m_safe = m_pos
+                    for on in range(AH):
+                        sr_mask: int32 = 0
+                        if sr_val != 0:
+                            sr_mask = 1
+                        if on == 0:
+                            sr_mask = 1
+                        n_off: int32 = sr_val * on + n_base_col
+                        val: int32 = tile_acc[col, on] * col_mask * sr_mask
                         if quant_scale != 0:
                             val = (val * quant_scale + quant_zp) & 255
-                        local_C[m_start + mi, n_start + ni] = val
+                        local_C[m_start + m_safe, n_start + n_off] = val
 
     return full_matrix_top
 
@@ -667,14 +654,9 @@ def schedule_feather_hls(s, K, N, AH, AW):
         s.partition("w_loader_0:local_B", dim=2, partition_type=Partition.Complete)
     else:
         s.partition("w_loader_0:local_B", dim=2, factor=AH, partition_type=Partition.Cyclic)
-    # Partition local_acc for output accumulation.
-    # dim=1 Complete: AH independent row banks (always safe).
-    # dim=2 Complete: only for small arrays (AH*AW <= 64); for large arrays,
-    # 256-entry fully-partitioned local_acc[16][16] with variable indexing creates
-    # a 256-way mux that makes the HLS scheduler intractable (30+ min on one loop).
-    s.partition("output_accum_0:local_acc", dim=1, partition_type=Partition.Complete)
-    if AH * AW <= 64:
-        s.partition("output_accum_0:local_acc", dim=2, partition_type=Partition.Complete)
+    # Partition tile_acc for output accumulation (fixed-index, always safe to fully partition).
+    s.partition("output_accum_0:tile_acc", dim=1, partition_type=Partition.Complete)
+    s.partition("output_accum_0:tile_acc", dim=2, partition_type=Partition.Complete)
 
 
 def build_feather_hls(M, K, N, AW, AH, Ty, num_inst,
