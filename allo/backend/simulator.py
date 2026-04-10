@@ -919,6 +919,7 @@ class LLVMOMPModule(LLVMModule):
                 "lower-affine,"
                 "convert-scf-to-cf,"
                 "finalize-memref-to-llvm,"
+                "convert-math-to-llvm,"
                 "convert-func-to-llvm,"
                 "convert-index-to-llvm,"
                 "convert-arith-to-llvm,"
