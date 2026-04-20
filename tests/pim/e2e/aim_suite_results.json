@@ -1,0 +1,134 @@
+[
+  {
+    "name": "dot_16x16",
+    "layout": "no-bank",
+    "mem_cycles": 2262,
+    "mac_abk_cycles": 0,
+    "mac_sbk_cycles": 528,
+    "trace_lines": 147,
+    "shadow_ok": true,
+    "returncode": 0,
+    "wall_s": 0.7055363655090332
+  },
+  {
+    "name": "dot_16x16",
+    "layout": "all-bank",
+    "mem_cycles": 263,
+    "mac_abk_cycles": 33,
+    "mac_sbk_cycles": 0,
+    "trace_lines": 42,
+    "shadow_ok": true,
+    "returncode": 0,
+    "wall_s": 0.8009727001190186
+  },
+  {
+    "name": "dot_16x32",
+    "layout": "no-bank",
+    "mem_cycles": 5936,
+    "mac_abk_cycles": 0,
+    "mac_sbk_cycles": 1952,
+    "trace_lines": 195,
+    "shadow_ok": true,
+    "returncode": 0,
+    "wall_s": 0.8715925216674805
+  },
+  {
+    "name": "dot_16x32",
+    "layout": "all-bank",
+    "mem_cycles": 462,
+    "mac_abk_cycles": 122,
+    "mac_sbk_cycles": 0,
+    "trace_lines": 75,
+    "shadow_ok": true,
+    "returncode": 0,
+    "wall_s": 0.6079301834106445
+  },
+  {
+    "name": "dot_16x64",
+    "layout": "no-bank",
+    "mem_cycles": 9264,
+    "mac_abk_cycles": 0,
+    "mac_sbk_cycles": 1984,
+    "trace_lines": 291,
+    "shadow_ok": true,
+    "returncode": 0,
+    "wall_s": 0.6496868133544922
+  },
+  {
+    "name": "dot_16x64",
+    "layout": "all-bank",
+    "mem_cycles": 798,
+    "mac_abk_cycles": 124,
+    "mac_sbk_cycles": 0,
+    "trace_lines": 141,
+    "shadow_ok": true,
+    "returncode": 0,
+    "wall_s": 0.6478292942047119
+  },
+  {
+    "name": "ewmul_16",
+    "layout": "no-bank",
+    "mem_cycles": 126,
+    "mac_abk_cycles": 0,
+    "mac_sbk_cycles": 0,
+    "trace_lines": 9,
+    "shadow_ok": true,
+    "returncode": 0,
+    "wall_s": 0.5845110416412354
+  },
+  {
+    "name": "ewmul_16",
+    "layout": "all-bank",
+    "mem_cycles": 126,
+    "mac_abk_cycles": 0,
+    "mac_sbk_cycles": 0,
+    "trace_lines": 9,
+    "shadow_ok": true,
+    "returncode": 0,
+    "wall_s": 0.6108951568603516
+  },
+  {
+    "name": "ewmul_64",
+    "layout": "no-bank",
+    "mem_cycles": 731,
+    "mac_abk_cycles": 0,
+    "mac_sbk_cycles": 0,
+    "trace_lines": 24,
+    "shadow_ok": true,
+    "returncode": 0,
+    "wall_s": 0.6092033386230469
+  },
+  {
+    "name": "ewmul_64",
+    "layout": "all-bank",
+    "mem_cycles": 449,
+    "mac_abk_cycles": 0,
+    "mac_sbk_cycles": 0,
+    "trace_lines": 21,
+    "shadow_ok": true,
+    "returncode": 0,
+    "wall_s": 0.6309216022491455
+  },
+  {
+    "name": "ewmul_256",
+    "layout": "no-bank",
+    "mem_cycles": 3120,
+    "mac_abk_cycles": 0,
+    "mac_sbk_cycles": 0,
+    "trace_lines": 84,
+    "shadow_ok": true,
+    "returncode": 0,
+    "wall_s": 0.6085360050201416
+  },
+  {
+    "name": "ewmul_256",
+    "layout": "all-bank",
+    "mem_cycles": 1710,
+    "mac_abk_cycles": 0,
+    "mac_sbk_cycles": 0,
+    "trace_lines": 69,
+    "shadow_ok": true,
+    "returncode": 0,
+    "wall_s": 0.5583853721618652
+  }
+]

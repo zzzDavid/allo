@@ -1,0 +1,236 @@
+[
+  {
+    "benchmark": "BS",
+    "num_tasklets": 1,
+    "logic_cycle": 0,
+    "memory_cycle": 0,
+    "returncode": 2,
+    "wall_s": 9.70205807685852,
+    "err": "IMulator/sdk/build/syslib/CMakeFiles/syslib.dir/subdf3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/mulvdi3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/defs.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/clzdi2.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/fixunssfdi.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/mcount.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/cmpdi2.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/stdlib/CMakeFiles/stdlib.dir/strdup.c.o...\nResolving symbols of BS...\nDumping the executable to ...\nRe-lexing executable\nRe-parsing executable...\nAssigning labels...\nAssigning addresses..\nSetting alias labels...\nAssigning instructions...\nexecution (0) is finished...\npanic: bytes are different\n\ngoroutine 232549 [running]:\nuPIMulator/src/simulator/host.(*ChannelTransferReadJob).CompareByteStreams(0x228ae4056910?, {0x228ae6ff6b50?, 0x228ae402e180?, 0x228af0d5cf70?}, {0x228ae6ff6b68?, 0x228ae7058728?, 0xffffffffffffffff?})\n\t/work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/src/simulator/host/channel_transfer_read_job.go:69 +0x9f\nuPIMulator/src/simulator/host.(*ChannelTransferReadJob).Execute(0x228ae6f686c0)\n\t/work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/src/simulator/host/channel_transfer_read_job.go:43 +0xaa\nuPIMulator/src/core.(*ThreadPool).Dispatch(0x0?, {0x650500?, 0x228ae6f686c0?})\n\t/work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/src/core/thread_pool.go:42 +0x53\ncreated by uPIMulator/src/core.(*ThreadPool).Start in goroutine 1\n\t/work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/src/core/thread_pool.go:35 +0x38"
+  },
+  {
+    "benchmark": "BS",
+    "num_tasklets": 16,
+    "logic_cycle": 0,
+    "memory_cycle": 0,
+    "returncode": 2,
+    "wall_s": 8.853875160217285,
+    "err": "ator/sdk/build/syslib/CMakeFiles/syslib.dir/ctzsi2.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/addvsi3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/mulosi4.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/sem.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/stdlib/CMakeFiles/stdlib.dir/strdup.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/waitqueue.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/umodsi3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/seqread256.c.o...\nResolving symbols of BS...\nDumping the executable to ...\nRe-lexing executable\nRe-parsing executable...\nAssigning labels...\nAssigning addresses..\nSetting alias labels...\nAssigning instructions...\nexecution (0) is finished...\npanic: bytes are different\n\ngoroutine 105650 [running]:\nuPIMulator/src/simulator/host.(*ChannelTransferReadJob).CompareByteStreams(0x325ad9dba910?, {0x325ae37ed088?, 0x325ad9d92180?, 0x325ae27f4770?}, {0x325ae37ed0a0?, 0x325ae37f1268?, 0xffffffffffffffff?})\n\t/work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/src/simulator/host/channel_transfer_read_job.go:69 +0x9f\nuPIMulator/src/simulator/host.(*ChannelTransferReadJob).Execute(0x325ae37f4ae0)\n\t/work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/src/simulator/host/channel_transfer_read_job.go:43 +0xaa\nuPIMulator/src/core.(*ThreadPool).Dispatch(0x0?, {0x650500?, 0x325ae37f4ae0?})\n\t/work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/src/core/thread_pool.go:42 +0x53\ncreated by uPIMulator/src/core.(*ThreadPool).Start in goroutine 1\n\t/work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/src/core/thread_pool.go:35 +0x38"
+  },
+  {
+    "benchmark": "GEMV",
+    "num_tasklets": 1,
+    "logic_cycle": 4473521,
+    "memory_cycle": 26841126,
+    "returncode": 0,
+    "wall_s": 35.109543561935425,
+    "err": ""
+  },
+  {
+    "benchmark": "GEMV",
+    "num_tasklets": 16,
+    "logic_cycle": 115988,
+    "memory_cycle": 695928,
+    "returncode": 2,
+    "wall_s": 17.453227519989014,
+    "err": "ulator/sdk/build/syslib/CMakeFiles/syslib.dir/subvdi3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/stdlib/CMakeFiles/stdlib.dir/abort.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/mulosi4.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/stdlib/CMakeFiles/stdlib.dir/stpcpy.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/muldc3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/udivsi3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/subvsi3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/stdlib/CMakeFiles/stdlib.dir/strcat.c.o...\nResolving symbols of GEMV...\nDumping the executable to ...\nRe-lexing executable\nRe-parsing executable...\nAssigning labels...\nAssigning addresses..\nSetting alias labels...\nAssigning instructions...\nexecution (0) is finished...\npanic: pointer is not found\n\ngoroutine 1 [running]:\nuPIMulator/src/simulator/host.(*Host).ChannelTransferOutputDpuHost(0x1e22858a0300, 0x0)\n\t/work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/src/simulator/host/host.go:430 +0xa46\nuPIMulator/src/simulator/host.(*Host).Check(0x1e22858a0300, 0x0)\n\t/work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/src/simulator/host/host.go:273 +0x1d\nuPIMulator/src/simulator.(*Simulator).Cycle(0x1e2291a10d10)\n\t/work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/src/simulator/simulator.go:80 +0x4a5\nmain.main()\n\t/work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/src/main.go:60 +0x4e5"
+  },
+  {
+    "benchmark": "HST-L",
+    "num_tasklets": 1,
+    "logic_cycle": 96583,
+    "memory_cycle": 579498,
+    "returncode": 0,
+    "wall_s": 8.795565605163574,
+    "err": ""
+  },
+  {
+    "benchmark": "HST-L",
+    "num_tasklets": 16,
+    "logic_cycle": 100101,
+    "memory_cycle": 600606,
+    "returncode": 0,
+    "wall_s": 8.280589818954468,
+    "err": ""
+  },
+  {
+    "benchmark": "HST-S",
+    "num_tasklets": 1,
+    "logic_cycle": 85066,
+    "memory_cycle": 510396,
+    "returncode": 0,
+    "wall_s": 6.725747585296631,
+    "err": ""
+  },
+  {
+    "benchmark": "HST-S",
+    "num_tasklets": 16,
+    "logic_cycle": 126188,
+    "memory_cycle": 757128,
+    "returncode": 0,
+    "wall_s": 7.306116819381714,
+    "err": ""
+  },
+  {
+    "benchmark": "MLP",
+    "num_tasklets": 1,
+    "logic_cycle": 0,
+    "memory_cycle": 0,
+    "returncode": -9,
+    "wall_s": 209.25088739395142,
+    "err": "es/stdlib.dir/strdup.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/umodsi3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/stdlib/CMakeFiles/stdlib.dir/strcspn.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/udivmodsi4.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/sem.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/stdlib/CMakeFiles/stdlib.dir/strupr.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/subdf3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/truncdfsf2.c.o...\nResolving symbols of MLP...\nDumping the executable to ...\nRe-lexing executable\nRe-parsing executable...\nAssigning labels...\nAssigning addresses..\nSetting alias labels...\nAssigning instructions...\nexecution (0) is finished...\nexecution (1) is finished..."
+  },
+  {
+    "benchmark": "MLP",
+    "num_tasklets": 16,
+    "logic_cycle": 0,
+    "memory_cycle": 0,
+    "returncode": -9,
+    "wall_s": 83.90284419059753,
+    "err": ".dir/divsf3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/fixunssfdi.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/stdlib/CMakeFiles/stdlib.dir/strspn.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/udivsi3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/subdf3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/extendsfdf2.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/floatundidf.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/fixsfsi.c.o...\nResolving symbols of MLP...\nDumping the executable to ...\nRe-lexing executable\nRe-parsing executable...\nAssigning labels...\nAssigning addresses..\nSetting alias labels...\nAssigning instructions...\nexecution (0) is finished...\nexecution (1) is finished..."
+  },
+  {
+    "benchmark": "RED",
+    "num_tasklets": 1,
+    "logic_cycle": 17229,
+    "memory_cycle": 103374,
+    "returncode": 0,
+    "wall_s": 6.000255584716797,
+    "err": ""
+  },
+  {
+    "benchmark": "RED",
+    "num_tasklets": 16,
+    "logic_cycle": 14820,
+    "memory_cycle": 88920,
+    "returncode": 0,
+    "wall_s": 6.236395835876465,
+    "err": ""
+  },
+  {
+    "benchmark": "SCAN-RSS",
+    "num_tasklets": 1,
+    "logic_cycle": 40523,
+    "memory_cycle": 243138,
+    "returncode": 0,
+    "wall_s": 6.817523241043091,
+    "err": ""
+  },
+  {
+    "benchmark": "SCAN-RSS",
+    "num_tasklets": 16,
+    "logic_cycle": 79266,
+    "memory_cycle": 475596,
+    "returncode": 0,
+    "wall_s": 7.598289251327515,
+    "err": ""
+  },
+  {
+    "benchmark": "SCAN-SSA",
+    "num_tasklets": 1,
+    "logic_cycle": 44699,
+    "memory_cycle": 268194,
+    "returncode": 0,
+    "wall_s": 6.977306604385376,
+    "err": ""
+  },
+  {
+    "benchmark": "SCAN-SSA",
+    "num_tasklets": 16,
+    "logic_cycle": 84623,
+    "memory_cycle": 507738,
+    "returncode": 0,
+    "wall_s": 13.355118751525879,
+    "err": ""
+  },
+  {
+    "benchmark": "SEL",
+    "num_tasklets": 1,
+    "logic_cycle": 23591,
+    "memory_cycle": 141546,
+    "returncode": 0,
+    "wall_s": 6.744443416595459,
+    "err": ""
+  },
+  {
+    "benchmark": "SEL",
+    "num_tasklets": 16,
+    "logic_cycle": 57017,
+    "memory_cycle": 342102,
+    "returncode": 0,
+    "wall_s": 7.326297760009766,
+    "err": ""
+  },
+  {
+    "benchmark": "TRNS",
+    "num_tasklets": 1,
+    "logic_cycle": 0,
+    "memory_cycle": 0,
+    "returncode": -9,
+    "wall_s": 64.21740221977234,
+    "err": "dk/build/syslib/CMakeFiles/syslib.dir/udivdi3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/absvdi2.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/addvsi3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/divsf3.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/stdlib/CMakeFiles/stdlib.dir/strspn.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/profiling.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/seqread512.c.o...\nAnalyzing the liveness of /work/shared/users/phd/nz264/spmw-for-pim/experiments/simulators/uPIMulator/golang/uPIMulator/sdk/build/syslib/CMakeFiles/syslib.dir/barrier.c.o...\nResolving symbols of TRNS...\nDumping the executable to ...\nRe-lexing executable\nRe-parsing executable...\nAssigning labels...\nAssigning addresses..\nSetting alias labels...\nAssigning instructions...\nexecution (0) is finished..."
+  },
+  {
+    "benchmark": "TRNS",
+    "num_tasklets": 16,
+    "logic_cycle": 2290180,
+    "memory_cycle": 13741080,
+    "returncode": 0,
+    "wall_s": 46.77981185913086,
+    "err": ""
+  },
+  {
+    "benchmark": "TS",
+    "num_tasklets": 1,
+    "logic_cycle": 3736720,
+    "memory_cycle": 22420320,
+    "returncode": 0,
+    "wall_s": 29.909346103668213,
+    "err": ""
+  },
+  {
+    "benchmark": "TS",
+    "num_tasklets": 16,
+    "logic_cycle": 2558415,
+    "memory_cycle": 15350490,
+    "returncode": 0,
+    "wall_s": 50.78345799446106,
+    "err": ""
+  },
+  {
+    "benchmark": "UNI",
+    "num_tasklets": 1,
+    "logic_cycle": 18763,
+    "memory_cycle": 112578,
+    "returncode": 0,
+    "wall_s": 7.481727361679077,
+    "err": ""
+  },
+  {
+    "benchmark": "UNI",
+    "num_tasklets": 16,
+    "logic_cycle": 33882,
+    "memory_cycle": 203292,
+    "returncode": 0,
+    "wall_s": 7.6198952198028564,
+    "err": ""
+  },
+  {
+    "benchmark": "VA",
+    "num_tasklets": 1,
+    "logic_cycle": 23354,
+    "memory_cycle": 140124,
+    "returncode": 0,
+    "wall_s": 6.33712911605835,
+    "err": ""
+  },
+  {
+    "benchmark": "VA",
+    "num_tasklets": 16,
+    "logic_cycle": 30247,
+    "memory_cycle": 181482,
+    "returncode": 0,
+    "wall_s": 6.395129919052124,
+    "err": ""
+  }
+]

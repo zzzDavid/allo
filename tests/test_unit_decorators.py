@@ -20,37 +20,77 @@ def _load_allo_unit():
     """Load ``allo.unit`` without forcing the full ``import allo``
     (which pulls in the MLIR dialect and is unusable in environments
     without a built Allo). Prefer the canonical ``from allo import
-    unit`` path; fall back to a direct file-load of ``allo/unit.py`` so
-    this test stays green in CI setups that don't ship MLIR.
+    unit`` path; fall back to a synthetic-package file-load so this
+    test stays green in CI setups that don't ship MLIR.
 
     In a real Allo install the first branch succeeds and the fallback
-    is dead code.
+    is dead code. The fallback mirrors the loader in
+    ``tests/pim/test_allo_end_to_end.py::_load_allo_mvp`` — we build a
+    synthetic ``_allo_mvp`` package rooted at ``allo/`` so the
+    ``from .pim.target import ...`` relative import inside ``unit.py``
+    resolves against a real subpackage.
     """
-    # Make sure ``pimdsl`` is importable — the decorator module imports
-    # the underlying ``Memory``/``Op``/``Target`` dataclasses from it.
     here = os.path.dirname(os.path.abspath(__file__))
-    pim_dsl_dir = os.path.normpath(os.path.join(
-        here, "..", "..", "pim_dsl"))
-    if os.path.isdir(pim_dsl_dir) and pim_dsl_dir not in sys.path:
-        sys.path.insert(0, pim_dsl_dir)
+    allo_pkg_dir = os.path.normpath(os.path.join(here, "..", "allo"))
     try:
         tn = importlib.import_module("allo.unit")
+        return tn
     except Exception:
-        unit_path = os.path.normpath(os.path.join(
-            here, "..", "allo", "unit.py"))
-        spec = importlib.util.spec_from_file_location(
-            "allo_unit_standalone", unit_path)
-        tn = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(tn)
+        pass
+
+    import types
+    pkg_name = "_allo_mvp"
+    if pkg_name in sys.modules:
+        pkg = sys.modules[pkg_name]
+    else:
+        pkg = types.ModuleType(pkg_name)
+        pkg.__path__ = [allo_pkg_dir]
+        sys.modules[pkg_name] = pkg
+
+    # Load the ``pim`` subpackage first so the relative ``from
+    # .pim.target import ...`` in unit.py resolves.
+    pim_pkg_name = f"{pkg_name}.pim"
+    if pim_pkg_name not in sys.modules:
+        pim_pkg_dir = os.path.join(allo_pkg_dir, "pim")
+        pim_pkg = types.ModuleType(pim_pkg_name)
+        pim_pkg.__path__ = [pim_pkg_dir]
+        sys.modules[pim_pkg_name] = pim_pkg
+        setattr(pkg, "pim", pim_pkg)
+        for sub in ("ops", "target", "lowering"):
+            full = f"{pim_pkg_name}.{sub}"
+            spec = importlib.util.spec_from_file_location(
+                full, os.path.join(pim_pkg_dir, f"{sub}.py"))
+            m = importlib.util.module_from_spec(spec)
+            sys.modules[full] = m
+            spec.loader.exec_module(m)
+            setattr(pim_pkg, sub, m)
+
+    unit_full = f"{pkg_name}.unit"
+    spec = importlib.util.spec_from_file_location(
+        unit_full, os.path.join(allo_pkg_dir, "unit.py"))
+    tn = importlib.util.module_from_spec(spec)
+    sys.modules[unit_full] = tn
+    spec.loader.exec_module(tn)
     return tn
 
 
 tn = _load_allo_unit()
 
 # Import the underlying target primitives for the round-trip test.
-from pimdsl.target import (  # noqa: E402
-    Memory, Op, Target, Grid, Leaf, build_from_grid,
-)
+# Prefer the ``allo.pim.target`` canonical path; fall back to the
+# synthetic-package child loaded by ``_load_allo_unit``.
+try:
+    from allo.pim.target import (  # noqa: E402
+        Memory, Op, Target, Grid, Leaf, build_from_grid,
+    )
+except Exception:  # noqa: BLE001
+    _target_mod = sys.modules["_allo_mvp.pim.target"]
+    Memory = _target_mod.Memory
+    Op = _target_mod.Op
+    Target = _target_mod.Target
+    Grid = _target_mod.Grid
+    Leaf = _target_mod.Leaf
+    build_from_grid = _target_mod.build_from_grid
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,201 @@
+{
+  "N": 131072,
+  "op": "add",
+  "runs": [
+    {
+      "layout": "element_only",
+      "n_vrs_per_body": 1,
+      "run_tag": "APU_AB_element_only_1776633049",
+      "host_ok": true,
+      "host_stdout_tail": "Num Contexts = 1\nMemory Size = 14.0G\nNum Apucs = 4\n\u001b[0;32mPASS (131072 elements)\u001b[0m\n\nSuccess",
+      "counters": {
+        "total": {
+          "hits": 1,
+          "seu": 1124,
+          "crun": 358403,
+          "iall": 119774,
+          "icm": 298,
+          "dcm": 7,
+          "microsec500": 716
+        },
+        "l4_to_l1": {
+          "hits": 4,
+          "seu": 688,
+          "crun": 207340,
+          "iall": 75180,
+          "icm": 115,
+          "dcm": 4,
+          "microsec500": 414
+        },
+        "calc": {
+          "hits": 4,
+          "seu": 36,
+          "crun": 5969,
+          "iall": 1214,
+          "icm": 24,
+          "dcm": 0,
+          "microsec500": 11
+        },
+        "l1_to_l4": {
+          "hits": 4,
+          "seu": 364,
+          "crun": 111808,
+          "iall": 38014,
+          "icm": 96,
+          "dcm": 0,
+          "microsec500": 223
+        },
+        "host_to_l4": {
+          "hits": 0,
+          "seu": 0,
+          "crun": 0,
+          "iall": 0,
+          "icm": 0,
+          "dcm": 0,
+          "microsec500": 0
+        }
+      },
+      "build_errors": null
+    },
+    {
+      "layout": "element_plus_vr2",
+      "n_vrs_per_body": 2,
+      "run_tag": "APU_AB_element_plus_vr2_1776633063",
+      "host_ok": true,
+      "host_stdout_tail": "Num Contexts = 1\nMemory Size = 14.0G\nNum Apucs = 4\n\u001b[0;32mPASS (131072 elements)\u001b[0m\n\nSuccess",
+      "counters": {
+        "total": {
+          "hits": 1,
+          "seu": 1124,
+          "crun": 349471,
+          "iall": 115623,
+          "icm": 289,
+          "dcm": 7,
+          "microsec500": 698
+        },
+        "l4_to_l1": {
+          "hits": 2,
+          "seu": 704,
+          "crun": 204385,
+          "iall": 74844,
+          "icm": 112,
+          "dcm": 1,
+          "microsec500": 408
+        },
+        "calc": {
+          "hits": 2,
+          "seu": 32,
+          "crun": 4539,
+          "iall": 632,
+          "icm": 25,
+          "dcm": 0,
+          "microsec500": 9
+        },
+        "l1_to_l4": {
+          "hits": 2,
+          "seu": 364,
+          "crun": 112431,
+          "iall": 37259,
+          "icm": 95,
+          "dcm": 0,
+          "microsec500": 224
+        },
+        "host_to_l4": {
+          "hits": 0,
+          "seu": 0,
+          "crun": 0,
+          "iall": 0,
+          "icm": 0,
+          "dcm": 0,
+          "microsec500": 0
+        }
+      },
+      "build_errors": null
+    },
+    {
+      "layout": "element_plus_vr",
+      "n_vrs_per_body": 4,
+      "run_tag": "APU_AB_element_plus_vr_1776633077",
+      "host_ok": true,
+      "host_stdout_tail": "Num Contexts = 1\nMemory Size = 14.0G\nNum Apucs = 4\n\u001b[0;32mPASS (131072 elements)\u001b[0m\n\nSuccess",
+      "counters": {
+        "total": {
+          "hits": 1,
+          "seu": 1124,
+          "crun": 344763,
+          "iall": 113160,
+          "icm": 287,
+          "dcm": 7,
+          "microsec500": 689
+        },
+        "l4_to_l1": {
+          "hits": 1,
+          "seu": 712,
+          "crun": 204287,
+          "iall": 74131,
+          "icm": 115,
+          "dcm": 4,
+          "microsec500": 408
+        },
+        "calc": {
+          "hits": 1,
+          "seu": 48,
+          "crun": 4848,
+          "iall": 341,
+          "icm": 23,
+          "dcm": 0,
+          "microsec500": 9
+        },
+        "l1_to_l4": {
+          "hits": 1,
+          "seu": 364,
+          "crun": 110396,
+          "iall": 37053,
+          "icm": 91,
+          "dcm": 0,
+          "microsec500": 220
+        },
+        "host_to_l4": {
+          "hits": 0,
+          "seu": 0,
+          "crun": 0,
+          "iall": 0,
+          "icm": 0,
+          "dcm": 0,
+          "microsec500": 0
+        }
+      },
+      "build_errors": null
+    }
+  ],
+  "comparison": {
+    "total": {
+      "element_only_crun": 358403,
+      "element_plus_vr2_crun": 349471,
+      "speedup_element_plus_vr2": 1.0255586300436945,
+      "element_plus_vr_crun": 344763,
+      "speedup_element_plus_vr": 1.0395634102267355
+    },
+    "l4_to_l1": {
+      "element_only_crun": 207340,
+      "element_plus_vr2_crun": 204385,
+      "speedup_element_plus_vr2": 1.014458008170854,
+      "element_plus_vr_crun": 204287,
+      "speedup_element_plus_vr": 1.014944661187447
+    },
+    "calc": {
+      "element_only_crun": 5969,
+      "element_plus_vr2_crun": 4539,
+      "speedup_element_plus_vr2": 1.3150473672615113,
+      "element_plus_vr_crun": 4848,
+      "speedup_element_plus_vr": 1.2312293729372936
+    },
+    "l1_to_l4": {
+      "element_only_crun": 111808,
+      "element_plus_vr2_crun": 112431,
+      "speedup_element_plus_vr2": 0.9944588236340511,
+      "element_plus_vr_crun": 110396,
+      "speedup_element_plus_vr": 1.0127903184898004
+    }
+  }
+}

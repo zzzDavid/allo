@@ -1,0 +1,218 @@
+{
+  "K": 4,
+  "M": 32768,
+  "runs": [
+    {
+      "layout": "A",
+      "run_tag": "APU_CHAIN_A_1776634746",
+      "host_ok": true,
+      "host_stdout_tail": "Num Contexts = 1\nMemory Size = 14.0G\nNum Apucs = 4\n\u001b[0;32mPASS (M=32768, K=4)\u001b[0m\n\nSuccess",
+      "counters": {
+        "total": {
+          "hits": 1,
+          "seu": 1781,
+          "crun": 389416,
+          "iall": 109610,
+          "icm": 485,
+          "dcm": 7,
+          "microsec500": 778
+        },
+        "load_W": {
+          "hits": 1,
+          "seu": 356,
+          "crun": 116803,
+          "iall": 36067,
+          "icm": 119,
+          "dcm": 1,
+          "microsec500": 233
+        },
+        "stage1": {
+          "hits": 1,
+          "seu": 393,
+          "crun": 13182,
+          "iall": 1099,
+          "icm": 52,
+          "dcm": 2,
+          "microsec500": 26
+        },
+        "stage1_spill": {
+          "hits": 1,
+          "seu": 91,
+          "crun": 45739,
+          "iall": 9631,
+          "icm": 88,
+          "dcm": 0,
+          "microsec500": 91
+        },
+        "load_W2": {
+          "hits": 1,
+          "seu": 356,
+          "crun": 96579,
+          "iall": 38195,
+          "icm": 39,
+          "dcm": 0,
+          "microsec500": 193
+        },
+        "stage2": {
+          "hits": 1,
+          "seu": 393,
+          "crun": 7563,
+          "iall": 1045,
+          "icm": 30,
+          "dcm": 0,
+          "microsec500": 15
+        },
+        "combine": {
+          "hits": 1,
+          "seu": 101,
+          "crun": 25782,
+          "iall": 9911,
+          "icm": 24,
+          "dcm": 3,
+          "microsec500": 51
+        },
+        "store_z": {
+          "hits": 1,
+          "seu": 91,
+          "crun": 26153,
+          "iall": 9526,
+          "icm": 23,
+          "dcm": 0,
+          "microsec500": 52
+        }
+      },
+      "build_errors": null
+    },
+    {
+      "layout": "B",
+      "run_tag": "APU_CHAIN_B_1776634761",
+      "host_ok": true,
+      "host_stdout_tail": "Num Contexts = 1\nMemory Size = 14.0G\nNum Apucs = 4\n\u001b[0;32mPASS (M=32768, K=4)\u001b[0m\n\nSuccess",
+      "counters": {
+        "total": {
+          "hits": 1,
+          "seu": 1601,
+          "crun": 311435,
+          "iall": 88069,
+          "icm": 383,
+          "dcm": 4,
+          "microsec500": 622
+        },
+        "load_W": {
+          "hits": 1,
+          "seu": 712,
+          "crun": 208088,
+          "iall": 74061,
+          "icm": 130,
+          "dcm": 1,
+          "microsec500": 416
+        },
+        "stage1": {
+          "hits": 1,
+          "seu": 393,
+          "crun": 10671,
+          "iall": 1021,
+          "icm": 39,
+          "dcm": 2,
+          "microsec500": 21
+        },
+        "stage1_spill": {
+          "hits": 0,
+          "seu": 0,
+          "crun": 0,
+          "iall": 0,
+          "icm": 0,
+          "dcm": 0,
+          "microsec500": 0
+        },
+        "load_W2": {
+          "hits": 0,
+          "seu": 0,
+          "crun": 0,
+          "iall": 0,
+          "icm": 0,
+          "dcm": 0,
+          "microsec500": 0
+        },
+        "stage2": {
+          "hits": 1,
+          "seu": 393,
+          "crun": 5349,
+          "iall": 973,
+          "icm": 26,
+          "dcm": 0,
+          "microsec500": 10
+        },
+        "combine": {
+          "hits": 1,
+          "seu": 12,
+          "crun": 3909,
+          "iall": 323,
+          "icm": 21,
+          "dcm": 0,
+          "microsec500": 7
+        },
+        "store_z": {
+          "hits": 1,
+          "seu": 91,
+          "crun": 44266,
+          "iall": 8910,
+          "icm": 89,
+          "dcm": 0,
+          "microsec500": 88
+        }
+      },
+      "build_errors": null
+    }
+  ],
+  "comparison": {
+    "total": {
+      "A_crun": 389416,
+      "B_crun": 311435,
+      "saved": 77981,
+      "speedup": 1.2503925377687157
+    },
+    "load_W": {
+      "A_crun": 116803,
+      "B_crun": 208088,
+      "saved": -91285,
+      "speedup": 0.5613154050209527
+    },
+    "stage1": {
+      "A_crun": 13182,
+      "B_crun": 10671,
+      "saved": 2511,
+      "speedup": 1.2353106550463875
+    },
+    "stage1_spill": {
+      "A_crun": 45739,
+      "B_crun": 0,
+      "saved": 45739,
+      "speedup": null
+    },
+    "load_W2": {
+      "A_crun": 96579,
+      "B_crun": 0,
+      "saved": 96579,
+      "speedup": null
+    },
+    "stage2": {
+      "A_crun": 7563,
+      "B_crun": 5349,
+      "saved": 2214,
+      "speedup": 1.4139091418956815
+    },
+    "combine": {
+      "A_crun": 25782,
+      "B_crun": 3909,
+      "saved": 21873,
+      "speedup": 6.595548733691481
+    },
+    "store_z": {
+      "A_crun": 26153,
+      "B_crun": 44266,
+      "saved": -18113,
+      "speedup": 0.590814620702119
+    }
+  }
+}

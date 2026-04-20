@@ -80,22 +80,21 @@ Semantic decisions worth calling out
    ``Grid`` class carries these as free attributes; we add them with
    ``setattr`` rather than extending the class signature.
 
-Note on the ``pim_dsl`` import
-------------------------------
+Note on the ``allo.pim`` import
+-------------------------------
 
 The underlying ``Memory`` / ``Op`` / ``Target`` / ``Grid`` / ``Leaf``
-dataclasses currently live in ``pim_dsl.target``; Allo's decorator
-surface reaches across the package boundary to reuse them directly. A
-future refactor may lift an abstract ``UnitTree`` dataclass into Allo
-itself and keep ``pim_dsl`` as a thin adapter, but Phase 1 keeps the
-existing types as the source of truth.
+dataclasses live in ``allo.pim.target`` (this was formerly the
+out-of-tree ``pim_dsl`` package; it has been folded into Allo so
+the decorator surface can reuse the dataclasses directly via a
+relative import).
 """
 from __future__ import annotations
 
 import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
-from pimdsl.target import (
+from .pim.target import (
     Memory, Op, Target, Grid, Leaf, build_from_grid,
 )
 

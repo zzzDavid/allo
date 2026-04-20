@@ -5,11 +5,11 @@
 Entry point:
 
     from allo.compile import compile
-    result = compile(work, target=t)          # -> pimdsl.LoweringResult
+    result = compile(work, target=t)          # -> allo.pim.LoweringResult
 
 ``work`` is an ``allo.work.Work`` handle produced by ``@allo.work``; it
 carries the user function, named tensor shapes, and a default dtype.
-``target`` is the ``pimdsl.Target`` built by ``@allo.unit`` + ``@allo.target``
+``target`` is the ``allo.pim.Target`` built by ``@allo.unit`` + ``@allo.target``
 (already wired by ``allo/unit.py``).
 
 Compile strategy
@@ -19,14 +19,14 @@ Phase 1 (this file) is an AST-walker that recognises a SHORT LIST of
 statement forms and emits exactly one ``SrcOp`` per recognised
 statement:
 
-  * ``C[:] = A + B``          -> pimdsl.Add(shape=shapes["C"])
-  * ``C[:] = A - B``          -> pimdsl.Add(..., attrs={"sign": -1})
+  * ``C[:] = A + B``          -> allo.pim.Add(shape=shapes["C"])
+  * ``C[:] = A - B``          -> allo.pim.Add(..., attrs={"sign": -1})
                                 (backends treat as add; sign is a hint)
-  * ``C[:] = A * B``          -> pimdsl.Mul(shape=shapes["C"])
-  * ``C[:] = A @ B``          -> pimdsl.Matmul(shape=shapes["C"] + last(A))
-  * ``C[:] = np.maximum(A,0)``-> pimdsl.Relu(shape=shapes["C"])
-  * ``C[:] = allo.softmax(A)``-> pimdsl.Softmax(shape=shapes["C"])
-  * ``C[:] = k * A``   (k const) -> pimdsl.Scale(shape=shapes["C"],
+  * ``C[:] = A * B``          -> allo.pim.Mul(shape=shapes["C"])
+  * ``C[:] = A @ B``          -> allo.pim.Matmul(shape=shapes["C"] + last(A))
+  * ``C[:] = np.maximum(A,0)``-> allo.pim.Relu(shape=shapes["C"])
+  * ``C[:] = allo.softmax(A)``-> allo.pim.Softmax(shape=shapes["C"])
+  * ``C[:] = k * A``   (k const) -> allo.pim.Scale(shape=shapes["C"],
                                      attrs={"scale": k})
 
 Everything else raises ``NotImplementedError`` with a message pointing
@@ -38,7 +38,7 @@ infer them from the Python body. That is the trade-off the MVP
 recommends: "write a narrow AST walker; raise clearly for everything
 else" (see the prompt / Report 11 follow-up list).
 
-Host-fallback is handled entirely by ``pimdsl.lower``: if the target
+Host-fallback is handled entirely by ``allo.pim.lower``: if the target
 has no device pattern for an op (e.g., softmax on Samsung), the target's
 synthetic-host-root pattern catches it and the op lowers to
 ``host.softmax``. We don't re-implement that here.
@@ -50,12 +50,12 @@ import inspect
 import textwrap
 from typing import Any, Dict, Optional, Tuple
 
-from pimdsl import (
+from .pim import (
     Add, Matmul, Mul, Relu, Scale, Softmax, SrcProgram,
     lower as _lower,
 )
-from pimdsl.lowering import LoweringResult
-from pimdsl.target import Target
+from .pim.lowering import LoweringResult
+from .pim.target import Target
 
 from .work import Work
 
@@ -122,6 +122,93 @@ def _const_value(node: ast.AST) -> Tuple[bool, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _infer_rhs_shape(rhs: ast.AST,
+                     shapes: Dict[str, Tuple[int, ...]],
+                     ) -> Tuple[int, ...]:
+    """Infer the output shape of an RHS expression from the shapes of
+    its operands. Handles only the RHS forms the walker already
+    recognises (see module docstring); anything else raises
+    ``NotImplementedError`` so the walker's main switch can produce its
+    detailed error message.
+
+    Inference rules:
+
+      * ``A @ B`` (matmul / gemv): delegates to :func:`_matmul_shape`.
+      * ``A + B``, ``A - B``, ``A * B`` (elementwise): output shape is
+        ``shapes[A]`` when both operands are named tensors with equal
+        shape; if one operand is a scalar literal, the output shape is
+        the other operand's shape.
+      * ``np.maximum(A, 0)`` / ``allo.relu(A)`` / ``allo.softmax(A)``:
+        output shape is ``shapes[A]``.
+      * ``scale * A`` / ``A * scale`` where ``scale`` is a numeric
+        literal: output shape is ``shapes[A]``.
+
+    Operand names that aren't in ``shapes`` raise ``ValueError`` with a
+    message pointing at the missing name. Elementwise shape mismatches
+    raise ``ValueError`` similarly. Anything structurally unrecognised
+    raises ``NotImplementedError`` so the walker's default branch can
+    take over and report the offending statement with source text.
+    """
+    def _tensor_shape(name: str) -> Tuple[int, ...]:
+        if name not in shapes:
+            raise ValueError(
+                f"shape for tensor {name!r} is unknown; declare it in "
+                f"@allo.work(shapes={{...}}) or produce it earlier in the "
+                f"kernel body.")
+        return shapes[name]
+
+    if isinstance(rhs, ast.BinOp):
+        left_name = _name_of(rhs.left)
+        right_name = _name_of(rhs.right)
+        op = rhs.op
+        if isinstance(op, ast.MatMult) and left_name and right_name:
+            return _matmul_shape(_tensor_shape(left_name),
+                                 _tensor_shape(right_name))
+        if isinstance(op, (ast.Add, ast.Sub)) and left_name and right_name:
+            ls, rs = _tensor_shape(left_name), _tensor_shape(right_name)
+            if ls != rs:
+                raise ValueError(
+                    f"elementwise op: operand shapes differ "
+                    f"({left_name}:{ls} vs {right_name}:{rs}); "
+                    f"broadcasting is not supported.")
+            return ls
+        if isinstance(op, ast.Mult):
+            if left_name and right_name:
+                ls, rs = _tensor_shape(left_name), _tensor_shape(right_name)
+                if ls != rs:
+                    raise ValueError(
+                        f"elementwise mul: operand shapes differ "
+                        f"({left_name}:{ls} vs {right_name}:{rs}); "
+                        f"broadcasting is not supported.")
+                return ls
+            # scalar * tensor / tensor * scalar
+            is_c, _ = _const_value(rhs.left)
+            if is_c and right_name:
+                return _tensor_shape(right_name)
+            is_c, _ = _const_value(rhs.right)
+            if is_c and left_name:
+                return _tensor_shape(left_name)
+
+    if isinstance(rhs, ast.Call):
+        path = _call_path(rhs)
+        if path in ("np.maximum", "numpy.maximum") and len(rhs.args) == 2:
+            in_name = _name_of(rhs.args[0])
+            is_c, v = _const_value(rhs.args[1])
+            if in_name and is_c and v == 0:
+                return _tensor_shape(in_name)
+        if path in ("allo.relu", "relu") and len(rhs.args) == 1:
+            in_name = _name_of(rhs.args[0])
+            if in_name:
+                return _tensor_shape(in_name)
+        if path in ("allo.softmax", "softmax") and len(rhs.args) == 1:
+            in_name = _name_of(rhs.args[0])
+            if in_name:
+                return _tensor_shape(in_name)
+
+    raise NotImplementedError(
+        "cannot infer output shape for this RHS form")
+
+
 def _compile_statement(stmt: ast.stmt,
                        shapes: Dict[str, Tuple[int, ...]],
                        dtype: str,
@@ -156,9 +243,23 @@ def _compile_statement(stmt: ast.stmt,
             f"LHS must be `X` or `X[:]`; got {ast.dump(stmt.targets[0])}")
 
     if out_name not in shapes:
+        # Shape inference: derive the output shape from the RHS operands.
+        # If the RHS is a form we do not recognise for inference, fall
+        # through without registering ``out_name`` -- the walker's main
+        # switch below will raise ``NotImplementedError`` with the full
+        # source-text message. ValueError (shape conflict, missing
+        # operand shape, matmul dim mismatch) propagates unchanged.
+        try:
+            inferred = _infer_rhs_shape(rhs, shapes)
+        except NotImplementedError:
+            inferred = None
+        if inferred is not None:
+            shapes[out_name] = inferred
+    if out_name not in shapes:
         raise ValueError(
             f"shape for output tensor {out_name!r} is missing; "
-            f"pass it via @allo.work(shapes={{...}}).")
+            f"pass it via @allo.work(shapes={{...}}) or assign from an "
+            f"RHS whose shape the compiler can infer.")
     out_shape = shapes[out_name]
 
     # --- shape: a + b ------------------------------------------------------
@@ -198,7 +299,7 @@ def _compile_statement(stmt: ast.stmt,
                 return
         if isinstance(op, ast.MatMult) and left and right:
             # C[M] = A[M,K] @ B[K]  or  C[M,N] = A[M,K] @ B[K,N]. Reuse
-            # pimdsl.Matmul and pass the matmul shape the backends
+            # allo.pim.Matmul and pass the matmul shape the backends
             # expect: (M, K, N) where N is derived from input shapes.
             # For GEMV (rhs is 1-D) we use (M, K). We require both inputs
             # to be in `shapes`.
@@ -254,14 +355,20 @@ def _matmul_shape(a: Tuple[int, ...], b: Tuple[int, ...]) -> Tuple[int, ...]:
     if len(a) == 2 and len(b) == 1:
         M, K = a
         K2, = b
-        assert K == K2, f"matmul: inner dims {K} != {K2}"
+        if K != K2:
+            raise ValueError(
+                f"matmul: inner dims do not match ({K} vs {K2}); "
+                f"got {a} @ {b}")
         return (M, K)
     if len(a) == 2 and len(b) == 2:
         M, K = a
         K2, N = b
-        assert K == K2, f"matmul: inner dims {K} != {K2}"
+        if K != K2:
+            raise ValueError(
+                f"matmul: inner dims do not match ({K} vs {K2}); "
+                f"got {a} @ {b}")
         return (M, K, N)
-    raise NotImplementedError(
+    raise ValueError(
         f"matmul shape: expected (M,K) @ (K,) or (M,K) @ (K,N); "
         f"got {a} @ {b}")
 
@@ -274,7 +381,7 @@ def _matmul_shape(a: Tuple[int, ...], b: Tuple[int, ...]) -> Tuple[int, ...]:
 def compile(work: Work, target: Target,
             *, verbose: bool = False) -> LoweringResult:
     """Compile an ``@allo.work``-decorated kernel against a ``@allo.unit``
-    target. Returns the ``pimdsl.LoweringResult``.
+    target. Returns the ``allo.pim.LoweringResult``.
 
     Raises ``TypeError`` if ``work`` is not a ``Work`` handle;
     ``NotImplementedError`` for kernel bodies that contain statements
@@ -302,9 +409,14 @@ def compile(work: Work, target: Target,
         raise RuntimeError(
             f"allo.compile: could not locate function def for {work.name!r}")
 
+    # Copy the user's shapes dict: ``_compile_statement`` registers
+    # inferred shapes for intermediates (e.g. ``y1 = W1 @ x1``) into
+    # this dict, and we don't want those mutations to leak across
+    # compile calls on the same Work handle.
+    shapes = dict(work.shapes)
     prog = SrcProgram()
     for stmt in fn.body:
-        _compile_statement(stmt, work.shapes, work.dtype, prog)
+        _compile_statement(stmt, shapes, work.dtype, prog)
 
     if verbose:
         print(f"[allo.compile] {work.name}: {len(prog.ops)} src ops "

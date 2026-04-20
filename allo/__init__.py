@@ -14,11 +14,7 @@ from .memory import Memory, Layout
 
 # SPMW target-description decorator surface (see allo/unit.py). Sits
 # next to the workload-side @allo.work decorator so users write
-# @allo.unit for targets and @allo.work for workloads. Imported lazily
-# inside a try/except because allo.unit depends on `pim_dsl`, which
-# isn't on every install's import path yet; a missing `pimdsl` should
-# not break `import allo` for users who aren't doing PIM target-
-# description work.
+# @allo.unit for targets and @allo.work for workloads.
 #
 # Note: the ``memory`` decorator exported here rebinds the ``allo.memory``
 # top-level attribute from the submodule to the decorator function. This
@@ -27,21 +23,13 @@ from .memory import Memory, Layout
 # and keeps working. The pre-existing ``allo.Memory`` class (from the
 # dataflow memory module) is re-exported at line 13 above and is
 # untouched.
-try:
-    from .unit import target, unit, memory, op, stream, cost  # noqa: F811
-except ImportError:
-    pass
+from .unit import target, unit, memory, op, stream, cost  # noqa: F811
 
-# SPMW workload-side decorator + MVP compile entry point. Same import-
-# resiliency story as ``allo.unit`` above: ``allo.work`` / ``allo.compile``
-# depend on ``pimdsl`` (via compile.py); if that dependency is not on
-# the import path for a given install, silently skip so ``import allo``
-# stays functional.
-try:
-    from .work import work, Work  # noqa: F811
-except ImportError:
-    pass
-try:
-    from .compile import compile  # noqa: F811,A001
-except ImportError:
-    pass
+# SPMW workload-side decorator + MVP compile entry point.
+from .work import work, Work  # noqa: F811
+from .compile import compile  # noqa: F811,A001
+
+# PIM subpackage: target descriptions, backends, and runtime drivers.
+# Surface ``allo.pim`` as a top-level attribute so ``from allo import pim``
+# and attribute access work without a separate explicit import.
+from . import pim  # noqa: F401
