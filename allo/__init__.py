@@ -31,3 +31,17 @@ try:
     from .unit import target, unit, memory, op, stream, cost  # noqa: F811
 except ImportError:
     pass
+
+# SPMW workload-side decorator + MVP compile entry point. Same import-
+# resiliency story as ``allo.unit`` above: ``allo.work`` / ``allo.compile``
+# depend on ``pimdsl`` (via compile.py); if that dependency is not on
+# the import path for a given install, silently skip so ``import allo``
+# stays functional.
+try:
+    from .work import work, Work  # noqa: F811
+except ImportError:
+    pass
+try:
+    from .compile import compile  # noqa: F811,A001
+except ImportError:
+    pass
