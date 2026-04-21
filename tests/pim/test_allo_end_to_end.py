@@ -1013,7 +1013,7 @@ _MLP_M = 1024
 _MLP_K = 4
 
 
-def _mk_mlp_block(dtype: str = "fp16"):
+def _mk_mlp_block(dtype: str = "fp16", M: int = _MLP_M, K: int = _MLP_K):
     """Return a fresh ``@allo.work``-decorated MLP-block kernel. The
     intermediates (``y1``, ``y2``) are inferred by the compiler's shape
     pass; only inputs and the final output ``z`` appear in ``shapes=``.
@@ -1022,9 +1022,9 @@ def _mk_mlp_block(dtype: str = "fp16"):
     """
     @allo.work(
         shapes={
-            "W1": (_MLP_M, _MLP_K), "x1": (_MLP_K,),
-            "W2": (_MLP_M, _MLP_K), "x2": (_MLP_K,),
-            "z":  (_MLP_M,),
+            "W1": (M, K), "x1": (K,),
+            "W2": (M, K), "x2": (K,),
+            "z":  (M,),
         },
         dtype=dtype,
     )
@@ -1037,15 +1037,17 @@ def _mk_mlp_block(dtype: str = "fp16"):
 
 
 def test_samsung_mlp_block_end_to_end():
-    """Samsung HBM-PIM: lower MLP-block (two GEMVs + vadd) via
-    ``allo.compile(..., target=build_samsung())``.
+    """Samsung HBM-PIM: lower MLP-block (two GEMVs + vadd) and run end-to-end.
 
-    Expected outcome today: LOWERING PASSES (3 ops, all matched against
-    ``pim.mac`` / ``pim.add`` / ``pim.fill``). Numeric stage SKIPPED:
-    ``pimdsl/runtime/pimsim_driver.py::run_eltwise`` only exposes
-    single-op entry points (``run_eltwise('ADD'|'MUL'|'MAC')``). Option-B
-    round-tripping of a 3-op emitted sequence requires new runtime
-    glue — outside the "trivial test-side fix" scope.
+    Uses ``pimsim_driver.run_program`` (BUG-5 closure): walks the
+    ``LoweringResult.schedule`` and dispatches each SrcOp to the correct
+    single-op helper, threading intermediates ``y1``/``y2`` through a
+    host-side state dict.
+
+    Samsung ``run_gemv`` requires ``K % 16 == 0`` so the numeric leg picks
+    M=1024, K=16 (distinct from the lowering-half's default _MLP_M/_MLP_K
+    because those were chosen to demonstrate compile+lower on a 3-op program,
+    not to satisfy every per-target hardware constraint).
     """
     mlp = _mk_mlp_block()
     t = build_samsung()
@@ -1069,16 +1071,50 @@ def test_samsung_mlp_block_end_to_end():
 
     if not _samsung_numeric_available():
         pytest.skip(
-            "Samsung pim_driver available but no runtime driver currently "
-            "chains matmul+matmul+add for MLP-block Option-B "
-            "(pimsim_driver.run_eltwise is single-op). Compile+lower path "
-            "demonstrated successful; numeric round-trip blocked on runtime."
-        )
-    pytest.skip(
-        "Runtime round-trip for multi-op MLP-block not wired on Samsung "
-        "(Option B driver is single-op). Bug to track: extend "
-        "pimsim_driver to accept a sequence."
-    )
+            "simulator unreachable in sandbox: "
+            "PIMSimulator pim_driver binary not built "
+            "(experiments/simulators/PIMSimulator/pim_driver missing)")
+
+    # Numeric leg: build a fresh MLP-block with shapes pim_driver accepts.
+    # Samsung run_gemv needs K large enough that the per-burst accumulator
+    # has real data (K=16 gives all-zero outputs — the existing single-op
+    # GEMV e2e test uses M=4096, K=1024 and that works; we use the same).
+    # The eltwise leg's N=M=4096 < 131072 minimum, so run_program
+    # tile-pads + trims automatically.
+    from allo.pim.runtime.pimsim_driver import run_program
+
+    M_s, K_s = 4096, 1024
+    mlp_s = _mk_mlp_block(dtype="fp16", M=M_s, K=K_s)
+    t2 = build_samsung()
+    result_s = allo.compile(mlp_s, target=t2)
+    assert len(result_s.unlowered) == 0
+
+    rng = np.random.default_rng(0xA110)
+    # Small range so fp16 accumulation stays in-range (see single-op GEMV
+    # e2e test_samsung_gemv_4096x1024 for the tolerance calibration).
+    W1 = rng.uniform(-0.1, 0.1, size=(M_s, K_s)).astype(np.float16)
+    x1 = rng.uniform(-0.5, 0.5, size=K_s).astype(np.float16)
+    W2 = rng.uniform(-0.1, 0.1, size=(M_s, K_s)).astype(np.float16)
+    x2 = rng.uniform(-0.5, 0.5, size=K_s).astype(np.float16)
+
+    tensors = {"W1": W1, "x1": x1, "W2": W2, "x2": x2}
+    state = run_program(result_s.schedule, tensors)
+
+    z_sim = state["z"].astype(np.float32)
+    y1_ref = (W1.astype(np.float32) @ x1.astype(np.float32))
+    y2_ref = (W2.astype(np.float32) @ x2.astype(np.float32))
+    z_ref = (y1_ref + y2_ref).astype(np.float16).astype(np.float32)
+
+    # Match the single-op Samsung-gemv e2e tolerance: fp16 MAC tree gives
+    # ~0.5 max abs error across 1024 multiplies.
+    diff = np.abs(z_sim - z_ref)
+    assert diff.max() < 1.0, (
+        f"Samsung MLP-block z differs too much: max_abs={diff.max():.3f}; "
+        f"z_sim[:5]={z_sim[:5]} z_ref[:5]={z_ref[:5]}")
+    rel = diff / (np.abs(z_ref) + 1e-3)
+    assert (rel < 0.1).mean() > 0.9, (
+        f"Samsung MLP-block: fewer than 90% of outputs within 10% rel "
+        f"(got {(rel < 0.1).mean():.2%})")
 
 
 def test_aim_mlp_block_end_to_end():
@@ -1155,13 +1191,54 @@ def test_aim_mlp_block_end_to_end():
         f"do not match y1/y2 slots ({y1_slot}, {y2_slot})"
     )
 
-    pytest.skip(
-        "AiM: compile+lower pass on MLP-block (BUG-3 fix verified: "
-        f"MAC_ABK rows distinct; y1 slot={y1_slot}, y2 slot={y2_slot}; "
-        f"EWADD operands match). Numeric round-trip via ramulator2 + "
-        "aim_shadow for the full 3-op sequence is BUG-5 domain "
-        "(staging glue for WR_BIAS + per-bank weight rows)."
+    # Numeric + timing round-trip via aim_suite.run_aim_multiop (BUG-5 closure).
+    ok, reason = _aim_numeric_available()
+    if not ok:
+        pytest.skip(f"simulator unreachable in sandbox: {reason}")
+
+    from allo.pim.runtime.aim_suite import run_aim_multiop
+    from allo.pim.runtime.aim_shadow import LANES
+
+    # Use tiny shapes (M=16, K=16) so the AiM functional model's 16-bank
+    # ceiling covers the full M axis and a single-burst GB suffices for x.
+    # The lowering half used _MLP_M=1024, _MLP_K=4 to stress compile+lower;
+    # the numeric half uses the shapes aim_shadow's per-bank MAC_ABK
+    # semantics can fully verify.
+    M_a, K_a = LANES, LANES   # 16 x 16
+    mlp_a = _mk_mlp_block(dtype="fp16", M=M_a, K=K_a)
+    t2 = build_aim()
+    result_a = allo.compile(mlp_a, target=t2)
+    assert len(result_a.unlowered) == 0
+
+    rng = np.random.default_rng(0xAD)
+    W1 = rng.standard_normal((M_a, K_a)).astype(np.float32)
+    x1 = rng.standard_normal(K_a).astype(np.float32)
+    W2 = rng.standard_normal((M_a, K_a)).astype(np.float32)
+    x2 = rng.standard_normal(K_a).astype(np.float32)
+    tensors_in = {"W1": W1, "x1": x1, "W2": W2, "x2": x2}
+    result_run = run_aim_multiop(
+        result_a.schedule, result_a.emitted, tensors_in,
+        tag="allo_aim_mlp_block_e2e")
+
+    # Timing: ramulator2 must have accepted the trace and produced cycles.
+    assert result_run["ramulator_returncode"] == 0, (
+        f"ramulator2 rejected multi-op trace:\n"
+        f"{result_run['ramulator_stdout'][-800:]}\n"
+        f"{result_run['ramulator_stderr'][-800:]}"
     )
+    assert result_run["mem_cycles"] > 0, (
+        f"ramulator2 reported zero memory_system_cycles for multi-op "
+        f"trace (tag=allo_aim_mlp_block_e2e)")
+
+    # Functional: compare z = y1 + y2 against CPU reference.
+    z_sim = result_run["state"]["z"]
+    y1_ref = W1 @ x1
+    y2_ref = W2 @ x2
+    z_ref = y1_ref + y2_ref
+    # fp32 shadow arithmetic — tolerance can be tight.
+    np.testing.assert_allclose(z_sim, z_ref, rtol=1e-4, atol=1e-4,
+        err_msg=(f"AiM MLP-block shadow diverges from CPU ref.\n"
+                 f"z_sim[:5]={z_sim[:5]}\nz_ref[:5]={z_ref[:5]}"))
 
 
 def test_upmem_mlp_block_end_to_end():
@@ -1191,12 +1268,41 @@ def test_upmem_mlp_block_end_to_end():
         f"UPMEM MLP-block missing add loop:\n{joined}"
     )
 
-    pytest.skip(
-        "UPMEM: compile+lower pass on MLP-block. Numeric round-trip "
-        "requires extending upmem_codegen.emit_benchmark to accept a "
-        "multi-op LoweringResult.emitted sequence (today it takes a "
-        "single op keyword and uses a pre-baked task.c template)."
-    )
+    # Numeric round-trip via run_multiop. The UPMEM driver today only has
+    # a task.c template for add/mul/relu — matmul has no DPU template, so
+    # the runner composes: gemv outputs are CPU-computed; the vadd is
+    # executed on the real uPIMulator Go binary with the same deterministic
+    # inputs the single-op UPMEM test already uses (see the module-level
+    # comment in upmem_codegen.run_multiop for the fallback rationale).
+    avail, reason = _upmem_numeric_available()
+    if not avail:
+        pytest.skip(f"simulator unreachable in sandbox: {reason}")
+
+    from allo.pim.runtime.upmem_codegen import run_multiop
+
+    # Use the DSLVA benchmark (already registered in the Go binary by
+    # the single-op test's precondition). The multi-op runner re-stamps
+    # the task.c / Assemblable for that benchmark per op type.
+    run_result = run_multiop(result.schedule, bench_name="DSLVA",
+                             data_prep_params=1024, num_tasklets=16)
+
+    # Every add step should have produced a bit-exact numeric match between
+    # the DPU output and the CPU reference (same int32 adder semantics).
+    add_steps = [r for r in run_result["by_step"]
+                 if r is not None and r["kind"] == "add"]
+    assert len(add_steps) == 1, \
+        f"expected exactly one add step run on DPU; got {len(add_steps)}"
+    add_res = add_steps[0]
+    assert add_res["mismatches"] == 0, (
+        f"UPMEM DPU vadd mismatch: {add_res['mismatches']}/{add_res['n_elems']}. "
+        f"a[:5]={add_res['a'][:5]}, b[:5]={add_res['b'][:5]}, "
+        f"c_sim[:5]={add_res['c_sim'][:5]}, c_ref[:5]={add_res['c_ref'][:5]}")
+
+    # The gemv/matmul steps have no DPU template today; by_step is None.
+    gemv_steps = [r for r in run_result["by_step"] if r is None]
+    assert len(gemv_steps) >= 2, \
+        (f"expected at least 2 None entries for the gemv fallback; "
+         f"got {len(gemv_steps)} None, by_step={run_result['by_step']!r}")
 
 
 def test_apu_v1_mlp_block_end_to_end():
@@ -1234,13 +1340,52 @@ def test_apu_v1_mlp_block_end_to_end():
         f"(two K-unrolled gemvs, K={_MLP_K}), got:\n{joined}"
     )
 
-    pytest.skip(
-        "APU v1: compile+lower pass on MLP-block after the "
-        "gemv->gvml_mac_unroll pattern addition. Numeric round-trip "
-        "requires the apu_v1_codegen runtime to accept a multi-op "
-        "LoweringResult.emitted sequence (today it drives a single-op "
-        "C++ template)."
+    # Numeric round-trip via gen_apu_v1_multiop_project + real APU v1
+    # hardware. The multi-op project codegen wraps the existing
+    # `_matmul_chain_device_c` template (which already implements the
+    # gemv+gemv+add motif and its ARC-C reference loop).
+    ok, reason = _apu_v1_preconditions()
+    if not ok:
+        pytest.skip(f"simulator unreachable in sandbox: {reason}")
+
+    import tempfile
+    import time
+    from allo.pim.runtime.apu_v1_codegen import (
+        gen_apu_v1_multiop_project, build_and_run_apu_v1,
     )
+
+    run_tag = f"ALLO_E2E_APU_V1_MLP_{int(time.time())}"
+    lab_name = "allo_e2e_apu_v1_mlp"
+    workdir = tempfile.mkdtemp(prefix="allo_e2e_apu_v1_mlp_")
+    project_dir = os.path.join(workdir, "proj")
+
+    gen_apu_v1_multiop_project(
+        project_dir,
+        schedule=result.schedule,
+        layout="A",                     # layout A == naive baseline
+        lab_name=lab_name,
+        run_tag=run_tag,
+    )
+
+    r = build_and_run_apu_v1(project_dir, lab_name=lab_name, timeout_s=600)
+
+    assert r.get("stage") == "run", (
+        f"APU v1 MLP build failed (stage={r.get('stage')}):\n"
+        f"stdout:\n{r.get('stdout', '')}\nstderr:\n{r.get('stderr', '')}")
+    assert r.get("returncode") == 0, (
+        f"APU v1 MLP run failed returncode={r.get('returncode')}:\n"
+        f"stdout:\n{r.get('stdout', '')}\nstderr:\n{r.get('stderr', '')}")
+
+    stdout = r.get("stdout") or ""
+    assert "Num Apucs = 4" in stdout, (
+        f"APU v1 MLP: hardware not visible (expected 'Num Apucs = 4'):\n"
+        f"{stdout}")
+    assert "PASS" in stdout, (
+        f"APU v1 MLP: binary did not report PASS — numeric verification "
+        f"against CPU reference in the generated host.c failed.\n"
+        f"stdout:\n{stdout}")
+    assert "FAIL" not in stdout, (
+        f"APU v1 MLP: 'FAIL' token appeared in stdout:\n{stdout}")
 
 
 def test_apu_v2_mlp_block_end_to_end():
@@ -1314,14 +1459,58 @@ def test_apu_v2_mlp_block_end_to_end():
             f"APU v2 MLP-block: gtml.add missing {ident!r}: {add_line!r}"
         )
 
-    pytest.skip(
-        "APU v2: compile+lower now emit distinct operand tuples per op "
-        "(BUG-4 fixed: gtml.matmul(W1,x1,y1) != gtml.matmul(W2,x2,y2), "
-        "gtml.add(y1,y2,z)). Numeric round-trip still skipped because "
-        "runtime apu_v2_codegen + the hand-rolled host.cc template "
-        "in this file wire only one tensor_add_kernel, not a 3-op "
-        "sequence — that is BUG-5 work."
-    )
+    # Numeric round-trip via gen_apu_v2_cc_multiop + gsi-g2-l1sim Docker
+    # (BUG-5 closure). The generator walks the schedule and emits a .cc
+    # that dispatches per-op `gtml.*` calls with distinct VectorPack
+    # names and verifies against a CPU reference. See the module-level
+    # comment in apu_v2_codegen about the gtml.matmul-vs-gtml.mul dodge
+    # for the L1 functional model.
+    ok, reason = _apu_v2_numeric_available()
+    if not ok:
+        pytest.skip(f"simulator unreachable in sandbox: {reason}")
+
+    import subprocess
+    import tempfile
+    from allo.pim.runtime.apu_v2_codegen import gen_apu_v2_cc_multiop
+
+    with tempfile.TemporaryDirectory(prefix="apu_v2_mlp_") as ws:
+        os.chmod(ws, 0o777)
+        # The image's example-gtml/ builds `host.cc` + `device.cc` into
+        # `example_tensor_add`. Our generated cc contains a full main()
+        # that calls gtml.add/mul directly, so we mount it over host.cc
+        # (device.cc compiles but its `tensor_add_kernel` helper is
+        # simply unused). Matches the mount pattern used by the single-op
+        # `test_apu_v2_vadd_end_to_end` above.
+        #
+        # Use INT16 (not FP32) because the image's `G2Gtml::mul` dispatches
+        # straight to the integer gtml_ref.mul regardless of the
+        # VectorPack's declared type — there is no `G2Gtml::mul_float`
+        # wired up in this image. Integer semantics are deterministic and
+        # the CPU reference is exact.  We still use a 16-group layout
+        # (G2Gtml::mul/add always build VectorPackRef(src, 16)).
+        cc_path = os.path.join(ws, "host.cc")
+        gen_apu_v2_cc_multiop(cc_path, result.schedule,
+                              num_vecs=1, bits=16)
+        build_sh = (
+            "cd /home/g2/gtml && "
+            "rm -f build/l1_sim/example-gtml/CMakeFiles/"
+            "example_tensor_add.dir/host.cc.o "
+            "build/l1_sim/bin/example_tensor_add && "
+            "cmake --build --preset l1_sim "
+            "--target example_tensor_add -j$(nproc) && "
+            "./build/l1_sim/bin/example_tensor_add"
+        )
+        r = subprocess.run(
+            ["docker", "run", "--rm",
+             "-v", f"{cc_path}:/home/g2/gtml/example-gtml/host.cc:ro",
+             "gsi-g2-l1sim", "bash", "-c", build_sh],
+            capture_output=True, text=True, timeout=600)
+        assert r.returncode == 0, (
+            f"APU v2 multi-op docker run failed (rc={r.returncode}).\n"
+            f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}")
+        assert "PASSED" in r.stdout, (
+            f"APU v2 multi-op binary did not print PASSED.\n"
+            f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}")
 
 
 if __name__ == "__main__":

@@ -757,6 +757,59 @@ int main(int GSI_UNUSED(argc), char *argv[]) {{
 '''
 
 
+def gen_apu_v1_multiop_project(dst_dir: str,
+                               schedule,
+                               tensors: dict = None,
+                               layout: str = "A",
+                               lab_name: str = "apu_multiop",
+                               run_tag: str = "APU_MULTIOP") -> str:
+    """Materialize a multi-op APU v1 project from a ``LoweringResult.schedule``.
+
+    Today we support the MLP-block motif (two gemvs + one add) directly via
+    the ``_matmul_chain_device_c`` template. For other schedule shapes this
+    raises; extend as new motifs become important.
+
+    The schedule must contain exactly three ops in order: ``matmul|gemv``,
+    ``matmul|gemv``, ``add``. The two matmuls must share ``K`` (the inner
+    dim of ``W``). ``tensors`` optionally supplies the ``x1``, ``x2``
+    vector values; if missing we use the same deterministic defaults as
+    ``gen_apu_v1_matmul_chain_project``.
+    """
+    # Validate the schedule shape.
+    kinds = [s["src"].kind for s in schedule]
+    if kinds != ["gemv", "gemv", "add"] and kinds != ["matmul", "matmul", "add"]:
+        raise NotImplementedError(
+            f"APU v1 multi-op codegen only supports MLP-block (gemv/gemv/add) "
+            f"today; got kinds={kinds}. Extend "
+            f"apu_v1_codegen.gen_apu_v1_multiop_project for other motifs.")
+    mm1, mm2, addop = schedule[0]["src"], schedule[1]["src"], schedule[2]["src"]
+    # Both matmuls: shape = (M, K) carrying inner dim.
+    M1, K1 = mm1.shape[0], mm1.shape[-1]
+    M2, K2 = mm2.shape[0], mm2.shape[-1]
+    if K1 != K2 or M1 != M2:
+        raise NotImplementedError(
+            f"APU v1 multi-op codegen requires matching matmul shapes; "
+            f"got {mm1.shape} vs {mm2.shape}")
+    K = K1
+    if not (1 <= K <= 7):
+        raise NotImplementedError(
+            f"APU v1 _matmul_chain_device_c template needs 1 <= K <= 7; got {K}")
+
+    x1 = None
+    x2 = None
+    if tensors:
+        # The schedule tells us which names hold x1 / x2.
+        if mm1.inputs[1] in tensors:
+            x1 = [int(v) & 0xffff for v in tensors[mm1.inputs[1]]]
+        if mm2.inputs[1] in tensors:
+            x2 = [int(v) & 0xffff for v in tensors[mm2.inputs[1]]]
+
+    return gen_apu_v1_matmul_chain_project(
+        dst_dir, K=K, layout=layout, lab_name=lab_name, run_tag=run_tag,
+        x1=x1, x2=x2,
+    )
+
+
 def gen_apu_v1_matmul_chain_project(dst_dir: str, K: int = 4,
                                     layout: str = "A",
                                     lab_name: str = "apu_chain",

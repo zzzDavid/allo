@@ -91,3 +91,98 @@ def run_gemv(W: np.ndarray, x: np.ndarray) -> np.ndarray:
         # one burst (16 fp16) per output element -> we sum within each burst
         bursts = _read_fp16_blob(op, M * 16).reshape(M, 16)
         return bursts.astype(np.float32).sum(axis=1).astype(np.float16)
+
+
+# ----------------------------------------------------------------------------- #
+# Multi-op driver (BUG-5 closure).
+#
+# `LoweringResult.schedule` carries a typed trace of SrcOps in program order
+# (with .kind / .inputs / .output / .shape). A multi-op program runs by
+# dispatching each schedule entry to the single-op helper appropriate for its
+# kind, threading intermediate tensors through a host-side `state` dict keyed
+# by tensor name. pim_driver itself has no "program" mode — it's one invocation
+# per op — so we stitch at the Python level.
+# ----------------------------------------------------------------------------- #
+
+# Samsung pim_driver has hardware-imposed minimum sizes:
+#   - eltwise (ADD/MUL/RELU): N >= 131072
+#   - GEMV: any M, K % 16 == 0
+# Tensors coming from a high-level @allo.work kernel may be smaller (e.g. the
+# MLP-block test uses M=1024, vvadd of 1024). For the eltwise path we therefore
+# tile-and-repeat the small tensor up to 131072 and trim on the way out. A
+# future compile pass will pad at the IR level; for now this is a host-side
+# fixup documented in the docstring.
+_PIM_ELTWISE_MIN = 131072
+
+
+def _eltwise_padded(op: str, a: np.ndarray, b: np.ndarray = None) -> np.ndarray:
+    """Dispatch an eltwise op at any N >= 16 (multiple of 16). If N below the
+    simulator's hard floor of 131072, tile + trim. Result has the original N.
+    """
+    n = a.shape[0]
+    if n >= _PIM_ELTWISE_MIN:
+        return run_eltwise(op, a, b)
+    # tile to the minimum, then trim
+    reps = (_PIM_ELTWISE_MIN + n - 1) // n
+    # round reps up so reps*n % 16 == 0 is automatic (n already mult of 16)
+    pad_len = reps * n
+    a_pad = np.tile(a, reps).astype(np.float16)[:pad_len]
+    b_pad = None if b is None else np.tile(b, reps).astype(np.float16)[:pad_len]
+    # pad to exact minimum (pad_len may be slightly above; trim inputs first
+    # so we have a clean tile of length pad_len then trim to 131072 if needed)
+    if pad_len > _PIM_ELTWISE_MIN:
+        # Use the first 131072 elements (still a full tile of the original)
+        a_pad = a_pad[:_PIM_ELTWISE_MIN].copy()
+        if b_pad is not None:
+            b_pad = b_pad[:_PIM_ELTWISE_MIN].copy()
+    elif pad_len < _PIM_ELTWISE_MIN:
+        # Shouldn't happen since reps was ceil, but guard anyway
+        extra = _PIM_ELTWISE_MIN - pad_len
+        a_pad = np.concatenate([a_pad, np.zeros(extra, dtype=np.float16)])
+        if b_pad is not None:
+            b_pad = np.concatenate([b_pad, np.zeros(extra, dtype=np.float16)])
+    out = run_eltwise(op, a_pad, b_pad)
+    return out[:n].copy()
+
+
+def run_program(schedule, tensors: dict) -> dict:
+    """Execute a multi-op Samsung program described by ``schedule``.
+
+    ``schedule`` is the ``LoweringResult.schedule`` list — each entry is
+    ``{"where": ..., "src": SrcOp, "pattern": ...}`` in program order.
+    ``tensors`` is a ``{name: np.ndarray[fp16]}`` host-side state dict holding
+    inputs (e.g. W1, x1, W2, x2) and slots for outputs (may be None).
+
+    Returns the mutated ``tensors`` dict with every produced tensor present.
+    Recognized kinds: ``gemv`` / ``matmul`` / ``mac`` (-> pim_driver GEMV),
+    ``add`` / ``mul`` / ``relu`` (-> pim_driver eltwise). Other kinds raise.
+    """
+    state = dict(tensors)
+    for step in schedule:
+        src = step["src"]
+        kind = src.kind
+        if kind in ("gemv", "matmul", "mac"):
+            wname, xname = src.inputs[0], src.inputs[1]
+            W = state[wname]
+            x = state[xname]
+            assert W.dtype == np.float16 and x.dtype == np.float16, \
+                f"Samsung run_program: {wname}, {xname} must be fp16"
+            y = run_gemv(W, x)
+            state[src.output] = y
+        elif kind == "add":
+            a, b = src.inputs
+            state[src.output] = _eltwise_padded(
+                "ADD", state[a].astype(np.float16), state[b].astype(np.float16))
+        elif kind == "mul":
+            a, b = src.inputs
+            state[src.output] = _eltwise_padded(
+                "MUL", state[a].astype(np.float16), state[b].astype(np.float16))
+        elif kind == "relu":
+            a = src.inputs[0]
+            state[src.output] = _eltwise_padded(
+                "RELU", state[a].astype(np.float16))
+        else:
+            raise NotImplementedError(
+                f"Samsung run_program: kind={kind!r} not implemented "
+                f"(supported: gemv/matmul/mac, add, mul, relu)")
+    return state
