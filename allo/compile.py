@@ -54,6 +54,7 @@ from .pim import (
     Add, Matmul, Mul, Relu, Scale, Softmax, SrcProgram,
     lower as _lower,
 )
+from .pim.grid_fit import grid_fit as _grid_fit
 from .pim.lowering import LoweringResult
 from .pim.target import Target
 
@@ -426,7 +427,22 @@ def compile(work: Work, target: Target,
                   f"inputs={o.inputs}, output={o.output!r})")
 
     work._last_program = prog
+
+    # Grid-fitting pass (Blocker #2). Only invoked when the user passes
+    # ``mapping=`` on ``@allo.work``, so the MVP-today (no-mapping) path
+    # stays byte-identical with the pre-pass compile. The result is
+    # attached to the ``LoweringResult`` but does not (yet) change the
+    # emitted text — that is a follow-up piece once backends can consume
+    # the assignment. Errors propagate with a readable message.
+    fit = None
+    if work.mapping is not None:
+        fit = _grid_fit(work, target)
+        if verbose:
+            print(f"[allo.compile] {work.name}: grid_fit ->")
+            print(fit.summary())
+
     result = _lower(prog, target)
+    result.grid_fit = fit
     return result
 
 

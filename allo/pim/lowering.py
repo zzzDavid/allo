@@ -12,7 +12,7 @@ order (falling back to `src.compute(state)` for typed ops from allo.pim.ops).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 from .ops import SrcOp, SrcProgram
 from .target import Target
@@ -25,6 +25,11 @@ class LoweringResult:
     perf_ir: List[Dict] = field(default_factory=list)
     schedule: List[Dict] = field(default_factory=list)
     unlowered: List[SrcOp] = field(default_factory=list)
+    # Set by ``allo.compile`` when ``work.mapping`` is supplied. Typed
+    # as ``Any`` to avoid a module-level circular import with
+    # ``allo.pim.grid_fit``; callers that care can ``isinstance``-check
+    # against ``allo.pim.grid_fit.GridFitResult``.
+    grid_fit: Optional[Any] = None
 
     @property
     def total_cycles(self) -> int:
