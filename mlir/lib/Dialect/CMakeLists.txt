@@ -17,3 +17,5 @@ add_mlir_dialect_library(MLIRAllo
 	LINK_LIBS PUBLIC
 	MLIRIR
 	)
+
+add_subdirectory(PimTarget)
