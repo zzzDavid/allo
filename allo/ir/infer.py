@@ -509,6 +509,43 @@ class TypeInferer(ASTVisitor):
         raise None
 
     @staticmethod
+    def _try_static_slice_length(ctx: ASTContext, sl: ast.Slice):
+        """Attempt to infer the *static* length of `sl.upper - sl.lower` using
+        sympy, substituting any free symbols from `ctx.global_vars` if they map
+        to plain Python ints. Returns an int or None.
+
+        This lets us narrow the shape of slice-binding forms like
+        `W[row0 : row0 + ROWS, :]` even when `row0` is a runtime expression,
+        as long as `(row0 + ROWS) - row0 = ROWS` is a known integer.
+        """
+        if sl.lower is None or sl.upper is None:
+            return None
+        try:
+            lo = TypeInferer.visit_symbol(ctx, sl.lower)
+            hi = TypeInferer.visit_symbol(ctx, sl.upper)
+            if lo is None or hi is None:
+                return None
+            diff = sympy.simplify(hi - lo)
+            # Substitute any remaining free symbols from ctx.global_vars
+            subs = {}
+            for sym in diff.free_symbols:
+                name = sym.name
+                if name in ctx.global_vars and isinstance(
+                    ctx.global_vars[name], int
+                ):
+                    subs[sym] = ctx.global_vars[name]
+            if subs:
+                diff = sympy.simplify(diff.subs(subs))
+            if isinstance(diff, sympy.Integer) or (
+                hasattr(diff, "is_Integer") and diff.is_Integer
+            ):
+                return int(diff)
+        # pylint: disable=broad-exception-caught
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
     def visit_Subscript(ctx: ASTContext, node: ast.Subscript):
         value = visit_stmt(ctx, node.value)
         # Handle struct field access
@@ -555,6 +592,24 @@ class TypeInferer(ASTVisitor):
                         step = (
                             index[2] if (len(index) > 2 and index[2] is not None) else 1
                         )
+                        # If lower/upper failed to resolve as Python constants but the
+                        # slice length (upper - lower) is statically determinable
+                        # (e.g., `row0 : row0 + ROWS` where ROWS is a module global int),
+                        # recover the static length symbolically. The offset can stay
+                        # dynamic; only the size is needed for type inference.
+                        if (index[0] is None or index[1] is None) and isinstance(
+                            elts[dim], ast.Slice
+                        ):
+                            sl = elts[dim]
+                            static_len = TypeInferer._try_static_slice_length(
+                                ctx, sl
+                            )
+                            if static_len is not None:
+                                step_val = step if isinstance(step, int) else 1
+                                size = static_len // step_val
+                                if size > 0:
+                                    shape.append(size)
+                                continue
                         size = (upper - lower) // step
                         if size > 0:
                             shape.append(size)

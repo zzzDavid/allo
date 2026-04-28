@@ -1379,6 +1379,26 @@ class ASTTransformer(ASTBuilder):
                 else:
                     raise RuntimeError("Unsupported step type")
                 if lower is None:
+                    # Slice with a non-constant lower bound. If the static
+                    # length (upper - lower) is symbolically determinable
+                    # (e.g., `row0 : row0 + ROWS`), we can keep the size
+                    # static and only the offset dynamic — that's compatible
+                    # with extract_slice / subview lowering.
+                    static_len = TypeInferer._try_static_slice_length(ctx, index)
+                    if static_len is not None and static_len > 0:
+                        offset_expr = build_stmt(ctx, index.lower)
+                        # Cast to index type for offsets operand list.
+                        offset_op = ASTTransformer.build_cast_op(
+                            ctx,
+                            offset_expr,
+                            getattr(index.lower, "dtype", Index()),
+                            Index(),
+                        )
+                        offsets.append(offset_op.result)
+                        static_offsets.append(ShapedType.get_dynamic_size())
+                        static_sizes.append(static_len // step)
+                        static_strides.append(step)
+                        continue
                     static_offsets.append(ShapedType.get_dynamic_size())
                     offset_expr = build_stmt(ctx, index.lower)
                     static_sizes.append(ShapedType.get_dynamic_size())
