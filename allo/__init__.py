@@ -19,3 +19,4 @@ from .spmw_match_engine import (
     compile_target_patterns,
     match_workload,
 )
+from .spmw_codegen import compile_for_target, Compiled
