@@ -14,3 +14,8 @@ from .memory import Memory, Layout
 from .dataflow import kernel as work, get_pid as get_wid
 from .spmw_target import target, unit, memory, reg, get_uid, move, op, any_, or_
 from .spmw_cost import cost, get_cost
+from .spmw_match_engine import (
+    compile_op_pattern,
+    compile_target_patterns,
+    match_workload,
+)
