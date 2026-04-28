@@ -152,11 +152,12 @@ class OrOf:
 class Move:
     """A data-movement primitive declared on a unit (LD/ST/etc.)."""
 
-    def __init__(self, owner, name, src, dst):
+    def __init__(self, owner, name, src, dst, emit=None):
         self.owner = owner
         self.name = name
         self.src = src
         self.dst = dst
+        self.emit = emit
         self.cycles = None  # populated by cost modules
 
     def __repr__(self):
@@ -168,16 +169,18 @@ class Op:
 
     `fn` is a Python lambda over the operand values that encodes the
     op's semantics; the lowering pass (Step E) matches workload
-    expressions against these lambdas.
+    expressions against these lambdas. `emit` is the codegen callback
+    that backends invoke per matched site; see report 16.
     """
 
-    def __init__(self, owner, name, src, dst, fn, accumulates=False):
+    def __init__(self, owner, name, src, dst, fn, accumulates=False, emit=None):
         self.owner = owner
         self.name = name
         self.src = src
         self.dst = dst
         self.fn = fn
         self.accumulates = accumulates
+        self.emit = emit
 
     def __repr__(self):
         return f"Op({self.name!r}, accumulates={self.accumulates})"
@@ -345,26 +348,26 @@ def get_uid():
 # ---------------- step C: move / op / any_ / or_ ---------------- #
 
 
-def move(name, src, dst):
+def move(name, src, dst, emit=None):
     """Attach a Move to the current unit; return the handle."""
     if not _target_stack:
         raise RuntimeError("allo.move must be called inside @allo.target/@allo.unit")
     cur = _target_stack[-1]
     if name in cur.moves:
         raise ValueError(f"duplicate move name {name!r} on unit {cur.name!r}")
-    m = Move(cur, name, src, dst)
+    m = Move(cur, name, src, dst, emit=emit)
     cur.moves[name] = m
     return m
 
 
-def op(name, src, dst, fn, accumulates=False):
+def op(name, src, dst, fn, accumulates=False, emit=None):
     """Attach an Op to the current unit; return the handle."""
     if not _target_stack:
         raise RuntimeError("allo.op must be called inside @allo.target/@allo.unit")
     cur = _target_stack[-1]
     if name in cur.ops:
         raise ValueError(f"duplicate op name {name!r} on unit {cur.name!r}")
-    o = Op(cur, name, src, dst, fn, accumulates=accumulates)
+    o = Op(cur, name, src, dst, fn, accumulates=accumulates, emit=emit)
     cur.ops[name] = o
     return o
 

@@ -11,53 +11,11 @@ from allo.dataflow import region as _df_region
 from allo.ir.types import float32 as fp16
 from allo.spmw_match import MatchTrace
 
+from _fixtures import build_samsung_target
+
 
 M, K = 4096, 1024
 ROWS = M // (16 * 8)  # 32 rows per work-item
-
-
-# --------------------------------------------------------------------- #
-# Target spec — the full Samsung HBM-PIM target from /tmp/test_step_c.py
-# --------------------------------------------------------------------- #
-
-
-def build_samsung_target():
-    @allo.target("samsung_hbm_pim")
-    def device():
-        @allo.unit(mapping=[16])
-        def pseudo_channel():
-            banks = allo.memory(banks=16, rows=16384, cols=128, width=8, name="banks")
-
-            @allo.unit(mapping=[8])
-            def pim():
-                _, pid = allo.get_uid()
-                even_bank = banks[2 * pid]
-                odd_bank = banks[2 * pid + 1]
-                grf_a = allo.reg(8, 256, name="grf_a")
-                grf_b = allo.reg(8, 256, name="grf_b")
-
-                allo.move("LD_A", src=even_bank, dst=grf_a)
-                allo.move("LD_B", src=odd_bank, dst=grf_b)
-                allo.move("ST_A", src=grf_a, dst=even_bank)
-                allo.move("ST_B", src=grf_b, dst=odd_bank)
-
-                any_bank = allo.any_(banks)
-                any_reg = allo.any_([grf_a, grf_b])
-                allo.op(
-                    "MUL",
-                    src=(allo.or_(any_bank, any_reg), allo.or_(any_bank, any_reg)),
-                    dst=any_reg,
-                    fn=lambda x, y: x * y,
-                )
-                allo.op(
-                    "MAC",
-                    src=(allo.or_(any_bank, any_reg), allo.or_(any_bank, any_reg)),
-                    dst=grf_b,
-                    accumulates=True,
-                    fn=lambda x, y, acc: acc + x * y,
-                )
-
-    return device
 
 
 # --------------------------------------------------------------------- #
