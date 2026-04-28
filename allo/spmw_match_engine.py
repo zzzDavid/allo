@@ -107,30 +107,37 @@ def compile_op_pattern(op) -> OpPattern:
     if getattr(op, "pattern", None) is not None:
         return op.pattern
     fn = op.fn
-    # Recover the lambda's source. For lambdas, ``inspect.getsource`` returns
-    # the *line* the lambda was written on, which may include surrounding
-    # syntax (commas, decorators, etc). We parse the line and locate the
-    # first Lambda node.
-    src = inspect.getsource(fn).strip()
-    # Try parsing as-is first; if that fails (because the line is e.g. an
-    # argument inside a function call), wrap it so it at least lexes.
-    tree = None
-    for trial in (src, "(" + src + ")", src.rstrip(",")):
-        try:
-            tree = ast.parse(trial, mode="exec")
-            break
-        except SyntaxError:
-            continue
-    if tree is None:
-        raise ValueError(f"cannot parse source for op {op.name!r}: {src!r}")
-
-    lam = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Lambda):
-            lam = node
-            break
+    # Recover the lambda's source. ``inspect.getsource(lambda)`` returns the
+    # single line the lambda was written on, which is unparseable when the
+    # lambda is embedded mid-expression (e.g. ``foo(fn=lambda ...)`` where the
+    # call spans multiple lines). Instead, parse the whole containing source
+    # file and find the Lambda whose ``lineno`` matches ``co_firstlineno``.
+    code = fn.__code__
+    try:
+        with open(code.co_filename, "r") as f:
+            file_src = f.read()
+        tree = ast.parse(file_src, filename=code.co_filename, mode="exec")
+        lam = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Lambda) and node.lineno == code.co_firstlineno:
+                lam = node
+                break
+    except (OSError, SyntaxError):
+        lam = None
     if lam is None:
-        raise ValueError(f"no lambda found in source for op {op.name!r}")
+        # Fallback: try the single-line form for the simple case where the
+        # lambda fits on its own line (e.g. ``mac = lambda x, y, acc: ...``).
+        try:
+            src = inspect.getsource(fn).strip()
+            tree = ast.parse(src, mode="exec")
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Lambda):
+                    lam = node
+                    break
+        except (OSError, SyntaxError):
+            pass
+    if lam is None:
+        raise ValueError(f"cannot recover lambda source for op {op.name!r}")
 
     params = [a.arg for a in lam.args.args]
     body = _compile_expr(lam.body, set(params))
