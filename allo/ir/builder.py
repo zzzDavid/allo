@@ -1166,10 +1166,10 @@ class ASTTransformer(ASTBuilder):
             targets.append(node.targets[0])
             values.append(node.value)
         if isinstance(node.value, ast.Call):
-            # special case: the builtin get_pid()
+            # special case: the builtin get_pid()/get_wid()
             if (
                 isinstance(node.value.func, ast.Attribute)
-                and node.value.func.attr == "get_pid"
+                and node.value.func.attr in ("get_pid", "get_wid")
             ):
                 for i, target in enumerate(targets):
                     # TODO: add target symbol for pid?? # pid = MockConstant(ctx.global_vars[f"df.p{i}"], ctx, dtype=Index())
@@ -2006,7 +2006,7 @@ class ASTTransformer(ASTBuilder):
             for decorator in node.decorator_list:
                 if isinstance(decorator, ast.Call):
                     if isinstance(decorator.func, ast.Attribute):
-                        if decorator.func.attr == "kernel":
+                        if decorator.func.attr in ("kernel", "work"):
                             assert len(decorator.keywords) > 0, "Missing kernel mapping"
                             mapping = eval(
                                 ast.unparse(decorator.keywords[0].value),
@@ -2069,7 +2069,7 @@ class ASTTransformer(ASTBuilder):
                                     if not (
                                         isinstance(d, ast.Call)
                                         and isinstance(d.func, ast.Attribute)
-                                        and d.func.attr == "kernel"
+                                        and d.func.attr in ("kernel", "work")
                                     )
                                 ]
 
@@ -2197,7 +2197,7 @@ class ASTTransformer(ASTBuilder):
                             if (
                                 isinstance(decorator, ast.Call)
                                 and isinstance(decorator.func, ast.Attribute)
-                                and decorator.func.attr == "kernel"
+                                and decorator.func.attr in ("kernel", "work")
                             ):
                                 # It is a kernel, insert calls
                                 assert (
@@ -2689,7 +2689,7 @@ class ASTTransformer(ASTBuilder):
             tree = TypeInferer()(type_inf_ctx, tree)
             func_def = tree.body[0]
 
-            if not isinstance(node.func, ast.Attribute) or node.func.attr != "kernel":
+            if not isinstance(node.func, ast.Attribute) or node.func.attr not in ("kernel", "work"):
                 # Mark as region so we can insert calls later
                 func_def.is_region = True
                 # Resolve naming collision by appending suffix
@@ -3096,7 +3096,7 @@ class ASTTransformer(ASTBuilder):
                         if ctx.enable_tensor
                         else alloc_op
                     )
-            if fn_name == "get_pid":
+            if fn_name in ("get_pid", "get_wid"):
                 res = []
                 for i in range(3):
                     if f"df.p{i}" in ctx.global_vars:

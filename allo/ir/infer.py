@@ -373,10 +373,10 @@ class TypeInferer(ASTVisitor):
             targets.append(node.targets[0])
             values.append(node.value)
         if isinstance(node.value, ast.Call):
-            # special case: the builtin get_pid()
+            # special case: the builtin get_pid()/get_wid()
             if (
                 isinstance(node.value.func, ast.Attribute)
-                and node.value.func.attr == "get_pid"
+                and node.value.func.attr in ("get_pid", "get_wid")
             ):
                 for i, target in enumerate(targets):
                     # TODO: add target symbol for pid??
@@ -736,7 +736,7 @@ class TypeInferer(ASTVisitor):
             for decorator in node.decorator_list:
                 if isinstance(decorator, ast.Call):
                     if isinstance(decorator.func, ast.Attribute):
-                        if decorator.func.attr == "kernel":
+                        if decorator.func.attr in ("kernel", "work"):
                             mapping, kernel_args = None, []
                             for kw in decorator.keywords:
                                 if kw.arg == "mapping":
@@ -1222,7 +1222,7 @@ class TypeInferer(ASTVisitor):
             new_args = visit_stmts(ctx, node.args)
             if len(new_args) == 0:
                 # No argument
-                if fn_name == "get_pid":
+                if fn_name in ("get_pid", "get_wid"):
                     node.shape = (tuple(), tuple(), tuple())
                     node.dtype = (Index(), Index(), Index())
                 else:
