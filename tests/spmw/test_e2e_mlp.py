@@ -193,19 +193,19 @@ def test_e2e_mlp_upmem(request):
 
 
 def _apu_v1_device_available() -> bool:
-    """Return True if the GVML Python module is importable (proxy for
-    APU v1 hardware being accessible at PCI 41:00.0)."""
-    try:
-        import gvml  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    """Return True if the ARC toolchain and PCI device are present (the build
+    harness uses the toolchain directly; gvml Python import is not required)."""
+    import os, pathlib
+    toolchain_bins = list(pathlib.Path("/usr/local/gsi-apu").rglob("arc-elf32-gcc")) \
+        if pathlib.Path("/usr/local/gsi-apu").is_dir() else []
+    pci_present = pathlib.Path("/sys/bus/pci/devices/0000:41:00.0").exists()
+    return bool(toolchain_bins) and pci_present
 
 
 @pytest.mark.hardware
 @pytest.mark.skipif(
     not _apu_v1_device_available(),
-    reason="APU v1 hardware not available: `gvml` module not importable",
+    reason="APU v1 hardware not available: ARC toolchain or PCI 41:00.0 absent",
 )
 def test_e2e_mlp_apu_v1(request):
     """Full pipeline for GSI APU v1 real hardware (PCI 41:00.0).
