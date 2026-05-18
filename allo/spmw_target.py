@@ -65,33 +65,39 @@ class UnitId(SymExpr):
         self.unit = unit
 
     def __repr__(self):
-        return f"UnitId(level={self.level}, unit={self.unit.name})"
+        unit_name = self.unit.name if self.unit is not None else "<anon>"
+        return f"UnitId(level={self.level}, unit={unit_name})"
 
 
 class Memory:
     """A memory cell array attached to a unit.
 
-    `banks` is the outer dimension; `rows × cols × width` is per-bank
-    geometry. Indexing with `m[i]` selects bank i and returns a `MemoryRef`.
+    Geometry is stored as a free-form `dict` (`self.geometry`) so each
+    target can declare its own axis names. For backward compat the
+    Samsung-style axes (`banks`, `rows`, `cols`, `width`) are also
+    bound as attributes — they are `None` when the target doesn't
+    declare that axis. Indexing with `m[i]` selects bank i (or the
+    target's outer axis) and returns a `MemoryRef`.
     """
 
-    def __init__(self, owner, banks, rows, cols, width, name=None):
+    def __init__(self, owner, *, name=None, **geometry):
         self.owner = owner
-        self.banks = banks
-        self.rows = rows
-        self.cols = cols
-        self.width = width
         self.name = name
+        self.geometry = dict(geometry)
+        # Convenience attributes for Samsung-shaped memories. Other
+        # targets that don't declare these axes get `None`.
+        self.banks = geometry.get("banks")
+        self.rows = geometry.get("rows")
+        self.cols = geometry.get("cols")
+        self.width = geometry.get("width")
 
     def __getitem__(self, idx):
         return MemoryRef(self, idx)
 
     def __repr__(self):
         n = self.name or "<anon>"
-        return (
-            f"Memory({n}, banks={self.banks}, rows={self.rows}, "
-            f"cols={self.cols}, width={self.width})"
-        )
+        geom = ", ".join(f"{k}={v}" for k, v in self.geometry.items())
+        return f"Memory({n}, {geom})"
 
 
 class MemoryRef:
@@ -301,17 +307,29 @@ def unit(mapping):
     return decorator
 
 
-def memory(banks, rows, cols, width, name=None):
-    """Attach a Memory to the current unit; return a handle."""
+def memory(*, name=None, **geometry):
+    """Attach a Memory to the current unit; return a handle.
+
+    Geometry is target-specific — Samsung HBM-PIM uses
+    `banks=…, rows=…, cols=…, width=…`; other targets (AiM, UPMEM,
+    APU v1/v2) pass their own axis names. Stored on `Memory.geometry`.
+    """
     if not _target_stack:
         raise RuntimeError("allo.memory must be called inside @allo.target/@allo.unit")
     cur = _target_stack[-1]
-    m = Memory(cur, banks, rows, cols, width, name=name)
+    m = Memory(cur, name=name, **geometry)
     if name is not None:
         if name in cur.memories:
             raise ValueError(f"duplicate memory name {name!r} on unit {cur.name!r}")
         cur.memories[name] = m
     return m
+
+
+# Tenon-style short alias — the public name exposed as `allo.mem`. The
+# longer `memory` name remains the in-module canonical (it reads more
+# naturally inside a @target body) but the legacy `allo.memory` module
+# attribute must not shadow it, so re-export lives under `mem`.
+mem = memory
 
 
 def reg(lanes, width, name=None):

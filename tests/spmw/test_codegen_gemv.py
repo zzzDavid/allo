@@ -62,13 +62,13 @@ def _canonical_jump_k() -> PIMCmd:
 
 
 def test_compile_emits_canonical_mac_jump_pair_per_match():
-    """Each of the 128 MAC matches must lower to a (MAC, JUMP) pair
-    matching the canonical Samsung GEMV inner loop.
+    """Each of the 128 MAC matches must produce a (MAC, JUMP) pair
+    matching the canonical Samsung GEMV inner loop, now bracketed by
+    preload (MOV LD_*) and storeback (MOV ST_*) moves per spec 009.
 
-    The walker emits one (MAC + JUMP) pair per match site (128 pairs =
-    256 PIMCmds). The pair is the canonical Samsung GEMV inner-K
-    sequence from PIMCmdGen.h:GemvPIMKernel — MAC followed by a
-    column-strobe JUMP back over the MAC + JUMP body (loop offset 2).
+    The canonical (MAC, JUMP) subsequence still appears 128 times in
+    the cmds stream; this test asserts the subsequence rather than a
+    strict total length so the new LD/ST records don't desynchronize it.
     """
     target = build_samsung_target()
     schedule = allo.customize(gemv_top, enable_tensor=False)
@@ -77,18 +77,32 @@ def test_compile_emits_canonical_mac_jump_pair_per_match():
     compiled = allo.compile_for_target(target, trace)
 
     assert compiled.target is target
-    # 16 pseudo-channels × 8 PIM units = 128 work-items, one (MAC, JUMP) each.
-    expected_pairs = 16 * 8
-    assert len(compiled.cmds) == 2 * expected_pairs, (
-        f"expected {2 * expected_pairs} PIMCmds, got {len(compiled.cmds)}"
-    )
+    expected_pairs = 16 * 8  # 16 pseudo-channels × 8 PIM units
 
     canonical_mac = _canonical_mac()
     canonical_jump = _canonical_jump_k()
-    for i in range(0, len(compiled.cmds), 2):
-        mac, jmp = compiled.cmds[i], compiled.cmds[i + 1]
-        assert mac == canonical_mac, f"cmds[{i}] = {mac!r}, expected {canonical_mac!r}"
-        assert jmp == canonical_jump, f"cmds[{i+1}] = {jmp!r}, expected {canonical_jump!r}"
+
+    mac_jump_count = 0
+    for i in range(len(compiled.cmds) - 1):
+        if compiled.cmds[i] == canonical_mac and compiled.cmds[i + 1] == canonical_jump:
+            mac_jump_count += 1
+    assert mac_jump_count == expected_pairs, (
+        f"expected {expected_pairs} canonical (MAC, JUMP) pairs, "
+        f"got {mac_jump_count}; cmds[0:6]={compiled.cmds[:6]!r}"
+    )
+
+    # At least one MOV must appear before the first MAC and at least
+    # one MOV after the last MAC -- the preload/storeback wrappers.
+    mac_positions = [i for i, c in enumerate(compiled.cmds) if c.type_ == "MAC"]
+    assert mac_positions, "no MAC emitted"
+    head = compiled.cmds[: mac_positions[0]]
+    tail = compiled.cmds[mac_positions[-1] + 1 :]
+    assert any(c.type_ == "MOV" for c in head), (
+        f"expected a MOV preload before the first MAC; head={head!r}"
+    )
+    assert any(c.type_ == "MOV" for c in tail), (
+        f"expected a MOV storeback after the last MAC; tail={tail!r}"
+    )
 
 
 if __name__ == "__main__":
