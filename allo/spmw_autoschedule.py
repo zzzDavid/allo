@@ -147,24 +147,36 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     )
 
     # Bind the bank input dim to `2 * pid` (level-1 pim UnitId): the pim
-    # axis has 8 units mapping to 16 banks, so each pim owns the even
-    # bank `2*pid` and its odd partner `2*pid + 1`. At fixed tile=0 this
-    # yields `idx = 2*pid` (EVEN_BANK); the codegen-side cmd stream
-    # toggles tile per K-iteration to fold the swizzle into the loop.
+    # axis has 8 units mapping to 16 banks (banks-per-pim = the bank
+    # out-size over the pim unit count), so each pim owns the even bank
+    # `2*pid` and its odd partner `2*pid + 1`. Materialising the swizzled
+    # layout at `fixed={"tile": v}` evaluates the same `tile->bank-bit-0`
+    # swizzle column at each fiber value: v=0 -> `2*pid` (EVEN_BANK),
+    # v=1 -> `2*pid + 1` (ODD_BANK). The `+0`/`+1` fall out of the
+    # swizzle column, not a pasted constant (SPEC-023 §2).
     pid = UnitId(level=1, unit=None)
-    y_handle = materialise_handle(
-        swizzled,
-        target=target,
-        out_dim="bank",
-        fixed={"grf": 0, "tile": 0},
-        symbol_table={"bank": 2 * pid},
-    )
 
-    # Candidate 1: bank-row `y` (is_auto=1 -> folded K-loop).
+    # Fiber values come from the layout's segment (tile) axis size, not a
+    # literal `2`. `size_of("tile") == 2` here because the swizzle gives
+    # the tile axis one basis bit.
+    n_fibers = swizzled.size_of("tile")
+    fibers = [
+        materialise_handle(
+            swizzled,
+            target=target,
+            out_dim="bank",
+            fixed={"grf": 0, "tile": v},
+            symbol_table={"bank": 2 * pid},
+        )
+        for v in range(n_fibers)
+    ]
+    y_even = fibers[0]
+
+    # Candidate 1: bank-row `y` (is_auto=1 -> folded K-loop, EVEN fiber).
     bank_row = Placement(
         placements={
             x_mref: target.grf_a,
-            y_mref: y_handle,
+            y_mref: y_even,
             acc_mref: target.grf_b,
         },
         mode="bank_row",
@@ -179,7 +191,26 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
         },
         mode="grf_staged",
     )
-    return [bank_row, grf_staged]
+    # Candidate 3: dual-fiber bank-row `y` (is_auto=1, both bank halves
+    # busy). Strict superset of `bank_row`: `placements[y]` is the EVEN
+    # fiber so any consumer ignoring `extra` degrades to `bank_row`. The
+    # per-fiber handles ride `extra["fibers"]`; codegen materialises the
+    # alternating (MAC EVEN, JUMP, MAC ODD, JUMP) stream from them and the
+    # cost model prices it ~n_fibers x cheaper (concurrent bank halves).
+    dual_fiber = Placement(
+        placements={
+            x_mref: target.grf_a,
+            y_mref: y_even,
+            acc_mref: target.grf_b,
+        },
+        mode="dual_fiber",
+        extra={
+            "fibers": list(fibers),
+            "fiber_axis": "tile",
+            "n_fibers": n_fibers,
+        },
+    )
+    return [bank_row, grf_staged, dual_fiber]
 
 
 @register_enumerator("aim")

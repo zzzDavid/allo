@@ -117,6 +117,21 @@ class LinearLayout:
         self.out_dims: tuple[str, ...] = tuple(out_dims)
         self.out_sizes: tuple[int, ...] = out_sizes
 
+    def size_of(self, in_dim: str) -> int:
+        """Size of an input axis = 2^(number of its basis vectors).
+
+        Each basis vector is one bit of the input axis, so an axis with
+        `k` vectors spans `2**k` values. Used by the Samsung enumerator
+        to read the segment (tile) fiber count off the layout instead of
+        writing a literal `2`.
+        """
+        if in_dim not in self.bases:
+            raise KeyError(
+                f"size_of: input dim {in_dim!r} not in layout "
+                f"(known: {sorted(self.bases)})"
+            )
+        return 1 << len(self.bases[in_dim])
+
     # ------------------------------------------------------------------ #
     # Class constructors
     # ------------------------------------------------------------------ #

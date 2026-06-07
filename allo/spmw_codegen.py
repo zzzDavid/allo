@@ -267,11 +267,73 @@ class SamsungCtx(CodegenContext):
             return (ld, st)
         return (None, None)
 
+    # Active placement + resolved bindings for the current match, set by
+    # `_walk_and_emit` before each compute emit. Default None keeps the
+    # single-fiber path (no dual-fiber state) unchanged.
+    _active_placement = None
+    _active_bindings = None
+
     def after_match(self, match, n_emitted):
         # Inner-K JUMP -- the loop counter is computed off the
         # just-emitted MAC body, so the call must stay inside the
         # work-id window between compute and storeback.
+        placement = self._active_placement
+        if (
+            placement is not None
+            and getattr(placement, "mode", "") == "dual_fiber"
+            and match.target_op_name == "MAC"
+        ):
+            self._emit_dual_fiber_jumps(match, n_emitted)
+            return
         _emit_inner_loop_jump(match, self, n_emitted)
+
+    def _emit_dual_fiber_jumps(self, match, n_emitted):
+        """Materialise the alternating (JUMP even, MAC odd, JUMP odd, ...)
+        tail for a dual-fiber MAC.
+
+        The walker already emitted the canonical MAC against the EVEN
+        fiber (`placements[y]`). Here we close fiber 0's inner loop with
+        its split JUMP, then for each later fiber emit one MAC (same
+        dst/src0, src1 = that fiber's bank handle so `_bank_parity` stamps
+        the parity) followed by its own split JUMP. Trip counts come from
+        `inner_ub // lanes` split across the fibers — no shape literal.
+        """
+        if not match.enclosing_loops:
+            return
+        ub = _parse_loop_bound(match.enclosing_loops[-1][2])
+        if ub is None:
+            return
+        folded = ub // _samsung_lane_burst(self)
+        fibers = self._active_placement.extra.get("fibers", [])
+        n_fibers = len(fibers)
+        if n_fibers <= 1:
+            _emit_inner_loop_jump(match, self, n_emitted)
+            return
+        split = _fiber_fold_split(folded, n_fibers)
+
+        bindings = self._active_bindings or {}
+        mac_dst = bindings.get("acc")
+        mac_src0 = bindings.get("x")
+
+        def emit_jump(trips):
+            # First MAC of the fiber is iteration 0; JUMP loops the rest.
+            loop_counter = trips - 1
+            if loop_counter <= 0:
+                return
+            self.cmds.append(
+                PIMCmd(
+                    type_="JUMP",
+                    loopCounter_=loop_counter,
+                    loopOffset_=n_emitted + 1,
+                )
+            )
+
+        # Fiber 0: the EVEN MAC the walker already emitted; just its JUMP.
+        emit_jump(split[0])
+        # Fibers 1..n-1: MAC against the fiber's bank handle, then JUMP.
+        for i in range(1, n_fibers):
+            self.cmd("MAC", dst=mac_dst, src0=mac_src0, src1=fibers[i])
+            emit_jump(split[i])
 
 
 # --------------------------------------------------------------------- #
@@ -1121,14 +1183,6 @@ def _resolve_layout(match: MatchedOp, layout: Placement) -> dict[str, Any]:
     return bindings
 
 
-# Samsung HBM-PIM GRF lane count — each MAC consumes this many fp16
-# elements per K-iteration, so the inner-K loop trip count is
-# `(K // _SAMSUNG_LANE_BURST) - 1` JUMPs after the first MAC. The real
-# value is layout-dependent (autoscheduler territory); we hard-code 8
-# here to match the report-16 target spec's `lanes=8`.
-_SAMSUNG_LANE_BURST = 8
-
-
 def _parse_loop_bound(text: str) -> int | None:
     """Extract a constant integer from an affine-map-text upper-bound
     string. Returns None if it can't be parsed.
@@ -1146,13 +1200,35 @@ def _parse_loop_bound(text: str) -> int | None:
     return None
 
 
+def _samsung_lane_burst(ctx) -> int:
+    """Samsung GRF lane count read from the target geometry.
+
+    Each MAC consumes this many fp16 elements per K-iteration, so the
+    inner-K loop folds `K` MACs into `K // lanes`. Sourced from
+    `target.grf_a.lanes` (the report-16 target spec, `lanes=8`); no
+    shape literal.
+    """
+    return ctx.target.grf_a.lanes
+
+
+def _fiber_fold_split(folded: int, n_fibers: int) -> list[int]:
+    """Round-robin split of `folded` burst-tiles across `n_fibers` banks.
+
+    Fiber `i` gets `ceil` for the first `folded % n_fibers` fibers and
+    `floor` after, so the busier fiber stays bounded (matches the cost
+    model's ceil `per_fiber`). For folded=128, n=2 -> [64, 64]; for an
+    odd folded=127, n=2 -> [64, 63].
+    """
+    return [(folded + (n_fibers - 1 - i)) // n_fibers for i in range(n_fibers)]
+
+
 def _emit_inner_loop_jump(
     match: MatchedOp, ctx: CodegenContext, n_emitted: int
 ) -> None:
     """Append a Samsung-style JUMP that folds the innermost reduction
     loop.
 
-    Loop counter is `(inner_ub // burst) - 1` (the first MAC counts as
+    Loop counter is `(inner_ub // lanes) - 1` (the first MAC counts as
     iteration 0; JUMP loops back the rest). Loop offset is the number of
     instructions that comprise one iteration body — i.e. `n_emitted` for
     the compute ops the match emitted, plus 1 for the JUMP itself.
@@ -1163,7 +1239,7 @@ def _emit_inner_loop_jump(
     ub = _parse_loop_bound(inner[2])
     if ub is None:
         return
-    loop_counter = ub // _SAMSUNG_LANE_BURST - 1
+    loop_counter = ub // _samsung_lane_burst(ctx) - 1
     if loop_counter <= 0:
         return
     ctx.cmds.append(
@@ -1173,6 +1249,46 @@ def _emit_inner_loop_jump(
             loopOffset_=n_emitted + 1,
         )
     )
+
+
+def _is_samsung_preload_mov(c: PIMCmd) -> bool:
+    """A GRF<-bank load MOV that opens a work-id (the `LD_A`/`LD_B`
+    preload). Used to delimit per-layer GEMV groups in the run path."""
+    if c.type_ not in ("MOV", "FILL"):
+        return False
+    grf_dst = c.dst_ in ("GRF_A", "GRF_B")
+    bank_src = any(s in ("EVEN_BANK", "ODD_BANK") for s in (c.src0_, c.src1_))
+    return grf_dst and bank_src
+
+
+def _split_samsung_layers(cmds: list[PIMCmd]) -> list[list[PIMCmd]]:
+    """Group a flat Samsung GEMV cmd stream into per-layer (work-id)
+    chunks, delimited by the preload MOV that opens each work-id.
+
+    A layer body is `[LD MOV, (MAC, JUMP)+, ST MOV]`; under lever 1 the
+    `(MAC, JUMP)` part repeats once per bank fiber, so we must NOT split
+    at JUMP. Setup before the first preload attaches to the first group;
+    the trailing terminator (NOP/EXIT) rides the last group. Groups with
+    no MAC are dropped (pure setup is meaningless to dispatch alone).
+    """
+    groups: list[list[PIMCmd]] = []
+    cur: list[PIMCmd] = []
+    for c in cmds:
+        if _is_samsung_preload_mov(c) and any(
+            g.type_ == "MAC" for g in cur
+        ):
+            # The current group already holds a fold; this preload opens
+            # the next layer.
+            groups.append(cur)
+            cur = [c]
+        else:
+            cur.append(c)
+    if cur:
+        if groups and not any(g.type_ == "MAC" for g in cur):
+            groups[-1].extend(cur)
+        else:
+            groups.append(cur)
+    return [g for g in groups if any(c.type_ == "MAC" for c in g)]
 
 
 def _bucket_by_work_id(trace: MatchTrace):
@@ -1299,6 +1415,11 @@ def _walk_and_emit(
                     f"target op {op_obj.name!r} has no `emit` callback."
                 )
             bindings = _resolve_layout(match, layout)
+            # Expose the active placement + bindings so a dual-fiber
+            # Samsung ctx can re-emit the odd-fiber MAC in after_match.
+            # Additive ctx state; ignored by every other backend.
+            ctx._active_placement = layout
+            ctx._active_bindings = bindings
             before = len(ctx.cmds)
             # SPEC-019: UPMEM MAC needs the inner-K bound on the ctx so
             # the fixture emit lambda can materialise an explicit C loop
@@ -1655,12 +1776,15 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
     ]
 
     # SPEC-020: detect multi-layer GEMV streams. `pim_driver` accepts one
-    # GEMV per invocation, so a cmd stream with >1 MAC (one per layer of
-    # an MLP, for example) must be split at the JUMP that closes each
-    # inner-K fold and dispatched as separate driver calls. Cycles are
-    # summed across invocations.
-    n_macs = sum(1 for c in pim_cmds_all if c.type_ == "MAC")
-    multi_layer = kernel == "GEMV" and n_macs > 1
+    # GEMV per invocation, so a cmd stream covering >1 layer (e.g. an MLP)
+    # must be split into per-layer groups dispatched as separate driver
+    # calls, cycles summed. A layer boundary is the preload MOV that loads
+    # GRF from a bank at the start of each work-id; this stays correct
+    # under lever 1, where one layer's body can hold several MAC+JUMP
+    # pairs (one per bank fiber) -- splitting at JUMP would wrongly cut a
+    # dual-fiber layer in two.
+    groups = _split_samsung_layers(pim_cmds_all)
+    multi_layer = kernel == "GEMV" and len(groups) > 1
 
     if multi_layer:
         layers = inputs.get("layers")
@@ -1671,30 +1795,11 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             return RunResult(
                 cycles=None,
                 stdout=(
-                    "Samsung: multi-MAC cmd stream needs layers=[...] kwarg "
-                    f"({n_macs} MAC ops detected)"
+                    "Samsung: multi-layer cmd stream needs layers=[...] kwarg "
+                    f"({len(groups)} GEMV layers detected)"
                 ),
                 backend="samsung_hbm_pim",
             )
-        # Split at JUMP boundaries: each MAC fold ends in a JUMP that
-        # closes its inner-K loop. Group = [setup ... MAC ... JUMP].
-        groups: list[list[PIMCmd]] = []
-        cur: list[PIMCmd] = []
-        for c in pim_cmds_all:
-            cur.append(c)
-            if c.type_ == "JUMP":
-                groups.append(cur)
-                cur = []
-        if cur:
-            # Trailing tail (e.g. EXIT) -- attach to last group so the
-            # driver still sees the terminator.
-            if groups:
-                groups[-1].extend(cur)
-            else:
-                groups.append(cur)
-        # Drop any group that has no MAC (pure setup with no fold) -- it
-        # is meaningless to dispatch standalone.
-        groups = [g for g in groups if any(c.type_ == "MAC" for c in g)]
         if len(layers) != len(groups):
             raise ValueError(
                 f"Samsung: {len(groups)} MAC groups in cmd stream but "

@@ -48,27 +48,41 @@ def _canonical_mac() -> PIMCmd:
     )
 
 
-def _canonical_jump_k() -> PIMCmd:
-    """The Samsung GEMV inner-K JUMP: `JUMP(K // 8 - 1, 2)`.
+def _canonical_mac_odd() -> PIMCmd:
+    """The dual-fiber ODD-bank MAC the lever-1 placement adds — same
+    GRF_B<-GRF_A MAC but `src1=ODD_BANK` (2*pid+1)."""
+    return PIMCmd(
+        type_="MAC",
+        dst_="GRF_B",
+        src0_="GRF_A",
+        src1_="ODD_BANK",
+        isAuto_=1,
+    )
 
-    Mirrors PIMCmdGen.h:121 with `num_jump_to_be_taken_even_bank` set to
-    the placeholder formula `(K // GRF_LANES) - 1` used by the walker.
+
+def _split_jump_k() -> PIMCmd:
+    """Per-fiber inner-K JUMP under lever 1: the K reduction is split
+    across the two bank halves, so each fiber's JUMP loops
+    `(K // lanes) // n_fibers - 1` times. With lanes=8, n_fibers=2,
+    K=1024 this is `1024 // 8 // 2 - 1 = 63` — the `63` *emerges* from
+    the geometry, it is not written into codegen.
     """
+    lanes, n_fibers = 8, 2
     return PIMCmd(
         type_="JUMP",
-        loopCounter_=K // 8 - 1,
+        loopCounter_=K // lanes // n_fibers - 1,
         loopOffset_=2,
     )
 
 
-def test_compile_emits_canonical_mac_jump_pair_per_match():
-    """Each of the 128 MAC matches must produce a (MAC, JUMP) pair
-    matching the canonical Samsung GEMV inner loop, now bracketed by
-    preload (MOV LD_*) and storeback (MOV ST_*) moves per spec 009.
-
-    The canonical (MAC, JUMP) subsequence still appears 128 times in
-    the cmds stream; this test asserts the subsequence rather than a
-    strict total length so the new LD/ST records don't desynchronize it.
+def test_compile_emits_dual_fiber_mac_jump_per_match():
+    """Lever 1: argmin now picks the dual-fiber placement, so each of the
+    128 MAC matches produces an alternating
+    (MAC EVEN, JUMP n_even, MAC ODD, JUMP n_odd) quad keeping both bank
+    halves busy. The per-fiber JUMP trip count is the K reduction split
+    across the two fibers (`K // lanes // n_fibers - 1`), and the ODD MAC
+    targets `ODD_BANK` (2*pid+1) — the parity falls out of the fiber
+    handle's idx, not a literal in codegen.
     """
     target = build_samsung_target()
     schedule = allo.customize(gemv_top, enable_tensor=False)
@@ -79,16 +93,23 @@ def test_compile_emits_canonical_mac_jump_pair_per_match():
     assert compiled.target is target
     expected_pairs = 16 * 8  # 16 pseudo-channels × 8 PIM units
 
-    canonical_mac = _canonical_mac()
-    canonical_jump = _canonical_jump_k()
+    mac_even = _canonical_mac()
+    mac_odd = _canonical_mac_odd()
+    split_jump = _split_jump_k()
 
-    mac_jump_count = 0
-    for i in range(len(compiled.cmds) - 1):
-        if compiled.cmds[i] == canonical_mac and compiled.cmds[i + 1] == canonical_jump:
-            mac_jump_count += 1
-    assert mac_jump_count == expected_pairs, (
-        f"expected {expected_pairs} canonical (MAC, JUMP) pairs, "
-        f"got {mac_jump_count}; cmds[0:6]={compiled.cmds[:6]!r}"
+    quad_count = 0
+    cmds = compiled.cmds
+    for i in range(len(cmds) - 3):
+        if (
+            cmds[i] == mac_even
+            and cmds[i + 1] == split_jump
+            and cmds[i + 2] == mac_odd
+            and cmds[i + 3] == split_jump
+        ):
+            quad_count += 1
+    assert quad_count == expected_pairs, (
+        f"expected {expected_pairs} dual-fiber (MAC EVEN, JUMP, MAC ODD, "
+        f"JUMP) quads, got {quad_count}; cmds[0:6]={cmds[:6]!r}"
     )
 
     # At least one MOV must appear before the first MAC and at least
@@ -106,5 +127,5 @@ def test_compile_emits_canonical_mac_jump_pair_per_match():
 
 
 if __name__ == "__main__":
-    test_compile_emits_canonical_mac_jump_pair_per_match()
+    test_compile_emits_dual_fiber_mac_jump_per_match()
     print("ALL PASSED")

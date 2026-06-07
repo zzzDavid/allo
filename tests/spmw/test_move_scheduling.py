@@ -116,11 +116,12 @@ def _apu_v1_synthetic_trace() -> MatchTrace:
 
 
 def test_samsung_gemv_emits_ld_mac_jump_st_per_workid():
-    """One work-id => LD_A preload, MAC + JUMP body, ST_B storeback.
+    """One work-id => LD_A preload, dual-fiber MAC body, ST_B storeback.
 
-    With autoschedule's preferred placement (x=grf_a, y=even_bank,
-    acc=grf_b), grf_a's preload is LD_A (read-only x) and grf_b's
-    storeback is ST_B (acc; no LD half since acc starts at 0).
+    With autoschedule's preferred placement (lever 1 `dual_fiber`:
+    x=grf_a, y=even_bank, acc=grf_b, both fibers in extra), grf_a's
+    preload is LD_A (read-only x) and grf_b's storeback is ST_B. The MAC
+    body keeps both bank halves busy: MAC EVEN, JUMP, MAC ODD, JUMP.
     """
     target = build_samsung_target()
     trace = _samsung_synthetic_trace([(0, 0)])
@@ -128,11 +129,14 @@ def test_samsung_gemv_emits_ld_mac_jump_st_per_workid():
 
     cmds = compiled.cmds
     types = [c.type_ for c in cmds]
-    # Exactly: MOV (LD_A), MAC, JUMP, MOV (ST_B).
-    assert types == ["MOV", "MAC", "JUMP", "MOV"], types
+    # Exactly: MOV (LD_A), MAC EVEN, JUMP, MAC ODD, JUMP, MOV (ST_B).
+    assert types == ["MOV", "MAC", "JUMP", "MAC", "JUMP", "MOV"], types
 
     # MOV LD_A -- dst is GRF_A, src0 is the EVEN_BANK that local_W lives on.
     assert cmds[0].dst_ == "GRF_A", cmds[0]
+    # The two MAC bodies target EVEN then ODD banks (both halves busy).
+    assert cmds[1].src1_ == "EVEN_BANK", cmds[1]
+    assert cmds[3].src1_ == "ODD_BANK", cmds[3]
     # MOV ST_B -- src0 is GRF_B, dst is the ODD_BANK that acc spills to.
     assert cmds[-1].src0_ == "GRF_B", cmds[-1]
 
@@ -143,11 +147,11 @@ def test_two_workids_emit_two_preload_blocks():
     trace = _samsung_synthetic_trace([(0, 0), (0, 1)])
     compiled = compile_for_target(target, trace)
 
-    # Two work-ids × (LD_A, MAC, JUMP, ST_B) = 8 PIMCmds.
+    # Two work-ids × (LD_A, MAC EVEN, JUMP, MAC ODD, JUMP, ST_B) = 12.
     types = [c.type_ for c in compiled.cmds]
     assert types == [
-        "MOV", "MAC", "JUMP", "MOV",
-        "MOV", "MAC", "JUMP", "MOV",
+        "MOV", "MAC", "JUMP", "MAC", "JUMP", "MOV",
+        "MOV", "MAC", "JUMP", "MAC", "JUMP", "MOV",
     ], types
     # Two preload MOVs (load) and two storeback MOVs (store).
     movs = [c for c in compiled.cmds if c.type_ == "MOV"]
@@ -155,17 +159,19 @@ def test_two_workids_emit_two_preload_blocks():
 
 
 def test_samsung_jump_stays_paired_with_mac():
-    """The JUMP record must sit immediately after its MAC inside the
-    work-id window, not after the storeback. Spec 009 §E rule 4."""
+    """Each JUMP record must sit immediately after its MAC inside the
+    work-id window, not after the storeback. Spec 009 §E rule 4 — under
+    lever 1 there is one JUMP per fiber, each following its own MAC."""
     target = build_samsung_target()
     trace = _samsung_synthetic_trace([(0, 0)])
     compiled = compile_for_target(target, trace)
 
     mac_idx = [i for i, c in enumerate(compiled.cmds) if c.type_ == "MAC"]
     jump_idx = [i for i, c in enumerate(compiled.cmds) if c.type_ == "JUMP"]
-    assert len(mac_idx) == 1 and len(jump_idx) == 1
-    # JUMP follows MAC directly.
-    assert jump_idx[0] == mac_idx[0] + 1
+    # Dual-fiber: two MACs, two JUMPs, each JUMP right after its MAC.
+    assert len(mac_idx) == 2 and len(jump_idx) == 2
+    for mi, ji in zip(mac_idx, jump_idx):
+        assert ji == mi + 1
 
 
 # --------------------------------------------------------------------- #

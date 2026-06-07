@@ -431,3 +431,33 @@ only non-Samsung-gated change and is value-preserving; keep it.
 5. **Measurement of the cycle delta is gated on task 025** (faithful run
    path). Until 025 lands, prove the win by cost-model ranking + the
    receipt, not by `getCycle()`.
+
+---
+
+## Implemented (coder task 031)
+
+- Files: `spmw_autoschedule.py` (dual_fiber Placement via per-fiber
+  `fixed={"tile":v}` loop over `swizzled.size_of("tile")`),
+  `spmw_cost_models.py` (`n_fibers`-aware ceil fold, default 1),
+  `spmw_codegen.py` (SamsungCtx `_emit_dual_fiber_jumps`; `_SAMSUNG_LANE_BURST`
+  literal replaced by `target.grf_a.lanes`; `_split_samsung_layers` so the
+  SPEC-020 run path splits by work-id/preload boundary, not JUMP — required
+  because a dual-fiber layer now holds 2 MAC+JUMP pairs),
+  `spmw_linear_layout.py` (additive `LinearLayout.size_of`, authorized by §3.1).
+- Cost @4096x1024 (inner K=1024, lanes=8): bank_row=513, grf_staged=4096,
+  **dual_fiber=258** → argmin picks dual_fiber (2x under bank_row).
+- Receipt: fiber0 idx `2*pid`→EVEN_BANK, fiber1 idx `2*pid+1`→ODD_BANK,
+  both from `materialise_handle` over the swizzled layout (the `+0`/`+1`
+  fall out of the swizzle `tile` column).
+- Faithful cycles @4096x1024: native_folded=dual_fiber=15251 (parity — the
+  faithful counter clamps each bank path to ≥1, so dual_fiber matches the
+  native folded baseline; it differentiates *redundant* streams, not
+  even-only vs dual-fiber). The lever-1 win is the cost-model ranking +
+  keeping both bank halves addressed, exactly as the §Status soft-gate frames.
+- Tests: new `test_autoschedule_samsung_dual_fiber.py` (6); updated the
+  canonical-pair / argmin / move-scheduling / multi-layer-split tests to the
+  dual-fiber stream. Full `tests/spmw/`: 121 passed.
+- Flagged to architect: enumerator still binds `symbol_table={"bank": 2*pid}`
+  (the pre-existing scalar-multiplier path). SPEC-022's `bank_stride(target)*pid`
+  swap (task 020 not yet coded) discharges the last `2*pid` literal; until then
+  SPEC-023 §2's committed `fixed={"tile":v}` mechanism is used.

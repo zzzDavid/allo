@@ -37,19 +37,31 @@ def _compile_mlp_for_samsung():
     return compiled
 
 
-def test_mlp_cmd_stream_has_one_mac_per_layer():
-    """The compiled MLP should emit one MAC per layer (two total),
-    each closed by a JUMP. That's what enables layer-splitting.
+def test_mlp_cmd_stream_splits_into_two_layers():
+    """The compiled MLP must split into two per-layer groups even though
+    lever 1's dual-fiber placement emits two MACs (EVEN + ODD) per layer.
+    Layer boundaries are the preload MOVs, not JUMPs, so the run path sees
+    2 layers (= len(layers=[...])), not 4.
     """
+    from allo.spmw_codegen import _split_samsung_layers
+
     compiled = _compile_mlp_for_samsung()
-    macs = [c for c in compiled.cmds if isinstance(c, PIMCmd) and c.type_ == "MAC"]
-    jumps = [c for c in compiled.cmds if isinstance(c, PIMCmd) and c.type_ == "JUMP"]
-    assert len(macs) == 2, f"Expected 2 MAC ops (one per MLP layer), got {len(macs)}"
-    # At least as many JUMPs as MACs (each MAC fold ends in a JUMP).
-    assert len(jumps) >= len(macs), (
-        f"Expected at least {len(macs)} JUMPs for {len(macs)} MAC folds, "
-        f"got {len(jumps)}"
+    pim_cmds = [c for c in compiled.cmds if isinstance(c, PIMCmd)]
+    macs = [c for c in pim_cmds if c.type_ == "MAC"]
+    jumps = [c for c in pim_cmds if c.type_ == "JUMP"]
+    # Dual-fiber: 2 fibers x 2 layers = 4 MACs, 4 JUMPs.
+    assert len(macs) == 4, f"Expected 4 MAC ops (2 fibers x 2 layers), got {len(macs)}"
+    assert len(jumps) == len(macs), (len(jumps), len(macs))
+    # But the layer split (used by the run path) yields exactly 2 layers.
+    groups = _split_samsung_layers(pim_cmds)
+    assert len(groups) == 2, (
+        f"Expected 2 layer groups, got {len(groups)}; "
+        f"each group must hold both bank fibers of one layer"
     )
+    for g in groups:
+        assert sum(1 for c in g if c.type_ == "MAC") == 2, (
+            "each layer group must keep both fibers' MACs together"
+        )
 
 
 def test_multi_mac_without_layers_returns_cycles_none():
@@ -87,12 +99,13 @@ def test_multi_mac_wrong_layer_count_raises():
         compiled.run(layers=[{"W": W1, "x": x}])
 
 
-def test_single_mac_back_compat_path_still_takes_w_x():
-    """A trace with a single MAC must keep the existing W=/x= kwarg
-    contract (no `layers=` required). We verify by checking the
-    multi-layer branch is NOT taken — calling with no kwargs returns
-    the legacy "GEMV needs W and x kwargs" diagnostic rather than the
-    multi-MAC "needs layers=" diagnostic.
+def test_single_layer_back_compat_path_still_takes_w_x():
+    """A single-layer (single work-id) trace must keep the existing W=/x=
+    kwarg contract (no `layers=` required) even though lever 1's
+    dual-fiber placement emits two MACs (EVEN + ODD) for it. The layer
+    split sees one layer group, so the multi-layer branch is NOT taken:
+    calling with no kwargs returns the legacy "GEMV needs W and x kwargs"
+    diagnostic rather than the multi-layer "needs layers=" diagnostic.
     """
     from allo.spmw_match import MatchTrace, MatchedOp, OperandBinding
 
@@ -123,11 +136,14 @@ def test_single_mac_back_compat_path_still_takes_w_x():
     )
     compiled = allo.compile_for_target(target, trace)
 
-    # Sanity: only one MAC in the emitted stream.
-    n_macs = sum(
-        1 for c in compiled.cmds if isinstance(c, PIMCmd) and c.type_ == "MAC"
-    )
-    assert n_macs == 1, f"Expected exactly 1 MAC in single-layer trace, got {n_macs}"
+    # Lever 1: a single work-id emits two MACs (EVEN + ODD fibers), but
+    # the layer split must still see exactly one layer group.
+    from allo.spmw_codegen import _split_samsung_layers
+
+    pim_cmds = [c for c in compiled.cmds if isinstance(c, PIMCmd)]
+    n_macs = sum(1 for c in pim_cmds if c.type_ == "MAC")
+    assert n_macs == 2, f"Expected 2 MACs (dual-fiber) in single-layer trace, got {n_macs}"
+    assert len(_split_samsung_layers(pim_cmds)) == 1, "single work-id => one layer group"
 
     # No kwargs: legacy "GEMV needs W and x kwargs" diagnostic must
     # fire (not the multi-MAC diagnostic).
@@ -140,6 +156,6 @@ def test_single_mac_back_compat_path_still_takes_w_x():
 
 
 if __name__ == "__main__":
-    test_mlp_cmd_stream_has_one_mac_per_layer()
+    test_mlp_cmd_stream_splits_into_two_layers()
     test_multi_mac_without_layers_returns_cycles_none()
     print("ALL PASSED (subprocess-dependent tests skipped if no pim_driver)")

@@ -113,7 +113,16 @@ def _samsung_kernel_cycles(target):
             is_auto = isinstance(y_handle, MemoryRef)
             if is_auto:
                 folded = inner_ub // lane_burst
-                total += folded * mac_cyc + jump_cyc
+                # Dual-fiber placements run their bank halves concurrently:
+                # the modelled MAC time is the busier fiber's share, not the
+                # sum. `n_fibers` comes from the layout's segment-axis size
+                # (filled by the enumerator from the swizzle), defaulting to
+                # 1 so bank_row/grf_staged keep today's cost byte-identical.
+                n_fibers = layout.extra.get("n_fibers", 1)
+                # Ceil-split so an odd fold still bounds the busier fiber;
+                # one JUMP folds each fiber's own inner loop.
+                per_fiber = (folded + n_fibers - 1) // n_fibers
+                total += per_fiber * mac_cyc + n_fibers * jump_cyc
             else:
                 total += inner_ub * mac_cyc
 

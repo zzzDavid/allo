@@ -173,15 +173,16 @@ def test_autoschedule_picks_is_auto_layout():
 
 
 def test_compile_with_autoschedule_emits_canonical_bytes():
-    """Driving `compile_for_target` with no explicit layout must still
-    produce the canonical Samsung GEMV inner loop — autoschedule's
-    argmin should pick the (x=grf_a, y=even_bank) layout (or its
-    odd-bank equivalent), and either yields canonical bytes after the
-    bank-parity classifier in SamsungCtx.
+    """Driving `compile_for_target` with no explicit layout must produce
+    the lever-1 dual-fiber Samsung GEMV inner loop — argmin now picks the
+    dual-fiber placement (both bank halves busy), so each work-id emits a
+    MAC against EVEN_BANK *and* a MAC against ODD_BANK, each followed by a
+    per-fiber split JUMP. The bank parity falls out of the fiber handle's
+    idx via SamsungCtx's `_bank_parity`.
 
-    After spec 009 the cmds stream is bracketed with LD/ST MOV
-    instructions per work-id; the canonical (MAC, JUMP) subsequence
-    still appears once per work-id.
+    The per-fiber JUMP trip count is the K reduction split across the two
+    fibers: `K // lanes // n_fibers - 1` (= 63 for K=1024, lanes=8,
+    n_fibers=2) — derived, not written.
     """
     target = build_samsung_target()
     schedule = allo.customize(gemv_top, enable_tensor=False)
@@ -189,17 +190,26 @@ def test_compile_with_autoschedule_emits_canonical_bytes():
 
     compiled = allo.compile_for_target(target, trace)
 
-    canonical_jump = _canonical_jump()
-    mac_jump_count = 0
+    lanes, n_fibers = 8, 2
+    split_jump = PIMCmd(
+        type_="JUMP", loopCounter_=K // lanes // n_fibers - 1, loopOffset_=2
+    )
+    even_mac_jump = 0
+    odd_mac_jump = 0
     for i in range(len(compiled.cmds) - 1):
         cur, nxt = compiled.cmds[i], compiled.cmds[i + 1]
-        if cur.type_ == "MAC" and nxt == canonical_jump:
+        if cur.type_ == "MAC" and nxt == split_jump:
             assert cur.dst_ == "GRF_B"
             assert cur.src0_ == "GRF_A"
-            assert cur.src1_ in ("EVEN_BANK", "ODD_BANK"), cur.src1_
             assert cur.isAuto_ == 1
-            mac_jump_count += 1
-    assert mac_jump_count == 16 * 8
+            if cur.src1_ == "EVEN_BANK":
+                even_mac_jump += 1
+            elif cur.src1_ == "ODD_BANK":
+                odd_mac_jump += 1
+            else:
+                raise AssertionError(cur.src1_)
+    assert even_mac_jump == 16 * 8, even_mac_jump
+    assert odd_mac_jump == 16 * 8, odd_mac_jump
 
 
 # --------------------------------------------------------------------- #
@@ -247,20 +257,29 @@ def test_samsung_enumerator_returns_two_candidates():
     assert {"bank_row", "grf_staged"} <= modes, modes
 
 
-def test_samsung_argmin_picks_bank_row():
-    """SPEC-009 §1: under the existing constants the bank-row candidate
-    (is_auto=1, K-loop folds) costs ~8x less than the GRF-staged one
-    (is_auto=0, K MACs unrolled). Argmin must return the bank-row
-    placement; assert `y` lands on a `MemoryRef`, not a `Register`."""
+def test_samsung_argmin_picks_dual_fiber():
+    """SPEC-023 lever 1: the dual-fiber candidate (is_auto=1, both bank
+    halves busy) prices ~2x cheaper than bank_row (single fiber) and far
+    cheaper than grf_staged (K MACs unrolled), so argmin now returns the
+    dual-fiber placement. `y` still lands on a bank `MemoryRef` (the EVEN
+    fiber), and `extra["fibers"]` carries both bank fibers EVEN then ODD.
+    The winner moved from bank_row -> dual_fiber purely via the cost
+    model's `n_fibers` read (SPEC-023 §6)."""
     target = build_samsung_target()
     trace = _synthetic_mac_trace()
     layouts = autoschedule(target, trace)
     assert len(layouts) == 1
-    y_handle = layouts[0].placements["local_x"]
+    chosen = layouts[0]
+    assert chosen.mode == "dual_fiber", chosen.mode
+    y_handle = chosen.placements["local_x"]
     assert isinstance(y_handle, MemoryRef), (
-        f"argmin should pick bank-row (y on MemoryRef); got {y_handle!r}"
+        f"dual_fiber y is the EVEN bank MemoryRef; got {y_handle!r}"
     )
-    assert layouts[0].mode == "bank_row", layouts[0].mode
+    from allo.spmw_codegen import _bank_parity
+
+    fibers = chosen.extra["fibers"]
+    assert _bank_parity(fibers[0].idx) == "EVEN_BANK"
+    assert _bank_parity(fibers[-1].idx) == "ODD_BANK"
 
 
 def test_apu_v1_enumerator_returns_two_candidates():
@@ -317,7 +336,7 @@ if __name__ == "__main__":
     test_autoschedule_picks_is_auto_layout()
     test_compile_with_autoschedule_emits_canonical_bytes()
     test_samsung_enumerator_returns_two_candidates()
-    test_samsung_argmin_picks_bank_row()
+    test_samsung_argmin_picks_dual_fiber()
     test_apu_v1_enumerator_returns_two_candidates()
     test_apu_v1_argmin_picks_sv_lookup()
     test_apu_v2_enumerator_returns_two_candidates()
