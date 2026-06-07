@@ -20,7 +20,7 @@ from typing import Any, Callable
 from .spmw_cost import get_cost
 from .spmw_linear_layout import LinearLayout, materialise_handle
 from .spmw_match import MatchTrace, MatchedOp
-from .spmw_target import UnitId
+from .spmw_target import Register, UnitId
 
 
 @dataclass
@@ -108,6 +108,50 @@ def _bucket_for_autoschedule(trace: MatchTrace) -> list[tuple[str, list[MatchedO
             order.append(m.func_name)
         buckets[m.func_name].append(m)
     return [(name, buckets[name]) for name in order]
+
+
+def _samsung_host_eligible_memrefs(
+    target, placement: "Placement", role_to_memref: dict[str, str]
+) -> list[str]:
+    """Return the memrefs whose GRF preload may be host-broadcast.
+
+    A role is host-eligible (SPEC-024 §3) iff (a) its placement handle is
+    the broadcast GRF register `grf_a` -- the register the target declares
+    as the HAB-broadcast input -- AND (b) its home is the broadcast vector,
+    not a per-bank-staged operand. For GEMV that is the `x`/vector role:
+    `x` is broadcast to every bank, so one host write fills GRF_A for the
+    whole fan-out. The weight `y` may also be staged into `grf_a`
+    (grf_staged mode) but its home is a per-bank handle, so it is *not*
+    broadcast-uniform and stays crf-resident; `acc -> grf_b` is the
+    per-work-id accumulator, also excluded. Both tests are over handle
+    identity + role home, never a shape.
+    """
+    grf_a = target.grf_a
+    x_mref = role_to_memref.get("x")
+    if x_mref is None:
+        return []
+    handle = placement.placements.get(x_mref)
+    if isinstance(handle, Register) and handle is grf_a:
+        return [x_mref]
+    return []
+
+
+def _with_residency(base: "Placement", memref: str, mode: str) -> "Placement":
+    """Copy `base`, tagging `memref`'s GRF residency in `extra`.
+
+    Residency is *how* a GRF is filled (host broadcast vs CRF MOV), not
+    *which* handle holds the value, so `placements` is untouched -- the
+    layout algebra (lever 1's fibers) rides alongside unchanged.
+    """
+    new_extra = dict(base.extra)
+    residency = dict(new_extra.get("grf_residency", {}))
+    residency[memref] = mode
+    new_extra["grf_residency"] = residency
+    return Placement(
+        placements=dict(base.placements),
+        mode=base.mode,
+        extra=new_extra,
+    )
 
 
 @register_enumerator("samsung_hbm_pim")
@@ -210,7 +254,33 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             "n_fibers": n_fibers,
         },
     )
-    return [bank_row, grf_staged, dual_fiber]
+    base_candidates = [bank_row, grf_staged, dual_fiber]
+
+    # Lever 2 (SPEC-024): cross the layout candidates with {crf, host}
+    # GRF residency for the broadcastable role(s). Host residency hoists
+    # the preload off the CRF stream onto the native HAB broadcast; crf
+    # residency keeps the per-work-id CRF MOV. Both are real Placements;
+    # argmin decides -- the enumerator must NOT prune the crf variant.
+    # Host-eligibility is COMPUTED from the placement handle (§3), never
+    # asserted: only memrefs landing on `grf_a` are broadcast-uniform.
+    out: list[Placement] = []
+    for base in base_candidates:
+        host_memrefs = _samsung_host_eligible_memrefs(
+            target, base, role_to_memref
+        )
+        # crf variant == today's behaviour (default-missing key == "crf").
+        crf = base
+        for mref in host_memrefs:
+            crf = _with_residency(crf, mref, "crf")
+        out.append(crf)
+        # host variant: every host-eligible memref moves to host residency.
+        # If no role is host-eligible there is no second variant to emit.
+        if host_memrefs:
+            host = base
+            for mref in host_memrefs:
+                host = _with_residency(host, mref, "host")
+            out.append(host)
+    return out
 
 
 @register_enumerator("aim")

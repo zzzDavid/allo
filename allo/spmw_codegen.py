@@ -74,6 +74,13 @@ class CodegenContext:
     def __init__(self, target):
         self.target = target
         self.cmds: list[PIMCmd] = []
+        # Lever 2 (SPEC-024 §5): GRF preloads whose residency is "host"
+        # are hoisted off the CRF stream onto the native broadcast; we
+        # record (move_name, phase) here instead of emitting a CRF MOV so
+        # the move is absent from `cmds` (the faithful run path then
+        # excludes it). Default-empty for every backend that never sets
+        # host residency.
+        self.host_preloads: list[tuple[str, str]] = []
 
     def cmd(self, name: str, **fields):  # pragma: no cover - abstract
         raise NotImplementedError(
@@ -1261,28 +1268,40 @@ def _is_samsung_preload_mov(c: PIMCmd) -> bool:
     return grf_dst and bank_src
 
 
+def _is_samsung_storeback_mov(c: PIMCmd) -> bool:
+    """A bank<-GRF store MOV that closes a work-id (the `ST_A`/`ST_B`
+    storeback). `acc -> grf_b` is never host-eligible (lever 2), so this
+    MOV is always present and is the residency-robust work-id delimiter."""
+    if c.type_ not in ("MOV", "FILL"):
+        return False
+    bank_dst = c.dst_ in ("EVEN_BANK", "ODD_BANK")
+    grf_src = any(s in ("GRF_A", "GRF_B") for s in (c.src0_, c.src1_))
+    return bank_dst and grf_src
+
+
 def _split_samsung_layers(cmds: list[PIMCmd]) -> list[list[PIMCmd]]:
     """Group a flat Samsung GEMV cmd stream into per-layer (work-id)
-    chunks, delimited by the preload MOV that opens each work-id.
+    chunks, closed by the storeback MOV that ends each work-id.
 
-    A layer body is `[LD MOV, (MAC, JUMP)+, ST MOV]`; under lever 1 the
-    `(MAC, JUMP)` part repeats once per bank fiber, so we must NOT split
-    at JUMP. Setup before the first preload attaches to the first group;
-    the trailing terminator (NOP/EXIT) rides the last group. Groups with
-    no MAC are dropped (pure setup is meaningless to dispatch alone).
+    A layer body is `[LD MOV?, (MAC, JUMP)+, ST MOV]`; under lever 1 the
+    `(MAC, JUMP)` part repeats once per bank fiber (so we must NOT split
+    at JUMP), and under lever 2 the opening LD MOV is *absent* for
+    host-resident preloads -- so the preload MOV is no longer a reliable
+    boundary. The storeback MOV (`acc -> grf_b -> bank`, never
+    host-eligible) always closes a work-id, so we split *after* it.
+    Trailing setup/terminator (NOP/EXIT) with no MAC attaches to the
+    last group; groups with no MAC are dropped.
     """
     groups: list[list[PIMCmd]] = []
     cur: list[PIMCmd] = []
     for c in cmds:
-        if _is_samsung_preload_mov(c) and any(
+        cur.append(c)
+        if _is_samsung_storeback_mov(c) and any(
             g.type_ == "MAC" for g in cur
         ):
-            # The current group already holds a fold; this preload opens
-            # the next layer.
+            # This storeback closes the current work-id's body.
             groups.append(cur)
-            cur = [c]
-        else:
-            cur.append(c)
+            cur = []
     if cur:
         if groups and not any(g.type_ == "MAC" for g in cur):
             groups[-1].extend(cur)
@@ -1343,7 +1362,17 @@ def _schedule_moves(
     # round-trip is a deferred extension).
     from .spmw_regalloc import Spilled
 
-    emitted_names: set[str] = set()
+    # Lever 2 (SPEC-024 §5): a move name is host-resident only if EVERY
+    # role routing to it is host-resident; if any role on the name is crf
+    # the CRF MOV must still be emitted (it materialises that crf role).
+    # Default-missing residency == "crf", so non-Samsung backends and
+    # every existing placement keep emitting exactly as before.
+    residency = getattr(layout, "extra", {}).get("grf_residency", {})
+
+    # First pass: resolve each role to its move name and whether it is
+    # crf-resident on that name.
+    name_crf: dict[str, bool] = {}
+    name_seen_order: list[str] = []
     for role, memref in role_to_memref.items():
         handle = layout.placements.get(memref)
         if handle is None:
@@ -1356,10 +1385,24 @@ def _schedule_moves(
         chosen = ld_name if phase == "pre" else st_name
         if chosen is None:
             continue
-        if chosen in emitted_names:
-            continue
-        emitted_names.add(chosen)
-        _emit_move(target, chosen, ctx)
+        is_crf = residency.get(memref, "crf") != "host"
+        if chosen not in name_crf:
+            name_crf[chosen] = is_crf
+            name_seen_order.append(chosen)
+        else:
+            name_crf[chosen] = name_crf[chosen] or is_crf
+
+    for chosen in name_seen_order:
+        if name_crf[chosen]:
+            _emit_move(target, chosen, ctx)
+        elif phase == "pre":
+            # Host-resident preload: the native HAB broadcast fills GRF_A
+            # (--op GEMV scaffolding); Tenon emits no CRF MOV so the move
+            # is absent from compiled.cmds and the faithful run path
+            # excludes it with zero new logic. Recorded on a ctx side-list
+            # for run-path/audit visibility.
+            if hasattr(ctx, "host_preloads"):
+                ctx.host_preloads.append((chosen, phase))
 
 
 def _walk_and_emit(
@@ -1770,20 +1813,21 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
                 return False
         return True
 
-    pim_cmds_all = [
-        c for c in compiled.cmds
-        if isinstance(c, PIMCmd) and _crf_valid(c)
-    ]
+    pim_cmds_raw = [c for c in compiled.cmds if isinstance(c, PIMCmd)]
 
     # SPEC-020: detect multi-layer GEMV streams. `pim_driver` accepts one
     # GEMV per invocation, so a cmd stream covering >1 layer (e.g. an MLP)
     # must be split into per-layer groups dispatched as separate driver
-    # calls, cycles summed. A layer boundary is the preload MOV that loads
-    # GRF from a bank at the start of each work-id; this stays correct
-    # under lever 1, where one layer's body can hold several MAC+JUMP
-    # pairs (one per bank fiber) -- splitting at JUMP would wrongly cut a
-    # dual-fiber layer in two.
-    groups = _split_samsung_layers(pim_cmds_all)
+    # calls, cycles summed. A layer boundary is the storeback MOV that
+    # closes each work-id; this stays correct under lever 1 (one layer's
+    # body holds several MAC+JUMP pairs -- splitting at JUMP would cut a
+    # dual-fiber layer in two) and under lever 2 (host residency omits the
+    # opening preload MOV, so the storeback is the residency-robust
+    # delimiter). We split on the RAW stream so the storeback MOV is still
+    # present, then drop the ISA-invalid storebacks per group.
+    raw_groups = _split_samsung_layers(pim_cmds_raw)
+    groups = [[c for c in g if _crf_valid(c)] for g in raw_groups]
+    pim_cmds_all = [c for c in pim_cmds_raw if _crf_valid(c)]
     multi_layer = kernel == "GEMV" and len(groups) > 1
 
     if multi_layer:

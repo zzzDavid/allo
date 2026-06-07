@@ -90,13 +90,57 @@ def _samsung_kernel_cycles(target):
     jump_cyc = target.move("JUMP").cycles
     lane_burst = target.grf_a.lanes
 
+    # Lever 2 (SPEC-024 §4): preload move name from the role's GRF handle,
+    # resolved the same way SamsungCtx.resolve_moves does so the priced
+    # move is the materialised move. grf_a -> LD_A, grf_b -> LD_B.
+    from .spmw_target import Register
+
+    grf_a = target.grf_a
+    grf_b = target.grf_b
+
+    def _preload_name(handle):
+        if isinstance(handle, Register):
+            if handle is grf_a:
+                return "LD_A"
+            if handle is grf_b:
+                return "LD_B"
+        return None
+
     def cost_fn(trace: MatchTrace, layout) -> int:
         total = 0
+        residency = layout.extra.get("grf_residency", {})
         for match in trace.matches:
             handles = {
                 opb.role: _unwrap(layout.placements.get(opb.memref_name))
                 for opb in match.operands
             }
+
+            # Lever-2 preload residency, per work-id (one per match).
+            # crf residency is the baseline (the per-work-id CRF MOV is the
+            # implicit preload cost the pre-lever model already carried, so
+            # it contributes 0 *delta* here -- this keeps every default-crf
+            # placement byte-identical, SPEC-024 §7.2). host residency
+            # hoists the preload onto the native HAB broadcast, subtracting
+            # `target.move(LD_x).cycles` per work-id -- so the host variant
+            # is cheaper than crf by exactly n_workids*LD_A.cycles (§4).
+            # `acc -> grf_b` is storeback-only (not preloaded). Group by
+            # move name to mirror `_schedule_moves`: a name's MOV is dropped
+            # (and the saving applied) iff EVERY role on it is host-resident.
+            host_only: dict[str, bool] = {}
+            for opb in match.operands:
+                if opb.role == "acc":
+                    continue
+                load_name = _preload_name(handles.get(opb.role))
+                if load_name is None:
+                    continue
+                is_host = residency.get(opb.memref_name, "crf") == "host"
+                if load_name not in host_only:
+                    host_only[load_name] = is_host
+                else:
+                    host_only[load_name] = host_only[load_name] and is_host
+            for load_name, dropped in host_only.items():
+                if dropped:
+                    total -= target.move(load_name).cycles
 
             inner_ub = None
             if match.enclosing_loops:

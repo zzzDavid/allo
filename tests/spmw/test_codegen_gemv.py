@@ -112,15 +112,18 @@ def test_compile_emits_dual_fiber_mac_jump_per_match():
         f"JUMP) quads, got {quad_count}; cmds[0:6]={cmds[:6]!r}"
     )
 
-    # At least one MOV must appear before the first MAC and at least
-    # one MOV after the last MAC -- the preload/storeback wrappers.
+    # Lever 2 (SPEC-024): argmin now picks the host-residency variant, so
+    # the `x` preload (LD_A) is hoisted onto the native HAB broadcast and
+    # is NOT emitted as a CRF MOV. The head before the first MAC therefore
+    # carries no preload MOV; the storeback MOV (ST_B for acc->grf_b, which
+    # is not host-eligible) still follows the last MAC.
     mac_positions = [i for i, c in enumerate(compiled.cmds) if c.type_ == "MAC"]
     assert mac_positions, "no MAC emitted"
     head = compiled.cmds[: mac_positions[0]]
     tail = compiled.cmds[mac_positions[-1] + 1 :]
-    assert any(c.type_ == "MOV" for c in head), (
-        f"expected a MOV preload before the first MAC; head={head!r}"
-    )
+    assert not any(
+        c.type_ == "MOV" and c.dst_ == "GRF_A" for c in head
+    ), f"host residency must omit the LD_A preload MOV; head={head!r}"
     assert any(c.type_ == "MOV" for c in tail), (
         f"expected a MOV storeback after the last MAC; tail={tail!r}"
     )

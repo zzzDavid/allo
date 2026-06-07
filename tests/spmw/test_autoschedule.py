@@ -280,6 +280,11 @@ def test_samsung_argmin_picks_dual_fiber():
     fibers = chosen.extra["fibers"]
     assert _bank_parity(fibers[0].idx) == "EVEN_BANK"
     assert _bank_parity(fibers[-1].idx) == "ODD_BANK"
+    # Lever 2 (SPEC-024): the winner also carries host residency for `x`
+    # (the broadcast vector), since that strictly lowers the cost.
+    assert chosen.extra.get("grf_residency", {}).get("local_W") == "host", (
+        chosen.extra.get("grf_residency")
+    )
 
 
 def test_apu_v1_enumerator_returns_two_candidates():

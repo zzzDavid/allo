@@ -115,17 +115,39 @@ def _apu_v1_synthetic_trace() -> MatchTrace:
 # --------------------------------------------------------------------- #
 
 
+def _samsung_crf_dual_fiber(target, trace):
+    """The crf-residency dual_fiber Placement the enumerator emits.
+
+    Lever 2 (SPEC-024) makes argmin prefer the *host*-residency variant
+    (LD_A omitted, native broadcast fills GRF_A). To exercise the crf
+    MOV emission these tests pin the explicit crf dual_fiber candidate
+    instead of letting autoschedule pick host.
+    """
+    from allo.spmw_autoschedule import _samsung_enumerate
+
+    matches = trace.matches
+    for p in _samsung_enumerate(target, matches):
+        if p.mode == "dual_fiber" and all(
+            v == "crf" for v in p.extra.get("grf_residency", {}).values()
+        ):
+            return p
+    raise AssertionError("enumerator produced no crf dual_fiber candidate")
+
+
 def test_samsung_gemv_emits_ld_mac_jump_st_per_workid():
     """One work-id => LD_A preload, dual-fiber MAC body, ST_B storeback.
 
-    With autoschedule's preferred placement (lever 1 `dual_fiber`:
-    x=grf_a, y=even_bank, acc=grf_b, both fibers in extra), grf_a's
-    preload is LD_A (read-only x) and grf_b's storeback is ST_B. The MAC
-    body keeps both bank halves busy: MAC EVEN, JUMP, MAC ODD, JUMP.
+    Pins the crf dual_fiber placement (x=grf_a, y=even_bank, acc=grf_b,
+    both fibers in extra, x residency=crf): grf_a's preload is LD_A
+    (read-only x) and grf_b's storeback is ST_B. The MAC body keeps both
+    bank halves busy: MAC EVEN, JUMP, MAC ODD, JUMP. (Under autoschedule
+    argmin now prefers host residency, which omits LD_A -- SPEC-024 §8.)
     """
     target = build_samsung_target()
     trace = _samsung_synthetic_trace([(0, 0)])
-    compiled = compile_for_target(target, trace)
+    compiled = compile_for_target(
+        target, trace, layout=_samsung_crf_dual_fiber(target, trace)
+    )
 
     cmds = compiled.cmds
     types = [c.type_ for c in cmds]
@@ -142,10 +164,15 @@ def test_samsung_gemv_emits_ld_mac_jump_st_per_workid():
 
 
 def test_two_workids_emit_two_preload_blocks():
-    """Two distinct work_ids => two LD/ST blocks, not one shared."""
+    """Two distinct work_ids => two LD/ST blocks, not one shared.
+
+    Pins crf residency so the per-work-id LD_A MOVs are emitted (host
+    residency, the argmin default, would omit them -- SPEC-024 §8)."""
     target = build_samsung_target()
     trace = _samsung_synthetic_trace([(0, 0), (0, 1)])
-    compiled = compile_for_target(target, trace)
+    compiled = compile_for_target(
+        target, trace, layout=_samsung_crf_dual_fiber(target, trace)
+    )
 
     # Two work-ids × (LD_A, MAC EVEN, JUMP, MAC ODD, JUMP, ST_B) = 12.
     types = [c.type_ for c in compiled.cmds]

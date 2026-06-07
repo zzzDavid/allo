@@ -352,3 +352,45 @@ the run path is untouched beyond what SPEC-021/025 already build.
 - The choice that reaches codegen is argmin's output; the four new tests
   (§8) pass; the full SPMW suite + the §7.3 inventory stays green.
 ```
+
+## Implemented (coder task 041)
+
+Files (all under `experiments/allo/`):
+- `allo/spmw_autoschedule.py` — `_samsung_enumerate` crosses each base
+  candidate (`bank_row`/`grf_staged`/`dual_fiber`) with {crf, host} GRF
+  residency for the broadcastable `x` role; `_samsung_host_eligible_memrefs`
+  computes eligibility from the placement handle (`is grf_a`) + role home
+  (the `x`/broadcast vector, not the per-bank-staged `y`); `_with_residency`
+  copies a `Placement` and tags `extra["grf_residency"][mref]`. Crf variant
+  is never pruned.
+- `allo/spmw_cost_models.py` — `_samsung_kernel_cycles` adds a per-work-id
+  preload term grouped by move name: crf is the baseline (0 delta, keeps
+  default placements byte-identical), host subtracts
+  `target.move("LD_A").cycles` per work-id. Differential scales with the
+  work-id count (an expression over operand shape + unit count), no shape
+  literal.
+- `allo/spmw_codegen.py` — `_schedule_moves` consults
+  `placement.extra["grf_residency"]`; a move name is emitted as a CRF MOV
+  iff ≥1 role on it is crf-resident, else it is recorded on
+  `ctx.host_preloads` and omitted from `compiled.cmds` (so the faithful run
+  path excludes it). `_split_samsung_layers` now delimits work-ids on the
+  storeback MOV (residency-robust; the opening preload MOV is absent under
+  host residency); `_run_samsung` splits the raw stream before the
+  `_crf_valid` filter so the storeback delimiter survives.
+- Tests: new `tests/spmw/test_samsung_host_residency.py` (§8 receipts —
+  omits-MOV, priced-cheaper + K-scaling, perturbation, argmin-picks-host,
+  enumerator-offers-both); updated `test_move_scheduling.py`,
+  `test_codegen_gemv.py`, `test_autoschedule.py`,
+  `test_samsung_multi_layer_split.py` for the argmin-now-host behaviour.
+
+Candidate costs @ 4096×1024 (single work-id GEMV): bank_row+crf=513,
+dual_fiber+crf=258, **dual_fiber+host=232 (argmin)** — 232 = 258 − 26
+(LD_A.cycles), confirming the §4 differential.
+
+Faithful cycles @ 4096×1024 (single GEMV driver call): bank_row+crf=15329,
+dual_fiber+crf=15329, **dual_fiber+host=15251**. Lever 2 drops the LD_A
+host_load → one fewer `WRIO_TO_GRF` transaction group → 15329→15251, and
+`stream_records` 6→5 (LD_A MOV omitted). Matches lever-1's 15251
+native-folded baseline.
+
+Full `tests/spmw/` suite green.

@@ -40,8 +40,10 @@ def _compile_mlp_for_samsung():
 def test_mlp_cmd_stream_splits_into_two_layers():
     """The compiled MLP must split into two per-layer groups even though
     lever 1's dual-fiber placement emits two MACs (EVEN + ODD) per layer.
-    Layer boundaries are the preload MOVs, not JUMPs, so the run path sees
-    2 layers (= len(layers=[...])), not 4.
+    Layer boundaries are the per-work-id storeback MOVs, not JUMPs, so the
+    run path sees 2 layers (= len(layers=[...])), not 4. (Lever 2 omits
+    the opening preload MOV under host residency, so the storeback -- not
+    the preload -- is the residency-robust delimiter; SPEC-024 §5.)
     """
     from allo.spmw_codegen import _split_samsung_layers
 
