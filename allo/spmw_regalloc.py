@@ -571,4 +571,10 @@ def allocate(
     for name, h in candidate.placements.items():
         if name not in result.placement.placements:
             result.placement.placements[name] = h
+    # Preserve the enumerator's `mode` / `extra` on the refined placement
+    # (SPEC-009 §0). `_solve` constructs a fresh `Placement` from
+    # `placements` only; without this round-trip the codegen-side
+    # mode-dispatch (APU v1 sv vs sv_lookup) would lose the signal.
+    result.placement.mode = getattr(candidate, "mode", "")
+    result.placement.extra = dict(getattr(candidate, "extra", {}))
     return result

@@ -104,14 +104,20 @@ def test_e2e_mlp_samsung(request):
     macs = trace.by_target_op("MAC")
     assert len(macs) >= 2, f"Expected >=2 MAC matches, got {len(macs)}"
 
-    # pim_driver requires the minimum tile shape (M=4096, K=1024) -- the
-    # MLP layer dims (256x128) are below the driver's structural floor.
-    # Cycle count reflects the driver's stock GEMV at the tile size, not
-    # numerical correctness, so dummy zero inputs are fine here.
-    M_drv, K_drv = 4096, 1024
-    W_np = np.zeros((M_drv, K_drv), dtype=np.float16)
-    x_np = np.zeros(K_drv, dtype=np.float16)
-    result = compiled.run(W=W_np, x=x_np)
+    # SPEC-020: measure the actual MLP, not a padded substitute. The
+    # cmd stream contains one MAC per layer; `_run_samsung` splits at
+    # JUMP boundaries and runs `pim_driver` once per layer, summing the
+    # PIM_CYCLES totals. Zero inputs are fine: we are measuring cycles
+    # for the CRF microcode `compile_for_target` actually emitted, not
+    # numerical correctness.
+    W1 = np.zeros((256, 128), dtype=np.float16)
+    x  = np.zeros(128,        dtype=np.float16)
+    W2 = np.zeros((64, 256),  dtype=np.float16)
+    h  = np.zeros(256,        dtype=np.float16)
+    result = compiled.run(layers=[
+        {"W": W1, "x": x},
+        {"W": W2, "x": h},
+    ])
     assert isinstance(result, RunResult), f"Expected RunResult, got {type(result).__name__}"
     assert result.backend == "samsung_hbm_pim", result.backend
 
@@ -193,26 +199,30 @@ def test_e2e_mlp_upmem(request):
 
 
 def _apu_v1_device_available() -> bool:
-    """Return True if the ARC toolchain and PCI device are present (the build
-    harness uses the toolchain directly; gvml Python import is not required)."""
-    import os, pathlib
-    toolchain_bins = list(pathlib.Path("/usr/local/gsi-apu").rglob("arc-elf32-gcc")) \
+    """True iff ARC toolchain, PCI device, AND GVML SDK headers are all present."""
+    import pathlib
+    from allo.spmw_apu_v1_build import _gvml_sdk_available
+    toolchain_bins = (
+        list(pathlib.Path("/usr/local/gsi-apu").rglob("arc-elf32-gcc"))
         if pathlib.Path("/usr/local/gsi-apu").is_dir() else []
+    )
     pci_present = pathlib.Path("/sys/bus/pci/devices/0000:41:00.0").exists()
-    return bool(toolchain_bins) and pci_present
+    return bool(toolchain_bins) and pci_present and _gvml_sdk_available()
 
 
 @pytest.mark.hardware
 @pytest.mark.skipif(
     not _apu_v1_device_available(),
-    reason="APU v1 hardware not available: ARC toolchain or PCI 41:00.0 absent",
+    reason="APU v1 hardware not available: ARC toolchain, PCI 41:00.0, or GVML SDK absent",
 )
 def test_e2e_mlp_apu_v1(request):
     """Full pipeline for GSI APU v1 real hardware (PCI 41:00.0).
 
-    Skipped when `gvml` is not importable. Cycle count comes from hardware
-    counters; numerical correctness check is within hardware tolerance
-    (same bounds as the MICRO '25 SV-lookup validation).
+    Hardware/SDK absence is handled entirely by the @pytest.mark.skipif
+    decorator above (via `_apu_v1_device_available`). Once the test runs,
+    cycle count must be present and positive -- build/runtime failures
+    in `_run_apu_v1` now raise `RuntimeError` rather than returning a
+    silent `cycles=None`.
     """
     target = build_apu_v1_target()
     workload = build_mlp_workload()
@@ -224,17 +234,15 @@ def test_e2e_mlp_apu_v1(request):
     result = compiled.run()
     assert isinstance(result, RunResult), f"Expected RunResult, got {type(result).__name__}"
     assert result.backend == "apu_v1", result.backend
-    # Hardware run must not report "unavailable".
-    assert "simulator unavailable" not in result.stdout, (
-        f"APU v1 unexpectedly unavailable: {result.stdout}"
+    # Real-hardware run: cycles must be present and positive. Hardware
+    # absence is handled by @pytest.mark.skipif above; we never expect
+    # to reach this assertion with cycles=None.
+    assert result.cycles is not None and result.cycles > 0, (
+        f"APU v1 hardware returned cycles={result.cycles!r}; "
+        f"stdout tail: {result.stdout[-400:]}"
     )
-    # Cycle count may be None if the workload-level build harness isn't
-    # wired yet (spec 014). Accept either a positive count or None.
-    if result.cycles is not None:
-        assert result.cycles > 0, f"APU v1 hardware returned non-positive cycles: {result.cycles}"
 
-    note = "PASS (hw)" if result.cycles is not None else "PASS (no cycles)"
-    request.node._e2e_result = ("apu_v1", result.cycles, note)
+    request.node._e2e_result = ("apu_v1", result.cycles, "PASS (hw)")
 
 
 # --------------------------------------------------------------------- #

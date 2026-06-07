@@ -31,9 +31,17 @@ class Placement:
     `"local_x"`, `"acc"`) to the target handle (`Register`, `MemoryRef`)
     chosen for it. Codegen reads this to translate matcher-side bindings
     to target-side handles when calling `emit`.
+
+    `mode` is a free-form label that the cost model and codegen consult
+    to disambiguate candidates whose `placements` dict is identical or
+    whose op-expansion differs (e.g. APU v1 SV vs SV-lookup). Default
+    `""` preserves existing behaviour for cost models that don't read
+    it. `extra` is a free-form per-candidate scratch dict.
     """
 
     placements: dict[str, Any] = field(default_factory=dict)
+    mode: str = ""
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------- #
@@ -104,17 +112,16 @@ def _bucket_for_autoschedule(trace: MatchTrace) -> list[tuple[str, list[MatchedO
 
 @register_enumerator("samsung_hbm_pim")
 def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
-    """Construct the optimal Samsung layout via LinearLayout algebra.
+    """Enumerate Samsung layouts: bank-row `y` vs GRF-staged `y`.
 
-    Per spec 013 §C: build the identity layout on (grf, bank, tile),
-    call `LinearLayout.optimal_swizzle` to drop the bank-bit-0 swizzle
-    (Zhou et al. ASPLOS '26 §5.4), then materialise into the canonical
-    `target.banks[2*pid]` / grf_a / grf_b handles. MAC's `dst=grf_b`
-    constraint pins `acc -> grf_b`.
+    Per SPEC-009 §1: bank-row `y` (is_auto=1, K-loop folds) is the
+    optimal layout via LinearLayout algebra (Zhou et al. ASPLOS '26
+    §5.4); GRF-staged `y` (is_auto=0, K MACs unrolled) is the
+    alternative the cost model can distinguish via
+    `isinstance(y_handle, MemoryRef)`. MAC's `dst=grf_b` constraint
+    pins `acc -> grf_b` in both candidates.
 
-    Returns exactly ONE Placement — the algebraically optimal layout.
-    The cost-fn argmin in `autoschedule` still runs (single-element
-    list); keeps the control flow uniform.
+    Argmin picks bank-row (~8x cheaper at K=1024).
     """
     role_to_memref = _trace_memrefs_by_role(matches)
     x_mref = role_to_memref.get("x")
@@ -153,12 +160,26 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
         symbol_table={"bank": 2 * pid},
     )
 
-    placement = Placement(placements={
-        x_mref: target.grf_a,
-        y_mref: y_handle,
-        acc_mref: target.grf_b,
-    })
-    return [placement]
+    # Candidate 1: bank-row `y` (is_auto=1 -> folded K-loop).
+    bank_row = Placement(
+        placements={
+            x_mref: target.grf_a,
+            y_mref: y_handle,
+            acc_mref: target.grf_b,
+        },
+        mode="bank_row",
+    )
+    # Candidate 2: GRF-staged `y` (is_auto=0 -> K MACs unrolled).
+    # Both candidates share x->grf_a, acc->grf_b; only y differs.
+    grf_staged = Placement(
+        placements={
+            x_mref: target.grf_a,
+            y_mref: target.grf_a,
+            acc_mref: target.grf_b,
+        },
+        mode="grf_staged",
+    )
+    return [bank_row, grf_staged]
 
 
 @register_enumerator("aim")
@@ -186,15 +207,15 @@ def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             f"got {sorted(role_to_memref)}"
         )
 
-    # Algebraic candidate descriptors (kept for parity with spec 013 §D.1;
-    # the concrete handle plumbing below reads from the same target tree
-    # either way -- the layout choice is encoded in whether `y` lands in
-    # a bank or in `gb`).
-    no_bank_layout = LinearLayout.identity({"k": 16}, out_dims=("k",))
-    all_bank_layout = no_bank_layout.product(
-        LinearLayout.identity({"bank": 16}, out_dims=("bank",))
-    )
-    del no_bank_layout, all_bank_layout  # algebraic-only; not materialised here
+    # AiM topology note: the A/B choice here is per-bank MAC (MAC_SBK) vs.
+    # all-bank-broadcast MAC (MAC_ABK). Algebraically this is "does the
+    # layout factor `bank` into an input dim?" but the runtime distinction
+    # is which *physical unit* `y` lives on -- a per-bank operand
+    # (`banks[8*bg+bk]`) or the chip-level global buffer (`target.gb`).
+    # `gb` is not an algebraic offset from `bank`; it is a discrete
+    # hardware unit. LinearLayout cannot model the choice, so we enumerate
+    # the two Placements directly. `acc` always lives in the per-channel
+    # accumulator file (`target.gpr`) because AiM's MAC ISR writes there.
 
     # AiM tree is `device -> channel -> bg -> bank`. The bank-level unit
     # is where banks / gb / gpr are bound; we read them from the target's
@@ -245,12 +266,13 @@ def _upmem_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             f"got {sorted(role_to_memref)}"
         )
 
-    scalar_layout = LinearLayout.identity({"element": 16}, out_dims=("element",))
-    tasklet_layout = scalar_layout.product(
-        LinearLayout.identity({"tasklet": 16}, out_dims=("tasklet",))
-    )
-    del scalar_layout, tasklet_layout  # algebraic-only; handles below
-
+    # UPMEM topology note: the A/B choice is whether `acc` lives in a
+    # WRAM cell or in the per-tasklet GPR file. `wram[0/1/2]` and `gprs`
+    # are discrete named storage classes on the DPU hierarchy
+    # (mram-vs-wram-vs-gprs), not coordinates on a linear address space,
+    # so LinearLayout has no out_dim that names this choice. The two
+    # Placements below encode the choice directly. Bulk MRAM loads are
+    # the C runtime's job; live operands stay in WRAM/GPR.
     wram = target.wram
     gprs = target.gprs
 
@@ -296,16 +318,22 @@ def _apu_v1_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             f"got {sorted(role_to_memref)}"
         )
 
-    _layout = LinearLayout.identity({"element": 32768}, out_dims=("element",))
-    del _layout  # algebraic-only; the VR file is the operand store
-
+    # APU v1 topology note: 32K-lane bit-serial element axis with a
+    # single VR file (16 VRs per APUC). All compute operands live in
+    # `target.vrs`, so the enumerator has zero swizzle degrees of
+    # freedom -- the two candidates differ only by MAC op-expansion:
+    # raw MUL+ADD (SV mode, 18 cyc) vs gvml_lookup_16 + add (SV-lookup,
+    # 8 cyc). The cost model branches on `placement.mode`; argmin picks
+    # `sv_lookup`. See SPEC-009 §2.
     vrs = target.vrs
+    placements = {
+        x_mref: vrs,
+        y_mref: vrs,
+        acc_mref: vrs,
+    }
     return [
-        Placement(placements={
-            x_mref: vrs,
-            y_mref: vrs,
-            acc_mref: vrs,
-        }),
+        Placement(placements=dict(placements), mode="sv"),
+        Placement(placements=dict(placements), mode="sv_lookup"),
     ]
 
 
@@ -328,18 +356,30 @@ def _apu_v2_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             f"got {sorted(role_to_memref)}"
         )
 
-    _layout = LinearLayout.identity(
-        {"element": 65536, "group": 16}, out_dims=("element", "group")
-    )
-    del _layout  # algebraic-only; concrete L1-row slots assigned below
-
+    # APU v2 topology note: 64K-lane element axis with a 16-row L1
+    # group. l1_sim treats all L1 addresses uniformly, so the cost
+    # model is a placeholder (constant per match). Two candidates with
+    # symbolic l1[0/1/2] bindings keep argmin exercised; under the
+    # placeholder cost they tie, and the sort tie-breaks on enumerator
+    # index (Candidate 1 wins). See SPEC-009 §3.
     l1 = target.l1
     return [
-        Placement(placements={
-            x_mref: l1[0],
-            y_mref: l1[1],
-            acc_mref: l1[2],
-        }),
+        Placement(
+            placements={
+                x_mref: l1[0],
+                y_mref: l1[1],
+                acc_mref: l1[2],
+            },
+            mode="l1_row_canonical",
+        ),
+        Placement(
+            placements={
+                x_mref: l1[2],
+                y_mref: l1[1],
+                acc_mref: l1[0],
+            },
+            mode="l1_row_reversed",
+        ),
     ]
 
 

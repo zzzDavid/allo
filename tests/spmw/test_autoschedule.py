@@ -16,12 +16,17 @@ from __future__ import annotations
 import allo
 from allo.dataflow import region as _df_region
 from allo.ir.types import float32 as fp16
-from allo.spmw_autoschedule import _samsung_enumerate, autoschedule
+from allo.spmw_autoschedule import (
+    _apu_v1_enumerate,
+    _apu_v2_enumerate,
+    _samsung_enumerate,
+    autoschedule,
+)
 from allo.spmw_codegen import PIMCmd
 from allo.spmw_match import MatchTrace, MatchedOp, OperandBinding
 from allo.spmw_target import MemoryRef, Register, UnitId
 
-from _fixtures import build_samsung_target
+from _fixtures import build_apu_v1_target, build_apu_v2_target, build_samsung_target
 
 
 M, K = 4096, 1024
@@ -86,9 +91,15 @@ def test_samsung_enumerator_respects_mac_dst_grf_b():
         acc_handle = layout.placements["acc"]
         assert isinstance(acc_handle, Register) and acc_handle.name == "grf_b"
 
-    # x and y must be distinct hardware resources.
-    for layout in candidates:
-        assert layout.placements["local_W"] is not layout.placements["local_x"]
+    # The bank-row candidate must place x and y on distinct resources
+    # (grf_a vs a bank handle). SPEC-009 §1's second candidate
+    # deliberately stages y on grf_a too, so the "distinct" invariant
+    # only applies to the bank-row layout.
+    bank_row = [c for c in candidates if c.mode == "bank_row"]
+    assert bank_row, "samsung enumerator must produce a bank_row candidate"
+    assert (
+        bank_row[0].placements["local_W"] is not bank_row[0].placements["local_x"]
+    )
 
 
 # --------------------------------------------------------------------- #
@@ -191,9 +202,124 @@ def test_compile_with_autoschedule_emits_canonical_bytes():
     assert mac_jump_count == 16 * 8
 
 
+# --------------------------------------------------------------------- #
+# SPEC-009: argmin sees >=2 candidates per backend
+# --------------------------------------------------------------------- #
+
+
+def _apu_synthetic_mac_trace(target_name: str) -> MatchTrace:
+    """Per-backend 1-match MAC trace with the local_W/local_x/acc role
+    triple the enumerators expect. Independent of the Samsung-shaped
+    fixture so role names line up with what `_trace_memrefs_by_role`
+    reports."""
+    return MatchTrace(
+        target_name=target_name,
+        module_name="synthetic",
+        matches=[
+            MatchedOp(
+                target_op_name="MAC",
+                func_name="kern_0_0",
+                work_id=(0, 0),
+                enclosing_loops=[
+                    ("%arg0", "0", "16", 1),
+                    ("%arg1", "0", "1024", 1),
+                ],
+                operands=[
+                    OperandBinding(role="x", memref_name="local_W"),
+                    OperandBinding(role="y", memref_name="local_x"),
+                    OperandBinding(role="acc", memref_name="acc", is_loop_carried=True),
+                ],
+                result_memref_name="acc",
+                op_range=("%a", "%b"),
+            )
+        ],
+    )
+
+
+def test_samsung_enumerator_returns_two_candidates():
+    """SPEC-009 §1: bank-row + GRF-staged candidates so argmin has a
+    real choice; the cost model's `isinstance(y_handle, MemoryRef)`
+    branch produces a ~8x gap between them."""
+    target = build_samsung_target()
+    candidates = _samsung_enumerate(target, _synthetic_mac_trace().matches)
+    assert len(candidates) >= 2, len(candidates)
+    modes = {c.mode for c in candidates}
+    assert {"bank_row", "grf_staged"} <= modes, modes
+
+
+def test_samsung_argmin_picks_bank_row():
+    """SPEC-009 §1: under the existing constants the bank-row candidate
+    (is_auto=1, K-loop folds) costs ~8x less than the GRF-staged one
+    (is_auto=0, K MACs unrolled). Argmin must return the bank-row
+    placement; assert `y` lands on a `MemoryRef`, not a `Register`."""
+    target = build_samsung_target()
+    trace = _synthetic_mac_trace()
+    layouts = autoschedule(target, trace)
+    assert len(layouts) == 1
+    y_handle = layouts[0].placements["local_x"]
+    assert isinstance(y_handle, MemoryRef), (
+        f"argmin should pick bank-row (y on MemoryRef); got {y_handle!r}"
+    )
+    assert layouts[0].mode == "bank_row", layouts[0].mode
+
+
+def test_apu_v1_enumerator_returns_two_candidates():
+    """SPEC-009 §2: sv + sv_lookup candidates differ only in
+    `placement.mode`; cost model branches on mode to charge the
+    MUL+ADD (18 cyc) vs lookup+ADD (8 cyc) expansion."""
+    target = build_apu_v1_target()
+    trace = _apu_synthetic_mac_trace("apu_v1")
+    candidates = _apu_v1_enumerate(target, trace.matches)
+    assert len(candidates) >= 2, len(candidates)
+    modes = {c.mode for c in candidates}
+    assert {"sv", "sv_lookup"} <= modes, modes
+
+
+def test_apu_v1_argmin_picks_sv_lookup():
+    """SPEC-009 §2: argmin must select the sv_lookup placement (8 cyc
+    per MAC) over the sv placement (18 cyc per MAC)."""
+    target = build_apu_v1_target()
+    trace = _apu_synthetic_mac_trace("apu_v1")
+    layouts = autoschedule(target, trace)
+    assert len(layouts) == 1
+    assert layouts[0].mode == "sv_lookup", layouts[0].mode
+
+
+def test_apu_v2_enumerator_returns_two_candidates():
+    """SPEC-009 §3: canonical + reversed L1-row bindings; cost is a
+    placeholder so the candidates tie and argmin picks lex-first by
+    enumerator index."""
+    target = build_apu_v2_target()
+    trace = _apu_synthetic_mac_trace("apu_v2")
+    candidates = _apu_v2_enumerate(target, trace.matches)
+    assert len(candidates) >= 2, len(candidates)
+    modes = {c.mode for c in candidates}
+    assert {"l1_row_canonical", "l1_row_reversed"} <= modes, modes
+
+
+def test_apu_v2_argmin_picks_canonical():
+    """Placeholder cost ties both candidates; argmin's stable
+    enumerator-index tie-break must select the canonical binding."""
+    import warnings as _warnings
+
+    target = build_apu_v2_target()
+    trace = _apu_synthetic_mac_trace("apu_v2")
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore", RuntimeWarning)
+        layouts = autoschedule(target, trace)
+    assert len(layouts) == 1
+    assert layouts[0].mode == "l1_row_canonical", layouts[0].mode
+
+
 if __name__ == "__main__":
     test_samsung_enumerator_respects_mac_dst_grf_b()
     test_kernel_cycles_prefers_is_auto()
     test_autoschedule_picks_is_auto_layout()
     test_compile_with_autoschedule_emits_canonical_bytes()
+    test_samsung_enumerator_returns_two_candidates()
+    test_samsung_argmin_picks_bank_row()
+    test_apu_v1_enumerator_returns_two_candidates()
+    test_apu_v1_argmin_picks_sv_lookup()
+    test_apu_v2_enumerator_returns_two_candidates()
+    test_apu_v2_argmin_picks_canonical()
     print("ALL PASSED")

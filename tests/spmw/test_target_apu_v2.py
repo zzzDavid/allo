@@ -3,15 +3,13 @@
 """Smoke tests for the GSI APU v2 (Gemini 2, G2, GTML) target spec.
 
 Per spec 003 §F.5: target build, ctx MAC -> matmul+add expansion, the
-GTML program-source wrapper, and the placeholder cost factory's
-one-shot warning.
+GTML program-source wrapper, and the functional-only cost factory
+(SPEC-011: no runtime warning; APU v2 is functional-correctness only).
 """
 
 from __future__ import annotations
 
 import warnings
-
-import pytest
 
 import allo
 from allo.spmw_autoschedule import autoschedule
@@ -130,27 +128,21 @@ def test_apu_v2_get_program_src_wraps():
 # --------------------------------------------------------------------- #
 
 
-def test_apu_v2_cost_factory_warns_once():
-    """The cost factory must emit a `RuntimeWarning` mentioning
-    "placeholder" on first build and stay silent on the second build
-    (idempotent guard). Both calls must return a working callable."""
-    # Reset the module-level guard so we can assert the warning fires.
-    import allo.spmw_cost_models as cm
-    cm._APU_V2_WARNED = False
-
+def test_apu_v2_cost_factory_no_warning():
+    """APU v2 is functional-only: the cost factory must NOT warn at
+    build time. The placeholder semantics are now documented in the
+    docstring, not via a runtime warning. See SPEC-011."""
     target = build_apu_v2_target()
 
-    with pytest.warns(RuntimeWarning, match="placeholder"):
-        cost_fn = allo.get_cost("kernel_cycles", target)
-    assert callable(cost_fn)
-
-    # Second call: no warning.
     with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        warnings.simplefilter("error")  # any warning -> test failure
+        cost_fn = allo.get_cost("kernel_cycles", target)
+        # Second call must also stay silent.
         cost_fn2 = allo.get_cost("kernel_cycles", target)
+    assert callable(cost_fn)
     assert callable(cost_fn2)
 
-    # Placeholder cost: 1 cycle per match.
+    # Non-comparative stub: 1 cycle per match.
     trace = _synthetic_mac_trace()
     assert cost_fn(trace, allo.Placement(placements={})) == 1
 
@@ -204,7 +196,7 @@ if __name__ == "__main__":
     test_apu_v2_ctx_emit_mac_expands_to_matmul_plus_add()
     test_apu_v2_ctx_cmd_emits_cpp_lines()
     test_apu_v2_get_program_src_wraps()
-    test_apu_v2_cost_factory_warns_once()
+    test_apu_v2_cost_factory_no_warning()
     test_apu_v2_autoschedule_returns_l1_placement()
     test_apu_v2_compile_emits_cpp_strings()
     print("ALL PASSED")

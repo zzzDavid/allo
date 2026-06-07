@@ -34,6 +34,9 @@ into MLIR, which the matcher then walks.
 | `allo/memory.py` | **untouched** | Legacy `Layout`/`Memory`/`DTensor` are owned by `allo/ir/*`. SPMW reserves `allo.Layout` *only at the package-namespace level* for the future Linear-Layout symbol; this is done by renaming SPMW's own `Layout` to `Placement` (spec 001). |
 | `allo/ir/*` | **untouched** | Upstream Allo's responsibility. |
 | `allo/__init__.py` | **edited (spec 001)** | Resolve `Layout` shadow (rename SPMW Layout → Placement). Drop `memory` callable re-export (replace with `mem`). |
+| `experiments/simulators/uPIMulator/golang/uPIMulator/` | **edited (spec 003, additive only)** | Add a permanent benchmark slot named `TENON` that `_run_upmem` overwrites with the emitted DPU `task.c` per call. Touched files: `benchmark/CMakeLists.txt` (+1 `add_subdirectory(TENON)` line), `src/assembler/assembler.go` (+1 registry line), plus four new files under `benchmark/TENON/` and `src/assembler/prim/tenon.go`. Templated from the existing `DSLVA` benchmark (which uPIMulator's own authors added as a codegen slot). No existing files are semantically changed; reverting is `git revert` plus an inert benchmark dir. No upstream Allo / FPGA tests touch this tree. See `SPEC-003-upmem-real-kernel.md`. |
+| `allo/spmw_linear_layout.py` (`materialise_handle`, new `bank_stride`) | **edited (spec 022, additive only)** | New `symbolic=` kwarg on `materialise_handle` carries the swizzle `tile` column as a free `SymExpr`; new `bank_stride(target, *, out_dim, unit_level)` derives banks-per-unit from target geometry so the even-bank base `stride*pid` is layout/target-derived, not a pasted `2*pid` (anti-hardcoding gate evidence #4). Kwarg defaults to `None` → today's behaviour; the four non-Samsung enumerators (SPEC-007 option b) never pass it. `_bank_parity` is **unchanged** (the new path emits the same `2*pid` / `2*pid+1` forms it already classifies, for Samsung's `stride==2`). Guarded by new `tests/spmw/test_linear_layout.py::test_materialise_symbolic_fibers` + existing `test_materialise_samsung_bank_handle` (back-compat). Upstream Allo does not import `spmw_linear_layout`, so `tests/dataflow/` and `tests/customize/` are not gated. See `SPEC-022-materialise-symbolic-fibers.md`. |
+| `experiments/simulators/PIMSimulator/src/PIMKernel.cpp` (`runPIM`, `executeGemv`, `executeGemvWithCmds`, `computeGemv`, `programCrf`) | **reference-only, FORBIDDEN to edit (spec 021)** | `getCycle()` is shape-fixed: cycles advance one tick per `mem_->update()` in `runPIM` (line 21-27); the `--cmds` stream reaches only `programCrf` (line 478), which caps at 4 CRF bursts (line 220-238); the work loop and per-tile MAC volume are derived from `w_data->bShape`, not from `cmds`. The faithful run path (spec 021, task 025) must be a **new** driver symbol/flag that calls these but does not edit their bodies, plus Tenon-side `spmw_codegen._run_samsung*` changes. The native `--op GEMV` cycle output must stay byte-for-byte (task 015 baseline). Guarded by upstream gtest `PIMKernelFixture.gemv` (must stay green) + `tests/spmw/test_samsung_placement_changes_cycles.py` (promoted to strict `cycles_a != cycles_b` once 025 lands). See `SPEC-021-samsung-cycle-model.md`. |
 
 Every shared-file edit must list the upstream tests that guard it
 here. So far (spec 001): no shared-file `.py` edits beyond
@@ -123,6 +126,52 @@ it to emit the inner-K `JUMP` record; previously this lived in
 `_walk_and_emit` directly and leaked Samsung-specific `PIMCmd`
 records into other backends' `ctx.cmds` (which are `list[str]`).
 
+### `Placement.extra["grf_residency"]` — GRF host-vs-CRF preload (spec 024, Samsung)
+Per-memref residency map `memref_name -> "host" | "crf"`; absent key
+== `"crf"` (back-compat, all five backends default). Set only by the
+Samsung enumerator for the broadcastable preload role (`x`/`grf_a`).
+`"host"` = the GRF is filled by the native HAB broadcast (host
+transaction, off the CRF stream); `"crf"` = a per-work-id `LD_A`/`LD_B`
+CRF MOV. Cost model (`_samsung_kernel_cycles`) prices `"host"` at 0 CRF
+cycles for the preload and `"crf"` at `target.move(load_name).cycles`
+per work-id; codegen (`SamsungCtx`/`_schedule_moves`) omits the CRF MOV
+for `"host"` (side-list → native host load) and emits it for `"crf"`.
+The choice is argmin's, not codegen's. Riding `extra` (not `mode`, not a
+new dataclass field) keeps residency per-operand and orthogonal to
+lever-1 layout modes, with zero blast radius to non-Samsung backends.
+See SPEC-024.
+
+### `Compiled.ctx` (spec 003, additive)
+`Compiled.__init__` grows an optional fifth kwarg `ctx=None` that
+retains the `CodegenContext` instance that produced the cmds.
+`compile_for_target` passes it through. Other backends ignore the
+field; UPMEM uses it so `_run_upmem` can call
+`ctx.get_kernel_src()` to render the full DPU envelope rather than
+duplicating the envelope logic in the runner. The field is private
+(`_ctx`); only intra-`spmw_codegen.py` code reads it. Fully
+back-compat for every positional caller.
+
+### `Compiled.run(layers=[...])` for multi-MAC streams (spec 020, Samsung)
+`pim_driver` accepts one GEMV per invocation; the Samsung emitted
+`compiled.cmds` for a multi-layer workload (e.g. MLP) concatenates
+MAC blocks across layers. `_run_samsung` therefore splits
+`compiled.cmds` at JUMP boundaries (one JUMP closes one MAC's inner-K
+fold), and when more than one MAC group is present accepts a new
+opt-in kwarg `layers=[{"W": ..., "x": ...}, ...]`. Each MAC group
+runs through one `pim_driver` invocation with its own per-layer
+`W.npy` / `x.npy` / `cmds.txt`; cycles are summed. Single-layer
+callers (`W=, x=` form) hit the back-compat branch unchanged. See
+`SPEC-020-samsung-subshape.md`.
+
+### `CodegenContext.get_kernel_src()` (existing; spec 003 extends UPMEM's)
+Per-backend hook returning the assembled source to feed to that
+backend's tool flow. APU v1 returns a flat C-call sequence (low
+mode). UPMEM (post-003) returns a complete DPU `task.c` with the
+PrIM-standard envelope (`__host dpu_arguments_t`, `BARRIER_INIT`,
+`kernels[]` dispatch, MRAM↔WRAM staging) wrapping the body in
+`self.cmds`. The envelope template is fixed per-ctx for now;
+multi-shape selection (`"va"` / `"gemv"` / `"mlp"`) is deferred.
+
 ### `CodegenContext.resolve_spill_moves(tier)` (spec 015)
 Per-backend hook returning `(load_move_name, store_move_name)` for one
 declared spill tier (e.g. `"bank_row"` on Samsung/AiM, `"mram"` on
@@ -143,14 +192,57 @@ this once per (group, candidate) and argmin-s on
 Chow-Hennessy 1990 (sort by cost-gap descending, pick cheapest fit);
 PBQP lives at `_solve()` as a deferred upgrade slot.
 
+### `Placement.mode` and `Placement.extra` (spec 009)
+Additive fields on the `Placement` dataclass
+(`spmw_autoschedule.py:Placement`). `mode: str = ""` is a free-form
+label the cost model and codegen consult to disambiguate candidates
+whose `placements` dict is identical or whose op-expansion differs
+(e.g. APU v1 `"sv"` vs `"sv_lookup"` MAC expansion). `extra: dict =
+{}` is a per-backend scratch slot. Defaults preserve current behaviour
+for cost models that don't read them. Allowed `mode` values are
+backend-declared (asserted in cost factory): APU v1 `{"sv",
+"sv_lookup"}`; Samsung `{"bank_row", "grf_staged"}` (label-only, cost
+reads `placements`); APU v2 `{"l1_row_canonical",
+"l1_row_reversed"}` (label-only; APU v2 is functional-only, see SPEC-011). The
+regalloc round-trips both fields untouched onto the refined
+`Placement`. Codegen consumers: APU v1 `MAC` dispatch branches on
+`mode` to pick between `emit_mac_lookup` and `emit_mac_mul_add`. See
+`SPEC-009-argmin-enumeration.md`.
+
+Samsung `extra["crf_issue"]` (spec 025, lever 3): `{"shared",
+"per_workid"}`, a CRF-issue mode **orthogonal** to the `y`-placement
+`mode`, threaded through `extra` (not a second cross-producted `mode`
+string) so it stays additive against levers 1/2. Cost model
+(`_samsung_kernel_cycles`) prices `shared = body_cyc +
+trigger_cyc·n_workids` vs `per_workid = body_cyc·n_workids`, where
+`n_workids = _samsung_workid_count(target)` (product of unit-tree
+`mapping` fanouts — geometry, never the literal 128). Codegen
+materialises `shared` as one shared CRF body + a host trigger schedule
+(`Compiled.host_schedule`). Default (absent key) = `per_workid` =
+byte-for-byte current behaviour; AiM/UPMEM/APU never read it. See
+`SPEC-025-lever3-shared-crf.md`.
+
+### `Compiled.host_schedule: list[HostTrigger]` (spec 025, Samsung, additive)
+New field on `Compiled`, parallel to `cmds`. For the Samsung shared-CRF
+mode, the shared CRF body goes into `cmds` (uploaded once by
+`programCrf`) and the per-work-id host triggers go into `host_schedule`
+(one `HostTrigger(work_id, tile_count)` per work-id). The SPEC-021
+faithful run path derives `stream_records` from `len(cmds)` (one body)
+and the issued-transaction multiplicity from `len(host_schedule)`,
+pricing native and Tenon under the same accounting (SPEC-021 §2). Empty
+for every other backend and for the `per_workid` Samsung mode. Triggers
+are deliberately NOT `PIMCmd`s so they bypass the C++ `validationCheck`
++ the ≤4-burst `programCrf` cap (SPEC-021 §1). See
+`SPEC-025-lever3-shared-crf.md` §5.4.
+
 ### `@allo.cost("register_spill")` (spec 015)
 Per-backend factory in `spmw_cost_models.py`. Returns
 `spill(reg, n_entries=1)` (UPMEM additionally takes `tier=`). The
 factory mutates the target by setting `target.move(LD/ST).cycles` from
 backend timing constants; the regalloc reads those when building
 spill-tier cost-vector entries. Five backends ship: Samsung, AiM,
-UPMEM, APU v1, APU v2 (the last is a placeholder because `l1_sim`
-declares `perf_is_placeholder = True`).
+UPMEM, APU v1, APU v2 (functional-only target; cost stub is
+non-comparative — see SPEC-011).
 
 ## 4. Open design tensions
 
@@ -223,6 +315,32 @@ by splitting live ranges. GEMV / MLP on all five backends do not
 exhibit this. The `CostVector` / `CapacityTable` / `LiveRange` data
 structures are designed to feed either solver unchanged.
 
+### T8a. UPMEM kernel envelope is fixed, not workload-shape-aware (spec 003 §6)
+The DPU `task.c` envelope `UPMEMCtx.get_kernel_src()` emits is a
+single template templated off `DSLVA` (binary in-place reduce
+shape). GEMV / three-buffer kernels will need a different
+envelope. Resolution path: `UPMEMCtx` declares a shape tag
+(`"va"` / `"gemv"` / `"mlp"`); `get_kernel_src` picks one of N
+templates. Triggered when the first non-VA-shape UPMEM workload
+lands. The `benchmark/TENON/` shell itself stays the same — only
+the rendered C and the matching `prim/tenon.go` data-prep
+parameterise.
+
+### T8b. UPMEM `tenon.go` data-prep is VA-shape-hardcoded (spec 003 §7)
+Counterpart to T8a on the Go side. Today `tenon.go` is a copy of
+`dslva.go` and ships VA-style host arguments. This is fine for
+cycle-counting (cycles come from the linker's real asm) but wrong
+for end-to-end numeric correctness. Resolution path: parameterise
+`tenon.go` via a small JSON dropped next to `task.c` describing
+buffer count, sizes, and types. Out of scope until a
+correctness-checking task lands.
+
+### T9. UPMEM `_run_upmem` hardcodes `num_dpus=1, num_tasklets=1` (spec 003 §7)
+The current CLI invocation pins single-DPU, single-tasklet. Once
+`UPMEMCtx` can emit tasklet-strided bodies, these values must
+come from the target / `compiled.layout`. Tracked by HANDOFF.md
+under the UPMEM blocker family.
+
 ### T8. `LinearLayout` is enumerator-ephemeral, not `Placement`-carried (spec 013 §E)
 `LinearLayout` is built inside each backend enumerator, materialised
 into a concrete `Register` / `MemoryRef`, and then discarded. The
@@ -236,3 +354,95 @@ Promoting `LinearLayout` into `Placement` (and deleting
 `_bank_parity`) is a future spec, triggered when a target needs more
 than two bank-parity classes — for which the existing SymExpr
 pattern-matcher is too narrow.
+
+### T11. APU v1 lookup-table identity is build-harness-implicit (spec 018)
+`APUv1Ctx.emit_mac_lookup` emits a fixed `mac_lut_ptr, 256` literal;
+`spmw_apu_v1_build.py` always emits a `uint16_t mac_lut[256]` field in
+`program_data` and a `popcount(u8)` initialisation in host.c. The LUT
+identity (popcount-of-byte) is **implicit in the build harness** — it
+is not carried on `Placement`, `MatchedOp`, or `compiled.dtype`. This
+is fine today because (i) the only `mode="sv_lookup"` consumer is
+binary MAC, (ii) the popcount table is constant, and (iii) the LUT
+fits inline in the cmd struct (512 B). The seam to cut when a second
+LUT identity ships (e.g. s16 MAC, ~256 KB LUT that no longer fits
+inline) is `Placement.extra["lut_kind"]` plus a build-harness
+dispatcher that routes large LUTs through a dedicated
+`mem_hndl_mac_lut` L4 role. Trigger to revisit: any workload whose
+matcher emits `MAC` with `dtype != u8` and selects `sv_lookup`. See
+SPEC-018 §6 (slots SPEC-018b for byte-pair packing and SPEC-018c for
+variable-dtype LUTs).
+
+### T12. Samsung cycle model is shape-fixed, not stream-driven (spec 021) — RESOLVED with a build action
+Determined definitively (verdict (a)): PIMSimulator `getCycle()` is a
+function of `--output-dim`/`--input-dim` only; the emitted PIMCmd stream
+reaches just the 32-entry CRF via `programCrf` (capped at 4 bursts) and
+never changes the transaction queue `runPIM` counts. **Until the
+faithful run path lands, metric (A) `tenon_cycles < native_cycles` is
+unmovable** by any enumerator/cost/codegen change — this is the DAG root
+of the Samsung-GEMV-peak task. Chosen resolution: **Option B** — a new
+driver symbol keeps `computeGemv` address generation (numerics/readback
+unchanged) but makes outer-loop trip counts and per-tile transaction
+multiplicity a function of the emitted stream (`stream_records`,
+`stream_macs_per_tile` derived from `compiled.cmds`), then counts cycles
+off the unmodified `runPIM`. Honest/flattering line and file boundary in
+`SPEC-021`. The remaining open sub-question (exact PIMCmd-stream ->
+`stream_macs_per_tile` map for JUMP-folded vs unrolled, and
+MOV-vs-host-broadcast accounting) is deferred to lever specs 030/040/050
+because it *is* levers 1/2; task 025 ships a conservative "one issued
+transaction per CRF instruction after JUMP expansion" rule that already
+moves all three levers in the right direction. The MOV-vs-host-broadcast
+half is now RESOLVED by SPEC-024: host-resident GRF preloads are never
+emitted as CRF MOV records, so they are absent from `compiled.cmds` and
+thus from `stream_records` automatically — the faithful path needs no
+new logic; the residency attribute changes the stream and the path
+already prices the stream. See
+`SPEC-021-samsung-cycle-model.md` and
+`dev/06072026-samsung-gemv-peak/work/reports/arch-cycle-model-determination.md`.
+
+### T13. Samsung CRF-issue mode: shared CRF vs per-work-id replication (spec 025) — RESOLVED
+Lever 3. Tenon's per-work-id walk (`_walk_and_emit` →
+`_bucket_by_work_id`) re-emits the CRF body once per PIM block (~128
+work-ids × ~4-insn body ≈ 512 records); native programs **one** shared
+CRF and issues a host trigger schedule. Resolved as an additive
+`Placement.extra["crf_issue"] ∈ {"shared","per_workid"}` mode the cost
+model prices (`shared = body_cyc + trigger_cyc·n_workids` vs
+`per_workid = body_cyc·n_workids`) so argmin prefers shared; codegen
+materialises one shared CRF body + `Compiled.host_schedule`. The
+replication factor `n_workids` is `_samsung_workid_count(target)` — the
+product of unit-tree `mapping` fanouts (target geometry), never the
+forbidden literal 128. **Zero shared-file footprint**: the change is
+entirely inside `spmw_autoschedule.py` / `spmw_cost_models.py` /
+`spmw_codegen.py` plus a new `Compiled.host_schedule` field and one new
+`CRF_TRIGGER` Move on the Samsung fixture; `ir/*`, `dataflow.py`,
+`customize.py`, and the PIMSimulator source are untouched. The cycle win
+is only observable through the SPEC-021 faithful run path (the lever
+feeds it a smaller `stream_records`). Rollback = drop the shared variant
+from the enumerator. See `SPEC-025-lever3-shared-crf.md`.
+
+### T14. Samsung dual-fiber (even/odd) bank placement (spec 023) — RESOLVED
+Lever 1. `_samsung_enumerate` built the correct swizzle
+(`tile_parity ⊕ bank_bit_0`, `bases["tile"]=[(0,1)]`) but then collapsed
+it with `fixed={"tile":0}`, so every MAC hit `EVEN_BANK` and the odd bank
+half idled (~2× loss). Resolved as a third additive `Placement`,
+`mode="dual_fiber"`, that materialises BOTH fibers
+(`materialise_handle(fixed={"tile": v})` for `v in range(tile_axis_size)`
+→ `2*pid` and `2*pid+1` over symbolic `pid`; the `+0`/`+1` fall out of
+the swizzle, not a pasted pair — that IS the layout-algebra receipt,
+anti-hardcoding evidence #4). Cost model splits the folded-MAC count
+`ceil(folded/n_fibers)` from `extra["n_fibers"]` (default 1, so the two
+existing candidates are unchanged) — output changes correctly with K and
+responds to perturbing `target.move("JUMP").cycles`. Codegen emits the
+alternating `(MAC EVEN, JUMP n_even, MAC ODD, JUMP n_odd)` with split
+trips derived from `inner_ub//target.grf_a.lanes` partitioned by
+`n_fibers` (the literal `63` *emerges*; never written), and replaces the
+stale `_SAMSUNG_LANE_BURST=8` codegen literal with `target.grf_a.lanes`.
+**Decision in argmin, mechanism in codegen** — codegen branches only on
+`placement.mode`, never on shape. Cross-reference SPEC-022 for the
+strictly-symbolic-`tile` materialise form; lever 1 only needs `tile`
+bound per fiber, which the current scalar-multiplier path already
+supports. The cycle win is observable only through the SPEC-021 faithful
+run path (task 025); the enumerator/cost/codegen changes are valid
+regardless. **Zero shared-file footprint** (`ir/*`, `dataflow.py`,
+`customize.py`, PIMSimulator untouched). Rollback = drop the `dual_fiber`
+append from the enumerator + the `n_fibers` read in the cost model; the
+codegen branch then goes dead. See `SPEC-023-lever1-dual-fiber.md`.

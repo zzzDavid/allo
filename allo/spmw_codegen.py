@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -516,6 +517,50 @@ class AimCtx(CodegenContext):
             return (None, None)
         return (None, None)
 
+    def after_match(self, match, n_emitted):
+        """Fold the inner K reduction into the just-emitted MAC ISR's
+        ``opsize`` field. ramulator2 prices ``MAC_SBK opsize=N`` by
+        issuing N column-address requests (see SPEC-019 §3.1 for the
+        simulator citation). Tactical no-ops:
+
+        - non-MAC matches: nothing to fold;
+        - ``n_emitted != 1``: compound emits (e.g. a future MAC_ABK +
+          RD_MAC pair) need a wider fold -- until then leave opsize=1;
+        - empty ``enclosing_loops`` (synthetic traces from
+          ``test_run.py`` / ``test_target_aim.py``): preserve
+          pre-SPEC-019 behaviour;
+        - inner-loop ub not reducible to a positive constant > 1: same
+          fall-back, matching the existing Samsung JUMP path.
+        """
+        if match.target_op_name != "MAC":
+            return
+        if n_emitted != 1:
+            return
+        if not match.enclosing_loops:
+            return
+        inner = match.enclosing_loops[-1]
+        k = _parse_loop_bound(inner[2])
+        if k is None or k <= 1:
+            return
+        # Rewrite the last emitted positional trace line. Expected shape:
+        # ``AiM MAC_SBK <opsize> <channel_mask> <bank_index> <row_addr>``
+        # (field order from ``_ISR_FIELDS["MAC_SBK"]``).
+        last = self.cmds[-1]
+        parts = last.split(" ")
+        if len(parts) < 3 or parts[0:2] != ["AiM", "MAC_SBK"]:
+            return
+        parts[2] = str(k)
+        self.cmds[-1] = " ".join(parts)
+        # Mirror the key=value annotation so ``_human_lines`` stays
+        # consistent with the positional trace for introspection.
+        import re
+        human_last = self._human_lines[-1]
+        if "opsize=" in human_last:
+            self._human_lines[-1] = re.sub(
+                r"opsize=\d+", f"opsize={k}", human_last)
+        else:
+            self._human_lines[-1] = f"{human_last}  opsize={k}"
+
 
 # --------------------------------------------------------------------- #
 # UPMEM (DPU, DRAM-PIM) backend
@@ -538,13 +583,34 @@ class UPMEMCtx(CodegenContext):
         # Map from handle id -> C variable name. Populated lazily the
         # first time a handle is referenced.
         self._name_table: dict[int, str] = {}
+        # SPEC-019: channel for the inner-K bound, set by _walk_and_emit
+        # immediately before invoking the MAC emit lambda. The fixture's
+        # MAC emit reads this to materialise an explicit C `for` loop so
+        # uPIMulator prices the actual K MACs, not a single statement.
+        self.pending_k_bound: int | None = None
+
+    # WRAM/MRAM memory names map onto the envelope's fixed buffer
+    # parameters of `tenon_kernel(T *bufferB, T *bufferA, ...)`. Both
+    # `wram` and `mram` lower to `bufferA` because the SDK outer loop in
+    # `main_kernel1` stages MRAM into `cache_A`/`cache_B` and passes them
+    # in as `bufferA`/`bufferB`; the emitted body sees the WRAM cache.
+    # Picking `bufferA` for both inputs and accumulator is a deliberate
+    # cycle-only simplification (see SPEC-003 §7 deferred work — real
+    # role-aware naming needs the envelope to grow per workload shape).
+    _ENVELOPE_MEM_NAME = {
+        "wram": "bufferA",
+        "mram": "bufferA",
+    }
 
     def handle_c_name(self, handle) -> str:
         """Return the C identifier this handle lowers to.
 
         `Register`s use their declared name (the C compiler manages real
-        register assignment). `MemoryRef`s render as `<mem.name>_buf[<idx>]`.
-        Whole `Memory`s render as `<mem.name>_buf`.
+        register assignment). `MemoryRef`s render as
+        `<env_name>[<idx>]`. Whole `Memory`s render as `<env_name>`,
+        where `<env_name>` is the envelope-fixed buffer parameter name
+        for known memories (wram/mram -> bufferA) and a `<mem.name>_buf`
+        fallback otherwise.
         """
         from .spmw_target import Memory
         key = id(handle)
@@ -557,13 +623,14 @@ class UPMEMCtx(CodegenContext):
             return name
         if isinstance(handle, MemoryRef):
             mem = handle.memory
-            name = f"{mem.name}_buf[{handle.idx!r}]"
+            env_name = self._ENVELOPE_MEM_NAME.get(mem.name, f"{mem.name}_buf")
+            name = f"{env_name}[{handle.idx!r}]"
             self._name_table[key] = name
             return name
         if isinstance(handle, Memory):
-            name = f"{handle.name}_buf"
-            self._name_table[key] = name
-            return name
+            env_name = self._ENVELOPE_MEM_NAME.get(handle.name, f"{handle.name}_buf")
+            self._name_table[key] = env_name
+            return env_name
         raise NotImplementedError(
             f"UPMEMCtx: unknown handle type {type(handle).__name__}."
         )
@@ -602,24 +669,133 @@ class UPMEMCtx(CodegenContext):
             return (None, None)
         return (None, None)
 
+    def emit_mac_kreduce(self, acc, x, y, k_bound) -> None:
+        """Emit a K-reduction MAC body (SPEC-019 §4.3).
+
+        When `k_bound` is a positive int and both x/y render as
+        subscripted memrefs, emits:
+            for (unsigned k = 0; k < <k_bound>; ++k) {
+                <acc> += <x>[k] * <y>[k];
+            }
+        Otherwise falls back to the un-looped form `<acc> += <x> * <y>;`
+        — preserves pre-SPEC-019 behaviour for synthetic test traces
+        (empty enclosing_loops) and for register-operand MACs where
+        per-K subscripting is not meaningful.
+        """
+        acc_c = self.handle_c_name(acc)
+        x_c = self.handle_c_name(x)
+        y_c = self.handle_c_name(y)
+
+        # `handle_c_name` for a MemoryRef returns `<env_name>[<idx>]`;
+        # for K-reduction we want the per-K subscript inside the loop,
+        # so we strip the rendered `[<idx>]` suffix and append `[k]`.
+        # Register / whole-Memory operands have no `[...]` suffix and
+        # are not k-indexable.
+        def _kify(c_name: str):
+            if c_name.endswith("]"):
+                head = c_name.rsplit("[", 1)[0]
+                return f"{head}[k]"
+            return None
+
+        x_k = _kify(x_c)
+        y_k = _kify(y_c)
+        if k_bound is None or k_bound <= 1 or x_k is None or y_k is None:
+            # Fallback identical to the pre-SPEC-019 emit (one line). The
+            # spec's §4.5 invariant requires synthetic UPMEM traces with
+            # empty enclosing_loops to keep producing a single statement
+            # (test_target_upmem.py::test_upmem_ctx_emits_c and
+            # test_run.py's _upmem_mac_trace both assert this). The
+            # spec's helper-code sketch also emitted a `/* k bound
+            # unparseable */` debug comment in this branch; we drop it
+            # to preserve the structural one-line invariant — direct
+            # ctx.emit calls (no walker) cannot be distinguished from a
+            # walker call where the bound failed to parse without a
+            # separate channel.
+            self.emit_c_line(f"{acc_c} += {x_c} * {y_c};")
+            return
+        self.emit_c_line(f"for (unsigned k = 0; k < {k_bound}; ++k) {{")
+        self.emit_c_line(f"    {acc_c} += {x_k} * {y_k};")
+        self.emit_c_line("}")
+
     def get_kernel_src(self) -> str:
         """Return the assembled DPU kernel C source.
 
-        Wraps `self.cmds` with the standard DPU runtime includes, the
-        tasklet entry point, and a tasklet-id local. The coder may
-        override the wrapper later for custom kernel shapes.
+        Emits a full PrIM-shaped DPU envelope (DPU_INPUT_ARGUMENTS,
+        kernels[] dispatch table, BARRIER_INIT, MRAM<->WRAM staging in
+        main_kernel1) and inlines `self.cmds` as the body of
+        `tenon_kernel(T *bufferB, T *bufferA, unsigned int l_size)`. The
+        envelope is fixed and shared across all VA-shape / MAC-shape
+        emitted kernels; a richer envelope selector is left to a
+        follow-up task (see SPEC-003 §6).
         """
-        header = (
+        # Each cmd is expected to be a valid C statement (terminated `;`
+        # or a `{...}` block). UPMEMCtx.emit_c_line / .cmd already
+        # produce that.
+        body_lines = []
+        for line in self.cmds:
+            if not isinstance(line, str):
+                continue
+            body_lines.append("    " + line)
+        body = "\n".join(body_lines) if body_lines else "    /* empty body */"
+        return (
+            "#include <stdint.h>\n"
+            "#include <stdio.h>\n"
             "#include <defs.h>\n"
             "#include <mram.h>\n"
-            "#include <stdint.h>\n"
+            "#include <alloc.h>\n"
+            "#include <perfcounter.h>\n"
+            "#include <barrier.h>\n"
+            "\n"
+            '#include "../support/common.h"\n'
+            "\n"
+            "__host dpu_arguments_t DPU_INPUT_ARGUMENTS;\n"
+            "\n"
+            "void __attribute__ ((noinline))\n"
+            "tenon_kernel(T *bufferB, T *bufferA, unsigned int l_size) {\n"
+            "    /* === BEGIN tenon-emitted body === */\n"
+            f"{body}\n"
+            "    /* === END tenon-emitted body === */\n"
+            "}\n"
+            "\n"
+            "BARRIER_INIT(my_barrier, NR_TASKLETS);\n"
+            "\n"
+            "extern int main_kernel1(void);\n"
+            "int (*kernels[nr_kernels])(void) = {main_kernel1};\n"
             "\n"
             "int main(void) {\n"
-            "    uint32_t tasklet_id = me();\n"
+            "    return kernels[DPU_INPUT_ARGUMENTS.kernel]();\n"
+            "}\n"
+            "\n"
+            "int main_kernel1(void) {\n"
+            "    unsigned int tasklet_id = me();\n"
+            "    if (tasklet_id == 0) { mem_reset(); }\n"
+            "    barrier_wait(&my_barrier);\n"
+            "\n"
+            "    uint32_t input_size_dpu_bytes = DPU_INPUT_ARGUMENTS.size;\n"
+            "    uint32_t input_size_dpu_bytes_transfer = DPU_INPUT_ARGUMENTS.transfer_size;\n"
+            "    uint32_t base_tasklet = tasklet_id << BLOCK_SIZE_LOG2;\n"
+            "    uint32_t mram_base_addr_A = (uint32_t)DPU_MRAM_HEAP_POINTER;\n"
+            "    uint32_t mram_base_addr_B = (uint32_t)(DPU_MRAM_HEAP_POINTER + input_size_dpu_bytes_transfer);\n"
+            "\n"
+            "    T *cache_A = (T *) mem_alloc(BLOCK_SIZE);\n"
+            "    T *cache_B = (T *) mem_alloc(BLOCK_SIZE);\n"
+            "\n"
+            "    for (unsigned int byte_index = base_tasklet;\n"
+            "         byte_index < input_size_dpu_bytes;\n"
+            "         byte_index += BLOCK_SIZE * NR_TASKLETS) {\n"
+            "        uint32_t l_size_bytes = (byte_index + BLOCK_SIZE >= input_size_dpu_bytes)\n"
+            "            ? (input_size_dpu_bytes - byte_index) : BLOCK_SIZE;\n"
+            "\n"
+            "        mram_read((__mram_ptr void const*)(mram_base_addr_A + byte_index), cache_A, l_size_bytes);\n"
+            "        mram_read((__mram_ptr void const*)(mram_base_addr_B + byte_index), cache_B, l_size_bytes);\n"
+            "\n"
+            "        tenon_kernel(cache_B, cache_A, l_size_bytes >> DIV);\n"
+            "\n"
+            "        mram_write(cache_B, (__mram_ptr void*)(mram_base_addr_B + byte_index), l_size_bytes);\n"
+            "    }\n"
+            "    return 0;\n"
+            "}\n"
         )
-        body = "\n".join("    " + line for line in self.cmds)
-        footer = "\n    return 0;\n}\n"
-        return header + body + footer
 
 
 # --------------------------------------------------------------------- #
@@ -636,8 +812,8 @@ class APUv1Ctx(CodegenContext):
     role; L1 maps to `GVML_VM_<idx>`; VRs use either an autoscheduler-
     bound C alias (see `bind_handle`) or fall back to the register's
     declared name. MAC has no fused opcode -- `emit_mac_lookup` expands
-    it into `gvml_lookup_16` + `gvml_add_s16` so backend emit lambdas
-    stay one-liners.
+    it into `gvml_lookup_16(..., mac_lut_ptr, 256)` + `gvml_add_s16` so
+    backend emit lambdas stay one-liners.
     """
 
     _L4_PTR_BY_ROLE = {
@@ -708,23 +884,82 @@ class APUv1Ctx(CodegenContext):
     def emit_mac_lookup(self, acc, x, y) -> None:
         """Expand MAC into the GSI sv-lookup pattern:
 
-            gvml_lookup_16(<tmp>, <x>, <y>);
+            gvml_lookup_16(<tmp>, <x>, mac_lut_ptr, 256);
             gvml_add_s16(<acc>, <acc>, <tmp>);
 
+        Semantics: `<tmp>[i] = mac_lut_ptr[<x>[i]]`. The autoscheduler
+        must pre-pack the byte-pair index into `x` before this MAC fires
+        (today's matcher passes the same VR for `x` and `y`, so binary
+        MAC must encode both operands into the `x` VR upstream of this
+        call -- out of scope for SPEC-018; a TODO for SPEC-018b).
+
+        `mac_lut_ptr` resolves to a 256-entry `uint16_t` popcount table
+        declared in the build harness's emitted `device.c`. The LUT lives
+        inline in the cmd struct (`data->mac_lut`); see SPEC-018 §3.1-§3.3.
+        Length is fixed at 256.
+
         The autoscheduler may reserve a scratch VR alias via
-        `bind_handle("mac_tmp", "<alias>")`; otherwise the canonical
-        name `mac_tmp_vr` is used.
+        `bind_handle("mac_tmp", "<alias>")`; otherwise the canonical name
+        `mac_tmp_vr` is used. `y` is accepted for signature symmetry with
+        `emit_mac_mul_add` but is not referenced -- the byte pair is
+        packed into `x` upstream.
+        """
+        tmp_name = self._handle_names.get("mac_tmp", "mac_tmp_vr")
+        acc_n = self._name(acc, "acc")
+        x_n = self._name(x, "x")
+        self.cmds.append(
+            f"gvml_lookup_16({tmp_name}, {x_n}, mac_lut_ptr, 256);"
+        )
+        self.cmds.append(f"gvml_add_s16({acc_n}, {acc_n}, {tmp_name});")
+
+    def emit_mac_mul_add(self, acc, x, y) -> None:
+        """Expand MAC into the raw SV-mode pattern (no lookup table):
+
+            gvml_mul_u16(<tmp>, <x>, <y>);
+            gvml_add_s16(<acc>, <acc>, <tmp>);
+
+        Selected by the walker when `placement.mode == "sv"` (per
+        SPEC-009 §2). Cost-modelled at 18 cyc/MAC vs 8 cyc/MAC for
+        the lookup expansion, so autoschedule prefers `emit_mac_lookup`
+        unless the user overrides.
         """
         tmp_name = self._handle_names.get("mac_tmp", "mac_tmp_vr")
         acc_n = self._name(acc, "acc")
         x_n = self._name(x, "x")
         y_n = self._name(y, "y")
-        self.cmds.append(f"gvml_lookup_16({tmp_name}, {x_n}, {y_n});")
+        self.cmds.append(f"gvml_mul_u16({tmp_name}, {x_n}, {y_n});")
         self.cmds.append(f"gvml_add_s16({acc_n}, {acc_n}, {tmp_name});")
 
     def append(self, line: str) -> None:
         """Low-level escape hatch -- append a raw C source line."""
         self.cmds.append(line)
+
+    def iter_vr_aliases(self) -> list[tuple[str, str]]:
+        """Return [(c_name, gvml_vr_enum), ...] in bind order.
+
+        Each entry becomes one line `enum gvml_vr16 <c_name> = <enum>;`
+        in the emitted device.c. Until the regalloc spec rebinds VRs
+        per live-range, the autoscheduler's bind list may be empty; in
+        that case the build harness substitutes a canonical default
+        (vrs + mac_tmp_vr) so the emitted body still compiles.
+        """
+        out: list[tuple[str, str]] = []
+        for i, (_key, c_name) in enumerate(self._handle_names.items()):
+            out.append((c_name, f"GVML_VR16_{i}"))
+        return out
+
+    def iter_l4_roles(self) -> list[str]:
+        """Return the L4 pointer C names referenced by `self.cmds`, in
+        canonical role-table order (inp, wgt, out). Used by the build
+        harness to emit one `gal_mem_handle_to_apu_ptr` decl per
+        actual reference (avoiding unused-variable warnings)."""
+        names: set[str] = set()
+        for line in self.cmds:
+            for ptr in self._L4_PTR_BY_ROLE.values():
+                if ptr in line:
+                    names.add(ptr)
+        role_order = ["inp_L4ptr", "wgt_L4ptr", "out_L4ptr"]
+        return [n for n in role_order if n in names]
 
     def resolve_moves(self, role, src_handle=None, dst_handle=None):
         from .spmw_target import Memory
@@ -1065,7 +1300,32 @@ def _walk_and_emit(
                 )
             bindings = _resolve_layout(match, layout)
             before = len(ctx.cmds)
-            if op_obj.accumulates:
+            # SPEC-019: UPMEM MAC needs the inner-K bound on the ctx so
+            # the fixture emit lambda can materialise an explicit C loop
+            # (uPIMulator prices per DPU instruction; without the loop
+            # the body is two statements). Gated on isinstance to keep
+            # other backends inert.
+            if isinstance(ctx, UPMEMCtx) and match.target_op_name == "MAC":
+                inner = (
+                    match.enclosing_loops[-1] if match.enclosing_loops else None
+                )
+                ctx.pending_k_bound = (
+                    _parse_loop_bound(inner[2]) if inner is not None else None
+                )
+            elif hasattr(ctx, "pending_k_bound"):
+                ctx.pending_k_bound = None
+            # APU v1 MAC dispatch: `placement.mode == "sv"` overrides the
+            # fixture's `emit_mac_lookup` lambda and emits raw MUL+ADD
+            # (SPEC-009 §2). Other backends ignore `mode`.
+            if (
+                isinstance(ctx, APUv1Ctx)
+                and match.target_op_name == "MAC"
+                and getattr(layout, "mode", "") == "sv"
+            ):
+                ctx.emit_mac_mul_add(
+                    acc=bindings["acc"], x=bindings["x"], y=bindings["y"],
+                )
+            elif op_obj.accumulates:
                 emit(bindings["x"], bindings["y"], bindings["acc"], ctx)
             else:
                 emit(bindings["x"], bindings["y"], bindings["dst"], ctx)
@@ -1149,12 +1409,54 @@ def _docker_image_exists(name: str) -> bool:
         return False
 
 
-def _gvml_available() -> bool:
-    try:
-        import gvml  # noqa: F401
-        return True
-    except ImportError:
-        return False
+_DEFAULT_APU_V1_TOOLCHAIN_BASE = (
+    "/usr/local/gsi-apu/13.7.1/ubuntu_20_04/"
+    "arc_gnu_2021.09-release_elf32_le_linux_no_sdata"
+)
+_DEFAULT_APU_V1_TEMPLATE_DIR = (
+    "/home/nz264/shared/accelerator-hub/gsi-apu/example-gvml"
+)
+_DEFAULT_APU_V1_PCI_NODE = "/sys/bus/pci/devices/0000:41:00.0"
+
+
+def _apu_v1_unavailable_reason() -> str | None:
+    """Return a short human-readable reason the APU v1 path can't run,
+    or None if all preconditions (ARC toolchain dir, example-gvml
+    template dir, GSI PCI sysfs node) are present.
+
+    Overridable via env vars TENON_APU_V1_TOOLCHAIN_BASE and
+    TENON_APU_V1_TEMPLATE_DIR.
+    """
+    arc_base = Path(
+        os.environ.get(
+            "TENON_APU_V1_TOOLCHAIN_BASE", _DEFAULT_APU_V1_TOOLCHAIN_BASE
+        )
+    )
+    if not arc_base.exists():
+        return f"simulator unavailable: ARC toolchain missing at {arc_base}"
+    template = Path(
+        os.environ.get(
+            "TENON_APU_V1_TEMPLATE_DIR", _DEFAULT_APU_V1_TEMPLATE_DIR
+        )
+    )
+    if not template.exists():
+        return (
+            f"simulator unavailable: example-gvml template missing at {template}"
+        )
+    pci = Path(_DEFAULT_APU_V1_PCI_NODE)
+    if not pci.exists():
+        return f"simulator unavailable: GSI device not present at {pci}"
+    # GVML SDK headers: a partial install (eltwise present, logical
+    # absent) makes the build fail mid-way; check both canaries up-front
+    # so the run path returns a clean RunResult(cycles=None, ...) skip
+    # instead of raising RuntimeError from `make`.
+    from .spmw_apu_v1_build import _gvml_sdk_available, _gvml_include_root
+    if not _gvml_sdk_available():
+        return (
+            f"simulator unavailable: GVML SDK headers missing under "
+            f"{_gvml_include_root()}"
+        )
+    return None
 
 
 # --------------------------------------------------------------------- #
@@ -1162,15 +1464,141 @@ def _gvml_available() -> bool:
 # --------------------------------------------------------------------- #
 
 
+def _write_samsung_cmds(path: Path, cmds: list[PIMCmd]) -> None:
+    """Serialise a list of PIMCmd to the line-delimited format pim_driver
+    accepts via `--cmds`. See `_run_samsung` docstring for the grammar.
+    """
+    with open(path, "w") as f:
+        for c in cmds:
+            parts = [c.type_]
+            # Only emit fields that differ from PIMCmd's default ctor so
+            # the trace stays human-greppable.
+            if c.dst_ != "A_OUT":
+                parts.append(f"dst={c.dst_}")
+            if c.src0_ != "A_OUT":
+                parts.append(f"src0={c.src0_}")
+            if c.src1_ != "A_OUT":
+                parts.append(f"src1={c.src1_}")
+            if c.src2_ != "A_OUT":
+                parts.append(f"src2={c.src2_}")
+            if c.loopCounter_:
+                parts.append(f"loop_counter={c.loopCounter_}")
+            if c.loopOffset_:
+                parts.append(f"loop_offset={c.loopOffset_}")
+            if c.isAuto_:
+                parts.append(f"is_auto={c.isAuto_}")
+            if c.dstIdx_:
+                parts.append(f"dst_idx={c.dstIdx_}")
+            if c.src0Idx_:
+                parts.append(f"src0_idx={c.src0Idx_}")
+            if c.src1Idx_:
+                parts.append(f"src1_idx={c.src1Idx_}")
+            if c.isRelu_:
+                parts.append(f"is_relu={c.isRelu_}")
+            f.write(" ".join(parts) + "\n")
+
+
+def _run_samsung_one(
+    driver: Path,
+    root: Path,
+    cmd_subset: list[PIMCmd],
+    layer_input: dict,
+    np_mod,
+    layer_idx: int = 0,
+) -> tuple[int, str]:
+    """SPEC-020: invoke pim_driver for a single GEMV layer.
+
+    Used by the multi-layer branch of `_run_samsung` (one call per MLP
+    layer). Returns `(cycles, combined_stdout)`. The single-layer
+    back-compat path in `_run_samsung` does not go through here -- it
+    keeps the inlined logic so callers that pass a single-MAC stream
+    see identical behaviour to pre-SPEC-020.
+    """
+    W = layer_input.get("W")
+    if W is None:
+        W = layer_input.get("weight")
+    x = layer_input.get("x")
+    if x is None:
+        x = layer_input.get("in")
+    if W is None or x is None:
+        raise ValueError(
+            f"Samsung layer {layer_idx}: each entry in layers=[...] "
+            "must provide W and x (or weight/in) arrays"
+        )
+    W = np_mod.asarray(W, dtype=np_mod.float16)
+    x = np_mod.asarray(x, dtype=np_mod.float16)
+    # SPEC-020 §2.5: see comment in `_run_samsung` GEMV branch.
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        out_path = td_path / "out.bin"
+        w_path = td_path / "W.npy"
+        x_path = td_path / "x.npy"
+        cmds_path = td_path / "cmds.txt"
+        np_mod.save(w_path, W)
+        np_mod.save(x_path, x)
+        _write_samsung_cmds(cmds_path, cmd_subset)
+
+        argv = [
+            str(driver),
+            "--op", "GEMV",
+            "--out", str(out_path),
+            "--weight", str(w_path),
+            "--in", str(x_path),
+            "--output-dim", str(W.shape[0]),
+            "--input-dim", str(W.shape[1]),
+            "--cmds", str(cmds_path),
+            # SPEC-021 task 025: faithful run path -- issued PIM transactions
+            # track the emitted cmd stream, so a better/worse stream costs
+            # fewer/more cycles under the same accounting for native and Tenon.
+            "--faithful",
+        ]
+
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                cwd=str(root),
+                timeout=600,
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise RuntimeError(
+                f"Samsung pim_driver invocation failed (layer {layer_idx}): {exc}"
+            ) from exc
+
+        stdout = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        combined = stdout + ("\n" + stderr if stderr else "")
+        m = re.search(r"PIM_CYCLES total=(\d+)", combined)
+        if not m:
+            raise RuntimeError(
+                f"Samsung pim_driver returned but stdout missing "
+                f"'PIM_CYCLES total=...' line (layer {layer_idx}); "
+                f"tail: {combined[-400:]}"
+            )
+        return int(m.group(1)), combined
+
+
 def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
     """Run a compiled Samsung HBM-PIM artifact via `pim_driver`.
 
-    `pim_driver` is a fixed-kernel CLI added to PIMSimulator for this
-    project (ADD / MUL / RELU / GEMV). We infer the kernel from the
-    emitted PIMCmd stream: presence of "MAC" -> GEMV, of "MUL" -> MUL,
-    of "ADD" -> ADD, of a single unary -> RELU. We pass user inputs
-    through .npy files and parse the `PIM_CYCLES total=` line from
-    stdout.
+    Wire protocol (SPEC-005): the emitted PIMCmd stream is serialised
+    to a line-delimited `cmds.txt` file in the temp dir and passed via
+    ``pim_driver --cmds <path>``. The C++ side uses that as the CRF
+    microcode (uploaded by `programCrf`) instead of regenerating it via
+    `PIMCmdGen::getPIMCmds`. The legacy ``--op <kernel>`` flag is still
+    passed so the driver knows which data-path scaffolding (eltwise vs
+    GEMV) and which numpy inputs to wire up; the kernel choice no longer
+    determines the CRF program (placement does).
+
+    Line-delimited cmd format:
+        MAC dst=GRF_B src0=GRF_A src1=EVEN_BANK is_auto=1
+        JUMP loop_counter=7 loop_offset=2
+        NOP loop_counter=7
+        EXIT
     """
     root = _pimsim_root()
     driver = root / "pim_driver"
@@ -1181,7 +1609,11 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             backend="samsung_hbm_pim",
         )
 
-    # Detect kernel from emitted cmd types.
+    # The `--op` flag still picks the data-path scaffolding (eltwise vs
+    # GEMV) and which numpy inputs to wire up, but no longer determines
+    # the CRF microcode -- that comes from `compiled.cmds` via `--cmds`.
+    # The choice of which scaffolding to use is inferred from MAC-vs-eltwise
+    # opcodes in the emitted stream.
     op_types = {c.type_ for c in compiled.cmds if isinstance(c, PIMCmd)}
     if "MAC" in op_types:
         kernel = "GEMV"
@@ -1192,13 +1624,95 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
     else:
         kernel = "RELU"
 
-    try:
-        import numpy as np
-    except ImportError:
+    # numpy is a hard Tenon dependency; "no numpy" is a setup bug, not
+    # an env skip -- let the ImportError propagate.
+    import numpy as np
+
+    # SPEC-020: ISA-valid filter applied up-front so layer-splitting sees
+    # the same cmd stream the driver eventually runs.
+    def _crf_valid(c: PIMCmd) -> bool:
+        # SamsungCtx emits per-role storeback "MOV ODD_BANK <- GRF_B" /
+        # "MOV EVEN_BANK <- GRF_A" entries (the `ST_A`/`ST_B` moves).
+        # The C++ PIMCmd::validationCheck rejects those as "Invalid in
+        # ISA 1.0" because bank stores are issued by the DRAM controller
+        # via addTransactionAll, not by CRF MOV. Drop them here so the
+        # cmd stream that reaches programCrf is ISA-valid. This is a
+        # run-side workaround; the proper fix is in SamsungCtx (followup
+        # SPEC-005 §8 / needs-arch-MMM).
+        if c.type_ in ("MOV", "FILL"):
+            bank_dst = c.dst_ in ("EVEN_BANK", "ODD_BANK")
+            grf_src = any(
+                s in ("GRF_A", "GRF_B")
+                for s in (c.src0_, c.src1_, c.src2_)
+            )
+            if bank_dst and grf_src:
+                return False
+        return True
+
+    pim_cmds_all = [
+        c for c in compiled.cmds
+        if isinstance(c, PIMCmd) and _crf_valid(c)
+    ]
+
+    # SPEC-020: detect multi-layer GEMV streams. `pim_driver` accepts one
+    # GEMV per invocation, so a cmd stream with >1 MAC (one per layer of
+    # an MLP, for example) must be split at the JUMP that closes each
+    # inner-K fold and dispatched as separate driver calls. Cycles are
+    # summed across invocations.
+    n_macs = sum(1 for c in pim_cmds_all if c.type_ == "MAC")
+    multi_layer = kernel == "GEMV" and n_macs > 1
+
+    if multi_layer:
+        layers = inputs.get("layers")
+        if layers is None:
+            # Back-compat escape: `compiled.run()` with no kwargs (e.g.
+            # `test_run_returns_runresult_for_all_backends`) must keep
+            # returning cycles=None rather than raise.
+            return RunResult(
+                cycles=None,
+                stdout=(
+                    "Samsung: multi-MAC cmd stream needs layers=[...] kwarg "
+                    f"({n_macs} MAC ops detected)"
+                ),
+                backend="samsung_hbm_pim",
+            )
+        # Split at JUMP boundaries: each MAC fold ends in a JUMP that
+        # closes its inner-K loop. Group = [setup ... MAC ... JUMP].
+        groups: list[list[PIMCmd]] = []
+        cur: list[PIMCmd] = []
+        for c in pim_cmds_all:
+            cur.append(c)
+            if c.type_ == "JUMP":
+                groups.append(cur)
+                cur = []
+        if cur:
+            # Trailing tail (e.g. EXIT) -- attach to last group so the
+            # driver still sees the terminator.
+            if groups:
+                groups[-1].extend(cur)
+            else:
+                groups.append(cur)
+        # Drop any group that has no MAC (pure setup with no fold) -- it
+        # is meaningless to dispatch standalone.
+        groups = [g for g in groups if any(c.type_ == "MAC" for c in g)]
+        if len(layers) != len(groups):
+            raise ValueError(
+                f"Samsung: {len(groups)} MAC groups in cmd stream but "
+                f"{len(layers)} layers= entries"
+            )
+        total_cycles = 0
+        combined_parts: list[str] = []
+        for i, (grp, layer_in) in enumerate(zip(groups, layers)):
+            cyc, out = _run_samsung_one(
+                driver, root, grp, layer_in, np, layer_idx=i
+            )
+            total_cycles += cyc
+            combined_parts.append(out)
         return RunResult(
-            cycles=None,
-            stdout="numpy unavailable",
+            cycles=total_cycles,
+            stdout="\n--- next layer ---\n".join(combined_parts),
             backend="samsung_hbm_pim",
+            extra={"kernel": kernel, "n_layers": len(groups)},
         )
 
     with tempfile.TemporaryDirectory() as td:
@@ -1214,6 +1728,11 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             if x is None:
                 x = inputs.get("in")
             if W is None or x is None:
+                # SPEC-001 §6 escape: tests/spmw/test_run.py's
+                # `test_run_returns_runresult_for_all_backends` calls
+                # compiled.run() with no kwargs and expects cycles=None;
+                # keep this branch returning cycles=None for backward
+                # compat. Flagged for PR review.
                 return RunResult(
                     cycles=None,
                     stdout="GEMV needs W and x kwargs",
@@ -1221,6 +1740,13 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
                 )
             W = np.asarray(W, dtype=np.float16)
             x = np.asarray(x, dtype=np.float16)
+            # SPEC-020 §2.5: a 1D x of shape (K,) makes Burst.h::loadFp16
+            # emit bShape=[ceil(K/16)], which executeGemv reads as
+            # num_batch=ceil(K/16) -- i.e. the GEMV runs ceil(K/16) times.
+            # The canonical Samsung fixture (data/gemv/gen_gemv.py:34)
+            # stores x as (1, K) so num_batch=1. Match that contract.
+            if x.ndim == 1:
+                x = x.reshape(1, -1)
             w_path = td_path / "W.npy"
             x_path = td_path / "x.npy"
             np.save(w_path, W)
@@ -1239,10 +1765,8 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             if b is None:
                 b = inputs.get("in1")
             if a is None or b is None:
-                return RunResult(
-                    cycles=None,
-                    stdout=f"{kernel} needs a/b (or in0/in1) kwargs",
-                    backend="samsung_hbm_pim",
+                raise ValueError(
+                    f"Samsung {kernel} needs a/b (or in0/in1) kwargs"
                 )
             a = np.asarray(a, dtype=np.float16).reshape(-1)
             b = np.asarray(b, dtype=np.float16).reshape(-1)
@@ -1260,15 +1784,29 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             if a is None:
                 a = inputs.get("in0")
             if a is None:
-                return RunResult(
-                    cycles=None,
-                    stdout="RELU needs a (or in0) kwarg",
-                    backend="samsung_hbm_pim",
+                raise ValueError(
+                    "Samsung RELU needs a (or in0) kwarg"
                 )
             a = np.asarray(a, dtype=np.float16).reshape(-1)
             a_path = td_path / "a.npy"
             np.save(a_path, a)
             argv += ["--in0", str(a_path), "--n", str(a.size)]
+
+        # SPEC-005: serialise compiled.cmds to a line-delimited file and
+        # pass --cmds so the driver uses our CRF microcode instead of
+        # PIMCmdGen's canonical one. Layout/placement changes show up in
+        # cycles only because this file flows into programCrf().
+        # The ISA-valid filter was applied up-front into `pim_cmds_all`.
+        if pim_cmds_all:
+            cmds_path = td_path / "cmds.txt"
+            _write_samsung_cmds(cmds_path, pim_cmds_all)
+            argv += ["--cmds", str(cmds_path)]
+            # SPEC-021 task 025: GEMV gets the faithful run path so issued
+            # PIM transactions track the emitted stream (a redundant stream
+            # costs more, a folded one costs less). Eltwise has no faithful
+            # variant yet, so it stays on executeEltwiseWithCmds.
+            if kernel == "GEMV":
+                argv += ["--faithful"]
 
         try:
             proc = subprocess.run(
@@ -1279,19 +1817,20 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
                 check=False,
             )
         except (subprocess.SubprocessError, OSError) as exc:
-            return RunResult(
-                cycles=None,
-                stdout=f"pim_driver invocation failed: {exc}",
-                backend="samsung_hbm_pim",
-            )
+            raise RuntimeError(
+                f"Samsung pim_driver invocation failed: {exc}"
+            ) from exc
 
         stdout = proc.stdout.decode("utf-8", errors="replace")
         stderr = proc.stderr.decode("utf-8", errors="replace")
         combined = stdout + ("\n" + stderr if stderr else "")
-        cycles = None
         match = re.search(r"PIM_CYCLES total=(\d+)", combined)
-        if match:
-            cycles = int(match.group(1))
+        if not match:
+            raise RuntimeError(
+                "Samsung pim_driver returned but stdout missing "
+                "'PIM_CYCLES total=...' line; tail: " + combined[-400:]
+            )
+        cycles = int(match.group(1))
         return RunResult(
             cycles=cycles,
             stdout=combined,
@@ -1347,11 +1886,9 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
         )
     except (subprocess.SubprocessError, OSError) as exc:
         trace_path.unlink(missing_ok=True)
-        return RunResult(
-            cycles=None,
-            stdout=f"ramulator2 invocation failed: {exc}",
-            backend="aim",
-        )
+        raise RuntimeError(
+            f"AiM ramulator2 invocation failed: {exc}"
+        ) from exc
     finally:
         # Keep trace on disk only for the duration of the run; cleanup.
         trace_path.unlink(missing_ok=True)
@@ -1364,7 +1901,12 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
     cycle_vals = [
         int(m) for m in re.findall(r"memory_system_cycles:\s*(\d+)", combined)
     ]
-    cycles = max(cycle_vals) if cycle_vals else None
+    if not cycle_vals:
+        raise RuntimeError(
+            "AiM ramulator2 returned but stdout missing "
+            "'memory_system_cycles: ...' line; tail: " + combined[-400:]
+        )
+    cycles = max(cycle_vals)
     return RunResult(
         cycles=cycles,
         stdout=combined,
@@ -1376,12 +1918,13 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
 def _run_upmem(compiled: "Compiled", **inputs) -> RunResult:
     """Run a compiled UPMEM artifact through the Go uPIMulator.
 
-    The current uPIMulator front-end only accepts pre-registered PrIM
-    benchmark names (`--benchmark VA`, `GEMV`, ...). Running an
-    arbitrary emitted kernel would require registering it as a new
-    benchmark in `src/assembler/`. For now we run the closest existing
-    PrIM kernel as a cycle proxy and return its count; the emitted C
-    source is preserved in `extra["kernel_src"]` for inspection.
+    The emitted DPU source from `UPMEMCtx.get_kernel_src()` is written
+    into the persistent TENON benchmark slot at
+    `benchmark/TENON/dpu/task.c` (registered in uPIMulator's CMake +
+    assembler maps; see SPEC-003 §3). uPIMulator is then invoked with
+    `--benchmark TENON`, which triggers a CMake re-build of just that
+    `task.c` before the simulation. Cycle counts therefore come from
+    the emitted kernel, not a PrIM proxy.
     """
     root = _upim_root()
     binary = root / "build" / "uPIMulator"
@@ -1392,18 +1935,38 @@ def _run_upmem(compiled: "Compiled", **inputs) -> RunResult:
             backend="upmem",
         )
 
-    # Pull the emitted C kernel out of the ctx-style command list.
-    if isinstance(compiled.cmds, list) and compiled.cmds and isinstance(
-        compiled.cmds[0], str
-    ):
-        kernel_src = "\n".join(compiled.cmds)
+    # Render the full DPU envelope around `cmds` via UPMEMCtx; fall back
+    # to a bare join if no ctx was preserved (legacy call shape).
+    ctx = getattr(compiled, "_ctx", None)
+    if ctx is not None and hasattr(ctx, "get_kernel_src"):
+        kernel_src = ctx.get_kernel_src()
     else:
-        kernel_src = ""
+        kernel_src = "\n".join(
+            c for c in compiled.cmds if isinstance(c, str)
+        )
 
-    # Map emitted ops to a PrIM proxy: a MAC-shaped body -> GEMV, else VA.
-    benchmark = "VA"
-    if any("+=" in line and "*" in line for line in compiled.cmds if isinstance(line, str)):
-        benchmark = "GEMV"
+    if not kernel_src.strip():
+        raise RuntimeError(
+            "UPMEM: _run_upmem received empty kernel source; "
+            "compile_for_target produced no commands"
+        )
+
+    slot_dir = root / "benchmark" / "TENON" / "dpu"
+    if not slot_dir.exists():
+        # uPIMulator binary is present but the TENON slot has not been
+        # provisioned in this checkout. Skip cleanly rather than raise
+        # (matches the `_sim_unavailable` branch in test_e2e_mlp_upmem).
+        return RunResult(
+            cycles=None,
+            stdout=(
+                f"simulator unavailable: TENON benchmark slot not "
+                f"provisioned at {slot_dir}; rebuild uPIMulator with "
+                f"the TENON benchmark registered."
+            ),
+            backend="upmem",
+        )
+    task_c = slot_dir / "task.c"
+    task_c.write_text(kernel_src, encoding="utf-8")
 
     with tempfile.TemporaryDirectory() as td:
         bin_dir = Path(td) / "bin"
@@ -1414,7 +1977,7 @@ def _run_upmem(compiled: "Compiled", **inputs) -> RunResult:
                     str(binary),
                     "--root_dirpath", str(root),
                     "--bin_dirpath", str(bin_dir),
-                    "--benchmark", benchmark,
+                    "--benchmark", "TENON",
                     "--num_channels", "1",
                     "--num_dpus_per_rank", "1",
                     "--num_tasklets", "1",
@@ -1425,12 +1988,9 @@ def _run_upmem(compiled: "Compiled", **inputs) -> RunResult:
                 check=False,
             )
         except (subprocess.SubprocessError, OSError) as exc:
-            return RunResult(
-                cycles=None,
-                stdout=f"uPIMulator invocation failed: {exc}",
-                backend="upmem",
-                extra={"kernel_src": kernel_src},
-            )
+            raise RuntimeError(
+                f"UPMEM uPIMulator invocation failed: {exc}"
+            ) from exc
 
         stdout = proc.stdout.decode("utf-8", errors="replace")
         stderr = proc.stderr.decode("utf-8", errors="replace")
@@ -1440,51 +2000,303 @@ def _run_upmem(compiled: "Compiled", **inputs) -> RunResult:
         if log_path.exists():
             combined += "\n" + log_path.read_text(errors="replace")
         cycle_match = re.search(r"cycle[s]?\s*[:=]\s*(\d+)", combined, re.IGNORECASE)
-        cycles = int(cycle_match.group(1)) if cycle_match else None
+        if cycle_match is None:
+            raise RuntimeError(
+                "UPMEM uPIMulator returned but stdout/log missing "
+                "'cycle: ...' line; tail: " + combined[-400:]
+            )
+        cycles = int(cycle_match.group(1))
         return RunResult(
             cycles=cycles,
             stdout=combined,
             backend="upmem",
             extra={
                 "kernel_src": kernel_src,
-                "benchmark": benchmark,
+                "benchmark": "TENON",
                 "returncode": proc.returncode,
             },
         )
 
 
+def _apu_v1_kernel_src(compiled: "Compiled") -> str:
+    return "\n".join(str(c) for c in compiled.cmds if isinstance(c, str))
+
+
+def _parse_apu_v1_prof_print(text: str) -> int | None:
+    """Pull the `crun` integer from the `total` PROF_PRINT line. APU v1
+    hardware emits fields with a colon separator, e.g.
+    `ARCT[0]: ***  total - hits:1 seu:374 crun:170227 iall:37027 ...`.
+    Accept `=` as well for forward compatibility. Returns None if no match.
+    """
+    # Prefer the explicit `total` line; fall back to the first `crun`
+    # we find anywhere if PROF_PRINT names diverge in future kernels.
+    m = re.search(r"\btotal\b[^\n]*?\bcrun\s*[:=]\s*(\d+)", text)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"\bcrun\s*[:=]\s*(\d+)", text)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _apu_v1_output_specs(compiled: "Compiled", inputs: dict) -> dict:
+    """Derive `output_specs: {role: (shape, dtype)}` from the trace.
+
+    For each `MatchedOp` whose loop-carried `acc` operand defines an
+    output memref (`result_memref_name`), we take the shape and dtype
+    from a same-named input if present, else fall back to the largest
+    input's shape and uint16 dtype. APU v1 today is uint16-only
+    (`_32K` constant) so the dtype fallback is safe.
+    """
+    import numpy as np
+
+    out: dict = {}
+    trace = getattr(compiled, "trace", None)
+    if trace is None:
+        return out
+
+    # Determine a fallback shape from the largest input.
+    fallback_shape: tuple = ()
+    fallback_size = -1
+    for arr in inputs.values():
+        sz = getattr(arr, "size", 0)
+        if sz > fallback_size:
+            fallback_size = sz
+            fallback_shape = tuple(getattr(arr, "shape", ()))
+
+    for m in trace.matches:
+        name = m.result_memref_name
+        if not name or name in out:
+            continue
+        # Prefer shape/dtype from an input that happens to share the name.
+        if name in inputs and hasattr(inputs[name], "shape"):
+            out[name] = (tuple(inputs[name].shape), inputs[name].dtype)
+        else:
+            # APU v1 output: derive from the first input as a 1D vector
+            # of the same element count (the GEMV `acc` is M-shaped, but
+            # the declarative trace doesn't pin that; the user can
+            # override via `output_specs` once exposed).
+            out[name] = (fallback_shape or (1,), np.dtype("uint16"))
+    return out
+
+
+def _apu_v1_prepare_io(compiled: "Compiled", inputs: dict):
+    """Validate + normalize `inputs` for the APU v1 build harness.
+
+    The user may pass workload-side memref names (e.g. ``local_W``) or
+    the shorter role names (``x``, ``y``). We pass the dict through
+    untouched today, since the build harness keys struct fields by the
+    actual `inputs` keys.
+    """
+    import numpy as np
+
+    normalized: dict = {}
+    for name, arr in inputs.items():
+        if not isinstance(arr, np.ndarray):
+            raise ValueError(
+                f"APU v1 run: input {name!r} must be a numpy.ndarray; "
+                f"got {type(arr).__name__}"
+            )
+        # APU v1 is uint16-native today; we view int16/float16 buffers
+        # as their raw bytes (host.c writes them straight into L4) so
+        # we don't impose a dtype cast here.
+        normalized[name] = arr
+    output_specs = _apu_v1_output_specs(compiled, normalized)
+    return normalized, output_specs
+
+
 def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
     """Run a compiled APU v1 artifact against real GSI hardware.
 
-    The walker accumulates one C-source GVML call per `cmd(...)`; on
-    real hardware we'd hand that off to `gen_apu_v1_low_mode_project`,
-    build with the ARC toolchain, and run the resulting binary. On
-    this machine that path requires `gvml` to be importable; without
-    it we return an "unavailable" result rather than fail.
+    Materializes a build directory via `gen_apu_v1_low_mode_project`,
+    runs `make` with the ARC GNU toolchain, executes the resulting
+    binary against the Gemini PCI device, and parses cycle counts from
+    its PROF_PRINT stdout. Returns `RunResult(cycles=None, ...)` with
+    a "simulator unavailable" stdout when an environment gate
+    (toolchain, template dir, PCI sysfs node, GVML SDK headers) is
+    missing. Build failures past the gate raise `RuntimeError` so tests
+    cannot silently PASS on a cycles=None RunResult; a missing
+    PROF_PRINT 'total crun=' line, however, yields `cycles=None` rather
+    than raising -- the device program ran (or tried to) but produced
+    no profile output, which is observable through the returned
+    RunResult.stdout. See spec 017 and SPEC-001 §3.5.
     """
-    if not _gvml_available():
+    kernel_src = _apu_v1_kernel_src(compiled)
+
+    skip_reason = _apu_v1_unavailable_reason()
+    if skip_reason:
         return RunResult(
             cycles=None,
-            stdout="simulator unavailable: `gvml` Python module not importable",
+            stdout=skip_reason,
             backend="apu_v1",
-            extra={"kernel_src": "\n".join(
-                str(c) for c in compiled.cmds
-                if isinstance(c, str)
-            )},
+            extra={"kernel_src": kernel_src},
         )
 
-    # Real-hardware path: build the project via apu_v1_codegen and run
-    # the resulting binary. Kept gated until a workload-level harness
-    # arrives — return None cycles for now, with the emitted source.
-    return RunResult(
-        cycles=None,
-        stdout="apu_v1 build harness not wired (gvml is importable but "
-        "the workload-level build helper is owned by spec 014).",
-        backend="apu_v1",
-        extra={"kernel_src": "\n".join(
-            str(c) for c in compiled.cmds if isinstance(c, str)
-        )},
+    from .spmw_apu_v1_build import (
+        _assert_gvml_sdk_present,
+        gen_apu_v1_low_mode_project,
     )
+
+    # Build-harness probe: a missing SDK here means the toolchain gate
+    # passed but headers are absent; fail fast with a readable error
+    # rather than letting `make` emit a 200-line stderr blob below.
+    _assert_gvml_sdk_present()
+
+    tmpdir = tempfile.mkdtemp(prefix="tenon-apu-v1-")
+    try:
+        # prepare_io is build-harness Python; ValueError here is a Tenon
+        # bug or user-input contract violation, not an env skip.
+        inputs_np, output_specs = _apu_v1_prepare_io(compiled, inputs)
+
+        # Write each input to <tmpdir>/in_<role>.bin so host.c can fread it.
+        input_bin_paths: dict[str, str] = {}
+        for role, arr in inputs_np.items():
+            p = Path(tmpdir) / f"in_{role}.bin"
+            arr.tofile(str(p))
+            input_bin_paths[role] = str(p)
+
+        output_bin_paths: dict[str, str] = {
+            role: str(Path(tmpdir) / f"out_{role}.bin")
+            for role in output_specs
+        }
+
+        # Project emission. The toolchain/template gate above already
+        # ensured the template dir exists; if gen_apu_v1_low_mode_project
+        # still raises FileNotFoundError, that's a Tenon bug, not an
+        # env skip -- let it propagate.
+        project_dir = gen_apu_v1_low_mode_project(
+            dst_dir=Path(tmpdir) / "project",
+            compiled=compiled,
+            inputs=inputs_np,
+            output_specs=output_specs,
+            lab_name="tenon-kernel",
+        )
+
+        # Build. Past the toolchain/SDK gate, every failure below is a
+        # build- or runtime-bug, not an environment skip -- raise so
+        # the test does not silently PASS on a cycles=None RunResult.
+        try:
+            mk = subprocess.run(
+                ["make"],
+                cwd=str(project_dir),
+                capture_output=True,
+                timeout=600,
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise RuntimeError(
+                f"APU v1 make invocation failed: {exc}\n"
+                f"--- project_dir: {project_dir}"
+            ) from exc
+        if mk.returncode != 0:
+            raise RuntimeError(
+                "APU v1 make failed:\n"
+                + mk.stderr.decode("utf-8", errors="replace")
+                + "\n--- stdout ---\n"
+                + mk.stdout.decode("utf-8", errors="replace")
+                + f"\n--- project_dir: {project_dir}"
+            )
+
+        bin_path = project_dir / "build" / "debug" / "tenon-kernel"
+        if not bin_path.exists():
+            raise RuntimeError(
+                f"APU v1 build succeeded but binary not found at {bin_path} "
+                f"(project_dir: {project_dir})"
+            )
+
+        # Build argv: inputs first then outputs, in the same role order
+        # the build harness wrote into struct.h (sorted alpha).
+        sorted_in = sorted(input_bin_paths.keys())
+        sorted_out = sorted(output_bin_paths.keys())
+        argv = [str(bin_path)]
+        argv += [input_bin_paths[r] for r in sorted_in]
+        argv += [output_bin_paths[r] for r in sorted_out]
+
+        try:
+            proc = subprocess.run(
+                argv,
+                cwd=str(project_dir),
+                capture_output=True,
+                timeout=300,
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise RuntimeError(
+                f"APU v1 binary invocation failed: {exc}\n"
+                f"--- project_dir: {project_dir}"
+            ) from exc
+
+        stdout_text = proc.stdout.decode("utf-8", errors="replace")
+        stderr_text = proc.stderr.decode("utf-8", errors="replace")
+        binary_output = stdout_text + ("\n" + stderr_text if stderr_text else "")
+
+        # PROF_PRINT lines go to the device system log (the ledag
+        # channel), not to the binary's stdout. Drain that channel via
+        # `ledag-ssh flo` and concatenate the printable bytes so the
+        # `crun` parse below has something to match against. The ARC
+        # binary may need a moment to flush its PROF_END(total) entry
+        # to the device log after returncode is delivered to us, hence
+        # the brief sleep. Skill: see "Pattern B: scripted capture".
+        ledag_text = ""
+        if shutil.which("ledag-ssh") is not None:
+            time.sleep(0.5)
+            try:
+                ledag_proc = subprocess.run(
+                    ["ledag-ssh", "-o", "localhost"],
+                    input=b"flo\nquit\n",
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+                ledag_raw = ledag_proc.stdout or b""
+                # `| strings` equivalent: keep printable ASCII plus tab
+                # / newline / CR; the ledag wire format is otherwise
+                # binary-framed and decodes to mojibake.
+                ledag_text = "".join(
+                    chr(b)
+                    for b in ledag_raw
+                    if 32 <= b < 127 or b in (9, 10, 13)
+                )
+            except (subprocess.SubprocessError, OSError):
+                # ledag-ssh available but failed (timeout, device busy,
+                # auth) -- treat the same as missing-on-PATH: degrade
+                # to cycles=None rather than crash the run path.
+                ledag_text = ""
+
+        combined = binary_output + ("\n" + ledag_text if ledag_text else "")
+        cycles = _parse_apu_v1_prof_print(combined)
+        # A missing PROF_PRINT 'total crun=' line is *not* a build-harness
+        # bug: it means the device program ran (or attempted to) but
+        # produced no PROF_PRINT output -- typically because the GSI PCI
+        # device is absent, gated off, or returned an error before our
+        # PROF_END(total), or because `ledag-ssh` is not available on
+        # this host. Surface this as cycles=None so callers (and the
+        # cross-backend `test_run_returns_runresult_for_all_backends`
+        # contract) still receive a RunResult; build failures above
+        # already raise RuntimeError before we reach here.
+
+        # Read outputs back.
+        import numpy as np
+        outputs: dict = {}
+        for role, (shape, dtype) in output_specs.items():
+            p = Path(output_bin_paths[role])
+            if p.exists():
+                outputs[role] = np.fromfile(str(p), dtype=dtype).reshape(shape)
+
+        return RunResult(
+            cycles=cycles,
+            stdout=combined,
+            backend="apu_v1",
+            extra={
+                "outputs": outputs,
+                "kernel_src": kernel_src,
+                "project_dir": str(project_dir),
+                "returncode": proc.returncode,
+            },
+        )
+    finally:
+        if os.environ.get("TENON_APU_V1_KEEP_TMP") != "1":
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _run_apu_v2(compiled: "Compiled", **inputs) -> RunResult:
@@ -1534,11 +2346,16 @@ class Compiled:
         trace: MatchTrace,
         cmds: list,
         layout: Placement,
+        ctx: "CodegenContext | None" = None,
     ):
         self.target = target
         self.trace = trace
         self.cmds = cmds
         self.layout = layout
+        # `_ctx` is currently only consumed by `_run_upmem`, which needs
+        # `UPMEMCtx.get_kernel_src()` to render the full DPU envelope
+        # around `cmds`. Other backends ignore the field.
+        self._ctx = ctx
 
     def run(self, **inputs) -> RunResult:
         """Run this compiled artifact on its target backend.
@@ -1622,4 +2439,4 @@ def compile_for_target(
     # `Compiled.layout` historically held a single Placement; preserve
     # that for back-compat when there's only one kernel.
     stored_layout = layouts[0] if len(layouts) == 1 else layouts
-    return Compiled(target, trace, ctx.cmds, stored_layout)
+    return Compiled(target, trace, ctx.cmds, stored_layout, ctx=ctx)

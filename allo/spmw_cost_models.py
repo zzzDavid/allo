@@ -10,7 +10,6 @@ return a working callback.
 from __future__ import annotations
 
 import re
-import warnings
 
 from .spmw_cost import cost
 from .spmw_match import MatchTrace
@@ -48,70 +47,11 @@ def _parse_loop_bound(text: str) -> int | None:
     return None
 
 
-# Samsung HBM2 timings (used as a coarse cost model only — not for
-# cycle-accurate simulation). MAC takes one tCCDL column command; JUMP
-# is treated as a 1-cycle control op; the inner-K reduction folds into
-# `(K // GRF_LANES)` MACs when src1 is bank-shaped (is_auto = 1) and
-# stays unrolled at K MACs otherwise.
-_SAMSUNG_TCCDL = 4
-_SAMSUNG_JUMP_CYCLES = 1
-_SAMSUNG_LANE_BURST = 8
-
-
-# AiM timing (from JSSC 2023 §IV, ramulator2 baseline). Coarse model —
-# exact per-ISR timings live in the ramulator2 YAML; here we only need
-# a monotonic objective for the autoscheduler's argmin.
-_AIM_MAC_SBK_CYCLES = 8     # one MAC_SBK = 1 burst, 16 lanes
-_AIM_MAC_ABK_CYCLES = 16    # all-bank broadcast: 2x latency
-_AIM_EWMUL_CYCLES = 4
-_AIM_EWADD_CYCLES = 4
-_AIM_AF_CYCLES = 6          # GELU/SIGMOID: 6 cycles per 16 lanes
-
-_AIM_OP_CYCLES = {
-    "MUL": _AIM_EWMUL_CYCLES,
-    "ADD": _AIM_EWADD_CYCLES,
-    "MAC": _AIM_MAC_SBK_CYCLES,
-    "MAC_ABK": _AIM_MAC_ABK_CYCLES,
-    "AF": _AIM_AF_CYCLES,
-}
-
-
-# UPMEM DPU latency model (uPIMulator / HPCA 2024 Table 2 + Figure 8).
-# MRAM read/write is the dominant cost; WRAM and GPR access are 1 cycle.
-# Per-op cycles below price the compute kernel only; bulk-load moves
-# are scheduled separately (Blocker 5).
-_UPMEM_MRAM_READ_CYCLES_PER_64B = 1000
-_UPMEM_MRAM_WRITE_CYCLES_PER_64B = 1000
-_UPMEM_WRAM_ACCESS_CYCLES = 1
-_UPMEM_GPR_OP_CYCLES = 1     # int add/mul: 1 cycle issue
-_UPMEM_MAC_CYCLES = 2        # mul + add (no fused MAC on DPU)
-
-_UPMEM_OP_CYCLES = {
-    "MUL": _UPMEM_GPR_OP_CYCLES,
-    "ADD": _UPMEM_GPR_OP_CYCLES,
-    "MAC": _UPMEM_MAC_CYCLES,
-}
-
-
-# GSI APU v1 cycle estimates (from report 12 §4.2 + the pim-apu-v1 skill
-# latency table). The 32K-lane bit-serial SIMD runs every VR op in
-# lockstep across all lanes, so one GVML call covers the innermost
-# K-dimension when the work-item tile fits within 32K lanes -- the
-# innermost loop is folded into the SIMD width, not multiplied in.
-_APU_V1_DMA_L4_L1_CYCLES = 140
-_APU_V1_DMA_L1_L4_CYCLES = 140
-_APU_V1_LD_VR_CYCLES = 4
-_APU_V1_ST_VR_CYCLES = 4
-_APU_V1_ADD_CYCLES = 2
-_APU_V1_MUL_CYCLES = 16    # gvml_mul_u16 over 32K lanes
-_APU_V1_LOOKUP_CYCLES = 6  # gvml_lookup_16 (sv-lookup body)
-_APU_V1_MAC_CYCLES = _APU_V1_LOOKUP_CYCLES + _APU_V1_ADD_CYCLES
-
-_APU_V1_OP_CYCLES = {
-    "ADD": _APU_V1_ADD_CYCLES,
-    "MUL": _APU_V1_MUL_CYCLES,
-    "MAC": _APU_V1_MAC_CYCLES,
-}
+# Per-op / per-move cycle constants are NOT born here -- they live on
+# each target's spec (Move.cycles / Op.cycles, set in the fixture). The
+# cost factories below read those fields via `target.move(name).cycles`
+# and `target.op(name).cycles`. See tests/spmw/_fixtures.py for the
+# Samsung / AiM / UPMEM / APU v1 / APU v2 numbers and their citations.
 
 
 @cost("kernel_cycles")
@@ -140,6 +80,16 @@ def _kernel_cycles_factory(target):
 
 
 def _samsung_kernel_cycles(target):
+    """Samsung HBM-PIM kernel-cycle estimator.
+
+    Per-op cycles come from `target.op("MAC").cycles` (tCCDL, 4 cyc).
+    JUMP is `target.move("JUMP").cycles`. The inner-K fold groups MACs
+    by GRF lane count (`target.grf_a.lanes`) when src1 is bank-shaped.
+    """
+    mac_cyc = target.op("MAC").cycles
+    jump_cyc = target.move("JUMP").cycles
+    lane_burst = target.grf_a.lanes
+
     def cost_fn(trace: MatchTrace, layout) -> int:
         total = 0
         for match in trace.matches:
@@ -153,7 +103,7 @@ def _samsung_kernel_cycles(target):
                 inner_ub = _parse_loop_bound(match.enclosing_loops[-1][2])
             if inner_ub is None:
                 # Without an inner loop we can't bound the work; assume 1 op.
-                total += _SAMSUNG_TCCDL
+                total += mac_cyc
                 continue
 
             # is_auto is set when src1 is bank-shaped — the bank read
@@ -162,10 +112,10 @@ def _samsung_kernel_cycles(target):
             y_handle = handles.get("y")
             is_auto = isinstance(y_handle, MemoryRef)
             if is_auto:
-                folded = inner_ub // _SAMSUNG_LANE_BURST
-                total += folded * _SAMSUNG_TCCDL + _SAMSUNG_JUMP_CYCLES
+                folded = inner_ub // lane_burst
+                total += folded * mac_cyc + jump_cyc
             else:
-                total += inner_ub * _SAMSUNG_TCCDL
+                total += inner_ub * mac_cyc
 
         return total
 
@@ -176,7 +126,12 @@ def _aim_kernel_cycles(target):
     def cost_fn(trace: MatchTrace, layout) -> int:
         total = 0
         for match in trace.matches:
-            per_op = _AIM_OP_CYCLES.get(match.target_op_name, 4)
+            try:
+                per_op = target.op(match.target_op_name).cycles
+            except KeyError:
+                per_op = 4
+            if per_op is None:
+                per_op = 4
             inner_ub = None
             if match.enclosing_loops:
                 inner_ub = _parse_loop_bound(match.enclosing_loops[-1][2])
@@ -193,16 +148,39 @@ def _apu_v1_kernel_cycles(target):
     The bit-serial SIMD width (32K lanes per VR) folds one work-item
     dimension into a single GVML call -- the innermost loop is therefore
     NOT multiplied into the per-op cost. Outer loops (everything but
-    the last enclosing loop) contribute multiplicatively. MAC is priced
-    as `gvml_lookup_16 + gvml_add_s16` (the SV-lookup expansion), which
-    is the placement preferred over a raw MUL+ADD (SV mode) by argmin.
+    the last enclosing loop) contribute multiplicatively.
+
+    MAC pricing branches on `layout.mode`:
+      * `"sv"`        -> raw MUL+ADD per MAC
+      * `"sv_lookup"` -> gvml_lookup_16 + gvml_add_s16 (= MAC.cycles)
+      * `""` (back-compat) -> SV-lookup expansion.
+    Unknown modes raise. Argmin picks SV-lookup (cheaper).
     """
+    _ALLOWED_MODES = {"", "sv", "sv_lookup"}
+    add_cyc = target.op("ADD").cycles
+    mul_cyc = target.op("MUL").cycles
+    mac_cyc = target.op("MAC").cycles
+    sv_mac_cyc = mul_cyc + add_cyc  # raw MUL+ADD
+
     def cost_fn(trace: MatchTrace, layout) -> int:
+        mode = getattr(layout, "mode", "")
+        if mode not in _ALLOWED_MODES:
+            raise ValueError(
+                f"apu_v1 kernel_cycles: unknown layout.mode {mode!r}; "
+                f"allowed: {sorted(_ALLOWED_MODES)}"
+            )
+        sv_raw = mode == "sv"
         total = 0
         for match in trace.matches:
-            per_op = _APU_V1_OP_CYCLES.get(
-                match.target_op_name, _APU_V1_ADD_CYCLES
-            )
+            if match.target_op_name == "MAC" and sv_raw:
+                per_op = sv_mac_cyc
+            else:
+                try:
+                    per_op = target.op(match.target_op_name).cycles
+                except KeyError:
+                    per_op = add_cyc
+                if per_op is None:
+                    per_op = add_cyc
             # Outer loops only -- the innermost loop is subsumed by the
             # 32K-lane SIMD width.
             iters = 1
@@ -220,16 +198,21 @@ def _apu_v1_kernel_cycles(target):
 def _upmem_kernel_cycles(target):
     """Cycle estimator for the UPMEM DPU compute kernel.
 
-    Per-op cost comes from `_UPMEM_OP_CYCLES`; MAC is priced as 2 cycles
-    because the DPU has no fused MAC. Bulk MRAM<->WRAM transfers are
-    scheduled by a later pass and are not counted here.
+    Per-op cost comes from `target.op(name).cycles`; MAC is priced as
+    2 cycles because the DPU has no fused MAC. Bulk MRAM<->WRAM
+    transfers are scheduled by a later pass and are not counted here.
     """
+    gpr_cyc = target.op("ADD").cycles  # 1 cyc GPR baseline
+
     def cost_fn(trace: MatchTrace, layout) -> int:
         total = 0
         for match in trace.matches:
-            per_op = _UPMEM_OP_CYCLES.get(
-                match.target_op_name, _UPMEM_GPR_OP_CYCLES
-            )
+            try:
+                per_op = target.op(match.target_op_name).cycles
+            except KeyError:
+                per_op = gpr_cyc
+            if per_op is None:
+                per_op = gpr_cyc
             inner_ub = None
             if match.enclosing_loops:
                 inner_ub = _parse_loop_bound(match.enclosing_loops[-1][2])
@@ -242,31 +225,24 @@ def _upmem_kernel_cycles(target):
 
 # GSI APU v2 (Gemini 2). The only available simulator on this server is
 # `l1_sim`, which declares `perf_is_placeholder = True` (skill file
-# §Limitations). The cost model therefore returns a *structural*
-# constant -- enough to keep autoschedule's argmin deterministic, but
-# not performance-predictive. A one-time warning fires at factory-build
-# time (NOT inside cost_fn, to avoid log-flood during search).
-_APU_V2_WARNED = False
+# §Limitations). APU v2 is therefore positioned as a functional-only
+# target; cost-based scheduling is out of scope until GTML grows cycle
+# counters. See SPEC-011 for the decision rationale and the option-a
+# upgrade slot.
 
 
 def _apu_v2_kernel_cycles(target):
-    """Placeholder cost for APU v2.
+    """Functional-only cost stub for APU v2.
 
-    Returns `len(trace.matches)` -- 1 cycle per match. The autoscheduler
-    can still call this without crashing; argmin between candidate
-    placements stays deterministic but is not performance-predictive.
+    APU v2 ships as a functional-correctness target: the only available
+    simulator (`l1_sim`) declares `perf_is_placeholder = True` and does
+    not report cycles. The autoscheduler still runs argmin on APU v2
+    candidates (so the autoschedule path stays uniform across backends),
+    but the ranking is a deterministic enumerator-order tie-break, not
+    a performance prediction. This stub returns `len(trace.matches)` so
+    argmin is well-defined; it is intentionally non-comparative across
+    placements. See SPEC-011 for the rationale and the upgrade slot.
     """
-    global _APU_V2_WARNED
-    if not _APU_V2_WARNED:
-        warnings.warn(
-            "apu_v2 kernel_cycles cost is a structural placeholder: "
-            "l1_sim declares perf_is_placeholder = True. Cost is "
-            "constant per match (1 cycle/op); autoscheduler argmin "
-            "is order-dependent.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        _APU_V2_WARNED = True
 
     def cost_fn(trace: MatchTrace, layout) -> int:
         return len(trace.matches)
@@ -307,16 +283,9 @@ def _register_spill_factory(target):
 def _samsung_register_spill(target):
     """Samsung HBM-PIM: GRF_A/B <-> bank-row round-trip.
 
-    Numbers from spec 015 §6.1: tCCDL=4, RL=20, WL=8, BL=4.
-    load = tCCDL + RL + BL//2 = 26 cycles; store = tCCDL + WL + BL//2 = 14.
+    Numbers from spec 015 §6.1, declared on the target spec (LD_A/LD_B
+    cycles 26 from tCCDL+RL+BL//2; ST_A/ST_B cycles 14 from tCCDL+WL+BL//2).
     """
-    tCCDL, RL, WL, BL = 4, 20, 8, 4
-    load_cyc = tCCDL + RL + BL // 2     # 26
-    store_cyc = tCCDL + WL + BL // 2    # 14
-    for mv in ("LD_A", "LD_B"):
-        target.move(mv).cycles = load_cyc
-    for mv in ("ST_A", "ST_B"):
-        target.move(mv).cycles = store_cyc
 
     def spill(reg, n_entries=1):
         side = "A" if reg is target.grf_a else "B"
@@ -331,28 +300,15 @@ def _samsung_register_spill(target):
 def _aim_register_spill(target):
     """AiM: GPR <-> bank-row round-trip.
 
-    Numbers from JSSC 2023 §IV: tCCDL=4, RD=16, WR=12, burst=4.
-    load = 24, store = 20.
-
-    AiM's existing fixture already declares RD_SBK (bank-row read) but
-    not the symmetric write-back; the cost model uses the existing
-    RD_SBK for loads and falls back to a fixed `store_cyc` constant for
-    the writeback (the allocator only needs a monotonic value; no
-    bank-row writeback opcode is emitted today).
+    Numbers from JSSC 2023 §IV, declared on the target spec: RD_SBK = 24
+    = tCCDL+RD+BURST; ST_SBK = 20 = tCCDL+WR+BURST. AiM emits no
+    bank-row writeback opcode today; ST_SBK is a synthetic move on the
+    fixture so the allocator's monotonic cost vector still has a number.
     """
-    tCCDL = 4
-    RD, WR, BURST = 16, 12, 4
-    load_cyc = tCCDL + RD + BURST   # 24
-    store_cyc = tCCDL + WR + BURST  # 20
-    # AiM's fixture declares RD_SBK (load from bank to gpr); use it for
-    # the load side and keep the store side as a constant (no bank-row
-    # writeback move is currently declared on AiM).
-    try:
-        target.move("RD_SBK").cycles = load_cyc
-    except KeyError:
-        pass
 
     def spill(reg, n_entries=1):
+        load_cyc = target.move("RD_SBK").cycles
+        store_cyc = target.move("ST_SBK").cycles
         return (load_cyc + store_cyc) * n_entries
 
     return spill
@@ -361,28 +317,20 @@ def _aim_register_spill(target):
 def _upmem_register_spill(target):
     """UPMEM: WRAM <-> MRAM round-trip dominates spill cost.
 
-    Per-burst (64 B) from uPIMulator HPCA 2024 Table 2. The cost vector
-    asks for whichever tier matches via the `tier` kwarg (spec 015 §6.3).
+    Per-burst (64 B) from uPIMulator HPCA 2024 Table 2, declared on the
+    target spec. The cost vector asks for whichever tier matches via
+    the `tier` kwarg (spec 015 §6.3).
     """
-    wram_load = 1
-    wram_store = 1
-    mram_burst = 1000
-    for mv_name, cyc in (
-        ("LD_WRAM", wram_load),
-        ("ST_WRAM", wram_store),
-        ("LD_MRAM", mram_burst),
-        ("ST_MRAM", mram_burst),
-    ):
-        try:
-            target.move(mv_name).cycles = cyc
-        except KeyError:
-            pass
 
     def spill(reg, n_entries=1, tier="mram"):
         if tier == "wram":
-            return (wram_store + wram_load) * n_entries
+            return (
+                target.move("ST_WRAM").cycles + target.move("LD_WRAM").cycles
+            ) * n_entries
         if tier == "mram":
-            return (mram_burst + mram_burst) * n_entries
+            return (
+                target.move("ST_MRAM").cycles + target.move("LD_MRAM").cycles
+            ) * n_entries
         raise ValueError(f"upmem spill tier {tier!r}")
 
     return spill
@@ -392,42 +340,31 @@ def _apu_v1_register_spill(target):
     """APU v1: VR <-> L1 round-trip.
 
     Same SRAM fabric as the VRs, so spill cost is roughly 1x register
-    access. Numbers from spec 015 §6.4 (~5 cycles each direction).
+    access. Numbers from spec 015 §6.4 (~5 cycles each direction),
+    declared on the target spec (LD_VR / ST_VR).
     """
-    load_cyc, store_cyc = 5, 5
-    for mv_name, cyc in (("LD_VR", load_cyc), ("ST_VR", store_cyc)):
-        try:
-            target.move(mv_name).cycles = cyc
-        except KeyError:
-            pass
 
     def spill(reg, n_entries=1):
-        return (store_cyc + load_cyc) * n_entries
+        return (
+            target.move("ST_VR").cycles + target.move("LD_VR").cycles
+        ) * n_entries
 
     return spill
 
 
 # Module-level flag so the placeholder warning fires once per process,
 # matching the kernel_cycles APU v2 convention above.
-_APU_V2_SPILL_WARNED = False
-
-
 def _apu_v2_register_spill(target):
-    """APU v2: L1 row <-> L2 row; l1_sim placeholder.
+    """Functional-only spill stub for APU v2.
 
-    l1_sim declares `perf_is_placeholder = True`; the allocator's
-    argmin will still run deterministically but its cost is not
-    performance-predictive. Constant `2 * n_entries`.
+    Mirrors `_apu_v2_kernel_cycles`: APU v2 is a functional-correctness
+    target (`l1_sim` declares `perf_is_placeholder = True`), so this
+    factory returns a non-comparative constant (`2 * n_entries`) and
+    does not emit a runtime warning. The allocator's argmin still runs
+    deterministically; the value is not performance-predictive. See
+    SPEC-011 for the rationale and the option-a upgrade slot when GTML
+    timing lands.
     """
-    global _APU_V2_SPILL_WARNED
-    if not _APU_V2_SPILL_WARNED:
-        warnings.warn(
-            "apu_v2 register_spill cost is a structural placeholder: "
-            "l1_sim declares perf_is_placeholder = True.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        _APU_V2_SPILL_WARNED = True
 
     def spill(reg, n_entries=1):
         return 2 * n_entries

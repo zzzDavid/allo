@@ -106,6 +106,11 @@ def test_apu_v1_ctx_emit_mac_expands_to_lookup_plus_add():
     # rebinds it.
     assert "mac_tmp_vr" in ctx.cmds[0]
     assert "mac_tmp_vr" in ctx.cmds[1]
+    # SPEC-018: the lookup call must carry the canonical LUT pointer
+    # and the 256-entry length. These names are emitted as literals
+    # by APUv1Ctx and must match the build-harness LUT decl.
+    assert "mac_lut_ptr" in ctx.cmds[0], ctx.cmds[0]
+    assert ", 256)" in ctx.cmds[0], ctx.cmds[0]
 
 
 def test_apu_v1_ctx_emit_mac_honors_bind_handle():

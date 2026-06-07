@@ -62,6 +62,47 @@ def test_upmem_get_kernel_src_wraps():
     assert "acc += local_W[i] * local_x[k];" in src
 
 
+def test_upmem_get_kernel_src_emits_prim_envelope():
+    """SPEC-003 §4.2 Region A: get_kernel_src must emit a full PrIM-shaped
+    DPU envelope so uPIMulator's linker can resolve DPU_INPUT_ARGUMENTS,
+    the kernels[] dispatch table, and BARRIER_INIT. The emitted cmd is
+    inlined into the tenon_kernel() body, not into main().
+    """
+    target = build_upmem_target()
+    ctx = UPMEMCtx(target)
+    ctx.emit_c_line("bufferB[i] += bufferA[i];")
+    src = ctx.get_kernel_src()
+    # Envelope must declare the host arguments struct and dispatch table.
+    assert "__host dpu_arguments_t DPU_INPUT_ARGUMENTS;" in src, src
+    assert "BARRIER_INIT(my_barrier, NR_TASKLETS);" in src, src
+    assert "int (*kernels[nr_kernels])(void)" in src, src
+    # Envelope must perform MRAM<->WRAM staging.
+    assert "mram_read(" in src and "mram_write(" in src, src
+    assert "DPU_MRAM_HEAP_POINTER" in src, src
+    # Envelope must include the support header (TENON/support/common.h).
+    assert '#include "../support/common.h"' in src, src
+    # The emitted body lives inside tenon_kernel, not main.
+    assert "void __attribute__ ((noinline))" in src, src
+    assert "tenon_kernel(T *bufferB, T *bufferA, unsigned int l_size)" in src, src
+    assert "bufferB[i] += bufferA[i];" in src, src
+
+
+def test_run_upmem_uses_tenon_slot_and_no_proxy():
+    """SPEC-003 §6 acceptance 1: _run_upmem must invoke uPIMulator with
+    --benchmark TENON and must not contain the old VA/GEMV proxy
+    heuristic.
+    """
+    import inspect
+    from allo.spmw_codegen import _run_upmem
+
+    source = inspect.getsource(_run_upmem)
+    assert '"TENON"' in source, source
+    assert 'benchmark = "VA"' not in source, source
+    assert 'benchmark = "GEMV"' not in source, source
+    # The TENON slot path must be the one we write task.c into.
+    assert "benchmark" in source and "TENON" in source and "task.c" in source
+
+
 def test_upmem_cost_factory_returns_callable():
     target = build_upmem_target()
     cost_fn = allo.get_cost("kernel_cycles", target)
@@ -76,5 +117,7 @@ if __name__ == "__main__":
     test_upmem_target_builds()
     test_upmem_ctx_emits_c()
     test_upmem_get_kernel_src_wraps()
+    test_upmem_get_kernel_src_emits_prim_envelope()
+    test_run_upmem_uses_tenon_slot_and_no_proxy()
     test_upmem_cost_factory_returns_callable()
     print("ALL PASSED")
