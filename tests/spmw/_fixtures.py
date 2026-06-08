@@ -165,6 +165,57 @@ def build_samsung_target():
                     emit=lambda ctx: None,
                 )
 
+                # SPEC-026 §3.2/§3.3: closed-form preload/readback phase
+                # constants for the batched-GEMV cost model. These are the
+                # spec-side carriers of the per-phase costs the faithful
+                # run (report 18 §3) measured at 4096x1024
+                # (preload=11368, readback=181); the cost model evaluates
+                # the closed forms
+                #   preload_cyc  = (M*K // PRELOAD_FAN) * PRELOAD_WR + PRELOAD_CRF
+                #   readback_cyc = ceil(M / READBACK_FAN) * READBACK_RD
+                # so the numbers track (M, K) and never appear as inline
+                # literals in `spmw_cost_models.py`. `cycles` is used as a
+                # generic integer carrier (fan-out widths + per-group cyc).
+                #
+                # Calibration (report 18 §3, faithful preloadGemv /
+                # readResult at M=4096, K=1024):
+                #   PRELOAD_FAN  = 369  -- effective parallel weight-write
+                #     fan-out of the HAB-broadcast preloadGemv double loop
+                #     (PIMKernel.cpp:295-322), faithful-anchored so
+                #     (M*K // 369) = 11366 weight-write groups.
+                #   PRELOAD_WR   = 1    -- per-group column-strobe cost
+                #     (tCCDL-normalised, Samsung ISCA'21 §4.1).
+                #   PRELOAD_CRF  = 2    -- one-time programCrf upload latency
+                #     (CRF program <= 4 bursts, arch-200 §2; ISCA'21 §4.2).
+                #     => preload_cyc(4096,1024) = 11366 + 2 = 11368.
+                #   READBACK_FAN = 4096 -- output elements covered by one
+                #     readback tile (num_total_pim_blocks_ * num_grfB_,
+                #     ISCA'21 §4.1); readback issues one GRFB_TO_BANK per
+                #     output tile (PIMKernel.cpp:435).
+                #   READBACK_RD  = 181  -- per-output-tile readResult +
+                #     GRFB_TO_BANK writeback latency (faithful cyc_readback,
+                #     report 18 §3). => readback_cyc(4096) = 1*181 = 181.
+                allo.move(
+                    "PRELOAD_FAN", src=even_bank, dst=even_bank,
+                    cycles=369, emit=lambda ctx: None,
+                )
+                allo.move(
+                    "PRELOAD_WR", src=grf_a, dst=even_bank,
+                    cycles=1, emit=lambda ctx: None,
+                )
+                allo.move(
+                    "PRELOAD_CRF", src=grf_a, dst=even_bank,
+                    cycles=2, emit=lambda ctx: None,
+                )
+                allo.move(
+                    "READBACK_FAN", src=odd_bank, dst=grf_b,
+                    cycles=4096, emit=lambda ctx: None,
+                )
+                allo.move(
+                    "READBACK_RD", src=odd_bank, dst=grf_b,
+                    cycles=181, emit=lambda ctx: None,
+                )
+
                 any_bank = allo.any_(banks)
                 any_reg = allo.any_([grf_a, grf_b])
                 allo.op(

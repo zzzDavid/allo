@@ -140,13 +140,26 @@ def test_kernel_cycles_prefers_is_auto():
     # cost is now the per-work-id body * n_workids -- a uniform scale that
     # preserves the fast-vs-slow ranking. The work-id count is derived from
     # target geometry, never a literal (§4.2).
-    from allo.spmw_cost_models import _samsung_workid_count
+    from allo.spmw_cost_models import (
+        _samsung_workid_count,
+        _samsung_mk,
+        _samsung_preload_cycles,
+        _samsung_readback_cycles,
+    )
 
     n = _samsung_workid_count(target)
+    # SPEC-026 §3.5: the cost-model return is now P + E + R for a single
+    # vector (B=1, no batch loop). The exec term E is unchanged
+    # (per-work-id body * n_workids); the placement-invariant P+R offset
+    # is added uniformly, so the fast<slow ranking is preserved. P/R are
+    # closed forms over (M, K), not literals.
+    M, K = _samsung_mk(target, trace)
+    P = _samsung_preload_cycles(target, M, K)
+    R = _samsung_readback_cycles(target, M)
     # K=1024, lane burst = 8 — folded body is 128 MACs (× 4 cyc) + 1 JUMP cyc;
     # unrolled body is 1024 MACs × 4 cyc; both replicated across n work-ids.
-    assert fast_cost == (128 * 4 + 1) * n
-    assert slow_cost == (1024 * 4) * n
+    assert fast_cost == (128 * 4 + 1) * n + P + R
+    assert slow_cost == (1024 * 4) * n + P + R
 
 
 # --------------------------------------------------------------------- #

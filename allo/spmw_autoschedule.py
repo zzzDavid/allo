@@ -189,6 +189,25 @@ def _with_crf_modes(base: "Placement") -> list["Placement"]:
     return variants
 
 
+def _with_weight_residency(base: "Placement", resident: bool) -> "Placement":
+    """Copy `base`, setting `extra['weight_resident']`. placements untouched.
+
+    SPEC-026 §2.2: weight residency is a *materialisation* flag (preload W
+    once and reuse across the batch vs re-preload per input vector), the
+    same class as `crf_issue in {shared, per_workid}`. It rides `extra`,
+    not `placements` -- the bank algebra (lever 1's fibers) is unchanged.
+    The cost model (205) earns the resident choice for B>=2; at B=1 the two
+    variants tie (I4) and the existing argmin winner is undisturbed.
+    """
+    new_extra = dict(base.extra)
+    new_extra["weight_resident"] = resident
+    return Placement(
+        placements=dict(base.placements),
+        mode=_join_mode(base.mode, "wresident") if resident else base.mode,
+        extra=new_extra,
+    )
+
+
 @register_enumerator("samsung_hbm_pim")
 def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     """Enumerate Samsung layouts: bank-row `y` vs GRF-staged `y`.
@@ -321,9 +340,18 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     # even-odd / host dimensions (SPEC-025 §3.1), so it is applied as a
     # final 2x fan-out tagged in `extra["crf_issue"]`. Argmin discards the
     # loser; the enumerator never prunes a variant or branches on shape.
+    #
+    # SPEC-026 §2.2: weight-residency is the final, outermost 2x tail
+    # cross -- orthogonal to lever-1/2/3, exactly as lever 3 is orthogonal
+    # to lever 2. Both `weight_resident in {False, True}` variants are
+    # emitted UNCONDITIONALLY; the enumerator never reads B or any shape.
+    # The cost model (205) earns the resident one for B>=2 and ties them
+    # at B=1 (so the pre-026 B=1 winner is undisturbed, I4).
     out: list[Placement] = []
     for cand in residency_candidates:
-        out.extend(_with_crf_modes(cand))
+        for crf_cand in _with_crf_modes(cand):
+            out.append(_with_weight_residency(crf_cand, False))
+            out.append(_with_weight_residency(crf_cand, True))
     return out
 
 

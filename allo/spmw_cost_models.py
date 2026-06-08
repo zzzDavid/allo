@@ -95,12 +95,112 @@ def _samsung_workid_count(target) -> int:
     return n
 
 
+def _trace_batch_dim(trace: MatchTrace) -> int:
+    """Max batch_dim across the trace's matches (SPEC-026 §3.4).
+
+    Reads `match.extra['batch_dim']` stamped by the matcher (SPEC-026
+    §1.2). B is geometry -- the same class as the M/K the body cost reads
+    from `enclosing_loops` -- never a literal. Absent key (every existing
+    trace, eltwise, single-vector GEMV) -> B = 1 (I4 parity).
+    """
+    return max((m.extra.get("batch_dim", 1) for m in trace.matches), default=1)
+
+
+def _samsung_output_rows(match, batch_var: str | None) -> int:
+    """Output rows this match covers per work-id = product of the
+    non-reduction, non-batch enclosing-loop bounds (SPEC-026 §3.2).
+
+    The reduction axis is the innermost loop (folded into the MAC body);
+    the batch axis (if any) is excluded so M counts output rows, not
+    batched repeats. Shape-derived from `enclosing_loops`, no literal.
+    """
+    loops = match.enclosing_loops
+    if len(loops) < 2:
+        return 1
+    rows = 1
+    for (var, _lb, ub, _step) in loops[:-1]:  # drop the innermost (reduction)
+        if batch_var is not None and var == batch_var:
+            continue
+        b = _parse_loop_bound(ub)
+        if b is not None:
+            rows *= b
+    return rows
+
+
+def _samsung_mk(target, trace: MatchTrace) -> tuple[int, int]:
+    """Recover (M, K) for the GEMV the trace describes (SPEC-026 §3.2).
+
+    K = innermost (reduction) loop bound. M = output rows per work-id
+    (product of non-reduction, non-batch loop bounds) times the work-id
+    fan-out -- so M is the *full* output dim across PIM blocks, matching
+    `preloadGemv`'s M*K weight-write walk. Both are operand-shape /
+    geometry derived; no shape literal.
+    """
+    n_workids = _samsung_workid_count(target)
+    M = 0
+    K = 0
+    for match in trace.matches:
+        if not match.enclosing_loops:
+            continue
+        k = _parse_loop_bound(match.enclosing_loops[-1][2])
+        if k is not None:
+            K = max(K, k)
+        batch_var = match.extra.get("batch_loop_var")
+        rows = _samsung_output_rows(match, batch_var)
+        M = max(M, rows * n_workids)
+    return M, K
+
+
+def _samsung_preload_cycles(target, M: int, K: int) -> int:
+    """Closed-form weight-preload cost (SPEC-026 §3.2).
+
+    preload_cyc = (M*K // write_width) * write_cyc + programCrf_cyc
+
+    where write_width / write_cyc / programCrf_cyc are target-spec
+    constants (PRELOAD_FAN / PRELOAD_WR / PRELOAD_CRF moves on the
+    fixture, calibrated to the faithful preloadGemv at 4096x1024 =
+    11368). M*K is operand shape. No inline literal. Placement-invariant
+    (depends only on M, K), so adding it uniformly to every candidate's
+    score does not move the argmin (SPEC-026 §3.5).
+    """
+    if M <= 0 or K <= 0:
+        return 0
+    write_width = target.move("PRELOAD_FAN").cycles
+    write_cyc = target.move("PRELOAD_WR").cycles
+    crf_cyc = target.move("PRELOAD_CRF").cycles
+    return (M * K // write_width) * write_cyc + crf_cyc
+
+
+def _samsung_readback_cycles(target, M: int) -> int:
+    """Closed-form result-readback cost (SPEC-026 §3.3).
+
+    readback_cyc = ceil(M / read_width) * read_cyc
+
+    read_width / read_cyc are target-spec constants (READBACK_FAN /
+    READBACK_RD moves), M is shape. One GRFB_TO_BANK per output tile.
+    Placement-invariant. No inline literal.
+    """
+    if M <= 0:
+        return 0
+    read_width = target.move("READBACK_FAN").cycles
+    read_cyc = target.move("READBACK_RD").cycles
+    return ((M + read_width - 1) // read_width) * read_cyc
+
+
 def _samsung_kernel_cycles(target):
     """Samsung HBM-PIM kernel-cycle estimator.
 
     Per-op cycles come from `target.op("MAC").cycles` (tCCDL, 4 cyc).
     JUMP is `target.move("JUMP").cycles`. The inner-K fold groups MACs
     by GRF lane count (`target.grf_a.lanes`) when src1 is bank-shaped.
+
+    SPEC-026 §3: the single per-vector exec body is wrapped with separable
+    closed-form preload/readback phases and composed over the batch dim B:
+        weight_resident ? preload + B*(exec+readback)
+                        : B*(preload+exec+readback)
+    At B=1 both branches reduce to preload+exec+readback (I4 parity); the
+    exec formula is unchanged, and preload/readback are placement-invariant
+    so the existing single-vector argmin winner is undisturbed (§3.5).
     """
     mac_cyc = target.op("MAC").cycles
     jump_cyc = target.move("JUMP").cycles
@@ -202,12 +302,32 @@ def _samsung_kernel_cycles(target):
         # SPEC-025 §4.4). Other backends never set crf_issue.
         crf_issue = layout.extra.get("crf_issue", "per_workid")
         if crf_issue == "shared":
-            return body_cyc + trigger_cyc * n_workids
-        if crf_issue == "per_workid":
-            return body_cyc * n_workids
-        raise ValueError(
-            f"samsung kernel_cycles: unknown crf_issue {crf_issue!r}"
-        )
+            exec_cyc = body_cyc + trigger_cyc * n_workids
+        elif crf_issue == "per_workid":
+            exec_cyc = body_cyc * n_workids
+        else:
+            raise ValueError(
+                f"samsung kernel_cycles: unknown crf_issue {crf_issue!r}"
+            )
+
+        # SPEC-026 §3.1: compose the per-vector exec with the separable
+        # closed-form preload/readback phases over the batch dim B. B is
+        # read off the trace (stamped by the matcher §1.2), default 1.
+        # preload/readback are placement-invariant (depend only on M, K) so
+        # the uniform +P+R offset does not move the argmin among lever-1/2/3
+        # placements (§3.5); the resident-vs-non-resident *choice* is the
+        # only batch-sensitive term, earned by argmin for B>=2.
+        M, K = _samsung_mk(target, trace)
+        preload_cyc = _samsung_preload_cycles(target, M, K)
+        readback_cyc = _samsung_readback_cycles(target, M)
+        B = _trace_batch_dim(trace)
+        weight_resident = layout.extra.get("weight_resident", False)
+        if weight_resident:
+            # Tenon: preload once, amortized across B exec+readback passes.
+            return preload_cyc + B * (exec_cyc + readback_cyc)
+        # Native / non-resident: re-pay preload per input vector. At B=1
+        # this is algebraically identical to the resident branch (I4).
+        return B * (preload_cyc + exec_cyc + readback_cyc)
 
     return cost_fn
 

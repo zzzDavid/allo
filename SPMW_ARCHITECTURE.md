@@ -36,6 +36,7 @@ into MLIR, which the matcher then walks.
 | `allo/__init__.py` | **edited (spec 001)** | Resolve `Layout` shadow (rename SPMW Layout → Placement). Drop `memory` callable re-export (replace with `mem`). |
 | `experiments/simulators/uPIMulator/golang/uPIMulator/` | **edited (spec 003, additive only)** | Add a permanent benchmark slot named `TENON` that `_run_upmem` overwrites with the emitted DPU `task.c` per call. Touched files: `benchmark/CMakeLists.txt` (+1 `add_subdirectory(TENON)` line), `src/assembler/assembler.go` (+1 registry line), plus four new files under `benchmark/TENON/` and `src/assembler/prim/tenon.go`. Templated from the existing `DSLVA` benchmark (which uPIMulator's own authors added as a codegen slot). No existing files are semantically changed; reverting is `git revert` plus an inert benchmark dir. No upstream Allo / FPGA tests touch this tree. See `SPEC-003-upmem-real-kernel.md`. |
 | `allo/spmw_linear_layout.py` (`materialise_handle`, new `bank_stride`) | **edited (spec 022, additive only)** | New `symbolic=` kwarg on `materialise_handle` carries the swizzle `tile` column as a free `SymExpr`; new `bank_stride(target, *, out_dim, unit_level)` derives banks-per-unit from target geometry so the even-bank base `stride*pid` is layout/target-derived, not a pasted `2*pid` (anti-hardcoding gate evidence #4). Kwarg defaults to `None` → today's behaviour; the four non-Samsung enumerators (SPEC-007 option b) never pass it. `_bank_parity` is **unchanged** (the new path emits the same `2*pid` / `2*pid+1` forms it already classifies, for Samsung's `stride==2`). Guarded by new `tests/spmw/test_linear_layout.py::test_materialise_symbolic_fibers` + existing `test_materialise_samsung_bank_handle` (back-compat). Upstream Allo does not import `spmw_linear_layout`, so `tests/dataflow/` and `tests/customize/` are not gated. See `SPEC-022-materialise-symbolic-fibers.md`. |
+| `experiments/simulators/PIMSimulator/src/pim_driver.cc` (GEMV phase block) | **edited (spec 026, additive only)** | New `--batch B` + `--native-rebaseline` flags wrap the GEMV phase block (`:292-321`) in a batched sequencing loop: resident clocks `preloadGemv` once + B*(exec+readback); native re-pays `preloadGemv` per call → B*(preload+exec+readback). Both loops call the SAME `executeGemvFaithful`+`readResult` per vector (I2, no flattering); only preload placement differs. With `--batch 1` / no flag the branch runs the byte-identical pre-026 single-vector sequence (FPGA/AIE CI never reaches this Samsung-only path). The five frozen fns + `executeGemvFaithful`/`countGemvStreamWork` + `>=1` clamp have a **zero diff**. Rebuild `scons -j32`. Guarded by upstream gtest `PIMKernelFixture.gemv` (frozen-fn bodies untouched) + new `tests/spmw/test_samsung_batched_*`. See `SPEC-026-batched-gemv-weight-reuse.md`. |
 | `experiments/simulators/PIMSimulator/src/PIMKernel.cpp` (`runPIM`, `executeGemv`, `executeGemvWithCmds`, `computeGemv`, `programCrf`) | **reference-only, FORBIDDEN to edit (spec 021)** | `getCycle()` is shape-fixed: cycles advance one tick per `mem_->update()` in `runPIM` (line 21-27); the `--cmds` stream reaches only `programCrf` (line 478), which caps at 4 CRF bursts (line 220-238); the work loop and per-tile MAC volume are derived from `w_data->bShape`, not from `cmds`. The faithful run path (spec 021, task 025) must be a **new** driver symbol/flag that calls these but does not edit their bodies, plus Tenon-side `spmw_codegen._run_samsung*` changes. The native `--op GEMV` cycle output must stay byte-for-byte (task 015 baseline). Guarded by upstream gtest `PIMKernelFixture.gemv` (must stay green) + `tests/spmw/test_samsung_placement_changes_cycles.py` (promoted to strict `cycles_a != cycles_b` once 025 lands). See `SPEC-021-samsung-cycle-model.md`. |
 
 Every shared-file edit must list the upstream tests that guard it
@@ -140,6 +141,32 @@ The choice is argmin's, not codegen's. Riding `extra` (not `mode`, not a
 new dataclass field) keeps residency per-operand and orthogonal to
 lever-1 layout modes, with zero blast radius to non-Samsung backends.
 See SPEC-024.
+
+### `Placement.extra["weight_resident"]` + `MatchedOp.extra["batch_dim"]` — batched GEMV weight reuse (spec 026, Samsung)
+Two additive carriers for the batched-GEMV fair beat (arch-200 (a) FEASIBLE,
+research-201 B\*=2 / 3.93x asymptote):
+- `MatchedOp.extra["batch_dim"]` (int, default 1): the operand-shape leading
+  dim B of `Y[B,M]=X[B,K]@W^T`. Stamped by the matcher via a new spmw-local
+  `batch_dim(match)` resolver that identifies the batch loop **structurally**
+  (its iter var is the leading index of both `x` and the result, and is not a
+  reduction axis) — never positional (`enclosing_loops[0]`), never a literal.
+  No `allo/ir/` edit (SPEC-026 §1.1 proves the existing `enclosing_loops` +
+  operand `indices` carry it). Cost (`_trace_batch_dim`) and codegen read this
+  key; default-absent → B=1.
+- `Placement.extra["weight_resident"]` (bool, default False): emitted as a
+  final 2x tail cross in `_samsung_enumerate` (`_with_weight_residency`), both
+  values unconditionally — argmin earns the choice. `_samsung_kernel_cycles`
+  composes `weight_resident ? P + B*(E+R) : B*(P+E+R)` with separable
+  closed-form `preload_cyc=(M*K/write_width)*write_cyc+programCrf_cyc` /
+  `exec_cyc` (today's formula, unchanged) / `readback_cyc=ceil(M/read_width)*
+  read_cyc`, all from target-spec constants + (M,K). P and R are
+  placement-invariant so the existing single-shape argmin winner is unchanged;
+  at B=1 both branches = P+E+R (T15 parity floor preserved). Codegen
+  (`_run_samsung*`) reads the flag and selects the driver invocation:
+  `--batch B` (preload once + B*(exec+readback)) vs `--native-rebaseline`
+  (B*(preload+exec+readback)), same `executeGemvFaithful`+`readResult` per
+  vector both sides — only preload-loop placement differs. Other backends
+  never set either key. See SPEC-026.
 
 ### `Compiled.ctx` (spec 003, additive)
 `Compiled.__init__` grows an optional fifth kwarg `ctx=None` that
@@ -446,3 +473,118 @@ regardless. **Zero shared-file footprint** (`ir/*`, `dataflow.py`,
 `customize.py`, PIMSimulator untouched). Rollback = drop the `dual_fiber`
 append from the enumerator + the `n_fibers` read in the cost model; the
 codegen branch then goes dead. See `SPEC-023-lever1-dual-fiber.md`.
+
+### T15. Samsung GEMV is at the hardware floor — strict-beat gate retired (arch 110) — RESOLVED (CASE 2)
+After levers 1+2+3 Tenon faithful *ties* native faithful at 15,251 /
+114,992 / 457,336 (4096×1024, 8192×4096, 16384×8192). Task 110 asked
+whether the faithful model (`countGemvStreamWork` / `executeGemvFaithful`,
+SPEC-021) is too coarse and flattening a real sub-native Tenon efficiency
+(CASE 1) or whether native is provably at the floor (CASE 2). **Ruled
+CASE 2.** Verified independently from PIMSimulator source: the body count
+`ceil(M/4096)*ceil(K/8)` is read from `w_data->bShape`
+(`PIMKernel.cpp:585-586`), never from `cmds`; the per-body MAC strobe is
+exactly the K columns each output's dot product requires
+(`computeGemv:686-688`); the `>= 1` clamp on `even_macs`/`odd_macs`
+(`PIMKernel.cpp:576-579`) is a **true floor** (one MAC body per present
+tile), not a modelling coarseness — a stream below it computes a wrong dot
+product. All four candidate efficiencies dispatched: C1 wider-GRF_A
+forbidden by `num_grfA_=8` register-file width (`PIMKernel.h:47`) and
+invariant under re-tiling (total = K columns); C2 shared-CRF and C3
+host-preload reach **parity** (native's folded CRF `MAC/JUMP/MAC/JUMP/NOP`,
+`PIMCmdGen.h:118-126`, has zero MOV/FILL, so `host_loads=0` already);
+C4 no double-count exists. The tie is the *correct* answer — the model is
+not floored at native (pre-lever redundant Tenon = 362,689 cycles), so it
+would reward a real efficiency if one existed; none does. **Decision:
+retire the strict performance gate (A) `tenon < native` in favor of
+parity-or-beat `tenon <= native` for Samsung GEMV.** The SPEC-021 §6
+`cycles_a != cycles_b` *model-faithfulness* test stays valid and passing
+(it discriminates redundant vs optimized streams) — it is never promoted
+against native. Paper claim: "Tenon's autoscheduler reaches the vendor
+hand-tuned floor from a high-level `@allo.work` description" (23.8× over
+its own naive baseline). **No source change**; the five SPEC-021 §3
+reference functions AND the `>=1` clamp at `PIMKernel.cpp:576-579` are
+frozen — lowering the clamp below 1 would be the flattering move (skipped
+tile = wrong numerics). DAG: task 150 (document floor) fires as the CASE-2
+terminal; tasks 120/130/140 (sub-floor lever + re-verify) cancelled as
+un-winnable by construction. **Open for next iteration (out of scope):**
+the one fair beat is *batched GEMV / weight reuse* — preload is 75% of the
+4096×1024 total and native re-runs it per call; a Tenon schedule hoisting
+preload out of a B-vector batch loop amortizes weight writes across B
+vectors. Different workload, not a new GEMV lever; flagged, not pursued.
+See `dev/06072026-samsung-gemv-peak/work/reports/arch-110-granularity-ruling.md`,
+`experiments/reports/17-samsung-gemv-subfloor-probe.md`, SPEC-021 §6.
+
+### T16. Batched-GEMV weight reuse is the fair beat — FEASIBLE (arch 200, iteration 3 DAG root)
+The T15 escape hatch is taken up here. **Ruled (a) FEASIBLE.** Verified
+from PIMSimulator source that W stays RESIDENT in banks across B input
+vectors and preload is paid once, not per vector:
+- `preloadGemv` (`PIMKernel.cpp:283-323`) is the **sole, separable**
+  weight-write phase; it is the only GEMV function issuing bank writes
+  (`addTransaction(true, addr, &operand->bData[d_idx])`, line 313). The
+  faithful driver clocks it **alone** (`pim_driver.cc:298-300`,
+  `cyc_preload`); at 4096×1024 it is 11,368 of 15,251 cyc (75%) — one-time
+  weight streaming.
+- The compute phase `executeGemvFaithful` → `computeGemv`
+  (`PIMKernel.cpp:582-688`) **never re-writes W**; it uploads the input
+  vector to GRF_A (`WRIO_TO_GRF_`) and MACs it against the **resident**
+  `EVEN_BANK`/`ODD_BANK` weight (folded CRF `PIMCmdGen.h:118-126`:
+  `MAC GRF_B, GRF_A, {EVEN,ODD}_BANK`). The bank operand is read in place.
+- The simulator **already** loops over input vectors with zero reload:
+  `for (b=0; b<num_batch; b++)` (`PIMKernel.cpp:587,619`),
+  `num_batch = i_data->bShape[0]`, one `computeGemv` per (tile, b), no
+  `preloadGemv` inside the loop. Residency is in-model, not inferred.
+
+**Native batched comparator (fair):** B *independent* GEMV calls, each
+re-paying preload — `native = B*(preload+exec+readback)`. **Tenon batched:**
+preload once, resident — `tenon = preload + B*(exec+readback)`. **Fair beat
+= `(B-1)*preload_cost > 0` for B≥2**, large at the 75% preload fraction. B
+is an **operand-shape dim** (X[B,K] / Y[B,M] leading dim, = the simulator's
+`i_data->bShape[0]`), NOT a literal — gate-B clean. At B=1, costs tie (T15
+floor preserved, no regression). Both candidates (preload-once vs
+preload-per-call) must be enumerated so argmin earns the choice (SPEC-009
+≥2-candidate discipline).
+
+**Frozen surface unchanged:** the five SPEC-021 §3 reference functions,
+`executeGemvFaithful` / `countGemvStreamWork`, and the `>=1` clamp stay
+frozen (T15). The batched beat lives in **new driver-level sequencing**
+(`pim_driver.cc` batch mode: preload-once + B passes for Tenon;
+preload-per-call B-loop for native), priced by the **same** faithful
+accounting both sides — Tenon wins only by *skipping redundant preloads* on
+calls 2..B, never by deleting needed work or re-pricing native. Tenon-side
+codegen change is Samsung-local (`spmw_codegen.py` `_run_samsung` /
+`_run_samsung_one`; the lever-2 host-residency `host_preloads` machinery is
+the "preload once" seam). **Default ruling on shared files:** the batch dim
+must be carried additively by the existing match path; `allo/ir/builder.py`
+/ `infer.py` edits are FORBIDDEN unless task 202 proves the match path
+cannot carry a leading batch dim additively (and then names the gating
+`tests/dataflow/` + `tests/customize/` tests).
+
+**Open quantitative question → research-201:** whether `preload_cost` is
+closed-form from target-spec constants + (M,K) or must be faithfully
+measured. The comparator structure and the `(B-1)*preload_cost` beat hold
+under either. DAG: this ruling (200) unblocks 201 (research), 202 (enum/
+cost/codegen SPEC), 203–208 (coders + verifiers), all already queued.
+See `dev/06072026-samsung-gemv-peak/work/reports/arch-200-batched-feasibility.md`,
+`.claude/agent-memory/architect/2026-06-07-batched-gemv-feasibility.md`.
+
+**Resolved into a build contract by SPEC-026 (task 202).** research-201
+closed the open question: `preload_cost` is **closed-form** from target-spec
+constants + (M,K) (`(M*K/write_width)*write_cyc + programCrf_cyc`), B\*=2,
+asymptote 3.93x. SPEC-026 pins the four coder tasks:
+- **203 MATCH:** **NO `allo/ir/` edit** (proven: existing `enclosing_loops` +
+  operand `indices` carry B). B stamped on `MatchedOp.extra["batch_dim"]` by a
+  new spmw-local structural `batch_dim(match)` resolver. Fallback (if ever
+  needed) escalates to architect, never an ad-hoc shared edit (SPEC-026 §1.4).
+- **204 ENUMERATOR:** `Placement.extra["weight_resident"]` 2x tail cross
+  (`_with_weight_residency`), both candidates unconditional, no shape branch.
+- **205 COST:** `_samsung_kernel_cycles` split into closed-form P/E/R + B from
+  `_trace_batch_dim`, composed `weight_resident ? P+B*(E+R) : B*(P+E+R)`; B=1
+  parity; P/R placement-invariant so existing argmin winner unchanged.
+- **206 CODEGEN:** `pim_driver.cc` `--batch`/`--native-rebaseline`; same
+  faithful instrument both sides, only preload-loop placement differs.
+- Gate A (207): `tenon_total <= native_total`, strict for B≥2; gate B (208):
+  no shape/batch literal in any decision path.
+New open tensions T16-a (resident call shape: single internal-b-loop call vs
+explicit driver B-loop) and T16-b (P/R placement-invariance assumption) carried
+in SPEC-026 §6. See `experiments/allo/allo/SPEC-026-batched-gemv-weight-reuse.md`
+and `.claude/agent-memory/architect/2026-06-07-batched-gemv-enum-cost-codegen.md`.

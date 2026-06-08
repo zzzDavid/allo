@@ -499,6 +499,11 @@ def _try_match_at_store(
     stored_ssa = operands[0]
     # The memref being stored into
     memref_ssa = operands[1] if len(operands) > 1 else None
+    # SPEC-026 §1.2: the store's index SSA names (everything after the
+    # value + memref operands). Carried additively on MatchedOp.extra so
+    # the batch-dim resolver can test the result's leading index without a
+    # second IR walk. None of the existing match contract changes.
+    store_indices = operands[2:] if len(operands) > 2 else []
     result_memref_name = None
     if "to" in store_op.attributes:
         result_memref_name = _attr_str(store_op.attributes["to"])
@@ -552,6 +557,7 @@ def _try_match_at_store(
                     operands=_operand_bindings(pat, bindings, op_obj.accumulates),
                     result_memref_name=result_memref_name,
                     op_range=(top_ssa, store_handle),
+                    extra={"store_indices": list(store_indices)},
                 )
             )
             # Use first matching op (more specific patterns should be
@@ -562,6 +568,95 @@ def _try_match_at_store(
         if matches:
             break
     return matches
+
+
+def _parse_loop_upper(text: str) -> int | None:
+    """Best-effort integer from an affine-map upper-bound string.
+
+    Mirrors the cost model's `_parse_loop_bound`; kept local so the
+    resolver does not import from `spmw_cost_models` (which imports this
+    module). Returns None on failure.
+    """
+    try:
+        return int(text.strip())
+    except ValueError:
+        pass
+    nums = re.findall(r"\b(\d+)\b", text)
+    if len(nums) == 1:
+        return int(nums[0])
+    return None
+
+
+def batch_dim(match: MatchedOp) -> tuple[str | None, int | None]:
+    """Return ``(batch_loop_var, B)`` for a batched reduction match.
+
+    SPEC-026 §1.2. A loop ``L`` in ``match.enclosing_loops`` is the BATCH
+    loop iff its iter var:
+      (a) is the LEADING index of some non-accumulator input operand load
+          (the per-batch input vector X[b, k]), AND
+      (b) is ABSENT from some OTHER non-accumulator input operand's index
+          list (the resident weight W[row, k], which the batch axis never
+          indexes).
+
+    This is the structural separation between the batch axis (leading
+    index of one input, absent from the other) and the reduction axis
+    (present in *every* input's index list). It is computed over loop
+    vars + operand indices only -- never a positional ``enclosing_loops[0]``
+    assumption, never a shape literal. ``B`` is `_parse_loop_upper(L.upper)`.
+
+    Returns ``(None, None)`` when no loop satisfies (a)+(b): the canonical
+    single-vector GEMV and the eltwise paths, which downstream treats as
+    ``B = 1`` (SPEC-026 I4 parity).
+    """
+    loops = match.enclosing_loops
+    if not loops:
+        return (None, None)
+    loop_vars = {L[0] for L in loops}
+
+    # Non-accumulator input operands with at least one index.
+    inputs = [
+        opb
+        for opb in match.operands
+        if not opb.is_loop_carried and opb.indices
+    ]
+    if len(inputs) < 2:
+        # Need >=2 inputs to separate "leading index of one, absent from
+        # another"; a single-input reduction has no batch axis.
+        return (None, None)
+
+    for L in loops:
+        var = L[0]
+        # (a) leading index of some input operand.
+        is_leading = any(opb.indices[0] == var for opb in inputs)
+        if not is_leading:
+            continue
+        # (b) absent from some OTHER input operand entirely.
+        absent_elsewhere = any(
+            opb.indices[0] != var and var not in opb.indices
+            for opb in inputs
+        )
+        if not absent_elsewhere:
+            continue
+        # Guard: a batch axis is an enclosing loop var (so B is bounded by
+        # the trace, never a literal we invented).
+        if var not in loop_vars:
+            continue
+        return (var, _parse_loop_upper(L[2]))
+    return (None, None)
+
+
+def _stamp_batch_dims(trace: MatchTrace) -> None:
+    """Write `match.extra['batch_loop_var']` / `['batch_dim']` for every
+    reduction match in ``trace`` (SPEC-026 §1.2).
+
+    Single source of truth: cost (205) and codegen (206) read
+    `extra['batch_dim']` and never re-derive it. A match with no batch
+    axis gets ``batch_dim = 1`` (I4 parity).
+    """
+    for m in trace.matches:
+        var, B = batch_dim(m)
+        m.extra["batch_loop_var"] = var
+        m.extra["batch_dim"] = B if B is not None else 1
 
 
 def match_workload(target, mlir_module) -> MatchTrace:
@@ -606,6 +701,9 @@ def match_workload(target, mlir_module) -> MatchTrace:
             )
             trace.matches.extend(ms)
 
+    # SPEC-026 §1.2: stamp the batch dim on each match (one source of
+    # truth for cost/codegen). Additive; default batch_dim=1.
+    _stamp_batch_dims(trace)
     return trace
 
 
@@ -621,4 +719,5 @@ __all__ = [
     "compile_op_pattern",
     "compile_target_patterns",
     "match_workload",
+    "batch_dim",
 ]

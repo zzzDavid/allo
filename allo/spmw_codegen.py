@@ -2100,6 +2100,183 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
         )
 
 
+def _layout_weight_resident(layout) -> bool:
+    """Read the chosen placement's `weight_resident` flag (SPEC-026 §4.1).
+
+    `Compiled.layout` is a single Placement (one kernel) or a list. The
+    batched run path is single-GEMV; default-absent key -> False (the
+    pre-026 non-resident shape). Codegen materialises this decision; it
+    does not re-decide (I5).
+    """
+    if isinstance(layout, list):
+        layout = layout[0] if layout else None
+    if layout is None:
+        return False
+    return bool(getattr(layout, "extra", {}).get("weight_resident", False))
+
+
+def _samsung_batched_invoke(
+    driver: Path,
+    root: Path,
+    cmd_subset: list,
+    W,
+    X,
+    batch: int,
+    native_rebaseline: bool,
+    np_mod,
+) -> tuple[int, dict, str]:
+    """One batched pim_driver --batch invocation (SPEC-026 §4.2).
+
+    Returns `(total_cycles, phase_dict, combined_stdout)`. `phase_dict`
+    has preload/exec/readback so the caller can assert the per-phase
+    split against the cost model. `native_rebaseline=True` selects the
+    re-preload-per-vector comparator loop.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        out_path = td_path / "out.bin"
+        w_path = td_path / "W.npy"
+        x_path = td_path / "X.npy"
+        cmds_path = td_path / "cmds.txt"
+        np_mod.save(w_path, W)
+        np_mod.save(x_path, X)
+        _write_samsung_cmds(cmds_path, cmd_subset)
+
+        argv = [
+            str(driver),
+            "--op", "GEMV",
+            "--out", str(out_path),
+            "--weight", str(w_path),
+            "--in", str(x_path),
+            "--output-dim", str(W.shape[0]),
+            "--input-dim", str(W.shape[1]),
+            "--cmds", str(cmds_path),
+            "--faithful",
+            "--batch", str(batch),
+        ]
+        if native_rebaseline:
+            argv.append("--native-rebaseline")
+
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, cwd=str(root),
+                timeout=600, check=False,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise RuntimeError(
+                f"Samsung batched pim_driver invocation failed: {exc}"
+            ) from exc
+
+        stdout = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        combined = stdout + ("\n" + stderr if stderr else "")
+        m = re.search(
+            r"PIM_CYCLES total=(\d+)\s+preload=(\d+)\s+exec=(\d+)\s+readback=(\d+)",
+            combined,
+        )
+        if not m:
+            raise RuntimeError(
+                "Samsung batched pim_driver returned but stdout missing "
+                "'PIM_CYCLES total=...' line; tail: " + combined[-400:]
+            )
+        phases = {
+            "preload": int(m.group(2)),
+            "exec": int(m.group(3)),
+            "readback": int(m.group(4)),
+        }
+        return int(m.group(1)), phases, combined
+
+
+def _run_samsung_batched(
+    compiled: "Compiled",
+    W,
+    X,
+    compare_native: bool = True,
+) -> RunResult:
+    """Batched-GEMV run path (SPEC-026 §4.2/§4.3).
+
+    Emits the Tenon stream (preload once + B*(exec+readback), selected by
+    the chosen placement's `weight_resident` flag) AND, when
+    `compare_native` is set, the native rebaseline (B*(preload+exec+
+    readback)) under the SAME faithful instrument, cmd stream, W, and
+    X(B,K). Only the preload-loop placement differs (I2). B = X.shape[0]
+    is read off the operand shape, never a literal (I3).
+
+    `RunResult.cycles` is the Tenon total; `extra` carries the native
+    total + both per-phase splits so the gate-A comparison and the
+    cost-model assertion can be made by the caller.
+    """
+    import numpy as np
+
+    root = _pimsim_root()
+    driver = root / "pim_driver"
+    if not driver.exists():
+        return RunResult(
+            cycles=None,
+            stdout=f"simulator unavailable: pim_driver not found at {driver}",
+            backend="samsung_hbm_pim",
+        )
+
+    W = np.asarray(W, dtype=np.float16)
+    X = np.asarray(X, dtype=np.float16)
+    if X.ndim == 1:
+        X = X.reshape(1, -1)
+    B = int(X.shape[0])  # I3: B is operand geometry (X[B,K] leading dim).
+
+    pim_cmds = [c for c in compiled.cmds if isinstance(c, PIMCmd)]
+    # Same ISA-valid filter the single-vector run path applies.
+    def _crf_valid(c: PIMCmd) -> bool:
+        if c.type_ in ("MOV", "FILL"):
+            bank_dst = c.dst_ in ("EVEN_BANK", "ODD_BANK")
+            grf_src = any(
+                s in ("GRF_A", "GRF_B") for s in (c.src0_, c.src1_, c.src2_)
+            )
+            if bank_dst and grf_src:
+                return False
+        return True
+
+    pim_cmds = [c for c in pim_cmds if _crf_valid(c)]
+
+    resident = _layout_weight_resident(compiled.layout)
+    # Tenon: resident mode preloads once when B>1; the driver reads the
+    # resident vs native loop from --native-rebaseline (absent => resident).
+    # If the chosen placement is NOT weight_resident, Tenon's own run is the
+    # native (re-preload-per-vector) sequencing -- codegen materialises the
+    # decision argmin made, it does not override it.
+    tenon_total, tenon_phases, tenon_out = _samsung_batched_invoke(
+        driver, root, pim_cmds, W, X, B,
+        native_rebaseline=not resident, np_mod=np,
+    )
+
+    extra = {
+        "kernel": "GEMV",
+        "batch": B,
+        "weight_resident": resident,
+        "tenon_total": tenon_total,
+        "tenon_phases": tenon_phases,
+    }
+    combined = tenon_out
+    if compare_native:
+        native_total, native_phases, native_out = _samsung_batched_invoke(
+            driver, root, pim_cmds, W, X, B,
+            native_rebaseline=True, np_mod=np,
+        )
+        extra["native_total"] = native_total
+        extra["native_phases"] = native_phases
+        combined = (
+            tenon_out
+            + "\n--- native rebaseline ---\n"
+            + native_out
+        )
+
+    return RunResult(
+        cycles=tenon_total,
+        stdout=combined,
+        backend="samsung_hbm_pim",
+        extra=extra,
+    )
+
+
 def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
     """Run a compiled AiM artifact through ramulator2 in Docker.
 
@@ -2643,6 +2820,23 @@ class Compiled:
                 backend=str(target_name),
             )
         return runner(self, **inputs)
+
+    def run_batched(self, W, X, compare_native: bool = True) -> RunResult:
+        """Run a batched GEMV (SPEC-026): B input vectors X[B,K] against
+        one weight W. Samsung-only. The chosen placement's
+        `weight_resident` flag (set by argmin) selects preload-once vs
+        re-preload-per-vector sequencing; codegen materialises it.
+
+        `compare_native=True` also runs the native rebaseline comparator
+        so the caller can assert the gate-A strict beat. B is read off
+        `X.shape[0]`, never a literal.
+        """
+        target_name = getattr(self.target, "name", None)
+        if target_name != "samsung_hbm_pim":
+            raise NotImplementedError(
+                f"run_batched is Samsung-only; got target {target_name!r}"
+            )
+        return _run_samsung_batched(self, W, X, compare_native=compare_native)
 
 
 _BACKEND_CTX = {

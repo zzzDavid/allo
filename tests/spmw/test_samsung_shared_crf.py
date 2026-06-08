@@ -130,11 +130,25 @@ def test_cost_prefers_shared_crf():
 
     n = _samsung_workid_count(target)
     trigger = target.move("CRF_TRIGGER").cycles
-    # body_cyc = c_per / n  (per_workid == body_cyc * n_workids).
-    assert c_per % n == 0, (c_per, n)
-    body_cyc = c_per // n
-    # shared == body_cyc + trigger * n; gap == body_cyc*(n-1) - trigger*n.
-    assert c_shared == body_cyc + trigger * n, (c_shared, body_cyc, trigger, n)
+    # SPEC-026 §3.5: the return is now P + E + R (B=1, non-resident). The
+    # placement-invariant P+R offset is identical for both crf-issue modes
+    # (it does not read crf_issue), so it cancels from the gap and the
+    # shared-vs-per_workid structure is preserved. Strip P+R before
+    # reconstructing the per-work-id body (E = body_cyc * n_workids).
+    from allo.spmw_cost_models import (
+        _samsung_mk,
+        _samsung_preload_cycles,
+        _samsung_readback_cycles,
+    )
+
+    M, K = _samsung_mk(target, trace)
+    PR = _samsung_preload_cycles(target, M, K) + _samsung_readback_cycles(target, M)
+    exec_per = c_per - PR
+    # body_cyc = exec_per / n  (per_workid exec == body_cyc * n_workids).
+    assert exec_per % n == 0, (exec_per, n)
+    body_cyc = exec_per // n
+    # shared == body_cyc + trigger*n + P+R; gap == body_cyc*(n-1) - trigger*n.
+    assert c_shared == body_cyc + trigger * n + PR, (c_shared, body_cyc, trigger, n, PR)
     assert c_per - c_shared == body_cyc * (n - 1) - trigger * n
 
 
@@ -173,7 +187,19 @@ def test_cost_ranking_responds_to_trigger_cycles():
 
     n = _samsung_workid_count(target)
     cost_fn = get_cost("kernel_cycles", target)
-    body_cyc = cost_fn(trace, per_wid) // n
+    # SPEC-026 §3.5: strip the placement-invariant P+R offset before
+    # reconstructing the per-work-id body (the flip threshold is a property
+    # of E, not of the preload/readback phases, which cancel from the
+    # shared-vs-per_workid comparison).
+    from allo.spmw_cost_models import (
+        _samsung_mk,
+        _samsung_preload_cycles,
+        _samsung_readback_cycles,
+    )
+
+    M, K = _samsung_mk(target, trace)
+    PR = _samsung_preload_cycles(target, M, K) + _samsung_readback_cycles(target, M)
+    body_cyc = (cost_fn(trace, per_wid) - PR) // n
 
     # Flip threshold: shared >= per_workid when
     # body_cyc + trigger*n >= body_cyc*n  <=>  trigger >= body_cyc*(n-1)/n.
