@@ -154,6 +154,41 @@ def _with_residency(base: "Placement", memref: str, mode: str) -> "Placement":
     )
 
 
+def _join_mode(mode: str, token: str) -> str:
+    """Append a human-readable lever token to `mode` for audit dumps.
+
+    The authoritative CRF-issue decision lives in `extra["crf_issue"]`;
+    this only keeps `mode` legible (e.g. ``dual_fiber+crf_shared``).
+    """
+    return f"{mode}+{token}" if mode else token
+
+
+def _with_crf_modes(base: "Placement") -> list["Placement"]:
+    """Return the {shared, per_workid} CRF-issue variants of `base`.
+
+    Lever 3 (SPEC-025 §3): the CRF body is either programmed once and
+    fired per work-id by the host (`shared`) or replicated per work-id
+    on the CRF stream (`per_workid`). This is orthogonal to where `y`
+    lives and to lever-1/lever-2 residency, so it rides
+    `extra["crf_issue"]` rather than cross-producting the `mode` string.
+    Both variants are materialisable; argmin discards the loser. No shape
+    branch -- the enumerator emits both unconditionally.
+    """
+    variants = []
+    for token, issue in (("crf_shared", "shared"),
+                         ("crf_per_workid", "per_workid")):
+        new_extra = dict(base.extra)
+        new_extra["crf_issue"] = issue
+        variants.append(
+            Placement(
+                placements=dict(base.placements),
+                mode=_join_mode(base.mode, token),
+                extra=new_extra,
+            )
+        )
+    return variants
+
+
 @register_enumerator("samsung_hbm_pim")
 def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     """Enumerate Samsung layouts: bank-row `y` vs GRF-staged `y`.
@@ -263,7 +298,7 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     # argmin decides -- the enumerator must NOT prune the crf variant.
     # Host-eligibility is COMPUTED from the placement handle (§3), never
     # asserted: only memrefs landing on `grf_a` are broadcast-uniform.
-    out: list[Placement] = []
+    residency_candidates: list[Placement] = []
     for base in base_candidates:
         host_memrefs = _samsung_host_eligible_memrefs(
             target, base, role_to_memref
@@ -272,14 +307,23 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
         crf = base
         for mref in host_memrefs:
             crf = _with_residency(crf, mref, "crf")
-        out.append(crf)
+        residency_candidates.append(crf)
         # host variant: every host-eligible memref moves to host residency.
         # If no role is host-eligible there is no second variant to emit.
         if host_memrefs:
             host = base
             for mref in host_memrefs:
                 host = _with_residency(host, mref, "host")
-            out.append(host)
+            residency_candidates.append(host)
+
+    # Lever 3 (SPEC-025): cross every candidate with {shared, per_workid}
+    # CRF-issue mode. The CRF-issue dimension is orthogonal to the y /
+    # even-odd / host dimensions (SPEC-025 §3.1), so it is applied as a
+    # final 2x fan-out tagged in `extra["crf_issue"]`. Argmin discards the
+    # loser; the enumerator never prunes a variant or branches on shape.
+    out: list[Placement] = []
+    for cand in residency_candidates:
+        out.extend(_with_crf_modes(cand))
     return out
 
 

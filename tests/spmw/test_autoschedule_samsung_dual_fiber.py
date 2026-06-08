@@ -54,7 +54,17 @@ def _mac_trace(k: int) -> MatchTrace:
 
 
 def _by_mode(candidates):
-    return {c.mode: c for c in candidates}
+    """Index candidates by the base `mode` token (lever 3 / SPEC-025
+    appends a `+crf_*` suffix). Keep the per_workid CRF-issue variant so
+    these lever-1 receipts compare body costs under a uniform x n_workids
+    scale (the dual-fiber-vs-bank-row ranking is preserved)."""
+    out = {}
+    for c in candidates:
+        base = c.mode.split("+", 1)[0]
+        if c.extra.get("crf_issue", "per_workid") != "per_workid":
+            continue
+        out.setdefault(base, c)
+    return out
 
 
 # --------------------------------------------------------------------- #

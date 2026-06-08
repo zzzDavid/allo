@@ -88,7 +88,25 @@ def test_compile_emits_dual_fiber_mac_jump_per_match():
     schedule = allo.customize(gemv_top, enable_tensor=False)
     trace = allo.match_workload(target, schedule.module)
 
-    compiled = allo.compile_for_target(target, trace)
+    # SPEC-025 §7 regression gate: the per-work-id default emit path stays
+    # byte-for-byte (128 quads). Lever 3's argmin now prefers the shared
+    # CRF body (one quad + 128 host triggers), so pin the per_workid
+    # candidate here to exercise the replicated body. The shared autoschedule
+    # pick is asserted separately in test_samsung_shared_crf.py.
+    from allo.spmw_autoschedule import (
+        _samsung_enumerate,
+        _bucket_for_autoschedule,
+    )
+
+    matches = _bucket_for_autoschedule(trace)[0][1]
+    per_workid = next(
+        p
+        for p in _samsung_enumerate(target, matches)
+        if p.mode.split("+", 1)[0] == "dual_fiber"
+        and p.extra.get("crf_issue") == "per_workid"
+        and p.extra.get("grf_residency", {}).get("local_W") == "host"
+    )
+    compiled = allo.compile_for_target(target, trace, per_workid)
 
     assert compiled.target is target
     expected_pairs = 16 * 8  # 16 pseudo-channels × 8 PIM units

@@ -95,7 +95,8 @@ def test_samsung_enumerator_respects_mac_dst_grf_b():
     # (grf_a vs a bank handle). SPEC-009 §1's second candidate
     # deliberately stages y on grf_a too, so the "distinct" invariant
     # only applies to the bank-row layout.
-    bank_row = [c for c in candidates if c.mode == "bank_row"]
+    # Lever 3 (SPEC-025) appends a `+crf_*` token to `mode`; match the base.
+    bank_row = [c for c in candidates if c.mode.split("+", 1)[0] == "bank_row"]
     assert bank_row, "samsung enumerator must produce a bank_row candidate"
     assert (
         bank_row[0].placements["local_W"] is not bank_row[0].placements["local_x"]
@@ -135,10 +136,17 @@ def test_kernel_cycles_prefers_is_auto():
     fast_cost = cost_fn(trace, fast)
     slow_cost = cost_fn(trace, slow)
     assert fast_cost < slow_cost
-    # K=1024, lane burst = 8 — folded form is 128 MACs (× 4 cyc) + 1 JUMP cyc;
-    # unrolled form is 1024 MACs × 4 cyc.
-    assert fast_cost == 128 * 4 + 1
-    assert slow_cost == 1024 * 4
+    # Lever 3 (SPEC-025 §4.4): the default (crf_issue absent => per_workid)
+    # cost is now the per-work-id body * n_workids -- a uniform scale that
+    # preserves the fast-vs-slow ranking. The work-id count is derived from
+    # target geometry, never a literal (§4.2).
+    from allo.spmw_cost_models import _samsung_workid_count
+
+    n = _samsung_workid_count(target)
+    # K=1024, lane burst = 8 — folded body is 128 MACs (× 4 cyc) + 1 JUMP cyc;
+    # unrolled body is 1024 MACs × 4 cyc; both replicated across n work-ids.
+    assert fast_cost == (128 * 4 + 1) * n
+    assert slow_cost == (1024 * 4) * n
 
 
 # --------------------------------------------------------------------- #
@@ -188,7 +196,21 @@ def test_compile_with_autoschedule_emits_canonical_bytes():
     schedule = allo.customize(gemv_top, enable_tensor=False)
     trace = allo.match_workload(target, schedule.module)
 
-    compiled = allo.compile_for_target(target, trace)
+    # SPEC-025 §7 gate: the per-work-id default emit path stays byte-for-byte
+    # (128 EVEN + 128 ODD MAC+JUMP pairs). Lever-3 argmin now prefers the
+    # shared CRF body (1 pair + host triggers), so pin the per_workid
+    # candidate to exercise the replicated body here.
+    from allo.spmw_autoschedule import _bucket_for_autoschedule
+
+    matches = _bucket_for_autoschedule(trace)[0][1]
+    per_workid = next(
+        p
+        for p in _samsung_enumerate(target, matches)
+        if p.mode.split("+", 1)[0] == "dual_fiber"
+        and p.extra.get("crf_issue") == "per_workid"
+        and p.extra.get("grf_residency", {}).get("local_W") == "host"
+    )
+    compiled = allo.compile_for_target(target, trace, per_workid)
 
     lanes, n_fibers = 8, 2
     split_jump = PIMCmd(
@@ -253,7 +275,8 @@ def test_samsung_enumerator_returns_two_candidates():
     target = build_samsung_target()
     candidates = _samsung_enumerate(target, _synthetic_mac_trace().matches)
     assert len(candidates) >= 2, len(candidates)
-    modes = {c.mode for c in candidates}
+    # Lever 3 (SPEC-025) appends a `+crf_*` token to `mode`; match base tokens.
+    modes = {c.mode.split("+", 1)[0] for c in candidates}
     assert {"bank_row", "grf_staged"} <= modes, modes
 
 
@@ -270,7 +293,10 @@ def test_samsung_argmin_picks_dual_fiber():
     layouts = autoschedule(target, trace)
     assert len(layouts) == 1
     chosen = layouts[0]
-    assert chosen.mode == "dual_fiber", chosen.mode
+    # Lever 3 (SPEC-025): argmin now also picks the shared CRF issue mode,
+    # so `mode` reads `dual_fiber+crf_shared`; the base token is dual_fiber.
+    assert chosen.mode.split("+", 1)[0] == "dual_fiber", chosen.mode
+    assert chosen.extra.get("crf_issue") == "shared", chosen.extra
     y_handle = chosen.placements["local_x"]
     assert isinstance(y_handle, MemoryRef), (
         f"dual_fiber y is the EVEN bank MemoryRef; got {y_handle!r}"

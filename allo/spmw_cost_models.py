@@ -79,6 +79,22 @@ def _kernel_cycles_factory(target):
     )
 
 
+def _samsung_workid_count(target) -> int:
+    """Product of unit-tree fanouts = number of PIM blocks the CRF body is
+    issued across in per-work-id mode (SPEC-025 §4.2).
+
+    Pure target geometry; no shape literal. For the Samsung fixture this
+    is the synthetic root's [1] x pseudo_channel [16] x pim [8] = 128, but
+    it is *computed* from the tree, valid for any topology. The forbidden
+    literal 128 never appears.
+    """
+    n = 1
+    for u in target._walk():
+        for f in u.mapping:
+            n *= f
+    return n
+
+
 def _samsung_kernel_cycles(target):
     """Samsung HBM-PIM kernel-cycle estimator.
 
@@ -89,6 +105,10 @@ def _samsung_kernel_cycles(target):
     mac_cyc = target.op("MAC").cycles
     jump_cyc = target.move("JUMP").cycles
     lane_burst = target.grf_a.lanes
+    # Lever 3 (SPEC-025 §4): replication factor (geometry, not literal) and
+    # the host per-tile trigger latency for the shared-CRF schedule.
+    n_workids = _samsung_workid_count(target)
+    trigger_cyc = target.move("CRF_TRIGGER").cycles
 
     # Lever 2 (SPEC-024 §4): preload move name from the role's GRF handle,
     # resolved the same way SamsungCtx.resolve_moves does so the priced
@@ -107,7 +127,10 @@ def _samsung_kernel_cycles(target):
         return None
 
     def cost_fn(trace: MatchTrace, layout) -> int:
-        total = 0
+        # `body_cyc` is the per-work-id CRF body cost (folded MAC + JUMP,
+        # minus any host-residency preload saving). Lever 3 (SPEC-025 §4.3)
+        # wraps it with the CRF-issue replication term below.
+        body_cyc = 0
         residency = layout.extra.get("grf_residency", {})
         for match in trace.matches:
             handles = {
@@ -140,14 +163,14 @@ def _samsung_kernel_cycles(target):
                     host_only[load_name] = host_only[load_name] and is_host
             for load_name, dropped in host_only.items():
                 if dropped:
-                    total -= target.move(load_name).cycles
+                    body_cyc -= target.move(load_name).cycles
 
             inner_ub = None
             if match.enclosing_loops:
                 inner_ub = _parse_loop_bound(match.enclosing_loops[-1][2])
             if inner_ub is None:
                 # Without an inner loop we can't bound the work; assume 1 op.
-                total += mac_cyc
+                body_cyc += mac_cyc
                 continue
 
             # is_auto is set when src1 is bank-shaped — the bank read
@@ -166,11 +189,25 @@ def _samsung_kernel_cycles(target):
                 # Ceil-split so an odd fold still bounds the busier fiber;
                 # one JUMP folds each fiber's own inner loop.
                 per_fiber = (folded + n_fibers - 1) // n_fibers
-                total += per_fiber * mac_cyc + n_fibers * jump_cyc
+                body_cyc += per_fiber * mac_cyc + n_fibers * jump_cyc
             else:
-                total += inner_ub * mac_cyc
+                body_cyc += inner_ub * mac_cyc
 
-        return total
+        # Lever 3 (SPEC-025 §4.3): wrap the per-work-id body with the
+        # CRF-issue replication term. per_workid replicates the CRF body
+        # across every PIM block (body_cyc * n_workids); shared programs the
+        # body once and the host fires one trigger per work-id (body_cyc +
+        # trigger_cyc * n_workids). Default per_workid keeps the pre-lever-3
+        # argmin among y-placements unchanged (uniform x n_workids scale,
+        # SPEC-025 §4.4). Other backends never set crf_issue.
+        crf_issue = layout.extra.get("crf_issue", "per_workid")
+        if crf_issue == "shared":
+            return body_cyc + trigger_cyc * n_workids
+        if crf_issue == "per_workid":
+            return body_cyc * n_workids
+        raise ValueError(
+            f"samsung kernel_cycles: unknown crf_issue {crf_issue!r}"
+        )
 
     return cost_fn
 

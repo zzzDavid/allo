@@ -148,6 +148,22 @@ def build_samsung_target():
                     cycles=1,
                     emit=lambda ctx: None,
                 )
+                # CRF_TRIGGER (SPEC-025 §6): host per-tile fire latency in
+                # the shared-CRF schedule. The host issues one trigger per
+                # work-id against the single broadcast CRF program rather
+                # than re-uploading the CRF body per work-id. Cost is the
+                # host-side per-command issue latency (tCCDL-class; Samsung
+                # ISCA'21 §4.2 PIM-command issue spacing) -- strictly less
+                # than a per-work-id CRF body (folded MAC + JUMP, >= 258 cyc
+                # for the fast dual-fiber candidate at K=1024), which is the
+                # invariant that makes shared CRF win in argmin (SPEC-025
+                # §4.5). No codegen emits a PIMCmd for it; it rides the host
+                # schedule side-list (SPEC-025 §5.4).
+                allo.move(
+                    "CRF_TRIGGER", src=grf_b, dst=grf_b,
+                    cycles=2,
+                    emit=lambda ctx: None,
+                )
 
                 any_bank = allo.any_(banks)
                 any_reg = allo.any_([grf_a, grf_b])

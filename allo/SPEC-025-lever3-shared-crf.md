@@ -451,3 +451,47 @@ New test file `tests/spmw/test_samsung_shared_crf.py`:
 - **Fixture**: add `CRF_TRIGGER` Move (cycles < body_cyc, cited).
 - **Decision in argmin; mechanism in codegen.** No shared-file edit. No
   simulator edit. Rollback = drop the shared variant.
+
+---
+
+## Implemented (task 051, coder)
+
+Built on levers 1+2 (allo@52713c1). All under `experiments/allo/`:
+
+- `allo/spmw_autoschedule.py`: `_join_mode` + `_with_crf_modes` helpers;
+  enumerator crosses every residency candidate with
+  `{shared, per_workid}` tagged `extra["crf_issue"]` (mode suffix
+  `+crf_shared`/`+crf_per_workid`). No shape branch.
+- `allo/spmw_cost_models.py`: `_samsung_workid_count(target)` (unit-tree
+  fanout product, = 128 for the fixture, derived). `_samsung_kernel_cycles`
+  accumulates `body_cyc` then wraps: shared = `body_cyc + trigger_cyc*n`,
+  per_workid (default) = `body_cyc*n`; `trigger_cyc =
+  target.move("CRF_TRIGGER").cycles`.
+- `allo/spmw_codegen.py`: `HostTrigger(work_id, tile_count)` dataclass;
+  `CodegenContext.host_schedule`; `Compiled.host_schedule`. `_walk_and_emit`
+  reads `extra["crf_issue"]`: shared emits ONE bucket body + one
+  HostTrigger/work-id, with a geometry-agreement guard (asserts
+  `len(buckets)==n_workids` for multi-work-id traces; single-bucket
+  sub-traces exempt). Per-work-id default path byte-for-byte unchanged.
+  Dual-fiber detection now reads the base `mode` token (split on `+`) so
+  the lever-3 suffix does not disable lever-1's odd-fiber MAC.
+- `tests/spmw/_fixtures.py`: `CRF_TRIGGER` Move, `cycles=2` (host
+  per-tile fire latency, tCCDL-class; strictly < the >=258-cyc fast body,
+  cited inline).
+- `tests/spmw/test_samsung_shared_crf.py` (new, 6 tests): both modes
+  offered, shared cost < per_workid by the derived gap, workid-count is
+  geometry, ranking flips on CRF_TRIGGER perturbation, codegen emits one
+  body + 128 triggers, full autoschedule argmins to shared.
+- Regression-gate updates (mode-suffix tolerance + pinned per_workid for
+  byte gates): `test_autoschedule.py`, `test_codegen_gemv.py`,
+  `test_move_scheduling.py`.
+
+Measurement @ 4096x1024 (faithful run path, `--faithful`):
+- argmin picks `dual_fiber+crf_shared` (host residency); cost 488 vs
+  per_workid 29696.
+- shared: **15251 cycles**, `len(compiled.cmds)=5` (4 after ISA filter),
+  `host_schedule=128`.
+- per_workid: **362689 cycles**, `len(compiled.cmds)=384` (512 after
+  fiber expansion / before ISA filter; 256 MACs).
+- shared matches the lever-2 native-folded baseline (15251) and beats
+  per_workid ~23.8x via fewer issued CRF MACs.

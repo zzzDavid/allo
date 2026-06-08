@@ -116,22 +116,32 @@ def _apu_v1_synthetic_trace() -> MatchTrace:
 
 
 def _samsung_crf_dual_fiber(target, trace):
-    """The crf-residency dual_fiber Placement the enumerator emits.
+    """The crf-residency, per-work-id dual_fiber Placement the enumerator
+    emits.
 
     Lever 2 (SPEC-024) makes argmin prefer the *host*-residency variant
-    (LD_A omitted, native broadcast fills GRF_A). To exercise the crf
-    MOV emission these tests pin the explicit crf dual_fiber candidate
-    instead of letting autoschedule pick host.
+    (LD_A omitted, native broadcast fills GRF_A); lever 3 (SPEC-025) makes
+    argmin prefer the *shared*-CRF variant (one body, not per-work-id). To
+    exercise the per-work-id crf MOV emission these tests pin the explicit
+    crf + per_workid dual_fiber candidate (`mode` now carries the lever-3
+    token suffix, so match on the base token + the two `extra` keys).
     """
     from allo.spmw_autoschedule import _samsung_enumerate
 
     matches = trace.matches
     for p in _samsung_enumerate(target, matches):
-        if p.mode == "dual_fiber" and all(
-            v == "crf" for v in p.extra.get("grf_residency", {}).values()
+        if (
+            p.mode.split("+", 1)[0] == "dual_fiber"
+            and p.extra.get("crf_issue") == "per_workid"
+            and all(
+                v == "crf"
+                for v in p.extra.get("grf_residency", {}).values()
+            )
         ):
             return p
-    raise AssertionError("enumerator produced no crf dual_fiber candidate")
+    raise AssertionError(
+        "enumerator produced no crf per_workid dual_fiber candidate"
+    )
 
 
 def test_samsung_gemv_emits_ld_mac_jump_st_per_workid():

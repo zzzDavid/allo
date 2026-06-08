@@ -59,6 +59,23 @@ class PIMCmd:
     isRelu_: int = 0
 
 
+@dataclass
+class HostTrigger:
+    """Lever 3 (SPEC-025 §5.4): one host-issued CRF fire for a work-id.
+
+    In shared-CRF mode the CRF body is uploaded once (`programCrf`) and
+    the host fires it per work-id rather than re-uploading the body.
+    A trigger is NOT a `PIMCmd` -- it never flows through `programCrf`'s
+    `<=4`-burst CRF upload / `validationCheck`. It rides a side-list
+    (`Compiled.host_schedule`) the faithful run path reads. `tile_count`
+    is the per-work-id output-tile fire count derived from the loop bound
+    the body's JUMP folds, never a shape literal.
+    """
+
+    work_id: int
+    tile_count: int
+
+
 # --------------------------------------------------------------------- #
 # Generic walker
 # --------------------------------------------------------------------- #
@@ -81,6 +98,11 @@ class CodegenContext:
         # excludes it). Default-empty for every backend that never sets
         # host residency.
         self.host_preloads: list[tuple[str, str]] = []
+        # Lever 3 (SPEC-025 §5.3): in shared-CRF mode the CRF body is
+        # emitted once into `cmds` and the per-work-id fires are recorded
+        # here as HostTrigger records (not PIMCmds). Default-empty for the
+        # per-work-id path and every non-Samsung backend.
+        self.host_schedule: list["HostTrigger"] = []
 
     def cmd(self, name: str, **fields):  # pragma: no cover - abstract
         raise NotImplementedError(
@@ -285,9 +307,14 @@ class SamsungCtx(CodegenContext):
         # just-emitted MAC body, so the call must stay inside the
         # work-id window between compute and storeback.
         placement = self._active_placement
+        # Lever 3 appends a `+crf_shared`/`+crf_per_workid` token to `mode`
+        # for audit legibility (SPEC-025 §3.1); the lever-1 dual-fiber
+        # signal is the base mode token, so split on the `+` joiner rather
+        # than matching the whole (possibly-suffixed) string.
+        base_mode = getattr(placement, "mode", "").split("+", 1)[0]
         if (
             placement is not None
-            and getattr(placement, "mode", "") == "dual_fiber"
+            and base_mode == "dual_fiber"
             and match.target_op_name == "MAC"
         ):
             self._emit_dual_fiber_jumps(match, n_emitted)
@@ -1432,7 +1459,7 @@ def _walk_and_emit(
     for (func_name, _), layout in zip(_bucket_for_autoschedule(trace), layouts):
         layout_by_func[func_name] = layout
 
-    for _work_id, matches in _bucket_by_work_id(trace):
+    def _emit_one_bucket(matches: list[MatchedOp]) -> None:
         # All matches in one work-id bucket share a func_name (work_id
         # is parsed from func_name in the matcher). Take the first.
         func_name = matches[0].func_name
@@ -1496,6 +1523,91 @@ def _walk_and_emit(
             n_emitted = len(ctx.cmds) - before
             ctx.after_match(match, n_emitted)
         _schedule_moves(target, ctx, layout, role_to_memref, phase="post")
+
+    buckets = _bucket_by_work_id(trace)
+
+    # Lever 3 (SPEC-025 §5): the CRF-issue mode is a decided property of the
+    # layout (`extra["crf_issue"]`, set by argmin). Codegen only
+    # materialises it -- it never chooses on shape/count/stream length.
+    # Default-missing key == "per_workid", so every pre-lever-3 placement
+    # and every non-Samsung backend takes the replicated path unchanged.
+    crf_issue = "per_workid"
+    for layout in layouts:
+        issue = getattr(layout, "extra", {}).get("crf_issue")
+        if issue is not None:
+            crf_issue = issue
+            break
+
+    if crf_issue == "shared":
+        # Shared CRF: per kernel, emit ONE representative CRF body (walked
+        # through the normal emit path -- generated from the Placement, not
+        # a golden table, SPEC-025 §5.5) and record one host trigger per
+        # work-id bucket. A single-kernel GEMV thus emits one body + N
+        # triggers; a multi-kernel workload (MLP) emits one body per layer
+        # (each layer's CRF is its own shared program).
+        from .spmw_cost_models import _samsung_workid_count
+
+        def _base_kernel(m) -> str:
+            # The grid replicates ONE logical `@allo.work` kernel across
+            # work-ids by suffixing the func_name with the work_id coords
+            # (e.g. `gemv` -> `gemv_0_0`..`gemv_15_7`). Strip that suffix so
+            # all grid replicas of one kernel share a base name and collapse
+            # to one shared CRF body, while genuinely-distinct kernels (an
+            # MLP's `mlp_layer1` vs `mlp_layer2`) stay separate. The number
+            # of suffixed coords is len(work_id).
+            fn = m.func_name
+            wid = m.work_id or ()
+            for coord in reversed(wid):
+                tail = f"_{coord}"
+                if fn.endswith(tail):
+                    fn = fn[: -len(tail)]
+            return fn
+
+        # Group buckets by base kernel, preserving first-seen order. Grid
+        # replicas of one kernel share a body; distinct kernels do not.
+        per_kernel: dict[str, list] = {}
+        kernel_order: list[str] = []
+        for work_id, matches in buckets:
+            fn = _base_kernel(matches[0])
+            if fn not in per_kernel:
+                per_kernel[fn] = []
+                kernel_order.append(fn)
+            per_kernel[fn].append((work_id, matches))
+
+        expected = _samsung_workid_count(target)
+        for fn in kernel_order:
+            k_buckets = per_kernel[fn]
+            # One shared body for this kernel (the first work-id bucket).
+            _emit_one_bucket(k_buckets[0][1])
+            for work_id, matches in k_buckets:
+                # tile_count = the per-work-id output-tile fire count (the
+                # MAC sites the host fires for this work-id), from the
+                # bucket's matches, not a shape literal.
+                tile_count = sum(
+                    1 for m in matches if m.target_op_name == "MAC"
+                )
+                ctx.host_schedule.append(HostTrigger(work_id, tile_count))
+            # SPEC-025 §5.3 agreement guard: a single full-grid GEMV kernel's
+            # work-id axis must equal the unit-tree fanout product, else the
+            # trigger schedule would be mispriced. Only a single-kernel
+            # workload spans the full grid; a multi-kernel layer
+            # (mapping=[1], etc.) legitimately walks fewer work-ids, so the
+            # guard applies only when this is the sole kernel.
+            if (
+                len(kernel_order) == 1
+                and len(k_buckets) > 1
+                and len(k_buckets) != expected
+            ):
+                raise ValueError(
+                    "samsung shared-CRF: single-kernel trace has "
+                    f"{len(k_buckets)} work-id buckets but target geometry "
+                    f"yields {expected} (unit-tree fanout product); the "
+                    "shared-CRF trigger schedule would be mispriced."
+                )
+        return
+
+    for _work_id, matches in buckets:
+        _emit_one_bucket(matches)
 
 
 # --------------------------------------------------------------------- #
@@ -2505,6 +2617,12 @@ class Compiled:
         # `UPMEMCtx.get_kernel_src()` to render the full DPU envelope
         # around `cmds`. Other backends ignore the field.
         self._ctx = ctx
+        # Lever 3 (SPEC-025 §5.4): shared-CRF host trigger schedule (one
+        # HostTrigger per work-id), parallel to `cmds`. Empty for the
+        # per-work-id path and every non-Samsung backend.
+        self.host_schedule: list[HostTrigger] = list(
+            getattr(ctx, "host_schedule", []) or []
+        )
 
     def run(self, **inputs) -> RunResult:
         """Run this compiled artifact on its target backend.

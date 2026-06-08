@@ -64,15 +64,28 @@ def _samsung_trace(work_ids: list[tuple[int, ...]]) -> MatchTrace:
 
 def _candidate(target, trace, mode: str, residency: str) -> Placement:
     """Pick the `mode` candidate from the enumerator and force `x`
-    (local_W) to the requested residency."""
+    (local_W) to the requested residency.
+
+    Lever 3 (SPEC-025) appends a `+crf_*` token to `mode`; these lever-2
+    receipts exercise per-work-id emission (LD_A MOV per work-id), so
+    select the per_workid CRF-issue variant and match the base token.
+    """
     for p in _samsung_enumerate(target, trace.matches):
-        if p.mode == mode and all(
-            v == residency for v in p.extra.get("grf_residency", {}).values()
+        if (
+            p.mode.split("+", 1)[0] == mode
+            and p.extra.get("crf_issue", "per_workid") == "per_workid"
+            and all(
+                v == residency
+                for v in p.extra.get("grf_residency", {}).values()
+            )
         ):
             return p
-    # Fall back: take the base mode candidate and stamp residency.
+    # Fall back: take the per_workid base mode candidate and stamp residency.
     for p in _samsung_enumerate(target, trace.matches):
-        if p.mode == mode:
+        if (
+            p.mode.split("+", 1)[0] == mode
+            and p.extra.get("crf_issue", "per_workid") == "per_workid"
+        ):
             return _with_residency(p, "local_W", residency)
     raise AssertionError(f"no {mode!r} candidate")
 
@@ -137,6 +150,13 @@ def test_samsung_host_residency_priced_cheaper():
     target = build_samsung_target()
     cost_fn = allo.get_cost("kernel_cycles", target)
     ld_a = target.move("LD_A").cycles
+    # Lever 3 (SPEC-025 §4.4): the per_workid body cost is now scaled by the
+    # unit-tree fanout product. The lever-2 LD_A saving rides that uniform
+    # scale, so the differential is geom * n_trace_workids * LD_A; derive
+    # geom from target geometry (no literal).
+    from allo.spmw_cost_models import _samsung_workid_count
+
+    geom = _samsung_workid_count(target)
 
     savings = {}
     for n_workids in (1, 4):
@@ -148,9 +168,9 @@ def test_samsung_host_residency_priced_cheaper():
         host_cost = cost_fn(trace, host)
         assert host_cost < crf_cost, (host_cost, crf_cost)
         savings[n_workids] = crf_cost - host_cost
-        # Saving == n_workids * LD_A.cycles (no shape literal; read off
-        # the move spec and the work-id count).
-        assert savings[n_workids] == n_workids * ld_a
+        # Saving == geom * n_workids * LD_A.cycles (no shape literal; read
+        # off the move spec, the trace work-id count, and target geometry).
+        assert savings[n_workids] == geom * n_workids * ld_a
 
     # The differential scales with the work-id count -- 4x as many
     # work-ids => 4x the saving.
@@ -200,7 +220,8 @@ def test_samsung_argmin_picks_host_residency():
     layouts = autoschedule(target, trace)
     assert len(layouts) == 1
     chosen = layouts[0]
-    assert chosen.mode == "dual_fiber", chosen.mode
+    # Lever 3 (SPEC-025) appends a `+crf_*` token; match the base mode.
+    assert chosen.mode.split("+", 1)[0] == "dual_fiber", chosen.mode
     assert chosen.extra.get("grf_residency", {}).get("local_W") == "host", (
         chosen.extra.get("grf_residency")
     )
@@ -219,7 +240,7 @@ def test_samsung_enumerator_offers_both_residencies():
     }
     assert {"crf", "host"} <= residencies, residencies
     # Both residencies appear for the dual_fiber mode specifically.
-    dual = [c for c in candidates if c.mode == "dual_fiber"]
+    dual = [c for c in candidates if c.mode.split("+", 1)[0] == "dual_fiber"]
     dual_res = {
         c.extra.get("grf_residency", {}).get("local_W", "crf") for c in dual
     }
