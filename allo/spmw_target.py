@@ -196,10 +196,16 @@ class Op:
 class Unit:
     """A node in the target's unit tree."""
 
-    def __init__(self, name, mapping, parent=None):
+    def __init__(self, name, mapping, parent=None, mode=None):
         self.name = name
         self.mapping = list(mapping) if mapping is not None else []
         self.parent = parent
+        # `mode="host"` marks a host-side staging node (design 05 §Q3); the
+        # device tree hangs under it. `None` for ordinary device units.
+        self.mode = mode
+        # Host-collective interface instance attached by @allo.host_xcel
+        # (only ever non-None on a mode="host" unit).
+        self.host_xcel = None
         self.children: list[Unit] = []
         self.memories: dict[str, Memory] = {}
         self.registers: dict[str, Register] = {}
@@ -294,14 +300,20 @@ def target(name):
     return decorator
 
 
-def unit(mapping):
-    """Decorator: registers a child Unit on the enclosing scope."""
+def unit(mapping=None, *, mode=None):
+    """Decorator: registers a child Unit on the enclosing scope.
+
+    `mode="host"` (default `None`) marks a host-side staging node; the
+    device unit tree hangs under it (design 05 §Q3). A host unit needs no
+    `mapping`. FPGA/AIE never call `@allo.unit`, so the new kwarg is inert
+    outside the spmw path.
+    """
 
     def decorator(fn):
         if not _target_stack:
             raise RuntimeError("@allo.unit must be used inside @allo.target")
         parent = _target_stack[-1]
-        u = Unit(fn.__name__, mapping=mapping, parent=parent)
+        u = Unit(fn.__name__, mapping=mapping, parent=parent, mode=mode)
         parent.children.append(u)
         _target_stack.append(u)
         try:
@@ -389,6 +401,79 @@ def get_uid():
 # ---------------- step C: move / op / any_ / or_ ---------------- #
 
 
+# Host-staging stub move-name prefixes/names: a `src==dst` move under one of
+# these names was a fake host self-move (design 05 §0). After task-017 these
+# are deleted; the validation rejects any re-introduction (§Q3).
+_HOST_STAGING_STUB_NAMES = ("CRF_TRIGGER",)
+_HOST_STAGING_STUB_PREFIXES = ("PRELOAD_", "READBACK_")
+
+
+def _handle_unit(h):
+    """The owning `Unit` of a concrete handle (Register / MemoryRef /
+    Memory), or None for patterns (`AnyOf`/`OrOf`/tuple) that have no single
+    owner."""
+    if isinstance(h, Register):
+        return h.owner
+    if isinstance(h, MemoryRef):
+        return h.memory.owner
+    if isinstance(h, Memory):
+        return h.owner
+    return None
+
+
+def _is_host_side(unit) -> bool:
+    """True if `unit` or any ancestor is a `mode="host"` node."""
+    while unit is not None:
+        if getattr(unit, "mode", None) == "host":
+            return True
+        unit = unit.parent
+    return False
+
+
+def _is_host_staging_stub_name(name: str) -> bool:
+    return name in _HOST_STAGING_STUB_NAMES or any(
+        name.startswith(p) for p in _HOST_STAGING_STUB_PREFIXES
+    )
+
+
+def _validate_move(name, src, dst, emit):
+    """Cross-boundary `Move` validation (design 05 §Q3, refined, task-017).
+
+    Two rules, both checkable from the target tree alone:
+
+    1. **Same-side `src==dst` self-move** is forbidden ONLY when it is a
+       host-staging stub — i.e. `emit is None` OR the name matches a
+       host-staging stub (`PRELOAD_*`/`READBACK_*`/`CRF_TRIGGER`). A
+       `src==dst` move with a real `emit` callback (e.g. the device control
+       op `JUMP`, `grf_b->grf_b`, `emit=lambda ctx: ...`) is ALLOWED — it is
+       a legitimate device control move, not a fake host stub.
+    2. A move whose `src` and `dst` are on **opposite sides** of the host
+       boundary (one under a `mode="host"` unit, one under a device unit)
+       is a host collective and must go through the `HostXcel` surface, not
+       a bare `allo.move`.
+    """
+    # rule 1: self-move that is a host-staging stub
+    if src is dst:
+        if emit is None or _is_host_staging_stub_name(name):
+            raise ValueError(
+                f"move {name!r} is a forbidden host-staging self-move "
+                f"(src is dst with {'emit=None' if emit is None else 'a host-staging stub name'}); "
+                f"host<->device staging must be declared via the HostXcel "
+                f"surface, not a bare allo.move (design 05 §Q3)"
+            )
+    # rule 2: cross-boundary bare move
+    su, du = _handle_unit(src), _handle_unit(dst)
+    if su is not None and du is not None:
+        if _is_host_side(su) != _is_host_side(du):
+            raise ValueError(
+                f"move {name!r} straddles the host<->device boundary "
+                f"(src under {'host' if _is_host_side(su) else 'device'}, "
+                f"dst under {'host' if _is_host_side(du) else 'device'}); "
+                f"a cross-boundary transfer is a host collective and must be "
+                f"declared via the HostXcel surface (design 05 §Q3)"
+            )
+
+
 def move(name, src, dst, emit=None, cycles=None):
     """Attach a Move to the current unit; return the handle."""
     if not _target_stack:
@@ -396,6 +481,7 @@ def move(name, src, dst, emit=None, cycles=None):
     cur = _target_stack[-1]
     if name in cur.moves:
         raise ValueError(f"duplicate move name {name!r} on unit {cur.name!r}")
+    _validate_move(name, src, dst, emit)
     m = Move(cur, name, src, dst, emit=emit, cycles=cycles)
     cur.moves[name] = m
     return m

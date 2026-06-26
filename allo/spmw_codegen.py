@@ -2281,19 +2281,21 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
         )
 
 
-def _layout_weight_resident(layout) -> bool:
-    """Read the chosen placement's `weight_resident` flag (SPEC-026 §4.1).
+def _layout_stage_resident(layout) -> bool:
+    """Read the chosen placement's structural `stage_resident` flag.
 
-    `Compiled.layout` is a single Placement (one kernel) or a list. The
-    batched run path is single-GEMV; default-absent key -> False (the
-    pre-026 non-resident shape). Codegen materialises this decision; it
-    does not re-decide (I5).
+    Bridge option (b) (task-017): renamed off `weight_resident`; the
+    host_staging cost split and this run-path preload sequencing both read
+    the same flag. `Compiled.layout` is a single Placement (one kernel) or a
+    list. The batched run path is single-GEMV; default-absent key -> False
+    (the non-resident shape). Codegen materialises this decision; it does
+    not re-decide (I5).
     """
     if isinstance(layout, list):
         layout = layout[0] if layout else None
     if layout is None:
         return False
-    return bool(getattr(layout, "extra", {}).get("weight_resident", False))
+    return bool(getattr(layout, "extra", {}).get("stage_resident", False))
 
 
 def _samsung_batched_invoke(
@@ -2377,7 +2379,7 @@ def _run_samsung_batched(
     """Batched-GEMV run path (SPEC-026 §4.2/§4.3).
 
     Emits the Tenon stream (preload once + B*(exec+readback), selected by
-    the chosen placement's `weight_resident` flag) AND, when
+    the chosen placement's `stage_resident` flag) AND, when
     `compare_native` is set, the native rebaseline (B*(preload+exec+
     readback)) under the SAME faithful instrument, cmd stream, W, and
     X(B,K). Only the preload-loop placement differs (I2). B = X.shape[0]
@@ -2418,10 +2420,10 @@ def _run_samsung_batched(
 
     pim_cmds = [c for c in pim_cmds if _crf_valid(c)]
 
-    resident = _layout_weight_resident(compiled.layout)
+    resident = _layout_stage_resident(compiled.layout)
     # Tenon: resident mode preloads once when B>1; the driver reads the
     # resident vs native loop from --native-rebaseline (absent => resident).
-    # If the chosen placement is NOT weight_resident, Tenon's own run is the
+    # If the chosen placement is NOT stage_resident, Tenon's own run is the
     # native (re-preload-per-vector) sequencing -- codegen materialises the
     # decision argmin made, it does not override it.
     tenon_total, tenon_phases, tenon_out = _samsung_batched_invoke(
@@ -2432,7 +2434,7 @@ def _run_samsung_batched(
     extra = {
         "kernel": "GEMV",
         "batch": B,
-        "weight_resident": resident,
+        "stage_resident": resident,
         "tenon_total": tenon_total,
         "tenon_phases": tenon_phases,
     }
@@ -3085,7 +3087,7 @@ class Compiled:
     def run_batched(self, W, X, compare_native: bool = True) -> RunResult:
         """Run a batched GEMV (SPEC-026): B input vectors X[B,K] against
         one weight W. Samsung-only. The chosen placement's
-        `weight_resident` flag (set by argmin) selects preload-once vs
+        `stage_resident` flag (set by argmin) selects preload-once vs
         re-preload-per-vector sequencing; codegen materialises it.
 
         `compare_native=True` also runs the native rebaseline comparator

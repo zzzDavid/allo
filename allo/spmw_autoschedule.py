@@ -189,18 +189,23 @@ def _with_crf_modes(base: "Placement") -> list["Placement"]:
     return variants
 
 
-def _with_weight_residency(base: "Placement", resident: bool) -> "Placement":
-    """Copy `base`, setting `extra['weight_resident']`. placements untouched.
+def _with_stage_resident(base: "Placement", resident: bool) -> "Placement":
+    """Copy `base`, stamping the structural `extra['stage_resident']` flag.
 
-    SPEC-026 §2.2: weight residency is a *materialisation* flag (preload W
-    once and reuse across the batch vs re-preload per input vector), the
-    same class as `crf_issue in {shared, per_workid}`. It rides `extra`,
-    not `placements` -- the bank algebra (lever 1's fibers) is unchanged.
-    The cost model (205) earns the resident choice for B>=2; at B=1 the two
-    variants tie (I4) and the existing argmin winner is undisturbed.
+    Bridge option (b) (design 05 §3 / task-017): the host-staging
+    materialisation flag (preload W once and reuse across the batch vs
+    re-preload per input vector). It rides `extra`, not `placements` -- the
+    bank algebra (lever 1's fibers) is unchanged. The `host_staging`
+    CostModel reads this flag to price preload-once vs preload-B; the 013
+    residency hoist stamps the same flag from the language-level
+    `residency="resident"` collective. (Renamed off the deleted
+    `weight_resident` key in task-017; the cost branch that keyed on
+    `weight_resident` is gone -- the split now lives in the host_staging
+    compose.) At B=1 the two variants tie and the argmin winner is
+    undisturbed; the resident one is earned for B>=2.
     """
     new_extra = dict(base.extra)
-    new_extra["weight_resident"] = resident
+    new_extra["stage_resident"] = resident
     return Placement(
         placements=dict(base.placements),
         mode=_join_mode(base.mode, "wresident") if resident else base.mode,
@@ -350,8 +355,8 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     out: list[Placement] = []
     for cand in residency_candidates:
         for crf_cand in _with_crf_modes(cand):
-            out.append(_with_weight_residency(crf_cand, False))
-            out.append(_with_weight_residency(crf_cand, True))
+            out.append(_with_stage_resident(crf_cand, False))
+            out.append(_with_stage_resident(crf_cand, True))
     return out
 
 

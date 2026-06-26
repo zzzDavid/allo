@@ -14,6 +14,21 @@ from .memory import Memory, Layout
 from .dataflow import kernel as work, get_pid as get_wid
 from .spmw_target import target, unit, reg, const, get_uid, move, op, any_, or_
 from .spmw_target import memory as mem
+from .spmw_host import HostXcel, host_xcel, primitive, NotSupported, host_cpu
+from .spmw_host import (
+    broadcast,
+    scatter,
+    gather,
+    reduce,
+    all_reduce,
+    all_gather,
+    reduce_scatter,
+    StageRequest,
+    staging_scope,
+    resolve_staging,
+    weight_resident_from_staging,
+    resolve_collective_axis,
+)
 from .spmw_cost import cost, get_cost
 from .spmw_cost_model import (
     CostModel,

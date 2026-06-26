@@ -20,8 +20,14 @@ from _fixtures import build_upmem_target
 def test_upmem_target_builds():
     target = build_upmem_target()
     assert target.name == "upmem"
-    # device -> rank child.
-    assert len(target.root.children) == 1
+    # device -> exactly one DEVICE child (rank); task-008 additionally hangs
+    # a parallel `mode="host"` staging node off the root (design 05 §7), so
+    # filter to device-side units for the device-tree shape assertion.
+    device_children = [
+        c for c in target.root.children if getattr(c, "mode", None) != "host"
+    ]
+    assert len(device_children) == 1
+    assert device_children[0].name == "rank"
     # DPU-level memories and tasklet-level registers resolve via the
     # flat handle map.
     assert isinstance(target.mram, Memory)

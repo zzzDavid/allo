@@ -183,8 +183,8 @@ def test_samsung_rank_preservation_weight_residency(B):
     cands = _samsung_enumerate(target, matches)
 
     # Pick one representative candidate from each weight_residency arm.
-    wr_false = next(c for c in cands if c.extra.get("weight_resident") is False)
-    wr_true = next(c for c in cands if c.extra.get("weight_resident") is True)
+    wr_false = next(c for c in cands if c.extra.get("stage_resident") is False)
+    wr_true = next(c for c in cands if c.extra.get("stage_resident") is True)
 
     rng = np.random.default_rng(42 + B)
     W = (rng.standard_normal((4096, 1024)) * 0.05).astype(np.float16)

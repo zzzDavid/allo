@@ -149,21 +149,83 @@ def _samsung_mk(target, trace: MatchTrace) -> tuple[int, int]:
     return M, K
 
 
-def _samsung_preload_cycles(model, M: int, K: int) -> int:
+def _samsung_preload_cycles(hs_model, M: int, K: int) -> int:
+    """Preload (broadcast/scatter) staging cost (design 05 §5).
+
+    Re-homed off the old `PRELOAD_*` self-moves onto the `host_staging`
+    CostModel's `STAGE_*` carriers (369/1/2 VERBATIM, task-017). `hs_model`
+    is the `host_staging`-concern CostModel. The arithmetic is unchanged:
+    `(M*K // fan) * per_group + crf_upload`.
+    """
     if M <= 0 or K <= 0:
         return 0
-    write_width = model.move_cost("PRELOAD_FAN", MoveCostCtx("PRELOAD_FAN"))
-    write_cyc = model.move_cost("PRELOAD_WR", MoveCostCtx("PRELOAD_WR"))
-    crf_cyc = model.move_cost("PRELOAD_CRF", MoveCostCtx("PRELOAD_CRF"))
+    write_width = hs_model.move_cost("STAGE_BCAST", MoveCostCtx("STAGE_BCAST"))
+    write_cyc = hs_model.move_cost("STAGE_SCATTER", MoveCostCtx("STAGE_SCATTER"))
+    crf_cyc = hs_model.move_cost("STAGE_CRF", MoveCostCtx("STAGE_CRF"))
     return (M * K // write_width) * write_cyc + crf_cyc
 
 
-def _samsung_readback_cycles(model, M: int) -> int:
+def _samsung_readback_cycles(hs_model, M: int) -> int:
+    """Readback (gather) staging cost (design 05 §5). Re-homed off
+    `READBACK_*` onto the `host_staging` `GATHER_*` carriers (4096/181
+    VERBATIM)."""
     if M <= 0:
         return 0
-    read_width = model.move_cost("READBACK_FAN", MoveCostCtx("READBACK_FAN"))
-    read_cyc = model.move_cost("READBACK_RD", MoveCostCtx("READBACK_RD"))
+    read_width = hs_model.move_cost("GATHER_FAN", MoveCostCtx("GATHER_FAN"))
+    read_cyc = hs_model.move_cost("GATHER_RD", MoveCostCtx("GATHER_RD"))
     return ((M + read_width - 1) // read_width) * read_cyc
+
+
+def _samsung_host_staging_compose_with(hs_model, ctx):
+    """`host_staging`-concern compose (design 05 §5, task-017),
+    parameterised by the bound `host_staging` model so the faithful +
+    optimistic flavors reuse one phase algebra.
+
+    Prices the host<->device staging for a Samsung GEMV: preload
+    (broadcast/scatter the weight) + readback (gather the output). The
+    structural resident flag (`layout.extra["stage_resident"]`, stamped by
+    the 013 hoist via the enumerator — bridge option (b)) selects
+    preload-once (resident) vs preload-B (per-call). Readback is always paid
+    per batch vector.
+
+    Returns a per-phase `CostResult.phases` breakdown so the whole-program
+    combiner can later become `max` for async overlap (design 05 §5,
+    open-Q4) without touching this function; the default combiner is `sum`.
+    Whole-program = kernel_cycles + host_staging.
+    """
+    target = ctx.target
+    trace = ctx.trace
+    layout = ctx.layout
+    M, K = _samsung_mk(target, trace)
+    B = _trace_batch_dim(trace)
+    preload_cyc = _samsung_preload_cycles(hs_model, M, K)
+    readback_cyc = _samsung_readback_cycles(hs_model, M)
+    resident = bool(getattr(layout, "extra", {}).get("stage_resident", False))
+    if resident:
+        stage_resident = preload_cyc          # preload paid ONCE
+        stage_per_call = 0
+    else:
+        stage_resident = 0
+        stage_per_call = B * preload_cyc       # preload paid per vector
+    readback_total = B * readback_cyc
+    cycles = stage_resident + stage_per_call + readback_total
+    return CostResult(
+        cycles=cycles,
+        phases={
+            "stage_resident": stage_resident,
+            "stage_per_call": stage_per_call,
+            "readback": readback_total,
+        },
+        confidence=hs_model.confidence,
+    )
+
+
+def _samsung_host_staging_compose(ctx):
+    return _samsung_host_staging_compose_with(SAMSUNG_HOST_STAGING, ctx)
+
+
+def _samsung_optimistic_host_staging_compose(ctx):
+    return _samsung_host_staging_compose_with(SAMSUNG_OPTIMISTIC_HOST_STAGING, ctx)
 
 
 def _samsung_compose(ctx):
@@ -188,20 +250,38 @@ SAMSUNG_FAITHFUL = CostModel(
         "ST_A": MoveCost(lambda c: 14, note="tCCDL+WL+BL//2"),
         "ST_B": MoveCost(lambda c: 14, note="tCCDL+WL+BL//2"),
         "JUMP": MoveCost(lambda c: 1, note="1-cyc control op"),
+        # CRF_TRIGGER is the lever-3 (SPEC-025 shared-CRF) per-work-id fire
+        # latency, consumed in the DEVICE-exec phase (`trigger_cyc`). It
+        # stays in kernel_cycles (lever 3 is retained, task-017). The old
+        # PRELOAD_*/READBACK_* preload/readback constants re-homed into the
+        # host_staging concern below (SAMSUNG_HOST_STAGING).
         "CRF_TRIGGER": MoveCost(lambda c: 2, note="host per-tile fire latency"),
-        # SPEC-026 §3.2/§3.3 calibration anchors (report 18 §3). PRELOAD_FAN
-        # / READBACK_FAN are fan-out WIDTHS, not cycle counts -- they ride
-        # MoveCost so a pessimistic flavor can recalibrate them without
-        # editing the device tree (design 04 §1.2 edge case).
-        "PRELOAD_FAN": MoveCost(lambda c: 369, note="HAB preload fan-out width"),
-        "PRELOAD_WR": MoveCost(lambda c: 1, note="per-group column-strobe"),
-        "PRELOAD_CRF": MoveCost(lambda c: 2, note="programCrf upload"),
-        "READBACK_FAN": MoveCost(lambda c: 4096, note="readback tile width"),
-        "READBACK_RD": MoveCost(lambda c: 181, note="per-tile readResult"),
     },
     constants={},
     compose=_samsung_compose,
 )
+
+
+# host_staging concern (design 05 §5, task-017): the report-18 preload /
+# readback calibration anchors re-homed VERBATIM off the deleted
+# PRELOAD_*/READBACK_* self-moves. NEW concern on the same
+# (target_name, flavor, concern) registry — not a fresh extraction.
+SAMSUNG_HOST_STAGING = register_cost_model(CostModel(
+    name="samsung_host_staging",
+    target_name="samsung_hbm_pim",
+    flavor="faithful",
+    concern="host_staging",
+    op_costs={},
+    move_costs={
+        "STAGE_BCAST": MoveCost(lambda c: 369, note="HAB preload fan-out width"),
+        "STAGE_SCATTER": MoveCost(lambda c: 1, note="per-group column-strobe"),
+        "STAGE_CRF": MoveCost(lambda c: 2, note="programCrf upload"),
+        "GATHER_FAN": MoveCost(lambda c: 4096, note="readback tile width"),
+        "GATHER_RD": MoveCost(lambda c: 181, note="per-tile readResult"),
+    },
+    constants={},
+    compose=_samsung_host_staging_compose,
+))
 
 
 # ===================================================================== #
@@ -313,6 +393,67 @@ UPMEM_FAITHFUL = CostModel(
     },
     compose=_upmem_compose,
 )
+
+
+def _upmem_host_staging_compose(ctx):
+    """UPMEM `host_staging`-concern compose (design 05 §5/§7, task 008).
+
+    OPT-IN: returns 0 unless the layout carries an explicit host-staging
+    signal (`layout.extra["host_stage"]`). This keeps every existing UPMEM
+    `kernel_cycles` estimate byte-identical when summed through the
+    whole-program seam (the device GEMV traces carry no staging signal, so
+    host_staging = 0).
+
+    When present, `host_stage` is a list of `(collective, fan_degree)` pairs
+    — the fan degree is the PLAIN INT host-side DPU partition fan
+    (`prod(mapping)` of the `over=` unit level, e.g. 2560 / 2552), NEVER a
+    `LinearLayout` (design 05 §1 invariant). A scatter/broadcast costs
+    `fan * STAGE_XFER` (per-DPU prepare+push); a gather costs
+    `fan * GATHER_XFER` (per-DPU copy-from). The non-pow2 fan type-checks and
+    prices with no F2 constraint — the generality proof (T-NONPOW2).
+    """
+    layout = ctx.layout
+    stages = list(getattr(layout, "extra", {}).get("host_stage", []) or [])
+    if not stages:
+        return CostResult(cycles=0, phases={}, confidence="calibrated")
+    xfer = UPMEM_HOST_STAGING.move_cost("STAGE_XFER", MoveCostCtx("STAGE_XFER"))
+    gxfer = UPMEM_HOST_STAGING.move_cost("GATHER_XFER", MoveCostCtx("GATHER_XFER"))
+    scatter_bcast = 0
+    gather = 0
+    for collective, fan in stages:
+        fan = int(fan)  # PLAIN INT — never routed through LinearLayout
+        if collective in ("scatter", "broadcast"):
+            scatter_bcast += fan * xfer
+        elif collective == "gather":
+            gather += fan * gxfer
+        else:
+            raise ValueError(
+                f"upmem host_staging: unknown collective {collective!r}"
+            )
+    cycles = scatter_bcast + gather
+    return CostResult(
+        cycles=cycles,
+        phases={"stage_scatter_bcast": scatter_bcast, "gather": gather},
+        confidence="calibrated",
+    )
+
+
+# UPMEM host_staging concern (design 05 §7, task 008 generality proof). The
+# per-DPU transfer constants (HPCA 2024 §IV CPU<->DPU bandwidth class) price
+# a host-driven scatter/gather/broadcast over the integer DPU fan-out.
+UPMEM_HOST_STAGING = register_cost_model(CostModel(
+    name="upmem_host_staging",
+    target_name="upmem",
+    flavor="faithful",
+    concern="host_staging",
+    op_costs={},
+    move_costs={
+        "STAGE_XFER": MoveCost(lambda c: 1000, note="per-DPU prepare+push (MRAM-class)"),
+        "GATHER_XFER": MoveCost(lambda c: 1000, note="per-DPU copy-from (MRAM-class)"),
+    },
+    constants={},
+    compose=_upmem_host_staging_compose,
+))
 
 
 # ===================================================================== #
@@ -565,20 +706,16 @@ def _samsung_compose_with(model, ctx):
             f"samsung kernel_cycles: unknown crf_issue {crf_issue!r}"
         )
 
-    M, K = _samsung_mk(target, trace)
-    preload_cyc = _samsung_preload_cycles(model, M, K)
-    readback_cyc = _samsung_readback_cycles(model, M)
+    # kernel_cycles is now the DEVICE-exec body ONLY (task-017): preload /
+    # readback re-homed into the host_staging concern, composed at the
+    # whole-program seam (`_kernel_cycles_factory`:
+    # whole-program = kernel_cycles + host_staging). The `weight_resident`
+    # batching branch is deleted — preload-once vs preload-B is now the
+    # host_staging compose's job (it reads `layout.extra["stage_resident"]`,
+    # bridge option (b)). Exec is paid per batch vector.
     B = _trace_batch_dim(trace)
-    weight_resident = layout.extra.get("weight_resident", False)
-    if weight_resident:
-        cycles = preload_cyc + B * (exec_cyc + readback_cyc)
-    else:
-        cycles = B * (preload_cyc + exec_cyc + readback_cyc)
-    phases = {
-        "preload": preload_cyc,
-        "exec": exec_cyc,
-        "readback": readback_cyc,
-    }
+    cycles = B * exec_cyc
+    phases = {"exec": exec_cyc}
     if dynamic:
         phases["dynamic_assumed"] = 1
     return CostResult(
@@ -602,17 +739,36 @@ SAMSUNG_OPTIMISTIC = CostModel(
         "ST_B": MoveCost(lambda c: 7),
         "JUMP": MoveCost(lambda c: 1),
         "CRF_TRIGGER": MoveCost(lambda c: 1),
-        "PRELOAD_FAN": MoveCost(lambda c: 738, note="optimistic: 2x fan-out"),
-        "PRELOAD_WR": MoveCost(lambda c: 1),
-        "PRELOAD_CRF": MoveCost(lambda c: 2),
-        "READBACK_FAN": MoveCost(lambda c: 4096),
-        "READBACK_RD": MoveCost(lambda c: 90),
+        # PRELOAD_*/READBACK_* re-homed into the host_staging concern
+        # (task-017); SAMSUNG_OPTIMISTIC_HOST_STAGING carries the optimistic
+        # preload/readback re-calibration below.
     },
     constants={},
     compose=_samsung_optimistic_compose,
     flavor="optimistic",
     confidence="coarse",
 )
+
+
+# Optimistic host_staging flavor (so the virtual backend's whole-program
+# estimate for cost_flavor="optimistic" stays consistent with the seam).
+SAMSUNG_OPTIMISTIC_HOST_STAGING = register_cost_model(CostModel(
+    name="samsung_optimistic_host_staging",
+    target_name="samsung_hbm_pim",
+    flavor="optimistic",
+    concern="host_staging",
+    op_costs={},
+    move_costs={
+        "STAGE_BCAST": MoveCost(lambda c: 738, note="optimistic: 2x fan-out"),
+        "STAGE_SCATTER": MoveCost(lambda c: 1),
+        "STAGE_CRF": MoveCost(lambda c: 2),
+        "GATHER_FAN": MoveCost(lambda c: 4096),
+        "GATHER_RD": MoveCost(lambda c: 90),
+    },
+    constants={},
+    compose=_samsung_optimistic_host_staging_compose,
+    confidence="coarse",
+))
 
 
 # ===================================================================== #

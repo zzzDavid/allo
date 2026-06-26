@@ -45,14 +45,19 @@ def _samsung_mk(target, trace):
 
 
 def _samsung_preload_cycles(target, M, K):
+    # Re-homed: preload constants now live on the host_staging concern
+    # (task-017). The shim reads that model so callers (tests) get the same
+    # 369/1/2 arithmetic from the new home.
     return _tables._samsung_preload_cycles(
-        get_cost_model("samsung_hbm_pim", "faithful"), M, K
+        get_cost_model("samsung_hbm_pim", "faithful", concern="host_staging"),
+        M, K,
     )
 
 
 def _samsung_readback_cycles(target, M):
     return _tables._samsung_readback_cycles(
-        get_cost_model("samsung_hbm_pim", "faithful"), M
+        get_cost_model("samsung_hbm_pim", "faithful", concern="host_staging"),
+        M,
     )
 
 
@@ -95,20 +100,44 @@ def _apu_v2_kernel_cycles(target):
 # --------------------------------------------------------------------- #
 
 
+def _whole_program_sum(device_cyc: int, host_cyc: int) -> int:
+    """Default whole-program combiner (design 05 §5): device + host as a
+    SUM. The async-overlap accommodation (sum -> max, report 23 open-Q4) is
+    a one-function swap here; the host-staging `CostResult.phases` breakdown
+    is preserved so a `max` combiner can split stage/compute later WITHOUT
+    touching the composes. We do NOT implement the overlap scheduler."""
+    return device_cyc + host_cyc
+
+
+# The pluggable whole-program combiner. Default = sum (device + host).
+_whole_program_combiner = _whole_program_sum
+
+
 @cost("kernel_cycles")
 def _kernel_cycles_factory(target):
     """Build a kernel-cycle estimator specialised to `target`.
 
     The autoschedule path always uses the `"faithful"` flavor so the
-    argmin stays calibrated (design 04 §1.5). The returned closure calls
-    the bound `CostModel.compose` and returns `result.cycles` -- exactly
-    the int the argmin expects.
+    argmin stays calibrated (design 04 §1.5). Whole-program estimate is
+    `kernel_cycles + host_staging` (design 05 §5, task-017): the device-exec
+    body from the `kernel_cycles` CostModel plus the host<->device staging
+    from the `host_staging` CostModel, combined by the pluggable combiner
+    (default sum). Targets with no `host_staging` model registered (AiM,
+    UPMEM, APU) return `kernel_cycles` unchanged.
     """
     target_name = getattr(target, "name", None)
     model = get_cost_model(target_name, "faithful")
+    try:
+        hs_model = get_cost_model(target_name, "faithful", concern="host_staging")
+    except KeyError:
+        hs_model = None
 
     def cost_fn(trace, layout) -> int:
-        return model.compose(ComposeCtx(target, trace, layout)).cycles
+        device = model.compose(ComposeCtx(target, trace, layout)).cycles
+        if hs_model is None:
+            return device
+        host = hs_model.compose(ComposeCtx(target, trace, layout)).cycles
+        return _whole_program_combiner(device, host)
 
     return cost_fn
 

@@ -90,8 +90,11 @@ def test_per_op_cost_is_a_callable_not_a_scalar():
     assert callable(mac.fn)
     # The full OpCostCtx is accepted even though the v1 entry ignores it.
     assert mac.fn(OpCostCtx("MAC", iters=99, lane_width=8)) == 4
-    fan = f.move_costs["PRELOAD_FAN"]
-    assert fan.fn(MoveCostCtx("PRELOAD_FAN")) == 369
+    # Task-017: the preload fan-out width re-homed off the deleted
+    # PRELOAD_FAN move onto the `host_staging` concern as STAGE_BCAST=369.
+    hs = get_cost_model("samsung_hbm_pim", "faithful", concern="host_staging")
+    fan = hs.move_costs["STAGE_BCAST"]
+    assert fan.fn(MoveCostCtx("STAGE_BCAST")) == 369
 
 
 if __name__ == "__main__":

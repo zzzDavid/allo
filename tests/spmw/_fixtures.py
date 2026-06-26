@@ -142,53 +142,19 @@ def build_samsung_target():
                     "JUMP", src=grf_b, dst=grf_b,
                     emit=lambda ctx: None,
                 )
-                # CRF_TRIGGER (SPEC-025 §6): host per-tile fire latency in
-                # the shared-CRF schedule. The host issues one trigger per
-                # work-id against the single broadcast CRF program rather
-                # than re-uploading the CRF body per work-id. Cost is the
-                # host-side per-command issue latency (tCCDL-class; Samsung
-                # ISCA'21 §4.2 PIM-command issue spacing) -- strictly less
-                # than a per-work-id CRF body (folded MAC + JUMP, >= 258 cyc
-                # for the fast dual-fiber candidate at K=1024), which is the
-                # invariant that makes shared CRF win in argmin (SPEC-025
-                # §4.5). No codegen emits a PIMCmd for it; it rides the host
-                # schedule side-list (SPEC-025 §5.4).
-                allo.move(
-                    "CRF_TRIGGER", src=grf_b, dst=grf_b,
-                    emit=lambda ctx: None,
-                )
-
-                # SPEC-026 §3.2/§3.3: the closed-form preload/readback
-                # phases are priced by the bound CostModel. Per design 04
-                # §1.2, the PRELOAD_FAN / READBACK_FAN fan-out WIDTHS and
-                # the per-group cycle costs are calibration anchors of the
-                # faithful model, NOT device structure -- so they live in
-                # spmw_cost_tables.SAMSUNG_FAITHFUL.move_costs, not on the
-                # target. The target keeps only the move structure so the
-                # closed forms have named carriers to look up. Calibration
-                # (report 18 §3, M=4096 K=1024): PRELOAD_FAN=369, WR=1,
-                # CRF=2 => preload=11368; READBACK_FAN=4096, RD=181 =>
-                # readback=181.
-                allo.move(
-                    "PRELOAD_FAN", src=even_bank, dst=even_bank,
-                    emit=lambda ctx: None,
-                )
-                allo.move(
-                    "PRELOAD_WR", src=grf_a, dst=even_bank,
-                    emit=lambda ctx: None,
-                )
-                allo.move(
-                    "PRELOAD_CRF", src=grf_a, dst=even_bank,
-                    emit=lambda ctx: None,
-                )
-                allo.move(
-                    "READBACK_FAN", src=odd_bank, dst=grf_b,
-                    emit=lambda ctx: None,
-                )
-                allo.move(
-                    "READBACK_RD", src=odd_bank, dst=grf_b,
-                    emit=lambda ctx: None,
-                )
+                # NOTE (task-017): the fake host self-moves
+                # PRELOAD_FAN/PRELOAD_WR/PRELOAD_CRF/READBACK_FAN/READBACK_RD
+                # and CRF_TRIGGER (formerly here as `src==dst, emit=None`
+                # stubs that only carried a cost-table name) are DELETED.
+                # Host<->device staging now lives on the host node's
+                # @allo.host_xcel (broadcast/scatter/gather, task-012) and
+                # its cost on the `host_staging` CostModel concern
+                # (369/1/2/4096/181 re-homed verbatim, task-017). The
+                # CRF_TRIGGER *cost* (lever-3 shared-CRF fire latency) stays
+                # in SAMSUNG_FAITHFUL.move_costs as a cost-table lookup; it
+                # no longer needs a target Move carrier. JUMP stays: it is a
+                # real device control op (src==dst with a real emit), not a
+                # host stub -- the §Q3 validation exempts it.
 
                 any_bank = allo.any_(banks)
                 any_reg = allo.any_([grf_a, grf_b])
@@ -207,6 +173,38 @@ def build_samsung_target():
                     fn=lambda x, y, acc: acc + x * y,
                     emit=lambda x, y, acc, ctx: ctx.cmd("MAC", dst=acc, src0=x, src1=y),
                 )
+
+        # Host-side staging node (design 05 §6, task 012). PARALLEL ADDITIVE:
+        # this is a sibling of `pseudo_channel` (not its parent) so the
+        # device unit tree depth, `get_uid()` chains, and
+        # `_samsung_workid_count` (which multiplies `u.mapping` over every
+        # unit -- a host node has no `mapping`, contributing 1) are all
+        # byte-identical. The host-xcel emit closures exist but are NOT yet
+        # wired into the run path; the `PRELOAD_*`/`READBACK_*`/`CRF_TRIGGER`
+        # self-moves and `_samsung_compose_with` are untouched. Wiring +
+        # self-move deletion + Move-validation land in task 007 (§9.1).
+        @allo.unit(mode="host")
+        def host():
+            allo.mem(name="host_dram", bytes=1 << 30)
+
+            @allo.host_xcel
+            class hx(allo.HostXcel):
+                # emit closures match the `allo.move` emit shape
+                # (lambda ctx, t: ...) and the design 05 §2 example; the
+                # ctx.host_* phases map to the real pim_driver
+                # preload (broadcast/scatter) and readback (gather) calls.
+                @allo.primitive
+                def broadcast(self, buf, *, over):
+                    return lambda ctx, t: ctx.host_broadcast(t)   # -> HAB preload
+
+                @allo.primitive
+                def scatter(self, buf, *, over):
+                    return lambda ctx, t: ctx.host_scatter(t)     # -> per-bank preload
+
+                @allo.primitive
+                def gather(self, buf, *, over):
+                    return lambda ctx, t: ctx.host_gather(t)      # -> readback
+                # no `reduce` -> Samsung output sum runs on host CPU after gather
 
     return device
 
@@ -466,6 +464,47 @@ def build_upmem_target():
                             acc=acc, x=x, y=y,
                             k_bound=ctx.pending_k_bound),
                     )
+
+        # Host-side staging node (design 05 §6/§7, task 008 generality
+        # proof). PARALLEL ADDITIVE, sibling of `rank` (not its parent) so
+        # the device tree depth / get_uid() / the UPMEM compose are
+        # byte-for-byte unchanged. PARTIAL implementation: scatter / gather /
+        # broadcast only — NO device `reduce` (UPMEM has no cross-DPU
+        # reduction primitive; an output sum runs host-side after gather).
+        # This exercises the coverage check: `all_gather` covers via the
+        # default composition (gather+broadcast), while `all_reduce` raises
+        # the hard coverage error (missing `reduce` basis).
+        #
+        # The DPU fan-out is a HOST-SIDE data-partition degree, NOT a device
+        # layout axis: UPMEM racks expose a NON-pow2 DPU count (2560, or 2552
+        # masked) that `scatter(W, over=dpu)` carries as a plain integer fan
+        # (`prod(mapping)`), never through `LinearLayout` (design 05 §1/§Q2).
+        @allo.unit(mode="host")
+        def host():
+            allo.mem(name="host_dram", bytes=1 << 34)
+
+            @allo.host_xcel
+            class hx(allo.HostXcel):
+                @allo.primitive
+                def scatter(self, buf, *, over):
+                    # partition buf across DPUs: prepare per-DPU buffers then
+                    # push the transfer (UPMEM SDK dpu_prepare_xfer +
+                    # dpu_push_xfer to DPU_MRAM_HEAP).
+                    return lambda ctx, t: (
+                        ctx.dpu_prepare_xfer(t),
+                        ctx.dpu_push_xfer("DPU_XFER_TO_DPU"),
+                    )
+
+                @allo.primitive
+                def gather(self, buf, *, over):
+                    # readback per-DPU results to the host (dpu_copy_from).
+                    return lambda ctx, t: ctx.dpu_copy_from(t)
+
+                @allo.primitive
+                def broadcast(self, buf, *, over):
+                    # replicate buf to every DPU (dpu_broadcast_to).
+                    return lambda ctx, t: ctx.dpu_broadcast_to(t)
+                # no `reduce` -> UPMEM sums host-side after gather
 
     return device
 

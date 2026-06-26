@@ -95,10 +95,10 @@ class OpCost:
 class MoveCost:
     """Per-move cost entry; the data-movement analogue of `OpCost`.
 
-    Some Samsung entries (PRELOAD_FAN / READBACK_FAN) carry a *fan-out
-    width*, not a cycle count -- `compose` reads them as model parameters
-    (design 04 §1.2 edge case). The interface is the same: a callable of
-    `MoveCostCtx`.
+    Some entries (the Samsung host_staging STAGE_BCAST / GATHER_FAN) carry a
+    *fan-out width*, not a cycle count -- `compose` reads them as model
+    parameters (design 04 §1.2 edge case). The interface is the same: a
+    callable of `MoveCostCtx`.
     """
 
     fn: Callable[["MoveCostCtx"], "int | float"]
@@ -285,6 +285,33 @@ def evaluate(target, trace, layout, flavor: str = "faithful") -> CostResult:
     It imports nothing from the simulator paths, calls no subprocess and
     no Docker -- its only inputs are the bound `CostModel` and the
     in-memory trace, so the no-sim guarantee holds by construction.
+
+    Whole-program = `kernel_cycles + host_staging` (design 05 §5, task-017):
+    the device-exec body plus the host<->device staging, summed (the default
+    combiner). Targets with no `host_staging` model registered return
+    `kernel_cycles` unchanged. The merged `phases` carry both the device
+    `exec` and the host `stage_resident`/`stage_per_call`/`readback`
+    breakdown, plus a `preload` alias (= resident + per_call) for callers
+    reading the legacy phase name.
     """
-    model = get_cost_model(getattr(target, "name", None), flavor)
-    return model.compose(ComposeCtx(target, trace, layout))
+    name = getattr(target, "name", None)
+    model = get_cost_model(name, flavor)
+    device = model.compose(ComposeCtx(target, trace, layout))
+    try:
+        hs_model = get_cost_model(name, flavor, concern="host_staging")
+    except KeyError:
+        return device
+    host = hs_model.compose(ComposeCtx(target, trace, layout))
+    phases = dict(device.phases)
+    phases.update(host.phases)
+    phases["preload"] = host.phases.get("stage_resident", 0) + host.phases.get(
+        "stage_per_call", 0
+    )
+    confidence = (
+        "coarse"
+        if "coarse" in (device.confidence, host.confidence)
+        else device.confidence
+    )
+    return CostResult(
+        cycles=device.cycles + host.cycles, phases=phases, confidence=confidence
+    )

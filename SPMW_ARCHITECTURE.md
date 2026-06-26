@@ -83,6 +83,58 @@ Cost names are global; the factory receives `target` so it can
 dispatch on `target.name`. Concrete models live in
 `spmw_cost_models.py`.
 
+### `HostXcel` collective interface (in `spmw_host.py`, design 05) — SPEC'D, NOT YET LANDED
+```
+@allo.unit(mode="host")                 # promoted host root, explicit
+def host():
+    dram = allo.mem(name="host_dram", bytes=...)
+    @allo.host_xcel                      # class decorator -> instance on host unit
+    class hx(allo.HostXcel):
+        @allo.primitive(cost=None)       # method -> returns emit closure
+        def broadcast(self, buf, *, over):
+            return lambda ctx, t: ctx.host_broadcast(t)
+        @allo.primitive
+        def scatter(self, buf, *, over): ...
+        @allo.primitive
+        def gather(self, buf, *, over): ...
+        # reduce omitted -> host-CPU sum (opt-in) after gather
+```
+Basis = `broadcast`/`scatter`/`gather`/`reduce`; derived
+`all_reduce`/`all_gather`/`reduce_scatter` have default compositions in
+the basis (overridable for a native fast path). `HostXcel.covers(name)`
+is the coverage check — requesting an uncovered collective is a hard
+compile error; host-CPU fallback is opt-in only. Workload writes
+host movement as `allo.broadcast`/`scatter`/`gather`(buf, over=axis,
+residency=...); `residency ∈ {resident,per_call,readback}` (modifier,
+not a separate concept). `over=` names a unit-tree axis (one binding
+rule, design 05 §Q2): its fan degree is `prod(mapping)` of that level;
+for a pow2 *device* axis the same-named F2 layout out-dim carries the
+placement, for a non-pow2 *host* fan-out (UPMEM 2560 DPUs) it is a plain
+`int` and **never** routed through `LinearLayout`.
+
+**Boundary rule (design 05 §Q3):** explicit collectives own host↔device
+staging; the implicit matcher keeps intra-device loads/stores. A cross-
+boundary move MUST go through `HostXcel`, never a bare `allo.move`;
+self-moves (`src is dst`) are forbidden after this cycle.
+
+**Naming-collision guard (design 05 §4):** `allo.gather`/`allo.scatter`
+(host collectives, from `spmw_host`) do NOT collide with
+`df.gather`/`df.scatter` (AIE pipe primitives in `dataflow.py`, used as
+`df.*` in `tests/dataflow/aie/test_collective_communication.py`). Do NOT
+import `gather`/`scatter` into `__init__.py` from `dataflow`.
+
+### `host_staging` cost concern (in `spmw_cost_tables.py`, design 05 §5) — SPEC'D, NOT YET LANDED
+Registered as a NEW concern on the landed `(target_name, flavor,
+concern)` CostModel registry (`tenon@7738fee`) — NOT a fresh extraction.
+`register_cost_model(CostModel(..., concern="host_staging", ...))`;
+looked up via `get_cost_model(name, flavor, concern="host_staging")`.
+Re-homes the report-18 calibration constants (369/1/2/4096/181) verbatim
+off the deleted `PRELOAD_*`/`READBACK_*` self-moves. Whole-program
+estimate = `kernel_cycles + host_staging` (sum). Returns per-phase
+`CostResult.phases` + a pluggable whole-program combiner so async
+overlap (sum→max) is a one-function swap later (not implemented this
+cycle). B=1 sum must EMERGE as 15251; crossover B\*=2; asymptote 3.93×.
+
 ### Enumerator registration (in `spmw_autoschedule.py`)
 ```
 @register_enumerator("samsung_hbm_pim")
@@ -362,13 +414,31 @@ interface already accommodates it (compose owns the fold). Trigger to
 revisit: a corpus workload where the over-count flips a rank-preservation
 decision.
 
-### T22. `host_staging` concern fit in the `CostModel` interface (design 04 §4.2, → host-side cycle)
-The host-side task adds `@allo.cost("host_staging")` as a sibling concern
-in the design-04 `CostModel` machinery. Open until that cycle lands
-whether the per-op `OpCost`/`MoveCost` context is rich enough for
-collectives (broadcast/scatter/gather/reduce derived from the linear-layout
-pair) or needs a collective-specific context. If insufficient, escalate
-back to architect — do NOT fork a parallel cost-spec home.
+### T22. `host_staging` concern fit in the `CostModel` interface (design 04 §4.2 → design 05) — RULED (design 05)
+The host-side cycle adds `host_staging` as a NEW concern on the landed
+`(target_name, flavor, concern)` CostModel registry. **Ruled in design 05
+§5:** the per-op `OpCost`/`MoveCost` context is sufficient — a collective's
+cost is `(buf.numel // fan_width) * per_unit_cyc` over the work's
+`StageRequest` list, derived from the layout transform (design 05 §Q2);
+the existing `MoveCostCtx.elem_count`/`extra` carry what a collective needs.
+No collective-specific cost context required. The per-phase
+`CostResult.phases` + pluggable whole-program combiner keeps async overlap
+(sum→max, T18) a later one-function swap. See design 05 and the new
+`HostXcel`/`host_staging` Seams subsections (§3).
+
+### T18. Async staging/compute overlap (design 05 §9, report 23 open-Q4)
+The whole-program composition is `device + host_staging` as a **sum** this
+cycle. Async overlap turns it into a `max`. Out of scope to implement; the
+seam (per-phase `CostResult.phases` + pluggable combiner) is reserved in
+design 05 §5. Revisit when a pipelined batched-GEMV workload with
+measurable overlap ships.
+
+### T19b. Host-staging cost units: device-cycle-equiv vs host wall-time (design 05 §9, report 23 open-Q2)
+`host_staging` keeps the report-18 device-cycle-equivalent convention
+(369/181 constants) so argmin stays single-currency. Real host bandwidth
+(PIM-MMU: 63.7% of end-to-end) is a later table-only refinement (design
+04's table split is exactly for this). Open until a host-bandwidth
+measurement on each backend's real host path lands.
 
 ### T1. `allo.Layout` reserved name (resolved by spec 013)
 SPMW's `Placement` was originally called `Layout`. The legacy

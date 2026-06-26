@@ -92,12 +92,19 @@ from allo.spmw_cost_model import MoveCost, get_cost_model
 
 @contextlib.contextmanager
 def _perturb_move_cost(move_name, value):
-    """Temporarily override a per-move cost on the bound faithful Samsung
-    CostModel. Per design 04 the cost numbers live on the CostModel, not
-    the target tree, so the falsifier perturbations target the model's
-    `move_costs` (and restore them) rather than `target.move().cycles`.
+    """Temporarily override a per-move cost on the bound Samsung CostModel.
+    Per design 04 the cost numbers live on the CostModel, not the target
+    tree. Task-017: the preload/readback carriers re-homed onto the
+    `host_staging` concern (STAGE_*/GATHER_*), so a falsifier that perturbs
+    a staging constant targets that model; device-exec carriers (LD/ST/MAC)
+    stay on the `kernel_cycles` model. The contextmanager routes by name.
     """
-    model = get_cost_model("samsung_hbm_pim", "faithful")
+    if move_name in ("STAGE_BCAST", "STAGE_SCATTER", "STAGE_CRF",
+                     "GATHER_FAN", "GATHER_RD"):
+        model = get_cost_model("samsung_hbm_pim", "faithful",
+                               concern="host_staging")
+    else:
+        model = get_cost_model("samsung_hbm_pim", "faithful")
     saved = model.move_costs[move_name]
     model.move_costs[move_name] = MoveCost(lambda c, _v=value: _v)
     try:
@@ -151,13 +158,13 @@ def test_enumerator_emits_both_residencies_unconditionally():
     trace = allo.match_workload(target, sch.module)
     _fn, matches = _bucket_for_autoschedule(trace)[0]
     cands = _samsung_enumerate(target, matches)
-    flags = [c.extra.get("weight_resident") for c in cands]
+    flags = [c.extra.get("stage_resident") for c in cands]
     # Every candidate carries the flag; both values appear; exact 50/50.
     assert all(f in (False, True) for f in flags), flags
     assert flags.count(True) == flags.count(False)
     assert flags.count(True) > 0
     # The resident variant tags its mode for audit; placements unchanged.
-    res = [c for c in cands if c.extra.get("weight_resident")]
+    res = [c for c in cands if c.extra.get("stage_resident")]
     assert all(c.mode.endswith("+wresident") for c in res)
 
 
@@ -167,7 +174,7 @@ def test_enumerator_emits_both_residencies_unconditionally():
 
 
 def _best(target, sub, cands, cost_fn, resident: bool) -> int:
-    sel = [c for c in cands if c.extra.get("weight_resident") == resident]
+    sel = [c for c in cands if c.extra.get("stage_resident") == resident]
     return min(cost_fn(sub, c) for c in sel)
 
 
@@ -207,7 +214,7 @@ def test_cost_b_ge_2_argmin_picks_weight_resident():
     # For B>=2 the resident schedule strictly beats non-resident.
     assert rr < nr, (rr, nr)
     # The overall argmin over ALL candidates lands on weight_resident.
-    scored = sorted((cost_fn(sub, c), c.extra.get("weight_resident")) for c in cands)
+    scored = sorted((cost_fn(sub, c), c.extra.get("stage_resident")) for c in cands)
     assert scored[0][1] is True, scored[0]
     # Structure: non-resident = B*(P+E+R); resident = P+B*(E+R).
     M_, K_ = _samsung_mk(target, sub)
@@ -222,9 +229,9 @@ def test_cost_zero_preload_falsifier():
     """With preload forced to 0 the resident win vanishes for ALL B --
     the entire speedup is the single P term (report 18 §6)."""
     target = build_samsung_target()
-    # Force PRELOAD_FAN huge so (M*K // fan) == 0 and PRELOAD_CRF=0 -> P=0.
-    with _perturb_move_cost("PRELOAD_FAN", M * K * 1000), \
-            _perturb_move_cost("PRELOAD_CRF", 0):
+    # Force STAGE_BCAST huge so (M*K // fan) == 0 and STAGE_CRF=0 -> P=0 (host_staging concern, task-017).
+    with _perturb_move_cost("STAGE_BCAST", M * K * 1000), \
+            _perturb_move_cost("STAGE_CRF", 0):
         cost_fn = allo.get_cost("kernel_cycles", target)
         sch = allo.customize(batched_gemv_top, enable_tensor=False)
         trace = allo.match_workload(target, sch.module)
@@ -250,8 +257,8 @@ def test_cost_bstar_invariant_under_preload_perturbation():
         target, sub, cands, cost_fn, True
     )
     model = get_cost_model("samsung_hbm_pim", "faithful")
-    wr0 = model.move_cost("PRELOAD_WR")
-    with _perturb_move_cost("PRELOAD_WR", wr0 * 4):
+    wr0 = get_cost_model("samsung_hbm_pim","faithful",concern="host_staging").move_cost("STAGE_SCATTER")
+    with _perturb_move_cost("STAGE_SCATTER", wr0 * 4):
         cost_fn2 = allo.get_cost("kernel_cycles", target)
         after = _best(target, sub, cands, cost_fn2, False) - _best(
             target, sub, cands, cost_fn2, True
