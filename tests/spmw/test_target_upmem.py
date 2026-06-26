@@ -88,18 +88,21 @@ def test_upmem_get_kernel_src_emits_prim_envelope():
 
 
 def test_run_upmem_uses_tenon_slot_and_no_proxy():
-    """SPEC-003 §6 acceptance 1: _run_upmem must invoke uPIMulator with
-    --benchmark TENON and must not contain the old VA/GEMV proxy
-    heuristic.
+    """SPEC-003 §6 acceptance 1 + design 02 §6c: _run_upmem routes on the
+    trace *shape* (gemv -> GEMV host, VA -> TENON slot), never on the old
+    workload-name VA/GEMV proxy heuristic.
     """
     import inspect
     from allo.spmw_codegen import _run_upmem
 
     source = inspect.getsource(_run_upmem)
+    # Both legitimate slots are reachable; the VA/TENON path persists.
     assert '"TENON"' in source, source
+    # The old proxy heuristic (name -> benchmark) must be absent.
     assert 'benchmark = "VA"' not in source, source
-    assert 'benchmark = "GEMV"' not in source, source
-    # The TENON slot path must be the one we write task.c into.
+    # The shape-routed slot decision is staged-field driven, and task.c
+    # is written into whichever slot the shape selected.
+    assert "is_gemv" in source and "row_count" in source, source
     assert "benchmark" in source and "TENON" in source and "task.c" in source
 
 

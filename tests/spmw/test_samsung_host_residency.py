@@ -149,7 +149,12 @@ def test_samsung_host_residency_priced_cheaper():
     and the differential changes when the work-id count changes."""
     target = build_samsung_target()
     cost_fn = allo.get_cost("kernel_cycles", target)
-    ld_a = target.move("LD_A").cycles
+    # Per design 04 the LD_A cost lives on the bound CostModel.
+    from allo.spmw_cost_model import MoveCostCtx, get_cost_model
+
+    ld_a = get_cost_model("samsung_hbm_pim", "faithful").move_cost(
+        "LD_A", MoveCostCtx("LD_A")
+    )
     # Lever 3 (SPEC-025 §4.4): the per_workid body cost is now scaled by the
     # unit-tree fanout product. The lever-2 LD_A saving rides that uniform
     # scale, so the differential is geom * n_trace_workids * LD_A; derive
@@ -193,15 +198,19 @@ def test_samsung_host_residency_perturbation():
 
     base_gap = cost_fn(trace, crf) - cost_fn(trace, host)
 
-    ld_a_move = target.move("LD_A")
-    original = ld_a_move.cycles
+    # Per design 04 the LD_A cost lives on the bound CostModel; perturb the
+    # model's move_costs (and restore) rather than target.move().cycles.
+    from allo.spmw_cost_model import MoveCost, MoveCostCtx, get_cost_model
+
+    model = get_cost_model("samsung_hbm_pim", "faithful")
+    original = model.move_cost("LD_A", MoveCostCtx("LD_A"))
+    saved = model.move_costs["LD_A"]
     try:
-        ld_a_move.cycles = original + 10
-        # Rebuild the cost fn so it re-reads the perturbed move cost.
+        model.move_costs["LD_A"] = MoveCost(lambda c, _v=original + 10: _v)
         cost_fn2 = allo.get_cost("kernel_cycles", target)
         bumped_gap = cost_fn2(trace, crf) - cost_fn2(trace, host)
     finally:
-        ld_a_move.cycles = original
+        model.move_costs["LD_A"] = saved
 
     assert bumped_gap > base_gap, (bumped_gap, base_gap)
 

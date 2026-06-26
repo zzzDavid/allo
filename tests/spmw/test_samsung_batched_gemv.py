@@ -85,6 +85,27 @@ def _sub_trace(trace: MatchTrace) -> MatchTrace:
     )
 
 
+import contextlib
+
+from allo.spmw_cost_model import MoveCost, get_cost_model
+
+
+@contextlib.contextmanager
+def _perturb_move_cost(move_name, value):
+    """Temporarily override a per-move cost on the bound faithful Samsung
+    CostModel. Per design 04 the cost numbers live on the CostModel, not
+    the target tree, so the falsifier perturbations target the model's
+    `move_costs` (and restore them) rather than `target.move().cycles`.
+    """
+    model = get_cost_model("samsung_hbm_pim", "faithful")
+    saved = model.move_costs[move_name]
+    model.move_costs[move_name] = MoveCost(lambda c, _v=value: _v)
+    try:
+        yield model
+    finally:
+        model.move_costs[move_name] = saved
+
+
 # --------------------------------------------------------------------- #
 # 203 -- MATCH
 # --------------------------------------------------------------------- #
@@ -202,17 +223,17 @@ def test_cost_zero_preload_falsifier():
     the entire speedup is the single P term (report 18 §6)."""
     target = build_samsung_target()
     # Force PRELOAD_FAN huge so (M*K // fan) == 0 and PRELOAD_CRF=0 -> P=0.
-    target.move("PRELOAD_FAN").cycles = M * K * 1000
-    target.move("PRELOAD_CRF").cycles = 0
-    cost_fn = allo.get_cost("kernel_cycles", target)
-    sch = allo.customize(batched_gemv_top, enable_tensor=False)
-    trace = allo.match_workload(target, sch.module)
-    sub = _sub_trace(trace)
-    assert _samsung_preload_cycles(target, *_samsung_mk(target, sub)) == 0
-    cands = _samsung_enumerate(target, sub.matches)
-    nr = _best(target, sub, cands, cost_fn, False)
-    rr = _best(target, sub, cands, cost_fn, True)
-    assert nr == rr, (nr, rr)
+    with _perturb_move_cost("PRELOAD_FAN", M * K * 1000), \
+            _perturb_move_cost("PRELOAD_CRF", 0):
+        cost_fn = allo.get_cost("kernel_cycles", target)
+        sch = allo.customize(batched_gemv_top, enable_tensor=False)
+        trace = allo.match_workload(target, sch.module)
+        sub = _sub_trace(trace)
+        assert _samsung_preload_cycles(target, *_samsung_mk(target, sub)) == 0
+        cands = _samsung_enumerate(target, sub.matches)
+        nr = _best(target, sub, cands, cost_fn, False)
+        rr = _best(target, sub, cands, cost_fn, True)
+        assert nr == rr, (nr, rr)
 
 
 def test_cost_bstar_invariant_under_preload_perturbation():
@@ -228,11 +249,13 @@ def test_cost_bstar_invariant_under_preload_perturbation():
     before = _best(target, sub, cands, cost_fn, False) - _best(
         target, sub, cands, cost_fn, True
     )
-    target.move("PRELOAD_WR").cycles = target.move("PRELOAD_WR").cycles * 4
-    cost_fn2 = allo.get_cost("kernel_cycles", target)
-    after = _best(target, sub, cands, cost_fn2, False) - _best(
-        target, sub, cands, cost_fn2, True
-    )
+    model = get_cost_model("samsung_hbm_pim", "faithful")
+    wr0 = model.move_cost("PRELOAD_WR")
+    with _perturb_move_cost("PRELOAD_WR", wr0 * 4):
+        cost_fn2 = allo.get_cost("kernel_cycles", target)
+        after = _best(target, sub, cands, cost_fn2, False) - _best(
+            target, sub, cands, cost_fn2, True
+        )
     # Win magnitude grows with P; the crossover (resident<non-resident for
     # B>=2) holds in both cases.
     assert before > 0 and after > before

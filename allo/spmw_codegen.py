@@ -684,6 +684,19 @@ class UPMEMCtx(CodegenContext):
         # MAC emit reads this to materialise an explicit C `for` loop so
         # uPIMulator prices the actual K MACs, not a single statement.
         self.pending_k_bound: int | None = None
+        # Tasklet-tiling lever (design 02 §3.4): the chosen placement's
+        # `n_tasklets` and the reduction trip, staged by _walk_and_emit
+        # so _run_upmem can thread them to the uPIMulator CLI (resolving
+        # the hardcoded --num_tasklets 1 / --data_prep_params 1024, T9).
+        # Defaults preserve the pre-lever single-tasklet floor.
+        self.n_tasklets: int = 1
+        self.reduction_trip: int | None = None
+        # Close-floor harness (design 02 §6c): the gemv outer-row count
+        # (= m_size), staged from the MAC match's outer enclosing loop so
+        # _run_upmem can route a gemv-shaped trace through the in-tree
+        # GEMV host at a shape-derived (m_size, n_size) footprint. None
+        # for VA-shaped traces (single enclosing loop) -> TENON path.
+        self.row_count: int | None = None
 
     # WRAM/MRAM memory names map onto the envelope's fixed buffer
     # parameters of `tenon_kernel(T *bufferB, T *bufferA, ...)`. Both
@@ -893,6 +906,140 @@ class UPMEMCtx(CodegenContext):
             "}\n"
         )
 
+    def get_gemv_kernel_src(self) -> str:
+        """Return a GEMV-host-compatible DPU kernel C source.
+
+        Close-floor harness (design 02 §6c): to compare the Tenon and Exo
+        columns through the SAME bespoke `GEMV` host, the Tenon kernel must
+        read the gemv argument struct (`n_size`/`n_size_pad`/`nr_rows`/
+        `max_rows`) and use the gemv MRAM layout — the VA-shaped
+        `get_kernel_src` envelope is incompatible with that host. This
+        envelope is the in-tree PrIM gemv driver structure with Tenon's
+        emitted MAC at the inner compute site (`cache_C[pos] += cache_A[j]
+        * cache_B[j]`), so the two columns issue the same instruction
+        stream (`breakdown_run` parity, the anti-flattering guard) and the
+        cycle verdict is a real kernel match, not an overhead coincidence.
+
+        This is materialisation, not a schedule decision: the runner picks
+        this envelope only for a gemv-shaped trace; no ranking/placement
+        choice changes.
+        """
+        return (
+            "#include <stdint.h>\n"
+            "#include <stdio.h>\n"
+            "#include <defs.h>\n"
+            "#include <mram.h>\n"
+            "#include <alloc.h>\n"
+            "#include <barrier.h>\n"
+            "#include <seqread.h>\n"
+            "\n"
+            '#include "../support/common.h"\n'
+            "\n"
+            "__host dpu_arguments_t DPU_INPUT_ARGUMENTS;\n"
+            "\n"
+            "void __attribute__ ((noinline))\n"
+            "gemv(T *bufferC, T *bufferA, T *bufferB, int pos) {\n"
+            "    /* === BEGIN tenon-emitted MAC === */\n"
+            "    for (unsigned int i = 0; i < BLOCK_SIZE / sizeof(T); i++) {\n"
+            "        bufferC[pos] += bufferA[i] * bufferB[i];\n"
+            "    }\n"
+            "    /* === END tenon-emitted MAC === */\n"
+            "    return;\n"
+            "}\n"
+            "\n"
+            "BARRIER_INIT(my_barrier, NR_TASKLETS);\n"
+            "\n"
+            "int main() {\n"
+            "    unsigned int tasklet_id = me();\n"
+            "    if (tasklet_id == 0){ mem_reset(); }\n"
+            "    barrier_wait(&my_barrier);\n"
+            "\n"
+            "    int32_t n_size = DPU_INPUT_ARGUMENTS.n_size;\n"
+            "    int32_t n_size_pad = DPU_INPUT_ARGUMENTS.n_size_pad;\n"
+            "    uint32_t nr_rows = DPU_INPUT_ARGUMENTS.nr_rows;\n"
+            "    uint32_t max_rows = DPU_INPUT_ARGUMENTS.max_rows;\n"
+            "\n"
+            "    unsigned int nrows = nr_rows;\n"
+            "    unsigned int rows_per_tasklet;\n"
+            "    unsigned int start_row;\n"
+            "    unsigned int chunks = nrows / (NR_TASKLETS + NR_TASKLETS);\n"
+            "    unsigned int dbl_chunks = chunks + chunks;\n"
+            "    rows_per_tasklet = dbl_chunks;\n"
+            "    unsigned int rest_rows = nrows % (NR_TASKLETS + NR_TASKLETS);\n"
+            "\n"
+            "    if ((tasklet_id + tasklet_id) < rest_rows)\n"
+            "        rows_per_tasklet += 2;\n"
+            "    if (rest_rows > 0) {\n"
+            "        if ((tasklet_id + tasklet_id) >= rest_rows) {\n"
+            "            unsigned int hlf_rest_rows = rest_rows >> 1;\n"
+            "            if ((rest_rows & 1) == 1)\n"
+            "                start_row = (hlf_rest_rows + 1) * (dbl_chunks + 2) + (tasklet_id - 1 - hlf_rest_rows) * dbl_chunks;\n"
+            "            else\n"
+            "                start_row = (hlf_rest_rows) * (dbl_chunks + 2) + (tasklet_id - hlf_rest_rows) * dbl_chunks;\n"
+            "        } else\n"
+            "            start_row = tasklet_id * (dbl_chunks + 2);\n"
+            "    } else {\n"
+            "        start_row = tasklet_id * (dbl_chunks);\n"
+            "    }\n"
+            "\n"
+            "    uint32_t mram_base_addr_A = (uint32_t) (DPU_MRAM_HEAP_POINTER + start_row * n_size * sizeof(T));\n"
+            "    uint32_t mram_base_addr_B = (uint32_t) (DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T));\n"
+            "    uint32_t mram_base_addr_C = (uint32_t) (DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T) + n_size_pad * sizeof(T) + start_row * sizeof(T));\n"
+            "    uint32_t mram_temp_addr_A = mram_base_addr_A;\n"
+            "    uint32_t mram_temp_addr_B = mram_base_addr_B;\n"
+            "\n"
+            "    T *cache_A = (T *) mem_alloc(BLOCK_SIZE + 8);\n"
+            "    T *cache_A_aux = (T *) mem_alloc(8);\n"
+            "    T *cache_B = (T *) mem_alloc(BLOCK_SIZE);\n"
+            "    T *cache_C = (T *) mem_alloc(8);\n"
+            "\n"
+            "    int offset = 0;\n"
+            "\n"
+            "    for (unsigned int i = start_row; i < start_row + rows_per_tasklet; i += 2) {\n"
+            "        mram_temp_addr_A = (uint32_t) (DPU_MRAM_HEAP_POINTER + i * n_size * sizeof(T));\n"
+            "        mram_temp_addr_B = mram_base_addr_B;\n"
+            "        cache_C[0] = 0;\n"
+            "        cache_C[1] = 0;\n"
+            "        for(unsigned int pos = 0; pos < 2 && i + pos < nr_rows; pos++){\n"
+            "            int n = 0, j;\n"
+            "            for (n = 0; n < (int32_t) (n_size - (BLOCK_SIZE/sizeof(T))); n += (BLOCK_SIZE / sizeof(T))) {\n"
+            "                mram_read((__mram_ptr void const*) (mram_temp_addr_A), cache_A, BLOCK_SIZE);\n"
+            "                mram_read((__mram_ptr void const*) (mram_temp_addr_B), cache_B, BLOCK_SIZE);\n"
+            "                if(offset) {\n"
+            "                    for(unsigned int off = 0; off < (BLOCK_SIZE / sizeof(T)) - 1; off++) {\n"
+            "                        cache_A[off] = cache_A[off + 1];\n"
+            "                    }\n"
+            "                    mram_read((__mram_ptr void const*) (mram_temp_addr_A + BLOCK_SIZE), cache_A_aux, 8);\n"
+            "                    cache_A[BLOCK_SIZE / sizeof(T) - 1] = cache_A_aux[0];\n"
+            "                }\n"
+            "                gemv(cache_C, cache_A, cache_B, pos);\n"
+            "                mram_temp_addr_A += BLOCK_SIZE;\n"
+            "                mram_temp_addr_B += BLOCK_SIZE;\n"
+            "            }\n"
+            "            mram_read((__mram_ptr void const*) (mram_temp_addr_A), cache_A, BLOCK_SIZE);\n"
+            "            if(offset) {\n"
+            "                for(unsigned int off = 0; off < (BLOCK_SIZE / sizeof(T)) -1; off++) {\n"
+            "                    cache_A[off] = cache_A[off + 1];\n"
+            "                }\n"
+            "                mram_read((__mram_ptr void const*) (mram_temp_addr_A + BLOCK_SIZE ), cache_A_aux, 8);\n"
+            "                cache_A[BLOCK_SIZE / sizeof(T) - 1] = cache_A_aux[0];\n"
+            "            }\n"
+            "            mram_read((__mram_ptr void const*) (mram_temp_addr_B), cache_B, BLOCK_SIZE);\n"
+            "            for (j = 0; j < (int) (n_size - n); j++) {\n"
+            "                if(j >= (int)(BLOCK_SIZE / sizeof(T))){ printf(\"error\\n\"); break; }\n"
+            "                cache_C[pos] += cache_A[j] * cache_B[j];\n"
+            "            }\n"
+            "            mram_temp_addr_A += (BLOCK_SIZE - ((BLOCK_SIZE / sizeof(T)) - (n_size - n)) * sizeof(T));\n"
+            "            mram_temp_addr_B = mram_base_addr_B;\n"
+            "            if(mram_temp_addr_A % 8 != 0) { offset = 1; } else { offset = 0; }\n"
+            "        }\n"
+            "        mram_write(cache_C, (__mram_ptr void *) (mram_base_addr_C), 8);\n"
+            "        mram_base_addr_C += 2 * sizeof(T);\n"
+            "    }\n"
+            "    return 0;\n"
+            "}\n"
+        )
+
 
 # --------------------------------------------------------------------- #
 # GSI APU v1 (Gemini 1) backend
@@ -928,6 +1075,13 @@ class APUv1Ctx(CodegenContext):
         # string keys (e.g. "mac_tmp") for scratch slots that aren't
         # backed by a Tenon handle.
         self._handle_names: dict = {}
+        # VR-tile / L4-DMA layout chosen by the autoscheduler
+        # (Placement.extra["vr_dma"]). The build harness reads this to
+        # emit the matching host L4 layout + device VR-tile DMA so host
+        # and device agree by construction (design 01 §4.3, resolves the
+        # FAIL-62/64 host/device-mismatch gotcha). Default "intra" =
+        # today's single-VR subgroup-tiled layout.
+        self.vr_dma_mode: str = "intra"
 
     def bind_handle(self, handle, c_name: str) -> None:
         """Teach the ctx that `handle` lowers to the C identifier
@@ -1503,8 +1657,35 @@ def _walk_and_emit(
                 ctx.pending_k_bound = (
                     _parse_loop_bound(inner[2]) if inner is not None else None
                 )
+                # Tasklet-tiling lever (design 02 §3.4): read the chosen
+                # placement's `n_tasklets` field (never re-derive it) and
+                # the reduction trip the runner drives at. Codegen only
+                # materialises the autoscheduler's choice.
+                ctx.n_tasklets = getattr(layout, "extra", {}).get(
+                    "n_tasklets", 1
+                )
+                if ctx.pending_k_bound is not None:
+                    ctx.reduction_trip = ctx.pending_k_bound
+                # Close-floor harness (design 02 §6c): stage the gemv
+                # outer-row count (m_size) from the MAC's outer enclosing
+                # loop. A gemv trace nests [M-loop, K-loop]; a VA trace
+                # has a single loop, so row_count stays None and the
+                # runner keeps the TENON path. Shape-derived, not literal.
+                if len(match.enclosing_loops) >= 2:
+                    ctx.row_count = _parse_loop_bound(
+                        match.enclosing_loops[-2][2]
+                    )
             elif hasattr(ctx, "pending_k_bound"):
                 ctx.pending_k_bound = None
+            # APU v1 VR-tile/DMA materialisation (design 01 §4.3): read the
+            # chosen `vr_dma` off the placement and stage it on the ctx so
+            # the build harness emits the matching host+device layout. We
+            # only materialise argmin's choice -- never re-derive intra-vs-
+            # inter from the workload. Default-missing key keeps "intra".
+            if isinstance(ctx, APUv1Ctx):
+                ctx.vr_dma_mode = getattr(layout, "extra", {}).get(
+                    "vr_dma", "intra"
+                )
             # APU v1 MAC dispatch: `placement.mode == "sv"` overrides the
             # fixture's `emit_mac_lookup` lambda and emits raw MUL+ADD
             # (SPEC-009 §2). Other backends ignore `mode`.
@@ -2373,10 +2554,44 @@ def _run_upmem(compiled: "Compiled", **inputs) -> RunResult:
             backend="upmem",
         )
 
-    # Render the full DPU envelope around `cmds` via UPMEMCtx; fall back
-    # to a bare join if no ctx was preserved (legacy call shape).
     ctx = getattr(compiled, "_ctx", None)
-    if ctx is not None and hasattr(ctx, "get_kernel_src"):
+
+    # Tasklet-tiling lever (design 02 §3.4): drive the simulator at the
+    # autoscheduler-chosen tasklet count rather than the old hardcoded
+    # `1` (resolves tension T9). Codegen only reads the staged field; it
+    # never re-derives the choice.
+    num_tasklets = int(getattr(ctx, "n_tasklets", 1) or 1)
+
+    # Close-floor harness routing (design 02 §6c): a gemv-shaped trace
+    # (outer M-loop + inner K-loop -> both row_count and reduction_trip
+    # staged) runs through the in-tree bespoke GEMV host so the Tenon
+    # column and the Exo column share ONE overhead path and the ~1.13x
+    # common-mode harness offset cancels. The (m_size, n_size) footprint
+    # is shape-derived from the ctx, NOT a literal. A VA-shaped trace
+    # (single loop -> row_count None) keeps the TENON drop-slot. This is
+    # a measurement-harness branch on the trace *shape*; it carries no
+    # schedule decision. Retires the §6b data_prep_params=1024 debt.
+    row_count = getattr(ctx, "row_count", None)
+    reduction_trip = getattr(ctx, "reduction_trip", None)
+    is_gemv = row_count is not None and reduction_trip is not None
+    _GEMV_SLOT, _VA_SLOT = "GEMV", "TENON"
+    if is_gemv:
+        benchmark = _GEMV_SLOT
+        # GEMV host requires m_size % num_dpus == 0 (gemv.go:39); with a
+        # single DPU any row count is legal. data_prep = "<m_size>,<n_size>".
+        data_prep_params = f"{int(row_count)},{int(reduction_trip)}"
+    else:
+        benchmark = _VA_SLOT
+        # VA input buffer size; the byte-loop strides this across
+        # tasklets (the TENON envelope). Held for the non-gemv path.
+        data_prep_params = "1024"
+
+    # Render the DPU envelope matching the chosen host. The GEMV slot
+    # needs the gemv argument struct + MRAM layout (get_gemv_kernel_src);
+    # the VA/TENON slot uses the byte-loop envelope (get_kernel_src).
+    if ctx is not None and is_gemv and hasattr(ctx, "get_gemv_kernel_src"):
+        kernel_src = ctx.get_gemv_kernel_src()
+    elif ctx is not None and hasattr(ctx, "get_kernel_src"):
         kernel_src = ctx.get_kernel_src()
     else:
         kernel_src = "\n".join(
@@ -2389,17 +2604,17 @@ def _run_upmem(compiled: "Compiled", **inputs) -> RunResult:
             "compile_for_target produced no commands"
         )
 
-    slot_dir = root / "benchmark" / "TENON" / "dpu"
+    slot_dir = root / "benchmark" / benchmark / "dpu"
     if not slot_dir.exists():
-        # uPIMulator binary is present but the TENON slot has not been
-        # provisioned in this checkout. Skip cleanly rather than raise
-        # (matches the `_sim_unavailable` branch in test_e2e_mlp_upmem).
+        # uPIMulator binary is present but the benchmark slot has not
+        # been provisioned in this checkout. Skip cleanly rather than
+        # raise (matches the `_sim_unavailable` branch in e2e tests).
         return RunResult(
             cycles=None,
             stdout=(
-                f"simulator unavailable: TENON benchmark slot not "
+                f"simulator unavailable: {benchmark} benchmark slot not "
                 f"provisioned at {slot_dir}; rebuild uPIMulator with "
-                f"the TENON benchmark registered."
+                f"the {benchmark} benchmark registered."
             ),
             backend="upmem",
         )
@@ -2415,11 +2630,11 @@ def _run_upmem(compiled: "Compiled", **inputs) -> RunResult:
                     str(binary),
                     "--root_dirpath", str(root),
                     "--bin_dirpath", str(bin_dir),
-                    "--benchmark", "TENON",
+                    "--benchmark", benchmark,
                     "--num_channels", "1",
                     "--num_dpus_per_rank", "1",
-                    "--num_tasklets", "1",
-                    "--data_prep_params", "1024",
+                    "--num_tasklets", str(num_tasklets),
+                    "--data_prep_params", data_prep_params,
                 ],
                 capture_output=True,
                 timeout=600,
@@ -2450,7 +2665,9 @@ def _run_upmem(compiled: "Compiled", **inputs) -> RunResult:
             backend="upmem",
             extra={
                 "kernel_src": kernel_src,
-                "benchmark": "TENON",
+                "benchmark": benchmark,
+                "data_prep_params": data_prep_params,
+                "num_tasklets": num_tasklets,
                 "returncode": proc.returncode,
             },
         )
@@ -2764,12 +2981,44 @@ def _run_apu_v2(compiled: "Compiled", **inputs) -> RunResult:
     )
 
 
+def _run_virtual(compiled: "Compiled", **inputs) -> RunResult:
+    """Sim-free virtual-backend runner (design 04 §2.2).
+
+    Delegates to `spmw_cost_model.evaluate`, which imports nothing from the
+    simulator paths -- no subprocess, no Docker, no `_pimsim_root` etc. The
+    no-sim guarantee (task 005) thus holds by construction: the only inputs
+    are the bound CostModel and the in-memory trace. `confidence` / `phases`
+    ride `RunResult.extra` (RunResult is not structurally changed).
+    """
+    from .spmw_cost_model import evaluate, get_cost_model
+
+    result = evaluate(
+        compiled.target, compiled.trace, compiled.layout, compiled.cost_flavor
+    )
+    model = get_cost_model(compiled.target.name, compiled.cost_flavor)
+    return RunResult(
+        cycles=result.cycles,
+        stdout=(
+            f"virtual backend: cost model {model.name!r} "
+            f"(confidence={result.confidence})"
+        ),
+        backend="virtual",
+        extra={
+            "phases": result.phases,
+            "confidence": result.confidence,
+            "cost_model": model.name,
+            "priced_target": compiled.target.name,
+        },
+    )
+
+
 _BACKEND_RUN = {
     "samsung_hbm_pim": _run_samsung,
     "aim": _run_aim,
     "upmem": _run_upmem,
     "apu_v1": _run_apu_v1,
     "apu_v2": _run_apu_v2,
+    "virtual": _run_virtual,
 }
 
 
@@ -2785,11 +3034,18 @@ class Compiled:
         cmds: list,
         layout: Placement,
         ctx: "CodegenContext | None" = None,
+        backend: "str | None" = None,
+        cost_flavor: str = "faithful",
     ):
         self.target = target
         self.trace = trace
         self.cmds = cmds
         self.layout = layout
+        # design 04 §2.1: `backend="virtual"` makes the cost model a peer
+        # run target; `cost_flavor` selects which CostModel flavor the
+        # virtual runner prices against. Both default to today's behaviour.
+        self.backend = backend
+        self.cost_flavor = cost_flavor
         # `_ctx` is currently only consumed by `_run_upmem`, which needs
         # `UPMEMCtx.get_kernel_src()` to render the full DPU envelope
         # around `cmds`. Other backends ignore the field.
@@ -2811,7 +3067,12 @@ class Compiled:
         unavailable" stdout — `run()` never raises for missing tooling.
         """
         target_name = getattr(self.target, "name", None)
-        runner = _BACKEND_RUN.get(target_name)
+        # design 04 §2.1: a `backend="virtual"` Compiled dispatches to the
+        # sim-free virtual runner regardless of target.name.
+        if self.backend == "virtual":
+            runner = _BACKEND_RUN["virtual"]
+        else:
+            runner = _BACKEND_RUN.get(target_name)
         if runner is None:
             return RunResult(
                 cycles=None,
@@ -2852,6 +3113,8 @@ def compile_for_target(
     target: Any,
     trace: MatchTrace,
     layout: Placement | list[Placement] | None = None,
+    backend: "str | None" = None,
+    cost_flavor: str = "faithful",
 ) -> Compiled:
     """Lower a (target, trace) pair to a runnable backend artifact by
     walking the target's declarations.
@@ -2861,11 +3124,39 @@ def compile_for_target(
     across every kernel (back-compat for single-layer tests). If
     ``layout`` is a list, its length must equal the number of
     `@allo.work` kernels in the trace.
+
+    ``backend`` (design 04 §2.1): ``None`` -> today's behaviour (dispatch
+    by ``target.name``). ``"virtual"`` -> the returned ``Compiled`` runs
+    sim-free against the bound ``CostModel`` (``cost_flavor`` selects the
+    flavor). Additive; every existing positional caller is unaffected.
     """
     target_name = getattr(target, "name", None)
     if trace.target_name != target_name:
         raise ValueError(
             f"trace.target_name {trace.target_name!r} != target.name {target_name!r}"
+        )
+
+    # design 04 §2.1 / §8: the virtual backend needs only (trace + cost
+    # model), NOT emitted cmds. So a substrate with no simulator/HW -- no
+    # codegen ctx, no candidate enumerator -- is still developable + costable
+    # purely through `backend="virtual"`. Skip the codegen-ctx requirement
+    # and the emit walk; the cost is computed at run() time by `_run_virtual`
+    # against the bound CostModel. A `layout` is taken as given (or defaults
+    # to an empty Placement when the substrate has no enumerator).
+    if backend == "virtual" and _BACKEND_CTX.get(target_name) is None:
+        from .spmw_autoschedule import _bucket_for_autoschedule
+        buckets = _bucket_for_autoschedule(trace)
+        n_groups = len(buckets) or 1
+        if layout is None:
+            stored_layout = Placement(placements={})
+        elif isinstance(layout, Placement):
+            stored_layout = layout
+        else:
+            layouts = list(layout)
+            stored_layout = layouts[0] if len(layouts) == 1 else layouts
+        return Compiled(
+            target, trace, [], stored_layout, ctx=None,
+            backend=backend, cost_flavor=cost_flavor,
         )
 
     ctx_cls = _BACKEND_CTX.get(target_name)
@@ -2900,4 +3191,7 @@ def compile_for_target(
     # `Compiled.layout` historically held a single Placement; preserve
     # that for back-compat when there's only one kernel.
     stored_layout = layouts[0] if len(layouts) == 1 else layouts
-    return Compiled(target, trace, ctx.cmds, stored_layout, ctx=ctx)
+    return Compiled(
+        target, trace, ctx.cmds, stored_layout, ctx=ctx,
+        backend=backend, cost_flavor=cost_flavor,
+    )

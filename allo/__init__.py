@@ -12,9 +12,20 @@ from .template import *
 from .verify import verify
 from .memory import Memory, Layout
 from .dataflow import kernel as work, get_pid as get_wid
-from .spmw_target import target, unit, reg, get_uid, move, op, any_, or_
+from .spmw_target import target, unit, reg, const, get_uid, move, op, any_, or_
 from .spmw_target import memory as mem
 from .spmw_cost import cost, get_cost
+from .spmw_cost_model import (
+    CostModel,
+    OpCost,
+    MoveCost,
+    OpCostCtx,
+    MoveCostCtx,
+    ComposeCtx,
+    CostResult,
+    register_cost_model,
+    get_cost_model,
+)
 from .spmw_match_engine import (
     compile_op_pattern,
     compile_target_patterns,

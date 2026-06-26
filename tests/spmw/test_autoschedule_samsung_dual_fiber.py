@@ -124,16 +124,25 @@ def test_cost_ranking_flips_when_jump_is_expensive():
     # Pick a JUMP cost large enough that the extra fiber's JUMP outweighs
     # the MAC cycles it saves: saving ~= (folded/2)*mac_cyc, extra cost =
     # 1 * jump_cyc. Setting jump_cyc above the saving guarantees the flip.
-    mac_cyc = target.op("MAC").cycles
-    target.move("JUMP").cycles = folded * mac_cyc  # comfortably dominant
+    # Per design 04 the JUMP/MAC costs live on the bound CostModel, not the
+    # target tree; perturb the model's move_costs (and restore) to make the
+    # JUMP dominant.
+    from allo.spmw_cost_model import MoveCost, OpCostCtx, get_cost_model
 
-    trace = _mac_trace(1024)
-    cost_fn = allo.get_cost("kernel_cycles", target)
-    by_mode = _by_mode(_samsung_enumerate(target, trace.matches))
+    model = get_cost_model("samsung_hbm_pim", "faithful")
+    mac_cyc = model.op_cost("MAC", OpCostCtx("MAC"))
+    saved_jump = model.move_costs["JUMP"]
+    model.move_costs["JUMP"] = MoveCost(lambda c, _v=folded * mac_cyc: _v)
+    try:
+        trace = _mac_trace(1024)
+        cost_fn = allo.get_cost("kernel_cycles", target)
+        by_mode = _by_mode(_samsung_enumerate(target, trace.matches))
 
-    bank_row_cost = cost_fn(trace, by_mode["bank_row"])
-    dual_cost = cost_fn(trace, by_mode["dual_fiber"])
-    assert dual_cost > bank_row_cost, (dual_cost, bank_row_cost)
+        bank_row_cost = cost_fn(trace, by_mode["bank_row"])
+        dual_cost = cost_fn(trace, by_mode["dual_fiber"])
+        assert dual_cost > bank_row_cost, (dual_cost, bank_row_cost)
+    finally:
+        model.move_costs["JUMP"] = saved_jump
 
 
 # --------------------------------------------------------------------- #

@@ -205,6 +205,10 @@ class Unit:
         self.registers: dict[str, Register] = {}
         self.moves: dict[str, Move] = {}
         self.ops: dict[str, Op] = {}
+        # Named scalar constants (e.g. UPMEM `revolver_latency`). Same
+        # provenance class as a Move's `cycles=`; surfaced flat on the
+        # Target so a cost model reads `target.<name>`.
+        self.constants: dict[str, object] = {}
 
     @property
     def level(self):
@@ -230,6 +234,8 @@ class Target:
             for nm, h in u.memories.items():
                 self._handles[nm] = h
             for nm, h in u.registers.items():
+                self._handles[nm] = h
+            for nm, h in u.constants.items():
                 self._handles[nm] = h
 
     def _walk(self):
@@ -344,6 +350,22 @@ def reg(lanes, width, name=None):
             raise ValueError(f"duplicate register name {name!r} on unit {cur.name!r}")
         cur.registers[name] = r
     return r
+
+
+def const(name, value):
+    """Attach a named scalar constant to the current unit; return it.
+
+    A target-spec scalar (e.g. UPMEM `revolver_latency`) declared with the
+    same provenance discipline as a Move's `cycles=`. The value is surfaced
+    flat on the `Target` so a cost model reads it as `target.<name>`.
+    """
+    if not _target_stack:
+        raise RuntimeError("allo.const must be called inside @allo.target/@allo.unit")
+    cur = _target_stack[-1]
+    if name in cur.constants:
+        raise ValueError(f"duplicate constant name {name!r} on unit {cur.name!r}")
+    cur.constants[name] = value
+    return value
 
 
 def get_uid():

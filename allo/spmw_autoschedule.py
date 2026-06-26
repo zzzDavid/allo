@@ -417,6 +417,66 @@ def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     return layouts
 
 
+def _trace_reduction_trip(matches: list[MatchedOp]) -> int | None:
+    """Innermost enclosing-loop bound of the reducing match (per-DPU K).
+
+    The tasklet lever stripes the inner-K reduction across tasklets, so
+    its work quantity is the trip count of the loop the accumulating
+    (MAC) match sits in -- the same `enclosing_loops[-1]` bound the cost
+    model reads. Returns None when no reducing match carries an inner
+    loop, in which case the enumerator falls back to the `nt=1`-only
+    candidate (parity with today). Mirror of SPEC-026's structural
+    `batch_dim` resolver; rides existing `enclosing_loops` (no
+    `allo/ir/` edit, per design 02 §3.1).
+    """
+    from .spmw_cost_models import _parse_loop_bound
+
+    for match in matches:
+        if match.target_op_name != "MAC":
+            continue
+        if not match.enclosing_loops:
+            continue
+        bound = _parse_loop_bound(match.enclosing_loops[-1][2])
+        if bound is not None:
+            return bound
+    return None
+
+
+def _tasklet_fanout(target) -> int | None:
+    """Tasklet-unit fanout (T_max) read from the target unit tree.
+
+    Walks for the unit named `tasklet` and returns the product of its
+    `mapping` (= 16 in the fixture's `@allo.unit(mapping=[16])`). This is
+    target-derived, never the literal 16. Returns None when absent.
+    """
+    from math import prod
+
+    for u in target._walk():
+        if u.name == "tasklet":
+            return prod(u.mapping) if u.mapping else None
+    return None
+
+
+def _upmem_tasklet_candidates(target, matches: list[MatchedOp]) -> list[int]:
+    """Derive the enumerated `n_tasklets` candidate set, shape+target only.
+
+    `{1, T_max}` at minimum (>=2-candidate discipline), where `T_max` is
+    the tasklet-unit fanout. When the reduction trip is known and smaller
+    than `T_max`, cap `T_max` at the trip so a short reduction is not
+    over-subscribed. No `16`/`1024`/`5.71` literal: the set is a function
+    of the unit fanout and the traced reduction trip only.
+    """
+    t_max = _tasklet_fanout(target)
+    if not t_max or t_max <= 1:
+        return [1]  # no tasklet axis -> parity with pre-lever behaviour
+    trip = _trace_reduction_trip(matches)
+    if trip is not None and trip < t_max:
+        t_max = max(1, trip)
+    if t_max <= 1:
+        return [1]
+    return [1, t_max]
+
+
 @register_enumerator("upmem")
 def _upmem_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     """Enumerate candidate layouts for UPMEM DPUs.
@@ -456,18 +516,24 @@ def _upmem_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     wram_y = wram[1]
     wram_acc = wram[2]
 
-    layouts: list[Placement] = [
-        Placement(placements={
-            x_mref: wram_x,
-            y_mref: wram_y,
-            acc_mref: wram_acc,
-        }),
-        Placement(placements={
-            x_mref: wram_x,
-            y_mref: wram_y,
-            acc_mref: gprs,
-        }),
+    acc_placements = [
+        {x_mref: wram_x, y_mref: wram_y, acc_mref: wram_acc},
+        {x_mref: wram_x, y_mref: wram_y, acc_mref: gprs},
     ]
+
+    # Tasklet-tiling lever (design 02 §3.2): cross each acc-placement
+    # with the derived `n_tasklets` candidate set so argmin ranks the
+    # parallelism. Default `n_tasklets=1` == today's behaviour (T9
+    # floor). The candidate set is shape+target-derived, not a literal.
+    tasklet_candidates = _upmem_tasklet_candidates(target, matches)
+
+    layouts: list[Placement] = []
+    for placements in acc_placements:
+        for n_tasklets in tasklet_candidates:
+            layouts.append(Placement(
+                placements=dict(placements),
+                extra={"n_tasklets": n_tasklets},
+            ))
     return layouts
 
 
@@ -475,11 +541,20 @@ def _upmem_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
 def _apu_v1_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     """Enumerate placements for APU v1.
 
-    Per spec 013 §D.3, this is a one-liner `LinearLayout.identity` over the
-    32K-lane bit-serial element axis. All compute operands live in VRs;
-    register pressure (16 VRs per APUC) is deferred to the regalloc spec
-    (Task 015). MICRO '25 Opt2 (stage-axis lift, 1.25x speedup) needs the
-    move scheduler to see the full @allo.work chain and is also deferred.
+    Per spec 013 §D.3 the operand placement is a one-liner
+    `LinearLayout.identity` over the 32K-lane bit-serial element axis:
+    all compute operands live in `target.vrs`, so there is no operand-
+    swizzle DOF.
+
+    The live DOF (design 01 §4) is the **VR-tile / L4-DMA mode**:
+    intra-VR re-fetches the contraction operand per output tile,
+    inter-VR loads it once and reuses it across output tiles. The two
+    cross the {sv, sv_lookup} MAC-expansion choice, giving four
+    candidates. The tile counts (`n_out_tiles`, `n_k_tiles`) carried in
+    `extra` are `ceil`-arithmetic over the operand shape and
+    `target.vrs.*` (computed by `_apu_v1_vr_tiling`), never a benchmark
+    literal; codegen materialises the chosen `vr_dma` so host and device
+    layout agree by construction.
     """
     role_to_memref = _trace_memrefs_by_role(matches)
     x_mref = role_to_memref.get("x")
@@ -504,10 +579,34 @@ def _apu_v1_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
         y_mref: vrs,
         acc_mref: vrs,
     }
-    return [
-        Placement(placements=dict(placements), mode="sv"),
-        Placement(placements=dict(placements), mode="sv_lookup"),
-    ]
+
+    # VR-tile arithmetic from operand shape + target.vrs (design 01 §4.1).
+    # The tile counts are identical for both vr_dma modes (they share the
+    # shape); only how the moves are issued (per-tile re-fetch vs reuse)
+    # differs, and the cost model prices that difference.
+    from .spmw_cost_models import _apu_v1_vr_tiling
+
+    trace = MatchTrace(
+        target_name="apu_v1", module_name="<enumerate>", matches=list(matches)
+    )
+    n_out_tiles, n_weight_tiles, n_boundaries = _apu_v1_vr_tiling(target, trace)
+
+    candidates: list[Placement] = []
+    for mode in ("sv", "sv_lookup"):
+        for vr_dma in ("intra", "inter"):
+            candidates.append(
+                Placement(
+                    placements=dict(placements),
+                    mode=mode,
+                    extra={
+                        "vr_dma": vr_dma,
+                        "n_out_tiles": n_out_tiles,
+                        "n_weight_tiles": n_weight_tiles,
+                        "n_stage_boundaries": n_boundaries,
+                    },
+                )
+            )
+    return candidates
 
 
 @register_enumerator("apu_v2")

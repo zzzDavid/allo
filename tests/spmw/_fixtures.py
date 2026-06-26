@@ -116,36 +116,30 @@ def build_samsung_target():
                 grf_a = allo.reg(8, 256, name="grf_a")
                 grf_b = allo.reg(8, 256, name="grf_b")
 
-                # Samsung HBM-PIM timing (coarse model). tCCDL=4 is the
-                # column-strobe period; LD/ST spills come from spec 015
-                # §6.1: load = tCCDL+RL+BL//2 = 26, store = tCCDL+WL+BL//2
-                # = 14 (RL=20, WL=8, BL=4). JUMP is a 1-cycle control op.
+                # Samsung HBM-PIM moves. Per design 04 the cycle numbers
+                # no longer live on the target tree -- they migrated to the
+                # bound CostModel (spmw_cost_tables.SAMSUNG_FAITHFUL). The
+                # target carries structure + emit only. JUMP is a synthetic
+                # control op the cost model prices for the inner-K fold; no
+                # codegen emits it.
                 allo.move(
                     "LD_A", src=even_bank, dst=grf_a,
-                    cycles=26,
                     emit=lambda ctx: ctx.cmd("MOV", dst=grf_a, src0=even_bank),
                 )
                 allo.move(
                     "LD_B", src=odd_bank, dst=grf_b,
-                    cycles=26,
                     emit=lambda ctx: ctx.cmd("MOV", dst=grf_b, src0=odd_bank),
                 )
                 allo.move(
                     "ST_A", src=grf_a, dst=even_bank,
-                    cycles=14,
                     emit=lambda ctx: ctx.cmd("MOV", dst=even_bank, src0=grf_a),
                 )
                 allo.move(
                     "ST_B", src=grf_b, dst=odd_bank,
-                    cycles=14,
                     emit=lambda ctx: ctx.cmd("MOV", dst=odd_bank, src0=grf_b),
                 )
-                # JUMP is a synthetic 1-cycle control op used by the cost
-                # model to price the inner-K fold in bank-row MAC; no
-                # codegen emits it today.
                 allo.move(
                     "JUMP", src=grf_b, dst=grf_b,
-                    cycles=1,
                     emit=lambda ctx: None,
                 )
                 # CRF_TRIGGER (SPEC-025 §6): host per-tile fire latency in
@@ -161,59 +155,39 @@ def build_samsung_target():
                 # schedule side-list (SPEC-025 §5.4).
                 allo.move(
                     "CRF_TRIGGER", src=grf_b, dst=grf_b,
-                    cycles=2,
                     emit=lambda ctx: None,
                 )
 
-                # SPEC-026 §3.2/§3.3: closed-form preload/readback phase
-                # constants for the batched-GEMV cost model. These are the
-                # spec-side carriers of the per-phase costs the faithful
-                # run (report 18 §3) measured at 4096x1024
-                # (preload=11368, readback=181); the cost model evaluates
-                # the closed forms
-                #   preload_cyc  = (M*K // PRELOAD_FAN) * PRELOAD_WR + PRELOAD_CRF
-                #   readback_cyc = ceil(M / READBACK_FAN) * READBACK_RD
-                # so the numbers track (M, K) and never appear as inline
-                # literals in `spmw_cost_models.py`. `cycles` is used as a
-                # generic integer carrier (fan-out widths + per-group cyc).
-                #
-                # Calibration (report 18 §3, faithful preloadGemv /
-                # readResult at M=4096, K=1024):
-                #   PRELOAD_FAN  = 369  -- effective parallel weight-write
-                #     fan-out of the HAB-broadcast preloadGemv double loop
-                #     (PIMKernel.cpp:295-322), faithful-anchored so
-                #     (M*K // 369) = 11366 weight-write groups.
-                #   PRELOAD_WR   = 1    -- per-group column-strobe cost
-                #     (tCCDL-normalised, Samsung ISCA'21 §4.1).
-                #   PRELOAD_CRF  = 2    -- one-time programCrf upload latency
-                #     (CRF program <= 4 bursts, arch-200 §2; ISCA'21 §4.2).
-                #     => preload_cyc(4096,1024) = 11366 + 2 = 11368.
-                #   READBACK_FAN = 4096 -- output elements covered by one
-                #     readback tile (num_total_pim_blocks_ * num_grfB_,
-                #     ISCA'21 §4.1); readback issues one GRFB_TO_BANK per
-                #     output tile (PIMKernel.cpp:435).
-                #   READBACK_RD  = 181  -- per-output-tile readResult +
-                #     GRFB_TO_BANK writeback latency (faithful cyc_readback,
-                #     report 18 §3). => readback_cyc(4096) = 1*181 = 181.
+                # SPEC-026 §3.2/§3.3: the closed-form preload/readback
+                # phases are priced by the bound CostModel. Per design 04
+                # §1.2, the PRELOAD_FAN / READBACK_FAN fan-out WIDTHS and
+                # the per-group cycle costs are calibration anchors of the
+                # faithful model, NOT device structure -- so they live in
+                # spmw_cost_tables.SAMSUNG_FAITHFUL.move_costs, not on the
+                # target. The target keeps only the move structure so the
+                # closed forms have named carriers to look up. Calibration
+                # (report 18 §3, M=4096 K=1024): PRELOAD_FAN=369, WR=1,
+                # CRF=2 => preload=11368; READBACK_FAN=4096, RD=181 =>
+                # readback=181.
                 allo.move(
                     "PRELOAD_FAN", src=even_bank, dst=even_bank,
-                    cycles=369, emit=lambda ctx: None,
+                    emit=lambda ctx: None,
                 )
                 allo.move(
                     "PRELOAD_WR", src=grf_a, dst=even_bank,
-                    cycles=1, emit=lambda ctx: None,
+                    emit=lambda ctx: None,
                 )
                 allo.move(
                     "PRELOAD_CRF", src=grf_a, dst=even_bank,
-                    cycles=2, emit=lambda ctx: None,
+                    emit=lambda ctx: None,
                 )
                 allo.move(
                     "READBACK_FAN", src=odd_bank, dst=grf_b,
-                    cycles=4096, emit=lambda ctx: None,
+                    emit=lambda ctx: None,
                 )
                 allo.move(
                     "READBACK_RD", src=odd_bank, dst=grf_b,
-                    cycles=181, emit=lambda ctx: None,
+                    emit=lambda ctx: None,
                 )
 
                 any_bank = allo.any_(banks)
@@ -223,7 +197,6 @@ def build_samsung_target():
                     src=(allo.or_(any_bank, any_reg), allo.or_(any_bank, any_reg)),
                     dst=any_reg,
                     fn=lambda x, y: x * y,
-                    cycles=4,
                     emit=lambda x, y, dst, ctx: ctx.cmd("MUL", dst=dst, src0=x, src1=y),
                 )
                 allo.op(
@@ -232,7 +205,6 @@ def build_samsung_target():
                     dst=grf_b,
                     accumulates=True,
                     fn=lambda x, y, acc: acc + x * y,
-                    cycles=4,
                     emit=lambda x, y, acc, ctx: ctx.cmd("MAC", dst=acc, src0=x, src1=y),
                 )
 
@@ -267,10 +239,9 @@ def build_aim_target():
                     bias = allo.reg(16, 16, name="bias")
 
                     # -------- moves -------- #
-                    # AiM bank-row spill: tCCDL=4, RD=16, WR=12, burst=4
-                    # (JSSC 2023 §IV). RD_SBK = tCCDL+RD+BURST = 24.
-                    # Other moves are not priced in the spill model and
-                    # default to None.
+                    # AiM bank-row spill numbers (RD_SBK=24, ST_SBK=20)
+                    # migrated to spmw_cost_tables.AIM_FAITHFUL per design
+                    # 04; the target keeps structure + emit only.
                     allo.move(
                         "WR_SBK", src=gb, dst=bank_ref,
                         emit=lambda ctx: ctx.cmd(
@@ -303,7 +274,6 @@ def build_aim_target():
                     )
                     allo.move(
                         "RD_SBK", src=bank_ref, dst=gpr,
-                        cycles=24,
                         emit=lambda ctx: ctx.cmd(
                             "RD_SBK", dst=gpr, src0=bank_ref),
                     )
@@ -318,21 +288,17 @@ def build_aim_target():
                             "COPY_GBBK", dst=bank_ref, src0=gb),
                     )
                     # Synthetic store-side move (no bank-row writeback
-                    # opcode is emitted today; cycles only exists so the
-                    # spill model can price ST_SBK monotonically).
-                    # store = tCCDL + WR + BURST = 20.
+                    # opcode is emitted today; exists so the spill model
+                    # has a named ST_SBK carrier to price = 20).
                     allo.move(
                         "ST_SBK", src=gpr, dst=bank_ref,
-                        cycles=20,
                         emit=lambda ctx: None,
                     )
 
                     # -------- compute ops -------- #
-                    # AiM cycle estimates (JSSC 2023 §IV; ramulator2
-                    # YAML carries the exact per-ISR timings):
-                    #   EWMUL = EWADD = 4; MAC_SBK = 8 (1 burst x 16
-                    #   lanes); MAC_ABK = 16 (all-bank broadcast = 2x);
-                    #   AF (GELU/SIGMOID) = 6.
+                    # AiM cycle estimates (JSSC 2023 §IV) migrated to
+                    # spmw_cost_tables.AIM_FAITHFUL: EWMUL=EWADD=4,
+                    # MAC_SBK=8, MAC_ABK=16, AF=6.
                     any_bank = allo.any_(banks)
                     any_gpr = allo.any_([gpr])
 
@@ -343,7 +309,6 @@ def build_aim_target():
                              allo.or_(any_bank, any_gpr)),
                         dst=any_gpr,
                         fn=lambda x, y: x * y,
-                        cycles=4,
                         emit=lambda x, y, dst, ctx: ctx.cmd(
                             "EWMUL", dst=dst, src0=x, src1=y),
                     )
@@ -355,7 +320,6 @@ def build_aim_target():
                              allo.or_(any_bank, any_gpr)),
                         dst=any_gpr,
                         fn=lambda x, y: x + y,
-                        cycles=4,
                         emit=lambda x, y, dst, ctx: ctx.cmd(
                             "EWADD", dst=dst, src0=x, src1=y),
                     )
@@ -368,7 +332,6 @@ def build_aim_target():
                         dst=gpr,
                         accumulates=True,
                         fn=lambda x, y, acc: acc + x * y,
-                        cycles=8,
                         emit=lambda x, y, acc, ctx: ctx.cmd(
                             "MAC_SBK", dst=acc, src0=x, src1=y),
                     )
@@ -381,7 +344,6 @@ def build_aim_target():
                         dst=gpr,
                         accumulates=True,
                         fn=lambda x, y, acc: acc + x * y,
-                        cycles=16,
                         emit=lambda x, y, acc, ctx: ctx.cmd(
                             "MAC_ABK", dst=acc, src0=x, src1=y),
                     )
@@ -392,7 +354,6 @@ def build_aim_target():
                         src=(any_gpr,),
                         dst=any_gpr,
                         fn=lambda x: x,
-                        cycles=6,
                         emit=lambda x, dst, ctx: ctx.cmd(
                             "AF", dst=dst, src0=x, kind="GELU"),
                     )
@@ -423,13 +384,14 @@ def build_upmem_target():
                 def tasklet():
                     gprs = allo.reg(24, 32, name="gprs")
 
+                    # revolver_latency (=11) and all move/op cycle numbers
+                    # migrated to spmw_cost_tables.UPMEM_FAITHFUL per design
+                    # 04 (revolver_latency rides CostModel.constants). The
+                    # target keeps move/op structure + emit only.
+
                     # -------- moves -------- #
-                    # UPMEM latency (uPIMulator / HPCA 2024 Table 2):
-                    # MRAM read/write = 1000 cyc per 64 B burst; WRAM
-                    # access = 1 cyc (GPR fused by C compiler).
                     allo.move(
                         "LD_MRAM", src=mram, dst=wram,
-                        cycles=1000,
                         emit=lambda ctx: ctx.emit_c_line(
                             "mram_read(&{src}, &{dst}, BL);".format(
                                 src=ctx.handle_c_name(mram),
@@ -437,7 +399,6 @@ def build_upmem_target():
                     )
                     allo.move(
                         "ST_MRAM", src=wram, dst=mram,
-                        cycles=1000,
                         emit=lambda ctx: ctx.emit_c_line(
                             "mram_write(&{src}, &{dst}, BL);".format(
                                 src=ctx.handle_c_name(wram),
@@ -448,20 +409,16 @@ def build_upmem_target():
                     # spills without forcing an emit pass.
                     allo.move(
                         "LD_WRAM", src=wram, dst=gprs,
-                        cycles=1,
                         emit=lambda ctx: ctx.emit_c_line(
                             "/* WRAM->GPR fused by C compiler */"),
                     )
                     allo.move(
                         "ST_WRAM", src=gprs, dst=wram,
-                        cycles=1,
                         emit=lambda ctx: ctx.emit_c_line(
                             "/* GPR->WRAM fused by C compiler */"),
                     )
 
                     # -------- compute ops -------- #
-                    # DPU GPR ops issue at 1 cyc; MAC = mul+add = 2 cyc
-                    # (no fused MAC on DPU).
                     any_wram = allo.any_(wram)
                     any_gpr = allo.any_([gprs])
 
@@ -471,7 +428,6 @@ def build_upmem_target():
                              allo.or_(any_wram, any_gpr)),
                         dst=any_gpr,
                         fn=lambda x, y: x * y,
-                        cycles=1,
                         emit=lambda x, y, dst, ctx: ctx.emit_c_line(
                             "{d} = {a} * {b};".format(
                                 d=ctx.handle_c_name(dst),
@@ -485,7 +441,6 @@ def build_upmem_target():
                              allo.or_(any_wram, any_gpr)),
                         dst=any_gpr,
                         fn=lambda x, y: x + y,
-                        cycles=1,
                         emit=lambda x, y, dst, ctx: ctx.emit_c_line(
                             "{d} = {a} + {b};".format(
                                 d=ctx.handle_c_name(dst),
@@ -507,7 +462,6 @@ def build_upmem_target():
                         dst=any_gpr,
                         accumulates=True,
                         fn=lambda x, y, acc: acc + x * y,
-                        cycles=2,
                         emit=lambda x, y, acc, ctx: ctx.emit_mac_kreduce(
                             acc=acc, x=x, y=y,
                             k_bound=ctx.pending_k_bound),
@@ -540,30 +494,27 @@ def build_apu_v1_target():
             vrs = allo.reg(16, 32768, name="vrs")
 
             # -------- moves -------- #
-            # APU v1 cycle estimates (report 12 §4.2 + pim-apu-v1 skill):
-            # DMA L4<->L1 = 140 cyc per 32K-element burst; LD/ST_VR = 4
-            # cyc (same SRAM fabric as VRs, ~5 cyc round-trip for spill).
+            # APU v1 cycle estimates (report 12 §4.2) migrated to
+            # spmw_cost_tables.APU_V1_FAITHFUL per design 04: DMA L4<->L1 =
+            # 140 cyc/32K burst; LD/ST_VR = 5 cyc. Target keeps structure
+            # + emit only.
             allo.move(
                 "DMA_L4_L1", src=l4, dst=l1,
-                cycles=140,
                 emit=lambda ctx: ctx.cmd(
                     "direct_dma_l4_to_l1_32k", dst=l1, src0=l4),
             )
             allo.move(
                 "DMA_L1_L4", src=l1, dst=l4,
-                cycles=140,
                 emit=lambda ctx: ctx.cmd(
                     "direct_dma_l1_to_l4_32k", dst=l4, src0=l1),
             )
             allo.move(
                 "LD_VR", src=l1, dst=vrs,
-                cycles=5,
                 emit=lambda ctx: ctx.cmd(
                     "gvml_load_16", dst=vrs, src0=l1),
             )
             allo.move(
                 "ST_VR", src=vrs, dst=l1,
-                cycles=5,
                 emit=lambda ctx: ctx.cmd(
                     "gvml_store_16", dst=l1, src0=vrs),
             )
@@ -586,11 +537,10 @@ def build_apu_v1_target():
             )
 
             # -------- compute ops -------- #
-            # APU v1 per-op cycles (32K bit-serial lanes per VR):
-            # gvml_add_s16 = 2; gvml_mul_u16 = 16; MAC (SV-lookup
-            # expansion = gvml_lookup_16 + gvml_add_s16) = 6 + 2 = 8.
-            # The autoscheduler also prices raw SV-mode MAC as 16+2=18
-            # (see _apu_v1_kernel_cycles).
+            # APU v1 per-op cycles (gvml_add_s16=2, gvml_mul_u16=16, MAC
+            # SV-lookup = gvml_lookup_16(6)+gvml_add_s16(2)=8; raw SV-mode
+            # MAC priced as 16+2=18) migrated to
+            # spmw_cost_tables.APU_V1_FAITHFUL per design 04.
             any_vr = allo.any_([vrs])
 
             allo.op(
@@ -598,7 +548,6 @@ def build_apu_v1_target():
                 src=(any_vr, any_vr),
                 dst=any_vr,
                 fn=lambda x, y: x + y,
-                cycles=2,
                 emit=lambda x, y, dst, ctx: ctx.cmd(
                     "gvml_add_s16", dst=dst, src0=x, src1=y),
             )
@@ -608,7 +557,6 @@ def build_apu_v1_target():
                 src=(any_vr, any_vr),
                 dst=any_vr,
                 fn=lambda x, y: x * y,
-                cycles=16,
                 emit=lambda x, y, dst, ctx: ctx.cmd(
                     "gvml_mul_u16", dst=dst, src0=x, src1=y),
             )
@@ -621,7 +569,6 @@ def build_apu_v1_target():
                 dst=any_vr,
                 accumulates=True,
                 fn=lambda x, y, acc: acc + x * y,
-                cycles=8,  # SV-lookup: gvml_lookup_16(6) + gvml_add_s16(2)
                 emit=lambda x, y, acc, ctx: ctx.emit_mac_lookup(
                     acc=acc, x=x, y=y),
             )

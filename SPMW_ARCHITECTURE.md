@@ -18,6 +18,9 @@ top-level packages.
 | `spmw_regalloc.py` (spec 015) | `LiveRange`, `Spilled`, `CostVector`, `CapacityTable`, `AllocResult`, `extract_live_ranges`, `allocate`, `_solve` (greedy v1; PBQP seam). Five backend capacity tables and the spill-tier dispatch live here, not on `Target`. | no (internal seam of `autoschedule`) |
 | `spmw_codegen.py` | `CodegenContext` base, per-backend ctx subclasses (currently `SamsungCtx`), `compile_for_target`, `Compiled` artifact, `_resolve_layout`, `_walk_and_emit`. After spec 015 `_resolve_layout` unwraps `Spilled` to its home handle and `_walk_and_emit` asks each backend ctx for spill LD/ST move names via `resolve_spill_moves(tier)`. | yes (`compile_for_target`, `Compiled`, `PIMCmd`, `SamsungCtx`) |
 | `spmw_linear_layout.py` (spec 013) | `LinearLayout` F2 algebra (apply / compose / product / invert / sublayout / `optimal_swizzle`) and `materialise_handle`. Consumed inside backend enumerators; the resulting concrete handle is what `Placement` actually carries. | yes (`LinearLayout`) |
+| `spmw_cost_model.py` (design 04) **LANDED (task 009)** | `CostModel`/`OpCost`/`MoveCost`/`OpCostCtx`/`MoveCostCtx`/`ComposeCtx`/`CostResult` dataclasses; `register_cost_model`/`get_cost_model` registry keyed by `(target_name, flavor, concern)`; `evaluate(target, trace, layout, flavor)` (the sim-free entry the virtual runner calls). Mechanism only — no numbers. | yes (`CostModel`, `evaluate`) |
+| `spmw_cost_tables.py` (design 04) **LANDED (task 009)** | the concrete `CostModel` instances (numbers + per-target `compose`): `samsung_faithful`, `aim_faithful`, `upmem_faithful`, `apu_v1_faithful`, `apu_v2_placeholder`, plus the swap-test flavor. The "Energy-Reference-Table" file — a profiling-refinement edits ONLY this. | no (side-effect registration) |
+| `spmw_tripcount.py` (design 04) **LANDED (task 009)** | `resolve_trip_count` (D3 symbolic bound resolution); retains `_parse_loop_bound` as the tier-1 literal helper. | no (cost-path internal) |
 
 User-facing `allo.work` and `allo.get_wid` are aliases for
 `allo.dataflow.kernel` and `allo.dataflow.get_pid` respectively (see
@@ -35,6 +38,7 @@ into MLIR, which the matcher then walks.
 | `allo/ir/*` | **untouched** | Upstream Allo's responsibility. |
 | `allo/__init__.py` | **edited (spec 001)** | Resolve `Layout` shadow (rename SPMW Layout → Placement). Drop `memory` callable re-export (replace with `mem`). |
 | `experiments/simulators/uPIMulator/golang/uPIMulator/` | **edited (spec 003, additive only)** | Add a permanent benchmark slot named `TENON` that `_run_upmem` overwrites with the emitted DPU `task.c` per call. Touched files: `benchmark/CMakeLists.txt` (+1 `add_subdirectory(TENON)` line), `src/assembler/assembler.go` (+1 registry line), plus four new files under `benchmark/TENON/` and `src/assembler/prim/tenon.go`. Templated from the existing `DSLVA` benchmark (which uPIMulator's own authors added as a codegen slot). No existing files are semantically changed; reverting is `git revert` plus an inert benchmark dir. No upstream Allo / FPGA tests touch this tree. See `SPEC-003-upmem-real-kernel.md`. |
+| `experiments/simulators/uPIMulator/golang/uPIMulator/src/assembler/prim/gemv.go` (`Init`) | **edited (design 02 §6c, additive only) — coder task 025** | The pre-existing in-tree bespoke `GEMV` host pins `n_size = 64` (`:35`). Change to `n_size = DataPrepParams()[1]` with a `len(...) >= 2`-guarded fallback to `64`, so the gemv reduction length is shape-derived (1024) not hardcoded. `DataPrepParams()` is already a comma-separated `[]int` (`command_line_parser.go:99-111`); this reads a second optional element. The native PrIM `--benchmark GEMV` invocation (one param) is byte-for-byte unchanged by the `len` guard. Used so the UPMEM gemv MATCH runs BOTH Tenon and Exo columns through one bespoke gemv overhead path (not the VA-shaped TENON slot), making the comparison byte-fair and retiring the `data_prep_params=1024` debt. Guarded by a native 1-param GEMV back-compat run + new `tests/spmw/test_upmem_gemv_host_routing`. No CMake/assembler-registry edit (`GEMV` already registered, `assembler.go:41`). See `design/02-upmem-tasklet-tiling.md` §6c. |
 | `allo/spmw_linear_layout.py` (`materialise_handle`, new `bank_stride`) | **edited (spec 022, additive only)** | New `symbolic=` kwarg on `materialise_handle` carries the swizzle `tile` column as a free `SymExpr`; new `bank_stride(target, *, out_dim, unit_level)` derives banks-per-unit from target geometry so the even-bank base `stride*pid` is layout/target-derived, not a pasted `2*pid` (anti-hardcoding gate evidence #4). Kwarg defaults to `None` → today's behaviour; the four non-Samsung enumerators (SPEC-007 option b) never pass it. `_bank_parity` is **unchanged** (the new path emits the same `2*pid` / `2*pid+1` forms it already classifies, for Samsung's `stride==2`). Guarded by new `tests/spmw/test_linear_layout.py::test_materialise_symbolic_fibers` + existing `test_materialise_samsung_bank_handle` (back-compat). Upstream Allo does not import `spmw_linear_layout`, so `tests/dataflow/` and `tests/customize/` are not gated. See `SPEC-022-materialise-symbolic-fibers.md`. |
 | `experiments/simulators/PIMSimulator/src/pim_driver.cc` (GEMV phase block) | **edited (spec 026, additive only)** | New `--batch B` + `--native-rebaseline` flags wrap the GEMV phase block (`:292-321`) in a batched sequencing loop: resident clocks `preloadGemv` once + B*(exec+readback); native re-pays `preloadGemv` per call → B*(preload+exec+readback). Both loops call the SAME `executeGemvFaithful`+`readResult` per vector (I2, no flattering); only preload placement differs. With `--batch 1` / no flag the branch runs the byte-identical pre-026 single-vector sequence (FPGA/AIE CI never reaches this Samsung-only path). The five frozen fns + `executeGemvFaithful`/`countGemvStreamWork` + `>=1` clamp have a **zero diff**. Rebuild `scons -j32`. Guarded by upstream gtest `PIMKernelFixture.gemv` (frozen-fn bodies untouched) + new `tests/spmw/test_samsung_batched_*`. See `SPEC-026-batched-gemv-weight-reuse.md`. |
 | `experiments/simulators/PIMSimulator/src/PIMKernel.cpp` (`runPIM`, `executeGemv`, `executeGemvWithCmds`, `computeGemv`, `programCrf`) | **reference-only, FORBIDDEN to edit (spec 021)** | `getCycle()` is shape-fixed: cycles advance one tick per `mem_->update()` in `runPIM` (line 21-27); the `--cmds` stream reaches only `programCrf` (line 478), which caps at 4 CRF bursts (line 220-238); the work loop and per-tile MAC volume are derived from `w_data->bShape`, not from `cmds`. The faithful run path (spec 021, task 025) must be a **new** driver symbol/flag that calls these but does not edit their bodies, plus Tenon-side `spmw_codegen._run_samsung*` changes. The native `--op GEMV` cycle output must stay byte-for-byte (task 015 baseline). Guarded by upstream gtest `PIMKernelFixture.gemv` (must stay green) + `tests/spmw/test_samsung_placement_changes_cycles.py` (promoted to strict `cycles_a != cycles_b` once 025 lands). See `SPEC-021-samsung-cycle-model.md`. |
@@ -168,6 +172,43 @@ research-201 B\*=2 / 3.93x asymptote):
   vector both sides — only preload-loop placement differs. Other backends
   never set either key. See SPEC-026.
 
+### `Placement.extra["n_tasklets"]` — UPMEM tasklet tiling (design 02, UPMEM)
+The UPMEM analog of the Samsung `weight_resident` lever — the one target where
+the abstraction is meant to move the number (TASK_DESCRIPTION line 104-107). The
+DPU's 11-cycle revolver thread scheduler (the throughput bound; the 14-stage
+pipeline is NOT the bottleneck — research-021) is filled by fine-grained tasklets
+(Exo `nt=16` beats Cinnamon `nt=1` by ~5.71x on our path, Phase-0 README §2).
+Today nothing in the decision path knows tasklet count: `_upmem_enumerate`
+enumerates only acc WRAM-vs-GPR, `_upmem_kernel_cycles` has no tasklet term, and
+`_run_upmem` hardcodes `--num_tasklets 1` (tension T9). Design 02 makes the
+lever a ranked decision:
+- `MatchedOp` side: a new spmw-local `_trace_reduction_trip(matches)` names the
+  per-DPU reduction trip (the innermost `enclosing_loops[-1]` bound of the
+  `accumulates=True` match — the same bound SPEC-019's `pending_k_bound` already
+  threads). **No `allo/ir/` edit** (SPEC-026 §1.4 proof reused).
+- `Placement.extra["n_tasklets"]` (int, default 1): enumerated as a cross over
+  the existing acc-placements, candidate set `{1, T_max}` (≥2, SPEC-009) where
+  `T_max` = the tasklet-unit `mapping` fanout read from the target tree (not the
+  literal 16). Default 1 == today (T9 floor preserved).
+- Cost (CLOSED by research-021): `_upmem_kernel_cycles` becomes
+  `S + ceil(S*(R-1) / min(T, R))` where `S` = today's issue count
+  (`sum(per_op*iters)`) and `R = target.revolver_latency`. The saturating
+  divisor is the **revolver scheduling window `R = 11`, NOT the 14-stage
+  pipeline depth** — the lever comes from the round-robin thread scheduler
+  (`thread_scheduler.go`): a tasklet re-issues at most once per 11 cycles, so
+  speedup saturates at `min(T, R)`. `fill_drain = 0` (no separate term). At T=1
+  this returns `S*R`, a uniform scale of today's `S`, so the acc argmin is
+  invariant. Exactly **one** new target-spec constant `revolver_latency = 11`
+  (uPIMulator `num_revolver_scheduling_cycles`, `src/main.go:115`, provenance-
+  parallel to `LD_MRAM cycles=1000`); `pipeline_depth` is deliberately NOT added.
+  Model reproduces the 5.71x lever within 0.9% (5.762), saturates at `T = 11`,
+  invariant across reduction trips (no literal keying).
+- Codegen: `UPMEMCtx` reads `extra["n_tasklets"]` (a field, no re-derivation);
+  `_run_upmem` threads it + the reduction trip to the CLI, **resolving T9**.
+The +1.12x harness offset (generic TENON slot vs Shiran's bespoke `EXO_GEMV`
+host) is independent: the lever is a ratio, offset-invariant; retiring the
+offset is a separate harness task under T8a/T8b. See `design/02-upmem-tasklet-tiling.md`.
+
 ### `Compiled.ctx` (spec 003, additive)
 `Compiled.__init__` grows an optional fifth kwarg `ctx=None` that
 retains the `CodegenContext` instance that produced the cmds.
@@ -271,7 +312,63 @@ spill-tier cost-vector entries. Five backends ship: Samsung, AiM,
 UPMEM, APU v1, APU v2 (functional-only target; cost stub is
 non-comparative — see SPEC-011).
 
+### `CostModel` — decoupled per-op cost spec (design 04, virtual backend) — SPEC'D, NOT YET LANDED
+Two-layer, per-op cost interface in new `spmw_cost_model.py` (mechanism)
++ `spmw_cost_tables.py` (numbers). Layer A: `dict[str, OpCost]` /
+`dict[str, MoveCost]` where each entry is a **callable** `fn(ctx) ->
+cycles` (independently refinable against device profiling — the MICRO-2025
+APU v1 per-op model is the canonical intended consumer of `OpCost.fn`).
+Layer B: a swappable `compose(ComposeCtx) -> CostResult(cycles, phases,
+confidence)`. The target tree carries **zero cost numbers** after design
+04; the 34 `cycles=` fixture literals + `revolver_latency` move into the
+`CostModel`. Bound by `(target_name, flavor)`; `_kernel_cycles_factory`
+delegates to the bound model's `compose` (faithful flavor → argmin
+byte-identical to today, report-18 invariant preserved). The host-side
+task's `@allo.cost("host_staging")` is a **sibling concern in the same
+machinery** (design 04 §4: this task owns the reformulation, host-side
+consumes it). See `experiments/allo/design/04-virtual-accelerator-backend.md`.
+
+### `virtual` backend (design 04 §2) — SPEC'D, NOT YET LANDED
+Selector: `compile_for_target(target, trace, backend="virtual",
+cost_flavor="faithful")` (NOT `run(virtual=True)` — symmetry: virtual is a
+peer of the five sim/HW backends). `_BACKEND_RUN["virtual"] =
+_run_virtual`, a sim-free adapter to `spmw_cost_model.evaluate` (no
+subprocess/Docker/sim-root import — the no-sim gate passes by
+construction). `RunResult` is structurally unchanged; `confidence` +
+`phases` ride in `extra`; functional `output` is None for v1.
+
+### `resolve_trip_count` (design 04 §3, new `spmw_tripcount.py`) — LANDED (task 011)
+Replaces the silent-`None`→`1` behaviour of `_parse_loop_bound` *on the
+cost path only* (matcher bound strings untouched). Signature
+`resolve_trip_count(match, loop_idx=-1, *, shapes, mapping_env)`;
+`resolve_bound_text` is the string-level core for non-inner bounds. Three
+tiers: literal / affine-over-operand-shapes+mapping-params / dynamic
+(None). On tier-3 each `compose` applies the model's DECLARED
+`CostModel.dynamic_trip_default(op_name)` (v1 = 1), stamps a
+`phases["dynamic_assumed"]=1` marker, and downgrades the result to
+`confidence="coarse"` — never silently wrong, *visibly* coarse. The
+corpus (gemv/FFN/batched on Samsung/UPMEM/AiM) is fully tier-1/2, so the
+faithful argmin stays calibrated and byte-identical. Cost-path-internal —
+no shared-Allo edit.
+
 ## 4. Open design tensions
+
+### T21. Virtual cost composition: v1 sequential vs v2 sum→max overlap (design 04 §6)
+v1 `compose` sums phases (no compute↔DMA overlap). Over-counts backends
+that overlap weight-stream DMA with compute (APU v1 L4→VR behind prior
+tile's MAC; UPMEM MRAM↔WRAM behind tasklet compute); faithful for
+Samsung's genuinely-serialized GEMV phases. v2 = sum→max; the `compose`
+interface already accommodates it (compose owns the fold). Trigger to
+revisit: a corpus workload where the over-count flips a rank-preservation
+decision.
+
+### T22. `host_staging` concern fit in the `CostModel` interface (design 04 §4.2, → host-side cycle)
+The host-side task adds `@allo.cost("host_staging")` as a sibling concern
+in the design-04 `CostModel` machinery. Open until that cycle lands
+whether the per-op `OpCost`/`MoveCost` context is rich enough for
+collectives (broadcast/scatter/gather/reduce derived from the linear-layout
+pair) or needs a collective-specific context. If insufficient, escalate
+back to architect — do NOT fork a parallel cost-spec home.
 
 ### T1. `allo.Layout` reserved name (resolved by spec 013)
 SPMW's `Placement` was originally called `Layout`. The legacy
@@ -362,11 +459,36 @@ for end-to-end numeric correctness. Resolution path: parameterise
 buffer count, sizes, and types. Out of scope until a
 correctness-checking task lands.
 
-### T9. UPMEM `_run_upmem` hardcodes `num_dpus=1, num_tasklets=1` (spec 003 §7)
-The current CLI invocation pins single-DPU, single-tasklet. Once
-`UPMEMCtx` can emit tasklet-strided bodies, these values must
-come from the target / `compiled.layout`. Tracked by HANDOFF.md
-under the UPMEM blocker family.
+### T9. UPMEM `_run_upmem` hardcodes `num_dpus=1, num_tasklets=1` (spec 003 §7) — RULED (design 02), FULLY SPECCED
+The current CLI invocation pins single-DPU, single-tasklet
+(`spmw_codegen.py:2421-2422`). This pins Tenon's UPMEM run at Cinnamon's
+`nt=1` operating point — the worst value of the very lever (tasklet tiling)
+that is the entire source of the UPMEM win (Exo `nt=16` = 5.71x, Phase-0
+README §2). **Ruled (design 02):** `num_tasklets` becomes
+`Placement.extra["n_tasklets"]` — a shape-derived, enumerated, cost-priced
+decision (Option B, mirror of Samsung SPEC-026 `weight_resident`). Codegen reads
+the field; it never re-derives the count. **COST coefficient CLOSED
+(research-021):** `kernel_cycles = S + ceil(S*(R-1)/min(T,R))` with `R =
+target.revolver_latency = 11` (revolver scheduling window from
+`thread_scheduler.go` / `src/main.go:115` `num_revolver_scheduling_cycles`, NOT
+the 14-stage pipeline depth), `fill_drain = 0`; one new spec constant
+`revolver_latency`, no `pipeline_depth`; reproduces 5.71x within 0.9%, saturates
+at `T = 11`. All four coder sub-tasks (MATCH / ENUMERATOR / COST / runner)
+implemented by coder 014. **`--data_prep_params` resolution (design 02 §6b/§6c,
+arch 024):** coder 014 found that setting it to the *reduction trip* INVERTS the
+lever (`data_prep_params` is the per-DPU *input-buffer size*, not an inner-K
+knob), so it was held at the prior literal pending architect ruling. **Ruled
+(§6c, research-22):** the gemv cell routes through the in-tree bespoke `GEMV` host
+with a shape-derived `(m_size, n_size)` footprint (`--data_prep_params
+"<m_size>,<n_size>"`), which retires the `1024` literal gate-clean AND makes the
+Tenon-vs-Exo comparison byte-fair (both columns share one bespoke gemv overhead
+path; the ~1.13x TENON-slot offset is common-mode and cancels). One Go-side fix
+(`gemv.go` `n_size` from `DataPrepParams()[1]`) + the `_run_upmem` route, specced
+for coder task 025. Default `n_tasklets=1` → `S*R` (uniform scale, parity),
+preserving the acc argmin and FPGA CI (rollback story). See
+`design/02-upmem-tasklet-tiling.md` §3, §6, §6c,
+`work/reports/021-research-upmem-pipeline-amortization.md`, and
+`experiments/reports/22-upmem-gemv-host-fairness.md`.
 
 ### T8. `LinearLayout` is enumerator-ephemeral, not `Placement`-carried (spec 013 §E)
 `LinearLayout` is built inside each backend enumerator, materialised
@@ -588,3 +710,154 @@ New open tensions T16-a (resident call shape: single internal-b-loop call vs
 explicit driver B-loop) and T16-b (P/R placement-invariance assumption) carried
 in SPEC-026 §6. See `experiments/allo/allo/SPEC-026-batched-gemv-weight-reuse.md`
 and `.claude/agent-memory/architect/2026-06-07-batched-gemv-enum-cost-codegen.md`.
+
+### T17. Cross-target fixed-function yardstick — Samsung redefined to faithful native, AiM verbatim (arch 008, cycle 06172026) — RESOLVED
+The beat-cinnamon-exo cross-target frame (TASKS.md, 8 in-scope cells)
+raised: which cycle model is the Samsung yardstick, after coder-003 found
+the published Cinnamon 222,919 (gemv 4096x1024) / 242,064 (FFN) is **not
+reproducible** under Phase-0 scope (the SamsungHBM lowering + `cinm-opt`
+are unbuilt and excluded).
+
+**Ruled (arch 008, Option 2): the Samsung yardstick is the faithful
+PIMSimulator native folded-GEMV cycle model, applied identically to BOTH
+the baseline and Tenon columns.** gemv 4096x1024 baseline = **15,251 cyc**
+(the SPMW `pim_driver --cmds --faithful` path, canonical; coder-003's
+standalone driver gives 15,156, a 0.6% harness delta, kept as corroborating
+evidence). NOT 222,919.
+
+Why not reproduce 222,919: the README publishes `1024^2 == 4096x1024 ==
+222,919` (identical for different shapes) — the fingerprint of a Cinnamon
+lowering that pads/serialises to a fixed quantum and does NOT model the
+64-channel x 8-block bank parallelism our `executeGemv` exploits
+(`num_total_pim_blocks_=512`). Anchoring to it would measure Tenon against
+Cinnamon's *detuned tiling*, not the hardware floor — violating the
+anti-flattering discipline (report 17 §4 / T15) on the baseline side.
+Building the toolchain (Option 1) reproduces a non-faithful artifact;
+BLOCKED (Option 3) forfeits a cell we can measure honestly.
+
+AiM needs no redefinition: its Cinnamon path collapses to an emittable ISR
+`.trace` ramulator2 times, so coder-004 reproduced 83,775 (gemv) / 12,402
+(FFN) **verbatim** — the yardstick is the published number, faithful.
+
+Per-cell verdicts (arch 008 §Part 2):
+- **Samsung gemv** — MATCH at floor (single shape, T15) + FAIR BEAT
+  (batched, T16/SPEC-026, B\*=2, 3.93x). Mechanism: enum `weight_resident`
+  + cost P+B(E+R).
+- **Samsung FFN 256-1024-256** — MATCH at floor (two GEMV legs, W1!=W2 so
+  no inter-leg weight reuse; host ReLU = 0 PIM cyc). The escalated
+  exploratory sub-question — inter-leg ACTIVATION residency (keep
+  h=ReLU(W1 x) PIM-resident, skip host round-trip) — is **RESOLVED
+  2026-06-17 (research-019, arch-020): MATCH, no fair-beat avenue.** Host
+  round-trip is 0 PIM cyc (not priced); the only skippable term (leg-1
+  readback R1) is ~45 cyc / ~0.15% of FFN total (sub-1% materiality);
+  leg-2 GRF_A input staging is mandatory either way; on-device ReLU
+  (exists, ISCA21 §IV-C / `computeRelu`) is net-negative. NO
+  `activation_resident` flag/cost/enum candidate. The honest
+  abstraction-moves-the-number avenue for FFN, if exercised, is
+  **batched-FFN weight residency** (each leg = batched GEMV inheriting
+  T16/SPEC-026), not activation residency. See
+  `dev/06172026-beat-cinnamon-exo-cross-target/work/reports/019-research-samsung-ffn-activation-residency.md`.
+  **BLOCKED-SIM on the MEASURED baseline (arch 028, design 03,
+  2026-06-17):** the FFN's analytical verdict (MATCH at floor) stands,
+  but ruling 008 §1.4 demanded a *measured* two-leg faithful number and
+  that number is unobtainable. The reference `pim_driver` **cores
+  (SIGSEGV in DRAMSim `Bank::write` during weight `preloadGemv`+`runPIM`,
+  pim_driver.cc:332)** at both leg shapes (W1 M=1024/K=256, W2
+  M=256/K=1024). Root: `preloadGemv` (PIMKernel.cpp:283-323) address
+  layout is validated only at the M=4096 design point (`output_tile_size
+  = num_grfB_*num_total_pim_blocks_ = 8*512 = 4096`, `NUM_COLS=128`); for
+  other M the `(row,col)` sweep aliases into an unopened bank. Boundary
+  fully mapped (design 03): M in {32,64,4096} run at K=1024; M in
+  {128,256,512,1024,2048} core at K=1024; M=1024 cores at every K. No
+  faithful runnable decomposition exists: M-tiling/M-padding prices any
+  M<=4096 as the full 4096-row quantum (the T15 `>=1` clamp makes M=64
+  K=1024 return 15251, IDENTICAL to M=4096 K=1024 — the same
+  fixed-quantum non-faithfulness fingerprint 008 §1.2 rejected for
+  Cinnamon 222,919), and K-tiling cannot reach W1 (M=1024 cores
+  independent of K). **Ruled (c): ESCALATE.** Cell is non-closable under
+  Phase-0 scope without a user descope (recommended) or an out-of-scope,
+  user-authorized reference-sim `preloadGemv`/DRAMSim fix (FORBIDDEN by
+  T12; not authorized here). The five frozen fns + M=4096 baseline 15251
+  stay byte-for-byte regardless. `samsung-ffn` MANIFEST row stays
+  BLOCKED-SIM; no number fabricated. See
+  `experiments/allo/design/03-samsung-ffn-runnable-path.md`.
+- **AiM gemv / FFN** — MATCH at floor (documented arithmetic floor;
+  SPEC-019 opsize=K MAC_ABK; argmin ABK/SBK). Batched extension to AiM NOT
+  ruled this cycle (would need a separate ramulator2 weight-phase source
+  read); single-shape MATCH stands.
+
+Shared-file ruling: zero `allo/ir/` edits for all four cells. Samsung
+batched carries `batch_dim`/`weight_resident` additively (SPEC-026); AiM in
+`spmw_codegen.py` + fixture (SPEC-019). Five frozen Samsung fns + `>=1`
+clamp stay frozen. No simulator rebuild authorized by this ruling. The
+yardstick redefinition is a *measurement convention* (no code) — the
+baseline column is generated through the same `pim_driver --faithful` path
+the Tenon column uses (I2 fairness). Rollback: trivial (no shared-file or
+FPGA-path edit). See
+`dev/06172026-beat-cinnamon-exo-cross-target/work/reports/008-arch-samsung-aim-fixedfn-ruling.md`
+and `.claude/agent-memory/architect/2026-06-17-cross-target-samsung-yardstick.md`.
+
+### T17. APU v1 inter-VR/intra-VR DMA tiling is enumerator-ephemeral and cost-invisible (design 01) — RESOLVED-IN-PRINCIPLE
+Phase-0 board profile (`experiments/baselines/cinnamon-exo/apu-v1/
+ffn-cinm-opt.flo.log`) splits FFN 64-256-64 crun as **retile 132,890
+(seu:0, pure move) + dma 103,922 = 59% data movement**, GVML compute
+~24%. GEMV 4096×1024 is the opposite — compute-bound, reproduced at
+−0.17%, at the floor. The APU v1 decision path today prices **only**
+compute: `_apu_v1_enumerate` emits 2 candidates differing only by MAC
+op-expansion (`sv` vs `sv_lookup`, identical `placements`), and
+`_apu_v1_kernel_cycles` never reads `target.move(...)`. So inter-VR vs
+intra-VR — the axis that dominates FFN — is **outside Tenon**: it is a
+host command-line layout arg (`intra`), and the wrong choice is the
+documented `FAIL 62/64` host/device-mismatch gotcha. **Ruling (design
+01):** GEMV gets **no** mechanism change (do not add VR machinery that
+cannot beat a floor; re-prove −0.17% as a regression gate). FFN's
+data-movement bottleneck is resolved via budgets (2)+(3): the
+enumerator surfaces inter-VR vs intra-VR as **two real, materialisable
+`Placement` candidates** keyed on `extra["vr_dma"]` with tile count
+**computed from operand shape + `target.vrs`** (not `256`/`64`); the
+cost model adds a move term `n_moves * target.move(...).cycles` so
+argmin organically prefers the movement-minimising layout; codegen
+**materialises** the chosen `extra["vr_dma"]` (emitting one consistent
+host+device layout, which dissolves the FAIL-62/64 gotcha) and may, in
+a *follow-up* iteration only, double-buffer/async the retile (Option B,
+pure codegen materialisation of an already-chosen placement). All edits
+additive and confined to the `spmw_*` set + APU v1 target data; **no
+`allo/ir/builder.py` / `infer.py` / `dataflow.py` edit**. Rollback:
+absent `vr_dma` → move term 0 → today's intra-VR/SV-lookup ranking
+reproduced; FPGA CI untouched. Guarding tests on the eventual coder
+spec (task 015): `tests/pim/test_autoselect_bmatmul_layout.py`,
+`tests/pim/test_codegen_layout_dispatch.py`,
+`tests/pim/test_bmatmul_sv_lookup_low_mode.py`, full `tests/spmw/`.
+Deferred, non-blocking: SV/SV-lookup cost-bucket realism (the
+15,650×-vs-19.8× note) is a separate cost-realism cleanup, not part of
+the FFN movement win. See `experiments/allo/design/01-apu-v1-vr-loop-strategy.md`.
+
+### T19. UPMEM tasklet axis as scheduling lever, not LinearLayout out-dim (design 02)
+(Numbered T19 — T17/T18 slugs were already taken by arch-008 Samsung yardstick
+and design-01 APU v1; this doc has pre-existing duplicate T17 headers.)
+The tasklet count is modelled as a parallelism / scheduling lever
+(`Placement.extra["n_tasklets"]`, the T9 resolution), NOT as a LinearLayout
+out-dim. Same category reasoning as the existing UPMEM acc-placement note
+(`spmw_autoschedule.py:442-448`): the tasklet count fills revolver slots, it
+is not a memory coordinate, so the layout algebra has no out-dim for it.
+Revisit ONLY if a future workload needs genuine *per-tasklet data partitioning*
+(then the tasklet axis is a real layout shard and would join `optimal_swizzle`).
+Until then, keeping it off the layout algebra is deliberate. See
+`design/02-upmem-tasklet-tiling.md` §2 Option C.
+
+### T20. UPMEM FFN cells BLOCKED-ON-HARNESS — selector-host port OUT OF SCOPE (design 02) — RULED
+The UPMEM Exo (`ffn_1pd_8`) and Cinnamon (`CINM_FFN`) FFN cells are
+multi-phase MRAM-selector kernels needing a bespoke per-phase host that does
+not exist in our tree. **Ruled (design 02 §4):** porting those selector hosts
+is OUT OF SCOPE for this cycle — it is uPIMulator harness engineering, not a
+change to any of the three mechanism budgets (layout / enumerator / cost), so
+it cannot be the source of an *earned* abstraction win. It is additionally
+blocked behind T8a/T8b (the UPMEM envelope + `tenon.go` data-prep are still
+VA-shape single-template, which a deterministic phase selector requires
+parameterized). The cells stay **BLOCKED-ON-HARNESS with reason** through the
+exit gate (already recorded in `MANIFEST.tsv` for `upmem-ffn-exo` /
+`upmem-ffn64-cinm`); this is distinct from the SDK↔VM block that stops Shiran
+(we cleared that — PrIM VA byte-exact). Never fabricate an FFN number. The
+cycle's UPMEM thesis (the tasklet lever) is carried by gemv. Future path: when
+T8a/T8b land a shape-parameterized envelope, a follow-up harness task can port
+the hosts and unblock these cells. See `design/02-upmem-tasklet-tiling.md` §4.

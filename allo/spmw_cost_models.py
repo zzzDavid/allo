@@ -5,457 +5,110 @@
 These run at import time to register cost callbacks with `spmw_cost`.
 Importing this module is what makes `allo.get_cost("kernel_cycles", ...)`
 return a working callback.
+
+Design 04 (decoupled CostModel): the per-target cycle bodies no longer
+live here. Each `kernel_cycles` factory looks up the `CostModel` bound to
+the target (faithful flavor) and returns a `(trace, layout) -> int`
+closure that calls `model.compose(...).cycles` -- byte-identical to the
+pre-decoupling numbers (report 18 invariants). The numbers + compose
+bodies live in `spmw_cost_tables.py`; the mechanism in
+`spmw_cost_model.py`. The register-spill factories still read per-move
+costs, now off the bound CostModel rather than the target tree.
 """
 
 from __future__ import annotations
 
-import re
-
 from .spmw_cost import cost
-from .spmw_match import MatchTrace
-from .spmw_target import MemoryRef
+from .spmw_cost_model import ComposeCtx, get_cost_model
+# Re-export so the few non-cost callers keep their import site. The literal
+# parser moved to spmw_tripcount (tier-1 of resolve_trip_count); the APU v1
+# VR-tiling helper moved to spmw_cost_tables.
+from .spmw_tripcount import _parse_loop_bound  # noqa: F401
+from .spmw_cost_tables import _apu_v1_vr_tiling  # noqa: F401
+from . import spmw_cost_tables as _tables
 
 
-def _unwrap(handle):
-    """Strip a `Spilled` wrapper, returning the home handle. Cost models
-    score the post-allocator placement: a spilled value still executes
-    against its `home_handle`, so unwrapping is what gives the right
-    is_auto / handle-type classification.
-    """
-    # Imported lazily to avoid a circular import (spmw_regalloc imports
-    # `get_cost` from this module's neighbour).
-    try:
-        from .spmw_regalloc import Spilled
-    except ImportError:
-        return handle
-    if isinstance(handle, Spilled):
-        return handle.home_handle
-    return handle
+# --------------------------------------------------------------------- #
+# Back-compat Samsung helper shims. The report-18 invariant tests import
+# these by their pre-decoupling `(target, ...)` signatures; the bodies
+# live in spmw_cost_tables and read the bound faithful CostModel.
+# --------------------------------------------------------------------- #
 
 
-def _parse_loop_bound(text: str) -> int | None:
-    """Best-effort integer extraction from an affine-map upper-bound
-    string (`"1024"`, `"() -> (1024)"`, ...). Returns None on failure.
-    """
-    try:
-        return int(text.strip())
-    except ValueError:
-        pass
-    nums = re.findall(r"\b(\d+)\b", text)
-    if len(nums) == 1:
-        return int(nums[0])
-    return None
+# Re-exported so codegen + tests keep their import site (used by
+# spmw_codegen for the shared-CRF work-id count audit).
+from .spmw_cost_tables import _samsung_workid_count  # noqa: F401,E402
 
 
-# Per-op / per-move cycle constants are NOT born here -- they live on
-# each target's spec (Move.cycles / Op.cycles, set in the fixture). The
-# cost factories below read those fields via `target.move(name).cycles`
-# and `target.op(name).cycles`. See tests/spmw/_fixtures.py for the
-# Samsung / AiM / UPMEM / APU v1 / APU v2 numbers and their citations.
+def _samsung_mk(target, trace):
+    return _tables._samsung_mk(target, trace)
+
+
+def _samsung_preload_cycles(target, M, K):
+    return _tables._samsung_preload_cycles(
+        get_cost_model("samsung_hbm_pim", "faithful"), M, K
+    )
+
+
+def _samsung_readback_cycles(target, M):
+    return _tables._samsung_readback_cycles(
+        get_cost_model("samsung_hbm_pim", "faithful"), M
+    )
+
+
+def _trace_batch_dim(trace):
+    return _tables._trace_batch_dim(trace)
+
+
+def _apu_v1_move_cycles(target, trace, layout):
+    return _tables._apu_v1_move_cycles(
+        get_cost_model("apu_v1", "faithful"), target, trace, layout
+    )
+
+
+# Back-compat per-target kernel-cycle factory shims. A handful of tests
+# build the closure directly (e.g. `_upmem_kernel_cycles(target)`); these
+# now delegate to the bound CostModel, so the returned closure is the same
+# `(trace, layout) -> int` the autoschedule path uses.
+def _upmem_kernel_cycles(target):
+    return _kernel_cycles_factory(target)
+
+
+def _samsung_kernel_cycles(target):
+    return _kernel_cycles_factory(target)
+
+
+def _aim_kernel_cycles(target):
+    return _kernel_cycles_factory(target)
+
+
+def _apu_v1_kernel_cycles(target):
+    return _kernel_cycles_factory(target)
+
+
+def _apu_v2_kernel_cycles(target):
+    return _kernel_cycles_factory(target)
+
+
+# --------------------------------------------------------------------- #
+# kernel_cycles: delegate to the bound CostModel (design 04 §1.5)
+# --------------------------------------------------------------------- #
 
 
 @cost("kernel_cycles")
 def _kernel_cycles_factory(target):
     """Build a kernel-cycle estimator specialised to `target`.
 
-    The callback takes `(trace, layout)` and returns a coarse cycle
-    count for the compute portion of the trace under `layout`. It
-    deliberately does not boot the simulator — the goal is a cheap,
-    monotonic objective for the autoscheduler's argmin search.
+    The autoschedule path always uses the `"faithful"` flavor so the
+    argmin stays calibrated (design 04 §1.5). The returned closure calls
+    the bound `CostModel.compose` and returns `result.cycles` -- exactly
+    the int the argmin expects.
     """
     target_name = getattr(target, "name", None)
-    if target_name == "samsung_hbm_pim":
-        return _samsung_kernel_cycles(target)
-    if target_name == "aim":
-        return _aim_kernel_cycles(target)
-    if target_name == "upmem":
-        return _upmem_kernel_cycles(target)
-    if target_name == "apu_v1":
-        return _apu_v1_kernel_cycles(target)
-    if target_name == "apu_v2":
-        return _apu_v2_kernel_cycles(target)
-    raise NotImplementedError(
-        f"kernel_cycles cost: no model for target {target_name!r}"
-    )
+    model = get_cost_model(target_name, "faithful")
 
-
-def _samsung_workid_count(target) -> int:
-    """Product of unit-tree fanouts = number of PIM blocks the CRF body is
-    issued across in per-work-id mode (SPEC-025 §4.2).
-
-    Pure target geometry; no shape literal. For the Samsung fixture this
-    is the synthetic root's [1] x pseudo_channel [16] x pim [8] = 128, but
-    it is *computed* from the tree, valid for any topology. The forbidden
-    literal 128 never appears.
-    """
-    n = 1
-    for u in target._walk():
-        for f in u.mapping:
-            n *= f
-    return n
-
-
-def _trace_batch_dim(trace: MatchTrace) -> int:
-    """Max batch_dim across the trace's matches (SPEC-026 §3.4).
-
-    Reads `match.extra['batch_dim']` stamped by the matcher (SPEC-026
-    §1.2). B is geometry -- the same class as the M/K the body cost reads
-    from `enclosing_loops` -- never a literal. Absent key (every existing
-    trace, eltwise, single-vector GEMV) -> B = 1 (I4 parity).
-    """
-    return max((m.extra.get("batch_dim", 1) for m in trace.matches), default=1)
-
-
-def _samsung_output_rows(match, batch_var: str | None) -> int:
-    """Output rows this match covers per work-id = product of the
-    non-reduction, non-batch enclosing-loop bounds (SPEC-026 §3.2).
-
-    The reduction axis is the innermost loop (folded into the MAC body);
-    the batch axis (if any) is excluded so M counts output rows, not
-    batched repeats. Shape-derived from `enclosing_loops`, no literal.
-    """
-    loops = match.enclosing_loops
-    if len(loops) < 2:
-        return 1
-    rows = 1
-    for (var, _lb, ub, _step) in loops[:-1]:  # drop the innermost (reduction)
-        if batch_var is not None and var == batch_var:
-            continue
-        b = _parse_loop_bound(ub)
-        if b is not None:
-            rows *= b
-    return rows
-
-
-def _samsung_mk(target, trace: MatchTrace) -> tuple[int, int]:
-    """Recover (M, K) for the GEMV the trace describes (SPEC-026 §3.2).
-
-    K = innermost (reduction) loop bound. M = output rows per work-id
-    (product of non-reduction, non-batch loop bounds) times the work-id
-    fan-out -- so M is the *full* output dim across PIM blocks, matching
-    `preloadGemv`'s M*K weight-write walk. Both are operand-shape /
-    geometry derived; no shape literal.
-    """
-    n_workids = _samsung_workid_count(target)
-    M = 0
-    K = 0
-    for match in trace.matches:
-        if not match.enclosing_loops:
-            continue
-        k = _parse_loop_bound(match.enclosing_loops[-1][2])
-        if k is not None:
-            K = max(K, k)
-        batch_var = match.extra.get("batch_loop_var")
-        rows = _samsung_output_rows(match, batch_var)
-        M = max(M, rows * n_workids)
-    return M, K
-
-
-def _samsung_preload_cycles(target, M: int, K: int) -> int:
-    """Closed-form weight-preload cost (SPEC-026 §3.2).
-
-    preload_cyc = (M*K // write_width) * write_cyc + programCrf_cyc
-
-    where write_width / write_cyc / programCrf_cyc are target-spec
-    constants (PRELOAD_FAN / PRELOAD_WR / PRELOAD_CRF moves on the
-    fixture, calibrated to the faithful preloadGemv at 4096x1024 =
-    11368). M*K is operand shape. No inline literal. Placement-invariant
-    (depends only on M, K), so adding it uniformly to every candidate's
-    score does not move the argmin (SPEC-026 §3.5).
-    """
-    if M <= 0 or K <= 0:
-        return 0
-    write_width = target.move("PRELOAD_FAN").cycles
-    write_cyc = target.move("PRELOAD_WR").cycles
-    crf_cyc = target.move("PRELOAD_CRF").cycles
-    return (M * K // write_width) * write_cyc + crf_cyc
-
-
-def _samsung_readback_cycles(target, M: int) -> int:
-    """Closed-form result-readback cost (SPEC-026 §3.3).
-
-    readback_cyc = ceil(M / read_width) * read_cyc
-
-    read_width / read_cyc are target-spec constants (READBACK_FAN /
-    READBACK_RD moves), M is shape. One GRFB_TO_BANK per output tile.
-    Placement-invariant. No inline literal.
-    """
-    if M <= 0:
-        return 0
-    read_width = target.move("READBACK_FAN").cycles
-    read_cyc = target.move("READBACK_RD").cycles
-    return ((M + read_width - 1) // read_width) * read_cyc
-
-
-def _samsung_kernel_cycles(target):
-    """Samsung HBM-PIM kernel-cycle estimator.
-
-    Per-op cycles come from `target.op("MAC").cycles` (tCCDL, 4 cyc).
-    JUMP is `target.move("JUMP").cycles`. The inner-K fold groups MACs
-    by GRF lane count (`target.grf_a.lanes`) when src1 is bank-shaped.
-
-    SPEC-026 §3: the single per-vector exec body is wrapped with separable
-    closed-form preload/readback phases and composed over the batch dim B:
-        weight_resident ? preload + B*(exec+readback)
-                        : B*(preload+exec+readback)
-    At B=1 both branches reduce to preload+exec+readback (I4 parity); the
-    exec formula is unchanged, and preload/readback are placement-invariant
-    so the existing single-vector argmin winner is undisturbed (§3.5).
-    """
-    mac_cyc = target.op("MAC").cycles
-    jump_cyc = target.move("JUMP").cycles
-    lane_burst = target.grf_a.lanes
-    # Lever 3 (SPEC-025 §4): replication factor (geometry, not literal) and
-    # the host per-tile trigger latency for the shared-CRF schedule.
-    n_workids = _samsung_workid_count(target)
-    trigger_cyc = target.move("CRF_TRIGGER").cycles
-
-    # Lever 2 (SPEC-024 §4): preload move name from the role's GRF handle,
-    # resolved the same way SamsungCtx.resolve_moves does so the priced
-    # move is the materialised move. grf_a -> LD_A, grf_b -> LD_B.
-    from .spmw_target import Register
-
-    grf_a = target.grf_a
-    grf_b = target.grf_b
-
-    def _preload_name(handle):
-        if isinstance(handle, Register):
-            if handle is grf_a:
-                return "LD_A"
-            if handle is grf_b:
-                return "LD_B"
-        return None
-
-    def cost_fn(trace: MatchTrace, layout) -> int:
-        # `body_cyc` is the per-work-id CRF body cost (folded MAC + JUMP,
-        # minus any host-residency preload saving). Lever 3 (SPEC-025 §4.3)
-        # wraps it with the CRF-issue replication term below.
-        body_cyc = 0
-        residency = layout.extra.get("grf_residency", {})
-        for match in trace.matches:
-            handles = {
-                opb.role: _unwrap(layout.placements.get(opb.memref_name))
-                for opb in match.operands
-            }
-
-            # Lever-2 preload residency, per work-id (one per match).
-            # crf residency is the baseline (the per-work-id CRF MOV is the
-            # implicit preload cost the pre-lever model already carried, so
-            # it contributes 0 *delta* here -- this keeps every default-crf
-            # placement byte-identical, SPEC-024 §7.2). host residency
-            # hoists the preload onto the native HAB broadcast, subtracting
-            # `target.move(LD_x).cycles` per work-id -- so the host variant
-            # is cheaper than crf by exactly n_workids*LD_A.cycles (§4).
-            # `acc -> grf_b` is storeback-only (not preloaded). Group by
-            # move name to mirror `_schedule_moves`: a name's MOV is dropped
-            # (and the saving applied) iff EVERY role on it is host-resident.
-            host_only: dict[str, bool] = {}
-            for opb in match.operands:
-                if opb.role == "acc":
-                    continue
-                load_name = _preload_name(handles.get(opb.role))
-                if load_name is None:
-                    continue
-                is_host = residency.get(opb.memref_name, "crf") == "host"
-                if load_name not in host_only:
-                    host_only[load_name] = is_host
-                else:
-                    host_only[load_name] = host_only[load_name] and is_host
-            for load_name, dropped in host_only.items():
-                if dropped:
-                    body_cyc -= target.move(load_name).cycles
-
-            inner_ub = None
-            if match.enclosing_loops:
-                inner_ub = _parse_loop_bound(match.enclosing_loops[-1][2])
-            if inner_ub is None:
-                # Without an inner loop we can't bound the work; assume 1 op.
-                body_cyc += mac_cyc
-                continue
-
-            # is_auto is set when src1 is bank-shaped — the bank read
-            # column-strobes through one inner-loop iteration per cycle,
-            # collapsing K MACs into (K // lanes) MACs + 1 JUMP.
-            y_handle = handles.get("y")
-            is_auto = isinstance(y_handle, MemoryRef)
-            if is_auto:
-                folded = inner_ub // lane_burst
-                # Dual-fiber placements run their bank halves concurrently:
-                # the modelled MAC time is the busier fiber's share, not the
-                # sum. `n_fibers` comes from the layout's segment-axis size
-                # (filled by the enumerator from the swizzle), defaulting to
-                # 1 so bank_row/grf_staged keep today's cost byte-identical.
-                n_fibers = layout.extra.get("n_fibers", 1)
-                # Ceil-split so an odd fold still bounds the busier fiber;
-                # one JUMP folds each fiber's own inner loop.
-                per_fiber = (folded + n_fibers - 1) // n_fibers
-                body_cyc += per_fiber * mac_cyc + n_fibers * jump_cyc
-            else:
-                body_cyc += inner_ub * mac_cyc
-
-        # Lever 3 (SPEC-025 §4.3): wrap the per-work-id body with the
-        # CRF-issue replication term. per_workid replicates the CRF body
-        # across every PIM block (body_cyc * n_workids); shared programs the
-        # body once and the host fires one trigger per work-id (body_cyc +
-        # trigger_cyc * n_workids). Default per_workid keeps the pre-lever-3
-        # argmin among y-placements unchanged (uniform x n_workids scale,
-        # SPEC-025 §4.4). Other backends never set crf_issue.
-        crf_issue = layout.extra.get("crf_issue", "per_workid")
-        if crf_issue == "shared":
-            exec_cyc = body_cyc + trigger_cyc * n_workids
-        elif crf_issue == "per_workid":
-            exec_cyc = body_cyc * n_workids
-        else:
-            raise ValueError(
-                f"samsung kernel_cycles: unknown crf_issue {crf_issue!r}"
-            )
-
-        # SPEC-026 §3.1: compose the per-vector exec with the separable
-        # closed-form preload/readback phases over the batch dim B. B is
-        # read off the trace (stamped by the matcher §1.2), default 1.
-        # preload/readback are placement-invariant (depend only on M, K) so
-        # the uniform +P+R offset does not move the argmin among lever-1/2/3
-        # placements (§3.5); the resident-vs-non-resident *choice* is the
-        # only batch-sensitive term, earned by argmin for B>=2.
-        M, K = _samsung_mk(target, trace)
-        preload_cyc = _samsung_preload_cycles(target, M, K)
-        readback_cyc = _samsung_readback_cycles(target, M)
-        B = _trace_batch_dim(trace)
-        weight_resident = layout.extra.get("weight_resident", False)
-        if weight_resident:
-            # Tenon: preload once, amortized across B exec+readback passes.
-            return preload_cyc + B * (exec_cyc + readback_cyc)
-        # Native / non-resident: re-pay preload per input vector. At B=1
-        # this is algebraically identical to the resident branch (I4).
-        return B * (preload_cyc + exec_cyc + readback_cyc)
-
-    return cost_fn
-
-
-def _aim_kernel_cycles(target):
-    def cost_fn(trace: MatchTrace, layout) -> int:
-        total = 0
-        for match in trace.matches:
-            try:
-                per_op = target.op(match.target_op_name).cycles
-            except KeyError:
-                per_op = 4
-            if per_op is None:
-                per_op = 4
-            inner_ub = None
-            if match.enclosing_loops:
-                inner_ub = _parse_loop_bound(match.enclosing_loops[-1][2])
-            iters = inner_ub if inner_ub is not None else 1
-            total += per_op * iters
-        return total
-
-    return cost_fn
-
-
-def _apu_v1_kernel_cycles(target):
-    """Cycle estimator for the APU v1 (Gemini 1) compute kernel.
-
-    The bit-serial SIMD width (32K lanes per VR) folds one work-item
-    dimension into a single GVML call -- the innermost loop is therefore
-    NOT multiplied into the per-op cost. Outer loops (everything but
-    the last enclosing loop) contribute multiplicatively.
-
-    MAC pricing branches on `layout.mode`:
-      * `"sv"`        -> raw MUL+ADD per MAC
-      * `"sv_lookup"` -> gvml_lookup_16 + gvml_add_s16 (= MAC.cycles)
-      * `""` (back-compat) -> SV-lookup expansion.
-    Unknown modes raise. Argmin picks SV-lookup (cheaper).
-    """
-    _ALLOWED_MODES = {"", "sv", "sv_lookup"}
-    add_cyc = target.op("ADD").cycles
-    mul_cyc = target.op("MUL").cycles
-    mac_cyc = target.op("MAC").cycles
-    sv_mac_cyc = mul_cyc + add_cyc  # raw MUL+ADD
-
-    def cost_fn(trace: MatchTrace, layout) -> int:
-        mode = getattr(layout, "mode", "")
-        if mode not in _ALLOWED_MODES:
-            raise ValueError(
-                f"apu_v1 kernel_cycles: unknown layout.mode {mode!r}; "
-                f"allowed: {sorted(_ALLOWED_MODES)}"
-            )
-        sv_raw = mode == "sv"
-        total = 0
-        for match in trace.matches:
-            if match.target_op_name == "MAC" and sv_raw:
-                per_op = sv_mac_cyc
-            else:
-                try:
-                    per_op = target.op(match.target_op_name).cycles
-                except KeyError:
-                    per_op = add_cyc
-                if per_op is None:
-                    per_op = add_cyc
-            # Outer loops only -- the innermost loop is subsumed by the
-            # 32K-lane SIMD width.
-            iters = 1
-            if match.enclosing_loops:
-                for (_, _, ub_text, _) in match.enclosing_loops[:-1]:
-                    ub = _parse_loop_bound(ub_text)
-                    if ub is not None:
-                        iters *= ub
-            total += per_op * iters
-        return total
-
-    return cost_fn
-
-
-def _upmem_kernel_cycles(target):
-    """Cycle estimator for the UPMEM DPU compute kernel.
-
-    Per-op cost comes from `target.op(name).cycles`; MAC is priced as
-    2 cycles because the DPU has no fused MAC. Bulk MRAM<->WRAM
-    transfers are scheduled by a later pass and are not counted here.
-    """
-    gpr_cyc = target.op("ADD").cycles  # 1 cyc GPR baseline
-
-    def cost_fn(trace: MatchTrace, layout) -> int:
-        total = 0
-        for match in trace.matches:
-            try:
-                per_op = target.op(match.target_op_name).cycles
-            except KeyError:
-                per_op = gpr_cyc
-            if per_op is None:
-                per_op = gpr_cyc
-            inner_ub = None
-            if match.enclosing_loops:
-                inner_ub = _parse_loop_bound(match.enclosing_loops[-1][2])
-            iters = inner_ub if inner_ub is not None else 1
-            total += per_op * iters
-        return total
-
-    return cost_fn
-
-
-# GSI APU v2 (Gemini 2). The only available simulator on this server is
-# `l1_sim`, which declares `perf_is_placeholder = True` (skill file
-# §Limitations). APU v2 is therefore positioned as a functional-only
-# target; cost-based scheduling is out of scope until GTML grows cycle
-# counters. See SPEC-011 for the decision rationale and the option-a
-# upgrade slot.
-
-
-def _apu_v2_kernel_cycles(target):
-    """Functional-only cost stub for APU v2.
-
-    APU v2 ships as a functional-correctness target: the only available
-    simulator (`l1_sim`) declares `perf_is_placeholder = True` and does
-    not report cycles. The autoscheduler still runs argmin on APU v2
-    candidates (so the autoschedule path stays uniform across backends),
-    but the ranking is a deterministic enumerator-order tie-break, not
-    a performance prediction. This stub returns `len(trace.matches)` so
-    argmin is well-defined; it is intentionally non-comparative across
-    placements. See SPEC-011 for the rationale and the upgrade slot.
-    """
-
-    def cost_fn(trace: MatchTrace, layout) -> int:
-        return len(trace.matches)
+    def cost_fn(trace, layout) -> int:
+        return model.compose(ComposeCtx(target, trace, layout)).cycles
 
     return cost_fn
 
@@ -465,11 +118,13 @@ def _apu_v2_kernel_cycles(target):
 # --------------------------------------------------------------------- #
 #
 # Each factory runs once per target (via `get_cost`'s cache) and returns
-# a closure `spill(reg, n_entries=1)` that returns the cycles charged
-# for spilling a single live range to its declared spill tier over
-# `n_entries` uses. The allocator builds a `Spilled(home, tier)`
-# placement when no register-file tier has room; codegen reads the
-# `tier` field to decide which LD/ST moves to inject.
+# a closure `spill(reg, n_entries=1)` that returns the cycles charged for
+# spilling a single live range to its declared spill tier over
+# `n_entries` uses. Per design 04 the per-move spill costs now come from
+# the bound CostModel's `move_costs`, not `target.move(name).cycles`.
+
+
+from .spmw_cost_model import MoveCostCtx  # noqa: E402
 
 
 @cost("register_spill")
@@ -491,55 +146,45 @@ def _register_spill_factory(target):
 
 
 def _samsung_register_spill(target):
-    """Samsung HBM-PIM: GRF_A/B <-> bank-row round-trip.
-
-    Numbers from spec 015 §6.1, declared on the target spec (LD_A/LD_B
-    cycles 26 from tCCDL+RL+BL//2; ST_A/ST_B cycles 14 from tCCDL+WL+BL//2).
-    """
+    """Samsung HBM-PIM: GRF_A/B <-> bank-row round-trip (spec 015 §6.1)."""
+    model = get_cost_model("samsung_hbm_pim", "faithful")
 
     def spill(reg, n_entries=1):
         side = "A" if reg is target.grf_a else "B"
         return (
-            target.move(f"ST_{side}").cycles
-            + target.move(f"LD_{side}").cycles
+            model.move_cost(f"ST_{side}", MoveCostCtx(f"ST_{side}"))
+            + model.move_cost(f"LD_{side}", MoveCostCtx(f"LD_{side}"))
         ) * n_entries
 
     return spill
 
 
 def _aim_register_spill(target):
-    """AiM: GPR <-> bank-row round-trip.
-
-    Numbers from JSSC 2023 §IV, declared on the target spec: RD_SBK = 24
-    = tCCDL+RD+BURST; ST_SBK = 20 = tCCDL+WR+BURST. AiM emits no
-    bank-row writeback opcode today; ST_SBK is a synthetic move on the
-    fixture so the allocator's monotonic cost vector still has a number.
-    """
+    """AiM: GPR <-> bank-row round-trip (JSSC 2023 §IV)."""
+    model = get_cost_model("aim", "faithful")
 
     def spill(reg, n_entries=1):
-        load_cyc = target.move("RD_SBK").cycles
-        store_cyc = target.move("ST_SBK").cycles
+        load_cyc = model.move_cost("RD_SBK", MoveCostCtx("RD_SBK"))
+        store_cyc = model.move_cost("ST_SBK", MoveCostCtx("ST_SBK"))
         return (load_cyc + store_cyc) * n_entries
 
     return spill
 
 
 def _upmem_register_spill(target):
-    """UPMEM: WRAM <-> MRAM round-trip dominates spill cost.
-
-    Per-burst (64 B) from uPIMulator HPCA 2024 Table 2, declared on the
-    target spec. The cost vector asks for whichever tier matches via
-    the `tier` kwarg (spec 015 §6.3).
-    """
+    """UPMEM: WRAM <-> MRAM round-trip dominates spill cost (spec 015 §6.3)."""
+    model = get_cost_model("upmem", "faithful")
 
     def spill(reg, n_entries=1, tier="mram"):
         if tier == "wram":
             return (
-                target.move("ST_WRAM").cycles + target.move("LD_WRAM").cycles
+                model.move_cost("ST_WRAM", MoveCostCtx("ST_WRAM"))
+                + model.move_cost("LD_WRAM", MoveCostCtx("LD_WRAM"))
             ) * n_entries
         if tier == "mram":
             return (
-                target.move("ST_MRAM").cycles + target.move("LD_MRAM").cycles
+                model.move_cost("ST_MRAM", MoveCostCtx("ST_MRAM"))
+                + model.move_cost("LD_MRAM", MoveCostCtx("LD_MRAM"))
             ) * n_entries
         raise ValueError(f"upmem spill tier {tier!r}")
 
@@ -547,33 +192,22 @@ def _upmem_register_spill(target):
 
 
 def _apu_v1_register_spill(target):
-    """APU v1: VR <-> L1 round-trip.
-
-    Same SRAM fabric as the VRs, so spill cost is roughly 1x register
-    access. Numbers from spec 015 §6.4 (~5 cycles each direction),
-    declared on the target spec (LD_VR / ST_VR).
-    """
+    """APU v1: VR <-> L1 round-trip (spec 015 §6.4)."""
+    model = get_cost_model("apu_v1", "faithful")
 
     def spill(reg, n_entries=1):
         return (
-            target.move("ST_VR").cycles + target.move("LD_VR").cycles
+            model.move_cost("ST_VR", MoveCostCtx("ST_VR"))
+            + model.move_cost("LD_VR", MoveCostCtx("LD_VR"))
         ) * n_entries
 
     return spill
 
 
-# Module-level flag so the placeholder warning fires once per process,
-# matching the kernel_cycles APU v2 convention above.
 def _apu_v2_register_spill(target):
-    """Functional-only spill stub for APU v2.
+    """Functional-only spill stub for APU v2 (SPEC-011).
 
-    Mirrors `_apu_v2_kernel_cycles`: APU v2 is a functional-correctness
-    target (`l1_sim` declares `perf_is_placeholder = True`), so this
-    factory returns a non-comparative constant (`2 * n_entries`) and
-    does not emit a runtime warning. The allocator's argmin still runs
-    deterministically; the value is not performance-predictive. See
-    SPEC-011 for the rationale and the option-a upgrade slot when GTML
-    timing lands.
+    Mirrors the placeholder kernel_cycles model: non-comparative constant.
     """
 
     def spill(reg, n_entries=1):

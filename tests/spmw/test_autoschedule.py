@@ -326,26 +326,37 @@ def test_samsung_argmin_picks_dual_fiber():
     )
 
 
-def test_apu_v1_enumerator_returns_two_candidates():
-    """SPEC-009 §2: sv + sv_lookup candidates differ only in
-    `placement.mode`; cost model branches on mode to charge the
-    MUL+ADD (18 cyc) vs lookup+ADD (8 cyc) expansion."""
+def test_apu_v1_enumerator_returns_four_candidates():
+    """SPEC-009 §2 + design 01 §4: {sv, sv_lookup} crossed with the
+    {intra, inter} vr_dma VR-tile/DMA mode = 4 candidates. mode still
+    drives the MAC expansion (18 vs 8 cyc); `extra["vr_dma"]` drives the
+    retile + L4-DMA cost. The tile counts ride `extra`, computed from
+    shape + target.vrs (never a literal)."""
     target = build_apu_v1_target()
     trace = _apu_synthetic_mac_trace("apu_v1")
     candidates = _apu_v1_enumerate(target, trace.matches)
-    assert len(candidates) >= 2, len(candidates)
+    assert len(candidates) == 4, len(candidates)
     modes = {c.mode for c in candidates}
     assert {"sv", "sv_lookup"} <= modes, modes
+    vr_dmas = {c.extra.get("vr_dma") for c in candidates}
+    assert vr_dmas == {"intra", "inter"}, vr_dmas
+    # Every candidate carries shape-derived tile counts.
+    for c in candidates:
+        assert "n_out_tiles" in c.extra and "n_weight_tiles" in c.extra
+        assert "n_stage_boundaries" in c.extra
 
 
-def test_apu_v1_argmin_picks_sv_lookup():
-    """SPEC-009 §2: argmin must select the sv_lookup placement (8 cyc
-    per MAC) over the sv placement (18 cyc per MAC)."""
+def test_apu_v1_argmin_picks_sv_lookup_intra_for_gemv():
+    """Single-stage GEMV: zero stage boundaries -> the retile term
+    vanishes for both vr_dma modes, so argmin keeps the compute pick
+    (sv_lookup) AND the GEMV layout pick (intra-VR), reproducing the
+    board's -0.17% floor layout (design 01 §4 GEMV non-regression gate)."""
     target = build_apu_v1_target()
-    trace = _apu_synthetic_mac_trace("apu_v1")
+    trace = _apu_synthetic_mac_trace("apu_v1")  # one MAC match = GEMV
     layouts = autoschedule(target, trace)
     assert len(layouts) == 1
     assert layouts[0].mode == "sv_lookup", layouts[0].mode
+    assert layouts[0].extra.get("vr_dma") == "intra", layouts[0].extra
 
 
 def test_apu_v2_enumerator_returns_two_candidates():
@@ -381,8 +392,8 @@ if __name__ == "__main__":
     test_compile_with_autoschedule_emits_canonical_bytes()
     test_samsung_enumerator_returns_two_candidates()
     test_samsung_argmin_picks_dual_fiber()
-    test_apu_v1_enumerator_returns_two_candidates()
-    test_apu_v1_argmin_picks_sv_lookup()
+    test_apu_v1_enumerator_returns_four_candidates()
+    test_apu_v1_argmin_picks_sv_lookup_intra_for_gemv()
     test_apu_v2_enumerator_returns_two_candidates()
     test_apu_v2_argmin_picks_canonical()
     print("ALL PASSED")

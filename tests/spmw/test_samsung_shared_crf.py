@@ -129,7 +129,12 @@ def test_cost_prefers_shared_crf():
     assert c_shared < c_per, (c_shared, c_per)
 
     n = _samsung_workid_count(target)
-    trigger = target.move("CRF_TRIGGER").cycles
+    # Per design 04 the CRF_TRIGGER cost lives on the bound CostModel.
+    from allo.spmw_cost_model import MoveCostCtx, get_cost_model
+
+    trigger = get_cost_model("samsung_hbm_pim", "faithful").move_cost(
+        "CRF_TRIGGER", MoveCostCtx("CRF_TRIGGER")
+    )
     # SPEC-026 §3.5: the return is now P + E + R (B=1, non-resident). The
     # placement-invariant P+R offset is identical for both crf-issue modes
     # (it does not read crf_issue), so it cancels from the gap and the
@@ -206,13 +211,25 @@ def test_cost_ranking_responds_to_trigger_cycles():
     # Push trigger past it on a freshly-built target (Target's __getattr__
     # makes copy.deepcopy recurse) and confirm the ranking inverts.
     flipped = build_samsung_target()
-    flipped.move("CRF_TRIGGER").cycles = body_cyc  # >= threshold for n>=2
-    cost_flipped = get_cost("kernel_cycles", flipped)
-    cands_f = _samsung_enumerate(flipped, trace.matches)
-    shared_f, per_f = _fast_pair(cands_f)
-    assert cost_flipped(trace, shared_f) >= cost_flipped(trace, per_f), (
-        "raising CRF_TRIGGER.cycles to body_cyc must flip the ranking"
-    )
+    # Per design 04 the CRF_TRIGGER cost lives on the bound CostModel;
+    # perturb the model's move_costs (and restore) to push past the flip
+    # threshold.
+    from allo.spmw_cost_model import MoveCost, get_cost_model
+
+    model = get_cost_model("samsung_hbm_pim", "faithful")
+    saved = model.move_costs["CRF_TRIGGER"]
+    try:
+        model.move_costs["CRF_TRIGGER"] = MoveCost(
+            lambda c, _v=body_cyc: _v
+        )  # >= threshold for n>=2
+        cost_flipped = get_cost("kernel_cycles", flipped)
+        cands_f = _samsung_enumerate(flipped, trace.matches)
+        shared_f, per_f = _fast_pair(cands_f)
+        assert cost_flipped(trace, shared_f) >= cost_flipped(trace, per_f), (
+            "raising CRF_TRIGGER cost to body_cyc must flip the ranking"
+        )
+    finally:
+        model.move_costs["CRF_TRIGGER"] = saved
 
 
 def test_codegen_shared_emits_one_body_plus_triggers():
