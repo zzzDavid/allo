@@ -21,6 +21,7 @@ top-level packages.
 | `spmw_cost_model.py` (design 04) **LANDED (task 009)** | `CostModel`/`OpCost`/`MoveCost`/`OpCostCtx`/`MoveCostCtx`/`ComposeCtx`/`CostResult` dataclasses; `register_cost_model`/`get_cost_model` registry keyed by `(target_name, flavor, concern)`; `evaluate(target, trace, layout, flavor)` (the sim-free entry the virtual runner calls). Mechanism only — no numbers. | yes (`CostModel`, `evaluate`) |
 | `spmw_cost_tables.py` (design 04) **LANDED (task 009)** | the concrete `CostModel` instances (numbers + per-target `compose`): `samsung_faithful`, `aim_faithful`, `upmem_faithful`, `apu_v1_faithful`, `apu_v2_placeholder`, plus the swap-test flavor. The "Energy-Reference-Table" file — a profiling-refinement edits ONLY this. | no (side-effect registration) |
 | `spmw_tripcount.py` (design 04) **LANDED (task 009)** | `resolve_trip_count` (D3 symbolic bound resolution); retains `_parse_loop_bound` as the tier-1 literal helper. | no (cost-path internal) |
+| `tests/spmw/_mortise_target.py` (design 06) **SPEC'D, NOT YET LANDED** | structure-only `@allo.target("mortise")` fixture — a Samsung-like near-bank-SIMD hypothetical substrate (no sim, no HW) whose ONLY structural addition is the `resident_cap_elems` geometry const (the swept capacity lever `C`). Clone of `_demo_target.py`; priced purely via `backend="virtual"`. NO cost numbers on the tree (acid test). | no (test fixture) |
 
 User-facing `allo.work` and `allo.get_wid` are aliases for
 `allo.dataflow.kernel` and `allo.dataflow.get_pid` respectively (see
@@ -135,7 +136,29 @@ estimate = `kernel_cycles + host_staging` (sum). Returns per-phase
 overlap (sum→max) is a one-function swap later (not implemented this
 cycle). B=1 sum must EMERGE as 15251; crossover B\*=2; asymptote 3.93×.
 
+### Mortise capacity lever (in `spmw_cost_tables.py` + `_mortise_target.py`, design 06) — SPEC'D, NOT YET LANDED
+The hypothetical-substrate capacity what-if. The lever is the
+on-device weight-resident capacity `C`, carried as the **geometry** const
+`resident_cap_elems` on the `mortise` target tree (NOT a cost number —
+acid test holds). It lives ONLY in the Mortise `host_staging` compose as
+`B*(1-phi)*P_var`, `phi = min(1, C/(M*K))`: resident pays preload `P`
+once, the evicted shortfall is re-streamed per vector. Three flavors on
+`(target_name="mortise")`: `faithful` (the §2.4 capacity-collapse
+finding), `unlimited` (the ABLATION — forces `phi≡1`, erases all `C`
+dependence, collapses to report-18 `P+B(E+R)`), `optimistic` (the §4
+sensitivity band). Swap via `cost_flavor=` — design-04 surface verbatim,
+zero device-tree edit. Sweep seam = `build_mortise_target(resident_cap_elems=C)`
+constructor kwarg + the trace's `batch_dim`, driven by
+`experiments/scripts/R26_mortise_capacity_sweep.py`. Anchor: at
+`C≥T_w`/resident the Mortise faithful whole-program is NUMERICALLY
+IDENTICAL to Samsung faithful (`P+B(E+R)`, report-18), riding the live
+`test_samsung_rank_preservation_weight_residency`. Design 06 §2–§5.
+
 ### Enumerator registration (in `spmw_autoschedule.py`)
+Mortise (design 06): a new `@register_enumerator("mortise")` emits the
+`stage_resident ∈ {False, True}` candidate pair (additive clone of the
+Samsung tail, lines 358–359) so the resident schedule is argmin-SELECTED,
+not hand-set.
 ```
 @register_enumerator("samsung_hbm_pim")
 def _enumerate(target, matches: list[MatchedOp]) -> list[Placement]: ...
@@ -426,12 +449,29 @@ No collective-specific cost context required. The per-phase
 (sum→max, T18) a later one-function swap. See design 05 and the new
 `HostXcel`/`host_staging` Seams subsections (§3).
 
+### T23. Mortise eviction granularity: smooth-`phi` vs `ceil(T_w/C)`-quantized (design 06 §7, report 26 §7 Q2)
+The Mortise capacity compose uses the smooth `(1-phi)*P_var` eviction
+term; real eviction is tile-quantized (`ceil(T_w/C)` tiles). The R26
+harness SHOULD report both curves so the finding statement picks the
+conservative one. Refines the *number* at fractional `C`, not the
+qualitative collapse. Commit a quantized compose only when a corpus shape
+flips a crossover-B decision under coarse `C`.
+
+### T24. Mortise headline ratio is Samsung-preload/exec-ratio specific (design 06 §7, report 26 §7 Q1/§4)
+The 3.93× ceiling = `P/(E+R)` is Samsung-analog-specific; a Mortise with a
+different MAC speed moves the *number* (2×-faster exec → ~2.6× ceiling),
+not the ordering. The `optimistic` flavor's `E`/`P_var` band quantifies
+it; calibrating Mortise's own `tCCDL` against a different analog datasheet
+(AiM 2 GHz) is a v2 nicety, out of scope.
+
 ### T18. Async staging/compute overlap (design 05 §9, report 23 open-Q4)
 The whole-program composition is `device + host_staging` as a **sum** this
 cycle. Async overlap turns it into a `max`. Out of scope to implement; the
 seam (per-phase `CostResult.phases` + pluggable combiner) is reserved in
 design 05 §5. Revisit when a pipelined batched-GEMV workload with
-measurable overlap ships.
+measurable overlap ships. Mortise (design 06) surfaces `evict_per_call` as
+a separate phase so a future `max`-combiner softening the capacity
+collapse is a one-line change.
 
 ### T19b. Host-staging cost units: device-cycle-equiv vs host wall-time (design 05 §9, report 23 open-Q2)
 `host_staging` keeps the report-18 device-cycle-equivalent convention

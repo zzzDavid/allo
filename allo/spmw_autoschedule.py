@@ -360,6 +360,27 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     return out
 
 
+@register_enumerator("mortise")
+def _mortise_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
+    """Enumerate Mortise layouts (design 06 §3.3).
+
+    Mortise is built Samsung-shaped (`tests/spmw/_mortise_target.py`:
+    grf_a/grf_b, nested tiles, the same moves/ops), so its layout
+    enumeration IS Samsung's: the same bank-row / grf-staged / dual-fiber
+    candidates crossed with residency / crf-issue / `stage_resident`. The
+    only Mortise-specific axis is the capacity lever `C`, which is a target
+    CONSTANT (`resident_cap_elems`) read by the host_staging compose -- not
+    a placement axis, so it does not multiply the candidate set.
+
+    This delegates to `_samsung_enumerate` rather than re-deriving the
+    bank algebra: Mortise's tree is Samsung's tree plus a const, so the
+    `stage_resident in {False, True}` candidate pair the autoscheduler
+    argmin-selects over is produced identically. Argmin picks the resident
+    arm at B>=2 (the Mortise faithful host_staging prices it cheaper).
+    """
+    return _samsung_enumerate(target, matches)
+
+
 @register_enumerator("aim")
 def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     """Enumerate candidate layouts for SK-Hynix AiM.

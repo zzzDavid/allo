@@ -909,6 +909,245 @@ DEMO_PIM_MICRO25 = replace(
 )
 
 
+# ===================================================================== #
+# Mortise hypothetical PIM substrate (design 06; report-26) -- a
+# capacity-aware near-bank-SIMD what-if grafted onto the Samsung exec
+# algebra. The structural target lives in `tests/spmw/_mortise_target.py`;
+# its CostModels live here. Three flavors on `(target_name="mortise")`:
+#
+#   * faithful    -- the baseline finding (the report-26 §2.1 capacity-aware
+#                    host_staging compose: `P + B*(R + (1-phi)*P_var)`
+#                    resident, `B*(P+R)` baseline; `phi=min(1,C/T_w)`).
+#   * unlimited   -- the ABLATION (report-26 §3): hard-wires `phi=1`, so the
+#                    `(1-phi)*P_var` capacity term vanishes for every `C` and
+#                    every capacity arm collapses to the report-18 curve.
+#   * optimistic  -- the swept sensitivity variant (report-26 §4): same
+#                    compose, the §4 0.5x-2x band on the staging numbers.
+#
+# The capacity lever lives ENTIRELY in the host_staging compose
+# (`B*(1-phi)*P_var`); `kernel_cycles` is the Samsung device-exec phase
+# verbatim (design 06 §0, the one load-bearing decision). This makes the
+# report-26 §5 anchor a NUMERICAL identity: at `phi=1` (C >= T_w) +
+# resident, Mortise's whole-program is byte-identical to the
+# Samsung-validated resident schedule (both = `P + B*(E+R)`).
+#
+# `unlimited` is carried as a CLOSURE-BAKED flag (design 06 §2.4
+# alternative: `phi=1` set inside the bound compose), so NO field is added
+# to the `CostModel` dataclass -- zero-FPGA-blast, spmw-local.
+# ===================================================================== #
+
+
+def _mortise_host_staging_compose_with(hs_model, ctx, *, unlimited: bool):
+    """`host_staging`-concern compose for Mortise (design 06 §2.2).
+
+    `_samsung_host_staging_compose_with` plus the report-26 §2.1 capacity
+    term. The capacity `C` is read off the target tree const
+    `resident_cap_elems` (a GEOMETRY constant, not a cost number); the
+    *cycles* of re-streaming the evicted shortfall live here, in the cost
+    model.
+
+        phi = min(1, C / T_w)         (unlimited -> phi == 1)
+        evict_per_call = (1 - phi) * P_var       P_var = P - crf_cyc
+
+    resident=True : P paid ONCE + B * evict_per_call  (the lever earns this)
+    resident=False: B * P                              (re-preload baseline)
+    readback is always paid per batch vector.
+
+    Reductions that must hold (report-26 §2.2):
+      * phi=1, resident   -> P + B*R         (whole-program = report-18)
+      * phi=1, non-resident -> B*(P+R)       (the re-preload comparator)
+      * phi=0.5, resident -> per-call adds 0.5*P_var
+    """
+    target = ctx.target
+    trace = ctx.trace
+    layout = ctx.layout
+    M, K = _samsung_mk(target, trace)
+    B = _trace_batch_dim(trace)
+    T_w = M * K                                  # weight-tile size (elements)
+
+    # --- the capacity lever (the one new term over Samsung) ---
+    C = getattr(target, "resident_cap_elems", T_w)
+    if unlimited:
+        phi = 1.0                                # ablation: capacity ignored
+    else:
+        phi = 1.0 if T_w <= 0 else min(1.0, C / T_w)
+
+    preload_cyc = _samsung_preload_cycles(hs_model, M, K)       # = P
+    readback_cyc = _samsung_readback_cycles(hs_model, M)        # = R per vector
+    crf_cyc = hs_model.move_cost("STAGE_CRF", MoveCostCtx("STAGE_CRF"))
+    P_var = preload_cyc - crf_cyc                # data-proportional part (§2.1)
+    evict_per_call = int(round((1.0 - phi) * P_var))
+
+    resident = bool(getattr(layout, "extra", {}).get("stage_resident", False))
+    if resident:
+        stage_resident = preload_cyc            # P paid ONCE
+        stage_per_call = B * evict_per_call      # only the evicted shortfall/vec
+    else:
+        stage_resident = 0
+        stage_per_call = B * preload_cyc         # re-preload-every-vector
+    readback_total = B * readback_cyc
+    cycles = stage_resident + stage_per_call + readback_total
+    return CostResult(
+        cycles=cycles,
+        phases={
+            "stage_resident": stage_resident,
+            "stage_per_call": stage_per_call,
+            "evict_per_call": B * evict_per_call,    # surfaced for the sweep
+            "readback": readback_total,
+        },
+        confidence=hs_model.confidence,
+    )
+
+
+def _mortise_host_staging_compose(ctx):
+    return _mortise_host_staging_compose_with(
+        MORTISE_HOST_STAGING, ctx, unlimited=False
+    )
+
+
+def _mortise_unlimited_host_staging_compose(ctx):
+    return _mortise_host_staging_compose_with(
+        MORTISE_UNLIMITED_HOST_STAGING, ctx, unlimited=True
+    )
+
+
+def _mortise_optimistic_host_staging_compose(ctx):
+    return _mortise_host_staging_compose_with(
+        MORTISE_OPTIMISTIC_HOST_STAGING, ctx, unlimited=False
+    )
+
+
+def _mortise_compose(ctx):
+    # Device-exec phase = Samsung's exec verbatim (design 06 §2.1): Mortise
+    # grafts onto the Samsung near-bank-SIMD substrate, so exec IS Samsung's.
+    return _samsung_compose_with(MORTISE_FAITHFUL, ctx)
+
+
+def _mortise_optimistic_compose(ctx):
+    return _samsung_compose_with(MORTISE_OPTIMISTIC, ctx)
+
+
+# --- kernel_cycles concern (shared exec algebra; Samsung-cloned numbers) ---
+# Every constant carries a provenance tag (design 06 §2.3 table); none is a
+# free fit param. Tags: [sim-anchored] / [assumption] / [structural].
+MORTISE_FAITHFUL = CostModel(
+    name="mortise_faithful",
+    target_name="mortise",
+    op_costs={
+        "MAC": OpCost(lambda c: 4, note="[sim-anchored] tCCDL column-strobe; "
+                      "Samsung-analog, report-18 E folded MAC=(K//8)*4"),
+        "MUL": OpCost(lambda c: 4, note="[sim-anchored] tCCDL, Samsung-analog"),
+    },
+    move_costs={
+        "LD_A": MoveCost(lambda c: 26, note="[sim-anchored] tCCDL+RL+BL//2"),
+        "LD_B": MoveCost(lambda c: 26, note="[sim-anchored] tCCDL+RL+BL//2"),
+        "ST_A": MoveCost(lambda c: 14, note="[sim-anchored] tCCDL+WL+BL//2"),
+        "ST_B": MoveCost(lambda c: 14, note="[sim-anchored] tCCDL+WL+BL//2"),
+        "JUMP": MoveCost(lambda c: 1, note="[structural] 1-cyc control op"),
+        "CRF_TRIGGER": MoveCost(lambda c: 2,
+            note="[assumption] host per-tile fire latency; Samsung-analog"),
+    },
+    constants={},
+    compose=_mortise_compose,
+    flavor="faithful",
+)
+
+
+# host_staging concern (faithful): the report-18 calibration anchors,
+# re-homed VERBATIM from SAMSUNG_HOST_STAGING (design 06 §2.3). Every
+# constant is provenance-tagged; `C` (the swept lever) lives on the tree,
+# not here.
+MORTISE_HOST_STAGING = register_cost_model(CostModel(
+    name="mortise_host_staging",
+    target_name="mortise",
+    flavor="faithful",
+    concern="host_staging",
+    op_costs={},
+    move_costs={
+        "STAGE_BCAST": MoveCost(lambda c: 369, note="[sim-anchored] HAB "
+            "preload fan-out width; report-18 §1 P=11368 on PIMSimulator; "
+            "Mortise inherits Samsung HAB bcast rate. Uncertainty: Mortise "
+            "bcast width may differ -> swept 0.5x-2x in optimistic flavor."),
+        "STAGE_SCATTER": MoveCost(lambda c: 1, note="[sim-anchored] per-group "
+            "column-strobe; report-18 P decomposition."),
+        "STAGE_CRF": MoveCost(lambda c: 2, note="[assumption] programCrf "
+            "upload; Samsung STAGE_CRF analog, capped 4-burst per report-18 "
+            "§1; swept 1-8 in optimistic flavor."),
+        "GATHER_FAN": MoveCost(lambda c: 4096, note="[sim-anchored] readback "
+            "tile width; report-18 R=181 @ M=4096."),
+        "GATHER_RD": MoveCost(lambda c: 181, note="[sim-anchored] per-tile "
+            "readResult; report-18 §1 GATHER_RD=181."),
+    },
+    constants={},
+    compose=_mortise_host_staging_compose,
+))
+
+
+# --- ablation flavor: unlimited (phi forced to 1; report-26 §3) ---
+# Same kernel numbers, same staging numbers; the ONLY difference is the
+# closure-baked `unlimited=True` in its host_staging compose, which kills
+# the capacity term for every `C`.
+MORTISE_UNLIMITED = replace(
+    MORTISE_FAITHFUL, name="mortise_unlimited", flavor="unlimited",
+    compose=lambda ctx: _samsung_compose_with(MORTISE_UNLIMITED, ctx),
+)
+MORTISE_UNLIMITED_HOST_STAGING = register_cost_model(CostModel(
+    name="mortise_unlimited_host_staging",
+    target_name="mortise",
+    flavor="unlimited",
+    concern="host_staging",
+    op_costs={},
+    move_costs=MORTISE_HOST_STAGING.move_costs,     # SAME faithful numbers
+    constants={},
+    compose=_mortise_unlimited_host_staging_compose,
+))
+
+
+# --- swept sensitivity flavor: optimistic (report-26 §4 band) ---
+# Same compose; the §4 0.5x-2x band on the staging / exec numbers. Capacity
+# term retained (this flavor still prices the lever; only the constants move).
+MORTISE_OPTIMISTIC = CostModel(
+    name="mortise_optimistic",
+    target_name="mortise",
+    op_costs={
+        "MAC": OpCost(lambda c: 2, note="[sim-anchored] optimistic: tCCDL/2 "
+                      "(report-26 §4 0.5x band on E)"),
+        "MUL": OpCost(lambda c: 2, note="[sim-anchored] optimistic: tCCDL/2"),
+    },
+    move_costs={
+        "LD_A": MoveCost(lambda c: 13, note="[sim-anchored] optimistic 0.5x"),
+        "LD_B": MoveCost(lambda c: 13, note="[sim-anchored] optimistic 0.5x"),
+        "ST_A": MoveCost(lambda c: 7, note="[sim-anchored] optimistic 0.5x"),
+        "ST_B": MoveCost(lambda c: 7, note="[sim-anchored] optimistic 0.5x"),
+        "JUMP": MoveCost(lambda c: 1, note="[structural] 1-cyc control op"),
+        "CRF_TRIGGER": MoveCost(lambda c: 1, note="[assumption] optimistic"),
+    },
+    constants={},
+    compose=_mortise_optimistic_compose,
+    flavor="optimistic",
+    confidence="coarse",
+)
+MORTISE_OPTIMISTIC_HOST_STAGING = register_cost_model(CostModel(
+    name="mortise_optimistic_host_staging",
+    target_name="mortise",
+    flavor="optimistic",
+    concern="host_staging",
+    op_costs={},
+    move_costs={
+        "STAGE_BCAST": MoveCost(lambda c: 738, note="[sim-anchored] optimistic: "
+            "2x fan-out (report-26 §4 2x band on P_var)"),
+        "STAGE_SCATTER": MoveCost(lambda c: 1, note="[sim-anchored]"),
+        "STAGE_CRF": MoveCost(lambda c: 4, note="[assumption] optimistic: "
+            "4-burst crf (report-26 §4 crf 1-8 band)"),
+        "GATHER_FAN": MoveCost(lambda c: 4096, note="[sim-anchored]"),
+        "GATHER_RD": MoveCost(lambda c: 90, note="[sim-anchored] optimistic 0.5x R"),
+    },
+    constants={},
+    compose=_mortise_optimistic_host_staging_compose,
+    confidence="coarse",
+))
+
+
 # --------------------------------------------------------------------- #
 # Register all faithful models + the swap-test flavor + the Phase-5 demo
 # at import (design 04 §1.5, §8).
@@ -924,5 +1163,8 @@ for _m in (
     DEMO_PIM_DEFAULT,
     DEMO_PIM_CONSTANT,
     DEMO_PIM_MICRO25,
+    MORTISE_FAITHFUL,
+    MORTISE_UNLIMITED,
+    MORTISE_OPTIMISTIC,
 ):
     register_cost_model(_m)
