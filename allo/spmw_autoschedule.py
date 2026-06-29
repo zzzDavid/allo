@@ -801,6 +801,78 @@ def autoschedule(
     cost_fn = get_cost(cost_name, target)
     regalloc_disabled = os.environ.get("SPMW_DISABLE_REGALLOC") == "1"
 
+    # Whole-trace liveness pre-pass (SPEC-023 D1): run ONCE before the
+    # per-group loop and thread it (via a contextvar `cross_with_knobs` reads)
+    # into every group's `KnobCtx`, so the cross-kernel/cross-work-id residency
+    # knob can bound its candidate set by the whole-trace analysis. The
+    # per-group argmin below stays structurally intact -- liveness only bounds
+    # the residency knob's candidate set; the cross-kernel decision is resolved
+    # by the post-argmin reconciliation, NOT a joint search. Single-op GEMV
+    # flags nothing -> residency returns ["restage"] (1x fan) -> byte-identical.
+    from .spmw_liveness import trace_liveness
+    from .spmw_knobs import set_active_liveness, reset_active_liveness
+
+    liveness = trace_liveness(trace)
+    _liveness_token = set_active_liveness(liveness)
+    try:
+        placements = _autoschedule_groups(
+            target, target_name, trace, enumerator, cost_fn,
+            cost_name, confidence_gate, gate_policy, regalloc_disabled,
+        )
+    finally:
+        reset_active_liveness(_liveness_token)
+    # Stamp the WORKLOAD-property cross-kernel marker `_xkernel` onto every
+    # chosen placement, from liveness, INDEPENDENT of the residency knob
+    # (SPEC-023 T6 win-emit, task 008-fix). A multi-op kernel whose activation
+    # crosses a kernel boundary must STAGE that activation between kernels --
+    # this is true for the group-local baseline too (the residency knob is
+    # disabled there, but the staging is still semantically required). Codegen
+    # emits the inter-kernel staging round-trip when `_xkernel` is present and
+    # the value is NOT resident; the `resident` decision (search only) elides
+    # it. Single-op / non-crossing traces get an empty marker -> no staging ->
+    # byte-identical floor.
+    _stamp_xkernel(trace, placements, liveness)
+    # Post-argmin resident-pair reconciliation (SPEC-023 D1): a "resident"
+    # choice is only honoured when BOTH endpoints (producer + consumer kernels)
+    # selected the matching arm; otherwise fall back to restage. Structurally
+    # intact per-group argmins; the cross-kernel constraint is a guard, not a
+    # joint optimization.
+    _reconcile_resident_pairs(trace, placements, liveness)
+    return placements
+
+
+def _stamp_xkernel(trace, placements, liveness) -> None:
+    """Stamp `extra["_xkernel"]` = the cross-kernel memref names each placement
+    touches (from whole-trace liveness), on EVERY placement -- baseline and
+    search alike. This is the workload-property signal codegen uses to emit the
+    inter-kernel activation staging (which `residency=resident` then elides);
+    it does not depend on the residency knob, so the group-local baseline
+    carries it too. Empty when nothing crosses -> byte-identical."""
+    from .spmw_liveness import memref_span, crosses_boundary
+
+    if not liveness:
+        return
+    bucket_funcs = [fn for fn, _ in _bucket_for_autoschedule(trace)]
+    for fn, pl in zip(bucket_funcs, placements):
+        xk = []
+        for mref in getattr(pl, "placements", {}):
+            span = memref_span(liveness, mref)
+            if span is not None and span.crosses_kernel:
+                xk.append(mref)
+        if xk:
+            new_extra = dict(getattr(pl, "extra", {}) or {})
+            new_extra["_xkernel"] = sorted(xk)
+            pl.extra = new_extra
+
+
+def _autoschedule_groups(
+    target, target_name, trace, enumerator, cost_fn,
+    cost_name, confidence_gate, gate_policy, regalloc_disabled,
+) -> "list[Placement]":
+    """The per-group argmin loop (SPEC-023 D1: lifted into a helper so the
+    whole-trace liveness pre-pass + post-argmin reconciliation wrap it without
+    perturbing the loop body -- it is byte-identical to the prior inline loop).
+    """
     placements: list[Placement] = []
     for func_name, matches in _bucket_for_autoschedule(trace):
         candidates = enumerator(target, matches)
@@ -869,6 +941,80 @@ def autoschedule(
             )
         placements.append(scored[0][2])
     return placements
+
+
+def _reconcile_resident_pairs(trace, placements, liveness) -> None:
+    """Post-argmin resident-pair reconciliation (SPEC-023 D1).
+
+    A `residency == "resident"` choice is only HONOURED when both endpoints of
+    the value's whole-trace live span agreed on it; otherwise it falls back to
+    restage (the resident-pair saving is not credited). This keeps the
+    per-group argmins independent -- the cross-kernel decision is expressed as a
+    typed knob + this reconciliation guard, NOT a joint optimization.
+
+    - Cross-WORK-ID (T4) residency lives entirely within one kernel (the
+      broadcast hoist: preload once, reuse across that kernel's work-ids), so a
+      single endpoint suffices -- it is honoured as chosen.
+    - Cross-KERNEL (T6) residency couples a producer kernel's output to a
+      consumer kernel's input: it is honoured only when the producer placement
+      AND the consumer placement both selected `resident` for that memref;
+      otherwise both are reverted to restage.
+
+    Mutates `placements` in place (each is a `Placement` whose `extra` carries
+    the chosen `residency` / `residency_pairs`). Byte-identical no-op when no
+    placement chose resident (the regression-default, since `residency`'s
+    `knob_cost` is unregistered so the argmin keeps restage).
+    """
+    from dataclasses import replace as _dc_replace  # noqa: F401 (kept local)
+
+    if not liveness:
+        return
+
+    # `placements` align with `_bucket_for_autoschedule(trace)` order, so zip to
+    # recover each placement's func_name WITHOUT stamping it onto `extra` (that
+    # would perturb the byte-identical default). The resident-pair check uses
+    # this func_name -> placement map.
+    bucket_funcs = [fn for fn, _ in _bucket_for_autoschedule(trace)]
+    func_to_pl = {}
+    pl_func = {}
+    for fn, pl in zip(bucket_funcs, placements):
+        func_to_pl[fn] = pl
+        pl_func[id(pl)] = fn
+
+    def _revert_to_restage(pl, mref):
+        new_extra = dict(getattr(pl, "extra", {}))
+        new_extra["residency"] = "restage"
+        pairs = dict(new_extra.get("residency_pairs", {}))
+        pairs.pop(mref, None)
+        if pairs:
+            new_extra["residency_pairs"] = pairs
+        else:
+            new_extra.pop("residency_pairs", None)
+        pl.extra = new_extra
+
+    for pl in placements:
+        extra = getattr(pl, "extra", {}) or {}
+        if extra.get("residency") != "resident":
+            continue
+        pairs = extra.get("residency_pairs", {})
+        for mref, info in list(pairs.items()):
+            if not info.get("crosses_kernel"):
+                continue  # T4: single-endpoint, honoured as chosen
+            # T6: require the matching endpoint kernel also chose resident.
+            other = info.get("consumer_func")
+            if other == pl_func.get(id(pl)):
+                other = info.get("producer_func")
+            other_pl = func_to_pl.get(other)
+            other_ok = (
+                other_pl is not None
+                and (getattr(other_pl, "extra", {}) or {}).get("residency")
+                == "resident"
+                and mref in (getattr(other_pl, "extra", {}) or {}).get(
+                    "residency_pairs", {}
+                )
+            )
+            if not other_ok:
+                _revert_to_restage(pl, mref)
 
 
 # The confidence bands the gate treats as "not safe to silently commit"

@@ -29,8 +29,38 @@ produced the SPEC-022 drift).
 
 from __future__ import annotations
 
+import contextvars
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+
+# Whole-trace liveness for the current `autoschedule` run (SPEC-023 D1).
+# `autoschedule` sets this once (before the per-group loop) so the per-group
+# enumerators' `cross_with_knobs` -- which builds `KnobCtx` -- can thread the
+# liveness into each ctx WITHOUT changing the landed `enumerator(target,
+# matches)` signature. Default `None` (unset) == today's per-kernel behaviour,
+# so any caller outside an `autoschedule` run is byte-identical.
+_active_liveness: "contextvars.ContextVar[Any]" = contextvars.ContextVar(
+    "spmw_active_liveness", default=None
+)
+
+
+# The SPEC-023 schedule-search knobs (D1 cross-op residency, D2 tile/fold, D3
+# double-buffer depth). `SPMW_DISABLE_SCHEDULE_SEARCH=1` skips exactly these in
+# `cross_with_knobs`, leaving the placement-realization levers -> the
+# group-local baseline schedule (the verifier's baseline-vs-search comparison).
+_SCHEDULE_SEARCH_KNOBS = frozenset({"residency", "tile", "double_buffer"})
+
+
+def set_active_liveness(liveness):
+    """Set the whole-trace liveness for the current run; returns the
+    contextvars Token so the caller can reset it. Called by `autoschedule`."""
+    return _active_liveness.set(liveness)
+
+
+def reset_active_liveness(token) -> None:
+    """Restore the prior liveness (paired with `set_active_liveness`)."""
+    _active_liveness.reset(token)
 
 
 # --------------------------------------------------------------------- #
@@ -52,6 +82,12 @@ class KnobCtx:
     matches: list = field(default_factory=list)
     role_to_memref: dict = field(default_factory=dict)
     base: Any = None  # the Placement being materialised (emit only)
+    # Whole-trace liveness result (SPEC-023 D1), threaded in by `autoschedule`
+    # so the cross-kernel/cross-work-id `residency` knob can read it. Additive,
+    # default `None` == today's per-kernel-local behaviour (no residency DOF).
+    # `KnobCtx` is the placement task's type; this is the additive `liveness`
+    # field the schedule-search task escalated to add (SPEC-023 Answer 4 #1).
+    liveness: Any = None
 
 
 # --------------------------------------------------------------------- #
@@ -206,6 +242,132 @@ def _vr_dma_emit(value, base, ctx: KnobCtx):
     )
 
 
+def _residency_crossing_memrefs(ctx: KnobCtx) -> list:
+    """The candidate's memrefs whose whole-trace liveness crosses a kernel or
+    work-id boundary (SPEC-023 D1). Empty when liveness is absent (per-kernel
+    mode) or nothing crosses -- the byte-identical no-residency case."""
+    from .spmw_liveness import memref_span, crosses_boundary
+
+    liveness = getattr(ctx, "liveness", None)
+    if not liveness:
+        return []
+    base = ctx.base
+    out = []
+    for mref in getattr(base, "placements", {}):
+        span = memref_span(liveness, mref)
+        if span is not None and crosses_boundary(span):
+            out.append((mref, span))
+    return out
+
+
+def _residency_candidates(ctx: KnobCtx) -> list:
+    # >=2-candidate discipline ONLY when liveness says residency is possible:
+    # `["restage", "resident"]` when some memref crosses a boundary, else the
+    # single-candidate `["restage"]` (today's behaviour, 1x fan, byte-identical).
+    return ["restage", "resident"] if _residency_crossing_memrefs(ctx) else ["restage"]
+
+
+def _residency_emit(value, base, ctx: KnobCtx):
+    from .spmw_autoschedule import Placement
+
+    new_extra = dict(base.extra)
+    new_extra["residency"] = value
+    crossing = _residency_crossing_memrefs(ctx)
+    if crossing:
+        # Record the crossing memrefs (with their LiveSpan endpoints) on BOTH
+        # arms (SPEC-023 T6/D2) so the `residency` knob_cost knows the
+        # inter-kernel staging magnitude: `restage` PAYS that staging, `resident`
+        # ELIDES it. A non-crossing value (no entries) records nothing -> its
+        # restage knob_cost is empty -> byte-identical to today.
+        info = {
+            mref: {
+                "producer_func": span.producer_func,
+                "consumer_func": span.consumer_func,
+                "crosses_kernel": span.crosses_kernel,
+                "crosses_workid": span.crosses_workid,
+                "handle": base.placements.get(mref),
+            }
+            for mref, span in crossing
+        }
+        new_extra["residency_crossing"] = info
+        if value == "resident":
+            # `residency_pairs` is the resident-only carrier codegen's
+            # move-elision branch + the post-argmin reconciliation read; the
+            # reconciliation pops a mref from here when an endpoint disagrees.
+            new_extra["residency_pairs"] = dict(info)
+    return Placement(
+        placements=dict(base.placements), mode=base.mode, extra=new_extra,
+        layout=getattr(base, "layout", None),
+    )
+
+
+def _tile_candidates(ctx: KnobCtx) -> list:
+    # Legal capacity-bounded re-tilings of the matched nest (SPEC-023 D2), from
+    # the tile generator. The identity tiling is always first (byte-identical);
+    # a non-identity retile appears ONLY when a legal capacity-fitting one
+    # exists. >=2-candidate discipline gated on capacity, never a tile literal.
+    from .spmw_tiling import tile_candidates
+
+    plans = tile_candidates(ctx.target, ctx.matches)
+    return plans if plans else None  # None -> knob is inert (no tileable nest)
+
+
+def _tile_emit(value, base, ctx: KnobCtx):
+    from .spmw_autoschedule import Placement
+
+    new_extra = dict(base.extra)
+    # Store the chosen TilePlan (the materialiser reads tile_size off it; the
+    # identity tiling is the default and is byte-identical). Only record a
+    # NON-identity tile so the identity candidate's extra is unchanged.
+    if value is not None and not getattr(value, "is_identity", True):
+        new_extra["tile"] = value
+    return Placement(
+        placements=dict(base.placements), mode=base.mode, extra=new_extra,
+        layout=getattr(base, "layout", None),
+    )
+
+
+def _has_dma_hide_dof(target) -> bool:
+    """True iff the target has a DMA-hide degree of freedom -- i.e. an
+    `overlap`-flavor cost model is registered for it, whose compose emits the
+    DMA on `Resource.DMA` so the §A1 overlap fold can hide it behind compute
+    (SPEC-023 D3). A structural check, NOT a backend-name hardcode: a backend
+    gains the depth-2 candidate exactly when its overlap compose is landed
+    (APU v1 today; UPMEM/others when their overlap arm is added)."""
+    name = getattr(target, "name", None)
+    if name is None:
+        return False
+    try:
+        from .spmw_cost_model import get_cost_model
+        get_cost_model(name, "overlap", "kernel_cycles")
+        return True
+    except Exception:
+        return False
+
+
+def _double_buffer_candidates(ctx: KnobCtx) -> list:
+    # >=2-candidate discipline gated on SUBSTRATE capability (SPEC-023 D3):
+    # depth {1, 2} only where an overlap-fold DMA-hide DOF exists, else [1] (a
+    # 1x fan, byte-identical -- Samsung's bank-row fold is single-buffered, and
+    # any backend with no `Resource.DMA` overlap compose stays depth-1).
+    return [1, 2] if _has_dma_hide_dof(ctx.target) else [1]
+
+
+def _double_buffer_emit(value, base, ctx: KnobCtx):
+    from .spmw_autoschedule import Placement
+
+    new_extra = dict(base.extra)
+    # Record the double-buffer flag ONLY for depth 2 so depth-1's extra is
+    # byte-identical to today. The overlap compose reads `extra["double_buffer"]`
+    # to pick the loop-encoded (hiding) vs collapsed (serial) DMA phase.
+    if int(value) >= 2:
+        new_extra["double_buffer"] = True
+    return Placement(
+        placements=dict(base.placements), mode=base.mode, extra=new_extra,
+        layout=getattr(base, "layout", None),
+    )
+
+
 def register_default_knobs():
     """Register the six live levers as typed knobs, in the per-target cross
     ORDER the hand-crossed enumerator applied them (the byte-identity anchor).
@@ -228,6 +390,38 @@ def register_default_knobs():
                                 _n_tasklets_candidates, _n_tasklets_emit))
     register_knob("apu_v1", Knob("vr_dma", _vr_dma_candidates, _vr_dma_emit))
 
+    # Cross-kernel / cross-work-id residency (SPEC-023 D1/T6). A 1x fan
+    # (byte-identical) for any value that does NOT cross a boundary; the
+    # candidate set only grows when whole-trace liveness flags residency as
+    # possible. Its `cost` delegates to the registered `knob_cost(target,
+    # "residency", ...)` (task 004); the resident arm is credited the elided
+    # inter-kernel staging so the argmin earns it.
+    for tname in ("samsung_hbm_pim", "mortise", "mortise_wide",
+                  "upmem", "apu_v1", "apu_v2"):
+        register_knob(tname, Knob("residency",
+                                  _residency_candidates, _residency_emit))
+
+    # Capacity-bounded tile/fold (SPEC-023 D2). Registered LAST on every
+    # backend so it is a 1x fan (byte-identical) whenever the generator finds
+    # no legal capacity-fitting retile -- the candidate set only grows when a
+    # legal one exists. Its `cost` delegates to `knob_cost(target, "tile",
+    # ...)`; the identity tiling is the default and writes no `extra`.
+    for tname in ("samsung_hbm_pim", "mortise", "mortise_wide",
+                  "upmem", "apu_v1", "apu_v2"):
+        register_knob(tname, Knob("tile", _tile_candidates, _tile_emit))
+
+    # Double-buffer depth (SPEC-023 D3). A 1x fan ([1], byte-identical) on
+    # every backend with no overlap-fold DMA-hide DOF; [1, 2] where one exists
+    # (APU v1 today). The depth-2 arm sets `extra["double_buffer"]`, which the
+    # overlap compose reads to emit the loop-encoded (hiding) DMA phase; under
+    # the default faithful flavor depth-1 and depth-2 tie (collapsed phase
+    # both), so the argmin default is byte-identical.
+    for tname in ("samsung_hbm_pim", "mortise", "mortise_wide",
+                  "upmem", "apu_v1", "apu_v2"):
+        register_knob(tname, Knob("double_buffer",
+                                  _double_buffer_candidates,
+                                  _double_buffer_emit))
+
 
 def cross_with_knobs(
     target, base_candidates: list, matches: list, role_to_memref: dict
@@ -243,13 +437,29 @@ def cross_with_knobs(
     same per-knob candidate sets.
     """
     target_name = getattr(target, "name", None)
+    # Thread the run's whole-trace liveness (SPEC-023 D1) into every KnobCtx so
+    # the residency knob can read it. `None` outside an autoschedule run ->
+    # byte-identical to today.
+    liveness = _active_liveness.get()
+    # Baseline-vs-search toggle (SPEC-023 wiring, task 007): with
+    # `SPMW_DISABLE_SCHEDULE_SEARCH=1` the three SPEC-023 schedule-search knobs
+    # (residency / tile / double_buffer) are SKIPPED, leaving only the
+    # placement-realization levers -- i.e. the group-local baseline schedule.
+    # Default off (unset) -> the full search, byte-identical to today. The
+    # verifier (008/009) compiles the SAME workload twice (this flag set vs
+    # unset) and compares real-sim cycles; this is the single choke point.
+    import os
+    _search_off = os.environ.get("SPMW_DISABLE_SCHEDULE_SEARCH") == "1"
     current = list(base_candidates)
     for knob in registered_knobs(target_name):
+        if _search_off and knob.name in _SCHEDULE_SEARCH_KNOBS:
+            continue
         nxt: list = []
         for base in current:
             ctx = KnobCtx(
                 target=target, matches=matches,
                 role_to_memref=role_to_memref, base=base,
+                liveness=liveness,
             )
             values = knob.candidates(ctx)
             if not values:

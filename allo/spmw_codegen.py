@@ -1081,6 +1081,42 @@ class UPMEMCtx(CodegenContext):
             "        /* === END tenon spill round-trip === */\n"
             if spill_accumulator else ""
         )
+        # Cross-op residency (SPEC-023 T6/D2, UPMEM): a cross-kernel activation
+        # that is RE-STAGED pays an inter-kernel MRAM round-trip of its tile
+        # (the producer ST_MRAM of the activation + the consumer LD_MRAM); a
+        # RESIDENT activation keeps it on-device and ELIDES that round-trip. So
+        # `restage` emits the round-trip and `resident` does NOT -- the
+        # uPIMulator-counted artifact differs (one MRAM write+read, ~2x1000
+        # cyc), and the resident schedule the argmin earned runs with fewer
+        # cycles. Gated on `extra["residency"] == "restage"` AND a crossing
+        # value: a single-op / non-crossing trace (residency absent or no
+        # `residency_crossing`) emits nothing -> byte-identical floor. Uses the
+        # same dedicated MRAM scratch region as the spill round-trip (one BLOCK
+        # past C); value-preserving, so the GEMV `c == W@x` check still passes.
+        # Gate on the WORKLOAD-property `_xkernel` marker (stamped by
+        # autoschedule from liveness, present on baseline AND search) so the
+        # group-local baseline ALSO emits the inter-kernel staging; only a
+        # `resident` decision (search) elides it. So: emit the round-trip when a
+        # cross-kernel activation exists AND it is not resident.
+        _rextra = getattr(active, "extra", {}) or {}
+        restage_crossing = (
+            bool(_rextra.get("_xkernel"))
+            and str(_rextra.get("residency", "restage")) != "resident"
+        )
+        residency_decl = (
+            "    uint32_t mram_resid_addr_C = (uint32_t) "
+            "(DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T) "
+            "+ n_size_pad * sizeof(T) + max_rows * sizeof(T) + 128);\n"
+            if restage_crossing else ""
+        )
+        residency_roundtrip = (
+            "        /* === BEGIN tenon residency restage (cross-kernel "
+            "activation -> mram and back) === */\n"
+            "        mram_write(cache_C, (__mram_ptr void *) (mram_resid_addr_C), 8);\n"
+            "        mram_read((__mram_ptr void const*) (mram_resid_addr_C), cache_C, 8);\n"
+            "        /* === END tenon residency restage === */\n"
+            if restage_crossing else ""
+        )
         return (
             "#include <stdint.h>\n"
             "#include <stdio.h>\n"
@@ -1142,7 +1178,8 @@ class UPMEMCtx(CodegenContext):
             "    uint32_t mram_base_addr_A = (uint32_t) (DPU_MRAM_HEAP_POINTER + start_row * n_size * sizeof(T));\n"
             "    uint32_t mram_base_addr_B = (uint32_t) (DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T));\n"
             "    uint32_t mram_base_addr_C = (uint32_t) (DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T) + n_size_pad * sizeof(T) + start_row * sizeof(T));\n"
-            + spill_decl +
+            + spill_decl
+            + residency_decl +
             "    uint32_t mram_temp_addr_A = mram_base_addr_A;\n"
             "    uint32_t mram_temp_addr_B = mram_base_addr_B;\n"
             "\n"
@@ -1191,7 +1228,8 @@ class UPMEMCtx(CodegenContext):
             "            mram_temp_addr_B = mram_base_addr_B;\n"
             "            if(mram_temp_addr_A % 8 != 0) { offset = 1; } else { offset = 0; }\n"
             "        }\n"
-            + spill_roundtrip +
+            + spill_roundtrip
+            + residency_roundtrip +
             "        mram_write(cache_C, (__mram_ptr void *) (mram_base_addr_C), 8);\n"
             "        mram_base_addr_C += 2 * sizeof(T);\n"
             "    }\n"
@@ -1241,6 +1279,12 @@ class APUv1Ctx(CodegenContext):
         # FAIL-62/64 host/device-mismatch gotcha). Default "intra" =
         # today's single-VR subgroup-tiled layout.
         self.vr_dma_mode: str = "intra"
+        # Double-buffer depth chosen by the autoscheduler
+        # (Placement.extra["double_buffer"], SPEC-023 D3). False = depth 1
+        # (serialized DMA then compute, today's behaviour); True = depth 2
+        # (ping-pong: prefetch tile 0, then overlap DMA tile i+1 with compute
+        # tile i). The build harness reads this to emit the staged schedule.
+        self.double_buffer: bool = False
 
     def bind_handle(self, handle, c_name: str) -> None:
         """Teach the ctx that `handle` lowers to the C identifier
@@ -1890,6 +1934,15 @@ def _walk_and_emit(
             if isinstance(ctx, APUv1Ctx):
                 ctx.vr_dma_mode = getattr(layout, "extra", {}).get(
                     "vr_dma", "intra"
+                )
+                # Double-buffer depth (SPEC-023 D3): stage the chosen depth so
+                # the build harness emits the ping-pong staged-DMA/compute
+                # (prologue prefetch of tile 0, then DMA tile i+1 while
+                # computing tile i). Decision in argmin; mechanism here. We
+                # only materialise argmin's choice -- never re-derive depth.
+                # Default-missing key keeps depth 1 (serialized, byte-identical).
+                ctx.double_buffer = bool(
+                    getattr(layout, "extra", {}).get("double_buffer", False)
                 )
             # APU v1 MAC dispatch: `placement.mode == "sv"` overrides the
             # fixture's `emit_mac_lookup` lambda and emits raw MUL+ADD

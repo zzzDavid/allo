@@ -234,7 +234,12 @@ def test_enumerator_emits_four_distinct_candidates():
     = uniform role->memref, the shape the per-bucket enumerator sees)."""
     target = build_apu_v1_target()
     cands = _apu_v1_enumerate(target, _gemv_trace().matches)
-    assert len(cands) == 4
+    # The {sv, sv_lookup} x {intra, inter} = 4 distinct (mode, vr_dma) keys are
+    # unchanged. APU v1 also carries the SPEC-023 D3 double_buffer 2x fan (it
+    # has the overlap-fold DMA-hide DOF), so the depth-1 subset is exactly
+    # those 4; depth does not change the (mode, vr_dma) key set.
+    depth1 = [c for c in cands if "double_buffer" not in c.extra]
+    assert len(depth1) == 4
     keys = {(c.mode, c.extra["vr_dma"]) for c in cands}
     assert keys == {
         ("sv", "intra"), ("sv", "inter"),

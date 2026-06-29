@@ -312,14 +312,34 @@ def _samsung_host_staging_compose_with(hs_model, ctx):
         stage_resident = 0
         stage_per_call = B * preload_cyc       # preload paid per vector
     readback_total = B * readback_cyc
-    cycles = stage_resident + stage_per_call + readback_total
+    # Cross-op residency (SPEC-023 T6/D2): when a cross-kernel activation is
+    # kept RESIDENT on-device (`extra["residency"] == "resident"`), the
+    # inter-kernel host round-trip it would otherwise pay (gather the producer
+    # output to host + re-scatter it for the consumer) is ELIDED. The credit is
+    # one host gather (`readback_cyc`, the SAME helper) per resident crossing
+    # activation -- a NEGATIVE host-staging phase, the staging the resident
+    # schedule avoids. `restage` (or key absent) elides nothing -> byte-
+    # identical. The `residency` knob_cost (register_knob_cost, §A3) pins this
+    # shape exactly; this is where it folds into the argmin (mirroring how
+    # `stage_resident` folds through this same compose, not the dormant
+    # knob_phases seam).
+    resident_credit = 0
+    if str(getattr(layout, "extra", {}).get("residency", "restage")) == "resident":
+        n_resident = len(getattr(layout, "extra", {}).get("residency_pairs", {}) or {})
+        resident_credit = n_resident * readback_cyc
+    cycles = stage_resident + stage_per_call + readback_total - resident_credit
+    phases = [
+        _host_phase(stage_resident, "stage_resident"),
+        _host_phase(stage_per_call, "stage_per_call"),
+        _host_phase(readback_total, "readback"),
+    ]
+    # Append the elision phase ONLY when there is a credit, so a non-resident
+    # placement's phase list is byte-identical to today (the regression anchor).
+    if resident_credit:
+        phases.append(_host_phase(-resident_credit, "residency_elision"))
     return CostResult(
         cycles=cycles,
-        phases=[
-            _host_phase(stage_resident, "stage_resident"),
-            _host_phase(stage_per_call, "stage_per_call"),
-            _host_phase(readback_total, "readback"),
-        ],
+        phases=phases,
         confidence=hs_model.confidence,
     )
 
@@ -461,6 +481,95 @@ def _samsung_stage_resident_knob_cost(value, ctx) -> "list[Phase]":
 register_knob_cost(
     "samsung_hbm_pim", "stage_resident", _samsung_stage_resident_knob_cost
 )
+
+
+def _samsung_residency_knob_cost(value, ctx) -> "list[Phase]":
+    """`residency` knob's phase contribution (SPEC-023 T6/D2).
+
+    A cross-kernel value (MLP inter-layer activation `h`) either RE-STAGES
+    through the host between layers (`"restage"`: gather the producer output to
+    host + re-scatter to the consumer -- a `Resource.HOST` staging phase) or
+    STAYS RESIDENT on-device (`"resident"`: that HOST round-trip is elided ->
+    zero phases). So `restage` is strictly costlier and argmin earns
+    `resident`; the saving is the inter-kernel host staging the resident value
+    avoids -- expressed as a positive HOST phase on restage, none on resident
+    (no negative phase needed; the seam carries it as landed).
+
+    Exact-by-construction: the HOST phase reuses the SAME host_staging gather
+    helper (`_samsung_readback_cycles`) the host_staging compose uses, sized by
+    the crossing activation's element count (the producer output rows). A value
+    that does NOT cross a boundary carries no `residency_crossing` entry, so
+    `restage` returns `[]` -- byte-identical to today (no residency knob_cost
+    effect on the per-kernel-local corpus).
+    """
+    extra = getattr(ctx.layout, "extra", {}) or {}
+    crossing = extra.get("residency_crossing", {})
+    if not crossing or value == "resident":
+        return []  # resident elides the staging; non-crossing pays nothing
+    # restage: one host gather+scatter round-trip per crossing activation.
+    hs_model = SAMSUNG_HOST_STAGING
+    M, _K = _samsung_mk(ctx.target, ctx.trace)
+    if M <= 0:
+        return []
+    per_activation = _samsung_readback_cycles(hs_model, M)
+    total = per_activation * len(crossing)
+    if total <= 0:
+        return []
+    return [_host_phase(int(total), "residency_restage")]
+
+
+register_knob_cost(
+    "samsung_hbm_pim", "residency", _samsung_residency_knob_cost
+)
+
+
+def _upmem_residency_knob_cost(value, ctx) -> "list[Phase]":
+    """`residency` knob's phase contribution for UPMEM (SPEC-023 T6/D2).
+
+    Mirrors the Samsung shape, sized by the UPMEM inter-kernel MRAM transfer:
+    `restage` pays an `LD_MRAM + ST_MRAM` round-trip per crossing activation (a
+    positive DMA phase the resident schedule avoids); `resident` (or no
+    crossing) contributes nothing. The argmin folds this through the UPMEM
+    `host_staging` compose (where the credit also lands), so the resident arm
+    is strictly cheaper and is earned. Exact-by-construction (same MRAM move
+    costs)."""
+    extra = getattr(ctx.layout, "extra", {}) or {}
+    crossing = extra.get("residency_crossing", {})
+    if not crossing or value == "resident":
+        return []
+    ld = UPMEM_FAITHFUL.move_cost("LD_MRAM", MoveCostCtx("LD_MRAM"))
+    st = UPMEM_FAITHFUL.move_cost("ST_MRAM", MoveCostCtx("ST_MRAM"))
+    total = (ld + st) * len(crossing)
+    return [_dma_phase(int(total), "residency_restage")] if total > 0 else []
+
+
+register_knob_cost("upmem", "residency", _upmem_residency_knob_cost)
+
+
+def _tile_knob_cost(value, ctx) -> "list[Phase]":
+    """`tile` knob's phase contribution (SPEC-023 D2).
+
+    The identity tiling (or key absent) contributes NOTHING -> byte-identical.
+    The win of a capacity-fitting non-identity retile is realized through the
+    allocator's capacity gate (a smaller per-tile working set FITS a bounded
+    tier the full nest would overflow, so the retiled candidate avoids the
+    spill `total_cost` the identity pays) -- a STRUCTURAL win on the landed
+    regalloc, not a separate phase here. So this knob_cost is empty by design;
+    it exists so `(target, "tile")` is a registered seam (the read side gates
+    on registration). A backend whose retile win needs an explicit phase
+    (a fold-overhead model) registers it here as a follow-up -- this task
+    pins the empty/structural shape and the generator; the sim-confirmed
+    "retile beats the user's nest" is verifier task 008.
+    """
+    return []
+
+
+# Register the tile knob_cost for every target that can carry a tile knob, so
+# the cost read-side `active_knobs` recognises `(target, "tile")`. Empty
+# contribution: the retile win flows through regalloc's capacity gate.
+for _tname in ("samsung_hbm_pim", "mortise", "mortise_wide",
+               "upmem", "apu_v1", "apu_v2"):
+    register_knob_cost(_tname, "tile", _tile_knob_cost)
 
 
 # ===================================================================== #
@@ -633,7 +742,24 @@ def _upmem_host_staging_compose(ctx):
     """
     layout = ctx.layout
     stages = list(getattr(layout, "extra", {}).get("host_stage", []) or [])
-    if not stages:
+    # Cross-op residency (SPEC-023 T6/D2, UPMEM): a cross-kernel activation kept
+    # RESIDENT on-device elides the inter-kernel MRAM round-trip it would
+    # otherwise pay (the producer ST_MRAM of `local_h` + the consumer LD_MRAM).
+    # `restage` (or key absent) pays it; `resident` elides it -> a negative
+    # host-staging credit, so the argmin (kernel_cycles + host_staging) earns
+    # resident. A value that does not cross carries no `residency_crossing`
+    # entry -> zero credit -> byte-identical. Exact-by-construction: the credit
+    # is the SAME MRAM move costs (LD_MRAM + ST_MRAM) the UPMEM kernel pays for
+    # an inter-kernel activation transfer, per crossing value.
+    resident_credit = 0
+    rextra = getattr(layout, "extra", {}) or {}
+    if str(rextra.get("residency", "restage")) == "resident":
+        n_resident = len(rextra.get("residency_crossing", {}) or {})
+        if n_resident:
+            ld = UPMEM_FAITHFUL.move_cost("LD_MRAM", MoveCostCtx("LD_MRAM"))
+            st = UPMEM_FAITHFUL.move_cost("ST_MRAM", MoveCostCtx("ST_MRAM"))
+            resident_credit = n_resident * (ld + st)
+    if not stages and not resident_credit:
         return CostResult(cycles=0, phases=[], confidence="calibrated")
     xfer = UPMEM_HOST_STAGING.move_cost("STAGE_XFER", MoveCostCtx("STAGE_XFER"))
     gxfer = UPMEM_HOST_STAGING.move_cost("GATHER_XFER", MoveCostCtx("GATHER_XFER"))
@@ -649,13 +775,16 @@ def _upmem_host_staging_compose(ctx):
             raise ValueError(
                 f"upmem host_staging: unknown collective {collective!r}"
             )
-    cycles = scatter_bcast + gather
+    cycles = scatter_bcast + gather - resident_credit
+    phases = [
+        _host_phase(scatter_bcast, "stage_scatter_bcast"),
+        _host_phase(gather, "gather"),
+    ]
+    if resident_credit:
+        phases.append(_host_phase(-resident_credit, "residency_elision"))
     return CostResult(
         cycles=cycles,
-        phases=[
-            _host_phase(scatter_bcast, "stage_scatter_bcast"),
-            _host_phase(gather, "gather"),
-        ],
+        phases=phases,
         confidence="calibrated",
     )
 
@@ -935,6 +1064,37 @@ APU_V1_OVERLAP = replace(
     compose=_apu_v1_overlap_compose,
     confidence="coarse",
     calibration=CalibrationRecord(),   # overlap fold is not sim-calibrated (D1.3)
+)
+
+
+def _apu_v1_double_buffer_knob_cost(value, ctx) -> "list[Phase]":
+    """`double_buffer` knob's phase contribution (SPEC-023 D3).
+
+    The knob's MARGINAL effect is the DMA phase ENCODING the overlap fold sees
+    (the compute COMPUTE phase is the compose's, not re-emitted here, so no
+    double-count):
+      * depth 2 -> LOOP-ENCODED `Phase(DMA, latency=per_move, ii=per_move,
+        count=n_moves)`: fill = per_move, steady state `per_move*(n-1)` hides
+        behind compute under `combine(overlap=True)` / `_max_across_with_fill_drain`.
+      * depth 1 (or no DMA) -> COLLAPSED `Phase(DMA, latency=move_total, ii=0,
+        count=1)`: fill IS the whole DMA, so it does not hide (byte-identical).
+    The magnitudes come from `_apu_v1_move_breakdown` (the SAME breakdown the
+    overlap compose uses -> exact by construction). Empty when there is no DMA.
+    """
+    target = ctx.target
+    layout = ctx.layout
+    n_moves, per_move = _apu_v1_move_breakdown(APU_V1_OVERLAP, target, ctx.trace, layout)
+    if not n_moves or per_move <= 0:
+        return []
+    if int(value) >= 2:
+        return [Phase(Resource.DMA, latency=per_move, ii=per_move,
+                      count=n_moves, tag="double_buffer_dma")]
+    return [Phase(Resource.DMA, latency=n_moves * per_move, ii=0,
+                  count=1, tag="double_buffer_dma")]
+
+
+register_knob_cost(
+    "apu_v1", "double_buffer", _apu_v1_double_buffer_knob_cost
 )
 
 

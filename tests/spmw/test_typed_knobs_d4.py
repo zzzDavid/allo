@@ -63,10 +63,16 @@ def test_live_levers_registered_as_typed_knobs():
     assert {"grf_residency", "crf_issue", "stage_resident"} <= samsung, samsung
     assert {k.name for k in registered_knobs("upmem")} >= {"n_tasklets"}
     assert {k.name for k in registered_knobs("apu_v1")} >= {"vr_dma"}
-    # Registration order on Samsung IS the cross order (the byte-identity anchor).
-    assert [k.name for k in registered_knobs("samsung_hbm_pim")] == [
-        "grf_residency", "crf_issue", "stage_resident",
-    ]
+    # Registration order on Samsung IS the cross order (the byte-identity
+    # anchor): the three migrated D4 levers come first, in their original
+    # order. The SPEC-023 schedule-search knobs are appended last (`residency`
+    # D1/T6, then `tile` D2) -- each a 1x fan in the default case, so they do
+    # not perturb the byte-identical corpus.
+    names = [k.name for k in registered_knobs("samsung_hbm_pim")]
+    assert names[:3] == ["grf_residency", "crf_issue", "stage_resident"], names
+    # The SPEC-023 schedule-search knobs appended last (each a 1x fan in the
+    # default case): residency (D1/T6), tile (D2), double_buffer (D3).
+    assert names[3:] == ["residency", "tile", "double_buffer"], names
 
 
 def test_knobs_bind_frozen_protocol():
@@ -124,10 +130,18 @@ def test_upmem_n_tasklets_set_unchanged():
 def test_apu_v1_vr_dma_set_unchanged():
     target = build_apu_v1_target()
     cands = _apu_v1_enumerate(target, [_gemv_match()])
-    # 2 modes x 2 vr_dma = 4 candidates; vr_dma in {intra, inter}.
-    assert len(cands) == 4, len(cands)
+    # The vr_dma x mode structure is unchanged: 2 modes x 2 vr_dma. APU v1 now
+    # ALSO carries the SPEC-023 D3 double_buffer 2x fan (it has the DMA-hide
+    # DOF), so the full set is 4 x 2 = 8; the depth-1 subset (no double_buffer
+    # key) is exactly the prior 4 vr_dma x mode candidates -- byte-identical.
     assert {c.extra["vr_dma"] for c in cands} == {"intra", "inter"}
     assert {c.mode for c in cands} == {"sv", "sv_lookup"}
+    depth1 = [c for c in cands if "double_buffer" not in c.extra]
+    assert len(depth1) == 4, len(depth1)  # the original vr_dma x mode set
+    assert {(c.mode, c.extra["vr_dma"]) for c in depth1} == {
+        ("sv", "intra"), ("sv", "inter"),
+        ("sv_lookup", "intra"), ("sv_lookup", "inter"),
+    }
 
 
 # --------------------------------------------------------------------- #

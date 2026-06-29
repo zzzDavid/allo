@@ -307,6 +307,8 @@ def knob_cost(target_name: str, knob_name: str, value, ctx) -> "list[Phase]":
 _KNOB_NAMES = (
     "stage_resident", "grf_residency", "crf_issue",
     "n_tasklets", "vr_dma", "n_fibers", "double_buffer",
+    "residency",   # SPEC-023 T6/D2: cross-op residency-vs-restage
+    "tile",        # SPEC-023 D2: capacity-bounded tile/fold
 )
 
 

@@ -335,7 +335,12 @@ def test_apu_v1_enumerator_returns_four_candidates():
     target = build_apu_v1_target()
     trace = _apu_synthetic_mac_trace("apu_v1")
     candidates = _apu_v1_enumerate(target, trace.matches)
-    assert len(candidates) == 4, len(candidates)
+    # The {sv, sv_lookup} x {intra, inter} vr_dma set is unchanged (4
+    # combinations). APU v1 ALSO carries the SPEC-023 D3 double_buffer 2x fan
+    # (it has the overlap-fold DMA-hide DOF), so the full set is 4 x 2 = 8; the
+    # depth-1 subset (no double_buffer key) is exactly the prior 4.
+    depth1 = [c for c in candidates if "double_buffer" not in c.extra]
+    assert len(depth1) == 4, len(depth1)
     modes = {c.mode for c in candidates}
     assert {"sv", "sv_lookup"} <= modes, modes
     vr_dmas = {c.extra.get("vr_dma") for c in candidates}

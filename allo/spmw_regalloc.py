@@ -286,16 +286,22 @@ def _build_capacity(target) -> CapacityTable:
     return CapacityTable(slots=slots, bytes_cap=bytes_cap, unlimited=unlimited)
 
 
-_CAPACITY_CACHE: dict[int, CapacityTable] = {}
+# Keyed by `id(target)`, storing `(target_ref, cap)` so a REUSED id (a prior
+# target was GC'd and CPython recycled its id for a different target object)
+# misses the cache instead of returning a stale `CapacityTable`. Without the
+# identity recheck this cache is non-deterministically wrong under heavy target
+# churn (exposed by the schedule-search tests building many targets) -- a
+# pre-existing latent fragility this hardens.
+_CAPACITY_CACHE: dict[int, "tuple[Any, CapacityTable]"] = {}
 
 
 def _get_capacity(target) -> CapacityTable:
     key = id(target)
     cached = _CAPACITY_CACHE.get(key)
-    if cached is not None:
-        return cached
+    if cached is not None and cached[0] is target:
+        return cached[1]
     cap = _build_capacity(target)
-    _CAPACITY_CACHE[key] = cap
+    _CAPACITY_CACHE[key] = (target, cap)
     return cap
 
 
