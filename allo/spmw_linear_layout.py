@@ -556,6 +556,46 @@ class LinearLayout:
                 return False
         return True
 
+    def conflict_count(
+        self,
+        *,
+        bank_dims: tuple[str, ...] | None = None,
+        varying_inputs: tuple[str, ...],
+        out_dim: str | None = None,
+    ) -> int:
+        """Count the nonzero vectors v in span(varying_inputs) whose image
+        projected onto `bank_dims` is zero (i.e. that collide on a bank).
+
+        The D2 locality companion to `describes_conflict_free` (design 07
+        §A2.4): same enumeration, but it COUNTS the colliding vectors instead
+        of early-returning on the first one. `conflict_count(...) == 0` iff
+        `describes_conflict_free(...)` (the invariant the D2 penalty and
+        `AccessDescr` rely on). `describes_conflict_free` is left byte-identical
+        for its existing callers; this is a purely additive method.
+        """
+        if bank_dims is None:
+            if out_dim is None:
+                raise TypeError(
+                    "conflict_count: pass bank_dims=(...) or out_dim=..."
+                )
+            bank_dims = (out_dim,)
+        bank_idxs = [self.out_dims.index(d) for d in bank_dims]
+
+        total_bits = sum(len(self.bases[d]) for d in varying_inputs)
+        count = 0
+        for code in range(1, 1 << total_bits):
+            bit = 0
+            kwargs: dict[str, int] = {}
+            for d in varying_inputs:
+                nb = len(self.bases[d])
+                val = (code >> bit) & ((1 << nb) - 1)
+                kwargs[d] = val
+                bit += nb
+            out = self.apply(**kwargs)
+            if all(out[j] == 0 for j in bank_idxs):
+                count += 1
+        return count
+
     # ------------------------------------------------------------------ #
     # Misc
     # ------------------------------------------------------------------ #

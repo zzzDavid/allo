@@ -19,7 +19,7 @@ costs, now off the bound CostModel rather than the target tree.
 from __future__ import annotations
 
 from .spmw_cost import cost
-from .spmw_cost_model import ComposeCtx, get_cost_model
+from .spmw_cost_model import ComposeCtx, combine, get_cost_model
 # Re-export so the few non-cost callers keep their import site. The literal
 # parser moved to spmw_tripcount (tier-1 of resolve_trip_count); the APU v1
 # VR-tiling helper moved to spmw_cost_tables.
@@ -100,17 +100,23 @@ def _apu_v2_kernel_cycles(target):
 # --------------------------------------------------------------------- #
 
 
-def _whole_program_sum(device_cyc: int, host_cyc: int) -> int:
-    """Default whole-program combiner (design 05 §5): device + host as a
-    SUM. The async-overlap accommodation (sum -> max, report 23 open-Q4) is
-    a one-function swap here; the host-staging `CostResult.phases` breakdown
-    is preserved so a `max` combiner can split stage/compute later WITHOUT
-    touching the composes. We do NOT implement the overlap scheduler."""
-    return device_cyc + host_cyc
-
-
-# The pluggable whole-program combiner. Default = sum (device + host).
-_whole_program_combiner = _whole_program_sum
+# The flavor->fold-rule binding (design 07 §A1.3): `True` binds the overlap
+# fold (max-across independent resources + fill/drain, D1), `False` the
+# faithful serial sum. Every existing flavor (faithful, optimistic, Mortise's
+# three, the demo's, the placeholders) folds by sum, so the faithful number is
+# frozen by construction; default is `False` for any flavor not listed. The
+# `overlap` flavor (design 07 §D1, task 005) is the ONLY one binding `True` --
+# overlap is a property of the Phase timeline + the fold, NOT a parallel
+# hand-coded flavor.
+_COMBINER_FOR_FLAVOR: dict[str, bool] = {
+    "faithful": False,
+    "optimistic": False,
+    "constant": False,
+    "micro25": False,
+    "unlimited": False,
+    "placeholder": False,
+    "overlap": True,   # design 07 D1 / task 005: max-across + fill/drain
+}
 
 
 @cost("kernel_cycles")
@@ -120,24 +126,27 @@ def _kernel_cycles_factory(target):
     The autoschedule path always uses the `"faithful"` flavor so the
     argmin stays calibrated (design 04 §1.5). Whole-program estimate is
     `kernel_cycles + host_staging` (design 05 §5, task-017): the device-exec
-    body from the `kernel_cycles` CostModel plus the host<->device staging
-    from the `host_staging` CostModel, combined by the pluggable combiner
-    (default sum). Targets with no `host_staging` model registered (AiM,
-    UPMEM, APU) return `kernel_cycles` unchanged.
+    `list[Phase]` from the `kernel_cycles` CostModel concatenated with the
+    host<->device staging `list[Phase]` from the `host_staging` CostModel,
+    folded by the flavor-bound combiner (design 07 §A1.3; faithful = serial
+    sum, byte-identical to the old `device + host`). Targets with no
+    `host_staging` model registered (AiM, UPMEM, APU) fold the device phases
+    alone.
     """
     target_name = getattr(target, "name", None)
     model = get_cost_model(target_name, "faithful")
+    overlap = _COMBINER_FOR_FLAVOR.get("faithful", False)
     try:
         hs_model = get_cost_model(target_name, "faithful", concern="host_staging")
     except KeyError:
         hs_model = None
 
     def cost_fn(trace, layout) -> int:
-        device = model.compose(ComposeCtx(target, trace, layout)).cycles
+        device = model.compose(ComposeCtx(target, trace, layout))
         if hs_model is None:
-            return device
-        host = hs_model.compose(ComposeCtx(target, trace, layout)).cycles
-        return _whole_program_combiner(device, host)
+            return combine(list(device.phases), overlap=overlap)
+        host = hs_model.compose(ComposeCtx(target, trace, layout))
+        return combine(list(device.phases) + list(host.phases), overlap=overlap)
 
     return cost_fn
 

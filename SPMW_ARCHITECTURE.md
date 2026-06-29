@@ -13,13 +13,13 @@ top-level packages.
 | `spmw_match.py` | `MatchTrace`, `MatchedOp`, `OperandBinding` dataclasses. Pure data; carries the matcher's output. | yes (for tests) |
 | `spmw_match_engine.py` | `compile_op_pattern`, `compile_target_patterns`, `match_workload`. AST-side compilation of target `op.fn` lambdas; MLIR-side unification against affine.store sites. | yes (`match_workload`) |
 | `spmw_cost.py` | `@cost` decorator, `get_cost` registry lookup. | yes |
-| `spmw_cost_models.py` | Concrete `@cost` factories. Imports `spmw_cost`; registers at import time. | no (side-effect only) |
+| `spmw_cost_models.py` | Concrete `@cost` factories. Imports `spmw_cost`; registers at import time. **Design 07 (SPEC'D, NOT YET LANDED):** `_whole_program_sum` → `combine`; `_whole_program_combiner` → a `_COMBINER_FOR_FLAVOR` table (`faithful`/`optimistic`/Mortise/demo → sum; `overlap` → max+fill/drain); `_kernel_cycles_factory` concatenates device+host `phases` and folds via the flavor-bound combiner (faithful fold is byte-identical). | no (side-effect only) |
 | `spmw_autoschedule.py` | `Placement` dataclass (per-memref handle assignment), `register_enumerator`, `autoschedule`. Per-backend candidate enumerators register here. After spec 015 the per-group argmin loop invokes the regalloc to refine each candidate before scoring. | yes (`autoschedule`, `Placement`) |
 | `spmw_regalloc.py` (spec 015) | `LiveRange`, `Spilled`, `CostVector`, `CapacityTable`, `AllocResult`, `extract_live_ranges`, `allocate`, `_solve` (greedy v1; PBQP seam). Five backend capacity tables and the spill-tier dispatch live here, not on `Target`. | no (internal seam of `autoschedule`) |
 | `spmw_codegen.py` | `CodegenContext` base, per-backend ctx subclasses (currently `SamsungCtx`), `compile_for_target`, `Compiled` artifact, `_resolve_layout`, `_walk_and_emit`. After spec 015 `_resolve_layout` unwraps `Spilled` to its home handle and `_walk_and_emit` asks each backend ctx for spill LD/ST move names via `resolve_spill_moves(tier)`. | yes (`compile_for_target`, `Compiled`, `PIMCmd`, `SamsungCtx`) |
 | `spmw_linear_layout.py` (spec 013) | `LinearLayout` F2 algebra (apply / compose / product / invert / sublayout / `optimal_swizzle`) and `materialise_handle`. Consumed inside backend enumerators; the resulting concrete handle is what `Placement` actually carries. | yes (`LinearLayout`) |
-| `spmw_cost_model.py` (design 04) **LANDED (task 009)** | `CostModel`/`OpCost`/`MoveCost`/`OpCostCtx`/`MoveCostCtx`/`ComposeCtx`/`CostResult` dataclasses; `register_cost_model`/`get_cost_model` registry keyed by `(target_name, flavor, concern)`; `evaluate(target, trace, layout, flavor)` (the sim-free entry the virtual runner calls). Mechanism only — no numbers. | yes (`CostModel`, `evaluate`) |
-| `spmw_cost_tables.py` (design 04) **LANDED (task 009)** | the concrete `CostModel` instances (numbers + per-target `compose`): `samsung_faithful`, `aim_faithful`, `upmem_faithful`, `apu_v1_faithful`, `apu_v2_placeholder`, plus the swap-test flavor. The "Energy-Reference-Table" file — a profiling-refinement edits ONLY this. | no (side-effect registration) |
+| `spmw_cost_model.py` (design 04; design 07 reshape **SPEC'D, NOT YET LANDED**) | `CostModel`/`OpCost`/`MoveCost`/`OpCostCtx`/`MoveCostCtx`/`ComposeCtx`/`CostResult` dataclasses; `register_cost_model`/`get_cost_model` registry keyed by `(target_name, flavor, concern)`; `evaluate(target, trace, layout, flavor)` (the sim-free entry the virtual runner calls). Mechanism only — no numbers. **Design 07 adds:** `Resource` enum, `Phase`, `phase_cycles`, `combine`, `AccessDescr`, the `Knob` protocol, `Provenance` enum, `CalibrationRecord`; `provenance` on `OpCost`/`MoveCost`; `calibration` on `CostModel`; enriched `OpCostCtx`/`MoveCostCtx` (placement/access/live_set/dtype_bits); `CostResult.phases: list[Phase]` + `phases_as_dict` shim. | yes (`CostModel`, `evaluate`, `Phase`, `AccessDescr`) |
+| `spmw_cost_tables.py` (design 04; design 07 reshape **SPEC'D, NOT YET LANDED**) | the concrete `CostModel` instances (numbers + per-target `compose`): `samsung_faithful`, `aim_faithful`, `upmem_faithful`, `apu_v1_faithful`, `apu_v2_placeholder`, plus the swap-test + Mortise + demo flavors. The "Energy-Reference-Table" file — a profiling-refinement edits ONLY this. **Design 07:** every `compose` emits `list[Phase]`; A5 deletes the 3 silent op fallbacks (`per_op=4`/GPR/`add_cyc`); provenance tags + calibration records on every constant; D2 locality `Phase` + per-backend row-buffer constants; D3 APU width lambdas; the A3 one-knob cost demo. | no (side-effect registration) |
 | `spmw_tripcount.py` (design 04) **LANDED (task 009)** | `resolve_trip_count` (D3 symbolic bound resolution); retains `_parse_loop_bound` as the tier-1 literal helper. | no (cost-path internal) |
 | `tests/spmw/_mortise_target.py` (design 06) **SPEC'D, NOT YET LANDED** | structure-only `@allo.target("mortise")` fixture — a Samsung-like near-bank-SIMD hypothetical substrate (no sim, no HW) whose ONLY structural addition is the `resident_cap_elems` geometry const (the swept capacity lever `C`). Clone of `_demo_target.py`; priced purely via `backend="virtual"`. NO cost numbers on the tree (acid test). | no (test fixture) |
 
@@ -83,6 +83,67 @@ def _factory(target):
 Cost names are global; the factory receives `target` so it can
 dispatch on `target.name`. Concrete models live in
 `spmw_cost_models.py`.
+
+### `Phase` timeline + resource-aware combiner (in `spmw_cost_model.py`, design 07) — SPEC'D, NOT YET LANDED
+The cost-abstraction keystone. `CostResult.phases` becomes a
+`list[Phase(resource: Resource, latency, ii, count, tag)]` (was a
+free-form dict). A phase's cycles = `latency + ii*(count-1)`;
+`phase_cycles(phase)` is the one module-level definition the combiner
+and every `knob.cost(...)` share. The whole-program combiner
+`combine(phases, *, overlap)` replaces `_whole_program_sum`: it sums
+within a `Resource` class and, per the flavor-bound fold rule, either
+sums across resources (`overlap=False`, `faithful`) or takes the max
+across independent resources + fill/drain (`overlap=True`, `overlap`
+flavor). `faithful = (latency=ii=per_op, sum)` reproduces every current
+`compose` scalar BYTE-FOR-BYTE (the regression anchor: 15251 / 114992 /
+457336, B\*=2, 3.93×). Backend-specific physics (UPMEM revolver, APU
+vr_dma) stays INSIDE `compose`, which emits already-resolved `Phase`s;
+the combiner is substrate-agnostic. The old dict shape survives ONLY as
+a read-only derived `phases_as_dict(phases)` shim for `RunResult.extra`.
+`Resource = {COMPUTE, DMA, HOST, LOCALITY}` (closed enum, A5). See
+design 07 §A1.
+
+### `AccessDescr` — layout-derived access pattern (in `spmw_cost_model.py`, design 07) — SPEC'D, NOT YET LANDED
+**CO-OWNED with `autosched-placement-realization` (its D2 allocator
+base-access cost consumes the SAME type).** A frozen dataclass derived
+from the chosen `LinearLayout` / `Placement` handle: `tier`
+(register/near_bank/scratchpad/dram), `stride`, `bank_dims`, `n_banks`,
+`conflict_free`, `conflict_count`, `row_hits`. `conflict_free=True ⇒
+conflict_count=0` (constructor invariant). `AccessDescr.identity()` is
+the back-compat zero-penalty default (stride 1, conflict-free) so any
+compose with no layout to derive from gets a 0 locality penalty —
+"conflict-free → 0" by construction. `conflict_count` is supplied by an
+additive `LinearLayout.conflict_count(bank_dims, varying_inputs)` method
+(D2/task 006 adds it; mirrors `describes_conflict_free`'s enumeration but
+counts collisions instead of early-returning). See design 07 §A2.
+
+### `Knob.cost(value, ctx) -> list[Phase]` seam (in `spmw_cost_model.py`, design 07) — SPEC'D, NOT YET LANDED
+**CO-OWNED with `autosched-placement-realization` (its D4 owns
+`candidates()` + the `emit()` codegen materializer; THIS task owns ONLY
+the `cost(...)` side).** Each schedule lever's cost contribution is a
+`list[Phase]` on the SAME A1 timeline the full objective folds, so
+`compose = base op/move phases + Σ knob.cost(chosen)`. A search evaluates
+a marginal knob delta by recomputing one knob's `cost(...)` and
+re-folding — proven EXACT (a knob-delta re-score == a full recompute
+byte-for-byte; the non-tautology test). Lever migration (the six
+existing `layout.extra` levers) is placement-task D4; this task wires the
+seam + proves it on one knob (`stage_resident`). See design 07 §A3.
+
+### Provenance + calibration + opt-in confidence-gate (in `spmw_cost_model.py` + `spmw_autoschedule.py`, design 07) — SPEC'D, NOT YET LANDED
+`Provenance = {MEASURED, DATASHEET, ASSUMPTION}` (default `ASSUMPTION` —
+an untagged constant is the least-trusted, so the gate widens, never
+silently narrows). `OpCost`/`MoveCost` carry a `provenance` field;
+`CostModel` carries a `CalibrationRecord(validated_against,
+residual_error, shape_coverage)`. The **opt-in `confidence_gate`** is the
+SOLE permitted `spmw_autoschedule.py` touch: a new defaulted-off param +
+a post-argmin `_check_confidence(...)` that, when ON, refuses to silently
+commit a `placeholder`/`coarse`-confidence ranking (default policy:
+warn-and-commit; refuse-and-error is opt-in). The argmin scoring core
+(`spmw_autoschedule.py:749-766`) is UNTOUCHED. Also closes the silent
+`dynamic_trip → 1` fall-through (the tier-3 coarse flag becomes visible
+to the committer). The provenance→band aggregation (the report-28 §A4.3
+symbolic-band sub-claim) is flagged T25, not built; the v1 gate reads the
+existing `CostResult.confidence`. See design 07 §A4/§A5.
 
 ### `HostXcel` collective interface (in `spmw_host.py`, design 05) — SPEC'D, NOT YET LANDED
 ```
@@ -428,14 +489,41 @@ no shared-Allo edit.
 
 ## 4. Open design tensions
 
-### T21. Virtual cost composition: v1 sequential vs v2 sum→max overlap (design 04 §6)
-v1 `compose` sums phases (no compute↔DMA overlap). Over-counts backends
-that overlap weight-stream DMA with compute (APU v1 L4→VR behind prior
-tile's MAC; UPMEM MRAM↔WRAM behind tasklet compute); faithful for
-Samsung's genuinely-serialized GEMV phases. v2 = sum→max; the `compose`
-interface already accommodates it (compose owns the fold). Trigger to
-revisit: a corpus workload where the over-count flips a rank-preservation
-decision.
+### T25. Provenance → uncertainty-band aggregation (design 07 §A4, report 28 §A4.3)
+Design 07 lands the provenance TAGS (`MEASURED|DATASHEET|ASSUMPTION`) and a
+confidence-gate that reads the existing `CostResult.confidence`
+(coarse/placeholder). The report-28 §A4.3 NEW sub-claim — the uncertainty
+band *derived symbolically from which tags participated in a candidate's
+cost* (the analytical-model analogue of BO/UCB's `sigma(x)`, but
+provenance-derived not sample-learned) — is FLAGGED, not built. Revisit
+when a calibration task wants the `optimistic`/`pessimistic` flavors to be
+provenance-derived bands rather than hand-typed ×0.5 multipliers. The v1
+gate's mechanism (read confidence, refuse-low) lands now; the
+aggregation is the open part.
+
+### T26. UPMEM MRAM phase split for the overlap fold (design 07 §A1.5/§D1.5)
+A1 keeps UPMEM's MRAM cost (`LD_MRAM=1000`) folded INSIDE the per-op cost
+(one `Resource.COMPUTE` phase), so the faithful number is frozen
+byte-for-byte. The D1 UPMEM overlap arm needs MRAM as a separate
+`Resource.DMA` phase so the stream can hide behind tasklet compute; that
+split lives ONLY in the overlap path (guarded by the `overlap` flavor),
+never in faithful. Open: whether the split should be PROMOTED into faithful
+— ruled NO until a measured UPMEM overlap workload ships (promoting it
+would change the frozen faithful number). See design 07 §D1.5.
+
+### T21. Virtual cost composition: v1 sequential vs v2 sum→max overlap (design 04 §6) — RESOLVED-IN-SHAPE (design 07)
+v1 `compose` summed phases (no compute↔DMA overlap). **Resolved in shape
+by design 07:** overlap is now a property of the `Phase` timeline + the
+`combine(phases, overlap)` fold, not a parallel flavor. `faithful` binds
+`overlap=False` (sum); the `overlap` flavor binds `overlap=True`
+(max-across independent resources + fill/drain). APU v1 L4→VR DMA hides
+behind compute; Samsung stays genuinely serial (its overlap fold = its
+sum fold, no concurrent resources). T21's old "trigger to revisit" (a
+corpus workload where the over-count flips a rank decision) is now the
+D1 argmin-flip DEMO, constructed deliberately (design 07 §D1.4). **Stays
+open as a CALIBRATION question** (the overlap fold's absolute error /
+T21 over-count of partial overlap + contention — design 07 §D1.3), not a
+shape question. See design 07 §A1/§D1.
 
 ### T22. `host_staging` concern fit in the `CostModel` interface (design 04 §4.2 → design 05) — RULED (design 05)
 The host-side cycle adds `host_staging` as a NEW concern on the landed
@@ -464,14 +552,17 @@ not the ordering. The `optimistic` flavor's `E`/`P_var` band quantifies
 it; calibrating Mortise's own `tCCDL` against a different analog datasheet
 (AiM 2 GHz) is a v2 nicety, out of scope.
 
-### T18. Async staging/compute overlap (design 05 §9, report 23 open-Q4)
-The whole-program composition is `device + host_staging` as a **sum** this
-cycle. Async overlap turns it into a `max`. Out of scope to implement; the
-seam (per-phase `CostResult.phases` + pluggable combiner) is reserved in
-design 05 §5. Revisit when a pipelined batched-GEMV workload with
-measurable overlap ships. Mortise (design 06) surfaces `evict_per_call` as
-a separate phase so a future `max`-combiner softening the capacity
-collapse is a one-line change.
+### T18. Async staging/compute overlap (design 05 §9, report 23 open-Q4) — SEAM REALIZED (design 07)
+The whole-program composition was `device + host_staging` as a **sum**.
+**Design 07 realizes the reserved seam:** `host_staging` is now a set of
+`Resource.HOST` phases on the A1 timeline, and the `overlap` combiner can
+fold them. T18 **stays open** because the v1 overlap fold deliberately
+keeps HOST serial vs device (the host must stage the weight before the
+device strobes — design 05 §9); a measured host-bandwidth overlap is the
+refinement that would let HOST hide behind device. Mortise's
+`evict_per_call` phase (design 06) is already a separate `Phase` the
+overlap combiner can soften. Revisit when a pipelined batched-GEMV
+workload with measurable host↔device overlap ships. See design 07 §D1.2.
 
 ### T19b. Host-staging cost units: device-cycle-equiv vs host wall-time (design 05 §9, report 23 open-Q2)
 `host_staging` keeps the report-18 device-cycle-equivalent convention

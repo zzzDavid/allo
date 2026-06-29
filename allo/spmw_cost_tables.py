@@ -22,14 +22,21 @@ import math
 from dataclasses import replace
 
 from .spmw_cost_model import (
+    AccessDescr,
+    CalibrationRecord,
     CostModel,
     MoveCostCtx,
     OpCost,
     OpCostCtx,
     MoveCost,
     CostResult,
+    Phase,
+    Provenance,
+    Resource,
     register_cost_model,
+    register_knob_cost,
 )
+from .spmw_linear_layout import LinearLayout
 from .spmw_match import MatchTrace
 from .spmw_target import MemoryRef, Register
 from .spmw_tripcount import resolve_bound_text, resolve_trip_count
@@ -98,6 +105,103 @@ def _confidence(model, dynamic: bool) -> str:
     """`"coarse"` when any tier-3 fallback fired, else the model's declared
     confidence (design 04 §3.2 -- never silently wrong, *visibly* coarse)."""
     return "coarse" if dynamic else model.confidence
+
+
+# --------------------------------------------------------------------- #
+# A1 phase-carrier helpers (design 07 §A1.4): every faithful compose uses
+# the COLLAPSED encoding (latency=total, ii=0, count=1) -> phase_cycles ==
+# total, so the serial-sum fold is byte-identical to the old per-phase /
+# whole-program sum (§A1.6 proof). The exec/dma/host helpers keep the call
+# sites terse; the `dynamic_assumed` marker is a ZERO-COST tagged phase
+# (a flag in the breakdown, never folded into cycles).
+# --------------------------------------------------------------------- #
+
+
+def _exec_phase(total: int, tag: str = "exec") -> Phase:
+    return Phase(Resource.COMPUTE, latency=int(total), ii=0, count=1, tag=tag)
+
+
+def _host_phase(total: int, tag: str) -> Phase:
+    return Phase(Resource.HOST, latency=int(total), ii=0, count=1, tag=tag)
+
+
+def _dma_phase(total: int, tag: str = "vr_dma") -> Phase:
+    return Phase(Resource.DMA, latency=int(total), ii=0, count=1, tag=tag)
+
+
+def _dynamic_marker() -> Phase:
+    """Zero-cost COMPUTE phase tagged `dynamic_assumed` -- the visible tier-3
+    flag (design 04 §3.2). `latency=0` so it contributes nothing to the
+    fold; the tag surfaces it in the breakdown (the old dict `=1` flag)."""
+    return Phase(Resource.COMPUTE, latency=0, ii=0, count=1, tag="dynamic_assumed")
+
+
+# --------------------------------------------------------------------- #
+# D2 locality term (design 07 §D2): a Resource.LOCALITY phase whose penalty
+# is layout-derived (AccessDescr.conflict_count) x ONE provenance-tagged
+# per-backend row-buffer constant. Conflict-free layouts (everything
+# optimal_swizzle emits) -> conflict_count == 0 -> penalty 0 -> NO LOCALITY
+# phase emitted -> the faithful corpus number is byte-identical by
+# construction (design 07 §D2.2). The term only moves a number when a worse
+# (parity-colliding) swizzle is enumerated.
+# --------------------------------------------------------------------- #
+
+
+def _access_descr_from_layout(layout) -> AccessDescr:
+    """Derive an `AccessDescr` for the locality term from `layout` (design 07
+    §A2.3 / §D2). A future placement task may stamp a fully-formed
+    `AccessDescr` on `layout.extra["access"]`; otherwise we derive
+    `conflict_count` from a promoted `LinearLayout` carried on
+    `layout.extra["bank_layout"]` together with its `bank_dims` /
+    `varying_inputs` (the layout-derived F2 conflict predicate,
+    `spmw_linear_layout.conflict_count`, design 07 §A2.4). Absent any layout
+    to derive from, return the conflict-free identity (penalty 0) -- the
+    back-compat default that keeps the corpus byte-identical.
+    """
+    extra = getattr(layout, "extra", {}) or {}
+    access = extra.get("access")
+    if isinstance(access, AccessDescr):
+        return access
+    ll = extra.get("bank_layout")
+    bank_dims = extra.get("bank_dims")
+    varying_inputs = extra.get("varying_inputs")
+    if isinstance(ll, LinearLayout) and bank_dims and varying_inputs:
+        n = ll.conflict_count(
+            bank_dims=tuple(bank_dims), varying_inputs=tuple(varying_inputs)
+        )
+        if n == 0:
+            return AccessDescr.identity(tier="near_bank")
+        return AccessDescr(
+            tier="near_bank",
+            bank_dims=tuple(bank_dims),
+            conflict_free=False,
+            conflict_count=n,
+        )
+    return AccessDescr.identity()
+
+
+def _locality_phase(model, layout):
+    """The D2 locality `Phase` (design 07 §D2.1), or `None` when the access is
+    conflict-free (penalty 0 -> no phase, so the fold is untouched).
+
+        penalty = access.conflict_count * ROW_BUFFER_MISS
+
+    `ROW_BUFFER_MISS` is the model's provenance-tagged per-backend row-buffer
+    constant (read off the bound model, NEVER pasted in the compose body). A
+    model with no `ROW_BUFFER_MISS` entry contributes no locality phase --
+    the term is opt-in per backend.
+    """
+    access = _access_descr_from_layout(layout)
+    if access.conflict_count <= 0:
+        return None
+    if "ROW_BUFFER_MISS" not in model.move_costs:
+        return None
+    miss = model.move_cost("ROW_BUFFER_MISS", MoveCostCtx("ROW_BUFFER_MISS"))
+    penalty = access.conflict_count * miss
+    if penalty <= 0:
+        return None
+    return Phase(Resource.LOCALITY, latency=int(penalty), ii=0, count=1,
+                 tag="locality")
 
 
 # ===================================================================== #
@@ -211,11 +315,11 @@ def _samsung_host_staging_compose_with(hs_model, ctx):
     cycles = stage_resident + stage_per_call + readback_total
     return CostResult(
         cycles=cycles,
-        phases={
-            "stage_resident": stage_resident,
-            "stage_per_call": stage_per_call,
-            "readback": readback_total,
-        },
+        phases=[
+            _host_phase(stage_resident, "stage_resident"),
+            _host_phase(stage_per_call, "stage_per_call"),
+            _host_phase(readback_total, "readback"),
+        ],
         confidence=hs_model.confidence,
     )
 
@@ -239,26 +343,50 @@ SAMSUNG_FAITHFUL = CostModel(
     name="samsung_faithful",
     target_name="samsung_hbm_pim",
     op_costs={
-        # tCCDL = 4 (column-strobe period). MUL/MAC both 4 cyc.
-        "MAC": OpCost(lambda c: 4, note="tCCDL, Samsung ISCA'21 §4.1"),
-        "MUL": OpCost(lambda c: 4, note="tCCDL"),
+        # tCCDL = 4 (column-strobe period). MUL/MAC both 4 cyc. The exec
+        # tCCDL=4 is the report-18 15251-anchored datasheet period (A4).
+        "MAC": OpCost(lambda c: 4, note="tCCDL, Samsung ISCA'21 §4.1",
+                      provenance=Provenance.MEASURED),
+        "MUL": OpCost(lambda c: 4, note="tCCDL", provenance=Provenance.MEASURED),
     },
     move_costs={
         # spec 015 §6.1: load = tCCDL+RL+BL//2 = 26; store = tCCDL+WL+BL//2 = 14
-        "LD_A": MoveCost(lambda c: 26, note="tCCDL+RL+BL//2"),
-        "LD_B": MoveCost(lambda c: 26, note="tCCDL+RL+BL//2"),
-        "ST_A": MoveCost(lambda c: 14, note="tCCDL+WL+BL//2"),
-        "ST_B": MoveCost(lambda c: 14, note="tCCDL+WL+BL//2"),
-        "JUMP": MoveCost(lambda c: 1, note="1-cyc control op"),
+        "LD_A": MoveCost(lambda c: 26, note="tCCDL+RL+BL//2",
+                         provenance=Provenance.DATASHEET),
+        "LD_B": MoveCost(lambda c: 26, note="tCCDL+RL+BL//2",
+                         provenance=Provenance.DATASHEET),
+        "ST_A": MoveCost(lambda c: 14, note="tCCDL+WL+BL//2",
+                         provenance=Provenance.DATASHEET),
+        "ST_B": MoveCost(lambda c: 14, note="tCCDL+WL+BL//2",
+                         provenance=Provenance.DATASHEET),
+        "JUMP": MoveCost(lambda c: 1, note="1-cyc control op",
+                         provenance=Provenance.DATASHEET),
         # CRF_TRIGGER is the lever-3 (SPEC-025 shared-CRF) per-work-id fire
         # latency, consumed in the DEVICE-exec phase (`trigger_cyc`). It
         # stays in kernel_cycles (lever 3 is retained, task-017). The old
         # PRELOAD_*/READBACK_* preload/readback constants re-homed into the
-        # host_staging concern below (SAMSUNG_HOST_STAGING).
-        "CRF_TRIGGER": MoveCost(lambda c: 2, note="host per-tile fire latency"),
+        # host_staging concern below (SAMSUNG_HOST_STAGING). A genuine guess
+        # (not yet sim-anchored) -> ASSUMPTION.
+        "CRF_TRIGGER": MoveCost(lambda c: 2, note="host per-tile fire latency",
+                                provenance=Provenance.ASSUMPTION),
+        # D2 (design 07 §D2.1): per-bank row-buffer miss penalty. HBM2 row
+        # cycle = tRCD + tRP (activate + precharge) per row-buffer conflict;
+        # the SAFARI PIM line owns the row-buffer penalty QUANTITY (report 27
+        # §1.2 -- cite, do not claim). tRCD+tRP ~ 14+14 = 28 cyc at the
+        # PIMSimulator clock. Read off the model by the D2 locality term;
+        # never pasted in the compose body. DATASHEET (JEDEC HBM2 timing).
+        "ROW_BUFFER_MISS": MoveCost(lambda c: 28,
+                                    note="HBM2 tRCD+tRP row-buffer miss; "
+                                         "SAFARI PIM line (report 27 §1.2)",
+                                    provenance=Provenance.DATASHEET),
     },
     constants={},
     compose=_samsung_compose,
+    calibration=CalibrationRecord(
+        validated_against="report-18 PIMSimulator GEMV M=4096 K=1024",
+        residual_error=0.0,
+        shape_coverage=((4096, 1024),),
+    ),
 )
 
 
@@ -273,15 +401,66 @@ SAMSUNG_HOST_STAGING = register_cost_model(CostModel(
     concern="host_staging",
     op_costs={},
     move_costs={
-        "STAGE_BCAST": MoveCost(lambda c: 369, note="HAB preload fan-out width"),
-        "STAGE_SCATTER": MoveCost(lambda c: 1, note="per-group column-strobe"),
-        "STAGE_CRF": MoveCost(lambda c: 2, note="programCrf upload"),
-        "GATHER_FAN": MoveCost(lambda c: 4096, note="readback tile width"),
-        "GATHER_RD": MoveCost(lambda c: 181, note="per-tile readResult"),
+        "STAGE_BCAST": MoveCost(lambda c: 369, note="HAB preload fan-out width",
+                                provenance=Provenance.MEASURED),
+        "STAGE_SCATTER": MoveCost(lambda c: 1, note="per-group column-strobe",
+                                  provenance=Provenance.MEASURED),
+        "STAGE_CRF": MoveCost(lambda c: 2, note="programCrf upload",
+                              provenance=Provenance.ASSUMPTION),
+        "GATHER_FAN": MoveCost(lambda c: 4096, note="readback tile width",
+                               provenance=Provenance.MEASURED),
+        "GATHER_RD": MoveCost(lambda c: 181, note="per-tile readResult",
+                              provenance=Provenance.MEASURED),
     },
     constants={},
     compose=_samsung_host_staging_compose,
+    calibration=CalibrationRecord(
+        validated_against="report-18 PIMSimulator GEMV M=4096 K=1024",
+        residual_error=0.0,
+        shape_coverage=((4096, 1024),),
+    ),
 ))
+
+
+# --------------------------------------------------------------------- #
+# A3 (design 07 §A3): the one-knob `cost(value, ctx) -> list[Phase]` demo.
+# The `stage_resident` knob's cost contribution IS the Samsung host_staging
+# preload/readback branch re-expressed on the A1 timeline -- preload paid
+# ONCE (resident) vs per-vector (non-resident). This proves the knob seam
+# and the phase timeline are the SAME currency: a knob's cost is a
+# `list[Phase]` the combiner folds exactly like the base phases (so a
+# marginal per-knob delta is exact, not approximate -- the A3.3 basis the
+# task 008 non-tautology test checks). The other five levers stay as
+# `layout.extra` reads inside compose until placement-task D4 migrates them.
+# --------------------------------------------------------------------- #
+
+
+def _samsung_stage_resident_knob_cost(value, ctx) -> "list[Phase]":
+    """`stage_resident` knob's phase contribution (design 07 §A3.2).
+
+    `value` is the chosen resident bool; the HOST phases returned are EXACTLY
+    the Samsung host_staging compose's phases for that resident choice -- so
+    `knob_cost(...)` folds to the same number as the host_staging compose.
+    The seam is exact by construction (it reuses the one phase algebra)."""
+    from .spmw_autoschedule import Placement
+
+    base_extra = dict(getattr(ctx.layout, "extra", {}) or {})
+    base_extra["stage_resident"] = bool(value)
+    knob_layout = Placement(
+        placements=getattr(ctx.layout, "placements", {}),
+        extra=base_extra,
+        mode=getattr(ctx.layout, "mode", ""),
+    )
+    from .spmw_cost_model import ComposeCtx
+    res = _samsung_host_staging_compose(
+        ComposeCtx(ctx.target, ctx.trace, knob_layout)
+    )
+    return list(res.phases)
+
+
+register_knob_cost(
+    "samsung_hbm_pim", "stage_resident", _samsung_stage_resident_knob_cost
+)
 
 
 # ===================================================================== #
@@ -296,20 +475,21 @@ def _aim_compose(ctx):
     total = 0
     dynamic = False
     for match in trace.matches:
-        if model.has_op_cost(match.target_op_name):
-            per_op = model.op_cost(
-                match.target_op_name, OpCostCtx(match.target_op_name)
-            )
-        else:
-            per_op = 4
-        if per_op is None:
-            per_op = 4
+        # A5 (design 07 §A5): closed vocabulary -- an op not in op_costs is a
+        # hard KeyError (via op_cost), not a silent per_op=4 default.
+        per_op = model.op_cost(
+            match.target_op_name, OpCostCtx(match.target_op_name)
+        )
         iters, dyn = _resolve_iters(model, target, match)
         dynamic = dynamic or dyn
         total += per_op * iters
-    phases = {"exec": total}
+    phases = [_exec_phase(total)]
+    loc = _locality_phase(model, ctx.layout)   # D2: 0 for conflict-free corpus
+    if loc is not None:
+        phases.append(loc)
+        total += loc.latency
     if dynamic:
-        phases["dynamic_assumed"] = 1
+        phases.append(_dynamic_marker())
     return CostResult(cycles=total, phases=phases,
                       confidence=_confidence(model, dynamic))
 
@@ -319,19 +499,35 @@ AIM_FAITHFUL = CostModel(
     target_name="aim",
     op_costs={
         # JSSC 2023 §IV: EWMUL=EWADD=4; MAC_SBK=8; MAC_ABK=16; AF=6.
-        "MUL": OpCost(lambda c: 4, note="EWMUL"),
-        "ADD": OpCost(lambda c: 4, note="EWADD"),
-        "MAC": OpCost(lambda c: 8, note="MAC_SBK = 1 burst x 16 lanes"),
-        "MAC_ABK": OpCost(lambda c: 16, note="all-bank broadcast = 2x"),
-        "AF": OpCost(lambda c: 6, note="GELU/SIGMOID"),
+        "MUL": OpCost(lambda c: 4, note="EWMUL", provenance=Provenance.DATASHEET),
+        "ADD": OpCost(lambda c: 4, note="EWADD", provenance=Provenance.DATASHEET),
+        "MAC": OpCost(lambda c: 8, note="MAC_SBK = 1 burst x 16 lanes",
+                      provenance=Provenance.DATASHEET),
+        "MAC_ABK": OpCost(lambda c: 16, note="all-bank broadcast = 2x",
+                          provenance=Provenance.DATASHEET),
+        "AF": OpCost(lambda c: 6, note="GELU/SIGMOID", provenance=Provenance.DATASHEET),
     },
     move_costs={
         # spill model: RD_SBK = tCCDL+RD+BURST = 24; ST_SBK = tCCDL+WR+BURST = 20
-        "RD_SBK": MoveCost(lambda c: 24, note="tCCDL+RD+BURST"),
-        "ST_SBK": MoveCost(lambda c: 20, note="tCCDL+WR+BURST"),
+        "RD_SBK": MoveCost(lambda c: 24, note="tCCDL+RD+BURST",
+                           provenance=Provenance.DATASHEET),
+        "ST_SBK": MoveCost(lambda c: 20, note="tCCDL+WR+BURST",
+                           provenance=Provenance.DATASHEET),
+        # D2 (design 07 §D2.1): GDDR6 row-buffer miss penalty per bank
+        # conflict (tRCD+tRP). JSSC 2023 §IV timing; SAFARI PIM line owns the
+        # penalty quantity (report 27 §1.2 -- cite, do not claim). Read off
+        # the model by the D2 locality term, never pasted in the compose.
+        "ROW_BUFFER_MISS": MoveCost(lambda c: 22,
+                                    note="GDDR6 tRCD+tRP row-buffer miss; "
+                                         "AiM JSSC 2023 §IV / SAFARI PIM line",
+                                    provenance=Provenance.DATASHEET),
     },
     constants={},
     compose=_aim_compose,
+    calibration=CalibrationRecord(
+        validated_against="ramulator2 AiM GEMV shape sweep K=512/1024/2048",
+        shape_coverage=((512,), (1024,), (2048,)),
+    ),
 )
 
 
@@ -345,27 +541,31 @@ def _upmem_compose(ctx):
     trace = ctx.trace
     layout = ctx.layout
     model = UPMEM_FAITHFUL
-    gpr_cyc = model.op_cost("ADD", OpCostCtx("ADD"))  # 1 cyc GPR baseline
     s = 0
     dynamic = False
     for match in trace.matches:
-        if model.has_op_cost(match.target_op_name):
-            per_op = model.op_cost(
-                match.target_op_name, OpCostCtx(match.target_op_name)
-            )
-        else:
-            per_op = gpr_cyc
-        if per_op is None:
-            per_op = gpr_cyc
+        # A5 (design 07 §A5): closed vocabulary -- unknown op = hard KeyError,
+        # not the silent GPR (ADD) baseline default.
+        per_op = model.op_cost(
+            match.target_op_name, OpCostCtx(match.target_op_name)
+        )
         iters, dyn = _resolve_iters(model, target, match)
         dynamic = dynamic or dyn
         s += per_op * iters
     r = model.const("revolver_latency")
     t = layout.extra.get("n_tasklets", 1)
+    # The revolver fold stays INSIDE compose (design 07 §A1.7); the combiner
+    # never sees r/t. Emitted as one collapsed COMPUTE phase.
     cycles = s + math.ceil(s * (r - 1) / min(t, r))
-    phases = {"exec": cycles}
+    phases = [_exec_phase(cycles)]
+    # D2 (design 07 §D2): locality penalty is a SEPARATE LOCALITY phase, not
+    # folded into the revolver-pipelined COMPUTE body. 0 for conflict-free.
+    loc = _locality_phase(model, layout)
+    if loc is not None:
+        phases.append(loc)
+        cycles += loc.latency
     if dynamic:
-        phases["dynamic_assumed"] = 1
+        phases.append(_dynamic_marker())
     return CostResult(cycles=cycles, phases=phases,
                       confidence=_confidence(model, dynamic))
 
@@ -375,23 +575,42 @@ UPMEM_FAITHFUL = CostModel(
     target_name="upmem",
     op_costs={
         # DPU GPR ops issue at 1 cyc; MAC = mul+add = 2 cyc (no fused MAC).
-        "MUL": OpCost(lambda c: 1, note="GPR op"),
-        "ADD": OpCost(lambda c: 1, note="GPR op"),
-        "MAC": OpCost(lambda c: 2, note="mul+add, no fused MAC"),
+        "MUL": OpCost(lambda c: 1, note="GPR op", provenance=Provenance.DATASHEET),
+        "ADD": OpCost(lambda c: 1, note="GPR op", provenance=Provenance.DATASHEET),
+        "MAC": OpCost(lambda c: 2, note="mul+add, no fused MAC",
+                      provenance=Provenance.DATASHEET),
     },
     move_costs={
         # HPCA 2024 Table 2: MRAM = 1000 cyc/64B burst; WRAM = 1 cyc.
-        "LD_MRAM": MoveCost(lambda c: 1000, note="MRAM read per 64B burst"),
-        "ST_MRAM": MoveCost(lambda c: 1000, note="MRAM write per 64B burst"),
-        "LD_WRAM": MoveCost(lambda c: 1, note="WRAM->GPR fused"),
-        "ST_WRAM": MoveCost(lambda c: 1, note="GPR->WRAM fused"),
+        "LD_MRAM": MoveCost(lambda c: 1000, note="MRAM read per 64B burst",
+                            provenance=Provenance.DATASHEET),
+        "ST_MRAM": MoveCost(lambda c: 1000, note="MRAM write per 64B burst",
+                            provenance=Provenance.DATASHEET),
+        "LD_WRAM": MoveCost(lambda c: 1, note="WRAM->GPR fused",
+                            provenance=Provenance.DATASHEET),
+        "ST_WRAM": MoveCost(lambda c: 1, note="GPR->WRAM fused",
+                            provenance=Provenance.DATASHEET),
+        # D2 (design 07 §D2.1): DRAM-bank row-buffer miss per conflict. The
+        # MRAM row activate/precharge dominates a row miss; HPCA 2024 §IV
+        # MRAM-row timing, SAFARI PIM line owns the quantity (report 27 §1.2).
+        # Read off the model by the D2 locality term, never pasted.
+        "ROW_BUFFER_MISS": MoveCost(lambda c: 33,
+                                    note="MRAM-row activate+precharge miss; "
+                                         "HPCA 2024 §IV / SAFARI PIM line",
+                                    provenance=Provenance.ASSUMPTION),
     },
     constants={
         # revolver scheduling window (uPIMulator src/main.go:115). NOT the
-        # 14-stage pipeline depth (research-021).
+        # 14-stage pipeline depth (research-021). MEASURED off the
+        # uPIMulator source (see calibration record); constants carry no
+        # structured provenance field -- the calibration record is its anchor.
         "revolver_latency": 11,
     },
     compose=_upmem_compose,
+    calibration=CalibrationRecord(
+        validated_against="uPIMulator GEMV; revolver_latency from src/main.go:115",
+        shape_coverage=((1024,), (2048,)),
+    ),
 )
 
 
@@ -415,7 +634,7 @@ def _upmem_host_staging_compose(ctx):
     layout = ctx.layout
     stages = list(getattr(layout, "extra", {}).get("host_stage", []) or [])
     if not stages:
-        return CostResult(cycles=0, phases={}, confidence="calibrated")
+        return CostResult(cycles=0, phases=[], confidence="calibrated")
     xfer = UPMEM_HOST_STAGING.move_cost("STAGE_XFER", MoveCostCtx("STAGE_XFER"))
     gxfer = UPMEM_HOST_STAGING.move_cost("GATHER_XFER", MoveCostCtx("GATHER_XFER"))
     scatter_bcast = 0
@@ -433,7 +652,10 @@ def _upmem_host_staging_compose(ctx):
     cycles = scatter_bcast + gather
     return CostResult(
         cycles=cycles,
-        phases={"stage_scatter_bcast": scatter_bcast, "gather": gather},
+        phases=[
+            _host_phase(scatter_bcast, "stage_scatter_bcast"),
+            _host_phase(gather, "gather"),
+        ],
         confidence="calibrated",
     )
 
@@ -448,8 +670,10 @@ UPMEM_HOST_STAGING = register_cost_model(CostModel(
     concern="host_staging",
     op_costs={},
     move_costs={
-        "STAGE_XFER": MoveCost(lambda c: 1000, note="per-DPU prepare+push (MRAM-class)"),
-        "GATHER_XFER": MoveCost(lambda c: 1000, note="per-DPU copy-from (MRAM-class)"),
+        "STAGE_XFER": MoveCost(lambda c: 1000, note="per-DPU prepare+push (MRAM-class)",
+                               provenance=Provenance.DATASHEET),
+        "GATHER_XFER": MoveCost(lambda c: 1000, note="per-DPU copy-from (MRAM-class)",
+                                provenance=Provenance.DATASHEET),
     },
     constants={},
     compose=_upmem_host_staging_compose,
@@ -489,10 +713,16 @@ def _apu_v1_vr_tiling(target, trace: MatchTrace) -> tuple[int, int, int]:
     return n_out_tiles, n_weight_tiles, n_boundaries
 
 
-def _apu_v1_move_cycles(model, target, trace: MatchTrace, layout) -> int:
+def _apu_v1_move_breakdown(model, target, trace: MatchTrace, layout):
+    """(n_moves, per_move) for the chosen `vr_dma` schedule, or `(0, 0)` when
+    no DMA is requested. Split out (design 07 §D1.4) so the overlap arm can
+    build a LOOP-ENCODED DMA phase (`Phase(DMA, latency=per_move,
+    ii=per_move, count=n_moves)`) whose fill is one `per_move` and whose
+    steady state hides behind compute; the faithful arm just multiplies
+    `n_moves * per_move` (collapsed, fully charged)."""
     vr_dma = getattr(layout, "extra", {}).get("vr_dma")
     if vr_dma is None:
-        return 0
+        return 0, 0
     n_out_tiles, n_weight_tiles, n_boundaries = _apu_v1_vr_tiling(target, trace)
     if vr_dma == "intra":
         n_moves = n_weight_tiles + n_boundaries * n_out_tiles
@@ -507,21 +737,80 @@ def _apu_v1_move_cycles(model, target, trace: MatchTrace, layout) -> int:
         model.move_cost("DMA_L4_L1", MoveCostCtx("DMA_L4_L1"))
         + model.move_cost("LD_VR", MoveCostCtx("LD_VR"))
     )
+    return n_moves, per_move
+
+
+def _apu_v1_move_cycles(model, target, trace: MatchTrace, layout) -> int:
+    n_moves, per_move = _apu_v1_move_breakdown(model, target, trace, layout)
     return n_moves * per_move
 
 
 _APU_V1_ALLOWED_MODES = {"", "sv", "sv_lookup"}
 
 
+# D3 (design 07 §D3): bit-serial width. On a bit-serial SRAM compute machine
+# (GSI APU) an op is computed one bit-plane at a time, so its cycle cost scales
+# with operand bit-width -- and a MULTIPLY's per-bit work is far steeper than
+# an ADD's (MICRO'25 Table 5: mul_u16=201 vs add_u16=12, ~16x; mul_f16=77).
+# The lambdas mirror that TABLE'S SHAPE (the `micro25_add_cost` affine template
+# `gap_floor + seu_per_bit * bits`), not its absolute magnitudes -- the claim
+# is the THREADING of width into the fused objective, not the APU table itself
+# (report 27 §1.3 -- cite Stripes/BitFusion + the APU table, claim only the
+# threading). Coefficients are anchored so width=16 reproduces today's
+# constant (ADD=2, MUL=16, MAC=8), and the MUL slope is 8x the ADD slope (the
+# table's mul>>add shape).
+APU_V1_BASE_BITS = 16  # gvml_*_16: the width today's constants are quoted at.
+
+
+def _apu_width_op(base_cyc, seu_per_bit, *, gap_floor=0.0):
+    """Build a width-aware APU OpCost.fn (design 07 §D3.2).
+
+    `dtype_bits is None` -> return `base_cyc` VERBATIM (the back-compat anchor:
+    a width-absent call is byte-identical to today's constant). Otherwise scale
+    affinely with the operand bit-width: `gap_floor + seu_per_bit * dtype_bits`,
+    rounded. Coefficients are chosen by the caller so the value at
+    `APU_V1_BASE_BITS` equals `base_cyc` (the anchor) and is monotonic in bits.
+    """
+
+    def fn(ctx):
+        if getattr(ctx, "dtype_bits", None) is None:
+            return base_cyc
+        return int(round(gap_floor + seu_per_bit * ctx.dtype_bits))
+
+    return fn
+
+
 def _apu_v1_compose(ctx):
+    # Faithful arm: collapsed DMA phase, byte-identical sum fold.
+    return _apu_v1_compose_with(APU_V1_FAITHFUL, ctx, overlap=False)
+
+
+def _apu_v1_overlap_compose(ctx):
+    # Overlap arm (design 07 §D1.4): same phase algebra + numbers, but the DMA
+    # phase is LOOP-ENCODED when the schedule is double-buffered so it can hide
+    # behind compute under the overlap fold. Bound to the overlap flavor.
+    return _apu_v1_compose_with(APU_V1_OVERLAP, ctx, overlap=True)
+
+
+def _apu_v1_compose_with(model, ctx, *, overlap: bool):
+    """APU v1 compose parameterised by model + an `overlap` flag (design 07
+    §D1.4). `exec_ops` and the DMA `n_moves * per_move` total are IDENTICAL
+    across both arms; the ONLY difference is the DMA phase ENCODING:
+
+      * faithful (`overlap=False`): one COLLAPSED `Phase(DMA, latency=move_total,
+        ii=0, count=1)` -> folds to `exec_ops + move_total` (byte-identical).
+      * overlap (`overlap=True`) + double-buffered: one LOOP-ENCODED
+        `Phase(DMA, latency=per_move, ii=per_move, count=n_moves)` -> same
+        `phase_cycles = move_total`, but fill = `per_move` so the steady state
+        hides behind compute under the max-across fold (D1.2). A serialized
+        (non-double-buffered) overlap candidate keeps the collapsed phase, so
+        its DMA cannot hide -- the D1.4 flip: double-buffered (b) scores below
+        serialized (a) under overlap, equal under faithful.
+    """
     target = ctx.target
     trace = ctx.trace
     layout = ctx.layout
-    model = APU_V1_FAITHFUL
     menv = _mapping_env(target)
-    add_cyc = model.op_cost("ADD", OpCostCtx("ADD"))
-    mul_cyc = model.op_cost("MUL", OpCostCtx("MUL"))
-    sv_mac_cyc = mul_cyc + add_cyc  # raw MUL+ADD
 
     mode = getattr(layout, "mode", "")
     if mode not in _APU_V1_ALLOWED_MODES:
@@ -530,20 +819,27 @@ def _apu_v1_compose(ctx):
             f"allowed: {sorted(_APU_V1_ALLOWED_MODES)}"
         )
     sv_raw = mode == "sv"
-    total = 0
+    exec_ops = 0
     dynamic = False
     for match in trace.matches:
-        if match.target_op_name == "MAC" and sv_raw:
-            per_op = sv_mac_cyc
+        # D3 (design 07 §D3.1): thread the operand element bit-width to the
+        # per-op OpCostCtx. The matcher stamps it on `match.extra["dtype_bits"]`
+        # (the existing extension seam, like batch_dim); absent -> None ->
+        # the width-aware lambda returns today's constant (byte-identical).
+        bits = match.extra.get("dtype_bits")
+        if sv_raw and match.target_op_name == "MAC":
+            # SV (raw MUL+ADD) MAC: width-aware MUL + ADD, each fed the dtype.
+            per_op = (
+                model.op_cost("MUL", OpCostCtx("MUL", dtype_bits=bits))
+                + model.op_cost("ADD", OpCostCtx("ADD", dtype_bits=bits))
+            )
         else:
-            if model.has_op_cost(match.target_op_name):
-                per_op = model.op_cost(
-                    match.target_op_name, OpCostCtx(match.target_op_name)
-                )
-            else:
-                per_op = add_cyc
-            if per_op is None:
-                per_op = add_cyc
+            # A5 (design 07 §A5): closed vocabulary -- unknown op = hard
+            # KeyError (via op_cost), not the silent ADD-cycle default.
+            per_op = model.op_cost(
+                match.target_op_name,
+                OpCostCtx(match.target_op_name, dtype_bits=bits),
+            )
         # Outer loops only -- the innermost loop is subsumed by the 32K-lane
         # SIMD width, so it is NOT multiplied here (hence no _resolve_inner).
         iters = 1
@@ -559,11 +855,28 @@ def _apu_v1_compose(ctx):
                     d = model.dynamic_trip_default(match.target_op_name)
                     iters *= d if isinstance(d, int) else 1
                     dynamic = True
-        total += per_op * iters
-    total += _apu_v1_move_cycles(model, target, trace, layout)
-    phases = {"exec": total}
+        exec_ops += per_op * iters
+    # A1 (design 07 §A1.5/§A1.7): the vr_dma move cost lives on Resource.DMA.
+    # The move arithmetic stays inside the breakdown helper; the combiner sees
+    # only the resolved Phase. faithful: total = exec_ops + move_total.
+    n_moves, per_move = _apu_v1_move_breakdown(model, target, trace, layout)
+    move_total = n_moves * per_move
+    total = exec_ops + move_total
+    phases = [_exec_phase(exec_ops)]
+    if move_total:
+        double_buffered = bool(getattr(layout, "extra", {}).get("double_buffer", False))
+        if overlap and double_buffered and n_moves > 0:
+            # Loop-encoded: fill = per_move, steady state hides (D1.2/D1.4).
+            phases.append(
+                Phase(Resource.DMA, latency=per_move, ii=per_move,
+                      count=n_moves, tag="vr_dma")
+            )
+        else:
+            # Collapsed: fill = move_total (no hiding). Both the faithful arm
+            # and a serialized overlap candidate take this branch.
+            phases.append(_dma_phase(move_total, "vr_dma"))
     if dynamic:
-        phases["dynamic_assumed"] = 1
+        phases.append(_dynamic_marker())
     return CostResult(cycles=total, phases=phases,
                       confidence=_confidence(model, dynamic))
 
@@ -573,20 +886,55 @@ APU_V1_FAITHFUL = CostModel(
     target_name="apu_v1",
     op_costs={
         # 32K bit-serial lanes per VR: gvml_add_s16=2; gvml_mul_u16=16;
-        # MAC (SV-lookup = gvml_lookup_16(6) + gvml_add_s16(2)) = 8.
-        "ADD": OpCost(lambda c: 2, note="gvml_add_s16"),
-        "MUL": OpCost(lambda c: 16, note="gvml_mul_u16"),
-        "MAC": OpCost(lambda c: 8, note="gvml_lookup_16 + gvml_add_s16"),
+        # MAC (SV-lookup = gvml_lookup_16(6) + gvml_add_s16(2)) = 8. MICRO'25
+        # Table 5 gvml per-op datasheet (A4). D3 (design 07 §D3): width-aware.
+        # Anchored at 16 bits to today's constant; width-absent -> the constant
+        # (byte-identical, design 07 §D3.2). seu_per_bit ratio MUL:ADD = 8:1
+        # mirrors the table's mul>>add per-bit shape (mul_u16=201 vs add_u16=12).
+        "ADD": OpCost(_apu_width_op(2, seu_per_bit=0.125),     # 16 bits -> 2
+                      note="gvml_add_s16; width-aware (MICRO'25 Table5 add)",
+                      provenance=Provenance.DATASHEET),
+        "MUL": OpCost(_apu_width_op(16, seu_per_bit=1.0),      # 16 bits -> 16
+                      note="gvml_mul_u16; width-aware (MICRO'25 Table5 mul)",
+                      provenance=Provenance.DATASHEET),
+        "MAC": OpCost(_apu_width_op(8, seu_per_bit=0.5),       # 16 bits -> 8
+                      note="gvml_lookup_16 + gvml_add_s16; width-aware",
+                      provenance=Provenance.DATASHEET),
     },
     move_costs={
         # report 12 §4.2: DMA L4<->L1 = 140 cyc/32K burst; LD/ST_VR = 5 cyc.
-        "DMA_L4_L1": MoveCost(lambda c: 140, note="L4<->L1 32K burst"),
-        "DMA_L1_L4": MoveCost(lambda c: 140, note="L4<->L1 32K burst"),
-        "LD_VR": MoveCost(lambda c: 5, note="gvml_load_16"),
-        "ST_VR": MoveCost(lambda c: 5, note="gvml_store_16"),
+        # The report-12 moves are sim/HW-anchored (MEASURED).
+        "DMA_L4_L1": MoveCost(lambda c: 140, note="L4<->L1 32K burst",
+                              provenance=Provenance.MEASURED),
+        "DMA_L1_L4": MoveCost(lambda c: 140, note="L4<->L1 32K burst",
+                              provenance=Provenance.MEASURED),
+        "LD_VR": MoveCost(lambda c: 5, note="gvml_load_16",
+                          provenance=Provenance.MEASURED),
+        "ST_VR": MoveCost(lambda c: 5, note="gvml_store_16",
+                          provenance=Provenance.MEASURED),
     },
     constants={},
     compose=_apu_v1_compose,
+    calibration=CalibrationRecord(
+        validated_against="report-12 §4.2 GSI APU v1 (Gemini 1) SV / SV-lookup",
+    ),
+)
+
+
+# APU v1 OVERLAP flavor (design 07 §D1): SAME structural target, SAME per-op /
+# per-move numbers, SAME compose algebra -- the ONLY difference is the fold
+# rule (`combine(overlap=True)`, bound via `_COMBINER_FOR_FLAVOR`) plus the
+# DMA phase encoding the overlap compose picks for a double-buffered schedule.
+# This is the report-27/28 keystone: overlap is a PROPERTY OF THE TIMELINE,
+# not a parallel hand-coded flavor. `confidence="coarse"` -- the overlap fold
+# over-counts partial overlap (D1.3 / T21), so it is honestly not calibrated.
+APU_V1_OVERLAP = replace(
+    APU_V1_FAITHFUL,
+    name="apu_v1_overlap",
+    flavor="overlap",
+    compose=_apu_v1_overlap_compose,
+    confidence="coarse",
+    calibration=CalibrationRecord(),   # overlap fold is not sim-calibrated (D1.3)
 )
 
 
@@ -599,7 +947,7 @@ def _apu_v2_compose(ctx):
     # Non-comparative: l1_sim declares perf_is_placeholder. Return a
     # well-defined-but-not-predictive count so argmin is deterministic.
     n = len(ctx.trace.matches)
-    return CostResult(cycles=n, phases={"exec": n}, confidence="placeholder")
+    return CostResult(cycles=n, phases=[_exec_phase(n)], confidence="placeholder")
 
 
 APU_V2_PLACEHOLDER = CostModel(
@@ -715,9 +1063,18 @@ def _samsung_compose_with(model, ctx):
     # bridge option (b)). Exec is paid per batch vector.
     B = _trace_batch_dim(trace)
     cycles = B * exec_cyc
-    phases = {"exec": exec_cyc}
+    # Collapsed COMPUTE phase carries the FULL device-exec total (B*exec_cyc)
+    # so the serial-sum fold reproduces `cycles` byte-identically (design 07
+    # §A1.6). The combiner sums phase_cycles; there is no separate B multiply.
+    phases = [_exec_phase(cycles)]
+    # D2 (design 07 §D2): layout-derived bank-locality penalty. None (no
+    # phase) for the conflict-free corpus -> faithful number byte-identical.
+    loc = _locality_phase(model, layout)
+    if loc is not None:
+        phases.append(loc)
+        cycles += loc.latency
     if dynamic:
-        phases["dynamic_assumed"] = 1
+        phases.append(_dynamic_marker())
     return CostResult(
         cycles=cycles, phases=phases, confidence=_confidence(model, dynamic)
     )
@@ -848,14 +1205,19 @@ def _demo_pim_compose(model):
             if model.has_op_cost(name):
                 per_op = model.op_cost(name, opctx)
             else:
+                # Demo substrate: an unmodeled op falls back to the ADD entry
+                # (the demo's intentional "everything reduces to a bit-serial
+                # add" stance). This is NOT the A5 silent-default antipattern
+                # -- it is an explicit, documented per-substrate policy on a
+                # no-hardware demo, kept for the refinability showcase.
                 per_op = model.op_cost("ADD", opctx)
             iters, dyn = _resolve_iters(model, target, match)
             dynamic = dynamic or dyn
             total += per_op * iters
         cycles = int(round(total))
-        phases = {"exec": cycles}
+        phases = [_exec_phase(cycles)]
         if dynamic:
-            phases["dynamic_assumed"] = 1
+            phases.append(_dynamic_marker())
         return CostResult(
             cycles=cycles, phases=phases,
             confidence=_confidence(model, dynamic),
@@ -987,14 +1349,18 @@ def _mortise_host_staging_compose_with(hs_model, ctx, *, unlimited: bool):
         stage_per_call = B * preload_cyc         # re-preload-every-vector
     readback_total = B * readback_cyc
     cycles = stage_resident + stage_per_call + readback_total
+    # The evicted-shortfall quantity (B*evict_per_call) IS `stage_per_call` in
+    # the resident arm (design 06 §2.2); under the list carrier it is no
+    # longer a redundant surfacing key -- the sweep reads it off the
+    # `stage_per_call` HOST phase (which folds, unlike the old non-folded
+    # `evict_per_call` alias).
     return CostResult(
         cycles=cycles,
-        phases={
-            "stage_resident": stage_resident,
-            "stage_per_call": stage_per_call,
-            "evict_per_call": B * evict_per_call,    # surfaced for the sweep
-            "readback": readback_total,
-        },
+        phases=[
+            _host_phase(stage_resident, "stage_resident"),
+            _host_phase(stage_per_call, "stage_per_call"),
+            _host_phase(readback_total, "readback"),
+        ],
         confidence=hs_model.confidence,
     )
 
@@ -1158,6 +1524,7 @@ for _m in (
     AIM_FAITHFUL,
     UPMEM_FAITHFUL,
     APU_V1_FAITHFUL,
+    APU_V1_OVERLAP,
     APU_V2_PLACEHOLDER,
     SAMSUNG_OPTIMISTIC,
     DEMO_PIM_DEFAULT,

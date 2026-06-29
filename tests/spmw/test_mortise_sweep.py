@@ -36,13 +36,32 @@ from pathlib import Path
 import pytest
 
 # The harness needs the regalloc kill-switch (Mortise has no capacity table;
-# the residency flag rides `extra`, so argmin is unaffected). Set before import.
+# the residency flag rides `extra`, so argmin is unaffected). It must be set
+# BEFORE importing the sweep script (which reads it at import time), so this
+# cannot be a per-test monkeypatch. Capture the prior value so the
+# module-scoped teardown below can RESTORE it -- otherwise this `setdefault`
+# poisons SPMW_DISABLE_REGALLOC for the whole pytest process, which would
+# silently push every sibling test's `autoschedule(...)` onto the
+# regalloc-disabled path (it masked the confidence_gate tests in
+# test_knob_seam_and_gate.py before this fix).
+_PRIOR_DISABLE_REGALLOC = os.environ.get("SPMW_DISABLE_REGALLOC")
 os.environ.setdefault("SPMW_DISABLE_REGALLOC", "1")
 
 _SCRIPTS = Path(__file__).resolve().parents[3] / "scripts"
 sys.path.insert(0, str(_SCRIPTS))
 
 import R26_mortise_capacity_sweep as R  # noqa: E402
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _restore_disable_regalloc_env():
+    """Restore SPMW_DISABLE_REGALLOC after this module's tests so the
+    import-time `setdefault` above does not leak into sibling test modules."""
+    yield
+    if _PRIOR_DISABLE_REGALLOC is None:
+        os.environ.pop("SPMW_DISABLE_REGALLOC", None)
+    else:
+        os.environ["SPMW_DISABLE_REGALLOC"] = _PRIOR_DISABLE_REGALLOC
 
 from _mortise_target import build_mortise_target, _T_W_FULL  # noqa: E402
 

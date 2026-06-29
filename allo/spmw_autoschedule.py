@@ -690,6 +690,8 @@ def autoschedule(
     target,
     trace: MatchTrace,
     cost_name: str = "kernel_cycles",
+    confidence_gate: bool = False,
+    gate_policy: str = "warn",
 ) -> list[Placement]:
     """Pick one `Placement` per `@allo.work` kernel in `trace`.
 
@@ -702,8 +704,24 @@ def autoschedule(
     `kernel_cycles + allocator.total_cost`. Set
     `SPMW_DISABLE_REGALLOC=1` in the environment to bypass the
     allocator (emergency rollback path).
+
+    `confidence_gate` (design 07 §A4.3) is OPT-IN and defaults OFF: when
+    `False` the argmin scoring core is byte-identical to today (commit
+    regardless) -- `_check_confidence` is never called. When `True`,
+    `_check_confidence` runs AFTER the argmin -- it never alters the argmin
+    SELECTION, only whether a low-confidence ranking is silently committed.
+    `gate_policy` (only consulted when the gate is on):
+      * "warn"   -- warn-and-commit (the default; never blocks a schedule).
+      * "refuse" -- refuse-and-error: raise on a placeholder/coarse/assumption
+                    ranking instead of silently committing it.
     """
     import os
+
+    if gate_policy not in ("warn", "refuse"):
+        raise ValueError(
+            f"autoschedule gate_policy must be 'warn' or 'refuse', "
+            f"got {gate_policy!r}"
+        )
 
     target_name = getattr(target, "name", None)
     enumerator = _ENUMERATORS.get(target_name)
@@ -737,7 +755,17 @@ def autoschedule(
                 for idx, layout in enumerate(candidates)
             ]
             scored.sort()
-            placements.append(candidates[scored[0][1]])
+            chosen = candidates[scored[0][1]]
+            if confidence_gate:
+                # Design 07 §A4.3: the gate is a property of confidence_gate,
+                # NOT of the regalloc path. Honour it here too so
+                # SPMW_DISABLE_REGALLOC does not silently bypass it. Inert when
+                # off (this guard); never alters the SELECTION (`chosen` is
+                # already committed below).
+                _check_confidence(
+                    target, sub_trace, chosen, cost_name, gate_policy
+                )
+            placements.append(chosen)
             continue
 
         # Per-candidate regalloc; argmin on kernel_cycles + total_cost.
@@ -763,5 +791,71 @@ def autoschedule(
                 f"on target {target_name!r}"
             )
         scored.sort(key=lambda t: (t[0], t[1]))
+        if confidence_gate:
+            # Design 07 §A4.3: post-argmin gate, OPT-IN. Inert when off; never
+            # alters the SELECTION (scored[0] is already committed below). It
+            # only decides whether a low-confidence ranking is silently
+            # committed (warn) or refused (raise).
+            _check_confidence(
+                target, sub_trace, scored[0][2], cost_name, gate_policy
+            )
         placements.append(scored[0][2])
     return placements
+
+
+# The confidence bands the gate treats as "not safe to silently commit"
+# (design 07 §A4.3): the coarse/placeholder CostResult flags + the
+# provenance-derived "assumption" band (the least-trusted symbolic band).
+_LOW_CONFIDENCE = ("coarse", "placeholder", "assumption")
+
+
+def _check_confidence(
+    target, sub_trace, placement, cost_name: str, gate_policy: str
+) -> None:
+    """Confidence gate (design 07 §A4.3). Combines TWO signals, both
+    objective-independent:
+      1. the chosen candidate's `CostResult.confidence` (which already
+         downgrades to "coarse" on a tier-3 dynamic-trip fall-through, so the
+         silent `dynamic_trip->1` is now VISIBLE here, A4<->A5); and
+      2. the SYMBOLIC provenance band of the bound model
+         (`provenance_band` -- "assumption" if any untrusted constant fed the
+         estimate, report 28 §A4.3).
+    The worse of the two governs. If it is low (coarse/placeholder/assumption),
+    the gate does NOT silently commit: `gate_policy="warn"` emits a diagnostic
+    and commits anyway; `gate_policy="refuse"` raises. The argmin SELECTION is
+    never altered either way."""
+    import warnings
+
+    from .spmw_cost_model import evaluate, get_cost_model, provenance_band
+
+    flavor = "faithful"
+    try:
+        result = evaluate(target, sub_trace, placement, flavor)
+        band = provenance_band(get_cost_model(getattr(target, "name", None), flavor))
+    except Exception:
+        # The gate is advisory under "warn": never let a confidence probe
+        # break the schedule. A real cost error would have already surfaced in
+        # the argmin scoring core above.
+        return
+    low = [
+        f"{label}={val!r}"
+        for label, val in (("confidence", result.confidence), ("provenance_band", band))
+        if val in _LOW_CONFIDENCE
+    ]
+    if not low:
+        return
+    name = getattr(target, "name", None)
+    detail = ", ".join(low)
+    msg = (
+        f"autoschedule confidence_gate: chosen placement for target {name!r} "
+        f"rests on a low-confidence cost estimate ({detail}; "
+        f"cost_name={cost_name!r})"
+    )
+    if gate_policy == "refuse":
+        # refuse-and-error: do NOT silently commit a low-confidence ranking.
+        raise RuntimeError(
+            msg + " -- refused (gate_policy='refuse'). Re-run with a "
+            "sim-validated cost model or gate_policy='warn' to commit."
+        )
+    warnings.warn(msg + " -- committing anyway (gate_policy='warn').",
+                  stacklevel=2)

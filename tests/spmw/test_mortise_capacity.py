@@ -47,6 +47,7 @@ from allo.spmw_cost_model import (
     MoveCostCtx,
     evaluate,
     get_cost_model,
+    phases_as_dict,
 )
 from allo.spmw_cost_tables import (
     _samsung_preload_cycles,
@@ -180,7 +181,9 @@ def test_reduction_phi1_resident_is_preload_once_plus_readback():
     for B in (1, 2, 8):
         h = hs.compose(ComposeCtx(t, _trace(B), _resident(True)))
         assert h.cycles == P + B * R, (B, h.cycles, P, R)
-        assert h.phases["evict_per_call"] == 0
+        # design 07 §A1.2: list carrier; the evicted-shortfall quantity IS
+        # the `stage_per_call` HOST phase in the resident arm (= B*evict).
+        assert phases_as_dict(h.phases)["stage_per_call"] == 0
 
 
 def test_reduction_phi1_baseline_is_repreload_every_vector():
@@ -207,7 +210,7 @@ def test_reduction_phi_half_resident_adds_half_pvar_per_call():
         h = hs.compose(ComposeCtx(t, _trace(B), _resident(True)))
         # P once + B*evict shortfall + B*R readback.
         assert h.cycles == P + B * evict + B * R, (B, h.cycles)
-        assert h.phases["evict_per_call"] == B * evict
+        assert phases_as_dict(h.phases)["stage_per_call"] == B * evict
 
 
 def test_capacity_monotone_collapse():

@@ -11,7 +11,7 @@ default and downgrade `confidence="coarse"` instead of the silent =1.
 """
 from __future__ import annotations
 
-from allo.spmw_cost_model import ComposeCtx, get_cost_model
+from allo.spmw_cost_model import ComposeCtx, get_cost_model, phases_as_dict
 from allo.spmw_match import MatchedOp, MatchTrace, OperandBinding
 from allo.spmw_tripcount import (
     _parse_loop_bound,
@@ -178,7 +178,9 @@ def test_compose_dynamic_marks_coarse_aim():
     model = get_cost_model("aim", "faithful")
     res = model.compose(ComposeCtx(target, _dynamic_trace("aim"), _layout()))
     assert res.confidence == "coarse"
-    assert res.phases.get("dynamic_assumed") == 1
+    # design 07 §A1.2: `dynamic_assumed` is now a tagged (zero-cost) Phase in
+    # the list carrier, a visible breakdown flag (was the dict `=1` flag).
+    assert "dynamic_assumed" in phases_as_dict(res.phases)
     # declared default = 1 iter -> MAC_SBK (8) * 1.
     assert res.cycles == 8
 
@@ -190,7 +192,7 @@ def test_compose_resolvable_stays_calibrated_aim():
     model = get_cost_model("aim", "faithful")
     res = model.compose(ComposeCtx(target, _resolvable_trace("aim"), _layout()))
     assert res.confidence == "calibrated"
-    assert "dynamic_assumed" not in res.phases
+    assert "dynamic_assumed" not in phases_as_dict(res.phases)
     assert res.cycles == 8 * 1024
 
 
@@ -201,7 +203,7 @@ def test_compose_dynamic_marks_coarse_upmem():
     model = get_cost_model("upmem", "faithful")
     res = model.compose(ComposeCtx(target, _dynamic_trace("upmem"), _layout()))
     assert res.confidence == "coarse"
-    assert res.phases.get("dynamic_assumed") == 1
+    assert "dynamic_assumed" in phases_as_dict(res.phases)
 
 
 def test_compose_dynamic_marks_coarse_samsung():
@@ -213,7 +215,7 @@ def test_compose_dynamic_marks_coarse_samsung():
         ComposeCtx(target, _dynamic_trace("samsung_hbm_pim"), _layout())
     )
     assert res.confidence == "coarse"
-    assert res.phases.get("dynamic_assumed") == 1
+    assert "dynamic_assumed" in phases_as_dict(res.phases)
 
 
 def test_declared_default_overridable():
