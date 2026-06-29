@@ -5,7 +5,7 @@
 Three positive-evidence checks the anti-hardcoding audit (task 100) cites:
 
   (a) the Samsung enumerator emits a `dual_fiber` candidate whose
-      `extra["fibers"]` are EVEN then ODD by `_bank_parity` — the
+      `extra["fibers"]` are EVEN then ODD by `_bank_fiber_class` — the
       layout-algebra receipt (even/odd indices fall out of the swizzle
       column, not a pasted 2*pid / 2*pid+1);
   (b) the cost model ranks `dual_fiber` < `bank_row` at K=1024, and the
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import allo
 from allo.spmw_autoschedule import _samsung_enumerate
-from allo.spmw_codegen import _bank_parity, _fiber_fold_split
+from allo.spmw_codegen import _bank_fiber_class, _fiber_fold_split
 from allo.spmw_match import MatchTrace, MatchedOp, OperandBinding
 
 from _fixtures import build_samsung_target
@@ -87,10 +87,10 @@ def test_enumerator_emits_dual_fiber_even_then_odd():
     assert dual.extra["n_fibers"] == len(fibers) == 2
 
     # The receipt: each fiber's idx is the swizzled-layout output at that
-    # tile value. _bank_parity classifies fiber 0 as EVEN (2*pid) and
+    # tile value. _bank_fiber_class classifies fiber 0 as EVEN (2*pid) and
     # fiber 1 as ODD (2*pid + 1).
-    assert _bank_parity(fibers[0].idx) == "EVEN_BANK"
-    assert _bank_parity(fibers[-1].idx) == "ODD_BANK"
+    assert _bank_fiber_class(fibers[0].idx) == "EVEN_BANK"
+    assert _bank_fiber_class(fibers[-1].idx) == "ODD_BANK"
 
     # The default y placement is the EVEN fiber, so any consumer that
     # ignores `extra` degrades to bank_row.

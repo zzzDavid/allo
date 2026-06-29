@@ -1514,6 +1514,19 @@ MORTISE_OPTIMISTIC_HOST_STAGING = register_cost_model(CostModel(
 ))
 
 
+# --- mortise_wide (SPEC-022 D3 proof: banks_per_pim==4) ---
+# The wide-fiber proof target is Samsung-shaped, so its kernel_cycles model is
+# Mortise's verbatim (same exec algebra, same numbers) -- only the bank fanout
+# differs (a layout property the cost model reads via `n_fibers`, not a new
+# number). Aliased off MORTISE_FAITHFUL so the wide-fiber candidate is rankable
+# (the cost model can SCORE it -- the spec's "ranks the wide-fiber candidate"),
+# proving a banks_per_pim>2 layout is no longer un-costable.
+MORTISE_WIDE_FAITHFUL = replace(
+    MORTISE_FAITHFUL, name="mortise_wide_faithful", target_name="mortise_wide",
+    compose=lambda ctx: _samsung_compose_with(MORTISE_WIDE_FAITHFUL, ctx),
+)
+
+
 # --------------------------------------------------------------------- #
 # Register all faithful models + the swap-test flavor + the Phase-5 demo
 # at import (design 04 §1.5, §8).
@@ -1533,5 +1546,6 @@ for _m in (
     MORTISE_FAITHFUL,
     MORTISE_UNLIMITED,
     MORTISE_OPTIMISTIC,
+    MORTISE_WIDE_FAITHFUL,
 ):
     register_cost_model(_m)

@@ -144,15 +144,43 @@ def _handle_key(h: Any) -> Any:
 # --------------------------------------------------------------------- #
 
 
-def _estimate_bytes(match: MatchedOp, opb) -> int | None:
-    """Best-effort byte estimate from the match's enclosing loops.
+def _loop_bound(text) -> int | None:
+    """Parse a single constant trip count out of an affine-bound string."""
+    try:
+        return int(str(text).strip())
+    except (TypeError, ValueError):
+        pass
+    import re
+    nums = re.findall(r"\b(\d+)\b", str(text))
+    return int(nums[0]) if len(nums) == 1 else None
 
-    Today returns None (slot-count fallback) -- spec 015 §1.1 says the
-    allocator treats memory-tier placements as slot-counted when
-    `size_bytes` is unknown, which keeps existing traces unblocked.
-    Future workloads with byte-budget pressure can tighten this.
+
+def _estimate_bytes(match: MatchedOp, opb) -> int | None:
+    """Byte footprint of a live value: `product(shape) * dtype_bytes`
+    (SPEC-022 D2).
+
+    `shape` is the product of the match's enclosing-loop trip counts (the
+    same shape source the cost model reads). `dtype_bytes` comes from the
+    operand element bit-width: `opb.dtype_bits`, else `match.extra
+    ["dtype_bits"]` (the carrier task 007 / a caller populates). When no
+    dtype is derivable (today's synthetic corpus carries none), returns
+    None -> `_fits` keeps its slot-counted fallback, so the corpus is
+    byte-identical. The byte arm only tightens behaviour for a workload
+    whose footprint IS derivable AND exceeds a bounded tier.
     """
-    return None
+    dtype_bits = getattr(opb, "dtype_bits", None)
+    if dtype_bits is None:
+        dtype_bits = (match.extra or {}).get("dtype_bits")
+    if not dtype_bits:
+        return None
+
+    n_elems = 1
+    for loop in match.enclosing_loops or ():
+        ub = _loop_bound(loop[2]) if len(loop) >= 3 else None
+        if ub is None:
+            return None  # unresolvable shape -> slot-counted fallback
+        n_elems *= ub
+    return n_elems * (int(dtype_bits) // 8 or 1)
 
 
 def extract_live_ranges(matches: list[MatchedOp]) -> list[LiveRange]:
@@ -200,56 +228,62 @@ def extract_live_ranges(matches: list[MatchedOp]) -> list[LiveRange]:
 # --------------------------------------------------------------------- #
 
 
-def _samsung_capacity(target) -> CapacityTable:
-    return CapacityTable(
-        slots={
-            _handle_key(target.grf_a): 8,
-            _handle_key(target.grf_b): 8,
-        },
-        bytes_cap={},
-        unlimited={("bank", id(target.banks))},
-    )
+def _memory_capacity_bytes(mem) -> int | None:
+    """Derivable byte size of a bounded `Memory` from its geometry, or None.
+
+    `size_bytes` is authoritative when declared. Otherwise derive from the
+    declared axes: `entries x width` (AiM gb, a width-bit-wide entry array)
+    or `rows x cols x width` (APU v2 l1 bitline grid). `width` is in bits;
+    the product is divided by 8 to yield bytes. Returns None when no byte
+    size is derivable (the slot-counted fallback applies).
+    """
+    g = mem.geometry
+    if "size_bytes" in g and g["size_bytes"] is not None:
+        return int(g["size_bytes"])
+    width = g.get("width")
+    if g.get("entries") is not None and width is not None:
+        return int(g["entries"]) * int(width) // 8
+    if g.get("rows") is not None and g.get("cols") is not None:
+        return int(g["rows"]) * int(g["cols"]) * int(width or 8) // 8
+    return None
 
 
-def _aim_capacity(target) -> CapacityTable:
-    return CapacityTable(
-        slots={_handle_key(target.gpr): 31},
-        bytes_cap={_handle_key(target.gb): 1024},
-        unlimited={("bank", id(target.banks))},
-    )
+def _build_capacity(target) -> CapacityTable:
+    """Derive the capacity table STRUCTURALLY from the target tree
+    (SPEC-022 D2), retiring the `target.name`-keyed constant table.
 
+    - Register slots = `reg.slots` (defaults to `reg.lanes`; AiM declares
+      `slots=31` structurally for its addressable GPR depth).
+    - A bulk DRAM-class memory (`banks` near-bank store / `mram` / `l4` / `l5`)
+      is `unlimited`: no per-value placement cap applies (it is the spill /
+      bulk store; `Spilled` choices bypass `_fits` regardless). `_fits`
+      checks both ("bank",..) and ("mem",..) so one key form suffices.
+    - Every other memory with a derivable byte size becomes a `bytes_cap`
+      arm (a bounded scratchpad: gb / wram / l1). Instruction memories /
+      unused scratch are harmless -- nothing is placed there, so `_fits`
+      never consults them.
 
-def _upmem_capacity(target) -> CapacityTable:
-    return CapacityTable(
-        slots={_handle_key(target.gprs): 24},
-        bytes_cap={_handle_key(target.wram): 65536},
-        unlimited={("mem", id(target.mram))},
-    )
+    A backend with no special-cased builder gets this same structural
+    default -- no `NotImplementedError`. The reviewer's anti-hardcoding
+    gate #2 holds: no `target.name`-keyed capacity dict, no pasted slot
+    constant; caps come from `Register`/`Memory` geometry.
+    """
+    slots: dict[Any, int] = {}
+    bytes_cap: dict[Any, int] = {}
+    unlimited: set[Any] = set()
 
+    for unit in target._walk():
+        for r in unit.registers.values():
+            slots[_handle_key(r)] = int(getattr(r, "slots", r.lanes))
+        for m in unit.memories.values():
+            if m.name in _BULK_STORE_MEMS:
+                unlimited.add(("mem", id(m)))
+                continue
+            nbytes = _memory_capacity_bytes(m)
+            if nbytes is not None:
+                bytes_cap[_handle_key(m)] = nbytes
 
-def _apu_v1_capacity(target) -> CapacityTable:
-    return CapacityTable(
-        slots={_handle_key(target.vrs): 16},
-        bytes_cap={_handle_key(target.l1): 32768},
-        unlimited={("mem", id(target.l4))},
-    )
-
-
-def _apu_v2_capacity(target) -> CapacityTable:
-    return CapacityTable(
-        slots={},
-        bytes_cap={_handle_key(target.l1): 3072 * 65536},
-        unlimited={("mem", id(target.l5))},
-    )
-
-
-_CAPACITY_BUILDERS: dict[str, Callable[[Any], CapacityTable]] = {
-    "samsung_hbm_pim": _samsung_capacity,
-    "aim": _aim_capacity,
-    "upmem": _upmem_capacity,
-    "apu_v1": _apu_v1_capacity,
-    "apu_v2": _apu_v2_capacity,
-}
+    return CapacityTable(slots=slots, bytes_cap=bytes_cap, unlimited=unlimited)
 
 
 _CAPACITY_CACHE: dict[int, CapacityTable] = {}
@@ -260,13 +294,7 @@ def _get_capacity(target) -> CapacityTable:
     cached = _CAPACITY_CACHE.get(key)
     if cached is not None:
         return cached
-    name = getattr(target, "name", None)
-    builder = _CAPACITY_BUILDERS.get(name)
-    if builder is None:
-        raise NotImplementedError(
-            f"regalloc: no capacity table for target {name!r}"
-        )
-    cap = builder(target)
+    cap = _build_capacity(target)
     _CAPACITY_CACHE[key] = cap
     return cap
 
@@ -325,15 +353,124 @@ def _pick_home(candidates: list[Any]) -> Any:
     return candidates[0]
 
 
-def _base_access_cost(target, lr: LiveRange, handle: Any) -> int:
-    """Per-use access cost charged to a non-spilled candidate.
+# Monotone tier rank: register < near_bank < scratchpad < dram. Ranks
+# start at 1 so a register-tier candidate carries a *non-zero* base cost
+# that is identical across register candidates (cancels in the argmin),
+# per the SPEC-022 D2 byte-for-byte default. The scale (cycles-per-rank)
+# is read from the bound CostModel, not pasted.
+_TIER_RANK = {"register": 1, "near_bank": 2, "scratchpad": 3, "dram": 4}
 
-    Today: 0 for register-tier handles (already on the fast path); 0
-    also for memory-tier handles (the kernel_cycles cost model already
-    prices the per-iteration access). The allocator's contribution is
-    the spill round-trip only -- non-spilled handles cost 0 here.
+# Memory-name -> tier classification (SPEC-022 D2). Near-bank = the
+# bank-resident PIM compute store; scratchpad = the bounded working buffer;
+# dram = the bulk spill store.
+_NEAR_BANK_MEMS = {"banks"}
+_SCRATCHPAD_MEMS = {"gb", "wram", "l1"}
+_DRAM_MEMS = {"mram", "l4", "l5"}
+# Bulk stores carry no per-value placement cap (the spill / bulk tier):
+# the near-bank store + the DRAM-class stores. A scratchpad that doubles as
+# a spill tier (APU v1 l1) stays BOUNDED here -- `Spilled` choices bypass
+# `_fits`, so a finite l1 cap never blocks a spill, but it DOES gate a
+# non-spilled scratchpad-resident value (which is the point of D2).
+_BULK_STORE_MEMS = _NEAR_BANK_MEMS | _DRAM_MEMS
+
+
+def _classify_tier(handle: Any) -> str:
+    """Classify a candidate handle to an `AccessDescr` tier."""
+    if isinstance(handle, Register):
+        return "register"
+    if isinstance(handle, MemoryRef):
+        nm = handle.memory.name
+        if nm in _NEAR_BANK_MEMS:
+            return "near_bank"
+        if nm in _DRAM_MEMS:
+            return "dram"
+        return "scratchpad"  # gb / wram / l1 and any other bounded buffer
+    return "scratchpad"
+
+
+def _locality_unit(target) -> int:
+    """The per-rank / per-conflict cycle weight, read from the bound
+    CostModel's `ROW_BUFFER_MISS` move cost (the `Resource.LOCALITY` unit
+    the cost-model locality term also uses). Falls back to 1 when the model
+    has no row-buffer-miss move (e.g. APU, no bank-conflict axis), so the
+    tier ordering is still monotone and non-zero."""
+    from .spmw_cost_model import get_cost_model, MoveCostCtx
+
+    name = getattr(target, "name", None)
+    try:
+        model = get_cost_model(name, "faithful")
+    except Exception:
+        return 1
+    if model.move_costs.get("ROW_BUFFER_MISS") is not None:
+        try:
+            return int(model.move_cost("ROW_BUFFER_MISS",
+                                       MoveCostCtx("ROW_BUFFER_MISS")))
+        except Exception:
+            return 1
+    return 1
+
+
+def _base_access_cost(target, lr: LiveRange, handle: Any, layout=None) -> int:
+    """Per-use access cost for a non-spilled candidate (SPEC-022 D2).
+
+    Locality-aware, computed from the shared `AccessDescr`
+    (`spmw_cost_model.AccessDescr`) -- the SAME type the cost-model §A2
+    locality term consumes (one notion of access pattern, two consumers):
+
+        base = TIER_RANK(tier) * unit            # monotone register<...<dram
+             + conflict_count   * unit           # Resource.LOCALITY penalty
+
+    where `unit` is the bound CostModel's `ROW_BUFFER_MISS` weight (not a
+    pasted constant). The descriptor's layout-derived `conflict_count` is
+    populated from the chosen `LinearLayout` when one is carried (D3); for a
+    handle with no layout it is `AccessDescr.identity(tier)` -- conflict-free,
+    penalty zero by construction.
+
+    Byte-for-byte default: every register-tier conflict-free candidate gets
+    the SAME non-zero cost (`1*unit`), which cancels in `kc + total_cost`;
+    the cost only changes a decision when candidates differ in tier or
+    conflict count -- exactly when the allocator should distinguish them.
     """
-    return 0
+    from .spmw_cost_model import AccessDescr
+
+    tier = _classify_tier(handle)
+    unit = _locality_unit(target)
+
+    # Build the access descriptor. With a carried layout we count bank
+    # conflicts off it (D2 population); without one, the conflict-free
+    # identity descriptor yields a zero locality penalty.
+    descr = AccessDescr.identity(tier)
+    if layout is not None:
+        descr = _access_descr_from_layout(layout, tier)
+
+    penalty = descr.conflict_count * unit
+    if descr.row_hits:
+        # Open-row reuse REDUCES the stall; bounded so the cost stays >= the
+        # tier floor (a fully-resolved reuse cannot make a placement free).
+        penalty = max(0, penalty - descr.row_hits)
+    return _TIER_RANK[tier] * unit + penalty
+
+
+def _access_descr_from_layout(layout, tier: str):
+    """Build an `AccessDescr` from a carried `LinearLayout` (D2 population
+    of the layout-derived fields). Counts bank conflicts via
+    `LinearLayout.conflict_count`; on any shape mismatch falls back to the
+    conflict-free identity (penalty zero)."""
+    from .spmw_cost_model import AccessDescr
+
+    bank_dims = tuple(getattr(layout, "bank_dims", ()) or ())
+    try:
+        varying = tuple(getattr(layout, "bases", {}).keys())
+        if bank_dims and varying:
+            n = layout.conflict_count(bank_dims=bank_dims, varying_inputs=varying)
+            if n > 0:
+                return AccessDescr(
+                    tier=tier, bank_dims=bank_dims,
+                    conflict_free=False, conflict_count=n,
+                )
+    except Exception:
+        pass
+    return AccessDescr.identity(tier)
 
 
 def build_cost_vector(
@@ -341,16 +478,37 @@ def build_cost_vector(
     lr: LiveRange,
     candidates: list[Any],
     spill_cb: Callable,
+    seed: Any = None,
 ) -> CostVector:
     """Build a `CostVector` for one live range.
 
     `candidates` is the list of distinct handles ever assigned to
     `lr.memref_name` across the enumerator's candidate placements.
     `spill_cb` is the closure returned by `get_cost("register_spill",
-    target)`.
+    target)`. `seed` is the handle THIS candidate's enumerator assigned to
+    the memref -- the placement the layout intends.
+
+    The seed handle is priced as the minimum over the candidate tiers, so
+    the allocator KEEPS the enumerator's layout-defining placement when it
+    fits and only reaches for an alternative handle (or a spill) under
+    capacity pressure (SPEC-022 D2). This preserves the no-spill corpus
+    byte-for-byte -- the base access cost is locality-aware (it distinguishes
+    candidates whose seeds sit on different tiers, feeding the candidate-level
+    `total_cost`) WITHOUT overriding which handle a memref lands on inside a
+    feasible candidate. The non-seed alternatives carry their own tier cost,
+    used only as pressure-relief fallback ordering.
     """
     entries: dict[Any, int] = {}
-    for h in candidates:
+    # The seed (the enumerator's intended handle for this memref) is listed
+    # FIRST so the greedy keeps it when it fits -- the layout-defining
+    # placement is not overridden by a cheaper-tier alternative; alternatives
+    # exist only for capacity-pressure relief. Each handle still carries its
+    # own locality-aware tier cost (feeding the candidate-level total).
+    ordered_handles = list(candidates)
+    if seed is not None and seed in ordered_handles:
+        ordered_handles.remove(seed)
+        ordered_handles.insert(0, seed)
+    for h in ordered_handles:
         entries[h] = _base_access_cost(target, lr, h)
 
     name = getattr(target, "name", None)
@@ -464,15 +622,53 @@ def _record_occupant(
     occupants[_handle_key(choice)].append(lr)
 
 
+def _forced_spill_choice(lr, cv, target, spill_cb):
+    """Return `(Spilled(home, tier), cost)` for a forced spill, or None when
+    the backend declares no spill tier (the hard-error case).
+
+    Reuses an existing `Spilled` entry in the cost vector if present;
+    otherwise synthesizes one for the backend's declared spill tier and
+    prices it via `spill_cb` (the same factory `build_cost_vector` uses, so
+    a forced spill and an enumerated spill price identically)."""
+    for choice, cost in cv.entries.items():
+        if isinstance(choice, Spilled):
+            return (choice, cost)
+    if target is None:
+        return None
+    name = getattr(target, "name", None)
+    tier_builder = _SPILL_TIER_BUILDERS.get(name)
+    if tier_builder is None:
+        return None
+    tier_name, _tier_handle = tier_builder(target)
+    home = _pick_home(list(cv.entries.keys())) if cv.entries else None
+    if home is None:
+        return None
+    n_uses = lr.last_idx - lr.first_idx + 1
+    cost = 0
+    if spill_cb is not None:
+        try:
+            cost = int(spill_cb(home, n_entries=n_uses))
+        except TypeError:
+            cost = int(spill_cb(home) * n_uses)
+    return (Spilled(home_handle=home, tier=tier_name), cost)
+
+
 def _solve(
     lrs: list[LiveRange],
     cost_vectors: dict[str, CostVector],
     cap: CapacityTable,
+    target=None,
+    spill_cb=None,
 ) -> AllocResult:
     """Greedy v1: sort by descending gap; cheapest-fits-first.
 
     PBQP slots in here -- replace `_solve` (same signature) with a
     branch-and-bound solver later. The data inputs are unchanged.
+
+    `target`/`spill_cb` enable the SPEC-022 D2 forced-spill-under-pressure
+    policy: when no unspilled choice fits, fall to a forced `Spilled(home,
+    tier)` (real after D1) rather than raising -- the hard error is reserved
+    for a backend whose ctx genuinely cannot spill the tier.
     """
     placements: dict[str, Any] = {}
     spilled: list[LiveRange] = []
@@ -486,9 +682,20 @@ def _solve(
 
     for lr in ordered:
         cv = cost_vectors[lr.memref_name]
-        # Iterate choices cheapest-first; ties broken by insertion order
-        # via Python's stable sort.
-        ranked = sorted(cv.entries.items(), key=lambda kv: kv[1])
+        # The first entry is the enumerator's seed handle (build_cost_vector
+        # lists it first); it is tried FIRST so a feasible layout placement
+        # is kept rather than overridden by a cheaper-tier alternative. The
+        # remaining handles (capacity-pressure alternatives + the Spilled
+        # fallback) are ranked cheapest-first. Within equal cost, insertion
+        # order breaks ties (stable sort) -- the byte-identical analogue of
+        # the pre-D2 all-zero behaviour.
+        items = list(cv.entries.items())
+        if items:
+            seed_item = items[0]
+            rest = sorted(items[1:], key=lambda kv: kv[1])
+            ranked = [seed_item] + rest
+        else:
+            ranked = []
         chosen = None
         chosen_cost = 0
         for choice, cost in ranked:
@@ -497,10 +704,20 @@ def _solve(
                 chosen_cost = cost
                 break
         if chosen is None:
-            raise RuntimeError(
-                f"regalloc: no choice fits for {lr.memref_name!r}; "
-                f"cost_vector={cv}"
-            )
+            # Forced spill under pressure (SPEC-022 D2): no unspilled tier
+            # has room. If the backend declares a spill tier, synthesize a
+            # `Spilled(home, tier)` (one may already be absent from the cost
+            # vector when candidates were register-only) and select it --
+            # spills are real after D1, so this keeps the workload compiling
+            # correctly instead of dropping the only candidate. The hard
+            # error is reserved for a backend that cannot spill at all.
+            forced = _forced_spill_choice(lr, cv, target, spill_cb)
+            if forced is None:
+                raise RuntimeError(
+                    f"regalloc: no choice fits for {lr.memref_name!r} and "
+                    f"no spill tier is available; cost_vector={cv}"
+                )
+            chosen, chosen_cost = forced
         placements[lr.memref_name] = chosen
         if isinstance(chosen, Spilled):
             spilled.append(lr)
@@ -552,19 +769,19 @@ def allocate(
     cost_vectors: dict[str, CostVector] = {}
     for lr in lrs:
         cands = role_candidates(pool, lr.memref_name)
+        seed = candidate.placements.get(lr.memref_name)
         if not cands:
             # No candidate handle for this memref -- preserve whatever
             # the seed placement had (None falls through to codegen's
             # missing-placement error, matching today's behaviour).
             cands = []
-            seed = candidate.placements.get(lr.memref_name)
             if seed is not None:
                 cands = [seed]
         cost_vectors[lr.memref_name] = build_cost_vector(
-            target, lr, cands, spill_cb
+            target, lr, cands, spill_cb, seed=seed
         )
 
-    result = _solve(lrs, cost_vectors, cap)
+    result = _solve(lrs, cost_vectors, cap, target=target, spill_cb=spill_cb)
     # Preserve any memrefs the live-range extractor did not see (e.g. a
     # result memref that never appears as an operand). Fall back to the
     # seed candidate's placement for those.
@@ -577,4 +794,14 @@ def allocate(
     # mode-dispatch (APU v1 sv vs sv_lookup) would lose the signal.
     result.placement.mode = getattr(candidate, "mode", "")
     result.placement.extra = dict(getattr(candidate, "extra", {}))
+    # SPEC-022 D3: carry the chosen F2 layout through the allocator so codegen
+    # consumes the layout object (the `range(stride)` fiber walk reads
+    # `layout.size_of(fiber_axis)`). `_solve` builds a bare Placement; without
+    # this the layout signal is lost after regalloc.
+    result.placement.layout = getattr(candidate, "layout", None)
+    # SPEC-022 D1: carry the spill audit onto the placement so the move
+    # scheduler can emit the LD/ST round-trip. `_solve` recorded the
+    # spilled live ranges; surface them by memref name. Empty (and so
+    # byte-identical) for every no-spill placement.
+    result.placement._spilled = [lr.memref_name for lr in result.spilled]
     return result

@@ -130,6 +130,30 @@ class CodegenContext:
             "see spec 009 §B for the per-backend table."
         )
 
+    def resolve_spill_moves(self, tier: str, home_handle, *, n_entries: int = 1):
+        """Return ``(load_move_name, store_move_name)`` for a value spilled
+        to ``tier`` (SPEC-022 D1).
+
+        ``home_handle`` is the register the value lives in while live;
+        ``tier`` is the backend spill tier name
+        (``bank_row`` | ``mram`` | ``wram`` | ``l1`` | ``l2``). The move
+        scheduler prepends the load (tier -> home) at the work-id window
+        open and appends the store (home -> tier) at the window close, in
+        addition to the home register's own LD/ST. The returned names are
+        the SAME ``(load, store)`` move-name pair shape ``resolve_moves``
+        returns, so they reuse the existing ``_emit_move`` machinery.
+
+        Default raises: a backend the allocator may spill onto MUST
+        override. A backend whose ``tier`` genuinely cannot spill leaves
+        this default (or re-raises), and that NotImplementedError
+        propagates as a hard compile error -- never a silent
+        register-resident emission.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__}.resolve_spill_moves({tier!r}) is not "
+            "implemented; this backend cannot spill to that tier."
+        )
+
     def after_match(self, match, n_emitted: int) -> None:
         """Post-match hook. Default no-op; Samsung overrides to emit the
         inner-K JUMP that folds the reduction loop (spec 009 §E rule 4).
@@ -185,26 +209,62 @@ def _eval_sym(expr, env: dict | None = None) -> int | None:
     return None
 
 
-def _bank_parity(idx) -> str | None:
-    """Classify a `MemoryRef.idx` SymExpr as the even or odd bank pattern.
+def _parse_fiber_idx(idx):
+    """Decompose a bank `MemoryRef.idx` of the form `stride*pid + r` into
+    `(stride, r)`, or `None` if it is not that affine-in-one-UnitId form.
 
-    Returns "EVEN_BANK" for `2*X`, "ODD_BANK" for `2*X+1`, None otherwise.
-    Codegen for any other indexing form is the autoscheduler's problem
-    (Blocker 4).
+    `stride*pid` (mul) -> `(stride, 0)`; `stride*pid + r` (add) -> `(stride, r)`.
+    The `stride` is the bank coordinate multiplier on the swizzle column (the
+    banks-per-pim ratio the enumerator bound via `bank_stride * pid`), read off
+    the index itself -- the idx is self-describing, so no separate stride
+    argument is needed and nothing is pasted.
     """
     if isinstance(idx, SymExpr) and idx.op == "mul":
         a, b = idx.args
-        if (a == 2 and isinstance(b, UnitId)) or (b == 2 and isinstance(a, UnitId)):
-            return "EVEN_BANK"
+        if isinstance(a, int) and isinstance(b, UnitId):
+            return (a, 0)
+        if isinstance(b, int) and isinstance(a, UnitId):
+            return (b, 0)
     if isinstance(idx, SymExpr) and idx.op == "add":
         a, b = idx.args
-        # `2*X + 1` — match either argument order.
-        for x, y in ((a, b), (b, a)):
-            if y == 1 and isinstance(x, SymExpr) and x.op == "mul":
-                m, n = x.args
-                if (m == 2 and isinstance(n, UnitId)) or (n == 2 and isinstance(m, UnitId)):
-                    return "ODD_BANK"
+        for base, rem in ((a, b), (b, a)):
+            if isinstance(rem, int) and isinstance(base, SymExpr) and base.op == "mul":
+                m, n = base.args
+                if isinstance(m, int) and isinstance(n, UnitId):
+                    return (m, rem)
+                if isinstance(n, int) and isinstance(m, UnitId):
+                    return (n, rem)
     return None
+
+
+def _bank_fiber_class(idx, stride: int | None = None) -> str | None:
+    """Classify a bank `MemoryRef.idx` (`stride*pid + r`) to its per-fiber
+    bank-class name -- the `range(stride)` generalization of the deleted
+    two-class `_bank_parity` (SPEC-022 D3).
+
+    `stride` may be supplied (e.g. from the carried `LinearLayout`'s
+    `size_of(fiber_axis)`); when omitted it is the index's own coefficient.
+    For `stride == 2` (the Samsung hardware fact: 16 banks / 8 pim units) the
+    fiber remainder maps to exactly `"EVEN_BANK"` (r=0) / `"ODD_BANK"` (r=1),
+    BYTE-IDENTICAL to `_bank_parity` on the Samsung path. For `stride > 2`
+    (a no-sim wide-fiber target) it returns a per-fiber `"BANK_<r>"` name --
+    PIMSimulator's `PIMOpdType` enum has only the two Samsung names, so a
+    third class can only be emitted on the cost-only / virtual path.
+
+    Returns `None` for an index that is not the `stride*pid + r` fiber form
+    (the same "not the autoscheduler's canonical form" signal the old
+    `_bank_parity` returned, so the `_opd` hard-error is preserved).
+    """
+    parsed = _parse_fiber_idx(idx)
+    if parsed is None:
+        return None
+    coeff, r = parsed
+    stride = coeff if stride is None else stride
+    if r < 0 or r >= stride:
+        return None
+    if stride == 2:
+        return "EVEN_BANK" if r == 0 else "ODD_BANK"
+    return f"BANK_{r}"
 
 
 class SamsungCtx(CodegenContext):
@@ -221,6 +281,27 @@ class SamsungCtx(CodegenContext):
 
     _REG_TO_OPD = {"grf_a": "GRF_A", "grf_b": "GRF_B"}
 
+    def _fiber_stride(self):
+        """Bank fiber count (= banks-per-pim stride) for the active placement,
+        read from the carried `LinearLayout`'s segment axis (D3) or the
+        materialised fiber list, else `None` (the index's own coefficient is
+        used). The layout object is load-bearing: it is what determined how
+        many fibers the bank axis was swizzled into."""
+        pl = self._active_placement
+        if pl is None:
+            return None
+        layout = getattr(pl, "layout", None)
+        axis = (getattr(pl, "extra", {}) or {}).get("fiber_axis")
+        if layout is not None and axis is not None:
+            try:
+                return layout.size_of(axis)
+            except Exception:
+                pass
+        fibers = (getattr(pl, "extra", {}) or {}).get("fibers")
+        if fibers:
+            return len(fibers)
+        return None
+
     def _opd(self, handle):
         """Return (opd_name, idx) for a Tenon handle, or ("A_OUT", 0)."""
         if handle is None:
@@ -234,14 +315,20 @@ class SamsungCtx(CodegenContext):
                 )
             return (opd, 0)
         if isinstance(handle, MemoryRef):
-            parity = _bank_parity(handle.idx)
-            if parity is None:
+            # The bank-class name comes from the `range(stride)` fiber walk
+            # (SPEC-022 D3). `stride` is read off the carried LinearLayout's
+            # segment (fiber) axis when one is present; otherwise it is the
+            # index's own coefficient (self-describing). The F2 layout object,
+            # not a pattern matcher, is what determined the fiber geometry.
+            stride = self._fiber_stride()
+            cls = _bank_fiber_class(handle.idx, stride)
+            if cls is None:
                 raise NotImplementedError(
                     f"SamsungCtx: memref index {handle.idx!r} is not the "
-                    "canonical 2*pid / 2*pid+1 even/odd bank form. Real "
-                    "layout decisions are the autoscheduler's job (Blocker 4)."
+                    "canonical stride*pid + r fiber form. Real layout "
+                    "decisions are the autoscheduler's job (Blocker 4)."
                 )
-            return (parity, 0)
+            return (cls, 0)
         raise NotImplementedError(
             f"SamsungCtx: unknown handle type {type(handle).__name__}."
         )
@@ -296,6 +383,18 @@ class SamsungCtx(CodegenContext):
             return (ld, st)
         return (None, None)
 
+    def resolve_spill_moves(self, tier, home_handle, *, n_entries=1):
+        # Samsung spills to a bank row. The LD/ST pair keys off the home
+        # register side (grf_a -> LD_A/ST_A, grf_b -> LD_B/ST_B) -- the
+        # same `side` switch the spill cost factory prices.
+        if tier != "bank_row":
+            return super().resolve_spill_moves(
+                tier, home_handle, n_entries=n_entries
+            )
+        if isinstance(home_handle, Register) and home_handle.name == "grf_b":
+            return ("LD_B", "ST_B")
+        return ("LD_A", "ST_A")
+
     # Active placement + resolved bindings for the current match, set by
     # `_walk_and_emit` before each compute emit. Default None keeps the
     # single-fiber path (no dual-fiber state) unchanged.
@@ -328,9 +427,11 @@ class SamsungCtx(CodegenContext):
         The walker already emitted the canonical MAC against the EVEN
         fiber (`placements[y]`). Here we close fiber 0's inner loop with
         its split JUMP, then for each later fiber emit one MAC (same
-        dst/src0, src1 = that fiber's bank handle so `_bank_parity` stamps
-        the parity) followed by its own split JUMP. Trip counts come from
-        `inner_ub // lanes` split across the fibers — no shape literal.
+        dst/src0, src1 = that fiber's bank handle so `_bank_fiber_class`
+        stamps the per-fiber bank class) followed by its own split JUMP. Trip
+        counts come from `inner_ub // lanes` split across the fibers — no
+        shape literal. This walks `range(n_fibers)`, so it already generalizes
+        to a stride>2 fiber count with no structural change (SPEC-022 D3).
         """
         if not match.enclosing_loops:
             return
@@ -613,6 +714,15 @@ class AimCtx(CodegenContext):
             return (None, None)
         return (None, None)
 
+    def resolve_spill_moves(self, tier, home_handle, *, n_entries=1):
+        # AiM spills a GPR-resident value to a bank row: RD_SBK loads the
+        # row back into the gpr, ST_SBK stores it out.
+        if tier != "bank_row":
+            return super().resolve_spill_moves(
+                tier, home_handle, n_entries=n_entries
+            )
+        return ("RD_SBK", "ST_SBK")
+
     def after_match(self, match, n_emitted):
         """Fold the inner K reduction into the just-emitted MAC ISR's
         ``opsize`` field. ramulator2 prices ``MAC_SBK opsize=N`` by
@@ -778,6 +888,16 @@ class UPMEMCtx(CodegenContext):
             return (None, None)
         return (None, None)
 
+    def resolve_spill_moves(self, tier, home_handle, *, n_entries=1):
+        # UPMEM spills a WRAM/GPR-resident value to MRAM: LD_MRAM reads it
+        # back (mram_read), ST_MRAM writes it out (mram_write). These are
+        # real C memory ops on the byte-verified uPIMulator run path.
+        if tier != "mram":
+            return super().resolve_spill_moves(
+                tier, home_handle, n_entries=n_entries
+            )
+        return ("LD_MRAM", "ST_MRAM")
+
     def emit_mac_kreduce(self, acc, x, y, k_bound) -> None:
         """Emit a K-reduction MAC body (SPEC-019 §4.3).
 
@@ -923,7 +1043,44 @@ class UPMEMCtx(CodegenContext):
         This is materialisation, not a schedule decision: the runner picks
         this envelope only for a gemv-shaped trace; no ranking/placement
         choice changes.
+
+        **Spill realization (SPEC-022 D1, task 004b).** When the chosen
+        placement spilled the accumulator to `mram`, the envelope injects a
+        REAL MRAM round-trip of the accumulator tile (`cache_C`): after the
+        per-row accumulation completes it `mram_write`s `cache_C` to a
+        dedicated MRAM scratch region and `mram_read`s it back before the
+        result write-back. The round-trip preserves the value (so the GEMV
+        host's byte-for-byte `c == W@x` check still passes) while the
+        `mram_read`/`mram_write` the allocator priced as a spill actually
+        execute on the simulator. The non-spill envelope is byte-identical
+        (the spill lines are added only when `_active_placement._spilled`
+        names a spilled memref). This closes the task-005 gap: the spilled
+        artifact, not a fixed template, is what the simulator runs and the
+        GEMV host verifies numerically.
         """
+        active = getattr(self, "_active_placement", None)
+        spilled = list(getattr(active, "_spilled", ()) or [])
+        spill_accumulator = bool(spilled)
+        # Scratch region for the spilled accumulator tile, one BLOCK past the
+        # output region C so it never aliases A/B/C. cache_C is 2 elements
+        # (the gemv host packs two rows per tasklet stride).
+        spill_decl = (
+            "    uint32_t mram_spill_addr_C = (uint32_t) "
+            "(DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T) "
+            "+ n_size_pad * sizeof(T) + max_rows * sizeof(T) + 64);\n"
+            if spill_accumulator else ""
+        )
+        # The spill round-trip: store the accumulator tile to MRAM and load
+        # it straight back. This is the LD_MRAM/ST_MRAM pair resolve_spill_moves
+        # returns, materialised at the accumulator's live-window close. A
+        # value-preserving round-trip: cache_C is unchanged after it.
+        spill_roundtrip = (
+            "        /* === BEGIN tenon spill round-trip (acc -> mram) === */\n"
+            "        mram_write(cache_C, (__mram_ptr void *) (mram_spill_addr_C), 8);\n"
+            "        mram_read((__mram_ptr void const*) (mram_spill_addr_C), cache_C, 8);\n"
+            "        /* === END tenon spill round-trip === */\n"
+            if spill_accumulator else ""
+        )
         return (
             "#include <stdint.h>\n"
             "#include <stdio.h>\n"
@@ -985,6 +1142,7 @@ class UPMEMCtx(CodegenContext):
             "    uint32_t mram_base_addr_A = (uint32_t) (DPU_MRAM_HEAP_POINTER + start_row * n_size * sizeof(T));\n"
             "    uint32_t mram_base_addr_B = (uint32_t) (DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T));\n"
             "    uint32_t mram_base_addr_C = (uint32_t) (DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T) + n_size_pad * sizeof(T) + start_row * sizeof(T));\n"
+            + spill_decl +
             "    uint32_t mram_temp_addr_A = mram_base_addr_A;\n"
             "    uint32_t mram_temp_addr_B = mram_base_addr_B;\n"
             "\n"
@@ -1033,6 +1191,7 @@ class UPMEMCtx(CodegenContext):
             "            mram_temp_addr_B = mram_base_addr_B;\n"
             "            if(mram_temp_addr_A % 8 != 0) { offset = 1; } else { offset = 0; }\n"
             "        }\n"
+            + spill_roundtrip +
             "        mram_write(cache_C, (__mram_ptr void *) (mram_base_addr_C), 8);\n"
             "        mram_base_addr_C += 2 * sizeof(T);\n"
             "    }\n"
@@ -1234,6 +1393,15 @@ class APUv1Ctx(CodegenContext):
             return (None, None)
         return (None, None)
 
+    def resolve_spill_moves(self, tier, home_handle, *, n_entries=1):
+        # APU v1 spills a VR-resident value to L1: LD_VR loads it back into
+        # the VR (gvml_load_16), ST_VR stores it out (gvml_store_16).
+        if tier != "l1":
+            return super().resolve_spill_moves(
+                tier, home_handle, n_entries=n_entries
+            )
+        return ("LD_VR", "ST_VR")
+
 
 # --------------------------------------------------------------------- #
 # GSI APU v2 (Gemini 2, G2) backend
@@ -1347,10 +1515,11 @@ def _resolve_layout(match: MatchedOp, layout: Placement) -> dict[str, Any]:
     handle into role → handle so `emit` can be called.
 
     Per spec 015 §7.4, if the regalloc wrapped a placement in a
-    `Spilled(home, tier)`, codegen unwraps it to `home` (the move
-    scheduler emits the spill LD/ST round-trip around the work-id
-    bucket -- a deferred extension; today's tests do not exercise the
-    spill code path).
+    `Spilled(home, tier)`, codegen unwraps it to `home` for the compute
+    operand binding (the value lives in the register during compute). The
+    spill LD/ST round-trip itself is emitted by `_schedule_moves` around
+    the work-id window (SPEC-022 D1) -- this unwrap is for operand binding
+    only and no longer drops the round-trip.
     """
     # Imported lazily because spmw_regalloc imports Placement from
     # spmw_autoschedule which is imported here at module load -- the
@@ -1538,10 +1707,16 @@ def _schedule_moves(
     which move name to emit; dedups by move name so broadcast operands
     that route through the same Move only emit it once per phase.
     """
-    # Unwrap Spilled() here: per spec 015 §7.4 the simple-path codegen
-    # treats Spilled(home, tier) as if it were `home` (the spill
-    # round-trip is a deferred extension).
+    # SPEC-022 D1: a `Spilled(home, tier)` handle unwraps to `home` for the
+    # compute emit (the value IS in the register during compute), but the
+    # spill round-trip is no longer dropped -- the spilled memrefs in
+    # `layout._spilled` drive an additional tier LD (pre) / tier ST (post)
+    # around the work-id window, via `ctx.resolve_spill_moves`. A backend
+    # whose tier cannot spill raises NotImplementedError, which propagates
+    # as a hard compile error rather than a silent register-resident emit.
     from .spmw_regalloc import Spilled
+
+    spilled_memrefs = set(getattr(layout, "_spilled", ()) or ())
 
     # Lever 2 (SPEC-024 §5): a move name is host-resident only if EVERY
     # role routing to it is host-resident; if any role on the name is crf
@@ -1549,6 +1724,11 @@ def _schedule_moves(
     # Default-missing residency == "crf", so non-Samsung backends and
     # every existing placement keep emitting exactly as before.
     residency = getattr(layout, "extra", {}).get("grf_residency", {})
+
+    # Spill moves to emit around this work-id window, in role-first-seen
+    # order, deduped by move name (same discipline as the home moves).
+    spill_names: list[str] = []
+    spill_seen: set[str] = set()
 
     # First pass: resolve each role to its move name and whether it is
     # crf-resident on that name.
@@ -1558,6 +1738,17 @@ def _schedule_moves(
         handle = layout.placements.get(memref)
         if handle is None:
             continue
+        # Spill round-trip for a spilled memref: emit the tier LD/ST in
+        # ADDITION to the home register's own LD/ST below. Resolve from the
+        # `Spilled` wrapper (tier + home) before unwrapping for compute.
+        if isinstance(handle, Spilled) and memref in spilled_memrefs:
+            spill_ld, spill_st = ctx.resolve_spill_moves(
+                handle.tier, handle.home_handle
+            )
+            spill_chosen = spill_ld if phase == "pre" else spill_st
+            if spill_chosen is not None and spill_chosen not in spill_seen:
+                spill_seen.add(spill_chosen)
+                spill_names.append(spill_chosen)
         if isinstance(handle, Spilled):
             handle = handle.home_handle
         ld_name, st_name = ctx.resolve_moves(
@@ -1573,6 +1764,14 @@ def _schedule_moves(
         else:
             name_crf[chosen] = name_crf[chosen] or is_crf
 
+    # Spill load is prepended at the window open (before the home preloads
+    # the compute consumes); the spill store is appended at the close. In
+    # `pre` the load goes first; in `post` the home storebacks run, then
+    # the spill store, so the value is written back to its tier last.
+    if phase == "pre":
+        for nm in spill_names:
+            _emit_move(target, nm, ctx)
+
     for chosen in name_seen_order:
         if name_crf[chosen]:
             _emit_move(target, chosen, ctx)
@@ -1584,6 +1783,12 @@ def _schedule_moves(
             # for run-path/audit visibility.
             if hasattr(ctx, "host_preloads"):
                 ctx.host_preloads.append((chosen, phase))
+
+    # Spill store: appended after the home storebacks so the value lands
+    # back in its tier last (the window-close write-out).
+    if phase == "post":
+        for nm in spill_names:
+            _emit_move(target, nm, ctx)
 
 
 def _walk_and_emit(
@@ -3104,6 +3309,11 @@ class Compiled:
 
 _BACKEND_CTX = {
     "samsung_hbm_pim": SamsungCtx,
+    # mortise_wide (SPEC-022 D3 proof, banks_per_pim==4): Samsung-shaped, so it
+    # reuses SamsungCtx -- which now emits the per-fiber BANK_<r> classes via
+    # the `range(stride)` `_bank_fiber_class` walk. No simulator runs it (no
+    # _BACKEND_RUN entry beyond "virtual"); the proof inspects compiled.cmds.
+    "mortise_wide": SamsungCtx,
     "aim": AimCtx,
     "upmem": UPMEMCtx,
     "apu_v1": APUv1Ctx,

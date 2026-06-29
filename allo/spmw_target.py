@@ -114,17 +114,28 @@ class MemoryRef:
 
 
 class Register:
-    """A vector register attached to a unit. `lanes` × `width` bits."""
+    """A vector register attached to a unit. `lanes` × `width` bits.
 
-    def __init__(self, owner, lanes, width, name=None):
+    `slots` is the number of addressable register entries the allocator
+    may pack distinct live values into. It defaults to `lanes` (the common
+    case where the SIMD-lane count equals the addressable depth, e.g.
+    Samsung grf / UPMEM gprs / APU vrs). A backend whose addressable GPR
+    depth is a *different* axis from the SIMD width declares `slots`
+    explicitly (AiM: 31 addressable MAC-accumulator GPRs vs 16 SIMD lanes,
+    JSSC 2023 §IV) so the allocator's capacity is tree-derived, not pasted.
+    """
+
+    def __init__(self, owner, lanes, width, name=None, slots=None):
         self.owner = owner
         self.lanes = lanes
         self.width = width
         self.name = name
+        # Addressable depth for register allocation; defaults to lanes.
+        self.slots = lanes if slots is None else slots
 
     def __repr__(self):
         n = self.name or "<anon>"
-        return f"Register({n}, lanes={self.lanes}, width={self.width})"
+        return f"Register({n}, lanes={self.lanes}, width={self.width}, slots={self.slots})"
 
 
 class AnyOf:
@@ -351,12 +362,16 @@ def memory(*, name=None, **geometry):
 mem = memory
 
 
-def reg(lanes, width, name=None):
-    """Attach a Register to the current unit; return a handle."""
+def reg(lanes, width, name=None, slots=None):
+    """Attach a Register to the current unit; return a handle.
+
+    `slots` overrides the allocator-visible addressable depth (defaults to
+    `lanes`); pass it when the GPR depth differs from the SIMD-lane count.
+    """
     if not _target_stack:
         raise RuntimeError("allo.reg must be called inside @allo.target/@allo.unit")
     cur = _target_stack[-1]
-    r = Register(cur, lanes, width, name=name)
+    r = Register(cur, lanes, width, name=name, slots=slots)
     if name is not None:
         if name in cur.registers:
             raise ValueError(f"duplicate register name {name!r} on unit {cur.name!r}")

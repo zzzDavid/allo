@@ -222,7 +222,12 @@ def build_aim_target():
     def device():
         @allo.unit(mapping=[32])  # 32 channels
         def channel():
-            gpr = allo.reg(16, 16, name="gpr")
+            # AiM GPR: 31 addressable MAC-accumulator GPRs (JSSC 2023 §IV
+            # datasheet) is the allocator SLOT axis; the 16-lane SIMD width
+            # (`lanes=16`) is a DIFFERENT axis and must not be conflated
+            # with slot count. The allocator reads `slots` (tree-derived),
+            # not a pasted 31 (SPEC-022 D2 reconciliation).
+            gpr = allo.reg(16, 16, name="gpr", slots=31)
             gb = allo.mem(entries=512, width=16, name="gb")
             banks = allo.mem(
                 banks=32, rows=16384, cols=1024, width=8, name="banks"

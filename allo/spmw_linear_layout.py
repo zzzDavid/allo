@@ -255,13 +255,25 @@ class LinearLayout:
                 out_sizes=base.out_sizes,
             )
 
-        # Search smallest XOR-augmentation: for each (segment_dim, bit, bank_dim,
-        # bank_bit), try setting that bit and check conflict freedom. Pick the
-        # first success in deterministic order (matches spec example).
+        # Greedy per-bit XOR-augmentation. Each segment-dim basis bit is XORed
+        # onto a DISTINCT bank-output bit (so the whole multi-bit segment span
+        # stays conflict-free, not just one bit) -- the SPEC-022 D3
+        # generalization to a banks-per-pim stride > 2 (tile size > 2, i.e.
+        # more than one segment bit). The first segment bit that achieves
+        # whole-span conflict-freedom returns immediately, so the single-bit
+        # Samsung case (one `tile` bit -> `bases["tile"]=[(0,1)]`) is
+        # BYTE-IDENTICAL to the prior single-bit-only search. For a 2-bit tile
+        # (stride 4) it consumes bank bits 0 then 1, yielding 4 conflict-free
+        # fibers. `used_bank_bits` keeps the assignment injective so two
+        # segment bits never collide on the same bank bit.
+        used_bank_bits: set[tuple[int, int]] = set()
         for sd in segment_dims:
             for bit_i in range(len(new_bases[sd])):
+                assigned = False
                 for bd_idx, bd in zip(bank_idxs, bank_dims):
                     for bank_bit in range(_ilog2_exact(base.out_sizes[bd_idx])):
+                        if (bd_idx, bank_bit) in used_bank_bits:
+                            continue
                         mask = 1 << bank_bit
                         new_bases[sd][bit_i][bd_idx] ^= mask
                         if _is_conflict_free():
@@ -273,12 +285,29 @@ class LinearLayout:
                                 out_dims=base.out_dims,
                                 out_sizes=base.out_sizes,
                             )
-                        # revert
-                        new_bases[sd][bit_i][bd_idx] ^= mask
+                        # Not yet whole-span conflict-free: keep this bit's
+                        # augmentation (it is a necessary part of a multi-bit
+                        # swizzle) and move to the next segment bit.
+                        used_bank_bits.add((bd_idx, bank_bit))
+                        assigned = True
+                        break
+                    if assigned:
+                        break
 
+        # If after augmenting every segment bit the span is conflict-free,
+        # return the accumulated swizzle (the multi-bit case lands here when
+        # the last bit completes the span rather than tripping the early-out).
+        if _is_conflict_free():
+            return cls(
+                bases={
+                    k: [tuple(v) for v in vecs] for k, vecs in new_bases.items()
+                },
+                out_dims=base.out_dims,
+                out_sizes=base.out_sizes,
+            )
         raise ValueError(
-            "optimal_swizzle: no single-bit XOR-augmentation makes the layout "
-            "conflict-free; larger search required (not implemented)"
+            "optimal_swizzle: no injective per-bit XOR-augmentation makes the "
+            "layout conflict-free (segment span exceeds available bank bits)"
         )
 
     # ------------------------------------------------------------------ #

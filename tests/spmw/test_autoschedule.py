@@ -199,7 +199,7 @@ def test_compile_with_autoschedule_emits_canonical_bytes():
     dual-fiber placement (both bank halves busy), so each work-id emits a
     MAC against EVEN_BANK *and* a MAC against ODD_BANK, each followed by a
     per-fiber split JUMP. The bank parity falls out of the fiber handle's
-    idx via SamsungCtx's `_bank_parity`.
+    idx via SamsungCtx's `_bank_fiber_class`.
 
     The per-fiber JUMP trip count is the K reduction split across the two
     fibers: `K // lanes // n_fibers - 1` (= 63 for K=1024, lanes=8,
@@ -314,11 +314,11 @@ def test_samsung_argmin_picks_dual_fiber():
     assert isinstance(y_handle, MemoryRef), (
         f"dual_fiber y is the EVEN bank MemoryRef; got {y_handle!r}"
     )
-    from allo.spmw_codegen import _bank_parity
+    from allo.spmw_codegen import _bank_fiber_class
 
     fibers = chosen.extra["fibers"]
-    assert _bank_parity(fibers[0].idx) == "EVEN_BANK"
-    assert _bank_parity(fibers[-1].idx) == "ODD_BANK"
+    assert _bank_fiber_class(fibers[0].idx) == "EVEN_BANK"
+    assert _bank_fiber_class(fibers[-1].idx) == "ODD_BANK"
     # Lever 2 (SPEC-024): the winner also carries host residency for `x`
     # (the broadcast vector), since that strictly lowers the cost.
     assert chosen.extra.get("grf_residency", {}).get("local_W") == "host", (

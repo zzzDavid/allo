@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import allo
 from allo.spmw_autoschedule import autoschedule
-from allo.spmw_codegen import _bank_parity
+from allo.spmw_codegen import _bank_fiber_class
 from allo.spmw_linear_layout import LinearLayout, materialise_handle
 from allo.spmw_match import MatchTrace, MatchedOp, OperandBinding
 from allo.spmw_target import MemoryRef, Register, SymExpr, UnitId
@@ -149,9 +149,9 @@ def test_materialise_samsung_bank_handle():
     )
     assert isinstance(h_even, MemoryRef)
     assert h_even.memory is target.banks
-    # The idx must look like `2 * pid` so `_bank_parity` lowers it to
+    # The idx must look like `2 * pid` so `_bank_fiber_class` lowers it to
     # EVEN_BANK — that is the canonical Samsung GEMV bank handle.
-    assert _bank_parity(h_even.idx) == "EVEN_BANK"
+    assert _bank_fiber_class(h_even.idx) == "EVEN_BANK"
 
     # Toggling tile yields ODD_BANK.
     h_odd = materialise_handle(
@@ -161,7 +161,7 @@ def test_materialise_samsung_bank_handle():
         fixed={"grf": 0, "tile": 1},
         symbol_table={"bank": 2 * pid},
     )
-    assert _bank_parity(h_odd.idx) == "ODD_BANK"
+    assert _bank_fiber_class(h_odd.idx) == "ODD_BANK"
 
 
 # --------------------------------------------------------------------- #
@@ -212,7 +212,7 @@ def test_autoschedule_picks_canonical_samsung_layout():
     assert isinstance(x_handle, Register) and x_handle.name == "grf_a"
     assert isinstance(acc_handle, Register) and acc_handle.name == "grf_b"
     assert isinstance(y_handle, MemoryRef)
-    assert _bank_parity(y_handle.idx) == "EVEN_BANK"
+    assert _bank_fiber_class(y_handle.idx) == "EVEN_BANK"
 
 
 def test_linear_layout_exported_from_allo():

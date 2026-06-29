@@ -42,6 +42,20 @@ class Placement:
     placements: dict[str, Any] = field(default_factory=dict)
     mode: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
+    # Spill audit (SPEC-022 D1): memref names the allocator spilled. Empty
+    # for every no-spill placement (byte-identical default); the move
+    # scheduler reads it to emit the tier LD/ST round-trip around the
+    # spilled value's work-id window. The `Spilled(home, tier)` wrapper in
+    # `placements` still unwraps to its home register for the compute emit;
+    # this list is what stops the round-trip being silently dropped.
+    _spilled: list[str] = field(default_factory=list)
+    # Chosen physical layout (SPEC-022 D3): the swizzled `LinearLayout` the
+    # enumerator built to materialise the fiber handles. Carried so codegen
+    # consumes the F2 layout OBJECT directly (the `range(stride)` fiber walk
+    # reads `layout.size_of(fiber_axis)`) instead of pattern-matching a
+    # `MemoryRef.idx`. Default `None` == today's behaviour (codegen falls back
+    # to the index's own coefficient, byte-identical for Samsung stride 2).
+    layout: Any = None
 
 
 # --------------------------------------------------------------------- #
@@ -151,6 +165,7 @@ def _with_residency(base: "Placement", memref: str, mode: str) -> "Placement":
         placements=dict(base.placements),
         mode=base.mode,
         extra=new_extra,
+        layout=getattr(base, "layout", None),
     )
 
 
@@ -184,6 +199,7 @@ def _with_crf_modes(base: "Placement") -> list["Placement"]:
                 placements=dict(base.placements),
                 mode=_join_mode(base.mode, token),
                 extra=new_extra,
+                layout=getattr(base, "layout", None),
             )
         )
     return variants
@@ -210,6 +226,7 @@ def _with_stage_resident(base: "Placement", resident: bool) -> "Placement":
         placements=dict(base.placements),
         mode=_join_mode(base.mode, "wresident") if resident else base.mode,
         extra=new_extra,
+        layout=getattr(base, "layout", None),
     )
 
 
@@ -237,9 +254,18 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
         )
 
     # Build the identity base on (grf, bank, tile) over outputs (grf, bank),
-    # then swizzle so the segment dim (tile) contributes to bank bit 0.
+    # then swizzle so the segment dim (tile) contributes to the bank bits.
+    # The tile (segment) axis size IS banks-per-pim = bank_out // pim_units,
+    # geometry-derived from the tree (SPEC-022 D3): for Samsung 16//8 == 2 (one
+    # tile bit -> the even/odd swizzle, byte-identical); a wide target with
+    # 16//4 == 4 gets a 2-bit tile -> a 4-fiber `range(stride)` walk. The
+    # `range(stride)` generalization is what makes the F2 algebra load-bearing
+    # beyond Samsung's factor-2 swizzle.
+    bank_out = _bank_out_size(target)
+    pim_units = _pim_unit_count(target)
+    banks_per_pim = (bank_out // pim_units) if (bank_out and pim_units) else 2
     base = LinearLayout.identity(
-        {"grf": 8, "bank": 16, "tile": 2},
+        {"grf": 8, "bank": bank_out or 16, "tile": banks_per_pim},
         out_dims=("grf", "bank"),
     )
     swizzled = LinearLayout.optimal_swizzle(
@@ -249,15 +275,19 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
         segment_dims=("tile",),
     )
 
-    # Bind the bank input dim to `2 * pid` (level-1 pim UnitId): the pim
-    # axis has 8 units mapping to 16 banks (banks-per-pim = the bank
-    # out-size over the pim unit count), so each pim owns the even bank
-    # `2*pid` and its odd partner `2*pid + 1`. Materialising the swizzled
-    # layout at `fixed={"tile": v}` evaluates the same `tile->bank-bit-0`
-    # swizzle column at each fiber value: v=0 -> `2*pid` (EVEN_BANK),
-    # v=1 -> `2*pid + 1` (ODD_BANK). The `+0`/`+1` fall out of the
-    # swizzle column, not a pasted constant (SPEC-023 §2).
+    # Bind the bank input dim to `stride * pid` (level-1 pim UnitId): the
+    # pim axis maps its units onto the bank out-axis, so each pim owns a
+    # contiguous run of `stride` banks starting at `stride*pid` (banks-per-pim
+    # = the bank out-size over the pim unit count). For Samsung that is
+    # `16 // 8 == 2`, so each pim owns the even bank `2*pid` and its odd
+    # partner `2*pid + 1`. The stride is geometry-derived (SPEC-022): the
+    # `2` is the `bank_out // pim_units` instantiation, not a pasted constant.
+    # Materialising the swizzled layout at `fixed={"tile": v}` evaluates the
+    # same `tile->bank-bit-0` swizzle column at each fiber value: v=0 ->
+    # `stride*pid` (EVEN_BANK), v=1 -> `stride*pid + 1` (ODD_BANK). The
+    # `+0`/`+1` fall out of the swizzle column (SPEC-023 §2).
     pid = UnitId(level=1, unit=None)
+    bank_stride = _bank_stride_per_pim(target, swizzled)
 
     # Fiber values come from the layout's segment (tile) axis size, not a
     # literal `2`. `size_of("tile") == 2` here because the swizzle gives
@@ -269,13 +299,15 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             target=target,
             out_dim="bank",
             fixed={"grf": 0, "tile": v},
-            symbol_table={"bank": 2 * pid},
+            symbol_table={"bank": bank_stride * pid},
         )
         for v in range(n_fibers)
     ]
     y_even = fibers[0]
 
     # Candidate 1: bank-row `y` (is_auto=1 -> folded K-loop, EVEN fiber).
+    # Carries the swizzled F2 layout (SPEC-022 D3) + the fiber axis so codegen
+    # reads the bank-fiber stride from `layout.size_of("tile")`, not the index.
     bank_row = Placement(
         placements={
             x_mref: target.grf_a,
@@ -283,6 +315,8 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             acc_mref: target.grf_b,
         },
         mode="bank_row",
+        extra={"fiber_axis": "tile"},
+        layout=swizzled,
     )
     # Candidate 2: GRF-staged `y` (is_auto=0 -> K MACs unrolled).
     # Both candidates share x->grf_a, acc->grf_b; only y differs.
@@ -293,6 +327,7 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             acc_mref: target.grf_b,
         },
         mode="grf_staged",
+        layout=swizzled,
     )
     # Candidate 3: dual-fiber bank-row `y` (is_auto=1, both bank halves
     # busy). Strict superset of `bank_row`: `placements[y]` is the EVEN
@@ -312,52 +347,21 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             "fiber_axis": "tile",
             "n_fibers": n_fibers,
         },
+        layout=swizzled,
     )
     base_candidates = [bank_row, grf_staged, dual_fiber]
 
     # Lever 2 (SPEC-024): cross the layout candidates with {crf, host}
-    # GRF residency for the broadcastable role(s). Host residency hoists
-    # the preload off the CRF stream onto the native HAB broadcast; crf
-    # residency keeps the per-work-id CRF MOV. Both are real Placements;
-    # argmin decides -- the enumerator must NOT prune the crf variant.
-    # Host-eligibility is COMPUTED from the placement handle (§3), never
-    # asserted: only memrefs landing on `grf_a` are broadcast-uniform.
-    residency_candidates: list[Placement] = []
-    for base in base_candidates:
-        host_memrefs = _samsung_host_eligible_memrefs(
-            target, base, role_to_memref
-        )
-        # crf variant == today's behaviour (default-missing key == "crf").
-        crf = base
-        for mref in host_memrefs:
-            crf = _with_residency(crf, mref, "crf")
-        residency_candidates.append(crf)
-        # host variant: every host-eligible memref moves to host residency.
-        # If no role is host-eligible there is no second variant to emit.
-        if host_memrefs:
-            host = base
-            for mref in host_memrefs:
-                host = _with_residency(host, mref, "host")
-            residency_candidates.append(host)
+    # Lever cross-product via the typed knob registry (SPEC-022 D4). The
+    # three Samsung levers -- grf_residency (SPEC-024), crf_issue (SPEC-025),
+    # stage_resident (SPEC-026) -- are registered knobs; `cross_with_knobs`
+    # applies them in registration order (residency -> crf_issue ->
+    # stage_resident), byte-identical to the prior hand-crossed loop. Each
+    # knob owns its candidate set + materialiser; adding a lever is one
+    # `register_knob` call, not a new loop here.
+    from .spmw_knobs import cross_with_knobs
 
-    # Lever 3 (SPEC-025): cross every candidate with {shared, per_workid}
-    # CRF-issue mode. The CRF-issue dimension is orthogonal to the y /
-    # even-odd / host dimensions (SPEC-025 §3.1), so it is applied as a
-    # final 2x fan-out tagged in `extra["crf_issue"]`. Argmin discards the
-    # loser; the enumerator never prunes a variant or branches on shape.
-    #
-    # SPEC-026 §2.2: weight-residency is the final, outermost 2x tail
-    # cross -- orthogonal to lever-1/2/3, exactly as lever 3 is orthogonal
-    # to lever 2. Both `weight_resident in {False, True}` variants are
-    # emitted UNCONDITIONALLY; the enumerator never reads B or any shape.
-    # The cost model (205) earns the resident one for B>=2 and ties them
-    # at B=1 (so the pre-026 B=1 winner is undisturbed, I4).
-    out: list[Placement] = []
-    for cand in residency_candidates:
-        for crf_cand in _with_crf_modes(cand):
-            out.append(_with_stage_resident(crf_cand, False))
-            out.append(_with_stage_resident(crf_cand, True))
-    return out
+    return cross_with_knobs(target, base_candidates, matches, role_to_memref)
 
 
 @register_enumerator("mortise")
@@ -377,6 +381,20 @@ def _mortise_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     `stage_resident in {False, True}` candidate pair the autoscheduler
     argmin-selects over is produced identically. Argmin picks the resident
     arm at B>=2 (the Mortise faithful host_staging prices it cheaper).
+    """
+    return _samsung_enumerate(target, matches)
+
+
+@register_enumerator("mortise_wide")
+def _mortise_wide_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
+    """Enumerate the Mortise-WIDE (banks_per_pim==4) layouts (SPEC-022 D3).
+
+    Samsung-shaped, so it delegates to `_samsung_enumerate`. Because the
+    swizzle tile axis is now sized by `banks_per_pim` (= bank_out // pim_units),
+    a pim fanout of 4 over 16 banks yields a 2-bit tile -> `size_of("tile")==4`
+    -> FOUR materialised fiber handles `banks[4*pid + r]` for r in range(4).
+    This is the `banks_per_pim > 2` proof input the deleted two-class
+    `_bank_parity` matcher could never have classified.
     """
     return _samsung_enumerate(target, matches)
 
@@ -468,6 +486,55 @@ def _trace_reduction_trip(matches: list[MatchedOp]) -> int | None:
     return None
 
 
+def _bank_stride_per_pim(target, layout: LinearLayout) -> int:
+    """Banks-per-pim stride, derived from layout + target geometry.
+
+    `stride = bank_out_size // pim_unit_count`: the bank out-axis size
+    (read off the layout's `bank` axis, == 16 for Samsung) divided by the
+    pim-unit fanout (the product of the `pim` unit's `mapping`, == 8). Each
+    pim owns `stride` contiguous banks based at `stride*pid`. For Samsung
+    this is `16 // 8 == 2` -- the `2` is this instantiation, never a pasted
+    constant (SPEC-022 anti-hardcoding gate). Falls back to a stride of 1
+    when the geometry is unresolvable (no `pim` unit / no bank axis), which
+    degrades to the identity `pid` binding rather than guessing a `2`.
+    """
+    from math import prod
+
+    bank_out = layout.size_of("bank") if "bank" in layout.bases else None
+    pim_units = None
+    for u in target._walk():
+        if u.name == "pim":
+            pim_units = prod(u.mapping) if u.mapping else None
+            break
+    if not bank_out or not pim_units:
+        return 1
+    return bank_out // pim_units
+
+
+def _pim_unit_count(target) -> int | None:
+    """Pim-unit fanout (`prod(pim.mapping)`) read from the unit tree, or None
+    when there is no `pim` unit. Sibling of `_bank_stride_per_pim`'s pim walk,
+    lifted out so the enumerator can size the swizzle tile axis BEFORE the
+    layout exists (the tile size == banks-per-pim == bank_out // pim_units)."""
+    from math import prod
+
+    for u in target._walk():
+        if u.name == "pim":
+            return prod(u.mapping) if u.mapping else None
+    return None
+
+
+def _bank_out_size(target) -> int | None:
+    """Bank out-axis size (the `banks` count) read from the target's `banks`
+    memory geometry, or None when absent. The bank dimension the swizzle maps
+    the tile fibers onto; geometry, never a pasted 16."""
+    banks = getattr(target, "banks", None)
+    if banks is None:
+        return None
+    n = getattr(banks, "banks", None)
+    return int(n) if n else None
+
+
 def _tasklet_fanout(target) -> int | None:
     """Tasklet-unit fanout (T_max) read from the target unit tree.
 
@@ -547,20 +614,16 @@ def _upmem_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
         {x_mref: wram_x, y_mref: wram_y, acc_mref: gprs},
     ]
 
-    # Tasklet-tiling lever (design 02 §3.2): cross each acc-placement
-    # with the derived `n_tasklets` candidate set so argmin ranks the
-    # parallelism. Default `n_tasklets=1` == today's behaviour (T9
-    # floor). The candidate set is shape+target-derived, not a literal.
-    tasklet_candidates = _upmem_tasklet_candidates(target, matches)
+    # Tasklet-tiling lever (design 02 §3.2): cross each acc-placement with the
+    # derived `n_tasklets` candidate set via the typed knob registry (SPEC-022
+    # D4). The base candidates are the two acc-placements; `cross_with_knobs`
+    # applies the registered `n_tasklets` knob (candidates =
+    # `_upmem_tasklet_candidates`, shape+target-derived). Byte-identical to the
+    # prior hand-crossed loop. Default `n_tasklets=1` == today's behaviour.
+    from .spmw_knobs import cross_with_knobs
 
-    layouts: list[Placement] = []
-    for placements in acc_placements:
-        for n_tasklets in tasklet_candidates:
-            layouts.append(Placement(
-                placements=dict(placements),
-                extra={"n_tasklets": n_tasklets},
-            ))
-    return layouts
+    base_candidates = [Placement(placements=dict(p)) for p in acc_placements]
+    return cross_with_knobs(target, base_candidates, matches, role_to_memref)
 
 
 @register_enumerator("apu_v1")
@@ -617,22 +680,27 @@ def _apu_v1_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     )
     n_out_tiles, n_weight_tiles, n_boundaries = _apu_v1_vr_tiling(target, trace)
 
-    candidates: list[Placement] = []
-    for mode in ("sv", "sv_lookup"):
-        for vr_dma in ("intra", "inter"):
-            candidates.append(
-                Placement(
-                    placements=dict(placements),
-                    mode=mode,
-                    extra={
-                        "vr_dma": vr_dma,
-                        "n_out_tiles": n_out_tiles,
-                        "n_weight_tiles": n_weight_tiles,
-                        "n_stage_boundaries": n_boundaries,
-                    },
-                )
-            )
-    return candidates
+    # vr_dma lever via the typed knob registry (SPEC-022 D4). The base
+    # candidates are one per MAC-expansion mode (sv / sv_lookup), each carrying
+    # the shared tile-count extra; `cross_with_knobs` applies the registered
+    # `vr_dma` knob (candidates = {intra, inter}) as the inner 2x fan. The
+    # mode-outer / vr_dma-inner order + the 4-candidate set are byte-identical
+    # to the prior hand-crossed `for mode: for vr_dma:` loop.
+    from .spmw_knobs import cross_with_knobs
+
+    base_candidates = [
+        Placement(
+            placements=dict(placements),
+            mode=mode,
+            extra={
+                "n_out_tiles": n_out_tiles,
+                "n_weight_tiles": n_weight_tiles,
+                "n_stage_boundaries": n_boundaries,
+            },
+        )
+        for mode in ("sv", "sv_lookup")
+    ]
+    return cross_with_knobs(target, base_candidates, matches, role_to_memref)
 
 
 @register_enumerator("apu_v2")
