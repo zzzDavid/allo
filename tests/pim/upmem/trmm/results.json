@@ -1,0 +1,28 @@
+{
+  "kernel": "trmm",
+  "target": "upmem",
+  "dataset": "SMALL",
+  "shapes": {
+    "M": 60,
+    "N": 80
+  },
+  "correctness": {
+    "status": "PASS",
+    "detail": "uPIMulator GEMV host numeric check passed (W@x vs numpy ref, host tol); recorded ref rtol=0.0001",
+    "reference": {
+      "source": "PolyBench/C 4.2.1",
+      "size_class": "SMALL_DATASET",
+      "validated_by": "experiments/scripts/R_polybench_ref_validation.py",
+      "alpha_convention": "canonical alpha=1.5 applied host-side (trmm_np); @allo.work is the bare A^T@B product"
+    }
+  },
+  "performance": {
+    "metric": "cycles",
+    "value": 215841,
+    "source": "uPIMulator@870d916334e9ff0b190f555f951a9ec3c4257781",
+    "run_cmd": "python -m pytest tests/pim/upmem/trmm/test_trmm_upmem.py -p no:cacheprovider -q",
+    "timestamp": "2026-06-29T11:15:15.716441"
+  },
+  "tenon_commit": "ed217633e316c4b45d19368b4cfadd61c028aa21",
+  "notes": "Tier-2 triangular; UPMEM GEMV-host slot verifies W@x internally (PASS w/ cycles); a VA-slot route is CYCLES-ONLY."
+}

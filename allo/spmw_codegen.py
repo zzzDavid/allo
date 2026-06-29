@@ -2301,7 +2301,75 @@ def _run_samsung_one(
                 f"'PIM_CYCLES total=...' line (layer {layer_idx}); "
                 f"tail: {combined[-400:]}"
             )
-        return int(m.group(1)), combined
+        # SPEC-004b: read this layer's out.bin while the tempdir is still alive
+        # (the multi-layer caller surfaces the FINAL layer's outputs). Additive;
+        # cycles (parsed above) untouched.
+        outputs = _samsung_read_gemv_outbin(out_path, "GEMV")
+        return int(m.group(1)), combined, outputs
+
+
+def _samsung_read_gemv_outbin(out_path, kernel: str) -> dict:
+    """SPEC-004b additive readback: surface the GEMV result `pim_driver` already
+    wrote to `out_path` (the `--out` file) as `{"y": <fp16 array>}`.
+
+    The driver writes `output_dim` bursts of 16 fp16 partial sums each
+    ("GEMV packs 16 partial sums per burst; caller tree-reduces" --
+    src/pim_driver.cc:349); the functional result is the per-row tree-reduction
+    (sum across the 16 lanes). At the M=4096 design point this matches `W @ x`
+    to fp16 tolerance; off the design point `computeGemv` leaves the read region
+    zero (an all-zero blob), which is NOT a functional result -- so we surface
+    `y` only when the blob is non-trivial. Graceful in every other case
+    (non-GEMV op, absent file, empty/zero blob) -> returns {} and the cell
+    stays CYCLES-ONLY. This is pure post-run file I/O: no cycle re-parse, no
+    driver re-run, no command-stream change.
+    """
+    if kernel != "GEMV":
+        return {}
+    try:
+        p = Path(out_path)
+        if not p.exists():
+            return {}
+        import numpy as np
+
+        raw = np.fromfile(str(p), dtype=np.float16)
+        if raw.size == 0 or raw.size % 16 != 0:
+            return {}
+        # (output_dim, 16) partial sums -> per-row tree-reduce across lanes.
+        y = raw.reshape(-1, 16).astype(np.float32).sum(axis=1)
+        # Off-design (small-shape) runs leave the read region all-zero; that is
+        # not a functional result -- do not surface a spurious zero output.
+        if not np.any(y):
+            return {}
+        return {"y": y}
+    except (OSError, ValueError):
+        # A readback hiccup never fails the run; the cell falls back to
+        # CYCLES-ONLY (prior behaviour).
+        return {}
+
+
+def _samsung_plain_gemv_rerun(driver, root, td_path, w_path, x_path,
+                              output_dim: int, input_dim: int) -> dict:
+    """SPEC-005d dual-run: a SECOND, plain `executeGemv` invocation (the same
+    GEMV argv WITHOUT `--cmds`/`--faithful`) of the same workload/shape, for the
+    functional output the cycle-accurate faithful run does not populate.
+
+    Returns `_samsung_read_gemv_outbin` of the plain run's out.bin (the
+    tree-reduced `y`), or `{}` when the plain run errs / writes no functional
+    output (off-design shape, sim core) -> the caller keeps CYCLES-ONLY. The
+    cycle number is NOT touched here; this run is correctness-only. Reuses the
+    SAME W.npy/x.npy the faithful run wrote (same real inputs)."""
+    out_plain = td_path / "out_plain.bin"
+    argv = [
+        str(driver), "--op", "GEMV", "--out", str(out_plain),
+        "--weight", str(w_path), "--in", str(x_path),
+        "--output-dim", str(output_dim), "--input-dim", str(input_dim),
+    ]  # NO --cmds / --faithful: the plain executeGemv path that populates out.bin
+    try:
+        subprocess.run(argv, capture_output=True, cwd=str(root),
+                       timeout=600, check=False)
+    except (subprocess.SubprocessError, OSError):
+        return {}
+    return _samsung_read_gemv_outbin(out_plain, "GEMV")
 
 
 def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
@@ -2409,17 +2477,22 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             )
         total_cycles = 0
         combined_parts: list[str] = []
+        final_outputs: dict = {}
         for i, (grp, layer_in) in enumerate(zip(groups, layers)):
-            cyc, out = _run_samsung_one(
+            cyc, out, layer_outputs = _run_samsung_one(
                 driver, root, grp, layer_in, np, layer_idx=i
             )
             total_cycles += cyc
             combined_parts.append(out)
+            final_outputs = layer_outputs  # terminal layer's output is the result
+        extra = {"kernel": kernel, "n_layers": len(groups)}
+        if final_outputs:
+            extra["outputs"] = final_outputs
         return RunResult(
             cycles=total_cycles,
             stdout="\n--- next layer ---\n".join(combined_parts),
             backend="samsung_hbm_pim",
-            extra={"kernel": kernel, "n_layers": len(groups)},
+            extra=extra,
         )
 
     with tempfile.TemporaryDirectory() as td:
@@ -2538,11 +2611,41 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
                 "'PIM_CYCLES total=...' line; tail: " + combined[-400:]
             )
         cycles = int(match.group(1))
+        # SPEC-004b (additive readback): surface the GEMV result the driver
+        # already wrote to `out_path` into extra["outputs"], mirroring
+        # _run_apu_v1. Pure post-run file I/O -- cycles (parsed above) and the
+        # command stream are untouched; graceful when absent. Output role "y".
+        extra = {"kernel": kernel, "returncode": proc.returncode}
+        outputs = _samsung_read_gemv_outbin(out_path, kernel)
+        if outputs:
+            extra["outputs"] = outputs
+            extra["cycles_source"] = "PIMSimulator faithful --cmds"
+            extra["correctness_source"] = "PIMSimulator faithful --cmds"
+
+        # SPEC-005d (additive dual-run): the faithful `--cmds`/`--faithful` path
+        # is cycle-accurate but writes an all-zero out.bin (executeGemvFaithful
+        # runs the CRF microcode; readResult reads an unpopulated region). So a
+        # real Samsung GEMV PASS needs a SECOND, plain `executeGemv` run of the
+        # SAME workload/shape for the functional output -- cycles stay from the
+        # faithful run above (byte-identical), correctness from the plain run.
+        # Both runs are real; gated so it fires only when the faithful readback
+        # was empty (the expected faithful case) and a GEMV cmd stream drove the
+        # faithful run. Graceful: a zero/absent plain out.bin -> no outputs ->
+        # the cell stays CYCLES-ONLY (never a fabricated/tautological PASS).
+        if kernel == "GEMV" and not outputs and pim_cmds_all:
+            plain_outputs = _samsung_plain_gemv_rerun(
+                driver, root, td_path, w_path, x_path,
+                int(W.shape[0]), int(W.shape[1]),
+            )
+            if plain_outputs:
+                extra["outputs"] = plain_outputs
+                extra["cycles_source"] = "PIMSimulator faithful --cmds"
+                extra["correctness_source"] = "PIMSimulator plain executeGemv"
         return RunResult(
             cycles=cycles,
             stdout=combined,
             backend="samsung_hbm_pim",
-            extra={"kernel": kernel, "returncode": proc.returncode},
+            extra=extra,
         )
 
 

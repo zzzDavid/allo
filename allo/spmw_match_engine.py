@@ -479,6 +479,38 @@ def _operand_bindings(
     return out
 
 
+def _flatten_add_chain(term, result_memref_name):
+    """Flatten a left-nested associative `add`-chain into
+    `(acc_load, [summand, ...])` for the multi-term reduction matcher (D3).
+
+    The chain `add(add(add(load(A), t1), t2), t3)` accumulating onto memref `A`
+    is collected as `acc_load = load(A)`, `summands = [t1, t2, t3]`. Returns
+    `(None, [])` when `term` is not an add-chain whose innermost left leaf is a
+    `WLoad` of `result_memref_name` (so the flatten is inert outside the
+    accumulate shape it targets). Pure term-tree walk -- reads only the existing
+    `WBinOp`/`WLoad` tree from `_trace_value`; no IR re-walk, no allo/ir edit.
+    """
+    if not isinstance(term, WBinOp) or term.op != "add":
+        return None, []
+    summands: list[Any] = []
+    node = term
+    # Walk down the left spine collecting right-hand summands.
+    while isinstance(node, WBinOp) and node.op == "add":
+        summands.append(node.rhs)
+        node = node.lhs
+    # `node` is now the innermost left leaf -- the accumulator load.
+    if not isinstance(node, WLoad):
+        return None, []
+    if (
+        result_memref_name is not None
+        and node.memref_name is not None
+        and node.memref_name != result_memref_name
+    ):
+        return None, []
+    summands.reverse()  # restore source order
+    return node, summands
+
+
 def _try_match_at_store(
     store_op,
     enclosing_loops: list[tuple[str, str, str, int]],
@@ -513,61 +545,79 @@ def _try_match_at_store(
     if not isinstance(term, WBinOp):
         return []
 
-    matches: list[MatchedOp] = []
-    # Walk ops in target tree and try each pattern.
-    for unit in target._walk():
-        for op_obj in unit.ops.values():
-            pat = compile_op_pattern(op_obj)
-            bindings: dict[str, Any] = {}
-            if not _unify(pat.body, term, bindings):
-                continue
+    store_handle = f"{op_name}@{stored_ssa}"
 
-            # Conservative filter: every parameter must bind to a memref
-            # load. Block-arg / constant / opaque-cast bindings are
-            # rejected so we don't match index-arithmetic chains (e.g.
-            # `pid * 8` computing `row0`) against data-plane ops.
-            if not all(isinstance(bindings.get(n), WLoad) for n in pat.param_names):
-                continue
-
-            # If this op accumulates, validate the accumulator: the last
-            # parameter must bind to a WLoad whose memref equals the
-            # store's "to" memref (i.e. the same accumulator memref).
-            if op_obj.accumulates and pat.param_names:
-                acc_term = bindings[pat.param_names[-1]]
-                if not isinstance(acc_term, WLoad):
+    def _match_term(t: "WBinOp") -> MatchedOp | None:
+        """Unify one binop term against the target's op patterns; return the
+        first matching MatchedOp (the existing single-term logic), or None."""
+        for unit in target._walk():
+            for op_obj in unit.ops.values():
+                pat = compile_op_pattern(op_obj)
+                bindings: dict[str, Any] = {}
+                if not _unify(pat.body, t, bindings):
                     continue
-                if (
-                    result_memref_name is not None
-                    and acc_term.memref_name is not None
-                    and acc_term.memref_name != result_memref_name
-                ):
+                # Conservative filter: every parameter must bind to a memref
+                # load. Block-arg / constant / opaque-cast bindings are
+                # rejected so we don't match index-arithmetic chains (e.g.
+                # `pid * 8` computing `row0`) against data-plane ops.
+                if not all(isinstance(bindings.get(n), WLoad) for n in pat.param_names):
                     continue
-
-            # Determine op_range — the first contributing load through the
-            # store. Conservatively: (root binop's defining op SSA, store's
-            # SSA-or-name).
-            top_ssa = term.ssa_name
-            store_handle = f"{op_name}@{stored_ssa}"
-            matches.append(
-                MatchedOp(
+                # If this op accumulates, validate the accumulator: the last
+                # parameter must bind to a WLoad whose memref equals the
+                # store's "to" memref (i.e. the same accumulator memref).
+                if op_obj.accumulates and pat.param_names:
+                    acc_term = bindings[pat.param_names[-1]]
+                    if not isinstance(acc_term, WLoad):
+                        continue
+                    if (
+                        result_memref_name is not None
+                        and acc_term.memref_name is not None
+                        and acc_term.memref_name != result_memref_name
+                    ):
+                        continue
+                # op_range — first contributing load through the store.
+                return MatchedOp(
                     target_op_name=op_obj.name,
                     func_name=func_name,
                     work_id=work_id,
                     enclosing_loops=list(enclosing_loops),
                     operands=_operand_bindings(pat, bindings, op_obj.accumulates),
                     result_memref_name=result_memref_name,
-                    op_range=(top_ssa, store_handle),
+                    op_range=(t.ssa_name, store_handle),
                     extra={"store_indices": list(store_indices)},
                 )
-            )
-            # Use first matching op (more specific patterns should be
-            # tried first if multiple match — but for our minimal target
-            # set, MAC is more specific than MUL because MAC is an
-            # `add(load, mul(...))` shape that MUL alone can't match.
-            break
-        if matches:
-            break
-    return matches
+            # (no break needed — return above exits on first match)
+        return None
+
+    # 1) The canonical single-term path: try the stored term as-is. A
+    #    single-`mul` GEMV/GEMM (`add(acc, mul(x,y))`) matches MAC here and the
+    #    multi-term flatten below NEVER fires -> byte-identical.
+    m = _match_term(term)
+    if m is not None:
+        return [m]
+
+    # 2) SPEC-004 (multi-output sub-spec D3) additive multi-term reduction
+    #    flatten. Reached ONLY when the single-term unify failed. A left-nested
+    #    associative `add`-chain accumulating onto the store's `to` memref --
+    #    e.g. gemver's `A[i,j] = A[i,j] + u1*v1 + u2*v2` -> two MAC terms, or
+    #    `x[i] = x[i] + z[i]` -> one reduction-free ADD term -- is flattened
+    #    into per-summand terms, each re-matched as `add(acc_load, summand)`.
+    #    Rides the existing `_trace_value` WBinOp tree; no allo/ir edit.
+    acc_load, summands = _flatten_add_chain(term, result_memref_name)
+    if acc_load is not None and len(summands) >= 2:
+        flat: list[MatchedOp] = []
+        for s in summands:
+            # Re-form `add(acc_load, summand)` and match it as a standalone
+            # accumulate (MAC for a mul summand, ADD-family for a load summand).
+            synth = WBinOp("add", acc_load, s, term.ssa_name)
+            sm = _match_term(synth)
+            if sm is None:
+                # A summand that does not match any pattern aborts the flatten
+                # (do not emit a partial / fabricated decomposition).
+                return []
+            flat.append(sm)
+        return flat
+    return []
 
 
 def _parse_loop_upper(text: str) -> int | None:
