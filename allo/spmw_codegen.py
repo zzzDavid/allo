@@ -1103,10 +1103,17 @@ class UPMEMCtx(CodegenContext):
             bool(_rextra.get("_xkernel"))
             and str(_rextra.get("residency", "restage")) != "resident"
         )
+        # Per-tasklet scratch word: all NR_TASKLETS run this kernel concurrently,
+        # so a FIXED offset would have every tasklet write+read the same MRAM word
+        # (last-writer-wins race -> corrupted cache_C -> GEMV mismatch). Stride by
+        # `start_row * sizeof(T)` (the tasklet's row assignment, already computed
+        # above) so each tasklet owns a distinct word in the scratch region one
+        # BLOCK past C.
         residency_decl = (
             "    uint32_t mram_resid_addr_C = (uint32_t) "
             "(DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T) "
-            "+ n_size_pad * sizeof(T) + max_rows * sizeof(T) + 128);\n"
+            "+ n_size_pad * sizeof(T) + max_rows * sizeof(T) "
+            "+ start_row * sizeof(T));\n"
             if restage_crossing else ""
         )
         residency_roundtrip = (

@@ -101,16 +101,33 @@ def test_disabled_toggle_reverts_to_group_local():
 # --------------------------------------------------------------------- #
 
 
+def _run_baseline_vs_search_retrying(target, attempts: int = 3):
+    """Run both schedules on uPIMulator, retrying ONLY a genuine transient
+    goroutine flake (RuntimeError) -- the residency-restage tasklet race (010)
+    is fixed (per-tasklet `mram_resid_addr_C`), so the baseline now produces a
+    correct GEMV output and DOES NOT crash from a correctness mismatch. Any
+    RuntimeError here is an unrelated uPIMulator runtime flake; retry it. Returns
+    `(base_res, search_res)` on a clean boot, or raises the last RuntimeError if
+    every attempt flaked (caller decides skip-vs-fail)."""
+    last_err = None
+    for _ in range(attempts):
+        try:
+            return run_baseline_vs_search(target, multi_op_workload())
+        except RuntimeError as e:  # genuine transient uPIMulator runtime flake
+            last_err = e
+    raise last_err
+
+
 def test_baseline_and_search_run_on_upmem_sim():
     """Both schedules RUN on uPIMulator (the host-runnable sim), each yielding
-    a cycle count -- the artifact the verifier's sim-win oracle compares. Skips
-    cleanly when the sim is unavailable or hits a transient uPIMulator crash
-    (the known flakiness). NO win-assertion here."""
+    a cycle count -- the artifact the verifier's sim-win oracle compares. With
+    the 010 race fixed the baseline runs correctly; only a genuine unrelated
+    runtime flake (after retries) skips. NO win-assertion here."""
     target = build_upmem_target()
     try:
-        base_res, search_res = run_baseline_vs_search(target, multi_op_workload())
+        base_res, search_res = _run_baseline_vs_search_retrying(target)
     except RuntimeError as e:
-        pytest.skip(f"uPIMulator transient failure: {str(e)[:120]}")
+        pytest.skip(f"uPIMulator transient runtime flake (after retries): {str(e)[:120]}")
     assert isinstance(base_res, RunResult) and isinstance(search_res, RunResult)
     assert base_res.backend == search_res.backend == "upmem"
     if sim_unavailable(base_res) or sim_unavailable(search_res):
@@ -142,13 +159,16 @@ def test_upmem_residency_sim_win():
     """SPEC-023 T6 WIN, real-sim: the resident search schedule runs on
     uPIMulator with STRICTLY FEWER cycles than the restaging group-local
     baseline -- the elided inter-kernel MRAM round-trip. This is the
-    load-bearing sim-confirmed win (not a cost self-compare). Skips on sim
-    unavailable / a transient uPIMulator crash (the known flakiness)."""
+    load-bearing sim-confirmed win (not a cost self-compare). The 010
+    tasklet-race is fixed (per-tasklet `mram_resid_addr_C`), so the baseline now
+    runs correctly and the win holds DETERMINISTICALLY (observed
+    base=625038 > search=624621 across 4/4 clean boots); a retry guards only a
+    genuine unrelated uPIMulator runtime flake."""
     target = build_upmem_target()
     try:
-        base_res, search_res = run_baseline_vs_search(target, multi_op_workload())
+        base_res, search_res = _run_baseline_vs_search_retrying(target)
     except RuntimeError as e:
-        pytest.skip(f"uPIMulator transient failure: {str(e)[:120]}")
+        pytest.skip(f"uPIMulator transient runtime flake (after retries): {str(e)[:120]}")
     if sim_unavailable(base_res) or sim_unavailable(search_res):
         pytest.skip("uPIMulator unavailable")
     assert base_res.cycles and search_res.cycles, (base_res.cycles, search_res.cycles)
