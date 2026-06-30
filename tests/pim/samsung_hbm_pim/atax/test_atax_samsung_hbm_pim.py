@@ -13,7 +13,6 @@ from __future__ import annotations
 from lib import cell, reference
 from lib.shapes import shape
 
-from workloads import atax as _wl
 
 _KERNEL = "atax"
 _TARGET = "samsung_hbm_pim"
@@ -25,12 +24,14 @@ _RUN_CMD = (
 
 def test_atax_samsung_hbm_pim(request):
     result, verdict, _record = cell.run_cell(
-        kernel=_KERNEL, target_name=_TARGET, workload=_wl.build(),
-        folder=request.path.parent, stages=_wl.STAGES, shapes=shape(_KERNEL),
+        kernel=_KERNEL, target_name=_TARGET,
+        folder=request.path.parent, stages=None, shapes=shape(_KERNEL),
         run_cmd=_RUN_CMD,
         notes="Tier-1 multi-output; Samsung reports cycles only (no functional readback on the faithful path) -> CYCLES-ONLY at the GEMV design point; shape the sim cannot express -> BLOCKED-SIM.",
     )
-    assert verdict.status in (reference.CYCLES_ONLY, reference.BLOCKED_SIM), verdict
+    assert verdict.status in (
+        reference.PASS, reference.CYCLES_ONLY, reference.BLOCKED_SIM,
+    ), verdict
     if verdict.status in (reference.CYCLES_ONLY, reference.PASS) and not cell.sim_unavailable(result):
         assert result.cycles is not None and result.cycles > 0, (
             f"{_TARGET}: expected positive cycles; got {result.cycles!r}; "

@@ -283,6 +283,28 @@ class Target:
                 return u.ops[name]
         raise KeyError(f"Target {self.name!r} has no op named {name!r}")
 
+    def work_grid(self):
+        """Derive the work-item grid implied by the @allo.unit tree.
+
+        Returns (factors, product) where `factors` is the per-unit mapping
+        factor list walked outer->inner (root [1] elided; host nodes have no
+        mapping and contribute nothing), and `product` is their product == the
+        number of PEs == the canonical full-grid work-id count. This is the
+        declarative counterpart of spmw_cost_tables._samsung_workid_count, which
+        must call this so the two never drift.
+        """
+        factors = []
+        for u in self._walk():
+            if getattr(u, "mode", None) == "host":
+                continue
+            for f in u.mapping:
+                if f != 1:            # root's synthetic [1] and unit [1]s elide
+                    factors.append(f)
+        product = 1
+        for f in factors:
+            product *= f
+        return factors, product
+
     def __repr__(self):
         return f"Target({self.name!r}, root={self.root!r})"
 

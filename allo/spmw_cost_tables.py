@@ -210,11 +210,11 @@ def _locality_phase(model, layout):
 
 
 def _samsung_workid_count(target) -> int:
-    n = 1
-    for u in target._walk():
-        for f in u.mapping:
-            n *= f
-    return n
+    # Delegate to target.work_grid() so the canonical full-grid work-id count
+    # (== unit-tree fanout product) is computed in exactly one place. The
+    # `f != 1` filter in work_grid only drops no-op [1] factors, so the product
+    # is identical to the historical all-factor multiply.
+    return target.work_grid()[1]
 
 
 def _trace_batch_dim(trace: MatchTrace) -> int:

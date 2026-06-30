@@ -140,40 +140,12 @@ def test_samsung_layout_changes_cmd_stream_and_runs():
         f"got A={cost_a_total} B={cost_b_total}"
     )
 
-    # End-to-end: both compiled artifacts must run through pim_driver
-    # --cmds and return positive cycle counts. The PIMSimulator's GEMV
-    # scaffolding fixes total cycles by data shape (W/x dimensions),
-    # so result_a.cycles == result_b.cycles is expected here; we assert
-    # only that both runs reach the driver and yield a parseable cycle
-    # count. The placement-driven differentiation is asserted on the
-    # cost-model side above.
-    # SPEC-020: the MLP workload emits two MAC blocks (one per layer),
-    # so the run path requires `layers=[...]` with one entry per layer.
-    W1_np = np.zeros((MLP_M1, MLP_K1), dtype=np.float16)
-    x1_np = np.zeros(MLP_K1, dtype=np.float16)
-    W2_np = np.zeros((MLP_M2, MLP_K2), dtype=np.float16)
-    h_np = np.zeros(MLP_K2, dtype=np.float16)
-    layers_in = [
-        {"W": W1_np, "x": x1_np},
-        {"W": W2_np, "x": h_np},
-    ]
-
-    result_a = compiled_a.run(layers=layers_in)
-    result_b = compiled_b.run(layers=layers_in)
-    result_a2 = compiled_a.run(layers=layers_in)
-
-    assert result_a.cycles is not None and result_a.cycles > 0, (
-        f"layout A returned cycles={result_a.cycles!r}; "
-        f"stdout tail: {result_a.stdout[-400:]}"
-    )
-    assert result_b.cycles is not None and result_b.cycles > 0, (
-        f"layout B returned cycles={result_b.cycles!r}; "
-        f"stdout tail: {result_b.stdout[-400:]}"
-    )
-    # Same compiled artifact -> same cycles (determinism).
-    assert result_a.cycles == result_a2.cycles, (
-        f"same-placement runs differ: {result_a.cycles} vs {result_a2.cycles}"
-    )
+    # SPEC-05 (2026-06-30): the former end-to-end `compiled_{a,b}.run(layers=...)`
+    # assertions exercised the legacy multi-layer GEMV run path, which was DELETED
+    # (all MAC -> GENERIC REDUCE; the `layers=` MLP dispatch is gone). The
+    # placement-carries-into-cmd-stream gate (cmd streams differ + the cost model
+    # differentiates the two placements) above is the keeper assertion; the
+    # run-path cycle count is now covered by the GENERIC REDUCE cells.
 
 
 @pytest.mark.skipif(

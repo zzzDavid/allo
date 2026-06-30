@@ -1,11 +1,14 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""PolyBench 3mm on samsung_hbm_pim -- Tier-1 single-output cell (task 005).
+"""PolyBench covariance on samsung_hbm_pim -- Tier-1 cell.
 
-Thin cell: build the target from `lib`, run the shared `three_mm` workload through
-`lib.cell.run_cell`, record the verdict + cycles + results.json/RESULTS.md +
-COVERAGE.tsv. Declares zero hardware (everything from `lib` + the shared
-workload). Verdict derived from what the run surfaces: Samsung reports cycles only (no output array) -> CYCLES-ONLY at the GEMV design point; a shape the reference sim cannot express -> BLOCKED-SIM.
+Thin cell: build the target from `lib`, run the shared `covariance` workload
+through `lib.cell.run_cell`, record the verdict + cycles + results.json/
+RESULTS.md + COVERAGE.tsv. The @allo.work is the bare GEMM contraction
+`cov_raw = cdata^T @ cdata`; the host mean/centering/normalize/symmetrize runs
+off-device against covariance_np. Samsung surfaces a real `y` only for a
+single-stage bare GEMV at the design point -> a GEMM-shaped emitted stream stays
+CYCLES-ONLY (honest); a shape the reference sim cannot express -> BLOCKED-SIM.
 """
 
 from __future__ import annotations
@@ -14,20 +17,20 @@ from lib import cell, reference
 from lib.shapes import shape
 
 
-_KERNEL = "3mm"
+_KERNEL = "covariance"
 _TARGET = "samsung_hbm_pim"
 _RUN_CMD = (
-    "python -m pytest tests/pim/samsung_hbm_pim/3mm/test_three_mm_samsung_hbm_pim.py "
+    "python -m pytest tests/pim/samsung_hbm_pim/covariance/test_covariance_samsung_hbm_pim.py "
     "-p no:cacheprovider -q"
 )
 
 
-def test_three_mm_samsung_hbm_pim(request):
+def test_covariance_samsung_hbm_pim(request):
     result, verdict, _record = cell.run_cell(
         kernel=_KERNEL, target_name=_TARGET,
         folder=request.path.parent, stages=None, shapes=shape(_KERNEL),
         run_cmd=_RUN_CMD,
-        notes="Tier-1 single-output; Samsung reports cycles only (no output array) -> CYCLES-ONLY at the GEMV design point; a shape the reference sim cannot express -> BLOCKED-SIM.",
+        notes="mean/centering/normalize/symmetrize host-side; on-device = cdata^T@cdata (GEMM nest). GEMM-shaped emitted stream -> CYCLES-ONLY (no W@x match); a shape the reference sim cannot express -> BLOCKED-SIM.",
     )
     # First-class recorded verdict (spec Answer 3), never a skip.
     assert verdict.status in (

@@ -88,6 +88,15 @@ def _compile_expr(node: ast.AST, params: set[str]) -> Any:
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         # -x  =>  0 - x   (keeps the AST simple)
         return PBinOp("sub", PConst(0), _compile_expr(node.operand, params))
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"max", "min"}:
+        # max(x, 0) / min(x, 0) -> binary PBinOp (allo lowers max -> arith.maximumf).
+        if len(node.args) != 2:
+            raise ValueError(f"{node.func.id} in lambda body requires exactly 2 args")
+        return PBinOp(
+            node.func.id,
+            _compile_expr(node.args[0], params),
+            _compile_expr(node.args[1], params),
+        )
     if isinstance(node, ast.Name):
         if node.id in params:
             return PVar(node.id)
@@ -200,6 +209,12 @@ _FP_BINOPS = {
     "arith.muli": "mul",
     "arith.addi": "add",
     "arith.subi": "sub",
+    "arith.maximumf": "max",
+    "arith.minimumf": "min",
+    "arith.maxsi": "max",
+    "arith.maxui": "max",
+    "arith.minsi": "min",
+    "arith.minui": "min",
 }
 
 _LOAD_OPS = {"memref.load", "affine.load"}
@@ -288,7 +303,7 @@ def _trace_value(ssa_name: str, defining_map: dict[str, Any]) -> Any:
 # --------------------------------------------------------------------- #
 
 
-_COMMUTATIVE = {"add", "mul"}
+_COMMUTATIVE = {"add", "mul", "max", "min"}
 
 
 def _unify(pattern, term, bindings: dict[str, Any]) -> bool:

@@ -15,12 +15,14 @@ comments below and report 16 for the design.
 
 from __future__ import annotations
 
+import inspect
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -333,7 +335,7 @@ class SamsungCtx(CodegenContext):
             f"SamsungCtx: unknown handle type {type(handle).__name__}."
         )
 
-    def cmd(self, name, dst=None, src0=None, src1=None):
+    def cmd(self, name, dst=None, src0=None, src1=None, is_relu=0):
         dst_name, dst_idx = self._opd(dst)
         src0_name, src0_idx = self._opd(src0)
         src1_name, src1_idx = self._opd(src1)
@@ -351,6 +353,7 @@ class SamsungCtx(CodegenContext):
                 src1_=src1_name,
                 src1Idx_=src1_idx,
                 isAuto_=is_auto,
+                isRelu_=is_relu,
             )
         )
 
@@ -1588,6 +1591,17 @@ def _resolve_layout(match: MatchedOp, layout: Placement) -> dict[str, Any]:
         if isinstance(handle, Spilled):
             handle = handle.home_handle
         bindings[opb.role] = handle
+    # Inject the store target as role "dst" (and "acc" stays from operands).
+    # result_memref_name is the @allo.work store's `to` memref. Non-accumulating
+    # ops (MUL/ADD/RELU) write a register dst; the placement maps the result
+    # memref to that register the same way it maps inputs. Inert for MAC, whose
+    # accumulate emit reads `acc`, not `dst`.
+    if match.result_memref_name is not None and "dst" not in bindings:
+        dst_handle = layout.placements.get(match.result_memref_name)
+        if dst_handle is not None:
+            if isinstance(dst_handle, Spilled):
+                dst_handle = dst_handle.home_handle
+            bindings["dst"] = dst_handle
     return bindings
 
 
@@ -1659,14 +1673,6 @@ def _emit_inner_loop_jump(
     )
 
 
-def _is_samsung_preload_mov(c: PIMCmd) -> bool:
-    """A GRF<-bank load MOV that opens a work-id (the `LD_A`/`LD_B`
-    preload). Used to delimit per-layer GEMV groups in the run path."""
-    if c.type_ not in ("MOV", "FILL"):
-        return False
-    grf_dst = c.dst_ in ("GRF_A", "GRF_B")
-    bank_src = any(s in ("EVEN_BANK", "ODD_BANK") for s in (c.src0_, c.src1_))
-    return grf_dst and bank_src
 
 
 def _is_samsung_storeback_mov(c: PIMCmd) -> bool:
@@ -1683,6 +1689,11 @@ def _is_samsung_storeback_mov(c: PIMCmd) -> bool:
 def _split_samsung_layers(cmds: list[PIMCmd]) -> list[list[PIMCmd]]:
     """Group a flat Samsung GEMV cmd stream into per-layer (work-id)
     chunks, closed by the storeback MOV that ends each work-id.
+
+    NOTE (SPEC-05, 2026-06-30): the legacy multi-layer GEMV RUN path that consumed
+    this was deleted. It is KEPT because the layer-split + FFN cost-model tests
+    (test_samsung_loop_012, test_samsung_multi_layer_split) assert its behaviour;
+    it is a pure cmd-stream analysis helper (no run-path coupling).
 
     A layer body is `[LD MOV?, (MAC, JUMP)+, ST MOV]`; under lever 1 the
     `(MAC, JUMP)` part repeats once per bank fiber (so we must NOT split
@@ -1842,6 +1853,25 @@ def _schedule_moves(
             _emit_move(target, nm, ctx)
 
 
+def _base_kernel_name(func_name: str, work_id=None) -> str:
+    """Strip the ``_<wid>`` grid-replica suffix from a work func name.
+
+    The grid replicates ONE logical ``@allo.work`` kernel across work-ids by
+    suffixing the func_name with the work_id coords (e.g. ``gemv`` ->
+    ``gemv_0_0``..``gemv_15_7``). Strip that suffix so all grid replicas of one
+    kernel share a base name and collapse to one shared CRF body, while
+    genuinely-distinct kernels (an MLP's ``mlp_layer1`` vs ``mlp_layer2``) stay
+    separate. The number of suffixed coords is ``len(work_id)``.
+    """
+    fn = func_name
+    wid = work_id or ()
+    for coord in reversed(wid):
+        tail = f"_{coord}"
+        if fn.endswith(tail):
+            fn = fn[: -len(tail)]
+    return fn
+
+
 def _walk_and_emit(
     target,
     trace: MatchTrace,
@@ -1964,6 +1994,9 @@ def _walk_and_emit(
                 )
             elif op_obj.accumulates:
                 emit(bindings["x"], bindings["y"], bindings["acc"], ctx)
+            elif len(inspect.signature(op_obj.fn).parameters) == 1:
+                # Unary op (e.g. RELU): single source + store dst.
+                emit(bindings["x"], bindings["dst"], ctx)
             else:
                 emit(bindings["x"], bindings["y"], bindings["dst"], ctx)
             n_emitted = len(ctx.cmds) - before
@@ -1994,20 +2027,7 @@ def _walk_and_emit(
         from .spmw_cost_models import _samsung_workid_count
 
         def _base_kernel(m) -> str:
-            # The grid replicates ONE logical `@allo.work` kernel across
-            # work-ids by suffixing the func_name with the work_id coords
-            # (e.g. `gemv` -> `gemv_0_0`..`gemv_15_7`). Strip that suffix so
-            # all grid replicas of one kernel share a base name and collapse
-            # to one shared CRF body, while genuinely-distinct kernels (an
-            # MLP's `mlp_layer1` vs `mlp_layer2`) stay separate. The number
-            # of suffixed coords is len(work_id).
-            fn = m.func_name
-            wid = m.work_id or ()
-            for coord in reversed(wid):
-                tail = f"_{coord}"
-                if fn.endswith(tail):
-                    fn = fn[: -len(tail)]
-            return fn
+            return _base_kernel_name(m.func_name, m.work_id)
 
         # Group buckets by base kernel, preserving first-seen order. Grid
         # replicas of one kernel share a body; distinct kernels do not.
@@ -2044,11 +2064,16 @@ def _walk_and_emit(
                 and len(k_buckets) > 1
                 and len(k_buckets) != expected
             ):
-                raise ValueError(
+                # Gap-1: advisory, not fatal. The trigger schedule above used
+                # the observed bucket count as authored; warn on mismatch so a
+                # mispriced grid surfaces without blocking the compile.
+                warnings.warn(
                     "samsung shared-CRF: single-kernel trace has "
                     f"{len(k_buckets)} work-id buckets but target geometry "
                     f"yields {expected} (unit-tree fanout product); the "
-                    "shared-CRF trigger schedule would be mispriced."
+                    "shared-CRF trigger schedule may be mispriced. Proceeding "
+                    "with the authored work-id count.",
+                    stacklevel=2,
                 )
         return
 
@@ -2220,169 +2245,293 @@ def _write_samsung_cmds(path: Path, cmds: list[PIMCmd]) -> None:
             f.write(" ".join(parts) + "\n")
 
 
-def _run_samsung_one(
-    driver: Path,
-    root: Path,
-    cmd_subset: list[PIMCmd],
-    layer_input: dict,
-    np_mod,
-    layer_idx: int = 0,
-) -> tuple[int, str]:
-    """SPEC-020: invoke pim_driver for a single GEMV layer.
 
-    Used by the multi-layer branch of `_run_samsung` (one call per MLP
-    layer). Returns `(cycles, combined_stdout)`. The single-layer
-    back-compat path in `_run_samsung` does not go through here -- it
-    keeps the inlined logic so callers that pass a single-MAC stream
-    see identical behaviour to pre-SPEC-020.
+
+def _samsung_num_pim_blocks(compiled) -> int:
+    """Inner `pim`-unit fanout (num PIM blocks per pseudo-channel) for the
+    Samsung tile-size derivation. Read off the unit tree's innermost mapping
+    factor (8 for the canonical fixture); falls back to 8 when unavailable so
+    elems_per_tile never collapses to a sub-tile size."""
+    try:
+        factors, _ = compiled.target.work_grid()
+        if factors:
+            return factors[-1]
+    except Exception:  # noqa: BLE001
+        pass
+    return 8
+
+
+def _samsung_read_generic_outbin(out_path, n):
+    """Flat fp16 readback for the GENERIC (ELTWISE) interpreter path: read `n`
+    fp16 elements from out.bin, NO reduce-sum (unlike the REDUCE readback's
+    per-element 16-lane tree reduction). Returns {"out": <fp32 array>} or {} when
+    the blob is absent/empty/all-zero (CYCLES-ONLY graceful fallback)."""
+    p = Path(out_path)
+    if not p.exists():
+        return {}
+    import numpy as np
+    raw = np.fromfile(str(p), dtype=np.float16)
+    if raw.size == 0:
+        return {}
+    out = raw[:n].astype(np.float32)
+    if not np.any(out):
+        return {}
+    return {"out": out}
+
+
+# SPEC-04: the PIMSimulator physical fabric row-tile = num_total_pim_blocks_ *
+# num_grfB_ = (64 channels * 8 PIM blocks) * 8 GRF_B = 4096. preloadGemv packs the
+# weight assuming M is a multiple of this (the y-loop strides output_tile_size =
+# num_grfB_*num_total_pim_blocks_); an M below it underfills the GRF_B slots and
+# reads OOB weight rows. The REDUCE run path pads A's rows up to this multiple
+# (zeros) and slices the real M back from the readback. It is a PIMSimulator
+# config constant (NUM_PIM_BLOCKS=8, 64 chans hardcoded in pim_driver make_kernel,
+# NUM_GRF=8), not a workload literal.
+_SAMSUNG_FABRIC_ROW_TILE = 4096
+
+# SPEC-04: pad the reduction extent K up to a multiple of this so computeGemv's
+# input-tile split (num_input_tiles = ceil(ceil(K/16)/8)) yields >= 2 tiles and
+# engages both even and odd banks. K below 256 (num_input_tiles==1) degenerates:
+# the odd bank's JUMP counter underflows and getResultColGemv's end_col collapses,
+# leaving the output undrained. 256 elems = 16 bursts = 2 input tiles. Zero-padding
+# K leaves A@B unchanged.
+_SAMSUNG_REDUCE_K_TILE = 256
+
+
+
+
+def _samsung_reduce_partition(compiled, inputs):
+    """SPEC-05 §2.1: derive the MAPPING-DRIVEN partition for a GENERIC_REDUCE run.
+
+    Returns `(ROWS, n_workids, K, N, M_real)`:
+      - ROWS      = per-PE output-row slice = bound(MAC enclosing_loops[-3]) for a
+                    3-deep slice nest [i(ROWS), j(N), k(K)], or [-2] for a 2-deep
+                    GEMV slice [i(ROWS), k(K)]. This is the partition primitive --
+                    it tracks `mapping` (a different mapping -> a different ROWS).
+      - n_workids = number of MAC work-id buckets = the realized PE count
+                    (= prod(mapping) once the dataflow expander materializes the
+                    grid). Cross-checked against target.work_grid()[1].
+      - K, N      = contraction / output-col loop bounds.
+      - M_real    = the true logical output rows = the operand A.shape[0] (the
+                    un-padded P); M_logical = ROWS * n_workids is the partition's
+                    total (>= M_real when the grid over-covers, e.g. P<128).
+
+    The PARTITION (ROWS, n_workids) is the trace's, NOT operand-shape tiling:
+    partition flows mapping -> trace -> codegen. Operand arrays still supply data
+    + the ground-truth K/N for the zero-pad. Returns None when no MAC match.
     """
-    W = layer_input.get("W")
-    if W is None:
-        W = layer_input.get("weight")
-    x = layer_input.get("x")
-    if x is None:
-        x = layer_input.get("in")
-    if W is None or x is None:
-        raise ValueError(
-            f"Samsung layer {layer_idx}: each entry in layers=[...] "
-            "must provide W and x (or weight/in) arrays"
+    import numpy as np
+
+    trace = getattr(compiled, "trace", None)
+    if trace is None:
+        return None
+    macs = [m for m in trace.matches if m.target_op_name == "MAC"]
+    if not macs or not macs[0].enclosing_loops:
+        return None
+    mac = macs[0]
+    depth = len(mac.enclosing_loops)
+    K = _parse_loop_bound(mac.enclosing_loops[-1][2])
+    if K is None:
+        return None
+    if depth >= 3:
+        ROWS = _parse_loop_bound(mac.enclosing_loops[-3][2])
+        N = _parse_loop_bound(mac.enclosing_loops[-2][2])
+    elif depth == 2:
+        ROWS = _parse_loop_bound(mac.enclosing_loops[-2][2])
+        N = 1
+    else:
+        ROWS, N = 1, 1
+    if ROWS is None or N is None:
+        return None
+
+    # n_workids = MAC work-id bucket count (the realized PE grid). Cross-check
+    # against the declared grid; warn (gap-1 discipline), do not raise.
+    buckets = [b for b in _bucket_by_work_id(trace)
+               if any(m.target_op_name == "MAC" for m in b[1])]
+    n_workids = len(buckets)
+    try:
+        declared = compiled.target.work_grid()[1]
+        if n_workids != declared:
+            warnings.warn(
+                f"Samsung REDUCE partition: trace has {n_workids} MAC work-id "
+                f"buckets but target.work_grid() declares {declared} PEs; using "
+                f"the trace count (mapping-driven).",
+                stacklevel=2,
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    if n_workids <= 0:
+        n_workids = 1
+
+    # M_real (the un-padded logical rows) from the operand; cross-check vs the
+    # partition product (ROWS * n_workids) -- a mismatch beyond the grid pad is
+    # advisory (the operand may legitimately be padded to the grid by the harness).
+    a = inputs.get("A")
+    if a is None:
+        a = inputs.get("a")
+    M_real = None
+    if a is not None:
+        a = np.asarray(a)
+        if a.ndim == 2:
+            M_real = int(a.shape[0])
+    M_logical = int(ROWS) * int(n_workids)
+    if M_real is None:
+        M_real = M_logical
+    elif M_real > M_logical:
+        warnings.warn(
+            f"Samsung REDUCE partition: operand rows {M_real} exceed the grid "
+            f"partition ROWS*n_workids = {ROWS}*{n_workids} = {M_logical}; the "
+            f"grid under-covers the operand (check mapping/ROWS).",
+            stacklevel=2,
         )
-    W = np_mod.asarray(W, dtype=np_mod.float16)
-    x = np_mod.asarray(x, dtype=np_mod.float16)
-    # SPEC-020 §2.5: see comment in `_run_samsung` GEMV branch.
-    if x.ndim == 1:
-        x = x.reshape(1, -1)
+    return (int(ROWS), int(n_workids), int(K), int(N), int(M_real))
+
+
+def _samsung_read_reduce_outbin(out_path, M, N, m_pad):
+    """SPEC-04 §4.3: REDUCE readback. The driver writes M_pad*N partial-sum bursts
+    (16 lanes each), drained N-pass-major: pass n's M_pad outputs, then pass n+1's.
+    So the blob reshapes (N, M_pad, 16) -> sum the 16 lanes -> (N, M_pad) -> .T ->
+    (M_pad, N) -> slice [:M, :N]. For GEMV (N==1) this collapses to (M,). Graceful:
+    empty/all-zero -> {} (CYCLES-ONLY), mirroring the GEMV readback contract.
+    Surfaces "out" (GEMM, (M, N)) or "y" (GEMV, (M,)) so the harness finds it."""
+    p = Path(out_path)
+    if not p.exists():
+        return {}
+    import numpy as np
+
+    raw = np.fromfile(str(p), dtype=np.float16)
+    need = m_pad * N * 16
+    if raw.size < need:
+        return {}
+    partials = raw[:need].reshape(-1, 16).astype(np.float32).sum(axis=1)  # (N*m_pad,)
+    grid = partials.reshape(N, m_pad).T[:M, :N]                            # (M, N)
+    if not np.any(grid):
+        return {}
+    if N == 1:
+        return {"y": grid.reshape(-1)}
+    return {"out": grid}
+
+
+def _samsung_run_reduce_driver(weight, vec, M, K, N):
+    """SPEC-04 cross-stage core: run ONE GENERIC REDUCE contraction `weight @ vec`
+    on real PIMSimulator and return `(readback_ndarray, cycles)`.
+
+    `weight` is the (M, K) bank-resident operand (already transposed by the caller
+    for an A^T stage); `vec` is the (K,) GEMV input or (K, N) GEMM second operand.
+    Pads K to a multiple of 256 and M to the fabric row-tile (zeros, leaving the
+    contraction unchanged), runs the driver, tree-reduces the 16-lane partial sums,
+    and slices [:M, :N]. Returns `(C, cycles)` where C is (M,) for N==1 else (M, N);
+    `(None, cycles)` if the readback is empty/all-zero; `(None, None)` if the driver
+    is unavailable. This is the reusable engine behind both the single-stage
+    GENERIC_REDUCE run path and `samsung_reduce_chain` (multi-stage threading)."""
+    import numpy as np
+
+    root = _pimsim_root()
+    driver = root / "pim_driver"
+    if not driver.exists():
+        return None, None
+
+    M, K, N = int(M), int(K), int(N)
+    weight = np.asarray(weight, dtype=np.float16).reshape(M, K)
+    if N > 1:
+        second = np.asarray(vec, dtype=np.float16).reshape(K, N)
+    else:
+        second = np.asarray(vec, dtype=np.float16).reshape(K, 1)
+
+    k_tile = _SAMSUNG_REDUCE_K_TILE
+    k_pad = ((K + k_tile - 1) // k_tile) * k_tile
+    if k_pad != K:
+        w_k = np.zeros((M, k_pad), dtype=np.float16)
+        w_k[:, :K] = weight
+        weight = w_k
+        s_k = np.zeros((k_pad, second.shape[1]), dtype=np.float16)
+        s_k[:K] = second
+        second = s_k
+    tile = _SAMSUNG_FABRIC_ROW_TILE
+    m_pad = ((M + tile - 1) // tile) * tile
+    w_pad = np.zeros((m_pad, k_pad), dtype=np.float16)
+    w_pad[:M] = weight
+    k_bursts = ((k_pad // 16) + 7) // 8
 
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
+        a_path = td_path / "A.npy"
+        b_path = td_path / "B.npy"
         out_path = td_path / "out.bin"
-        w_path = td_path / "W.npy"
-        x_path = td_path / "x.npy"
-        cmds_path = td_path / "cmds.txt"
-        np_mod.save(w_path, W)
-        np_mod.save(x_path, x)
-        _write_samsung_cmds(cmds_path, cmd_subset)
-
+        crf_path = td_path / "reduce.crf"
+        np.save(a_path, w_pad)
+        np.save(b_path, second)
+        # The REDUCE path rebuilds the canonical GEMV CRF internally (matched JUMP
+        # counters), but the driver's GENERIC parser still requires a non-empty
+        # CRF. Supply a minimal MAC body; its JUMP counter is inert for REDUCE.
+        crf_path.write_text(
+            "MAC dst=GRF_B src0=GRF_A src1=EVEN_BANK is_auto=1\n"
+            "JUMP loop_counter=0 loop_offset=2\n"
+            "MAC dst=GRF_B src0=GRF_A src1=ODD_BANK is_auto=1\n"
+            "JUMP loop_counter=0 loop_offset=2\n"
+            "MOV dst=ODD_BANK src0=GRF_B\n"
+        )
         argv = [
-            str(driver),
-            "--op", "GEMV",
-            "--out", str(out_path),
-            "--weight", str(w_path),
-            "--in", str(x_path),
-            "--output-dim", str(W.shape[0]),
-            "--input-dim", str(W.shape[1]),
-            "--cmds", str(cmds_path),
-            # SPEC-021 task 025: faithful run path -- issued PIM transactions
-            # track the emitted cmd stream, so a better/worse stream costs
-            # fewer/more cycles under the same accounting for native and Tenon.
-            "--faithful",
+            str(driver), "--op", "GENERIC", "--op-kind", "REDUCE",
+            "--crf", str(crf_path), "--out", str(out_path),
+            "--inputs", f"{a_path},{b_path}",
+            "--out-rows", str(m_pad), "--out-cols", str(N),
+            "--reduce-k", str(k_pad), "--num-tiles", "1", "--bank-type", "ALL",
+            "--roles",
+            f"A:0:0:2:0:0:0:{k_bursts},B:0:0:2:0:0:0:0,out:0:0:1:1:0:8:0",
         ]
-
         try:
             proc = subprocess.run(
-                argv,
-                capture_output=True,
-                cwd=str(root),
-                timeout=600,
-                check=False,
+                argv, capture_output=True, cwd=str(root), timeout=600, check=False
             )
         except (subprocess.SubprocessError, OSError) as exc:
             raise RuntimeError(
-                f"Samsung pim_driver invocation failed (layer {layer_idx}): {exc}"
+                f"Samsung pim_driver REDUCE invocation failed: {exc}"
             ) from exc
-
-        stdout = proc.stdout.decode("utf-8", errors="replace")
-        stderr = proc.stderr.decode("utf-8", errors="replace")
-        combined = stdout + ("\n" + stderr if stderr else "")
+        combined = proc.stdout.decode("utf-8", "replace") + proc.stderr.decode(
+            "utf-8", "replace"
+        )
         m = re.search(r"PIM_CYCLES total=(\d+)", combined)
         if not m:
             raise RuntimeError(
-                f"Samsung pim_driver returned but stdout missing "
-                f"'PIM_CYCLES total=...' line (layer {layer_idx}); "
-                f"tail: {combined[-400:]}"
+                "Samsung REDUCE driver missing PIM_CYCLES; tail: " + combined[-400:]
             )
-        # SPEC-004b: read this layer's out.bin while the tempdir is still alive
-        # (the multi-layer caller surfaces the FINAL layer's outputs). Additive;
-        # cycles (parsed above) untouched.
-        outputs = _samsung_read_gemv_outbin(out_path, "GEMV")
-        return int(m.group(1)), combined, outputs
+        cycles = int(m.group(1))
+        outputs = _samsung_read_reduce_outbin(out_path, M, N, m_pad)
+    if not outputs:
+        return None, cycles
+    arr = outputs.get("out")
+    if arr is None:
+        arr = outputs.get("y")
+    return np.asarray(arr), cycles
 
 
-def _samsung_read_gemv_outbin(out_path, kernel: str) -> dict:
-    """SPEC-004b additive readback: surface the GEMV result `pim_driver` already
-    wrote to `out_path` (the `--out` file) as `{"y": <fp16 array>}`.
-
-    The driver writes `output_dim` bursts of 16 fp16 partial sums each
-    ("GEMV packs 16 partial sums per burst; caller tree-reduces" --
-    src/pim_driver.cc:349); the functional result is the per-row tree-reduction
-    (sum across the 16 lanes). At the M=4096 design point this matches `W @ x`
-    to fp16 tolerance; off the design point `computeGemv` leaves the read region
-    zero (an all-zero blob), which is NOT a functional result -- so we surface
-    `y` only when the blob is non-trivial. Graceful in every other case
-    (non-GEMV op, absent file, empty/zero blob) -> returns {} and the cell
-    stays CYCLES-ONLY. This is pure post-run file I/O: no cycle re-parse, no
-    driver re-run, no command-stream change.
-    """
-    if kernel != "GEMV":
-        return {}
-    try:
-        p = Path(out_path)
-        if not p.exists():
-            return {}
-        import numpy as np
-
-        raw = np.fromfile(str(p), dtype=np.float16)
-        if raw.size == 0 or raw.size % 16 != 0:
-            return {}
-        # (output_dim, 16) partial sums -> per-row tree-reduce across lanes.
-        y = raw.reshape(-1, 16).astype(np.float32).sum(axis=1)
-        # Off-design (small-shape) runs leave the read region all-zero; that is
-        # not a functional result -- do not surface a spurious zero output.
-        if not np.any(y):
-            return {}
-        return {"y": y}
-    except (OSError, ValueError):
-        # A readback hiccup never fails the run; the cell falls back to
-        # CYCLES-ONLY (prior behaviour).
-        return {}
+def run_samsung_reduce(weight, vec, M, K, N):
+    """Public entry for the harness cross-stage chain: run one Samsung GENERIC
+    REDUCE contraction `weight @ vec` and return `(readback_ndarray, cycles)`.
+    See `_samsung_run_reduce_driver`. The caller owns the numpy reference and any
+    host pre/post-pass (alpha/beta, transpose, centering)."""
+    return _samsung_run_reduce_driver(weight, vec, M, K, N)
 
 
-def _samsung_plain_gemv_rerun(driver, root, td_path, w_path, x_path,
-                              output_dim: int, input_dim: int) -> dict:
-    """SPEC-005d dual-run: a SECOND, plain `executeGemv` invocation (the same
-    GEMV argv WITHOUT `--cmds`/`--faithful`) of the same workload/shape, for the
-    functional output the cycle-accurate faithful run does not populate.
-
-    Returns `_samsung_read_gemv_outbin` of the plain run's out.bin (the
-    tree-reduced `y`), or `{}` when the plain run errs / writes no functional
-    output (off-design shape, sim core) -> the caller keeps CYCLES-ONLY. The
-    cycle number is NOT touched here; this run is correctness-only. Reuses the
-    SAME W.npy/x.npy the faithful run wrote (same real inputs)."""
-    out_plain = td_path / "out_plain.bin"
-    argv = [
-        str(driver), "--op", "GEMV", "--out", str(out_plain),
-        "--weight", str(w_path), "--in", str(x_path),
-        "--output-dim", str(output_dim), "--input-dim", str(input_dim),
-    ]  # NO --cmds / --faithful: the plain executeGemv path that populates out.bin
-    try:
-        subprocess.run(argv, capture_output=True, cwd=str(root),
-                       timeout=600, check=False)
-    except (subprocess.SubprocessError, OSError):
-        return {}
-    return _samsung_read_gemv_outbin(out_plain, "GEMV")
 
 
 def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
     """Run a compiled Samsung HBM-PIM artifact via `pim_driver`.
 
-    Wire protocol (SPEC-005): the emitted PIMCmd stream is serialised
-    to a line-delimited `cmds.txt` file in the temp dir and passed via
-    ``pim_driver --cmds <path>``. The C++ side uses that as the CRF
-    microcode (uploaded by `programCrf`) instead of regenerating it via
-    `PIMCmdGen::getPIMCmds`. The legacy ``--op <kernel>`` flag is still
-    passed so the driver knows which data-path scaffolding (eltwise vs
-    GEMV) and which numpy inputs to wire up; the kernel choice no longer
-    determines the CRF program (placement does).
+    SPEC-05 routing (legacy GEMV/ADD/MUL/RELU paths DELETED, 2026-06-30): a MAC
+    kernel routes to the mapping-driven GENERIC REDUCE conductor; everything else
+    routes to the GENERIC ELTWISE conductor. There is no dedicated --op
+    GEMV/ADD/MUL/RELU branch and no multi-layer GEMV split.
+
+    Wire protocol (SPEC-005): for the GENERIC ELTWISE path the emitted PIMCmd
+    stream is serialised to a line-delimited `cmds.txt` and passed via
+    ``pim_driver --cmds <path>``; the C++ side uses it as the CRF microcode
+    (uploaded by `programCrf`) instead of regenerating it via
+    `PIMCmdGen::getPIMCmds`. The static ``--op`` choice only selects which numpy
+    inputs to wire up; the kernel choice no longer determines the CRF program
+    (placement does). The GENERIC REDUCE path supplies its own minimal --crf
+    (rebuilt canonical GEMV body) and does not pass --cmds.
 
     Line-delimited cmd format:
         MAC dst=GRF_B src0=GRF_A src1=EVEN_BANK is_auto=1
@@ -2405,14 +2554,20 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
     # The choice of which scaffolding to use is inferred from MAC-vs-eltwise
     # opcodes in the emitted stream.
     op_types = {c.type_ for c in compiled.cmds if isinstance(c, PIMCmd)}
-    if "MAC" in op_types:
-        kernel = "GEMV"
-    elif "MUL" in op_types:
-        kernel = "MUL"
-    elif "ADD" in op_types:
-        kernel = "ADD"
+    # Legacy single-kernel shapes keep their dedicated C++ data-path (frozen):
+    #   MAC-only -> GEMV; MUL-only -> MUL; ADD-only -> ADD; RELU(MOV is_relu)-only
+    #   -> RELU. Anything else (multiple distinct compute opcodes, fused MAC+ADD,
+    #   multi-store polybench kernels) routes to the faithful GENERIC interpreter.
+    compute_types = op_types & {"MAC", "MUL", "ADD", "RELU"}
+    # SPEC-05 routing (legacy GEMV/ADD/MUL/RELU paths DELETED, user-approved
+    # 2026-06-30): every MAC kernel routes to the mapping-driven GENERIC REDUCE
+    # conductor (a plain GEMV is N=1); everything else (eltwise MUL/ADD/RELU,
+    # multi-opcode, fused) routes to the faithful GENERIC ELTWISE conductor. There
+    # is no dedicated --op GEMV/ADD/MUL/RELU branch and no multi-layer GEMV split.
+    if compute_types == {"MAC"}:
+        kernel = "GENERIC_REDUCE"
     else:
-        kernel = "RELU"
+        kernel = "GENERIC"
 
     # numpy is a hard Tenon dependency; "no numpy" is a setup bug, not
     # an env skip -- let the ImportError propagate.
@@ -2440,153 +2595,191 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
         return True
 
     pim_cmds_raw = [c for c in compiled.cmds if isinstance(c, PIMCmd)]
-
-    # SPEC-020: detect multi-layer GEMV streams. `pim_driver` accepts one
-    # GEMV per invocation, so a cmd stream covering >1 layer (e.g. an MLP)
-    # must be split into per-layer groups dispatched as separate driver
-    # calls, cycles summed. A layer boundary is the storeback MOV that
-    # closes each work-id; this stays correct under lever 1 (one layer's
-    # body holds several MAC+JUMP pairs -- splitting at JUMP would cut a
-    # dual-fiber layer in two) and under lever 2 (host residency omits the
-    # opening preload MOV, so the storeback is the residency-robust
-    # delimiter). We split on the RAW stream so the storeback MOV is still
-    # present, then drop the ISA-invalid storebacks per group.
-    raw_groups = _split_samsung_layers(pim_cmds_raw)
-    groups = [[c for c in g if _crf_valid(c)] for g in raw_groups]
+    # ISA-valid filter (drop the ST_A/ST_B storeback MOVs the C++ validationCheck
+    # rejects) -> the cmd stream that reaches programCrf via --cmds for the GENERIC
+    # ELTWISE path. (The GENERIC_REDUCE path supplies its own minimal CRF and
+    # ignores this; see its argv branch.)
     pim_cmds_all = [c for c in pim_cmds_raw if _crf_valid(c)]
-    multi_layer = kernel == "GEMV" and len(groups) > 1
-
-    if multi_layer:
-        layers = inputs.get("layers")
-        if layers is None:
-            # Back-compat escape: `compiled.run()` with no kwargs (e.g.
-            # `test_run_returns_runresult_for_all_backends`) must keep
-            # returning cycles=None rather than raise.
-            return RunResult(
-                cycles=None,
-                stdout=(
-                    "Samsung: multi-layer cmd stream needs layers=[...] kwarg "
-                    f"({len(groups)} GEMV layers detected)"
-                ),
-                backend="samsung_hbm_pim",
-            )
-        if len(layers) != len(groups):
-            raise ValueError(
-                f"Samsung: {len(groups)} MAC groups in cmd stream but "
-                f"{len(layers)} layers= entries"
-            )
-        total_cycles = 0
-        combined_parts: list[str] = []
-        final_outputs: dict = {}
-        for i, (grp, layer_in) in enumerate(zip(groups, layers)):
-            cyc, out, layer_outputs = _run_samsung_one(
-                driver, root, grp, layer_in, np, layer_idx=i
-            )
-            total_cycles += cyc
-            combined_parts.append(out)
-            final_outputs = layer_outputs  # terminal layer's output is the result
-        extra = {"kernel": kernel, "n_layers": len(groups)}
-        if final_outputs:
-            extra["outputs"] = final_outputs
-        return RunResult(
-            cycles=total_cycles,
-            stdout="\n--- next layer ---\n".join(combined_parts),
-            backend="samsung_hbm_pim",
-            extra=extra,
-        )
 
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
         out_path = td_path / "out.bin"
-        argv = [str(driver), "--op", kernel, "--out", str(out_path)]
+        # SPEC-04 §3.2: GENERIC_REDUCE is not a new --op; it reuses --op GENERIC
+        # with --op-kind REDUCE (added in the branch below). All other kernels map
+        # their name 1:1 to --op.
+        op_arg = "GENERIC" if kernel == "GENERIC_REDUCE" else kernel
+        argv = [str(driver), "--op", op_arg, "--out", str(out_path)]
+        # REDUCE state threaded to the readback (set in the GENERIC_REDUCE branch).
+        reduce_shape = None  # (M, K, N, m_pad)
 
-        if kernel == "GEMV":
-            W = inputs.get("W")
-            if W is None:
-                W = inputs.get("weight")
-            x = inputs.get("x")
-            if x is None:
-                x = inputs.get("in")
-            if W is None or x is None:
-                # SPEC-001 §6 escape: tests/spmw/test_run.py's
-                # `test_run_returns_runresult_for_all_backends` calls
-                # compiled.run() with no kwargs and expects cycles=None;
-                # keep this branch returning cycles=None for backward
-                # compat. Flagged for PR review.
+        if kernel == "GENERIC_REDUCE":
+            # SPEC-05 §2: MAPPING-DRIVEN genuine fp16 matmul via --op GENERIC
+            # --op-kind REDUCE. The PARTITION (per-PE slice ROWS, PE count
+            # n_workids) comes from the TRACE (the work-id buckets + the MAC slice
+            # loop bound), NOT from operand-shape tiling: partition flows
+            # mapping -> trace -> codegen. M_logical = ROWS * n_workids; operands
+            # supply data + ground-truth K/N. A is padded to the logical grid
+            # (n_workids*ROWS) then to the physical fabric tile; --num-tiles =
+            # ceil(M_logical/4096) tiles the logical grid across fabric tiles.
+            part = _samsung_reduce_partition(compiled, inputs)
+            if part is None:
                 return RunResult(
                     cycles=None,
-                    stdout="GEMV needs W and x kwargs",
+                    stdout="Samsung GENERIC_REDUCE: no MAC partition in trace",
                     backend="samsung_hbm_pim",
                 )
-            W = np.asarray(W, dtype=np.float16)
-            x = np.asarray(x, dtype=np.float16)
-            # SPEC-020 §2.5: a 1D x of shape (K,) makes Burst.h::loadFp16
-            # emit bShape=[ceil(K/16)], which executeGemv reads as
-            # num_batch=ceil(K/16) -- i.e. the GEMV runs ceil(K/16) times.
-            # The canonical Samsung fixture (data/gemv/gen_gemv.py:34)
-            # stores x as (1, K) so num_batch=1. Match that contract.
-            if x.ndim == 1:
-                x = x.reshape(1, -1)
-            w_path = td_path / "W.npy"
-            x_path = td_path / "x.npy"
-            np.save(w_path, W)
-            np.save(x_path, x)
-            argv += [
-                "--weight", str(w_path),
-                "--in", str(x_path),
-                "--output-dim", str(W.shape[0]),
-                "--input-dim", str(W.shape[1]),
-            ]
-        elif kernel in ("ADD", "MUL"):
-            a = inputs.get("a")
-            if a is None:
-                a = inputs.get("in0")
-            b = inputs.get("b")
-            if b is None:
-                b = inputs.get("in1")
-            if a is None or b is None:
-                raise ValueError(
-                    f"Samsung {kernel} needs a/b (or in0/in1) kwargs"
+            ROWS, n_workids, K, N, M_real = part
+            M_logical = ROWS * n_workids
+            # Operand arrays (real A/B/x). Accept A/B, a/b, x/in role names.
+            A = inputs.get("A")
+            if A is None:
+                A = inputs.get("a")
+            B = inputs.get("B")
+            if B is None:
+                B = inputs.get("b")
+            xv = inputs.get("x")
+            if xv is None:
+                xv = inputs.get("in")
+            if A is None:
+                return RunResult(
+                    cycles=None,
+                    stdout="Samsung GENERIC_REDUCE needs A (and B for GEMM / x "
+                    "for GEMV) kwargs",
+                    backend="samsung_hbm_pim",
                 )
-            a = np.asarray(a, dtype=np.float16).reshape(-1)
-            b = np.asarray(b, dtype=np.float16).reshape(-1)
-            a_path = td_path / "a.npy"
-            b_path = td_path / "b.npy"
-            np.save(a_path, a)
-            np.save(b_path, b)
-            argv += [
-                "--in0", str(a_path),
-                "--in1", str(b_path),
-                "--n", str(a.size),
-            ]
-        else:  # RELU
-            a = inputs.get("a")
-            if a is None:
-                a = inputs.get("in0")
-            if a is None:
-                raise ValueError(
-                    "Samsung RELU needs a (or in0) kwarg"
+            A = np.asarray(A, dtype=np.float16).reshape(int(M_real), int(K))
+            # The second operand: B[K,N] (GEMM) or x[K] (GEMV).
+            if N > 1:
+                if B is None:
+                    return RunResult(
+                        cycles=None,
+                        stdout="Samsung GENERIC_REDUCE GEMM needs B kwarg",
+                        backend="samsung_hbm_pim",
+                    )
+                second = np.asarray(B, dtype=np.float16).reshape(int(K), int(N))
+            else:
+                src = B if B is not None else xv
+                if src is None:
+                    return RunResult(
+                        cycles=None,
+                        stdout="Samsung GENERIC_REDUCE GEMV needs x (or B) kwarg",
+                        backend="samsung_hbm_pim",
+                    )
+                second = np.asarray(src, dtype=np.float16).reshape(int(K), 1)
+            # Partition-provenance assertion (SPEC-05 §2.3): M_logical is the grid
+            # product; the operand's real rows must fit within it (the harness pads
+            # the operand to the grid).
+            if M_real > M_logical:
+                warnings.warn(
+                    f"Samsung GENERIC_REDUCE: operand rows {M_real} exceed the "
+                    f"mapping partition ROWS*n_workids = {ROWS}*{n_workids} = "
+                    f"{M_logical}; the grid under-covers (check mapping).",
+                    stacklevel=2,
                 )
-            a = np.asarray(a, dtype=np.float16).reshape(-1)
-            a_path = td_path / "a.npy"
-            np.save(a_path, a)
-            argv += ["--in0", str(a_path), "--n", str(a.size)]
+            # Pad K up to a multiple of _SAMSUNG_REDUCE_K_TILE (256) so computeGemv's
+            # input-tile split engages both even and odd banks cleanly (K<256 /
+            # odd num_input_tiles degenerates -- zero-padding K leaves A@B unchanged).
+            k_tile = _SAMSUNG_REDUCE_K_TILE
+            k_pad = ((int(K) + k_tile - 1) // k_tile) * k_tile
+            # Pad A's rows: first to the LOGICAL grid (n_workids*ROWS = M_logical,
+            # so the partition divides evenly), then to the PHYSICAL fabric tile
+            # (preloadGemv requires it). The two pads compose (logical <= physical
+            # for SMALL/milestone). The readback slices [:M_real, :N].
+            tile = _SAMSUNG_FABRIC_ROW_TILE
+            m_pad = ((int(M_logical) + tile - 1) // tile) * tile
+            A_pad = np.zeros((m_pad, k_pad), dtype=np.float16)
+            A_pad[: int(M_real), : int(K)] = A      # zero-fill grid pad + K pad
+            second_pad = np.zeros((k_pad, second.shape[1]), dtype=np.float16)
+            second_pad[: int(K)] = second
+            second = second_pad
+            a_path = td_path / "A.npy"
+            b_path = td_path / "B.npy"
+            np.save(a_path, A_pad)
+            np.save(b_path, second)
+            # k_bursts on the weight role = ceil(K_pad_bursts/8); the C++ derives
+            # the JUMP counters itself from the weight shape (advisory here).
+            k_bursts = ((k_pad // 16) + 7) // 8
+            # --num-tiles tiles the LOGICAL grid across physical fabric tiles
+            # (derived from the partition, not hardcoded 1). For M_logical <= 4096
+            # this is 1 (the whole grid fits one fabric tile).
+            num_tiles = ((m_pad + tile - 1) // tile)
+            # The REDUCE path rebuilds the canonical GEMV CRF internally from the
+            # weight shape (matched JUMP counters), so the EMITTED cmd stream is
+            # irrelevant -- and a slice-form workload's emitted stream is
+            # prod(mapping)*body cmds (e.g. 512 for the 128-PE grid), which would
+            # trip the conductor's 32-cmd cap. Pass a minimal MAC CRF (inert for
+            # REDUCE) and SKIP the emitted --cmds block below.
+            crf_path = td_path / "reduce.crf"
+            crf_path.write_text(
+                "MAC dst=GRF_B src0=GRF_A src1=EVEN_BANK is_auto=1\n"
+                "JUMP loop_counter=0 loop_offset=2\n"
+                "MAC dst=GRF_B src0=GRF_A src1=ODD_BANK is_auto=1\n"
+                "JUMP loop_counter=0 loop_offset=2\n"
+                "MOV dst=ODD_BANK src0=GRF_B\n"
+            )
+            argv += [
+                "--inputs", f"{a_path},{b_path}",
+                "--crf", str(crf_path),
+                "--op-kind", "REDUCE",
+                "--out-rows", str(m_pad),
+                "--out-cols", str(int(N)),
+                "--reduce-k", str(k_pad),
+                "--num-tiles", str(num_tiles),
+                "--bank-type", "ALL",
+                "--roles",
+                f"A:0:0:2:0:0:0:{k_bursts},B:0:0:2:0:0:0:0,out:0:0:1:1:0:8:0",
+            ]
+            # readback slices the REAL P (M_real), not the grid/fabric pad.
+            reduce_shape = (int(M_real), int(K), int(N), m_pad)
+        else:  # GENERIC -- faithful multi-opcode interpreter (spec 01 §4)
+            # Flat-CLI contract (§5.1): role .npy paths joined comma-separated
+            # in role order, one flat fp16 out.bin, --num-tiles derived from
+            # the operand size (never a shape literal). No --faithful: GENERIC
+            # is always faithful (spec 01 §5.1).
+            generic_inputs = {
+                k: v for k, v in inputs.items()
+                if v is not None and k not in ("layers",)
+            }
+            if not generic_inputs:
+                # Back-compat: compiled.run() with no kwargs returns cycles=None.
+                return RunResult(
+                    cycles=None,
+                    stdout="Samsung GENERIC needs operand kwargs",
+                    backend="samsung_hbm_pim",
+                )
+            in_paths = []
+            generic_n = None
+            for ri, (rname, rval) in enumerate(generic_inputs.items()):
+                arr = np.asarray(rval, dtype=np.float16).reshape(-1)
+                if generic_n is None:
+                    generic_n = int(arr.size)
+                rp = td_path / f"in{ri}.npy"
+                np.save(rp, arr)
+                in_paths.append(str(rp))
+            # elems_per_tile = 16 lanes x 8 GRF x num_pim_blocks; derive
+            # num_tiles from the operand size (spec 01 §4.3 / §5.2). Fall back
+            # to 1 tile for sub-tile operands.
+            elems_per_tile = 16 * 8 * _samsung_num_pim_blocks(compiled)
+            num_tiles = max(1, (generic_n + elems_per_tile - 1) // elems_per_tile)
+            argv += [
+                "--inputs", ",".join(in_paths),
+                "--num-tiles", str(num_tiles),
+                "--bank-type", "ALL",
+            ]
 
         # SPEC-005: serialise compiled.cmds to a line-delimited file and
         # pass --cmds so the driver uses our CRF microcode instead of
         # PIMCmdGen's canonical one. Layout/placement changes show up in
         # cycles only because this file flows into programCrf().
         # The ISA-valid filter was applied up-front into `pim_cmds_all`.
-        if pim_cmds_all:
+        # SPEC-05: GENERIC_REDUCE supplies its OWN minimal --crf (the emitted
+        # stream is canonicalized internally + a slice-form stream blows the
+        # 32-cmd cap), so it skips this emitted-cmds block. The GENERIC ELTWISE
+        # path uses the emitted CRF microcode via --cmds.
+        if pim_cmds_all and kernel != "GENERIC_REDUCE":
             cmds_path = td_path / "cmds.txt"
             _write_samsung_cmds(cmds_path, pim_cmds_all)
             argv += ["--cmds", str(cmds_path)]
-            # SPEC-021 task 025: GEMV gets the faithful run path so issued
-            # PIM transactions track the emitted stream (a redundant stream
-            # costs more, a folded one costs less). Eltwise has no faithful
-            # variant yet, so it stays on executeEltwiseWithCmds.
-            if kernel == "GEMV":
-                argv += ["--faithful"]
 
         try:
             proc = subprocess.run(
@@ -2616,31 +2809,33 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
         # _run_apu_v1. Pure post-run file I/O -- cycles (parsed above) and the
         # command stream are untouched; graceful when absent. Output role "y".
         extra = {"kernel": kernel, "returncode": proc.returncode}
-        outputs = _samsung_read_gemv_outbin(out_path, kernel)
+        if kernel == "GENERIC_REDUCE":
+            # SPEC-04 §4.3: faithful matmul readback. The REDUCE column cadence
+            # drives the real PIMBlock::mac accumulator and the real drain, so
+            # out.bin holds genuine numerics (no dual-run / plain rerun needed).
+            M, K, N, m_pad = reduce_shape
+            outputs = _samsung_read_reduce_outbin(out_path, M, N, m_pad)
+            if outputs:
+                extra["outputs"] = outputs
+                extra["cycles_source"] = "PIMSimulator GENERIC REDUCE interpreter"
+                extra["correctness_source"] = (
+                    "PIMSimulator GENERIC REDUCE interpreter"
+                )
+            return RunResult(
+                cycles=cycles,
+                stdout=combined,
+                backend="samsung_hbm_pim",
+                extra=extra,
+            )
+        # GENERIC (ELTWISE) flat fp16 readback (spec 01 §3.3): the faithful
+        # interpreter writes real numerics into out.bin. Role name "out". (The
+        # only two routes are GENERIC_REDUCE above and GENERIC here -- the legacy
+        # GEMV/ADD/MUL/RELU readbacks were deleted with the legacy routing.)
+        outputs = _samsung_read_generic_outbin(out_path, generic_n)
         if outputs:
             extra["outputs"] = outputs
-            extra["cycles_source"] = "PIMSimulator faithful --cmds"
-            extra["correctness_source"] = "PIMSimulator faithful --cmds"
-
-        # SPEC-005d (additive dual-run): the faithful `--cmds`/`--faithful` path
-        # is cycle-accurate but writes an all-zero out.bin (executeGemvFaithful
-        # runs the CRF microcode; readResult reads an unpopulated region). So a
-        # real Samsung GEMV PASS needs a SECOND, plain `executeGemv` run of the
-        # SAME workload/shape for the functional output -- cycles stay from the
-        # faithful run above (byte-identical), correctness from the plain run.
-        # Both runs are real; gated so it fires only when the faithful readback
-        # was empty (the expected faithful case) and a GEMV cmd stream drove the
-        # faithful run. Graceful: a zero/absent plain out.bin -> no outputs ->
-        # the cell stays CYCLES-ONLY (never a fabricated/tautological PASS).
-        if kernel == "GEMV" and not outputs and pim_cmds_all:
-            plain_outputs = _samsung_plain_gemv_rerun(
-                driver, root, td_path, w_path, x_path,
-                int(W.shape[0]), int(W.shape[1]),
-            )
-            if plain_outputs:
-                extra["outputs"] = plain_outputs
-                extra["cycles_source"] = "PIMSimulator faithful --cmds"
-                extra["correctness_source"] = "PIMSimulator plain executeGemv"
+            extra["cycles_source"] = "PIMSimulator GENERIC interpreter"
+            extra["correctness_source"] = "PIMSimulator GENERIC interpreter"
         return RunResult(
             cycles=cycles,
             stdout=combined,
@@ -3484,6 +3679,53 @@ _BACKEND_CTX = {
 }
 
 
+def _check_work_grid(target, trace, *, auto_fill=True):
+    """Gap-1 derive/lint: compare the trace's work-id partition against the
+    grid derived from the @allo.unit tree. Warns on mismatch; optionally
+    auto-fills. Returns the (possibly auto-filled) expected work-id count.
+
+    - derived = target.work_grid()[1]  (e.g. 128 for Samsung)
+    - observed = number of distinct work-id buckets for the trace's SOLE
+      kernel (multi-kernel traces are exempt: each @allo.work layer
+      legitimately walks its own partition, e.g. MLP mapping=[1]).
+    """
+    from .spmw_autoschedule import _bucket_for_autoschedule
+
+    derived = target.work_grid()[1]
+    buckets = _bucket_for_autoschedule(trace)
+    # Distinct base kernels (strip the _<wid> grid-replica suffix). The bucket
+    # func_name carries the suffix; recover the work_id from the bucket's first
+    # match so the suffix strips correctly.
+    base_kernels = set()
+    for _fn, matches in buckets:
+        m0 = matches[0]
+        base_kernels.add(_base_kernel_name(m0.func_name, m0.work_id))
+    if len(base_kernels) != 1:
+        return derived                       # multi-kernel: exempt
+    observed = len(buckets)
+    if observed == derived:
+        return derived
+    if observed == 1 and auto_fill:
+        # Under-specified partition (e.g. mapping=[1] on a single kernel).
+        warnings.warn(
+            f"work grid: workload declares 1 work-item but target "
+            f"{target.name!r} has {derived} PEs (unit-tree fanout "
+            f"{target.work_grid()[0]}); auto-filling the full grid. Declare "
+            f"@allo.work(mapping={target.work_grid()[0]}) to silence.",
+            stacklevel=2,
+        )
+        return derived
+    # Genuine mismatch: advisory, do not raise. Trigger schedule uses observed.
+    warnings.warn(
+        f"work grid: workload partition has {observed} work-items but target "
+        f"{target.name!r} unit-tree implies {derived} "
+        f"(fanout {target.work_grid()[0]}); proceeding with the authored "
+        f"{observed}. Mispricing possible if this was unintended.",
+        stacklevel=2,
+    )
+    return observed
+
+
 def compile_for_target(
     target: Any,
     trace: MatchTrace,
@@ -3510,6 +3752,11 @@ def compile_for_target(
         raise ValueError(
             f"trace.target_name {trace.target_name!r} != target.name {target_name!r}"
         )
+
+    # Gap-1 derive/lint: compare the trace's work-id partition against the grid
+    # implied by the @allo.unit tree. Warns + auto-fills; never raises.
+    if hasattr(target, "work_grid"):
+        _check_work_grid(target, trace)
 
     # design 04 §2.1 / §8: the virtual backend needs only (trace + cost
     # model), NOT emitted cmds. So a substrate with no simulator/HW -- no

@@ -8,8 +8,8 @@
     "Q": 80
   },
   "correctness": {
-    "status": "CYCLES-ONLY",
-    "detail": "samsung/gemm: run path reports cycles only (no output array); computed at the GEMV design point",
+    "status": "PASS",
+    "detail": "samsung gemm output matches the contraction reference within rtol=0.02 (max_abs_err=7.67112e-05)",
     "reference": {
       "source": "PolyBench/C 4.2.1",
       "size_class": "SMALL_DATASET",
@@ -19,11 +19,11 @@
   },
   "performance": {
     "metric": "cycles",
-    "value": 2813,
-    "source": "PIMSimulator@bin-sha256:3f032694bfe1",
+    "value": 75205,
+    "source": "PIMSimulator@bin-sha256:121250edea00",
     "run_cmd": "python -m pytest tests/pim/samsung_hbm_pim/gemm/test_gemm_samsung_hbm_pim.py -p no:cacheprovider -q",
-    "timestamp": "2026-06-29T10:56:29.868578"
+    "timestamp": "2026-06-30T01:05:16.421224"
   },
-  "tenon_commit": "ed217633e316c4b45d19368b4cfadd61c028aa21",
-  "notes": "Tier-1 single-output; Samsung reports cycles only (no output array) -> CYCLES-ONLY at the GEMV design point; a shape the reference sim cannot express -> BLOCKED-SIM."
+  "tenon_commit": "ee1e52a539d6385a60d149ca238b592d9763103e",
+  "notes": "SPEC-05 SPMW slice-form gemm (mapping=[16,8]); genuine fp16 PASS vs A@B; partition mapping-driven (128 work-id buckets, per-PE slice loop bound = P//128)."
 }

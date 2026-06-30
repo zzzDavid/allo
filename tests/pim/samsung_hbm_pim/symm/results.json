@@ -7,8 +7,8 @@
     "N": 80
   },
   "correctness": {
-    "status": "BLOCKED-SIM",
-    "detail": "samsung_hbm_pim/symm: reference sim cored on the shape (env limit, not a Tenon gap): Samsung pim_driver returned but stdout missing 'PIM_CYCLES total=...' line; tail: \nmalloc(): invalid size (unsorted)\n",
+    "status": "CYCLES-ONLY",
+    "detail": "samsung/symm: multi-stage kernel out of the pure-MAC REDUCE paradigm (gemver mixes ELTWISE rank-1 + GEMV); a real REDUCE pass over stage-0 gives cycles, but the composed numerics are unchecked (no chain recipe). Honest CYCLES-ONLY, never a fabricated PASS.",
     "reference": {
       "source": "PolyBench/C 4.2.1",
       "size_class": "SMALL_DATASET",
@@ -18,11 +18,11 @@
   },
   "performance": {
     "metric": "cycles",
-    "value": null,
-    "source": "PIMSimulator@bin-sha256:3f032694bfe1 (cored on shape)",
+    "value": 4435,
+    "source": "PIMSimulator@bin-sha256:121250edea00",
     "run_cmd": "python -m pytest tests/pim/samsung_hbm_pim/symm/test_symm_samsung_hbm_pim.py -p no:cacheprovider -q",
-    "timestamp": "2026-06-29T11:14:46.590606"
+    "timestamp": "2026-06-30T01:05:24.332096"
   },
-  "tenon_commit": "ed217633e316c4b45d19368b4cfadd61c028aa21",
-  "notes": "Tier-2 triangular; Samsung reports cycles only (no output array) -> CYCLES-ONLY at the GEMV design point; a shape the reference sim cannot express -> BLOCKED-SIM."
+  "tenon_commit": "ee1e52a539d6385a60d149ca238b592d9763103e",
+  "notes": "Tier-2 triangular; Samsung reports cycles only (no output array) -> CYCLES-ONLY at the GEMV design point; a shape the reference sim cannot express -> BLOCKED-SIM. | SPEC-05 multi-stage, no chain recipe (mixed ELTWISE+REDUCE); honest CYCLES-ONLY."
 }

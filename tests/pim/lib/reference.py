@@ -35,6 +35,7 @@ from mvt import mvt_np  # noqa: E402
 from two_mm import two_mm_np  # noqa: E402
 from three_mm import three_mm_np  # noqa: E402
 from doitgen import doitgen_np  # noqa: E402
+from covariance import covariance_np  # noqa: E402
 from syrk import syrk_np  # noqa: E402
 from syr2k import syr2k_np  # noqa: E402
 
@@ -59,6 +60,7 @@ REFERENCES = {
     "2mm": two_mm_np,
     "3mm": three_mm_np,
     "doitgen": doitgen_np,
+    "covariance": covariance_np,
     "syrk": syrk_np,
     "syr2k": syr2k_np,
     # Tier-2 (Phase 4):

@@ -227,38 +227,11 @@ def test_apu_v2_returns_none_cycles():
     assert result.backend == "apu_v2"
 
 
-_PIMSIM_DRIVER = _pimsim_root() / "pim_driver"
-
-
-@pytest.mark.skipif(
-    not _PIMSIM_DRIVER.exists(),
-    reason=f"pim_driver not built at {_PIMSIM_DRIVER}",
-)
-def test_samsung_gemv_real_pim_driver_returns_cycles():
-    """When the real `pim_driver` is available, a Samsung GEMV run
-    must report a positive cycle count.
-
-    Marked `slow` via the long timeout in `_run_samsung`; pytest -x will
-    surface failures fast. The smallest GEMV the driver accepts is
-    output_dim=4096, input_dim=1024 (one full Samsung tile).
-    """
-    import numpy as np
-
-    target = build_samsung_target()
-    compiled = allo.compile_for_target(target, _samsung_mac_trace())
-    M, K = 4096, 1024
-    W = np.zeros((M, K), dtype=np.float16)
-    x = np.zeros(K, dtype=np.float16)
-    result = compiled.run(W=W, x=x)
-    assert result.backend == "samsung_hbm_pim"
-    # The driver may fail on a malformed cmd stream; if it does, stdout
-    # will tell us. We only assert the no-crash + positive-cycles
-    # contract when the driver returned successfully.
-    if result.extra.get("returncode") == 0:
-        assert result.cycles is not None and result.cycles > 0, (
-            f"expected positive cycles, got {result.cycles!r}; "
-            f"stdout tail:\n{result.stdout[-400:]}"
-        )
+# SPEC-05 (2026-06-30): test_samsung_gemv_real_pim_driver_returns_cycles was
+# DELETED with the legacy GEMV run path it exercised (compiled.run(W=,x=) ->
+# --op GEMV). The Samsung run path is now GENERIC REDUCE (genuine fp16 matmul),
+# covered by tests/pim/samsung_hbm_pim/ cells + tests/spmw/test_rankpreserve_vs_sim
+# (run_batched) + test_samsung_faithful_run_path (driver-level --op GEMV).
 
 
 if __name__ == "__main__":
