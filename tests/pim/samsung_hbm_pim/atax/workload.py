@@ -15,14 +15,15 @@ from allo.ir.types import float32 as fp16
 from allo.dataflow import region as _df_region
 
 from lib.shapes import shape
+from lib import host_staging
 
 _S = shape("atax")
 M, N = _S["M"], _S["N"]
 
 _MAPPING = [16, 8]
 _NPE = _MAPPING[0] * _MAPPING[1]
-ROWS_M = -(-M // _NPE)                          # stage1 slice (M rows)
-ROWS_N = -(-N // _NPE)                          # stage2 slice (N rows)
+ROWS_M = -(-M // _NPE)  # stage1 slice (M rows)
+ROWS_N = -(-N // _NPE)  # stage2 slice (N rows)
 
 
 @_df_region()
@@ -44,12 +45,25 @@ def _atax_top(A: fp16[M, N], x: fp16[N], tmp: fp16[M], y: fp16[N]):
         for i in range(ROWS_N):
             acc: fp16 = 0
             for k in range(M):
-                acc += local_A[k, row0 + i] * local_tmp[k]   # A^T access
+                acc += local_A[k, row0 + i] * local_tmp[k]  # A^T access
             local_y[row0 + i] = acc
 
 
 def build():
     return _atax_top
+
+
+# Host data movement (spec backend-host-transfer-dispatch.md), per stage:
+#   stage1 tmp = A @ x      -- scatter A, broadcast x; tmp stays DEVICE-RESIDENT
+#                              (threaded into stage2), so NO gather (per-cell
+#                              override of the GEMM-family triple).
+#   stage2 y   = A^T @ tmp  -- scatter A (transposed access), broadcast tmp;
+#                              gather y (the final readback).
+with allo.record_host_moves() as _hm:
+    host_staging.stage_in(weight="A", vec="x")  # stage1: tmp on-device
+    host_staging.stage_in(weight="A", vec="tmp")  # stage2 inputs
+    host_staging.gather_out(out="y")  # stage2 readback
+HOST_MOVES = list(_hm)
 
 
 STAGES = [(M, N), (N, M)]

@@ -760,6 +760,7 @@ def autoschedule(
     cost_name: str = "kernel_cycles",
     confidence_gate: bool = False,
     gate_policy: str = "warn",
+    performance_model=None,
 ) -> list[Placement]:
     """Pick one `Placement` per `@allo.work` kernel in `trace`.
 
@@ -798,7 +799,22 @@ def autoschedule(
             f"no autoscheduler enumerator registered for target {target_name!r}; "
             f"supported: {sorted(_ENUMERATORS)}"
         )
-    cost_fn = get_cost(cost_name, target)
+    if getattr(target, "has_performance_model", False) and cost_name == "kernel_cycles":
+        # Canonical resource-DAG path: the same candidate graph and evaluator
+        # are consumed by the autoscheduler and virtual backend.
+        from .spmw_plan import build_execution_graph
+
+        def cost_fn(candidate_trace, candidate_layout):
+            graph = build_execution_graph(target, candidate_trace, candidate_layout)
+            if performance_model is None:
+                from .pim.performance import virtual_target
+
+                estimate = virtual_target(target).evaluate(graph)
+            else:
+                estimate = performance_model.evaluate(graph)
+            return estimate.cycles
+    else:
+        cost_fn = get_cost(cost_name, target)
     regalloc_disabled = os.environ.get("SPMW_DISABLE_REGALLOC") == "1"
 
     # Whole-trace liveness pre-pass (SPEC-023 D1): run ONCE before the

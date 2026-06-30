@@ -22,8 +22,8 @@
     "value": 34444,
     "source": "PIMSimulator@bin-sha256:121250edea00",
     "run_cmd": "python -m pytest tests/pim/samsung_hbm_pim/doitgen/test_doitgen_samsung_hbm_pim.py -p no:cacheprovider -q",
-    "timestamp": "2026-06-30T01:03:22.417689"
+    "timestamp": "2026-06-30T11:51:53.555013"
   },
-  "tenon_commit": "ee1e52a539d6385a60d149ca238b592d9763103e",
+  "tenon_commit": "1af5ccd18a995ba016570ea802403affd91cad2a",
   "notes": "Tier-1 single-output; Samsung reports cycles only (no output array) -> CYCLES-ONLY at the GEMV design point; a shape the reference sim cannot express -> BLOCKED-SIM."
 }

@@ -2,28 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """PolyBench-on-PIM suite: target constructors, re-exported (Phase-0 Answer 1).
 
-This module RE-EXPORTS the four per-target constructors from
-`tests/spmw/_fixtures.py`. No constructor body is duplicated or edited -- the
-suite reuses the validated target trees verbatim (spec Answer 6: re-export-only,
-zero behavior change to `_fixtures.py`).
-
-`_fixtures.py` is a top-level test module (pytest prepends `tests/spmw/` to
-`sys.path` for the spmw suite); it is not importable as a package path, so we
-add `tests/spmw/` to `sys.path` here rather than touch `tests/` packaging. This
-is additive and changes no existing import behavior.
+This module RE-EXPORTS the four per-target constructors from the
+:mod:`allo.pim.targets` device library. No constructor body is duplicated or
+edited -- the suite reuses the validated target trees verbatim (spec Answer 6:
+re-export-only). The trees now live in the package (not the test folder), so
+this module imports them directly with no ``sys.path`` manipulation.
 """
 
 from __future__ import annotations
 
-import sys
-import pathlib
-
-# tests/pim/lib/targets.py -> parents[1] == tests/pim, parents[2] == tests
-_SPMW_DIR = pathlib.Path(__file__).resolve().parents[2] / "spmw"
-if str(_SPMW_DIR) not in sys.path:
-    sys.path.insert(0, str(_SPMW_DIR))
-
-from _fixtures import (  # noqa: E402  -- re-export ONLY, no behavior change
+from allo.pim.targets import (
     build_samsung_target,
     build_aim_target,
     build_upmem_target,

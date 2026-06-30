@@ -13,8 +13,6 @@ from __future__ import annotations
 from lib import cell, reference
 from lib.shapes import shape
 
-from workloads import syr2k as _wl
-
 _KERNEL = "syr2k"
 _TARGET = "samsung_hbm_pim"
 _RUN_CMD = (
@@ -24,9 +22,12 @@ _RUN_CMD = (
 
 
 def test_syr2k_samsung_hbm_pim(request):
+    # Task 006: workload loaded from the leaf dir
+    # (samsung_hbm_pim/syr2k/workload.py, slice form) by run_cell; STAGES re-read
+    # from it.
     result, verdict, _record = cell.run_cell(
-        kernel=_KERNEL, target_name=_TARGET, workload=_wl.build(),
-        folder=request.path.parent, stages=_wl.STAGES, shapes=shape(_KERNEL),
+        kernel=_KERNEL, target_name=_TARGET,
+        folder=request.path.parent, stages=None, shapes=shape(_KERNEL),
         run_cmd=_RUN_CMD,
         notes="Tier-1 single-output; Samsung reports cycles only (no output array) -> CYCLES-ONLY at the GEMV design point; a shape the reference sim cannot express -> BLOCKED-SIM.",
     )

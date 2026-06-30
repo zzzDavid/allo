@@ -14,6 +14,7 @@ from allo.ir.types import float32 as fp16
 from allo.dataflow import region as _df_region
 
 from lib.shapes import shape
+from lib import host_staging
 
 _S = shape("bicg")
 M, N = _S["M"], _S["N"]
@@ -43,12 +44,21 @@ def _bicg_top(A: fp16[M, N], p: fp16[N], r: fp16[M], q: fp16[M], s: fp16[N]):
         for i in range(ROWS_N):
             acc: fp16 = 0
             for k in range(M):
-                acc += local_A[k, row0 + i] * local_r[k]   # A^T access
+                acc += local_A[k, row0 + i] * local_r[k]  # A^T access
             local_s[row0 + i] = acc
 
 
 def build():
     return _bicg_top
+
+
+# Host data movement (spec backend-host-transfer-dispatch.md): two INDEPENDENT
+# GEMVs, each a full scatter/broadcast/gather (neither output is device-resident
+# input to the other -- both q and s are gathered back for the host).
+with allo.record_host_moves() as _hm:
+    host_staging.stage_gemm(weight="A", vec="p", out="q")  # q = A @ p
+    host_staging.stage_gemm(weight="A", vec="r", out="s")  # s = A^T @ r
+HOST_MOVES = list(_hm)
 
 
 STAGES = [(M, N), (N, M)]

@@ -1,12 +1,11 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""PolyBench-on-PIM suite: the two-line-test entry point (Phase-0 Answer 1).
+"""PolyBench-on-PIM suite: public compile-and-call entry point.
 
-`compile_and_run` threads the EXISTING public pipeline --
-`allo.customize -> allo.match_workload -> allo.compile_for_target ->
-Compiled.run` -- and returns the `RunResult` unchanged. The sim-vs-real-device
-selection is `Compiled.run`'s existing `_BACKEND_RUN` dispatch keyed on
-`target.name`; this module NEVER re-implements dispatch (spec Answer 1/6).
+`compile_workload` delegates to ``allo.compile(workload, target, cost)`` and
+returns its ``CompiledCallable``. `compile_and_run` invokes the callable's
+backend-role escape hatch and returns the `RunResult` unchanged. The suite does
+not reconstruct customization, matching, autoscheduling, or backend dispatch.
 
 It also provides the anti-fabrication provenance helpers (spec Answer 4): the
 sim fingerprint / device identity, the tenon commit, and the run timestamp are
@@ -23,19 +22,46 @@ import subprocess
 import allo
 from allo.spmw_codegen import RunResult
 
+from .cost import bind_cost
 
-def compile_and_run(target, workload, backend=None, **inputs) -> RunResult:
-    """match_workload -> autoschedule (inside compile_for_target) -> run.
 
-    `backend=None` is the real per-target path (sim/device by `target.name`);
-    `backend="virtual"` is a cost-only dry-run (NEVER used for an apu_v1 cell --
-    spec Answer 5 sim-substitution ban). Returns the `RunResult` unchanged
-    (cycles + stdout + extra, incl. extra['outputs'] where the backend surfaces
-    them)."""
-    schedule = allo.customize(workload, enable_tensor=False)
-    trace = allo.match_workload(target, schedule.module)
-    compiled = allo.compile_for_target(target, trace, backend=backend)
-    return compiled.run(**inputs)
+def compile_workload(target, workload, backend=None, host_moves=None, cost=None):
+    """Compile through the public ``allo.compile`` interface.
+
+    Samsung binds its packaged resource-DAG calibration profile. Targets not
+    yet ported to the new model receive ``cost=None`` and use their existing
+    target path behind the same public facade.
+    """
+    if cost is None:
+        cost = bind_cost(target)
+    return allo.compile(
+        workload,
+        target,
+        cost,
+        backend=backend,
+        host_moves=host_moves,
+    )
+
+
+def compile_and_run(
+    target, workload, backend=None, host_moves=None, cost=None, **inputs
+) -> RunResult:
+    """Compile publicly and invoke explicit backend-role arrays.
+
+    ``backend=None`` selects the real target simulator/device;
+    ``backend="virtual"`` is a cost-only dry run. Samsung's backend-role inputs
+    intentionally differ from some source signatures (for covariance,
+    ``A=cdata.T`` and ``B=cdata``), so this compiler-test helper invokes
+    ``run_backend`` instead of weakening normal callable signature checking.
+    """
+    compiled = compile_workload(
+        target,
+        workload,
+        backend=backend,
+        host_moves=host_moves,
+        cost=cost,
+    )
+    return compiled.run_backend(**inputs)
 
 
 # --------------------------------------------------------------------- #
@@ -53,7 +79,10 @@ def tenon_commit() -> str:
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=str(_ALLO_ROOT), capture_output=True, text=True, check=True,
+            cwd=str(_ALLO_ROOT),
+            capture_output=True,
+            text=True,
+            check=True,
         )
         return out.stdout.strip()
     except (subprocess.SubprocessError, OSError) as exc:
@@ -135,7 +164,10 @@ def _try_git_sha(repo_dir: pathlib.Path) -> str | None:
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            cwd=str(repo_dir), capture_output=True, text=True, check=True,
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            check=True,
         )
         return out.stdout.strip()
     except (subprocess.SubprocessError, OSError):

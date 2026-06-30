@@ -6,7 +6,7 @@
 - cycles: 4435
 - source: `PIMSimulator@bin-sha256:121250edea00`
 - run_cmd: `python -m pytest tests/pim/samsung_hbm_pim/syrk/test_syrk_samsung_hbm_pim.py -p no:cacheprovider -q`
-- timestamp: 2026-06-30T01:05:26.652500
-- tenon_commit: `ee1e52a539d6385a60d149ca238b592d9763103e`
+- timestamp: 2026-06-30T11:54:01.925866
+- tenon_commit: `1af5ccd18a995ba016570ea802403affd91cad2a`
 
 Tier-1 single-output; Samsung reports cycles only (no output array) -> CYCLES-ONLY at the GEMV design point; a shape the reference sim cannot express -> BLOCKED-SIM. | SPEC-05 multi-stage, no chain recipe (mixed ELTWISE+REDUCE); honest CYCLES-ONLY.

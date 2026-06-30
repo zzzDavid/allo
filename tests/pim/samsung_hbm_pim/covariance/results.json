@@ -20,8 +20,8 @@
     "value": 85604,
     "source": "PIMSimulator@bin-sha256:121250edea00",
     "run_cmd": "python -m pytest tests/pim/samsung_hbm_pim/covariance/test_covariance_samsung_hbm_pim.py -p no:cacheprovider -q",
-    "timestamp": "2026-06-30T01:01:35.221565"
+    "timestamp": "2026-06-30T11:50:08.109015"
   },
-  "tenon_commit": "ee1e52a539d6385a60d149ca238b592d9763103e",
+  "tenon_commit": "1af5ccd18a995ba016570ea802403affd91cad2a",
   "notes": "mean/centering/normalize/symmetrize host-side; on-device = cdata^T@cdata (GEMM nest). GEMM-shaped emitted stream -> CYCLES-ONLY (no W@x match); a shape the reference sim cannot express -> BLOCKED-SIM."
 }

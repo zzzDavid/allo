@@ -17,6 +17,7 @@ from allo.ir.types import float32 as fp16
 from allo.dataflow import region as _df_region
 
 from lib.shapes import shape
+from lib import host_staging
 
 N = shape("gemver")["N"]
 
@@ -27,8 +28,14 @@ ROWS = -(-N // _NPE)
 
 @_df_region()
 def _gemver_top(
-    A: fp16[N, N], u1: fp16[N], v1: fp16[N], u2: fp16[N], v2: fp16[N],
-    y: fp16[N], x: fp16[N], w: fp16[N],
+    A: fp16[N, N],
+    u1: fp16[N],
+    v1: fp16[N],
+    u2: fp16[N],
+    v2: fp16[N],
+    y: fp16[N],
+    x: fp16[N],
+    w: fp16[N],
 ):
     @allo.work(mapping=_MAPPING, args=[A, u1, v1])
     def rank1_a(lA: fp16[N, N], lu1: fp16[N], lv1: fp16[N]):
@@ -53,7 +60,7 @@ def _gemver_top(
         for i in range(ROWS):
             acc: fp16 = 0
             for k in range(N):
-                acc += lA[k, row0 + i] * ly[k]   # A^T access
+                acc += lA[k, row0 + i] * ly[k]  # A^T access
             lx[row0 + i] = acc
 
     @allo.work(mapping=_MAPPING, args=[A, x, w])
@@ -69,6 +76,21 @@ def _gemver_top(
 
 def build():
     return _gemver_top
+
+
+# Host data movement (spec backend-host-transfer-dispatch.md). gemver mixes two
+# ELTWISE rank-1 updates of A (A stays DEVICE-RESIDENT across all four stages)
+# with two GEMVs. A is scattered once; the per-stage vectors (v1/v2 for the
+# rank-1 updates, y/x for the GEMVs) are broadcast; only the final w is gathered.
+# The rank-1 stages route out of the pure-MAC REDUCE path, so the cell records
+# honest CYCLES-ONLY -- the visible moves still pin the operand roles.
+with allo.record_host_moves() as _hm:
+    host_staging.stage_in(weight="A", vec="v1")  # rank-1 update A += u1*v1
+    host_staging.broadcast_vec(vec="v2")  # rank-1 update A += u2*v2
+    host_staging.broadcast_vec(vec="y")  # x = A^T @ y
+    host_staging.broadcast_vec(vec="x")  # w = A @ x
+    host_staging.gather_out(out="w")  # final readback
+HOST_MOVES = list(_hm)
 
 
 STAGES = [(N, N), (N, N), (N, N), (N, N)]

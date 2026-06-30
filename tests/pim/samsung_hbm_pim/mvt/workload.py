@@ -14,6 +14,7 @@ from allo.ir.types import float32 as fp16
 from allo.dataflow import region as _df_region
 
 from lib.shapes import shape
+from lib import host_staging
 
 N = shape("mvt")["N"]
 
@@ -41,12 +42,21 @@ def _mvt_top(A: fp16[N, N], y1: fp16[N], y2: fp16[N], x1: fp16[N], x2: fp16[N]):
         for i in range(ROWS):
             acc: fp16 = 0
             for k in range(N):
-                acc += local_A[k, row0 + i] * local_y2[k]   # A^T access
+                acc += local_A[k, row0 + i] * local_y2[k]  # A^T access
             local_x2[row0 + i] = acc
 
 
 def build():
     return _mvt_top
+
+
+# Host data movement (spec backend-host-transfer-dispatch.md): two INDEPENDENT
+# GEMVs over the same A; both outputs (x1, x2) are gathered back for the host
+# `x += x1 + x2` fold.
+with allo.record_host_moves() as _hm:
+    host_staging.stage_gemm(weight="A", vec="y1", out="x1")  # x1 = A @ y1
+    host_staging.stage_gemm(weight="A", vec="y2", out="x2")  # x2 = A^T @ y2
+HOST_MOVES = list(_hm)
 
 
 STAGES = [(N, N), (N, N)]

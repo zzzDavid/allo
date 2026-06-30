@@ -14,20 +14,26 @@ from allo.ir.types import float32 as fp16
 from allo.dataflow import region as _df_region
 
 from lib.shapes import shape
+from lib import host_staging
 
 _S = shape("3mm")
 P, Q, R, NT, S = _S["P"], _S["Q"], _S["R"], _S["T"], _S["S"]
 
 _MAPPING = [16, 8]
 _NPE = _MAPPING[0] * _MAPPING[1]
-ROWS_P = -(-P // _NPE)                           # mm1 (AB), mm3 (G) output P rows
-ROWS_R = -(-R // _NPE)                           # mm2 (CD) output R rows
+ROWS_P = -(-P // _NPE)  # mm1 (AB), mm3 (G) output P rows
+ROWS_R = -(-R // _NPE)  # mm2 (CD) output R rows
 
 
 @_df_region()
 def _three_mm_top(
-    A: fp16[P, Q], B: fp16[Q, R], C: fp16[R, S], D: fp16[S, NT],
-    AB: fp16[P, R], CD: fp16[R, NT], G: fp16[P, NT],
+    A: fp16[P, Q],
+    B: fp16[Q, R],
+    C: fp16[R, S],
+    D: fp16[S, NT],
+    AB: fp16[P, R],
+    CD: fp16[R, NT],
+    G: fp16[P, NT],
 ):
     @allo.work(mapping=_MAPPING, args=[A, B, AB])
     def mm1(local_A: fp16[P, Q], local_B: fp16[Q, R], local_AB: fp16[P, R]):
@@ -65,6 +71,18 @@ def _three_mm_top(
 
 def build():
     return _three_mm_top
+
+
+# Host data movement (spec backend-host-transfer-dispatch.md), a GEMM chain:
+#   AB = A @ B  -- scatter A, broadcast B; AB stays DEVICE-RESIDENT, no gather.
+#   CD = C @ D  -- scatter C, broadcast D; CD stays DEVICE-RESIDENT, no gather.
+#   G  = AB @ CD -- scatter AB, broadcast CD; gather G (final readback).
+with allo.record_host_moves() as _hm:
+    host_staging.stage_in(weight="A", vec="B")  # AB on-device
+    host_staging.stage_in(weight="C", vec="D")  # CD on-device
+    host_staging.stage_in(weight="AB", vec="CD")  # G stage inputs
+    host_staging.gather_out(out="G")  # final readback
+HOST_MOVES = list(_hm)
 
 
 STAGES = [(P, Q), (R, S), (P, R)]

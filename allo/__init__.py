@@ -12,23 +12,55 @@ from .template import *
 from .verify import verify
 from .memory import Memory, Layout
 from .dataflow import kernel as work, get_pid as get_wid
-from .spmw_target import target, unit, reg, const, get_uid, move, op, any_, or_
+from .spmw_target import (
+    target,
+    unit,
+    device,
+    reg,
+    const,
+    resource,
+    cycle_model,
+    get_uid,
+    move,
+    op,
+    any_,
+    or_,
+)
 from .spmw_target import memory as mem
-from .spmw_host import HostXcel, host_xcel, primitive, NotSupported, host_cpu
-from .spmw_host import (
+# Host-transfer dispatch surface (spec 001). NOTE: the proxy is `allo.host_xfer`,
+# NOT `allo.backend` — `allo.backend` is already the codegen-backend submodule
+# (imported on line 5; llvm/hls/ip/aie). Re-exporting the proxy as `backend`
+# would shadow it and break the FPGA/AIE path. See backend-host-transfer-dispatch.md
+# open question.
+from .spmw_target import (
     broadcast,
     scatter,
     gather,
-    reduce,
-    all_reduce,
-    all_gather,
-    reduce_scatter,
-    StageRequest,
-    staging_scope,
-    resolve_staging,
-    weight_resident_from_staging,
-    resolve_collective_axis,
+    move_only,
+    host_xfer,
+    record_host_moves,
+    BackendHandle,
+    HandleToken,
+    HostMoveRecord,
+    host_program,
+    launch,
+    BufferToken,
+    LaunchRecord,
+    HostProgram,
 )
+from .spmw_host_program import (
+    HostSchedule,
+    HostGroup,
+    HostLaunch,
+    analyze as analyze_host_program,
+    resolve_shapes as resolve_host_program_shapes,
+    schedule_residency,
+    schedule_cost,
+)
+# HostXcel collective surface removed (2026-06-30): host<->device transfers
+# are now explicit `allo.move`s declared on an @allo.unit(mode="host") scope,
+# naming device memory (e.g. hbm_pim.banks) as an endpoint. See spmw_target.py
+# (@allo.device / DeviceScope) and allo/pim/targets.py (the Samsung host scope).
 from .spmw_cost import cost, get_cost
 from .spmw_cost_model import (
     CostModel,
@@ -47,7 +79,8 @@ from .spmw_match_engine import (
     match_workload,
 )
 from .spmw_autoschedule import Placement, autoschedule
-from .spmw_codegen import compile_for_target, Compiled, PIMCmd, SamsungCtx
+from .spmw_codegen import compile_for_target, Compiled, PIMCmd, SamsungCtx, ResolvedHostMove
 from .spmw_linear_layout import LinearLayout, materialise_handle
 from .spmw_regalloc import allocate
+from .compiler import compile, CompiledCallable
 from . import spmw_cost_models  # noqa: F401  — registers @cost factories

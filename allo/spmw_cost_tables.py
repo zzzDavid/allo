@@ -19,6 +19,7 @@ one-entry edit (design 04 §1.3, T-APU-v1).
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import replace
 
 from .spmw_cost_model import (
@@ -253,6 +254,43 @@ def _samsung_mk(target, trace: MatchTrace) -> tuple[int, int]:
     return M, K
 
 
+def _attribute_host_staging_provenance(layout, M: int, K: int) -> None:
+    """Cross-check the M,K-derived staging cost against resolved host moves (D5).
+
+    When `layout.extra["host_moves"]` is present (stamped by
+    `compile_for_target` from the workload's `host_xfer.*` calls), verify the
+    explicit moves cover the three host_staging phases: a scatter (the weight
+    fan-out into banks), a broadcast (the input into GRF), and a gather (the
+    output out of banks). A missing phase that the M,K cost nonetheless prices
+    is advisory (warn) -- the staging cost still flows from M,K, so cycles are
+    unchanged. This function has NO effect on the computed cost; it only
+    attributes provenance, satisfying D5 without perturbing the carried numbers.
+    """
+    extra = getattr(layout, "extra", None)
+    if not isinstance(extra, dict):
+        return
+    moves = extra.get("host_moves")
+    if not moves:
+        return
+    verbs = {getattr(m.verb, "name", str(m.verb)) for m in moves}
+    # M,K>0 implies a weight preload + readback are priced. If the explicit
+    # moves omit a phase the cost charges for, flag it (provenance gap).
+    if M > 0 and K > 0:
+        if "scatter" not in verbs and "broadcast" not in verbs:
+            warnings.warn(
+                "Samsung host_staging prices a weight preload (M,K>0) but the "
+                "recorded host moves declare neither a scatter nor a broadcast; "
+                "the cost is still M,K-derived (provenance gap only).",
+                stacklevel=3,
+            )
+    if M > 0 and "gather" not in verbs:
+        warnings.warn(
+            "Samsung host_staging prices a readback (M>0) but the recorded host "
+            "moves declare no gather; cost is still M-derived (provenance gap).",
+            stacklevel=3,
+        )
+
+
 def _samsung_preload_cycles(hs_model, M: int, K: int) -> int:
     """Preload (broadcast/scatter) staging cost (design 05 §5).
 
@@ -301,6 +339,12 @@ def _samsung_host_staging_compose_with(hs_model, ctx):
     trace = ctx.trace
     layout = ctx.layout
     M, K = _samsung_mk(target, trace)
+    # spec 001 D5 provenance: attribute this (unchanged) M,K-derived staging cost
+    # to the explicit `host_xfer.*` moves when the placement carries them. The
+    # cross-check is advisory; it does NOT alter `cycles` (carriers + arithmetic
+    # below are untouched), so the carried numbers (12037 / 15251 / B*=2 / 3.93x)
+    # reproduce bit-for-bit. No stamped moves -> skipped (trace-M,K fallback).
+    _attribute_host_staging_provenance(layout, M, K)
     B = _trace_batch_dim(trace)
     preload_cyc = _samsung_preload_cycles(hs_model, M, K)
     readback_cyc = _samsung_readback_cycles(hs_model, M)

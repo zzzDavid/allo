@@ -62,6 +62,24 @@ class PIMCmd:
 
 
 @dataclass
+class ResolvedHostMove:
+    """A `host_xfer.*` record resolved against the target (spec 001 D5).
+
+    `verb` is the `_Verb` sentinel; `move` is the declared `Move` it resolved
+    to (by handle identity, not string ==); `device_handle` is the target's
+    `Memory`/`Register` the transfer touches; `buffer_role` is the workload
+    buffer's parameter name (`A`/`B`/`x`/`out`), recovered from the record's
+    non-handle arg when it carries one (else `None`). These carry cost +
+    operand-role info; the driver still performs the transfer (Q2 option a).
+    """
+
+    verb: object
+    move: object
+    device_handle: object
+    buffer_role: "str | None" = None
+
+
+@dataclass
 class HostTrigger:
     """Lever 3 (SPEC-025 §5.4): one host-issued CRF fire for a work-id.
 
@@ -282,6 +300,60 @@ class SamsungCtx(CodegenContext):
     """
 
     _REG_TO_OPD = {"grf_a": "GRF_A", "grf_b": "GRF_B"}
+
+    def __init__(self, target):
+        super().__init__(target)
+        # Host-move bookkeeping (spec 001 D5): the host-scope moves' `emit`
+        # closures (`host_broadcast`/`host_scatter`/`host_gather`/`program_crf`)
+        # append `(hook, device_handle)` records here -- parallel to `cmds`,
+        # consumed by the cost model for `host_staging`, NOT by the driver argv
+        # (Q2 option a: the driver keeps doing the transfer; these moves carry
+        # cost + operand-role only). Empty for every cell that does not yet
+        # express `host_xfer.*`.
+        self.host_moves_emitted: list[tuple[str, object]] = []
+
+    # ------------------------------------------------------------------ #
+    # Host-transfer ctx hooks (spec 001 D5). These are bookkeeping hooks the
+    # host-scope moves' `emit` closures call; none emit a compute `PIMCmd`.
+    # The driver still performs the real preload/readback over PIM_REG_RA, so
+    # the cmd stream that reaches `programCrf` is unchanged.
+    # ------------------------------------------------------------------ #
+
+    def drain(self, dst=None, src0=None):
+        """GRF->bank writeback as a NOP+WRITE column-command drain.
+
+        ISA-1.0 forbids a bank dst with a GRF src (PIMCmd.cpp:73-97), so this
+        is NOT a `MOV ODD_BANK<-GRF_B`. The proven drain (PIMRank.cpp:474-487,
+        samsung-pim-isa.md) is a `NOP` in the CRF stream; the conductor issues
+        the WRITE column command host-side. Emitting the NOP form directly means
+        the run-side `_crf_valid` filter (which strips the rejected MOV) now
+        finds nothing to drop -- resolving the SPEC-005 §8 followup. We keep the
+        NOP minimal (loopCounter 0): the canonical `NOP 7` pipe-hold already
+        rides the inner-loop body; this drain marker only carries the writeback.
+        """
+        self.cmds.append(PIMCmd(type_="NOP"))
+
+    def program_crf(self, crf_handle):
+        """Record that the <=32-word CRF microcode is uploaded for this group.
+
+        Host upload bookkeeping (the `STAGE_CRF` carrier); it does NOT emit a
+        compute `PIMCmd`. The CRF is already conveyed via `--cmds` (ELTWISE) or
+        the REDUCE minimal `--crf`, so this is a no-op on the cmd stream.
+        """
+        self.host_moves_emitted.append(("program_crf", crf_handle))
+
+    def host_broadcast(self, handle):
+        """Record a host->device broadcast (GRF_A/GRF_B/SRF). Bookkeeping +
+        operand-role tag; the driver performs the HAB broadcast."""
+        self.host_moves_emitted.append(("broadcast", handle))
+
+    def host_scatter(self, handle):
+        """Record a host->device per-bank scatter (the weight preload)."""
+        self.host_moves_emitted.append(("scatter", handle))
+
+    def host_gather(self, handle):
+        """Record a device->host gather (the output readback)."""
+        self.host_moves_emitted.append(("gather", handle))
 
     def _fiber_stride(self):
         """Bank fiber count (= banks-per-pim stride) for the active placement,
@@ -2514,6 +2586,98 @@ def run_samsung_reduce(weight, vec, M, K, N):
     return _samsung_run_reduce_driver(weight, vec, M, K, N)
 
 
+def execute_host_schedule_samsung(schedule, dev_inputs):
+    """Execute an analyzed host schedule on Samsung HBM-PIM (the run-path hook).
+
+    `schedule` is a `spmw_host_program.HostSchedule`; `dev_inputs` maps each
+    external-input buffer name to its float16 device array. Runs one
+    `run_samsung_reduce` per group -- a **batched (coalesced) group preloads its
+    resident weight ONCE** and stacks its B input vectors as the N=B columns of a
+    single contraction (the `P + B*(E+R)` schedule); a singleton group is a plain
+    contraction at its own N. Threads each group's real device readback forward
+    so a later group can consume a device-resident intermediate.
+
+    Returns `(dev, total_cycles)` where `dev` maps every buffer name to its
+    device value, or `(None, None)` if the driver is unavailable / surfaced
+    nothing. Backend execution only: NO reference composition (that is the
+    caller's concern), mirroring `run_samsung_reduce`.
+    """
+    import numpy as np
+
+    dev = {k: np.asarray(v, dtype=np.float16) for k, v in dev_inputs.items()}
+    total = 0
+    for g in schedule.groups:
+        M, K = g.weight_shape
+        W = dev[g.weight]
+        if not g.is_batched:
+            lx = g.launches[0]
+            out_dev, cyc = run_samsung_reduce(W, dev[lx.vec], M=M, K=K, N=lx.N)
+            if cyc is None:
+                return None, None
+            total += cyc
+            if out_dev is None:
+                return None, total
+            dev[lx.out] = np.asarray(out_dev, dtype=np.float16)
+        else:
+            # Batched GEMV: stack the B input vectors as the N columns of ONE
+            # contraction -> a single preload of the resident weight.
+            second = np.stack([dev[lx.vec] for lx in g.launches], axis=1)  # (K, B)
+            out_dev, cyc = run_samsung_reduce(W, second, M=M, K=K, N=len(g.launches))
+            if cyc is None:
+                return None, None
+            total += cyc
+            if out_dev is None:
+                return None, total
+            out_arr = np.asarray(out_dev)
+            for b, lx in enumerate(g.launches):
+                dev[lx.out] = out_arr[:, b].astype(np.float16)
+    return dev, total
+
+
+
+
+def _assert_host_move_roles(compiled, inputs) -> None:
+    """Assert the operand->role binding against the recorded host moves.
+
+    spec 001 D5 (Q2 option a): when `compiled.host_moves` is non-empty the
+    operand roles are *driven by the explicit moves* rather than purely inferred
+    -- the scatter buffer is the weight, the broadcast buffer is the input, the
+    gather buffer is the output. The driver still performs the transfer; this is
+    a consistency check that the recorded role names correspond to supplied
+    inputs. Advisory (warn, never raise): a buffer role may be unbound when the
+    workload passed a positional array rather than a named label, in which case
+    the run path's operand-shape inference is the fallback. When `host_moves` is
+    empty (today's path / non-Samsung) this is a no-op.
+    """
+    moves = getattr(compiled, "host_moves", None)
+    if not moves:
+        return
+    # Map verb name -> the buffer roles the moves bind it to.
+    by_verb: dict[str, list[str]] = {}
+    for rhm in moves:
+        verb_name = getattr(rhm.verb, "name", str(rhm.verb))
+        if rhm.buffer_role is not None:
+            by_verb.setdefault(verb_name, []).append(rhm.buffer_role)
+    supplied = {k for k, v in inputs.items() if v is not None}
+    for verb_name, roles in by_verb.items():
+        # A gather binds the OUTPUT buffer, which is legitimately absent from
+        # `inputs` (it is the readback target, supplied separately or inferred);
+        # only the input-side verbs (scatter weight / broadcast input) name
+        # buffers that must appear among the supplied inputs.
+        if verb_name == "gather":
+            continue
+        for role in roles:
+            # A named role that names no supplied input is suspicious only when
+            # SOME inputs were supplied (a bare `compiled.run()` probe supplies
+            # none and is exempt).
+            if supplied and role not in supplied:
+                warnings.warn(
+                    f"Samsung host move ({verb_name}) binds buffer role "
+                    f"{role!r} but no input named {role!r} was supplied "
+                    f"(supplied: {sorted(supplied)}); falling back to "
+                    f"operand-shape inference for that operand.",
+                    stacklevel=2,
+                )
 
 
 def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
@@ -2547,6 +2711,11 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             stdout=f"simulator unavailable: pim_driver not found at {driver}",
             backend="samsung_hbm_pim",
         )
+
+    # spec 001 D5: assert operand->role binding against the recorded host moves
+    # (no-op when none recorded; advisory when bound). The driver argv below is
+    # unchanged -- the moves carry cost + role, not driver args (Q2 option a).
+    _assert_host_move_roles(compiled, inputs)
 
     # The `--op` flag still picks the data-path scaffolding (eltwise vs
     # GEMV) and which numpy inputs to wire up, but no longer determines
@@ -3555,6 +3724,35 @@ def _run_virtual(compiled: "Compiled", **inputs) -> RunResult:
     are the bound CostModel and the in-memory trace. `confidence` / `phases`
     ride `RunResult.extra` (RunResult is not structurally changed).
     """
+    if getattr(compiled.target, "has_performance_model", False):
+        from .pim.performance import virtual_target
+        from .spmw_plan import build_execution_graph
+
+        graph = compiled.execution_graph
+        if graph is None:
+            graph = build_execution_graph(
+                compiled.target, compiled.trace, compiled.layout
+            )
+        performance_model = compiled.performance_model or virtual_target(compiled.target)
+        estimate = performance_model.evaluate(graph)
+        return RunResult(
+            cycles=estimate.cycles,
+            stdout=(
+                "virtual backend: resource-DAG analytical model "
+                f"(interval={estimate.cycle_interval})"
+            ),
+            backend="virtual",
+            extra={
+                "cycle_interval": estimate.cycle_interval,
+                "critical_path": list(estimate.critical_path),
+                "utilization": dict(estimate.utilization),
+                "bottlenecks": list(estimate.bottlenecks),
+                "model_fingerprint": estimate.model_fingerprint,
+                "cost_model": "resource-dag-v1",
+                "priced_target": compiled.target.name,
+            },
+        )
+
     from .spmw_cost_model import evaluate, get_cost_model
 
     result = evaluate(
@@ -3601,11 +3799,24 @@ class Compiled:
         ctx: "CodegenContext | None" = None,
         backend: "str | None" = None,
         cost_flavor: str = "faithful",
+        host_moves: "list[ResolvedHostMove] | None" = None,
+        execution_graph=None,
+        performance_model=None,
     ):
         self.target = target
         self.trace = trace
         self.cmds = cmds
         self.layout = layout
+        # spec 001 D5: the resolved `host_xfer.*` moves (verb, declared Move,
+        # device handle, buffer role). Empty by default -> today's inferred-role
+        # path in `_run_samsung`. When non-empty, the run path asserts the
+        # operand->role binding against these explicit moves.
+        self.host_moves: list[ResolvedHostMove] = list(host_moves or [])
+        # Canonical candidate plan consumed by both virtual execution and
+        # diagnostics. Targets not yet ported to the resource model leave it
+        # unset and remain on their existing path during migration.
+        self.execution_graph = execution_graph
+        self.performance_model = performance_model
         # design 04 §2.1: `backend="virtual"` makes the cost model a peer
         # run target; `cost_flavor` selects which CostModel flavor the
         # virtual runner prices against. Both default to today's behaviour.
@@ -3726,12 +3937,71 @@ def _check_work_grid(target, trace, *, auto_fill=True):
     return observed
 
 
+def _resolve_host_moves(target, records):
+    """Resolve recorded `host_xfer.*` calls against `target` (spec 001 D5).
+
+    Returns `list[ResolvedHostMove]`. Each `HostMoveRecord` is dispatched via
+    `BackendHandle.resolve` (verb identity + device-handle identity); the
+    buffer role is the record's single non-handle arg (its parameter name when
+    the workload passed a named buffer, else `None`). An empty / None `records`
+    yields `[]` -> today's inferred-role run path.
+    """
+    if not records:
+        return []
+    from .spmw_target import BackendHandle, HandleToken
+    try:
+        from .spmw_target import _VerbCallOrToken
+        _token_types = (HandleToken, _VerbCallOrToken)
+    except ImportError:  # pragma: no cover - _VerbCallOrToken always present
+        _token_types = (HandleToken,)
+
+    bh = BackendHandle(target)
+    resolved = []
+    for rec in records:
+        move = bh.resolve(rec)
+        # Device handle = the resolved move's device endpoint (Memory/Register).
+        device_handle = bh.__getattr__(  # by declared name -> identical object
+            next(a for a in rec.args if isinstance(a, _token_types)).name
+        )
+        # Buffer role = the workload buffer arg (the non-token). Recover its
+        # name when it is a string label; otherwise leave None (the run path
+        # falls back to operand-shape inference for the actual array).
+        buffers = [a for a in rec.args if not isinstance(a, _token_types)]
+        role = None
+        if buffers:
+            b = buffers[0]
+            role = b if isinstance(b, str) else getattr(b, "name", None)
+        resolved.append(
+            ResolvedHostMove(
+                verb=rec.verb, move=move,
+                device_handle=device_handle, buffer_role=role,
+            )
+        )
+    return resolved
+
+
+def _stamp_host_moves(stored_layout, resolved):
+    """Stamp resolved host moves onto placement `extra["host_moves"]` (D5).
+
+    Free-form provenance only; the cost arithmetic does not read the value to
+    compute cycles, so numbers are unchanged. Handles a single Placement or a
+    list of them.
+    """
+    layouts = stored_layout if isinstance(stored_layout, list) else [stored_layout]
+    for pl in layouts:
+        extra = getattr(pl, "extra", None)
+        if isinstance(extra, dict):
+            extra["host_moves"] = resolved
+
+
 def compile_for_target(
     target: Any,
     trace: MatchTrace,
     layout: Placement | list[Placement] | None = None,
     backend: "str | None" = None,
     cost_flavor: str = "faithful",
+    host_moves: "list | None" = None,
+    performance_model=None,
 ) -> Compiled:
     """Lower a (target, trace) pair to a runnable backend artifact by
     walking the target's declarations.
@@ -3746,8 +4016,15 @@ def compile_for_target(
     by ``target.name``). ``"virtual"`` -> the returned ``Compiled`` runs
     sim-free against the bound ``CostModel`` (``cost_flavor`` selects the
     flavor). Additive; every existing positional caller is unaffected.
+
+    ``host_moves`` (spec 001 D5): an optional list of recorded ``host_xfer.*``
+    calls (``HostMoveRecord``) from the workload's region body. ``None`` (the
+    default) preserves today's inferred-role path. When supplied they are
+    resolved against the target (verb + device-handle identity) and stored on
+    ``Compiled.host_moves`` so the run path asserts the operand->role binding.
     """
     target_name = getattr(target, "name", None)
+    resolved_host_moves = _resolve_host_moves(target, host_moves)
     if trace.target_name != target_name:
         raise ValueError(
             f"trace.target_name {trace.target_name!r} != target.name {target_name!r}"
@@ -3779,6 +4056,8 @@ def compile_for_target(
         return Compiled(
             target, trace, [], stored_layout, ctx=None,
             backend=backend, cost_flavor=cost_flavor,
+            host_moves=resolved_host_moves,
+            performance_model=performance_model,
         )
 
     ctx_cls = _BACKEND_CTX.get(target_name)
@@ -3793,7 +4072,9 @@ def compile_for_target(
     n_groups = len(buckets) or 1
 
     if layout is None:
-        layouts = autoschedule(target, trace)
+        layouts = autoschedule(
+            target, trace, performance_model=performance_model
+        )
     elif isinstance(layout, Placement):
         # Single layout: replicate across every kernel. Equivalent to
         # the old behaviour for single-layer traces.
@@ -3813,7 +4094,21 @@ def compile_for_target(
     # `Compiled.layout` historically held a single Placement; preserve
     # that for back-compat when there's only one kernel.
     stored_layout = layouts[0] if len(layouts) == 1 else layouts
+    # spec 001 D5: stamp the resolved host moves onto the placement(s)' `extra`
+    # so the `host_staging` cost compose can ATTRIBUTE its (unchanged) M,K-derived
+    # cost to the explicit `host_xfer.*` moves (provenance cross-check). Additive:
+    # a placement without this key prices exactly as before.
+    if resolved_host_moves:
+        _stamp_host_moves(stored_layout, resolved_host_moves)
+    execution_graph = None
+    if getattr(target, "has_performance_model", False):
+        from .spmw_plan import build_execution_graph
+
+        execution_graph = build_execution_graph(target, trace, stored_layout)
     return Compiled(
         target, trace, ctx.cmds, stored_layout, ctx=ctx,
         backend=backend, cost_flavor=cost_flavor,
+        host_moves=resolved_host_moves,
+        execution_graph=execution_graph,
+        performance_model=performance_model,
     )

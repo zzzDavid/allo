@@ -15,13 +15,14 @@ from allo.ir.types import float32 as fp16
 from allo.dataflow import region as _df_region
 
 from lib.shapes import shape
+from lib import host_staging
 
 _S = shape("covariance")
 M, N = _S["M"], _S["N"]
 
 _MAPPING = [16, 8]
 _NPE = _MAPPING[0] * _MAPPING[1]
-ROWS = -(-M // _NPE)                          # ceil(M / 128)
+ROWS = -(-M // _NPE)  # ceil(M / 128)
 
 
 @_df_region()
@@ -40,6 +41,15 @@ def _covariance_top(cdata: fp16[N, M], cov_raw: fp16[M, M]):
 
 def build():
     return _covariance_top
+
+
+# Host data movement (spec backend-host-transfer-dispatch.md): the contraction is
+# cov_raw = cdata^T @ cdata, so cdata is staged as BOTH the scattered weight and
+# the broadcast input; cov_raw is gathered back. Recorded at import and consumed
+# by the suite's ``allo.compile`` helper.
+with allo.record_host_moves() as _hm:
+    host_staging.stage_gemm(weight="cdata", vec="cdata", out="cov_raw")
+HOST_MOVES = list(_hm)
 
 
 STAGES = [(M, N)]

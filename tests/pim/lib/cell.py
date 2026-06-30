@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """PolyBench-on-PIM suite: the shared per-cell driver (written once).
 
-`run_cell` is the body every kernel-folder test calls: build the target, run the
-folder's workload through `lib.runner.compile_and_run`, derive the verdict from
-what the run surfaces (`lib.reference.verdict_for_run`), and write the per-cell
+`run_cell` is the body every kernel-folder test calls: build the target, compile
+single-artifact workloads through `allo.compile` via `lib.runner`, derive the
+verdict from what the run surfaces (`lib.reference.verdict_for_run`), and write the per-cell
 `results.json` + `RESULTS.md` + regenerate `COVERAGE.tsv` with run-stamped
 provenance. A kernel-folder test stays a thin call -- it declares only its
 workload + inputs, no hardware, no schema, no verdict logic.
@@ -75,11 +75,13 @@ def _samsung_gemm_operands(kernel, shapes):
     if kernel == "gemm":
         # C = A[P,Q] @ B[Q,R]; host alpha/beta is applied to the ref off-device.
         P, Q, R = int(shapes["P"]), int(shapes["Q"]), int(shapes["R"])
-        A = (rng0.random((P, Q)).astype(np.float16) * 0.1)
-        B = (rng1.random((Q, R)).astype(np.float16) * 0.1)
+        A = rng0.random((P, Q)).astype(np.float16) * 0.1
+        B = rng1.random((Q, R)).astype(np.float16) * 0.1
         alpha, beta = 1.5, 1.2
-        C0 = (rng0.random((P, R)).astype(np.float16) * 0.1)
-        ref = alpha * (A.astype(np.float32) @ B.astype(np.float32)) + beta * C0.astype(np.float32)
+        C0 = rng0.random((P, R)).astype(np.float16) * 0.1
+        ref = alpha * (A.astype(np.float32) @ B.astype(np.float32)) + beta * C0.astype(
+            np.float32
+        )
         # The device computes the bare A@B; the harness checks that bare product
         # (host alpha/beta is a trivial elementwise post-pass on the ref, recorded
         # but not gated here -- the device contraction is what REDUCE proves).
@@ -92,18 +94,22 @@ def _samsung_gemm_operands(kernel, shapes):
         # cdata^T @ cdata. Express as GEMM with operand0 = cdata^T (M,N) and
         # operand1 = cdata (N,M) -> (M,M).
         N, M = int(shapes["N"]), int(shapes["M"])
-        cdata = (rng0.random((N, M)).astype(np.float16) * 0.1)
-        A = cdata.T.copy()                 # (M, N)
-        B = cdata.copy()                   # (N, M)
-        bare_ref = A.astype(np.float32) @ B.astype(np.float32)   # (M, M)
+        cdata = rng0.random((N, M)).astype(np.float16) * 0.1
+        A = cdata.T.copy()  # (M, N)
+        B = cdata.copy()  # (N, M)
+        bare_ref = A.astype(np.float32) @ B.astype(np.float32)  # (M, M)
         return A, B, bare_ref
     if kernel == "doitgen":
         # out[r,q,p] = sum_s A[r,q,s]*x[s,p]; batch (r,q) -> (R*Q, S) @ (S, P).
-        R, Q, S, P = (int(shapes["R"]), int(shapes["Q"]),
-                      int(shapes["S"]), int(shapes["P"]))
-        A = (rng0.random((R * Q, S)).astype(np.float16) * 0.1)
-        B = (rng1.random((S, P)).astype(np.float16) * 0.1)
-        bare_ref = A.astype(np.float32) @ B.astype(np.float32)   # (R*Q, P)
+        R, Q, S, P = (
+            int(shapes["R"]),
+            int(shapes["Q"]),
+            int(shapes["S"]),
+            int(shapes["P"]),
+        )
+        A = rng0.random((R * Q, S)).astype(np.float16) * 0.1
+        B = rng1.random((S, P)).astype(np.float16) * 0.1
+        bare_ref = A.astype(np.float32) @ B.astype(np.float32)  # (R*Q, P)
         return A, B, bare_ref
     return None
 
@@ -125,13 +131,15 @@ def harness_inputs(backend, stages, kernel=None, shapes=None):
     import numpy as np
 
     def _wx(rows, red):
-        return (np.zeros((int(rows), int(red)), dtype=np.float16),
-                np.zeros(int(red), dtype=np.float16))
+        return (
+            np.zeros((int(rows), int(red)), dtype=np.float16),
+            np.zeros(int(red), dtype=np.float16),
+        )
 
     def _wx_real(rows, red):
         rng = np.random.default_rng(0)
-        W = (rng.random((int(rows), int(red))).astype(np.float16) * 0.1)
-        x = (rng.random(int(red)).astype(np.float16) * 0.1)
+        W = rng.random((int(rows), int(red))).astype(np.float16) * 0.1
+        x = rng.random(int(red)).astype(np.float16) * 0.1
         return W, x
 
     if backend == "aim":
@@ -152,9 +160,13 @@ def harness_inputs(backend, stages, kernel=None, shapes=None):
             # cycle count. samsung_correctness can't build a matching ref for these
             # (no _samsung_gemm_operands entry) -> honest CYCLES-ONLY, real cycles.
             rows, red = stages[0]
-            A = (np.random.default_rng(0).random((int(rows), int(red)))
-                 .astype(np.float16) * 0.1)
-            x = (np.random.default_rng(1).random(int(red)).astype(np.float16) * 0.1)
+            A = (
+                np.random.default_rng(0)
+                .random((int(rows), int(red)))
+                .astype(np.float16)
+                * 0.1
+            )
+            x = np.random.default_rng(1).random(int(red)).astype(np.float16) * 0.1
             return {"A": A, "x": x}
         layers = []
         for rows, red in stages:
@@ -168,8 +180,8 @@ def harness_inputs(backend, stages, kernel=None, shapes=None):
         # array to Python). First-stage geometry.
         rows, red = stages[0]
         rng = np.random.default_rng(0)
-        W = (rng.random((int(rows), int(red))).astype(np.float16) * 0.1)
-        x = (rng.random(int(red)).astype(np.float16) * 0.1)
+        W = rng.random((int(rows), int(red))).astype(np.float16) * 0.1
+        x = rng.random(int(red)).astype(np.float16) * 0.1
         return {"W": W, "x": x}
     # upmem (and any GEMV-slot backend): first-stage geometry.
     W, x = _wx(*stages[0])
@@ -195,8 +207,8 @@ def apu_v1_correctness(result, stages, kernel) -> "reference.Verdict":
     tol = reference.tolerance_for("apu_v1")
     rows, red = stages[0]
     rng = np.random.default_rng(0)  # SAME seed as harness_inputs -> the real inputs
-    W = (rng.random((int(rows), int(red))).astype(np.float16) * 0.1)
-    x = (rng.random(int(red)).astype(np.float16) * 0.1)
+    W = rng.random((int(rows), int(red))).astype(np.float16) * 0.1
+    x = rng.random(int(red)).astype(np.float16) * 0.1
     ref = W.astype(np.float32) @ x.astype(np.float32)
     for arr in outputs.values():
         a = np.asarray(arr).reshape(-1)
@@ -256,8 +268,8 @@ def samsung_correctness(result, stages, kernel, shapes=None) -> "reference.Verdi
     if ref is None:
         rows, red = _SAMSUNG_DESIGN_POINT if len(stages) <= 1 else stages[-1]
         rng = np.random.default_rng(0)  # SAME seed as harness_inputs legacy path
-        W = (rng.random((int(rows), int(red))).astype(np.float16) * 0.1)
-        x = (rng.random(int(red)).astype(np.float16) * 0.1)
+        W = rng.random((int(rows), int(red))).astype(np.float16) * 0.1
+        x = rng.random(int(red)).astype(np.float16) * 0.1
         ref = W.astype(np.float32) @ x.astype(np.float32)
 
     arr = outputs.get("out")
@@ -299,6 +311,56 @@ def samsung_correctness(result, stages, kernel, shapes=None) -> "reference.Verdi
     )
 
 
+def run_host_program(host, module):
+    """Execute a recorded host program (host-xcel driver) and judge it.
+
+    Thin harness shim over the compiler's host-program capability: the residency
+    analysis (`allo.spmw_host_program.analyze`) and device execution
+    (`spmw_codegen.execute_host_schedule_samsung`) live in `allo/`; this function
+    keeps only the TEST-side concerns -- seeding external inputs and composing the
+    float32 reference -- and returns `(final_readback, composed_ref, total_cycles)`
+    like `samsung_reduce_chain` (or `(None,None,None)`/`(False,None,total)` on a
+    down/empty driver).
+
+    External inputs are seeded in first-consumed order with `rng(0)*0.1` (the same
+    draws the legacy recipe used, so the numbers are unchanged). The cross-stage
+    orchestration -- and the weight-residency / batched-GEMV coalescing -- come
+    from the workload's host program via the compiler analysis, not a per-kernel
+    recipe.
+    """
+    import numpy as np
+    from allo.spmw_codegen import execute_host_schedule_samsung
+    from allo.spmw_host_program import resolve_shapes, analyze
+
+    shapes = resolve_shapes(host, vars(module))
+    schedule = analyze(host, shapes)
+
+    # Seed external inputs (test data) in first-consumed order; ref mirrors them.
+    rng = np.random.default_rng(0)
+    dev_inputs: dict = {}
+    ref: dict = {}
+    for name in schedule.external_inputs:
+        v = rng.random(shapes[name]).astype(np.float16) * 0.1
+        dev_inputs[name] = v
+        ref[name] = v.astype(np.float32)
+
+    dev, total = execute_host_schedule_samsung(schedule, dev_inputs)
+    if total is None:
+        return None, None, None  # driver unavailable
+    if dev is None:
+        return False, None, total  # ran but surfaced nothing
+
+    # Compose the float32 reference by mirroring each group's contraction.
+    for g in schedule.groups:
+        for lx in g.launches:
+            ref[lx.out] = ref[lx.weight] @ ref[lx.vec]
+
+    final = schedule.final
+    if final is None or final not in dev:
+        return False, None, total
+    return dev[final], ref[final], total
+
+
 def samsung_reduce_chain(kernel, shapes):
     """SPEC-04 §5.1: run a multi-stage GEMM-family kernel through GENERIC_REDUCE,
     threading each stage's REAL readback forward as the next stage's input, and
@@ -324,7 +386,7 @@ def samsung_reduce_chain(kernel, shapes):
     rng = np.random.default_rng(0)
 
     def seed(*shape):
-        return (rng.random(shape).astype(np.float16) * 0.1)
+        return rng.random(shape).astype(np.float16) * 0.1
 
     def f32(a):
         return np.asarray(a, dtype=np.float32)
@@ -355,7 +417,7 @@ def samsung_reduce_chain(kernel, shapes):
         y = stage(A.T.copy(), tmp, M=N, K=M, N=1)
         if y is False:
             return False, None, total
-        ref = f32(A.T) @ (f32(A) @ f32(x))     # genuine composition
+        ref = f32(A.T) @ (f32(A) @ f32(x))  # genuine composition
         return y, ref, total
 
     if kernel == "bicg":
@@ -372,8 +434,7 @@ def samsung_reduce_chain(kernel, shapes):
             return False, None, total
         q_ref = f32(A) @ f32(p)
         s_ref = f32(A.T) @ f32(r)
-        return (np.concatenate([f32(q), f32(s)]),
-                np.concatenate([q_ref, s_ref]), total)
+        return (np.concatenate([f32(q), f32(s)]), np.concatenate([q_ref, s_ref]), total)
 
     if kernel == "mvt":
         # x1 = A @ y1 ; x2 = A^T @ y2. Two independent GEMVs; polybench folds
@@ -388,8 +449,11 @@ def samsung_reduce_chain(kernel, shapes):
             return False, None, total
         x1_ref = f32(A) @ f32(y1)
         x2_ref = f32(A.T) @ f32(y2)
-        return (np.concatenate([f32(x1), f32(x2)]),
-                np.concatenate([x1_ref, x2_ref]), total)
+        return (
+            np.concatenate([f32(x1), f32(x2)]),
+            np.concatenate([x1_ref, x2_ref]),
+            total,
+        )
 
     if kernel == "gesummv":
         # tmp = A @ x ; y = B @ x ; out = alpha*tmp + beta*y. Two INDEPENDENT
@@ -404,14 +468,18 @@ def samsung_reduce_chain(kernel, shapes):
         y = stage(B, x, M=N, K=N, N=1)
         if tmp is False or y is False:
             return False, None, total
-        out = alpha * f32(tmp) + beta * f32(y)          # host axpy on device outs
+        out = alpha * f32(tmp) + beta * f32(y)  # host axpy on device outs
         ref = alpha * (f32(A) @ f32(x)) + beta * (f32(B) @ f32(x))
         return out, ref, total
 
     if kernel == "two_mm":
         # AB = A @ B ; D = AB @ C. A GEMM chain (stage2 input = stage1 readback).
-        P, Q, R, S = (int(shapes["P"]), int(shapes["Q"]),
-                      int(shapes["R"]), int(shapes["S"]))
+        P, Q, R, S = (
+            int(shapes["P"]),
+            int(shapes["Q"]),
+            int(shapes["R"]),
+            int(shapes["S"]),
+        )
         A, B, C = seed(P, Q), seed(Q, R), seed(R, S)
         AB = stage(A, B, M=P, K=Q, N=R)
         if AB is None:
@@ -426,8 +494,13 @@ def samsung_reduce_chain(kernel, shapes):
 
     if kernel == "three_mm":
         # AB = A@B ; CD = C@D ; G = AB@CD. G threads TWO prior readbacks.
-        P, Q, R, NT, S = (int(shapes["P"]), int(shapes["Q"]), int(shapes["R"]),
-                          int(shapes["T"]), int(shapes["S"]))
+        P, Q, R, NT, S = (
+            int(shapes["P"]),
+            int(shapes["Q"]),
+            int(shapes["R"]),
+            int(shapes["T"]),
+            int(shapes["S"]),
+        )
         A, B, C, D = seed(P, Q), seed(Q, R), seed(R, S), seed(S, NT)
         AB = stage(A, B, M=P, K=Q, N=R)
         if AB is None:
@@ -444,8 +517,9 @@ def samsung_reduce_chain(kernel, shapes):
     return None, None, None  # no chain recipe (e.g. gemver: mixed ELTWISE+REDUCE)
 
 
-def _finish_samsung_chain_cell(*, kernel, folder, dataset, shapes, run_cmd, notes,
-                               final, ref, total_cyc):
+def _finish_samsung_chain_cell(
+    *, kernel, folder, dataset, shapes, run_cmd, notes, final, ref, total_cyc
+):
     """Build the verdict + record + RunResult for a multi-stage Samsung REDUCE
     chain. `final`/`ref` are the composed device output + genuine numpy ref;
     `final is False` => a stage ran but surfaced nothing (CYCLES-ONLY). PASS only
@@ -486,10 +560,17 @@ def _finish_samsung_chain_cell(*, kernel, folder, dataset, shapes, run_cmd, note
             )
     source = runner.sim_source("samsung_hbm_pim")
     record = results.build_record(
-        kernel=kernel, target="samsung_hbm_pim", dataset=dataset, shapes=shapes,
-        verdict=verdict, reference_provenance=reference.provenance(kernel),
-        metric="cycles", value=result.cycles, source=source,
-        run_cmd=run_cmd, timestamp=runner.now_iso(),
+        kernel=kernel,
+        target="samsung_hbm_pim",
+        dataset=dataset,
+        shapes=shapes,
+        verdict=verdict,
+        reference_provenance=reference.provenance(kernel),
+        metric="cycles",
+        value=result.cycles,
+        source=source,
+        run_cmd=run_cmd,
+        timestamp=runner.now_iso(),
         tenon_commit=runner.tenon_commit(),
         notes=notes + " | SPEC-04 cross-stage REDUCE chain (logical shape; fabric "
         "M padded to 4096, K to 256 per stage).",
@@ -500,8 +581,9 @@ def _finish_samsung_chain_cell(*, kernel, folder, dataset, shapes, run_cmd, note
     return result, verdict, record
 
 
-def _finish_samsung_no_chain_cell(*, kernel, folder, dataset, shapes, stages,
-                                  run_cmd, notes):
+def _finish_samsung_no_chain_cell(
+    *, kernel, folder, dataset, shapes, stages, run_cmd, notes
+):
     """SPEC-05: a multi-stage Samsung kernel with NO chain recipe (gemver: mixed
     ELTWISE rank-1 + GEMV) -> honest CYCLES-ONLY. Run ONE slice-form REDUCE pass
     over the first stage (real seeded operands) for a genuine cycle count; the
@@ -512,8 +594,8 @@ def _finish_samsung_no_chain_cell(*, kernel, folder, dataset, shapes, stages,
 
     rng = np.random.default_rng(0)
     rows, red = (int(stages[0][0]), int(stages[0][1]))
-    A = (rng.random((rows, red)).astype(np.float16) * 0.1)
-    x = (rng.random(red).astype(np.float16) * 0.1)
+    A = rng.random((rows, red)).astype(np.float16) * 0.1
+    x = rng.random(red).astype(np.float16) * 0.1
     _out, cyc = run_samsung_reduce(A, x, M=rows, K=red, N=1)
     verdict = reference.Verdict(
         reference.CYCLES_ONLY,
@@ -525,13 +607,21 @@ def _finish_samsung_no_chain_cell(*, kernel, folder, dataset, shapes, stages,
     result = RunResult(
         cycles=cyc,
         stdout=f"samsung GENERIC_REDUCE no-chain ({kernel} {shapes}): cycles={cyc}",
-        backend="samsung_hbm_pim", extra={"kernel": "GENERIC_REDUCE_NOCHAIN"},
+        backend="samsung_hbm_pim",
+        extra={"kernel": "GENERIC_REDUCE_NOCHAIN"},
     )
     record = results.build_record(
-        kernel=kernel, target="samsung_hbm_pim", dataset=dataset, shapes=shapes,
-        verdict=verdict, reference_provenance=reference.provenance(kernel),
-        metric="cycles", value=cyc, source=runner.sim_source("samsung_hbm_pim"),
-        run_cmd=run_cmd, timestamp=runner.now_iso(),
+        kernel=kernel,
+        target="samsung_hbm_pim",
+        dataset=dataset,
+        shapes=shapes,
+        verdict=verdict,
+        reference_provenance=reference.provenance(kernel),
+        metric="cycles",
+        value=cyc,
+        source=runner.sim_source("samsung_hbm_pim"),
+        run_cmd=run_cmd,
+        timestamp=runner.now_iso(),
         tenon_commit=runner.tenon_commit(),
         notes=notes + " | SPEC-05 multi-stage, no chain recipe (mixed "
         "ELTWISE+REDUCE); honest CYCLES-ONLY.",
@@ -542,8 +632,18 @@ def _finish_samsung_no_chain_cell(*, kernel, folder, dataset, shapes, stages,
     return result, verdict, record
 
 
-def run_cell(*, kernel, target_name, folder, stages, dataset="SMALL",
-             shapes, run_cmd, workload=None, notes=""):
+def run_cell(
+    *,
+    kernel,
+    target_name,
+    folder,
+    stages,
+    dataset="SMALL",
+    shapes,
+    run_cmd,
+    workload=None,
+    notes="",
+):
     """Run one (kernel, target) cell end-to-end and write its artifacts.
 
     Returns `(result, verdict, record)`. `stages` is the workload's `STAGES`
@@ -563,19 +663,39 @@ def run_cell(*, kernel, target_name, folder, stages, dataset="SMALL",
 
     # SPEC-05: prefer the leaf-dir (target-specific, slice-form) workload; the
     # loaded module's STAGES wins (the slice form may declare its own geometry).
+    host_moves = None
+    host_prog = None  # Level 2 (emit): the @allo.host_program driver, if any.
+    wl_module = None
     if workload is None:
         _wl = load_workload(folder, kernel)
         workload = _wl.build()
         stages = getattr(_wl, "STAGES", stages)
+        # spec backend-host-transfer-dispatch.md (task 004): a leaf workload that
+        # expresses its host data movement via `allo.host_xfer.*` exports the
+        # recorded moves as `HOST_MOVES`; thread them into the single-artifact
+        # Samsung run so the role binding is driven by the explicit moves.
+        host_moves = getattr(_wl, "HOST_MOVES", None)
+        # Level 2 (emit): a leaf workload that declares a host-xcel driver via
+        # `@allo.host_program` exposes it as `host`; the multi-stage chain is then
+        # EXECUTED from that program rather than a hardcoded per-kernel recipe.
+        host_prog = getattr(_wl, "host", None)
+        wl_module = _wl
 
     target = build_target(target_name)
     inputs = harness_inputs(target_name, stages, kernel=kernel, shapes=shapes)
 
     if target_name == "apu_v1":
         return _run_apu_v1_cell(
-            kernel=kernel, target=target, workload=workload, folder=folder,
-            stages=stages, inputs=inputs, dataset=dataset, shapes=shapes,
-            run_cmd=run_cmd, notes=notes,
+            kernel=kernel,
+            target=target,
+            workload=workload,
+            folder=folder,
+            stages=stages,
+            inputs=inputs,
+            dataset=dataset,
+            shapes=shapes,
+            run_cmd=run_cmd,
+            notes=notes,
         )
 
     # SPEC-05: a single-stage Samsung kernel NOT in the GEMM-family operand table
@@ -584,11 +704,19 @@ def run_cell(*, kernel, target_name, folder, stages, dataset="SMALL",
     # GENERIC_REDUCE, record an honest CYCLES-ONLY via one stage-0 GEMV REDUCE pass
     # (real cycles, numerics unchecked) -- NOT the single-artifact path, which would
     # need GEMM B kwargs and return cycles=None.
-    if (target_name == "samsung_hbm_pim" and len(stages) <= 1
-            and _samsung_gemm_operands(kernel, shapes) is None):
+    if (
+        target_name == "samsung_hbm_pim"
+        and len(stages) <= 1
+        and _samsung_gemm_operands(kernel, shapes) is None
+    ):
         return _finish_samsung_no_chain_cell(
-            kernel=kernel, folder=folder, dataset=dataset, shapes=shapes,
-            stages=stages, run_cmd=run_cmd, notes=notes,
+            kernel=kernel,
+            folder=folder,
+            dataset=dataset,
+            shapes=shapes,
+            stages=stages,
+            run_cmd=run_cmd,
+            notes=notes,
         )
 
     # SPEC-04 §5.1: a multi-stage GEMM-family Samsung cell threads stage outputs
@@ -597,7 +725,15 @@ def run_cell(*, kernel, target_name, folder, stages, dataset="SMALL",
     # the driver per stage directly (not through compile_and_run), so handle it
     # before the single-artifact run below.
     if target_name == "samsung_hbm_pim" and len(stages) > 1:
-        chain = samsung_reduce_chain(kernel, shapes)
+        # Level 2 (emit): if the workload ships a host-xcel driver, EXECUTE it
+        # (the chain is driven by the recorded `host.steps`, no per-kernel recipe);
+        # otherwise fall back to the legacy hardcoded `samsung_reduce_chain`.
+        from allo.spmw_target import HostProgram
+
+        if isinstance(host_prog, HostProgram):
+            chain = run_host_program(host_prog, wl_module)
+        else:
+            chain = samsung_reduce_chain(kernel, shapes)
         final, ref, total_cyc = chain
         if final is None and ref is None and total_cyc is None:
             # No chain recipe (e.g. gemver: mixed ELTWISE rank-1 + GEMV, out of
@@ -606,12 +742,23 @@ def run_cell(*, kernel, target_name, folder, stages, dataset="SMALL",
             # NOT a fall-through to the single-artifact path, which would expect
             # A/B kwargs and return cycles=None.
             return _finish_samsung_no_chain_cell(
-                kernel=kernel, folder=folder, dataset=dataset, shapes=shapes,
-                stages=stages, run_cmd=run_cmd, notes=notes,
+                kernel=kernel,
+                folder=folder,
+                dataset=dataset,
+                shapes=shapes,
+                stages=stages,
+                run_cmd=run_cmd,
+                notes=notes,
             )
         return _finish_samsung_chain_cell(
-            kernel=kernel, folder=folder, dataset=dataset, shapes=shapes,
-            run_cmd=run_cmd, notes=notes, final=final, ref=ref,
+            kernel=kernel,
+            folder=folder,
+            dataset=dataset,
+            shapes=shapes,
+            run_cmd=run_cmd,
+            notes=notes,
+            final=final,
+            ref=ref,
             total_cyc=total_cyc,
         )
 
@@ -624,11 +771,14 @@ def run_cell(*, kernel, target_name, folder, stages, dataset="SMALL",
     # not edit the (re-export-only) run path.
     sim_core = None
     try:
-        result = runner.compile_and_run(target, workload, **inputs)
+        result = runner.compile_and_run(
+            target, workload, host_moves=host_moves, **inputs
+        )
     except RuntimeError as exc:
         sim_core = str(exc)
         result = RunResult(
-            cycles=None, stdout=f"BLOCKED-SIM: {sim_core[:300]}",
+            cycles=None,
+            stdout=f"BLOCKED-SIM: {sim_core[:300]}",
             backend=target_name,
         )
 
@@ -657,17 +807,23 @@ def run_cell(*, kernel, target_name, folder, stages, dataset="SMALL",
         verdict = samsung_correctness(result, stages, kernel, shapes=shapes)
         source = runner.sim_source(target_name)
     else:
-        verdict = reference.verdict_for_run(
-            result, backend=target_name, kernel=kernel
-        )
+        verdict = reference.verdict_for_run(result, backend=target_name, kernel=kernel)
         source = runner.sim_source(target_name)
 
     record = results.build_record(
-        kernel=kernel, target=target_name, dataset=dataset, shapes=shapes,
-        verdict=verdict, reference_provenance=reference.provenance(kernel),
-        metric="cycles", value=result.cycles, source=source,
-        run_cmd=run_cmd, timestamp=runner.now_iso(),
-        tenon_commit=runner.tenon_commit(), notes=notes,
+        kernel=kernel,
+        target=target_name,
+        dataset=dataset,
+        shapes=shapes,
+        verdict=verdict,
+        reference_provenance=reference.provenance(kernel),
+        metric="cycles",
+        value=result.cycles,
+        source=source,
+        run_cmd=run_cmd,
+        timestamp=runner.now_iso(),
+        tenon_commit=runner.tenon_commit(),
+        notes=notes,
     )
     results.write_results(folder, record)
     results.write_results_md(folder, record)
@@ -675,8 +831,9 @@ def run_cell(*, kernel, target_name, folder, stages, dataset="SMALL",
     return result, verdict, record
 
 
-def _run_apu_v1_cell(*, kernel, target, workload, folder, stages, inputs,
-                     dataset, shapes, run_cmd, notes):
+def _run_apu_v1_cell(
+    *, kernel, target, workload, folder, stages, inputs, dataset, shapes, run_cmd, notes
+):
     """APU v1 REAL-DEVICE cell: serialize board access, run on the board, check
     real numerics vs the numpy ref. Device-unreachable -> BLOCKED-DEVICE with the
     concrete reason, NEVER sim-substituted (spec Answer 5). source records the
@@ -692,24 +849,39 @@ def _run_apu_v1_cell(*, kernel, target, workload, folder, stages, inputs,
             f"sim-substituted",
         )
         record = results.build_record(
-            kernel=kernel, target="apu_v1", dataset=dataset, shapes=shapes,
-            verdict=verdict, reference_provenance=reference.provenance(kernel),
-            metric="cycles", value=None, source="apu_v1_device@unreachable",
-            run_cmd=run_cmd, timestamp=runner.now_iso(),
-            tenon_commit=runner.tenon_commit(), notes=notes,
+            kernel=kernel,
+            target="apu_v1",
+            dataset=dataset,
+            shapes=shapes,
+            verdict=verdict,
+            reference_provenance=reference.provenance(kernel),
+            metric="cycles",
+            value=None,
+            source="apu_v1_device@unreachable",
+            run_cmd=run_cmd,
+            timestamp=runner.now_iso(),
+            tenon_commit=runner.tenon_commit(),
+            notes=notes,
         )
         results.write_results(folder, record)
         results.write_results_md(folder, record)
         results.regenerate_coverage()
-        return RunResult(cycles=None, stdout=f"BLOCKED-DEVICE: {reason}",
-                         backend="apu_v1"), verdict, record
+        return (
+            RunResult(
+                cycles=None, stdout=f"BLOCKED-DEVICE: {reason}", backend="apu_v1"
+            ),
+            verdict,
+            record,
+        )
 
     # Serialize the shared board (conftest file-lock) around the real run.
     try:
         import conftest  # tests/pim/conftest.py is on sys.path under the suite
+
         board_lock = conftest.board_lock
     except Exception:  # noqa: BLE001 -- fall back to a no-op CM if absent
         import contextlib
+
         board_lock = contextlib.nullcontext
 
     device_unreachable = None
@@ -722,9 +894,11 @@ def _run_apu_v1_cell(*, kernel, target, workload, folder, stages, inputs,
             # number. (A genuine Tenon build/codegen gap would be fixed in
             # session; this branch is the environment/board failure.)
             device_unreachable = str(exc)
-            result = RunResult(cycles=None,
-                               stdout=f"BLOCKED-DEVICE: {device_unreachable[:300]}",
-                               backend="apu_v1")
+            result = RunResult(
+                cycles=None,
+                stdout=f"BLOCKED-DEVICE: {device_unreachable[:300]}",
+                backend="apu_v1",
+            )
 
     source = runner.apu_v1_device_source()
     if device_unreachable is not None or result.cycles is None:
@@ -738,11 +912,19 @@ def _run_apu_v1_cell(*, kernel, target, workload, folder, stages, inputs,
         verdict = apu_v1_correctness(result, stages, kernel)
 
     record = results.build_record(
-        kernel=kernel, target="apu_v1", dataset=dataset, shapes=shapes,
-        verdict=verdict, reference_provenance=reference.provenance(kernel),
-        metric="cycles", value=result.cycles, source=source,
-        run_cmd=run_cmd, timestamp=runner.now_iso(),
-        tenon_commit=runner.tenon_commit(), notes=notes,
+        kernel=kernel,
+        target="apu_v1",
+        dataset=dataset,
+        shapes=shapes,
+        verdict=verdict,
+        reference_provenance=reference.provenance(kernel),
+        metric="cycles",
+        value=result.cycles,
+        source=source,
+        run_cmd=run_cmd,
+        timestamp=runner.now_iso(),
+        tenon_commit=runner.tenon_commit(),
+        notes=notes,
     )
     results.write_results(folder, record)
     results.write_results_md(folder, record)

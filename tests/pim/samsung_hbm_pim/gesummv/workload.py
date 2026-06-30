@@ -14,6 +14,7 @@ from allo.ir.types import float32 as fp16
 from allo.dataflow import region as _df_region
 
 from lib.shapes import shape
+from lib import host_staging
 
 N = shape("gesummv")["N"]
 
@@ -47,6 +48,15 @@ def _gesummv_top(A: fp16[N, N], B: fp16[N, N], x: fp16[N], tmp: fp16[N], y: fp16
 
 def build():
     return _gesummv_top
+
+
+# Host data movement (spec backend-host-transfer-dispatch.md): two INDEPENDENT
+# GEMVs over the SAME x; both tmp and y are gathered back for the host axpy
+# `out = alpha*tmp + beta*y`.
+with allo.record_host_moves() as _hm:
+    host_staging.stage_gemm(weight="A", vec="x", out="tmp")  # tmp = A @ x
+    host_staging.stage_gemm(weight="B", vec="x", out="y")  # y   = B @ x
+HOST_MOVES = list(_hm)
 
 
 STAGES = [(N, N), (N, N)]

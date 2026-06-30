@@ -20,11 +20,13 @@ P, Q, R, S = _S["P"], _S["Q"], _S["R"], _S["S"]
 
 _MAPPING = [16, 8]
 _NPE = _MAPPING[0] * _MAPPING[1]
-ROWS = -(-P // _NPE)                            # both stages output P rows
+ROWS = -(-P // _NPE)  # both stages output P rows
 
 
 @_df_region()
-def _two_mm_top(A: fp16[P, Q], B: fp16[Q, R], C: fp16[R, S], AB: fp16[P, R], D: fp16[P, S]):
+def _two_mm_top(
+    A: fp16[P, Q], B: fp16[Q, R], C: fp16[R, S], AB: fp16[P, R], D: fp16[P, S]
+):
     @allo.work(mapping=_MAPPING, args=[A, B, AB])
     def mm1(local_A: fp16[P, Q], local_B: fp16[Q, R], local_AB: fp16[P, R]):
         pid, uid = allo.get_wid()
@@ -50,6 +52,33 @@ def _two_mm_top(A: fp16[P, Q], B: fp16[Q, R], C: fp16[R, S], AB: fp16[P, R], D: 
 
 def build():
     return _two_mm_top
+
+
+# Host program (host-xcel model): a top-to-bottom driver that stages operands,
+# invokes the two device kernels in order, and reads the final result back.
+# Operands are referenced by identity (the BufferTokens bound to the params),
+# device endpoints by handle (`banks`/`grf_a`). A GEMM chain: AB stays
+# DEVICE-RESIDENT between the stages (it is re-staged for stage 2 but never
+# gathered to host); only D is read back.
+banks, grf_a = allo.host_xfer.banks, allo.host_xfer.grf_a
+
+
+@allo.host_program(_two_mm_top)
+def host(A, B, C, AB, D):
+    # stage 1:  AB = A @ B
+    allo.host_xfer.scatter(A, banks)  # weight A -> per-bank DRAM
+    allo.host_xfer.broadcast(B, grf_a)  # input  B -> GRF_A (all PEs)
+    allo.launch("mm1", A, B, AB)  # invoke kernel 1 -> AB on device
+
+    # stage 2:  D = AB @ C   (AB device-resident, re-staged as the weight)
+    allo.host_xfer.scatter(AB, banks)
+    allo.host_xfer.broadcast(C, grf_a)
+    allo.launch("mm2", AB, C, D)  # invoke kernel 2 -> D
+
+    allo.host_xfer.gather(D, banks)  # read the final result back
+
+
+HOST_MOVES = host.moves
 
 
 STAGES = [(P, Q), (P, R)]
