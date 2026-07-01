@@ -28,9 +28,8 @@ from .cost import bind_cost
 def compile_workload(target, workload, backend=None, host_moves=None, cost=None):
     """Compile through the public ``allo.compile`` interface.
 
-    Samsung binds its packaged resource-DAG calibration profile. Targets not
-    yet ported to the new model receive ``cost=None`` and use their existing
-    target path behind the same public facade.
+    Samsung binds its standalone executable cost program. Targets not yet
+    ported receive ``cost=None`` and use their existing physical backend path.
     """
     if cost is None:
         cost = bind_cost(target)

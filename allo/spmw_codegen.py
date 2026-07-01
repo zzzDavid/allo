@@ -463,9 +463,7 @@ class SamsungCtx(CodegenContext):
         # register side (grf_a -> LD_A/ST_A, grf_b -> LD_B/ST_B) -- the
         # same `side` switch the spill cost factory prices.
         if tier != "bank_row":
-            return super().resolve_spill_moves(
-                tier, home_handle, n_entries=n_entries
-            )
+            return super().resolve_spill_moves(tier, home_handle, n_entries=n_entries)
         if isinstance(home_handle, Register) and home_handle.name == "grf_b":
             return ("LD_B", "ST_B")
         return ("LD_A", "ST_A")
@@ -568,23 +566,23 @@ class AimCtx(CodegenContext):
     # Each tuple is the legal field sequence; values are pulled from
     # the field map built by `_field_map(...)`.
     _ISR_FIELDS = {
-        "WR_SBK":     ("gpr_addr_0", "channel_mask", "bank_index", "row_addr"),
-        "WR_ABK":     ("gpr_addr_0", "channel_mask", "row_addr"),
-        "WR_GB":      ("opsize", "gpr_addr_0", "channel_mask"),
-        "WR_BIAS":    ("gpr_addr_0", "channel_mask"),
-        "WR_AFLUT":   ("opsize",),
-        "RD_MAC":     ("gpr_addr_0", "channel_mask"),
-        "RD_AF":      ("gpr_addr_0", "channel_mask"),
-        "RD_SBK":     ("gpr_addr_0", "channel_mask", "bank_index", "row_addr"),
-        "COPY_BKGB":  ("opsize", "channel_mask", "bank_index", "row_addr"),
-        "COPY_GBBK":  ("opsize", "channel_mask", "bank_index", "row_addr"),
-        "MAC_SBK":    ("opsize", "channel_mask", "bank_index", "row_addr"),
-        "MAC_ABK":    ("opsize", "channel_mask", "row_addr"),
-        "AF":         ("channel_mask",),
-        "EWMUL":      ("opsize", "channel_mask", "row_addr"),
-        "EWADD":      ("opsize", "gpr_addr_0", "gpr_addr_1"),
-        "SYNC":       (),
-        "EOC":        (),
+        "WR_SBK": ("gpr_addr_0", "channel_mask", "bank_index", "row_addr"),
+        "WR_ABK": ("gpr_addr_0", "channel_mask", "row_addr"),
+        "WR_GB": ("opsize", "gpr_addr_0", "channel_mask"),
+        "WR_BIAS": ("gpr_addr_0", "channel_mask"),
+        "WR_AFLUT": ("opsize",),
+        "RD_MAC": ("gpr_addr_0", "channel_mask"),
+        "RD_AF": ("gpr_addr_0", "channel_mask"),
+        "RD_SBK": ("gpr_addr_0", "channel_mask", "bank_index", "row_addr"),
+        "COPY_BKGB": ("opsize", "channel_mask", "bank_index", "row_addr"),
+        "COPY_GBBK": ("opsize", "channel_mask", "bank_index", "row_addr"),
+        "MAC_SBK": ("opsize", "channel_mask", "bank_index", "row_addr"),
+        "MAC_ABK": ("opsize", "channel_mask", "row_addr"),
+        "AF": ("channel_mask",),
+        "EWMUL": ("opsize", "channel_mask", "row_addr"),
+        "EWADD": ("opsize", "gpr_addr_0", "gpr_addr_1"),
+        "SYNC": (),
+        "EOC": (),
     }
 
     def __init__(self, target):
@@ -609,8 +607,8 @@ class AimCtx(CodegenContext):
             if handle.name == "gpr":
                 prefix = "gpr_in" if role.startswith("src") else "gpr_out"
                 return f"{prefix}=0"
-            if handle.name == "bias":
-                return "bias=0"
+            if handle.name in ("mac_reg", "af_reg"):
+                return f"{handle.name}=0"
             raise NotImplementedError(
                 f"AimCtx: register {handle.name!r} has no operand mapping."
             )
@@ -620,7 +618,13 @@ class AimCtx(CodegenContext):
                 # `handle.idx` may be a symbolic SymExpr (e.g. autoscheduler
                 # produces `8*bg + bank` with placeholder UnitIds); collapse
                 # to a concrete int via `_eval_sym` so ramulator2 accepts it.
-                bank_int = _eval_sym(handle.idx)
+                env = {
+                    level: value
+                    for level, value in enumerate(
+                        getattr(self, "_active_work_id", ())
+                    )
+                }
+                bank_int = _eval_sym(handle.idx, env)
                 if bank_int is None:
                     raise NotImplementedError(
                         f"AimCtx: bank index {handle.idx!r} cannot be reduced "
@@ -634,11 +638,15 @@ class AimCtx(CodegenContext):
             )
         # Memory (whole-memory broadcast operand, e.g. WR_ABK src0=banks).
         from .spmw_target import Memory
+
         if isinstance(handle, Memory):
             if handle.name == "banks":
                 return "bank=ALL row=0"
             if handle.name == "gb":
                 return "gb=1"
+            if handle.name == "gpr":
+                prefix = "gpr_in" if role.startswith("src") else "gpr_out"
+                return f"{prefix}=0"
             raise NotImplementedError(
                 f"AimCtx: whole-memory {handle.name!r} has no operand mapping."
             )
@@ -657,8 +665,9 @@ class AimCtx(CodegenContext):
         if handle is None:
             return
         from .spmw_target import Memory
+
         if isinstance(handle, Register):
-            if handle.name in ("gpr", "bias"):
+            if handle.name in ("gpr", "mac_reg", "af_reg"):
                 # gpr_addr_1 hosts the second GPR for ISRs that need two
                 # (EWADD); the first src GPR routes to gpr_addr_0.
                 if role == "src1" and "gpr_addr_0" in fields:
@@ -669,7 +678,13 @@ class AimCtx(CodegenContext):
         if isinstance(handle, MemoryRef):
             mem = handle.memory
             if mem.name == "banks":
-                bank_int = _eval_sym(handle.idx)
+                env = {
+                    level: value
+                    for level, value in enumerate(
+                        getattr(self, "_active_work_id", ())
+                    )
+                }
+                bank_int = _eval_sym(handle.idx, env)
                 if bank_int is None:
                     raise NotImplementedError(
                         f"AimCtx: bank index {handle.idx!r} cannot be reduced "
@@ -687,6 +702,11 @@ class AimCtx(CodegenContext):
                 fields.setdefault("row_addr", 0)
             elif handle.name == "gb":
                 fields.setdefault("channel_mask", 1)
+            elif handle.name == "gpr":
+                if role == "src1" and "gpr_addr_0" in fields:
+                    fields["gpr_addr_1"] = 0
+                else:
+                    fields.setdefault("gpr_addr_0", 0)
             return
 
     def cmd(self, name: str, dst=None, src0=None, src1=None, **fields):
@@ -699,7 +719,9 @@ class AimCtx(CodegenContext):
         parseable diagnostic line.
         """
         # Build the integer field map from operand handles + overrides.
-        field_map: dict = {}
+        work_id = getattr(self, "_active_work_id", ())
+        channel_id = int(work_id[0]) if work_id else 0
+        field_map: dict = {"channel_mask": 1 << channel_id}
         self._handle_to_fields(src0, "src0", field_map)
         self._handle_to_fields(src1, "src1", field_map)
         self._handle_to_fields(dst, "dst", field_map)
@@ -709,7 +731,7 @@ class AimCtx(CodegenContext):
 
         # Human-readable mirror — keeps the older key=value annotation so
         # tests can introspect handle-derived field labels.
-        parts = [f"AiM {name}", "ch=0"]
+        parts = [f"AiM {name}", f"ch={channel_id}"]
         if src0 is not None:
             parts.append(self._operand_text(src0, "src0"))
         if src1 is not None:
@@ -756,6 +778,7 @@ class AimCtx(CodegenContext):
 
     def resolve_moves(self, role, src_handle=None, dst_handle=None):
         from .spmw_target import Memory
+
         if dst_handle is None:
             return (None, None)
         if isinstance(dst_handle, MemoryRef):
@@ -774,29 +797,14 @@ class AimCtx(CodegenContext):
                 return ("WR_GB", None)
             return (None, None)
         if isinstance(dst_handle, Register):
-            # gpr is the MAC accumulator target -- read-back the accumulated
-            # value via RD_MAC at storeback time for the `acc` role.
+            if dst_handle.name == "mac_reg":
+                return (None, "RD_MAC")
+            if dst_handle.name == "af_reg":
+                return (None, "RD_AF")
             if dst_handle.name == "gpr":
-                if role == "acc":
-                    return (None, "RD_MAC")
                 return (None, None)
-            # TODO(task-017): per-bank bias handle collapse -- `bias`
-            # registers are declared per bank but the flat handle map
-            # only retains one. WR_BIAS is per-bank, so without the
-            # rework we can only safely emit one per work-id.
-            if dst_handle.name == "bias":
-                return ("WR_BIAS", None)
             return (None, None)
         return (None, None)
-
-    def resolve_spill_moves(self, tier, home_handle, *, n_entries=1):
-        # AiM spills a GPR-resident value to a bank row: RD_SBK loads the
-        # row back into the gpr, ST_SBK stores it out.
-        if tier != "bank_row":
-            return super().resolve_spill_moves(
-                tier, home_handle, n_entries=n_entries
-            )
-        return ("RD_SBK", "ST_SBK")
 
     def after_match(self, match, n_emitted):
         """Fold the inner K reduction into the just-emitted MAC ISR's
@@ -813,7 +821,12 @@ class AimCtx(CodegenContext):
         - inner-loop ub not reducible to a positive constant > 1: same
           fall-back, matching the existing Samsung JUMP path.
         """
-        if match.target_op_name != "MAC":
+        operation_name = getattr(
+            getattr(self, "_active_placement", None), "extra", {}
+        ).get(
+            "operation_name", match.target_op_name
+        )
+        if operation_name not in ("MAC", "MAC_ABK"):
             return
         if n_emitted != 1:
             return
@@ -828,19 +841,32 @@ class AimCtx(CodegenContext):
         # (field order from ``_ISR_FIELDS["MAC_SBK"]``).
         last = self.cmds[-1]
         parts = last.split(" ")
-        if len(parts) < 3 or parts[0:2] != ["AiM", "MAC_SBK"]:
+        if len(parts) < 3 or parts[0] != "AiM" or parts[1] not in (
+            "MAC_SBK",
+            "MAC_ABK",
+        ):
             return
-        parts[2] = str(k)
+        # ``opsize`` counts 256-bit DRAM columns, not scalar loop iterations.
+        # One column supplies 16 BF16 lanes; MAC_ABK stripes the reduction over
+        # all 16 banks in the channel.  Keep this conversion identical to the
+        # executable AiM cost program's `_columns` formula.
+        lanes = 256 // int(getattr(self.target.banks, "width", 16))
+        banks = int(getattr(self.target.banks, "banks", 1))
+        divisor = lanes * (banks if parts[1] == "MAC_ABK" else 1)
+        columns = (k + divisor - 1) // divisor
+        parts[2] = str(columns)
         self.cmds[-1] = " ".join(parts)
         # Mirror the key=value annotation so ``_human_lines`` stays
         # consistent with the positional trace for introspection.
         import re
+
         human_last = self._human_lines[-1]
         if "opsize=" in human_last:
             self._human_lines[-1] = re.sub(
-                r"opsize=\d+", f"opsize={k}", human_last)
+                r"opsize=\d+", f"opsize={columns}", human_last
+            )
         else:
-            self._human_lines[-1] = f"{human_last}  opsize={k}"
+            self._human_lines[-1] = f"{human_last}  opsize={columns}"
 
 
 # --------------------------------------------------------------------- #
@@ -907,6 +933,7 @@ class UPMEMCtx(CodegenContext):
         fallback otherwise.
         """
         from .spmw_target import Memory
+
         key = id(handle)
         cached = self._name_table.get(key)
         if cached is not None:
@@ -946,6 +973,7 @@ class UPMEMCtx(CodegenContext):
 
     def resolve_moves(self, role, src_handle=None, dst_handle=None):
         from .spmw_target import Memory
+
         if dst_handle is None:
             return (None, None)
         # Whole-MRAM placements drive bulk MRAM↔WRAM copies; WRAM↔GPR is
@@ -968,9 +996,7 @@ class UPMEMCtx(CodegenContext):
         # back (mram_read), ST_MRAM writes it out (mram_write). These are
         # real C memory ops on the byte-verified uPIMulator run path.
         if tier != "mram":
-            return super().resolve_spill_moves(
-                tier, home_handle, n_entries=n_entries
-            )
+            return super().resolve_spill_moves(tier, home_handle, n_entries=n_entries)
         return ("LD_MRAM", "ST_MRAM")
 
     def emit_mac_kreduce(self, acc, x, y, k_bound) -> None:
@@ -1119,43 +1145,9 @@ class UPMEMCtx(CodegenContext):
         this envelope only for a gemv-shaped trace; no ranking/placement
         choice changes.
 
-        **Spill realization (SPEC-022 D1, task 004b).** When the chosen
-        placement spilled the accumulator to `mram`, the envelope injects a
-        REAL MRAM round-trip of the accumulator tile (`cache_C`): after the
-        per-row accumulation completes it `mram_write`s `cache_C` to a
-        dedicated MRAM scratch region and `mram_read`s it back before the
-        result write-back. The round-trip preserves the value (so the GEMV
-        host's byte-for-byte `c == W@x` check still passes) while the
-        `mram_read`/`mram_write` the allocator priced as a spill actually
-        execute on the simulator. The non-spill envelope is byte-identical
-        (the spill lines are added only when `_active_placement._spilled`
-        names a spilled memref). This closes the task-005 gap: the spilled
-        artifact, not a fixed template, is what the simulator runs and the
-        GEMV host verifies numerically.
         """
-        active = getattr(self, "_active_placement", None)
-        spilled = list(getattr(active, "_spilled", ()) or [])
-        spill_accumulator = bool(spilled)
-        # Scratch region for the spilled accumulator tile, one BLOCK past the
-        # output region C so it never aliases A/B/C. cache_C is 2 elements
-        # (the gemv host packs two rows per tasklet stride).
-        spill_decl = (
-            "    uint32_t mram_spill_addr_C = (uint32_t) "
-            "(DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T) "
-            "+ n_size_pad * sizeof(T) + max_rows * sizeof(T) + 64);\n"
-            if spill_accumulator else ""
-        )
-        # The spill round-trip: store the accumulator tile to MRAM and load
-        # it straight back. This is the LD_MRAM/ST_MRAM pair resolve_spill_moves
-        # returns, materialised at the accumulator's live-window close. A
-        # value-preserving round-trip: cache_C is unchanged after it.
-        spill_roundtrip = (
-            "        /* === BEGIN tenon spill round-trip (acc -> mram) === */\n"
-            "        mram_write(cache_C, (__mram_ptr void *) (mram_spill_addr_C), 8);\n"
-            "        mram_read((__mram_ptr void const*) (mram_spill_addr_C), cache_C, 8);\n"
-            "        /* === END tenon spill round-trip === */\n"
-            if spill_accumulator else ""
-        )
+        spill_decl = ""
+        spill_roundtrip = ""
         # Cross-op residency (SPEC-023 T6/D2, UPMEM): a cross-kernel activation
         # that is RE-STAGED pays an inter-kernel MRAM round-trip of its tile
         # (the producer ST_MRAM of the activation + the consumer LD_MRAM); a
@@ -1189,7 +1181,8 @@ class UPMEMCtx(CodegenContext):
             "(DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T) "
             "+ n_size_pad * sizeof(T) + max_rows * sizeof(T) "
             "+ start_row * sizeof(T));\n"
-            if restage_crossing else ""
+            if restage_crossing
+            else ""
         )
         residency_roundtrip = (
             "        /* === BEGIN tenon residency restage (cross-kernel "
@@ -1197,7 +1190,8 @@ class UPMEMCtx(CodegenContext):
             "        mram_write(cache_C, (__mram_ptr void *) (mram_resid_addr_C), 8);\n"
             "        mram_read((__mram_ptr void const*) (mram_resid_addr_C), cache_C, 8);\n"
             "        /* === END tenon residency restage === */\n"
-            if restage_crossing else ""
+            if restage_crossing
+            else ""
         )
         return (
             "#include <stdint.h>\n"
@@ -1261,8 +1255,8 @@ class UPMEMCtx(CodegenContext):
             "    uint32_t mram_base_addr_B = (uint32_t) (DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T));\n"
             "    uint32_t mram_base_addr_C = (uint32_t) (DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T) + n_size_pad * sizeof(T) + start_row * sizeof(T));\n"
             + spill_decl
-            + residency_decl +
-            "    uint32_t mram_temp_addr_A = mram_base_addr_A;\n"
+            + residency_decl
+            + "    uint32_t mram_temp_addr_A = mram_base_addr_A;\n"
             "    uint32_t mram_temp_addr_B = mram_base_addr_B;\n"
             "\n"
             "    T *cache_A = (T *) mem_alloc(BLOCK_SIZE + 8);\n"
@@ -1303,7 +1297,7 @@ class UPMEMCtx(CodegenContext):
             "            }\n"
             "            mram_read((__mram_ptr void const*) (mram_temp_addr_B), cache_B, BLOCK_SIZE);\n"
             "            for (j = 0; j < (int) (n_size - n); j++) {\n"
-            "                if(j >= (int)(BLOCK_SIZE / sizeof(T))){ printf(\"error\\n\"); break; }\n"
+            '                if(j >= (int)(BLOCK_SIZE / sizeof(T))){ printf("error\\n"); break; }\n'
             "                cache_C[pos] += cache_A[j] * cache_B[j];\n"
             "            }\n"
             "            mram_temp_addr_A += (BLOCK_SIZE - ((BLOCK_SIZE / sizeof(T)) - (n_size - n)) * sizeof(T));\n"
@@ -1311,8 +1305,8 @@ class UPMEMCtx(CodegenContext):
             "            if(mram_temp_addr_A % 8 != 0) { offset = 1; } else { offset = 0; }\n"
             "        }\n"
             + spill_roundtrip
-            + residency_roundtrip +
-            "        mram_write(cache_C, (__mram_ptr void *) (mram_base_addr_C), 8);\n"
+            + residency_roundtrip
+            + "        mram_write(cache_C, (__mram_ptr void *) (mram_base_addr_C), 8);\n"
             "        mram_base_addr_C += 2 * sizeof(T);\n"
             "    }\n"
             "    return 0;\n"
@@ -1381,6 +1375,7 @@ class APUv1Ctx(CodegenContext):
 
     def _name(self, handle, role: str = "") -> str:
         from .spmw_target import Memory
+
         cached = self._handle_names.get(id(handle))
         if cached is not None:
             return cached
@@ -1442,9 +1437,7 @@ class APUv1Ctx(CodegenContext):
         tmp_name = self._handle_names.get("mac_tmp", "mac_tmp_vr")
         acc_n = self._name(acc, "acc")
         x_n = self._name(x, "x")
-        self.cmds.append(
-            f"gvml_lookup_16({tmp_name}, {x_n}, mac_lut_ptr, 256);"
-        )
+        self.cmds.append(f"gvml_lookup_16({tmp_name}, {x_n}, mac_lut_ptr, 256);")
         self.cmds.append(f"gvml_add_s16({acc_n}, {acc_n}, {tmp_name});")
 
     def emit_mac_mul_add(self, acc, x, y) -> None:
@@ -1498,6 +1491,7 @@ class APUv1Ctx(CodegenContext):
 
     def resolve_moves(self, role, src_handle=None, dst_handle=None):
         from .spmw_target import Memory
+
         if dst_handle is None:
             return (None, None)
         # Chained L4↔VR moves cover the two-stage DMA + LD/ST path; VR
@@ -1523,9 +1517,7 @@ class APUv1Ctx(CodegenContext):
         # APU v1 spills a VR-resident value to L1: LD_VR loads it back into
         # the VR (gvml_load_16), ST_VR stores it out (gvml_store_16).
         if tier != "l1":
-            return super().resolve_spill_moves(
-                tier, home_handle, n_entries=n_entries
-            )
+            return super().resolve_spill_moves(tier, home_handle, n_entries=n_entries)
         return ("LD_VR", "ST_VR")
 
 
@@ -1618,7 +1610,7 @@ class APUv2Ctx(CodegenContext):
         plus `main()`. The coder may replace this wrapper later.
         """
         header = (
-            "#include \"gtml.h\"\n\n"
+            '#include "gtml.h"\n\n'
             "int main() {\n"
             "    G2Gtml &g = G2Gtml::instance();\n"
         )
@@ -1640,18 +1632,7 @@ def _resolve_layout(match: MatchedOp, layout: Placement) -> dict[str, Any]:
     `Placement`; this function is a thin lookup that turns role → memref →
     handle into role → handle so `emit` can be called.
 
-    Per spec 015 §7.4, if the regalloc wrapped a placement in a
-    `Spilled(home, tier)`, codegen unwraps it to `home` for the compute
-    operand binding (the value lives in the register during compute). The
-    spill LD/ST round-trip itself is emitted by `_schedule_moves` around
-    the work-id window (SPEC-022 D1) -- this unwrap is for operand binding
-    only and no longer drops the round-trip.
     """
-    # Imported lazily because spmw_regalloc imports Placement from
-    # spmw_autoschedule which is imported here at module load -- the
-    # cycle is broken by deferring the regalloc import until first use.
-    from .spmw_regalloc import Spilled
-
     bindings: dict[str, Any] = {}
     for opb in match.operands:
         handle = layout.placements.get(opb.memref_name)
@@ -1660,8 +1641,6 @@ def _resolve_layout(match: MatchedOp, layout: Placement) -> dict[str, Any]:
                 f"layout has no placement for memref {opb.memref_name!r}; "
                 f"available: {sorted(layout.placements)}"
             )
-        if isinstance(handle, Spilled):
-            handle = handle.home_handle
         bindings[opb.role] = handle
     # Inject the store target as role "dst" (and "acc" stays from operands).
     # result_memref_name is the @allo.work store's `to` memref. Non-accumulating
@@ -1671,8 +1650,6 @@ def _resolve_layout(match: MatchedOp, layout: Placement) -> dict[str, Any]:
     if match.result_memref_name is not None and "dst" not in bindings:
         dst_handle = layout.placements.get(match.result_memref_name)
         if dst_handle is not None:
-            if isinstance(dst_handle, Spilled):
-                dst_handle = dst_handle.home_handle
             bindings["dst"] = dst_handle
     return bindings
 
@@ -1688,6 +1665,7 @@ def _parse_loop_bound(text: str) -> int | None:
     except ValueError:
         pass
     import re
+
     nums = re.findall(r"\b(\d+)\b", text)
     if len(nums) == 1:
         return int(nums[0])
@@ -1745,8 +1723,6 @@ def _emit_inner_loop_jump(
     )
 
 
-
-
 def _is_samsung_storeback_mov(c: PIMCmd) -> bool:
     """A bank<-GRF store MOV that closes a work-id (the `ST_A`/`ST_B`
     storeback). `acc -> grf_b` is never host-eligible (lever 2), so this
@@ -1780,9 +1756,7 @@ def _split_samsung_layers(cmds: list[PIMCmd]) -> list[list[PIMCmd]]:
     cur: list[PIMCmd] = []
     for c in cmds:
         cur.append(c)
-        if _is_samsung_storeback_mov(c) and any(
-            g.type_ == "MAC" for g in cur
-        ):
+        if _is_samsung_storeback_mov(c) and any(g.type_ == "MAC" for g in cur):
             # This storeback closes the current work-id's body.
             groups.append(cur)
             cur = []
@@ -1841,28 +1815,12 @@ def _schedule_moves(
     which move name to emit; dedups by move name so broadcast operands
     that route through the same Move only emit it once per phase.
     """
-    # SPEC-022 D1: a `Spilled(home, tier)` handle unwraps to `home` for the
-    # compute emit (the value IS in the register during compute), but the
-    # spill round-trip is no longer dropped -- the spilled memrefs in
-    # `layout._spilled` drive an additional tier LD (pre) / tier ST (post)
-    # around the work-id window, via `ctx.resolve_spill_moves`. A backend
-    # whose tier cannot spill raises NotImplementedError, which propagates
-    # as a hard compile error rather than a silent register-resident emit.
-    from .spmw_regalloc import Spilled
-
-    spilled_memrefs = set(getattr(layout, "_spilled", ()) or ())
-
     # Lever 2 (SPEC-024 §5): a move name is host-resident only if EVERY
     # role routing to it is host-resident; if any role on the name is crf
     # the CRF MOV must still be emitted (it materialises that crf role).
     # Default-missing residency == "crf", so non-Samsung backends and
     # every existing placement keep emitting exactly as before.
     residency = getattr(layout, "extra", {}).get("grf_residency", {})
-
-    # Spill moves to emit around this work-id window, in role-first-seen
-    # order, deduped by move name (same discipline as the home moves).
-    spill_names: list[str] = []
-    spill_seen: set[str] = set()
 
     # First pass: resolve each role to its move name and whether it is
     # crf-resident on that name.
@@ -1872,22 +1830,7 @@ def _schedule_moves(
         handle = layout.placements.get(memref)
         if handle is None:
             continue
-        # Spill round-trip for a spilled memref: emit the tier LD/ST in
-        # ADDITION to the home register's own LD/ST below. Resolve from the
-        # `Spilled` wrapper (tier + home) before unwrapping for compute.
-        if isinstance(handle, Spilled) and memref in spilled_memrefs:
-            spill_ld, spill_st = ctx.resolve_spill_moves(
-                handle.tier, handle.home_handle
-            )
-            spill_chosen = spill_ld if phase == "pre" else spill_st
-            if spill_chosen is not None and spill_chosen not in spill_seen:
-                spill_seen.add(spill_chosen)
-                spill_names.append(spill_chosen)
-        if isinstance(handle, Spilled):
-            handle = handle.home_handle
-        ld_name, st_name = ctx.resolve_moves(
-            role, src_handle=None, dst_handle=handle
-        )
+        ld_name, st_name = ctx.resolve_moves(role, src_handle=None, dst_handle=handle)
         chosen = ld_name if phase == "pre" else st_name
         if chosen is None:
             continue
@@ -1897,14 +1840,6 @@ def _schedule_moves(
             name_seen_order.append(chosen)
         else:
             name_crf[chosen] = name_crf[chosen] or is_crf
-
-    # Spill load is prepended at the window open (before the home preloads
-    # the compute consumes); the spill store is appended at the close. In
-    # `pre` the load goes first; in `post` the home storebacks run, then
-    # the spill store, so the value is written back to its tier last.
-    if phase == "pre":
-        for nm in spill_names:
-            _emit_move(target, nm, ctx)
 
     for chosen in name_seen_order:
         if name_crf[chosen]:
@@ -1917,12 +1852,6 @@ def _schedule_moves(
             # for run-path/audit visibility.
             if hasattr(ctx, "host_preloads"):
                 ctx.host_preloads.append((chosen, phase))
-
-    # Spill store: appended after the home storebacks so the value lands
-    # back in its tier last (the window-close write-out).
-    if phase == "post":
-        for nm in spill_names:
-            _emit_move(target, nm, ctx)
 
 
 def _base_kernel_name(func_name: str, work_id=None) -> str:
@@ -1976,6 +1905,9 @@ def _walk_and_emit(
         # is parsed from func_name in the matcher). Take the first.
         func_name = matches[0].func_name
         layout = layout_by_func[func_name]
+        # Backend contexts use this coordinate to materialise symbolic target
+        # handles (for AiM: channel mask and 4*bank_group+bank index).
+        ctx._active_work_id = tuple(matches[0].work_id)
 
         # Per-bucket role -> memref must come from THIS bucket's matches,
         # not the full trace -- that was the root bug for multi-kernel
@@ -1990,7 +1922,11 @@ def _walk_and_emit(
 
         _schedule_moves(target, ctx, layout, role_to_memref, phase="pre")
         for match in matches:
-            op_obj = target.op(match.target_op_name)
+            op_obj = target.op(
+                getattr(layout, "extra", {}).get(
+                    "operation_name", match.target_op_name
+                )
+            )
             emit = getattr(op_obj, "emit", None)
             if emit is None:
                 raise NotImplementedError(
@@ -2009,9 +1945,7 @@ def _walk_and_emit(
             # the body is two statements). Gated on isinstance to keep
             # other backends inert.
             if isinstance(ctx, UPMEMCtx) and match.target_op_name == "MAC":
-                inner = (
-                    match.enclosing_loops[-1] if match.enclosing_loops else None
-                )
+                inner = match.enclosing_loops[-1] if match.enclosing_loops else None
                 ctx.pending_k_bound = (
                     _parse_loop_bound(inner[2]) if inner is not None else None
                 )
@@ -2019,9 +1953,7 @@ def _walk_and_emit(
                 # placement's `n_tasklets` field (never re-derive it) and
                 # the reduction trip the runner drives at. Codegen only
                 # materialises the autoscheduler's choice.
-                ctx.n_tasklets = getattr(layout, "extra", {}).get(
-                    "n_tasklets", 1
-                )
+                ctx.n_tasklets = getattr(layout, "extra", {}).get("n_tasklets", 1)
                 if ctx.pending_k_bound is not None:
                     ctx.reduction_trip = ctx.pending_k_bound
                 # Close-floor harness (design 02 §6c): stage the gemv
@@ -2030,9 +1962,7 @@ def _walk_and_emit(
                 # has a single loop, so row_count stays None and the
                 # runner keeps the TENON path. Shape-derived, not literal.
                 if len(match.enclosing_loops) >= 2:
-                    ctx.row_count = _parse_loop_bound(
-                        match.enclosing_loops[-2][2]
-                    )
+                    ctx.row_count = _parse_loop_bound(match.enclosing_loops[-2][2])
             elif hasattr(ctx, "pending_k_bound"):
                 ctx.pending_k_bound = None
             # APU v1 VR-tile/DMA materialisation (design 01 §4.3): read the
@@ -2041,9 +1971,7 @@ def _walk_and_emit(
             # only materialise argmin's choice -- never re-derive intra-vs-
             # inter from the workload. Default-missing key keeps "intra".
             if isinstance(ctx, APUv1Ctx):
-                ctx.vr_dma_mode = getattr(layout, "extra", {}).get(
-                    "vr_dma", "intra"
-                )
+                ctx.vr_dma_mode = getattr(layout, "extra", {}).get("vr_dma", "intra")
                 # Double-buffer depth (SPEC-023 D3): stage the chosen depth so
                 # the build harness emits the ping-pong staged-DMA/compute
                 # (prologue prefetch of tile 0, then DMA tile i+1 while
@@ -2062,7 +1990,9 @@ def _walk_and_emit(
                 and getattr(layout, "mode", "") == "sv"
             ):
                 ctx.emit_mac_mul_add(
-                    acc=bindings["acc"], x=bindings["x"], y=bindings["y"],
+                    acc=bindings["acc"],
+                    x=bindings["x"],
+                    y=bindings["y"],
                 )
             elif op_obj.accumulates:
                 emit(bindings["x"], bindings["y"], bindings["acc"], ctx)
@@ -2096,8 +2026,6 @@ def _walk_and_emit(
         # work-id bucket. A single-kernel GEMV thus emits one body + N
         # triggers; a multi-kernel workload (MLP) emits one body per layer
         # (each layer's CRF is its own shared program).
-        from .spmw_cost_models import _samsung_workid_count
-
         def _base_kernel(m) -> str:
             return _base_kernel_name(m.func_name, m.work_id)
 
@@ -2112,7 +2040,10 @@ def _walk_and_emit(
                 kernel_order.append(fn)
             per_kernel[fn].append((work_id, matches))
 
-        expected = _samsung_workid_count(target)
+        # The expected work-id count is a structural target fact, not a cost
+        # model helper. Axis 0 is the replica axis; axis 1 is the spatial
+        # work-id fanout used by the Samsung backend.
+        expected = target.work_grid()[1]
         for fn in kernel_order:
             k_buckets = per_kernel[fn]
             # One shared body for this kernel (the first work-id bucket).
@@ -2121,9 +2052,7 @@ def _walk_and_emit(
                 # tile_count = the per-work-id output-tile fire count (the
                 # MAC sites the host fires for this work-id), from the
                 # bucket's matches, not a shape literal.
-                tile_count = sum(
-                    1 for m in matches if m.target_op_name == "MAC"
-                )
+                tile_count = sum(1 for m in matches if m.target_op_name == "MAC")
                 ctx.host_schedule.append(HostTrigger(work_id, tile_count))
             # SPEC-025 §5.3 agreement guard: a single full-grid GEMV kernel's
             # work-id axis must equal the unit-tree fanout product, else the
@@ -2180,15 +2109,9 @@ class RunResult:
 # environment variables before importing this module. The defaults
 # match the layout on this server (see `experiments/simulators/`).
 _DEFAULT_PIMSIM_ROOT = (
-    Path(__file__).resolve().parents[2]
-    / "simulators"
-    / "PIMSimulator"
+    Path(__file__).resolve().parents[2] / "simulators" / "PIMSimulator"
 )
-_DEFAULT_AIM_ROOT = (
-    Path(__file__).resolve().parents[2]
-    / "simulators"
-    / "aim_simulator"
-)
+_DEFAULT_AIM_ROOT = Path(__file__).resolve().parents[2] / "simulators" / "aim_simulator"
 _DEFAULT_UPIM_ROOT = (
     Path(__file__).resolve().parents[2]
     / "simulators"
@@ -2232,9 +2155,7 @@ _DEFAULT_APU_V1_TOOLCHAIN_BASE = (
     "/usr/local/gsi-apu/13.7.1/ubuntu_20_04/"
     "arc_gnu_2021.09-release_elf32_le_linux_no_sdata"
 )
-_DEFAULT_APU_V1_TEMPLATE_DIR = (
-    "/home/nz264/shared/accelerator-hub/gsi-apu/example-gvml"
-)
+_DEFAULT_APU_V1_TEMPLATE_DIR = "/home/nz264/shared/accelerator-hub/gsi-apu/example-gvml"
 _DEFAULT_APU_V1_PCI_NODE = "/sys/bus/pci/devices/0000:41:00.0"
 
 
@@ -2247,21 +2168,15 @@ def _apu_v1_unavailable_reason() -> str | None:
     TENON_APU_V1_TEMPLATE_DIR.
     """
     arc_base = Path(
-        os.environ.get(
-            "TENON_APU_V1_TOOLCHAIN_BASE", _DEFAULT_APU_V1_TOOLCHAIN_BASE
-        )
+        os.environ.get("TENON_APU_V1_TOOLCHAIN_BASE", _DEFAULT_APU_V1_TOOLCHAIN_BASE)
     )
     if not arc_base.exists():
         return f"simulator unavailable: ARC toolchain missing at {arc_base}"
     template = Path(
-        os.environ.get(
-            "TENON_APU_V1_TEMPLATE_DIR", _DEFAULT_APU_V1_TEMPLATE_DIR
-        )
+        os.environ.get("TENON_APU_V1_TEMPLATE_DIR", _DEFAULT_APU_V1_TEMPLATE_DIR)
     )
     if not template.exists():
-        return (
-            f"simulator unavailable: example-gvml template missing at {template}"
-        )
+        return f"simulator unavailable: example-gvml template missing at {template}"
     pci = Path(_DEFAULT_APU_V1_PCI_NODE)
     if not pci.exists():
         return f"simulator unavailable: GSI device not present at {pci}"
@@ -2270,6 +2185,7 @@ def _apu_v1_unavailable_reason() -> str | None:
     # so the run path returns a clean RunResult(cycles=None, ...) skip
     # instead of raising RuntimeError from `make`.
     from .spmw_apu_v1_build import _gvml_sdk_available, _gvml_include_root
+
     if not _gvml_sdk_available():
         return (
             f"simulator unavailable: GVML SDK headers missing under "
@@ -2317,8 +2233,6 @@ def _write_samsung_cmds(path: Path, cmds: list[PIMCmd]) -> None:
             f.write(" ".join(parts) + "\n")
 
 
-
-
 def _samsung_num_pim_blocks(compiled) -> int:
     """Inner `pim`-unit fanout (num PIM blocks per pseudo-channel) for the
     Samsung tile-size derivation. Read off the unit tree's innermost mapping
@@ -2342,6 +2256,7 @@ def _samsung_read_generic_outbin(out_path, n):
     if not p.exists():
         return {}
     import numpy as np
+
     raw = np.fromfile(str(p), dtype=np.float16)
     if raw.size == 0:
         return {}
@@ -2368,8 +2283,6 @@ _SAMSUNG_FABRIC_ROW_TILE = 4096
 # leaving the output undrained. 256 elems = 16 bursts = 2 input tiles. Zero-padding
 # K leaves A@B unchanged.
 _SAMSUNG_REDUCE_K_TILE = 256
-
-
 
 
 def _samsung_reduce_partition(compiled, inputs):
@@ -2418,8 +2331,11 @@ def _samsung_reduce_partition(compiled, inputs):
 
     # n_workids = MAC work-id bucket count (the realized PE grid). Cross-check
     # against the declared grid; warn (gap-1 discipline), do not raise.
-    buckets = [b for b in _bucket_by_work_id(trace)
-               if any(m.target_op_name == "MAC" for m in b[1])]
+    buckets = [
+        b
+        for b in _bucket_by_work_id(trace)
+        if any(m.target_op_name == "MAC" for m in b[1])
+    ]
     n_workids = len(buckets)
     try:
         declared = compiled.target.work_grid()[1]
@@ -2476,7 +2392,7 @@ def _samsung_read_reduce_outbin(out_path, M, N, m_pad):
     if raw.size < need:
         return {}
     partials = raw[:need].reshape(-1, 16).astype(np.float32).sum(axis=1)  # (N*m_pad,)
-    grid = partials.reshape(N, m_pad).T[:M, :N]                            # (M, N)
+    grid = partials.reshape(N, m_pad).T[:M, :N]  # (M, N)
     if not np.any(grid):
         return {}
     if N == 1:
@@ -2544,11 +2460,27 @@ def _samsung_run_reduce_driver(weight, vec, M, K, N):
             "MOV dst=ODD_BANK src0=GRF_B\n"
         )
         argv = [
-            str(driver), "--op", "GENERIC", "--op-kind", "REDUCE",
-            "--crf", str(crf_path), "--out", str(out_path),
-            "--inputs", f"{a_path},{b_path}",
-            "--out-rows", str(m_pad), "--out-cols", str(N),
-            "--reduce-k", str(k_pad), "--num-tiles", "1", "--bank-type", "ALL",
+            str(driver),
+            "--op",
+            "GENERIC",
+            "--op-kind",
+            "REDUCE",
+            "--crf",
+            str(crf_path),
+            "--out",
+            str(out_path),
+            "--inputs",
+            f"{a_path},{b_path}",
+            "--out-rows",
+            str(m_pad),
+            "--out-cols",
+            str(N),
+            "--reduce-k",
+            str(k_pad),
+            "--num-tiles",
+            "1",
+            "--bank-type",
+            "ALL",
             "--roles",
             f"A:0:0:2:0:0:0:{k_bursts},B:0:0:2:0:0:0:0,out:0:0:1:1:0:8:0",
         ]
@@ -2632,8 +2564,6 @@ def execute_host_schedule_samsung(schedule, dev_inputs):
             for b, lx in enumerate(g.launches):
                 dev[lx.out] = out_arr[:, b].astype(np.float16)
     return dev, total
-
-
 
 
 def _assert_host_move_roles(compiled, inputs) -> None:
@@ -2755,10 +2685,7 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
         # SPEC-005 §8 / needs-arch-MMM).
         if c.type_ in ("MOV", "FILL"):
             bank_dst = c.dst_ in ("EVEN_BANK", "ODD_BANK")
-            grf_src = any(
-                s in ("GRF_A", "GRF_B")
-                for s in (c.src0_, c.src1_, c.src2_)
-            )
+            grf_src = any(s in ("GRF_A", "GRF_B") for s in (c.src0_, c.src1_, c.src2_))
             if bank_dst and grf_src:
                 return False
         return True
@@ -2857,7 +2784,7 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             tile = _SAMSUNG_FABRIC_ROW_TILE
             m_pad = ((int(M_logical) + tile - 1) // tile) * tile
             A_pad = np.zeros((m_pad, k_pad), dtype=np.float16)
-            A_pad[: int(M_real), : int(K)] = A      # zero-fill grid pad + K pad
+            A_pad[: int(M_real), : int(K)] = A  # zero-fill grid pad + K pad
             second_pad = np.zeros((k_pad, second.shape[1]), dtype=np.float16)
             second_pad[: int(K)] = second
             second = second_pad
@@ -2871,7 +2798,7 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             # --num-tiles tiles the LOGICAL grid across physical fabric tiles
             # (derived from the partition, not hardcoded 1). For M_logical <= 4096
             # this is 1 (the whole grid fits one fabric tile).
-            num_tiles = ((m_pad + tile - 1) // tile)
+            num_tiles = (m_pad + tile - 1) // tile
             # The REDUCE path rebuilds the canonical GEMV CRF internally from the
             # weight shape (matched JUMP counters), so the EMITTED cmd stream is
             # irrelevant -- and a slice-form workload's emitted stream is
@@ -2887,14 +2814,22 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
                 "MOV dst=ODD_BANK src0=GRF_B\n"
             )
             argv += [
-                "--inputs", f"{a_path},{b_path}",
-                "--crf", str(crf_path),
-                "--op-kind", "REDUCE",
-                "--out-rows", str(m_pad),
-                "--out-cols", str(int(N)),
-                "--reduce-k", str(k_pad),
-                "--num-tiles", str(num_tiles),
-                "--bank-type", "ALL",
+                "--inputs",
+                f"{a_path},{b_path}",
+                "--crf",
+                str(crf_path),
+                "--op-kind",
+                "REDUCE",
+                "--out-rows",
+                str(m_pad),
+                "--out-cols",
+                str(int(N)),
+                "--reduce-k",
+                str(k_pad),
+                "--num-tiles",
+                str(num_tiles),
+                "--bank-type",
+                "ALL",
                 "--roles",
                 f"A:0:0:2:0:0:0:{k_bursts},B:0:0:2:0:0:0:0,out:0:0:1:1:0:8:0",
             ]
@@ -2906,7 +2841,8 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             # the operand size (never a shape literal). No --faithful: GENERIC
             # is always faithful (spec 01 §5.1).
             generic_inputs = {
-                k: v for k, v in inputs.items()
+                k: v
+                for k, v in inputs.items()
                 if v is not None and k not in ("layers",)
             }
             if not generic_inputs:
@@ -2931,9 +2867,12 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             elems_per_tile = 16 * 8 * _samsung_num_pim_blocks(compiled)
             num_tiles = max(1, (generic_n + elems_per_tile - 1) // elems_per_tile)
             argv += [
-                "--inputs", ",".join(in_paths),
-                "--num-tiles", str(num_tiles),
-                "--bank-type", "ALL",
+                "--inputs",
+                ",".join(in_paths),
+                "--num-tiles",
+                str(num_tiles),
+                "--bank-type",
+                "ALL",
             ]
 
         # SPEC-005: serialise compiled.cmds to a line-delimited file and
@@ -2959,9 +2898,7 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
                 check=False,
             )
         except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(
-                f"Samsung pim_driver invocation failed: {exc}"
-            ) from exc
+            raise RuntimeError(f"Samsung pim_driver invocation failed: {exc}") from exc
 
         stdout = proc.stdout.decode("utf-8", errors="replace")
         stderr = proc.stderr.decode("utf-8", errors="replace")
@@ -2987,9 +2924,7 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             if outputs:
                 extra["outputs"] = outputs
                 extra["cycles_source"] = "PIMSimulator GENERIC REDUCE interpreter"
-                extra["correctness_source"] = (
-                    "PIMSimulator GENERIC REDUCE interpreter"
-                )
+                extra["correctness_source"] = "PIMSimulator GENERIC REDUCE interpreter"
             return RunResult(
                 cycles=cycles,
                 stdout=combined,
@@ -3059,23 +2994,34 @@ def _samsung_batched_invoke(
 
         argv = [
             str(driver),
-            "--op", "GEMV",
-            "--out", str(out_path),
-            "--weight", str(w_path),
-            "--in", str(x_path),
-            "--output-dim", str(W.shape[0]),
-            "--input-dim", str(W.shape[1]),
-            "--cmds", str(cmds_path),
+            "--op",
+            "GEMV",
+            "--out",
+            str(out_path),
+            "--weight",
+            str(w_path),
+            "--in",
+            str(x_path),
+            "--output-dim",
+            str(W.shape[0]),
+            "--input-dim",
+            str(W.shape[1]),
+            "--cmds",
+            str(cmds_path),
             "--faithful",
-            "--batch", str(batch),
+            "--batch",
+            str(batch),
         ]
         if native_rebaseline:
             argv.append("--native-rebaseline")
 
         try:
             proc = subprocess.run(
-                argv, capture_output=True, cwd=str(root),
-                timeout=600, check=False,
+                argv,
+                capture_output=True,
+                cwd=str(root),
+                timeout=600,
+                check=False,
             )
         except (subprocess.SubprocessError, OSError) as exc:
             raise RuntimeError(
@@ -3139,13 +3085,12 @@ def _run_samsung_batched(
     B = int(X.shape[0])  # I3: B is operand geometry (X[B,K] leading dim).
 
     pim_cmds = [c for c in compiled.cmds if isinstance(c, PIMCmd)]
+
     # Same ISA-valid filter the single-vector run path applies.
     def _crf_valid(c: PIMCmd) -> bool:
         if c.type_ in ("MOV", "FILL"):
             bank_dst = c.dst_ in ("EVEN_BANK", "ODD_BANK")
-            grf_src = any(
-                s in ("GRF_A", "GRF_B") for s in (c.src0_, c.src1_, c.src2_)
-            )
+            grf_src = any(s in ("GRF_A", "GRF_B") for s in (c.src0_, c.src1_, c.src2_))
             if bank_dst and grf_src:
                 return False
         return True
@@ -3159,8 +3104,14 @@ def _run_samsung_batched(
     # native (re-preload-per-vector) sequencing -- codegen materialises the
     # decision argmin made, it does not override it.
     tenon_total, tenon_phases, tenon_out = _samsung_batched_invoke(
-        driver, root, pim_cmds, W, X, B,
-        native_rebaseline=not resident, np_mod=np,
+        driver,
+        root,
+        pim_cmds,
+        W,
+        X,
+        B,
+        native_rebaseline=not resident,
+        np_mod=np,
     )
 
     extra = {
@@ -3173,16 +3124,18 @@ def _run_samsung_batched(
     combined = tenon_out
     if compare_native:
         native_total, native_phases, native_out = _samsung_batched_invoke(
-            driver, root, pim_cmds, W, X, B,
-            native_rebaseline=True, np_mod=np,
+            driver,
+            root,
+            pim_cmds,
+            W,
+            X,
+            B,
+            native_rebaseline=True,
+            np_mod=np,
         )
         extra["native_total"] = native_total
         extra["native_phases"] = native_phases
-        combined = (
-            tenon_out
-            + "\n--- native rebaseline ---\n"
-            + native_out
-        )
+        combined = tenon_out + "\n--- native rebaseline ---\n" + native_out
 
     return RunResult(
         cycles=tenon_total,
@@ -3227,10 +3180,14 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
     try:
         proc = subprocess.run(
             [
-                "docker", "run", "--rm",
-                "-v", f"{root}:/work",
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{root}:/work",
                 "aim-simulator-build",
-                "bash", "-c",
+                "bash",
+                "-c",
                 f"cd /work && ./build/ramulator2 -f {cfg_rel} -t {trace_rel}",
             ],
             capture_output=True,
@@ -3239,9 +3196,7 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
         )
     except (subprocess.SubprocessError, OSError) as exc:
         trace_path.unlink(missing_ok=True)
-        raise RuntimeError(
-            f"AiM ramulator2 invocation failed: {exc}"
-        ) from exc
+        raise RuntimeError(f"AiM ramulator2 invocation failed: {exc}") from exc
     finally:
         # Keep trace on disk only for the duration of the run; cleanup.
         trace_path.unlink(missing_ok=True)
@@ -3328,9 +3283,7 @@ def _run_upmem(compiled: "Compiled", **inputs) -> RunResult:
     elif ctx is not None and hasattr(ctx, "get_kernel_src"):
         kernel_src = ctx.get_kernel_src()
     else:
-        kernel_src = "\n".join(
-            c for c in compiled.cmds if isinstance(c, str)
-        )
+        kernel_src = "\n".join(c for c in compiled.cmds if isinstance(c, str))
 
     if not kernel_src.strip():
         raise RuntimeError(
@@ -3362,22 +3315,27 @@ def _run_upmem(compiled: "Compiled", **inputs) -> RunResult:
             proc = subprocess.run(
                 [
                     str(binary),
-                    "--root_dirpath", str(root),
-                    "--bin_dirpath", str(bin_dir),
-                    "--benchmark", benchmark,
-                    "--num_channels", "1",
-                    "--num_dpus_per_rank", "1",
-                    "--num_tasklets", str(num_tasklets),
-                    "--data_prep_params", data_prep_params,
+                    "--root_dirpath",
+                    str(root),
+                    "--bin_dirpath",
+                    str(bin_dir),
+                    "--benchmark",
+                    benchmark,
+                    "--num_channels",
+                    "1",
+                    "--num_dpus_per_rank",
+                    "1",
+                    "--num_tasklets",
+                    str(num_tasklets),
+                    "--data_prep_params",
+                    data_prep_params,
                 ],
                 capture_output=True,
                 timeout=600,
                 check=False,
             )
         except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(
-                f"UPMEM uPIMulator invocation failed: {exc}"
-            ) from exc
+            raise RuntimeError(f"UPMEM uPIMulator invocation failed: {exc}") from exc
 
         stdout = proc.stdout.decode("utf-8", errors="replace")
         stderr = proc.stderr.decode("utf-8", errors="replace")
@@ -3545,8 +3503,7 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
             input_bin_paths[role] = str(p)
 
         output_bin_paths: dict[str, str] = {
-            role: str(Path(tmpdir) / f"out_{role}.bin")
-            for role in output_specs
+            role: str(Path(tmpdir) / f"out_{role}.bin") for role in output_specs
         }
 
         # Project emission. The toolchain/template gate above already
@@ -3642,9 +3599,7 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
                 # / newline / CR; the ledag wire format is otherwise
                 # binary-framed and decodes to mojibake.
                 ledag_text = "".join(
-                    chr(b)
-                    for b in ledag_raw
-                    if 32 <= b < 127 or b in (9, 10, 13)
+                    chr(b) for b in ledag_raw if 32 <= b < 127 or b in (9, 10, 13)
                 )
             except (subprocess.SubprocessError, OSError):
                 # ledag-ssh available but failed (timeout, device busy,
@@ -3666,6 +3621,7 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
 
         # Read outputs back.
         import numpy as np
+
         outputs: dict = {}
         for role, (shape, dtype) in output_specs.items():
             p = Path(output_bin_paths[role])
@@ -3716,60 +3672,20 @@ def _run_apu_v2(compiled: "Compiled", **inputs) -> RunResult:
 
 
 def _run_virtual(compiled: "Compiled", **inputs) -> RunResult:
-    """Sim-free virtual-backend runner (design 04 §2.2).
-
-    Delegates to `spmw_cost_model.evaluate`, which imports nothing from the
-    simulator paths -- no subprocess, no Docker, no `_pimsim_root` etc. The
-    no-sim guarantee (task 005) thus holds by construction: the only inputs
-    are the bound CostModel and the in-memory trace. `confidence` / `phases`
-    ride `RunResult.extra` (RunResult is not structurally changed).
-    """
-    if getattr(compiled.target, "has_performance_model", False):
-        from .pim.performance import virtual_target
-        from .spmw_plan import build_execution_graph
-
-        graph = compiled.execution_graph
-        if graph is None:
-            graph = build_execution_graph(
-                compiled.target, compiled.trace, compiled.layout
-            )
-        performance_model = compiled.performance_model or virtual_target(compiled.target)
-        estimate = performance_model.evaluate(graph)
-        return RunResult(
-            cycles=estimate.cycles,
-            stdout=(
-                "virtual backend: resource-DAG analytical model "
-                f"(interval={estimate.cycle_interval})"
-            ),
-            backend="virtual",
-            extra={
-                "cycle_interval": estimate.cycle_interval,
-                "critical_path": list(estimate.critical_path),
-                "utilization": dict(estimate.utilization),
-                "bottlenecks": list(estimate.bottlenecks),
-                "model_fingerprint": estimate.model_fingerprint,
-                "cost_model": "resource-dag-v1",
-                "priced_target": compiled.target.name,
-            },
-        )
-
-    from .spmw_cost_model import evaluate, get_cost_model
-
-    result = evaluate(
-        compiled.target, compiled.trace, compiled.layout, compiled.cost_flavor
-    )
-    model = get_cost_model(compiled.target.name, compiled.cost_flavor)
+    """Execute the already-lowered cost program without a simulator."""
+    if compiled.cost is None or compiled.execution_graph is None:
+        raise RuntimeError("virtual execution requires an executable CostSpec")
+    estimate = compiled.cost.evaluate(compiled.execution_graph)
     return RunResult(
-        cycles=result.cycles,
-        stdout=(
-            f"virtual backend: cost model {model.name!r} "
-            f"(confidence={result.confidence})"
-        ),
+        cycles=estimate.cycles,
+        stdout=f"virtual backend: executable cost spec {compiled.cost.spec.name!r}",
         backend="virtual",
         extra={
-            "phases": result.phases,
-            "confidence": result.confidence,
-            "cost_model": model.name,
+            "critical_path": list(estimate.critical_path),
+            "utilization": dict(estimate.utilization),
+            "bottlenecks": list(estimate.bottlenecks),
+            "model_fingerprint": estimate.model_fingerprint,
+            "cost_model": compiled.cost.spec.name,
             "priced_target": compiled.target.name,
         },
     )
@@ -3798,10 +3714,9 @@ class Compiled:
         layout: Placement,
         ctx: "CodegenContext | None" = None,
         backend: "str | None" = None,
-        cost_flavor: str = "faithful",
         host_moves: "list[ResolvedHostMove] | None" = None,
         execution_graph=None,
-        performance_model=None,
+        cost=None,
     ):
         self.target = target
         self.trace = trace
@@ -3816,12 +3731,8 @@ class Compiled:
         # diagnostics. Targets not yet ported to the resource model leave it
         # unset and remain on their existing path during migration.
         self.execution_graph = execution_graph
-        self.performance_model = performance_model
-        # design 04 §2.1: `backend="virtual"` makes the cost model a peer
-        # run target; `cost_flavor` selects which CostModel flavor the
-        # virtual runner prices against. Both default to today's behaviour.
+        self.cost = cost
         self.backend = backend
-        self.cost_flavor = cost_flavor
         # `_ctx` is currently only consumed by `_run_upmem`, which needs
         # `UPMEMCtx.get_kernel_src()` to render the full DPU envelope
         # around `cmds`. Other backends ignore the field.
@@ -3912,10 +3823,20 @@ def _check_work_grid(target, trace, *, auto_fill=True):
         m0 = matches[0]
         base_kernels.add(_base_kernel_name(m0.func_name, m0.work_id))
     if len(base_kernels) != 1:
-        return derived                       # multi-kernel: exempt
+        return derived  # multi-kernel: exempt
     observed = len(buckets)
     if observed == derived:
         return derived
+    # A workload may intentionally stop at an outer spatial scope.  AiM's
+    # MAC_ABK is the canonical case: one work item addresses a channel while
+    # the instruction itself fans out over all 16 descendant banks.  Accept
+    # products of outer prefixes (32 for [32,4,4]) as structurally valid; the
+    # selected operation and cost rule account for the internal parallelism.
+    prefix = 1
+    for factor in target.work_grid()[0]:
+        prefix *= factor
+        if observed == prefix:
+            return observed
     if observed == 1 and auto_fill:
         # Under-specified partition (e.g. mapping=[1] on a single kernel).
         warnings.warn(
@@ -3949,8 +3870,10 @@ def _resolve_host_moves(target, records):
     if not records:
         return []
     from .spmw_target import BackendHandle, HandleToken
+
     try:
         from .spmw_target import _VerbCallOrToken
+
         _token_types = (HandleToken, _VerbCallOrToken)
     except ImportError:  # pragma: no cover - _VerbCallOrToken always present
         _token_types = (HandleToken,)
@@ -3973,8 +3896,10 @@ def _resolve_host_moves(target, records):
             role = b if isinstance(b, str) else getattr(b, "name", None)
         resolved.append(
             ResolvedHostMove(
-                verb=rec.verb, move=move,
-                device_handle=device_handle, buffer_role=role,
+                verb=rec.verb,
+                move=move,
+                device_handle=device_handle,
+                buffer_role=role,
             )
         )
     return resolved
@@ -3999,9 +3924,9 @@ def compile_for_target(
     trace: MatchTrace,
     layout: Placement | list[Placement] | None = None,
     backend: "str | None" = None,
-    cost_flavor: str = "faithful",
     host_moves: "list | None" = None,
-    performance_model=None,
+    buffer_metrics: "dict | None" = None,
+    cost=None,
 ) -> Compiled:
     """Lower a (target, trace) pair to a runnable backend artifact by
     walking the target's declarations.
@@ -4012,10 +3937,7 @@ def compile_for_target(
     ``layout`` is a list, its length must equal the number of
     `@allo.work` kernels in the trace.
 
-    ``backend`` (design 04 §2.1): ``None`` -> today's behaviour (dispatch
-    by ``target.name``). ``"virtual"`` -> the returned ``Compiled`` runs
-    sim-free against the bound ``CostModel`` (``cost_flavor`` selects the
-    flavor). Additive; every existing positional caller is unaffected.
+    ``backend="virtual"`` executes the supplied CostSpec without a simulator.
 
     ``host_moves`` (spec 001 D5): an optional list of recorded ``host_xfer.*``
     calls (``HostMoveRecord``) from the workload's region body. ``None`` (the
@@ -4035,17 +3957,9 @@ def compile_for_target(
     if hasattr(target, "work_grid"):
         _check_work_grid(target, trace)
 
-    # design 04 §2.1 / §8: the virtual backend needs only (trace + cost
-    # model), NOT emitted cmds. So a substrate with no simulator/HW -- no
-    # codegen ctx, no candidate enumerator -- is still developable + costable
-    # purely through `backend="virtual"`. Skip the codegen-ctx requirement
-    # and the emit walk; the cost is computed at run() time by `_run_virtual`
-    # against the bound CostModel. A `layout` is taken as given (or defaults
-    # to an empty Placement when the substrate has no enumerator).
+    # A virtual-only target needs no code generator. Its executable cost spec
+    # lowers the trace directly to the retained handle-based graph.
     if backend == "virtual" and _BACKEND_CTX.get(target_name) is None:
-        from .spmw_autoschedule import _bucket_for_autoschedule
-        buckets = _bucket_for_autoschedule(trace)
-        n_groups = len(buckets) or 1
         if layout is None:
             stored_layout = Placement(placements={})
         elif isinstance(layout, Placement):
@@ -4053,11 +3967,28 @@ def compile_for_target(
         else:
             layouts = list(layout)
             stored_layout = layouts[0] if len(layouts) == 1 else layouts
+        execution_graph = None
+        if cost is not None:
+            from .spmw_plan import build_execution_graph
+
+            execution_graph = build_execution_graph(
+                target,
+                trace,
+                stored_layout,
+                cost,
+                host_moves=resolved_host_moves,
+                buffer_metrics=buffer_metrics,
+            )
         return Compiled(
-            target, trace, [], stored_layout, ctx=None,
-            backend=backend, cost_flavor=cost_flavor,
+            target,
+            trace,
+            [],
+            stored_layout,
+            ctx=None,
+            backend=backend,
             host_moves=resolved_host_moves,
-            performance_model=performance_model,
+            execution_graph=execution_graph,
+            cost=cost,
         )
 
     ctx_cls = _BACKEND_CTX.get(target_name)
@@ -4068,13 +3999,12 @@ def compile_for_target(
         )
 
     from .spmw_autoschedule import _bucket_for_autoschedule
+
     buckets = _bucket_for_autoschedule(trace)
     n_groups = len(buckets) or 1
 
     if layout is None:
-        layouts = autoschedule(
-            target, trace, performance_model=performance_model
-        )
+        layouts = autoschedule(target, trace, cost=cost)
     elif isinstance(layout, Placement):
         # Single layout: replicate across every kernel. Equivalent to
         # the old behaviour for single-layer traces.
@@ -4101,14 +4031,25 @@ def compile_for_target(
     if resolved_host_moves:
         _stamp_host_moves(stored_layout, resolved_host_moves)
     execution_graph = None
-    if getattr(target, "has_performance_model", False):
+    if cost is not None:
         from .spmw_plan import build_execution_graph
 
-        execution_graph = build_execution_graph(target, trace, stored_layout)
+        execution_graph = build_execution_graph(
+            target,
+            trace,
+            stored_layout,
+            cost,
+            host_moves=resolved_host_moves,
+            buffer_metrics=buffer_metrics,
+        )
     return Compiled(
-        target, trace, ctx.cmds, stored_layout, ctx=ctx,
-        backend=backend, cost_flavor=cost_flavor,
+        target,
+        trace,
+        ctx.cmds,
+        stored_layout,
+        ctx=ctx,
+        backend=backend,
         host_moves=resolved_host_moves,
         execution_graph=execution_graph,
-        performance_model=performance_model,
+        cost=cost,
     )

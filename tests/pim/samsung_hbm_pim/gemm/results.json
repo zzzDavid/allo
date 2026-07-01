@@ -22,8 +22,8 @@
     "value": 75205,
     "source": "PIMSimulator@bin-sha256:121250edea00",
     "run_cmd": "python -m pytest tests/pim/samsung_hbm_pim/gemm/test_gemm_samsung_hbm_pim.py -p no:cacheprovider -q",
-    "timestamp": "2026-06-30T11:53:51.776912"
+    "timestamp": "2026-06-30T15:58:05.054280"
   },
-  "tenon_commit": "1af5ccd18a995ba016570ea802403affd91cad2a",
-  "notes": "SPEC-05 SPMW slice-form gemm (mapping=[16,8]); genuine fp16 PASS vs A@B; partition mapping-driven (128 work-id buckets, per-PE slice loop bound = P//128)."
+  "tenon_commit": "837aab5ab7def05b5255b98cf66eee65362bb546",
+  "notes": "SPMW slice-form GEMM on the 128-PE mapping; genuine fp16 PASS against A@B."
 }

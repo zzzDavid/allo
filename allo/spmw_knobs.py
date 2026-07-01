@@ -1,13 +1,10 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SPMW typed knob registry (SPEC-022 D4).
+"""SPMW typed schedule-knob registry.
 
-The write-side of the co-owned knob seam. The `Knob` Protocol is FROZEN in
-`spmw_cost_model.py` (`name` / `candidates(ctx)` / `cost(value, ctx)` /
-`emit(value, ctx)`); this module supplies the concrete `Knob` implementations
-and the `register_knob` registry, binding against the frozen
-`register_knob_cost` / `knob_cost` seam there. It does NOT redefine the
-Protocol or the cost side.
+Knobs enumerate and materialize schedule choices. Their performance is not
+defined here: the executable CostSpec observes the resulting Placement while
+scoring each candidate.
 
 Ownership split (design 07 §A3 / SPEC-022 D4):
   - `candidates(ctx)` -- the per-lever fan-out, OWNED here (lifted out of the
@@ -18,9 +15,6 @@ Ownership split (design 07 §A3 / SPEC-022 D4):
     and the codegen `extra`-read branches consume). The typed knob owns
     PRODUCTION of the value set and its placement into `extra`; the existing
     `extra`-read consumers are unchanged.
-  - `cost(value, ctx)` -- delegates to `knob_cost(target, name, value, ctx)`
-    (the cost task's registered seam). Exactly one cost definition exists.
-
 The autoscheduler cross-products the registered knobs generically
 (`cross_with_knobs`): adding a lever is a single `register_knob(...)` call, not
 lockstep edits to enumerator + cost-compose + codegen (the lockstep that
@@ -97,13 +91,11 @@ class KnobCtx:
 
 @dataclass
 class Knob:
-    """A concrete typed schedule knob (binds the frozen `Knob` Protocol).
+    """A concrete typed schedule knob.
 
     `candidates_fn(ctx) -> list[value]` is the lever's fan-out; `emit_fn(value,
     base, ctx) -> Placement` materialises the value onto a copy of `base`
-    (writing `extra[name] = value` as the compatibility carrier). `cost(...)`
-    delegates to the cost task's registered `knob_cost` seam -- the knob never
-    re-implements cost.
+    (writing `extra[name] = value` on the resulting placement).
     """
 
     name: str
@@ -115,13 +107,6 @@ class Knob:
 
     def emit(self, value, ctx: KnobCtx):
         return self.emit_fn(value, ctx.base, ctx)
-
-    def cost(self, value, ctx):
-        # Delegate to the cost task's frozen seam: ONE cost definition.
-        from .spmw_cost_model import knob_cost
-
-        target_name = getattr(getattr(ctx, "target", None), "name", None)
-        return knob_cost(target_name, self.name, value, ctx)
 
 
 # --------------------------------------------------------------------- #
@@ -145,9 +130,7 @@ def register_knob(target_name: str, knob: Knob) -> Knob:
     by_name = _knob_registry.setdefault(target_name, {})
     existing = by_name.get(knob.name)
     if existing is not None and existing is not knob:
-        raise ValueError(
-            f"duplicate knob {knob.name!r} for target {target_name!r}"
-        )
+        raise ValueError(f"duplicate knob {knob.name!r} for target {target_name!r}")
     by_name[knob.name] = knob
     return knob
 
@@ -222,7 +205,9 @@ def _n_tasklets_emit(value, base, ctx: KnobCtx):
     new_extra = dict(base.extra)
     new_extra["n_tasklets"] = value
     return Placement(
-        placements=dict(base.placements), mode=base.mode, extra=new_extra,
+        placements=dict(base.placements),
+        mode=base.mode,
+        extra=new_extra,
         layout=getattr(base, "layout", None),
     )
 
@@ -237,7 +222,9 @@ def _vr_dma_emit(value, base, ctx: KnobCtx):
     new_extra = dict(base.extra)
     new_extra["vr_dma"] = value
     return Placement(
-        placements=dict(base.placements), mode=base.mode, extra=new_extra,
+        placements=dict(base.placements),
+        mode=base.mode,
+        extra=new_extra,
         layout=getattr(base, "layout", None),
     )
 
@@ -296,7 +283,9 @@ def _residency_emit(value, base, ctx: KnobCtx):
             # reconciliation pops a mref from here when an endpoint disagrees.
             new_extra["residency_pairs"] = dict(info)
     return Placement(
-        placements=dict(base.placements), mode=base.mode, extra=new_extra,
+        placements=dict(base.placements),
+        mode=base.mode,
+        extra=new_extra,
         layout=getattr(base, "layout", None),
     )
 
@@ -322,35 +311,19 @@ def _tile_emit(value, base, ctx: KnobCtx):
     if value is not None and not getattr(value, "is_identity", True):
         new_extra["tile"] = value
     return Placement(
-        placements=dict(base.placements), mode=base.mode, extra=new_extra,
+        placements=dict(base.placements),
+        mode=base.mode,
+        extra=new_extra,
         layout=getattr(base, "layout", None),
     )
 
 
-def _has_dma_hide_dof(target) -> bool:
-    """True iff the target has a DMA-hide degree of freedom -- i.e. an
-    `overlap`-flavor cost model is registered for it, whose compose emits the
-    DMA on `Resource.DMA` so the §A1 overlap fold can hide it behind compute
-    (SPEC-023 D3). A structural check, NOT a backend-name hardcode: a backend
-    gains the depth-2 candidate exactly when its overlap compose is landed
-    (APU v1 today; UPMEM/others when their overlap arm is added)."""
-    name = getattr(target, "name", None)
-    if name is None:
-        return False
-    try:
-        from .spmw_cost_model import get_cost_model
-        get_cost_model(name, "overlap", "kernel_cycles")
-        return True
-    except Exception:
-        return False
-
-
 def _double_buffer_candidates(ctx: KnobCtx) -> list:
-    # >=2-candidate discipline gated on SUBSTRATE capability (SPEC-023 D3):
-    # depth {1, 2} only where an overlap-fold DMA-hide DOF exists, else [1] (a
-    # 1x fan, byte-identical -- Samsung's bank-row fold is single-buffered, and
-    # any backend with no `Resource.DMA` overlap compose stays depth-1).
-    return [1, 2] if _has_dma_hide_dof(ctx.target) else [1]
+    # Double buffering needs a structural buffer pair before it is a legal
+    # candidate. No current target declares that pair, so this knob is inert.
+    # Once that structure lands, CostSpec can price both placements directly.
+    del ctx
+    return [1]
 
 
 def _double_buffer_emit(value, base, ctx: KnobCtx):
@@ -363,7 +336,9 @@ def _double_buffer_emit(value, base, ctx: KnobCtx):
     if int(value) >= 2:
         new_extra["double_buffer"] = True
     return Placement(
-        placements=dict(base.placements), mode=base.mode, extra=new_extra,
+        placements=dict(base.placements),
+        mode=base.mode,
+        extra=new_extra,
         layout=getattr(base, "layout", None),
     )
 
@@ -380,14 +355,15 @@ def register_default_knobs():
     preserve the exact 4-tuple set. Idempotent (safe to call at import).
     """
     for tname in ("samsung_hbm_pim", "mortise", "mortise_wide"):
-        register_knob(tname, Knob("grf_residency",
-                                  _grf_residency_candidates, _grf_residency_emit))
-        register_knob(tname, Knob("crf_issue",
-                                  _crf_issue_candidates, _crf_issue_emit))
-        register_knob(tname, Knob("stage_resident",
-                                  _stage_resident_candidates, _stage_resident_emit))
-    register_knob("upmem", Knob("n_tasklets",
-                                _n_tasklets_candidates, _n_tasklets_emit))
+        register_knob(
+            tname, Knob("grf_residency", _grf_residency_candidates, _grf_residency_emit)
+        )
+        register_knob(tname, Knob("crf_issue", _crf_issue_candidates, _crf_issue_emit))
+        register_knob(
+            tname,
+            Knob("stage_resident", _stage_resident_candidates, _stage_resident_emit),
+        )
+    register_knob("upmem", Knob("n_tasklets", _n_tasklets_candidates, _n_tasklets_emit))
     register_knob("apu_v1", Knob("vr_dma", _vr_dma_candidates, _vr_dma_emit))
 
     # Cross-kernel / cross-work-id residency (SPEC-023 D1/T6). A 1x fan
@@ -396,18 +372,29 @@ def register_default_knobs():
     # possible. Its `cost` delegates to the registered `knob_cost(target,
     # "residency", ...)` (task 004); the resident arm is credited the elided
     # inter-kernel staging so the argmin earns it.
-    for tname in ("samsung_hbm_pim", "mortise", "mortise_wide",
-                  "upmem", "apu_v1", "apu_v2"):
-        register_knob(tname, Knob("residency",
-                                  _residency_candidates, _residency_emit))
+    for tname in (
+        "samsung_hbm_pim",
+        "mortise",
+        "mortise_wide",
+        "upmem",
+        "apu_v1",
+        "apu_v2",
+    ):
+        register_knob(tname, Knob("residency", _residency_candidates, _residency_emit))
 
     # Capacity-bounded tile/fold (SPEC-023 D2). Registered LAST on every
     # backend so it is a 1x fan (byte-identical) whenever the generator finds
     # no legal capacity-fitting retile -- the candidate set only grows when a
     # legal one exists. Its `cost` delegates to `knob_cost(target, "tile",
     # ...)`; the identity tiling is the default and writes no `extra`.
-    for tname in ("samsung_hbm_pim", "mortise", "mortise_wide",
-                  "upmem", "apu_v1", "apu_v2"):
+    for tname in (
+        "samsung_hbm_pim",
+        "mortise",
+        "mortise_wide",
+        "upmem",
+        "apu_v1",
+        "apu_v2",
+    ):
         register_knob(tname, Knob("tile", _tile_candidates, _tile_emit))
 
     # Double-buffer depth (SPEC-023 D3). A 1x fan ([1], byte-identical) on
@@ -416,11 +403,17 @@ def register_default_knobs():
     # overlap compose reads to emit the loop-encoded (hiding) DMA phase; under
     # the default faithful flavor depth-1 and depth-2 tie (collapsed phase
     # both), so the argmin default is byte-identical.
-    for tname in ("samsung_hbm_pim", "mortise", "mortise_wide",
-                  "upmem", "apu_v1", "apu_v2"):
-        register_knob(tname, Knob("double_buffer",
-                                  _double_buffer_candidates,
-                                  _double_buffer_emit))
+    for tname in (
+        "samsung_hbm_pim",
+        "mortise",
+        "mortise_wide",
+        "upmem",
+        "apu_v1",
+        "apu_v2",
+    ):
+        register_knob(
+            tname, Knob("double_buffer", _double_buffer_candidates, _double_buffer_emit)
+        )
 
 
 def cross_with_knobs(
@@ -449,6 +442,7 @@ def cross_with_knobs(
     # verifier (008/009) compiles the SAME workload twice (this flag set vs
     # unset) and compares real-sim cycles; this is the single choke point.
     import os
+
     _search_off = os.environ.get("SPMW_DISABLE_SCHEDULE_SEARCH") == "1"
     current = list(base_candidates)
     for knob in registered_knobs(target_name):
@@ -457,8 +451,10 @@ def cross_with_knobs(
         nxt: list = []
         for base in current:
             ctx = KnobCtx(
-                target=target, matches=matches,
-                role_to_memref=role_to_memref, base=base,
+                target=target,
+                matches=matches,
+                role_to_memref=role_to_memref,
+                base=base,
                 liveness=liveness,
             )
             values = knob.candidates(ctx)

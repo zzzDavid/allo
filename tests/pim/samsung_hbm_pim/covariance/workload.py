@@ -46,7 +46,7 @@ def build():
 # Host data movement (spec backend-host-transfer-dispatch.md): the contraction is
 # cov_raw = cdata^T @ cdata, so cdata is staged as BOTH the scattered weight and
 # the broadcast input; cov_raw is gathered back. Recorded at import and consumed
-# by the suite's ``allo.compile`` helper.
+# by the leaf test's explicit ``allo.compile`` call.
 with allo.record_host_moves() as _hm:
     host_staging.stage_gemm(weight="cdata", vec="cdata", out="cov_raw")
 HOST_MOVES = list(_hm)

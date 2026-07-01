@@ -17,9 +17,6 @@ from .spmw_target import (
     unit,
     device,
     reg,
-    const,
-    resource,
-    cycle_model,
     get_uid,
     move,
     op,
@@ -27,6 +24,7 @@ from .spmw_target import (
     or_,
 )
 from .spmw_target import memory as mem
+
 # Host-transfer dispatch surface (spec 001). NOTE: the proxy is `allo.host_xfer`,
 # NOT `allo.backend` — `allo.backend` is already the codegen-backend submodule
 # (imported on line 5; llvm/hls/ip/aie). Re-exporting the proxy as `backend`
@@ -57,30 +55,24 @@ from .spmw_host_program import (
     schedule_residency,
     schedule_cost,
 )
+
 # HostXcel collective surface removed (2026-06-30): host<->device transfers
 # are now explicit `allo.move`s declared on an @allo.unit(mode="host") scope,
 # naming device memory (e.g. hbm_pim.banks) as an endpoint. See spmw_target.py
 # (@allo.device / DeviceScope) and allo/pim/targets.py (the Samsung host scope).
-from .spmw_cost import cost, get_cost
-from .spmw_cost_model import (
-    CostModel,
-    OpCost,
-    MoveCost,
-    OpCostCtx,
-    MoveCostCtx,
-    ComposeCtx,
-    CostResult,
-    register_cost_model,
-    get_cost_model,
-)
+from .perf import CostSpec, BoundCostSpec, cost, rule
 from .spmw_match_engine import (
     compile_op_pattern,
     compile_target_patterns,
     match_workload,
 )
 from .spmw_autoschedule import Placement, autoschedule
-from .spmw_codegen import compile_for_target, Compiled, PIMCmd, SamsungCtx, ResolvedHostMove
+from .spmw_codegen import (
+    compile_for_target,
+    Compiled,
+    PIMCmd,
+    SamsungCtx,
+    ResolvedHostMove,
+)
 from .spmw_linear_layout import LinearLayout, materialise_handle
-from .spmw_regalloc import allocate
 from .compiler import compile, CompiledCallable
-from . import spmw_cost_models  # noqa: F401  — registers @cost factories

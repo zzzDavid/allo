@@ -6,7 +6,7 @@
 - cycles: 173490
 - source: `uPIMulator@870d916334e9ff0b190f555f951a9ec3c4257781`
 - run_cmd: `python -m pytest tests/pim/upmem/3mm/test_three_mm_upmem.py -p no:cacheprovider -q`
-- timestamp: 2026-06-29T10:15:12.681764
-- tenon_commit: `ed217633e316c4b45d19368b4cfadd61c028aa21`
+- timestamp: 2026-06-29T12:21:35.666320
+- tenon_commit: `ee1e52a539d6385a60d149ca238b592d9763103e`
 
 Tier-1 single-output; UPMEM GEMV-host slot verifies W@x internally (PASS w/ cycles); a VA-slot route is CYCLES-ONLY.

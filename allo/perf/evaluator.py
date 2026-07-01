@@ -1,16 +1,13 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Generic resource-constrained cycle estimator."""
+"""Generic calendar evaluator for lowered cost programs."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from .calibration import CalibrationProfile
-from .graph import Activity, ExecutionGraph
-from .resources import ResourceSpec, ResourceTopology
-from .timing import CycleTiming, TimingLibrary
+from .graph import ExecutionGraph, HandleInstance
 
 
 @dataclass(frozen=True)
@@ -19,13 +16,12 @@ class ActivitySpan:
     start_cycle: int
     end_cycle: int
     latency_cycles: int
-    resource_occupancy_cycles: Mapping[str, int] = field(default_factory=dict)
+    handle_occupancy_cycles: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class Estimate:
     cycles: int
-    cycle_interval: tuple[int, int]
     spans: Mapping[str, ActivitySpan]
     critical_path: tuple[str, ...]
     utilization: Mapping[str, float]
@@ -42,14 +38,11 @@ class _Reservation:
 
 
 class _Calendar:
-    def __init__(self, capacity: int):
+    def __init__(self, capacity):
         self.capacity = capacity
         self.reservations: list[_Reservation] = []
 
-    def _usage_at(self, cycle: int) -> int:
-        return sum(r.amount for r in self.reservations if r.start <= cycle < r.end)
-
-    def fits(self, start: int, duration: int, amount: int) -> bool:
+    def fits(self, start, duration, amount):
         if duration <= 0:
             return True
         end = start + duration
@@ -59,167 +52,126 @@ class _Calendar:
                 continue
             points.add(max(start, reservation.start))
             points.add(min(end, reservation.end))
-        return not any(
-            point < end and self._usage_at(point) + amount > self.capacity
-            for point in sorted(points)
-        )
+        for point in sorted(points):
+            if point >= end:
+                continue
+            usage = sum(
+                reservation.amount
+                for reservation in self.reservations
+                if reservation.start <= point < reservation.end
+            )
+            if usage + amount > self.capacity:
+                return False
+        return True
 
-    def earliest(
-        self, start: int, duration: int, amount: int
-    ) -> tuple[int, str | None]:
+    def earliest(self, start, duration, amount):
         candidate = start
         blocker = None
         while not self.fits(candidate, duration, amount):
             overlapping = [
-                r
-                for r in self.reservations
-                if r.end > candidate and r.start < candidate + duration
+                reservation
+                for reservation in self.reservations
+                if reservation.end > candidate
+                and reservation.start < candidate + duration
             ]
             if not overlapping:
-                raise RuntimeError("resource calendar failed to make progress")
-            next_end = min(r.end for r in overlapping if r.end > candidate)
-            ending = [r for r in overlapping if r.end == next_end]
-            blocker = ending[-1].activity_id
+                raise RuntimeError("handle calendar failed to make progress")
+            next_end = min(
+                reservation.end
+                for reservation in overlapping
+                if reservation.end > candidate
+            )
+            blocker = next(
+                reservation.activity_id
+                for reservation in reversed(overlapping)
+                if reservation.end == next_end
+            )
             candidate = next_end
         return candidate, blocker
 
-    def reserve(self, start: int, duration: int, amount: int, activity_id: str) -> None:
+    def reserve(self, start, duration, amount, activity_id):
         if duration <= 0:
             return
         if not self.fits(start, duration, amount):
-            raise RuntimeError("attempted to overbook a resource calendar")
+            raise RuntimeError("attempted to overbook a target handle")
         self.reservations.append(
             _Reservation(start, start + duration, amount, activity_id)
         )
 
 
 class Evaluator:
-    """ASAP list scheduler over a dependency DAG and target resource calendars."""
+    """ASAP scheduler over dependencies and concrete target-handle calendars."""
 
-    def evaluate(
-        self,
-        graph: ExecutionGraph,
-        topology: ResourceTopology,
-        timings: TimingLibrary,
-        profile: CalibrationProfile,
-    ) -> Estimate:
-        nominal = self._schedule(graph, topology, timings, profile, bound="nominal")
-        lower = self._schedule(graph, topology, timings, profile, bound="lower")
-        upper = self._schedule(graph, topology, timings, profile, bound="upper")
-        cycles, spans, predecessor, calendars = nominal
-        lower_cycles = min(lower[0], cycles)
-        upper_cycles = max(upper[0], cycles)
+    def evaluate(self, graph: ExecutionGraph) -> Estimate:
+        calendars: dict[HandleInstance, _Calendar] = {}
+        spans = {}
+        predecessor = {}
 
+        for activity in graph.topological_order():
+            dep_end = 0
+            dep_predecessor = None
+            for dependency in activity.depends_on:
+                end = spans[dependency].end_cycle
+                if end >= dep_end:
+                    dep_end = end
+                    dep_predecessor = dependency
+
+            start = dep_end
+            handle_predecessor = None
+            while True:
+                moved = False
+                for use in activity.occupancy:
+                    calendar = calendars.setdefault(
+                        use.handle, _Calendar(use.handle.capacity)
+                    )
+                    available, blocker = calendar.earliest(
+                        start, use.cycles, use.amount
+                    )
+                    if available > start:
+                        start = available
+                        handle_predecessor = blocker
+                        moved = True
+                if not moved:
+                    break
+
+            occupancy = {}
+            for use in activity.occupancy:
+                calendar = calendars.setdefault(
+                    use.handle, _Calendar(use.handle.capacity)
+                )
+                calendar.reserve(start, use.cycles, use.amount, activity.id)
+                occupancy[use.handle.name] = (
+                    occupancy.get(use.handle.name, 0) + use.cycles * use.amount
+                )
+
+            end = start + activity.latency_cycles
+            spans[activity.id] = ActivitySpan(
+                activity.id, start, end, activity.latency_cycles, occupancy
+            )
+            predecessor[activity.id] = (
+                handle_predecessor if start > dep_end else dep_predecessor
+            )
+
+        cycles = max((span.end_cycle for span in spans.values()), default=0)
         critical = self._critical_path(spans, predecessor)
-        utilization = self._utilization(calendars, topology, cycles)
+        utilization = self._utilization(calendars, cycles)
         bottlenecks = tuple(
             name
-            for name, _ in sorted(
+            for name, _value in sorted(
                 utilization.items(), key=lambda item: (-item[1], item[0])
             )[:5]
         )
         return Estimate(
             cycles=cycles,
-            cycle_interval=(lower_cycles, upper_cycles),
             spans=spans,
             critical_path=critical,
             utilization=utilization,
             bottlenecks=bottlenecks,
-            model_fingerprint=profile.fingerprint(),
+            model_fingerprint=str(graph.metadata.get("cost_fingerprint", "")),
         )
 
-    def _timing_for_bound(
-        self,
-        activity: Activity,
-        timings: TimingLibrary,
-        profile: CalibrationProfile,
-        bound: str,
-    ) -> CycleTiming:
-        timing = timings.evaluate(
-            activity.timing_model, activity.invocation.model_inputs(), profile
-        )
-        if bound == "nominal" or timing.cycle_interval is None:
-            return timing
-        latency = timing.cycle_interval[0 if bound == "lower" else 1]
-        if timing.initiation_interval_cycle_interval is None:
-            ii = timing.initiation_interval_cycles
-        else:
-            ii = timing.initiation_interval_cycle_interval[0 if bound == "lower" else 1]
-        return CycleTiming(latency, max(0, ii))
-
-    def _schedule(self, graph, topology, timings, profile, *, bound):
-        calendars: dict[tuple[str, int], _Calendar] = {}
-        for spec in topology:
-            for instance in range(spec.instances):
-                calendars[(spec.name, instance)] = _Calendar(spec.capacity)
-
-        spans: dict[str, ActivitySpan] = {}
-        predecessor: dict[str, str | None] = {}
-        for activity in graph.topological_order():
-            for request in activity.resources:
-                topology.validate_request(request)
-            timing = self._timing_for_bound(activity, timings, profile, bound)
-            dep_end = 0
-            dep_predecessor = None
-            for dep in activity.depends_on:
-                end = spans[dep].end_cycle
-                if end >= dep_end:
-                    dep_end = end
-                    dep_predecessor = dep
-
-            start = dep_end
-            resource_predecessor = None
-            # Atomic acquisition: moving one request later can invalidate an
-            # earlier request, so iterate until every calendar accepts the same
-            # start cycle.
-            while True:
-                moved = False
-                for request in activity.resources:
-                    spec = topology.get(request.resource)
-                    duration = self._occupancy(spec, timing)
-                    for instance in request.instances:
-                        available, blocker = calendars[(spec.name, instance)].earliest(
-                            start, duration, request.amount
-                        )
-                        if available > start:
-                            start = available
-                            resource_predecessor = blocker
-                            moved = True
-                if not moved:
-                    break
-
-            occupancy: dict[str, int] = {}
-            for request in activity.resources:
-                spec = topology.get(request.resource)
-                duration = self._occupancy(spec, timing)
-                for instance in request.instances:
-                    calendars[(spec.name, instance)].reserve(
-                        start, duration, request.amount, activity.id
-                    )
-                    key = f"{spec.name}[{instance}]"
-                    occupancy[key] = duration * request.amount
-
-            end = start + timing.latency_cycles
-            spans[activity.id] = ActivitySpan(
-                activity.id, start, end, timing.latency_cycles, occupancy
-            )
-            predecessor[activity.id] = (
-                resource_predecessor if start > dep_end else dep_predecessor
-            )
-
-        cycles = max((span.end_cycle for span in spans.values()), default=0)
-        return cycles, spans, predecessor, calendars
-
     @staticmethod
-    def _occupancy(spec: ResourceSpec, timing: CycleTiming) -> int:
-        if timing.latency_cycles == 0:
-            return 0
-        if spec.pipelined:
-            return max(1, timing.initiation_interval_cycles)
-        return timing.latency_cycles
-
-    @staticmethod
-    def _critical_path(spans, predecessor) -> tuple[str, ...]:
+    def _critical_path(spans, predecessor):
         if not spans:
             return ()
         current = max(spans, key=lambda name: (spans[name].end_cycle, name))
@@ -228,24 +180,22 @@ class Evaluator:
         while current is not None and current not in seen:
             path.append(current)
             seen.add(current)
-            current = predecessor.get(current)
+            current = predecessor[current]
         path.reverse()
         return tuple(path)
 
     @staticmethod
-    def _utilization(calendars, topology, cycles) -> dict[str, float]:
+    def _utilization(calendars, cycles):
         if cycles <= 0:
-            return {
-                f"{spec.name}[{i}]": 0.0
-                for spec in topology
-                for i in range(spec.instances)
-            }
-        out = {}
-        for spec in topology:
-            for instance in range(spec.instances):
-                calendar = calendars[(spec.name, instance)]
-                occupied = sum(
-                    (r.end - r.start) * r.amount for r in calendar.reservations
+            return {handle.name: 0.0 for handle in calendars}
+        return {
+            handle.name: min(
+                1.0,
+                sum(
+                    (reservation.end - reservation.start) * reservation.amount
+                    for reservation in calendar.reservations
                 )
-                out[f"{spec.name}[{instance}]"] = occupied / (cycles * spec.capacity)
-        return out
+                / (cycles * calendar.capacity),
+            )
+            for handle, calendar in calendars.items()
+        }

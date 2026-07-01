@@ -1,12 +1,13 @@
 # bicg on upmem (SMALL)
 
-- correctness: **PASS** -- uPIMulator GEMV host numeric check passed (W@x vs numpy ref, host tol); recorded ref rtol=0.0001
+- correctness: **BLOCKED-SIM** -- upmem/bicg: reference sim cored on the shape (env limit, not a Tenon gap): UPMEM uPIMulator returned but stdout/log missing 'cycle: ...' line; tail: PIMulator/src/core.(*ThreadPool).Dispatch(0x0?, {0x656f60?, 0x2660a450a068?})
+	/work/s
 - reference: PolyBench/C 4.2.1 SMALL_DATASET (validated by `experiments/scripts/R_polybench_ref_validation.py`)
 - shapes: {'M': 116, 'N': 124}
-- cycles: 561538
-- source: `uPIMulator@870d916334e9ff0b190f555f951a9ec3c4257781`
+- cycles: N/A
+- source: `uPIMulator@870d916334e9ff0b190f555f951a9ec3c4257781 (cored on shape)`
 - run_cmd: `python -m pytest tests/pim/upmem/bicg/test_bicg_upmem.py -p no:cacheprovider -q`
-- timestamp: 2026-06-29T10:48:21.766227
-- tenon_commit: `ed217633e316c4b45d19368b4cfadd61c028aa21`
+- timestamp: 2026-06-29T12:21:45.164459
+- tenon_commit: `ee1e52a539d6385a60d149ca238b592d9763103e`
 
 Tier-1 multi-output; UPMEM GEMV-host slot verifies W@x internally (PASS w/ cycles); a VA-slot route is CYCLES-ONLY.

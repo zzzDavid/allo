@@ -1,45 +1,40 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""PolyBench covariance on samsung_hbm_pim -- Tier-1 cell.
-
-Thin cell: build the target from `lib`, run the shared `covariance` workload
-through `lib.cell.run_cell`, record the verdict + cycles + results.json/
-RESULTS.md + COVERAGE.tsv. The @allo.work is the bare GEMM contraction
-`cov_raw = cdata^T @ cdata`; the host mean/centering/normalize/symmetrize runs
-off-device against covariance_np. Samsung surfaces a real `y` only for a
-single-stage bare GEMV at the design point -> a GEMM-shaped emitted stream stays
-CYCLES-ONLY (honest); a shape the reference sim cannot express -> BLOCKED-SIM.
-"""
+"""Covariance contraction compiled explicitly for Samsung HBM-PIM."""
 
 from __future__ import annotations
 
-from lib import cell, reference
-from lib.shapes import shape
+import allo
 
+from lib import samsung
+from lib.cost import bind_cost
+from lib.shapes import shape
+from lib.targets import build_target
 
 _KERNEL = "covariance"
 _TARGET = "samsung_hbm_pim"
-_RUN_CMD = (
-    "python -m pytest tests/pim/samsung_hbm_pim/covariance/test_covariance_samsung_hbm_pim.py "
-    "-p no:cacheprovider -q"
-)
+_RUN_CMD = "python -m pytest tests/pim/samsung_hbm_pim/covariance/test_covariance_samsung_hbm_pim.py -p no:cacheprovider -q"
+_NOTES = "On-device cdata.T@cdata contraction; host centering/normalization remains off-device."
 
 
 def test_covariance_samsung_hbm_pim(request):
-    result, verdict, _record = cell.run_cell(
-        kernel=_KERNEL, target_name=_TARGET,
-        folder=request.path.parent, stages=None, shapes=shape(_KERNEL),
-        run_cmd=_RUN_CMD,
-        notes="mean/centering/normalize/symmetrize host-side; on-device = cdata^T@cdata (GEMM nest). GEMM-shaped emitted stream -> CYCLES-ONLY (no W@x match); a shape the reference sim cannot express -> BLOCKED-SIM.",
+    workload = samsung.load_workload(request.path.parent, _KERNEL)
+    target = build_target(_TARGET)
+
+    compiled = allo.compile(
+        workload.build(),
+        target,
+        bind_cost(target),
+        host_moves=workload.HOST_MOVES,
     )
-    # First-class recorded verdict (spec Answer 3), never a skip.
-    assert verdict.status in (
-        reference.PASS, reference.CYCLES_ONLY, reference.BLOCKED_SIM,
-    ), verdict
-    if verdict.status in (reference.CYCLES_ONLY, reference.PASS) and not cell.sim_unavailable(result):
-        assert result.cycles is not None and result.cycles > 0, (
-            f"{_TARGET}: expected positive cycles; got {result.cycles!r}; "
-            f"stdout tail: {result.stdout[-400:]}"
-        )
-    elif verdict.status == reference.BLOCKED_SIM:
-        assert result.cycles is None
+
+    result, verdict, _record = samsung.run_compiled(
+        compiled,
+        workload,
+        kernel=_KERNEL,
+        folder=request.path.parent,
+        shapes=shape(_KERNEL),
+        run_cmd=_RUN_CMD,
+        notes=_NOTES,
+    )
+    samsung.assert_result(result, verdict, allow_pass=True)

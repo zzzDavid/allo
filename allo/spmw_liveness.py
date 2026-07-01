@@ -3,7 +3,7 @@
 """Whole-trace liveness for the SPMW autoscheduler (SPEC-023 D1).
 
 The autoscheduler's allocator runs liveness PER GROUP (`extract_live_ranges`
-takes one `func_name` bucket's matches, `spmw_regalloc.py`). That cannot see a
+takes one `func_name` bucket's matches). That cannot see a
 value used across two `@allo.work` kernels (MLP `h = ReLU(W1.x)` consumed by
 layer 2) or a value invariant across work-ids (GEMV `x` broadcast to every
 bank): each is placed independently, with no representation of "keep it

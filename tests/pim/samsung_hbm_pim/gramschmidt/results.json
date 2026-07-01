@@ -20,8 +20,8 @@
     "value": 4435,
     "source": "PIMSimulator@bin-sha256:121250edea00",
     "run_cmd": "python -m pytest tests/pim/samsung_hbm_pim/gramschmidt/test_gramschmidt_samsung_hbm_pim.py -p no:cacheprovider -q",
-    "timestamp": "2026-06-30T11:53:56.315906"
+    "timestamp": "2026-06-30T12:35:11.542895"
   },
-  "tenon_commit": "1af5ccd18a995ba016570ea802403affd91cad2a",
-  "notes": "Tier-2 triangular; Samsung reports cycles only (no output array) -> CYCLES-ONLY at the GEMV design point; a shape the reference sim cannot express -> BLOCKED-SIM. | SPEC-05 multi-stage, no chain recipe (mixed ELTWISE+REDUCE); honest CYCLES-ONLY."
+  "tenon_commit": "837aab5ab7def05b5255b98cf66eee65362bb546",
+  "notes": "Tier-2 Gram contraction; real REDUCE cycles with honest CYCLES-ONLY numerics. | SPEC-05 multi-stage, no chain recipe (mixed ELTWISE+REDUCE); honest CYCLES-ONLY."
 }

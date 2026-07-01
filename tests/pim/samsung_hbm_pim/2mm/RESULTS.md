@@ -6,7 +6,7 @@
 - cycles: 140313
 - source: `PIMSimulator@bin-sha256:121250edea00`
 - run_cmd: `python -m pytest tests/pim/samsung_hbm_pim/2mm/test_two_mm_samsung_hbm_pim.py -p no:cacheprovider -q`
-- timestamp: 2026-06-30T11:47:15.371222
-- tenon_commit: `1af5ccd18a995ba016570ea802403affd91cad2a`
+- timestamp: 2026-06-30T12:33:15.784137
+- tenon_commit: `837aab5ab7def05b5255b98cf66eee65362bb546`
 
-Tier-1 single-output; Samsung reports cycles only (no output array) -> CYCLES-ONLY at the GEMV design point; a shape the reference sim cannot express -> BLOCKED-SIM. | SPEC-04 cross-stage REDUCE chain (logical shape; fabric M padded to 4096, K to 256 per stage).
+Tier-1 two-stage GEMM chain; genuine fp16 PASS against the composed reference. | SPEC-04 cross-stage REDUCE chain (logical shape; fabric M padded to 4096, K to 256 per stage).

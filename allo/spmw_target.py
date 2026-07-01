@@ -8,14 +8,9 @@ Decorators run their bodies at registration time and build a tree of
 a `Memory` with a symbolic uid returns a `MemoryRef` whose index is a
 `SymExpr`; lowering (Step E) substitutes concrete coordinates.
 
-Resources and analytical cycle models are declared on the same unit tree.  The
-tree therefore describes both physical structure and the resource instances
-that constrain parallel execution, while timing parameters remain in a
-separate calibration profile.
+The target tree contains structural and functional hardware facts only. Cycle
+behavior is authored separately as an executable ``CostSpec``.
 """
-
-from .perf.resources import ResourceSpec, ResourceTopology
-from .perf.timing import TimingLibrary, TimingModel
 
 _target_stack: list = []
 
@@ -95,6 +90,9 @@ class Memory:
         self.rows = geometry.get("rows")
         self.cols = geometry.get("cols")
         self.width = geometry.get("width")
+        self.capacity = int(geometry.get("ports", 1))
+        if self.capacity <= 0:
+            raise ValueError("memory ports must be positive")
 
     def __getitem__(self, idx):
         return MemoryRef(self, idx)
@@ -130,17 +128,22 @@ class Register:
     JSSC 2023 §IV) so the allocator's capacity is tree-derived, not pasted.
     """
 
-    def __init__(self, owner, lanes, width, name=None, slots=None):
+    def __init__(self, owner, lanes, width, name=None, slots=None, ports=1):
         self.owner = owner
         self.lanes = lanes
         self.width = width
         self.name = name
         # Addressable depth for register allocation; defaults to lanes.
         self.slots = lanes if slots is None else slots
+        self.capacity = int(ports)
+        if self.capacity <= 0:
+            raise ValueError("register ports must be positive")
 
     def __repr__(self):
         n = self.name or "<anon>"
-        return f"Register({n}, lanes={self.lanes}, width={self.width}, slots={self.slots})"
+        return (
+            f"Register({n}, lanes={self.lanes}, width={self.width}, slots={self.slots})"
+        )
 
 
 class AnyOf:
@@ -203,20 +206,16 @@ class Move:
     record.verb`. Device moves leave it at the default.
     """
 
-    def __init__(
-        self, owner, name, src, dst, emit=None, cycles=None, verb=move_only,
-        timing_model=None, resources=(), performance_inputs=None,
-    ):
+    def __init__(self, owner, name, src, dst, emit=None, verb=move_only, capacity=1):
         self.owner = owner
         self.name = name
         self.src = src
         self.dst = dst
         self.emit = emit
-        self.cycles = cycles  # populated by fixtures / cost modules
         self.verb = verb
-        self.timing_model = _timing_model_name(timing_model)
-        self.resources = tuple(resources)
-        self.performance_inputs = dict(performance_inputs or {})
+        self.capacity = int(capacity)
+        if self.capacity <= 0:
+            raise ValueError("move capacity must be positive")
 
     def __repr__(self):
         return f"Move({self.name!r}, src={self.src!r}, dst={self.dst!r}, verb={self.verb.name})"
@@ -232,8 +231,16 @@ class Op:
     """
 
     def __init__(
-        self, owner, name, src, dst, fn, accumulates=False, emit=None,
-        cycles=None, timing_model=None, resources=(), performance_inputs=None,
+        self,
+        owner,
+        name,
+        src,
+        dst,
+        fn,
+        accumulates=False,
+        emit=None,
+        capacity=1,
+        matchable=True,
     ):
         self.owner = owner
         self.name = name
@@ -242,114 +249,33 @@ class Op:
         self.fn = fn
         self.accumulates = accumulates
         self.emit = emit
-        self.cycles = cycles  # populated by fixtures / cost modules
-        self.timing_model = _timing_model_name(timing_model)
-        self.resources = tuple(resources)
-        self.performance_inputs = dict(performance_inputs or {})
+        self.capacity = int(capacity)
+        self.matchable = bool(matchable)
+        if self.capacity <= 0:
+            raise ValueError("operation capacity must be positive")
 
     def __repr__(self):
         return f"Op({self.name!r}, accumulates={self.accumulates})"
 
 
-class ResourceHandle:
-    """A resource pool attached to one target-tree scope."""
-
-    def __init__(
-        self, owner, name, *, capacity=1, pipelined=False, parent=None,
-        description="", attributes=None,
-    ):
-        self.owner = owner
-        self.name = name
-        self.capacity = capacity
-        self.pipelined = pipelined
-        self.parent = parent
-        self.description = description
-        self.attributes = dict(attributes or {})
-
-    @property
-    def qualified_name(self):
-        chain = []
-        unit = self.owner
-        while unit is not None:
-            chain.append(unit.name)
-            unit = unit.parent
-        return "/".join(reversed(chain)) + "/" + self.name
-
-    def scope_extents(self):
-        units = []
-        unit = self.owner
-        while unit is not None and unit.parent is not None:
-            if unit.mode not in ("device", "host"):
-                extent = 1
-                for factor in unit.mapping:
-                    extent *= factor
-                if extent != 1:
-                    units.append(extent)
-            unit = unit.parent
-        return tuple(reversed(units))
-
-    @property
-    def instances(self):
-        total = 1
-        for extent in self.scope_extents():
-            total *= extent
-        return total
-
-    def instance_for(self, work_id=()):
-        """Flatten the work-id prefix corresponding to this resource scope."""
-        extents = self.scope_extents()
-        if not extents:
-            return 0
-        coords = tuple(work_id[: len(extents)])
-        if len(coords) < len(extents):
-            coords += (0,) * (len(extents) - len(coords))
-        flat = 0
-        for coord, extent in zip(coords, extents):
-            if coord < 0 or coord >= extent:
-                raise ValueError(
-                    f"work-id coordinate {coord} is outside resource "
-                    f"{self.qualified_name!r} extent {extent}"
-                )
-            flat = flat * extent + coord
-        return flat
-
-    def to_spec(self):
-        parent = self.parent.qualified_name if self.parent is not None else None
-        return ResourceSpec(
-            name=self.qualified_name,
-            instances=self.instances,
-            capacity=self.capacity,
-            pipelined=self.pipelined,
-            parent=parent,
-            description=self.description,
-            attributes=self.attributes,
-        )
-
-    def __repr__(self):
-        return (
-            f"ResourceHandle({self.qualified_name!r}, instances={self.instances}, "
-            f"capacity={self.capacity}, pipelined={self.pipelined})"
-        )
-
-
-def _timing_model_name(model):
-    if model is None:
-        return None
-    if isinstance(model, TimingModel):
-        return model.name
-    return str(model)
-
-
 class Unit:
     """A node in the target's unit tree."""
 
-    def __init__(self, name, mapping, parent=None, mode=None):
+    def __init__(self, name, mapping, parent=None, mode=None, capacity=1):
         self.name = name
-        self.mapping = list(mapping) if mapping is not None else []
+        self.axes = dict(mapping) if isinstance(mapping, dict) else {}
+        self.mapping = (
+            list(mapping.values())
+            if isinstance(mapping, dict)
+            else (list(mapping) if mapping is not None else [])
+        )
         self.parent = parent
         # `mode="host"` marks a host-side staging node (design 05 §Q3); the
         # device tree hangs under it. `None` for ordinary device units.
         self.mode = mode
+        self.capacity = int(capacity)
+        if self.capacity <= 0:
+            raise ValueError("unit capacity must be positive")
         # Host-collective interface instance attached by @allo.host_xcel
         # (only ever non-None on a mode="host" unit).
         self.host_xcel = None
@@ -358,12 +284,6 @@ class Unit:
         self.registers: dict[str, Register] = {}
         self.moves: dict[str, Move] = {}
         self.ops: dict[str, Op] = {}
-        self.resources: dict[str, ResourceHandle] = {}
-        self.timing_models: dict[str, TimingModel] = {}
-        # Named scalar constants (e.g. UPMEM `revolver_latency`). Same
-        # provenance class as a Move's `cycles=`; surfaced flat on the
-        # Target so a cost model reads `target.<name>`.
-        self.constants: dict[str, object] = {}
 
     @property
     def level(self):
@@ -385,19 +305,11 @@ class Target:
         self.root = root
         # flat name → handle index (memories + registers, all units)
         self._handles: dict[str, object] = {}
-        resources = []
-        timing_models = []
         for u in self._walk():
             for nm, h in u.memories.items():
                 self._handles[nm] = h
             for nm, h in u.registers.items():
                 self._handles[nm] = h
-            for nm, h in u.constants.items():
-                self._handles[nm] = h
-            resources.extend(handle.to_spec() for handle in u.resources.values())
-            timing_models.extend(u.timing_models.values())
-        self.resource_topology = ResourceTopology(resources)
-        self.timing_library = TimingLibrary(timing_models)
 
     def _walk(self):
         stack = [self.root]
@@ -427,25 +339,14 @@ class Target:
                 return u.ops[name]
         raise KeyError(f"Target {self.name!r} has no op named {name!r}")
 
-    def resource(self, name):
-        """Look up a resource by qualified name or unique local name."""
-        matches = []
-        for unit in self._walk():
-            for local_name, handle in unit.resources.items():
-                if name in (local_name, handle.qualified_name):
-                    matches.append(handle)
+    def unit(self, name):
+        """Look up one uniquely named structural unit."""
+        matches = [unit for unit in self._walk() if unit.name == name]
         if len(matches) == 1:
             return matches[0]
         if not matches:
-            raise KeyError(f"Target {self.name!r} has no resource named {name!r}")
-        raise KeyError(
-            f"resource name {name!r} is ambiguous; use a qualified name: "
-            f"{[m.qualified_name for m in matches]}"
-        )
-
-    @property
-    def has_performance_model(self):
-        return bool(len(self.resource_topology) and self.timing_library.models)
+            raise KeyError(f"Target {self.name!r} has no unit named {name!r}")
+        raise KeyError(f"Target {self.name!r} has ambiguous unit name {name!r}")
 
     def work_grid(self):
         """Derive the work-item grid implied by the @allo.unit tree.
@@ -454,15 +355,14 @@ class Target:
         factor list walked outer->inner (root [1] elided; host nodes have no
         mapping and contribute nothing), and `product` is their product == the
         number of PEs == the canonical full-grid work-id count. This is the
-        declarative counterpart of spmw_cost_tables._samsung_workid_count, which
-        must call this so the two never drift.
+        declarative counterpart of any cost program's spatial instance map.
         """
         factors = []
         for u in self._walk():
             if getattr(u, "mode", None) == "host":
                 continue
             for f in u.mapping:
-                if f != 1:            # root's synthetic [1] and unit [1]s elide
+                if f != 1:  # root's synthetic [1] and unit [1]s elide
                     factors.append(f)
         product = 1
         for f in factors:
@@ -497,7 +397,7 @@ def target(name):
     return decorator
 
 
-def unit(mapping=None, *, mode=None):
+def unit(mapping=None, *, mode=None, capacity=1):
     """Decorator: registers a child Unit on the enclosing scope.
 
     `mode="host"` (default `None`) marks a host-side staging node; the
@@ -510,7 +410,13 @@ def unit(mapping=None, *, mode=None):
         if not _target_stack:
             raise RuntimeError("@allo.unit must be used inside @allo.target")
         parent = _target_stack[-1]
-        u = Unit(fn.__name__, mapping=mapping, parent=parent, mode=mode)
+        u = Unit(
+            fn.__name__,
+            mapping=mapping,
+            parent=parent,
+            mode=mode,
+            capacity=capacity,
+        )
         parent.children.append(u)
         _target_stack.append(u)
         try:
@@ -559,10 +465,7 @@ class DeviceScope:
             ) from e
 
     def __repr__(self):
-        return (
-            f"DeviceScope({self._unit.name!r}, "
-            f"handles={sorted(self._handles)})"
-        )
+        return f"DeviceScope({self._unit.name!r}, " f"handles={sorted(self._handles)})"
 
 
 def device(fn):
@@ -613,7 +516,7 @@ def memory(*, name=None, **geometry):
 mem = memory
 
 
-def reg(lanes, width, name=None, slots=None):
+def reg(lanes, width, name=None, slots=None, ports=1):
     """Attach a Register to the current unit; return a handle.
 
     `slots` overrides the allocator-visible addressable depth (defaults to
@@ -622,76 +525,12 @@ def reg(lanes, width, name=None, slots=None):
     if not _target_stack:
         raise RuntimeError("allo.reg must be called inside @allo.target/@allo.unit")
     cur = _target_stack[-1]
-    r = Register(cur, lanes, width, name=name, slots=slots)
+    r = Register(cur, lanes, width, name=name, slots=slots, ports=ports)
     if name is not None:
         if name in cur.registers:
             raise ValueError(f"duplicate register name {name!r} on unit {cur.name!r}")
         cur.registers[name] = r
     return r
-
-
-def const(name, value):
-    """Attach a named scalar constant to the current unit; return it.
-
-    A target-spec scalar (e.g. UPMEM `revolver_latency`) declared with the
-    same provenance discipline as a Move's `cycles=`. The value is surfaced
-    flat on the `Target` so a cost model reads it as `target.<name>`.
-    """
-    if not _target_stack:
-        raise RuntimeError("allo.const must be called inside @allo.target/@allo.unit")
-    cur = _target_stack[-1]
-    if name in cur.constants:
-        raise ValueError(f"duplicate constant name {name!r} on unit {cur.name!r}")
-    cur.constants[name] = value
-    return value
-
-
-def resource(
-    name, *, capacity=1, pipelined=False, parent=None, description="",
-    **attributes,
-):
-    """Declare a schedulable resource pool on the current target-tree unit."""
-    if not _target_stack:
-        raise RuntimeError("allo.resource must be called inside @allo.target/@allo.unit")
-    cur = _target_stack[-1]
-    if name in cur.resources:
-        raise ValueError(f"duplicate resource name {name!r} on unit {cur.name!r}")
-    if parent is not None and not isinstance(parent, ResourceHandle):
-        raise TypeError("resource parent must be another ResourceHandle")
-    handle = ResourceHandle(
-        cur,
-        name,
-        capacity=capacity,
-        pipelined=pipelined,
-        parent=parent,
-        description=description,
-        attributes=attributes,
-    )
-    cur.resources[name] = handle
-    return handle
-
-
-def cycle_model(
-    name, *, latency_cycles, initiation_interval_cycles=0, inputs=(),
-    parameters=(), description="", valid_when=None,
-):
-    """Declare a serializable analytical cycle model on the current unit."""
-    if not _target_stack:
-        raise RuntimeError("allo.cycle_model must be called inside @allo.target/@allo.unit")
-    cur = _target_stack[-1]
-    if name in cur.timing_models:
-        raise ValueError(f"duplicate timing model {name!r} on unit {cur.name!r}")
-    model = TimingModel(
-        name,
-        latency_cycles=latency_cycles,
-        initiation_interval_cycles=initiation_interval_cycles,
-        inputs=inputs,
-        parameters=parameters,
-        description=description,
-        valid_when=valid_when,
-    )
-    cur.timing_models[name] = model
-    return model
 
 
 def get_uid():
@@ -711,7 +550,8 @@ def get_uid():
     # grouping scope (a device scope is transparent to the work-id chain so
     # the real mapped units -- pseudo_channel, pim, ... -- keep their depth).
     chain = [
-        u for u in reversed(chain)
+        u
+        for u in reversed(chain)
         if u.parent is not None and getattr(u, "mode", None) != "device"
     ]
     return tuple(UnitId(level=i, unit=chain[i]) for i in range(len(chain)))
@@ -767,9 +607,7 @@ def _validate_move(name, src, dst, emit, owner):
        other, so cross-boundary is allowed there.
     """
     if src is dst and emit is None:
-        raise ValueError(
-            f"move {name!r} is a no-op self-move (src is dst, emit=None)"
-        )
+        raise ValueError(f"move {name!r} is a no-op self-move (src is dst, emit=None)")
     # Host scope: this move is the host's transfer primitive -> cross-boundary OK.
     if _is_host_side(owner):
         return
@@ -780,14 +618,11 @@ def _validate_move(name, src, dst, emit, owner):
             raise ValueError(
                 f"move {name!r} straddles the host<->device boundary but is "
                 f"declared on a device scope; a host<->device transfer must be "
-                f"declared on an @allo.unit(mode=\"host\") scope"
+                f'declared on an @allo.unit(mode="host") scope'
             )
 
 
-def move(
-    name, src, dst, emit=None, cycles=None, verb=move_only, *,
-    timing_model=None, resources=(), performance_inputs=None,
-):
+def move(name, src, dst, emit=None, verb=move_only, capacity=1):
     """Attach a Move to the current unit; return the handle.
 
     `verb` (default :data:`move_only`) is the first-class host-transfer tag the
@@ -800,18 +635,20 @@ def move(
     if name in cur.moves:
         raise ValueError(f"duplicate move name {name!r} on unit {cur.name!r}")
     _validate_move(name, src, dst, emit, cur)
-    m = Move(
-        cur, name, src, dst, emit=emit, cycles=cycles, verb=verb,
-        timing_model=timing_model, resources=resources,
-        performance_inputs=performance_inputs,
-    )
+    m = Move(cur, name, src, dst, emit=emit, verb=verb, capacity=capacity)
     cur.moves[name] = m
     return m
 
 
 def op(
-    name, src, dst, fn, accumulates=False, emit=None, cycles=None, *,
-    timing_model=None, resources=(), performance_inputs=None,
+    name,
+    src,
+    dst,
+    fn,
+    accumulates=False,
+    emit=None,
+    capacity=1,
+    matchable=True,
 ):
     """Attach an Op to the current unit; return the handle."""
     if not _target_stack:
@@ -820,9 +657,15 @@ def op(
     if name in cur.ops:
         raise ValueError(f"duplicate op name {name!r} on unit {cur.name!r}")
     o = Op(
-        cur, name, src, dst, fn, accumulates=accumulates, emit=emit,
-        cycles=cycles, timing_model=timing_model, resources=resources,
-        performance_inputs=performance_inputs,
+        cur,
+        name,
+        src,
+        dst,
+        fn,
+        accumulates=accumulates,
+        emit=emit,
+        capacity=capacity,
+        matchable=matchable,
     )
     cur.ops[name] = o
     return o
@@ -1224,9 +1067,9 @@ def _move_device_endpoint(move):
     dst_host = du is not None and _is_host_side(du)
     # device endpoint = the non-host side.
     if dst_host and not src_host:
-        return move.src, "src"   # out-of-device (src is device, dst is host)
+        return move.src, "src"  # out-of-device (src is device, dst is host)
     if src_host and not dst_host:
-        return move.dst, "dst"   # into-device (dst is device, src is host)
+        return move.dst, "dst"  # into-device (dst is device, src is host)
     return None, None
 
 
@@ -1268,8 +1111,12 @@ class BackendHandle:
                 f"{verb.name!r}"
             )
         # 2. Direction + device-handle identity. Exactly one arg is a token.
-        tokens = [a for a in record.args if isinstance(a, (HandleToken, _VerbCallOrToken))]
-        buffers = [a for a in record.args if not isinstance(a, (HandleToken, _VerbCallOrToken))]
+        tokens = [
+            a for a in record.args if isinstance(a, (HandleToken, _VerbCallOrToken))
+        ]
+        buffers = [
+            a for a in record.args if not isinstance(a, (HandleToken, _VerbCallOrToken))
+        ]
         if len(tokens) != 1:
             raise ValueError(
                 f"host_xfer.{verb.name}(...) must name exactly one device handle "

@@ -5,18 +5,16 @@
 A `HostProgram` (`allo/spmw_target.py`) records a user's host-side driver: an
 ordered list of `host_xfer.*` data moves interleaved with `allo.launch(...)`
 kernel invocations. This module turns that recorded program into a **host
-schedule** -- the backend-agnostic plan the run path executes and the cost model
-prices, from ONE analysis.
+schedule** -- the backend-agnostic plan the run path executes and an executable
+cost program can price from the same analysis.
 
 The load-bearing decision is *weight residency*: a weight `scatter` hoisted out
 of a batch loop is preloaded ONCE and reused across the launches that follow it
 (until it is re-scattered). Consecutive GEMV launches reusing a resident weight
 are **coalesced** into one batched contraction -> the preload amortizes (the
 `P + B*(E+R)` schedule). A re-scatter, a different weight, or a 2-D (GEMM)
-operand breaks the group. This is exactly the `weight_resident` lever the cost
-model already prices (`spmw_cost_tables._samsung_host_staging_compose_with`); the
-schedule is the single source that drives BOTH the executor's coalescing and the
-cost compose's `stage_resident` flag.
+operand breaks the group. The schedule is the single source that drives the
+executor's coalescing and is available to cost-program lowering.
 
 Pure and backend-agnostic: no simulator calls, no numpy. `analyze()` is unit
 testable in isolation; the Samsung execution hook lives in `spmw_codegen.py` and
@@ -35,7 +33,7 @@ class HostLaunch:
     weight: str
     vec: str
     out: str
-    N: int          # contraction width (1 for a GEMV vec; trailing dim for GEMM)
+    N: int  # contraction width (1 for a GEMV vec; trailing dim for GEMM)
 
 
 @dataclass
@@ -47,7 +45,7 @@ class HostGroup:
     """
 
     weight: str
-    weight_shape: tuple          # (M, K) of the bank-resident weight
+    weight_shape: tuple  # (M, K) of the bank-resident weight
     launches: list = field(default_factory=list)
 
     @property
@@ -98,8 +96,8 @@ def resolve_shapes(host, namespace) -> dict:
             return cache[name]
         base, _, rest = name.partition("[")
         t = ann[base]
-        if isinstance(t, str):           # PEP 563 string annotation -> evaluate
-            t = eval(t, namespace)       # pylint: disable=eval-used
+        if isinstance(t, str):  # PEP 563 string annotation -> evaluate
+            t = eval(t, namespace)  # pylint: disable=eval-used
         shape = tuple(int(d) for d in t.shape)
         shape = shape[1:] if rest else shape
         cache[name] = shape
@@ -133,7 +131,7 @@ def analyze(host, shapes) -> HostSchedule:
         return next(a.name for a in rec.args if isinstance(a, BufferToken))
 
     # --- Pass 1: ordered launch events + weight-residency flag. ---
-    events = []          # (weight, vec, out, weight_restaged)
+    events = []  # (weight, vec, out, weight_restaged)
     resident_weight = None
     pending_vec = None
     restaged: set = set()
@@ -147,7 +145,7 @@ def analyze(host, shapes) -> HostSchedule:
             if verb in ("scatter", "broadcast"):
                 consumed_order.append(name)
                 if verb == "scatter":
-                    resident_weight = name        # persists until re-scattered
+                    resident_weight = name  # persists until re-scattered
                     restaged.add(name)
                 else:
                     pending_vec = name
@@ -158,7 +156,7 @@ def analyze(host, shapes) -> HostSchedule:
             out = next(o.name for o in step.operands if o.name not in (w, vc))
             events.append((w, vc, out, w in restaged))
             produced.add(out)
-            restaged = set()                      # resident_weight persists
+            restaged = set()  # resident_weight persists
             pending_vec = None
 
     external_inputs = [n for n in dict.fromkeys(consumed_order) if n not in produced]
@@ -170,18 +168,25 @@ def analyze(host, shapes) -> HostSchedule:
         return len(shapes[name]) == 1
 
     groups: list = []
-    for (w, vc, out, fresh) in events:
-        if (groups and not fresh and groups[-1].weight == w
-                and batchable(vc) and batchable(groups[-1].launches[0].vec)):
+    for w, vc, out, fresh in events:
+        if (
+            groups
+            and not fresh
+            and groups[-1].weight == w
+            and batchable(vc)
+            and batchable(groups[-1].launches[0].vec)
+        ):
             groups[-1].launches.append(HostLaunch(w, vc, out, 1))
         else:
             vshape = shapes[vc]
             N = vshape[1] if len(vshape) == 2 else 1
             M, K = shapes[w]
-            groups.append(HostGroup(weight=w, weight_shape=(M, K),
-                                    launches=[HostLaunch(w, vc, out, N)]))
-    return HostSchedule(groups=groups, final=final,
-                        external_inputs=external_inputs)
+            groups.append(
+                HostGroup(
+                    weight=w, weight_shape=(M, K), launches=[HostLaunch(w, vc, out, N)]
+                )
+            )
+    return HostSchedule(groups=groups, final=final, external_inputs=external_inputs)
 
 
 def schedule_residency(schedule) -> tuple:
@@ -192,7 +197,7 @@ def schedule_residency(schedule) -> tuple:
     no coalescing (each launch its own preload, or distinct weights like a GEMM
     chain) -> `(False, 1)`, i.e. the existing trace-driven cost path is unchanged
     (B=1 parity). This is the single seam where the host program's residency
-    decision feeds the cost compose (`_samsung_host_staging_compose_with`).
+    decision can feed executable cost-program lowering.
     """
     for g in schedule.groups:
         if g.is_batched:
@@ -211,13 +216,12 @@ def schedule_cost(schedule, preload_of, exec_readback_of) -> int:
     `P + B*(E+R)`, while B singleton groups cost `B*(P+E+R)` -- the batched-GEMV
     crossover, derived from the program structure, never a hardcoded
     `weight_resident` flag. Backend-agnostic: the caller supplies the two phase
-    callables (Samsung wires `_samsung_preload_cycles` / `_samsung_readback_cycles`
-    + exec).
+    callables.
     """
     total = 0
     for g in schedule.groups:
         M, K = g.weight_shape
-        total += preload_of(M, K)                 # ONE preload per group
+        total += preload_of(M, K)  # ONE preload per group
         for lx in g.launches:
             total += exec_readback_of(M, K, lx.N)
     return total

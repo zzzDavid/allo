@@ -46,7 +46,7 @@ def build():
 
 # Host data movement (spec backend-host-transfer-dispatch.md): scatter the
 # flattened batch weight A into bank DRAM, broadcast x into GRF_A, gather out.
-# Recorded at import and consumed by the suite's ``allo.compile`` helper.
+# Recorded at import and consumed by the leaf test's explicit ``allo.compile`` call.
 with allo.record_host_moves() as _hm:
     host_staging.stage_gemm(weight="A", vec="x", out="out")
 HOST_MOVES = list(_hm)

@@ -11,6 +11,7 @@ from .targets import (
     build_apu_v1_target,
     build_apu_v2_target,
 )
+from .costs import samsung_cost, aim_cost
 
 __all__ = [
     "build_samsung_target",
@@ -18,7 +19,6 @@ __all__ = [
     "build_upmem_target",
     "build_apu_v1_target",
     "build_apu_v2_target",
+    "samsung_cost",
+    "aim_cost",
 ]
-from .performance import default_profile, virtual_target
-
-__all__ = ["default_profile", "virtual_target"]

@@ -8,8 +8,8 @@ is the smallest version of that loop: enumerate candidate `Placement`s,
 score each via a named cost callback, return the argmin.
 
 The candidate enumerator is per-backend; cost callbacks come from the
-`spmw_cost` registry. A new backend plugs in by registering its own
-enumerator under the target name.
+the executable :class:`allo.CostSpec`. A new backend plugs in by registering
+its own enumerator under the target name.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .spmw_cost import get_cost
 from .spmw_linear_layout import LinearLayout, materialise_handle
 from .spmw_match import MatchTrace, MatchedOp
 from .spmw_target import Register, UnitId
@@ -42,13 +41,6 @@ class Placement:
     placements: dict[str, Any] = field(default_factory=dict)
     mode: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
-    # Spill audit (SPEC-022 D1): memref names the allocator spilled. Empty
-    # for every no-spill placement (byte-identical default); the move
-    # scheduler reads it to emit the tier LD/ST round-trip around the
-    # spilled value's work-id window. The `Spilled(home, tier)` wrapper in
-    # `placements` still unwraps to its home register for the compute emit;
-    # this list is what stops the round-trip being silently dropped.
-    _spilled: list[str] = field(default_factory=list)
     # Chosen physical layout (SPEC-022 D3): the swizzled `LinearLayout` the
     # enumerator built to materialise the fiber handles. Carried so codegen
     # consumes the F2 layout OBJECT directly (the `range(stride)` fiber walk
@@ -190,8 +182,7 @@ def _with_crf_modes(base: "Placement") -> list["Placement"]:
     branch -- the enumerator emits both unconditionally.
     """
     variants = []
-    for token, issue in (("crf_shared", "shared"),
-                         ("crf_per_workid", "per_workid")):
+    for token, issue in (("crf_shared", "shared"), ("crf_per_workid", "per_workid")):
         new_extra = dict(base.extra)
         new_extra["crf_issue"] = issue
         variants.append(
@@ -409,10 +400,10 @@ def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
       no_bank_layout  = identity({"k": K})       -- per-bank MAC (MAC_SBK)
       all_bank_layout = no_bank ⊗ identity({"bank": NBANKS})  -- broadcast (MAC_ABK)
 
-    Both materialise to the same `target.banks[8*bg + bk]` handle for
-    operands that live in DRAM (codegen reads the role-to-bank vs role-to-gb
-    selection from the Placement directly). `acc` always lands in `gpr`
-    (AiM's MAC ISR writes the per-channel accumulator file).
+    Both materialise to the same ``target.banks[4*bg + bank]`` handle for
+    operands that live in DRAM.  The selected placement explicitly names
+    either the bank-scoped ``MAC`` or channel-scoped ``MAC_ABK`` primitive;
+    both accumulate into the physical MAC register file.
     """
     role_to_memref = _trace_memrefs_by_role(matches)
     x_mref = role_to_memref.get("x")
@@ -427,37 +418,46 @@ def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     # AiM topology note: the A/B choice here is per-bank MAC (MAC_SBK) vs.
     # all-bank-broadcast MAC (MAC_ABK). Algebraically this is "does the
     # layout factor `bank` into an input dim?" but the runtime distinction
-    # is which *physical unit* `y` lives on -- a per-bank operand
-    # (`banks[8*bg+bk]`) or the chip-level global buffer (`target.gb`).
+    # is which *physical unit* executes -- one bank or the whole channel.
     # `gb` is not an algebraic offset from `bank`; it is a discrete
     # hardware unit. LinearLayout cannot model the choice, so we enumerate
-    # the two Placements directly. `acc` always lives in the per-channel
-    # accumulator file (`target.gpr`) because AiM's MAC ISR writes there.
+    # the two Placements directly and carry the physical operation name.
 
-    # AiM tree is `device -> channel -> bg -> bank`. The bank-level unit
-    # is where banks / gb / gpr are bound; we read them from the target's
-    # flat handle map.
-    bg_id = UnitId(level=2, unit=None)
-    bk_id = UnitId(level=3, unit=None)
+    # Device grouping nodes are transparent to work coordinates, so the
+    # spatial levels are channel=0, bank_group=1, bank=2.
+    bg_id = UnitId(level=1, unit=target.unit("bank_group"))
+    bk_id = UnitId(level=2, unit=target.unit("bank"))
     banks = target.banks
     gb = target.gb
-    gpr = target.gpr
+    mac_reg = target.mac_reg
 
-    bank_handle = banks[8 * bg_id + bk_id]
+    bank_handle = banks[4 * bg_id + bk_id]
 
     layouts: list[Placement] = []
     # Candidate 1: per-bank MAC (no_bank_layout -- y stays in its bank).
-    layouts.append(Placement(placements={
-        x_mref: bank_handle,
-        y_mref: bank_handle,
-        acc_mref: gpr,
-    }))
+    layouts.append(
+        Placement(
+            placements={
+                x_mref: bank_handle,
+                y_mref: gb,
+                acc_mref: mac_reg,
+            },
+            mode="single_bank",
+            extra={"operation_name": "MAC"},
+        )
+    )
     # Candidate 2: all-bank-broadcast MAC (all_bank_layout -- y rides gb).
-    layouts.append(Placement(placements={
-        x_mref: bank_handle,
-        y_mref: gb,
-        acc_mref: gpr,
-    }))
+    layouts.append(
+        Placement(
+            placements={
+                x_mref: banks,
+                y_mref: gb,
+                acc_mref: mac_reg,
+            },
+            mode="all_bank",
+            extra={"operation_name": "MAC_ABK"},
+        )
+    )
     return layouts
 
 
@@ -473,7 +473,7 @@ def _trace_reduction_trip(matches: list[MatchedOp]) -> int | None:
     `batch_dim` resolver; rides existing `enclosing_loops` (no
     `allo/ir/` edit, per design 02 §3.1).
     """
-    from .spmw_cost_models import _parse_loop_bound
+    from .spmw_tripcount import _parse_loop_bound
 
     for match in matches:
         if match.target_op_name != "MAC":
@@ -484,6 +484,44 @@ def _trace_reduction_trip(matches: list[MatchedOp]) -> int | None:
         if bound is not None:
             return bound
     return None
+
+
+def _apu_v1_vr_tiling(target, trace: MatchTrace) -> tuple[int, int, int]:
+    """Derive APU VR tile counts from target and loop geometry."""
+    import math
+
+    from .spmw_tripcount import resolve_bound_text, resolve_trip_count
+
+    lane_width = max(1, int(target.vrs.width or 1))
+    mapping_env = {}
+    for unit_spec in target._walk():
+        extent = 1
+        for factor in unit_spec.mapping:
+            extent *= factor
+        mapping_env[unit_spec.name] = extent
+
+    n_out = 1
+    weight_elements = 0
+    n_macs = 0
+    for match in trace.matches:
+        if match.target_op_name == "MAC":
+            n_macs += 1
+        loops = match.enclosing_loops or []
+        if not loops:
+            continue
+        reduction = resolve_trip_count(match, -1, mapping_env=mapping_env) or 1
+        rows = 1
+        for _name, _lower, upper, _step in loops[:-1]:
+            bound = resolve_bound_text(upper, mapping_env=mapping_env)
+            if bound is not None:
+                rows *= bound
+        n_out = max(n_out, rows)
+        weight_elements += rows * reduction
+    return (
+        max(1, math.ceil(n_out / lane_width)),
+        max(1, math.ceil(weight_elements / lane_width)),
+        max(0, n_macs - 1),
+    )
 
 
 def _bank_stride_per_pim(target, layout: LinearLayout) -> int:
@@ -673,8 +711,6 @@ def _apu_v1_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     # The tile counts are identical for both vr_dma modes (they share the
     # shape); only how the moves are issued (per-tile re-fetch vs reuse)
     # differs, and the cost model prices that difference.
-    from .spmw_cost_models import _apu_v1_vr_tiling
-
     trace = MatchTrace(
         target_name="apu_v1", module_name="<enumerate>", matches=list(matches)
     )
@@ -757,10 +793,7 @@ def _apu_v2_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
 def autoschedule(
     target,
     trace: MatchTrace,
-    cost_name: str = "kernel_cycles",
-    confidence_gate: bool = False,
-    gate_policy: str = "warn",
-    performance_model=None,
+    cost,
 ) -> list[Placement]:
     """Pick one `Placement` per `@allo.work` kernel in `trace`.
 
@@ -768,30 +801,9 @@ def autoschedule(
     ``result[i]`` is the chosen placement for the i-th kernel (in
     trace order). For single-kernel workloads this list has length 1.
 
-    Per spec 015, the allocator runs per candidate (after the
-    enumerator, before argmin); the argmin is on
-    `kernel_cycles + allocator.total_cost`. Set
-    `SPMW_DISABLE_REGALLOC=1` in the environment to bypass the
-    allocator (emergency rollback path).
-
-    `confidence_gate` (design 07 §A4.3) is OPT-IN and defaults OFF: when
-    `False` the argmin scoring core is byte-identical to today (commit
-    regardless) -- `_check_confidence` is never called. When `True`,
-    `_check_confidence` runs AFTER the argmin -- it never alters the argmin
-    SELECTION, only whether a low-confidence ranking is silently committed.
-    `gate_policy` (only consulted when the gate is on):
-      * "warn"   -- warn-and-commit (the default; never blocks a schedule).
-      * "refuse" -- refuse-and-error: raise on a placeholder/coarse/assumption
-                    ranking instead of silently committing it.
+    Every candidate is lowered through the same executable cost program used
+    by the virtual backend. Target declarations never supply timing data.
     """
-    import os
-
-    if gate_policy not in ("warn", "refuse"):
-        raise ValueError(
-            f"autoschedule gate_policy must be 'warn' or 'refuse', "
-            f"got {gate_policy!r}"
-        )
-
     target_name = getattr(target, "name", None)
     enumerator = _ENUMERATORS.get(target_name)
     if enumerator is None:
@@ -799,23 +811,21 @@ def autoschedule(
             f"no autoscheduler enumerator registered for target {target_name!r}; "
             f"supported: {sorted(_ENUMERATORS)}"
         )
-    if getattr(target, "has_performance_model", False) and cost_name == "kernel_cycles":
-        # Canonical resource-DAG path: the same candidate graph and evaluator
-        # are consumed by the autoscheduler and virtual backend.
-        from .spmw_plan import build_execution_graph
+    if cost is None:
+        raise TypeError("autoschedule() requires an executable CostSpec")
 
-        def cost_fn(candidate_trace, candidate_layout):
-            graph = build_execution_graph(target, candidate_trace, candidate_layout)
-            if performance_model is None:
-                from .pim.performance import virtual_target
+    # The executable cost program is shared by autoscheduling and virtual
+    # execution. It interprets each candidate over concrete target handles.
+    from .perf import CostSpec
+    from .spmw_plan import build_execution_graph
 
-                estimate = virtual_target(target).evaluate(graph)
-            else:
-                estimate = performance_model.evaluate(graph)
-            return estimate.cycles
-    else:
-        cost_fn = get_cost(cost_name, target)
-    regalloc_disabled = os.environ.get("SPMW_DISABLE_REGALLOC") == "1"
+    bound_cost = cost.bind(target) if isinstance(cost, CostSpec) else cost
+
+    def cost_fn(candidate_trace, candidate_layout):
+        graph = build_execution_graph(
+            target, candidate_trace, candidate_layout, bound_cost
+        )
+        return bound_cost.evaluate(graph).cycles
 
     # Whole-trace liveness pre-pass (SPEC-023 D1): run ONCE before the
     # per-group loop and thread it (via a contextvar `cross_with_knobs` reads)
@@ -832,8 +842,11 @@ def autoschedule(
     _liveness_token = set_active_liveness(liveness)
     try:
         placements = _autoschedule_groups(
-            target, target_name, trace, enumerator, cost_fn,
-            cost_name, confidence_gate, gate_policy, regalloc_disabled,
+            target,
+            target_name,
+            trace,
+            enumerator,
+            cost_fn,
         )
     finally:
         reset_active_liveness(_liveness_token)
@@ -882,8 +895,11 @@ def _stamp_xkernel(trace, placements, liveness) -> None:
 
 
 def _autoschedule_groups(
-    target, target_name, trace, enumerator, cost_fn,
-    cost_name, confidence_gate, gate_policy, regalloc_disabled,
+    target,
+    target_name,
+    trace,
+    enumerator,
+    cost_fn,
 ) -> "list[Placement]":
     """The per-group argmin loop (SPEC-023 D1: lifted into a helper so the
     whole-trace liveness pre-pass + post-argmin reconciliation wrap it without
@@ -903,59 +919,11 @@ def _autoschedule_groups(
             matches=matches,
         )
 
-        if regalloc_disabled:
-            # Kill switch: skip the allocator, score by kernel_cycles
-            # alone (preserves spec 012a behaviour exactly).
-            scored = [
-                (cost_fn(sub_trace, layout), idx)
-                for idx, layout in enumerate(candidates)
-            ]
-            scored.sort()
-            chosen = candidates[scored[0][1]]
-            if confidence_gate:
-                # Design 07 §A4.3: the gate is a property of confidence_gate,
-                # NOT of the regalloc path. Honour it here too so
-                # SPMW_DISABLE_REGALLOC does not silently bypass it. Inert when
-                # off (this guard); never alters the SELECTION (`chosen` is
-                # already committed below).
-                _check_confidence(
-                    target, sub_trace, chosen, cost_name, gate_policy
-                )
-            placements.append(chosen)
-            continue
-
-        # Per-candidate regalloc; argmin on kernel_cycles + total_cost.
-        # Lazy import to avoid an import cycle through spmw_cost_models.
-        from .spmw_regalloc import allocate
-        # Each scored entry is (combined_cost, enumerator_idx,
-        # refined_placement); we keep the placement in the tuple so the
-        # sort itself selects the right refined layout.
-        scored: list[tuple[int, int, Placement]] = []
-        for idx, cand in enumerate(candidates):
-            try:
-                alloc = allocate(
-                    target, matches, cand, all_candidates=candidates,
-                )
-            except RuntimeError:
-                # No allocator-feasible placement for this candidate.
-                continue
-            kc = cost_fn(sub_trace, alloc.placement)
-            scored.append((kc + alloc.total_cost, idx, alloc.placement))
-        if not scored:
-            raise RuntimeError(
-                f"no allocator-feasible placement for {func_name!r} "
-                f"on target {target_name!r}"
-            )
-        scored.sort(key=lambda t: (t[0], t[1]))
-        if confidence_gate:
-            # Design 07 §A4.3: post-argmin gate, OPT-IN. Inert when off; never
-            # alters the SELECTION (scored[0] is already committed below). It
-            # only decides whether a low-confidence ranking is silently
-            # committed (warn) or refused (raise).
-            _check_confidence(
-                target, sub_trace, scored[0][2], cost_name, gate_policy
-            )
-        placements.append(scored[0][2])
+        scored = [
+            (cost_fn(sub_trace, layout), idx) for idx, layout in enumerate(candidates)
+        ]
+        scored.sort()
+        placements.append(candidates[scored[0][1]])
     return placements
 
 
@@ -1025,67 +993,8 @@ def _reconcile_resident_pairs(trace, placements, liveness) -> None:
                 other_pl is not None
                 and (getattr(other_pl, "extra", {}) or {}).get("residency")
                 == "resident"
-                and mref in (getattr(other_pl, "extra", {}) or {}).get(
-                    "residency_pairs", {}
-                )
+                and mref
+                in (getattr(other_pl, "extra", {}) or {}).get("residency_pairs", {})
             )
             if not other_ok:
                 _revert_to_restage(pl, mref)
-
-
-# The confidence bands the gate treats as "not safe to silently commit"
-# (design 07 §A4.3): the coarse/placeholder CostResult flags + the
-# provenance-derived "assumption" band (the least-trusted symbolic band).
-_LOW_CONFIDENCE = ("coarse", "placeholder", "assumption")
-
-
-def _check_confidence(
-    target, sub_trace, placement, cost_name: str, gate_policy: str
-) -> None:
-    """Confidence gate (design 07 §A4.3). Combines TWO signals, both
-    objective-independent:
-      1. the chosen candidate's `CostResult.confidence` (which already
-         downgrades to "coarse" on a tier-3 dynamic-trip fall-through, so the
-         silent `dynamic_trip->1` is now VISIBLE here, A4<->A5); and
-      2. the SYMBOLIC provenance band of the bound model
-         (`provenance_band` -- "assumption" if any untrusted constant fed the
-         estimate, report 28 §A4.3).
-    The worse of the two governs. If it is low (coarse/placeholder/assumption),
-    the gate does NOT silently commit: `gate_policy="warn"` emits a diagnostic
-    and commits anyway; `gate_policy="refuse"` raises. The argmin SELECTION is
-    never altered either way."""
-    import warnings
-
-    from .spmw_cost_model import evaluate, get_cost_model, provenance_band
-
-    flavor = "faithful"
-    try:
-        result = evaluate(target, sub_trace, placement, flavor)
-        band = provenance_band(get_cost_model(getattr(target, "name", None), flavor))
-    except Exception:
-        # The gate is advisory under "warn": never let a confidence probe
-        # break the schedule. A real cost error would have already surfaced in
-        # the argmin scoring core above.
-        return
-    low = [
-        f"{label}={val!r}"
-        for label, val in (("confidence", result.confidence), ("provenance_band", band))
-        if val in _LOW_CONFIDENCE
-    ]
-    if not low:
-        return
-    name = getattr(target, "name", None)
-    detail = ", ".join(low)
-    msg = (
-        f"autoschedule confidence_gate: chosen placement for target {name!r} "
-        f"rests on a low-confidence cost estimate ({detail}; "
-        f"cost_name={cost_name!r})"
-    )
-    if gate_policy == "refuse":
-        # refuse-and-error: do NOT silently commit a low-confidence ranking.
-        raise RuntimeError(
-            msg + " -- refused (gate_policy='refuse'). Re-run with a "
-            "sim-validated cost model or gate_policy='warn' to commit."
-        )
-    warnings.warn(msg + " -- committing anyway (gate_policy='warn').",
-                  stacklevel=2)

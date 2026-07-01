@@ -1,19 +1,14 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Lower an autoscheduler candidate to the canonical performance DAG.
-
-This is intentionally upstream of both code generation and virtual execution.
-The graph contains candidate decisions (placement, folding, and ordering), while
-the target supplies resource bindings and analytical cycle formulas.
-"""
+"""Lower a scheduled SPMW candidate through an executable CostSpec."""
 
 from __future__ import annotations
 
-from .perf import Activity, ExecutionGraph, Invocation, ResourceRequest
+from .perf import BoundCostSpec, CostEvent, CostSpec, ExecutionGraph
 from .spmw_tripcount import resolve_trip_count
 
 
-def _mapping_env(target) -> dict[str, int]:
+def _mapping_env(target):
     env = {}
     for unit in target._walk():
         extent = 1
@@ -40,7 +35,6 @@ def _layouts_by_function(trace, layout):
 
 
 def _logical_function_name(match):
-    """Strip matcher-added work-id suffixes from one replicated kernel name."""
     name = match.func_name
     for coordinate in reversed(match.work_id):
         suffix = f"_{coordinate}"
@@ -49,7 +43,7 @@ def _logical_function_name(match):
     return name
 
 
-def _loop_metrics(target, match) -> dict[str, int]:
+def _loop_metrics(target, match):
     env = _mapping_env(target)
     extents = []
     for axis in range(len(match.enclosing_loops)):
@@ -60,21 +54,10 @@ def _loop_metrics(target, match) -> dict[str, int]:
     for extent in extents:
         iterations *= extent
     return {
+        "loop_extents": tuple(extents),
         "reduction_extent": reduction,
         "iterations": iterations,
     }
-
-
-def _resource_requests(primitive, work_id) -> tuple[ResourceRequest, ...]:
-    requests = []
-    for handle in primitive.resources:
-        requests.append(
-            ResourceRequest(
-                resource=handle.qualified_name,
-                instances=(handle.instance_for(work_id),),
-            )
-        )
-    return tuple(requests)
 
 
 def _unwrap_handle(handle):
@@ -82,7 +65,6 @@ def _unwrap_handle(handle):
 
 
 def _same_handle(pattern, handle):
-    """Match a concrete placement handle against a move endpoint."""
     from .spmw_target import Memory, MemoryRef, Register
 
     pattern = _unwrap_handle(pattern)
@@ -99,20 +81,12 @@ def _same_handle(pattern, handle):
 
 
 def _moves_for_handles(target, handles, *, phase):
-    """Resolve declared device moves structurally, without a backend ctx.
-
-    Preloads end at the placed handle; storebacks start from it. Host-scope
-    moves and control self-moves are excluded. Ambiguity is a plan-construction
-    error rather than a silently selected backend special case.
-    """
-    out = []
-    seen = set()
+    """Resolve structural register materialization moves for a placement."""
     from .spmw_target import Register
 
+    out = []
+    seen = set()
     for handle in handles:
-        # A bank/memory placement is already at its storage tier. This helper
-        # resolves register materialization only; explicit memory-to-memory and
-        # host transfers are first-class activities supplied by their plan pass.
         if not isinstance(_unwrap_handle(handle), Register):
             continue
         matches = []
@@ -125,53 +99,79 @@ def _moves_for_handles(target, handles, *, phase):
                 endpoint = move.dst if phase == "pre" else move.src
                 if _same_handle(endpoint, handle):
                     matches.append(move)
-        # A placement can legitimately need no move (already in a bank). More
-        # than one distinct route needs an explicit route in the candidate IR.
         if len(matches) > 1:
             names = sorted(move.name for move in matches)
             raise ValueError(
                 f"ambiguous {phase} move for placement {handle!r}: {names}"
             )
         if matches and matches[0].name not in seen:
-            move = matches[0]
-            if move.timing_model is None:
-                raise KeyError(f"target move {move.name!r} has no timing_model")
-            seen.add(move.name)
-            out.append(move)
+            seen.add(matches[0].name)
+            out.append(matches[0])
     return out
 
 
-def _add_primitive_activity(
-    graph,
-    primitive,
-    activity_id,
-    work_id,
-    metrics,
-    attributes,
-    deps,
-):
-    graph.add(
-        Activity(
-            id=activity_id,
-            primitive=primitive.name,
-            timing_model=primitive.timing_model,
-            invocation=Invocation(metrics=metrics, attributes=attributes),
-            resources=_resource_requests(primitive, work_id),
-            depends_on=tuple(deps),
-            label=f"{attributes['func_name']}:{primitive.name}",
-        )
+def _bind_cost(cost_spec, target):
+    if isinstance(cost_spec, BoundCostSpec):
+        if cost_spec.target is not target:
+            raise ValueError("bound cost spec belongs to a different target instance")
+        return cost_spec
+    if not isinstance(cost_spec, CostSpec):
+        raise TypeError("cost must be an executable CostSpec")
+    return cost_spec.bind(target)
+
+
+def _emit_event(bound_cost, graph, primitive, event_id, work_id, metrics, attrs, deps):
+    event = CostEvent.create(
+        event_id,
+        primitive,
+        work_id=work_id,
+        metrics=metrics,
+        attributes=attrs,
     )
-    return activity_id
+    return list(bound_cost.emit(graph, event, deps))
 
 
-def build_execution_graph(target, trace, layout) -> ExecutionGraph:
-    """Build the exact resource/timing graph for one candidate placement."""
-    if not getattr(target, "has_performance_model", False):
-        raise ValueError(f"target {target.name!r} has no resource performance model")
+def _lookup_buffer_metrics(buffer_metrics, name):
+    if not name:
+        return None
+    candidates = [name]
+    if name.startswith("local_"):
+        candidates.append(name[len("local_") :])
+    folded = {key.casefold(): value for key, value in buffer_metrics.items()}
+    for candidate in candidates:
+        if candidate in buffer_metrics:
+            return buffer_metrics[candidate]
+        if candidate.casefold() in folded:
+            return folded[candidate.casefold()]
+    return None
+
+
+def _host_move_metrics(resolved, buffer_metrics):
+    metrics = _lookup_buffer_metrics(buffer_metrics, resolved.buffer_role)
+    return dict(metrics or {})
+
+
+def build_execution_graph(
+    target,
+    trace,
+    layout,
+    cost_spec,
+    *,
+    host_moves=(),
+    buffer_metrics=None,
+):
+    """Execute a cost program over one target-bound autoscheduler candidate."""
+    bound_cost = _bind_cost(cost_spec, target)
+    buffer_metrics = dict(buffer_metrics or {})
     layouts = _layouts_by_function(trace, layout)
     graph = ExecutionGraph(
         name=f"{trace.module_name}@{target.name}",
-        metadata={"target": target.name, "module": trace.module_name},
+        metadata={
+            "target": target.name,
+            "module": trace.module_name,
+            "cost": bound_cost.spec.name,
+            "cost_fingerprint": bound_cost.fingerprint,
+        },
     )
 
     function_order = []
@@ -180,14 +180,45 @@ def build_execution_graph(target, trace, layout) -> ExecutionGraph:
         if logical_name not in function_order:
             function_order.append(logical_name)
 
-    previous_function_terminals: tuple[str, ...] = ()
-    for func_name in function_order:
+    # Host-to-device transfers are an explicit prefix. The current recorded
+    # host-move surface does not retain launch positions, so intermediate
+    # ingress transfers are conservatively complete before device execution.
+    # Gathers form an explicit suffix below.
+    previous_function_terminals = ()
+    ingress = [
+        resolved
+        for resolved in host_moves
+        if getattr(getattr(resolved, "verb", None), "name", None) != "gather"
+    ]
+    egress = [
+        resolved
+        for resolved in host_moves
+        if getattr(getattr(resolved, "verb", None), "name", None) == "gather"
+    ]
+    for index, resolved in enumerate(ingress):
+        previous_function_terminals = tuple(
+            _emit_event(
+                bound_cost,
+                graph,
+                resolved.move,
+                f"host:ingress:{index}:{resolved.move.name}",
+                (),
+                _host_move_metrics(resolved, buffer_metrics),
+                {
+                    "buffer_role": resolved.buffer_role,
+                    "phase": "host_ingress",
+                },
+                previous_function_terminals,
+            )
+        )
+
+    for function_name in function_order:
         matches = [
             match
             for match in trace.matches
-            if _logical_function_name(match) == func_name
+            if _logical_function_name(match) == function_name
         ]
-        streams: dict[tuple[int, ...], list] = {}
+        streams = {}
         stream_order = []
         for match in matches:
             work_id = tuple(match.work_id)
@@ -200,100 +231,129 @@ def build_execution_graph(target, trace, layout) -> ExecutionGraph:
         for work_id in stream_order:
             stream_matches = streams[work_id]
             placement = layouts[stream_matches[0].func_name]
-            coordinate_text = ".".join([str(coordinate) for coordinate in work_id])
-            prefix = f"{func_name}:{coordinate_text or 'root'}"
-            deps = list(previous_function_terminals)
+            coordinate_text = ".".join(str(value) for value in work_id)
+            prefix = f"{function_name}:{coordinate_text or 'root'}"
+            dependencies = list(previous_function_terminals)
+
             operand_memrefs = []
+            result_memrefs = []
             for match in stream_matches:
                 for operand in match.operands:
-                    name = operand.memref_name
-                    if name is not None and name not in operand_memrefs:
-                        operand_memrefs.append(name)
+                    if (
+                        operand.memref_name is not None
+                        and operand.memref_name not in operand_memrefs
+                    ):
+                        operand_memrefs.append(operand.memref_name)
+                if (
+                    match.result_memref_name is not None
+                    and match.result_memref_name not in result_memrefs
+                ):
+                    result_memrefs.append(match.result_memref_name)
             operand_handles = [
                 placement.placements[name]
                 for name in operand_memrefs
                 if name in placement.placements
             ]
-            result_memrefs = []
-            for match in stream_matches:
-                name = match.result_memref_name
-                if name is not None and name not in result_memrefs:
-                    result_memrefs.append(name)
             result_handles = [
                 placement.placements[name]
                 for name in result_memrefs
                 if name in placement.placements
             ]
 
-            for move_index, move in enumerate(
+            for index, move in enumerate(
                 _moves_for_handles(target, operand_handles, phase="pre")
             ):
-                activity_id = f"{prefix}:pre:{move_index}:{move.name}"
-                deps = [
-                    _add_primitive_activity(
-                        graph,
-                        move,
-                        activity_id,
-                        work_id,
-                        dict(move.performance_inputs),
-                        {"func_name": func_name, "work_id": work_id, "phase": "pre"},
-                        deps,
-                    )
-                ]
+                dependencies = _emit_event(
+                    bound_cost,
+                    graph,
+                    move,
+                    f"{prefix}:pre:{index}:{move.name}",
+                    work_id,
+                    {},
+                    {"func_name": function_name, "phase": "pre"},
+                    dependencies,
+                )
 
-            for op_index, match in enumerate(stream_matches):
-                primitive = target.op(match.target_op_name)
-                if primitive.timing_model is None:
-                    raise KeyError(
-                        f"target op {match.target_op_name!r} has no timing_model"
-                    )
-                metrics = dict(primitive.performance_inputs)
-                metrics.update(_loop_metrics(target, match))
+            for index, match in enumerate(stream_matches):
                 extra = getattr(placement, "extra", {}) or {}
-                metrics["n_fibers"] = max(1, int(extra.get("n_fibers", 1)))
-                metrics["batch"] = max(1, int(match.extra.get("batch_dim", 1)))
-                activity_id = f"{prefix}:op:{op_index}:{primitive.name}"
-                deps = [
-                    _add_primitive_activity(
-                        graph,
-                        primitive,
-                        activity_id,
-                        work_id,
-                        metrics,
-                        {
-                            "func_name": func_name,
-                            "work_id": work_id,
-                            "placement_mode": getattr(placement, "mode", ""),
-                            "phase": "compute",
-                        },
-                        deps,
+                operation = target.op(
+                    extra.get("operation_name", match.target_op_name)
+                )
+                metrics = _loop_metrics(target, match)
+                operand_shapes = {}
+                for operand in match.operands:
+                    geometry = _lookup_buffer_metrics(
+                        buffer_metrics, operand.memref_name
                     )
-                ]
+                    if geometry is not None:
+                        operand_shapes[operand.role] = geometry["shape"]
+                result_geometry = _lookup_buffer_metrics(
+                    buffer_metrics, match.result_memref_name
+                )
+                metrics.update(
+                    n_fibers=max(1, int(extra.get("n_fibers", 1))),
+                    batch=max(1, int(match.extra.get("batch_dim", 1))),
+                    lanes=8,
+                    operand_shapes=operand_shapes,
+                    result_shape=(
+                        result_geometry["shape"]
+                        if result_geometry is not None
+                        else None
+                    ),
+                    candidate=dict(extra),
+                )
+                dependencies = _emit_event(
+                    bound_cost,
+                    graph,
+                    operation,
+                    f"{prefix}:op:{index}:{operation.name}",
+                    work_id,
+                    metrics,
+                    {
+                        "func_name": function_name,
+                        "placement_mode": getattr(placement, "mode", ""),
+                        "phase": "compute",
+                    },
+                    dependencies,
+                )
 
-            for move_index, move in enumerate(
+            for index, move in enumerate(
                 _moves_for_handles(target, result_handles, phase="post")
             ):
-                activity_id = f"{prefix}:post:{move_index}:{move.name}"
-                deps = [
-                    _add_primitive_activity(
-                        graph,
-                        move,
-                        activity_id,
-                        work_id,
-                        dict(move.performance_inputs),
-                        {"func_name": func_name, "work_id": work_id, "phase": "post"},
-                        deps,
-                    )
-                ]
-            if deps:
-                function_terminals.append(deps[-1])
+                dependencies = _emit_event(
+                    bound_cost,
+                    graph,
+                    move,
+                    f"{prefix}:post:{index}:{move.name}",
+                    work_id,
+                    {},
+                    {"func_name": function_name, "phase": "post"},
+                    dependencies,
+                )
+            function_terminals.extend(dependencies)
         previous_function_terminals = tuple(function_terminals)
+
+    for index, resolved in enumerate(egress):
+        previous_function_terminals = tuple(
+            _emit_event(
+                bound_cost,
+                graph,
+                resolved.move,
+                f"host:egress:{index}:{resolved.move.name}",
+                (),
+                _host_move_metrics(resolved, buffer_metrics),
+                {
+                    "buffer_role": resolved.buffer_role,
+                    "phase": "host_egress",
+                },
+                previous_function_terminals,
+            )
+        )
     return graph
 
 
-def estimate_candidate(target, trace, layout, profile=None):
-    """Convenience seam shared by autoscheduling and virtual execution."""
-    from .pim.performance import virtual_target
-
-    graph = build_execution_graph(target, trace, layout)
-    return graph, virtual_target(target, profile).evaluate(graph)
+def estimate_candidate(target, trace, layout, cost_spec):
+    """Lower and evaluate one candidate with the same executable cost program."""
+    bound = _bind_cost(cost_spec, target)
+    graph = build_execution_graph(target, trace, layout, bound)
+    return graph, bound.evaluate(graph)

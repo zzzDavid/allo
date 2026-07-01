@@ -3,11 +3,12 @@
 """The PIM suite delegates compilation to the public ``allo.compile`` API."""
 
 from types import SimpleNamespace
+from pathlib import Path
 
 import numpy as np
 
 from lib import runner
-from allo.pim.performance import SAMSUNG_BASE_PROFILE
+from allo.pim.costs import samsung_cost
 from allo.spmw_codegen import RunResult
 
 
@@ -49,7 +50,7 @@ def test_suite_runner_binds_profile_and_invokes_backend_roles(monkeypatch):
     assert result.cycles == 23
     assert captured["workload"] is _workload
     assert captured["target"] is target
-    assert captured["cost"] is SAMSUNG_BASE_PROFILE
+    assert captured["cost"] is samsung_cost
     assert captured["compile_kwargs"] == {
         "backend": "virtual",
         "host_moves": ["move"],
@@ -57,7 +58,7 @@ def test_suite_runner_binds_profile_and_invokes_backend_roles(monkeypatch):
     assert captured["inputs"] == {"A": A, "B": B}
 
 
-def test_unported_target_uses_same_public_interface_with_no_profile(monkeypatch):
+def test_aim_uses_same_public_interface_with_executable_cost(monkeypatch):
     captured = {}
 
     class FakeCallable:
@@ -77,4 +78,17 @@ def test_unported_target_uses_same_public_interface_with_no_profile(monkeypatch)
     )
 
     assert result.backend == "aim"
-    assert captured["cost"] is None
+    assert captured["cost"].name == "aim_cost"
+    assert captured["cost"].target_name == "aim"
+
+
+def test_every_samsung_leaf_exposes_public_compile_call():
+    """Samsung design tests keep the public compilation boundary visible."""
+    root = Path(__file__).parent / "samsung_hbm_pim"
+    leaves = sorted(root.glob("*/test_*_samsung_hbm_pim.py"))
+
+    assert len(leaves) == 15
+    for leaf in leaves:
+        source = leaf.read_text(encoding="utf-8")
+        assert "allo.compile(" in source, leaf
+        assert "cell.run_cell" not in source, leaf

@@ -8,12 +8,12 @@
 from __future__ import annotations
 
 import inspect
-from pathlib import Path
+import math
 
 import numpy as np
 
 from .customize import customize
-from .perf import CalibrationProfile, VirtualTarget
+from .perf import BoundCostSpec, CostSpec
 from .spmw_codegen import RunResult, compile_for_target
 from .spmw_match_engine import match_workload
 
@@ -37,31 +37,17 @@ def _materialize_target(target):
     raise TypeError("target must be a Target or a zero-argument target builder")
 
 
-def _resolve_performance_model(target, cost):
-    """Normalize a cost argument to a bound ``VirtualTarget``."""
-    if isinstance(cost, VirtualTarget):
-        if getattr(cost.target, "name", None) != target.name:
-            raise ValueError(
-                f"cost model targets {getattr(cost.target, 'name', None)!r}, "
-                f"not {target.name!r}"
-            )
-        return cost
-    if isinstance(cost, (str, Path)):
-        cost = CalibrationProfile.load(cost)
-    if isinstance(cost, CalibrationProfile):
-        from .pim.performance import virtual_target
-
-        return virtual_target(target, cost)
-    if cost is not None:
-        raise TypeError(
-            "cost must be a CalibrationProfile, VirtualTarget, JSON profile path, "
-            "or None"
-        )
-    if getattr(target, "has_performance_model", False):
-        from .pim.performance import virtual_target
-
-        return virtual_target(target)
-    return None
+def _resolve_cost(target, cost_spec):
+    """Bind an executable cost program to this target instance."""
+    if cost_spec is None:
+        return None
+    if isinstance(cost_spec, BoundCostSpec):
+        if cost_spec.target is not target:
+            raise ValueError("bound cost spec belongs to a different target instance")
+        return cost_spec
+    if not isinstance(cost_spec, CostSpec):
+        raise TypeError("cost must be an executable CostSpec")
+    return cost_spec.bind(target)
 
 
 def _discover_host_moves(workload):
@@ -74,6 +60,40 @@ def _discover_host_moves(workload):
         if records is not None:
             return list(records)
     return None
+
+
+def _buffer_metrics(workload):
+    """Extract static operand geometry for executable cost rules.
+
+    Allo workloads commonly use postponed annotations, so resolve them in the
+    defining module before inspecting ``TypeAnnotation.shape`` and dtype bits.
+    Unknown annotations are simply omitted; cost programs remain free to use
+    other event metrics.
+    """
+    try:
+        annotations = inspect.get_annotations(workload, eval_str=True)
+    except (NameError, TypeError):
+        annotations = getattr(workload, "__annotations__", {}) or {}
+
+    metrics = {}
+    for name, annotation in annotations.items():
+        if name == "return":
+            continue
+        shape = getattr(annotation, "shape", None)
+        if shape is None:
+            continue
+        try:
+            shape = tuple(int(extent) for extent in shape)
+        except (TypeError, ValueError):
+            continue
+        dtype = getattr(annotation, "dtype", None)
+        bits = int(getattr(dtype, "bits", 0) or 0)
+        elements = math.prod(shape)
+        entry = {"shape": shape, "elements": elements}
+        if bits > 0:
+            entry.update(dtype_bits=bits, bytes=(elements * bits + 7) // 8)
+        metrics[name] = entry
+    return metrics
 
 
 class CompiledCallable:
@@ -92,14 +112,14 @@ class CompiledCallable:
         schedule,
         trace,
         compiled,
-        performance_model=None,
+        cost=None,
     ):
         self.workload = workload
         self.target = target
         self.schedule = schedule
         self.trace = trace
         self.compiled = compiled
-        self.performance_model = performance_model
+        self.cost = cost
         self.signature = inspect.signature(workload)
         self.__signature__ = self.signature
         self.__name__ = getattr(workload, "__name__", "compiled_workload")
@@ -131,11 +151,11 @@ class CompiledCallable:
 
     def estimate(self):
         """Evaluate the retained candidate graph without invoking a backend."""
-        if self.performance_model is None:
-            raise RuntimeError("compiled workload has no analytical performance model")
+        if self.cost is None:
+            raise RuntimeError("compiled workload has no executable cost spec")
         if self.execution_graph is None:
             raise RuntimeError("compiled workload has no retained execution graph")
-        return self.performance_model.evaluate(self.execution_graph)
+        return self.cost.evaluate(self.execution_graph)
 
     def _copy_outputs(self, result, arguments):
         outputs = result.extra.get("outputs", {}) if result.extra else {}
@@ -189,9 +209,8 @@ def compile(
         An Allo workload callable, or a module/object exposing ``build()``.
     target : Target or callable
         A built Tenon target or a zero-argument target builder.
-    cost : object
-        A ``CalibrationProfile``, ``VirtualTarget``, JSON profile path, or
-        ``None`` for the target's default profile.
+    cost : CostSpec
+        Executable cost program used by autoscheduling and virtual execution.
     backend : str or None
         ``None`` selects the target's normal simulator/device runner;
         ``"virtual"`` evaluates only the analytical performance graph.
@@ -203,7 +222,7 @@ def compile(
     """
     workload = _materialize_workload(workload)
     target = _materialize_target(target)
-    performance_model = _resolve_performance_model(target, cost)
+    bound_cost = _resolve_cost(target, cost)
     if host_moves is None:
         host_moves = _discover_host_moves(workload)
 
@@ -215,7 +234,8 @@ def compile(
         layout=layout,
         backend=backend,
         host_moves=host_moves,
-        performance_model=performance_model,
+        buffer_metrics=_buffer_metrics(workload),
+        cost=bound_cost,
     )
     return CompiledCallable(
         workload,
@@ -223,5 +243,5 @@ def compile(
         schedule,
         trace,
         compiled,
-        performance_model=performance_model,
+        cost=bound_cost,
     )

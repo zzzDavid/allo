@@ -13,7 +13,7 @@ sys.path.insert(0, _allo_root)
 # Add tests/spmw to path for fixture imports
 sys.path.insert(0, os.path.join(_allo_root, "tests", "spmw"))
 
-from _fixtures import build_upmem_target
+from allo.pim.targets import build_upmem_target
 from _schedule_search_corpus import (
     run_baseline_vs_search,
     multi_op_workload,

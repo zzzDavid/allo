@@ -84,11 +84,17 @@ def _compile_expr(node: ast.AST, params: set[str]) -> Any:
         kind = _AST_BINOP_TO_NAME.get(type(node.op))
         if kind is None:
             raise ValueError(f"unsupported binop in lambda: {ast.dump(node.op)}")
-        return PBinOp(kind, _compile_expr(node.left, params), _compile_expr(node.right, params))
+        return PBinOp(
+            kind, _compile_expr(node.left, params), _compile_expr(node.right, params)
+        )
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         # -x  =>  0 - x   (keeps the AST simple)
         return PBinOp("sub", PConst(0), _compile_expr(node.operand, params))
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"max", "min"}:
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"max", "min"}
+    ):
         # max(x, 0) / min(x, 0) -> binary PBinOp (allo lowers max -> arith.maximumf).
         if len(node.args) != 2:
             raise ValueError(f"{node.func.id} in lambda body requires exactly 2 args")
@@ -162,6 +168,8 @@ def compile_target_patterns(target) -> None:
     """
     for u in target._walk():
         for op in u.ops.values():
+            if not op.matchable:
+                continue
             compile_op_pattern(op)
 
 
@@ -249,7 +257,9 @@ def _build_load_term(load_op) -> WLoad:
     # operands[0] is the memref; the rest are the indices.
     indices = operands[1:] if len(operands) > 1 else []
     ssa = _result_names(load_op)[0] if load_op.results else "<no-result>"
-    return WLoad(memref_name=memref_name, ssa_name=ssa, indices=indices, source_op_name=name)
+    return WLoad(
+        memref_name=memref_name, ssa_name=ssa, indices=indices, source_op_name=name
+    )
 
 
 def _trace_value(ssa_name: str, defining_map: dict[str, Any]) -> Any:
@@ -404,11 +414,23 @@ def _walk_loops(block, prefix: list[tuple[str, str, str, int]], collector):
         if op.operation.name == "affine.for":
             attrs = op.attributes
             iv_name = op.regions[0].blocks[0].arguments[0].get_name()
-            lb = _affine_map_text(attrs["lowerBoundMap"]) if "lowerBoundMap" in attrs else "?"
-            ub = _affine_map_text(attrs["upperBoundMap"]) if "upperBoundMap" in attrs else "?"
+            lb = (
+                _affine_map_text(attrs["lowerBoundMap"])
+                if "lowerBoundMap" in attrs
+                else "?"
+            )
+            ub = (
+                _affine_map_text(attrs["upperBoundMap"])
+                if "upperBoundMap" in attrs
+                else "?"
+            )
             step_attr = attrs["step"] if "step" in attrs else None
             try:
-                step = int(str(step_attr).split(":")[0].strip()) if step_attr is not None else 1
+                step = (
+                    int(str(step_attr).split(":")[0].strip())
+                    if step_attr is not None
+                    else 1
+                )
             except ValueError:
                 step = 1
             loop = (iv_name, lb, ub, step)
@@ -452,7 +474,9 @@ def _operand_bindings(
     # The accumulator parameter — convention: if accumulates, the last
     # parameter is the loop-carried accumulator. Allo's frontend names it
     # "acc" via the {from = "acc"} attr; we mark it as such.
-    acc_name = pattern.param_names[-1] if (accumulates and pattern.param_names) else None
+    acc_name = (
+        pattern.param_names[-1] if (accumulates and pattern.param_names) else None
+    )
     for name in pattern.param_names:
         term = bindings.get(name)
         if isinstance(term, WLoad):
@@ -567,6 +591,8 @@ def _try_match_at_store(
         first matching MatchedOp (the existing single-term logic), or None."""
         for unit in target._walk():
             for op_obj in unit.ops.values():
+                if not op_obj.matchable:
+                    continue
                 pat = compile_op_pattern(op_obj)
                 bindings: dict[str, Any] = {}
                 if not _unify(pat.body, t, bindings):
@@ -639,7 +665,7 @@ def _parse_loop_upper(text: str) -> int | None:
     """Best-effort integer from an affine-map upper-bound string.
 
     Mirrors the cost model's `_parse_loop_bound`; kept local so the
-    resolver does not import from `spmw_cost_models` (which imports this
+    resolver remains independent of cost-program lowering (which imports this
     module). Returns None on failure.
     """
     try:
@@ -679,11 +705,7 @@ def batch_dim(match: MatchedOp) -> tuple[str | None, int | None]:
     loop_vars = {L[0] for L in loops}
 
     # Non-accumulator input operands with at least one index.
-    inputs = [
-        opb
-        for opb in match.operands
-        if not opb.is_loop_carried and opb.indices
-    ]
+    inputs = [opb for opb in match.operands if not opb.is_loop_carried and opb.indices]
     if len(inputs) < 2:
         # Need >=2 inputs to separate "leading index of one, absent from
         # another"; a single-input reduction has no batch axis.
@@ -697,8 +719,7 @@ def batch_dim(match: MatchedOp) -> tuple[str | None, int | None]:
             continue
         # (b) absent from some OTHER input operand entirely.
         absent_elsewhere = any(
-            opb.indices[0] != var and var not in opb.indices
-            for opb in inputs
+            opb.indices[0] != var and var not in opb.indices for opb in inputs
         )
         if not absent_elsewhere:
             continue

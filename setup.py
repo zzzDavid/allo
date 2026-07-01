@@ -106,7 +106,6 @@ if __name__ == "__main__":
         setup_requires=["nanobind>=2.9"],
         install_requires=parse_requirements("requirements.txt"),
         packages=find_packages(),
-        package_data={"allo.pim": ["calibration/*.json"]},
         ext_modules=[CMakeExtension("mlir", sourcedir="mlir")],
         cmdclass={"build_ext": CMakeBuild},
         url="https://github.com/cornell-zhang/allo",

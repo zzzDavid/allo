@@ -1,42 +1,42 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""PolyBench syrk on samsung_hbm_pim -- Tier-1 single-output cell (task 005).
-
-Thin cell: build the target from `lib`, run the shared `syrk` workload through
-`lib.cell.run_cell`, record the verdict + cycles + results.json/RESULTS.md +
-COVERAGE.tsv. Declares zero hardware (everything from `lib` + the shared
-workload). Verdict derived from what the run surfaces: Samsung reports cycles only (no output array) -> CYCLES-ONLY at the GEMV design point; a shape the reference sim cannot express -> BLOCKED-SIM.
-"""
+"""SYRK contraction core compiled explicitly for Samsung HBM-PIM."""
 
 from __future__ import annotations
 
-from lib import cell, reference
+import allo
+
+from lib import samsung
+from lib.cost import bind_cost
 from lib.shapes import shape
+from lib.targets import build_target
 
 _KERNEL = "syrk"
 _TARGET = "samsung_hbm_pim"
-_RUN_CMD = (
-    "python -m pytest tests/pim/samsung_hbm_pim/syrk/test_syrk_samsung_hbm_pim.py "
-    "-p no:cacheprovider -q"
+_RUN_CMD = "python -m pytest tests/pim/samsung_hbm_pim/syrk/test_syrk_samsung_hbm_pim.py -p no:cacheprovider -q"
+_NOTES = (
+    "Tier-2 symmetric rank-k core; real REDUCE cycles with honest CYCLES-ONLY numerics."
 )
 
 
 def test_syrk_samsung_hbm_pim(request):
-    # Task 006: workload loaded from the leaf dir
-    # (samsung_hbm_pim/syrk/workload.py, slice form) by run_cell; STAGES re-read
-    # from it.
-    result, verdict, _record = cell.run_cell(
-        kernel=_KERNEL, target_name=_TARGET,
-        folder=request.path.parent, stages=None, shapes=shape(_KERNEL),
-        run_cmd=_RUN_CMD,
-        notes="Tier-1 single-output; Samsung reports cycles only (no output array) -> CYCLES-ONLY at the GEMV design point; a shape the reference sim cannot express -> BLOCKED-SIM.",
+    workload = samsung.load_workload(request.path.parent, _KERNEL)
+    target = build_target(_TARGET)
+
+    compiled = allo.compile(
+        workload.build(),
+        target,
+        bind_cost(target),
+        host_moves=workload.HOST_MOVES,
     )
-    # First-class recorded verdict (spec Answer 3), never a skip.
-    assert verdict.status in (reference.CYCLES_ONLY, reference.BLOCKED_SIM), verdict
-    if verdict.status in (reference.CYCLES_ONLY, reference.PASS) and not cell.sim_unavailable(result):
-        assert result.cycles is not None and result.cycles > 0, (
-            f"{_TARGET}: expected positive cycles; got {result.cycles!r}; "
-            f"stdout tail: {result.stdout[-400:]}"
-        )
-    elif verdict.status == reference.BLOCKED_SIM:
-        assert result.cycles is None
+
+    result, verdict, _record = samsung.run_compiled(
+        compiled,
+        workload,
+        kernel=_KERNEL,
+        folder=request.path.parent,
+        shapes=shape(_KERNEL),
+        run_cmd=_RUN_CMD,
+        notes=_NOTES,
+    )
+    samsung.assert_result(result, verdict, allow_pass=False)

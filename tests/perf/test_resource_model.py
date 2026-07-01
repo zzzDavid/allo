@@ -1,165 +1,210 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
+"""Unit tests for the executable, handle-based cost abstraction."""
+
+import allo
 
 from allo.perf import (
     Activity,
-    CalibrationProfile,
+    CostEvent,
     Evaluator,
     ExecutionGraph,
-    Invocation,
-    MeasurementRecord,
-    ParameterValue,
-    ProbeSpec,
-    ResourceRequest,
-    ResourceSpec,
-    ResourceTopology,
-    TimingLibrary,
-    TimingModel,
-    fit_profile,
+    HandleInstance,
+    Occupancy,
+    cost,
+    rule,
 )
+from allo.spmw_target import op, target, unit
 
 
-def _model_and_profile(latency=10, ii=0):
-    timing = TimingModel(
-        "test.op",
-        latency_cycles="latency",
-        initiation_interval_cycles="ii",
-        parameters=("latency", "ii"),
-    )
-    profile = CalibrationProfile(
-        name="test/base",
-        target="test",
-        model_version="v1",
-        parameters={
-            "latency": ParameterValue(latency),
-            "ii": ParameterValue(ii),
-        },
-    )
-    return TimingLibrary([timing]), profile
-
-
-def _activity(name, instance=0, deps=()):
+def _activity(name, handle, latency=10, occupancy=None, deps=()):
     return Activity(
         id=name,
-        primitive="OP",
-        timing_model="test.op",
-        resources=(ResourceRequest("engine", (instance,)),),
+        primitive="test/op",
+        latency_cycles=latency,
+        occupancy=(Occupancy(handle, occupancy or latency),),
         depends_on=tuple(deps),
     )
 
 
-def test_independent_instances_overlap():
+def test_independent_handle_instances_overlap():
+    first = HandleInstance("chip/engine", (0,))
+    second = HandleInstance("chip/engine", (1,))
     graph = ExecutionGraph("parallel")
-    graph.extend([_activity("a", 0), _activity("b", 1)])
-    topology = ResourceTopology([ResourceSpec("engine", instances=2)])
-    timings, profile = _model_and_profile(latency=10)
+    graph.extend([_activity("a", first), _activity("b", second)])
 
-    estimate = Evaluator().evaluate(graph, topology, timings, profile)
+    estimate = Evaluator().evaluate(graph)
 
     assert estimate.cycles == 10
     assert estimate.spans["a"].start_cycle == 0
     assert estimate.spans["b"].start_cycle == 0
 
 
-def test_shared_instance_serializes():
-    graph = ExecutionGraph("serial")
-    graph.extend([_activity("a"), _activity("b")])
-    topology = ResourceTopology([ResourceSpec("engine")])
-    timings, profile = _model_and_profile(latency=10)
+def test_old_configuration_apis_are_removed():
+    assert not hasattr(allo, "cycle_model")
+    assert not hasattr(allo, "resource")
+    assert not hasattr(allo, "const")
 
-    estimate = Evaluator().evaluate(graph, topology, timings, profile)
+
+def test_shared_handle_instance_serializes():
+    engine = HandleInstance("chip/engine", (0,))
+    graph = ExecutionGraph("serial")
+    graph.extend([_activity("a", engine), _activity("b", engine)])
+
+    estimate = Evaluator().evaluate(graph)
 
     assert estimate.cycles == 20
     assert estimate.spans["b"].start_cycle == 10
     assert estimate.critical_path == ("a", "b")
 
 
-def test_pipelined_resource_admits_at_initiation_interval():
+def test_latency_and_handle_occupancy_are_independent():
+    engine = HandleInstance("chip/pipeline", (0,))
     graph = ExecutionGraph("pipeline")
-    graph.extend([_activity("a"), _activity("b"), _activity("c")])
-    topology = ResourceTopology([ResourceSpec("engine", pipelined=True)])
-    timings, profile = _model_and_profile(latency=10, ii=2)
+    graph.extend(
+        [
+            _activity("a", engine, latency=10, occupancy=2),
+            _activity("b", engine, latency=10, occupancy=2),
+            _activity("c", engine, latency=10, occupancy=2),
+        ]
+    )
 
-    estimate = Evaluator().evaluate(graph, topology, timings, profile)
+    estimate = Evaluator().evaluate(graph)
 
     assert estimate.cycles == 14
-    assert [estimate.spans[x].start_cycle for x in "abc"] == [0, 2, 4]
+    assert [estimate.spans[name].start_cycle for name in "abc"] == [0, 2, 4]
 
 
-def test_dependency_prevents_overlap_on_independent_resources():
+def test_dependency_prevents_overlap_on_independent_handles():
     graph = ExecutionGraph("dependency")
-    graph.extend([_activity("a", 0), _activity("b", 1, deps=("a",))])
-    topology = ResourceTopology([ResourceSpec("engine", instances=2)])
-    timings, profile = _model_and_profile(latency=7)
+    graph.extend(
+        [
+            _activity("a", HandleInstance("chip/engine", (0,)), latency=7),
+            _activity(
+                "b",
+                HandleInstance("chip/engine", (1,)),
+                latency=7,
+                deps=("a",),
+            ),
+        ]
+    )
 
-    estimate = Evaluator().evaluate(graph, topology, timings, profile)
+    estimate = Evaluator().evaluate(graph)
 
     assert estimate.cycles == 14
     assert estimate.spans["b"].start_cycle == 7
 
 
-def test_analytical_shape_formula_and_uncertainty():
-    model = TimingModel(
-        "vector",
-        inputs=("elements", "lanes"),
-        parameters=("startup", "per_vector"),
-        latency_cycles="startup + ceil_div(elements, lanes) * per_vector",
-        initiation_interval_cycles="per_vector",
+def _build_test_target():
+    @target("cost_test")
+    def device():
+        @unit(mapping={"lane": 2})
+        def lane():
+            scalar = object()
+            op("ADD", src=(scalar, scalar), dst=scalar, fn=lambda x, y: x + y)
+
+    return device
+
+
+@cost(target="cost_test")
+def sample_cost(target_spec):
+    lane = target_spec.unit("lane")
+
+    @rule(target_spec.op("ADD"))
+    def add(event, ctx):
+        cycles = int(event.elements) + 1
+        ctx.step(
+            latency=cycles,
+            occupy=[
+                ctx.use(event.primitive, cycles=1),
+                ctx.use(lane, cycles=cycles),
+            ],
+            name="add",
+        )
+
+
+def test_cost_spec_is_ordinary_executable_code():
+    target_spec = _build_test_target()
+    bound = sample_cost.bind(target_spec)
+    graph = ExecutionGraph("program")
+    bound.emit(
+        graph,
+        CostEvent.create(
+            "left", target_spec.op("ADD"), work_id=(0,), metrics={"elements": 4}
+        ),
     )
-    profile = CalibrationProfile(
-        name="test/uncertain",
-        target="test",
-        model_version="v1",
-        parameters={
-            "startup": ParameterValue(2),
-            "per_vector": ParameterValue(4, lower=3, upper=5),
-        },
+    bound.emit(
+        graph,
+        CostEvent.create(
+            "right", target_spec.op("ADD"), work_id=(1,), metrics={"elements": 8}
+        ),
     )
 
-    timing = model.evaluate({"elements": 33, "lanes": 16}, profile)
+    estimate = bound.evaluate(graph)
 
-    assert timing.latency_cycles == 14
-    assert timing.initiation_interval_cycles == 4
-    assert timing.cycle_interval == (11, 17)
-    assert timing.initiation_interval_cycle_interval == (3, 5)
-
-
-def test_microprofile_fit_updates_only_named_parameter():
-    base = CalibrationProfile(
-        name="chip/base",
-        target="chip",
-        model_version="v1",
-        parameters={
-            "mac_cycles": ParameterValue(8),
-            "dma_cycles": ParameterValue(20),
-        },
-    )
-    probe = ProbeSpec("mac-loop", parameter="mac_cycles")
-    record = MeasurementRecord(
-        id="run-1",
-        probe_id="mac-loop",
-        target="chip",
-        target_fingerprint="board-a/fw-3",
-        cycles_samples=(39, 40, 41),
-        normalizer=10,
-    )
-
-    fitted = fit_profile(base, [probe], [record], name="chip/board-a")
-
-    assert fitted.get("mac_cycles").value == 4
-    assert fitted.get("mac_cycles").provenance == "measured"
-    assert fitted.get("mac_cycles").measurement_ids == ("run-1",)
-    assert fitted.get("dma_cycles") == base.get("dma_cycles")
-    assert fitted.parent == "chip/base"
+    assert estimate.cycles == 9
+    assert estimate.spans["left:cost:0:add"].latency_cycles == 5
+    assert estimate.spans["right:cost:0:add"].latency_cycles == 9
+    assert estimate.model_fingerprint == bound.fingerprint
 
 
-def test_calibration_profile_json_roundtrip(tmp_path):
-    timings, profile = _model_and_profile(latency=13, ii=2)
-    del timings
-    path = tmp_path / "profile.json"
+def test_cost_repeat_and_parallel_are_program_constructs():
+    target_spec = _build_test_target()
 
-    profile.save(path)
-    loaded = CalibrationProfile.load(path)
+    @cost(target="cost_test")
+    def composite(spec):
+        operation = spec.op("ADD")
 
-    assert loaded == profile
-    assert loaded.fingerprint() == profile.fingerprint()
+        @rule(operation)
+        def add(_event, ctx):
+            with ctx.parallel():
+                with ctx.repeat(3):
+                    ctx.step(cycles=2, occupy=[ctx.use(operation)], name="lhs")
+                ctx.step(cycles=5, name="rhs")
+            ctx.step(cycles=1, name="join")
+
+    bound = composite.bind(target_spec)
+    graph = ExecutionGraph("composite")
+    bound.emit(graph, CostEvent.create("add", target_spec.op("ADD")))
+
+    estimate = bound.evaluate(graph)
+
+    assert estimate.cycles == 7
+    assert estimate.spans["add:cost:0:lhs"].latency_cycles == 6
+    assert estimate.spans["add:cost:1:rhs"].start_cycle == 0
+    assert estimate.spans["add:cost:2:join"].start_cycle == 6
+
+
+def test_capacity_is_declared_on_existing_target_handles():
+    @target("capacity_test")
+    def capacity_target():
+        @unit(mapping={"lane": 1}, capacity=2)
+        def lane():
+            storage = allo.mem(name="storage", ports=3)
+            op(
+                "ADD",
+                src=(storage, storage),
+                dst=storage,
+                fn=lambda x, y: x + y,
+                capacity=2,
+            )
+
+    operation = capacity_target.op("ADD")
+    event = CostEvent.create("add", operation, work_id=(0,))
+
+    assert event.instance(capacity_target.unit("lane")).capacity == 2
+    assert event.operation_instance.capacity == 2
+    assert event.instance(capacity_target.storage).capacity == 3
+
+
+def test_symbolic_memory_refs_become_concrete_bank_instances():
+    from allo.pim.targets import build_samsung_target
+
+    target_spec = build_samsung_target()
+    even_bank = target_spec.move("LD_A").src
+
+    first = CostEvent.create("first", target_spec.move("LD_A"), work_id=(2, 0))
+    second = CostEvent.create("second", target_spec.move("LD_A"), work_id=(2, 1))
+
+    assert first.instance(even_bank).name.endswith("banks[0][channel=2]")
+    assert second.instance(even_bank).name.endswith("banks[2][channel=2]")

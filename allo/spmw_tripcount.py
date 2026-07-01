@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Trip-count resolution for the cost path (design 04 §3).
 
-`_parse_loop_bound` (formerly in `spmw_cost_models.py`) is a regex over
+`_parse_loop_bound` is a regex over
 the affine upper-bound *string*: it returns an int for a literal bound,
 the sole number when there is exactly one, else `None`. A symbolic bound
 (`M*K//16`, `512*c0`, an outer-var-dependent bound) silently defaulted to
@@ -36,7 +36,7 @@ def _parse_loop_bound(text: str) -> int | None:
     string (`"1024"`, `"() -> (1024)"`, ...). Returns None on failure.
 
     Tier-1 of `resolve_trip_count`; retained here (moved, not duplicated)
-    as the literal fast path. `spmw_cost_models` re-exports it for the few
+    as the literal fast path. Callers use it for the few
     callers that still want the pure literal parse.
     """
     try:
@@ -67,7 +67,7 @@ def _strip_affine_wrapper(text: str) -> str:
     """
     arrow = text.rfind("->")
     if arrow != -1:
-        text = text[arrow + 2:]
+        text = text[arrow + 2 :]
     text = text.strip()
     if text.startswith("(") and text.endswith(")"):
         text = text[1:-1].strip()
@@ -139,9 +139,7 @@ def resolve_trip_count(
         bound_text = loops[loop_idx][2]
     except (IndexError, TypeError):
         return None
-    return resolve_bound_text(
-        bound_text, shapes=shapes, mapping_env=mapping_env
-    )
+    return resolve_bound_text(bound_text, shapes=shapes, mapping_env=mapping_env)
 
 
 def resolve_bound_text(

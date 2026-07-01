@@ -8,9 +8,8 @@ already wrote -- derived purely from the matched trace
 capacity, with NO `allo/ir/` edit and NO tile literal. This is the same
 additive-trace discipline `_trace_reduction_trip` / `batch_dim` already prove:
 the loop bounds give the iteration space, the operand indices give which axis
-each operand strides on, and the target geometry (register lanes / scratchpad
-bytes via the landed `_build_capacity` / `_estimate_bytes`) gives the capacity
-that bounds the tile.
+each operand strides on, and the target geometry (register lanes and
+scratchpad bytes) gives the capacity that bounds the tile.
 
 The ALWAYS-present first candidate is the IDENTITY tiling (tile_size = full
 bound) == today's nest. Additional candidates are capacity-fitting divisors of
@@ -56,12 +55,13 @@ class TilePlan:
 
 def _loop_bound(text) -> int | None:
     """Parse a single constant trip count out of an affine-bound string
-    (mirrors `spmw_regalloc._loop_bound` / `_parse_loop_bound`)."""
+    (mirrors `_parse_loop_bound`)."""
     try:
         return int(str(text).strip())
     except (TypeError, ValueError):
         pass
     import re
+
     nums = re.findall(r"\b(\d+)\b", str(text))
     return int(nums[0]) if len(nums) == 1 else None
 
@@ -90,20 +90,46 @@ def _lane_burst(target) -> int | None:
 
 def _capacity_tile_cap(target, match, opb) -> int | None:
     """The largest tile (in elements) whose working set fits a bounded tier,
-    derived from the landed `_build_capacity` + `_estimate_bytes` (ONE capacity
-    notion, shared with the allocator). Returns None when no byte cap is
+    derived directly from target memory geometry. Returns None when no byte cap is
     derivable (today's corpus carries no dtype -> unbounded -> identity-only,
     byte-identical). The element cap is the bounded-tier byte cap divided by the
     element width implied by the operand's footprint."""
-    from .spmw_regalloc import _build_capacity, _estimate_bytes
-
-    nbytes = _estimate_bytes(match, opb)
-    if nbytes is None:
-        return None  # no derivable footprint -> no capacity bound -> identity
-    cap = _build_capacity(target)
-    if not cap.bytes_cap:
+    dtype_bits = getattr(opb, "dtype_bits", None)
+    if dtype_bits is None:
+        dtype_bits = (match.extra or {}).get("dtype_bits")
+    if not dtype_bits:
         return None
-    tier_bytes = min(cap.bytes_cap.values())
+    n_elems = 1
+    for loop in match.enclosing_loops or ():
+        upper = _loop_bound(loop[2]) if len(loop) >= 3 else None
+        if upper is None:
+            return None
+        n_elems *= upper
+    nbytes = n_elems * max(1, int(dtype_bits) // 8)
+
+    capacities = []
+    bulk_memories = {"banks", "mram", "l4", "l5"}
+    for unit_spec in target._walk():
+        for memory in unit_spec.memories.values():
+            if memory.name in bulk_memories:
+                continue
+            geometry = memory.geometry
+            if geometry.get("size_bytes") is not None:
+                capacities.append(int(geometry["size_bytes"]))
+            elif geometry.get("entries") is not None and geometry.get("width"):
+                capacities.append(
+                    int(geometry["entries"]) * int(geometry["width"]) // 8
+                )
+            elif geometry.get("rows") is not None and geometry.get("cols") is not None:
+                capacities.append(
+                    int(geometry["rows"])
+                    * int(geometry["cols"])
+                    * int(geometry.get("width", 8))
+                    // 8
+                )
+    if not capacities:
+        return None
+    tier_bytes = min(capacities)
     # element width from the footprint / iteration count.
     n_elems = 1
     for loop in match.enclosing_loops or ():
