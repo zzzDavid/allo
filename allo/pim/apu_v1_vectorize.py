@@ -710,6 +710,7 @@ def _candidate_recipes(analysis: ContractionAnalysis):
                 "name": (
                     "temporal_dma_coalescing_broadcast_friendly_"
                     f"acc{accumulator_block}"
+                    + ("_l4" if lookup_storage == "l4" else "")
                 ),
                 "spatial_axes": output_axes,
                 "temporal_axes": (reduction,),
@@ -718,9 +719,10 @@ def _candidate_recipes(analysis: ContractionAnalysis):
                 "coalesced": True,
                 "broadcast": True,
                 "accumulator_block": accumulator_block,
-                "lookup_storage": "l4",
+                "lookup_storage": lookup_storage,
             }
             for accumulator_block in (2, 4, 8)
+            for lookup_storage in ("l3", "l4")
         ),
     )
 

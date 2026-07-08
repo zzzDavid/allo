@@ -222,7 +222,7 @@ def test_large_broadcast_route_streams_reduction_chunks_through_one_vr():
     assert source.count("right_resident") == 3  # declaration, load, and duplicate
     assert "for (uint32_t output_block = 0;" in source
     assert "result__acc7" in source
-    assert "left_L4ptr" in source
+    assert "left_L3ptr" in source
     # The streamed RHS is outside the eight statically unrolled accumulator
     # updates and is therefore loaded/expanded once per reduction step.
     reduction_loop = source.split("for (uint32_t reduction_step", 1)[1]
@@ -262,7 +262,7 @@ def test_large_lookup_plan_uses_l4_instead_of_exhausting_runtime_l3():
 
     assert compiled.realization is not None, compiled.realization_error
     assert compiled.selected_plan.name == (
-        "temporal_dma_coalescing_broadcast_friendly_acc8"
+        "temporal_dma_coalescing_broadcast_friendly_acc8_l4"
     )
     assert "left_L4ptr" in compiled.device_source()
     assert "left_L3ptr" not in compiled.device_source()

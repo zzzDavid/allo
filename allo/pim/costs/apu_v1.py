@@ -85,6 +85,13 @@ MICRO_PIO_CALL_STARTUP = 3_365
 MICRO_VR_LOAD_STORE = 29
 MICRO_LOOKUP_SLOPE = 7.15
 MICRO_LOOKUP_STARTUP = 629
+# Direct-L4 lookup is legal but pays the backing-memory access on every table
+# entry.  Two route-controlled board pairs isolate that increment while
+# keeping the GVML loop identical: M256xN160xK160 (128-entry tables) measured
+# 1,170,053 CRUN from L3 versus 2,862,521 from L4; M256xN1024xK1200
+# (32-entry tables) measured 10,760,275 versus 23,778,223.  Adding back the
+# one-time L4->L3 copy predicts 42.71 and 42.89 CRUN per lookup-table entry.
+MICRO_LOOKUP_L4_SLOPE = 42.8
 MICRO_COPY_IMMEDIATE = 13
 MICRO_RESET = 16
 MICRO_XOR = 12
@@ -227,7 +234,10 @@ def apu_v1_cost(target):
     micro_vector_rule(
         target.op("LOOKUP_16"),
         lambda event: MICRO_LOOKUP_STARTUP
-        + MICRO_LOOKUP_SLOPE * _metric(event, "table_size"),
+        + MICRO_LOOKUP_SLOPE * _metric(event, "table_size")
+        + MICRO_LOOKUP_L4_SLOPE
+        * _metric(event, "table_size")
+        * _metric(event, "source_is_l4", 0),
         "gvml_lookup_16",
     )
     micro_vector_rule(

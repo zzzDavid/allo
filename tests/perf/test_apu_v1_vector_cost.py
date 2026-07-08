@@ -77,12 +77,15 @@ def test_full_micro_shape_ranks_accumulator_blocks_by_rhs_reuse(plans):
 
     cycles = [item.cycles for item in ranked]
     assert all(cycle > 0 for cycle in cycles)
-    assert len(set(cycles)) == 7
+    assert len(set(cycles)) == 10
     assert [item.plan.name for item in ranked] == [
         "temporal_dma_coalescing_broadcast_friendly_acc8",
         "temporal_dma_coalescing_broadcast_friendly_acc4",
         "temporal_dma_coalescing_broadcast_friendly_acc2",
+        "temporal_dma_coalescing_broadcast_friendly_acc8_l4",
+        "temporal_dma_coalescing_broadcast_friendly_acc4_l4",
         "temporal_dma_coalescing_broadcast_friendly",
+        "temporal_dma_coalescing_broadcast_friendly_acc2_l4",
         "temporal_dma_coalescing",
         "baseline_spatial_reduction",
         "temporal_svp",
@@ -141,6 +144,24 @@ def test_transfer_cost_does_not_consume_planner_broadcast_metadata(plans):
     )
 
     assert estimate_apu_v1_plan(poisoned, target, apu_v1_cost).cycles == original
+
+
+def test_lookup_cost_prices_l4_source_from_the_explicit_route(plans):
+    target = build_apu_v1_target()
+    l3 = next(item for item in plans if item.name.endswith("acc8"))
+    l4 = next(item for item in plans if item.name.endswith("acc8_l4"))
+
+    l3_result = estimate_apu_v1_plan(l3, target, apu_v1_cost)
+    l4_result = estimate_apu_v1_plan(l4, target, apu_v1_cost)
+    l4_lookup = next(
+        step
+        for route in l4_result.graph.metadata["transfer_routes"]
+        for step in route["steps"]
+        if step["kind"] == "lookup"
+    )
+
+    assert l4_lookup["source_storage"] == "l4"
+    assert l4_result.cycles > l3_result.cycles
 
 
 def test_streamed_resident_route_prices_each_accumulator_block_replay():

@@ -269,7 +269,11 @@ def _route_step_sequence(plan, target, transfer: Transfer, step):
         table_size = _checked_layout_parameter(
             step, "table_size", metrics["source_elements_per_call"]
         )
-        vector = {**metrics, "table_size": table_size}
+        vector = {
+            **metrics,
+            "table_size": table_size,
+            "source_is_l4": int(str(step.source.storage).lower() == "l4"),
+        }
         return (
             (
                 target.op("CREATE_GROUP_INDEX_16"),
@@ -351,6 +355,7 @@ def _transfer_route_metadata(plan, transfer):
     return tuple(
         {
             "kind": step.kind,
+            "source_storage": step.source.storage,
             "call_count": metrics["count"],
             **{field: metrics[field] for field in fields if field in metrics},
         }

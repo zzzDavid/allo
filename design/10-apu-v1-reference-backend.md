@@ -131,15 +131,18 @@ name or plan object through `layout=`, and exposes `candidates`,
 returned callable. Unknown arithmetic, unsafe reductions, unsupported dtypes,
 and VR pressure above VR16_0..14 fail closed.
 
-Accumulator-blocked plans lookup the compact row operand directly from L4.
-This avoids copying a dense lookup image into the ARC's bounded L3 cache and
-matches the direct-L4 lookup used by the hand-tuned implementation. The cost
-program leaves lookup and arithmetic counts unchanged, but divides streamed
-RHS DMA/load replay and subgroup-duplicate calls by the legal accumulator
-block. Plan selection still realizes candidates in cost order, so an otherwise
-attractive block is rejected if its simultaneously live accumulators do not
-fit beside indices, streamed operands, and compute temporaries in the fifteen
-writable VRs.
+Accumulator-blocked plans expose both L3-resident and direct-L4 lookup routes.
+L3 is faster when the compact image fits; direct L4 avoids copying an oversized
+dense image into the ARC cache and matches the route used by the hand-tuned
+large-shape implementation. The cost program prices the lookup source from the
+explicit route. Its L4 increment is a board-calibrated 42.8 CRUN per table
+entry, derived from otherwise identical L3/L4 blocked kernels. Arithmetic and
+lookup counts stay unchanged, while streamed RHS DMA/load replay and
+subgroup-duplicate calls are divided by the legal accumulator block. Plan
+selection realizes candidates in cost order, so an otherwise attractive block
+is rejected if either its lookup image exceeds the safe L3 budget or its live
+accumulators do not fit beside indices, streamed operands, and compute
+temporaries in the fifteen writable VRs.
 
 The original full real-device milestone is
 `tests/pim/apu_v1/vector_gemm/test_vector_gemm_apu_v1.py`: one ordinary Allo
