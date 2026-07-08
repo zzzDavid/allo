@@ -10,8 +10,8 @@
     "S": 80
   },
   "correctness": {
-    "status": "CYCLES-ONLY",
-    "detail": "apu_v1/3mm: real-device run (real cycles) -- but apu_v1 fp16-MAC is OUT-OF-PARADIGM (planner SPEC-018b ruling): the silicon runs BINARY XNOR-popcount MAC (the validated bmatmul_sv/sv_lookup paradigm); a general fp16 multiply-accumulate is a DIFFERENT compute kernel (no gvml fp16-MAC primitive; the autoscheduler/cost model know only the binary {sv,sv_lookup} modes), an architectural boundary (SPEC-018b, noted for a ceiling task), NOT a fix-in-session gap. The board runs the binary LUT-MAC stub so the output cannot match the fp16 ref -- CYCLES-ONLY, never a FAIL and never a fabricated fp16 PASS",
+    "status": "PASS",
+    "detail": "canonical uint16 MLIR -> scalar ARC C matched repository NumPy reference bit-for-bit for output (max_abs_err=0)",
     "reference": {
       "source": "PolyBench/C 4.2.1",
       "size_class": "SMALL_DATASET",
@@ -20,11 +20,33 @@
   },
   "performance": {
     "metric": "cycles",
-    "value": 3609445,
+    "value": 48825932,
     "source": "apu_v1_device@zhang-capra-xcel.ece.cornell.edu/gsi-13.7.1",
-    "run_cmd": "python -m pytest tests/pim/apu_v1/3mm/test_three_mm_apu_v1.py -p no:cacheprovider -q",
-    "timestamp": "2026-06-29T12:18:50.499680"
+    "run_cmd": "python -m pytest tests/pim/apu_v1/3mm/test_three_mm_apu_v1.py::test_three_mm_apu_v1_scalar_baseline -p no:cacheprovider -q",
+    "timestamp": "2026-07-08T00:42:15.781831"
   },
-  "tenon_commit": "ee1e52a539d6385a60d149ca238b592d9763103e",
-  "notes": "Tier-1 real-device; APU v1 surfaces real numerics from the board. The emitted declarative MAC is the SPEC-018 popcount-LUT pattern, so the board runs real cycles but a general fp16 GEMV output is the SPEC-018b TODO -> CYCLES-ONLY (real cycles), never a fabricated PASS."
+  "hybrid_uint16": {
+    "status": "PASS",
+    "comparison": "bit-exact modular uint16 reference",
+    "regions": ["mm1:vector", "mm2:vector", "mm3:vector"],
+    "vector_layout": "temporal_dma_coalescing",
+    "precision_conversions": 0,
+    "cycles": 31577401,
+    "phase_cycles": [
+      {"phase": "mm1", "critical": 3358726, "per_apuc": {"0": 3344459, "1": 3342992, "2": 3358655, "3": 3358726}},
+      {"phase": "mm2", "critical": 4281142, "per_apuc": {"0": 4262505, "1": 4268403, "2": 4278168, "3": 4281142}},
+      {"phase": "join_repack", "critical": 20873332, "per_apuc": {"0": 20863533, "1": 20850662, "2": 20873332, "3": 20851666}},
+      {"phase": "mm3", "critical": 2700893, "per_apuc": {"0": 2692892, "1": 2700893, "2": 2693868, "3": 2698103}},
+      {"phase": "gather", "critical": 363308, "per_apuc": {"0": 363308}}
+    ],
+    "vector_apucs": [0, 1, 2, 3],
+    "scalar_apucs": [],
+    "final_gather_apucs": [0],
+    "persistent_l4": true,
+    "host_intermediate_round_trips": 0,
+    "device_run_cmd": "python -m pytest tests/pim/apu_v1/3mm/test_three_mm_apu_v1.py::test_three_mm_apu_v1_hybrid_device_uint16 -p no:cacheprovider -q",
+    "profiled_on": "2026-07-08"
+  },
+  "tenon_commit": "6bc7474a09fa7d2d64007e6b929b6f68660729d3",
+  "notes": "Complete canonical uint16 PolyBench program lowered through MLIR to scalar C on APUC 0. This is the explicit scalar correctness baseline; other APUCs are not launched because arbitrary multi-phase programs do not yet carry cross-APUC barriers. Analytical scalar estimate=366428415 cycles."
 }

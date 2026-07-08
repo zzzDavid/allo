@@ -193,42 +193,6 @@ def _stage_resident_emit(value, base, ctx: KnobCtx):
     return _with_stage_resident(base, value)
 
 
-def _n_tasklets_candidates(ctx: KnobCtx) -> list:
-    from .spmw_autoschedule import _upmem_tasklet_candidates
-
-    return _upmem_tasklet_candidates(ctx.target, ctx.matches)
-
-
-def _n_tasklets_emit(value, base, ctx: KnobCtx):
-    from .spmw_autoschedule import Placement
-
-    new_extra = dict(base.extra)
-    new_extra["n_tasklets"] = value
-    return Placement(
-        placements=dict(base.placements),
-        mode=base.mode,
-        extra=new_extra,
-        layout=getattr(base, "layout", None),
-    )
-
-
-def _vr_dma_candidates(ctx: KnobCtx) -> list:
-    return ["intra", "inter"]
-
-
-def _vr_dma_emit(value, base, ctx: KnobCtx):
-    from .spmw_autoschedule import Placement
-
-    new_extra = dict(base.extra)
-    new_extra["vr_dma"] = value
-    return Placement(
-        placements=dict(base.placements),
-        mode=base.mode,
-        extra=new_extra,
-        layout=getattr(base, "layout", None),
-    )
-
-
 def _residency_crossing_memrefs(ctx: KnobCtx) -> list:
     """The candidate's memrefs whose whole-trace liveness crosses a kernel or
     work-id boundary (SPEC-023 D1). Empty when liveness is absent (per-kernel
@@ -348,11 +312,8 @@ def register_default_knobs():
     ORDER the hand-crossed enumerator applied them (the byte-identity anchor).
 
     Samsung/Mortise: grf_residency -> crf_issue -> stage_resident (the
-    `fibers` lever is baked into the base candidates, not a cross). UPMEM:
-    n_tasklets. APU v1's vr_dma is crossed WITH `mode` inside its enumerator
-    (a paired 4-candidate fan), so it is registered as one knob whose
-    candidates carry the (mode, vr_dma) pair -- kept in the enumerator to
-    preserve the exact 4-tuple set. Idempotent (safe to call at import).
+    `fibers` lever is baked into the base candidates, not a cross).
+    Idempotent (safe to call at import).
     """
     for tname in ("samsung_hbm_pim", "mortise", "mortise_wide"):
         register_knob(
@@ -363,9 +324,6 @@ def register_default_knobs():
             tname,
             Knob("stage_resident", _stage_resident_candidates, _stage_resident_emit),
         )
-    register_knob("upmem", Knob("n_tasklets", _n_tasklets_candidates, _n_tasklets_emit))
-    register_knob("apu_v1", Knob("vr_dma", _vr_dma_candidates, _vr_dma_emit))
-
     # Cross-kernel / cross-work-id residency (SPEC-023 D1/T6). A 1x fan
     # (byte-identical) for any value that does NOT cross a boundary; the
     # candidate set only grows when whole-trace liveness flags residency as
@@ -376,7 +334,6 @@ def register_default_knobs():
         "samsung_hbm_pim",
         "mortise",
         "mortise_wide",
-        "upmem",
         "apu_v1",
         "apu_v2",
     ):
@@ -391,7 +348,6 @@ def register_default_knobs():
         "samsung_hbm_pim",
         "mortise",
         "mortise_wide",
-        "upmem",
         "apu_v1",
         "apu_v2",
     ):
@@ -407,7 +363,6 @@ def register_default_knobs():
         "samsung_hbm_pim",
         "mortise",
         "mortise_wide",
-        "upmem",
         "apu_v1",
         "apu_v2",
     ):
@@ -469,7 +424,6 @@ def cross_with_knobs(
     return current
 
 
-# Register the six live levers at import (idempotent). Importing this module
-# -- which `_samsung_enumerate` / `_upmem_enumerate` do via `cross_with_knobs`
-# -- installs the typed knob registry.
+# Register the live levers at import (idempotent). Backend enumerators call
+# `cross_with_knobs`, which consumes this registry.
 register_default_knobs()

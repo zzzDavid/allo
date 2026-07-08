@@ -1,0 +1,38 @@
+{
+  "kernel": "vector_binary",
+  "target": "apu_v1",
+  "dataset": "XNOR_POPCOUNT_VECTOR_MILESTONE",
+  "shapes": {
+    "M": 32,
+    "N": 1024,
+    "K": 8,
+    "packed_word_bits": 16
+  },
+  "workload_expression": "result[row, column] += allo.popcount(~(left[row, depth] ^ right[depth, column]))",
+  "correctness": {
+    "status": "PASS",
+    "detail": "bit-exact against NumPy uint16 XNOR/popcount",
+    "comparison": "bit-exact against NumPy uint16 XNOR/popcount",
+    "outputs_checked": 32768,
+    "outputs_matched": 32768,
+    "mismatches": 0,
+    "max_abs_error": 0
+  },
+  "performance": {
+    "metric": "CRUN cycles",
+    "value": 248424,
+    "estimated_cycles": 131286,
+    "measured_cycles": 248424,
+    "wall_seconds": 9.314730167,
+    "source": "apu_v1_device@zhang-capra-xcel.ece.cornell.edu/gsi-13.7.1",
+    "timestamp": "2026-07-07T17:47:00-04:00",
+    "run_cmd": "LD_PRELOAD=/opt/intel/oneapi/intelpython/python3.9/pkgs/intel-extension-for-tensorflow-1.2.0-py3.9_gpu_0/share/intel_extension_for_tensorflow/libstdc/libstdc++.so.6.0.30 PYTHONPATH=.:tests/pim pytest -q tests/pim/apu_v1/vector_binary/test_vector_binary_apu_v1.py -m apu_v1_device"
+  },
+  "device": {
+    "hostname": "zhang-capra-xcel.ece.cornell.edu",
+    "runtime": "GSI 13.7.1",
+    "apucs_used": 1
+  },
+  "tenon_commit": "6bc7474a09fa7d2d64007e6b929b6f68660729d3",
+  "notes": "The ordinary Allo DSL call retains math.ctpop in MLIR. Structural analysis proves XOR, all-ones inversion, and raw popcount before lowering to GVML XOR/NOT/POPCOUNT/ADD. No bipolar shift/subtract is introduced."
+}

@@ -47,10 +47,9 @@ def _ilog2_exact(n: int) -> int:
 class LinearLayout:
     """F2-linear map between named bit-vector dims.
 
-    See module docstring + spec 013 §A/§B for semantics. Layouts are
-    enumerator-ephemeral: built inside `_*_enumerate`, materialised to
-    `Register`/`MemoryRef` via `materialise_handle`, then discarded
-    before reaching codegen.
+    See module docstring + spec 013 §A/§B for semantics. Layouts may be
+    materialised to `Register`/`MemoryRef` handles and remain attached to a
+    placement or launch so cost and code generation consume the same map.
     """
 
     def __init__(
@@ -131,6 +130,91 @@ class LinearLayout:
                 f"(known: {sorted(self.bases)})"
             )
         return 1 << len(self.bases[in_dim])
+
+    def output_size(self, out_dim: str) -> int:
+        """Return the declared power-of-two extent of one output axis."""
+        try:
+            return self.out_sizes[self.out_dims.index(out_dim)]
+        except ValueError as exc:
+            raise KeyError(
+                f"output_size: output dim {out_dim!r} not in layout "
+                f"(known: {self.out_dims})"
+            ) from exc
+
+    def image_size(
+        self,
+        *,
+        varying_inputs: tuple[str, ...],
+        output_dims: tuple[str, ...] | None = None,
+    ) -> int:
+        """Count distinct output coordinates reached by selected inputs.
+
+        All non-selected inputs are fixed at zero.  This is the load-bearing
+        bridge from the F2 map to backend parallelism: AiM uses it for bank
+        fanout and UPMEM uses it for DPU/tasklet fanout.  Callers should select
+        only the logical axes that actually vary concurrently.
+        """
+        for name in varying_inputs:
+            if name not in self.bases:
+                raise KeyError(
+                    f"image_size: input dim {name!r} not in layout "
+                    f"(known: {sorted(self.bases)})"
+                )
+        if output_dims is None:
+            output_dims = self.out_dims
+        output_indices = []
+        for name in output_dims:
+            if name not in self.out_dims:
+                raise KeyError(
+                    f"image_size: output dim {name!r} not in layout "
+                    f"(known: {self.out_dims})"
+                )
+            output_indices.append(self.out_dims.index(name))
+
+        row_widths = [_ilog2_exact(self.out_sizes[index]) for index in output_indices]
+        columns = []
+        for input_name in varying_inputs:
+            for vector in self.bases[input_name]:
+                column = []
+                for output_index, width in zip(output_indices, row_widths):
+                    word = vector[output_index]
+                    column.extend((word >> bit) & 1 for bit in range(width))
+                columns.append(column)
+        if not columns:
+            return 1
+        matrix = np.asarray(columns, dtype=np.uint8).T
+        rows, cols = matrix.shape
+        rank = 0
+        for col in range(cols):
+            pivot = next((row for row in range(rank, rows) if matrix[row, col]), None)
+            if pivot is None:
+                continue
+            if pivot != rank:
+                matrix[[rank, pivot]] = matrix[[pivot, rank]]
+            for row in range(rows):
+                if row != rank and matrix[row, col]:
+                    matrix[row] ^= matrix[rank]
+            rank += 1
+            if rank == rows:
+                break
+        return 1 << rank
+
+    def manifest(self) -> dict[str, object]:
+        """Return a JSON-compatible representation of the exact F2 map."""
+        return {
+            "kind": "linear-layout-f2",
+            "input_dims": {
+                name: {
+                    "size": self.size_of(name),
+                    "basis": [list(vector) for vector in vectors],
+                }
+                for name, vectors in self.bases.items()
+            },
+            "output_dims": [
+                {"name": name, "size": size}
+                for name, size in zip(self.out_dims, self.out_sizes)
+            ],
+        }
 
     # ------------------------------------------------------------------ #
     # Class constructors
@@ -299,9 +383,7 @@ class LinearLayout:
         # the last bit completes the span rather than tripping the early-out).
         if _is_conflict_free():
             return cls(
-                bases={
-                    k: [tuple(v) for v in vecs] for k, vecs in new_bases.items()
-                },
+                bases={k: [tuple(v) for v in vecs] for k, vecs in new_bases.items()},
                 out_dims=base.out_dims,
                 out_sizes=base.out_sizes,
             )
@@ -389,9 +471,7 @@ class LinearLayout:
             new_vecs: list[tuple[int, ...]] = []
             for vec in vecs:
                 # Feed vec into `other` keyed by self.out_dims.
-                kwargs = {
-                    self.out_dims[j]: vec[j] for j in range(len(self.out_dims))
-                }
+                kwargs = {self.out_dims[j]: vec[j] for j in range(len(self.out_dims))}
                 new_vecs.append(other.apply(**kwargs))
             new_bases[in_name] = new_vecs
         return LinearLayout(
@@ -406,9 +486,7 @@ class LinearLayout:
         """
         overlap = set(self.bases) & set(other.bases)
         if overlap:
-            raise ValueError(
-                f"product: input dims overlap: {sorted(overlap)}"
-            )
+            raise ValueError(f"product: input dims overlap: {sorted(overlap)}")
         if set(self.out_dims) & set(other.out_dims):
             raise ValueError(
                 "product: output dims overlap: "
@@ -456,9 +534,7 @@ class LinearLayout:
         n_in_bits = sum(len(v) for v in self.bases.values())
         n_out_bits = sum(_ilog2_exact(s) for s in self.out_sizes)
         if n_in_bits != n_out_bits:
-            raise ValueError(
-                f"invert: matrix is {n_out_bits}x{n_in_bits}, not square"
-            )
+            raise ValueError(f"invert: matrix is {n_out_bits}x{n_in_bits}, not square")
 
         M = self.matrix()  # shape (n_out_bits, n_in_bits)
         n = n_in_bits
@@ -492,9 +568,7 @@ class LinearLayout:
 
         row_widths = [_ilog2_exact(s) for s in new_out_sizes]
 
-        new_bases: dict[str, list[tuple[int, ...]]] = {
-            d: [] for d in new_in_dims
-        }
+        new_bases: dict[str, list[tuple[int, ...]]] = {d: [] for d in new_in_dims}
         col_base = 0
         for in_name, in_size in zip(new_in_dims, new_in_sizes):
             k = _ilog2_exact(in_size)
@@ -604,9 +678,7 @@ class LinearLayout:
         """
         if bank_dims is None:
             if out_dim is None:
-                raise TypeError(
-                    "conflict_count: pass bank_dims=(...) or out_dim=..."
-                )
+                raise TypeError("conflict_count: pass bank_dims=(...) or out_dim=...")
             bank_dims = (out_dim,)
         bank_idxs = [self.out_dims.index(d) for d in bank_dims]
 

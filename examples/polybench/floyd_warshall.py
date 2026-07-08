@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -19,7 +19,7 @@ def floyd_warshall_np(path):
     return path
 
 
-def kernel_floyd_warshall[T: (float32, int32), N: int32](path: "T[N, N]"):
+def kernel_floyd_warshall[T: (float32, int32, uint16), N: int32](path: "T[N, N]"):
     for k, i, j in allo.grid(N, N, N):
         path_: T = path[i, k] + path[k, j]
         if path[i, j] >= path_:

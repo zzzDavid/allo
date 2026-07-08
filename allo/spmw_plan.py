@@ -20,9 +20,17 @@ def _mapping_env(target):
 
 def _layouts_by_function(trace, layout):
     functions = []
+    aliases = {}
     for match in trace.matches:
-        if match.func_name not in functions:
-            functions.append(match.func_name)
+        key = match.func_name
+        if match.extra.get("coalesced_spmw_axis"):
+            for coordinate in reversed(match.work_id):
+                suffix = f"_{coordinate}"
+                if key.endswith(suffix):
+                    key = key[: -len(suffix)]
+        aliases[match.func_name] = key
+        if key not in functions:
+            functions.append(key)
     if isinstance(layout, (list, tuple)):
         layouts = list(layout)
         if len(layouts) != len(functions):
@@ -31,7 +39,8 @@ def _layouts_by_function(trace, layout):
             )
     else:
         layouts = [layout] * len(functions)
-    return dict(zip(functions, layouts))
+    by_key = dict(zip(functions, layouts))
+    return {func_name: by_key[key] for func_name, key in aliases.items()}
 
 
 def _logical_function_name(match):
@@ -227,10 +236,27 @@ def build_execution_graph(
                 stream_order.append(work_id)
             streams[work_id].append(match)
 
+        if any(match.extra.get("coalesced_spmw_axis") == "group" for match in matches):
+            zero = next(
+                (
+                    work_id
+                    for work_id in stream_order
+                    if all(int(value) == 0 for value in work_id)
+                ),
+                stream_order[0],
+            )
+            streams = {zero: streams[zero]}
+            stream_order = [zero]
+
         function_terminals = []
         for work_id in stream_order:
             stream_matches = streams[work_id]
             placement = layouts[stream_matches[0].func_name]
+            from .spmw_autoschedule import derive_layout_properties
+
+            placement_metrics = {
+                "candidate": derive_layout_properties(target, placement)
+            }
             coordinate_text = ".".join(str(value) for value in work_id)
             prefix = f"{function_name}:{coordinate_text or 'root'}"
             dependencies = list(previous_function_terminals)
@@ -269,16 +295,14 @@ def build_execution_graph(
                     move,
                     f"{prefix}:pre:{index}:{move.name}",
                     work_id,
-                    {},
+                    placement_metrics,
                     {"func_name": function_name, "phase": "pre"},
                     dependencies,
                 )
 
             for index, match in enumerate(stream_matches):
-                extra = getattr(placement, "extra", {}) or {}
-                operation = target.op(
-                    extra.get("operation_name", match.target_op_name)
-                )
+                extra = derive_layout_properties(target, placement)
+                operation = target.op(extra.get("operation_name", match.target_op_name))
                 metrics = _loop_metrics(target, match)
                 operand_shapes = {}
                 for operand in match.operands:
@@ -326,7 +350,7 @@ def build_execution_graph(
                     move,
                     f"{prefix}:post:{index}:{move.name}",
                     work_id,
-                    {},
+                    placement_metrics,
                     {"func_name": function_name, "phase": "post"},
                     dependencies,
                 )

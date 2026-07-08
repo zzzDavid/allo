@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -24,7 +24,7 @@ def doitgen_np(A, x, sum):
 
 
 def kernel_doitgen[
-    T: (float32, int32), R: int32, Q: int32, P: int32, S: int32
+    T: (float32, int32, uint16), R: int32, Q: int32, P: int32, S: int32
 ](A: "T[R, Q, S]", x: "T[P, S]", sum_: "T[P]"):
     for r, q in allo.grid(R, Q):
         for p in allo.grid(P):

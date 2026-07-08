@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -20,7 +20,7 @@ def mvt_np(A, x1, x2, y1, y2):
 
 
 def stageA[
-    T: (float32, int32), N: int32
+    T: (float32, int32, uint16), N: int32
 ](x1_in: "T[N]", x1_out: "T[N]", A: "T[N, N]", y1: "T[N]"):
     for i0 in allo.grid(N, name="A"):
         x: T = x1_in[i0]
@@ -30,7 +30,7 @@ def stageA[
 
 
 def stageB[
-    T: (float32, int32), N: int32
+    T: (float32, int32, uint16), N: int32
 ](x2_in: "T[N]", x2_out: "T[N]", A: "T[N, N]", y2: "T[N]"):
     for i1 in allo.grid(N, name="B"):
         x: T = x2_in[i1]
@@ -40,7 +40,7 @@ def stageB[
 
 
 def kernel_mvt[
-    T: (float32, int32), N: int32
+    T: (float32, int32, uint16), N: int32
 ](
     A: "T[N, N]",
     A_copy: "T[N, N]",

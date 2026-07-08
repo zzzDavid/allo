@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -48,7 +48,7 @@ def correlation_np(data, mean, stddev, corr, M, N, N_float, epsilon):
 
 
 def compute_mean[
-    T: (float32, int32), M: int32, N: int32
+    T: (float32, int32, uint16), M: int32, N: int32
 ](data: "T[N, M]", mean: "T[M]"):
     for x in allo.grid(M):
         total: T = 0.0
@@ -58,7 +58,7 @@ def compute_mean[
 
 
 def compute_stddev[
-    T: (float32, int32), M: int32, N: int32
+    T: (float32, int32, uint16), M: int32, N: int32
 ](data: "T[N, M]", mean: "T[M]", mean_passed_on: "T[M]", stddev: "T[M]"):
     for x in allo.grid(M):
         variance: T = 0.0
@@ -72,7 +72,7 @@ def compute_stddev[
 
 
 def center_reduce[
-    T: (float32, int32), M: int32, N: int32
+    T: (float32, int32, uint16), M: int32, N: int32
 ](data: "T[N, M]", data_out: "T[N, M]", mean: "T[M]", stddev: "T[M]"):
     for x in allo.grid(N):
         for y in allo.grid(M):
@@ -83,7 +83,7 @@ def center_reduce[
 
 
 def compute_corr[
-    T: (float32, int32), M: int32, N: int32
+    T: (float32, int32, uint16), M: int32, N: int32
 ](data: "T[N, M]", corr: "T[M, M]"):
     for i in range(M - 1):
         corr[i, i] = 1.0
@@ -99,7 +99,7 @@ def compute_corr[
 
 
 def kernel_correlation[
-    T: (float32, int32), M: int32, N: int32
+    T: (float32, int32, uint16), M: int32, N: int32
 ](
     data_mean: "T[N, M]",
     data_stddev: "T[N, M]",

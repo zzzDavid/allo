@@ -4,5 +4,6 @@
 
 from .samsung import samsung_cost
 from .aim import aim_cost
+from .apu_v1 import apu_v1_cost
 
-__all__ = ["samsung_cost", "aim_cost"]
+__all__ = ["samsung_cost", "aim_cost", "apu_v1_cost"]

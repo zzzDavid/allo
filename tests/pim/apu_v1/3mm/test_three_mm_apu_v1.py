@@ -1,55 +1,121 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""PolyBench 3mm on APU v1 -- Tier-1 REAL-DEVICE cell (task 007).
+"""Canonical 3mm through three structurally selected GVML contractions."""
 
-Thin cell: build the apu_v1 target from `lib`, run the shared `three_mm` workload
-on the REAL Gemini board through `lib.cell.run_cell` (which serializes board
-access, runs via the existing `_run_apu_v1` deploy/PROF_PRINT path, and checks
-real numerics vs the numpy ref), and record the verdict + real-device cycles +
-results.json/RESULTS.md/COVERAGE.tsv. Declares zero hardware (everything from
-`lib` + the shared workload). The board is gated by `@pytest.mark.apu_v1_device`
-+ the device fixture; unreachable -> BLOCKED-DEVICE, NEVER sim-substituted.
-"""
-
-from __future__ import annotations
+import numpy as np
 
 import pytest
 
-from lib import cell, reference
-from lib.shapes import shape
-
-from workloads import three_mm as _wl
+import allo
+from lib import apu_v1, cell
+from lib.cost import bind_cost
+from lib.targets import build_target
 
 _KERNEL = "3mm"
-_TARGET = "apu_v1"
 _RUN_CMD = (
-    "python -m pytest tests/pim/apu_v1/3mm/test_three_mm_apu_v1.py "
+    "python -m pytest tests/pim/apu_v1/3mm/test_three_mm_apu_v1.py"
+    "::test_three_mm_apu_v1_scalar_baseline "
     "-p no:cacheprovider -q"
 )
 
 
-@pytest.mark.apu_v1_device
-def test_three_mm_apu_v1(request, apu_v1_device_gate):
-    result, verdict, _record = cell.run_cell(
-        kernel=_KERNEL, target_name=_TARGET, workload=_wl.build(),
-        folder=request.path.parent, stages=_wl.STAGES, shapes=shape(_KERNEL),
-        run_cmd=_RUN_CMD,
-        notes=(
-            "Tier-1 real-device; APU v1 surfaces real numerics from the board. "
-            "The emitted declarative MAC is the SPEC-018 popcount-LUT pattern, "
-            "so the board runs real cycles but a general fp16 GEMV output is the "
-            "SPEC-018b TODO -> CYCLES-ONLY (real cycles), never a fabricated PASS."
-        ),
+def _assert_hybrid_manifest(compiled):
+    phase = compiled.hybrid_manifest.phases[0]
+    assert [(region.function, region.kind) for region in phase.regions] == [
+        ("mm1", "vector"),
+        ("mm2", "vector"),
+        ("mm3", "vector"),
+    ]
+    assert phase.regions[0].dependencies == ()
+    assert phase.regions[1].dependencies == ()
+    assert phase.regions[2].dependencies == (
+        phase.regions[0].id,
+        phase.regions[1].id,
     )
-    # First-class recorded verdict (spec Answer 3), never a silent skip.
-    assert verdict.status in (
-        reference.PASS, reference.CYCLES_ONLY, reference.BLOCKED_DEVICE,
-    ), verdict
-    if verdict.status in (reference.PASS, reference.CYCLES_ONLY):
-        # A real board run surfaced a real PROF_PRINT cycle count.
-        assert result.cycles is not None and result.cycles > 0, (
-            f"{_TARGET}: expected positive real-device cycles; got "
-            f"{result.cycles!r}; stdout tail: {result.stdout[-400:]}"
-        )
-    elif verdict.status == reference.BLOCKED_DEVICE:
-        assert result.cycles is None
+    assert phase.barriers[0].values == ("out_AB", "out_CD")
+    assert all(region.selected_plan is not None for region in phase.regions)
+    assert phase.conversions == ()
+    assert all(
+        region.compute_analysis.numeric_type == "ui16" for region in phase.regions
+    )
+
+
+def test_three_mm_apu_v1_hybrid_manifest(request):
+    workload = cell.load_workload(request.path.parent, _KERNEL)
+    target = build_target("apu_v1")
+    compiled = allo.compile(
+        workload.build(), target, bind_cost(target), backend="virtual"
+    )
+    _assert_hybrid_manifest(compiled)
+
+
+def test_three_mm_apu_v1_hybrid_functional_uint16(request):
+    workload = cell.load_workload(request.path.parent, _KERNEL)
+    target = build_target("apu_v1")
+    compiled = allo.compile(
+        workload.build(), target, bind_cost(target), backend="functional"
+    )
+    _assert_hybrid_manifest(compiled)
+    case = apu_v1.get_case(_KERNEL)
+    inputs = case.make_inputs()
+    canonical = case.run_reference(inputs)["output"]
+    run = compiled(**inputs)
+    observed = run.extra["outputs"]["output"]
+    ab = (inputs["A"].astype(np.uint64) @ inputs["B"].astype(np.uint64)).astype(
+        np.uint16
+    )
+    cd = (inputs["C"].astype(np.uint64) @ inputs["D"].astype(np.uint64)).astype(
+        np.uint16
+    )
+    staged = (ab.astype(np.uint64) @ cd.astype(np.uint64)).astype(np.uint16)
+    np.testing.assert_array_equal(observed, staged)
+    np.testing.assert_array_equal(observed, canonical)
+    assert run.extra["host_intermediate_round_trips"] == 0
+
+
+@pytest.mark.apu_v1_device
+def test_three_mm_apu_v1_hybrid_device_uint16(request, apu_v1_device_gate):
+    """Three uint16 GVML contractions preserve exact modular semantics."""
+
+    workload = cell.load_workload(request.path.parent, _KERNEL)
+    target = build_target("apu_v1")
+    compiled = allo.compile(workload.build(), target, bind_cost(target))
+    _assert_hybrid_manifest(compiled)
+    case = apu_v1.get_case(_KERNEL)
+    inputs = case.make_inputs()
+    canonical = case.run_reference(inputs)["output"]
+
+    def matmul_u16(lhs, rhs):
+        return (lhs.astype(np.uint64) @ rhs.astype(np.uint64)).astype(np.uint16)
+
+    ab = matmul_u16(inputs["A"], inputs["B"])
+    cd = matmul_u16(inputs["C"], inputs["D"])
+    staged = matmul_u16(ab, cd)
+
+    import conftest
+
+    with conftest.board_lock():
+        result = compiled(**inputs)
+    observed = result.extra["outputs"]["output"]
+    np.testing.assert_array_equal(observed, staged)
+    np.testing.assert_array_equal(observed, canonical)
+    assert result.cycles is not None and result.cycles > 0
+    assert result.extra["host_intermediate_round_trips"] == 0
+    assert result.extra["persistent_l4"] is True
+    assert result.extra["vector_apucs"] == (0, 1, 2, 3)
+    assert result.extra["scalar_apucs"] == ()
+    assert result.extra["final_gather_apucs"] == (0,)
+    assert len(result.extra["phase_cycles"]["batches"]) == 5
+
+
+@pytest.mark.apu_v1_device
+def test_three_mm_apu_v1_scalar_baseline(request, apu_v1_device_gate):
+    target = build_target("apu_v1")
+    compiled = allo.compile(apu_v1.build_program(_KERNEL), target, bind_cost(target))
+    result, verdict, _record = apu_v1.run_compiled(
+        compiled,
+        _KERNEL,
+        folder=request.path.parent,
+        run_cmd=_RUN_CMD,
+    )
+    apu_v1.assert_result(result, verdict)

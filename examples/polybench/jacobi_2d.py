@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -25,7 +25,7 @@ def jacobi_2d_np(A, B, TSTEPS):
     return A, B
 
 
-def compute_A[T: (float32, int32), N: int32](A0: "T[N, N]", B0: "T[N, N]"):
+def compute_A[T: (float32, int32, uint16), N: int32](A0: "T[N, N]", B0: "T[N, N]"):
     for i0, j0 in allo.grid(N - 2, N - 2, name="A"):
         B0[i0 + 1, j0 + 1] = 0.2 * (
             A0[i0, j0 + 1]
@@ -36,7 +36,7 @@ def compute_A[T: (float32, int32), N: int32](A0: "T[N, N]", B0: "T[N, N]"):
         )
 
 
-def compute_B[T: (float32, int32), N: int32](B1: "T[N, N]", A1: "T[N, N]"):
+def compute_B[T: (float32, int32, uint16), N: int32](B1: "T[N, N]", A1: "T[N, N]"):
     for i1, j1 in allo.grid(N - 2, N - 2, name="B"):
         A1[i1 + 1, j1 + 1] = 0.2 * (
             B1[i1, j1 + 1]
@@ -47,7 +47,7 @@ def compute_B[T: (float32, int32), N: int32](B1: "T[N, N]", A1: "T[N, N]"):
         )
 
 
-def kernel_jacobi_2d[T: (float32, int32), N: int32](A: "T[N, N]", B: "T[N, N]"):
+def kernel_jacobi_2d[T: (float32, int32, uint16), N: int32](A: "T[N, N]", B: "T[N, N]"):
     for m in range(TSTEPS):
         compute_A(A, B)
         compute_B(B, A)

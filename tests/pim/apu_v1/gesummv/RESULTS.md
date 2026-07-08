@@ -1,12 +1,12 @@
 # gesummv on apu_v1 (SMALL)
 
-- correctness: **CYCLES-ONLY** -- apu_v1/gesummv: real-device run (real cycles) -- but apu_v1 fp16-MAC is OUT-OF-PARADIGM (planner SPEC-018b ruling): the silicon runs BINARY XNOR-popcount MAC (the validated bmatmul_sv/sv_lookup paradigm); a general fp16 multiply-accumulate is a DIFFERENT compute kernel (no gvml fp16-MAC primitive; the autoscheduler/cost model know only the binary {sv,sv_lookup} modes), an architectural boundary (SPEC-018b, noted for a ceiling task), NOT a fix-in-session gap. The board runs the binary LUT-MAC stub so the output cannot match the fp16 ref -- CYCLES-ONLY, never a FAIL and never a fabricated fp16 PASS
+- correctness: **PASS** -- canonical uint16 MLIR -> scalar ARC C matched repository NumPy reference bit-for-bit for y (max_abs_err=0)
 - reference: PolyBench/C 4.2.1 SMALL_DATASET (validated by `experiments/scripts/R_polybench_ref_validation.py`)
 - shapes: {'N': 90}
-- cycles: 3609445
+- cycles: 1715339
 - source: `apu_v1_device@zhang-capra-xcel.ece.cornell.edu/gsi-13.7.1`
 - run_cmd: `python -m pytest tests/pim/apu_v1/gesummv/test_gesummv_apu_v1.py -p no:cacheprovider -q`
-- timestamp: 2026-06-29T12:20:01.854323
-- tenon_commit: `ee1e52a539d6385a60d149ca238b592d9763103e`
+- timestamp: 2026-07-08T00:39:00.689070
+- tenon_commit: `6bc7474a09fa7d2d64007e6b929b6f68660729d3`
 
-Tier-1 real-device; APU v1 surfaces real numerics from the board. The emitted declarative MAC is the SPEC-018 popcount-LUT pattern, so the board runs real cycles but a general fp16 GEMV output is the SPEC-018b TODO -> CYCLES-ONLY (real cycles), never a fabricated PASS.
+Complete canonical uint16 PolyBench program lowered through MLIR to scalar C on APUC 0. This is the explicit scalar correctness baseline; other APUCs are not launched because arbitrary multi-phase programs do not yet carry cross-APUC barriers. Analytical scalar estimate=10313175 cycles.

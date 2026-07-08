@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -21,7 +21,7 @@ def durbin_np(r, y):
         sum_ = 0.0
         for i in range(k):
             sum_ = sum_ + r[k - i - 1] * y[i]
-        alpha = -1.0 * (r[k] + sum_)
+        alpha = -(r[k] + sum_)
         # alpha = alpha / beta
         for i in range(k):
             z[i] = y[i] + alpha * y[k - i - 1]
@@ -31,7 +31,7 @@ def durbin_np(r, y):
     return y
 
 
-def kernel_durbin[T: (float32, int32), N: int32](r: "T[N]", y: "T[N]"):
+def kernel_durbin[T: (float32, int32, uint16), N: int32](r: "T[N]", y: "T[N]"):
     y[0] = -r[0]
     beta: T = 1.0
     alpha: T = -r[0]
@@ -44,7 +44,7 @@ def kernel_durbin[T: (float32, int32), N: int32](r: "T[N]", y: "T[N]"):
         for i in range(k):
             sum_ = sum_ + r[k - i - 1] * y[i]
 
-        alpha = -1.0 * (r[k] + sum_)
+        alpha = -(r[k] + sum_)
         # alpha = alpha / beta # unstable
 
         for i in range(k):

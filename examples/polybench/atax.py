@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -17,7 +17,7 @@ def atax_np(A, x):
 
 
 def stage_M[
-    T: (float32, int32), M: int32, N: int32
+    T: (float32, int32, uint16), M: int32, N: int32
 ](A: "T[M, N]", x: "T[N]", out_Ax: "T[M]"):
     for m in allo.grid(M):
         for r in allo.reduction(N):
@@ -25,7 +25,7 @@ def stage_M[
 
 
 def stage_N[
-    T: (float32, int32), M: int32, N: int32
+    T: (float32, int32, uint16), M: int32, N: int32
 ](A: "T[M, N]", out_Ax: "T[M]", y: "T[N]"):
     for n in allo.grid(N):
         for k in allo.reduction(M):
@@ -33,7 +33,7 @@ def stage_N[
 
 
 def kernel_atax[
-    T: (float32, int32), M: int32, N: int32
+    T: (float32, int32, uint16), M: int32, N: int32
 ](A: "T[M, N]", x: "T[N]", y: "T[N]"):
     out_Ax: T[M] = 0
     stage_M[T, M, N](A, x, out_Ax)

@@ -588,107 +588,206 @@ def build_upmem_target():
 
 
 def build_apu_v1_target():
-    """Return the GSI APU v1 (Gemini 1) target tree per spec 003.
+    """Return the structural target for one GSI Gemini APU v1 device.
 
-    Architecture: 4 APUCs per chip. Each APUC has 16 vector registers
-    (32K bit-serial lanes, u16 each), a 32 KB L1 scratch (slot-addressed),
-    and shares a 14 GB L4 DRAM at the chip level. MAC has no fused
-    opcode -- the SV-lookup expansion (`gvml_lookup_16 + gvml_add_s16`)
-    is owned by the codegen ctx's `emit_mac_lookup` method.
+    The official GVML abstraction exposes four APUCs.  Each APUC has fifteen
+    writable 32K x 16-bit VRs plus the read-only index VR, forty-eight 32K x
+    16-bit VMRs in L1, one VIOR in L2, eight writable marker vectors, an ARC
+    controller, an asynchronous section-execution unit (SEU), and a DMA engine.
+    L4 is shared by the four APUCs.
+
+    A group is not a fixed hardware child unit: it is a power-of-two partition
+    view of a 32K-lane VR selected by each GVML call.  Workload LinearLayouts
+    map logical ``(group, lane_in_group)`` coordinates to the target-declared
+    ``lane`` axis.  This keeps group size in the programming abstraction while
+    the target remains an accurate description of available storage and
+    execution resources.
+
+    No performance numbers live here.  Real-device calibrated formulas are in
+    :mod:`allo.pim.costs.apu_v1`.
     """
 
     @allo.target("apu_v1")
     def device():
-        # Top-level: L4 DRAM is chip-shared.
-        l4 = allo.mem(size_bytes=14 * 2**30, name="l4")
+        # L4 is one shared address space, but the four APUCs have independent
+        # DMA paths into disjoint slices. Real multicore profiling confirms
+        # that one 32K stream per APUC overlaps rather than serializing.
+        l4 = allo.mem(size_bytes=14 * 2**30, ports=4, name="l4")
 
-        @allo.unit(mapping=[4])  # 4 APUCs
+        @allo.unit(mapping={"apuc": 4})
         def apuc():
-            # Per-APUC L1 scratch (32 KB SRAM, 32 slots of 1 KB).
-            l1 = allo.mem(size_bytes=32768, slots=32, slot_bytes=1024, name="l1")
-            # Per-APUC vector register file (16 VRs x 32K elements).
-            vrs = allo.reg(16, 32768, name="vrs")
+            lane_axis = {"lane": 32768}
+            # Per-APUC memory hierarchy from MICRO'25 Fig. 3 / Sec. 2.1.
+            # L3 is the ARC control-processor cache used by indexed lookup;
+            # L2 is the 32K x 16-bit DMA scratchpad.  The 48 VMRs below are
+            # the 3 MiB L1 vector register file.  These are capacities only;
+            # all transfer timing belongs to the executable cost spec.
+            l3 = allo.mem(size_bytes=1 << 20, ports=2, name="l3")
+            l2 = allo.mem(size_bytes=64 << 10, ports=2, name="l2")
+            # VR16_0..VR16_14 are writable. VR16_IDX is library-owned.
+            vrs = tuple(
+                allo.reg(32768, 16, slots=1, axes=lane_axis, name=f"vr{i}")
+                for i in range(15)
+            )
+            index_vr = allo.reg(32768, 16, slots=1, axes=lane_axis, name="index_vr")
+            vmrs = allo.reg(32768, 16, slots=48, axes=lane_axis, name="vmrs")
+            vior = allo.reg(32768, 16, slots=1, axes=lane_axis, name="vior")
+            markers = allo.reg(32768, 1, slots=8, axes=lane_axis, name="markers")
 
-            # -------- moves -------- #
-            allo.move(
-                "DMA_L4_L1",
-                src=l4,
-                dst=l1,
-                emit=lambda ctx: ctx.cmd("direct_dma_l4_to_l1_32k", dst=l1, src0=l4),
-            )
-            allo.move(
-                "DMA_L1_L4",
-                src=l1,
-                dst=l4,
-                emit=lambda ctx: ctx.cmd("direct_dma_l1_to_l4_32k", dst=l4, src0=l1),
-            )
-            allo.move(
-                "LD_VR",
-                src=l1,
-                dst=vrs,
-                emit=lambda ctx: ctx.cmd("gvml_load_16", dst=vrs, src0=l1),
-            )
-            allo.move(
-                "ST_VR",
-                src=vrs,
-                dst=l1,
-                emit=lambda ctx: ctx.cmd("gvml_store_16", dst=l1, src0=vrs),
-            )
-            # Chained two-stage moves -- preferred over splitting the
-            # walker on a list-of-names contract (spec 009 §F). Each
-            # `emit` calls ctx.cmd twice in order.
-            allo.move(
-                "LD_L4_TO_VR",
-                src=l4,
-                dst=vrs,
-                emit=lambda ctx: (
-                    ctx.cmd("direct_dma_l4_to_l1_32k", dst=l1, src0=l4),
-                    ctx.cmd("gvml_load_16", dst=vrs, src0=l1),
-                ),
-            )
-            allo.move(
-                "ST_VR_TO_L4",
-                src=vrs,
-                dst=l4,
-                emit=lambda ctx: (
-                    ctx.cmd("gvml_store_16", dst=l1, src0=vrs),
-                    ctx.cmd("direct_dma_l1_to_l4_32k", dst=l4, src0=l1),
-                ),
-            )
+            @allo.unit(capacity=1)
+            def dma():
+                any_vr = allo.any_(vrs)
+                # Target-neutral movement vocabulary used by the vector-plan
+                # realizer.  The older role-specific combined moves remain
+                # below for the grouped-FP16 compatibility path.
+                allo.move("DMA_L4_TO_L3", src=l4, dst=l3)
+                allo.move("DMA_L4_TO_L2", src=l4, dst=l2)
+                allo.move("DMA_L2_TO_L1_32K", src=l2, dst=vmrs)
+                allo.move("DMA_L4_TO_L1_32K", src=l4, dst=vmrs)
+                allo.move("DMA_L1_TO_L4_32K", src=vmrs, dst=l4)
+                allo.move("LOAD_L1_TO_VR16", src=vmrs, dst=any_vr)
+                allo.move("STORE_VR16_TO_L1", src=any_vr, dst=vmrs)
+                allo.move("PIO_L4_TO_VR16", src=l4, dst=any_vr)
+                allo.move("PIO_VR16_TO_L4", src=any_vr, dst=l4)
 
-            # -------- compute ops -------- #
-            any_vr = allo.any_([vrs])
+                # Role-specific combined helpers match the actual public
+                # direct_dma_l4_to_l1_32k + gvml_load/store sequence.
+                for role, vr, vm_index in (
+                    ("X", vrs[0], 0),
+                    ("Y", vrs[1], 1),
+                    ("ACC", vrs[2], 2),
+                ):
+                    allo.move(
+                        f"LD_{role}_L4_TO_VR",
+                        src=l4,
+                        dst=vr,
+                        emit=lambda ctx, r=role.lower(), v=vr, m=vm_index: (
+                            ctx.emit_l4_to_vr(r, v, m)
+                        ),
+                    )
+                allo.move(
+                    "ST_ACC_VR_TO_L4",
+                    src=vrs[2],
+                    dst=l4,
+                    emit=lambda ctx: ctx.emit_vr_to_l4("acc", vrs[2], 2),
+                )
 
-            allo.op(
-                "ADD",
-                src=(any_vr, any_vr),
-                dst=any_vr,
-                fn=lambda x, y: x + y,
-                emit=lambda x, y, dst, ctx: ctx.cmd(
-                    "gvml_add_s16", dst=dst, src0=x, src1=y
-                ),
-            )
+            @allo.unit(capacity=1)
+            def seu():
+                any_vr = allo.any_(vrs)
+                allo.op(
+                    "ADD",
+                    src=(any_vr, any_vr),
+                    dst=any_vr,
+                    fn=lambda x, y: x + y,
+                    emit=lambda x, y, dst, ctx: ctx.cmd(
+                        "gvml_add_f16", dst=dst, src0=x, src1=y
+                    ),
+                )
+                allo.op(
+                    "SUB",
+                    src=(any_vr, any_vr),
+                    dst=any_vr,
+                    fn=lambda x, y: x - y,
+                    emit=lambda x, y, dst, ctx: ctx.cmd(
+                        "gvml_sub_f16", dst=dst, src0=x, src1=y
+                    ),
+                )
+                allo.op(
+                    "MUL",
+                    src=(any_vr, any_vr),
+                    dst=any_vr,
+                    fn=lambda x, y: x * y,
+                    emit=lambda x, y, dst, ctx: ctx.cmd(
+                        "gvml_mul_f16", dst=dst, src0=x, src1=y
+                    ),
+                )
+                allo.op(
+                    "GROUP_REDUCE_ADD_F16",
+                    src=(any_vr,),
+                    dst=any_vr,
+                    matchable=False,
+                    fn=lambda x: x,
+                    emit=lambda x, dst, ctx: ctx.emit_group_reduce_f16(dst, x),
+                )
+                # A source-level reduction maps to one full-VR multiply and
+                # one group reduction, not a binary lookup-table surrogate.
+                allo.op(
+                    "MAC",
+                    src=(any_vr, any_vr),
+                    dst=any_vr,
+                    accumulates=True,
+                    fn=lambda x, y, acc: acc + x * y,
+                    emit=lambda x, y, acc, ctx: ctx.emit_grouped_f16_mac(
+                        acc=acc, x=x, y=y
+                    ),
+                )
 
-            allo.op(
-                "MUL",
-                src=(any_vr, any_vr),
-                dst=any_vr,
-                fn=lambda x, y: x * y,
-                emit=lambda x, y, dst, ctx: ctx.cmd(
-                    "gvml_mul_u16", dst=dst, src0=x, src1=y
-                ),
-            )
+                # Integer/logical and layout-realization primitives used by
+                # the MICRO'25 binary-matmul plans.  They are deliberately
+                # non-matchable: the region vectorizer recognizes a complete
+                # loop/access pattern and emits these typed plan operations.
+                for name, fn in (
+                    ("RESET_16", lambda x: 0),
+                    ("CPY_IMM_16", lambda x: x),
+                    ("NOT_16", lambda x: ~x),
+                    ("POPCOUNT_16", lambda x: x),
+                    ("SHL_IMM_16", lambda x: x),
+                    ("CREATE_GROUP_INDEX_16", lambda x: x),
+                    ("CREATE_SUBGROUP_INDEX_16", lambda x: x),
+                    ("LOOKUP_16", lambda x: x),
+                ):
+                    allo.op(
+                        name,
+                        src=(any_vr,),
+                        dst=any_vr,
+                        fn=fn,
+                        matchable=False,
+                    )
+                for name, fn in (
+                    ("XOR_16", lambda x, y: x ^ y),
+                    ("AND_16", lambda x, y: x & y),
+                    ("OR_16", lambda x, y: x | y),
+                    ("ADD_U16", lambda x, y: x + y),
+                    ("ADD_S16", lambda x, y: x + y),
+                    ("SUB_U16", lambda x, y: x - y),
+                    ("SUB_S16", lambda x, y: x - y),
+                    ("MUL_U16", lambda x, y: x * y),
+                    ("DUPLICATE_SUBGROUP_16", lambda x, y: x),
+                ):
+                    allo.op(
+                        name,
+                        src=(any_vr, any_vr),
+                        dst=any_vr,
+                        fn=fn,
+                        matchable=False,
+                    )
+                allo.op(
+                    "GROUP_REDUCE_ADD_U16",
+                    src=(any_vr,),
+                    dst=any_vr,
+                    fn=lambda x: x,
+                    matchable=False,
+                )
+                allo.op(
+                    "GROUP_REDUCE_ADD_S16",
+                    src=(any_vr,),
+                    dst=any_vr,
+                    fn=lambda x: x,
+                    matchable=False,
+                )
 
-            # MAC: no fused opcode. The ctx owns the lookup + add
-            # expansion (see APUv1Ctx.emit_mac_lookup).
-            allo.op(
-                "MAC",
-                src=(any_vr, any_vr),
-                dst=any_vr,
-                accumulates=True,
-                fn=lambda x, y, acc: acc + x * y,
-                emit=lambda x, y, acc, ctx: ctx.emit_mac_lookup(acc=acc, x=x, y=y),
-            )
+            @allo.unit(capacity=1)
+            def arc():
+                # The ARC issues GVML/DMA calls and can execute scalar control
+                # while an asynchronous SEU fragment is in flight.
+                allo.op(
+                    "SCALAR_C",
+                    src=(vior,),
+                    dst=vior,
+                    fn=lambda x: x,
+                    matchable=False,
+                )
 
     return device
 

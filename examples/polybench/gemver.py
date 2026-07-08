@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -30,7 +30,7 @@ def gemver_np(A, u1, u2, v1, v2, x, y, w, z, alpha, beta):
 
 
 def kernel_gemver[
-    T: (float32, int32), N: int32
+    T: (float32, int32, uint16), N: int32
 ](
     A: "T[N, N]",
     u1: "T[N]",

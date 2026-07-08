@@ -14,6 +14,11 @@ import numpy as np
 
 from .customize import customize
 from .perf import BoundCostSpec, CostSpec
+from .pim.apu_v1_program import APUv1Program, compile_apu_v1_program
+from .pim.apu_v1_vector_program import (
+    APUv1VectorCallable,
+    compile_apu_v1_vector_workload,
+)
 from .spmw_codegen import RunResult, compile_for_target
 from .spmw_match_engine import match_workload
 
@@ -200,7 +205,7 @@ def compile(
     backend=None,
     host_moves=None,
     layout=None,
-) -> CompiledCallable:
+) -> CompiledCallable | APUv1VectorCallable:
     """Compile ``workload`` for ``target`` and return a NumPy-callable object.
 
     Parameters
@@ -223,11 +228,61 @@ def compile(
     workload = _materialize_workload(workload)
     target = _materialize_target(target)
     bound_cost = _resolve_cost(target, cost)
+
+    if isinstance(workload, APUv1Program):
+        if backend not in (None, "virtual", "functional"):
+            raise ValueError(
+                "APUv1Program supports the device, virtual, or functional backend"
+            )
+        if host_moves is not None or layout is not None:
+            raise ValueError("APUv1Program owns its scalar L4 ABI")
+        return compile_apu_v1_program(
+            workload, target, cost=bound_cost, backend=backend
+        )
+
     if host_moves is None:
         host_moves = _discover_host_moves(workload)
 
     schedule = customize(workload, enable_tensor=False)
+    # Ordinary contractions use the retained-MLIR layout-plan/vector path.
+    # Dataflow regions retain the grouped ``@allo.work`` implementation.
+    if target.name == "apu_v1" and not hasattr(workload, "mappings"):
+        from .pim.contraction_analysis import NoContractionError
+
+        try:
+            return compile_apu_v1_vector_workload(
+                workload,
+                target,
+                schedule,
+                cost=bound_cost,
+                layout=layout,
+                backend=backend,
+            )
+        except NoContractionError:
+            pass
     trace = match_workload(target, schedule.module)
+    if target.name == "apu_v1":
+        extents = {}
+        for match in trace.matches:
+            if len(match.work_id) != 1:
+                raise TypeError(
+                    "APU v1 @allo.work requires scalar mapping=N; N controls "
+                    "the number of coalesced GVML groups"
+                )
+            base = match.func_name
+            for coordinate in reversed(match.work_id):
+                suffix = f"_{coordinate}"
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+            extents[base] = max(extents.get(base, 0), int(match.work_id[0]) + 1)
+        for match in trace.matches:
+            base = match.func_name
+            for coordinate in reversed(match.work_id):
+                suffix = f"_{coordinate}"
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+            match.extra["spmw_group_count"] = extents[base]
+            match.extra["coalesced_spmw_axis"] = "group"
     compiled = compile_for_target(
         target,
         trace,

@@ -128,11 +128,25 @@ class Register:
     JSSC 2023 §IV) so the allocator's capacity is tree-derived, not pasted.
     """
 
-    def __init__(self, owner, lanes, width, name=None, slots=None, ports=1):
+    def __init__(self, owner, lanes, width, name=None, slots=None, ports=1, axes=None):
         self.owner = owner
         self.lanes = lanes
         self.width = width
         self.name = name
+        self.axes = dict(axes or {})
+        if self.axes:
+            extent = 1
+            for axis, size in self.axes.items():
+                size = int(size)
+                if size <= 0:
+                    raise ValueError(
+                        f"register axis {axis!r} must have positive extent"
+                    )
+                extent *= size
+            if extent != int(lanes):
+                raise ValueError(
+                    f"register axes span {extent} lanes, but lanes={lanes}"
+                )
         # Addressable depth for register allocation; defaults to lanes.
         self.slots = lanes if slots is None else slots
         self.capacity = int(ports)
@@ -142,7 +156,8 @@ class Register:
     def __repr__(self):
         n = self.name or "<anon>"
         return (
-            f"Register({n}, lanes={self.lanes}, width={self.width}, slots={self.slots})"
+            f"Register({n}, lanes={self.lanes}, width={self.width}, "
+            f"slots={self.slots}, axes={self.axes})"
         )
 
 
@@ -516,7 +531,7 @@ def memory(*, name=None, **geometry):
 mem = memory
 
 
-def reg(lanes, width, name=None, slots=None, ports=1):
+def reg(lanes, width, name=None, slots=None, ports=1, axes=None):
     """Attach a Register to the current unit; return a handle.
 
     `slots` overrides the allocator-visible addressable depth (defaults to
@@ -525,7 +540,15 @@ def reg(lanes, width, name=None, slots=None, ports=1):
     if not _target_stack:
         raise RuntimeError("allo.reg must be called inside @allo.target/@allo.unit")
     cur = _target_stack[-1]
-    r = Register(cur, lanes, width, name=name, slots=slots, ports=ports)
+    r = Register(
+        cur,
+        lanes,
+        width,
+        name=name,
+        slots=slots,
+        ports=ports,
+        axes=axes,
+    )
     if name is not None:
         if name in cur.registers:
             raise ValueError(f"duplicate register name {name!r} on unit {cur.name!r}")

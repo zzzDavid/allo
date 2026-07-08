@@ -1,55 +1,137 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""PolyBench gemm on APU v1 -- Tier-1 REAL-DEVICE cell (task 007).
+"""Canonical hybrid GEMM plus the scalar-mapping GVML integration test."""
 
-Thin cell: build the apu_v1 target from `lib`, run the shared `gemm` workload
-on the REAL Gemini board through `lib.cell.run_cell` (which serializes board
-access, runs via the existing `_run_apu_v1` deploy/PROF_PRINT path, and checks
-real numerics vs the numpy ref), and record the verdict + real-device cycles +
-results.json/RESULTS.md/COVERAGE.tsv. Declares zero hardware (everything from
-`lib` + the shared workload). The board is gated by `@pytest.mark.apu_v1_device`
-+ the device fixture; unreachable -> BLOCKED-DEVICE, NEVER sim-substituted.
-"""
+import importlib.util
 
-from __future__ import annotations
-
+import numpy as np
 import pytest
 
-from lib import cell, reference
+import allo
+from lib import apu_v1, cell
+from lib.cost import bind_cost
 from lib.shapes import shape
+from lib.targets import build_target
 
-from workloads import gemm as _wl
-
-_KERNEL = "gemm"
-_TARGET = "apu_v1"
 _RUN_CMD = (
-    "python -m pytest tests/pim/apu_v1/gemm/test_gemm_apu_v1.py "
+    "python -m pytest tests/pim/apu_v1/gemm/test_gemm_apu_v1.py"
+    "::test_gemm_apu_v1_scalar_baseline "
     "-p no:cacheprovider -q"
 )
 
 
-@pytest.mark.apu_v1_device
-def test_gemm_apu_v1(request, apu_v1_device_gate):
-    result, verdict, _record = cell.run_cell(
-        kernel=_KERNEL, target_name=_TARGET, workload=_wl.build(),
-        folder=request.path.parent, stages=_wl.STAGES, shapes=shape(_KERNEL),
-        run_cmd=_RUN_CMD,
-        notes=(
-            "Tier-1 real-device; APU v1 surfaces real numerics from the board. "
-            "The emitted declarative MAC is the SPEC-018 popcount-LUT pattern, "
-            "so the board runs real cycles but a general fp16 GEMV output is the "
-            "SPEC-018b TODO -> CYCLES-ONLY (real cycles), never a fabricated PASS."
-        ),
+def _assert_hybrid_manifest(compiled):
+    phase = compiled.hybrid_manifest.phases[0]
+    assert [(region.function, region.kind) for region in phase.regions] == [
+        ("mm1", "vector"),
+        ("ele_add", "scalar"),
+    ]
+    assert phase.regions[1].dependencies == (phase.regions[0].id,)
+    assert phase.barriers[0].values == ("out_AB",)
+    assert phase.conversions == ()
+    assert phase.regions[0].compute_analysis.numeric_type == "ui16"
+    assert phase.regions[0].selected_plan is not None
+
+
+def test_gemm_apu_v1_hybrid_manifest(request):
+    workload = cell.load_workload(request.path.parent, "gemm")
+    target = build_target("apu_v1")
+    compiled = allo.compile(
+        workload.build(), target, bind_cost(target), backend="virtual"
     )
-    # First-class recorded verdict (spec Answer 3), never a silent skip.
-    assert verdict.status in (
-        reference.PASS, reference.CYCLES_ONLY, reference.BLOCKED_DEVICE,
-    ), verdict
-    if verdict.status in (reference.PASS, reference.CYCLES_ONLY):
-        # A real board run surfaced a real PROF_PRINT cycle count.
-        assert result.cycles is not None and result.cycles > 0, (
-            f"{_TARGET}: expected positive real-device cycles; got "
-            f"{result.cycles!r}; stdout tail: {result.stdout[-400:]}"
-        )
-    elif verdict.status == reference.BLOCKED_DEVICE:
-        assert result.cycles is None
+    _assert_hybrid_manifest(compiled)
+
+
+def test_gemm_apu_v1_hybrid_functional_uint16(request):
+    workload = cell.load_workload(request.path.parent, "gemm")
+    target = build_target("apu_v1")
+    compiled = allo.compile(
+        workload.build(), target, bind_cost(target), backend="functional"
+    )
+    _assert_hybrid_manifest(compiled)
+    case = apu_v1.get_case("gemm")
+    inputs = case.make_inputs()
+    canonical = case.run_reference(inputs)["output"]
+    run = compiled(**inputs)
+    observed = run.extra["outputs"]["output"]
+    product = (inputs["A"].astype(np.uint64) @ inputs["B"].astype(np.uint64)).astype(
+        np.uint16
+    )
+    staged = (
+        product.astype(np.uint64)
+        + np.uint64(case.scalars["beta"]) * inputs["C"].astype(np.uint64)
+    ).astype(np.uint16)
+    np.testing.assert_array_equal(observed, staged)
+    np.testing.assert_array_equal(observed, canonical)
+    assert run.extra["host_intermediate_round_trips"] == 0
+
+
+@pytest.mark.apu_v1_device
+def test_gemm_apu_v1_hybrid_device(request, apu_v1_device_gate):
+    """Four shard-local GVML tasks feed one retained ARC epilogue."""
+
+    workload = cell.load_workload(request.path.parent, "gemm")
+    target = build_target("apu_v1")
+    compiled = allo.compile(workload.build(), target, bind_cost(target))
+    _assert_hybrid_manifest(compiled)
+    case = apu_v1.get_case("gemm")
+    inputs = case.make_inputs()
+    canonical = case.run_reference(inputs)["output"]
+    product = (inputs["A"].astype(np.uint64) @ inputs["B"].astype(np.uint64)).astype(
+        np.uint16
+    )
+    staged = (
+        product.astype(np.uint64)
+        + np.uint64(case.scalars["beta"]) * inputs["C"].astype(np.uint64)
+    ).astype(np.uint16)
+
+    import conftest
+
+    with conftest.board_lock():
+        result = compiled(**inputs)
+    observed = result.extra["outputs"]["output"]
+    np.testing.assert_array_equal(observed, staged)
+    np.testing.assert_array_equal(observed, canonical)
+    assert result.cycles is not None and result.cycles > 0
+    assert result.extra["host_intermediate_round_trips"] == 0
+    assert result.extra["persistent_l4"] is True
+    assert result.extra["vector_apucs"] == (0, 1, 2, 3)
+    assert result.extra["scalar_apucs"] == (0,)
+
+
+@pytest.mark.apu_v1_device
+def test_gemm_apu_v1_scalar_baseline(request, apu_v1_device_gate):
+    target = build_target("apu_v1")
+    compiled = allo.compile(apu_v1.build_program("gemm"), target, bind_cost(target))
+    result, verdict, _record = apu_v1.run_compiled(
+        compiled, "gemm", folder=request.path.parent, run_cmd=_RUN_CMD
+    )
+    apu_v1.assert_result(result, verdict)
+
+
+@pytest.mark.apu_v1_device
+def test_gemm_scalar_mapping_eight_groups(request, apu_v1_device_gate):
+    path = request.path.parent / "group_workload.py"
+    spec = importlib.util.spec_from_file_location("apu_v1_gemm_group_workload", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    target = build_target("apu_v1")
+    compiled = allo.compile(module.build(), target, bind_cost(target))
+
+    placement = compiled.compiled.layout
+    assert placement.extra["groups_per_vr"] == 8
+    assert placement.extra["group_size"] == 4096
+
+    dims = shape("gemm")
+    rng = np.random.default_rng(7)
+    A = (rng.standard_normal((dims["P"], dims["Q"])) * 0.05).astype(np.float16)
+    B = (rng.standard_normal((dims["Q"], dims["R"])) * 0.05).astype(np.float16)
+    C = np.zeros((dims["P"], dims["R"]), dtype=np.float16)
+    expected = A.astype(np.float32) @ B.astype(np.float32)
+
+    import conftest
+
+    with conftest.board_lock():
+        result = compiled(A, B, C)
+    np.testing.assert_allclose(C, expected, rtol=2e-2, atol=2e-2)
+    assert result.cycles is not None and result.cycles > 0

@@ -37,6 +37,26 @@ void ModuleEmitterBase::emitUnary(Operation *op, const char *syntax) {
   emitNestedLoopTail(rank);
 }
 
+void ModuleEmitterBase::emitPopcount(Operation *op, unsigned bitwidth) {
+  auto rank = emitNestedLoopHead(op->getResult(0));
+  indent();
+  Value result = op->getResult(0);
+  fixUnsignedType(result, op->hasAttr("unsigned"));
+  emitValue(result, rank);
+  bool narrow = bitwidth <= 32;
+  os << " = " << (narrow ? "__builtin_popcount" : "__builtin_popcountll")
+     << "((" << (narrow ? "unsigned int" : "unsigned long long") << ")(";
+  emitValue(op->getOperand(0), rank);
+  os << ")";
+  unsigned storageWidth = narrow ? 32 : 64;
+  if (bitwidth < storageWidth)
+    os << " & ((1" << (narrow ? "u" : "ull") << " << " << bitwidth
+       << ") - 1" << (narrow ? "u" : "ull") << ")";
+  os << ");";
+  emitInfoAndNewLine(op);
+  emitNestedLoopTail(rank);
+}
+
 void ModuleEmitterBase::emitPower(Operation *op) {
   auto rank = emitNestedLoopHead(op->getResult(0));
   indent();

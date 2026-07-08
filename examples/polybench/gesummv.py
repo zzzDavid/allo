@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -23,7 +23,7 @@ def gesummv_np(A, B, x, y, alpha, beta):
 
 
 def compute_tmp[
-    T: (float32, int32), N: int32
+    T: (float32, int32, uint16), N: int32
 ](y_in: "T[N]", y_out: "T[N]", A: "T[N, N]", B: "T[N, N]", x: "T[N]", tmp: "T[N]"):
     tt: T[N] = 0.0
     yy: T[N]
@@ -37,13 +37,13 @@ def compute_tmp[
         y_out[i1] = yy[i1]
 
 
-def compute_y[T: (float32, int32), N: int32](y_in: "T[N]", y_out: "T[N]", tmp: "T[N]"):
+def compute_y[T: (float32, int32, uint16), N: int32](y_in: "T[N]", y_out: "T[N]", tmp: "T[N]"):
     for i0 in allo.grid(N, name="load"):
         y_out[i0] = alpha * tmp[i0] + beta * y_in[i0]
 
 
 def kernel_gesummv[
-    T: (float32, int32), N: int32
+    T: (float32, int32, uint16), N: int32
 ](A: "T[N, N]", B: "T[N, N]", x: "T[N]", y: "T[N]"):
     y_init: T[N] = 0
     y_fifo: T[N]

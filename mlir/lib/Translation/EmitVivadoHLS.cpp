@@ -546,6 +546,10 @@ public:
   bool visitOp(math::Log10Op op) {
     return emitter.emitUnary(op, "log10"), true;
   }
+  bool visitOp(math::CtPopOp op) {
+    auto width = llvm::cast<IntegerType>(op.getOperand().getType()).getWidth();
+    return emitter.emitPopcount(op, width), true;
+  }
   bool visitOp(arith::NegFOp op) { return emitter.emitUnary(op, "-"), true; }
 
   /// Special operations.

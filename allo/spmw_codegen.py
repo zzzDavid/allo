@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .spmw_autoschedule import Placement, autoschedule
+from .spmw_autoschedule import Placement, autoschedule, derive_layout_properties
 from .spmw_match import MatchTrace, MatchedOp
 from .spmw_target import MemoryRef, Register, SymExpr, UnitId
 
@@ -620,9 +620,7 @@ class AimCtx(CodegenContext):
                 # to a concrete int via `_eval_sym` so ramulator2 accepts it.
                 env = {
                     level: value
-                    for level, value in enumerate(
-                        getattr(self, "_active_work_id", ())
-                    )
+                    for level, value in enumerate(getattr(self, "_active_work_id", ()))
                 }
                 bank_int = _eval_sym(handle.idx, env)
                 if bank_int is None:
@@ -680,9 +678,7 @@ class AimCtx(CodegenContext):
             if mem.name == "banks":
                 env = {
                     level: value
-                    for level, value in enumerate(
-                        getattr(self, "_active_work_id", ())
-                    )
+                    for level, value in enumerate(getattr(self, "_active_work_id", ()))
                 }
                 bank_int = _eval_sym(handle.idx, env)
                 if bank_int is None:
@@ -823,9 +819,7 @@ class AimCtx(CodegenContext):
         """
         operation_name = getattr(
             getattr(self, "_active_placement", None), "extra", {}
-        ).get(
-            "operation_name", match.target_op_name
-        )
+        ).get("operation_name", match.target_op_name)
         if operation_name not in ("MAC", "MAC_ABK"):
             return
         if n_emitted != 1:
@@ -841,9 +835,14 @@ class AimCtx(CodegenContext):
         # (field order from ``_ISR_FIELDS["MAC_SBK"]``).
         last = self.cmds[-1]
         parts = last.split(" ")
-        if len(parts) < 3 or parts[0] != "AiM" or parts[1] not in (
-            "MAC_SBK",
-            "MAC_ABK",
+        if (
+            len(parts) < 3
+            or parts[0] != "AiM"
+            or parts[1]
+            not in (
+                "MAC_SBK",
+                "MAC_ABK",
+            )
         ):
             return
         # ``opsize`` counts 256-bit DRAM columns, not scalar loop iterations.
@@ -852,7 +851,15 @@ class AimCtx(CodegenContext):
         # executable AiM cost program's `_columns` formula.
         lanes = 256 // int(getattr(self.target.banks, "width", 16))
         banks = int(getattr(self.target.banks, "banks", 1))
-        divisor = lanes * (banks if parts[1] == "MAC_ABK" else 1)
+        candidate = getattr(getattr(self, "_active_placement", None), "extra", {}) or {}
+        bank_fanout = int(
+            candidate.get("bank_fanout", banks if parts[1] == "MAC_ABK" else 1)
+        )
+        if bank_fanout < 1 or bank_fanout > banks:
+            raise ValueError(
+                f"AiM layout bank_fanout {bank_fanout} exceeds {banks} banks"
+            )
+        divisor = lanes * bank_fanout
         columns = (k + divisor - 1) // divisor
         parts[2] = str(columns)
         self.cmds[-1] = " ".join(parts)
@@ -870,451 +877,6 @@ class AimCtx(CodegenContext):
 
 
 # --------------------------------------------------------------------- #
-# UPMEM (DPU, DRAM-PIM) backend
-# --------------------------------------------------------------------- #
-
-
-class UPMEMCtx(CodegenContext):
-    """Codegen ctx for UPMEM DPU tasklets.
-
-    Output is a list of C source lines on `self.cmds`. The coder
-    assembles them into a `task.c` with the standard DPU includes and
-    `main()` wrapper. Handle-to-C-name translation is table-driven so
-    workload-side memref names flow through unchanged.
-    """
-
-    def __init__(self, target):
-        super().__init__(target)
-        # Override the parent's PIMCmd list — UPMEM emits raw C text.
-        self.cmds: list[str] = []
-        # Map from handle id -> C variable name. Populated lazily the
-        # first time a handle is referenced.
-        self._name_table: dict[int, str] = {}
-        # SPEC-019: channel for the inner-K bound, set by _walk_and_emit
-        # immediately before invoking the MAC emit lambda. The fixture's
-        # MAC emit reads this to materialise an explicit C `for` loop so
-        # uPIMulator prices the actual K MACs, not a single statement.
-        self.pending_k_bound: int | None = None
-        # Tasklet-tiling lever (design 02 §3.4): the chosen placement's
-        # `n_tasklets` and the reduction trip, staged by _walk_and_emit
-        # so _run_upmem can thread them to the uPIMulator CLI (resolving
-        # the hardcoded --num_tasklets 1 / --data_prep_params 1024, T9).
-        # Defaults preserve the pre-lever single-tasklet floor.
-        self.n_tasklets: int = 1
-        self.reduction_trip: int | None = None
-        # Close-floor harness (design 02 §6c): the gemv outer-row count
-        # (= m_size), staged from the MAC match's outer enclosing loop so
-        # _run_upmem can route a gemv-shaped trace through the in-tree
-        # GEMV host at a shape-derived (m_size, n_size) footprint. None
-        # for VA-shaped traces (single enclosing loop) -> TENON path.
-        self.row_count: int | None = None
-
-    # WRAM/MRAM memory names map onto the envelope's fixed buffer
-    # parameters of `tenon_kernel(T *bufferB, T *bufferA, ...)`. Both
-    # `wram` and `mram` lower to `bufferA` because the SDK outer loop in
-    # `main_kernel1` stages MRAM into `cache_A`/`cache_B` and passes them
-    # in as `bufferA`/`bufferB`; the emitted body sees the WRAM cache.
-    # Picking `bufferA` for both inputs and accumulator is a deliberate
-    # cycle-only simplification (see SPEC-003 §7 deferred work — real
-    # role-aware naming needs the envelope to grow per workload shape).
-    _ENVELOPE_MEM_NAME = {
-        "wram": "bufferA",
-        "mram": "bufferA",
-    }
-
-    def handle_c_name(self, handle) -> str:
-        """Return the C identifier this handle lowers to.
-
-        `Register`s use their declared name (the C compiler manages real
-        register assignment). `MemoryRef`s render as
-        `<env_name>[<idx>]`. Whole `Memory`s render as `<env_name>`,
-        where `<env_name>` is the envelope-fixed buffer parameter name
-        for known memories (wram/mram -> bufferA) and a `<mem.name>_buf`
-        fallback otherwise.
-        """
-        from .spmw_target import Memory
-
-        key = id(handle)
-        cached = self._name_table.get(key)
-        if cached is not None:
-            return cached
-        if isinstance(handle, Register):
-            name = handle.name or f"reg_{key}"
-            self._name_table[key] = name
-            return name
-        if isinstance(handle, MemoryRef):
-            mem = handle.memory
-            env_name = self._ENVELOPE_MEM_NAME.get(mem.name, f"{mem.name}_buf")
-            name = f"{env_name}[{handle.idx!r}]"
-            self._name_table[key] = name
-            return name
-        if isinstance(handle, Memory):
-            env_name = self._ENVELOPE_MEM_NAME.get(handle.name, f"{handle.name}_buf")
-            self._name_table[key] = env_name
-            return env_name
-        raise NotImplementedError(
-            f"UPMEMCtx: unknown handle type {type(handle).__name__}."
-        )
-
-    def emit_c_line(self, line: str) -> None:
-        """Append one C source line."""
-        self.cmds.append(line)
-
-    def cmd(self, name: str, **fields) -> None:
-        """Compatibility shim — emits a comment line so the unified
-        walker can call `ctx.cmd(...)` if it needs to. Real emits go
-        through `emit_c_line`."""
-        rendered = " ".join(f"{k}={v!r}" for k, v in fields.items())
-        self.emit_c_line(f"/* {name} {rendered} */")
-
-    def append(self, line: str) -> None:
-        """Low-level escape hatch."""
-        self.cmds.append(line)
-
-    def resolve_moves(self, role, src_handle=None, dst_handle=None):
-        from .spmw_target import Memory
-
-        if dst_handle is None:
-            return (None, None)
-        # Whole-MRAM placements drive bulk MRAM↔WRAM copies; WRAM↔GPR is
-        # handled by the C compiler so wram/gprs placements are no-ops.
-        if isinstance(dst_handle, Memory):
-            if dst_handle.name == "mram":
-                return ("LD_MRAM", "ST_MRAM")
-            return (None, None)
-        if isinstance(dst_handle, MemoryRef):
-            mem = dst_handle.memory
-            if mem.name == "mram":
-                return ("LD_MRAM", "ST_MRAM")
-            return (None, None)
-        if isinstance(dst_handle, Register):
-            return (None, None)
-        return (None, None)
-
-    def resolve_spill_moves(self, tier, home_handle, *, n_entries=1):
-        # UPMEM spills a WRAM/GPR-resident value to MRAM: LD_MRAM reads it
-        # back (mram_read), ST_MRAM writes it out (mram_write). These are
-        # real C memory ops on the byte-verified uPIMulator run path.
-        if tier != "mram":
-            return super().resolve_spill_moves(tier, home_handle, n_entries=n_entries)
-        return ("LD_MRAM", "ST_MRAM")
-
-    def emit_mac_kreduce(self, acc, x, y, k_bound) -> None:
-        """Emit a K-reduction MAC body (SPEC-019 §4.3).
-
-        When `k_bound` is a positive int and both x/y render as
-        subscripted memrefs, emits:
-            for (unsigned k = 0; k < <k_bound>; ++k) {
-                <acc> += <x>[k] * <y>[k];
-            }
-        Otherwise falls back to the un-looped form `<acc> += <x> * <y>;`
-        — preserves pre-SPEC-019 behaviour for synthetic test traces
-        (empty enclosing_loops) and for register-operand MACs where
-        per-K subscripting is not meaningful.
-        """
-        acc_c = self.handle_c_name(acc)
-        x_c = self.handle_c_name(x)
-        y_c = self.handle_c_name(y)
-
-        # `handle_c_name` for a MemoryRef returns `<env_name>[<idx>]`;
-        # for K-reduction we want the per-K subscript inside the loop,
-        # so we strip the rendered `[<idx>]` suffix and append `[k]`.
-        # Register / whole-Memory operands have no `[...]` suffix and
-        # are not k-indexable.
-        def _kify(c_name: str):
-            if c_name.endswith("]"):
-                head = c_name.rsplit("[", 1)[0]
-                return f"{head}[k]"
-            return None
-
-        x_k = _kify(x_c)
-        y_k = _kify(y_c)
-        if k_bound is None or k_bound <= 1 or x_k is None or y_k is None:
-            # Fallback identical to the pre-SPEC-019 emit (one line). The
-            # spec's §4.5 invariant requires synthetic UPMEM traces with
-            # empty enclosing_loops to keep producing a single statement
-            # (test_target_upmem.py::test_upmem_ctx_emits_c and
-            # test_run.py's _upmem_mac_trace both assert this). The
-            # spec's helper-code sketch also emitted a `/* k bound
-            # unparseable */` debug comment in this branch; we drop it
-            # to preserve the structural one-line invariant — direct
-            # ctx.emit calls (no walker) cannot be distinguished from a
-            # walker call where the bound failed to parse without a
-            # separate channel.
-            self.emit_c_line(f"{acc_c} += {x_c} * {y_c};")
-            return
-        self.emit_c_line(f"for (unsigned k = 0; k < {k_bound}; ++k) {{")
-        self.emit_c_line(f"    {acc_c} += {x_k} * {y_k};")
-        self.emit_c_line("}")
-
-    def get_kernel_src(self) -> str:
-        """Return the assembled DPU kernel C source.
-
-        Emits a full PrIM-shaped DPU envelope (DPU_INPUT_ARGUMENTS,
-        kernels[] dispatch table, BARRIER_INIT, MRAM<->WRAM staging in
-        main_kernel1) and inlines `self.cmds` as the body of
-        `tenon_kernel(T *bufferB, T *bufferA, unsigned int l_size)`. The
-        envelope is fixed and shared across all VA-shape / MAC-shape
-        emitted kernels; a richer envelope selector is left to a
-        follow-up task (see SPEC-003 §6).
-        """
-        # Each cmd is expected to be a valid C statement (terminated `;`
-        # or a `{...}` block). UPMEMCtx.emit_c_line / .cmd already
-        # produce that.
-        body_lines = []
-        for line in self.cmds:
-            if not isinstance(line, str):
-                continue
-            body_lines.append("    " + line)
-        body = "\n".join(body_lines) if body_lines else "    /* empty body */"
-        return (
-            "#include <stdint.h>\n"
-            "#include <stdio.h>\n"
-            "#include <defs.h>\n"
-            "#include <mram.h>\n"
-            "#include <alloc.h>\n"
-            "#include <perfcounter.h>\n"
-            "#include <barrier.h>\n"
-            "\n"
-            '#include "../support/common.h"\n'
-            "\n"
-            "__host dpu_arguments_t DPU_INPUT_ARGUMENTS;\n"
-            "\n"
-            "void __attribute__ ((noinline))\n"
-            "tenon_kernel(T *bufferB, T *bufferA, unsigned int l_size) {\n"
-            "    /* === BEGIN tenon-emitted body === */\n"
-            f"{body}\n"
-            "    /* === END tenon-emitted body === */\n"
-            "}\n"
-            "\n"
-            "BARRIER_INIT(my_barrier, NR_TASKLETS);\n"
-            "\n"
-            "extern int main_kernel1(void);\n"
-            "int (*kernels[nr_kernels])(void) = {main_kernel1};\n"
-            "\n"
-            "int main(void) {\n"
-            "    return kernels[DPU_INPUT_ARGUMENTS.kernel]();\n"
-            "}\n"
-            "\n"
-            "int main_kernel1(void) {\n"
-            "    unsigned int tasklet_id = me();\n"
-            "    if (tasklet_id == 0) { mem_reset(); }\n"
-            "    barrier_wait(&my_barrier);\n"
-            "\n"
-            "    uint32_t input_size_dpu_bytes = DPU_INPUT_ARGUMENTS.size;\n"
-            "    uint32_t input_size_dpu_bytes_transfer = DPU_INPUT_ARGUMENTS.transfer_size;\n"
-            "    uint32_t base_tasklet = tasklet_id << BLOCK_SIZE_LOG2;\n"
-            "    uint32_t mram_base_addr_A = (uint32_t)DPU_MRAM_HEAP_POINTER;\n"
-            "    uint32_t mram_base_addr_B = (uint32_t)(DPU_MRAM_HEAP_POINTER + input_size_dpu_bytes_transfer);\n"
-            "\n"
-            "    T *cache_A = (T *) mem_alloc(BLOCK_SIZE);\n"
-            "    T *cache_B = (T *) mem_alloc(BLOCK_SIZE);\n"
-            "\n"
-            "    for (unsigned int byte_index = base_tasklet;\n"
-            "         byte_index < input_size_dpu_bytes;\n"
-            "         byte_index += BLOCK_SIZE * NR_TASKLETS) {\n"
-            "        uint32_t l_size_bytes = (byte_index + BLOCK_SIZE >= input_size_dpu_bytes)\n"
-            "            ? (input_size_dpu_bytes - byte_index) : BLOCK_SIZE;\n"
-            "\n"
-            "        mram_read((__mram_ptr void const*)(mram_base_addr_A + byte_index), cache_A, l_size_bytes);\n"
-            "        mram_read((__mram_ptr void const*)(mram_base_addr_B + byte_index), cache_B, l_size_bytes);\n"
-            "\n"
-            "        tenon_kernel(cache_B, cache_A, l_size_bytes >> DIV);\n"
-            "\n"
-            "        mram_write(cache_B, (__mram_ptr void*)(mram_base_addr_B + byte_index), l_size_bytes);\n"
-            "    }\n"
-            "    return 0;\n"
-            "}\n"
-        )
-
-    def get_gemv_kernel_src(self) -> str:
-        """Return a GEMV-host-compatible DPU kernel C source.
-
-        Close-floor harness (design 02 §6c): to compare the Tenon and Exo
-        columns through the SAME bespoke `GEMV` host, the Tenon kernel must
-        read the gemv argument struct (`n_size`/`n_size_pad`/`nr_rows`/
-        `max_rows`) and use the gemv MRAM layout — the VA-shaped
-        `get_kernel_src` envelope is incompatible with that host. This
-        envelope is the in-tree PrIM gemv driver structure with Tenon's
-        emitted MAC at the inner compute site (`cache_C[pos] += cache_A[j]
-        * cache_B[j]`), so the two columns issue the same instruction
-        stream (`breakdown_run` parity, the anti-flattering guard) and the
-        cycle verdict is a real kernel match, not an overhead coincidence.
-
-        This is materialisation, not a schedule decision: the runner picks
-        this envelope only for a gemv-shaped trace; no ranking/placement
-        choice changes.
-
-        """
-        spill_decl = ""
-        spill_roundtrip = ""
-        # Cross-op residency (SPEC-023 T6/D2, UPMEM): a cross-kernel activation
-        # that is RE-STAGED pays an inter-kernel MRAM round-trip of its tile
-        # (the producer ST_MRAM of the activation + the consumer LD_MRAM); a
-        # RESIDENT activation keeps it on-device and ELIDES that round-trip. So
-        # `restage` emits the round-trip and `resident` does NOT -- the
-        # uPIMulator-counted artifact differs (one MRAM write+read, ~2x1000
-        # cyc), and the resident schedule the argmin earned runs with fewer
-        # cycles. Gated on `extra["residency"] == "restage"` AND a crossing
-        # value: a single-op / non-crossing trace (residency absent or no
-        # `residency_crossing`) emits nothing -> byte-identical floor. Uses the
-        # same dedicated MRAM scratch region as the spill round-trip (one BLOCK
-        # past C); value-preserving, so the GEMV `c == W@x` check still passes.
-        # Gate on the WORKLOAD-property `_xkernel` marker (stamped by
-        # autoschedule from liveness, present on baseline AND search) so the
-        # group-local baseline ALSO emits the inter-kernel staging; only a
-        # `resident` decision (search) elides it. So: emit the round-trip when a
-        # cross-kernel activation exists AND it is not resident.
-        _rextra = getattr(active, "extra", {}) or {}
-        restage_crossing = (
-            bool(_rextra.get("_xkernel"))
-            and str(_rextra.get("residency", "restage")) != "resident"
-        )
-        # Per-tasklet scratch word: all NR_TASKLETS run this kernel concurrently,
-        # so a FIXED offset would have every tasklet write+read the same MRAM word
-        # (last-writer-wins race -> corrupted cache_C -> GEMV mismatch). Stride by
-        # `start_row * sizeof(T)` (the tasklet's row assignment, already computed
-        # above) so each tasklet owns a distinct word in the scratch region one
-        # BLOCK past C.
-        residency_decl = (
-            "    uint32_t mram_resid_addr_C = (uint32_t) "
-            "(DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T) "
-            "+ n_size_pad * sizeof(T) + max_rows * sizeof(T) "
-            "+ start_row * sizeof(T));\n"
-            if restage_crossing
-            else ""
-        )
-        residency_roundtrip = (
-            "        /* === BEGIN tenon residency restage (cross-kernel "
-            "activation -> mram and back) === */\n"
-            "        mram_write(cache_C, (__mram_ptr void *) (mram_resid_addr_C), 8);\n"
-            "        mram_read((__mram_ptr void const*) (mram_resid_addr_C), cache_C, 8);\n"
-            "        /* === END tenon residency restage === */\n"
-            if restage_crossing
-            else ""
-        )
-        return (
-            "#include <stdint.h>\n"
-            "#include <stdio.h>\n"
-            "#include <defs.h>\n"
-            "#include <mram.h>\n"
-            "#include <alloc.h>\n"
-            "#include <barrier.h>\n"
-            "#include <seqread.h>\n"
-            "\n"
-            '#include "../support/common.h"\n'
-            "\n"
-            "__host dpu_arguments_t DPU_INPUT_ARGUMENTS;\n"
-            "\n"
-            "void __attribute__ ((noinline))\n"
-            "gemv(T *bufferC, T *bufferA, T *bufferB, int pos) {\n"
-            "    /* === BEGIN tenon-emitted MAC === */\n"
-            "    for (unsigned int i = 0; i < BLOCK_SIZE / sizeof(T); i++) {\n"
-            "        bufferC[pos] += bufferA[i] * bufferB[i];\n"
-            "    }\n"
-            "    /* === END tenon-emitted MAC === */\n"
-            "    return;\n"
-            "}\n"
-            "\n"
-            "BARRIER_INIT(my_barrier, NR_TASKLETS);\n"
-            "\n"
-            "int main() {\n"
-            "    unsigned int tasklet_id = me();\n"
-            "    if (tasklet_id == 0){ mem_reset(); }\n"
-            "    barrier_wait(&my_barrier);\n"
-            "\n"
-            "    int32_t n_size = DPU_INPUT_ARGUMENTS.n_size;\n"
-            "    int32_t n_size_pad = DPU_INPUT_ARGUMENTS.n_size_pad;\n"
-            "    uint32_t nr_rows = DPU_INPUT_ARGUMENTS.nr_rows;\n"
-            "    uint32_t max_rows = DPU_INPUT_ARGUMENTS.max_rows;\n"
-            "\n"
-            "    unsigned int nrows = nr_rows;\n"
-            "    unsigned int rows_per_tasklet;\n"
-            "    unsigned int start_row;\n"
-            "    unsigned int chunks = nrows / (NR_TASKLETS + NR_TASKLETS);\n"
-            "    unsigned int dbl_chunks = chunks + chunks;\n"
-            "    rows_per_tasklet = dbl_chunks;\n"
-            "    unsigned int rest_rows = nrows % (NR_TASKLETS + NR_TASKLETS);\n"
-            "\n"
-            "    if ((tasklet_id + tasklet_id) < rest_rows)\n"
-            "        rows_per_tasklet += 2;\n"
-            "    if (rest_rows > 0) {\n"
-            "        if ((tasklet_id + tasklet_id) >= rest_rows) {\n"
-            "            unsigned int hlf_rest_rows = rest_rows >> 1;\n"
-            "            if ((rest_rows & 1) == 1)\n"
-            "                start_row = (hlf_rest_rows + 1) * (dbl_chunks + 2) + (tasklet_id - 1 - hlf_rest_rows) * dbl_chunks;\n"
-            "            else\n"
-            "                start_row = (hlf_rest_rows) * (dbl_chunks + 2) + (tasklet_id - hlf_rest_rows) * dbl_chunks;\n"
-            "        } else\n"
-            "            start_row = tasklet_id * (dbl_chunks + 2);\n"
-            "    } else {\n"
-            "        start_row = tasklet_id * (dbl_chunks);\n"
-            "    }\n"
-            "\n"
-            "    uint32_t mram_base_addr_A = (uint32_t) (DPU_MRAM_HEAP_POINTER + start_row * n_size * sizeof(T));\n"
-            "    uint32_t mram_base_addr_B = (uint32_t) (DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T));\n"
-            "    uint32_t mram_base_addr_C = (uint32_t) (DPU_MRAM_HEAP_POINTER + max_rows * n_size_pad * sizeof(T) + n_size_pad * sizeof(T) + start_row * sizeof(T));\n"
-            + spill_decl
-            + residency_decl
-            + "    uint32_t mram_temp_addr_A = mram_base_addr_A;\n"
-            "    uint32_t mram_temp_addr_B = mram_base_addr_B;\n"
-            "\n"
-            "    T *cache_A = (T *) mem_alloc(BLOCK_SIZE + 8);\n"
-            "    T *cache_A_aux = (T *) mem_alloc(8);\n"
-            "    T *cache_B = (T *) mem_alloc(BLOCK_SIZE);\n"
-            "    T *cache_C = (T *) mem_alloc(8);\n"
-            "\n"
-            "    int offset = 0;\n"
-            "\n"
-            "    for (unsigned int i = start_row; i < start_row + rows_per_tasklet; i += 2) {\n"
-            "        mram_temp_addr_A = (uint32_t) (DPU_MRAM_HEAP_POINTER + i * n_size * sizeof(T));\n"
-            "        mram_temp_addr_B = mram_base_addr_B;\n"
-            "        cache_C[0] = 0;\n"
-            "        cache_C[1] = 0;\n"
-            "        for(unsigned int pos = 0; pos < 2 && i + pos < nr_rows; pos++){\n"
-            "            int n = 0, j;\n"
-            "            for (n = 0; n < (int32_t) (n_size - (BLOCK_SIZE/sizeof(T))); n += (BLOCK_SIZE / sizeof(T))) {\n"
-            "                mram_read((__mram_ptr void const*) (mram_temp_addr_A), cache_A, BLOCK_SIZE);\n"
-            "                mram_read((__mram_ptr void const*) (mram_temp_addr_B), cache_B, BLOCK_SIZE);\n"
-            "                if(offset) {\n"
-            "                    for(unsigned int off = 0; off < (BLOCK_SIZE / sizeof(T)) - 1; off++) {\n"
-            "                        cache_A[off] = cache_A[off + 1];\n"
-            "                    }\n"
-            "                    mram_read((__mram_ptr void const*) (mram_temp_addr_A + BLOCK_SIZE), cache_A_aux, 8);\n"
-            "                    cache_A[BLOCK_SIZE / sizeof(T) - 1] = cache_A_aux[0];\n"
-            "                }\n"
-            "                gemv(cache_C, cache_A, cache_B, pos);\n"
-            "                mram_temp_addr_A += BLOCK_SIZE;\n"
-            "                mram_temp_addr_B += BLOCK_SIZE;\n"
-            "            }\n"
-            "            mram_read((__mram_ptr void const*) (mram_temp_addr_A), cache_A, BLOCK_SIZE);\n"
-            "            if(offset) {\n"
-            "                for(unsigned int off = 0; off < (BLOCK_SIZE / sizeof(T)) -1; off++) {\n"
-            "                    cache_A[off] = cache_A[off + 1];\n"
-            "                }\n"
-            "                mram_read((__mram_ptr void const*) (mram_temp_addr_A + BLOCK_SIZE ), cache_A_aux, 8);\n"
-            "                cache_A[BLOCK_SIZE / sizeof(T) - 1] = cache_A_aux[0];\n"
-            "            }\n"
-            "            mram_read((__mram_ptr void const*) (mram_temp_addr_B), cache_B, BLOCK_SIZE);\n"
-            "            for (j = 0; j < (int) (n_size - n); j++) {\n"
-            '                if(j >= (int)(BLOCK_SIZE / sizeof(T))){ printf("error\\n"); break; }\n'
-            "                cache_C[pos] += cache_A[j] * cache_B[j];\n"
-            "            }\n"
-            "            mram_temp_addr_A += (BLOCK_SIZE - ((BLOCK_SIZE / sizeof(T)) - (n_size - n)) * sizeof(T));\n"
-            "            mram_temp_addr_B = mram_base_addr_B;\n"
-            "            if(mram_temp_addr_A % 8 != 0) { offset = 1; } else { offset = 0; }\n"
-            "        }\n"
-            + spill_roundtrip
-            + residency_roundtrip
-            + "        mram_write(cache_C, (__mram_ptr void *) (mram_base_addr_C), 8);\n"
-            "        mram_base_addr_C += 2 * sizeof(T);\n"
-            "    }\n"
-            "    return 0;\n"
-            "}\n"
-        )
-
-
-# --------------------------------------------------------------------- #
 # GSI APU v1 (Gemini 1) backend
 # --------------------------------------------------------------------- #
 
@@ -1322,14 +884,9 @@ class UPMEMCtx(CodegenContext):
 class APUv1Ctx(CodegenContext):
     """Codegen ctx for GSI APU v1.
 
-    Output is a list of C-source lines on `self.cmds` (each is a single
-    GVML call). Handle-to-C translation is by canonical name: L4 maps to
-    one of `inp_L4ptr` / `wgt_L4ptr` / `out_L4ptr` keyed by the operand
-    role; L1 maps to `GVML_VM_<idx>`; VRs use either an autoscheduler-
-    bound C alias (see `bind_handle`) or fall back to the register's
-    declared name. MAC has no fused opcode -- `emit_mac_lookup` expands
-    it into `gvml_lookup_16(..., mac_lut_ptr, 256)` + `gvml_add_s16` so
-    backend emit lambdas stay one-liners.
+    Output is a list of C-source lines containing real GVML calls. Logical
+    reductions use an F2 layout-derived group size and lower to native FP16
+    multiply plus ``gvml_add_subgrps_f16_grp``.
     """
 
     _L4_PTR_BY_ROLE = {
@@ -1348,19 +905,18 @@ class APUv1Ctx(CodegenContext):
         # string keys (e.g. "mac_tmp") for scratch slots that aren't
         # backed by a Tenon handle.
         self._handle_names: dict = {}
-        # VR-tile / L4-DMA layout chosen by the autoscheduler
-        # (Placement.extra["vr_dma"]). The build harness reads this to
-        # emit the matching host L4 layout + device VR-tile DMA so host
-        # and device agree by construction (design 01 §4.3, resolves the
-        # FAIL-62/64 host/device-mismatch gotcha). Default "intra" =
-        # today's single-VR subgroup-tiled layout.
-        self.vr_dma_mode: str = "intra"
-        # Double-buffer depth chosen by the autoscheduler
-        # (Placement.extra["double_buffer"], SPEC-023 D3). False = depth 1
-        # (serialized DMA then compute, today's behaviour); True = depth 2
-        # (ping-pong: prefetch tile 0, then overlap DMA tile i+1 with compute
-        # tile i). The build harness reads this to emit the staged schedule.
-        self.double_buffer: bool = False
+        self._used_vr_names: list[str] = []
+        self.group_size: int = 32768
+        self.vector_batches: int = 1
+
+    def _enabled(self) -> bool:
+        """Emit one SPMD body; the host launches it on every APUC."""
+        work_id = tuple(getattr(self, "_active_work_id", ()))
+        return not work_id or all(int(value) == 0 for value in work_id)
+
+    def _append(self, line: str) -> None:
+        if self._enabled():
+            self.cmds.append(line)
 
     def bind_handle(self, handle, c_name: str) -> None:
         """Teach the ctx that `handle` lowers to the C identifier
@@ -1376,11 +932,17 @@ class APUv1Ctx(CodegenContext):
     def _name(self, handle, role: str = "") -> str:
         from .spmw_target import Memory
 
+        if isinstance(handle, str):
+            return self._handle_names.get(handle, f"{handle}_vr")
         cached = self._handle_names.get(id(handle))
         if cached is not None:
             return cached
         if isinstance(handle, Register):
-            return handle.name or "vr_unknown"
+            name = handle.name or "vr_unknown"
+            if name.startswith("vr") and name[2:].isdigit():
+                if name not in self._used_vr_names:
+                    self._used_vr_names.append(name)
+            return name
         if isinstance(handle, MemoryRef):
             mem = handle.memory
             if mem.name == "l4":
@@ -1409,58 +971,50 @@ class APUv1Ctx(CodegenContext):
             operands.append(self._name(src1, "src1"))
         for k, v in kwargs.items():
             operands.append(f"/* {k}= */ {v!r}")
-        self.cmds.append(name + "(" + ", ".join(operands) + ");")
+        self._append(name + "(" + ", ".join(operands) + ");")
 
-    def emit_mac_lookup(self, acc, x, y) -> None:
-        """Expand MAC into the GSI sv-lookup pattern:
+    @staticmethod
+    def _group_enum(group_size: int) -> str:
+        if group_size <= 0 or group_size > 32768 or group_size & (group_size - 1):
+            raise ValueError(f"invalid GVML group size {group_size}")
+        suffix = f"{group_size // 1024}K" if group_size >= 1024 else str(group_size)
+        return f"GVML_P2_{suffix}"
 
-            gvml_lookup_16(<tmp>, <x>, mac_lut_ptr, 256);
-            gvml_add_s16(<acc>, <acc>, <tmp>);
+    def emit_l4_to_vr(self, role: str, vr, vm_index: int) -> None:
+        pointer = self._L4_PTR_BY_ROLE[role]
+        if self.vector_batches > 1:
+            pointer = f"({pointer} + batch * 32768)"
+        vr_name = self._name(vr, role)
+        self._append(f"direct_dma_l4_to_l1_32k(GVML_VM_{vm_index}, {pointer});")
+        self._append(f"gvml_load_16({vr_name}, GVML_VM_{vm_index});")
 
-        Semantics: `<tmp>[i] = mac_lut_ptr[<x>[i]]`. The autoscheduler
-        must pre-pack the byte-pair index into `x` before this MAC fires
-        (today's matcher passes the same VR for `x` and `y`, so binary
-        MAC must encode both operands into the `x` VR upstream of this
-        call -- out of scope for SPEC-018; a TODO for SPEC-018b).
+    def emit_vr_to_l4(self, role: str, vr, vm_index: int) -> None:
+        pointer = self._L4_PTR_BY_ROLE[role]
+        if self.vector_batches > 1:
+            pointer = f"({pointer} + batch * 32768)"
+        vr_name = self._name(vr, role)
+        self._append(f"gvml_store_16(GVML_VM_{vm_index}, {vr_name});")
+        self._append(f"direct_dma_l1_to_l4_32k({pointer}, GVML_VM_{vm_index});")
 
-        `mac_lut_ptr` resolves to a 256-entry `uint16_t` popcount table
-        declared in the build harness's emitted `device.c`. The LUT lives
-        inline in the cmd struct (`data->mac_lut`); see SPEC-018 §3.1-§3.3.
-        Length is fixed at 256.
+    def emit_group_reduce_f16(self, dst, src) -> None:
+        dst_name = self._name(dst, "acc")
+        src_name = self._name(src, "x")
+        group = self._group_enum(self.group_size)
+        self._append(
+            "gvml_add_subgrps_f16_grp("
+            f"{dst_name}, {src_name}, {group}, GVML_P2_1, 0, "
+            "GVML_VM_3, reduce_tmp_vr);"
+        )
 
-        The autoscheduler may reserve a scratch VR alias via
-        `bind_handle("mac_tmp", "<alias>")`; otherwise the canonical name
-        `mac_tmp_vr` is used. `y` is accepted for signature symmetry with
-        `emit_mac_mul_add` but is not referenced -- the byte pair is
-        packed into `x` upstream.
-        """
-        tmp_name = self._handle_names.get("mac_tmp", "mac_tmp_vr")
-        acc_n = self._name(acc, "acc")
-        x_n = self._name(x, "x")
-        self.cmds.append(f"gvml_lookup_16({tmp_name}, {x_n}, mac_lut_ptr, 256);")
-        self.cmds.append(f"gvml_add_s16({acc_n}, {acc_n}, {tmp_name});")
-
-    def emit_mac_mul_add(self, acc, x, y) -> None:
-        """Expand MAC into the raw SV-mode pattern (no lookup table):
-
-            gvml_mul_u16(<tmp>, <x>, <y>);
-            gvml_add_s16(<acc>, <acc>, <tmp>);
-
-        Selected by the walker when `placement.mode == "sv"` (per
-        SPEC-009 §2). Cost-modelled at 18 cyc/MAC vs 8 cyc/MAC for
-        the lookup expansion, so autoschedule prefers `emit_mac_lookup`
-        unless the user overrides.
-        """
-        tmp_name = self._handle_names.get("mac_tmp", "mac_tmp_vr")
-        acc_n = self._name(acc, "acc")
-        x_n = self._name(x, "x")
-        y_n = self._name(y, "y")
-        self.cmds.append(f"gvml_mul_u16({tmp_name}, {x_n}, {y_n});")
-        self.cmds.append(f"gvml_add_s16({acc_n}, {acc_n}, {tmp_name});")
+    def emit_grouped_f16_mac(self, acc, x, y) -> None:
+        self._append(
+            f"gvml_mul_f16(mac_tmp_vr, {self._name(x, 'x')}, " f"{self._name(y, 'y')});"
+        )
+        self.emit_group_reduce_f16(acc, "mac_tmp")
 
     def append(self, line: str) -> None:
         """Low-level escape hatch -- append a raw C source line."""
-        self.cmds.append(line)
+        self._append(line)
 
     def iter_vr_aliases(self) -> list[tuple[str, str]]:
         """Return [(c_name, gvml_vr_enum), ...] in bind order.
@@ -1472,8 +1026,15 @@ class APUv1Ctx(CodegenContext):
         (vrs + mac_tmp_vr) so the emitted body still compiles.
         """
         out: list[tuple[str, str]] = []
-        for i, (_key, c_name) in enumerate(self._handle_names.items()):
-            out.append((c_name, f"GVML_VR16_{i}"))
+        used_indices = set()
+        for name in self._used_vr_names:
+            index = int(name[2:])
+            used_indices.add(index)
+            out.append((name, f"GVML_VR16_{index}"))
+        for temporary in ("mac_tmp_vr", "reduce_tmp_vr"):
+            index = next(i for i in range(15) if i not in used_indices)
+            used_indices.add(index)
+            out.append((temporary, f"GVML_VR16_{index}"))
         return out
 
     def iter_l4_roles(self) -> list[str]:
@@ -1490,35 +1051,18 @@ class APUv1Ctx(CodegenContext):
         return [n for n in role_order if n in names]
 
     def resolve_moves(self, role, src_handle=None, dst_handle=None):
-        from .spmw_target import Memory
-
         if dst_handle is None:
             return (None, None)
-        # Chained L4↔VR moves cover the two-stage DMA + LD/ST path; VR
-        # placements are no-ops (operands already live in VRs).
-        if isinstance(dst_handle, Memory):
-            if dst_handle.name == "l4":
-                return ("LD_L4_TO_VR", "ST_VR_TO_L4")
-            if dst_handle.name == "l1":
-                return ("LD_VR", "ST_VR")
-            return (None, None)
-        if isinstance(dst_handle, MemoryRef):
-            mem = dst_handle.memory
-            if mem.name == "l4":
-                return ("LD_L4_TO_VR", "ST_VR_TO_L4")
-            if mem.name == "l1":
-                return ("LD_VR", "ST_VR")
-            return (None, None)
         if isinstance(dst_handle, Register):
-            return (None, None)
+            role_name = {"x": "X", "y": "Y", "acc": "ACC", "dst": "ACC"}.get(role)
+            if role_name is None:
+                return (None, None)
+            store = "ST_ACC_VR_TO_L4" if role_name == "ACC" else None
+            return (f"LD_{role_name}_L4_TO_VR", store)
         return (None, None)
 
     def resolve_spill_moves(self, tier, home_handle, *, n_entries=1):
-        # APU v1 spills a VR-resident value to L1: LD_VR loads it back into
-        # the VR (gvml_load_16), ST_VR stores it out (gvml_store_16).
-        if tier != "l1":
-            return super().resolve_spill_moves(tier, home_handle, n_entries=n_entries)
-        return ("LD_VR", "ST_VR")
+        return super().resolve_spill_moves(tier, home_handle, n_entries=n_entries)
 
 
 # --------------------------------------------------------------------- #
@@ -1897,17 +1441,26 @@ def _walk_and_emit(
     from .spmw_autoschedule import _bucket_for_autoschedule, _trace_memrefs_by_role
 
     layout_by_func: dict[str, Placement] = {}
-    for (func_name, _), layout in zip(_bucket_for_autoschedule(trace), layouts):
+    for (func_name, matches), layout in zip(_bucket_for_autoschedule(trace), layouts):
         layout_by_func[func_name] = layout
+        for match in matches:
+            layout_by_func[match.func_name] = layout
 
     def _emit_one_bucket(matches: list[MatchedOp]) -> None:
         # All matches in one work-id bucket share a func_name (work_id
         # is parsed from func_name in the matcher). Take the first.
         func_name = matches[0].func_name
         layout = layout_by_func[func_name]
+        # Make backend decisions derived from the carried F2 layout visible to
+        # operation dispatch and backend contexts. This deliberately
+        # overwrites stale duplicated fields on hand-authored placements.
+        layout.extra = derive_layout_properties(target, layout)
         # Backend contexts use this coordinate to materialise symbolic target
         # handles (for AiM: channel mask and 4*bank_group+bank index).
         ctx._active_work_id = tuple(matches[0].work_id)
+        if isinstance(ctx, APUv1Ctx):
+            ctx.group_size = int(layout.extra.get("group_size", 32768))
+            ctx.vector_batches = max(1, int(layout.extra.get("n_out_tiles", 1)))
 
         # Per-bucket role -> memref must come from THIS bucket's matches,
         # not the full trace -- that was the root bug for multi-kernel
@@ -1923,9 +1476,7 @@ def _walk_and_emit(
         _schedule_moves(target, ctx, layout, role_to_memref, phase="pre")
         for match in matches:
             op_obj = target.op(
-                getattr(layout, "extra", {}).get(
-                    "operation_name", match.target_op_name
-                )
+                getattr(layout, "extra", {}).get("operation_name", match.target_op_name)
             )
             emit = getattr(op_obj, "emit", None)
             if emit is None:
@@ -1939,62 +1490,7 @@ def _walk_and_emit(
             ctx._active_placement = layout
             ctx._active_bindings = bindings
             before = len(ctx.cmds)
-            # SPEC-019: UPMEM MAC needs the inner-K bound on the ctx so
-            # the fixture emit lambda can materialise an explicit C loop
-            # (uPIMulator prices per DPU instruction; without the loop
-            # the body is two statements). Gated on isinstance to keep
-            # other backends inert.
-            if isinstance(ctx, UPMEMCtx) and match.target_op_name == "MAC":
-                inner = match.enclosing_loops[-1] if match.enclosing_loops else None
-                ctx.pending_k_bound = (
-                    _parse_loop_bound(inner[2]) if inner is not None else None
-                )
-                # Tasklet-tiling lever (design 02 §3.4): read the chosen
-                # placement's `n_tasklets` field (never re-derive it) and
-                # the reduction trip the runner drives at. Codegen only
-                # materialises the autoscheduler's choice.
-                ctx.n_tasklets = getattr(layout, "extra", {}).get("n_tasklets", 1)
-                if ctx.pending_k_bound is not None:
-                    ctx.reduction_trip = ctx.pending_k_bound
-                # Close-floor harness (design 02 §6c): stage the gemv
-                # outer-row count (m_size) from the MAC's outer enclosing
-                # loop. A gemv trace nests [M-loop, K-loop]; a VA trace
-                # has a single loop, so row_count stays None and the
-                # runner keeps the TENON path. Shape-derived, not literal.
-                if len(match.enclosing_loops) >= 2:
-                    ctx.row_count = _parse_loop_bound(match.enclosing_loops[-2][2])
-            elif hasattr(ctx, "pending_k_bound"):
-                ctx.pending_k_bound = None
-            # APU v1 VR-tile/DMA materialisation (design 01 §4.3): read the
-            # chosen `vr_dma` off the placement and stage it on the ctx so
-            # the build harness emits the matching host+device layout. We
-            # only materialise argmin's choice -- never re-derive intra-vs-
-            # inter from the workload. Default-missing key keeps "intra".
-            if isinstance(ctx, APUv1Ctx):
-                ctx.vr_dma_mode = getattr(layout, "extra", {}).get("vr_dma", "intra")
-                # Double-buffer depth (SPEC-023 D3): stage the chosen depth so
-                # the build harness emits the ping-pong staged-DMA/compute
-                # (prologue prefetch of tile 0, then DMA tile i+1 while
-                # computing tile i). Decision in argmin; mechanism here. We
-                # only materialise argmin's choice -- never re-derive depth.
-                # Default-missing key keeps depth 1 (serialized, byte-identical).
-                ctx.double_buffer = bool(
-                    getattr(layout, "extra", {}).get("double_buffer", False)
-                )
-            # APU v1 MAC dispatch: `placement.mode == "sv"` overrides the
-            # fixture's `emit_mac_lookup` lambda and emits raw MUL+ADD
-            # (SPEC-009 §2). Other backends ignore `mode`.
-            if (
-                isinstance(ctx, APUv1Ctx)
-                and match.target_op_name == "MAC"
-                and getattr(layout, "mode", "") == "sv"
-            ):
-                ctx.emit_mac_mul_add(
-                    acc=bindings["acc"],
-                    x=bindings["x"],
-                    y=bindings["y"],
-                )
-            elif op_obj.accumulates:
+            if op_obj.accumulates:
                 emit(bindings["x"], bindings["y"], bindings["acc"], ctx)
             elif len(inspect.signature(op_obj.fn).parameters) == 1:
                 # Unary op (e.g. RELU): single source + store dst.
@@ -2005,7 +1501,15 @@ def _walk_and_emit(
             ctx.after_match(match, n_emitted)
         _schedule_moves(target, ctx, layout, role_to_memref, phase="post")
 
-    buckets = _bucket_by_work_id(trace)
+    if isinstance(ctx, APUv1Ctx) and any(
+        match.extra.get("coalesced_spmw_axis") == "group" for match in trace.matches
+    ):
+        buckets = [
+            (tuple(matches[0].work_id), matches)
+            for _name, matches in _bucket_for_autoschedule(trace)
+        ]
+    else:
+        buckets = _bucket_by_work_id(trace)
 
     # Lever 3 (SPEC-025 §5): the CRF-issue mode is a decided property of the
     # layout (`extra["crf_issue"]`, set by argmin). Codegen only
@@ -2112,13 +1616,6 @@ _DEFAULT_PIMSIM_ROOT = (
     Path(__file__).resolve().parents[2] / "simulators" / "PIMSimulator"
 )
 _DEFAULT_AIM_ROOT = Path(__file__).resolve().parents[2] / "simulators" / "aim_simulator"
-_DEFAULT_UPIM_ROOT = (
-    Path(__file__).resolve().parents[2]
-    / "simulators"
-    / "uPIMulator"
-    / "golang"
-    / "uPIMulator"
-)
 
 
 def _pimsim_root() -> Path:
@@ -2127,10 +1624,6 @@ def _pimsim_root() -> Path:
 
 def _aim_root() -> Path:
     return Path(os.environ.get("AIM_SIMULATOR_ROOT", str(_DEFAULT_AIM_ROOT)))
-
-
-def _upim_root() -> Path:
-    return Path(os.environ.get("UPIMULATOR_ROOT", str(_DEFAULT_UPIM_ROOT)))
 
 
 def _docker_available() -> bool:
@@ -3223,177 +2716,34 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
     )
 
 
-def _run_upmem(compiled: "Compiled", **inputs) -> RunResult:
-    """Run a compiled UPMEM artifact through the Go uPIMulator.
-
-    The emitted DPU source from `UPMEMCtx.get_kernel_src()` is written
-    into the persistent TENON benchmark slot at
-    `benchmark/TENON/dpu/task.c` (registered in uPIMulator's CMake +
-    assembler maps; see SPEC-003 §3). uPIMulator is then invoked with
-    `--benchmark TENON`, which triggers a CMake re-build of just that
-    `task.c` before the simulation. Cycle counts therefore come from
-    the emitted kernel, not a PrIM proxy.
-    """
-    root = _upim_root()
-    binary = root / "build" / "uPIMulator"
-    if not binary.exists():
-        return RunResult(
-            cycles=None,
-            stdout=f"simulator unavailable: {binary} not found",
-            backend="upmem",
-        )
-
-    ctx = getattr(compiled, "_ctx", None)
-
-    # Tasklet-tiling lever (design 02 §3.4): drive the simulator at the
-    # autoscheduler-chosen tasklet count rather than the old hardcoded
-    # `1` (resolves tension T9). Codegen only reads the staged field; it
-    # never re-derives the choice.
-    num_tasklets = int(getattr(ctx, "n_tasklets", 1) or 1)
-
-    # Close-floor harness routing (design 02 §6c): a gemv-shaped trace
-    # (outer M-loop + inner K-loop -> both row_count and reduction_trip
-    # staged) runs through the in-tree bespoke GEMV host so the Tenon
-    # column and the Exo column share ONE overhead path and the ~1.13x
-    # common-mode harness offset cancels. The (m_size, n_size) footprint
-    # is shape-derived from the ctx, NOT a literal. A VA-shaped trace
-    # (single loop -> row_count None) keeps the TENON drop-slot. This is
-    # a measurement-harness branch on the trace *shape*; it carries no
-    # schedule decision. Retires the §6b data_prep_params=1024 debt.
-    row_count = getattr(ctx, "row_count", None)
-    reduction_trip = getattr(ctx, "reduction_trip", None)
-    is_gemv = row_count is not None and reduction_trip is not None
-    _GEMV_SLOT, _VA_SLOT = "GEMV", "TENON"
-    if is_gemv:
-        benchmark = _GEMV_SLOT
-        # GEMV host requires m_size % num_dpus == 0 (gemv.go:39); with a
-        # single DPU any row count is legal. data_prep = "<m_size>,<n_size>".
-        data_prep_params = f"{int(row_count)},{int(reduction_trip)}"
-    else:
-        benchmark = _VA_SLOT
-        # VA input buffer size; the byte-loop strides this across
-        # tasklets (the TENON envelope). Held for the non-gemv path.
-        data_prep_params = "1024"
-
-    # Render the DPU envelope matching the chosen host. The GEMV slot
-    # needs the gemv argument struct + MRAM layout (get_gemv_kernel_src);
-    # the VA/TENON slot uses the byte-loop envelope (get_kernel_src).
-    if ctx is not None and is_gemv and hasattr(ctx, "get_gemv_kernel_src"):
-        kernel_src = ctx.get_gemv_kernel_src()
-    elif ctx is not None and hasattr(ctx, "get_kernel_src"):
-        kernel_src = ctx.get_kernel_src()
-    else:
-        kernel_src = "\n".join(c for c in compiled.cmds if isinstance(c, str))
-
-    if not kernel_src.strip():
-        raise RuntimeError(
-            "UPMEM: _run_upmem received empty kernel source; "
-            "compile_for_target produced no commands"
-        )
-
-    slot_dir = root / "benchmark" / benchmark / "dpu"
-    if not slot_dir.exists():
-        # uPIMulator binary is present but the benchmark slot has not
-        # been provisioned in this checkout. Skip cleanly rather than
-        # raise (matches the `_sim_unavailable` branch in e2e tests).
-        return RunResult(
-            cycles=None,
-            stdout=(
-                f"simulator unavailable: {benchmark} benchmark slot not "
-                f"provisioned at {slot_dir}; rebuild uPIMulator with "
-                f"the {benchmark} benchmark registered."
-            ),
-            backend="upmem",
-        )
-    task_c = slot_dir / "task.c"
-    task_c.write_text(kernel_src, encoding="utf-8")
-
-    with tempfile.TemporaryDirectory() as td:
-        bin_dir = Path(td) / "bin"
-        bin_dir.mkdir()
-        try:
-            proc = subprocess.run(
-                [
-                    str(binary),
-                    "--root_dirpath",
-                    str(root),
-                    "--bin_dirpath",
-                    str(bin_dir),
-                    "--benchmark",
-                    benchmark,
-                    "--num_channels",
-                    "1",
-                    "--num_dpus_per_rank",
-                    "1",
-                    "--num_tasklets",
-                    str(num_tasklets),
-                    "--data_prep_params",
-                    data_prep_params,
-                ],
-                capture_output=True,
-                timeout=600,
-                check=False,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(f"UPMEM uPIMulator invocation failed: {exc}") from exc
-
-        stdout = proc.stdout.decode("utf-8", errors="replace")
-        stderr = proc.stderr.decode("utf-8", errors="replace")
-        combined = stdout + ("\n" + stderr if stderr else "")
-        # uPIMulator prints "cycle: <N>" in log.txt; also tail it if present.
-        log_path = bin_dir / "log.txt"
-        if log_path.exists():
-            combined += "\n" + log_path.read_text(errors="replace")
-        cycle_match = re.search(r"cycle[s]?\s*[:=]\s*(\d+)", combined, re.IGNORECASE)
-        if cycle_match is None:
-            raise RuntimeError(
-                "UPMEM uPIMulator returned but stdout/log missing "
-                "'cycle: ...' line; tail: " + combined[-400:]
-            )
-        cycles = int(cycle_match.group(1))
-        return RunResult(
-            cycles=cycles,
-            stdout=combined,
-            backend="upmem",
-            extra={
-                "kernel_src": kernel_src,
-                "benchmark": benchmark,
-                "data_prep_params": data_prep_params,
-                "num_tasklets": num_tasklets,
-                "returncode": proc.returncode,
-            },
-        )
-
-
 def _apu_v1_kernel_src(compiled: "Compiled") -> str:
     return "\n".join(str(c) for c in compiled.cmds if isinstance(c, str))
 
 
 def _parse_apu_v1_prof_print(text: str) -> int | None:
-    """Pull the `crun` integer from the `total` PROF_PRINT line. APU v1
-    hardware emits fields with a colon separator, e.g.
+    """Return the four-APUC parallel makespan from ``total`` PROF_PRINTs.
+
+    Hardware emits fields with a colon separator, e.g.
     `ARCT[0]: ***  total - hits:1 seu:374 crun:170227 iall:37027 ...`.
-    Accept `=` as well for forward compatibility. Returns None if no match.
+    ``ledag flo`` can include older buffered records, so only the final four
+    totals belong to the batch just launched. Those APUCs run concurrently;
+    their cost is the maximum CRUN, not their sum. Accept `=` as well for
+    forward compatibility. Returns None if no match.
     """
-    # Prefer the explicit `total` line; fall back to the first `crun`
-    # we find anywhere if PROF_PRINT names diverge in future kernels.
-    m = re.search(r"\btotal\b[^\n]*?\bcrun\s*[:=]\s*(\d+)", text)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"\bcrun\s*[:=]\s*(\d+)", text)
-    if m:
-        return int(m.group(1))
+    totals = re.findall(r"\btotal\b[^\n]*?\bcrun\s*[:=]\s*(\d+)", text)
+    if totals:
+        return max(int(value) for value in totals[-4:])
+    counters = re.findall(r"\bcrun\s*[:=]\s*(\d+)", text)
+    if counters:
+        return max(int(value) for value in counters[-4:])
     return None
 
 
 def _apu_v1_output_specs(compiled: "Compiled", inputs: dict) -> dict:
     """Derive `output_specs: {role: (shape, dtype)}` from the trace.
 
-    For each `MatchedOp` whose loop-carried `acc` operand defines an
-    output memref (`result_memref_name`), we take the shape and dtype
-    from a same-named input if present, else fall back to the largest
-    input's shape and uint16 dtype. APU v1 today is uint16-only
-    (`_32K` constant) so the dtype fallback is safe.
+    This is the fallback for non-grouped operations. Grouped contractions use
+    `_apu_v1_prepare_io`, which knows the logical output shape and FP16 ABI.
     """
     import numpy as np
 
@@ -3413,6 +2763,8 @@ def _apu_v1_output_specs(compiled: "Compiled", inputs: dict) -> dict:
 
     for m in trace.matches:
         name = m.result_memref_name
+        if name and name.startswith("local_"):
+            name = name[len("local_") :]
         if not name or name in out:
             continue
         # Prefer shape/dtype from an input that happens to share the name.
@@ -3428,12 +2780,11 @@ def _apu_v1_output_specs(compiled: "Compiled", inputs: dict) -> dict:
 
 
 def _apu_v1_prepare_io(compiled: "Compiled", inputs: dict):
-    """Validate + normalize `inputs` for the APU v1 build harness.
+    """Normalize inputs and realize the grouped-contraction callable ABI.
 
-    The user may pass workload-side memref names (e.g. ``local_W``) or
-    the shorter role names (``x``, ``y``). We pass the dict through
-    untouched today, since the build harness keys struct fields by the
-    actual `inputs` keys.
+    Dense contractions are packed one output dot product per GVML group, split
+    over four APUCs, and streamed in 32K-lane batches. The returned metadata
+    drives group-head gathering after execution.
     """
     import numpy as np
 
@@ -3448,8 +2799,102 @@ def _apu_v1_prepare_io(compiled: "Compiled", inputs: dict):
         # as their raw bytes (host.c writes them straight into L4) so
         # we don't impose a dtype cast here.
         normalized[name] = arr
+
+    layout = getattr(compiled, "layout", None)
+    if isinstance(layout, list):
+        layout = layout[0] if layout else None
+    extra = getattr(layout, "extra", {}) or {}
+    group_size = int(extra.get("group_size", 0) or 0)
+    batches = max(1, int(extra.get("n_out_tiles", 1)))
+    if group_size and len(normalized) >= 2:
+        trace_output_names = []
+        operand_names = []
+        for match in compiled.trace.matches:
+            name = match.result_memref_name
+            if name:
+                name = name[len("local_") :] if name.startswith("local_") else name
+                if name not in trace_output_names:
+                    trace_output_names.append(name)
+            for operand in match.operands:
+                if operand.role not in ("x", "y") or not operand.memref_name:
+                    continue
+                operand_name = operand.memref_name
+                if operand_name.startswith("local_"):
+                    operand_name = operand_name[len("local_") :]
+                if operand_name not in operand_names:
+                    operand_names.append(operand_name)
+        # Reduction matchers name the loop-carried scalar ``acc`` as the
+        # result.  At the callable boundary, the real output is the source
+        # argument not bound to semantic x/y (C in GEMM, y in GEMV).
+        abi_output_names = [name for name in normalized if name not in operand_names]
+        operands = [
+            (name, arr)
+            for name, arr in normalized.items()
+            if name in operand_names and arr.ndim > 0
+        ]
+        matrices = [(name, arr) for name, arr in operands if arr.ndim == 2]
+        if len(matrices) >= 2:
+            # Grouped GEMM: one group is one output dot product.  Rows are
+            # partitioned over four APUCs; each core may stream several VRs.
+            (lhs_name, lhs), (rhs_name, rhs) = matrices[:2]
+            if lhs.shape[1] == rhs.shape[0]:
+                if lhs.dtype != np.float16 or rhs.dtype != np.float16:
+                    raise ValueError(
+                        "APU v1 grouped contractions require float16 inputs; "
+                        f"got {lhs.dtype} and {rhs.dtype}"
+                    )
+                rows, reduction = lhs.shape
+                cols = rhs.shape[1]
+                if reduction > group_size:
+                    raise ValueError("APU v1 group is smaller than GEMM reduction")
+                groups_per_vr = 32768 // group_size
+                rows_per_core = (rows + 3) // 4
+                required = (rows_per_core * cols + groups_per_vr - 1) // groups_per_vr
+                batches = max(batches, required)
+                packed_lhs = np.zeros((4, batches, 32768), dtype=lhs.dtype)
+                packed_rhs = np.zeros((4, batches, 32768), dtype=rhs.dtype)
+                for core in range(4):
+                    row0 = core * rows_per_core
+                    pairs = [
+                        (row, col)
+                        for row in range(row0, min(rows, row0 + rows_per_core))
+                        for col in range(cols)
+                    ]
+                    for output_index, (row, col) in enumerate(pairs):
+                        batch, group = divmod(output_index, groups_per_vr)
+                        base = group * group_size
+                        packed_lhs[core, batch, base : base + reduction] = lhs[row, :]
+                        packed_rhs[core, batch, base : base + reduction] = rhs[:, col]
+                normalized = {
+                    lhs_name: packed_lhs.reshape(-1),
+                    rhs_name: packed_rhs.reshape(-1),
+                }
+                output_name = (
+                    abi_output_names[0]
+                    if abi_output_names
+                    else trace_output_names[0] if trace_output_names else "output"
+                )
+                output_specs = {output_name: ((4, batches, 32768), np.dtype(lhs.dtype))}
+                return (
+                    normalized,
+                    output_specs,
+                    {
+                        "kind": "gemm",
+                        "output": output_name,
+                        "logical_shape": (rows, cols),
+                        "rows_per_core": rows_per_core,
+                        "group_size": group_size,
+                        "groups_per_vr": groups_per_vr,
+                    },
+                )
+
+        raise NotImplementedError(
+            "APU v1 physical execution currently supports a dense FP16 matrix "
+            "contraction with lhs.shape[1] == rhs.shape[0]"
+        )
+
     output_specs = _apu_v1_output_specs(compiled, normalized)
-    return normalized, output_specs
+    return normalized, output_specs, None
 
 
 def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
@@ -3493,7 +2938,7 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
     try:
         # prepare_io is build-harness Python; ValueError here is a Tenon
         # bug or user-input contract violation, not an env skip.
-        inputs_np, output_specs = _apu_v1_prepare_io(compiled, inputs)
+        inputs_np, output_specs, packing = _apu_v1_prepare_io(compiled, inputs)
 
         # Write each input to <tmpdir>/in_<role>.bin so host.c can fread it.
         input_bin_paths: dict[str, str] = {}
@@ -3575,6 +3020,11 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
         stdout_text = proc.stdout.decode("utf-8", errors="replace")
         stderr_text = proc.stderr.decode("utf-8", errors="replace")
         binary_output = stdout_text + ("\n" + stderr_text if stderr_text else "")
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"APU v1 device program failed with exit code {proc.returncode}:\n"
+                f"{binary_output[-2000:]}\n--- project_dir: {project_dir}"
+            )
 
         # PROF_PRINT lines go to the device system log (the ledag
         # channel), not to the binary's stdout. Drain that channel via
@@ -3627,6 +3077,25 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
             p = Path(output_bin_paths[role])
             if p.exists():
                 outputs[role] = np.fromfile(str(p), dtype=dtype).reshape(shape)
+
+        if packing and packing["kind"] == "gemm":
+            packed = outputs[packing["output"]]
+            rows, cols = packing["logical_shape"]
+            rows_per_core = packing["rows_per_core"]
+            group_size = packing["group_size"]
+            groups_per_vr = packing["groups_per_vr"]
+            logical = np.zeros((rows, cols), dtype=packed.dtype)
+            for core in range(4):
+                row0 = core * rows_per_core
+                pairs = [
+                    (row, col)
+                    for row in range(row0, min(rows, row0 + rows_per_core))
+                    for col in range(cols)
+                ]
+                for output_index, (row, col) in enumerate(pairs):
+                    batch, group = divmod(output_index, groups_per_vr)
+                    logical[row, col] = packed[core, batch, group * group_size]
+            outputs[packing["output"]] = logical
 
         return RunResult(
             cycles=cycles,
@@ -3694,7 +3163,6 @@ def _run_virtual(compiled: "Compiled", **inputs) -> RunResult:
 _BACKEND_RUN = {
     "samsung_hbm_pim": _run_samsung,
     "aim": _run_aim,
-    "upmem": _run_upmem,
     "apu_v1": _run_apu_v1,
     "apu_v2": _run_apu_v2,
     "virtual": _run_virtual,
@@ -3722,6 +3190,9 @@ class Compiled:
         self.trace = trace
         self.cmds = cmds
         self.layout = layout
+        # Backend project emitters may need the realized layout/codegen state
+        # (for APU v1: used VR aliases and group size).
+        self.layout_ctx = ctx
         # spec 001 D5: the resolved `host_xfer.*` moves (verb, declared Move,
         # device handle, buffer role). Empty by default -> today's inferred-role
         # path in `_run_samsung`. When non-empty, the run path asserts the
@@ -3733,10 +3204,6 @@ class Compiled:
         self.execution_graph = execution_graph
         self.cost = cost
         self.backend = backend
-        # `_ctx` is currently only consumed by `_run_upmem`, which needs
-        # `UPMEMCtx.get_kernel_src()` to render the full DPU envelope
-        # around `cmds`. Other backends ignore the field.
-        self._ctx = ctx
         # Lever 3 (SPEC-025 §5.4): shared-CRF host trigger schedule (one
         # HostTrigger per work-id), parallel to `cmds`. Empty for the
         # per-work-id path and every non-Samsung backend.
@@ -3795,7 +3262,6 @@ _BACKEND_CTX = {
     # _BACKEND_RUN entry beyond "virtual"); the proof inspects compiled.cmds.
     "mortise_wide": SamsungCtx,
     "aim": AimCtx,
-    "upmem": UPMEMCtx,
     "apu_v1": APUv1Ctx,
     "apu_v2": APUv2Ctx,
 }
@@ -3815,6 +3281,12 @@ def _check_work_grid(target, trace, *, auto_fill=True):
 
     derived = target.work_grid()[1]
     buckets = _bucket_for_autoschedule(trace)
+    if target.name == "apu_v1" and any(
+        match.extra.get("coalesced_spmw_axis") == "group" for match in trace.matches
+    ):
+        # The authored scalar mapping is a VR partition axis. Four physical
+        # APUC tasks are supplied by the backend and are not source replicas.
+        return target.work_grid()[1]
     # Distinct base kernels (strip the _<wid> grid-replica suffix). The bucket
     # func_name carries the suffix; recover the work_id from the bucket's first
     # match so the suffix strips correctly.
@@ -3946,6 +3418,11 @@ def compile_for_target(
     ``Compiled.host_moves`` so the run path asserts the operand->role binding.
     """
     target_name = getattr(target, "name", None)
+    if target_name == "upmem":
+        raise TypeError(
+            "compile_for_target no longer accepts matcher traces for UPMEM; "
+            "use allo.compile(UPMEMProgram(...), target, cost)"
+        )
     resolved_host_moves = _resolve_host_moves(target, host_moves)
     if trace.target_name != target_name:
         raise ValueError(

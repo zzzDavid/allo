@@ -7,7 +7,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -33,7 +33,7 @@ def heat_3d_np(A, B, TSTEPS, N):
 
 
 def kernel_heat_3d[
-    T: (float32, int32), TSTEPS: int32, N: int32
+    T: (float32, int32, uint16), TSTEPS: int32, N: int32
 ](A: "T[N, N, N]", B: "T[N, N, N]"):
     const0: float32 = 0.125
     const1: float32 = 2.0

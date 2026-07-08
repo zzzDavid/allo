@@ -136,23 +136,31 @@ class LLVMModule:
         # 1. Construct argument pointers
         for arg, (target_in_type, shape) in zip(args, input_types):
             if len(shape) == 0:  # scalar
-                if isinstance(arg, int):
-                    if target_in_type != "i32":
+                if isinstance(arg, (int, np.integer)):
+                    source_type = (
+                        np_type_to_str(arg.dtype)
+                        if isinstance(arg, np.integer)
+                        else "i32"
+                    )
+                    if target_in_type != source_type:
                         DTypeWarning(
-                            f"Input type mismatch: {target_in_type} vs i32. Please use NumPy array"
-                            " to wrap the data to avoid possible result mismatch"
+                            f"Input type mismatch: {target_in_type} vs {source_type}"
                         ).warn()
                     bitwidth = get_bitwidth_from_type(target_in_type)
                     pow2_width = max(get_clostest_pow2(bitwidth), 8)
                     signed = "i" if target_in_type.startswith("i") else "ui"
                     dtype = ctype_map[f"{signed}{pow2_width}"]
                     c_int_p = dtype * 1
-                    arg_ptrs.append(c_int_p(arg))
-                elif isinstance(arg, float):
-                    if target_in_type != "f32":
+                    arg_ptrs.append(c_int_p(int(arg)))
+                elif isinstance(arg, (float, np.floating)):
+                    source_type = (
+                        np_type_to_str(arg.dtype)
+                        if isinstance(arg, np.floating)
+                        else "f32"
+                    )
+                    if target_in_type != source_type:
                         DTypeWarning(
-                            f"Input type mismatch: {target_in_type} vs f32. Please use NumPy array"
-                            " to wrap the data to avoid possible result mismatch"
+                            f"Input type mismatch: {target_in_type} vs {source_type}"
                         ).warn()
                     if target_in_type == "f16":
                         c_float_p = ctypes.c_int16 * 1

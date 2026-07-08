@@ -541,16 +541,20 @@ _current_region_context = None
 def kernel(mapping=None, args=None):
 
     def actual_decorator(func):
+        normalized_mapping = [mapping] if isinstance(mapping, int) else mapping
+
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             # *args and **kwargs are the actual arguments that are passed into the kernel function
-            func.mapping = mapping
+            func.mapping = normalized_mapping
             hls_mod = build(funcs=[func])
             return hls_mod(*args, **kwargs)
 
-        wrapper.mapping = mapping
+        wrapper.mapping = normalized_mapping
         global _current_region_context
         if _current_region_context is not None:
+            # Preserve scalar spelling: Tenon uses it as an elastic/coalesced
+            # SPMW axis, while the frontend consumes normalized_mapping.
             _current_region_context[func.__name__] = mapping
         return wrapper
 

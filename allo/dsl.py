@@ -65,6 +65,44 @@ def abs(x, name=None):
     return np.abs(x)
 
 
+def popcount(x, name=None):
+    """Count set bits while preserving the operand's integer shape and width.
+
+    Signed values are interpreted as their fixed-width two's-complement bit
+    pattern.  The compiled Allo operation has the same integer element type as
+    ``x``; the NumPy implementation mirrors that contract for direct execution.
+    """
+
+    value = np.asarray(x)
+    if value.dtype.kind not in {"b", "i", "u"}:
+        raise TypeError("allo.popcount expects an integer operand")
+    width = value.dtype.itemsize * 8
+    mask = (1 << width) - 1
+    result = np.fromiter(
+        ((int(item) & mask).bit_count() for item in value.flat),
+        dtype=value.dtype,
+        count=value.size,
+    ).reshape(value.shape)
+    return result.item() if value.ndim == 0 else result
+
+
+def xnor(lhs, rhs, name=None):
+    """Fixed-width bitwise equivalence (complement of XOR)."""
+
+    lhs_value = np.asarray(lhs)
+    rhs_value = np.asarray(rhs)
+    if lhs_value.dtype.kind not in {"b", "i", "u"} or rhs_value.dtype.kind not in {
+        "b",
+        "i",
+        "u",
+    }:
+        raise TypeError("allo.xnor expects integer operands")
+    if lhs_value.dtype != rhs_value.dtype:
+        raise TypeError("allo.xnor operands must have the same integer type")
+    result = np.bitwise_not(np.bitwise_xor(lhs_value, rhs_value))
+    return result.item() if result.ndim == 0 else result
+
+
 def softmax(x, name=None):
     exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
     return exp_x / np.sum(exp_x, axis=-1, keepdims=True)

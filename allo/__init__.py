@@ -76,3 +76,5 @@ from .spmw_codegen import (
 )
 from .spmw_linear_layout import LinearLayout, materialise_handle
 from .compiler import compile, CompiledCallable
+from .pim.apu_v1_vector_program import APUv1VectorCallable
+from .pim.apu_v1_program import APUv1Phase, APUv1PrecisionPolicy, APUv1Program

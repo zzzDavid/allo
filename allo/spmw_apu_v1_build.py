@@ -41,14 +41,30 @@ _DEFAULT_GVML_INCLUDE_ROOT = "/usr/local/include"
 # alongside the arithmetic eltwise ops -- this SDK has no separate
 # `libgvml_logical.h`, and nothing in the generated `device.c` chain
 # pulls one in. A single canary on the eltwise header is sufficient.
-_GVML_CANARY_HEADERS = ("gsi/libgvml_element_wise.h",)
+_GVML_CANARY_HEADERS = (
+    "gsi/libgvml_element_wise.h",
+    "gsi/libgvml_iv.h",
+)
 
 # Files copied verbatim from the example-gvml template. `Common/` is
 # handled separately (copytree).
 _COPY_FILES = ("gsi_dma.c", "gsi_dma.h", "gsi_device_profiling.h")
 
 # APU v1 element width today; report 12 §3 and the `_32K` constant.
-_SUPPORTED_DTYPE_NAMES = ("uint16", "int16", "float16")
+_SUPPORTED_DTYPE_NAMES = (
+    "bool",
+    "uint8",
+    "int8",
+    "uint16",
+    "int16",
+    "float16",
+    "uint32",
+    "int32",
+    "float32",
+    "uint64",
+    "int64",
+    "float64",
+)
 
 
 def _template_dir() -> Path:
@@ -154,17 +170,21 @@ def _emit_makefile(lab_name: str) -> str:
     )
 
 
-def _emit_struct_h(in_roles: list[str], out_roles: list[str]) -> str:
+def _emit_struct_h(
+    in_roles: list[str], out_roles: list[str], *, include_core_id: bool = False
+) -> str:
     fields = []
-    for role in in_roles + out_roles:
+    for role in dict.fromkeys(in_roles + out_roles):
         fields.append(f"        uint64_t mem_hndl_{role};")
+    if include_core_id:
+        fields.append("        uint32_t core_id;")
     body = "\n".join(fields)
     return (
         "#ifndef DATA_STRUCT_H\n"
         "#define DATA_STRUCT_H\n"
         "\n"
         "#ifdef __cplusplus\n"
-        "extern \"C\"\n"
+        'extern "C"\n'
         "{\n"
         "#endif /* __cplusplus */\n"
         "\n"
@@ -172,7 +192,6 @@ def _emit_struct_h(in_roles: list[str], out_roles: list[str]) -> str:
         "    struct program_data\n"
         "    {\n"
         f"{body}\n"
-        "        uint16_t mac_lut[256];\n"
         "    } __attribute__((packed));\n"
         "\n"
         "    struct program_cmd\n"
@@ -192,19 +211,38 @@ def _emit_struct_h(in_roles: list[str], out_roles: list[str]) -> str:
     )
 
 
-# Map workload-side memref names to the canonical L4 pointer C names the
-# APUv1Ctx emits into self.cmds. Mirrors `APUv1Ctx._L4_PTR_BY_ROLE` but
-# routed by memref *name* (since that's what the build harness sees from
-# the user). Conservative default for any unmatched name: pick the next
-# free pointer slot.
-def _l4_ptr_for_role(role: str, is_output: bool) -> str:
-    if is_output:
-        return "out_L4ptr"
-    # Inputs: "x"-ish memref names get inp_L4ptr; "W"/"y"-ish get wgt_L4ptr.
-    low = role.lower()
-    if low.endswith("_w") or low == "w" or "wgt" in low or "weight" in low:
-        return "wgt_L4ptr"
-    return "inp_L4ptr"
+def _canonical_memref_name(name: str | None) -> str | None:
+    """Convert matcher-local names (``local_A``) back to ABI names (``A``)."""
+    if name is None:
+        return None
+    return name[len("local_") :] if name.startswith("local_") else name
+
+
+def _operand_pointer_fields(compiled: "Compiled") -> dict[str, str]:
+    """Map semantic APU pointers to workload ABI fields from the match trace.
+
+    Device emission deliberately uses the stable semantic pointers
+    ``inp_L4ptr`` (MAC x), ``wgt_L4ptr`` (MAC y), and ``out_L4ptr`` (acc).
+    The public callable, however, retains source names such as A/B/C or W/x/y.
+    Deriving this bridge from ``OperandBinding.role`` avoids guessing from a
+    parameter's spelling or alphabetical position.
+    """
+    role_to_pointer = {
+        "x": "inp_L4ptr",
+        "y": "wgt_L4ptr",
+        "acc": "out_L4ptr",
+    }
+    fields: dict[str, str] = {}
+    for match in getattr(getattr(compiled, "trace", None), "matches", ()):
+        for operand in match.operands:
+            pointer = role_to_pointer.get(operand.role)
+            name = _canonical_memref_name(operand.memref_name)
+            if pointer is not None and name is not None:
+                fields.setdefault(pointer, f"mem_hndl_{name}")
+        result = _canonical_memref_name(match.result_memref_name)
+        if result is not None:
+            fields.setdefault("out_L4ptr", f"mem_hndl_{result}")
+    return fields
 
 
 def _emit_device_c(
@@ -232,17 +270,27 @@ def _emit_device_c(
             if any(ptr in line for line in compiled.cmds):
                 ctx_l4_roles.append(ptr)
 
-    # Build a stable input-role -> ptr mapping using the same heuristic
-    # as APUv1Ctx (inp/wgt by role string heuristic; out for outputs).
-    ptr_to_field: dict[str, str] = {}
-    for role in in_roles:
-        ptr = _l4_ptr_for_role(role, is_output=False)
-        # Avoid collisions: if "inp_L4ptr" is taken, fall through to "wgt_L4ptr".
-        if ptr in ptr_to_field:
-            ptr = "wgt_L4ptr" if ptr == "inp_L4ptr" else "inp_L4ptr"
-        ptr_to_field[ptr] = f"mem_hndl_{role}"
-    for role in out_roles:
-        ptr_to_field["out_L4ptr"] = f"mem_hndl_{role}"
+    ptr_to_field = _operand_pointer_fields(compiled)
+    valid_fields = {f"mem_hndl_{role}" for role in in_roles + out_roles}
+    ptr_to_field = {
+        pointer: field
+        for pointer, field in ptr_to_field.items()
+        if field in valid_fields
+    }
+    assigned_inputs = {
+        field[len("mem_hndl_") :]
+        for pointer, field in ptr_to_field.items()
+        if pointer != "out_L4ptr"
+    }
+    available_inputs = iter(role for role in in_roles if role not in assigned_inputs)
+    for pointer in ("inp_L4ptr", "wgt_L4ptr"):
+        if pointer not in ptr_to_field:
+            try:
+                ptr_to_field[pointer] = f"mem_hndl_{next(available_inputs)}"
+            except StopIteration:
+                break
+    if out_roles:
+        ptr_to_field.setdefault("out_L4ptr", f"mem_hndl_{out_roles[0]}")
 
     # Emit decls only for the L4 pointers the body references (drops
     # unused-variable warnings); always emit out_L4ptr if we have any
@@ -257,16 +305,6 @@ def _emit_device_c(
             )
             used_ptrs.add(ptr)
 
-    # SPEC-018: unconditionally declare the popcount LUT pointer used by
-    # the sv_lookup MAC expansion (`gvml_lookup_16(..., mac_lut_ptr, 256)`).
-    # The decl is always emitted to keep device.c shape stable across
-    # mode="sv" / mode="sv_lookup"; the (void) guard silences
-    # -Wunused-variable when the body never names it.
-    l4_decls.append(
-        "    const uint16_t *mac_lut_ptr = (const uint16_t *)data->mac_lut;"
-    )
-    l4_decls.append("    (void)mac_lut_ptr;")
-
     # VR alias decls -- pulled from the ctx via iter_vr_aliases(); fall
     # back to the canonical pair the declarative-mode body needs.
     vr_aliases: list[tuple[str, str]] = []
@@ -275,13 +313,25 @@ def _emit_device_c(
     except Exception:
         vr_aliases = []
     if not vr_aliases:
-        vr_aliases = [("vrs", "GVML_VR16_0"), ("mac_tmp_vr", "GVML_VR16_1")]
+        vr_aliases = [
+            ("vr0", "GVML_VR16_0"),
+            ("vr1", "GVML_VR16_1"),
+            ("vr2", "GVML_VR16_2"),
+            ("mac_tmp_vr", "GVML_VR16_3"),
+            ("reduce_tmp_vr", "GVML_VR16_4"),
+        ]
     vr_decls = [
         f"    enum gvml_vr16 {c_name} = {enum_name};"
         for c_name, enum_name in vr_aliases
     ]
 
-    body_lines = ["    " + ln for ln in compiled.cmds]
+    batches = max(1, int(getattr(compiled.layout_ctx, "vector_batches", 1)))
+    if batches == 1:
+        body_lines = ["    " + ln for ln in compiled.cmds]
+    else:
+        body_lines = [f"    for (unsigned batch = 0; batch < {batches}; ++batch) {{"]
+        body_lines.extend("        " + ln for ln in compiled.cmds)
+        body_lines.append("    }")
 
     header = (
         "#include <gsi/libsys/assert.h>\n"
@@ -290,10 +340,11 @@ def _emit_device_c(
         "#include <gsi/gal-fast-funcs.h>\n"
         "#include <gsi/libgvml_memory.h>\n"
         "#include <gsi/libgvml_element_wise.h>\n"
+        "#include <gsi/libgvml_iv.h>\n"
         "#include <gsi/libgvml_debug.h>\n"
         "\n"
-        "#include \"struct.h\"\n"
-        "#include \"gsi_dma.h\"\n"
+        '#include "struct.h"\n'
+        '#include "gsi_dma.h"\n'
         "#include <gsi_device_profiling.h>\n"
         "\n"
         "PROF_VAR(total);\n"
@@ -328,7 +379,7 @@ def _emit_device_c(
         "GAL_TASK_ENTRY_POINT(apu_kernel_task, in, out)\n"
         "{\n"
         "    struct program_cmd *cmd = (struct program_cmd *)in;\n"
-        "    gsi_info(\"\\nRunning tenon program!\\n\");\n"
+        '    gsi_info("\\nRunning tenon program!\\n");\n'
         "    gvml_init_once();\n"
         "    return my_kernel(&cmd->data);\n"
         "}\n"
@@ -372,21 +423,19 @@ def _emit_host_c(
         for role, sz in list(input_byte_sizes.items()) + list(output_byte_sizes.items())
     ]
     total_size_expr = " + ".join(f"sz_{r}" for r in all_roles)
-    alloc_block_lines.append(
-        f"    const uint64_t io_total = {total_size_expr};"
-    )
+    alloc_block_lines.append(f"    const uint64_t io_total = {total_size_expr};")
 
     # Chained handle assignments: first role from base ptr, each next
     # role offset by prior role's size.
     chain_lines = [
-        f"    struct program_cmd cmd = {{ .data.mem_hndl_{all_roles[0]} = "
+        f"    struct program_cmd base_cmd = {{ .data.mem_hndl_{all_roles[0]} = "
         "input_dev_bufs, };"
     ]
     for i, role in enumerate(all_roles[1:], start=1):
         prev = all_roles[i - 1]
         chain_lines.append(
-            f"    ret = gdl_add_to_mem_handle(&cmd.data.mem_hndl_{role}, "
-            f"cmd.data.mem_hndl_{prev}, sz_{prev});\n"
+            f"    ret = gdl_add_to_mem_handle(&base_cmd.data.mem_hndl_{role}, "
+            f"base_cmd.data.mem_hndl_{prev}, sz_{prev});\n"
             f"    if (ret) goto CLEAN_UP;"
         )
 
@@ -395,16 +444,30 @@ def _emit_host_c(
     for role in in_roles:
         copy_to_dev_lines.append(
             f"    {{\n"
-            f"        FILE *f = fopen(path_{role}, \"rb\");\n"
-            f"        if (!f) {{ gsi_error(\"open %s\\n\", path_{role}); "
+            f'        FILE *f = fopen(path_{role}, "rb");\n'
+            f'        if (!f) {{ gsi_error("open %s\\n", path_{role}); '
             f"ret = -1; goto CLEAN_UP; }}\n"
             f"        void *buf = malloc(sz_{role});\n"
             f"        size_t n = fread(buf, 1, sz_{role}, f);\n"
             f"        fclose(f);\n"
             f"        if (n != sz_{role}) {{ free(buf); "
-            f"gsi_error(\"short read %s\\n\", path_{role}); "
+            f'gsi_error("short read %s\\n", path_{role}); '
             f"ret = -1; goto CLEAN_UP; }}\n"
-            f"        ret = gdl_mem_cpy_to_dev(cmd.data.mem_hndl_{role}, "
+            f"        ret = gdl_mem_cpy_to_dev(base_cmd.data.mem_hndl_{role}, "
+            f"buf, sz_{role});\n"
+            f"        free(buf);\n"
+            f"        if (ret) goto CLEAN_UP;\n"
+            f"    }}"
+        )
+    # The matcher exposes a zero-initialized loop-carried accumulator. Ensure
+    # its backing L4 slice has the same semantics before LD_ACC reads it; this
+    # also makes padding lanes deterministic on readback.
+    for role in out_roles:
+        copy_to_dev_lines.append(
+            f"    {{\n"
+            f"        void *buf = calloc(1, sz_{role});\n"
+            f"        if (!buf) {{ ret = gsi_status(ENOMEM); goto CLEAN_UP; }}\n"
+            f"        ret = gdl_mem_cpy_to_dev(base_cmd.data.mem_hndl_{role}, "
             f"buf, sz_{role});\n"
             f"        free(buf);\n"
             f"        if (ret) goto CLEAN_UP;\n"
@@ -417,18 +480,18 @@ def _emit_host_c(
         copy_from_dev_lines.append(
             f"    {{\n"
             f"        void *buf = malloc(sz_{role});\n"
-            f"        ret = gdl_mem_cpy_from_dev(buf, cmd.data.mem_hndl_{role}, "
+            f"        ret = gdl_mem_cpy_from_dev(buf, base_cmd.data.mem_hndl_{role}, "
             f"sz_{role});\n"
             f"        if (ret) {{ free(buf); goto CLEAN_UP; }}\n"
-            f"        FILE *f = fopen(path_{role}, \"wb\");\n"
+            f'        FILE *f = fopen(path_{role}, "wb");\n'
             f"        if (!f) {{ free(buf); "
-            f"gsi_error(\"create %s\\n\", path_{role}); "
+            f'gsi_error("create %s\\n", path_{role}); '
             f"ret = -1; goto CLEAN_UP; }}\n"
             f"        size_t n = fwrite(buf, 1, sz_{role}, f);\n"
             f"        fclose(f);\n"
             f"        free(buf);\n"
             f"        if (n != sz_{role}) {{ "
-            f"gsi_error(\"short write %s\\n\", path_{role}); "
+            f'gsi_error("short write %s\\n", path_{role}); '
             f"ret = -1; goto CLEAN_UP; }}\n"
             f"    }}"
         )
@@ -438,6 +501,12 @@ def _emit_host_c(
     chain_str = "\n".join(chain_lines)
     copy_to_dev_str = "\n".join(copy_to_dev_lines)
     copy_from_dev_str = "\n".join(copy_from_dev_lines)
+    per_core_handles = "\n".join(
+        f"        ret = gdl_add_to_mem_handle(&cmds[core].data.mem_hndl_{role}, "
+        f"base_cmd.data.mem_hndl_{role}, core * (sz_{role} / NUM_APUC));\n"
+        f"        if (ret) goto CLEAN_UP;"
+        for role in all_roles
+    )
 
     return (
         "#include <string.h>\n"
@@ -452,13 +521,16 @@ def _emit_host_c(
         "\n"
         "GDL_TASK_DECLARE(apu_kernel_task);\n"
         "\n"
-        "#include \"struct.h\"\n"
-        "#include \"gsi_dma.h\"\n"
+        '#include "struct.h"\n'
+        '#include "gsi_dma.h"\n'
+        "enum { NUM_APUC = 4 };\n"
         "\n"
         "static int run_tenon_kernel(gdl_context_handle_t ctx_id, int argc, char *argv[])\n"
         "{\n"
         "    int ret;\n"
-        "    gdl_mem_handle_t dev_cmd_buf = GDL_MEM_HANDLE_NULL;\n"
+        "    gdl_mem_handle_t dev_cmd_bufs[NUM_APUC] = {0};\n"
+        "    struct program_cmd cmds[NUM_APUC];\n"
+        "    struct gsi_task_desc tasks[NUM_APUC];\n"
         "    gdl_mem_handle_t input_dev_bufs = GDL_MEM_HANDLE_NULL;\n"
         "\n"
         f"{argv_decls_str}\n"
@@ -468,7 +540,7 @@ def _emit_host_c(
         "    input_dev_bufs = gdl_mem_alloc_aligned(ctx_id, io_total, "
         "GDL_CONST_MAPPED_POOL, GDL_ALIGN_32);\n"
         "    if (gdl_mem_handle_is_null(input_dev_bufs)) {\n"
-        "        gsi_error(\"gdl_mem_alloc() failed (%lu bytes)\\n\", io_total);\n"
+        '        gsi_error("gdl_mem_alloc() failed (%lu bytes)\\n", io_total);\n'
         "        ret = gsi_status(ENOMEM);\n"
         "        goto CLEAN_UP;\n"
         "    }\n"
@@ -477,44 +549,32 @@ def _emit_host_c(
         "\n"
         f"{copy_to_dev_str}\n"
         "\n"
-        "    uint64_t cmd_buf_size = sizeof(cmd);\n"
-        "    dev_cmd_buf = gdl_mem_alloc_aligned(ctx_id, cmd_buf_size, "
+        "    memset(tasks, 0, sizeof(tasks));\n"
+        "    uint64_t cmd_buf_size = sizeof(struct program_cmd);\n"
+        "    for (uint32_t core = 0; core < NUM_APUC; ++core) {\n"
+        "        cmds[core] = base_cmd;\n"
+        f"{per_core_handles}\n"
+        "        dev_cmd_bufs[core] = gdl_mem_alloc_aligned(ctx_id, cmd_buf_size, "
         "GDL_CONST_MAPPED_POOL, GDL_ALIGN_32);\n"
-        "    if (gdl_mem_handle_is_null(dev_cmd_buf)) {\n"
-        "        gsi_error(\"gdl_mem_alloc() cmd failed (%lu bytes)\\n\", cmd_buf_size);\n"
-        "        ret = gsi_status(ENOMEM);\n"
-        "        goto CLEAN_UP;\n"
+        "        if (gdl_mem_handle_is_null(dev_cmd_bufs[core])) { ret = gsi_status(ENOMEM); goto CLEAN_UP; }\n"
+        "        ret = gdl_mem_cpy_to_dev(dev_cmd_bufs[core], &cmds[core], cmd_buf_size);\n"
+        "        if (ret) goto CLEAN_UP;\n"
+        "        if (GSI_IS_ERR_PTR_OR_NULL(gdl_task_desc_init(ctx_id, &tasks[core], "
+        "GDL_TASK(apu_kernel_task), dev_cmd_bufs[core], GDL_MEM_HANDLE_NULL, 0, core))) {\n"
+        "            ret = -1; goto CLEAN_UP;\n"
+        "        }\n"
         "    }\n"
-        "    /* SPEC-018: populate the MAC popcount LUT used by gvml_lookup_16\n"
-        "     * for the sv_lookup mode of binary MAC. The LUT lives inline in\n"
-        "     * cmd.data.mac_lut and is copied to the device with the rest of\n"
-        "     * the cmd struct. */\n"
-        "    for (unsigned k = 0; k < 256; ++k) {\n"
-        "        unsigned c = 0;\n"
-        "        for (unsigned b = 0; b < 8; ++b) if ((k >> b) & 1u) ++c;\n"
-        "        cmd.data.mac_lut[k] = (uint16_t)c;\n"
-        "    }\n"
-        "\n"
-        "    ret = gdl_mem_cpy_to_dev(dev_cmd_buf, &cmd, cmd_buf_size);\n"
-        "    if (ret) goto CLEAN_UP;\n"
-        "\n"
-        "    ret = gdl_run_task_timeout(\n"
-        "        ctx_id,\n"
-        "        GDL_TASK(apu_kernel_task),\n"
-        "        dev_cmd_buf,\n"
-        "        GDL_MEM_HANDLE_NULL,\n"
-        "        GDL_TEMPORARY_DEFAULT_MEM_BUF,\n"
-        "        GDL_TEMPORARY_DEFAULT_MEM_BUF_SIZE,\n"
-        "        GDL_TEMPORARY_DEFAULT_CORE_INDEX,\n"
-        "        NULL,\n"
-        "        0,\n"
-        "        GDL_USER_MAPPING);\n"
+        "    ret = gdl_schedule_batch_timeout(tasks, NUM_APUC, "
+        "GDL_TEMPORARY_DEFAULT_MEM_BUF, GDL_TEMPORARY_DEFAULT_MEM_BUF_SIZE, "
+        "NULL, 0, GDL_USER_MAPPING);\n"
         "    if (ret) goto CLEAN_UP;\n"
         "\n"
         f"{copy_from_dev_str}\n"
         "\n"
         "CLEAN_UP:\n"
-        "    if (!gdl_mem_handle_is_null(dev_cmd_buf)) gdl_mem_free(dev_cmd_buf);\n"
+        "    for (uint32_t core = 0; core < NUM_APUC; ++core) {\n"
+        "        if (!gdl_mem_handle_is_null(dev_cmd_bufs[core])) gdl_mem_free(dev_cmd_bufs[core]);\n"
+        "    }\n"
         "    if (!gdl_mem_handle_is_null(input_dev_bufs)) gdl_mem_free(input_dev_bufs);\n"
         "    return ret;\n"
         "}\n"
@@ -533,19 +593,19 @@ def _emit_host_c(
         "    uint32_t num_ctxs;\n"
         "    struct gdl_context_desc contexts_desc[GDL_MAX_NUM_CONTEXTS];\n"
         "\n"
-        "    int ret = gsi_libsys_init(\"tenon apu program\", true);\n"
-        "    if (ret) gsi_fatal(\"gsi_libsys_init(): %s\", gsi_status_errorstr(ret));\n"
+        '    int ret = gsi_libsys_init("tenon apu program", true);\n'
+        '    if (ret) gsi_fatal("gsi_libsys_init(): %s", gsi_status_errorstr(ret));\n'
         "\n"
         "    gsi_sim_create_simulator(NUM_CTXS, g_ctxs);\n"
         "\n"
         "    ret = gdl_init();\n"
-        "    if (ret) gsi_fatal(\"gdl_init(): %s\", gsi_status_errorstr(ret));\n"
+        '    if (ret) gsi_fatal("gdl_init(): %s", gsi_status_errorstr(ret));\n'
         "\n"
         "    ret = gdl_context_count_get(&num_ctxs);\n"
-        "    if (ret) gsi_fatal(\"gdl_context_count_get(): %s\", gsi_status_errorstr(ret));\n"
+        '    if (ret) gsi_fatal("gdl_context_count_get(): %s", gsi_status_errorstr(ret));\n'
         "\n"
         "    ret = gdl_context_desc_get(contexts_desc, num_ctxs);\n"
-        "    if (ret) gsi_fatal(\"gdl_context_desc_get(): %s\", gsi_status_errorstr(ret));\n"
+        '    if (ret) gsi_fatal("gdl_context_desc_get(): %s", gsi_status_errorstr(ret));\n'
         "\n"
         "    gdl_context_handle_t valid_ctx_id = 0;\n"
         "    uint32_t ctx;\n"
@@ -555,13 +615,13 @@ def _emit_host_c(
         "            break;\n"
         "        }\n"
         "    }\n"
-        "    if (ctx == num_ctxs) gsi_fatal(\"no valid context\");\n"
+        '    if (ctx == num_ctxs) gsi_fatal("no valid context");\n'
         "\n"
         "    const long long unsigned int const_mapped_size_req = 3LL * 1024L * 1024L * 1024L;\n"
         "    long long unsigned int const_mapped_size_recv = 0, dynamic_mapped_size_recv = 0;\n"
         "    ret = gdl_context_alloc(valid_ctx_id, const_mapped_size_req, "
         "&const_mapped_size_recv, &dynamic_mapped_size_recv);\n"
-        "    if (ret) gsi_fatal(\"gdl_context_alloc(): %s\", gsi_status_errorstr(ret));\n"
+        '    if (ret) gsi_fatal("gdl_context_alloc(): %s", gsi_status_errorstr(ret));\n'
         "\n"
         "    ret = run_tenon_kernel(valid_ctx_id, argc, argv);\n"
         "\n"
@@ -613,9 +673,7 @@ def gen_apu_v1_low_mode_project(
 
     template = _template_dir()
     if not template.exists():
-        raise FileNotFoundError(
-            f"APU v1 build: template dir missing at {template}"
-        )
+        raise FileNotFoundError(f"APU v1 build: template dir missing at {template}")
 
     # Step 1: copy support files.
     common_src = template / "Common"
@@ -638,9 +696,7 @@ def gen_apu_v1_low_mode_project(
         # np.ndarray has .nbytes; tolerate plain bytes/buffer too.
         nb = getattr(arr, "nbytes", None)
         if nb is None:
-            raise ValueError(
-                f"APU v1 build: input {role!r} is not a numpy array."
-            )
+            raise ValueError(f"APU v1 build: input {role!r} is not a numpy array.")
         input_byte_sizes[role] = int(nb)
     output_byte_sizes: dict[str, int] = {}
     for role in out_roles:

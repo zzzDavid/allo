@@ -33,7 +33,7 @@ class Placement:
 
     `mode` is a free-form label that the cost model and codegen consult
     to disambiguate candidates whose `placements` dict is identical or
-    whose op-expansion differs (e.g. APU v1 SV vs SV-lookup). Default
+    whose op-expansion differs (e.g. grouped versus scalar execution). Default
     `""` preserves existing behaviour for cost models that don't read
     it. `extra` is a free-form per-candidate scratch dict.
     """
@@ -48,6 +48,57 @@ class Placement:
     # `MemoryRef.idx`. Default `None` == today's behaviour (codegen falls back
     # to the index's own coefficient, byte-identical for Samsung stride 2).
     layout: Any = None
+
+
+def derive_layout_properties(target, placement: Placement) -> dict[str, Any]:
+    """Derive backend performance/codegen facts from a carried LinearLayout.
+
+    Explicit ``extra`` fields remain valid for non-linear or hand-authored
+    placements. For AiM, layout-derived values take precedence so removing the
+    F2 map changes both costing and emitted execution.
+    """
+    properties = dict(getattr(placement, "extra", {}) or {})
+    layout = getattr(placement, "layout", None)
+    if not isinstance(layout, LinearLayout):
+        return properties
+    target_name = getattr(target, "name", None)
+    if (
+        target_name == "aim"
+        and {
+            "lane_bank",
+        }.issubset(layout.bases)
+        and "bank" in layout.out_dims
+    ):
+        fanout = layout.image_size(varying_inputs=("lane_bank",), output_dims=("bank",))
+        bank_count = int(getattr(target.banks, "banks", 1))
+        if fanout not in (1, bank_count):
+            raise ValueError(
+                f"AiM LinearLayout bank image must be 1 or {bank_count}, got {fanout}"
+            )
+        properties.update(
+            bank_fanout=fanout,
+            bank_conflicts=layout.conflict_count(
+                bank_dims=("bank",), varying_inputs=("lane_bank",)
+            ),
+            operation_name="MAC" if fanout == 1 else "MAC_ABK",
+        )
+    if (
+        target_name == "apu_v1"
+        and {"group", "lane_in_group"}.issubset(layout.bases)
+        and "vr_lane" in layout.out_dims
+    ):
+        group_size = layout.size_of("lane_in_group")
+        groups_per_vr = layout.image_size(
+            varying_inputs=("group",), output_dims=("vr_lane",)
+        )
+        if group_size * groups_per_vr != layout.output_size("vr_lane"):
+            raise ValueError("APU v1 group layout must cover one complete VR")
+        properties.update(
+            group_size=group_size,
+            groups_per_vr=groups_per_vr,
+            subgroup_size=1,
+        )
+    return properties
 
 
 # --------------------------------------------------------------------- #
@@ -109,10 +160,24 @@ def _bucket_for_autoschedule(trace: MatchTrace) -> list[tuple[str, list[MatchedO
     buckets: dict[str, list[MatchedOp]] = {}
     order: list[str] = []
     for m in trace.matches:
-        if m.func_name not in buckets:
-            buckets[m.func_name] = []
-            order.append(m.func_name)
-        buckets[m.func_name].append(m)
+        coalesced = m.extra.get("coalesced_spmw_axis")
+        if coalesced:
+            # One source replica describes one logical group, but a group-aware
+            # GVML call materializes the complete axis at once. Retain only the
+            # zero-coordinate body and key it by the unsuffixed kernel name.
+            if any(int(value) != 0 for value in m.work_id):
+                continue
+            key = m.func_name
+            for coordinate in reversed(m.work_id):
+                suffix = f"_{coordinate}"
+                if key.endswith(suffix):
+                    key = key[: -len(suffix)]
+        else:
+            key = m.func_name
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(m)
     return [(name, buckets[name]) for name in order]
 
 
@@ -415,14 +480,6 @@ def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             f"got {sorted(role_to_memref)}"
         )
 
-    # AiM topology note: the A/B choice here is per-bank MAC (MAC_SBK) vs.
-    # all-bank-broadcast MAC (MAC_ABK). Algebraically this is "does the
-    # layout factor `bank` into an input dim?" but the runtime distinction
-    # is which *physical unit* executes -- one bank or the whole channel.
-    # `gb` is not an algebraic offset from `bank`; it is a discrete
-    # hardware unit. LinearLayout cannot model the choice, so we enumerate
-    # the two Placements directly and carry the physical operation name.
-
     # Device grouping nodes are transparent to work coordinates, so the
     # spatial levels are channel=0, bank_group=1, bank=2.
     bg_id = UnitId(level=1, unit=target.unit("bank_group"))
@@ -431,7 +488,62 @@ def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     gb = target.gb
     mac_reg = target.mac_reg
 
-    bank_handle = banks[4 * bg_id + bk_id]
+    reduction = max(1, int(_trace_reduction_trip(matches) or 1))
+    reduction_span = 1 << (reduction - 1).bit_length()
+    bank_count = int(getattr(banks, "banks", 1))
+    if bank_count <= 0 or bank_count & (bank_count - 1):
+        raise ValueError("AiM LinearLayout requires a power-of-two bank count")
+
+    # The same logical work-bank coordinate feeds both candidates.  The
+    # lane_bank input is either projected to zero (all reduction lanes collide
+    # on one bank) or mapped identically (one lane per physical bank).  Thus
+    # bank fanout, conflicts, selected primitive, cost width, and generated
+    # address scope all derive from the carried F2 map.
+    zero = (0,)
+    work_bank_basis = [(1 << bit,) for bit in range(bank_count.bit_length() - 1)]
+    reduction_basis = [zero for _ in range(reduction_span.bit_length() - 1)]
+    lane_zero_basis = [zero for _ in range(bank_count.bit_length() - 1)]
+    lane_bank_basis = list(work_bank_basis)
+    single_bank_layout = LinearLayout(
+        bases={
+            "k": reduction_basis,
+            "work_bank": work_bank_basis,
+            "lane_bank": lane_zero_basis,
+        },
+        out_dims=("bank",),
+        out_sizes=(bank_count,),
+    )
+    all_bank_layout = LinearLayout(
+        bases={
+            "k": reduction_basis,
+            "work_bank": work_bank_basis,
+            "lane_bank": lane_bank_basis,
+        },
+        out_dims=("bank",),
+        out_sizes=(bank_count,),
+    )
+
+    def properties(layout):
+        fanout = layout.image_size(varying_inputs=("lane_bank",), output_dims=("bank",))
+        conflicts = layout.conflict_count(
+            bank_dims=("bank",), varying_inputs=("lane_bank",)
+        )
+        if fanout not in (1, bank_count):
+            raise ValueError(
+                f"AiM supports bank fanout 1 or {bank_count}, got {fanout}"
+            )
+        return fanout, conflicts
+
+    single_fanout, single_conflicts = properties(single_bank_layout)
+    all_fanout, all_conflicts = properties(all_bank_layout)
+    bank_handle = materialise_handle(
+        single_bank_layout,
+        target=target,
+        out_dim="bank",
+        fixed={"k": 0, "lane_bank": 0},
+        symbol_table={"work_bank": 4 * bg_id + bk_id},
+        handle_table={"bank": banks},
+    )
 
     layouts: list[Placement] = []
     # Candidate 1: per-bank MAC (no_bank_layout -- y stays in its bank).
@@ -443,7 +555,12 @@ def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
                 acc_mref: mac_reg,
             },
             mode="single_bank",
-            extra={"operation_name": "MAC"},
+            extra={
+                "operation_name": "MAC" if single_fanout == 1 else "MAC_ABK",
+                "bank_fanout": single_fanout,
+                "bank_conflicts": single_conflicts,
+            },
+            layout=single_bank_layout,
         )
     )
     # Candidate 2: all-bank-broadcast MAC (all_bank_layout -- y rides gb).
@@ -455,23 +572,23 @@ def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
                 acc_mref: mac_reg,
             },
             mode="all_bank",
-            extra={"operation_name": "MAC_ABK"},
+            extra={
+                "operation_name": "MAC" if all_fanout == 1 else "MAC_ABK",
+                "bank_fanout": all_fanout,
+                "bank_conflicts": all_conflicts,
+            },
+            layout=all_bank_layout,
         )
     )
     return layouts
 
 
 def _trace_reduction_trip(matches: list[MatchedOp]) -> int | None:
-    """Innermost enclosing-loop bound of the reducing match (per-DPU K).
+    """Innermost enclosing-loop bound of an accumulating MAC match.
 
-    The tasklet lever stripes the inner-K reduction across tasklets, so
-    its work quantity is the trip count of the loop the accumulating
-    (MAC) match sits in -- the same `enclosing_loops[-1]` bound the cost
-    model reads. Returns None when no reducing match carries an inner
-    loop, in which case the enumerator falls back to the `nt=1`-only
-    candidate (parity with today). Mirror of SPEC-026's structural
-    `batch_dim` resolver; rides existing `enclosing_loops` (no
-    `allo/ir/` edit, per design 02 §3.1).
+    AiM uses this shape-derived extent when constructing the logical reduction
+    axis of its bank layout. Returns ``None`` when the trace has no statically
+    resolved reducing loop.
     """
     from .spmw_tripcount import _parse_loop_bound
 
@@ -492,7 +609,7 @@ def _apu_v1_vr_tiling(target, trace: MatchTrace) -> tuple[int, int, int]:
 
     from .spmw_tripcount import resolve_bound_text, resolve_trip_count
 
-    lane_width = max(1, int(target.vrs.width or 1))
+    lane_width = max(1, int(target.vr0.lanes or 1))
     mapping_env = {}
     for unit_spec in target._walk():
         extent = 1
@@ -503,6 +620,7 @@ def _apu_v1_vr_tiling(target, trace: MatchTrace) -> tuple[int, int, int]:
     n_out = 1
     weight_elements = 0
     n_macs = 0
+    max_reduction = 1
     for match in trace.matches:
         if match.target_op_name == "MAC":
             n_macs += 1
@@ -510,6 +628,7 @@ def _apu_v1_vr_tiling(target, trace: MatchTrace) -> tuple[int, int, int]:
         if not loops:
             continue
         reduction = resolve_trip_count(match, -1, mapping_env=mapping_env) or 1
+        max_reduction = max(max_reduction, int(reduction))
         rows = 1
         for _name, _lower, upper, _step in loops[:-1]:
             bound = resolve_bound_text(upper, mapping_env=mapping_env)
@@ -517,8 +636,19 @@ def _apu_v1_vr_tiling(target, trace: MatchTrace) -> tuple[int, int, int]:
                 rows *= bound
         n_out = max(n_out, rows)
         weight_elements += rows * reduction
+    authored_groups = int(
+        next(
+            (
+                match.extra["spmw_group_count"]
+                for match in trace.matches
+                if "spmw_group_count" in match.extra
+            ),
+            1,
+        )
+    )
+    groups_per_vr = authored_groups
     return (
-        max(1, math.ceil(n_out / lane_width)),
+        max(1, math.ceil(n_out / groups_per_vr)),
         max(1, math.ceil(weight_elements / lane_width)),
         max(0, n_macs - 1),
     )
@@ -573,115 +703,13 @@ def _bank_out_size(target) -> int | None:
     return int(n) if n else None
 
 
-def _tasklet_fanout(target) -> int | None:
-    """Tasklet-unit fanout (T_max) read from the target unit tree.
-
-    Walks for the unit named `tasklet` and returns the product of its
-    `mapping` (= 16 in the fixture's `@allo.unit(mapping=[16])`). This is
-    target-derived, never the literal 16. Returns None when absent.
-    """
-    from math import prod
-
-    for u in target._walk():
-        if u.name == "tasklet":
-            return prod(u.mapping) if u.mapping else None
-    return None
-
-
-def _upmem_tasklet_candidates(target, matches: list[MatchedOp]) -> list[int]:
-    """Derive the enumerated `n_tasklets` candidate set, shape+target only.
-
-    `{1, T_max}` at minimum (>=2-candidate discipline), where `T_max` is
-    the tasklet-unit fanout. When the reduction trip is known and smaller
-    than `T_max`, cap `T_max` at the trip so a short reduction is not
-    over-subscribed. No `16`/`1024`/`5.71` literal: the set is a function
-    of the unit fanout and the traced reduction trip only.
-    """
-    t_max = _tasklet_fanout(target)
-    if not t_max or t_max <= 1:
-        return [1]  # no tasklet axis -> parity with pre-lever behaviour
-    trip = _trace_reduction_trip(matches)
-    if trip is not None and trip < t_max:
-        t_max = max(1, trip)
-    if t_max <= 1:
-        return [1]
-    return [1, t_max]
-
-
-@register_enumerator("upmem")
-def _upmem_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
-    """Enumerate candidate layouts for UPMEM DPUs.
-
-    Per spec 013 §D.2, the UPMEM A/B choice is whether `acc` rides the
-    per-tasklet GPR file or a WRAM cell. Algebraically:
-
-      scalar_layout  = identity({"element": E})         -- acc in WRAM
-      tasklet_layout = scalar ⊗ identity({"tasklet": T}) -- acc in GPR
-
-    MRAM is reserved for bulk loads; live operands stay in WRAM/GPR.
-    """
-    role_to_memref = _trace_memrefs_by_role(matches)
-    x_mref = role_to_memref.get("x")
-    y_mref = role_to_memref.get("y")
-    acc_mref = role_to_memref.get("acc")
-    if x_mref is None or y_mref is None or acc_mref is None:
-        raise NotImplementedError(
-            "upmem enumerator: trace is missing one of x/y/acc roles; "
-            f"got {sorted(role_to_memref)}"
-        )
-
-    # UPMEM topology note: the A/B choice is whether `acc` lives in a
-    # WRAM cell or in the per-tasklet GPR file. `wram[0/1/2]` and `gprs`
-    # are discrete named storage classes on the DPU hierarchy
-    # (mram-vs-wram-vs-gprs), not coordinates on a linear address space,
-    # so LinearLayout has no out_dim that names this choice. The two
-    # Placements below encode the choice directly. Bulk MRAM loads are
-    # the C runtime's job; live operands stay in WRAM/GPR.
-    wram = target.wram
-    gprs = target.gprs
-
-    # Symbolic WRAM offsets — distinct integer indices keep the three
-    # operand placements distinguishable in the layout dict. The C
-    # compiler resolves concrete addresses.
-    wram_x = wram[0]
-    wram_y = wram[1]
-    wram_acc = wram[2]
-
-    acc_placements = [
-        {x_mref: wram_x, y_mref: wram_y, acc_mref: wram_acc},
-        {x_mref: wram_x, y_mref: wram_y, acc_mref: gprs},
-    ]
-
-    # Tasklet-tiling lever (design 02 §3.2): cross each acc-placement with the
-    # derived `n_tasklets` candidate set via the typed knob registry (SPEC-022
-    # D4). The base candidates are the two acc-placements; `cross_with_knobs`
-    # applies the registered `n_tasklets` knob (candidates =
-    # `_upmem_tasklet_candidates`, shape+target-derived). Byte-identical to the
-    # prior hand-crossed loop. Default `n_tasklets=1` == today's behaviour.
-    from .spmw_knobs import cross_with_knobs
-
-    base_candidates = [Placement(placements=dict(p)) for p in acc_placements]
-    return cross_with_knobs(target, base_candidates, matches, role_to_memref)
-
-
 @register_enumerator("apu_v1")
 def _apu_v1_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
-    """Enumerate placements for APU v1.
+    """Build the group view used by a GVML reduction.
 
-    Per spec 013 §D.3 the operand placement is a one-liner
-    `LinearLayout.identity` over the 32K-lane bit-serial element axis:
-    all compute operands live in `target.vrs`, so there is no operand-
-    swizzle DOF.
-
-    The live DOF (design 01 §4) is the **VR-tile / L4-DMA mode**:
-    intra-VR re-fetches the contraction operand per output tile,
-    inter-VR loads it once and reuses it across output tiles. The two
-    cross the {sv, sv_lookup} MAC-expansion choice, giving four
-    candidates. The tile counts (`n_out_tiles`, `n_k_tiles`) carried in
-    `extra` are `ceil`-arithmetic over the operand shape and
-    `target.vrs.*` (computed by `_apu_v1_vr_tiling`), never a benchmark
-    literal; codegen materialises the chosen `vr_dma` so host and device
-    layout agree by construction.
+    ``lane_in_group`` is the padded reduction axis and ``group`` enumerates
+    independent outputs. Both map contiguously onto the target-declared 32K
+    VR lane axis. A single GVML call processes every group concurrently.
     """
     role_to_memref = _trace_memrefs_by_role(matches)
     x_mref = role_to_memref.get("x")
@@ -693,18 +721,40 @@ def _apu_v1_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             f"got {sorted(role_to_memref)}"
         )
 
-    # APU v1 topology note: 32K-lane bit-serial element axis with a
-    # single VR file (16 VRs per APUC). All compute operands live in
-    # `target.vrs`, so the enumerator has zero swizzle degrees of
-    # freedom -- the two candidates differ only by MAC op-expansion:
-    # raw MUL+ADD (SV mode, 18 cyc) vs gvml_lookup_16 + add (SV-lookup,
-    # 8 cyc). The cost model branches on `placement.mode`; argmin picks
-    # `sv_lookup`. See SPEC-009 §2.
-    vrs = target.vrs
+    reduction = max(1, int(_trace_reduction_trip(matches) or 1))
+    vr_lanes = int(target.vr0.axes["lane"])
+    group_count = int(matches[0].extra.get("spmw_group_count", 0))
+    if (
+        group_count <= 0
+        or group_count > vr_lanes
+        or group_count & (group_count - 1)
+        or vr_lanes % group_count
+    ):
+        raise ValueError(
+            "APU v1 scalar mapping must be a power-of-two divisor of "
+            f"{vr_lanes}, got {group_count}"
+        )
+    group_size = vr_lanes // group_count
+    if reduction > group_size:
+        raise ValueError(
+            f"APU v1 reduction extent {reduction} exceeds the {group_size}-lane "
+            f"group selected by mapping={group_count}"
+        )
+    groups_per_vr = group_count
+    group_bits = groups_per_vr.bit_length() - 1
+    lane_bits = group_size.bit_length() - 1
+    layout = LinearLayout(
+        bases={
+            "group": [((group_size << bit),) for bit in range(group_bits)],
+            "lane_in_group": [((1 << bit),) for bit in range(lane_bits)],
+        },
+        out_dims=("vr_lane",),
+        out_sizes=(vr_lanes,),
+    )
     placements = {
-        x_mref: vrs,
-        y_mref: vrs,
-        acc_mref: vrs,
+        x_mref: target.vr0,
+        y_mref: target.vr1,
+        acc_mref: target.vr2,
     }
 
     # VR-tile arithmetic from operand shape + target.vrs (design 01 §4.1).
@@ -716,27 +766,18 @@ def _apu_v1_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     )
     n_out_tiles, n_weight_tiles, n_boundaries = _apu_v1_vr_tiling(target, trace)
 
-    # vr_dma lever via the typed knob registry (SPEC-022 D4). The base
-    # candidates are one per MAC-expansion mode (sv / sv_lookup), each carrying
-    # the shared tile-count extra; `cross_with_knobs` applies the registered
-    # `vr_dma` knob (candidates = {intra, inter}) as the inner 2x fan. The
-    # mode-outer / vr_dma-inner order + the 4-candidate set are byte-identical
-    # to the prior hand-crossed `for mode: for vr_dma:` loop.
-    from .spmw_knobs import cross_with_knobs
-
-    base_candidates = [
+    return [
         Placement(
-            placements=dict(placements),
-            mode=mode,
+            placements=placements,
+            mode="grouped_f16",
             extra={
                 "n_out_tiles": n_out_tiles,
                 "n_weight_tiles": n_weight_tiles,
                 "n_stage_boundaries": n_boundaries,
             },
+            layout=layout,
         )
-        for mode in ("sv", "sv_lookup")
     ]
-    return cross_with_knobs(target, base_candidates, matches, role_to_memref)
 
 
 @register_enumerator("apu_v2")
@@ -877,7 +918,7 @@ def _stamp_xkernel(trace, placements, liveness) -> None:
     inter-kernel activation staging (which `residency=resident` then elides);
     it does not depend on the residency knob, so the group-local baseline
     carries it too. Empty when nothing crosses -> byte-identical."""
-    from .spmw_liveness import memref_span, crosses_boundary
+    from .spmw_liveness import memref_span
 
     if not liveness:
         return
@@ -949,8 +990,6 @@ def _reconcile_resident_pairs(trace, placements, liveness) -> None:
     placement chose resident (the regression-default, since `residency`'s
     `knob_cost` is unregistered so the argmin keeps restage).
     """
-    from dataclasses import replace as _dc_replace  # noqa: F401 (kept local)
-
     if not liveness:
         return
 

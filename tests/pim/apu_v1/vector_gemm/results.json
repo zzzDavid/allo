@@ -1,0 +1,51 @@
+{
+  "kernel": "vector_gemm",
+  "target": "apu_v1",
+  "dataset": "MICRO_LAYOUT_MILESTONE",
+  "shapes": {
+    "M": 1024,
+    "N": 1024,
+    "K": 64
+  },
+  "correctness": {
+    "status": "PASS",
+    "detail": "all four retained-MLIR layout plans matched the NumPy FP32 reference for all 1048576 outputs",
+    "max_abs_error": {
+      "baseline_spatial_reduction": 0.00009806,
+      "temporal_svp": 0.000360,
+      "temporal_dma_coalescing": 0.000281,
+      "temporal_dma_coalescing_broadcast_friendly": 0.000294
+    }
+  },
+  "performance": {
+    "metric": "cycles",
+    "value": 7349987,
+    "source": "apu_v1_device@zhang-capra-xcel.ece.cornell.edu/gsi-13.7.1",
+    "run_cmd": "PYTHONPATH=.:tests/pim python tests/pim/apu_v1/vector_gemm/profile_plans.py",
+    "timestamp": "2026-07-07T17:29:24-04:00",
+    "plans": [
+      {
+        "name": "temporal_dma_coalescing_broadcast_friendly",
+        "estimated_cycles": 8552316,
+        "measured_cycles": 7349987
+      },
+      {
+        "name": "temporal_dma_coalescing",
+        "estimated_cycles": 93711488,
+        "measured_cycles": 93449834
+      },
+      {
+        "name": "baseline_spatial_reduction",
+        "estimated_cycles": 7785192064,
+        "measured_cycles": 6254825903
+      },
+      {
+        "name": "temporal_svp",
+        "estimated_cycles": 7789201728,
+        "measured_cycles": 6258832854
+      }
+    ]
+  },
+  "tenon_commit": "6bc7474a09fa7d2d64007e6b929b6f68660729d3",
+  "notes": "One ordinary Allo contraction generated every candidate. Explicit transfer layouts drive compact LHS L3 lookup, eight resident RHS VRs, subgroup expansion, DMA/PIO traffic, NumPy packing, GVML codegen, and executable cost events. Measured and predicted ranking agree; broadcast-friendly is 12.71x faster than coalesced DMA. Spatial baseline currently requires zero-initialized C and fails closed otherwise."
+}

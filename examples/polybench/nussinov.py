@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32, index
+from allo.ir.types import int32, float32, index, uint16
 import allo.ir.types as T
 
 
@@ -39,7 +39,7 @@ def nussinov_np(seq, table):
     return table
 
 
-def kernel_nussinov[T: (float32, int32), N: int32](seq: "T[N]", table: "T[N, N]"):
+def kernel_nussinov[T: (float32, int32, uint16), N: int32](seq: "T[N]", table: "T[N, N]"):
     for i_inv in range(N):
         i: index = N - 1 - i_inv
         for j in range(i + 1, N):

@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -19,19 +19,19 @@ def trmm_np(A, B, alpha):
     return B
 
 
-def S0[T: (float32, int32), M, N](A: "T[M, M]", B: "T[M, N]"):
+def S0[T: (float32, int32, uint16), M, N](A: "T[M, M]", B: "T[M, N]"):
     for i1, j1 in allo.grid(M, N, name="update"):
         for k1 in allo.reduction(M):
             if k1 > i1:
                 B[i1, j1] += A[k1, i1] * B[k1, j1]
 
 
-def S1[T: (float32, int32), M, N](B: "T[M, N]"):
+def S1[T: (float32, int32, uint16), M, N](B: "T[M, N]"):
     for i0, j0 in allo.grid(M, N, name="mul"):
         B[i0, j0] = B[i0, j0] * alpha
 
 
-def kernel_trmm[T: (float32, int32), M, N](A: "T[M, M]", B: "T[M, N]"):
+def kernel_trmm[T: (float32, int32, uint16), M, N](A: "T[M, M]", B: "T[M, N]"):
     S0[T, M, N](A, B)
     S1[T, M, N](B)
 
