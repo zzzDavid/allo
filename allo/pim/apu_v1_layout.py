@@ -1233,6 +1233,7 @@ class APUV1Plan:
     vr_allocations: tuple[VRAllocation, ...] = ()
     metadata: Mapping[str, object] = field(default_factory=dict)
     output_batching: OutputBatching | None = None
+    accumulator_block: int = 1
 
     def __post_init__(self):
         if not self.name.isidentifier():
@@ -1255,6 +1256,18 @@ class APUV1Plan:
             self.output_batching, OutputBatching
         ):
             raise TypeError("output_batching must be an OutputBatching value")
+        accumulator_block = int(self.accumulator_block)
+        if accumulator_block <= 0:
+            raise ValueError("accumulator_block must be positive")
+        if accumulator_block > 8:
+            raise ValueError("APU v1 accumulator_block cannot exceed eight VRs")
+        if (
+            self.output_batching is not None
+            and accumulator_block > self.output_batching.physical_output_batches
+        ):
+            raise ValueError(
+                "accumulator_block cannot exceed the physical output batches"
+            )
         names = [value.value for value in values]
         if len(names) != len(set(names)):
             raise ValueError("value layout names must be unique")
@@ -1318,6 +1331,7 @@ class APUV1Plan:
         object.__setattr__(self, "vr_allocations", allocations)
         object.__setattr__(self, "reduction_strategy", reduction)
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+        object.__setattr__(self, "accumulator_block", accumulator_block)
 
     def value_layout(self, name: str) -> ValueLayout:
         for value in self.value_layouts:
@@ -1346,6 +1360,7 @@ class APUV1Plan:
             "vr_allocations": _manifest_value(self.vr_allocations),
             "metadata": _manifest_value(self.metadata),
             "output_batching": _manifest_value(self.output_batching),
+            "accumulator_block": self.accumulator_block,
         }
 
 

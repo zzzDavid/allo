@@ -197,6 +197,21 @@ def _effective_route_metrics(plan: APUV1Plan, transfer: Transfer, step):
     """Return traffic for the concrete resident-or-streaming realization."""
 
     metrics = _route_metrics(plan, step)
+    accumulator_block = max(1, int(getattr(plan, "accumulator_block", 1)))
+    if step.kind == "duplicate_subgroup" and accumulator_block > 1:
+        facts = _shape_facts(plan)
+        blocked_calls = (
+            _ceil_div(facts["output_tiles"], accumulator_block) * facts["reduction"]
+        )
+        metrics["count"] = blocked_calls
+        metrics["source_elements"] = metrics["source_elements_per_call"] * blocked_calls
+        metrics["destination_elements"] = (
+            metrics["destination_elements_per_call"] * blocked_calls
+        )
+        metrics["total_bytes"] = metrics["bytes"] * blocked_calls
+        metrics["iterations"] = metrics["source_elements_per_call"] * blocked_calls
+        metrics["accumulator_block"] = accumulator_block
+        return metrics
     if step.kind not in {"dma_l4_l1_32k", "load_vr"}:
         return metrics
     duplicate = next(
@@ -221,7 +236,10 @@ def _effective_route_metrics(plan: APUV1Plan, transfer: Transfer, step):
 
     # The code generator reuses one VR and therefore reloads the chunk stream
     # for every output batch instead of pinning an impossible bank of VRs.
-    replay = max(1, int(metrics["resident_reuse_factor"]))
+    replay = max(
+        1,
+        _ceil_div(int(metrics["resident_reuse_factor"]), accumulator_block),
+    )
     for name in (
         "count",
         "source_elements",
@@ -232,6 +250,7 @@ def _effective_route_metrics(plan: APUV1Plan, transfer: Transfer, step):
         metrics[name] *= replay
     metrics["resident_reuse_factor"] = 1
     metrics["streaming_replay_factor"] = replay
+    metrics["accumulator_block"] = accumulator_block
     return metrics
 
 
@@ -333,11 +352,7 @@ def _transfer_route_metadata(plan, transfer):
         {
             "kind": step.kind,
             "call_count": metrics["count"],
-            **{
-                field: metrics[field]
-                for field in fields
-                if field in metrics
-            },
+            **{field: metrics[field] for field in fields if field in metrics},
         }
         for step in transfer.route
         for metrics in (_effective_route_metrics(plan, transfer, step),)

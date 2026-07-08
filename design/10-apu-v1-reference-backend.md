@@ -100,13 +100,24 @@ against a 14,906,715-cycle analytical estimate.
 
 An ordinary, non-dataflow Allo contraction now takes a separate retained-MLIR
 path. `apu_v1_vectorize.py` proves the two parallel output axes and one
-reduction axis from SSA accesses, then creates four immutable plans inspired by
-the MICRO'25 mapping progression:
+reduction axis from SSA accesses, then creates immutable plans inspired by the
+MICRO'25 mapping progression:
 
 1. spatial group reduction;
 2. temporal/SVP reduction;
 3. temporal reduction with 32K DMA coalescing;
-4. a broadcast-friendly temporal layout.
+4. a broadcast-friendly temporal layout;
+5. broadcast-friendly temporal layouts with two, four, or eight simultaneous
+   output accumulators, when the physical output batching makes that factor
+   legal.
+
+`accumulator_block` is a temporal register-reuse decision, not a synonym for
+`mapping`. `mapping=8` still means eight spatial groups within one 32K VR. An
+accumulator block of eight means eight distinct output VRs stay live while one
+RHS reduction chunk is loaded and expanded once. For each reduction step the
+generated GVML updates all eight accumulators, then commits them after the
+reduction. Tail predicates make the same lowering valid when the number of
+physical output batches is not divisible by the block.
 
 The plans use the same F2 `LinearLayout` algebra as AiM and UPMEM. Low tile
 bits map to `vr_lane`; high output/reduction/temporal bits map injectively to
@@ -120,9 +131,20 @@ name or plan object through `layout=`, and exposes `candidates`,
 returned callable. Unknown arithmetic, unsafe reductions, unsupported dtypes,
 and VR pressure above VR16_0..14 fail closed.
 
-The full real-device milestone is
+Accumulator-blocked plans lookup the compact row operand directly from L4.
+This avoids copying a dense lookup image into the ARC's bounded L3 cache and
+matches the direct-L4 lookup used by the hand-tuned implementation. The cost
+program leaves lookup and arithmetic counts unchanged, but divides streamed
+RHS DMA/load replay and subgroup-duplicate calls by the legal accumulator
+block. Plan selection still realizes candidates in cost order, so an otherwise
+attractive block is rejected if its simultaneously live accumulators do not
+fit beside indices, streamed operands, and compute temporaries in the fifteen
+writable VRs.
+
+The original full real-device milestone is
 `tests/pim/apu_v1/vector_gemm/test_vector_gemm_apu_v1.py`: one ordinary Allo
-1024x1024x64 FP16 contraction generates all four candidates. Every candidate
+1024x1024x64 FP16 contraction generates the four base candidates plus legal
+accumulator-blocked candidates. Every base candidate
 compiles through MLIR to GVML and matches all 1,048,576 NumPy outputs on the
 Gemini board.
 

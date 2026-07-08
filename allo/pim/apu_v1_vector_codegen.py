@@ -740,8 +740,14 @@ def _explicit_route_instructions(plan, transfer, transfer_index, current_vm):
             if batching is not None
             else max(1, int(_metadata(plan).get("physical_output_batches", 1)))
         )
+        lookup_level = str(getattr(lookup.source, "storage", "")).upper()
+        if lookup_level not in {"L3", "L4"}:
+            raise UnsupportedVectorOperation(
+                f"lookup source for {name!r} must be L3 or L4, got "
+                f"{lookup_level or '<unspecified>'}"
+            )
         lookup_bytes = table_size * temporal_extent * physical_batches * 2
-        if lookup_bytes > L3_LOOKUP_BUDGET_BYTES:
+        if lookup_level == "L3" and lookup_bytes > L3_LOOKUP_BUDGET_BYTES:
             raise UnsupportedVectorOperation(
                 f"lookup image for {name!r} needs {lookup_bytes} L3 bytes, "
                 f"exceeding the safe {L3_LOOKUP_BUDGET_BYTES}-byte budget"
@@ -765,7 +771,7 @@ def _explicit_route_instructions(plan, transfer, transfer_index, current_vm):
                     name,
                     (index_name,),
                     {
-                        "pointer": PointerRef(name, True, "L3", table_size),
+                        "pointer": PointerRef(name, True, lookup_level, table_size),
                         "table_size": table_size,
                     },
                 ),
@@ -775,7 +781,10 @@ def _explicit_route_instructions(plan, transfer, transfer_index, current_vm):
         ingress[-1] = GVMLInstruction(
             **{**ingress[-1].__dict__, "phase": "transfer_in"}
         )
-        return ingress, ("dma_l4_l3", "create_group_index", "lookup_16")
+        selected = ["create_group_index", "lookup_16"]
+        if lookup_level == "L3":
+            selected.insert(0, "dma_l4_l3")
+        return ingress, tuple(selected)
 
     if duplicate is not None:
         parameters = _step_parameters(duplicate)
@@ -808,8 +817,7 @@ def _explicit_route_instructions(plan, transfer, transfer_index, current_vm):
         streamed = resident_count >= WRITABLE_VRS
         allocated_resident_count = 1 if streamed else resident_count
         resident_names = tuple(
-            _tmp(f"{name}_resident", index)
-            for index in range(allocated_resident_count)
+            _tmp(f"{name}_resident", index) for index in range(allocated_resident_count)
         )
         for index, resident in enumerate(resident_names):
             vm = (current_vm + index) % VMR_COUNT
@@ -1374,6 +1382,45 @@ def _allocate_vrs(plan, instructions, *, capacity: int) -> tuple[VRBinding, ...]
     )
 
 
+def _reserve_accumulator_block(
+    plan,
+    bindings: tuple[VRBinding, ...],
+    output_names: set[str],
+    *,
+    capacity: int,
+) -> tuple[VRBinding, ...]:
+    """Reserve distinct physical VRs for simultaneously live accumulators."""
+
+    block = int(getattr(plan, "accumulator_block", 1))
+    if block == 1:
+        return bindings
+    if len(output_names) != 1:
+        raise UnsupportedVectorOperation(
+            "accumulator blocking currently requires exactly one carried output"
+        )
+    output = next(iter(output_names))
+    if not any(binding.logical_name == output for binding in bindings):
+        raise VRCapacityError(f"carried output {output!r} has no allocated VR")
+    occupied = {binding.concrete for binding in bindings}
+    available = [index for index in range(capacity) if index not in occupied]
+    if len(available) < block - 1:
+        raise VRCapacityError(
+            f"accumulator block {block} needs {block - 1} additional writable VRs; "
+            f"only {len(available)} remain after allocating the vector program"
+        )
+    lifetime = (0, max((binding.live_range[1] for binding in bindings), default=1))
+    extras = tuple(
+        VRBinding(f"{output}__acc{slot}", available[slot - 1], lifetime)
+        for slot in range(1, block)
+    )
+    return tuple(
+        sorted(
+            bindings + extras,
+            key=lambda value: (value.concrete, value.logical_name),
+        )
+    )
+
+
 class APUVectorABI:
     """Layout-driven NumPy pack/gather ABI for one realized plan."""
 
@@ -1923,6 +1970,10 @@ class APUVectorRealization:
             return 1
         return max(1, int(batching.work_tiles_per_output_batch))
 
+    @property
+    def accumulator_block(self) -> int:
+        return max(1, int(getattr(self.plan, "accumulator_block", 1)))
+
     def _spatial_scatter_elements(self) -> int | None:
         """Return dense elements per spatial work tile, proving placement order."""
 
@@ -2030,6 +2081,104 @@ class APUVectorRealization:
         )
 
         spatial_elements = self._spatial_scatter_elements()
+        if self.accumulator_block > 1:
+            if spatial_elements is not None:
+                raise UnsupportedVectorOperation(
+                    "accumulator blocking is only defined for temporal reductions"
+                )
+            if len(output_names) != 1:
+                raise UnsupportedVectorOperation(
+                    "accumulator blocking requires exactly one carried output"
+                )
+            output = next(iter(output_names))
+            block = self.accumulator_block
+            accumulator_bindings = (
+                bindings[output],
+                *(bindings[f"{output}__acc{slot}"] for slot in range(1, block)),
+            )
+
+            def has_batched_pointer(instruction):
+                return any(
+                    isinstance(argument, PointerRef) for argument in instruction.args
+                )
+
+            slot_ingress = [item for item in inner_ingress if has_batched_pointer(item)]
+            shared_ingress = [
+                item for item in inner_ingress if not has_batched_pointer(item)
+            ]
+            if not slot_ingress:
+                raise UnsupportedVectorOperation(
+                    "accumulator blocking needs output-batched operand ingress"
+                )
+
+            def render_slot(instruction, slot):
+                current = f"(output_block * {block} + {slot})"
+                slot_bindings = dict(bindings)
+                slot_bindings[output] = accumulator_bindings[slot]
+                slot_batches = dict(pointer_batches)
+                slot_batches[output] = current
+                for item in slot_ingress:
+                    if item.opcode != "LOOKUP_16":
+                        continue
+                    for argument in item.args:
+                        if isinstance(argument, PointerRef):
+                            slot_batches[argument.name] = (
+                                f"{current} * {self.reduction_steps} + reduction_step"
+                            )
+                return instruction.render(slot_bindings, slot_batches)
+
+            output_blocks = math.ceil(self.output_batches / block)
+            lines.append(
+                f"    for (uint32_t output_block = 0; output_block < {output_blocks}; "
+                "++output_block) {"
+            )
+            for slot in range(block):
+                lines.append(
+                    f"        if (output_block * {block} + {slot} < "
+                    f"{self.output_batches}) {{"
+                )
+                lines.extend(
+                    "            " + render_slot(instruction, slot)
+                    for instruction in outer_ingress
+                )
+                lines.append("        }")
+            lines.append(
+                f"        for (uint32_t reduction_step = 0; reduction_step < "
+                f"{self.reduction_steps}; ++reduction_step) {{"
+            )
+            lines.extend(
+                "            " + instruction.render(bindings, pointer_batches)
+                for instruction in shared_ingress
+            )
+            for slot in range(block):
+                lines.append(
+                    f"            if (output_block * {block} + {slot} < "
+                    f"{self.output_batches}) {{"
+                )
+                lines.append(
+                    f"                const uint32_t batch = "
+                    f"(output_block * {block} + {slot}) * {self.reduction_steps} "
+                    "+ reduction_step;"
+                )
+                lines.extend(
+                    "                " + render_slot(instruction, slot)
+                    for instruction in slot_ingress + compute
+                )
+                lines.append("            }")
+            lines.append("        }")
+            for slot in range(block):
+                lines.append(
+                    f"        if (output_block * {block} + {slot} < "
+                    f"{self.output_batches}) {{"
+                )
+                lines.extend(
+                    "            " + render_slot(instruction, slot)
+                    for instruction in egress
+                )
+                lines.append("        }")
+            lines.extend(["    }", "    return 0;", "}", ""])
+            return "\n".join(lines)
+
         lines.append(
             f"    for (uint32_t output_batch = 0; output_batch < {self.output_batches}; "
             "++output_batch) {"
@@ -2213,6 +2362,12 @@ def realize_apu_v1_plan(
         compute.extend(_op_instructions(operation, index))
     instructions = tuple(ingress + compute + egress)
     bindings = _allocate_vrs(plan, instructions, capacity=int(vr_capacity))
+    bindings = _reserve_accumulator_block(
+        plan,
+        bindings,
+        output_names,
+        capacity=int(vr_capacity),
+    )
     abi = APUVectorABI(plan, normalized_values)
     return APUVectorRealization(
         plan,

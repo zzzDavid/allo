@@ -71,14 +71,17 @@ def test_plan_graph_uses_structural_operations_moves_and_vector_counts(plans):
     assert all(activity.latency_cycles > 0 for activity in graph.activities)
 
 
-def test_full_micro_shape_has_four_positive_costs_and_broadcast_plan_wins(plans):
+def test_full_micro_shape_ranks_accumulator_blocks_by_rhs_reuse(plans):
     target = build_apu_v1_target()
     ranked = rank_apu_v1_plans(plans, target, apu_v1_cost)
 
     cycles = [item.cycles for item in ranked]
     assert all(cycle > 0 for cycle in cycles)
-    assert len(set(cycles)) == 4
+    assert len(set(cycles)) == 7
     assert [item.plan.name for item in ranked] == [
+        "temporal_dma_coalescing_broadcast_friendly_acc8",
+        "temporal_dma_coalescing_broadcast_friendly_acc4",
+        "temporal_dma_coalescing_broadcast_friendly_acc2",
         "temporal_dma_coalescing_broadcast_friendly",
         "temporal_dma_coalescing",
         "baseline_spatial_reduction",
@@ -88,7 +91,12 @@ def test_full_micro_shape_has_four_positive_costs_and_broadcast_plan_wins(plans)
 
 def test_transfer_traffic_is_derived_from_route_layout_relations(plans):
     target = build_apu_v1_target()
-    result = estimate_apu_v1_plan(plans[-1], target, apu_v1_cost)
+    plan = next(
+        item
+        for item in plans
+        if item.name == "temporal_dma_coalescing_broadcast_friendly"
+    )
+    result = estimate_apu_v1_plan(plan, target, apu_v1_cost)
     routes = {
         (route["value"], step["kind"]): step
         for route in result.graph.metadata["transfer_routes"]
@@ -135,7 +143,7 @@ def test_transfer_cost_does_not_consume_planner_broadcast_metadata(plans):
     assert estimate_apu_v1_plan(poisoned, target, apu_v1_cost).cycles == original
 
 
-def test_streamed_resident_route_prices_each_output_batch_replay():
+def test_streamed_resident_route_prices_each_accumulator_block_replay():
     module = allo.customize(streamed_micro, enable_tensor=False).module
     plan = generate_apu_v1_vectorization_candidates(module)[-1].plan
     result = estimate_apu_v1_plan(plan, build_apu_v1_target(), apu_v1_cost)
@@ -146,9 +154,12 @@ def test_streamed_resident_route_prices_each_output_batch_replay():
     }
 
     rhs_dma = routes[("right", "dma_l4_l1_32k")]
-    assert rhs_dma["call_count"] == 16 * 8
+    assert plan.accumulator_block == 8
+    assert rhs_dma["call_count"] == 16
     assert rhs_dma["resident_reuse_factor"] == 1
-    assert rhs_dma["streaming_replay_factor"] == 8
+    assert rhs_dma["streaming_replay_factor"] == 1
+    rhs_duplicate = routes[("right", "duplicate_subgroup")]
+    assert rhs_duplicate["call_count"] == 128
 
 
 def test_estimate_retains_plan_graph_and_bound_cost_fingerprint(plans):

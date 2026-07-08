@@ -193,7 +193,9 @@ def test_lookup_ingress_repeats_table_slices_for_each_physical_output_batch():
         "result": np.zeros((64, 1024), dtype=np.uint16),
     }
     images = realization.abi.transfer_input_images(arrays)
-    transfer = next(item for item in compiled.selected_plan.transfers if item.value == "left")
+    transfer = next(
+        item for item in compiled.selected_plan.transfers if item.value == "left"
+    )
     lookup = next(step for step in transfer.route if step.kind == "lookup")
     table_size = lookup.parameters["table_size"]
     required = realization.output_batches * table_size
@@ -212,12 +214,23 @@ def test_large_broadcast_route_streams_reduction_chunks_through_one_vr():
     )
 
     assert compiled.selected_plan.name == (
-        "temporal_dma_coalescing_broadcast_friendly"
+        "temporal_dma_coalescing_broadcast_friendly_acc8"
     )
     source = compiled.device_source()
     assert "if (reduction_step % 8 == 0) direct_dma_l4_to_l1_32k" in source
     assert "(reduction_step / 8) * 32768" in source
     assert source.count("right_resident") == 3  # declaration, load, and duplicate
+    assert "for (uint32_t output_block = 0;" in source
+    assert "result__acc7" in source
+    assert "left_L4ptr" in source
+    # The streamed RHS is outside the eight statically unrolled accumulator
+    # updates and is therefore loaded/expanded once per reduction step.
+    reduction_loop = source.split("for (uint32_t reduction_step", 1)[1]
+    first_accumulator = reduction_loop.index("const uint32_t batch")
+    assert reduction_loop.index("direct_dma_l4_to_l1_32k") < first_accumulator
+    assert (
+        reduction_loop.index("gvml_duplicate_subgrp_16_grp_sgidx") < first_accumulator
+    )
     bindings = compiled.realization.binding_map
     resident = next(
         binding.concrete
@@ -236,12 +249,10 @@ def test_non_power_of_two_gemm_edge_tile_has_a_realizable_plan():
     )
 
     assert compiled.realization is not None, compiled.realization_error
-    assert compiled.selected_plan.name == (
-        "temporal_dma_coalescing_broadcast_friendly"
-    )
+    assert compiled.selected_plan.name == ("temporal_dma_coalescing_broadcast_friendly")
 
 
-def test_lookup_plan_falls_back_before_exhausting_runtime_l3():
+def test_large_lookup_plan_uses_l4_instead_of_exhausting_runtime_l3():
     compiled = allo.compile(
         l3_over_capacity_dense_tile,
         build_apu_v1_target(),
@@ -250,4 +261,8 @@ def test_lookup_plan_falls_back_before_exhausting_runtime_l3():
     )
 
     assert compiled.realization is not None, compiled.realization_error
-    assert compiled.selected_plan.name == "temporal_dma_coalescing"
+    assert compiled.selected_plan.name == (
+        "temporal_dma_coalescing_broadcast_friendly_acc8"
+    )
+    assert "left_L4ptr" in compiled.device_source()
+    assert "left_L3ptr" not in compiled.device_source()

@@ -435,7 +435,11 @@ def test_padded_layout_capacity_may_exceed_valid_singleton_output_batches():
 def test_full_micro_problem_uses_lane_low_bits_and_distinct_vr_batches():
     analysis = analyze_apu_v1_contraction(_module(full_problem_micro))
     plans = generate_apu_v1_plans(analysis)
-    optimized = plans[-1]
+    optimized = next(
+        plan
+        for plan in plans
+        if plan.name == "temporal_dma_coalescing_broadcast_friendly"
+    )
     assert "broadcast_geometry" not in optimized.metadata
     left_transfer = next(item for item in optimized.transfers if item.value == "left")
     right_transfer = next(item for item in optimized.transfers if item.value == "right")
@@ -477,6 +481,12 @@ def test_full_micro_problem_uses_lane_low_bits_and_distinct_vr_batches():
         assert plan.value_layout("result").layout.out_sizes[1] == 32
         persistence = plan.metadata["accumulator_persistence"]
         assert persistence["reduction_tiles"] == plan.output_batching.reduction_tiles
+
+    blocked = plans[-1]
+    assert blocked.accumulator_block == 8
+    blocked_left = next(item for item in blocked.transfers if item.value == "left")
+    assert [step.kind for step in blocked_left.route] == ["lookup"]
+    assert blocked_left.route[0].source.storage == "l4"
     assert plans[0].metadata["accumulator_persistence"] == {
         "scope": "work_tile",
         "reduction_tiles": 1,

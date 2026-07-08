@@ -5,7 +5,7 @@
 This module is deliberately independent of code generation and runtime.  It
 recognizes reduction updates from retained Allo MLIR, recovers logical loop
 axes and memory accesses, proves the output/reduction independence needed for
-vector execution, and materializes four named layout candidates.  No decision
+vector execution, and materializes named layout candidates.  No decision
 depends on a Python function or kernel name.
 
 The accepted analysis core is a dense one-reduction contraction with one or
@@ -669,6 +669,8 @@ def _candidate_recipes(analysis: ContractionAnalysis):
             "reduction_strategy": "spatial",
             "coalesced": False,
             "broadcast": False,
+            "accumulator_block": 1,
+            "lookup_storage": "l3",
         },
         {
             "name": "temporal_svp",
@@ -678,6 +680,8 @@ def _candidate_recipes(analysis: ContractionAnalysis):
             "reduction_strategy": "temporal",
             "coalesced": False,
             "broadcast": False,
+            "accumulator_block": 1,
+            "lookup_storage": "l3",
         },
         {
             "name": "temporal_dma_coalescing",
@@ -687,6 +691,8 @@ def _candidate_recipes(analysis: ContractionAnalysis):
             "reduction_strategy": "temporal",
             "coalesced": True,
             "broadcast": False,
+            "accumulator_block": 1,
+            "lookup_storage": "l3",
         },
         {
             "name": "temporal_dma_coalescing_broadcast_friendly",
@@ -696,14 +702,33 @@ def _candidate_recipes(analysis: ContractionAnalysis):
             "reduction_strategy": "temporal",
             "coalesced": True,
             "broadcast": True,
+            "accumulator_block": 1,
+            "lookup_storage": "l3",
         },
+        *(
+            {
+                "name": (
+                    "temporal_dma_coalescing_broadcast_friendly_"
+                    f"acc{accumulator_block}"
+                ),
+                "spatial_axes": output_axes,
+                "temporal_axes": (reduction,),
+                "temporal_strategy": "svp",
+                "reduction_strategy": "temporal",
+                "coalesced": True,
+                "broadcast": True,
+                "accumulator_block": accumulator_block,
+                "lookup_storage": "l4",
+            }
+            for accumulator_block in (2, 4, 8)
+        ),
     )
 
 
 def generate_apu_v1_vectorization_candidates(
     module_or_analysis,
 ) -> tuple[VectorizationCandidate, ...]:
-    """Create the four MICRO-motivated plans for a proven contraction."""
+    """Create MICRO-motivated plans for a proven contraction."""
     analysis = (
         module_or_analysis
         if isinstance(module_or_analysis, ContractionAnalysis)
@@ -966,10 +991,10 @@ def generate_apu_v1_vectorization_candidates(
 
             replicas = set(compute.replica_axes)
             if column_axis in replicas:
-                # A compact row operand is retained in L3 as one lookup table
-                # per (output-row tile, reduction step).  The full operand fits
-                # in L3 for the MICRO reference problem, so its DMA is issued
-                # once; lookup alone executes for every table.
+                # A compact row operand is one lookup table per (output-row
+                # tile, reduction step).  The unblocked MICRO plan may retain
+                # it in L3.  Accumulator-blocked plans lookup directly from L4
+                # so dense workloads are not constrained by ARC cache capacity.
                 table_tiles = {
                     axis: (
                         min(row_tile, padded(extents[axis])) if axis == row_axis else 1
@@ -1002,16 +1027,23 @@ def generate_apu_v1_vectorization_candidates(
                     window(column_axis, column_tile),
                     window(analysis.reduction_axis, 1),
                 )
+                lookup_source = l3 if recipe["lookup_storage"] == "l3" else l4
                 route = (
-                    TransferRouteStep(
-                        "dma_l4_l3",
-                        l4,
-                        l3,
-                        parameters={"whole_operand": True},
+                    *(
+                        (
+                            TransferRouteStep(
+                                "dma_l4_l3",
+                                l4,
+                                l3,
+                                parameters={"whole_operand": True},
+                            ),
+                        )
+                        if recipe["lookup_storage"] == "l3"
+                        else ()
                     ),
                     TransferRouteStep(
                         "lookup",
-                        l3,
+                        lookup_source,
                         compute_endpoint,
                         temporal_axis=analysis.reduction_axis,
                         executed_at=table_windows,
@@ -1359,6 +1391,9 @@ def generate_apu_v1_vectorization_candidates(
             raise IllegalContractionError(
                 "output batching exceeds the physical output layout capacity"
             )
+        accumulator_block = int(recipe["accumulator_block"])
+        if accumulator_block > physical_output_batches:
+            continue
         compute_tiles_per_output = output_batching.work_tiles_per_output_batch
         work_steps_per_output = output_batching.work_steps_per_output_batch
         metadata = {
@@ -1436,6 +1471,7 @@ def generate_apu_v1_vectorization_candidates(
                     else "egress_after_work_steps"
                 ),
             },
+            "accumulator_block": accumulator_block,
             "product_operation": analysis.multiply_operation,
             "packed_word_bits": analysis.packed_word_bits,
             "combine_operation": analysis.combine_operation,
@@ -1464,6 +1500,7 @@ def generate_apu_v1_vectorization_candidates(
             operations=operations,
             metadata=metadata,
             output_batching=output_batching,
+            accumulator_block=accumulator_block,
         )
         candidates.append(VectorizationCandidate(recipe["name"], analysis, plan))
     return tuple(candidates)
