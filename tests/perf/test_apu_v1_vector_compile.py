@@ -165,17 +165,35 @@ def test_public_compile_consumes_target_neutral_xnor_popcount_mlir():
     assert "gvml_add_s16" in source
 
 
-def test_cost_selection_falls_through_to_a_realizable_singleton_output_plan():
+def test_native_spatial_gemv_realizes_for_singleton_output_axis():
     compiled = allo.compile(
         singleton_output_gemv,
         build_apu_v1_target(),
         apu_v1_cost,
         backend="virtual",
+        layout="spatial_gemv_group_reduction",
     )
 
     assert compiled.realization is not None, compiled.realization_error
     assert compiled.selected_estimate.plan.name == compiled.selected_plan.name
-    assert "gvml_mul_u16" in compiled.device_source()
+    assert compiled.selected_plan.name == "spatial_gemv_group_reduction"
+    source = compiled.device_source()
+    assert "gvml_mul_u16" in source
+    assert "gvml_add_subgrps_u16_grp" in source
+    assert "for (uint32_t output_tile" in source
+    assert "for (uint32_t reduction_step" not in source
+    assert source.index("right_L4ptr") < source.index("for (uint32_t output_tile")
+    vector = np.arange(1, 20, dtype=np.uint16).reshape(19, 1)
+    images = compiled.realization.abi.transfer_input_images(
+        {
+            "left": np.ones((17, 19), dtype=np.uint16),
+            "right": vector,
+            "result": np.zeros((17, 1), dtype=np.uint16),
+        }
+    )
+    groups = images["right"].reshape(-1, 32)
+    np.testing.assert_array_equal(groups[:, :19], np.tile(vector.T, (1024, 1)))
+    assert np.count_nonzero(groups[:, 19:]) == 0
 
 
 def test_lookup_ingress_repeats_table_slices_for_each_physical_output_batch():

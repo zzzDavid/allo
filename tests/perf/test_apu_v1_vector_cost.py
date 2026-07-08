@@ -45,6 +45,16 @@ def streamed_micro(
             result[row, column] += left[row, depth] * right[depth, column]
 
 
+def spatial_gemv(
+    left: uint16[1900, 2100],
+    right: uint16[2100, 1],
+    result: uint16[1900, 1],
+):
+    for row, column in allo.grid(1900, 1):
+        for depth in allo.reduction(2100):
+            result[row, column] += left[row, depth] * right[depth, column]
+
+
 @pytest.fixture(scope="module")
 def plans():
     module = allo.customize(micro_1k, enable_tensor=False).module
@@ -181,6 +191,41 @@ def test_streamed_resident_route_prices_each_accumulator_block_replay():
     assert rhs_dma["streaming_replay_factor"] == 1
     rhs_duplicate = routes[("right", "duplicate_subgroup")]
     assert rhs_duplicate["call_count"] == 128
+
+
+def test_spatial_gemv_prices_matrix_tiles_and_resident_vector_bank():
+    module = allo.customize(spatial_gemv, enable_tensor=False).module
+    plans = generate_apu_v1_vectorization_candidates(module)
+    plan = next(
+        candidate.plan
+        for candidate in plans
+        if candidate.name == "spatial_gemv_group_reduction"
+    )
+    result = estimate_apu_v1_plan(plan, build_apu_v1_target(), apu_v1_cost)
+    routes = {
+        (route["value"], step["kind"]): step
+        for route in result.graph.metadata["transfer_routes"]
+        for step in route["steps"]
+    }
+
+    assert plan.metadata["tile_sizes"] == {
+        "row": 128,
+        "column": 1,
+        "depth": 256,
+    }
+    assert routes[("left", "dma_l4_l1_32k")]["call_count"] == 135
+    assert routes[("right", "dma_l4_l1_32k")]["call_count"] == 9
+    assert routes[("right", "dma_l4_l1_32k")]["resident_reuse_factor"] == 15
+    assert result.cycles > 0
+    temporal = next(
+        candidate.plan
+        for candidate in plans
+        if candidate.name == "temporal_dma_coalescing"
+    )
+    assert (
+        result.cycles
+        < estimate_apu_v1_plan(temporal, build_apu_v1_target(), apu_v1_cost).cycles
+    )
 
 
 def test_estimate_retains_plan_graph_and_bound_cost_fingerprint(plans):

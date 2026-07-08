@@ -20,12 +20,12 @@ product are transparent.  ``math.ctpop(xori(xori(a, b), all_ones))`` is
 recognized structurally as raw XNOR/popcount; it is not silently reinterpreted
 as the bipolar ``2*popcount-word_bits`` operation.
 
-This boundary also makes the next PolyBench subset precise.  GEMM and the GEMM
-stages of 2mm/3mm fit the realized rank-2 form.  The matrix-vector reductions
-in ATAX, BiCG, and MVT are now discovered but intentionally fail plan
-generation until a singleton output-axis layout is defined.  Doitgen needs a
-batched-output layout; SYRK/SYR2K need triangular-domain legality; Gemver needs
-multi-stage fusion.  Those patterns are never mislabeled as executable plans.
+This boundary also makes the PolyBench subset precise. GEMM and the GEMM
+stages of 2mm/3mm fit the dense rank-2 form. Matrix-vector reductions expressed
+with an explicit singleton second output axis use a native spatial-K group
+reduction plan; a genuinely rank-1 MLIR result still needs normalization to
+that layout. Batched contractions, triangular domains, and multi-stage fusion
+remain separate legality and program-composition concerns.
 """
 
 from __future__ import annotations
@@ -660,6 +660,9 @@ def _layout_api():
 def _candidate_recipes(analysis: ContractionAnalysis):
     output_axes = analysis.output_axes
     reduction = analysis.reduction_axis
+    singleton_gemv = (
+        len(output_axes) == 2 and analysis.axis_extents[output_axes[1]] == 1
+    )
     return (
         {
             "name": "baseline_spatial_reduction",
@@ -723,6 +726,24 @@ def _candidate_recipes(analysis: ContractionAnalysis):
             }
             for accumulator_block in (2, 4, 8)
             for lookup_storage in ("l3", "l4")
+        ),
+        *(
+            (
+                {
+                    "name": "spatial_gemv_group_reduction",
+                    "spatial_axes": output_axes + (reduction,),
+                    "temporal_axes": (),
+                    "temporal_strategy": "none",
+                    "reduction_strategy": "spatial",
+                    "coalesced": True,
+                    "broadcast": False,
+                    "accumulator_block": 1,
+                    "lookup_storage": "l3",
+                    "gemv": True,
+                },
+            )
+            if singleton_gemv
+            else ()
         ),
     )
 
@@ -855,7 +876,35 @@ def generate_apu_v1_vectorization_candidates(
         )
 
     def iteration_layout(recipe):
-        spatial = spatial_tiles(recipe["spatial_axes"])
+        if recipe.get("gemv"):
+            row_axis, column_axis = analysis.output_axes
+            reduction_extent = extents[analysis.reduction_axis]
+            choices = []
+            for reduction_tile in (32, 64, 128, 256, 512, 1024, 2048):
+                tile = min(reduction_extent, reduction_tile)
+                padded_tile = padded(tile)
+                resident_count = (reduction_extent + padded_tile - 1) // padded_tile
+                if resident_count > 10:
+                    continue
+                rows_per_vr = 32768 // padded_tile
+                matrix_tiles = (
+                    (extents[row_axis] + rows_per_vr - 1) // rows_per_vr
+                ) * resident_count
+                choices.append(
+                    (matrix_tiles, resident_count, -padded_tile, tile, rows_per_vr)
+                )
+            if not choices:
+                raise IllegalContractionError(
+                    "spatial GEMV needs at most ten resident vector tiles"
+                )
+            _calls, _resident, _neg_tile, reduction_tile, rows_per_vr = min(choices)
+            spatial = {
+                row_axis: min(extents[row_axis], rows_per_vr),
+                column_axis: 1,
+                analysis.reduction_axis: reduction_tile,
+            }
+        else:
+            spatial = spatial_tiles(recipe["spatial_axes"])
         tiles = {axis: spatial.get(axis, 1) for axis in axis_order}
         layout = batched_layout(extents, tiles)
         temporal = tuple(
@@ -954,6 +1003,132 @@ def generate_apu_v1_vectorization_candidates(
                 replicas=compute.replica_axes,
                 role="expanded_compute",
             )
+            if recipe.get("gemv"):
+                if access.value == analysis.lhs.value:
+                    gemv_compute_windows = (
+                        window(row_axis, padded(tile_sizes[row_axis])),
+                        window(column_axis, padded(tile_sizes[column_axis])),
+                        window(
+                            analysis.reduction_axis,
+                            padded(tile_sizes[analysis.reduction_axis]),
+                        ),
+                    )
+                    l4 = endpoint(
+                        "l4_expanded",
+                        access,
+                        compute.layout,
+                        replicas=compute.replica_axes,
+                        role="packed_gemv_matrix_tiles",
+                    )
+                    l1 = endpoint(
+                        "l1",
+                        access,
+                        compute.layout,
+                        replicas=compute.replica_axes,
+                        role="gemv_matrix_dma_staging",
+                    )
+                    return Transfer(
+                        access.value,
+                        "in",
+                        route=(
+                            TransferRouteStep(
+                                "dma_l4_l1_32k",
+                                l4,
+                                l1,
+                                executed_at=gemv_compute_windows,
+                            ),
+                            TransferRouteStep(
+                                "load_vr",
+                                l1,
+                                compute_endpoint,
+                                executed_at=gemv_compute_windows,
+                            ),
+                        ),
+                    )
+
+                # Collapse high output-row replica bits in storage. One
+                # pre-expanded vector VR is therefore shared by every matrix
+                # row tile instead of being materialized once per tile.
+                from ..spmw_linear_layout import LinearLayout
+
+                carrier = compute.layout.carrier
+                gemv_row_tile = padded(tile_sizes[row_axis])
+                row_bits = gemv_row_tile.bit_length() - 1
+                resident_bases = {
+                    axis: [tuple(vector) for vector in vectors]
+                    for axis, vectors in carrier.bases.items()
+                }
+                resident_bases[row_axis] = resident_bases[row_axis][:row_bits]
+                carrier_reduction_batches = max(
+                    1,
+                    padded(extents[analysis.reduction_axis]) // reduction_tile,
+                )
+                resident_count = (
+                    extents[analysis.reduction_axis] + reduction_tile - 1
+                ) // reduction_tile
+                resident_carrier = LinearLayout(
+                    resident_bases,
+                    carrier.out_dims,
+                    (32768, carrier_reduction_batches),
+                )
+                resident_layout = AffineTiledLayout(
+                    resident_carrier,
+                    {
+                        **compute.layout.input_extents,
+                        row_axis: min(gemv_row_tile, extents[row_axis]),
+                    },
+                    physical_out_sizes=(32768, carrier_reduction_batches),
+                )
+                l4 = endpoint(
+                    "l4_expanded",
+                    access,
+                    resident_layout,
+                    replicas=compute.replica_axes,
+                    role="resident_gemv_vector_image",
+                )
+                l1 = endpoint(
+                    "l1",
+                    access,
+                    resident_layout,
+                    replicas=compute.replica_axes,
+                    role="gemv_vector_dma_staging",
+                )
+                resident = endpoint(
+                    "resident_vr",
+                    access,
+                    resident_layout,
+                    replicas=compute.replica_axes,
+                    role="resident_gemv_vector",
+                )
+                vector_window = (window(analysis.reduction_axis, reduction_tile),)
+                row_residency = (window(row_axis, gemv_row_tile),)
+                parameters = {
+                    "gemv_resident_vector": True,
+                    "reduction_tile": reduction_tile,
+                    "resident_count": resident_count,
+                }
+                return Transfer(
+                    access.value,
+                    "in",
+                    route=(
+                        TransferRouteStep(
+                            "dma_l4_l1_32k",
+                            l4,
+                            l1,
+                            executed_at=vector_window,
+                            resident_across=row_residency,
+                            parameters=parameters,
+                        ),
+                        TransferRouteStep(
+                            "load_vr",
+                            l1,
+                            resident,
+                            executed_at=vector_window,
+                            resident_across=row_residency,
+                            parameters=parameters,
+                        ),
+                    ),
+                )
             if not recipe["broadcast"]:
                 if recipe["coalesced"]:
                     source = endpoint(
@@ -1204,7 +1379,7 @@ def generate_apu_v1_vectorization_candidates(
                     executed_at=output_windows,
                 ),
             )
-            if recipe["coalesced"]
+            if recipe["coalesced"] and not recipe.get("gemv")
             else (
                 TransferRouteStep(
                     "direct",
@@ -1216,7 +1391,11 @@ def generate_apu_v1_vectorization_candidates(
         )
         output_egress_route = (
             TransferRouteStep(
-                "dma_vr_l4" if recipe["coalesced"] else "direct",
+                (
+                    "dma_vr_l4"
+                    if recipe["coalesced"] and not recipe.get("gemv")
+                    else "direct"
+                ),
                 output_compute,
                 output_l4,
                 executed_at=output_windows,
@@ -1474,6 +1653,7 @@ def generate_apu_v1_vectorization_candidates(
                 ),
             },
             "accumulator_block": accumulator_block,
+            "gemv_spatial_reduction": bool(recipe.get("gemv")),
             "product_operation": analysis.multiply_operation,
             "packed_word_bits": analysis.packed_word_bits,
             "combine_operation": analysis.combine_operation,

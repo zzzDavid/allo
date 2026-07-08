@@ -712,10 +712,49 @@ def _explicit_route_instructions(plan, transfer, transfer_index, current_vm):
     duplicate = next(
         (step for step in route if step.kind == "duplicate_subgroup"), None
     )
+    gemv_resident = next(
+        (
+            step
+            for step in route
+            if bool(_step_parameters(step).get("gemv_resident_vector"))
+        ),
+        None,
+    )
     if lookup is not None and duplicate is not None:
         raise UnsupportedVectorOperation(
             f"value {name!r} cannot use lookup and subgroup duplication in one route"
         )
+
+    if gemv_resident is not None:
+        resident_count = int(_step_parameters(gemv_resident)["resident_count"])
+        if resident_count <= 0 or resident_count > 10:
+            raise UnsupportedVectorOperation(
+                "spatial GEMV needs between one and ten resident vector tiles"
+            )
+        for index in range(resident_count):
+            resident = name if index == 0 else f"{name}__gemv_resident{index}"
+            vm = (current_vm + index) % VMR_COUNT
+            ingress.extend(
+                [
+                    GVMLInstruction(
+                        "DMA_L4_TO_L1_32K",
+                        "direct_dma_l4_to_l1_32k",
+                        (
+                            f"GVML_VM_{vm}",
+                            PointerOffsetRef(name, f"{index} * {VR_LANES}"),
+                        ),
+                        phase="resident_setup",
+                    ),
+                    GVMLInstruction(
+                        "LOAD_16",
+                        "gvml_load_16",
+                        (VRRef(resident), f"GVML_VM_{vm}"),
+                        (resident,),
+                        phase="resident_setup",
+                    ),
+                ]
+            )
+        return ingress, ("dma_l4_l1", "load_resident_vr")
 
     if lookup is not None:
         parameters = _step_parameters(lookup)
@@ -1720,8 +1759,44 @@ class APUVectorABI:
         lanes remain zero and F2 batch order never relies on a row-major guess.
         """
 
-        destination = _route(transfer)[-1].destination
-        layout = destination.layout
+        route = _route(transfer)
+        gemv_resident = any(
+            bool(_step_parameters(step).get("gemv_resident_vector")) for step in route
+        )
+        layout = (route[0].source if gemv_resident else route[-1].destination).layout
+        if gemv_resident:
+            parameters = next(
+                _step_parameters(step)
+                for step in route
+                if _step_parameters(step).get("gemv_resident_vector")
+            )
+            reduction_tile = int(parameters["reduction_tile"])
+            if VR_LANES % reduction_tile:
+                raise APULayoutPackingError(
+                    f"{value.name}: GEMV reduction tile must divide one VR"
+                )
+            roles = dict(_metadata(self.plan).get("loop_roles", {}))
+            reduction_axis = next(
+                axis for axis, role in roles.items() if role == "reduction"
+            )
+            value_layout = self._value_layout(value.name)
+            reduction_position = value_layout.axes.index(reduction_axis)
+            ordered = np.moveaxis(bits, reduction_position, 0)
+            if math.prod(ordered.shape[1:]) != 1:
+                raise APULayoutPackingError(
+                    f"{value.name}: spatial GEMV vector payload must be rank one"
+                )
+            vector = ordered.reshape(ordered.shape[0])
+            resident_count = math.ceil(vector.size / reduction_tile)
+            packed = np.zeros((resident_count, VR_LANES), dtype=np.uint16)
+            row_groups = VR_LANES // reduction_tile
+            for bank in range(resident_count):
+                begin = bank * reduction_tile
+                end = min(begin + reduction_tile, vector.size)
+                group = np.zeros(reduction_tile, dtype=np.uint16)
+                group[: end - begin] = vector[begin:end]
+                packed[bank] = np.tile(group, row_groups)
+            return packed.reshape(-1)
         metadata = _metadata(self.plan)
         roles = dict(metadata.get("loop_roles", {}))
         reduction_axes = [axis for axis, role in roles.items() if role == "reduction"]
@@ -2079,6 +2154,79 @@ class APUVectorRealization:
             "    " + instruction.render(bindings, pointer_batches)
             for instruction in resident_setup + index_setup
         )
+
+        if bool(_metadata(self.plan).get("gemv_spatial_reduction")):
+            if len(output_names) != 1:
+                raise UnsupportedVectorOperation(
+                    "spatial GEMV requires exactly one output vector"
+                )
+            output = next(iter(output_names))
+            gemv_transfer = next(
+                transfer
+                for transfer in tuple(getattr(self.plan, "transfers", ()))
+                if any(
+                    bool(_step_parameters(step).get("gemv_resident_vector"))
+                    for step in _route(transfer)
+                )
+            )
+            vector = str(gemv_transfer.value)
+            reduction_tiles = int(_metadata(self.plan).get("reduction_tiles", 1))
+            resident_names = (
+                vector,
+                *(
+                    f"{vector}__gemv_resident{index}"
+                    for index in range(1, reduction_tiles)
+                ),
+            )
+            if any(name not in bindings for name in resident_names):
+                raise VRCapacityError(
+                    "spatial GEMV resident vector bank was not fully allocated"
+                )
+            group_size = _plan_group_size(self.plan)
+            rows_per_tile = VR_LANES // group_size
+            problem = dict(_metadata(self.plan).get("problem_shape", {}))
+            output_rows = int(problem.get("M", rows_per_tile))
+            matrix_tiles = math.ceil(output_rows / rows_per_tile)
+            lines.append(
+                f"    for (uint32_t output_tile = 0; output_tile < {matrix_tiles}; "
+                "++output_tile) {"
+            )
+            lines.append(f"        gvml_reset_16({bindings[output].c_name});")
+            for reduction_index, resident_name in enumerate(resident_names):
+                lines.append(
+                    f"        const uint32_t batch_{reduction_index} = "
+                    f"output_tile * {reduction_tiles} + {reduction_index};"
+                )
+                slot_bindings = dict(bindings)
+                slot_bindings[vector] = bindings[resident_name]
+                slot_batches = dict(pointer_batches)
+                for instruction in inner_ingress:
+                    for argument in instruction.args:
+                        if isinstance(argument, PointerRef):
+                            slot_batches[argument.name] = f"batch_{reduction_index}"
+                for instruction in inner_ingress:
+                    lines.append(
+                        "        " + instruction.render(slot_bindings, slot_batches)
+                    )
+                lines.extend(
+                    "        " + instruction.render(slot_bindings, slot_batches)
+                    for instruction in compute
+                )
+            lines.extend(
+                [
+                    f"        for (uint32_t scatter = 0; scatter < {rows_per_tile} "
+                    f"&& output_tile * {rows_per_tile} + scatter < {output_rows}; "
+                    "++scatter)",
+                    f"            {output}_L4ptr[output_tile * {rows_per_tile} + "
+                    f"scatter] = gvml_get_entry_16({bindings[output].c_name}, "
+                    f"scatter * {group_size});",
+                    "    }",
+                    "    return 0;",
+                    "}",
+                    "",
+                ]
+            )
+            return "\n".join(lines)
 
         spatial_elements = self._spatial_scatter_elements()
         if self.accumulator_block > 1:

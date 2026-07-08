@@ -424,12 +424,24 @@ def test_padded_layout_capacity_may_exceed_valid_singleton_output_batches():
         _module(padded_singleton_output)
     )
 
-    assert len(candidates) == 4
+    assert len(candidates) == 5
     for candidate in candidates:
         plan = candidate.plan
         assert plan.output_batching.physical_output_batches <= (
             plan.value_layouts[2].layout.out_sizes[1]
         )
+
+    gemv = candidates[-1].plan
+    assert gemv.name == "spatial_gemv_group_reduction"
+    assert gemv.metadata["gemv_spatial_reduction"] is True
+    assert gemv.metadata["tile_sizes"] == {"m": 32, "n": 1, "k": 1024}
+    assert gemv.metadata["reduction_tiles"] == 3
+    lhs = next(item for item in gemv.transfers if item.value == "left")
+    rhs = next(item for item in gemv.transfers if item.value == "right")
+    assert [step.kind for step in lhs.route] == ["dma_l4_l1_32k", "load_vr"]
+    assert [step.kind for step in rhs.route] == ["dma_l4_l1_32k", "load_vr"]
+    assert rhs.route[0].parameters["gemv_resident_vector"] is True
+    assert rhs.route[0].parameters["resident_count"] == 3
 
 
 def test_full_micro_problem_uses_lane_low_bits_and_distinct_vr_batches():

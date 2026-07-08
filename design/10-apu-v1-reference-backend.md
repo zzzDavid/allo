@@ -370,33 +370,44 @@ GEMM additionally contains `group_workload.py` and a physical grouped-GVML
 test for `mapping=8`. This keeps correctness coverage of arbitrary programs
 separate from the optimized vector path.
 
-The retained-MLIR analyzer now discovers dense contractions with one or more
-parallel output axes, while APU vector-plan generation remains deliberately
-restricted to the proven two-output-axis layout:
+The retained-MLIR analyzer discovers dense contractions with one or more
+parallel output axes. A two-axis contraction whose second output extent is one
+now receives a dedicated `spatial_gemv_group_reduction` candidate. Its F2
+layout maps one matrix row group and one reduction tile into a VR, packs up to
+ten reduction-vector tiles into resident VRs, streams each matrix tile once,
+and reduces every row group with `GROUP_REDUCE_ADD_U16`. The planner searches
+power-of-two reduction tiles from 32 through 2,048 and minimizes the number of
+full-VR matrix transfers subject to VR capacity. Group heads are scattered to
+the dense output vector only after all resident reduction tiles accumulate.
+
+This is distinct from treating GEMV as a dense `M x 1 x K` temporal
+contraction, which issued two full-VR input transfers for every scalar `k`.
+For a 2,000 x 2,000 GEMV, the native plan uses one resident-vector transfer and
+125 matrix transfers instead of 4,000 input transfers.
 
 | PolyBench vector pattern | analysis | native APU vector plan | missing abstraction |
 |---|---|---|---|
 | GEMM and GEMM stages in 2mm/3mm | supported | supported | — |
-| ATAX, BiCG, and MVT matrix-vector reductions | supported | fail closed | singleton second output/layout axis |
+| ATAX, BiCG, GESUMMV, and MVT matrix-vector reductions | supported | supported through singleton output axis | — |
 | Doitgen batched contraction | supported | fail closed | batched output-layout axis |
 | SYRK/SYR2K triangular updates | not yet legal | fail closed | triangular-domain validity and symmetric ownership |
-| Gemver multi-stage reductions/updates | individual forms only | fail closed | phase/fusion and intermediate residency |
+| Gemver multi-stage reductions/updates | individual contractions supported | GEMV and rank-1 stages supported | phase fusion and vector epilogues |
 
-The next enabled native-vector subset is ATAX/BiCG/MVT. Their one-dimensional
-matrix-vector reductions already have proven load/reduction structure; they
-need a singleton output axis carried consistently through `ValueLayout`,
-`OutputBatching`, the NumPy ABI, and GVML egress. Doitgen is the following
-layout extension because its extra output axis requires genuine batching,
-not a singleton. Triangular and fused programs remain separate legality work.
+Genuinely rank-1 MLIR outputs still need normalization to the explicit
+singleton-axis representation before plan generation. Doitgen's canonical
+artifact currently flattens its independent outer dimensions into one output
+axis; a general batched-output layout remains future work. Triangular and fused
+programs remain separate legality work.
 
 ## Current boundaries
 
 - Native group-parallel lowering currently recognizes dense FP16
   contractions; canonical uint16 contractions use the ordinary retained-MLIR
   planner.
-- Ordinary vector planning realizes rank-2 FP16 and uint16 contractions plus
-  packed XNOR/popcount contractions. Rank-1 and batched contractions are analyzed but
-  fail plan generation until their output-layout extensions are implemented.
+- Ordinary vector planning realizes rank-2 FP16 and uint16 contractions,
+  singleton-axis GEMV, and packed XNOR/popcount contractions. Genuine rank-1
+  and general batched contractions are analyzed but require output-layout
+  normalization or extension before plan generation.
   The spatial group-reduction realization requires a zero-initialized `C` and
   rejects nonzero accumulators until group-head input placement is modeled.
 - The complete scalar realization currently accepts one phase and runs it on
