@@ -16,11 +16,11 @@
   },
   "performance": {
     "metric": "cycles",
-    "value": 29314,
+    "value": 3566,
     "source": "ramulator2@0f28a07bdb83e42b9305ad3d45410ebd3aa2c091",
     "run_cmd": "python -m pytest tests/pim/aim/gemver/test_gemver_aim.py -p no:cacheprovider -q",
-    "timestamp": "2026-06-30T18:19:11.797052"
+    "timestamp": "2026-07-08T09:56:21.686742"
   },
-  "tenon_commit": "837aab5ab7def05b5255b98cf66eee65362bb546",
+  "tenon_commit": "fc0ab691deb957bbb5b9193660d11615c0275283",
   "notes": "AiM-local SPMW workload; ramulator2 trace simulation; cycles only because the simulator exposes no functional numerics."
 }

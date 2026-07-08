@@ -186,6 +186,7 @@ class WLoad:
     ssa_name: str  # the load result's SSA name (e.g. "%21")
     indices: list[str]
     source_op_name: str  # MLIR op name, e.g. "memref.load"
+    memref_type: str | None = None
 
 
 @dataclass
@@ -257,8 +258,13 @@ def _build_load_term(load_op) -> WLoad:
     # operands[0] is the memref; the rest are the indices.
     indices = operands[1:] if len(operands) > 1 else []
     ssa = _result_names(load_op)[0] if load_op.results else "<no-result>"
+    memref_type = str(load_op.operands[0].type) if load_op.operands else None
     return WLoad(
-        memref_name=memref_name, ssa_name=ssa, indices=indices, source_op_name=name
+        memref_name=memref_name,
+        ssa_name=ssa,
+        indices=indices,
+        source_op_name=name,
+        memref_type=memref_type,
     )
 
 
@@ -486,6 +492,7 @@ def _operand_bindings(
                     memref_name=term.memref_name,
                     indices=list(term.indices),
                     is_loop_carried=(name == acc_name),
+                    memref_type=term.memref_type,
                 )
             )
         elif isinstance(term, WBlockArg):
@@ -683,8 +690,8 @@ def batch_dim(match: MatchedOp) -> tuple[str | None, int | None]:
 
     SPEC-026 §1.2. A loop ``L`` in ``match.enclosing_loops`` is the BATCH
     loop iff its iter var:
-      (a) is the LEADING index of some non-accumulator input operand load
-          (the per-batch input vector X[b, k]), AND
+      (a) indexes some non-accumulator input operand load (the per-batch input
+          vector may be stored either X[b,k] or X[k,b]), AND
       (b) is ABSENT from some OTHER non-accumulator input operand's index
           list (the resident weight W[row, k], which the batch axis never
           indexes).
@@ -713,14 +720,13 @@ def batch_dim(match: MatchedOp) -> tuple[str | None, int | None]:
 
     for L in loops:
         var = L[0]
-        # (a) leading index of some input operand.
-        is_leading = any(opb.indices[0] == var for opb in inputs)
-        if not is_leading:
+        # (a) indexes some input operand.  Requiring a leading index loses the
+        # canonical PolyBench A@B spelling, whose column batch is B[k,j].
+        is_input_axis = any(var in opb.indices for opb in inputs)
+        if not is_input_axis:
             continue
         # (b) absent from some OTHER input operand entirely.
-        absent_elsewhere = any(
-            opb.indices[0] != var and var not in opb.indices for opb in inputs
-        )
+        absent_elsewhere = any(var not in opb.indices for opb in inputs)
         if not absent_elsewhere:
             continue
         # Guard: a batch axis is an enclosing loop var (so B is bounded by

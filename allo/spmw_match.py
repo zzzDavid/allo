@@ -38,6 +38,12 @@ class OperandBinding:
     memref_name: str | None
     indices: list[str] = field(default_factory=list)
     is_loop_carried: bool = False
+    # Retained shaped type of the source memref (for example
+    # ``memref<1900x2100xbf16>``).  This is part of the programming
+    # abstraction: a target lowering may need the logical tensor extents to
+    # materialise a compact matched loop nest as a native command stream.
+    # Older/synthetic matches may leave it unset.
+    memref_type: str | None = None
 
 
 @dataclass

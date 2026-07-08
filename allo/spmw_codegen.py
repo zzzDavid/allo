@@ -328,10 +328,11 @@ class SamsungCtx(CodegenContext):
         the WRITE column command host-side. Emitting the NOP form directly means
         the run-side `_crf_valid` filter (which strips the rejected MOV) now
         finds nothing to drop -- resolving the SPEC-005 §8 followup. We keep the
-        NOP minimal (loopCounter 0): the canonical `NOP 7` pipe-hold already
-        rides the inner-loop body; this drain marker only carries the writeback.
+        canonical eight-cycle pipe hold (`NOP` plus loopCounter 7).  The
+        faithful GEMV conductor passes this emitted stream directly to
+        ``programCrf``; omitting the hold produces an invalid drain schedule.
         """
-        self.cmds.append(PIMCmd(type_="NOP"))
+        self.cmds.append(PIMCmd(type_="NOP", loopCounter_=7))
 
     def program_crf(self, crf_handle):
         """Record that the <=32-word CRF microcode is uploaded for this group.
@@ -771,6 +772,81 @@ class AimCtx(CodegenContext):
         """End-of-command marker — every AiM trace ends with EOC."""
         self.cmds.append("AiM EOC")
         self._human_lines.append("AiM EOC")
+
+    @staticmethod
+    def _memref_shape(type_text: str | None) -> tuple[int, ...]:
+        """Parse the static dimensions retained on an operand binding."""
+        if not type_text or not type_text.startswith("memref<"):
+            return ()
+        body = type_text[len("memref<") :].split(">", 1)[0]
+        dims = []
+        for token in body.split("x")[:-1]:
+            try:
+                dims.append(int(token))
+            except ValueError:
+                return ()
+        return tuple(dims)
+
+    def gemv_shape(self, match) -> tuple[int, int, int]:
+        """Recover ``(outputs, reduction, batches)`` from one MAC match.
+
+        The matcher retains the loop bounds and source memref shapes.  The
+        innermost loop is the reduction; an input-only loop is the independent
+        GEMV batch; the remaining axis of an operand containing the reduction
+        is the logical output extent.  This covers GEMV, transposed GEMV and
+        the batched-GEMV decomposition of GEMM without benchmark metadata.
+        """
+        if not match.enclosing_loops:
+            raise ValueError("AiM MAC match has no reduction loop")
+        reduction_var, _lb, reduction_ub, _step = match.enclosing_loops[-1]
+        reduction = _parse_loop_bound(reduction_ub)
+        if reduction is None or reduction <= 0:
+            raise ValueError(f"AiM reduction extent is not static: {reduction_ub}")
+        batch_var = match.extra.get("batch_loop_var")
+        batches = int(match.extra.get("batch_dim", 1) or 1)
+
+        output_candidates: list[int] = []
+        for operand in match.operands:
+            if operand.is_loop_carried:
+                continue
+            shape = self._memref_shape(getattr(operand, "memref_type", None))
+            if len(shape) != len(operand.indices):
+                continue
+            if reduction_var not in operand.indices:
+                continue
+            for extent, index in zip(shape, operand.indices):
+                if index == reduction_var or index == batch_var:
+                    continue
+                output_candidates.append(extent)
+        if not output_candidates:
+            # Compatibility for old/synthetic matches without retained types:
+            # use the per-work-item output loop and structural channel grid.
+            outer = _parse_loop_bound(match.enclosing_loops[0][2])
+            channels = int(getattr(self.target.channel, "axes", {}).get("channel", 32))
+            if outer is None:
+                raise ValueError("AiM cannot recover output extent from match")
+            outputs = outer * channels
+        else:
+            outputs = output_candidates[0]
+        return outputs, reduction, batches
+
+    def emit_gemv(self, match) -> None:
+        """Emit a complete, native ABK GEMV trace segment from a MAC match."""
+        outputs, reduction, batches = self.gemv_shape(match)
+        groups = (outputs + 15) // 16
+        columns = (reduction + 15) // 16
+        all_channels = (1 << 32) - 1
+        # Keep batched GEMM compact. The runner profiles this exact native
+        # GEMV segment once and multiplies by the statically proven repeat
+        # count, matching the PolyBench AiM summed-leg methodology.
+        self.append(f"# TENON_GEMV {outputs} {reduction} repeat={batches}")
+        self.append("W CFR 0 1")
+        self.append(f"AiM WR_GB 2 2 {all_channels}")
+        for group in range(groups):
+            self.append(f"AiM WR_ABK 4 1 {group}")
+        for group in range(groups):
+            self.append(f"AiM MAC_ABK {columns} {all_channels} {group}")
+        self.append(f"AiM RD_MAC 8 {all_channels}")
 
     def resolve_moves(self, role, src_handle=None, dst_handle=None):
         from .spmw_target import Memory
@@ -1439,6 +1515,41 @@ def _walk_and_emit(
     JUMP) flows through ``ctx.after_match``.
     """
     from .spmw_autoschedule import _bucket_for_autoschedule, _trace_memrefs_by_role
+
+    # AiM's native MAC command is already broadcast over all 32 channels and
+    # all 16 banks.  A matched SPMW grid therefore lowers once per logical
+    # kernel, not once per unrolled work-id replica.  Materialise every MAC in
+    # the representative bucket as a complete GEMV segment; its retained MLIR
+    # loops encode output, reduction and independent-batch multiplicity.
+    if isinstance(ctx, AimCtx):
+        representatives: dict[str, list[MatchedOp]] = {}
+        order: list[str] = []
+        for match in trace.matches:
+            base = _base_kernel_name(match.func_name, match.work_id)
+            if base not in representatives:
+                representatives[base] = []
+                order.append(base)
+            if match.work_id in ((), (0,)):
+                representatives[base].append(match)
+        for base in order:
+            reps = representatives[base]
+            if not reps:
+                reps = [
+                    next(
+                        match
+                        for match in trace.matches
+                        if _base_kernel_name(match.func_name, match.work_id) == base
+                    )
+                ]
+            for match in reps:
+                if match.target_op_name != "MAC":
+                    raise NotImplementedError(
+                        "AiM native whole-program lowering currently supports "
+                        f"MAC reductions; {base} contains {match.target_op_name}. "
+                        "Keep unsupported broadcast/normalization work on the host."
+                    )
+                ctx.emit_gemv(match)
+        return
 
     layout_by_func: dict[str, Placement] = {}
     for (func_name, matches), layout in zip(_bucket_for_autoschedule(trace), layouts):
@@ -2481,8 +2592,30 @@ def _samsung_batched_invoke(
         w_path = td_path / "W.npy"
         x_path = td_path / "X.npy"
         cmds_path = td_path / "cmds.txt"
-        np_mod.save(w_path, W)
-        np_mod.save(x_path, X)
+        # The vendor GEMV conductor addresses a complete 4096-row Samsung
+        # fabric tile and alternates even/odd 128-wide reduction tiles.  Small
+        # or ragged PolyBench legs therefore need the same zero padding as the
+        # generic REDUCE path; passing an underfilled matrix makes the reference
+        # PIMSimulator preload walk beyond ``NumpyBurstType::bData`` and abort.
+        # Zero padding preserves W@X and is part of the physical lowering, not
+        # a workload-size change.
+        m_real, k_real = int(W.shape[0]), int(W.shape[1])
+        m_pad = (
+            (m_real + _SAMSUNG_FABRIC_ROW_TILE - 1) // _SAMSUNG_FABRIC_ROW_TILE
+        ) * _SAMSUNG_FABRIC_ROW_TILE
+        k_pad = (
+            (k_real + _SAMSUNG_REDUCE_K_TILE - 1) // _SAMSUNG_REDUCE_K_TILE
+        ) * _SAMSUNG_REDUCE_K_TILE
+        if m_pad != m_real or k_pad != k_real:
+            W_physical = np_mod.zeros((m_pad, k_pad), dtype=np_mod.float16)
+            W_physical[:m_real, :k_real] = W
+            X_physical = np_mod.zeros((batch, k_pad), dtype=np_mod.float16)
+            X_physical[:, :k_real] = X
+        else:
+            W_physical = W
+            X_physical = X
+        np_mod.save(w_path, W_physical)
+        np_mod.save(x_path, X_physical)
         _write_samsung_cmds(cmds_path, cmd_subset)
 
         argv = [
@@ -2496,9 +2629,9 @@ def _samsung_batched_invoke(
             "--in",
             str(x_path),
             "--output-dim",
-            str(W.shape[0]),
+            str(m_pad),
             "--input-dim",
-            str(W.shape[1]),
+            str(k_pad),
             "--cmds",
             str(cmds_path),
             "--faithful",
@@ -2581,6 +2714,13 @@ def _run_samsung_batched(
 
     # Same ISA-valid filter the single-vector run path applies.
     def _crf_valid(c: PIMCmd) -> bool:
+        # GRF_A is populated by the faithful GEMV conductor before CRF
+        # execution.  ``SamsungCtx`` retains a FILL marker for the generic
+        # interpreter, but forwarding it to the vendor GEMV programCrf path
+        # makes PIMSimulator reject/abort the stream before reporting cycles.
+        # The canonical Samsung GEMV CRF begins with MAC for the same reason.
+        if c.type_ == "FILL":
+            return False
         if c.type_ in ("MOV", "FILL"):
             bank_dst = c.dst_ in ("EVEN_BANK", "ODD_BANK")
             grf_src = any(s in ("GRF_A", "GRF_B") for s in (c.src0_, c.src1_, c.src2_))
@@ -2656,63 +2796,100 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
             backend="aim",
         )
 
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        delete=False,
-        suffix=".trace",
-        dir=str(root / "test"),
-    ) as tf:
-        for line in compiled.cmds:
-            tf.write(str(line) + "\n")
-        if not any("EOC" in str(l) for l in compiled.cmds):
-            tf.write("AiM EOC\n")
-        trace_path = Path(tf.name)
-    trace_rel = trace_path.relative_to(root)
     cfg_rel = yaml_cfg.relative_to(root)
 
-    try:
-        proc = subprocess.run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "-v",
-                f"{root}:/work",
-                "aim-simulator-build",
-                "bash",
-                "-c",
-                f"cd /work && ./build/ramulator2 -f {cfg_rel} -t {trace_rel}",
-            ],
-            capture_output=True,
-            timeout=600,
-            check=False,
-        )
-    except (subprocess.SubprocessError, OSError) as exc:
-        trace_path.unlink(missing_ok=True)
-        raise RuntimeError(f"AiM ramulator2 invocation failed: {exc}") from exc
-    finally:
-        # Keep trace on disk only for the duration of the run; cleanup.
-        trace_path.unlink(missing_ok=True)
+    def run_segment(lines: list[str]) -> tuple[int, str, int]:
+        with tempfile.NamedTemporaryFile(
+            mode="w", delete=False, suffix=".trace", dir=str(root / "test")
+        ) as tf:
+            for line in lines:
+                tf.write(str(line) + "\n")
+            if not any("EOC" in str(line) for line in lines):
+                tf.write("AiM EOC\n")
+            trace_path = Path(tf.name)
+        trace_rel = trace_path.relative_to(root)
+        try:
+            proc = subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "-v",
+                    f"{root}:/work",
+                    "aim-simulator-build",
+                    "bash",
+                    "-c",
+                    f"cd /work && ./build/ramulator2 -f {cfg_rel} -t {trace_rel}",
+                ],
+                capture_output=True,
+                timeout=600,
+                check=False,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise RuntimeError(f"AiM ramulator2 invocation failed: {exc}") from exc
+        finally:
+            trace_path.unlink(missing_ok=True)
+        stdout = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        combined = stdout + ("\n" + stderr if stderr else "")
+        values = [
+            int(m) for m in re.findall(r"memory_system_cycles:\s*(\d+)", combined)
+        ]
+        if not values:
+            raise RuntimeError(
+                "AiM ramulator2 returned but stdout missing "
+                "'memory_system_cycles: ...' line; tail: " + combined[-400:]
+            )
+        return max(values), combined, proc.returncode
 
-    stdout = proc.stdout.decode("utf-8", errors="replace")
-    stderr = proc.stderr.decode("utf-8", errors="replace")
-    combined = stdout + ("\n" + stderr if stderr else "")
-    # ramulator2 emits per-channel `memory_system_cycles: <N>` in YAML;
-    # take the max across channels as the headline number.
-    cycle_vals = [
-        int(m) for m in re.findall(r"memory_system_cycles:\s*(\d+)", combined)
-    ]
-    if not cycle_vals:
-        raise RuntimeError(
-            "AiM ramulator2 returned but stdout missing "
-            "'memory_system_cycles: ...' line; tail: " + combined[-400:]
+    # Compact traces carry independently dispatched GEMV templates. Profile
+    # every native segment once, then apply its compile-time repeat count. All
+    # base values are direct Ramulator2 measurements from this invocation.
+    segments: list[tuple[str, int, list[str]]] = []
+    current_label = "program"
+    current_repeat = 1
+    current: list[str] = []
+    for raw in map(str, compiled.cmds):
+        if raw.startswith("# TENON_GEMV "):
+            if current:
+                segments.append((current_label, current_repeat, current))
+            current_label = raw[2:]
+            repeat_match = re.search(r"repeat=(\d+)", raw)
+            current_repeat = int(repeat_match.group(1)) if repeat_match else 1
+            current = []
+        else:
+            current.append(raw)
+    if current:
+        segments.append((current_label, current_repeat, current))
+    if not segments:
+        segments = [("program", 1, list(map(str, compiled.cmds)))]
+
+    total_cycles = 0
+    logs: list[str] = []
+    returncodes: list[int] = []
+    cache: dict[tuple[str, ...], tuple[int, str, int]] = {}
+    for label, repeat, lines in segments:
+        key = tuple(lines)
+        if key not in cache:
+            cache[key] = run_segment(lines)
+        raw_cycles, log, returncode = cache[key]
+        total_cycles += raw_cycles * repeat
+        returncodes.append(returncode)
+        logs.append(
+            f"=== {label}; repeat={repeat}; raw_cycles={raw_cycles}; "
+            f"composed_cycles={raw_cycles * repeat} ===\n{log}"
         )
-    cycles = max(cycle_vals)
+    cycles = total_cycles
+    combined = "\n".join(logs)
     return RunResult(
         cycles=cycles,
         stdout=combined,
         backend="aim",
-        extra={"returncode": proc.returncode},
+        extra={
+            "returncode": max(returncodes, default=0),
+            "segments": len(segments),
+            "unique_segments": len(cache),
+        },
     )
 
 

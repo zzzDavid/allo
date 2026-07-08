@@ -61,15 +61,28 @@ def _metric(event, name, default=1):
     return max(0, int(event.metrics.get(name, default)))
 
 
-def _columns(event, *, all_banks=False):
+def _bank_fanout(event, default):
+    candidate = event.metrics.get("candidate", {}) or {}
+    fanout = max(1, int(candidate.get("bank_fanout", default)))
+    if fanout > BANKS_PER_CHANNEL or fanout & (fanout - 1):
+        raise ValueError(
+            f"AiM layout bank_fanout must be a power of two up to "
+            f"{BANKS_PER_CHANNEL}, got {fanout}"
+        )
+    return fanout
+
+
+def _columns(event, *, default_bank_fanout=1):
     elements = _metric(event, "reduction_extent")
-    width = LANES_PER_PU * (BANKS_PER_CHANNEL if all_banks else 1)
+    width = LANES_PER_PU * _bank_fanout(event, default_bank_fanout)
     return max(1, _ceil_div(elements, width))
 
 
 @cost(target="aim")
 def aim_cost(target):
     """Interpret AiM operations over target-declared spatial resources."""
+    # Model revision: linear-layout-v1. MAC width is the realized bank image
+    # supplied in candidate.bank_fanout.
     channel = target.unit("channel")
     bank_group = target.unit("bank_group")
     bank = target.unit("bank")
@@ -94,7 +107,7 @@ def aim_cost(target):
 
     @rule(target.op("MAC_ABK"))
     def all_bank_mac(event, ctx):
-        columns = _columns(event, all_banks=True)
+        columns = _columns(event, default_bank_fanout=BANKS_PER_CHANNEL)
         latency = N_RCD_RD_MAC + (columns - 1) * N_CCD + CMD_MAC
         ctx.step(
             latency=latency,

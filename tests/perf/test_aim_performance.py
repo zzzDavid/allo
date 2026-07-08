@@ -4,9 +4,11 @@
 
 from allo.pim.costs import aim_cost
 from allo.pim.targets import build_aim_target
-from allo.spmw_autoschedule import Placement, autoschedule
+from allo.spmw_autoschedule import Placement, _aim_enumerate, autoschedule
 from allo.spmw_codegen import AimCtx
+from allo.spmw_linear_layout import LinearLayout
 from allo.spmw_match import MatchTrace, MatchedOp, OperandBinding
+from allo.spmw_match_engine import batch_dim
 from allo.spmw_plan import build_execution_graph
 
 
@@ -105,6 +107,48 @@ def test_autoscheduler_selects_channel_scoped_mac_abk():
     assert chosen.placements["W"] is target.banks
     assert chosen.placements["x"] is target.gb
     assert chosen.placements["out"] is target.mac_reg
+    assert isinstance(chosen.layout, LinearLayout)
+    assert (
+        chosen.layout.image_size(varying_inputs=("lane_bank",), output_dims=("bank",))
+        == 16
+    )
+    assert (
+        chosen.layout.conflict_count(bank_dims=("bank",), varying_inputs=("lane_bank",))
+        == 0
+    )
+
+
+def test_linear_layout_is_load_bearing_for_aim_bank_scope():
+    target = build_aim_target()
+    single, all_bank = _aim_enumerate(target, [_mac(bound=True)])
+
+    assert (
+        single.layout.image_size(varying_inputs=("lane_bank",), output_dims=("bank",))
+        == 1
+    )
+    assert single.extra == {
+        "operation_name": "MAC",
+        "bank_fanout": 1,
+        "bank_conflicts": 15,
+    }
+    assert (
+        all_bank.layout.image_size(varying_inputs=("lane_bank",), output_dims=("bank",))
+        == 16
+    )
+    assert all_bank.extra == {
+        "operation_name": "MAC_ABK",
+        "bank_fanout": 16,
+        "bank_conflicts": 0,
+    }
+
+    # Duplicated metadata cannot override the F2 map: the execution planner
+    # re-derives fanout and primitive selection from Placement.layout.
+    all_bank.extra.update(operation_name="MAC", bank_fanout=1)
+    graph, _estimate = _evaluate(target, [_mac(bound=True)], all_bank)
+    mac = next(
+        activity for activity in graph.activities if "MAC_ABK" in activity.primitive
+    )
+    assert mac.latency_cycles == 57
 
 
 def test_codegen_materializes_channel_mask_bank_index_and_column_count():
@@ -128,3 +172,37 @@ def test_codegen_materializes_channel_mask_bank_index_and_column_count():
     operation.emit(operation.src[0], target.gb, target.mac_reg, sbk_ctx)
     sbk_ctx.after_match(_mac((3, 2, 1)), 1)
     assert sbk_ctx.cmds == ["AiM MAC_SBK 16 8 9 0"]
+
+
+def test_codegen_materializes_complete_batched_gemv_from_mlir_shapes():
+    target = build_aim_target()
+    match = MatchedOp(
+        target_op_name="MAC",
+        func_name="gemm_0",
+        work_id=(0,),
+        enclosing_loops=[
+            ("i", "0", "32", 1),
+            ("j", "0", "1100", 1),
+            ("k", "0", "1200", 1),
+        ],
+        operands=[
+            OperandBinding(
+                "x", "A", ["row", "k"], memref_type="memref<1000x1200xbf16>"
+            ),
+            OperandBinding("y", "B", ["k", "j"], memref_type="memref<1200x1100xbf16>"),
+            OperandBinding("acc", "acc", [], is_loop_carried=True),
+        ],
+        result_memref_name="acc",
+        op_range=("begin", "end"),
+    )
+    batch_var, batches = batch_dim(match)
+    match.extra.update(batch_loop_var=batch_var, batch_dim=batches)
+
+    ctx = AimCtx(target)
+    ctx.emit_gemv(match)
+
+    assert ctx.cmds[0] == "# TENON_GEMV 1000 1200 repeat=1100"
+    assert ctx.cmds.count("AiM WR_ABK 4 1 0") == 1
+    assert "AiM MAC_ABK 75 4294967295 62" in ctx.cmds
+    assert ctx.cmds[-1] == "AiM RD_MAC 8 4294967295"
+    assert len(ctx.cmds) == 130

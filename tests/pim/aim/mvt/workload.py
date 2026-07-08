@@ -10,7 +10,7 @@ get_wid(). The host `x += both` fold is on the ref. Co-located leaf-dir.
 from __future__ import annotations
 
 import allo
-from allo.ir.types import float32 as fp16
+from allo.ir.types import bfloat16 as fp16
 from allo.dataflow import region as _df_region
 
 from lib.shapes import shape

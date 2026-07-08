@@ -4,11 +4,14 @@
 
 from types import SimpleNamespace
 
+import numpy as np
+
 from allo.perf import cost, rule
 from allo.pim.costs import samsung_cost
 from allo.pim.targets import build_samsung_target
 from allo.spmw_autoschedule import Placement, autoschedule
-from allo.spmw_codegen import Compiled
+from allo import spmw_codegen
+from allo.spmw_codegen import Compiled, PIMCmd, SamsungCtx
 from allo.spmw_match import MatchTrace, MatchedOp, OperandBinding
 from allo.spmw_plan import build_execution_graph
 
@@ -198,3 +201,89 @@ def test_agents_calibrate_by_editing_cost_program_code():
     )
 
     assert estimate.cycles == 129
+
+
+def test_samsung_drain_emits_required_eight_cycle_hold():
+    ctx = SamsungCtx(build_samsung_target())
+
+    ctx.drain()
+
+    assert ctx.cmds == [PIMCmd(type_="NOP", loopCounter_=7)]
+
+
+def test_batched_invoke_zero_pads_to_physical_fabric(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(argv, **_kwargs):
+        weight = np.load(argv[argv.index("--weight") + 1])
+        input_batch = np.load(argv[argv.index("--in") + 1])
+        captured["weight_shape"] = weight.shape
+        captured["input_shape"] = input_batch.shape
+        captured["output_dim"] = argv[argv.index("--output-dim") + 1]
+        captured["input_dim"] = argv[argv.index("--input-dim") + 1]
+        return SimpleNamespace(
+            returncode=0,
+            stdout=b"PIM_CYCLES total=17 preload=8 exec=6 readback=3\n",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(spmw_codegen.subprocess, "run", fake_run)
+    cycles, phases, _stdout = spmw_codegen._samsung_batched_invoke(
+        tmp_path / "pim_driver",
+        tmp_path,
+        [PIMCmd(type_="NOP", loopCounter_=7)],
+        np.ones((1024, 1408), dtype=np.float16),
+        np.ones((1, 1408), dtype=np.float16),
+        1,
+        False,
+        np,
+    )
+
+    assert cycles == 17
+    assert phases == {"preload": 8, "exec": 6, "readback": 3}
+    assert captured == {
+        "weight_shape": (4096, 1536),
+        "input_shape": (1, 1536),
+        "output_dim": "4096",
+        "input_dim": "1536",
+    }
+
+
+def test_batched_runner_does_not_program_host_fill(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_invoke(_driver, _root, commands, *_args, **_kwargs):
+        captured["types"] = [command.type_ for command in commands]
+        return 11, {"preload": 5, "exec": 4, "readback": 2}, "raw"
+
+    monkeypatch.setattr(spmw_codegen, "_pimsim_root", lambda: tmp_path)
+    (tmp_path / "pim_driver").touch()
+    monkeypatch.setattr(spmw_codegen, "_samsung_batched_invoke", fake_invoke)
+    target = build_samsung_target()
+    trace = MatchTrace(target.name, "batched", [])
+    compiled = Compiled(
+        target,
+        trace,
+        [
+            PIMCmd(type_="FILL", dst_="GRF_A", src0_="EVEN_BANK"),
+            PIMCmd(
+                type_="MAC",
+                dst_="GRF_B",
+                src0_="GRF_A",
+                src1_="EVEN_BANK",
+                isAuto_=1,
+            ),
+            PIMCmd(type_="NOP", loopCounter_=7),
+        ],
+        Placement(placements={}),
+    )
+
+    result = spmw_codegen._run_samsung_batched(
+        compiled,
+        np.ones((128, 256), dtype=np.float16),
+        np.ones((1, 256), dtype=np.float16),
+        compare_native=False,
+    )
+
+    assert result.cycles == 11
+    assert captured["types"] == ["MAC", "NOP"]
