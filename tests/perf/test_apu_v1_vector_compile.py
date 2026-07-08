@@ -46,6 +46,14 @@ def padded_outer_product(
             result[row, column] += left[row, depth] * right[depth, column]
 
 
+def wide_outer_product(
+    left: uint16[32, 1], right: uint16[1, 2000], result: uint16[32, 2000]
+):
+    for row, column in allo.grid(32, 2000):
+        for depth in allo.reduction(1):
+            result[row, column] += left[row, depth] * right[depth, column]
+
+
 def streamed_dense_tile(
     left: uint16[256, 128],
     right: uint16[128, 1024],
@@ -221,6 +229,24 @@ def test_lookup_ingress_repeats_table_slices_for_each_physical_output_batch():
     assert images["left"].size >= required
     tables = images["left"][:required].reshape(realization.output_batches, table_size)
     assert np.all(np.count_nonzero(tables, axis=1) > 0)
+
+
+def test_wide_outer_product_derives_sixteen_entry_lookup_geometry():
+    compiled = allo.compile(
+        wide_outer_product,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="virtual",
+    )
+
+    assert compiled.realization is not None, compiled.realization_error
+    transfer = next(
+        item for item in compiled.selected_plan.transfers if item.value == "left"
+    )
+    lookup = next(step for step in transfer.route if step.kind == "lookup")
+    assert lookup.parameters["group_size"] == 2048
+    assert lookup.parameters["table_size"] == 16
+    assert "gvml_lookup_16" in compiled.device_source()
 
 
 def test_large_broadcast_route_streams_reduction_chunks_through_one_vr():

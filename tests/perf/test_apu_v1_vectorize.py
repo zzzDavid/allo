@@ -363,7 +363,7 @@ def test_generates_four_named_micro_candidates_with_layout_metadata():
         "load_vr",
         "duplicate_subgroup",
     ]
-    assert left_transfer.route[-1].parameters["table_size"] == 32
+    assert left_transfer.route[-1].parameters["table_size"] == 4096
     assert right_transfer.route[-1].parameters["rows_per_vr"] == 4
     assert len([item for item in broadcast.transfers if item.value == "result"]) == 2
     assert generate_apu_v1_plans(analysis) == tuple(
@@ -414,7 +414,7 @@ def test_non_power_of_two_micro_shape_is_validity_tiled_within_32k_lanes():
     right_route = next(
         item.route for item in broadcast.transfers if item.value == "right"
     )
-    assert left_route[-1].parameters["table_size"] == 64
+    assert left_route[-1].parameters["table_size"] == 256
     assert right_route[-1].parameters["group_size"] == 8 * 128
     assert right_route[-1].parameters["subgroup_size"] == 128
 

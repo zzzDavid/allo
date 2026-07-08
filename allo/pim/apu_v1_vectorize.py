@@ -1172,9 +1172,12 @@ def generate_apu_v1_vectorization_candidates(
                 # tile, reduction step).  The unblocked MICRO plan may retain
                 # it in L3.  Accumulator-blocked plans lookup directly from L4
                 # so dense workloads are not constrained by ARC cache capacity.
+                table_slots = 32768 // column_tile
                 table_tiles = {
                     axis: (
-                        min(row_tile, padded(extents[axis])) if axis == row_axis else 1
+                        min(table_slots, padded(extents[axis]))
+                        if axis == row_axis
+                        else 1
                     )
                     for axis in access.indices
                 }
@@ -1183,21 +1186,21 @@ def generate_apu_v1_vectorization_candidates(
                     table_tiles,
                     within_dim="lookup_entry",
                     batch_dim="lookup_table",
-                    physical_within_size=max(32, row_tile),
+                    physical_within_size=table_slots,
                 )
                 l4 = endpoint(
                     "l4",
                     access,
                     table_layout,
                     role="compact_lookup_tables",
-                    padded_tile_extents={row_axis: max(32, row_tile)},
+                    padded_tile_extents={row_axis: table_slots},
                 )
                 l3 = endpoint(
                     "l3",
                     access,
                     table_layout,
                     role="resident_lookup_tables",
-                    padded_tile_extents={row_axis: max(32, row_tile)},
+                    padded_tile_extents={row_axis: table_slots},
                 )
                 table_windows = (
                     window(row_axis, row_tile),
@@ -1225,7 +1228,7 @@ def generate_apu_v1_vectorization_candidates(
                         temporal_axis=analysis.reduction_axis,
                         executed_at=table_windows,
                         parameters={
-                            "table_size": max(32, row_tile),
+                            "table_size": table_slots,
                             "group_size": column_tile,
                             "subgroup_size": 1,
                         },
