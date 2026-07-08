@@ -1533,6 +1533,37 @@ class APUVectorABI:
             begin = batch * table_size
             end = min(begin + table_size, table_extent)
             packed[batch, :, : end - begin] = ordered[begin:end, :].T
+        batching = getattr(self.plan, "output_batching", None)
+        if (
+            batching is not None
+            and table_axis in batching.output_axes
+            and batching.physical_output_batches > batches
+        ):
+            # A physical output stream may tile another output axis (for
+            # example the columns of an outer product) more often than it
+            # advances this lookup table axis.  Device code indexes compact
+            # lookup data by physical output batch, so materialize the exact
+            # repeated table slice for every batch instead of reading beyond
+            # the shorter logical table image.
+            axis_index = batching.output_axes.index(table_axis)
+            expanded = np.zeros(
+                (batching.physical_output_batches, temporal_extent, table_size),
+                dtype=np.uint16,
+            )
+            for physical_batch in range(batching.physical_output_batches):
+                placements = [
+                    placement
+                    for placement in batching.placements
+                    if placement.physical_output_batch == physical_batch
+                ]
+                if not placements:
+                    continue
+                begin = min(
+                    placement.logical_origin[axis_index] for placement in placements
+                )
+                end = min(begin + table_size, table_extent)
+                expanded[physical_batch, :, : end - begin] = ordered[begin:end, :].T
+            packed = expanded
         flattened = packed.reshape(-1)
         # L4->L3 uses 512-byte transactions.  Padding is physical transfer
         # validity, not host-side replication of the compute layout.
@@ -1647,9 +1678,21 @@ class APUVectorABI:
                 split_shape.extend((extent // tile, tile))
             outer = tuple(range(0, 2 * len(iteration_axes), 2))
             inner = tuple(range(1, 2 * len(iteration_axes), 2))
-            blocks = np.transpose(carrier.reshape(split_shape), outer + inner).reshape(
-                -1, math.prod(tile_shape)
+            outer_shape = tuple(
+                extent // tile for extent, tile in zip(padded_shape, tile_shape)
             )
+            blocks = np.transpose(carrier.reshape(split_shape), outer + inner).reshape(
+                *outer_shape, math.prod(tile_shape)
+            )
+            valid_outer = tuple(
+                slice(0, (logical + tile - 1) // tile)
+                for logical, tile in zip(logical_shape, tile_shape)
+            )
+            # Remove padded outer coordinates from the execution stream while
+            # retaining zero-filled lanes inside each edge block. This keeps
+            # dense work IDs aligned with source pointer batches for arbitrary
+            # non-power-of-two output and reduction extents.
+            blocks = blocks[valid_outer].reshape(-1, math.prod(tile_shape))
             packed = np.zeros((blocks.shape[0], VR_LANES), dtype=np.uint16)
             packed[:, : blocks.shape[1]] = blocks
             return packed.reshape(-1)

@@ -6,7 +6,7 @@ import inspect
 import allo
 import numpy as np
 import pytest
-from allo.ir.types import float16, int16
+from allo.ir.types import float16, int16, uint16
 from allo.pim.apu_v1_vector_program import APUv1VectorCallable
 from allo.pim.costs import apu_v1_cost
 from allo.pim.targets import build_apu_v1_target
@@ -28,6 +28,22 @@ def packed_similarity(
             result[row, column] += allo.popcount(
                 ~(left[row, depth] ^ right[depth, column])
             )
+
+
+def singleton_output_gemv(
+    left: uint16[17, 19], right: uint16[19, 1], result: uint16[17, 1]
+):
+    for row, column in allo.grid(17, 1):
+        for depth in allo.reduction(19):
+            result[row, column] += left[row, depth] * right[depth, column]
+
+
+def padded_outer_product(
+    left: uint16[64, 1], right: uint16[1, 1024], result: uint16[64, 1024]
+):
+    for row, column in allo.grid(64, 1024):
+        for depth in allo.reduction(1):
+            result[row, column] += left[row, depth] * right[depth, column]
 
 
 def test_public_compile_generates_ranks_and_executes_four_apu_plans():
@@ -117,3 +133,41 @@ def test_public_compile_consumes_target_neutral_xnor_popcount_mlir():
     assert "gvml_not_16" in source
     assert "gvml_popcount_16" in source
     assert "gvml_add_s16" in source
+
+
+def test_cost_selection_falls_through_to_a_realizable_singleton_output_plan():
+    compiled = allo.compile(
+        singleton_output_gemv,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="virtual",
+    )
+
+    assert compiled.realization is not None, compiled.realization_error
+    assert compiled.selected_estimate.plan.name == compiled.selected_plan.name
+    assert "gvml_mul_u16" in compiled.device_source()
+
+
+def test_lookup_ingress_repeats_table_slices_for_each_physical_output_batch():
+    compiled = allo.compile(
+        padded_outer_product,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="virtual",
+    )
+    realization = compiled.realization
+    assert realization.output_batches > 1
+    arrays = {
+        "left": np.ones((64, 1), dtype=np.uint16),
+        "right": np.ones((1, 1024), dtype=np.uint16),
+        "result": np.zeros((64, 1024), dtype=np.uint16),
+    }
+    images = realization.abi.transfer_input_images(arrays)
+    transfer = next(item for item in compiled.selected_plan.transfers if item.value == "left")
+    lookup = next(step for step in transfer.route if step.kind == "lookup")
+    table_size = lookup.parameters["table_size"]
+    required = realization.output_batches * table_size
+
+    assert images["left"].size >= required
+    tables = images["left"][:required].reshape(realization.output_batches, table_size)
+    assert np.all(np.count_nonzero(tables, axis=1) > 0)

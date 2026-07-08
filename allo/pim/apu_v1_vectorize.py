@@ -1327,11 +1327,13 @@ def generate_apu_v1_vectorization_candidates(
                 axis: (0 if axis == analysis.reduction_axis else origin[axis])
                 for axis in axis_order
             }
-            work_coordinate = planned_iteration_layout.coordinate(**iteration_indices)
             output_coordinate = value_layouts[2].layout.coordinate(**origin)
             placements.append(
                 OutputTilePlacement(
-                    work_tile=work_coordinate["vr_batch"] // reduction_tiles,
+                    # Valid logical tiles are a compact execution stream.
+                    # The F2 carrier may contain padded outer coordinates;
+                    # those are storage capacity, not executable work IDs.
+                    work_tile=len(placements),
                     physical_output_batch=output_coordinate["vr_batch"],
                     lane_offset=output_coordinate["vr_lane"],
                     logical_origin=tuple(origin[axis] for axis in analysis.output_axes),
@@ -1353,9 +1355,9 @@ def generate_apu_v1_vectorization_candidates(
             tuple(placements),
         )
         physical_output_batches = output_batching.physical_output_batches
-        if physical_output_batches != value_layouts[2].layout.out_sizes[1]:
+        if physical_output_batches > value_layouts[2].layout.out_sizes[1]:
             raise IllegalContractionError(
-                "output batching disagrees with the physical output layout"
+                "output batching exceeds the physical output layout capacity"
             )
         compute_tiles_per_output = output_batching.work_tiles_per_output_batch
         work_steps_per_output = output_batching.work_steps_per_output_batch

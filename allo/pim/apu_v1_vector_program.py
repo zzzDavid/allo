@@ -22,6 +22,7 @@ import numpy as np
 from ..spmw_codegen import RunResult
 from .apu_v1_layout import APUV1Plan
 from .apu_v1_vector_codegen import (
+    UnsupportedVectorOperation,
     VectorOp,
     fp16_contraction_ops,
     realize_apu_v1_plan,
@@ -167,8 +168,13 @@ def _realize(analysis, plan):
             }
         )
     try:
-        return realize_apu_v1_plan(plan, operations=operations, values=values), None
-    except (TypeError, ValueError) as error:
+        realization = realize_apu_v1_plan(plan, operations=operations, values=values)
+        # Allocation alone is not sufficient proof of a physical program.
+        # Rendering validates scatter contiguity, lookup geometry, and every
+        # concrete GVML call before the plan can win cost-based selection.
+        realization.device_source()
+        return realization, None
+    except (TypeError, ValueError, UnsupportedVectorOperation) as error:
         # Planning and functional execution are useful even while a particular
         # concrete plan exceeds today's codegen envelope.  Preserve the exact
         # failure and make device_source()/device execution fail closed.
@@ -223,6 +229,42 @@ class APUv1VectorCallable:
         self.realization, self.realization_error = _realize(
             self.analysis, self.selected_plan
         )
+        if layout is None and self.realization is None:
+            # Cost ranking is over legal abstract layouts.  Some edge shapes
+            # (notably GEMV represented as MxK @ Kx1) expose a concrete GVML
+            # restriction only during realization.  Fall through in ranked
+            # order instead of returning a callable whose selected plan can
+            # never compile or run.
+            ordered = [item.plan for item in self.candidate_estimates]
+            ordered.extend(candidate.plan for candidate in self.candidates)
+            seen = {self.selected_plan.name}
+            failures = [f"{self.selected_plan.name}: {self.realization_error}"]
+            for candidate_plan in ordered:
+                if candidate_plan.name in seen:
+                    continue
+                seen.add(candidate_plan.name)
+                realization, error = _realize(self.analysis, candidate_plan)
+                if realization is not None:
+                    self.selected_plan = candidate_plan
+                    self.realization = realization
+                    self.realization_error = None
+                    break
+                failures.append(f"{candidate_plan.name}: {error}")
+            else:
+                self.realization_error = "; ".join(failures)
+            if self.realization is not None and cost is not None:
+                self.selected_estimate = next(
+                    (
+                        estimate
+                        for estimate in self.candidate_estimates
+                        if estimate.plan.name == self.selected_plan.name
+                    ),
+                    None,
+                )
+                if self.selected_estimate is None:
+                    self.selected_estimate = estimate_apu_v1_plan(
+                        self.selected_plan, target, cost
+                    )
         self.backend = "device" if backend is None else str(backend)
         if self.backend not in _FUNCTIONAL_BACKENDS | {"device"}:
             raise ValueError(

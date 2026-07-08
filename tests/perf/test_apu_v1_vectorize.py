@@ -55,6 +55,16 @@ def non_power_of_two_micro(
             result[m, n] += left[m, k] * right[k, n]
 
 
+def padded_singleton_output(
+    left: float16[2800, 2800],
+    right: float16[2800, 1],
+    result: float16[2800, 1],
+):
+    for m, n in allo.grid(2800, 1):
+        for k in allo.reduction(2800):
+            result[m, n] += left[m, k] * right[k, n]
+
+
 def matrix_vector(left: float16[8, 16], right: float16[16], result: float16[8]):
     for row in allo.grid(8):
         for depth in allo.reduction(16):
@@ -407,6 +417,19 @@ def test_non_power_of_two_micro_shape_is_validity_tiled_within_32k_lanes():
     assert left_route[-1].parameters["table_size"] == 64
     assert right_route[-1].parameters["group_size"] == 8 * 128
     assert right_route[-1].parameters["subgroup_size"] == 128
+
+
+def test_padded_layout_capacity_may_exceed_valid_singleton_output_batches():
+    candidates = generate_apu_v1_vectorization_candidates(
+        _module(padded_singleton_output)
+    )
+
+    assert len(candidates) == 4
+    for candidate in candidates:
+        plan = candidate.plan
+        assert plan.output_batching.physical_output_batches <= (
+            plan.value_layouts[2].layout.out_sizes[1]
+        )
 
 
 def test_full_micro_problem_uses_lane_low_bits_and_distinct_vr_batches():
