@@ -17,6 +17,7 @@ from .apu_v1_layout import APUV1Plan, PlanOperation, Transfer
 
 
 VR_LANES = 32768
+WRITABLE_VRS = 15
 
 
 @dataclass(frozen=True)
@@ -192,10 +193,52 @@ def _route_metrics(plan: APUV1Plan, step):
     }
 
 
+def _effective_route_metrics(plan: APUV1Plan, transfer: Transfer, step):
+    """Return traffic for the concrete resident-or-streaming realization."""
+
+    metrics = _route_metrics(plan, step)
+    if step.kind not in {"dma_l4_l1_32k", "load_vr"}:
+        return metrics
+    duplicate = next(
+        (item for item in transfer.route if item.kind == "duplicate_subgroup"),
+        None,
+    )
+    if duplicate is None:
+        return metrics
+    rows_per_vr = int(duplicate.parameters["rows_per_vr"])
+    temporal_axis = str(
+        duplicate.temporal_axis
+        or transfer.temporal_axis
+        or getattr(plan.reduction_strategy, "axis", "")
+    )
+    temporal_extent = int(
+        dict(plan.metadata.get("axis_extents", {})).get(
+            temporal_axis, dict(plan.metadata.get("problem_shape", {})).get("K", 1)
+        )
+    )
+    if _ceil_div(temporal_extent, rows_per_vr) < WRITABLE_VRS:
+        return metrics
+
+    # The code generator reuses one VR and therefore reloads the chunk stream
+    # for every output batch instead of pinning an impossible bank of VRs.
+    replay = max(1, int(metrics["resident_reuse_factor"]))
+    for name in (
+        "count",
+        "source_elements",
+        "destination_elements",
+        "total_bytes",
+        "iterations",
+    ):
+        metrics[name] *= replay
+    metrics["resident_reuse_factor"] = 1
+    metrics["streaming_replay_factor"] = replay
+    return metrics
+
+
 def _route_step_sequence(plan, target, transfer: Transfer, step):
     """Map one explicit source/transit/compute relation to priced handles."""
 
-    metrics = _route_metrics(plan, step)
+    metrics = _effective_route_metrics(plan, transfer, step)
     kind = step.kind
     if kind == "dma_l4_l3":
         return ((target.move("DMA_L4_TO_L3"), "DMA_L4_TO_L3", metrics),)
@@ -276,6 +319,31 @@ def _transfer_sequence(plan, target, transfer):
     return tuple(sequence)
 
 
+def _transfer_route_metadata(plan, transfer):
+    fields = (
+        "source_elements",
+        "destination_elements",
+        "source_elements_per_call",
+        "destination_elements_per_call",
+        "expansion_factor",
+        "resident_reuse_factor",
+        "streaming_replay_factor",
+    )
+    return tuple(
+        {
+            "kind": step.kind,
+            "call_count": metrics["count"],
+            **{
+                field: metrics[field]
+                for field in fields
+                if field in metrics
+            },
+        }
+        for step in transfer.route
+        for metrics in (_effective_route_metrics(plan, transfer, step),)
+    )
+
+
 def build_apu_v1_plan_graph(plan, target, bound_cost) -> ExecutionGraph:
     """Execute one plan into a concrete target-bound dependency graph."""
 
@@ -297,24 +365,7 @@ def build_apu_v1_plan_graph(plan, target, bound_cost) -> ExecutionGraph:
                 {
                     "value": transfer.value,
                     "direction": transfer.direction,
-                    "steps": tuple(
-                        {
-                            "kind": step.kind,
-                            **{
-                                field: getattr(step.metrics(), field)
-                                for field in (
-                                    "source_elements",
-                                    "destination_elements",
-                                    "source_elements_per_call",
-                                    "destination_elements_per_call",
-                                    "call_count",
-                                    "expansion_factor",
-                                    "resident_reuse_factor",
-                                )
-                            },
-                        }
-                        for step in transfer.route
-                    ),
+                    "steps": _transfer_route_metadata(plan, transfer),
                 }
                 for transfer in plan.transfers
             ),

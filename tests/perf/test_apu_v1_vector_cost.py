@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import allo
 import pytest
-from allo.ir.types import float16, int32
+from allo.ir.types import float16, int32, uint16
 
 from allo.pim.apu_v1_layout import PlanOperation, Transfer
 from allo.pim.apu_v1_vector_cost import (
@@ -33,6 +33,16 @@ def binary_micro(left: int32[16, 32], right: int32[32, 8], result: int32[16, 8])
     for row, column in allo.grid(16, 8):
         for depth in allo.reduction(32):
             result[row, column] += left[row, depth] & right[depth, column]
+
+
+def streamed_micro(
+    left: uint16[256, 128],
+    right: uint16[128, 1024],
+    result: uint16[256, 1024],
+):
+    for row, column in allo.grid(256, 1024):
+        for depth in allo.reduction(128):
+            result[row, column] += left[row, depth] * right[depth, column]
 
 
 @pytest.fixture(scope="module")
@@ -123,6 +133,22 @@ def test_transfer_cost_does_not_consume_planner_broadcast_metadata(plans):
     )
 
     assert estimate_apu_v1_plan(poisoned, target, apu_v1_cost).cycles == original
+
+
+def test_streamed_resident_route_prices_each_output_batch_replay():
+    module = allo.customize(streamed_micro, enable_tensor=False).module
+    plan = generate_apu_v1_vectorization_candidates(module)[-1].plan
+    result = estimate_apu_v1_plan(plan, build_apu_v1_target(), apu_v1_cost)
+    routes = {
+        (route["value"], step["kind"]): step
+        for route in result.graph.metadata["transfer_routes"]
+        for step in route["steps"]
+    }
+
+    rhs_dma = routes[("right", "dma_l4_l1_32k")]
+    assert rhs_dma["call_count"] == 16 * 8
+    assert rhs_dma["resident_reuse_factor"] == 1
+    assert rhs_dma["streaming_replay_factor"] == 8
 
 
 def test_estimate_retains_plan_graph_and_bound_cost_fingerprint(plans):

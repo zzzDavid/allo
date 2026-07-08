@@ -46,6 +46,36 @@ def padded_outer_product(
             result[row, column] += left[row, depth] * right[depth, column]
 
 
+def streamed_dense_tile(
+    left: uint16[256, 128],
+    right: uint16[128, 1024],
+    result: uint16[256, 1024],
+):
+    for row, column in allo.grid(256, 1024):
+        for depth in allo.reduction(128):
+            result[row, column] += left[row, depth] * right[depth, column]
+
+
+def polybench_gemm_edge_tile(
+    left: uint16[256, 1200],
+    right: uint16[1200, 76],
+    result: uint16[256, 76],
+):
+    for row, column in allo.grid(256, 76):
+        for depth in allo.reduction(1200):
+            result[row, column] += left[row, depth] * right[depth, column]
+
+
+def l3_over_capacity_dense_tile(
+    left: uint16[256, 2000],
+    right: uint16[2000, 1024],
+    result: uint16[256, 1024],
+):
+    for row, column in allo.grid(256, 1024):
+        for depth in allo.reduction(2000):
+            result[row, column] += left[row, depth] * right[depth, column]
+
+
 def test_public_compile_generates_ranks_and_executes_four_apu_plans():
     target = build_apu_v1_target()
     compiled = allo.compile(
@@ -171,3 +201,53 @@ def test_lookup_ingress_repeats_table_slices_for_each_physical_output_batch():
     assert images["left"].size >= required
     tables = images["left"][:required].reshape(realization.output_batches, table_size)
     assert np.all(np.count_nonzero(tables, axis=1) > 0)
+
+
+def test_large_broadcast_route_streams_reduction_chunks_through_one_vr():
+    compiled = allo.compile(
+        streamed_dense_tile,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="virtual",
+    )
+
+    assert compiled.selected_plan.name == (
+        "temporal_dma_coalescing_broadcast_friendly"
+    )
+    source = compiled.device_source()
+    assert "if (reduction_step % 8 == 0) direct_dma_l4_to_l1_32k" in source
+    assert "(reduction_step / 8) * 32768" in source
+    assert source.count("right_resident") == 3  # declaration, load, and duplicate
+    bindings = compiled.realization.binding_map
+    resident = next(
+        binding.concrete
+        for name, binding in bindings.items()
+        if "right_resident" in name
+    )
+    assert resident != bindings["__result_product"].concrete
+
+
+def test_non_power_of_two_gemm_edge_tile_has_a_realizable_plan():
+    compiled = allo.compile(
+        polybench_gemm_edge_tile,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="virtual",
+    )
+
+    assert compiled.realization is not None, compiled.realization_error
+    assert compiled.selected_plan.name == (
+        "temporal_dma_coalescing_broadcast_friendly"
+    )
+
+
+def test_lookup_plan_falls_back_before_exhausting_runtime_l3():
+    compiled = allo.compile(
+        l3_over_capacity_dense_tile,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="virtual",
+    )
+
+    assert compiled.realization is not None, compiled.realization_error
+    assert compiled.selected_plan.name == "temporal_dma_coalescing"

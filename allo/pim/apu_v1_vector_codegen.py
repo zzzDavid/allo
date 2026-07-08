@@ -39,6 +39,11 @@ VR_LANES = 32768
 APUC_COUNT = 4
 WRITABLE_VRS = 15
 VMR_COUNT = 48
+# Leave one quarter of the 1 MiB per-APUC L3 available for the generated
+# project, allocator metadata, and other runtime state. Near-capacity lookup
+# images (the 1,024,000-byte K=2000 case) build but do not complete reliably
+# on the installed G1 board.
+L3_LOOKUP_BUDGET_BYTES = 3 * (1 << 18)
 
 
 class UnsupportedVectorOperation(ValueError):
@@ -185,6 +190,7 @@ class GVMLInstruction:
     definitions: tuple[str, ...] = ()
     uses: tuple[str, ...] = ()
     phase: str = "compute"
+    predicate: str | None = None
 
     def render(
         self,
@@ -234,7 +240,8 @@ class GVMLInstruction:
                 f"++pio_lane) {pointer}[pio_lane] = "
                 f"gvml_get_entry_16({vr}, pio_lane);"
             )
-        return f"{self.api}({', '.join(argument(value) for value in self.args)});"
+        call = f"{self.api}({', '.join(argument(value) for value in self.args)});"
+        return f"if ({self.predicate}) {call}" if self.predicate else call
 
 
 @dataclass(frozen=True)
@@ -715,9 +722,29 @@ def _explicit_route_instructions(plan, transfer, transfer_index, current_vm):
         table_size = int(parameters["table_size"])
         group_size = int(parameters["group_size"])
         _enum_size(group_size)
-        if table_size <= 0 or table_size > group_size:
+        table_slots = VR_LANES // group_size
+        if table_size != table_slots:
             raise UnsupportedVectorOperation(
-                f"lookup table_size={table_size} must be in [1, group_size={group_size}]"
+                f"lookup table_size={table_size} must equal the {table_slots} "
+                f"physical groups induced by group_size={group_size}"
+            )
+        temporal_axis = str(
+            getattr(lookup, "temporal_axis", None)
+            or getattr(transfer, "temporal_axis", None)
+            or getattr(getattr(plan, "reduction_strategy", None), "axis", "")
+        )
+        temporal_extent = _route_axis_extent(lookup, temporal_axis)
+        batching = getattr(plan, "output_batching", None)
+        physical_batches = (
+            max(1, int(batching.physical_output_batches))
+            if batching is not None
+            else max(1, int(_metadata(plan).get("physical_output_batches", 1)))
+        )
+        lookup_bytes = table_size * temporal_extent * physical_batches * 2
+        if lookup_bytes > L3_LOOKUP_BUDGET_BYTES:
+            raise UnsupportedVectorOperation(
+                f"lookup image for {name!r} needs {lookup_bytes} L3 bytes, "
+                f"exceeding the safe {L3_LOOKUP_BUDGET_BYTES}-byte budget"
             )
         index_name = _tmp(f"{name}_lookup_index", transfer_index)
         ingress.extend(
@@ -772,32 +799,47 @@ def _explicit_route_instructions(plan, transfer, transfer_index, current_vm):
         )
         temporal_extent = _route_axis_extent(duplicate, temporal_axis)
         resident_count = math.ceil(temporal_extent / rows_per_vr)
-        if resident_count <= 0 or resident_count >= WRITABLE_VRS:
-            raise VRCapacityError(
-                f"resident route for {name!r} needs {resident_count} VRs"
-            )
+        if resident_count <= 0:
+            raise VRCapacityError(f"resident route for {name!r} is empty")
+        # A compact table may be pinned before the kernel. Large reductions
+        # instead reuse one streaming VR. The old lowering tried to pin all
+        # 150 PolyBench GEMM chunks at once on hardware with fifteen writable
+        # VRs, forcing selection to fall back to two full-VR DMAs per k-step.
+        streamed = resident_count >= WRITABLE_VRS
+        allocated_resident_count = 1 if streamed else resident_count
         resident_names = tuple(
-            _tmp(f"{name}_resident", index) for index in range(resident_count)
+            _tmp(f"{name}_resident", index)
+            for index in range(allocated_resident_count)
         )
         for index, resident in enumerate(resident_names):
             vm = (current_vm + index) % VMR_COUNT
+            if streamed:
+                pointer = PointerOffsetRef(
+                    name,
+                    f"(reduction_step / {rows_per_vr}) * {VR_LANES}",
+                )
+                phase = "transfer_in"
+                predicate = f"reduction_step % {rows_per_vr} == 0"
+            else:
+                pointer = PointerOffsetRef(name, f"{index} * {VR_LANES}")
+                phase = "resident_setup"
+                predicate = None
             ingress.extend(
                 [
                     GVMLInstruction(
                         "DMA_L4_TO_L1_32K",
                         "direct_dma_l4_to_l1_32k",
-                        (
-                            f"GVML_VM_{vm}",
-                            PointerOffsetRef(name, f"{index} * {VR_LANES}"),
-                        ),
-                        phase="resident_setup",
+                        (f"GVML_VM_{vm}", pointer),
+                        phase=phase,
+                        predicate=predicate,
                     ),
                     GVMLInstruction(
                         "LOAD_16",
                         "gvml_load_16",
                         (VRRef(resident), f"GVML_VM_{vm}"),
                         (resident,),
-                        phase="resident_setup",
+                        phase=phase,
+                        predicate=predicate,
                     ),
                 ]
             )
@@ -817,12 +859,18 @@ def _explicit_route_instructions(plan, transfer, transfer_index, current_vm):
                 "gvml_duplicate_subgrp_16_grp_sgidx",
                 (
                     VRRef(name),
-                    VRBankRef(resident_names, f"reduction_step / {rows_per_vr}"),
+                    (
+                        VRRef(resident_names[0])
+                        if streamed
+                        else VRBankRef(
+                            resident_names, f"reduction_step / {rows_per_vr}"
+                        )
+                    ),
                     VRRef(index_name),
                     _enum_size(group_size),
                     _enum_size(subgroup_size),
                     CExpression(f"reduction_step % {rows_per_vr}"),
-                    f"GVML_VM_{(current_vm + resident_count) % VMR_COUNT}",
+                    f"GVML_VM_{(current_vm + allocated_resident_count) % VMR_COUNT}",
                 ),
                 (name,),
                 resident_names + (index_name,),
@@ -830,8 +878,8 @@ def _explicit_route_instructions(plan, transfer, transfer_index, current_vm):
             )
         )
         return ingress, (
-            "dma_l4_l1",
-            "load_resident_vr",
+            "stream_l4_l1_32k" if streamed else "dma_l4_l1",
+            "load_stream_vr" if streamed else "load_resident_vr",
             "create_subgroup_index",
             "duplicate_subgroup",
         )
@@ -1260,7 +1308,11 @@ def _allocate_vrs(plan, instructions, *, capacity: int) -> tuple[VRBinding, ...]
     for position, instruction in enumerate(instructions):
         for name in instruction.definitions + instruction.uses:
             positions.setdefault(name, []).append(position)
-        if instruction.phase in {"resident_setup", "index_setup"}:
+        if instruction.phase in {"resident_setup", "index_setup"} or (
+            instruction.phase == "transfer_in"
+            and instruction.opcode == "LOAD_16"
+            and instruction.predicate is not None
+        ):
             persistent.update(instruction.definitions)
     # These definitions are emitted before the output loop after phase-aware
     # code motion.  Their textual position in the neutral instruction list is
