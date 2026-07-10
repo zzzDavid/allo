@@ -391,25 +391,19 @@ def build_aim_target():
                             "WR_SBK",
                             src=gpr,
                             dst=bank_ref,
-                            emit=lambda ctx: ctx.cmd(
-                                "WR_SBK", dst=bank_ref, src0=gpr
-                            ),
+                            emit=lambda ctx: ctx.cmd("WR_SBK", dst=bank_ref, src0=gpr),
                         )
                         allo.move(
                             "RD_SBK",
                             src=bank_ref,
                             dst=gpr,
-                            emit=lambda ctx: ctx.cmd(
-                                "RD_SBK", dst=gpr, src0=bank_ref
-                            ),
+                            emit=lambda ctx: ctx.cmd("RD_SBK", dst=gpr, src0=bank_ref),
                         )
                         allo.move(
                             "ST_SBK",
                             src=gpr,
                             dst=bank_ref,
-                            emit=lambda ctx: ctx.cmd(
-                                "WR_SBK", dst=bank_ref, src0=gpr
-                            ),
+                            emit=lambda ctx: ctx.cmd("WR_SBK", dst=bank_ref, src0=gpr),
                         )
                         allo.op(
                             "MAC",
@@ -426,12 +420,17 @@ def build_aim_target():
 
 
 def build_upmem_target():
-    """Return the UPMEM DPU (DRAM-PIM) target tree per spec 003.
+    """Return the structural target for one real UPMEM DIMM rank.
 
-    Architecture: rank -> DPUs -> tasklets. Per-DPU memories are MRAM
-    (64 MB bulk), WRAM (64 KB scratch), and IRAM (24 KB instruction).
-    Per-tasklet GPRs (24 entries). UPMEM's emit lambdas produce C
-    statement strings (assembled later into a DPU task.c).
+    The hierarchy and capacities follow the UPMEM architecture measured by
+    Gomez-Luna et al.: one rank contains 64 independent DPUs; every DPU has
+    64 MiB MRAM, 64 KiB WRAM, 24 KiB IRAM, and at most 24 tasklets.  The
+    tasklets share the DPU pipeline and DMA engine, so tasklet count is a
+    scheduling choice rather than another host-visible DPU partition.
+
+    This target deliberately contains no latency constants.  Instruction,
+    revolver-scheduling, DMA, and host-link cycles live in the standalone
+    :mod:`allo.pim.costs.upmem` executable cost program.
     """
 
     @allo.target("upmem")
@@ -439,15 +438,22 @@ def build_upmem_target():
         # ============================ device ============================ #
         @allo.device
         def dram_pim():
-            @allo.unit(mapping=[1])  # rank (collapsed multi-rank)
+            # One rank is a containment/resource scope, not a degenerate
+            # spatial program axis.  This keeps a workload mapping=[64]
+            # aligned directly with the 64 DPU instances.
+            @allo.unit()
             def rank():
-                @allo.unit(mapping=[64])  # DPUs per rank
+                @allo.unit(mapping={"dpu": 64})
                 def dpu():
                     mram = allo.mem(size_bytes=67108864, name="mram")
                     wram = allo.mem(size_bytes=65536, name="wram")
                     iram = allo.mem(size_bytes=24576, name="iram")
+                    # Mutex/barrier state lives in the DPU's 256-byte atomic
+                    # memory.  It is structural even though PolyBench kernels
+                    # below only need the barrier runtime built on top of it.
+                    atomic = allo.mem(size_bytes=256, name="atomic")
 
-                    @allo.unit(mapping=[16])  # tasklets per DPU
+                    @allo.unit(mapping={"tasklet": 24})
                     def tasklet():
                         gprs = allo.reg(24, 32, name="gprs")
 
@@ -531,12 +537,150 @@ def build_upmem_target():
                             ),
                         )
 
-                        # UPMEM has no fused MAC; lowers to mul+add in C.
-                        # SPEC-019: emit_mac_kreduce wraps the body in an
-                        # explicit `for (k...)` loop so uPIMulator prices
-                        # the full K-reduction, not a single statement.
-                        # `pending_k_bound` is set on the ctx by
-                        # `_walk_and_emit` immediately before this fires.
+                        allo.op(
+                            "SUB",
+                            src=(
+                                allo.or_(any_wram, any_gpr),
+                                allo.or_(any_wram, any_gpr),
+                            ),
+                            dst=any_gpr,
+                            fn=lambda x, y: x - y,
+                            emit=lambda x, y, dst, ctx: ctx.emit_c_line(
+                                "{d} = {a} - {b};".format(
+                                    d=ctx.handle_c_name(dst),
+                                    a=ctx.handle_c_name(x),
+                                    b=ctx.handle_c_name(y),
+                                )
+                            ),
+                        )
+
+                        allo.op(
+                            "DIV",
+                            src=(
+                                allo.or_(any_wram, any_gpr),
+                                allo.or_(any_wram, any_gpr),
+                            ),
+                            dst=any_gpr,
+                            fn=lambda x, y: x / y,
+                            emit=lambda x, y, dst, ctx: ctx.emit_c_line(
+                                "{d} = {a} / {b};".format(
+                                    d=ctx.handle_c_name(dst),
+                                    a=ctx.handle_c_name(x),
+                                    b=ctx.handle_c_name(y),
+                                )
+                            ),
+                        )
+
+                        # The general MLIR-to-C path selects these primitives
+                        # directly. CMP/SELECT/SQRT/BRANCH are not expression-
+                        # matcher patterns because their MLIR forms are not the
+                        # binary store tree recognized by spmw_match_engine.
+                        allo.op(
+                            "SQRT",
+                            src=(allo.or_(any_wram, any_gpr),),
+                            dst=any_gpr,
+                            fn=lambda x: x,
+                            matchable=False,
+                            emit=lambda x, dst, ctx: ctx.emit_c_line(
+                                "{d} = sqrtf({a});".format(
+                                    d=ctx.handle_c_name(dst),
+                                    a=ctx.handle_c_name(x),
+                                )
+                            ),
+                        )
+
+                        allo.op(
+                            "CMP",
+                            src=(
+                                allo.or_(any_wram, any_gpr),
+                                allo.or_(any_wram, any_gpr),
+                            ),
+                            dst=any_gpr,
+                            fn=lambda x, y: x,
+                            matchable=False,
+                            emit=lambda x, y, dst, ctx: ctx.emit_c_line(
+                                "{d} = ({a} < {b});".format(
+                                    d=ctx.handle_c_name(dst),
+                                    a=ctx.handle_c_name(x),
+                                    b=ctx.handle_c_name(y),
+                                )
+                            ),
+                        )
+
+                        allo.op(
+                            "SELECT",
+                            src=(
+                                any_gpr,
+                                allo.or_(any_wram, any_gpr),
+                                allo.or_(any_wram, any_gpr),
+                            ),
+                            dst=any_gpr,
+                            fn=lambda cond, x, y: x,
+                            matchable=False,
+                            emit=lambda cond, x, y, dst, ctx: ctx.emit_c_line(
+                                "{d} = {c} ? {a} : {b};".format(
+                                    d=ctx.handle_c_name(dst),
+                                    c=ctx.handle_c_name(cond),
+                                    a=ctx.handle_c_name(x),
+                                    b=ctx.handle_c_name(y),
+                                )
+                            ),
+                        )
+
+                        allo.op(
+                            "MIN",
+                            src=(
+                                allo.or_(any_wram, any_gpr),
+                                allo.or_(any_wram, any_gpr),
+                            ),
+                            dst=any_gpr,
+                            fn=lambda x, y: min(x, y),
+                            emit=lambda x, y, dst, ctx: ctx.emit_c_line(
+                                "{d} = {a} < {b} ? {a} : {b};".format(
+                                    d=ctx.handle_c_name(dst),
+                                    a=ctx.handle_c_name(x),
+                                    b=ctx.handle_c_name(y),
+                                )
+                            ),
+                        )
+
+                        allo.op(
+                            "MAX",
+                            src=(
+                                allo.or_(any_wram, any_gpr),
+                                allo.or_(any_wram, any_gpr),
+                            ),
+                            dst=any_gpr,
+                            fn=lambda x, y: max(x, y),
+                            emit=lambda x, y, dst, ctx: ctx.emit_c_line(
+                                "{d} = {a} > {b} ? {a} : {b};".format(
+                                    d=ctx.handle_c_name(dst),
+                                    a=ctx.handle_c_name(x),
+                                    b=ctx.handle_c_name(y),
+                                )
+                            ),
+                        )
+
+                        allo.op(
+                            "BRANCH",
+                            src=(any_gpr,),
+                            dst=any_gpr,
+                            fn=lambda cond: cond,
+                            matchable=False,
+                            # The MLIR C backend owns labels and structured
+                            # control flow; this callback is only a diagnostic
+                            # fallback for primitive-level emitters.
+                            emit=lambda cond, dst, ctx: ctx.emit_c_line(
+                                "/* branch on {c}; emitted by MLIR C lowering */".format(
+                                    c=ctx.handle_c_name(cond)
+                                )
+                            ),
+                        )
+
+                        # UPMEM has no fused MAC; the MLIR-to-C path lowers it
+                        # to ordinary multiply/add code. Loop structure stays
+                        # in MLIR rather than being reconstructed by a matcher
+                        # context.
                         allo.op(
                             "MAC",
                             src=(
@@ -546,8 +690,12 @@ def build_upmem_target():
                             dst=any_gpr,
                             accumulates=True,
                             fn=lambda x, y, acc: acc + x * y,
-                            emit=lambda x, y, acc, ctx: ctx.emit_mac_kreduce(
-                                acc=acc, x=x, y=y, k_bound=ctx.pending_k_bound
+                            emit=lambda x, y, acc, ctx: ctx.emit_c_line(
+                                "{a} += {x} * {y};".format(
+                                    a=ctx.handle_c_name(acc),
+                                    x=ctx.handle_c_name(x),
+                                    y=ctx.handle_c_name(y),
+                                )
                             ),
                         )
 
@@ -563,6 +711,7 @@ def build_upmem_target():
                 "SCATTER_MRAM",
                 src=host_dram,
                 dst=dram_pim.mram,
+                verb=allo.scatter,
                 emit=lambda ctx: (
                     ctx.dpu_prepare_xfer(dram_pim.mram),
                     ctx.dpu_push_xfer("DPU_XFER_TO_DPU"),
@@ -573,6 +722,7 @@ def build_upmem_target():
                 "BCAST_MRAM",
                 src=host_dram,
                 dst=dram_pim.mram,
+                verb=allo.broadcast,
                 emit=lambda ctx: ctx.dpu_broadcast_to(dram_pim.mram),
             )
             # Readback per-DPU results to the host (dpu_copy_from). UPMEM has
@@ -581,6 +731,7 @@ def build_upmem_target():
                 "GATHER_MRAM",
                 src=dram_pim.mram,
                 dst=host_dram,
+                verb=allo.gather,
                 emit=lambda ctx: ctx.dpu_copy_from(dram_pim.mram),
             )
 
@@ -793,112 +944,225 @@ def build_apu_v1_target():
 
 
 def build_apu_v2_target():
-    """Return the GSI APU v2 (Gemini 2, G2) target tree per spec 003.
+    """Return one hardware-faithful GSI Gemini-II (APUg2) vector core.
 
-    Architecture: 1 chip with a chip-wide L1 bitline grid (3072 rows x
-    65536 cols) and host-side L5 DRAM. 16 L1 row groups partition the
-    grid; each owns 4096 elements of a 64K-element vector. There is no
-    per-group register file -- the L1 row itself is the operand store.
-    GTML's higher ops (matmul / rms_norm / softmax / AF) are declared
-    so the target surface mirrors the GTML API even though the MLIR
-    matcher currently only lowers MAC / MUL / ADD.
+    The logical Tenon grid is the sixteen 4K-column L1 groups.  A VL64
+    instruction is *coalesced* across that grid: one issued operation covers
+    all 16 groups, all 65,536 columns, and the four MMB sets.  Consequently the
+    mapped ``pe`` unit is a layout/work partition, while the singleton
+    ``vector_engine`` owns the executable L1<->MMB moves and arithmetic.
+
+    Timing is deliberately absent.  Real-card calibration lives in
+    :mod:`allo.pim.costs.apu_g2`.
     """
 
     @allo.target("apu_v2")
     def device():
-        l5 = allo.mem(size_bytes=2**40, name="l5")
+        @allo.device
+        def core():
+            # One core's private L5/DRAM slot on the installed Leda-E2 board.
+            l5 = allo.mem(
+                size_bytes=256 << 20,
+                alignment_bytes=256,
+                name="l5",
+            )
+            # Two independently served 4 KiB halves, 16 x 256-byte blocks each.
+            l2a = allo.mem(
+                size_bytes=4 << 10,
+                blocks_per_half=16,
+                block_bytes=256,
+                name="l2a",
+            )
+            l2b = allo.mem(
+                size_bytes=4 << 10,
+                blocks_per_half=16,
+                block_bytes=256,
+                name="l2b",
+            )
+            # Bit-sliced L1: every n-bit vector consumes n rows across 64K cols.
+            l1 = allo.mem(
+                banks=8,
+                groups=16,
+                groups_per_bank=2,
+                cols_per_group=4096,
+                rows=3072,
+                cols=65536,
+                width=1,
+                name="l1",
+            )
+            # Four associative sets; rows 0..23 and 24..47 are distinct
+            # operand segments enforced by the VL64 descriptor types.
+            mmb = allo.mem(
+                sets=4,
+                rows_per_set=48,
+                segment_rows=24,
+                cols=65536,
+                width=1,
+                name="mmb",
+            )
+            rwen = allo.reg(
+                65536,
+                1,
+                slots=1,
+                axes={"column": 65536},
+                name="rwen",
+            )
 
-        @allo.unit(mapping=[1])  # 1 chip
-        def chip():
-            l1 = allo.mem(rows=3072, cols=65536, width=1, name="l1")
+            # The user-requested 1-D 16-PE grid.  These PEs partition columns;
+            # they do not cause sixteen separate VL64 calls.
+            @allo.unit(mapping={"group": 16})
+            def pe():
+                pass
 
-            @allo.unit(mapping=[16])  # 16 L1 row groups
-            def row_group():
-                # -------- moves -------- #
-                allo.move(
-                    "COPY_TO_L1",
-                    src=l5,
-                    dst=l1,
-                    emit=lambda ctx: ctx.cmd("copy_to_l1", dst=l1, src0=l5),
-                )
-                allo.move(
-                    "COPY_FROM_L1",
-                    src=l1,
-                    dst=l5,
-                    emit=lambda ctx: ctx.cmd("copy_from_l1", dst=l5, src0=l1),
-                )
+            @allo.unit(capacity=1)
+            def gdma_a():
+                allo.move("DMA_A_L5_TO_L1", src=l5, dst=l1)
+                allo.move("DMA_A_L1_TO_L5", src=l1, dst=l5)
 
-                # -------- compute ops -------- #
-                any_l1 = allo.any_(l1)
+            @allo.unit(capacity=1)
+            def gdma_b():
+                allo.move("DMA_B_L5_TO_L1", src=l5, dst=l1)
+                allo.move("DMA_B_L1_TO_L5", src=l1, dst=l5)
 
+            @allo.unit(capacity=1)
+            def vector_engine():
+                seg0 = mmb["seg0"]
+                seg1 = mmb["seg1"]
+                allo.move("L1_TO_MMB_SEG0", src=l1, dst=seg0)
+                allo.move("L1_TO_MMB_SEG1", src=l1, dst=seg1)
+                allo.move("MMB_TO_L1", src=seg1, dst=l1)
+                allo.move("MMB_TO_L1_BITS", src=seg1, dst=l1)
                 allo.op(
-                    "ADD",
-                    src=(any_l1, any_l1),
-                    dst=any_l1,
+                    "ADD_U16",
+                    src=(seg0, seg1),
+                    dst=seg1,
                     fn=lambda x, y: x + y,
-                    emit=lambda x, y, dst, ctx: ctx.cmd(
-                        "g.add", dst=dst, src0=x, src1=y
-                    ),
+                    matchable=False,
                 )
-
+                # Full uint16 modular multiplication is lowered into three
+                # byte products: lo*lo + ((lo*hi + hi*lo) << 8).  One 8x8
+                # product fits the MMB segment's 24-row result envelope.
                 allo.op(
-                    "MUL",
-                    src=(any_l1, any_l1),
-                    dst=any_l1,
-                    fn=lambda x, y: x * y,
-                    emit=lambda x, y, dst, ctx: ctx.cmd(
-                        "g.mul", dst=dst, src0=x, src1=y
-                    ),
+                    "MUL_U8_TO_U16",
+                    src=(l1, seg0),
+                    dst=seg1,
+                    fn=lambda x, y: (x * y) & 0xFFFF,
+                    matchable=False,
                 )
-
-                # MAC: GTML has no fused MAC primitive at vector
-                # granularity. The ctx expands it into matmul + add.
                 allo.op(
-                    "MAC",
-                    src=(any_l1, any_l1),
-                    dst=any_l1,
-                    accumulates=True,
-                    fn=lambda x, y, acc: acc + x * y,
-                    emit=lambda x, y, acc, ctx: ctx.emit_mac_matmul(acc=acc, x=x, y=y),
-                )
-
-                # Higher-level ops mirror the GTML surface. fn= slots
-                # are placeholders -- the MLIR matcher does not
-                # currently generate these.
-                allo.op(
-                    "MATMUL",
-                    src=(any_l1, any_l1),
-                    dst=any_l1,
-                    fn=lambda x, y: x,
-                    emit=lambda x, y, dst, ctx: ctx.cmd(
-                        "g.matmul", dst=dst, src0=x, src1=y
-                    ),
-                )
-
-                allo.op(
-                    "RMS_NORM",
-                    src=(any_l1,),
-                    dst=any_l1,
+                    "GROUP_REDUCE_ADD_U16_TO_U23",
+                    src=(seg0,),
+                    dst=seg1,
                     fn=lambda x: x,
-                    emit=lambda x, dst, ctx: ctx.cmd(
-                        "g.rms_norm_gflt", dst=dst, src0=x
-                    ),
+                    matchable=False,
+                )
+                allo.op(
+                    "SHIFT_LEFT_U16",
+                    src=(seg1,),
+                    dst=seg1,
+                    fn=lambda x: (x << 8) & 0xFFFF,
+                    matchable=False,
+                )
+                allo.op(
+                    "SHIFT_RIGHT_U16",
+                    src=(seg1,),
+                    dst=seg1,
+                    fn=lambda x: x >> 1,
+                    matchable=False,
+                )
+                allo.op(
+                    "LT_U16",
+                    src=(seg0, seg1),
+                    dst=mmb,
+                    fn=lambda x, y: x < y,
+                    matchable=False,
+                )
+                allo.op(
+                    "MIN_U16",
+                    src=(seg1, seg0),
+                    dst=seg1,
+                    fn=lambda x, y: min(x, y),
+                    matchable=False,
+                )
+                allo.op(
+                    "MAX_U16",
+                    src=(seg1, seg0),
+                    dst=seg1,
+                    fn=lambda x, y: max(x, y),
+                    matchable=False,
+                )
+                allo.op(
+                    "DIV_U16",
+                    src=(seg0, seg1),
+                    dst=l1,
+                    fn=lambda x, y: x // y,
+                    matchable=False,
+                )
+                allo.op(
+                    "SUB_U16",
+                    src=(seg0, seg1),
+                    dst=seg1,
+                    fn=lambda x, y: (x - y) & 0xFFFF,
+                    matchable=False,
+                )
+                allo.op(
+                    "SEU_BARRIER",
+                    src=(seg1,),
+                    dst=seg1,
+                    fn=lambda x: x,
+                    matchable=False,
+                )
+                # Resident ATAX layout transforms.  GTML lowers both to the
+                # same VL64 engine; the intermediate never leaves L1.
+                allo.op(
+                    "SQUEEZE_ROWS_INPLACE",
+                    src=(l1,),
+                    dst=l1,
+                    fn=lambda x: x,
+                    matchable=False,
+                )
+                allo.op(
+                    "SPREAD_BLOCK",
+                    src=(l1,),
+                    dst=l1,
+                    fn=lambda x: x,
+                    matchable=False,
                 )
 
+            @allo.unit(capacity=1)
+            def arc():
                 allo.op(
-                    "SOFTMAX",
-                    src=(any_l1,),
-                    dst=any_l1,
-                    fn=lambda x: x,
-                    emit=lambda x, dst, ctx: ctx.cmd("g.softmax", dst=dst, src0=x),
+                    "DISPATCH",
+                    src=(l2a, l2b),
+                    dst=rwen,
+                    fn=lambda x, _y: x,
+                    matchable=False,
                 )
 
-                allo.op(
-                    "AF",
-                    src=(any_l1,),
-                    dst=any_l1,
-                    fn=lambda x: x,
-                    emit=lambda x, dst, ctx: ctx.cmd("g.relu", dst=dst, src0=x),
-                )
+        @allo.unit(mode="host")
+        def host():
+            host_dram = allo.mem(name="host_dram", bytes=1 << 34)
+            allo.move(
+                "COPY_TO_L5",
+                src=host_dram,
+                dst=core.l5,
+                verb=allo.move_only,
+            )
+            allo.move(
+                "COPY_FROM_L5",
+                src=core.l5,
+                dst=host_dram,
+                verb=allo.move_only,
+            )
 
     return device
+
+
+def build_apu_g2_target():
+    """Preferred hardware name for :func:`build_apu_v2_target`.
+
+    ``target.name`` remains ``"apu_v2"`` so existing Tenon registries and
+    archived results keep a stable backend key.
+    """
+
+    return build_apu_v2_target()

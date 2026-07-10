@@ -10,7 +10,11 @@ from allo.pim.costs.apu_v1 import (
     GROUPED_KERNEL_STARTUP_CRUN,
 )
 from allo.pim.targets import build_apu_v1_target
-from allo.spmw_autoschedule import _apu_v1_enumerate, derive_layout_properties
+from allo.spmw_autoschedule import (
+    MatcherWorkScope,
+    _apu_v1_enumerate,
+    derive_layout_properties,
+)
 from allo.spmw_codegen import APUv1Ctx, _parse_apu_v1_prof_print
 from allo.spmw_match import MatchedOp, OperandBinding
 
@@ -32,8 +36,12 @@ def _mac(rows=60, reduction=80, groups=256):
         result_memref_name="out",
         op_range=("begin", "end"),
         extra={
-            "spmw_group_count": groups,
-            "coalesced_spmw_axis": "group",
+            "spmw_work_scope": MatcherWorkScope(
+                group_id=0,
+                work_id=(0,),
+                group_shape=(groups,),
+                coalesced_axes=(0,),
+            )
         },
     )
 

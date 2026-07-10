@@ -34,7 +34,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .spmw_match import MatchedOp, MatchTrace, OperandBinding
+from .spmw_match import IRValueRef, MatchedOp, MatchTrace, OperandBinding
 
 
 # --------------------------------------------------------------------- #
@@ -187,6 +187,7 @@ class WLoad:
     indices: list[str]
     source_op_name: str  # MLIR op name, e.g. "memref.load"
     memref_type: str | None = None
+    value_ref: IRValueRef | None = None
 
 
 @dataclass
@@ -248,7 +249,7 @@ def _result_names(op) -> list[str]:
     return [r.get_name() for r in op.results]
 
 
-def _build_load_term(load_op) -> WLoad:
+def _build_load_term(load_op, value_refs) -> WLoad:
     name = load_op.operation.name
     attrs = load_op.attributes
     memref_name = None
@@ -265,10 +266,11 @@ def _build_load_term(load_op) -> WLoad:
         indices=indices,
         source_op_name=name,
         memref_type=memref_type,
+        value_ref=value_refs.get(load_op.operands[0]) if load_op.operands else None,
     )
 
 
-def _trace_value(ssa_name: str, defining_map: dict[str, Any]) -> Any:
+def _trace_value(ssa_name: str, defining_map: dict[str, Any], value_refs) -> Any:
     """Build a WTerm for the SSA value named ``ssa_name``.
 
     ``defining_map`` maps SSA result names to the MLIR op that defines them.
@@ -281,12 +283,12 @@ def _trace_value(ssa_name: str, defining_map: dict[str, Any]) -> Any:
 
     op_name = src.operation.name
     if op_name in _LOAD_OPS:
-        return _build_load_term(src)
+        return _build_load_term(src, value_refs)
     if op_name in _FP_BINOPS:
         kind = _FP_BINOPS[op_name]
         ops = _operand_names(src)
-        lhs = _trace_value(ops[0], defining_map)
-        rhs = _trace_value(ops[1], defining_map)
+        lhs = _trace_value(ops[0], defining_map, value_refs)
+        rhs = _trace_value(ops[1], defining_map, value_refs)
         return WBinOp(kind, lhs, rhs, _result_names(src)[0])
     if op_name == "arith.constant":
         # Try to extract the literal; not strictly needed for matching.
@@ -307,7 +309,7 @@ def _trace_value(ssa_name: str, defining_map: dict[str, Any]) -> Any:
     # We trace through single-input casts so that constants on the other
     # side still appear as constants when the pattern needs them.
     if len(src.operands) == 1 and src.results:
-        inner = _trace_value(_operand_names(src)[0], defining_map)
+        inner = _trace_value(_operand_names(src)[0], defining_map, value_refs)
         # Wrap-through: keep the original ssa name so codegen can audit.
         if isinstance(inner, (WLoad, WBlockArg, WConst, WBinOp)):
             return inner
@@ -465,6 +467,152 @@ def _build_defining_map(func) -> dict[str, Any]:
     return m
 
 
+def _is_memref_value(value) -> bool:
+    return str(getattr(value, "type", "")).startswith("memref<")
+
+
+def _walk_ir_values(block, prefix, collector):
+    for operation_index, operation in enumerate(block.operations):
+        path = prefix + (operation_index,)
+        collector.append((operation, path))
+        for region_index, region in enumerate(operation.regions):
+            for block_index, nested in enumerate(region.blocks):
+                _walk_ir_values(
+                    nested,
+                    path + (region_index, block_index),
+                    collector,
+                )
+
+
+def _retained_abi_value_ids(function) -> tuple[int, ...] | None:
+    attributes = function.attributes
+    name = "spmw.abi_value_ids"
+    if name not in attributes:
+        return None
+    source_ids = tuple(
+        int(getattr(value, "value", value)) for value in attributes[name]
+    )
+    if len(source_ids) != len(function.arguments):
+        raise ValueError("retained matcher ABI identity has the wrong arity")
+    if any(value < 0 for value in source_ids):
+        raise ValueError("retained matcher ABI identity must be non-negative")
+    return source_ids
+
+
+def _callee_symbol(operation) -> str | None:
+    if operation.operation.name != "func.call" or "callee" not in operation.attributes:
+        return None
+    symbol = _attr_str(operation.attributes["callee"])
+    return symbol[1:] if symbol and symbol.startswith("@") else symbol
+
+
+def _build_ir_value_refs(mlir_module) -> dict[Any, IRValueRef]:
+    """Canonicalize exact MLIR def-use, call, and retained ABI edges."""
+
+    functions = [
+        function
+        for function in mlir_module.body.operations
+        if function.operation.name == "func.func" and "sym_name" in function.attributes
+    ]
+    functions_by_symbol = {
+        _attr_str(function.attributes["sym_name"]): function for function in functions
+    }
+    order = {}
+    parents = {}
+    calls = []
+    retained_sources = {}
+
+    def add(value, position):
+        if not _is_memref_value(value):
+            return
+        if value not in parents:
+            parents[value] = value
+            order[value] = tuple(int(component) for component in position)
+
+    def find(value):
+        parent = parents[value]
+        if parent != value:
+            parents[value] = find(parent)
+        return parents[value]
+
+    def union(lhs, rhs):
+        if lhs not in parents or rhs not in parents:
+            return
+        lhs_root = find(lhs)
+        rhs_root = find(rhs)
+        if lhs_root == rhs_root:
+            return
+        if order[rhs_root] < order[lhs_root]:
+            lhs_root, rhs_root = rhs_root, lhs_root
+        parents[rhs_root] = lhs_root
+
+    for function_index, function in enumerate(functions):
+        for argument_index, argument in enumerate(function.arguments):
+            add(argument, (function_index, 0, argument_index))
+        source_ids = _retained_abi_value_ids(function)
+        if source_ids is not None:
+            for argument, source_id in zip(function.arguments, source_ids):
+                if _is_memref_value(argument):
+                    retained_sources.setdefault(source_id, []).append(argument)
+
+        operations = []
+        _walk_ir_values(function.regions[0].blocks[0], (), operations)
+        for operation, path in operations:
+            for result_index, result in enumerate(operation.results):
+                add(result, (function_index, 1, *path, result_index))
+            for operand_index, operand in enumerate(operation.operands):
+                add(operand, (function_index, 2, *path, operand_index))
+            if operation.operation.name == "memref.cast":
+                if len(operation.operands) == len(operation.results) == 1 and str(
+                    operation.operands[0].type
+                ) == str(operation.results[0].type):
+                    union(operation.operands[0], operation.results[0])
+            if operation.operation.name == "func.call":
+                calls.append(operation)
+
+    for source_id, values in retained_sources.items():
+        types = {str(value.type) for value in values}
+        if len(types) != 1:
+            raise ValueError(
+                f"retained matcher ABI source {source_id} has incompatible types"
+            )
+        for value in values[1:]:
+            union(values[0], value)
+
+    for call in calls:
+        symbol = _callee_symbol(call)
+        callee = functions_by_symbol.get(symbol)
+        if callee is None:
+            continue
+        if len(call.operands) != len(callee.arguments):
+            raise ValueError("matcher call edge has incompatible ABI arity")
+        for operand, argument in zip(call.operands, callee.arguments):
+            if _is_memref_value(operand) != _is_memref_value(argument):
+                raise ValueError("matcher call edge has incompatible ABI value kinds")
+            if _is_memref_value(operand):
+                if str(operand.type) != str(argument.type):
+                    raise ValueError("matcher call edge has incompatible memref types")
+                union(operand, argument)
+
+    component_sources = {}
+    for source_id, values in retained_sources.items():
+        for value in values:
+            component_sources.setdefault(find(value), set()).add(source_id)
+    if any(len(source_ids) != 1 for source_ids in component_sources.values()):
+        raise ValueError("one matcher def-use component has conflicting ABI identities")
+
+    components = {}
+    for value in parents:
+        components.setdefault(find(value), []).append(value)
+    refs = {}
+    for members in components.values():
+        canonical_path = min(order[value] for value in members)
+        value_ref = IRValueRef("mlir", canonical_path)
+        for value in members:
+            refs[value] = value_ref
+    return refs
+
+
 # --------------------------------------------------------------------- #
 # Match driver
 # --------------------------------------------------------------------- #
@@ -493,6 +641,7 @@ def _operand_bindings(
                     indices=list(term.indices),
                     is_loop_carried=(name == acc_name),
                     memref_type=term.memref_type,
+                    value_ref=term.value_ref,
                 )
             )
         elif isinstance(term, WBlockArg):
@@ -564,6 +713,7 @@ def _try_match_at_store(
     func_name: str,
     work_id: tuple[int, ...],
     defining_map: dict[str, Any],
+    value_refs: dict[Any, IRValueRef],
 ) -> list[MatchedOp]:
     """If ``store_op`` (a memref.store / affine.store) writes a value that
     matches one of the target's compiled op patterns, emit MatchedOps for it.
@@ -585,8 +735,11 @@ def _try_match_at_store(
     result_memref_name = None
     if "to" in store_op.attributes:
         result_memref_name = _attr_str(store_op.attributes["to"])
+    result_value_ref = (
+        value_refs.get(store_op.operands[1]) if len(store_op.operands) > 1 else None
+    )
 
-    term = _trace_value(stored_ssa, defining_map)
+    term = _trace_value(stored_ssa, defining_map, value_refs)
     # Only a binop term is interesting for the patterns we care about.
     if not isinstance(term, WBinOp):
         return []
@@ -623,6 +776,12 @@ def _try_match_at_store(
                         and acc_term.memref_name != result_memref_name
                     ):
                         continue
+                    if (
+                        result_value_ref is not None
+                        and acc_term.value_ref is not None
+                        and acc_term.value_ref != result_value_ref
+                    ):
+                        continue
                 # op_range — first contributing load through the store.
                 return MatchedOp(
                     target_op_name=op_obj.name,
@@ -633,6 +792,7 @@ def _try_match_at_store(
                     result_memref_name=result_memref_name,
                     op_range=(t.ssa_name, store_handle),
                     extra={"store_indices": list(store_indices)},
+                    result_value_ref=result_value_ref,
                 )
             # (no break needed — return above exits on first match)
         return None
@@ -761,6 +921,7 @@ def match_workload(target, mlir_module) -> MatchTrace:
         target_name=getattr(target, "name", "<unknown>"),
         module_name=str(getattr(mlir_module, "name", "<unnamed>")),
     )
+    value_refs = _build_ir_value_refs(mlir_module)
 
     # Iterate every func.func at the module top level.
     for func in mlir_module.body.operations:
@@ -790,6 +951,7 @@ def match_workload(target, mlir_module) -> MatchTrace:
                 func_name,
                 work_id,
                 defining_map,
+                value_refs,
             )
             trace.matches.extend(ms)
 

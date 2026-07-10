@@ -13,12 +13,37 @@ import math
 import numpy as np
 
 from .customize import customize
+from .ir.builder import _spmw_group_contract
 from .perf import BoundCostSpec, CostSpec
 from .pim.apu_v1_program import APUv1Program, compile_apu_v1_program
 from .pim.apu_v1_vector_program import (
     APUv1VectorCallable,
     compile_apu_v1_vector_workload,
 )
+from .pim.apu_g2_program import APUG2Callable, APUG2Program, compile_apu_g2_program
+from .pim.apu_g2_vector_program import (
+    APUG2AtaxCallable,
+    APUG2ChunkedGesummvCallable,
+    APUG2ColumnBatchedGemmCallable,
+    APUG2ContractionChainCallable,
+    APUG2CorrelationCallable,
+    APUG2CovarianceCallable,
+    APUG2GemverCallable,
+    APUG2GemvCallable,
+    APUG2IndependentContractionsCallable,
+    APUG2RankNContractionCallable,
+    APUG2StreamingGemvCallable,
+    APUG2SymmCallable,
+    APUG2TrmmCallable,
+    compile_apu_g2_vector_workload,
+)
+from .pim.schedule_promotion import PromotionEvidence, SchedulePromotionGate
+from .pim.upmem_program import (
+    UPMEMProgram,
+    UPMEMProgramCallable,
+    compile_upmem_program,
+)
+from .spmw_autoschedule import MatcherWorkScope, _retain_matcher_work_scope
 from .spmw_codegen import RunResult, compile_for_target
 from .spmw_match_engine import match_workload
 
@@ -101,6 +126,275 @@ def _buffer_metrics(workload):
     return metrics
 
 
+def _retained_symbol_name(function):
+    attributes = getattr(function, "attributes", {})
+    if "sym_name" not in attributes:
+        return None
+    attribute = attributes["sym_name"]
+    value = getattr(attribute, "value", None)
+    if value is not None:
+        return str(value)
+    text = str(attribute)
+    return text[1:-1] if len(text) >= 2 and text[0] == text[-1] == '"' else text
+
+
+_SPMW_SCOPE_ATTRS = (
+    "spmw.group_id",
+    "spmw.work_id",
+    "spmw.group_shape",
+    "spmw.coalesced_axes",
+    "spmw.group_fingerprint",
+    "spmw.body_fingerprint",
+)
+_SPMW_ABI_VALUE_IDS_ATTR = "spmw.abi_value_ids"
+
+
+def _retained_integer_attribute(attributes, name):
+    attribute = attributes[name]
+    return int(getattr(attribute, "value", attribute))
+
+
+def _retained_integer_array_attribute(attributes, name):
+    return tuple(
+        int(getattr(attribute, "value", attribute)) for attribute in attributes[name]
+    )
+
+
+def _retained_string_attribute(attributes, name):
+    attribute = attributes[name]
+    value = getattr(attribute, "value", attribute)
+    return str(value)
+
+
+def _retained_matcher_work_scope(function):
+    attributes = getattr(function, "attributes", {})
+    present = tuple(name in attributes for name in _SPMW_SCOPE_ATTRS)
+    if not any(present):
+        return None
+    if not all(present):
+        raise ValueError("retained matcher scope attributes are incomplete")
+    return MatcherWorkScope(
+        group_id=_retained_integer_attribute(attributes, "spmw.group_id"),
+        work_id=_retained_integer_array_attribute(attributes, "spmw.work_id"),
+        group_shape=_retained_integer_array_attribute(attributes, "spmw.group_shape"),
+        coalesced_axes=_retained_integer_array_attribute(
+            attributes, "spmw.coalesced_axes"
+        ),
+    )
+
+
+def _retained_function_arguments(function):
+    arguments = getattr(function, "arguments", None)
+    if arguments is not None:
+        return tuple(arguments)
+    return None
+
+
+def _validated_retained_matcher_contract(module):
+    body = getattr(module, "body", None)
+    records = []
+    saw_kernel = False
+    for function in getattr(body, "operations", ()):
+        operation = getattr(function, "operation", None)
+        if getattr(operation, "name", None) != "func.func":
+            continue
+        attributes = getattr(function, "attributes", {})
+        is_kernel = "df.kernel" in attributes
+        retained_scope = _retained_matcher_work_scope(function)
+        if retained_scope is not None and not is_kernel:
+            raise ValueError("retained matcher scope is attached to a non-kernel")
+        if not is_kernel:
+            continue
+        saw_kernel = True
+        if retained_scope is None:
+            raise ValueError("retained matcher adapter contract is incomplete")
+        if _SPMW_ABI_VALUE_IDS_ATTR not in attributes:
+            raise ValueError("retained matcher adapter lacks typed ABI identities")
+        abi_value_ids = _retained_integer_array_attribute(
+            attributes, _SPMW_ABI_VALUE_IDS_ATTR
+        )
+        if any(value < 0 for value in abi_value_ids):
+            raise ValueError("retained matcher ABI identities must be non-negative")
+        arguments = _retained_function_arguments(function)
+        if arguments is not None and len(abi_value_ids) != len(arguments):
+            raise ValueError("retained matcher ABI identity arity is inconsistent")
+        if tuple(sorted(set(retained_scope.coalesced_axes))) != tuple(
+            retained_scope.coalesced_axes
+        ):
+            raise ValueError("retained matcher coalesced axes are not canonical")
+        if any(
+            coordinate >= extent
+            for coordinate, extent in zip(
+                retained_scope.work_id, retained_scope.group_shape
+            )
+        ):
+            raise ValueError("retained matcher work coordinate is outside its grid")
+        records.append(
+            {
+                "function": function,
+                "symbol": _retained_symbol_name(function),
+                "scope": retained_scope,
+                "group_fingerprint": _retained_string_attribute(
+                    attributes, "spmw.group_fingerprint"
+                ),
+                "body_fingerprint": _retained_string_attribute(
+                    attributes, "spmw.body_fingerprint"
+                ),
+                "abi_value_ids": abi_value_ids,
+            }
+        )
+
+    if not saw_kernel:
+        return ()
+
+    groups = {}
+    for record in records:
+        scope = record["scope"]
+        key = (scope.group_id, record["group_fingerprint"])
+        groups.setdefault(key, []).append(record)
+
+    for group_records in groups.values():
+        first_scope = group_records[0]["scope"]
+        for record in group_records[1:]:
+            scope = record["scope"]
+            if (
+                scope.group_shape != first_scope.group_shape
+                or scope.coalesced_axes != first_scope.coalesced_axes
+            ):
+                raise ValueError("retained matcher group has inconsistent topology")
+        expected_size = math.prod(first_scope.group_shape)
+        if len(group_records) != expected_size:
+            raise ValueError("retained matcher group does not cover its complete grid")
+        work_ids = tuple(record["scope"].work_id for record in group_records)
+        if len(set(work_ids)) != len(work_ids):
+            raise ValueError("retained matcher group repeats a work coordinate")
+        expected_id, expected_group_fingerprint, expected_bodies = _spmw_group_contract(
+            first_scope.group_shape,
+            first_scope.coalesced_axes,
+            [(record["scope"].work_id, record["function"]) for record in group_records],
+        )
+        if expected_id != first_scope.group_id:
+            raise ValueError("retained matcher group identity is stale")
+        if any(
+            record["group_fingerprint"] != expected_group_fingerprint
+            for record in group_records
+        ):
+            raise ValueError("retained matcher group fingerprint is stale")
+        expected_bodies_by_work_id = dict(expected_bodies)
+        if any(
+            record["body_fingerprint"]
+            != expected_bodies_by_work_id[record["scope"].work_id]
+            for record in group_records
+        ):
+            raise ValueError("retained matcher body fingerprint is stale")
+    return tuple(records)
+
+
+def _module_has_retained_matcher_scopes(module):
+    return bool(_validated_retained_matcher_contract(module))
+
+
+def _effective_group_ids(records):
+    fingerprints_by_group_id = {}
+    for record in records:
+        scope = record["scope"]
+        fingerprints_by_group_id.setdefault(scope.group_id, set()).add(
+            record["group_fingerprint"]
+        )
+    effective = {}
+    for record in records:
+        scope = record["scope"]
+        key = (scope.group_id, record["group_fingerprint"])
+        if len(fingerprints_by_group_id[scope.group_id]) == 1:
+            effective[key] = scope.group_id
+        else:
+            effective[key] = int(record["group_fingerprint"], 16)
+    if len(set(effective.values())) != len(effective):
+        raise ValueError("retained matcher identities collide")
+    return effective
+
+
+def _stamp_matcher_work_scopes(
+    target,
+    module,
+    trace,
+):
+    """Copy typed retained-IR scopes onto matcher records."""
+    matches = list(getattr(trace, "matches", ()) or ())
+    kernel_records = list(_validated_retained_matcher_contract(module))
+
+    matches_by_symbol = {}
+    for match in matches:
+        matches_by_symbol.setdefault(match.func_name, []).append(match)
+
+    body = getattr(module, "body", None)
+    operations = getattr(body, "operations", ())
+    functions_by_symbol = {}
+    for function in operations:
+        operation = getattr(function, "operation", None)
+        if getattr(operation, "name", None) != "func.func":
+            continue
+        symbol = _retained_symbol_name(function)
+        if symbol in functions_by_symbol:
+            raise ValueError("retained module repeats a function symbol")
+        functions_by_symbol[symbol] = function
+
+    records_by_symbol = {record["symbol"]: dict(record) for record in kernel_records}
+    if len(records_by_symbol) != len(kernel_records):
+        raise ValueError("retained matcher kernels repeat a function symbol")
+    for symbol, function_matches in matches_by_symbol.items():
+        function = functions_by_symbol.get(symbol)
+        if function is None:
+            raise ValueError("matcher trace site has no retained function boundary")
+        record = records_by_symbol.get(symbol)
+        if record is None:
+            group_id, group_fingerprint, body_fingerprints = _spmw_group_contract(
+                (), (), [((), function)]
+            )
+            record = {
+                "function": function,
+                "symbol": symbol,
+                "scope": MatcherWorkScope(group_id, (), (), ()),
+                "group_fingerprint": group_fingerprint,
+                "body_fingerprint": dict(body_fingerprints)[()],
+                "abi_value_ids": (),
+            }
+            records_by_symbol[symbol] = record
+        record["matches"] = function_matches
+
+    if any("matches" not in record for record in records_by_symbol.values()):
+        raise ValueError("retained matcher kernel has no matched implementation")
+
+    records = list(records_by_symbol.values())
+    non_kernel_keys = set()
+    for record in records:
+        attributes = getattr(record["function"], "attributes", {})
+        if "df.kernel" in attributes:
+            continue
+        key = (record["scope"].group_id, record["group_fingerprint"])
+        if key in non_kernel_keys:
+            raise ValueError("non-kernel matcher boundaries are structurally ambiguous")
+        non_kernel_keys.add(key)
+
+    assigned = {id(match) for record in records for match in record["matches"]}
+    if len(assigned) != len(matches):
+        raise ValueError("matcher trace site has no retained function boundary")
+
+    del target
+    effective_group_ids = _effective_group_ids(records)
+    for record in records:
+        scope = record["scope"]
+        effective_scope = MatcherWorkScope(
+            effective_group_ids[(scope.group_id, record["group_fingerprint"])],
+            scope.work_id,
+            scope.group_shape,
+            scope.coalesced_axes,
+        )
+        for match in record["matches"]:
+            match.work_id = effective_scope.work_id
+            _retain_matcher_work_scope(match, effective_scope)
+
+
 class CompiledCallable:
     """An Allo-style callable backed by a compiled PIM artifact.
 
@@ -129,6 +423,13 @@ class CompiledCallable:
         self.__signature__ = self.signature
         self.__name__ = getattr(workload, "__name__", "compiled_workload")
         self.__doc__ = getattr(workload, "__doc__", None)
+        self.schedule_search_result = getattr(
+            compiled,
+            "schedule_search_result",
+            None,
+        )
+        self.schedule_activation = getattr(compiled, "schedule_activation", None)
+        self.fallback_reason = getattr(compiled, "fallback_reason", None)
         self.last_result: RunResult | None = None
 
     def __call__(self, *args, **kwargs) -> RunResult:
@@ -205,7 +506,22 @@ def compile(
     backend=None,
     host_moves=None,
     layout=None,
-) -> CompiledCallable | APUv1VectorCallable:
+    promotion_evidence=None,
+) -> (
+    CompiledCallable
+    | UPMEMProgramCallable
+    | APUv1VectorCallable
+    | APUG2Callable
+    | APUG2ChunkedGesummvCallable
+    | APUG2GemvCallable
+    | APUG2GemverCallable
+    | APUG2ContractionChainCallable
+    | APUG2CorrelationCallable
+    | APUG2CovarianceCallable
+    | APUG2RankNContractionCallable
+    | APUG2SymmCallable
+    | APUG2TrmmCallable
+):
     """Compile ``workload`` for ``target`` and return a NumPy-callable object.
 
     Parameters
@@ -224,12 +540,32 @@ def compile(
         discovered beside the workload.
     layout : object
         Optional preselected placement or placement list.
+    promotion_evidence : PromotionEvidence or None
+        Exact correctness, materialization, and repeated-performance evidence
+        for an already inspected search challenger. ``None`` always retains
+        the incumbent when the search recommendation differs.
     """
     workload = _materialize_workload(workload)
     target = _materialize_target(target)
     bound_cost = _resolve_cost(target, cost)
+    if promotion_evidence is not None and not isinstance(
+        promotion_evidence,
+        PromotionEvidence,
+    ):
+        raise TypeError("promotion_evidence must be a PromotionEvidence record")
+    promotion_gate = (
+        None
+        if promotion_evidence is None
+        else SchedulePromotionGate(promotion_evidence)
+    )
+    if promotion_gate is not None and bound_cost is None:
+        raise ValueError("promotion evidence requires an executable cost model")
+    if promotion_gate is not None and layout is not None:
+        raise ValueError("promotion evidence cannot override an explicit layout")
 
     if isinstance(workload, APUv1Program):
+        if promotion_gate is not None:
+            raise ValueError("APUv1Program has no schedule-search activation")
         if backend not in (None, "virtual", "functional"):
             raise ValueError(
                 "APUv1Program supports the device, virtual, or functional backend"
@@ -240,13 +576,50 @@ def compile(
             workload, target, cost=bound_cost, backend=backend
         )
 
+    if isinstance(workload, UPMEMProgram):
+        if backend not in (None, "virtual", "functional"):
+            raise ValueError(
+                "MLIR-driven UPMEMProgram currently supports only the functional "
+                "portable-C runtime (backend=None, 'virtual', or 'functional')"
+            )
+        if host_moves is not None or layout is not None:
+            raise ValueError(
+                "UPMEMProgram owns its phased ABI; host_moves/layout are not accepted"
+            )
+        return compile_upmem_program(
+            workload,
+            target,
+            cost=bound_cost,
+            promotion_gate=promotion_gate,
+        )
+
+    if isinstance(workload, APUG2Program):
+        if promotion_gate is not None:
+            raise ValueError("APUG2Program has no schedule-search activation")
+        if host_moves is not None or layout is not None:
+            raise ValueError("APUG2Program owns its VL64 layout and hardware ABI")
+        return compile_apu_g2_program(
+            workload,
+            target,
+            cost=bound_cost,
+            backend=backend,
+        )
+
+    if target.name == "upmem":
+        raise TypeError(
+            "the contraction-only UPMEM matcher backend was removed; wrap one "
+            "or more MLIR callables in allo.UPMEMProgram"
+        )
+
     if host_moves is None:
         host_moves = _discover_host_moves(workload)
 
     schedule = customize(workload, enable_tensor=False)
-    # Ordinary contractions use the retained-MLIR layout-plan/vector path.
-    # Dataflow regions retain the grouped ``@allo.work`` implementation.
-    if target.name == "apu_v1" and not hasattr(workload, "mappings"):
+    retained_matcher_dataflow = _module_has_retained_matcher_scopes(schedule.module)
+    # Ordinary contractions use the new MLIR -> layout-plan -> vector path.
+    # Dataflow regions retain their matcher/group implementation through typed
+    # structural scope attributes stamped on retained IR kernel functions.
+    if target.name == "apu_v1" and not retained_matcher_dataflow:
         from .pim.contraction_analysis import NoContractionError
 
         try:
@@ -257,32 +630,33 @@ def compile(
                 cost=bound_cost,
                 layout=layout,
                 backend=backend,
+                promotion_gate=promotion_gate,
             )
         except NoContractionError:
+            # Non-contraction APU workloads continue through the existing
+            # matcher path; this dispatch is deliberately additive.
+            pass
+    if target.name == "apu_v2" and not retained_matcher_dataflow:
+        from .pim.contraction_analysis import NoContractionError
+
+        try:
+            if host_moves is not None or layout is not None:
+                raise ValueError(
+                    "MLIR-driven APUg2 GEMV owns its reduction layout and hardware ABI"
+                )
+            return compile_apu_g2_vector_workload(
+                workload,
+                target,
+                schedule,
+                cost=bound_cost,
+                backend=backend,
+                promotion_gate=promotion_gate,
+            )
+        except NoContractionError:
+            # Non-contractions retain the established matcher path.
             pass
     trace = match_workload(target, schedule.module)
-    if target.name == "apu_v1":
-        extents = {}
-        for match in trace.matches:
-            if len(match.work_id) != 1:
-                raise TypeError(
-                    "APU v1 @allo.work requires scalar mapping=N; N controls "
-                    "the number of coalesced GVML groups"
-                )
-            base = match.func_name
-            for coordinate in reversed(match.work_id):
-                suffix = f"_{coordinate}"
-                if base.endswith(suffix):
-                    base = base[: -len(suffix)]
-            extents[base] = max(extents.get(base, 0), int(match.work_id[0]) + 1)
-        for match in trace.matches:
-            base = match.func_name
-            for coordinate in reversed(match.work_id):
-                suffix = f"_{coordinate}"
-                if base.endswith(suffix):
-                    base = base[: -len(suffix)]
-            match.extra["spmw_group_count"] = extents[base]
-            match.extra["coalesced_spmw_axis"] = "group"
+    _stamp_matcher_work_scopes(target, schedule.module, trace)
     compiled = compile_for_target(
         target,
         trace,
@@ -291,6 +665,7 @@ def compile(
         host_moves=host_moves,
         buffer_metrics=_buffer_metrics(workload),
         cost=bound_cost,
+        promotion_gate=promotion_gate,
     )
     return CompiledCallable(
         workload,

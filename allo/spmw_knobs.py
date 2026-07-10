@@ -205,7 +205,7 @@ def _residency_crossing_memrefs(ctx: KnobCtx) -> list:
     base = ctx.base
     out = []
     for mref in getattr(base, "placements", {}):
-        span = memref_span(liveness, mref)
+        span = memref_span(liveness, mref, matches=ctx.matches)
         if span is not None and crosses_boundary(span):
             out.append((mref, span))
     return out

@@ -83,6 +83,8 @@ class ContractionAnalysis:
     combine_operation: str
     numeric_type: str
     packed_word_bits: int | None = None
+    product_coefficient: int = 1
+    accumulator_coefficient: int = 1
 
     @property
     def axis_extents(self) -> dict[str, int]:
@@ -152,6 +154,7 @@ class _ProductMatch:
     lhs: ValueAccess
     rhs: ValueAccess
     packed_word_bits: int | None = None
+    coefficient: int = 1
 
 
 @dataclass(frozen=True)
@@ -258,6 +261,18 @@ def _parse_function(name: str, lines: tuple[str, ...]):
     all_loops: list[_RawLoop] = []
     definitions: dict[str, object] = {}
     stores: list[_Store] = []
+    current_definition: dict[str, str] = {}
+    definition_counts: dict[str, int] = {}
+
+    def use(ssa: str) -> str:
+        return current_definition.get(ssa, ssa)
+
+    def define(ssa: str) -> str:
+        count = definition_counts.get(ssa, 0)
+        definition_counts[ssa] = count + 1
+        unique = ssa if count == 0 else f"{ssa}__def_{count}"
+        current_definition[ssa] = unique
+        return unique
 
     for raw_line in lines:
         line = raw_line.split("//", 1)[0].strip()
@@ -285,33 +300,37 @@ def _parse_function(name: str, lines: tuple[str, ...]):
                 dtype,
                 shape,
             )
-            definitions[load.group("result")] = _LoadExpr(access)
+            definitions[define(load.group("result"))] = _LoadExpr(access)
             continue
 
         binary = _BINARY.search(line)
         if binary is not None:
-            definitions[binary.group("result")] = _BinaryExpr(
-                binary.group("op"), binary.group("lhs"), binary.group("rhs")
+            definitions[define(binary.group("result"))] = _BinaryExpr(
+                binary.group("op"),
+                use(binary.group("lhs")),
+                use(binary.group("rhs")),
             )
             continue
 
         constant = _CONSTANT.search(line)
         if constant is not None:
-            definitions[constant.group("result")] = _ConstantExpr(
+            definitions[define(constant.group("result"))] = _ConstantExpr(
                 int(constant.group("value")), constant.group("dtype")
             )
             continue
 
         popcount = _POPCOUNT.search(line) or _GENERIC_LLVM_POPCOUNT.search(line)
         if popcount is not None:
-            definitions[popcount.group("result")] = _UnaryExpr(
-                "popcount", popcount.group("source")
+            definitions[define(popcount.group("result"))] = _UnaryExpr(
+                "popcount", use(popcount.group("source"))
             )
             continue
 
         alias = _ALIAS.search(line)
         if alias is not None:
-            definitions[alias.group("result")] = _AliasExpr(alias.group("source"))
+            definitions[define(alias.group("result"))] = _AliasExpr(
+                use(alias.group("source"))
+            )
             continue
 
         store = _STORE.search(line)
@@ -319,7 +338,7 @@ def _parse_function(name: str, lines: tuple[str, ...]):
             shape, dtype = _memref_type(store.group("tail"))
             stores.append(
                 _Store(
-                    store.group("value"),
+                    use(store.group("value")),
                     ValueAccess(
                         _value_name(store.group("tail"), store.group("memref")),
                         _split_indices(store.group("indices")),
@@ -378,10 +397,66 @@ def _all_ones(ssa: str, definitions: dict[str, object], width: int) -> bool:
     return constant_width == width and expression.value in {-1, (1 << width) - 1}
 
 
-def _match_product(ssa: str, definitions: dict[str, object]) -> _ProductMatch | None:
+def _integer_multiplicative_terms(
+    ssa: str, definitions: dict[str, object]
+) -> tuple[tuple[ValueAccess, ...], tuple[int, ...]] | None:
+    expression = definitions.get(_resolve_alias(ssa, definitions))
+    if isinstance(expression, _LoadExpr):
+        return (expression.access,), ()
+    if isinstance(expression, _ConstantExpr):
+        return (), (expression.value,)
+    if not isinstance(expression, _BinaryExpr) or expression.operation != "arith.muli":
+        return None
+    lhs = _integer_multiplicative_terms(expression.lhs, definitions)
+    rhs = _integer_multiplicative_terms(expression.rhs, definitions)
+    if lhs is None or rhs is None:
+        return None
+    return lhs[0] + rhs[0], lhs[1] + rhs[1]
+
+
+def _match_scaled_integer_load(
+    ssa: str, definitions: dict[str, object]
+) -> tuple[ValueAccess, int] | None:
+    terms = _integer_multiplicative_terms(ssa, definitions)
+    if terms is None or len(terms[0]) != 1:
+        return None
+    coefficient = 1
+    for value in terms[1]:
+        coefficient *= value
+    return terms[0][0], coefficient
+
+
+def _integer_constant_value(ssa: str, definitions: dict[str, object]) -> int | None:
+    expression = definitions.get(_resolve_alias(ssa, definitions))
+    return expression.value if isinstance(expression, _ConstantExpr) else None
+
+
+def _match_product(
+    ssa: str,
+    definitions: dict[str, object],
+    *,
+    allow_integer_coefficient: bool = False,
+) -> _ProductMatch | None:
     """Recover a two-load product, including canonical packed XNOR/popcount."""
 
     expression = definitions.get(_resolve_alias(ssa, definitions))
+    if (
+        allow_integer_coefficient
+        and isinstance(expression, _BinaryExpr)
+        and expression.operation == "arith.muli"
+    ):
+        terms = _integer_multiplicative_terms(ssa, definitions)
+        if terms is None or len(terms[0]) != 2:
+            return None
+        coefficient = 1
+        for value in terms[1]:
+            coefficient *= value
+        return _ProductMatch(
+            "arith.muli",
+            terms[0][0],
+            terms[0][1],
+            coefficient=coefficient,
+        )
     if isinstance(expression, _BinaryExpr) and expression.operation in {
         "arith.mulf",
         "arith.muli",
@@ -1063,9 +1138,6 @@ def generate_apu_v1_vectorization_candidates(
                     1,
                     padded(extents[analysis.reduction_axis]) // reduction_tile,
                 )
-                resident_count = (
-                    extents[analysis.reduction_axis] + reduction_tile - 1
-                ) // reduction_tile
                 resident_carrier = LinearLayout(
                     resident_bases,
                     carrier.out_dims,
@@ -1102,11 +1174,6 @@ def generate_apu_v1_vectorization_candidates(
                 )
                 vector_window = (window(analysis.reduction_axis, reduction_tile),)
                 row_residency = (window(row_axis, gemv_row_tile),)
-                parameters = {
-                    "gemv_resident_vector": True,
-                    "reduction_tile": reduction_tile,
-                    "resident_count": resident_count,
-                }
                 return Transfer(
                     access.value,
                     "in",
@@ -1117,7 +1184,6 @@ def generate_apu_v1_vectorization_candidates(
                             l1,
                             executed_at=vector_window,
                             resident_across=row_residency,
-                            parameters=parameters,
                         ),
                         TransferRouteStep(
                             "load_vr",
@@ -1125,7 +1191,6 @@ def generate_apu_v1_vectorization_candidates(
                             resident,
                             executed_at=vector_window,
                             resident_across=row_residency,
-                            parameters=parameters,
                         ),
                     ),
                 )
@@ -1656,7 +1721,6 @@ def generate_apu_v1_vectorization_candidates(
                 ),
             },
             "accumulator_block": accumulator_block,
-            "gemv_spatial_reduction": bool(recipe.get("gemv")),
             "product_operation": analysis.multiply_operation,
             "packed_word_bits": analysis.packed_word_bits,
             "combine_operation": analysis.combine_operation,

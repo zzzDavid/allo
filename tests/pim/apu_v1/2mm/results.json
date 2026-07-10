@@ -20,31 +20,11 @@
   },
   "performance": {
     "metric": "cycles",
-    "value": 27358199,
+    "value": 27359120,
     "source": "apu_v1_device@zhang-capra-xcel.ece.cornell.edu/gsi-13.7.1",
     "run_cmd": "python -m pytest tests/pim/apu_v1/2mm/test_two_mm_apu_v1.py::test_two_mm_apu_v1_scalar_baseline -p no:cacheprovider -q",
-    "timestamp": "2026-07-08T00:42:06.437560"
+    "timestamp": "2026-07-08T17:45:34.752300"
   },
-  "hybrid_uint16": {
-    "status": "PASS",
-    "comparison": "bit-exact modular uint16 reference",
-    "regions": ["mm1:vector", "mm2:vector", "ele_add:scalar"],
-    "vector_layout": "temporal_dma_coalescing",
-    "precision_conversions": 0,
-    "cycles": 16788652,
-    "phase_cycles": [
-      {"phase": "mm1", "critical": 3893847, "per_apuc": {"0": 3875303, "1": 3876363, "2": 3893847, "3": 3893121}},
-      {"phase": "repack", "critical": 9732698, "per_apuc": {"0": 9726935, "1": 9649572, "2": 9644639, "3": 9732698}},
-      {"phase": "mm2", "critical": 2701142, "per_apuc": {"0": 2701061, "1": 2694335, "2": 2693346, "3": 2701142}},
-      {"phase": "scalar", "critical": 460965, "per_apuc": {"0": 460965}}
-    ],
-    "vector_apucs": [0, 1, 2, 3],
-    "scalar_apucs": [0],
-    "persistent_l4": true,
-    "host_intermediate_round_trips": 0,
-    "device_run_cmd": "python -m pytest tests/pim/apu_v1/2mm/test_two_mm_apu_v1.py::test_two_mm_apu_v1_hybrid_device -p no:cacheprovider -q",
-    "profiled_on": "2026-07-08"
-  },
-  "tenon_commit": "6bc7474a09fa7d2d64007e6b929b6f68660729d3",
+  "tenon_commit": "a2586d1b0aa59a7b477cf91402dec06daa3f83be",
   "notes": "Complete canonical uint16 PolyBench program lowered through MLIR to scalar C on APUC 0. This is the explicit scalar correctness baseline; other APUCs are not launched because arbitrary multi-phase programs do not yet carry cross-APUC barriers. Analytical scalar estimate=206199151 cycles."
 }

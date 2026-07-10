@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """PolyBench-on-PIM suite: target constructors, re-exported (Phase-0 Answer 1).
 
-This module RE-EXPORTS the four per-target constructors from the
+This module RE-EXPORTS the per-target constructors from the
 :mod:`allo.pim.targets` device library. No constructor body is duplicated or
 edited -- the suite reuses the validated target trees verbatim (spec Answer 6:
 re-export-only). The trees now live in the package (not the test folder), so
@@ -16,15 +16,17 @@ from allo.pim.targets import (
     build_aim_target,
     build_upmem_target,
     build_apu_v1_target,
+    build_apu_g2_target,
 )
 
-# The four suite backends keyed by target.name (matches each constructor's
+# The suite backends keyed by target.name (matches each constructor's
 # `@allo.target("<name>")` so a kernel folder names a backend, never a tree).
 TARGETS = {
     "samsung_hbm_pim": build_samsung_target,
     "aim": build_aim_target,
     "upmem": build_upmem_target,
     "apu_v1": build_apu_v1_target,
+    "apu_v2": build_apu_g2_target,
 }
 
 

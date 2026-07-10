@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Samsung executable-cost integration tests."""
 
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,7 +10,12 @@ import numpy as np
 from allo.perf import cost, rule
 from allo.pim.costs import samsung_cost
 from allo.pim.targets import build_samsung_target
-from allo.spmw_autoschedule import Placement, autoschedule
+from allo.spmw_autoschedule import (
+    MatcherWorkScope,
+    Placement,
+    _samsung_enumerate,
+    autoschedule,
+)
 from allo import spmw_codegen
 from allo.spmw_codegen import Compiled, PIMCmd, SamsungCtx
 from allo.spmw_match import MatchTrace, MatchedOp, OperandBinding
@@ -37,6 +43,27 @@ def _bound_mac(work_id=(0, 0)):
     ]
     match.result_memref_name = "acc"
     return match
+
+
+def _scoped_bound_mac(func_name, group_id, work_id, group_shape):
+    match = _bound_mac(work_id)
+    match.func_name = func_name
+    match.extra["spmw_work_scope"] = MatcherWorkScope(
+        group_id=group_id,
+        work_id=work_id,
+        group_shape=group_shape,
+    )
+    return match
+
+
+def _shared_bank_row(target, match):
+    return next(
+        candidate
+        for candidate in _samsung_enumerate(target, [match])
+        if candidate.mode == "bank_row+crf_shared"
+        and candidate.extra.get("grf_residency", {}).get("x") == "crf"
+        and candidate.extra.get("stage_resident") is False
+    )
 
 
 def _evaluate(target, trace, placement, cost_spec=samsung_cost):
@@ -109,6 +136,93 @@ def test_full_spatial_grid_overlaps_by_channel_and_pim_axes():
     assert estimate.cycles == 65 + 7 * 4
 
 
+def test_shared_crf_codegen_is_invariant_to_digit_ending_symbol_renames():
+    target = build_samsung_target()
+
+    def compile_names(names, parsed_work_ids):
+        matches = [
+            _scoped_bound_mac(names[0], 0, (0, 0), (1, 2)),
+            _scoped_bound_mac(names[1], 0, (0, 1), (1, 2)),
+            _scoped_bound_mac(names[2], 1, (0, 0), (1, 2)),
+            _scoped_bound_mac(names[3], 1, (0, 1), (1, 2)),
+        ]
+        for match, parsed_work_id in zip(matches, parsed_work_ids):
+            match.work_id = parsed_work_id
+        trace = MatchTrace(target.name, "shared_crf_rename", matches)
+        layout = _shared_bank_row(target, matches[0])
+        return spmw_codegen.compile_for_target(target, trace, layout=layout)
+
+    original = compile_names(
+        ("gemv2_0_0", "gemv2_0_1", "tail7_0_0", "tail7_0_1"),
+        ((0, 0), (0, 1), (0, 0), (0, 1)),
+    )
+    renamed = compile_names(
+        ("phase_2024", "phase_2025", "answer42", "answer43"),
+        ((2024,), (2025,), (42,), (43,)),
+    )
+
+    assert renamed.cmds == original.cmds
+    assert renamed.host_schedule == original.host_schedule
+    assert len(original.host_schedule) == 4
+
+
+def test_each_matcher_group_materializes_its_own_crf_issue_decision():
+    target = build_samsung_target()
+    first = _scoped_bound_mac("first", 0, (0, 0), (1, 1))
+    second = _scoped_bound_mac("second", 1, (0, 0), (1, 1))
+    trace = MatchTrace(target.name, "mixed_crf_issue", [first, second])
+    first_candidates = _samsung_enumerate(target, [first])
+    second_candidates = _samsung_enumerate(target, [second])
+    shared = next(
+        candidate
+        for candidate in first_candidates
+        if candidate.mode == "bank_row+crf_shared"
+        and candidate.extra.get("stage_resident") is False
+    )
+    per_workid = next(
+        candidate
+        for candidate in second_candidates
+        if candidate.mode == "bank_row+crf_per_workid"
+        and candidate.extra.get("stage_resident") is False
+    )
+
+    compiled = spmw_codegen.compile_for_target(
+        target,
+        trace,
+        layout=[shared, per_workid],
+    )
+
+    assert compiled.host_schedule == [spmw_codegen.HostTrigger((0, 0), 1)]
+
+
+def test_work_grid_validation_is_invariant_to_digit_ending_symbol_renames():
+    target = build_samsung_target()
+
+    def validate(names, parsed_work_ids):
+        matches = [
+            _scoped_bound_mac(names[0], 0, (0, 0), (1, 2)),
+            _scoped_bound_mac(names[1], 0, (0, 1), (1, 2)),
+        ]
+        for match, parsed_work_id in zip(matches, parsed_work_ids):
+            match.work_id = parsed_work_id
+        trace = MatchTrace(
+            target.name,
+            "work_grid_rename",
+            matches,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = spmw_codegen._check_work_grid(target, trace, auto_fill=False)
+        return result, tuple(str(item.message) for item in caught)
+
+    original = validate(("gemv2_0_0", "gemv2_0_1"), ((0, 0), (0, 1)))
+    renamed = validate(("phase_2024", "answer42"), ((2024,), (42,)))
+
+    assert renamed == original
+    assert original[0] == 2
+    assert len(original[1]) == 1
+
+
 def test_virtual_graph_includes_shape_aware_host_transfers():
     target = build_samsung_target()
     trace = MatchTrace(target.name, "host_boundary", [_mac((0, 0))])
@@ -169,6 +283,45 @@ def test_autoscheduler_and_virtual_backend_share_cost_program(monkeypatch):
     assert result.cycles == direct.cycles
     assert result.extra["critical_path"] == list(direct.critical_path)
     assert result.extra["model_fingerprint"] == bound.fingerprint
+
+
+def test_autoscheduler_scores_with_final_host_and_buffer_context(monkeypatch):
+    target = build_samsung_target()
+    trace = MatchTrace(target.name, "host_context", [_bound_mac((0, 0))])
+    host_moves = (object(),)
+    buffer_metrics = {"W": {"bytes": 128}}
+    observed = []
+
+    class FakeCost:
+        fingerprint = "host-context-test"
+
+        def evaluate(self, graph):
+            return type("Estimate", (), {"cycles": graph[1]})()
+
+    def fake_graph(
+        _target,
+        _trace,
+        placement,
+        _cost,
+        *,
+        host_moves=(),
+        buffer_metrics=None,
+    ):
+        observed.append((host_moves, buffer_metrics))
+        return placement, int(placement.extra.get("n_fibers", 1))
+
+    monkeypatch.setattr("allo.spmw_plan.build_execution_graph", fake_graph)
+
+    autoschedule(
+        target,
+        trace,
+        FakeCost(),
+        host_moves=host_moves,
+        buffer_metrics=buffer_metrics,
+    )
+
+    assert observed
+    assert all(item == (host_moves, buffer_metrics) for item in observed)
 
 
 def test_agents_calibrate_by_editing_cost_program_code():

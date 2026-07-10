@@ -118,10 +118,13 @@ OUT_OF_PARADIGM = "OUT-OF-PARADIGM"
 # PIM backends downcast, so the tolerance absorbs the downcast -- the reference
 # is NOT weakened. AiM is a trace sim (no functional numerics) -> no tolerance.
 TOLERANCE = {
-    "apu_v1": {"rtol": 2e-2, "atol": 2e-2},          # fp16 bit-serial (GEMV-walkthrough ~0.0156, +1 notch)
-    "upmem": {"rtol": 1e-4, "atol": 1e-4},           # functional DPU exec (probe fp32 tolerance)
-    "samsung_hbm_pim": {"rtol": 2e-2, "atol": 2e-2}, # fp16 near-bank
-    "aim": None,                                     # CYCLES-ONLY (trace sim)
+    "apu_v1": {
+        "rtol": 2e-2,
+        "atol": 2e-2,
+    },  # fp16 bit-serial (GEMV-walkthrough ~0.0156, +1 notch)
+    "upmem": {"rtol": 1e-4, "atol": 1e-4},  # functional DPU exec (probe fp32 tolerance)
+    "samsung_hbm_pim": {"rtol": 2e-2, "atol": 2e-2},  # fp16 near-bank
+    "aim": None,  # CYCLES-ONLY (trace sim)
 }
 
 
@@ -131,6 +134,7 @@ class Verdict:
     results.json, NOT a pytest skip. `status` is one of the taxonomy constants;
     `detail` is the human-readable reason (matched-within-tol / why CYCLES-ONLY
     / which environment limit)."""
+
     status: str
     detail: str
 
@@ -185,48 +189,22 @@ def assert_matches(out, ref, *, backend: str, kernel: str) -> Verdict:
 def verdict_for_run(result, *, backend: str, kernel: str) -> Verdict:
     """Derive the cell verdict from what the run path actually SURFACES.
 
-    None of the three simulated backends return an output array to Python
-    (`RunResult.extra['outputs']` is APU-v1-only); the functional check, where it
-    exists, is the SIMULATOR HOST'S OWN internal numeric verification. This helper
-    encodes that honestly per backend (spec Answer 3), keyed on `RunResult`:
+    The trace-backed Samsung and AiM paths do not return an output array to
+    Python. This helper records that honestly from the `RunResult`:
 
-      - **UPMEM, GEMV host slot, cycles returned** -> `PASS`. The uPIMulator GEMV
-        host computes `W @ x` and byte-compares the DPU output against it; a
-        mismatch PANICS with no cycle line (the task-011 failure mode). So a
-        returned cycle count means the emitted kernel matched the host's
-        reference within the host's own check -- functional execution verified by
-        the sim, with the validated numpy ref recorded as the matching reference.
-      - **UPMEM, TENON (VA) host slot** -> `CYCLES-ONLY`. The VA host checks its
-        own `a + b`, not this kernel, so a returned cycle count does NOT verify
-        the kernel's numerics; cycles are real, correctness is not checked.
       - **Samsung** -> `CYCLES-ONLY`. `_run_samsung` reports cycles + stdout only
         (no output array); it computes at the GEMV design point.
       - **AiM** -> `CYCLES-ONLY`. ramulator2 is a memory-trace sim with no
         functional numerics.
 
+    UPMEM programs use their MLIR/C callable directly and compare returned
+    arrays through `assert_matches`; they do not enter this trace-simulator
+    verdict path.
+
     `sim unavailable` (cycles is None because the binary/slot is absent) is left
     to the caller to record as the environment skip; this helper assumes a real
     run produced `result`.
     """
-    extra = getattr(result, "extra", {}) or {}
-    cycles = getattr(result, "cycles", None)
-
-    if backend == "upmem":
-        bench = extra.get("benchmark")
-        if bench == "GEMV" and cycles is not None:
-            tol = tolerance_for(backend)
-            return Verdict(
-                PASS,
-                f"uPIMulator GEMV host numeric check passed (W@x vs numpy ref, "
-                f"host tol); recorded ref rtol={tol['rtol']:g}",
-            )
-        return Verdict(
-            CYCLES_ONLY,
-            f"upmem/{kernel}: routed to {bench or 'VA'} host slot -- the host "
-            f"checks its own data, not this kernel; cycles real, numerics "
-            f"unchecked",
-        )
-
     if backend == "samsung_hbm_pim":
         return Verdict(
             CYCLES_ONLY,
@@ -240,6 +218,4 @@ def verdict_for_run(result, *, backend: str, kernel: str) -> Verdict:
             f"aim/{kernel}: ramulator2 trace sim -- N/A (no functional numerics)",
         )
 
-    return Verdict(
-        CYCLES_ONLY, f"{backend}/{kernel}: no functional output surfaced"
-    )
+    return Verdict(CYCLES_ONLY, f"{backend}/{kernel}: no functional output surfaced")

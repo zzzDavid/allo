@@ -15,7 +15,7 @@ the same validated plan later.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from itertools import product
 import math
 from types import MappingProxyType
@@ -1217,7 +1217,10 @@ def _manifest_value(value):
     if isinstance(value, LinearLayout):
         return value.manifest()
     if is_dataclass(value):
-        return _manifest_value(asdict(value))
+        return {
+            item.name: _manifest_value(getattr(value, item.name))
+            for item in fields(value)
+        }
     return repr(value)
 
 

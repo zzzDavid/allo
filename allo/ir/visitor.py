@@ -121,6 +121,9 @@ class ASTContext:
         self.mapping = None
         # track the current AST node being visited for error reporting
         self.current_node = None
+        # Shared by copied builder contexts so retained matcher call edges use
+        # one collision-free source-value namespace for the whole module.
+        self._spmw_value_identity_state = {"values": {}, "next": 0}
 
     def copy(self):
         ctx = ASTContext(
@@ -145,6 +148,7 @@ class ASTContext:
         ctx.mapping = self.mapping
         ctx.meta_fors_to_unroll = self.meta_fors_to_unroll
         ctx.current_node = self.current_node
+        ctx._spmw_value_identity_state = self._spmw_value_identity_state
         if hasattr(self, "func_suffix"):
             ctx.func_suffix = self.func_suffix
         return ctx

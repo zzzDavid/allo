@@ -26,7 +26,9 @@ Unknown operations, dtypes wider than one 16-bit lane, layouts without a
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from itertools import product
+import json
 import math
 import re
 from types import MappingProxyType
@@ -448,6 +450,114 @@ OPCODES = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class APUVectorComputeInvocation:
+    """One operand-free compute opcode and its exact emitted call count."""
+
+    opcode: str
+    count: int
+    attrs: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self):
+        opcode = str(self.opcode).upper()
+        if opcode not in OPCODES:
+            raise UnsupportedVectorOperation(
+                f"unsupported emitted APU vector opcode {opcode!r}"
+            )
+        count = int(self.count)
+        if count <= 0:
+            raise ValueError("emitted APU vector invocation count must be positive")
+        object.__setattr__(self, "opcode", opcode)
+        object.__setattr__(self, "count", count)
+        object.__setattr__(self, "attrs", _attrs(self.attrs))
+
+
+@dataclass(frozen=True)
+class LoopNestEmission:
+    """Physical output/reduction loop nest used by the general emitter."""
+
+    output_batches: int
+    reduction_steps: int
+
+    def __post_init__(self):
+        output_batches = int(self.output_batches)
+        reduction_steps = int(self.reduction_steps)
+        if output_batches <= 0 or reduction_steps <= 0:
+            raise ValueError("physical loop extents must be positive")
+        object.__setattr__(self, "output_batches", output_batches)
+        object.__setattr__(self, "reduction_steps", reduction_steps)
+
+    @property
+    def operation_call_count(self) -> int:
+        return self.output_batches * self.reduction_steps
+
+
+@dataclass(frozen=True)
+class SpatialResidentReductionEmission:
+    """Stream output tiles across a bank of resident reduction-vector VRs."""
+
+    streamed_value: str
+    resident_value: str
+    output_value: str
+    output_axis: str
+    reduction_axis: str
+    output_extent: int
+    rows_per_tile: int
+    matrix_tiles: int
+    reduction_tile_extent: int
+    reduction_tiles: int
+
+    def __post_init__(self):
+        for field_name in (
+            "streamed_value",
+            "resident_value",
+            "output_value",
+            "output_axis",
+            "reduction_axis",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _identifier(getattr(self, field_name), label=field_name),
+            )
+        for field_name in (
+            "output_extent",
+            "rows_per_tile",
+            "matrix_tiles",
+            "reduction_tile_extent",
+            "reduction_tiles",
+        ):
+            value = int(getattr(self, field_name))
+            if value <= 0:
+                raise ValueError(f"{field_name} must be positive")
+            object.__setattr__(self, field_name, value)
+        if self.reduction_tiles > 10:
+            raise UnsupportedVectorOperation(
+                "spatial resident reduction needs at most ten resident vector tiles"
+            )
+
+    @property
+    def resident_names(self) -> tuple[str, ...]:
+        return (
+            self.resident_value,
+            *(
+                f"{self.resident_value}__gemv_resident{index}"
+                for index in range(1, self.reduction_tiles)
+            ),
+        )
+
+    @property
+    def operation_call_count(self) -> int:
+        return self.matrix_tiles * self.reduction_tiles
+
+    @property
+    def output_reset_call_count(self) -> int:
+        return self.matrix_tiles
+
+
+PhysicalEmissionDescriptor = LoopNestEmission | SpatialResidentReductionEmission
+
+
 def _op_instructions(op: VectorOp, index: int) -> list[GVMLInstruction]:
     output = op.output
     inputs = op.inputs
@@ -698,7 +808,196 @@ def _route_axis_extent(step, axis: str) -> int:
     )
 
 
-def _explicit_route_instructions(plan, transfer, transfer_index, current_vm):
+def _plan_vector_batches(plan) -> int:
+    metadata = _metadata(plan)
+    metadata_batches = int(
+        metadata.get("vr_batches", metadata.get("vector_batches", 1))
+    )
+    temporal = int(getattr(plan, "temporal_extent", 1))
+    return max(1, metadata_batches, temporal)
+
+
+def _plan_output_batches(plan) -> int:
+    batching = getattr(plan, "output_batching", None)
+    if batching is not None:
+        return max(1, int(batching.physical_output_batches))
+    return max(1, int(_metadata(plan).get("output_tiles", 1)))
+
+
+def _plan_reduction_steps(plan) -> int:
+    batching = getattr(plan, "output_batching", None)
+    if batching is not None:
+        return max(1, int(batching.work_steps_per_output_batch))
+    return max(
+        1,
+        int(
+            _metadata(plan).get(
+                "temporal_steps",
+                _plan_vector_batches(plan) // _plan_output_batches(plan),
+            )
+        ),
+    )
+
+
+def _route_window_signature(step, field_name: str):
+    return tuple(
+        (str(window.axis), int(window.tile_extent), window.extent)
+        for window in tuple(getattr(step, field_name, ()) or ())
+    )
+
+
+def _derive_spatial_resident_reduction_emission(
+    plan, values: Sequence[VectorValue]
+) -> SpatialResidentReductionEmission | None:
+    """Recognize the physical resident-bank topology without semantic names."""
+
+    batching = getattr(plan, "output_batching", None)
+    reduction = getattr(plan, "reduction_strategy", None)
+    if (
+        batching is None
+        or str(getattr(reduction, "kind", "")) != "group_tree"
+        or str(getattr(reduction, "axis", ""))
+        != str(getattr(batching, "reduction_axis", ""))
+    ):
+        return None
+    output_values = tuple(value for value in values if value.intent in {"out", "inout"})
+    if len(output_values) != 1:
+        return None
+    output_value = output_values[0].name
+    reduction_axis = str(reduction.axis)
+    transfers = tuple(getattr(plan, "transfers", ()))
+
+    resident_candidates = []
+    for transfer in transfers:
+        if transfer.value == output_value or _direction(transfer.direction) not in {
+            "in",
+            "inout",
+        }:
+            continue
+        route = _route(transfer)
+        if tuple(step.kind for step in route) != ("dma_l4_l1_32k", "load_vr"):
+            continue
+        destination = str(getattr(route[-1].destination, "storage", "")).lower()
+        if destination != "resident_vr":
+            continue
+        executed = _route_window_signature(route[0], "executed_at")
+        resident = _route_window_signature(route[0], "resident_across")
+        if (
+            not executed
+            or tuple(axis for axis, _tile, _extent in executed) != (reduction_axis,)
+            or len(resident) != 1
+            or any(
+                _route_window_signature(step, "executed_at") != executed
+                or _route_window_signature(step, "resident_across") != resident
+                for step in route[1:]
+            )
+        ):
+            continue
+        resident_candidates.append((transfer, route, resident[0][0]))
+    if len(resident_candidates) != 1:
+        return None
+    resident_transfer, resident_route, output_axis = resident_candidates[0]
+
+    output_extents = dict(batching.axis_extents)
+    if output_axis not in output_extents or any(
+        int(extent) != 1
+        for axis, extent in output_extents.items()
+        if axis != output_axis
+    ):
+        return None
+    group_size = int(getattr(reduction, "group_size", 0) or 0)
+    if group_size <= 0 or VR_LANES % group_size:
+        return None
+    rows_per_tile = VR_LANES // group_size
+    output_extent = int(output_extents[output_axis])
+    matrix_tiles = math.ceil(output_extent / rows_per_tile)
+    reduction_tiles = int(batching.reduction_tiles)
+    if matrix_tiles != int(batching.work_output_tiles):
+        return None
+    if any(
+        int(step.metrics().call_count) != reduction_tiles
+        or int(step.metrics().resident_reuse_factor) != matrix_tiles
+        for step in resident_route
+    ):
+        return None
+
+    expected_calls = matrix_tiles * reduction_tiles
+    expected_axes = set(batching.output_axes) | {reduction_axis}
+    streamed_candidates = []
+    for transfer in transfers:
+        if transfer.value in {output_value, resident_transfer.value}:
+            continue
+        if _direction(transfer.direction) not in {"in", "inout"}:
+            continue
+        route = _route(transfer)
+        if tuple(step.kind for step in route) != ("dma_l4_l1_32k", "load_vr"):
+            continue
+        destination = str(getattr(route[-1].destination, "storage", "")).lower()
+        if destination != "compute_vr":
+            continue
+        if any(
+            {
+                axis
+                for axis, _tile, _extent in _route_window_signature(step, "executed_at")
+            }
+            != expected_axes
+            or int(step.metrics().call_count) != expected_calls
+            for step in route
+        ):
+            continue
+        streamed_candidates.append(transfer)
+    if len(streamed_candidates) != 1:
+        return None
+
+    output_transfers = tuple(
+        transfer for transfer in transfers if transfer.value == output_value
+    )
+    if (
+        not any(
+            _direction(transfer.direction) in {"in", "inout"}
+            for transfer in output_transfers
+        )
+        or not any(
+            _direction(transfer.direction) in {"out", "inout"}
+            for transfer in output_transfers
+        )
+        or any(
+            tuple(step.kind for step in _route(transfer)) != ("direct",)
+            for transfer in output_transfers
+        )
+    ):
+        return None
+
+    return SpatialResidentReductionEmission(
+        str(streamed_candidates[0].value),
+        str(resident_transfer.value),
+        output_value,
+        output_axis,
+        reduction_axis,
+        output_extent,
+        rows_per_tile,
+        matrix_tiles,
+        group_size,
+        reduction_tiles,
+    )
+
+
+def _derive_physical_emission(
+    plan, values: Sequence[VectorValue]
+) -> PhysicalEmissionDescriptor:
+    spatial = _derive_spatial_resident_reduction_emission(plan, values)
+    if spatial is not None:
+        return spatial
+    return LoopNestEmission(_plan_output_batches(plan), _plan_reduction_steps(plan))
+
+
+def _explicit_route_instructions(
+    plan,
+    transfer,
+    transfer_index,
+    current_vm,
+    physical_emission: PhysicalEmissionDescriptor,
+):
     """Lower one source->transit->compute relation without metadata guesses."""
 
     route = _route(transfer)
@@ -712,27 +1011,16 @@ def _explicit_route_instructions(plan, transfer, transfer_index, current_vm):
     duplicate = next(
         (step for step in route if step.kind == "duplicate_subgroup"), None
     )
-    gemv_resident = next(
-        (
-            step
-            for step in route
-            if bool(_step_parameters(step).get("gemv_resident_vector"))
-        ),
-        None,
-    )
     if lookup is not None and duplicate is not None:
         raise UnsupportedVectorOperation(
             f"value {name!r} cannot use lookup and subgroup duplication in one route"
         )
 
-    if gemv_resident is not None:
-        resident_count = int(_step_parameters(gemv_resident)["resident_count"])
-        if resident_count <= 0 or resident_count > 10:
-            raise UnsupportedVectorOperation(
-                "spatial GEMV needs between one and ten resident vector tiles"
-            )
-        for index in range(resident_count):
-            resident = name if index == 0 else f"{name}__gemv_resident{index}"
+    if (
+        isinstance(physical_emission, SpatialResidentReductionEmission)
+        and name == physical_emission.resident_value
+    ):
+        for index, resident in enumerate(physical_emission.resident_names):
             vm = (current_vm + index) % VMR_COUNT
             ingress.extend(
                 [
@@ -983,7 +1271,11 @@ def _explicit_route_instructions(plan, transfer, transfer_index, current_vm):
     )
 
 
-def _transfer_instructions(plan, value_names: set[str]):
+def _transfer_instructions(
+    plan,
+    value_names: set[str],
+    physical_emission: PhysicalEmissionDescriptor,
+):
     ingress: list[GVMLInstruction] = []
     egress: list[GVMLInstruction] = []
     records: list[TransferRecord] = []
@@ -1005,7 +1297,11 @@ def _transfer_instructions(plan, value_names: set[str]):
         vm_index += 1
         if direction in {"in", "inout"}:
             explicit = _explicit_route_instructions(
-                plan, transfer, transfer_index, current_vm
+                plan,
+                transfer,
+                transfer_index,
+                current_vm,
+                physical_emission,
             )
             if explicit is not None:
                 route_instructions, route_kinds = explicit
@@ -1463,9 +1759,17 @@ def _reserve_accumulator_block(
 class APUVectorABI:
     """Layout-driven NumPy pack/gather ABI for one realized plan."""
 
-    def __init__(self, plan, values: Sequence[VectorValue]):
+    def __init__(
+        self,
+        plan,
+        values: Sequence[VectorValue],
+        physical_emission: PhysicalEmissionDescriptor | None = None,
+    ):
         self.plan = plan
         self.values = tuple(values)
+        self.physical_emission = physical_emission or _derive_physical_emission(
+            plan, self.values
+        )
         self._by_name = {value.name: value for value in self.values}
 
     def _value_layout(self, name):
@@ -1760,25 +2064,22 @@ class APUVectorABI:
         """
 
         route = _route(transfer)
-        gemv_resident = any(
-            bool(_step_parameters(step).get("gemv_resident_vector")) for step in route
+        resident_emission = (
+            self.physical_emission
+            if isinstance(self.physical_emission, SpatialResidentReductionEmission)
+            and transfer.value == self.physical_emission.resident_value
+            else None
         )
-        layout = (route[0].source if gemv_resident else route[-1].destination).layout
-        if gemv_resident:
-            parameters = next(
-                _step_parameters(step)
-                for step in route
-                if _step_parameters(step).get("gemv_resident_vector")
-            )
-            reduction_tile = int(parameters["reduction_tile"])
+        layout = (
+            route[0].source if resident_emission else route[-1].destination
+        ).layout
+        if resident_emission:
+            reduction_tile = resident_emission.reduction_tile_extent
             if VR_LANES % reduction_tile:
                 raise APULayoutPackingError(
                     f"{value.name}: GEMV reduction tile must divide one VR"
                 )
-            roles = dict(_metadata(self.plan).get("loop_roles", {}))
-            reduction_axis = next(
-                axis for axis, role in roles.items() if role == "reduction"
-            )
+            reduction_axis = resident_emission.reduction_axis
             value_layout = self._value_layout(value.name)
             reduction_position = value_layout.axes.index(reduction_axis)
             ordered = np.moveaxis(bits, reduction_position, 0)
@@ -1788,6 +2089,10 @@ class APUVectorABI:
                 )
             vector = ordered.reshape(ordered.shape[0])
             resident_count = math.ceil(vector.size / reduction_tile)
+            if resident_count != resident_emission.reduction_tiles:
+                raise APULayoutPackingError(
+                    f"{value.name}: resident bank count disagrees with physical emission"
+                )
             packed = np.zeros((resident_count, VR_LANES), dtype=np.uint16)
             row_groups = VR_LANES // reduction_tile
             for bank in range(resident_count):
@@ -2002,7 +2307,56 @@ class APUVectorRealization:
     instructions: tuple[GVMLInstruction, ...]
     vr_bindings: tuple[VRBinding, ...]
     transfers: tuple[TransferRecord, ...]
+    physical_emission: PhysicalEmissionDescriptor
     abi: APUVectorABI
+    _runtime_artifact: object | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def runtime_artifact(self):
+        artifact = self._runtime_artifact
+        if artifact is not None:
+            return artifact
+        try:
+            from .apu_v1_vector_runtime import freeze_apu_v1_runtime_artifact
+
+            artifact = freeze_apu_v1_runtime_artifact(self)
+        except FileNotFoundError:
+            return None
+        object.__setattr__(self, "_runtime_artifact", artifact)
+        return artifact
+
+    @property
+    def promotion_materialization_fingerprint(self) -> str | None:
+        artifact = self.runtime_artifact
+        if artifact is None:
+            return None
+        runtime_source_fingerprint = artifact.promotion_source_fingerprint(self)
+        if runtime_source_fingerprint is None:
+            return None
+        payload = {
+            "kind": "apu-v1-vector-materialization-v2",
+            "plan": self.plan.manifest(),
+            "values": [
+                {
+                    "name": value.name,
+                    "shape": list(value.shape),
+                    "dtype": value.dtype.str,
+                    "intent": value.intent,
+                }
+                for value in self.values
+            ],
+            "runtime_source_fingerprint": runtime_source_fingerprint,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    @property
+    def promotion_platform_fingerprint(self):
+        artifact = self.runtime_artifact
+        if artifact is None or artifact.platform_fingerprint is None:
+            return None
+        return artifact.current_platform_fingerprint()
 
     @property
     def binding_map(self) -> dict[str, VRBinding]:
@@ -2010,33 +2364,53 @@ class APUVectorRealization:
 
     @property
     def vector_batches(self) -> int:
-        metadata = _metadata(self.plan)
-        metadata_batches = int(
-            metadata.get("vr_batches", metadata.get("vector_batches", 1))
-        )
-        temporal = int(getattr(self.plan, "temporal_extent", 1))
-        return max(1, metadata_batches, temporal)
+        return _plan_vector_batches(self.plan)
 
     @property
     def output_batches(self) -> int:
-        batching = getattr(self.plan, "output_batching", None)
-        if batching is not None:
-            return max(1, int(batching.physical_output_batches))
-        return max(1, int(_metadata(self.plan).get("output_tiles", 1)))
+        return _plan_output_batches(self.plan)
 
     @property
     def reduction_steps(self) -> int:
-        batching = getattr(self.plan, "output_batching", None)
-        if batching is not None:
-            return max(1, int(batching.work_steps_per_output_batch))
-        return max(
-            1,
-            int(
-                _metadata(self.plan).get(
-                    "temporal_steps", self.vector_batches // self.output_batches
-                )
-            ),
+        return _plan_reduction_steps(self.plan)
+
+    @property
+    def compute_invocation_inventory(
+        self,
+    ) -> tuple[APUVectorComputeInvocation, ...]:
+        """Return every emitted compute opcode with its exact dynamic count."""
+
+        compute_opcodes = tuple(
+            instruction.opcode
+            for instruction in self.instructions
+            if instruction.phase == "compute"
         )
+        operation_opcodes = tuple(operation.opcode for operation in self.operations)
+        if compute_opcodes != operation_opcodes:
+            raise UnsupportedVectorOperation(
+                "realized operations disagree with emitted compute instructions"
+            )
+        emission = self.physical_emission
+        reset_count = 0
+        if isinstance(emission, SpatialResidentReductionEmission):
+            operation_count = emission.operation_call_count
+            reset_count = emission.output_reset_call_count
+        else:
+            operation_count = emission.operation_call_count
+            if self._spatial_scatter_elements() is not None:
+                reset_count = operation_count
+        inventory = []
+        if reset_count:
+            inventory.append(APUVectorComputeInvocation("RESET_16", reset_count))
+        inventory.extend(
+            APUVectorComputeInvocation(
+                operation.opcode,
+                operation_count,
+                operation.attrs,
+            )
+            for operation in self.operations
+        )
+        return tuple(inventory)
 
     @property
     def compute_tiles_per_output(self) -> int:
@@ -2155,38 +2529,24 @@ class APUVectorRealization:
             for instruction in resident_setup + index_setup
         )
 
-        if bool(_metadata(self.plan).get("gemv_spatial_reduction")):
-            if len(output_names) != 1:
+        emission = self.physical_emission
+        if isinstance(emission, SpatialResidentReductionEmission):
+            if output_names != {emission.output_value}:
                 raise UnsupportedVectorOperation(
-                    "spatial GEMV requires exactly one output vector"
+                    "spatial resident reduction requires its retained output vector"
                 )
-            output = next(iter(output_names))
-            gemv_transfer = next(
-                transfer
-                for transfer in tuple(getattr(self.plan, "transfers", ()))
-                if any(
-                    bool(_step_parameters(step).get("gemv_resident_vector"))
-                    for step in _route(transfer)
-                )
-            )
-            vector = str(gemv_transfer.value)
-            reduction_tiles = int(_metadata(self.plan).get("reduction_tiles", 1))
-            resident_names = (
-                vector,
-                *(
-                    f"{vector}__gemv_resident{index}"
-                    for index in range(1, reduction_tiles)
-                ),
-            )
+            output = emission.output_value
+            vector = emission.resident_value
+            reduction_tiles = emission.reduction_tiles
+            resident_names = emission.resident_names
             if any(name not in bindings for name in resident_names):
                 raise VRCapacityError(
                     "spatial GEMV resident vector bank was not fully allocated"
                 )
-            group_size = _plan_group_size(self.plan)
-            rows_per_tile = VR_LANES // group_size
-            problem = dict(_metadata(self.plan).get("problem_shape", {}))
-            output_rows = int(problem.get("M", rows_per_tile))
-            matrix_tiles = math.ceil(output_rows / rows_per_tile)
+            group_size = emission.reduction_tile_extent
+            rows_per_tile = emission.rows_per_tile
+            output_rows = emission.output_extent
+            matrix_tiles = emission.matrix_tiles
             lines.append(
                 f"    for (uint32_t output_tile = 0; output_tile < {matrix_tiles}; "
                 "++output_tile) {"
@@ -2484,8 +2844,13 @@ def realize_apu_v1_plan(
         raise UnsupportedVectorOperation(
             "APU vector plan contains no realizable compute operations"
         )
+    physical_emission = _derive_physical_emission(plan, normalized_values)
     value_names = {value.name for value in normalized_values}
-    ingress, egress, transfer_records = _transfer_instructions(plan, value_names)
+    ingress, egress, transfer_records = _transfer_instructions(
+        plan,
+        value_names,
+        physical_emission,
+    )
     output_names = {
         value.name for value in normalized_values if value.intent in {"out", "inout"}
     }
@@ -2516,26 +2881,31 @@ def realize_apu_v1_plan(
         output_names,
         capacity=int(vr_capacity),
     )
-    abi = APUVectorABI(plan, normalized_values)
+    abi = APUVectorABI(plan, normalized_values, physical_emission)
     return APUVectorRealization(
-        plan,
-        normalized_values,
-        normalized_operations,
-        instructions,
-        bindings,
-        transfer_records,
-        abi,
+        plan=plan,
+        values=normalized_values,
+        operations=normalized_operations,
+        instructions=instructions,
+        vr_bindings=bindings,
+        transfers=transfer_records,
+        physical_emission=physical_emission,
+        abi=abi,
     )
 
 
 __all__ = [
     "APUC_COUNT",
     "APULayoutPackingError",
+    "APUVectorComputeInvocation",
     "APUVectorABI",
     "APUVectorRealization",
     "GVMLInstruction",
     "OPCODES",
     "PackedVector",
+    "PhysicalEmissionDescriptor",
+    "LoopNestEmission",
+    "SpatialResidentReductionEmission",
     "TransferRecord",
     "UnsupportedVectorOperation",
     "VRBinding",

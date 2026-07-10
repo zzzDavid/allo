@@ -9,11 +9,15 @@ import pytest
 from allo.ir.types import float16, int32, uint16
 
 from allo.pim.apu_v1_layout import PlanOperation, Transfer
+from allo.pim.apu_v1_vector_codegen import SpatialResidentReductionEmission
 from allo.pim.apu_v1_vector_cost import (
     build_apu_v1_plan_graph,
     estimate_apu_v1_plan,
+    estimate_apu_v1_realization,
+    materialized_apu_v1_operation_inventory,
     rank_apu_v1_plans,
 )
+from allo.pim.apu_v1_vector_program import _realize
 from allo.pim.apu_v1_vectorize import generate_apu_v1_vectorization_candidates
 from allo.pim.costs.apu_v1 import apu_v1_cost
 from allo.pim.targets import build_apu_v1_target
@@ -53,6 +57,29 @@ def spatial_gemv(
     for row, column in allo.grid(1900, 1):
         for depth in allo.reduction(2100):
             result[row, column] += left[row, depth] * right[depth, column]
+
+
+def large_spatial_gemv(
+    left: uint16[70000, 2100],
+    right: uint16[2100, 1],
+    result: uint16[70000, 1],
+):
+    for row, column in allo.grid(70000, 1):
+        for depth in allo.reduction(2100):
+            result[row, column] += left[row, depth] * right[depth, column]
+
+
+def renamed_large_spatial_gemv(
+    matrix: uint16[70000, 2100],
+    vector: uint16[2100, 1],
+    destination: uint16[70000, 1],
+):
+    for output_row, singleton_column in allo.grid(70000, 1):
+        for reduction_index in allo.reduction(2100):
+            destination[output_row, singleton_column] += (
+                matrix[output_row, reduction_index]
+                * vector[reduction_index, singleton_column]
+            )
 
 
 @pytest.fixture(scope="module")
@@ -226,6 +253,89 @@ def test_spatial_gemv_prices_matrix_tiles_and_resident_vector_bank():
         result.cycles
         < estimate_apu_v1_plan(temporal, build_apu_v1_target(), apu_v1_cost).cycles
     )
+
+
+def test_materialized_spatial_gemv_inventory_uses_exact_ragged_tile_counts():
+    def realize(function, *, strip_dispatch_markers=False):
+        module = allo.customize(function, enable_tensor=False).module
+        candidate = generate_apu_v1_vectorization_candidates(module)[-1]
+        plan = candidate.plan
+        if strip_dispatch_markers:
+            transfers = tuple(
+                replace(
+                    transfer,
+                    route=tuple(
+                        replace(step, parameters={}) for step in transfer.route
+                    ),
+                )
+                for transfer in plan.transfers
+            )
+            plan = replace(
+                plan,
+                name="renamed_physical_plan",
+                transfers=transfers,
+                metadata={
+                    **dict(plan.metadata),
+                    "diagnostic_only_marker": "ignored",
+                    "problem_shape": {"M": 1, "N": 1, "K": 1},
+                    "reduction_tiles": 1,
+                },
+            )
+        realization, error = _realize(candidate.analysis, plan)
+        assert realization is not None, error
+        return realization
+
+    original = realize(large_spatial_gemv)
+    stripped = realize(large_spatial_gemv, strip_dispatch_markers=True)
+    renamed = realize(renamed_large_spatial_gemv)
+    emission = original.physical_emission
+
+    assert "gemv_spatial_reduction" not in original.plan.metadata
+    assert isinstance(emission, SpatialResidentReductionEmission)
+    assert original.plan.output_batching.work_tile_counts == (256, 256, 35)
+    assert original.output_batches == 3
+    assert original.reduction_steps == 2304
+    assert emission.matrix_tiles == 547
+    assert emission.reduction_tiles == 9
+    assert emission.operation_call_count == 4923
+    assert original.output_batches * original.reduction_steps == 6912
+
+    expected = (
+        ("RESET_16", 547),
+        ("MUL_U16", 4923),
+        ("RESET_16", 4923),
+        ("GROUP_REDUCE_U16", 4923),
+        ("ADD_U16", 4923),
+    )
+    inventories = tuple(
+        materialized_apu_v1_operation_inventory(realization)
+        for realization in (original, stripped, renamed)
+    )
+    assert all(
+        tuple((operation.opcode, operation.count) for operation in inventory)
+        == expected
+        for inventory in inventories
+    )
+    assert stripped.physical_emission == original.physical_emission
+    assert (
+        "for (uint32_t output_tile = 0; output_tile < 547;" in stripped.device_source()
+    )
+    original_source = original.device_source()
+    assert stripped.device_source() == original_source.replace(
+        "spatial_gemv_group_reduction_vector",
+        "renamed_physical_plan_vector",
+    )
+
+    target = build_apu_v1_target()
+    estimates = tuple(
+        estimate_apu_v1_realization(realization, target, apu_v1_cost)
+        for realization in (original, stripped, renamed)
+    )
+    assert all(
+        estimate.operation_inventory == inventory
+        for estimate, inventory in zip(estimates, inventories)
+    )
+    assert len({estimate.cycles for estimate in estimates}) == 1
 
 
 def test_estimate_retains_plan_graph_and_bound_cost_fingerprint(plans):

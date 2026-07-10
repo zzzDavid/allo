@@ -1242,49 +1242,6 @@ REGISTRY = _build_registry()
 NAMES = tuple(REGISTRY)
 
 
-# Exact labels observed in the portable-C emitter.  This set is intentionally
-# smaller than the conceptual phase metadata: pivot, reduction, temporal, and
-# wavefront frontiers need host orchestration and must not be converted into a
-# flat OpenMP loop.  Each listed loop has disjoint writes at its source phase.
-_SAFE_EMITTED_PARALLEL_LOOPS: dict[str, tuple[str, ...]] = {
-    "2mm": ("l_mm1_i0", "l_mm2_i1", "l_S_i2_j2_0_i2"),
-    "3mm": ("l_mm1_i0", "l_mm2_i1", "l_mm3_i2"),
-    "adi": ("l_S_i_0_i", "l_S_i_3_i1"),
-    "atax": ("l_S_m_0_m", "l_S_n_0_n"),
-    "bicg": ("l_S_i1_0_i1",),
-    "correlation": (
-        "l_S_x_0_x",
-        "l_S_x_0_x1",
-        "l_S_x_0_x2",
-        "l_S_i_0_i",
-    ),
-    "covariance": ("l_S_x_0_x", "l_S_i_j_2_i"),
-    "deriche": (
-        "l_S_i_0_i",
-        "l_S_i_2_i1",
-        "l_S_i_4_i2",
-        "l_S_j_6_j3",
-        "l_S_j_8_j4",
-        "l_S_i_10_i5",
-    ),
-    "durbin": ("l_S_i_1_i1", "l_S_i_2_i2"),
-    "fdtd_2d": ("l_S_j_0_j", "l_S_i_1_i", "l_S_i_3_i1", "l_S_i_5_i2"),
-    "gemm": ("l_mm1_i0", "l_S_i2_j2_0_i2"),
-    "gemver": ("l_S_i_j_0_i", "l_S_i_j_1_i1", "l_S_i_2_i2", "l_S_i_j_3_i3"),
-    "gesummv": ("l_tmp_i", "l_load_i01"),
-    "gramschmidt": ("l_S_i_1_i1", "l_S_j_2_j"),
-    "jacobi_1d": ("l_S_i0_0_i0", "l_S_i1_1_i1"),
-    "jacobi_2d": ("l_A_i0", "l_B_i1"),
-    "lu": ("l_S_j_2_j1",),
-    "ludcmp": ("l_S_j_2_j1",),
-    "mvt": ("l_A_i0", "l_B_i1"),
-    "symm": ("l_sum_i1",),
-    "syr2k": ("l_update_i0", "l_load_i01", "l_sum_i1", "l_store_i2"),
-    "syrk": ("l_update_i0", "l_load_i01", "l_sum_i1", "l_store_i2"),
-    "trmm": ("l_mul_i0",),
-}
-
-
 _HALO_CASES = {
     "fdtd_2d": (1, 1),
     "heat_3d": (1, 1),
@@ -1336,9 +1293,7 @@ def execution_manifest(case: PolyBenchCase) -> dict[str, object]:
             }
             for phase in case.execution.phases
         ],
-        "portable_c_parallel_loops": list(
-            _SAFE_EMITTED_PARALLEL_LOOPS.get(case.name, ())
-        ),
+        "parallel_region_policy": "retained-mlir-dependence-analysis",
     }
 
 
@@ -1362,7 +1317,6 @@ def build_upmem_program(case_or_name: PolyBenchCase | str) -> UPMEMProgram:
         name=case.name.replace("2mm", "two_mm").replace("3mm", "three_mm"),
         instantiate=tuple(case.instantiate),
         result_names=result_names,
-        parallel_loops=_SAFE_EMITTED_PARALLEL_LOOPS.get(case.name, ()),
         parallel_workers=64,
     )
     declarations = [_array_declaration(case, argument) for argument in case.arguments]

@@ -9,6 +9,7 @@ or planner-owned transfer-count annotation.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import math
 
@@ -20,6 +21,65 @@ VR_LANES = 32768
 WRITABLE_VRS = 15
 
 
+def _freeze_inventory_value(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        return tuple(
+            sorted(
+                (str(key), _freeze_inventory_value(item)) for key, item in value.items()
+            )
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_inventory_value(item) for item in value)
+    raise TypeError(
+        "APU v1 operation inventory attributes must be immutable scalar data"
+    )
+
+
+@dataclass(frozen=True)
+class APUV1OperationInventoryEntry:
+    """One operand-name-free operation and its exact materialized call count."""
+
+    opcode: str
+    count: int
+    dtype: str = "f16"
+    attributes: tuple[tuple[str, object], ...] = ()
+
+    def __post_init__(self):
+        opcode = str(self.opcode).upper()
+        if not opcode or not opcode.replace("_", "").isalnum():
+            raise ValueError("APU v1 inventory opcode must be an uppercase-style name")
+        count = int(self.count)
+        if count <= 0:
+            raise ValueError("APU v1 inventory call count must be positive")
+        source = (
+            self.attributes.items()
+            if isinstance(self.attributes, Mapping)
+            else tuple(self.attributes)
+        )
+        attributes = tuple(
+            sorted(
+                (str(name), _freeze_inventory_value(value)) for name, value in source
+            )
+        )
+        if len({name for name, _value in attributes}) != len(attributes):
+            raise ValueError("APU v1 inventory attributes must have unique names")
+        object.__setattr__(self, "opcode", opcode)
+        object.__setattr__(self, "count", count)
+        object.__setattr__(self, "dtype", str(self.dtype).lower())
+        object.__setattr__(self, "attributes", attributes)
+
+    @property
+    def canonical_manifest(self) -> dict[str, object]:
+        return {
+            "opcode": self.opcode,
+            "count": self.count,
+            "dtype": self.dtype,
+            "attributes": dict(self.attributes),
+        }
+
+
 @dataclass(frozen=True)
 class APUV1PlanEstimate:
     """One plan, its retained graph, and its evaluated analytical result."""
@@ -27,6 +87,7 @@ class APUV1PlanEstimate:
     plan: APUV1Plan
     graph: ExecutionGraph
     estimate: object
+    operation_inventory: tuple[APUV1OperationInventoryEntry, ...] = ()
 
     @property
     def cycles(self) -> int:
@@ -126,8 +187,33 @@ def _operation_calls(plan: APUV1Plan, operation: PlanOperation, facts) -> int:
     return max(1, int(operation.count or fallback))
 
 
-def _operation_handle(target, operation: PlanOperation):
-    name = operation.name.upper()
+def _plan_operation_inventory(plan, facts):
+    return tuple(
+        APUV1OperationInventoryEntry(
+            operation.name,
+            _operation_calls(plan, operation, facts),
+            operation.dtype,
+        )
+        for operation in plan.operations
+    )
+
+
+def _operation_inventory(plan, facts, operation_inventory):
+    if operation_inventory is None:
+        return _plan_operation_inventory(plan, facts)
+    inventory = tuple(operation_inventory)
+    if any(
+        not isinstance(operation, APUV1OperationInventoryEntry)
+        for operation in inventory
+    ):
+        raise TypeError(
+            "operation_inventory must contain APUV1OperationInventoryEntry values"
+        )
+    return inventory
+
+
+def _operation_handle(target, operation: APUV1OperationInventoryEntry):
+    name = operation.opcode
     dtype = str(operation.dtype).lower()
     floating = dtype.startswith(("f", "bf"))
     unsigned = dtype.startswith("ui")
@@ -148,6 +234,11 @@ def _operation_handle(target, operation: PlanOperation):
         "AND": "AND_16",
         "OR": "OR_16",
         "XOR": "XOR_16",
+        "MUL_F16": "MUL",
+        "ADD_F16": "ADD",
+        "GROUP_REDUCE_F16": "GROUP_REDUCE_ADD_F16",
+        "GROUP_REDUCE_U16": "GROUP_REDUCE_ADD_U16",
+        "GROUP_REDUCE_S16": "GROUP_REDUCE_ADD_S16",
     }
     target_name = aliases.get(name, name)
     try:
@@ -364,7 +455,13 @@ def _transfer_route_metadata(plan, transfer):
     )
 
 
-def build_apu_v1_plan_graph(plan, target, bound_cost) -> ExecutionGraph:
+def build_apu_v1_plan_graph(
+    plan,
+    target,
+    bound_cost,
+    *,
+    operation_inventory=None,
+) -> ExecutionGraph:
     """Execute one plan into a concrete target-bound dependency graph."""
 
     if not isinstance(plan, APUV1Plan):
@@ -373,6 +470,7 @@ def build_apu_v1_plan_graph(plan, target, bound_cost) -> ExecutionGraph:
         raise ValueError("APU v1 plans require the apu_v1 target")
     cost = _bound_cost(target, bound_cost)
     facts = _shape_facts(plan)
+    inventory = _operation_inventory(plan, facts, operation_inventory)
     graph = ExecutionGraph(
         name=f"{plan.name}@apu_v1",
         metadata={
@@ -388,6 +486,9 @@ def build_apu_v1_plan_graph(plan, target, bound_cost) -> ExecutionGraph:
                     "steps": _transfer_route_metadata(plan, transfer),
                 }
                 for transfer in plan.transfers
+            ),
+            "operation_inventory": tuple(
+                operation.canonical_manifest for operation in inventory
             ),
             "analytical": True,
         },
@@ -421,11 +522,16 @@ def build_apu_v1_plan_graph(plan, target, bound_cost) -> ExecutionGraph:
             dependencies = tuple(cost.emit(graph, event, dependencies))
             event_index += 1
 
-    for operation in plan.operations:
+    for operation in inventory:
         handle, target_name = _operation_handle(target, operation)
-        count = _operation_calls(plan, operation, facts)
+        count = operation.count
         reduction = plan.reduction_strategy
-        group_size = int(getattr(reduction, "group_size", 0) or facts["reduction_tile"])
+        parameters = dict(operation.attributes)
+        group_size = int(
+            parameters.get("group_size")
+            or getattr(reduction, "group_size", 0)
+            or facts["reduction_tile"]
+        )
         metrics = {
             "count": count,
             "iterations": count * VR_LANES,
@@ -433,7 +539,7 @@ def build_apu_v1_plan_graph(plan, target, bound_cost) -> ExecutionGraph:
             "group_size": max(1, group_size),
             "candidate": {"group_size": max(1, group_size)},
         }
-        if target_name in {"GROUP_REDUCE_ADD_F16", "GROUP_REDUCE_ADD_S16"}:
+        if target_name.startswith("GROUP_REDUCE_ADD_"):
             metrics["candidate"]["n_out_tiles"] = count
         event = CostEvent.create(
             f"operation:{event_index}:{target_name}",
@@ -441,8 +547,9 @@ def build_apu_v1_plan_graph(plan, target, bound_cost) -> ExecutionGraph:
             work_id=(0,),
             metrics=metrics,
             attributes={
-                "operation": operation.name,
+                "operation": operation.opcode,
                 "dtype": operation.dtype,
+                "materialized_attributes": parameters,
                 "cost_count": count,
             },
         )
@@ -470,10 +577,60 @@ def build_apu_v1_plan_graph(plan, target, bound_cost) -> ExecutionGraph:
     return graph
 
 
-def estimate_apu_v1_plan(plan, target, bound_cost) -> APUV1PlanEstimate:
+def estimate_apu_v1_plan(
+    plan,
+    target,
+    bound_cost,
+    *,
+    operation_inventory=None,
+) -> APUV1PlanEstimate:
     cost = _bound_cost(target, bound_cost)
-    graph = build_apu_v1_plan_graph(plan, target, cost)
-    return APUV1PlanEstimate(plan, graph, cost.evaluate(graph))
+    inventory = _operation_inventory(plan, _shape_facts(plan), operation_inventory)
+    graph = build_apu_v1_plan_graph(
+        plan,
+        target,
+        cost,
+        operation_inventory=inventory,
+    )
+    return APUV1PlanEstimate(plan, graph, cost.evaluate(graph), inventory)
+
+
+def materialized_apu_v1_operation_inventory(realization):
+    """Freeze the exact repeated compute calls from one faithful realization."""
+
+    plan = getattr(realization, "plan", None)
+    if not isinstance(plan, APUV1Plan):
+        raise TypeError("APU v1 realization must retain its APUV1Plan")
+    invocations = tuple(getattr(realization, "compute_invocation_inventory", ()) or ())
+    if not invocations:
+        raise ValueError("APU v1 realization has no compute operation inventory")
+    if any(
+        not all(hasattr(invocation, field) for field in ("opcode", "count", "attrs"))
+        for invocation in invocations
+    ):
+        raise TypeError("APU v1 realization has an invalid compute invocation entry")
+    dtype = str(plan.metadata.get("dtype", "f16"))
+    return tuple(
+        APUV1OperationInventoryEntry(
+            invocation.opcode,
+            invocation.count,
+            dtype,
+            invocation.attrs,
+        )
+        for invocation in invocations
+    )
+
+
+def estimate_apu_v1_realization(realization, target, bound_cost) -> APUV1PlanEstimate:
+    """Estimate the exact immutable operation inventory that was materialized."""
+
+    inventory = materialized_apu_v1_operation_inventory(realization)
+    return estimate_apu_v1_plan(
+        realization.plan,
+        target,
+        bound_cost,
+        operation_inventory=inventory,
+    )
 
 
 def rank_apu_v1_plans(plans, target, bound_cost) -> tuple[APUV1PlanEstimate, ...]:
@@ -488,8 +645,11 @@ def rank_apu_v1_plans(plans, target, bound_cost) -> tuple[APUV1PlanEstimate, ...
 
 
 __all__ = [
+    "APUV1OperationInventoryEntry",
     "APUV1PlanEstimate",
     "build_apu_v1_plan_graph",
+    "estimate_apu_v1_realization",
     "estimate_apu_v1_plan",
+    "materialized_apu_v1_operation_inventory",
     "rank_apu_v1_plans",
 ]

@@ -6,6 +6,7 @@
 import gc
 import ast
 import copy
+import hashlib
 import inspect
 import itertools
 import numpy as np
@@ -86,6 +87,295 @@ from ..utils import (
     construct_kernel_name,
     allo_to_numpy_dtype,
 )
+
+
+_SPMW_GROUP_ID_ATTR = "spmw.group_id"
+_SPMW_WORK_ID_ATTR = "spmw.work_id"
+_SPMW_GROUP_SHAPE_ATTR = "spmw.group_shape"
+_SPMW_COALESCED_AXES_ATTR = "spmw.coalesced_axes"
+_SPMW_ABI_VALUE_IDS_ATTR = "spmw.abi_value_ids"
+_SPMW_GROUP_FINGERPRINT_ATTR = "spmw.group_fingerprint"
+_SPMW_BODY_FINGERPRINT_ATTR = "spmw.body_fingerprint"
+_SPMW_SCOPE_ATTRS = (
+    _SPMW_GROUP_ID_ATTR,
+    _SPMW_WORK_ID_ATTR,
+    _SPMW_GROUP_SHAPE_ATTR,
+    _SPMW_COALESCED_AXES_ATTR,
+    _SPMW_GROUP_FINGERPRINT_ATTR,
+    _SPMW_BODY_FINGERPRINT_ATTR,
+)
+_SPMW_NON_STRUCTURAL_ATTRS = frozenset(
+    {
+        "callee",
+        "from",
+        "loop_name",
+        "name",
+        "op_name",
+        "stream_list",
+        "stream_symbolic_slice_list",
+        "stypes",
+        "sym_name",
+        "tag",
+        "to",
+        _SPMW_ABI_VALUE_IDS_ATTR,
+    }
+)
+
+
+def _spmw_operation_structure(operation, value_tokens, path):
+    op = getattr(operation, "operation", operation)
+    attributes = getattr(operation, "attributes", getattr(op, "attributes", {}))
+    semantic_attributes = tuple(
+        sorted(
+            (
+                str(name),
+                str(attributes[name]),
+            )
+            for name in attributes
+            if name not in _SPMW_NON_STRUCTURAL_ATTRS and name not in _SPMW_SCOPE_ATTRS
+        )
+    )
+    operands = tuple(
+        (
+            value_tokens.get(operand, ("external", str(operand.type))),
+            str(operand.type),
+        )
+        for operand in getattr(op, "operands", ())
+    )
+    results = tuple(getattr(op, "results", ()))
+    result_types = tuple(str(result.type) for result in results)
+    for result_index, result in enumerate(results):
+        value_tokens[result] = ("result", path, result_index)
+
+    regions = []
+    for region_index, region in enumerate(getattr(op, "regions", ())):
+        blocks = []
+        for block_index, block in enumerate(region.blocks):
+            block_path = path + ((region_index, block_index),)
+            block_tokens = dict(value_tokens)
+            arguments = []
+            for argument_index, argument in enumerate(block.arguments):
+                token = ("argument", block_path, argument_index)
+                block_tokens[argument] = token
+                arguments.append((token, str(argument.type)))
+            operations = tuple(
+                _spmw_operation_structure(
+                    child,
+                    block_tokens,
+                    block_path + (operation_index,),
+                )
+                for operation_index, child in enumerate(block.operations)
+            )
+            blocks.append((tuple(arguments), operations))
+        regions.append(tuple(blocks))
+    return (
+        str(op.name),
+        semantic_attributes,
+        operands,
+        result_types,
+        tuple(regions),
+    )
+
+
+def _spmw_digest(value):
+    return hashlib.sha256(repr(value).encode("utf-8"))
+
+
+def _spmw_group_contract(group_shape, coalesced_axes, instances):
+    """Return a canonical identity binding every coordinate and body."""
+    group_shape = tuple(int(extent) for extent in group_shape)
+    coalesced_axes = tuple(int(axis) for axis in coalesced_axes)
+    normalized = []
+    seen_work_ids = set()
+    for work_id, function in instances:
+        work_id = tuple(int(coordinate) for coordinate in work_id)
+        if work_id in seen_work_ids:
+            raise ValueError("dataflow kernel group repeats a work coordinate")
+        seen_work_ids.add(work_id)
+        attributes = getattr(function, "attributes", {})
+        retained_abi = (
+            attributes[_SPMW_ABI_VALUE_IDS_ATTR]
+            if _SPMW_ABI_VALUE_IDS_ATTR in attributes
+            else ()
+        )
+        abi_value_ids = tuple(
+            int(_spmw_attribute_value(value)) for value in retained_abi
+        )
+        normalized.append(
+            (
+                work_id,
+                abi_value_ids,
+                _spmw_operation_structure(function, {}, ()),
+            )
+        )
+    if not normalized:
+        raise ValueError("dataflow kernel group has no retained instances")
+    normalized.sort(key=lambda item: item[0])
+
+    manifest = (
+        "spmw-retained-group-v2",
+        group_shape,
+        coalesced_axes,
+        tuple(normalized),
+    )
+    group_fingerprint = _spmw_digest(manifest).hexdigest()
+    body_fingerprints = tuple(
+        (work_id, _spmw_digest(("spmw-retained-body-v1", structure)).hexdigest())
+        for work_id, _abi_value_ids, structure in normalized
+    )
+
+    structures = tuple(structure for _work_id, _abi_value_ids, structure in normalized)
+    if all(structure == structures[0] for structure in structures[1:]):
+        identity_structure = (group_shape, coalesced_axes, structures[0])
+    else:
+        structural_members = tuple(
+            (work_id, structure) for work_id, _abi_value_ids, structure in normalized
+        )
+        identity_structure = (group_shape, coalesced_axes, structural_members)
+    identity_seed = _spmw_digest(identity_structure).digest()
+    identity = hashlib.sha256(identity_seed + bytes(8)).digest()
+    group_id = int.from_bytes(identity[:8], byteorder="big", signed=False) & (
+        (1 << 63) - 1
+    )
+    return group_id, group_fingerprint, body_fingerprints
+
+
+def _stamp_spmw_scope(
+    function,
+    group_id,
+    work_id,
+    group_shape,
+    coalesced_axes,
+    group_fingerprint,
+    body_fingerprint,
+):
+    i64 = IntegerType.get_signless(64)
+
+    def integer_array(values):
+        return ArrayAttr.get([IntegerAttr.get(i64, int(value)) for value in values])
+
+    function.attributes[_SPMW_GROUP_ID_ATTR] = IntegerAttr.get(i64, int(group_id))
+    function.attributes[_SPMW_WORK_ID_ATTR] = integer_array(work_id)
+    function.attributes[_SPMW_GROUP_SHAPE_ATTR] = integer_array(group_shape)
+    function.attributes[_SPMW_COALESCED_AXES_ATTR] = integer_array(coalesced_axes)
+    function.attributes[_SPMW_GROUP_FINGERPRINT_ATTR] = StringAttr.get(
+        group_fingerprint
+    )
+    function.attributes[_SPMW_BODY_FINGERPRINT_ATTR] = StringAttr.get(body_fingerprint)
+
+
+def _spmw_attribute_value(attribute):
+    return getattr(attribute, "value", attribute)
+
+
+def _restamp_spmw_scope_contract(module):
+    """Rebind retained identities after a structure-preserving IR rewrite."""
+    groups = {}
+    for function in getattr(getattr(module, "body", None), "operations", ()):
+        operation = getattr(function, "operation", None)
+        if getattr(operation, "name", None) != "func.func":
+            continue
+        attributes = getattr(function, "attributes", {})
+        present = tuple(name in attributes for name in _SPMW_SCOPE_ATTRS)
+        if not any(present):
+            continue
+        if not all(present):
+            raise ValueError("retained matcher scope attributes are incomplete")
+        group_id = int(_spmw_attribute_value(attributes[_SPMW_GROUP_ID_ATTR]))
+        work_id = tuple(
+            int(_spmw_attribute_value(value))
+            for value in attributes[_SPMW_WORK_ID_ATTR]
+        )
+        group_shape = tuple(
+            int(_spmw_attribute_value(value))
+            for value in attributes[_SPMW_GROUP_SHAPE_ATTR]
+        )
+        coalesced_axes = tuple(
+            int(_spmw_attribute_value(value))
+            for value in attributes[_SPMW_COALESCED_AXES_ATTR]
+        )
+        group_fingerprint = str(
+            _spmw_attribute_value(attributes[_SPMW_GROUP_FINGERPRINT_ATTR])
+        )
+        groups.setdefault((group_id, group_fingerprint), []).append(
+            (work_id, group_shape, coalesced_axes, function)
+        )
+
+    for records in groups.values():
+        group_shape = records[0][1]
+        coalesced_axes = records[0][2]
+        if any(
+            shape != group_shape or axes != coalesced_axes
+            for _work_id, shape, axes, _function in records[1:]
+        ):
+            raise ValueError("retained matcher group has inconsistent topology")
+        expected_size = int(np.prod(group_shape, dtype=np.int64))
+        if len(records) != expected_size:
+            raise ValueError("retained matcher group does not cover its complete grid")
+        for work_id, _shape, _axes, _function in records:
+            if len(work_id) != len(group_shape) or any(
+                coordinate < 0 or coordinate >= extent
+                for coordinate, extent in zip(work_id, group_shape)
+            ):
+                raise ValueError("retained matcher work coordinate is outside its grid")
+        group_id, group_fingerprint, body_fingerprints = _spmw_group_contract(
+            group_shape,
+            coalesced_axes,
+            [(work_id, function) for work_id, _, _, function in records],
+        )
+        fingerprints_by_work_id = dict(body_fingerprints)
+        for work_id, _shape, _axes, function in records:
+            _stamp_spmw_scope(
+                function,
+                group_id,
+                work_id,
+                group_shape,
+                coalesced_axes,
+                group_fingerprint,
+                fingerprints_by_work_id[work_id],
+            )
+
+
+def _spmw_source_value_id(ctx, value):
+    """Return one module-local identity for an exact caller SSA value."""
+
+    argument_number = getattr(value, "arg_number", None)
+    if argument_number is not None:
+        return int(argument_number)
+    state = ctx._spmw_value_identity_state
+    identities = state["values"]
+    try:
+        return identities[value]
+    except KeyError:
+        ordinal = int(state["next"])
+        identity = (1 << 62) + ordinal
+        if identity >= (1 << 63):
+            raise OverflowError("retained matcher ABI identity space is exhausted")
+        state["next"] = ordinal + 1
+        identities[value] = identity
+        return identity
+
+
+def _stamp_spmw_abi_value_ids(function, ctx, argument_values):
+    """Retain exact call-operand identities on a generated kernel ABI."""
+
+    if len(argument_values) != len(function.arguments):
+        raise ValueError("dataflow kernel call arity does not match its ABI")
+    i64 = IntegerType.get_signless(64)
+    source_ids = tuple(_spmw_source_value_id(ctx, value) for value in argument_values)
+    existing = (
+        function.attributes[_SPMW_ABI_VALUE_IDS_ATTR]
+        if _SPMW_ABI_VALUE_IDS_ATTR in function.attributes
+        else None
+    )
+    if existing is not None:
+        retained = tuple(int(getattr(value, "value", value)) for value in existing)
+        if retained != source_ids:
+            raise ValueError("one dataflow kernel ABI has conflicting call operands")
+        return
+    function.attributes[_SPMW_ABI_VALUE_IDS_ATTR] = ArrayAttr.get(
+        [IntegerAttr.get(i64, value) for value in source_ids]
+    )
 
 
 class ASTBuilder(ASTVisitor):
@@ -2078,18 +2368,39 @@ class ASTTransformer(ASTBuilder):
                     if isinstance(decorator.func, ast.Attribute):
                         if decorator.func.attr in ("kernel", "work"):
                             assert len(decorator.keywords) > 0, "Missing kernel mapping"
-                            mapping = eval(
+                            raw_mapping = eval(
                                 ast.unparse(decorator.keywords[0].value),
                                 ctx.global_vars,
                             )
-                            if isinstance(mapping, int):
-                                mapping = [mapping]
+                            scalar_mapping = isinstance(raw_mapping, (int, np.integer))
+                            mapping = [raw_mapping] if scalar_mapping else raw_mapping
+                            group_shape = tuple(int(extent) for extent in mapping)
+                            if not group_shape or any(
+                                extent <= 0 for extent in group_shape
+                            ):
+                                raise ValueError(
+                                    "dataflow kernel mappings must have positive extents"
+                                )
+                            coalesced_axes = (0,) if scalar_mapping else ()
+                            args_kw = get_kwarg_value(decorator.keywords, "args")
+                            if args_kw is None:
+                                abi_argument_values = []
+                            else:
+                                abi_argument_values = [
+                                    ASTTransformer.get_mlir_op_result(old_ctx, argument)
+                                    for argument in build_stmts(old_ctx, args_kw)
+                                ]
+                            group_instances = []
                             orig_name = node.name
                             if orig_name not in ctx.func_tag2instance:
                                 ctx.func_tag2instance[orig_name] = {}
                             # Initialize dict to store kernel instance names for call insertion
-                            if not hasattr(ctx, "_kernel_instance_names"):
-                                ctx._kernel_instance_names = {}
+                            if not hasattr(old_ctx, "_kernel_instance_names"):
+                                old_ctx._kernel_instance_names = {}
+                            if not hasattr(old_ctx, "_kernel_instance_ops"):
+                                old_ctx._kernel_instance_ops = {}
+                            ctx._kernel_instance_names = old_ctx._kernel_instance_names
+                            ctx._kernel_instance_ops = old_ctx._kernel_instance_ops
                             for dim in np.ndindex(*mapping):
                                 if not ctx.unroll:
                                     # If not unrolled, assign tag to each instance.
@@ -2148,6 +2459,12 @@ class ASTTransformer(ASTBuilder):
                                 func_op = ASTTransformer.build_FunctionDef(
                                     new_ctx, new_node
                                 )
+                                ctx._kernel_instance_ops[(orig_name, dim)] = func_op
+                                _stamp_spmw_abi_value_ids(
+                                    func_op,
+                                    old_ctx,
+                                    abi_argument_values,
+                                )
                                 func_op.attributes["df.kernel"] = UnitAttr.get()
                                 # Mark kernels inside sub-regions so they aren't called from top
                                 if hasattr(ctx, "func_suffix"):
@@ -2161,8 +2478,31 @@ class ASTTransformer(ASTBuilder):
                                     ctx.func_tag2instance[orig_name][
                                         predicate_tag
                                     ] = func_op
+                                group_instances.append((dim, func_op))
                                 # Restore original name for next iteration
                                 node.name = orig_name
+                            expected_size = int(np.prod(group_shape, dtype=np.int64))
+                            if len(group_instances) == expected_size:
+                                (
+                                    group_id,
+                                    group_fingerprint,
+                                    body_fingerprints,
+                                ) = _spmw_group_contract(
+                                    group_shape,
+                                    coalesced_axes,
+                                    group_instances,
+                                )
+                                fingerprints_by_work_id = dict(body_fingerprints)
+                                for dim, func_op in group_instances:
+                                    _stamp_spmw_scope(
+                                        func_op,
+                                        group_id,
+                                        dim,
+                                        group_shape,
+                                        coalesced_axes,
+                                        group_fingerprint,
+                                        fingerprints_by_work_id[tuple(dim)],
+                                    )
                             return
 
                         if decorator.func.attr == "region":
@@ -2310,6 +2650,18 @@ class ASTTransformer(ASTBuilder):
                                             kernel_name = (
                                                 f"{kernel_name}_{ctx.func_suffix}"
                                             )
+                                    kernel_op = getattr(
+                                        ctx, "_kernel_instance_ops", {}
+                                    ).get(key)
+                                    if kernel_op is None:
+                                        raise ValueError(
+                                            "dataflow kernel call lacks its retained ABI"
+                                        )
+                                    _stamp_spmw_abi_value_ids(
+                                        kernel_op,
+                                        ctx,
+                                        arg_values,
+                                    )
                                     # We need to resolve the tag for the kernel
                                     # FIXME: checking the tag mapping is tricky here,
                                     # we assume there is no tag mismatch for now

@@ -1,12 +1,12 @@
 # trmm on upmem (SMALL)
 
-- correctness: **PASS** -- uPIMulator GEMV host numeric check passed (W@x vs numpy ref, host tol); recorded ref rtol=0.0001
-- reference: PolyBench/C 4.2.1 SMALL_DATASET (validated by `experiments/scripts/R_polybench_ref_validation.py`)
+- correctness: **PASS** -- canonical MLIR -> portable C matched repository NumPy reference for B (max_abs_err=0, rtol=0.0001, atol=0.0001); ABI packed and gathered a full 64-DPU rank
+- reference: examples/polybench/trmm.py::trmm_np SMALL_DATASET (validated by `tests/pim/test_upmem_polybench_registry.py`)
 - shapes: {'M': 60, 'N': 80}
-- cycles: 215841
-- source: `uPIMulator@870d916334e9ff0b190f555f951a9ec3c4257781`
+- cycles: 1084622
+- source: `upmem_cost@1e9f869de726a65f (analytical MLIR operation graph); portable-C functional oracle`
 - run_cmd: `python -m pytest tests/pim/upmem/trmm/test_trmm_upmem.py -p no:cacheprovider -q`
-- timestamp: 2026-06-29T12:23:26.974377
-- tenon_commit: `ee1e52a539d6385a60d149ca238b592d9763103e`
+- timestamp: 2026-07-01T09:39:40.443018
+- tenon_commit: `6bc7474a09fa7d2d64007e6b929b6f68660729d3`
 
-Tier-2 triangular; UPMEM GEMV-host slot verifies W@x internally (PASS w/ cycles); a VA-slot route is CYCLES-ONLY.
+The complete canonical Allo kernel is lowered through MLIR to portable C. Its NumPy-visible results are checked against the repository reference; the UPMEM ABI uses 64 DPUs and retains the declarative partition, barrier, collective, temporal, pivot, or wavefront orchestration plan. Reported cycles are analytical cost-program estimates, not simulator measurements. Tensor MRAM ownership and analytical DPU/tasklet fanout are derived from the compiled F2 LinearLayout.

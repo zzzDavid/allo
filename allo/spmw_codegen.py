@@ -15,7 +15,10 @@ comments below and report 16 for the design.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
+import marshal
 import os
 import re
 import shutil
@@ -27,7 +30,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .spmw_autoschedule import Placement, autoschedule, derive_layout_properties
+from .spmw_autoschedule import (
+    Placement,
+    _matcher_search_scope,
+    _matcher_work_scope,
+    autoschedule,
+    derive_layout_properties,
+)
 from .spmw_match import MatchTrace, MatchedOp
 from .spmw_target import MemoryRef, Register, SymExpr, UnitId
 
@@ -94,6 +103,209 @@ class HostTrigger:
 
     work_id: int
     tile_count: int
+
+
+_PIM_CMD_FIELDS = (
+    "type_",
+    "dst_",
+    "src0_",
+    "src1_",
+    "src2_",
+    "loopCounter_",
+    "loopOffset_",
+    "isAuto_",
+    "dstIdx_",
+    "src0Idx_",
+    "src1Idx_",
+    "isRelu_",
+)
+
+
+def _clone_matcher_command(command):
+    if isinstance(command, PIMCmd):
+        return PIMCmd(**{name: getattr(command, name) for name in _PIM_CMD_FIELDS})
+    if isinstance(command, str):
+        return str(command)
+    raise TypeError(
+        f"matcher command stream contains unsupported {type(command).__name__!r}"
+    )
+
+
+def _matcher_command_manifest(commands) -> tuple:
+    manifest = []
+    for command in commands:
+        if isinstance(command, PIMCmd):
+            manifest.append(
+                ("pim_cmd", tuple(getattr(command, name) for name in _PIM_CMD_FIELDS))
+            )
+        elif isinstance(command, str):
+            manifest.append(("source_line", command))
+        else:
+            raise TypeError(
+                "matcher command stream contains unsupported "
+                f"{type(command).__name__!r}"
+            )
+    return tuple(manifest)
+
+
+def _matcher_host_schedule_manifest(schedule) -> tuple:
+    return tuple(
+        (
+            (
+                tuple(trigger.work_id)
+                if isinstance(trigger.work_id, tuple)
+                else trigger.work_id
+            ),
+            int(trigger.tile_count),
+        )
+        for trigger in schedule
+    )
+
+
+def _matcher_handle_path(handle) -> str:
+    from .perf.cost import handle_path
+
+    return handle_path(handle)
+
+
+def _matcher_resolved_host_move_manifest(moves) -> tuple:
+    manifest = []
+    for resolved in moves:
+        verb = getattr(resolved.verb, "name", None)
+        if not isinstance(verb, str) or not verb:
+            raise TypeError("resolved matcher host transfer has no typed verb")
+        manifest.append(
+            (
+                verb,
+                _matcher_handle_path(resolved.move),
+                _matcher_handle_path(resolved.device_handle),
+                resolved.buffer_role,
+            )
+        )
+    return tuple(manifest)
+
+
+def _matcher_emitted_host_move_manifest(moves) -> tuple:
+    return tuple((str(kind), _matcher_handle_path(handle)) for kind, handle in moves)
+
+
+def _matcher_artifact_digest(payload: object) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True)
+class MatcherCodegenArtifact:
+    """Frozen command/source stream and runtime contract for one candidate."""
+
+    target_name: str
+    commands: tuple
+    command_manifest: tuple
+    host_schedule: tuple
+    host_schedule_manifest: tuple
+    host_preloads: tuple
+    emitted_host_moves_manifest: tuple
+    resolved_host_moves: tuple
+    resolved_host_moves_manifest: tuple
+    runtime_abi: tuple
+    runtime_segments: tuple
+    runtime_source_fingerprint: str
+    non_promotable_reason: str | None
+    context: Any = field(compare=False, repr=False)
+    platform_fingerprint: object | None = field(default=None, compare=False)
+
+    @property
+    def promotion_materialization_fingerprint(self) -> str | None:
+        if self.non_promotable_reason is not None:
+            return None
+        try:
+            if _matcher_command_manifest(self.commands) != self.command_manifest:
+                return None
+            if _matcher_command_manifest(self.context.cmds) != self.command_manifest:
+                return None
+            if (
+                _matcher_host_schedule_manifest(self.context.host_schedule)
+                != self.host_schedule_manifest
+            ):
+                return None
+            if tuple(self.context.host_preloads) != self.host_preloads:
+                return None
+            if (
+                _matcher_emitted_host_move_manifest(
+                    getattr(self.context, "host_moves_emitted", ())
+                )
+                != self.emitted_host_moves_manifest
+            ):
+                return None
+            if (
+                _matcher_resolved_host_move_manifest(self.resolved_host_moves)
+                != self.resolved_host_moves_manifest
+            ):
+                return None
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if (
+            _matcher_runtime_source_fingerprint(self.target_name)
+            != self.runtime_source_fingerprint
+        ):
+            return None
+        return _matcher_artifact_digest(
+            {
+                "kind": "matcher-codegen-materialization-v1",
+                "target": self.target_name,
+                "commands": self.command_manifest,
+                "host_schedule": self.host_schedule_manifest,
+                "host_preloads": self.host_preloads,
+                "emitted_host_moves": self.emitted_host_moves_manifest,
+                "resolved_host_moves": self.resolved_host_moves_manifest,
+                "runtime_abi": self.runtime_abi,
+                "runtime_segments": self.runtime_segments,
+                "runtime_source": self.runtime_source_fingerprint,
+            }
+        )
+
+    @property
+    def promotion_platform_fingerprint(self):
+        return self.platform_fingerprint
+
+    def instantiate_commands(self) -> list:
+        return [_clone_matcher_command(command) for command in self.commands]
+
+    def instantiate_host_schedule(self) -> list[HostTrigger]:
+        return [
+            HostTrigger(trigger.work_id, trigger.tile_count)
+            for trigger in self.host_schedule
+        ]
+
+    def validate_compiled(self, compiled) -> None:
+        if (
+            self.non_promotable_reason is None
+            and self.promotion_materialization_fingerprint is None
+        ):
+            raise RuntimeError(
+                "frozen matcher source/command evidence changed after scoring"
+            )
+        if _matcher_command_manifest(compiled.cmds) != self.command_manifest:
+            raise RuntimeError(
+                "compiled matcher command/source stream changed after scoring"
+            )
+        if (
+            _matcher_host_schedule_manifest(compiled.host_schedule)
+            != self.host_schedule_manifest
+        ):
+            raise RuntimeError("compiled matcher host schedule changed after scoring")
+        if (
+            _matcher_resolved_host_move_manifest(compiled.host_moves)
+            != self.resolved_host_moves_manifest
+        ):
+            raise RuntimeError("compiled matcher host transfers changed after scoring")
+        if tuple(getattr(compiled, "runtime_abi", ())) != self.runtime_abi:
+            raise RuntimeError("compiled matcher runtime ABI changed after scoring")
+        if tuple(getattr(compiled, "runtime_segments", ())) != self.runtime_segments:
+            raise RuntimeError(
+                "compiled matcher runtime command segments changed after scoring"
+            )
 
 
 # --------------------------------------------------------------------- #
@@ -480,16 +692,8 @@ class SamsungCtx(CodegenContext):
         # just-emitted MAC body, so the call must stay inside the
         # work-id window between compute and storeback.
         placement = self._active_placement
-        # Lever 3 appends a `+crf_shared`/`+crf_per_workid` token to `mode`
-        # for audit legibility (SPEC-025 §3.1); the lever-1 dual-fiber
-        # signal is the base mode token, so split on the `+` joiner rather
-        # than matching the whole (possibly-suffixed) string.
-        base_mode = getattr(placement, "mode", "").split("+", 1)[0]
-        if (
-            placement is not None
-            and base_mode == "dual_fiber"
-            and match.target_op_name == "MAC"
-        ):
+        fibers = tuple(getattr(placement, "extra", {}).get("fibers", ()))
+        if placement is not None and len(fibers) > 1 and match.target_op_name == "MAC":
             self._emit_dual_fiber_jumps(match, n_emitted)
             return
         _emit_inner_loop_jump(match, self, n_emitted)
@@ -822,7 +1026,9 @@ class AimCtx(CodegenContext):
             # Compatibility for old/synthetic matches without retained types:
             # use the per-work-item output loop and structural channel grid.
             outer = _parse_loop_bound(match.enclosing_loops[0][2])
-            channels = int(getattr(self.target.channel, "axes", {}).get("channel", 32))
+            channels = int(
+                getattr(self.target.unit("channel"), "axes", {}).get("channel", 32)
+            )
             if outer is None:
                 raise ValueError("AiM cannot recover output extent from match")
             outputs = outer * channels
@@ -1389,20 +1595,18 @@ def _split_samsung_layers(cmds: list[PIMCmd]) -> list[list[PIMCmd]]:
 
 
 def _bucket_by_work_id(trace: MatchTrace):
-    """Group matches in trace order by ``(func_name, work_id)``.
+    """Group matches by their retained structural group and work ids.
 
     Returns a list of ``(work_id, [matches])`` pairs preserving
-    first-seen order. We key on `(func_name, work_id)` rather than
-    `work_id` alone because multi-kernel workloads (e.g. an MLP with
-    two `@allo.work` layers) can reuse the same numeric `work_id`
-    across kernels; without the func_name in the key, layer1 and
-    layer2 matches would collapse into the same bucket and the walker
-    would apply the wrong placement to one of them.
+    first-seen order. ``group_id`` keeps distinct ``@allo.work`` kernels
+    separate when they reuse the same numeric ``work_id``; symbol spelling is
+    deliberately irrelevant.
     """
     buckets: dict = {}
     order: list = []
     for m in trace.matches:
-        key = (m.func_name, m.work_id)
+        scope = _matcher_work_scope(m)
+        key = (scope.group_id, scope.work_id)
         if key not in buckets:
             buckets[key] = []
             order.append(key)
@@ -1474,25 +1678,6 @@ def _schedule_moves(
                 ctx.host_preloads.append((chosen, phase))
 
 
-def _base_kernel_name(func_name: str, work_id=None) -> str:
-    """Strip the ``_<wid>`` grid-replica suffix from a work func name.
-
-    The grid replicates ONE logical ``@allo.work`` kernel across work-ids by
-    suffixing the func_name with the work_id coords (e.g. ``gemv`` ->
-    ``gemv_0_0``..``gemv_15_7``). Strip that suffix so all grid replicas of one
-    kernel share a base name and collapse to one shared CRF body, while
-    genuinely-distinct kernels (an MLP's ``mlp_layer1`` vs ``mlp_layer2``) stay
-    separate. The number of suffixed coords is ``len(work_id)``.
-    """
-    fn = func_name
-    wid = work_id or ()
-    for coord in reversed(wid):
-        tail = f"_{coord}"
-        if fn.endswith(tail):
-            fn = fn[: -len(tail)]
-    return fn
-
-
 def _walk_and_emit(
     target,
     trace: MatchTrace,
@@ -1502,11 +1687,10 @@ def _walk_and_emit(
     """Walk every match in ``trace``, bucketed by work-id, and dispatch
     each match to its target op's ``emit`` callback.
 
-    ``layouts`` is aligned with ``_bucket_for_autoschedule(trace)`` —
-    one `Placement` per `@allo.work` kernel. For each work-id bucket,
-    we look up the layout by the bucket's `func_name` and compute the
-    `role -> memref` map from THIS bucket's matches (the real bug fix:
-    role -> memref is per-kernel, not per-trace).
+    ``layouts`` is aligned with ``_bucket_for_autoschedule(trace)``. For each
+    work-id bucket, we look up the layout by its retained matcher search scope
+    and compute the `role -> memref` map from THIS bucket's matches (the real
+    bug fix: role -> memref is per-kernel, not per-trace).
 
     Move scheduling (preloads before the first match of a work-id and
     storebacks after the last) is delegated to ``_schedule_moves``; the
@@ -1522,53 +1706,53 @@ def _walk_and_emit(
     # the representative bucket as a complete GEMV segment; its retained MLIR
     # loops encode output, reduction and independent-batch multiplicity.
     if isinstance(ctx, AimCtx):
-        representatives: dict[str, list[MatchedOp]] = {}
-        order: list[str] = []
+        representatives: dict[int, list[MatchedOp]] = {}
+        order: list[int] = []
         for match in trace.matches:
-            base = _base_kernel_name(match.func_name, match.work_id)
-            if base not in representatives:
-                representatives[base] = []
-                order.append(base)
-            if match.work_id in ((), (0,)):
-                representatives[base].append(match)
-        for base in order:
-            reps = representatives[base]
+            scope = _matcher_work_scope(match)
+            if scope.group_id not in representatives:
+                representatives[scope.group_id] = []
+                order.append(scope.group_id)
+            if scope.work_id in ((), (0,)):
+                representatives[scope.group_id].append(match)
+        for group_id in order:
+            reps = representatives[group_id]
             if not reps:
                 reps = [
                     next(
                         match
                         for match in trace.matches
-                        if _base_kernel_name(match.func_name, match.work_id) == base
+                        if _matcher_work_scope(match).group_id == group_id
                     )
                 ]
             for match in reps:
                 if match.target_op_name != "MAC":
                     raise NotImplementedError(
                         "AiM native whole-program lowering currently supports "
-                        f"MAC reductions; {base} contains {match.target_op_name}. "
+                        f"MAC reductions; {match.func_name} contains "
+                        f"{match.target_op_name}. "
                         "Keep unsupported broadcast/normalization work on the host."
                     )
                 ctx.emit_gemv(match)
+                ctx.emit_eoc()
         return
 
-    layout_by_func: dict[str, Placement] = {}
-    for (func_name, matches), layout in zip(_bucket_for_autoschedule(trace), layouts):
-        layout_by_func[func_name] = layout
-        for match in matches:
-            layout_by_func[match.func_name] = layout
+    layout_by_scope: dict[tuple, Placement] = {
+        search_scope: layout
+        for (search_scope, _matches), layout in zip(
+            _bucket_for_autoschedule(trace), layouts
+        )
+    }
 
     def _emit_one_bucket(matches: list[MatchedOp]) -> None:
-        # All matches in one work-id bucket share a func_name (work_id
-        # is parsed from func_name in the matcher). Take the first.
-        func_name = matches[0].func_name
-        layout = layout_by_func[func_name]
+        layout = layout_by_scope[_matcher_search_scope(matches[0])]
         # Make backend decisions derived from the carried F2 layout visible to
         # operation dispatch and backend contexts. This deliberately
         # overwrites stale duplicated fields on hand-authored placements.
         layout.extra = derive_layout_properties(target, layout)
         # Backend contexts use this coordinate to materialise symbolic target
         # handles (for AiM: channel mask and 4*bank_group+bank index).
-        ctx._active_work_id = tuple(matches[0].work_id)
+        ctx._active_work_id = _matcher_work_scope(matches[0]).work_id
         if isinstance(ctx, APUv1Ctx):
             ctx.group_size = int(layout.extra.get("group_size", 32768))
             ctx.vector_batches = max(1, int(layout.extra.get("n_out_tiles", 1)))
@@ -1613,61 +1797,90 @@ def _walk_and_emit(
         _schedule_moves(target, ctx, layout, role_to_memref, phase="post")
 
     if isinstance(ctx, APUv1Ctx) and any(
-        match.extra.get("coalesced_spmw_axis") == "group" for match in trace.matches
+        _matcher_work_scope(match).coalesced_axes for match in trace.matches
     ):
         buckets = [
-            (tuple(matches[0].work_id), matches)
+            (_matcher_work_scope(matches[0]).work_id, matches)
             for _name, matches in _bucket_for_autoschedule(trace)
         ]
     else:
         buckets = _bucket_by_work_id(trace)
 
-    # Lever 3 (SPEC-025 §5): the CRF-issue mode is a decided property of the
-    # layout (`extra["crf_issue"]`, set by argmin). Codegen only
-    # materialises it -- it never chooses on shape/count/stream length.
-    # Default-missing key == "per_workid", so every pre-lever-3 placement
-    # and every non-Samsung backend takes the replicated path unchanged.
-    crf_issue = "per_workid"
-    for layout in layouts:
-        issue = getattr(layout, "extra", {}).get("crf_issue")
-        if issue is not None:
-            crf_issue = issue
-            break
-
-    if crf_issue == "shared":
-        # Shared CRF: per kernel, emit ONE representative CRF body (walked
-        # through the normal emit path -- generated from the Placement, not
-        # a golden table, SPEC-025 §5.5) and record one host trigger per
-        # work-id bucket. A single-kernel GEMV thus emits one body + N
-        # triggers; a multi-kernel workload (MLP) emits one body per layer
-        # (each layer's CRF is its own shared program).
-        def _base_kernel(m) -> str:
-            return _base_kernel_name(m.func_name, m.work_id)
-
-        # Group buckets by base kernel, preserving first-seen order. Grid
-        # replicas of one kernel share a body; distinct kernels do not.
-        per_kernel: dict[str, list] = {}
-        kernel_order: list[str] = []
+    if isinstance(ctx, SamsungCtx):
+        # Resolve CRF issue independently for every retained matcher group.
+        # A prior implementation inspected the first placement carrying a
+        # `crf_issue` field and silently imposed that choice on the complete
+        # program. Mixed shared/per-work-id programs now materialize exactly,
+        # while an internally mixed group fails as an infeasible schedule.
+        per_kernel: dict[int, list] = {}
+        kernel_order: list[int] = []
         for work_id, matches in buckets:
-            fn = _base_kernel(matches[0])
-            if fn not in per_kernel:
-                per_kernel[fn] = []
-                kernel_order.append(fn)
-            per_kernel[fn].append((work_id, matches))
+            group_id = _matcher_work_scope(matches[0]).group_id
+            if group_id not in per_kernel:
+                per_kernel[group_id] = []
+                kernel_order.append(group_id)
+            per_kernel[group_id].append((work_id, matches))
 
-        # The expected work-id count is a structural target fact, not a cost
-        # model helper. Axis 0 is the replica axis; axis 1 is the spatial
-        # work-id fanout used by the Samsung backend.
         expected = target.work_grid()[1]
-        for fn in kernel_order:
-            k_buckets = per_kernel[fn]
-            # One shared body for this kernel (the first work-id bucket).
+        for group_id in kernel_order:
+            k_buckets = per_kernel[group_id]
+            group_layouts = [
+                layout_by_scope[_matcher_search_scope(matches[0])]
+                for _work_id, matches in k_buckets
+            ]
+            issues = tuple(
+                getattr(layout, "extra", {}).get("crf_issue", "per_workid")
+                for layout in group_layouts
+            )
+            if any(issue not in ("shared", "per_workid") for issue in issues):
+                from .pim.schedule_search import InfeasibleSchedule
+
+                raise InfeasibleSchedule(
+                    f"matcher group {group_id} has an invalid CRF issue decision"
+                )
+            if len(set(issues)) != 1:
+                from .pim.schedule_search import InfeasibleSchedule
+
+                raise InfeasibleSchedule(
+                    f"matcher group {group_id} mixes shared and per-work-id CRF issue"
+                )
+            if issues[0] == "per_workid":
+                for _work_id, matches in k_buckets:
+                    _emit_one_bucket(matches)
+                continue
+
+            from .spmw_autoschedule import _matcher_placement_decision
+
+            representative_trace = MatchTrace(
+                target_name=trace.target_name,
+                module_name=trace.module_name,
+                matches=k_buckets[0][1],
+            )
+            representative = _matcher_placement_decision(
+                representative_trace,
+                group_layouts[0],
+            )
+            for layout, (_work_id, matches) in zip(group_layouts[1:], k_buckets[1:]):
+                candidate_trace = MatchTrace(
+                    target_name=trace.target_name,
+                    module_name=trace.module_name,
+                    matches=matches,
+                )
+                if (
+                    _matcher_placement_decision(candidate_trace, layout)
+                    != representative
+                ):
+                    from .pim.schedule_search import InfeasibleSchedule
+
+                    raise InfeasibleSchedule(
+                        f"matcher group {group_id} shares CRF across distinct bodies"
+                    )
+
             _emit_one_bucket(k_buckets[0][1])
             for work_id, matches in k_buckets:
-                # tile_count = the per-work-id output-tile fire count (the
-                # MAC sites the host fires for this work-id), from the
-                # bucket's matches, not a shape literal.
-                tile_count = sum(1 for m in matches if m.target_op_name == "MAC")
+                tile_count = sum(
+                    1 for match in matches if match.target_op_name == "MAC"
+                )
                 ctx.host_schedule.append(HostTrigger(work_id, tile_count))
             # SPEC-025 §5.3 agreement guard: a single full-grid GEMV kernel's
             # work-id axis must equal the unit-tree fanout product, else the
@@ -2214,6 +2427,32 @@ def _assert_host_move_roles(compiled, inputs) -> None:
                 )
 
 
+def _samsung_runtime_route(commands) -> str:
+    op_types = {command.type_ for command in commands if isinstance(command, PIMCmd)}
+    compute_types = op_types & {"MAC", "MUL", "ADD", "RELU"}
+    return "GENERIC_REDUCE" if compute_types == {"MAC"} else "GENERIC"
+
+
+def _samsung_main_runtime_command_valid(command: PIMCmd) -> bool:
+    if command.type_ in ("MOV", "FILL"):
+        bank_dst = command.dst_ in ("EVEN_BANK", "ODD_BANK")
+        grf_src = any(
+            source in ("GRF_A", "GRF_B")
+            for source in (command.src0_, command.src1_, command.src2_)
+        )
+        if bank_dst and grf_src:
+            return False
+    return True
+
+
+def _samsung_main_runtime_commands(commands) -> tuple[PIMCmd, ...]:
+    return tuple(
+        command
+        for command in commands
+        if isinstance(command, PIMCmd) and _samsung_main_runtime_command_valid(command)
+    )
+
+
 def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
     """Run a compiled Samsung HBM-PIM artifact via `pim_driver`.
 
@@ -2256,50 +2495,17 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
     # the CRF microcode -- that comes from `compiled.cmds` via `--cmds`.
     # The choice of which scaffolding to use is inferred from MAC-vs-eltwise
     # opcodes in the emitted stream.
-    op_types = {c.type_ for c in compiled.cmds if isinstance(c, PIMCmd)}
-    # Legacy single-kernel shapes keep their dedicated C++ data-path (frozen):
-    #   MAC-only -> GEMV; MUL-only -> MUL; ADD-only -> ADD; RELU(MOV is_relu)-only
-    #   -> RELU. Anything else (multiple distinct compute opcodes, fused MAC+ADD,
-    #   multi-store polybench kernels) routes to the faithful GENERIC interpreter.
-    compute_types = op_types & {"MAC", "MUL", "ADD", "RELU"}
-    # SPEC-05 routing (legacy GEMV/ADD/MUL/RELU paths DELETED, user-approved
-    # 2026-06-30): every MAC kernel routes to the mapping-driven GENERIC REDUCE
-    # conductor (a plain GEMV is N=1); everything else (eltwise MUL/ADD/RELU,
-    # multi-opcode, fused) routes to the faithful GENERIC ELTWISE conductor. There
-    # is no dedicated --op GEMV/ADD/MUL/RELU branch and no multi-layer GEMV split.
-    if compute_types == {"MAC"}:
-        kernel = "GENERIC_REDUCE"
-    else:
-        kernel = "GENERIC"
+    kernel = _samsung_runtime_route(compiled.cmds)
 
     # numpy is a hard Tenon dependency; "no numpy" is a setup bug, not
     # an env skip -- let the ImportError propagate.
     import numpy as np
 
-    # SPEC-020: ISA-valid filter applied up-front so layer-splitting sees
-    # the same cmd stream the driver eventually runs.
-    def _crf_valid(c: PIMCmd) -> bool:
-        # SamsungCtx emits per-role storeback "MOV ODD_BANK <- GRF_B" /
-        # "MOV EVEN_BANK <- GRF_A" entries (the `ST_A`/`ST_B` moves).
-        # The C++ PIMCmd::validationCheck rejects those as "Invalid in
-        # ISA 1.0" because bank stores are issued by the DRAM controller
-        # via addTransactionAll, not by CRF MOV. Drop them here so the
-        # cmd stream that reaches programCrf is ISA-valid. This is a
-        # run-side workaround; the proper fix is in SamsungCtx (followup
-        # SPEC-005 §8 / needs-arch-MMM).
-        if c.type_ in ("MOV", "FILL"):
-            bank_dst = c.dst_ in ("EVEN_BANK", "ODD_BANK")
-            grf_src = any(s in ("GRF_A", "GRF_B") for s in (c.src0_, c.src1_, c.src2_))
-            if bank_dst and grf_src:
-                return False
-        return True
-
-    pim_cmds_raw = [c for c in compiled.cmds if isinstance(c, PIMCmd)]
     # ISA-valid filter (drop the ST_A/ST_B storeback MOVs the C++ validationCheck
     # rejects) -> the cmd stream that reaches programCrf via --cmds for the GENERIC
     # ELTWISE path. (The GENERIC_REDUCE path supplies its own minimal CRF and
     # ignores this; see its argv branch.)
-    pim_cmds_all = [c for c in pim_cmds_raw if _crf_valid(c)]
+    pim_cmds_all = list(_samsung_main_runtime_commands(compiled.cmds))
 
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
@@ -2778,12 +2984,49 @@ def _run_samsung_batched(
     )
 
 
+def _aim_runtime_segments(commands) -> tuple[tuple[str, int, tuple[str, ...]], ...]:
+    """Parse the exact pre-terminated AiM streams consumed by Ramulator2."""
+
+    segments: list[tuple[str, int, tuple[str, ...]]] = []
+    current_label = "program"
+    current_repeat = 1
+    current: list[str] = []
+
+    def finish_segment() -> None:
+        nonlocal current
+        if not current:
+            return
+        eoc_positions = [
+            index for index, line in enumerate(current) if line.strip() == "AiM EOC"
+        ]
+        if eoc_positions != [len(current) - 1]:
+            raise ValueError(
+                "AiM runtime segment must contain exactly one trailing EOC"
+            )
+        segments.append((current_label, current_repeat, tuple(current)))
+        current = []
+
+    for raw in map(str, commands):
+        if raw.startswith("# TENON_GEMV "):
+            finish_segment()
+            current_label = raw[2:]
+            repeat_match = re.search(r"repeat=(\d+)", raw)
+            current_repeat = int(repeat_match.group(1)) if repeat_match else 1
+            current = []
+        else:
+            current.append(raw)
+    finish_segment()
+    if not segments:
+        raise ValueError("AiM runtime requires at least one terminated segment")
+    return tuple(segments)
+
+
 def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
     """Run a compiled AiM artifact through ramulator2 in Docker.
 
-    `compiled.cmds` is a list of text trace lines; we serialise them
-    plus a trailing EOC marker, then invoke the ramulator2 binary
-    inside the `aim-simulator-build` Docker image. The simulator's
+    `compiled.cmds` is a list of already-terminated text trace lines. We
+    serialize those exact candidate-owned segments and invoke the ramulator2
+    binary inside the `aim-simulator-build` Docker image. The simulator's
     YAML stdout carries per-channel `memory_system_cycles`; we parse
     out the max across channels as the headline cycle count.
     """
@@ -2804,8 +3047,6 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
         ) as tf:
             for line in lines:
                 tf.write(str(line) + "\n")
-            if not any("EOC" in str(line) for line in lines):
-                tf.write("AiM EOC\n")
             trace_path = Path(tf.name)
         trace_rel = trace_path.relative_to(root)
         try:
@@ -2845,24 +3086,9 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
     # Compact traces carry independently dispatched GEMV templates. Profile
     # every native segment once, then apply its compile-time repeat count. All
     # base values are direct Ramulator2 measurements from this invocation.
-    segments: list[tuple[str, int, list[str]]] = []
-    current_label = "program"
-    current_repeat = 1
-    current: list[str] = []
-    for raw in map(str, compiled.cmds):
-        if raw.startswith("# TENON_GEMV "):
-            if current:
-                segments.append((current_label, current_repeat, current))
-            current_label = raw[2:]
-            repeat_match = re.search(r"repeat=(\d+)", raw)
-            current_repeat = int(repeat_match.group(1)) if repeat_match else 1
-            current = []
-        else:
-            current.append(raw)
-    if current:
-        segments.append((current_label, current_repeat, current))
+    segments = tuple(getattr(compiled, "runtime_segments", ()))
     if not segments:
-        segments = [("program", 1, list(map(str, compiled.cmds)))]
+        segments = _aim_runtime_segments(compiled.cmds)
 
     total_cycles = 0
     logs: list[str] = []
@@ -3362,6 +3588,13 @@ class Compiled:
         host_moves: "list[ResolvedHostMove] | None" = None,
         execution_graph=None,
         cost=None,
+        schedule_search_result=None,
+        schedule_activation=None,
+        host_schedule=None,
+        runtime_abi=(),
+        runtime_segments=(),
+        matcher_codegen_artifact=None,
+        matcher_materialization=None,
     ):
         self.target = target
         self.trace = trace
@@ -3380,13 +3613,38 @@ class Compiled:
         # unset and remain on their existing path during migration.
         self.execution_graph = execution_graph
         self.cost = cost
+        self.schedule_search_result = schedule_search_result
+        self.schedule_activation = schedule_activation
+        self.fallback_reason = (
+            None if schedule_activation is None else schedule_activation.fallback_reason
+        )
         self.backend = backend
+        self.runtime_abi = tuple(runtime_abi)
+        self.runtime_segments = tuple(runtime_segments)
+        self.matcher_codegen_artifact = matcher_codegen_artifact
+        self.matcher_materialization = matcher_materialization
         # Lever 3 (SPEC-025 §5.4): shared-CRF host trigger schedule (one
         # HostTrigger per work-id), parallel to `cmds`. Empty for the
         # per-work-id path and every non-Samsung backend.
         self.host_schedule: list[HostTrigger] = list(
             getattr(ctx, "host_schedule", []) or []
+            if host_schedule is None
+            else host_schedule
         )
+
+    @property
+    def promotion_materialization_fingerprint(self):
+        if self.matcher_materialization is None:
+            return None
+        try:
+            self._validate_matcher_materialization()
+        except RuntimeError:
+            return None
+        return self.matcher_materialization.promotion_materialization_fingerprint
+
+    def _validate_matcher_materialization(self) -> None:
+        if self.matcher_codegen_artifact is not None:
+            self.matcher_codegen_artifact.validate_compiled(self)
 
     def run(self, **inputs) -> RunResult:
         """Run this compiled artifact on its target backend.
@@ -3397,6 +3655,7 @@ class Compiled:
         succeeds and returns `cycles=None` with a "simulator
         unavailable" stdout — `run()` never raises for missing tooling.
         """
+        self._validate_matcher_materialization()
         target_name = getattr(self.target, "name", None)
         # design 04 §2.1: a `backend="virtual"` Compiled dispatches to the
         # sim-free virtual runner regardless of target.name.
@@ -3423,6 +3682,7 @@ class Compiled:
         so the caller can assert the gate-A strict beat. B is read off
         `X.shape[0]`, never a literal.
         """
+        self._validate_matcher_materialization()
         target_name = getattr(self.target, "name", None)
         if target_name != "samsung_hbm_pim":
             raise NotImplementedError(
@@ -3459,19 +3719,17 @@ def _check_work_grid(target, trace, *, auto_fill=True):
     derived = target.work_grid()[1]
     buckets = _bucket_for_autoschedule(trace)
     if target.name == "apu_v1" and any(
-        match.extra.get("coalesced_spmw_axis") == "group" for match in trace.matches
+        _matcher_work_scope(match).coalesced_axes for match in trace.matches
     ):
         # The authored scalar mapping is a VR partition axis. Four physical
         # APUC tasks are supplied by the backend and are not source replicas.
         return target.work_grid()[1]
-    # Distinct base kernels (strip the _<wid> grid-replica suffix). The bucket
-    # func_name carries the suffix; recover the work_id from the bucket's first
-    # match so the suffix strips correctly.
-    base_kernels = set()
+    # Distinct retained matcher groups. Multi-kernel traces are exempt because
+    # each ``@allo.work`` layer may legitimately walk its own partition.
+    group_ids = set()
     for _fn, matches in buckets:
-        m0 = matches[0]
-        base_kernels.add(_base_kernel_name(m0.func_name, m0.work_id))
-    if len(base_kernels) != 1:
+        group_ids.add(_matcher_work_scope(matches[0]).group_id)
+    if len(group_ids) != 1:
         return derived  # multi-kernel: exempt
     observed = len(buckets)
     if observed == derived:
@@ -3568,6 +3826,173 @@ def _stamp_host_moves(stored_layout, resolved):
             extra["host_moves"] = resolved
 
 
+def _matcher_trace_runtime_abi(trace: MatchTrace) -> tuple:
+    matches = []
+    for match in trace.matches:
+        scope = _matcher_work_scope(match)
+        operands = tuple(
+            (
+                operand.role,
+                operand.memref_name,
+                tuple(map(str, operand.indices)),
+                operand.memref_type,
+                bool(operand.is_loop_carried),
+                None if operand.value_ref is None else operand.value_ref.manifest(),
+            )
+            for operand in match.operands
+        )
+        matches.append(
+            (
+                scope.group_id,
+                tuple(scope.work_id),
+                match.target_op_name,
+                tuple(
+                    (str(var), str(lower), str(upper), int(step))
+                    for var, lower, upper, step in match.enclosing_loops
+                ),
+                operands,
+                match.result_memref_name,
+                (
+                    None
+                    if match.result_value_ref is None
+                    else match.result_value_ref.manifest()
+                ),
+            )
+        )
+    return tuple(matches)
+
+
+def _matcher_runtime_source_fingerprint(target_name: str) -> str:
+    functions = {
+        "aim": (_aim_runtime_segments, _run_aim),
+        "samsung_hbm_pim": (
+            _samsung_runtime_route,
+            _samsung_main_runtime_command_valid,
+            _samsung_main_runtime_commands,
+            _write_samsung_cmds,
+            _run_samsung,
+        ),
+        "apu_v1": (_run_apu_v1,),
+        "apu_v2": (_run_apu_v2,),
+    }.get(target_name, ())
+    runner = _BACKEND_RUN.get(target_name)
+    if runner is not None and runner not in functions:
+        functions = (*functions, runner)
+    digest = hashlib.sha256()
+    for function in functions:
+        code = getattr(function, "__code__", None)
+        if code is None:
+            return ""
+        digest.update(marshal.dumps(code))
+        digest.update(repr(getattr(function, "__defaults__", None)).encode("utf-8"))
+        digest.update(repr(getattr(function, "__kwdefaults__", None)).encode("utf-8"))
+        digest.update(repr(sorted(vars(function).items())).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _materialize_matcher_codegen(
+    target,
+    trace: MatchTrace,
+    layouts,
+    *,
+    host_moves=(),
+) -> MatcherCodegenArtifact:
+    """Emit and freeze the exact executable side of one scored candidate."""
+
+    target_name = getattr(target, "name", None)
+    ctx_cls = _BACKEND_CTX.get(target_name)
+    if ctx_cls is None:
+        raise NotImplementedError(f"no matcher codegen context for {target_name!r}")
+
+    ctx = ctx_cls(target)
+    _walk_and_emit(target, trace, ctx, layouts)
+    commands = tuple(_clone_matcher_command(command) for command in ctx.cmds)
+    command_manifest = _matcher_command_manifest(commands)
+    host_schedule = tuple(
+        HostTrigger(trigger.work_id, trigger.tile_count)
+        for trigger in getattr(ctx, "host_schedule", ())
+    )
+    host_schedule_manifest = _matcher_host_schedule_manifest(host_schedule)
+    host_preloads = tuple(getattr(ctx, "host_preloads", ()))
+    emitted_host_moves_manifest = _matcher_emitted_host_move_manifest(
+        getattr(ctx, "host_moves_emitted", ())
+    )
+    resolved_host_moves = tuple(host_moves)
+    host_manifest_error = None
+    try:
+        resolved_host_moves_manifest = _matcher_resolved_host_move_manifest(
+            resolved_host_moves
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        resolved_host_moves_manifest = (
+            ("unavailable", tuple(type(item).__name__ for item in resolved_host_moves)),
+        )
+        host_manifest_error = str(error)
+    trace_abi = _matcher_trace_runtime_abi(trace)
+    runtime_source_fingerprint = _matcher_runtime_source_fingerprint(target_name)
+    blockers = []
+    if host_manifest_error is not None:
+        blockers.append(
+            f"resolved host transfer ABI is unavailable: {host_manifest_error}"
+        )
+
+    if target_name == "aim":
+        try:
+            runtime_segments = _aim_runtime_segments(commands)
+        except ValueError as error:
+            runtime_segments = ()
+            blockers.append(str(error))
+        route = "ramulator2-preterminated-segments"
+        if host_schedule:
+            blockers.append("AiM runtime does not consume a host trigger side stream")
+        if host_preloads:
+            blockers.append("AiM runtime does not consume matcher host preloads")
+    elif target_name == "samsung_hbm_pim":
+        route = _samsung_runtime_route(commands)
+        runtime_commands = _samsung_main_runtime_commands(commands)
+        runtime_segments = (_matcher_command_manifest(runtime_commands),)
+        if route == "GENERIC_REDUCE":
+            blockers.append(
+                "Samsung REDUCE runtime replaces the emitted CRF command stream"
+            )
+        if _matcher_command_manifest(runtime_commands) != command_manifest:
+            blockers.append("Samsung runtime filters the emitted command stream")
+        if host_schedule:
+            blockers.append("Samsung runtime does not consume shared-CRF triggers")
+        if host_preloads:
+            blockers.append("Samsung runtime does not consume matcher host preloads")
+    else:
+        route = "unsupported-exact-matcher-runtime"
+        runtime_segments = ()
+        blockers.append(
+            f"{target_name} matcher runtime is not an exact frozen command consumer"
+        )
+
+    runtime_abi = (
+        "matcher-runtime-abi-v1",
+        target_name,
+        route,
+        trace_abi,
+        resolved_host_moves_manifest,
+    )
+    return MatcherCodegenArtifact(
+        target_name=target_name,
+        commands=commands,
+        command_manifest=command_manifest,
+        host_schedule=host_schedule,
+        host_schedule_manifest=host_schedule_manifest,
+        host_preloads=host_preloads,
+        emitted_host_moves_manifest=emitted_host_moves_manifest,
+        resolved_host_moves=resolved_host_moves,
+        resolved_host_moves_manifest=resolved_host_moves_manifest,
+        runtime_abi=runtime_abi,
+        runtime_segments=runtime_segments,
+        runtime_source_fingerprint=runtime_source_fingerprint,
+        non_promotable_reason="; ".join(blockers) if blockers else None,
+        context=ctx,
+    )
+
+
 def compile_for_target(
     target: Any,
     trace: MatchTrace,
@@ -3576,6 +4001,7 @@ def compile_for_target(
     host_moves: "list | None" = None,
     buffer_metrics: "dict | None" = None,
     cost=None,
+    promotion_gate=None,
 ) -> Compiled:
     """Lower a (target, trace) pair to a runnable backend artifact by
     walking the target's declarations.
@@ -3594,6 +4020,11 @@ def compile_for_target(
     resolved against the target (verb + device-handle identity) and stored on
     ``Compiled.host_moves`` so the run path asserts the operand->role binding.
     """
+    from .pim.schedule_promotion import validate_schedule_promotion_gate
+
+    promotion_gate = validate_schedule_promotion_gate(promotion_gate)
+    if promotion_gate is not None and layout is not None:
+        raise ValueError("promotion evidence cannot override an explicit layout")
     target_name = getattr(target, "name", None)
     if target_name == "upmem":
         raise TypeError(
@@ -3614,6 +4045,10 @@ def compile_for_target(
     # A virtual-only target needs no code generator. Its executable cost spec
     # lowers the trace directly to the retained handle-based graph.
     if backend == "virtual" and _BACKEND_CTX.get(target_name) is None:
+        if promotion_gate is not None:
+            raise ValueError(
+                "the selected virtual lowering has no schedule-search activation"
+            )
         if layout is None:
             stored_layout = Placement(placements={})
         elif isinstance(layout, Placement):
@@ -3658,7 +4093,14 @@ def compile_for_target(
     n_groups = len(buckets) or 1
 
     if layout is None:
-        layouts = autoschedule(target, trace, cost=cost)
+        layouts = autoschedule(
+            target,
+            trace,
+            cost=cost,
+            host_moves=resolved_host_moves,
+            buffer_metrics=buffer_metrics,
+            promotion_gate=promotion_gate,
+        )
     elif isinstance(layout, Placement):
         # Single layout: replicate across every kernel. Equivalent to
         # the old behaviour for single-layer traces.
@@ -3670,6 +4112,39 @@ def compile_for_target(
         raise ValueError(
             f"layout list has {len(layouts)} entries but trace has "
             f"{len(buckets)} @allo.work kernels"
+        )
+
+    schedule_search_result = getattr(layouts, "schedule_search_result", None)
+    schedule_activation = getattr(layouts, "schedule_activation", None)
+    active_materialization = getattr(layouts, "active_materialization", None)
+    if active_materialization is not None:
+        executable = active_materialization.executable
+        if hasattr(active_materialization, "placement"):
+            exact_layouts = [active_materialization.placement]
+        else:
+            exact_layouts = list(active_materialization.placements)
+        if len(exact_layouts) != len(buckets):
+            raise RuntimeError(
+                "activated matcher materialization does not align with trace buckets"
+            )
+        stored_layout = exact_layouts[0] if len(exact_layouts) == 1 else exact_layouts
+        return Compiled(
+            target,
+            trace,
+            executable.instantiate_commands(),
+            stored_layout,
+            ctx=executable.context,
+            backend=backend,
+            host_moves=resolved_host_moves,
+            execution_graph=active_materialization.execution_graph,
+            cost=cost,
+            schedule_search_result=schedule_search_result,
+            schedule_activation=schedule_activation,
+            host_schedule=executable.instantiate_host_schedule(),
+            runtime_abi=executable.runtime_abi,
+            runtime_segments=executable.runtime_segments,
+            matcher_codegen_artifact=executable,
+            matcher_materialization=active_materialization,
         )
 
     ctx = ctx_cls(target)
@@ -3706,4 +4181,6 @@ def compile_for_target(
         host_moves=resolved_host_moves,
         execution_graph=execution_graph,
         cost=cost,
+        schedule_search_result=schedule_search_result,
+        schedule_activation=schedule_activation,
     )

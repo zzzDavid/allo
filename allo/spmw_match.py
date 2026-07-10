@@ -15,6 +15,32 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+@dataclass(frozen=True, order=True)
+class IRValueRef:
+    """Exact retained-IR identity for one matcher-visible SSA value."""
+
+    namespace: str
+    path: tuple[int, ...]
+
+    def __post_init__(self):
+        if not isinstance(self.namespace, str) or not self.namespace:
+            raise ValueError("IR value namespace must be nonempty")
+        if (
+            not isinstance(self.path, tuple)
+            or not self.path
+            or any(
+                not isinstance(component, int)
+                or isinstance(component, bool)
+                or component < 0
+                for component in self.path
+            )
+        ):
+            raise ValueError("IR value path must contain non-negative components")
+
+    def manifest(self) -> tuple[str, tuple[int, ...]]:
+        return self.namespace, self.path
+
+
 @dataclass
 class OperandBinding:
     """One operand of a MatchedOp, traced back to its memref-load origin.
@@ -44,6 +70,9 @@ class OperandBinding:
     # materialise a compact matched loop nest as a native command stream.
     # Older/synthetic matches may leave it unset.
     memref_type: str | None = None
+    # Exact source SSA/storage identity retained from MLIR def-use and call/ABI
+    # edges. Diagnostic memref names and textual types never substitute for it.
+    value_ref: IRValueRef | None = None
 
 
 @dataclass
@@ -82,6 +111,9 @@ class MatchedOp:
     result_memref_name: str | None
     op_range: tuple[str, str]
     extra: dict[str, Any] = field(default_factory=dict)
+    # Exact SSA/storage identity of the store destination. Synthetic or legacy
+    # traces may leave it unset; cross-boundary analysis then fails closed.
+    result_value_ref: IRValueRef | None = None
 
 
 @dataclass

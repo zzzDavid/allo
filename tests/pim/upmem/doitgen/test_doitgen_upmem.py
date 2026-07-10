@@ -1,41 +1,44 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""PolyBench doitgen on upmem -- Tier-1 single-output cell (task 005).
-
-Thin cell: build the target from `lib`, run the shared `doitgen` workload through
-`lib.cell.run_cell`, record the verdict + cycles + results.json/RESULTS.md +
-COVERAGE.tsv. Declares zero hardware (everything from `lib` + the shared
-workload). Verdict derived from what the run surfaces: UPMEM GEMV-host slot verifies W@x internally (PASS w/ cycles); a VA-slot route is CYCLES-ONLY.
-"""
+"""Faithful PolyBench leaf compiled through MLIR for a full UPMEM rank."""
 
 from __future__ import annotations
 
-from lib import cell, reference
-from lib.shapes import shape
+from pathlib import Path
 
-from workloads import doitgen as _wl
+import allo
+
+from lib import upmem
+from lib.cost import bind_cost
+from lib.targets import build_target
 
 _KERNEL = "doitgen"
-_TARGET = "upmem"
 _RUN_CMD = (
-    "python -m pytest tests/pim/upmem/doitgen/test_doitgen_upmem.py "
+    f"python -m pytest tests/pim/upmem/{_KERNEL}/{Path(__file__).name} "
     "-p no:cacheprovider -q"
+)
+_NOTES = (
+    "The complete canonical Allo kernel is lowered through MLIR to portable C. "
+    "Its NumPy-visible results are checked against the repository reference; "
+    "the UPMEM ABI uses 64 DPUs and retains the declarative partition, barrier, "
+    "collective, temporal, pivot, or wavefront orchestration plan. Reported "
+    "cycles are analytical cost-program estimates, not simulator measurements."
 )
 
 
-def test_doitgen_upmem(request):
-    result, verdict, _record = cell.run_cell(
-        kernel=_KERNEL, target_name=_TARGET, workload=_wl.build(),
-        folder=request.path.parent, stages=_wl.STAGES, shapes=shape(_KERNEL),
+def test_upmem_polybench_leaf(request):
+    workload = upmem.load_leaf_workload(request.path.parent)
+    target = build_target("upmem")
+    cost = bind_cost(target)
+
+    compiled = allo.compile(workload.build(), target, cost)
+
+    _result, estimate, verdict, _record = upmem.run_polybench_case(
+        compiled,
+        workload.CASE,
+        folder=request.path.parent,
         run_cmd=_RUN_CMD,
-        notes="Tier-1 single-output; UPMEM GEMV-host slot verifies W@x internally (PASS w/ cycles); a VA-slot route is CYCLES-ONLY.",
+        notes=_NOTES,
     )
-    # First-class recorded verdict (spec Answer 3), never a skip.
-    assert verdict.status in (reference.PASS, reference.CYCLES_ONLY), verdict
-    if verdict.status in (reference.CYCLES_ONLY, reference.PASS) and not cell.sim_unavailable(result):
-        assert result.cycles is not None and result.cycles > 0, (
-            f"{_TARGET}: expected positive cycles; got {result.cycles!r}; "
-            f"stdout tail: {result.stdout[-400:]}"
-        )
-    elif verdict.status == reference.BLOCKED_SIM:
-        assert result.cycles is None
+    assert verdict.status == "PASS"
+    assert estimate.cycles > 0

@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import contextlib
 import pathlib
+import shutil
+import subprocess
 
 import pytest
 
@@ -25,6 +27,7 @@ import pytest
 # folder under tests/pim/.
 
 _BOARD_LOCK = pathlib.Path(__file__).resolve().parent / ".apu_v1.lock"
+_APU_G2_LOCK = pathlib.Path(__file__).resolve().parent / ".apu_g2.lock"
 
 
 def pytest_configure(config):
@@ -33,6 +36,10 @@ def pytest_configure(config):
         "apu_v1_device: APU v1 real-device test; gated to the server with the "
         "Gemini board (skips + records BLOCKED-DEVICE when unreachable). Never "
         "sim-substituted.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "apu_g2_device: APUg2 real-device VL64 test; never simulation-substituted.",
     )
 
 
@@ -76,3 +83,58 @@ def board_lock():
             yield
         finally:
             fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def apu_g2_unavailable_reason() -> str | None:
+    """Return why the installed Gemini-II hardware path cannot run."""
+
+    required = (
+        pathlib.Path("/dev/gsi/g2apu/apu-00"),
+        pathlib.Path("/opt/gsi/g2/vector_core/lib/libg2_64vl.a"),
+        pathlib.Path("/opt/gsi/share/g2_transport"),
+    )
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        return "missing " + ", ".join(missing)
+    if shutil.which("gsi_tool") is None or shutil.which("cmake") is None:
+        return "gsi_tool/cmake is not on PATH"
+    try:
+        probe = subprocess.run(
+            ["gsi_tool", "info", "apu-00", "-v"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"card probe failed: {error}"
+    if probe.returncode != 0:
+        return f"card probe exited {probe.returncode}"
+    if "Status          : Available" not in probe.stdout:
+        return "card is not Available"
+    return None
+
+
+@pytest.fixture
+def apu_g2_device_gate():
+    reason = apu_g2_unavailable_reason()
+    if reason is not None:
+        pytest.skip(f"BLOCKED-DEVICE({reason})")
+    yield
+
+
+@contextlib.contextmanager
+def apu_g2_board_lock():
+    """Serialize G2 card allocation without sharing the unrelated v1 lock."""
+
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    with open(_APU_G2_LOCK, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)

@@ -1,13 +1,12 @@
 # atax on upmem (SMALL)
 
-- correctness: **BLOCKED-SIM** -- upmem/atax: reference sim cored on the shape (env limit, not a Tenon gap): UPMEM uPIMulator returned but stdout/log missing 'cycle: ...' line; tail: PIMulator/src/core.(*ThreadPool).Dispatch(0x0?, {0x656f60?, 0x24501a794088?})
-	/work/s
-- reference: PolyBench/C 4.2.1 SMALL_DATASET (validated by `experiments/scripts/R_polybench_ref_validation.py`)
+- correctness: **PASS** -- canonical MLIR -> portable C matched repository NumPy reference for y (max_abs_err=2.28882e-05, rtol=0.0001, atol=0.0001); ABI packed and gathered a full 64-DPU rank
+- reference: examples/polybench/atax.py::atax_np SMALL_DATASET (validated by `tests/pim/test_upmem_polybench_registry.py`)
 - shapes: {'M': 116, 'N': 124}
-- cycles: N/A
-- source: `uPIMulator@870d916334e9ff0b190f555f951a9ec3c4257781 (cored on shape)`
+- cycles: 589396
+- source: `upmem_cost@1e9f869de726a65f (analytical MLIR operation graph); portable-C functional oracle`
 - run_cmd: `python -m pytest tests/pim/upmem/atax/test_atax_upmem.py -p no:cacheprovider -q`
-- timestamp: 2026-06-29T12:21:40.052159
-- tenon_commit: `ee1e52a539d6385a60d149ca238b592d9763103e`
+- timestamp: 2026-07-01T09:39:20.367427
+- tenon_commit: `6bc7474a09fa7d2d64007e6b929b6f68660729d3`
 
-Tier-1 multi-output; UPMEM GEMV-host slot verifies W@x internally (PASS w/ cycles); a VA-slot route is CYCLES-ONLY.
+The complete canonical Allo kernel is lowered through MLIR to portable C. Its NumPy-visible results are checked against the repository reference; the UPMEM ABI uses 64 DPUs and retains the declarative partition, barrier, collective, temporal, pivot, or wavefront orchestration plan. Reported cycles are analytical cost-program estimates, not simulator measurements. Tensor MRAM ownership and analytical DPU/tasklet fanout are derived from the compiled F2 LinearLayout.

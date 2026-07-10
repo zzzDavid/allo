@@ -1,7 +1,8 @@
 # Design 04 — Virtual accelerator backend: decoupled `CostModel`, virtual runner, trip-count resolution
 
-Status: Phase-0 architect spec (gating). Authoritative for tasks 002–008
-in `dev/06262026-virtual-accelerator-backend/`.
+Status: historical Phase-0 architect spec. The current public cost API is
+`allo/perf/`; UPMEM now uses `UPMEMProgram` and is not a simulator-backed
+matcher target. See designs 06 and 09 for the implemented path.
 Author: architect, 2026-06-26.
 
 This doc answers the five Phase-0 questions the task gates on:
@@ -260,7 +261,7 @@ Decision: **`compile_for_target(target, trace, backend="virtual",
 cost_flavor="faithful")`**. Reject `run(virtual=True)`.
 
 Why: the headline claim is *toolflow symmetry* — "virtual" is one more
-member of `{PIMSimulator, uPIMulator, ramulator2, APU silicon, virtual}`
+member of `{PIMSimulator, ramulator2, APU silicon, virtual}`
 behind **one dispatch surface**. A `virtual=True` kwarg on `run()` makes
 virtual a *modifier of a real backend's run*, which is the opposite of
 the claim. A `backend=` selector at compile time makes "virtual" a peer
@@ -324,8 +325,8 @@ the keys in `SPMW_ARCHITECTURE.md` §3 so callers can rely on them.
 ### 2.3 The virtual runner is genuinely sim-free (the anti-coupling gate)
 
 `_run_virtual` imports nothing from the simulator paths, calls no
-`subprocess`, no Docker, touches no `_pimsim_root()`/`_aim_root()`/
-`_upim_root()`. Task 005's no-sim proof (run with binaries removed from
+`subprocess`, no Docker, touches no `_pimsim_root()`/`_aim_root()`.
+Task 005's no-sim proof (run with binaries removed from
 PATH) passes **by construction** because the runner's only inputs are the
 `CostModel` and the in-memory trace. The coder must keep `_run_virtual`
 in a region of `spmw_codegen.py` (or import it from `spmw_cost_model.py`)
@@ -520,8 +521,8 @@ target)`, and the virtual runner calls the **same** `CostModel.compose`
 (§1.5). Comparing them is `cost_fn == cost_fn`; it proves nothing about
 whether the analytical model tracks reality. The validation MUST anchor
 the ground-truth ranking to **real simulator cycle numbers** produced by
-the existing `_BACKEND_RUN` simulator path (PIMSimulator / uPIMulator /
-ramulator2), never to the cost model.
+the existing `_BACKEND_RUN` simulator path (PIMSimulator / ramulator2), never
+to the cost model.
 
 **The metric.** For a backend `b` and a candidate set
 `C = [c_1 … c_n]` (n ≥ 2, §5.5.1):
@@ -562,7 +563,6 @@ apart**:
 | Backend | Candidate set (≥2, sim-distinguishable) | Why the simulator ranks them apart | Sim source |
 |---|---|---|---|
 | **Samsung** | **batched GEMV**: `weight_resident=False` vs `True` at B≥2 (SPEC-026), e.g. 4096×1024, B∈{2,4}. NOT single-shape placement parity (floor, zero delta). | resident preloads once + B·(exec+readback); non-resident re-preloads per vector. Driver `--batch`/`--native-rebaseline` emit genuinely different cycle totals (report 18: B*=2 crossover, 3.93× asymptote). | `_run_samsung_batched` (real `pim_driver`) |
-| **UPMEM** | `n_tasklets ∈ {1, 11}` (revolver fill) on a fixed GEMV/VA shape, AND a shape sweep (gemv 1024²/2048²). | uPIMulator schedules round-robin tasklets; the revolver model `S + ceil(S·(R−1)/min(T,R))` is validated against the sim's tasklet scaling (design 02). Different `T` → different sim cycles. | `_run_upmem` (real uPIMulator) |
 | **AiM** | shape sweep gemv 1024² / 2048² / 4096×1024 (opsize=K, SPEC-019). | ramulator2 issues `opsize` column requests per MAC_SBK; bigger K → more sim cycles, monotone. A ranking over shapes exists and the sim emits it. | `_run_aim` (real ramulator2) |
 
 > Why a *shape sweep* counts as a candidate set: rank-preservation over
@@ -643,7 +643,7 @@ Recorded as open tension T21 in `SPMW_ARCHITECTURE.md`.
    numbers from the non-virtual `_BACKEND_RUN` path; the gate is
    argmin-agreement (virtual winner == simulator winner) over per-backend
    candidate sets chosen so the **simulator** ranks them apart (Samsung
-   batched resident-vs-not; UPMEM `n_tasklets`/shape sweep; AiM shape
+   batched resident-vs-not; AiM shape
    sweep). Single-shape Samsung placement parity is excluded (floor =
    flat sim ranking = vacuous). Absent simulator → explicit skip, never a
    silent PASS and never a cost_fn fallback.

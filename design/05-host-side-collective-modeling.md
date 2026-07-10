@@ -62,12 +62,11 @@ backend's layout touches (Samsung GRF/bank/tile, APU v1/v2 element, AiM
 bank/bg) is pow2 hardware.
 
 The non-pow2 case — UPMEM racks expose 2560 (or 2552 masked) DPUs — is
-**not a device-layout axis**. The UPMEM enumerator carries no LinearLayout
-at all (SPEC-007 chose "remove"); its DOF are storage class + `n_tasklets`
-(report 25 §3.1), and the runtime is single-DPU
-(`spmw_codegen.py` `--num_channels 1 --num_dpus_per_rank 1`). The DPU
-*count* is a **host-side data-partition fan-out** — exactly the axis the
-host collective layer owns. So:
+**not a device-layout axis**. It remains a **host-side data-partition
+fan-out**, exactly the axis the host collective layer owns. The power-of-two
+64-DPU rank and padded tasklet subgroups are now device LinearLayout outputs;
+this does not route the rack fan through F2. See
+`design/09-aim-upmem-linear-layout.md`. So:
 
 * **Sharding annotation is retired for device placement** (Q4-of-task's D4
   holds): what the layout derives, `@[S(0)]` / `allo.grid_map` no longer
@@ -535,11 +534,11 @@ fallback second target if UPMEM scatter/gather hits a runtime wall.
   convention this cycle; a real host-bandwidth term is a later
   table-only refinement (the whole point of design 04's table split).
   Report 23 open-Q2.
-* **T20 — intra-DPU non-pow2 row count.** Report 25 §5: if a future spec
-  ever moves intra-DPU element tiling into a `LinearLayout`, a non-pow2
-  per-DPU row count (5 rows/DPU for M=12800/2560) hits the same pow2 wall.
-  Recommendation: keep intra-DPU tiling as integer arithmetic
-  (`n_tasklets`), never a layout axis. Closed unless a later spec moves it.
+* **T20 — intra-DPU non-pow2 row count.** UPMEM tensor layouts now pad
+  non-power-of-two logical spans to an F2 domain and keep tail validity in the
+  ABI. Padding never gathers back. This permits genuine `(dpu,tasklet,local)`
+  layout axes without pretending that 24 tasklets or an arbitrary row count is
+  itself a power of two. See design 09.
 * **T21 — reduce-operator resolution path.** Q4 reuses the `fn=lambda`
   path; the open edge is a `reduce` whose `op` is a *composite* (e.g.
   max-plus) not declared as a single target `Op`. Today's corpus only needs

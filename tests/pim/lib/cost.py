@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from allo.pim.costs import aim_cost, apu_v1_cost, samsung_cost
+from allo.pim.costs import aim_cost, apu_g2_cost, apu_v1_cost, samsung_cost, upmem_cost
 
 
 def bind_cost(target):
@@ -13,6 +13,10 @@ def bind_cost(target):
         return samsung_cost
     if getattr(target, "name", target) == "aim":
         return aim_cost
+    if getattr(target, "name", target) == "upmem":
+        return upmem_cost
     if getattr(target, "name", target) == "apu_v1":
         return apu_v1_cost
+    if getattr(target, "name", target) == "apu_v2":
+        return apu_g2_cost
     return None

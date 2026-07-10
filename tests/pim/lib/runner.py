@@ -118,18 +118,6 @@ def sim_source(backend: str) -> str:
             return f"PIMSimulator@bin-sha256:{_file_sha256_prefix(driver)}"
         return "PIMSimulator@unknown"
 
-    if backend == "upmem":
-        from allo.spmw_codegen import _upim_root
-
-        root = _upim_root()
-        sha = _try_git_sha(root)
-        if sha:
-            return f"uPIMulator@{sha}"
-        binary = root / "build" / "uPIMulator"
-        if binary.exists():
-            return f"uPIMulator@bin-sha256:{_file_sha256_prefix(binary)}"
-        return "uPIMulator@unknown"
-
     if backend == "aim":
         from allo.spmw_codegen import _aim_root
 
