@@ -13,7 +13,7 @@ import allo
 import allo.dataflow as df
 from allo._mlir.ir import ArrayAttr, IntegerAttr, StringAttr
 from allo.ir.builder import _spmw_group_contract
-from allo.ir.types import float32
+from allo.ir.types import bfloat16, float32
 from allo.pim.schedule_promotion import (
     CorrectnessEvidence,
     ExactCyclePolicy,
@@ -28,7 +28,9 @@ from allo.pim.schedule_promotion import (
 from allo.pim.schedule_search import ScheduleCandidate, ScheduleObjectiveDomain
 from allo.spmw_autoschedule import MatcherWorkScope, _bucket_for_autoschedule
 from allo.spmw_codegen import RunResult, _check_work_grid
+from allo.spmw_liveness import MatcherValueId, trace_liveness
 from allo.spmw_match import MatchTrace, MatchedOp
+from allo.spmw_plan import BufferMetricManifest, _coerce_buffer_metric_manifest
 
 
 class _FakeCompiled:
@@ -54,6 +56,38 @@ class _FakeCompiled:
 
 def _workload(A, B, C):
     del A, B, C
+
+
+@df.region()
+def _repeated_shape_metric_pipeline(
+    A: bfloat16[4, 4],
+    x: bfloat16[4],
+    tmp: bfloat16[4],
+    C: bfloat16[4],
+):
+    @allo.work(mapping=[1], args=[A, x, tmp])
+    def first_stage(
+        local_A: bfloat16[4, 4],
+        local_x: bfloat16[4],
+        local_tmp: bfloat16[4],
+    ):
+        for i in range(4):
+            acc: bfloat16 = 0
+            for j in range(4):
+                acc += local_A[i, j] * local_x[j]
+            local_tmp[i] = acc
+
+    @allo.work(mapping=[1], args=[A, tmp, C])
+    def second_stage(
+        local_A: bfloat16[4, 4],
+        local_tmp: bfloat16[4],
+        local_C: bfloat16[4],
+    ):
+        for i in range(4):
+            acc: bfloat16 = 0
+            for j in range(4):
+                acc += local_A[i, j] * local_tmp[j]
+            local_C[i] = acc
 
 
 @df.region()
@@ -160,9 +194,7 @@ def _stamp_retained_group(functions, work_ids, group_shape, coalesced_axes=()):
                 "spmw.body_fingerprint": body_fingerprints[work_id],
             }
         )
-        scopes.append(
-            MatcherWorkScope(group_id, work_id, group_shape, coalesced_axes)
-        )
+        scopes.append(MatcherWorkScope(group_id, work_id, group_shape, coalesced_axes))
     return tuple(scopes)
 
 
@@ -316,6 +348,56 @@ def test_compile_binds_executable_cost_spec(monkeypatch):
     assert captured["cost"] is module.cost
 
 
+def test_compile_binds_repeated_shape_metrics_by_retained_value(monkeypatch):
+    compiler_api = importlib.import_module("allo.compiler")
+    fake = _FakeCompiled()
+    captured = {}
+
+    def compile_fake(target, trace, **kwargs):
+        captured.update(trace=trace, **kwargs)
+        return fake
+
+    monkeypatch.setattr(compiler_api, "compile_for_target", compile_fake)
+    from allo.pim.costs import aim_cost
+    from allo.pim.targets import build_aim_target
+
+    allo.compile(_repeated_shape_metric_pipeline, build_aim_target(), aim_cost)
+
+    trace = captured["trace"]
+    manifest = captured["buffer_metrics"]
+    assert isinstance(manifest, BufferMetricManifest)
+    liveness = trace_liveness(trace)
+
+    def matcher_value_for_source(ordinal):
+        source_ref = trace.source_value_refs[ordinal]
+        values = {
+            liveness.value_id_for_operand(match, index)
+            for match in trace.matches
+            for index, operand in enumerate(match.operands)
+            if operand.value_ref == source_ref
+        }
+        values.discard(None)
+        assert len(values) == 1
+        return next(iter(values))
+
+    x_value = matcher_value_for_source(1)
+    tmp_value = matcher_value_for_source(2)
+    assert x_value != tmp_value
+    assert manifest.metrics_for(x_value)["shape"] == (4,)
+    assert manifest.metrics_for(tmp_value)["shape"] == (4,)
+    assert manifest.metrics_for(MatcherValueId("abi", -1, "argument", 3))["shape"] == (
+        4,
+    )
+
+    # The same whole-program manifest remains valid while the autoscheduler
+    # scores either individual kernel, which is where the legacy name/shape
+    # map previously rejected tmp/C as unbound.
+    for _scope, matches in _bucket_for_autoschedule(trace):
+        sub_trace = MatchTrace(trace.target_name, trace.module_name, matches)
+        coerced, _values = _coerce_buffer_metric_manifest(sub_trace, (), manifest)
+        assert coerced is manifest
+
+
 def test_run_backend_accepts_lowered_roles_outside_workload_signature(monkeypatch):
     fake, _captured = _patch_pipeline(monkeypatch)
     target = SimpleNamespace(name="fake")
@@ -448,8 +530,7 @@ def test_structural_mapping_boundaries_keep_distinct_kernel_groups():
         for name, operation in zip(names, ("MAC", "ADD"))
     ]
     retained_scopes = tuple(
-        _stamp_retained_group((function,), ((0,),), (1,))[0]
-        for function in functions
+        _stamp_retained_group((function,), ((0,),), (1,))[0] for function in functions
     )
     matches = [
         _matched_function(names[0], (0,), "MAC"),
@@ -558,13 +639,19 @@ def test_duplicate_isomorphic_groups_use_explicit_abi_identity_not_occurrence():
             if function.operation.name == "func.func"
             and "df.kernel" in function.attributes
         ]
-        assert len({int(function.attributes["spmw.group_id"]) for function in functions}) == 1
-        assert len(
-            {
-                function.attributes["spmw.group_fingerprint"].value
-                for function in functions
-            }
-        ) == 2
+        assert (
+            len({int(function.attributes["spmw.group_id"]) for function in functions})
+            == 1
+        )
+        assert (
+            len(
+                {
+                    function.attributes["spmw.group_fingerprint"].value
+                    for function in functions
+                }
+            )
+            == 2
+        )
         matches = [
             _matched_function(compiler_api._retained_symbol_name(function), (999,))
             for function in functions
@@ -574,8 +661,9 @@ def test_duplicate_isomorphic_groups_use_explicit_abi_identity_not_occurrence():
             SimpleNamespace(name="fake"), schedule.module, trace
         )
         return {
-            tuple(int(value) for value in function.attributes["spmw.abi_value_ids"]):
-            match.extra["spmw_work_scope"].group_id
+            tuple(
+                int(value) for value in function.attributes["spmw.abi_value_ids"]
+            ): match.extra["spmw_work_scope"].group_id
             for function, match in zip(functions, matches)
         }
 

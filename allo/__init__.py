@@ -77,6 +77,19 @@ from .spmw_codegen import (
 from .spmw_linear_layout import LinearLayout, materialise_handle
 from .compiler import compile, CompiledCallable
 from .pim.schedule_promotion import PromotionEvidence
+from .pim.aim_program import (
+    AimOp,
+    AimContraction,
+    AimElementwise,
+    AimActivation,
+    AimHostTransfer,
+    AimDistributedHostTransfer,
+    AimBankCopy,
+    AimAllBankWrite,
+    AimSync,
+    AimProgram,
+    AimProgramCallable,
+)
 from .pim.apu_v1_vector_program import APUv1VectorCallable
 from .pim.upmem_program import (
     UPMEMArray,

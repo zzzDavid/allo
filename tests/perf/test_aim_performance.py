@@ -22,16 +22,31 @@ from allo.spmw_match_engine import batch_dim
 from allo.spmw_plan import build_execution_graph
 
 
-def _mac(work_id=(0, 0, 0), index=0, *, bound=False):
+def _mac(
+    work_id=(0, 0, 0),
+    index=0,
+    *,
+    bound=False,
+    outputs=1,
+    reduction=256,
+    batch=1,
+):
+    loops = []
+    if outputs != 1:
+        loops.append(("i", "0", str(outputs), 1))
+    if batch != 1:
+        loops.append(("j", "0", str(batch), 1))
+    loops.append(("k", "0", str(reduction), 1))
     match = MatchedOp(
         target_op_name="MAC",
         func_name="gemv",
         work_id=work_id,
-        enclosing_loops=[("k", "0", "256", 1)],
+        enclosing_loops=loops,
         operands=[],
         result_memref_name=None,
         op_range=(f"begin{index}", f"end{index}"),
     )
+    match.extra.update(batch_dim=batch)
     if bound:
         match.operands = [
             OperandBinding("x", "W"),
@@ -94,7 +109,7 @@ def test_target_is_structural_and_matches_simulator_topology():
     assert not hasattr(target, "timing_library")
 
 
-def test_cost_distinguishes_single_bank_and_all_bank_mac():
+def test_mac_reduction_width_is_independent_of_output_bank_fanout():
     target = build_aim_target()
     match = _mac()
     single = Placement(placements={}, extra={"operation_name": "MAC"})
@@ -103,9 +118,47 @@ def test_cost_distinguishes_single_bank_and_all_bank_mac():
     _single_graph, single_estimate = _evaluate(target, [match], single)
     _all_graph, all_estimate = _evaluate(target, [match], all_bank)
 
-    # 256 scalars are 16 SBK columns, but one 16-bank ABK column.
+    # Both commands consume the same 16 reduction columns. MAC_ABK's banks
+    # produce independent outputs; they do not partition these 256 scalars.
     assert single_estimate.cycles == 87
-    assert all_estimate.cycles == 57
+    assert all_estimate.cycles == 87
+
+
+@pytest.mark.parametrize(
+    ("reduction", "expected_cycles"),
+    ((1, 57), (16, 57), (17, 59), (256, 87), (257, 89)),
+)
+def test_mac_reduction_tail_requires_a_complete_column_for_both_scopes(
+    reduction, expected_cycles
+):
+    target = build_aim_target()
+    match = _mac(reduction=reduction)
+
+    for operation_name in ("MAC", "MAC_ABK"):
+        placement = Placement(placements={}, extra={"operation_name": operation_name})
+        _graph, estimate = _evaluate(target, [match], placement)
+        assert estimate.cycles == expected_cycles
+
+
+def test_all_bank_fanout_reduces_output_launches_not_reduction_columns():
+    target = build_aim_target()
+    match = _mac(outputs=17, reduction=17, batch=3)
+    single = Placement(
+        placements={},
+        extra={"operation_name": "MAC", "bank_fanout": 1},
+    )
+    all_bank = Placement(
+        placements={},
+        extra={"operation_name": "MAC_ABK", "bank_fanout": 16},
+    )
+
+    _single_graph, single_estimate = _evaluate(target, [match], single)
+    _all_graph, all_estimate = _evaluate(target, [match], all_bank)
+
+    # A 17-element reduction takes two columns (59 cycles). Across three
+    # batches, SBK launches once per output; ABK launches two 16-output tiles.
+    assert single_estimate.cycles == 17 * 3 * 59
+    assert all_estimate.cycles == 2 * 3 * 59
 
 
 def test_parallelism_follows_channel_and_bank_instances():
@@ -174,7 +227,7 @@ def test_linear_layout_is_load_bearing_for_aim_bank_scope():
     mac = next(
         activity for activity in graph.activities if "MAC_ABK" in activity.primitive
     )
-    assert mac.latency_cycles == 57
+    assert mac.latency_cycles == 87
 
 
 def test_active_aim_enumerator_excludes_unrealized_single_bank_layout():
@@ -197,7 +250,7 @@ def test_codegen_materializes_channel_mask_bank_index_and_column_count():
     )
     target.op("MAC_ABK").emit(target.banks, target.gb, target.mac_reg, abk_ctx)
     abk_ctx.after_match(_mac((3,)), 1)
-    assert abk_ctx.cmds == ["AiM MAC_ABK 1 8 0"]
+    assert abk_ctx.cmds == ["AiM MAC_ABK 16 8 0"]
 
     sbk_ctx = AimCtx(target)
     sbk_ctx._active_work_id = (3, 2, 1)
@@ -208,6 +261,27 @@ def test_codegen_materializes_channel_mask_bank_index_and_column_count():
     operation.emit(operation.src[0], target.gb, target.mac_reg, sbk_ctx)
     sbk_ctx.after_match(_mac((3, 2, 1)), 1)
     assert sbk_ctx.cmds == ["AiM MAC_SBK 16 8 9 0"]
+
+
+@pytest.mark.parametrize(
+    ("reduction", "columns"),
+    ((16, 1), (17, 2), (256, 16), (257, 17)),
+)
+def test_legacy_abk_codegen_keeps_reduction_columns_independent_of_fanout(
+    reduction, columns
+):
+    target = build_aim_target()
+    ctx = AimCtx(target)
+    ctx._active_work_id = (3,)
+    ctx._active_placement = Placement(
+        placements={},
+        extra={"operation_name": "MAC_ABK", "bank_fanout": 16},
+    )
+
+    target.op("MAC_ABK").emit(target.banks, target.gb, target.mac_reg, ctx)
+    ctx.after_match(_mac((3,), reduction=reduction), 1)
+
+    assert ctx.cmds == [f"AiM MAC_ABK {columns} 8 0"]
 
 
 def test_whole_program_codegen_is_invariant_to_digit_ending_symbol_renames():

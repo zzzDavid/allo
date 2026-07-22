@@ -274,7 +274,13 @@ def build_aim_target():
             @allo.unit(mapping={"channel": 32})
             def channel():
                 gb = allo.mem(entries=64, width=256, name="gb")
-                mac_reg = allo.reg(16, 16, name="mac_reg")
+                # CENT's reference mapper uses a 32-entry register-reuse
+                # window, and its functional model sizes the abstract latch
+                # array from the same default reuse_size=32.  `slots` records
+                # that installed mapper/simulator contract; it must not be
+                # read as a claim about the circuit-level physical latch count.
+                # The window is distinct from the 16 BF16 SIMD lanes.
+                mac_reg = allo.reg(16, 16, name="mac_reg", slots=32)
                 af_reg = allo.reg(16, 16, name="af_reg")
                 # The JSSC design stores activation lookup tables in a
                 # reserved word line in every DRAM bank.

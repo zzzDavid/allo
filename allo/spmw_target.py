@@ -124,8 +124,10 @@ class Register:
     case where the SIMD-lane count equals the addressable depth, e.g.
     Samsung grf / UPMEM gprs / APU vrs). A backend whose addressable GPR
     depth is a *different* axis from the SIMD width declares `slots`
-    explicitly (AiM: 31 addressable MAC-accumulator GPRs vs 16 SIMD lanes,
-    JSSC 2023 §IV) so the allocator's capacity is tree-derived, not pasted.
+    explicitly.  A simulator target may also use this field for its
+    mapper-visible register-reuse window when that is the capacity the
+    backend must schedule against.  In either case the allocator's limit is
+    tree-derived, not pasted into a lowering rule.
     """
 
     def __init__(self, owner, lanes, width, name=None, slots=None, ports=1, axes=None):

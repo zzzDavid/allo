@@ -20,8 +20,9 @@ import math
 from ...perf import cost, rule
 
 
-# One 256-bit DRAM column contains 16 BF16 operands.  MAC_ABK launches one
-# column operation in every one of the channel's 16 banks.
+# One 256-bit DRAM column contains 16 BF16 operands.  MAC_ABK launches the
+# same column operation in every one of the channel's 16 banks: those banks
+# hold independent output rows, not disjoint pieces of one reduction.
 LANES_PER_PU = 16
 BANKS_PER_CHANNEL = 16
 
@@ -72,17 +73,33 @@ def _bank_fanout(event, default):
     return fanout
 
 
-def _columns(event, *, default_bank_fanout=1):
+def _columns(event):
     elements = _metric(event, "reduction_extent")
-    width = LANES_PER_PU * _bank_fanout(event, default_bank_fanout)
-    return max(1, _ceil_div(elements, width))
+    return max(1, _ceil_div(elements, LANES_PER_PU))
+
+
+def _mac_launches(event, *, default_bank_fanout=1):
+    """Number of physical MAC commands represented by one loop-nest event.
+
+    ``iterations`` contains every enclosing loop, while ``reduction_extent``
+    and the matcher-stamped ``batch`` identify the reduction and independent
+    vector axes.  The quotient is therefore the number of output rows owned
+    by this work item.  An all-bank command computes one such row per bank in
+    parallel; it does not make the reduction itself wider.
+    """
+    reduction = max(1, _metric(event, "reduction_extent"))
+    batch = max(1, _metric(event, "batch"))
+    iterations = max(1, _metric(event, "iterations", reduction * batch))
+    outputs = max(1, _ceil_div(iterations, reduction * batch))
+    fanout = _bank_fanout(event, default_bank_fanout)
+    return batch * _ceil_div(outputs, fanout)
 
 
 @cost(target="aim")
 def aim_cost(target):
     """Interpret AiM operations over target-declared spatial resources."""
-    # Model revision: linear-layout-v1. MAC width is the realized bank image
-    # supplied in candidate.bank_fanout.
+    # Model revision: linear-layout-v1. The realized bank image determines
+    # how many output rows one command produces, never its reduction width.
     channel = target.unit("channel")
     bank_group = target.unit("bank_group")
     bank = target.unit("bank")
@@ -90,34 +107,38 @@ def aim_cost(target):
 
     def single_bank_mac(event, ctx):
         columns = _columns(event)
+        launches = _mac_launches(event)
         issue = max(CMD_MAC, columns * N_CCD)
         latency = N_RCD_RD_MAC + (columns - 1) * N_CCD + CMD_MAC
-        ctx.step(
-            latency=latency,
-            occupy=[
-                ctx.use(event.primitive, cycles=latency),
-                ctx.use(bank, cycles=latency),
-                ctx.use(channel, cycles=issue),
-                ctx.use(gb, cycles=issue),
-            ],
-            name="mac_sbk",
-        )
+        with ctx.repeat(launches):
+            ctx.step(
+                latency=latency,
+                occupy=[
+                    ctx.use(event.primitive, cycles=latency),
+                    ctx.use(bank, cycles=latency),
+                    ctx.use(channel, cycles=issue),
+                    ctx.use(gb, cycles=issue),
+                ],
+                name="mac_sbk",
+            )
 
     rule(target.op("MAC"))(single_bank_mac)
 
     @rule(target.op("MAC_ABK"))
     def all_bank_mac(event, ctx):
-        columns = _columns(event, default_bank_fanout=BANKS_PER_CHANNEL)
+        columns = _columns(event)
+        launches = _mac_launches(event, default_bank_fanout=BANKS_PER_CHANNEL)
         latency = N_RCD_RD_MAC + (columns - 1) * N_CCD + CMD_MAC
-        ctx.step(
-            latency=latency,
-            occupy=[
-                ctx.use(event.primitive, cycles=latency),
-                ctx.use(channel, cycles=latency),
-                ctx.use(gb, cycles=latency),
-            ],
-            name="mac_abk",
-        )
+        with ctx.repeat(launches):
+            ctx.step(
+                latency=latency,
+                occupy=[
+                    ctx.use(event.primitive, cycles=latency),
+                    ctx.use(channel, cycles=latency),
+                    ctx.use(gb, cycles=latency),
+                ],
+                name="mac_abk",
+            )
 
     @rule(target.op("MUL"))
     def elementwise_mul(event, ctx):

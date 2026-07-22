@@ -15,6 +15,7 @@ import numpy as np
 from .customize import customize
 from .ir.builder import _spmw_group_contract
 from .perf import BoundCostSpec, CostSpec
+from .pim.aim_program import AimProgram, AimProgramCallable, compile_aim_program
 from .pim.apu_v1_program import APUv1Program, compile_apu_v1_program
 from .pim.apu_v1_vector_program import (
     APUv1VectorCallable,
@@ -45,7 +46,9 @@ from .pim.upmem_program import (
 )
 from .spmw_autoschedule import MatcherWorkScope, _retain_matcher_work_scope
 from .spmw_codegen import RunResult, compile_for_target
+from .spmw_liveness import MatcherValueId, trace_liveness
 from .spmw_match_engine import match_workload
+from .spmw_plan import BufferMetricManifest
 
 
 def _materialize_workload(workload):
@@ -124,6 +127,77 @@ def _buffer_metrics(workload):
             entry.update(dtype_bits=bits, bytes=(elements * bits + 7) // 8)
         metrics[name] = entry
     return metrics
+
+
+def _host_move_buffer_role(record):
+    """Recover the workload ABI role from a recorded or resolved host move."""
+    role = getattr(record, "buffer_role", None)
+    if role is not None:
+        return role
+    from .spmw_target import BufferToken, HandleToken
+
+    for argument in getattr(record, "args", ()):
+        if isinstance(argument, BufferToken):
+            return argument.name
+        if isinstance(argument, str):
+            return argument
+        if not isinstance(argument, HandleToken):
+            name = getattr(argument, "name", None)
+            if name is not None:
+                return name
+    return None
+
+
+def _buffer_metric_manifest(workload, trace, host_moves):
+    """Bind annotation geometry to exact matcher-visible workload values."""
+    metrics_by_name = _buffer_metrics(workload)
+    source_value_refs = getattr(trace, "source_value_refs", None)
+    if not source_value_refs:
+        # Preserve the legacy path for externally constructed traces that do
+        # not carry frontend source identity.
+        return metrics_by_name
+
+    liveness = trace_liveness(trace)
+    values_by_ref = {}
+    for match in trace.matches:
+        for index, operand in enumerate(match.operands):
+            value_id = liveness.value_id_for_operand(match, index)
+            if operand.value_ref is not None and value_id is not None:
+                values_by_ref.setdefault(operand.value_ref, set()).add(value_id)
+        value_id = liveness.value_id_for_result(match)
+        if match.result_value_ref is not None and value_id is not None:
+            values_by_ref.setdefault(match.result_value_ref, set()).add(value_id)
+
+    parameters = tuple(inspect.signature(workload).parameters)
+    parameter_ordinals = {name: index for index, name in enumerate(parameters)}
+    entries = {}
+    parameter_values = {}
+    for name, metrics in metrics_by_name.items():
+        ordinal = parameter_ordinals[name]
+        source_ref = source_value_refs.get(ordinal)
+        candidates = values_by_ref.get(source_ref, set())
+        if len(candidates) > 1:
+            raise ValueError(
+                f"workload buffer {name!r} has conflicting structural values"
+            )
+        value_id = (
+            next(iter(candidates))
+            if candidates
+            else MatcherValueId("abi", -1, "argument", ordinal)
+        )
+        existing = entries.get(value_id)
+        if existing is not None and existing != metrics:
+            raise ValueError("one structural value has conflicting buffer metrics")
+        entries[value_id] = metrics
+        parameter_values[name] = value_id
+
+    host_bindings = {}
+    for index, record in enumerate(host_moves or ()):
+        role = _host_move_buffer_role(record)
+        if role not in parameter_values:
+            raise ValueError(f"host transfer {index} lacks an exact ABI metric binding")
+        host_bindings[index] = parameter_values[role]
+    return BufferMetricManifest.create(entries, host_bindings=host_bindings)
 
 
 def _retained_symbol_name(function):
@@ -509,6 +583,7 @@ def compile(
     promotion_evidence=None,
 ) -> (
     CompiledCallable
+    | AimProgramCallable
     | UPMEMProgramCallable
     | APUv1VectorCallable
     | APUG2Callable
@@ -562,6 +637,18 @@ def compile(
         raise ValueError("promotion evidence requires an executable cost model")
     if promotion_gate is not None and layout is not None:
         raise ValueError("promotion evidence cannot override an explicit layout")
+
+    if isinstance(workload, AimProgram):
+        if promotion_gate is not None:
+            raise ValueError("AimProgram has no schedule-search activation")
+        if host_moves is not None or layout is not None:
+            raise ValueError("AimProgram owns its ordered trace and placement")
+        return compile_aim_program(
+            workload,
+            target,
+            cost=bound_cost,
+            backend=backend,
+        )
 
     if isinstance(workload, APUv1Program):
         if promotion_gate is not None:
@@ -663,7 +750,7 @@ def compile(
         layout=layout,
         backend=backend,
         host_moves=host_moves,
-        buffer_metrics=_buffer_metrics(workload),
+        buffer_metrics=_buffer_metric_manifest(workload, trace, host_moves),
         cost=bound_cost,
         promotion_gate=promotion_gate,
     )

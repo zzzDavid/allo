@@ -506,8 +506,15 @@ def _callee_symbol(operation) -> str | None:
     return symbol[1:] if symbol and symbol.startswith("@") else symbol
 
 
-def _build_ir_value_refs(mlir_module) -> dict[Any, IRValueRef]:
-    """Canonicalize exact MLIR def-use, call, and retained ABI edges."""
+def _build_ir_value_refs(
+    mlir_module,
+) -> tuple[dict[Any, IRValueRef], dict[int, IRValueRef]]:
+    """Canonicalize exact MLIR def-use, call, and retained ABI edges.
+
+    The second result retains the frontend source-ID to canonical-reference
+    relation.  Public compilation uses it to bind annotation-derived geometry
+    to matcher values without consulting diagnostic buffer names or shapes.
+    """
 
     functions = [
         function
@@ -610,7 +617,21 @@ def _build_ir_value_refs(mlir_module) -> dict[Any, IRValueRef]:
         value_ref = IRValueRef("mlir", canonical_path)
         for value in members:
             refs[value] = value_ref
-    return refs
+
+    source_value_refs = {}
+    for source_id, values in retained_sources.items():
+        retained_refs = {refs[value] for value in values}
+        if len(retained_refs) != 1:
+            raise ValueError("one retained source has conflicting value identities")
+        source_value_refs[int(source_id)] = next(iter(retained_refs))
+
+    # An ordinary (non-dataflow) workload has no retained source-ID attribute.
+    # Its sole function ABI is nevertheless an exact structural source.
+    if not retained_sources and len(functions) == 1:
+        for argument_index, argument in enumerate(functions[0].arguments):
+            if _is_memref_value(argument):
+                source_value_refs[argument_index] = refs[argument]
+    return refs, source_value_refs
 
 
 # --------------------------------------------------------------------- #
@@ -917,11 +938,12 @@ def match_workload(target, mlir_module) -> MatchTrace:
     Eagerly compiles target Op patterns the first time it sees them.
     """
     compile_target_patterns(target)
+    value_refs, source_value_refs = _build_ir_value_refs(mlir_module)
     trace = MatchTrace(
         target_name=getattr(target, "name", "<unknown>"),
         module_name=str(getattr(mlir_module, "name", "<unnamed>")),
+        source_value_refs=source_value_refs,
     )
-    value_refs = _build_ir_value_refs(mlir_module)
 
     # Iterate every func.func at the module top level.
     for func in mlir_module.body.operations:

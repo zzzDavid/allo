@@ -1128,21 +1128,11 @@ class AimCtx(CodegenContext):
         ):
             return
         # ``opsize`` counts 256-bit DRAM columns, not scalar loop iterations.
-        # One column supplies 16 BF16 lanes; MAC_ABK stripes the reduction over
-        # all 16 banks in the channel.  Keep this conversion identical to the
-        # executable AiM cost program's `_columns` formula.
+        # One column supplies 16 BF16 lanes in each targeted bank. MAC_ABK's
+        # banks hold independent output rows; they do not partition K. Keep
+        # this conversion identical to the AiM cost program's `_columns`.
         lanes = 256 // int(getattr(self.target.banks, "width", 16))
-        banks = int(getattr(self.target.banks, "banks", 1))
-        candidate = getattr(getattr(self, "_active_placement", None), "extra", {}) or {}
-        bank_fanout = int(
-            candidate.get("bank_fanout", banks if parts[1] == "MAC_ABK" else 1)
-        )
-        if bank_fanout < 1 or bank_fanout > banks:
-            raise ValueError(
-                f"AiM layout bank_fanout {bank_fanout} exceeds {banks} banks"
-            )
-        divisor = lanes * bank_fanout
-        columns = (k + divisor - 1) // divisor
+        columns = (k + lanes - 1) // lanes
         parts[2] = str(columns)
         self.cmds[-1] = " ".join(parts)
         # Mirror the key=value annotation so ``_human_lines`` stays

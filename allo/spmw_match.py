@@ -123,6 +123,11 @@ class MatchTrace:
     target_name: str
     module_name: str
     matches: list[MatchedOp] = field(default_factory=list)
+    # Exact retained frontend-source identities. Keys are the module-local
+    # source IDs stamped on dataflow kernel arguments (ordinary single-function
+    # workloads use their ABI argument ordinal); values are the canonical IR
+    # references already carried by matcher operands/results.
+    source_value_refs: dict[int, IRValueRef] = field(default_factory=dict)
 
     def by_target_op(self, name: str) -> list[MatchedOp]:
         return [m for m in self.matches if m.target_op_name == name]
