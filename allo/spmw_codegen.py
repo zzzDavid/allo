@@ -3318,6 +3318,7 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
         )
 
     from .spmw_apu_v1_build import (
+        _apu_v1_build_config,
         _assert_gvml_sdk_present,
         gen_apu_v1_low_mode_project,
     )
@@ -3326,6 +3327,7 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
     # passed but headers are absent; fail fast with a readable error
     # rather than letting `make` emit a 200-line stderr blob below.
     _assert_gvml_sdk_present()
+    build_config = _apu_v1_build_config()
 
     tmpdir = tempfile.mkdtemp(prefix="tenon-apu-v1-")
     try:
@@ -3361,7 +3363,7 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
         # the test does not silently PASS on a cycles=None RunResult.
         try:
             mk = subprocess.run(
-                ["make"],
+                build_config.make_command,
                 cwd=str(project_dir),
                 capture_output=True,
                 timeout=600,
@@ -3381,7 +3383,7 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
                 + f"\n--- project_dir: {project_dir}"
             )
 
-        bin_path = project_dir / "build" / "debug" / "tenon-kernel"
+        bin_path = build_config.binary_path(project_dir, "tenon-kernel")
         if not bin_path.exists():
             raise RuntimeError(
                 f"APU v1 build succeeded but binary not found at {bin_path} "
@@ -3497,6 +3499,7 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
             extra={
                 "outputs": outputs,
                 "kernel_src": kernel_src,
+                "build_mode": build_config.mode,
                 "project_dir": str(project_dir),
                 "returncode": proc.returncode,
             },

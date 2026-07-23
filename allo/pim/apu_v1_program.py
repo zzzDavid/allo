@@ -12,7 +12,7 @@ device-wide barrier plan.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import inspect
 import math
 import os
@@ -30,6 +30,7 @@ from ..backend.c import emit_c_from_mlir
 from ..customize import customize
 from ..perf import CostEvent
 from ..perf.graph import ExecutionGraph
+from ..spmw_apu_v1_build import _apu_v1_build_config
 from ..spmw_codegen import RunResult
 from .upmem_analysis import analyze_upmem_mlir
 from .apu_v1_hybrid import (
@@ -81,6 +82,7 @@ class APUv1Phase:
     bindings: Mapping[str, str] | tuple[tuple[str, str], ...] = ()
     dependencies: tuple[str, ...] = ()
     zero_initialize: tuple[str, ...] = ()
+    argument_bounds: object = ()
 
     def __post_init__(self):
         if not callable(self.kernel):
@@ -104,13 +106,37 @@ class APUv1Phase:
         if not set(zero_initialize) <= set(produces):
             raise ValueError("zero_initialize values must also appear in produces")
         bindings = dict(self.bindings)
+        argument_bounds = dict(self.argument_bounds)
         if any(not key or not value for key, value in bindings.items()):
             raise ValueError("APUv1Phase bindings require non-empty names")
+        source_parameters = set(inspect.signature(self.kernel).parameters)
+        unknown_bounds = set(argument_bounds) - source_parameters
+        if unknown_bounds:
+            raise ValueError(
+                f"argument_bounds names are not kernel arguments: {sorted(unknown_bounds)}"
+            )
+        for name, interval in argument_bounds.items():
+            if (
+                not isinstance(interval, (tuple, list))
+                or len(interval) != 2
+                or any(not isinstance(value, int) for value in interval)
+                or interval[0] > interval[1]
+            ):
+                raise ValueError(
+                    f"argument_bounds[{name!r}] must be an inclusive integer pair"
+                )
         object.__setattr__(self, "vectorize", vectorize)
         object.__setattr__(self, "produces", produces)
         object.__setattr__(self, "bindings", MappingProxyType(bindings))
         object.__setattr__(self, "dependencies", dependencies)
         object.__setattr__(self, "zero_initialize", zero_initialize)
+        object.__setattr__(
+            self,
+            "argument_bounds",
+            MappingProxyType(
+                {name: tuple(interval) for name, interval in argument_bounds.items()}
+            ),
+        )
 
     @property
     def phase_name(self):
@@ -423,8 +449,26 @@ class CompiledAPUv1Program:
             for argument in self.arguments
             if argument.source == "result" or argument.mode in {"out", "both"}
         )
-        self.hybrid_manifest = discover_apu_v1_hybrid_manifest(
+        from .apu_v1_native_vector import (
+            discover_apu_v1_native_vector_lowering,
+        )
+
+        self.native_vector_lowering = discover_apu_v1_native_vector_lowering(
             phase,
+            self.artifact,
+            self.arguments,
+            self.schedule.top_func_name,
+        )
+        # Native recipes carry their own complete structural proof and source
+        # lowering.  Discover the ordinary scalar ABI manifest without asking
+        # the contraction-only hybrid discoverer to prove the same phase.
+        manifest_phase = (
+            replace(phase, vectorize=False)
+            if self.native_vector_lowering is not None
+            else phase
+        )
+        self.hybrid_manifest = discover_apu_v1_hybrid_manifest(
+            manifest_phase,
             self.schedule,
             self.artifact,
             target,
@@ -448,18 +492,31 @@ class CompiledAPUv1Program:
                 backend="device" if backend is None else backend,
                 device_runner=device_runner,
             )
-        transformed, self.scratch_bytes = _replace_local_arrays(self.artifact.c_source)
-        self.scratch_role = "allo_scratch"
-        self.device_source = _emit_device_source(
-            self.schedule.top_func_name,
-            transformed,
-            self.arguments,
-            self.outputs,
-            self.scratch_role,
+        transformed, scalar_scratch_bytes = _replace_local_arrays(
+            self.artifact.c_source
         )
+        self.scratch_role = "allo_scratch"
+        if self.native_vector_lowering is None:
+            self.scratch_bytes = scalar_scratch_bytes
+            self.device_source = _emit_device_source(
+                self.schedule.top_func_name,
+                transformed,
+                self.arguments,
+                self.outputs,
+                self.scratch_role,
+            )
+        else:
+            self.scratch_bytes = self.native_vector_lowering.scratch_bytes
+            self.device_source = self.native_vector_lowering.emit_device_source()
         self.execution_graph = ExecutionGraph(program.name)
         if cost is not None:
-            if self.hybrid_manifest.has_vector_regions:
+            if self.native_vector_lowering is not None and hasattr(
+                self.native_vector_lowering, "build_execution_graph"
+            ):
+                self.execution_graph = (
+                    self.native_vector_lowering.build_execution_graph(target, cost)
+                )
+            elif self.hybrid_manifest.has_vector_regions:
                 self.execution_graph = build_apu_v1_hybrid_execution_graph(
                     self.hybrid_manifest,
                     target,
@@ -508,6 +565,8 @@ class CompiledAPUv1Program:
                 )
             normalized[argument.name] = np.ascontiguousarray(value)
         normalized[self.scratch_role] = np.zeros(self.scratch_bytes, dtype=np.uint8)
+        if self.native_vector_lowering is not None:
+            normalized = self.native_vector_lowering.pack_inputs(normalized)
         output_specs = {}
         output_roles = {}
         for argument in self.outputs:
@@ -521,6 +580,7 @@ class CompiledAPUv1Program:
 
         root = tempfile.mkdtemp(prefix="tenon-apu-v1-scalar-")
         try:
+            build_config = _apu_v1_build_config()
             project = _generate_project(
                 Path(root) / "project",
                 self.device_source,
@@ -537,14 +597,18 @@ class CompiledAPUv1Program:
                 role: Path(root) / f"out_{role}.bin" for role in output_specs
             }
             build = subprocess.run(
-                ["make"], cwd=project, capture_output=True, timeout=600, check=False
+                build_config.make_command,
+                cwd=project,
+                capture_output=True,
+                timeout=600,
+                check=False,
             )
             if build.returncode:
                 raise RuntimeError(
                     "APU v1 scalar build failed:\n"
                     + build.stderr.decode(errors="replace")[-6000:]
                 )
-            binary = project / "build" / "debug" / "tenon-scalar"
+            binary = build_config.binary_path(project, "tenon-scalar")
             argv = [str(binary)]
             argv.extend(str(input_paths[name]) for name in sorted(input_paths))
             argv.extend(str(output_paths[name]) for name in sorted(output_paths))
@@ -580,7 +644,13 @@ class CompiledAPUv1Program:
                 "apu_v1",
                 extra={
                     "outputs": outputs,
-                    "scalar_arc": True,
+                    "scalar_arc": self.native_vector_lowering is None,
+                    "native_vector_route": (
+                        None
+                        if self.native_vector_lowering is None
+                        else self.native_vector_lowering.route
+                    ),
+                    "build_mode": build_config.mode,
                     "device_source": self.device_source,
                 },
             )

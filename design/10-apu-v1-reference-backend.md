@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # GSI APU v1 reference backend
 
 This document describes the APU v1 implementation in the current tree. It is
@@ -225,10 +228,71 @@ ARC stack to aligned L4 scratch. In-place results are copied to explicit result
 buffers for host readback. A local Newton implementation supplies scalar square
 root for kernels such as Cholesky and correlation.
 
+All real-device vector, hybrid, and scalar runners select the GSI build mode
+through `TENON_APU_V1_BUILD_MODE`. The default is `release`, which applies the
+stock harness's `-O3 -DNDEBUG` flags to both host and ARC code; `debug` is the
+only supported override. Each runner passes the selected mode explicitly to
+`make` and launches `build/<mode>/<lab_name>`, so campaign measurements cannot
+silently fall back to the harness's `-O0` debug default. Invalid values fail
+before the external build starts, and each successful `RunResult` records the
+selection as `extra["build_mode"]`.
+
 This path currently executes on APUC 0. It is an explicit,
 correctness-complete scalar baseline, not a performance claim: using four APUCs
 faithfully requires phase boundaries, partition ownership, and cross-APUC
 barrier semantics that arbitrary scalar programs do not yet declare.
+
+### Required-vector native structural recipes
+
+Complete vector computations with non-contraction control flow use the native
+structural registry in `allo/pim/apu_v1_native_vector.py`. A caller retains one
+ordinary Allo kernel as the semantic source and requests a fail-closed route:
+
+```python
+phase = allo.APUv1Phase(
+    kernel,
+    vectorize="required",
+    argument_bounds={"points": (0, 31), "centers": (0, 31)},
+)
+```
+
+Each registered discoverer receives retained MLIR plus the decoded argument
+ABI. It must prove its complete loop, access, arithmetic, control-flow, shape,
+dtype, and output skeleton before returning a lowering. Zero matches fall
+through to the existing contraction requirement and fail if that also cannot
+prove a vector route; multiple matches are an error. Function and benchmark
+names are never selection inputs. The registry currently contains structural
+recipes for squared-L2 argmin, dense histograms, fixed-record frequency, and
+bivariate moments. The latter recipes are compiler capabilities only here;
+their hardware results are reported separately after their campaigns finish.
+
+The squared-L2 recipe recognizes the strict first-index computation
+
+```text
+labels[p] = argmin_c sum_d (points[p,d] - centers[c,d])**2
+```
+
+and packs the logical row-major points into one dimension-major 32K-lane VMR
+per coordinate. Its selected center-streaming plan computes the point norm
+once and applies `sum(p*p) + sum(c*c) - 2*sum(p*c)` in the uint16 ring for each
+candidate. The identity is exact modulo 2^16. For a retained signed comparison,
+the generic unbounded route flips the distance sign bit before `gvml_lt_u16`.
+An optional `APUv1Phase.argument_bounds` contract can remove that transform
+only when the compiler proves every squared distance is at most `INT16_MAX`.
+For 24 coordinates in `[0,31]`, the proof is `24 * 31^2 = 23,064`, so signed
+and unsigned order are identical while strict comparison still preserves the
+lowest candidate on ties.
+
+The lowering owns its physical input transforms, direct result egress, emitted
+GVML source, and operation inventory. Its calibrated graph prices the exact
+center L4-to-L3 transfer, 24 point L4-to-L1 transfers, vector loads and uint16
+arithmetic, comparison/masked-copy issue proxy, and label egress. On the
+Phoenix shape it predicts 643,130 CRUN instead of the scalar fallback's former
+8.823-billion-cycle estimate. The first compiler-emitted release calibration
+measured 624,472 CRUN with all 32,768 labels bit-exact. A seemingly cheaper
+all-dots-resident candidate measured 631,701 and 633,253 CRUN; real profiles
+therefore select center streaming and expose why primitive-call count alone is
+not a sufficient cost objective.
 
 ### Structurally discovered hybrid programs
 
@@ -300,6 +364,49 @@ core-0 final gather for 31,577,401 cycles. It is now bit-exact: the old
 compounded-FP16 out-of-tolerance result is obsolete. The join/all-gather remains
 the dominant phase at 20,873,332 cycles, exposing the next layout/residency
 optimization target.
+
+### Structural native vector routes
+
+APUv1 also has a benchmark-name-independent native-vector registry for loop
+nests whose best physical plan is not a dense contraction. Discoverers inspect
+the retained MLIR, ABI, loop bounds, operator inventory, value origins, and
+output indexing, then return a complete physical lowering only when every
+required condition holds. The current registry covers four families:
+
+| retained computation | native route |
+|---|---|
+| bounded uint16 squared-L2 plus strict argmin | `gvml_squared_l2_argmin_center_streaming` |
+| dense 256-bin histogram over one 32K frontier | `gvml_dense_histogram_pair_count` |
+| fixed-width record/query frequency | `gvml_record_frequency_resident_chunks_pair_count` |
+| batched bivariate sufficient statistics | `gvml_bivariate_moments_fused_group_reduce` |
+
+The squared-L2 route uses phase argument bounds to prove when signed retained
+comparison is equivalent to native unsigned ordering. It forms the point norm
+once and streams candidate dot products using
+`||p-c||^2 = ||p||^2 + ||c||^2 - 2 p.c` in the uint16 ring. The other routes
+select paired marker counts, resident record chunks, or native group reductions
+from structural facts. With `vectorize="required"`, losing any proof or ABI
+condition rejects compilation instead of silently choosing the scalar ARC
+fallback.
+
+Each native lowering also builds an operation-level execution graph through
+`apu_v1_native_cost.py`. The graph uses the exact emitted inventory and
+calibrated target primitives for DMA, marker operations, paired counts, group
+reductions, extraction, and scalar stores; it does not cost the original scalar
+loop nest. The 2026-07-22 APUv1 comparison produced:
+
+| route | estimated CRUN | measured median CRUN |
+|---|---:|---:|
+| squared-L2 argmin | 643,130 | 624,677 |
+| dense histogram | 72,605 | 166,783 |
+| bivariate moments | 54,299 | 94,618.5 |
+| record frequency | 140,070 | 171,988 |
+
+These estimates are compiler selection signals, not reported measurements.
+Their remaining route-dependent error is explicit calibration work; the
+important correction is that native candidates are no longer ranked with the
+multi-million- or multi-billion-cycle scalar fallback estimate for their
+source loop.
 
 ## Executable cost specification
 

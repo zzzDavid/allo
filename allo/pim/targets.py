@@ -919,6 +919,45 @@ def build_apu_v1_target():
                         fn=fn,
                         matchable=False,
                     )
+                # Marker and scalar-extraction operations used by complete
+                # native reduction recipes.  They are deliberately distinct
+                # from VR logical/reduction operations: marker counts return
+                # ARC scalars, and an immediate comparison writes a marker.
+                allo.op(
+                    "EQ_IMM_16",
+                    src=(any_vr,),
+                    dst=markers,
+                    fn=lambda x: x,
+                    matchable=False,
+                )
+                allo.op(
+                    "AND_M",
+                    src=(markers, markers),
+                    dst=markers,
+                    fn=lambda x, y: x & y,
+                    matchable=False,
+                )
+                allo.op(
+                    "COUNT_M_G32K",
+                    src=(markers,),
+                    dst=vior,
+                    fn=lambda x: x,
+                    matchable=False,
+                )
+                allo.op(
+                    "FAST_COUNT_2M_G32K",
+                    src=(markers, markers),
+                    dst=vior,
+                    fn=lambda x, y: x,
+                    matchable=False,
+                )
+                allo.op(
+                    "GET_ENTRY_16",
+                    src=(any_vr,),
+                    dst=vior,
+                    fn=lambda x: x,
+                    matchable=False,
+                )
                 allo.op(
                     "GROUP_REDUCE_ADD_U16",
                     src=(any_vr,),
@@ -945,6 +984,7 @@ def build_apu_v1_target():
                     fn=lambda x: x,
                     matchable=False,
                 )
+                allo.move("ARC_STORE_L4_U16", src=vior, dst=l4)
 
     return device
 

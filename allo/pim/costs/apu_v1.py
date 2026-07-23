@@ -107,6 +107,20 @@ MICRO_SUM_U16_G128 = 527
 MICRO_CREATE_GROUP_INDEX = 33
 MICRO_CREATE_SUBGROUP_INDEX = 37
 MICRO_DUPLICATE_SUBGROUP_8K_1K = 1_915
+# Native marker/scalar calls used by complete reduction recipes. Equality is
+# the MICRO'25 ``gvml_eq_16`` measurement; immediate equality uses the same
+# element-wise fragment. Marker AND shares the measured 16-bit logical issue
+# path. The supplied analytical operation table records 245 cycles for a 32K
+# marker count and 60 cycles for one VR extraction. The documented fast paired
+# count traverses the same 32K frontier once while returning two counts, so it
+# inherits the single-traversal calibration. Direct scalar L4 stores use the
+# conservative measured per-element PIO store cost.
+MICRO_EQ_IMM_16 = 13
+MICRO_AND_M = 13
+MICRO_COUNT_M_G32K = 245
+MICRO_FAST_COUNT_2M_G32K = MICRO_COUNT_M_G32K
+MICRO_GET_ENTRY_16 = 60
+MICRO_ARC_STORE_L4_U16 = MICRO_PIO_STORE_PER_ELEMENT
 
 
 def _ceil_div(value, divisor):
@@ -228,6 +242,19 @@ def apu_v1_cost(target):
             MICRO_DUPLICATE_SUBGROUP_8K_1K,
             "gvml_duplicate_subgrp_16_grp_sgidx",
         ),
+    ):
+        micro_vector_rule(target.op(op_name), lambda _event, value=cycles: value, label)
+
+    for op_name, cycles, label in (
+        ("EQ_IMM_16", MICRO_EQ_IMM_16, "gvml_eq_imm_16"),
+        ("AND_M", MICRO_AND_M, "gvml_and_m"),
+        ("COUNT_M_G32K", MICRO_COUNT_M_G32K, "gvml_count_m_g32k"),
+        (
+            "FAST_COUNT_2M_G32K",
+            MICRO_FAST_COUNT_2M_G32K,
+            "gvml_2_fast_count_m_g32k",
+        ),
+        ("GET_ENTRY_16", MICRO_GET_ENTRY_16, "gvml_get_entry_16"),
     ):
         micro_vector_rule(target.op(op_name), lambda _event, value=cycles: value, label)
 
@@ -464,6 +491,20 @@ def apu_v1_cost(target):
         "pio_vr16_to_l4",
         (target.l4,),
     )
+
+    @rule(target.move("ARC_STORE_L4_U16"))
+    def arc_store_l4_u16(event, ctx):
+        cycles = MICRO_ARC_STORE_L4_U16 * _count(event)
+        ctx.step(
+            latency=cycles,
+            occupy=[
+                ctx.use(event.primitive, cycles=cycles),
+                ctx.use(apuc, cycles=cycles),
+                ctx.use(arc, cycles=cycles),
+                ctx.use(target.l4, cycles=cycles),
+            ],
+            name="scalar_l4_store_u16",
+        )
 
     @rule(target.move("ST_ACC_VR_TO_L4"))
     def store(event, ctx):

@@ -11,6 +11,7 @@ contract.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 import shutil
 from pathlib import Path
@@ -33,6 +34,10 @@ _DEFAULT_TOOLCHAIN_BASE = (
 # dev_modules compile, so we do not pass an extra `-I` into the emitted
 # Makefile -- this constant is used only by the Python-side probe.
 _DEFAULT_GVML_INCLUDE_ROOT = "/usr/local/include"
+
+_APU_V1_BUILD_MODE_ENV = "TENON_APU_V1_BUILD_MODE"
+_DEFAULT_APU_V1_BUILD_MODE = "release"
+_APU_V1_BUILD_MODES = frozenset(("debug", "release"))
 
 # Headers we know must exist for any device.c compile to succeed; used
 # as canary files the probe checks. `libgvml_element_wise.h` declares
@@ -65,6 +70,40 @@ _SUPPORTED_DTYPE_NAMES = (
     "int64",
     "float64",
 )
+
+
+@dataclass(frozen=True)
+class _APUv1BuildConfig:
+    """One consistent GSI make-mode selection for a device launch."""
+
+    mode: str
+
+    @property
+    def make_command(self) -> tuple[str, str]:
+        return ("make", f"mode={self.mode}")
+
+    def binary_path(self, project: Path | str, lab_name: str) -> Path:
+        return Path(project) / "build" / self.mode / lab_name
+
+    def binary_relative_path(self, lab_name: str) -> str:
+        return f"build/{self.mode}/{lab_name}"
+
+
+def _apu_v1_build_config() -> _APUv1BuildConfig:
+    """Resolve and validate the build mode shared by every APU v1 runner.
+
+    Device performance campaigns use release mode by default.  Debug remains
+    available as an explicit diagnostic override, but misspelled modes fail
+    before invoking the external GSI build harness.
+    """
+
+    mode = os.environ.get(_APU_V1_BUILD_MODE_ENV, _DEFAULT_APU_V1_BUILD_MODE)
+    if mode not in _APU_V1_BUILD_MODES:
+        choices = ", ".join(sorted(_APU_V1_BUILD_MODES))
+        raise ValueError(
+            f"{_APU_V1_BUILD_MODE_ENV} must be one of {choices}; got {mode!r}"
+        )
+    return _APUv1BuildConfig(mode)
 
 
 def _template_dir() -> Path:
@@ -160,11 +199,13 @@ def _role_io_table(
 
 def _emit_makefile(lab_name: str) -> str:
     base = _toolchain_base()
+    build = _apu_v1_build_config()
     return (
         f"GNU_TOOLCHAIN_FOR_ARC_BASE := {base}\n"
         "export PATH:=${GNU_TOOLCHAIN_FOR_ARC_BASE}/bin:${PATH}\n"
         "\n"
         f"lab_name := {lab_name}\n"
+        f"mode ?= {build.mode}\n"
         "TOP_DIR  := $(shell pwd)\n"
         "include $(TOP_DIR)/Common/common.mk\n"
     )
@@ -666,7 +707,8 @@ def gen_apu_v1_low_mode_project(
         and copied back after the kernel runs.
     lab_name : str
         Becomes the Makefile `lab_name`; binary lives at
-        `build/debug/<lab_name>`.
+        `build/<mode>/<lab_name>`. The mode defaults to `release` and may be
+        overridden with `TENON_APU_V1_BUILD_MODE=debug`.
     """
     dst = Path(dst_dir)
     dst.mkdir(parents=True, exist_ok=True)

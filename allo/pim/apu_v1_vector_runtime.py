@@ -28,6 +28,7 @@ from types import CodeType, FunctionType
 
 import numpy as np
 
+from ..spmw_apu_v1_build import _apu_v1_build_config
 from ..spmw_codegen import RunResult
 from .apu_v1_program import _generate_project, _ledag_log
 from .apu_v1_vector_codegen import PointerOffsetRef, PointerRef, VR_LANES
@@ -236,11 +237,12 @@ def _abi_manifest(realization, input_images, output_specs, output_batches, role_
 
 
 def _build_manifest(lab_name: str):
+    build = _apu_v1_build_config()
     return {
         "schema": "apu-v1-make-build-v1",
-        "build": ["make"],
+        "build": list(build.make_command),
         "build_timeout_seconds": 600,
-        "binary": f"build/debug/{lab_name}",
+        "binary": build.binary_relative_path(lab_name),
         "execution_timeout_seconds": 900,
         "execution_attempts": 3,
         "retry_marker": "no valid context",
@@ -596,6 +598,7 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
 
     root = tempfile.mkdtemp(prefix="tenon-apu-v1-vector-")
     try:
+        build_config = _apu_v1_build_config()
         project = runtime_artifact.write_project(Path(root) / "project")
         input_paths = {}
         for role, value in input_images.items():
@@ -604,14 +607,18 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
             input_paths[role] = path
         output_paths = {role: Path(root) / f"out_{role}.bin" for role in output_specs}
         build = subprocess.run(
-            ["make"], cwd=project, capture_output=True, timeout=600, check=False
+            build_config.make_command,
+            cwd=project,
+            capture_output=True,
+            timeout=600,
+            check=False,
         )
         if build.returncode:
             raise RuntimeError(
                 "APU v1 vector build failed:\n"
                 + build.stderr.decode(errors="replace")[-8000:]
             )
-        binary = project / "build" / "debug" / lab_name
+        binary = build_config.binary_path(project, lab_name)
         argv = [str(binary)]
         argv.extend(str(input_paths[name]) for name in sorted(input_paths))
         argv.extend(str(output_paths[name]) for name in sorted(output_paths))
@@ -662,6 +669,7 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
                 ].decode("utf-8"),
                 "source_sha256": dict(runtime_artifact.source_hashes),
                 "source_fingerprint": runtime_artifact.source_fingerprint,
+                "build_mode": build_config.mode,
                 "promotion_platform_fingerprint": (
                     runtime_artifact.current_platform_fingerprint()
                 ),

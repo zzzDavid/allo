@@ -24,6 +24,7 @@ import time
 
 import numpy as np
 
+from ..spmw_apu_v1_build import _apu_v1_build_config
 from ..spmw_codegen import RunResult
 from .apu_v1_hybrid import realize_apu_v1_region_shards
 from .apu_v1_program import _generate_project, _ledag_log
@@ -1079,6 +1080,7 @@ def run_apu_v1_hybrid(compiled, inputs, *, lab_name=None):
         return RunResult(None, reason, "apu_v1")
     root = tempfile.mkdtemp(prefix="tenon-apu-v1-hybrid-")
     try:
+        build_config = _apu_v1_build_config()
         physical = compiled.physical_manifest
         vector_count = sum(
             region.kind == "vector"
@@ -1111,14 +1113,18 @@ def run_apu_v1_hybrid(compiled, inputs, *, lab_name=None):
             paths[role] = path
         output_path = Path(root) / "out_output.bin"
         build = subprocess.run(
-            ["make"], cwd=emitted.path, capture_output=True, timeout=600, check=False
+            build_config.make_command,
+            cwd=emitted.path,
+            capture_output=True,
+            timeout=600,
+            check=False,
         )
         if build.returncode:
             raise RuntimeError(
                 "APU v1 hybrid build failed:\n"
                 + build.stderr.decode(errors="replace")[-10000:]
             )
-        binary = emitted.path / "build" / "debug" / lab_name
+        binary = build_config.binary_path(emitted.path, lab_name)
         argv = [str(binary)]
         argv.extend(str(paths[name]) for name in sorted(emitted.inputs))
         argv.append(str(output_path))
@@ -1158,6 +1164,7 @@ def run_apu_v1_hybrid(compiled, inputs, *, lab_name=None):
                 "outputs": {"output": output},
                 "host_intermediate_round_trips": 0,
                 "persistent_l4": True,
+                "build_mode": build_config.mode,
                 "vector_apucs": (0, 1, 2, 3),
                 "scalar_apucs": (0,) if has_scalar_region else (),
                 "final_gather_apucs": (0,),
