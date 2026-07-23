@@ -7,7 +7,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
 
 set(CMAKE_BUILD_TYPE ArcDebug)
-set(GSI_SYSTEM_CMAKE_BUILD_TYPE Debug)
+# ArcDebug is required to select the ARC toolchain, but the GSI runtime and
+# wrapper optimization policy are selected independently.  Use the installed
+# release runtime and make the wrapper optimization explicit: the SDK's
+# GSI_SYSTEM_OPT_FLAGS lookup is keyed by CMAKE_BUILD_TYPE and therefore
+# resolves to an empty list for the required nonstandard "ArcDebug" value.
+set(GSI_SYSTEM_CMAKE_BUILD_TYPE Release)
 set(GSI_SYSTEM_PRODUCT_NAME g2)
 set(GSI_SYSTEM_TARGET_NAME vector_core)
 
@@ -45,6 +50,8 @@ add_executable(tenon_apu_g2_tasks
   apu_g2_u16_shift_right.cc
   apu_g2_u16_sqrt.cc
   apu_g2_u16_sub.cc
+  apu_g2_typed.cc
+  apu_g2_composed_dot.cc
   apu_g2_u16_gemm.cc
   ${CMAKE_CURRENT_BINARY_DIR}/gsi_library_entry_points_wrapper.cpp)
 
@@ -61,7 +68,10 @@ target_include_directories(tenon_apu_g2_tasks PRIVATE
   /opt/gsi/include/gsi/device
   ${g2_transport_INCLUDE_DIRS}
   ${g2_transport_TASK_INCLUDE_DIRS})
-target_compile_options(tenon_apu_g2_tasks PRIVATE ${GSI_SYSTEM_OPT_FLAGS})
+target_compile_options(tenon_apu_g2_tasks PRIVATE
+  ${GSI_SYSTEM_OPT_FLAGS}
+  -O3
+  -DNDEBUG)
 target_compile_definitions(tenon_apu_g2_tasks PRIVATE ARC=1)
 target_link_libraries(tenon_apu_g2_tasks PRIVATE GTML::arc_standalone)
 

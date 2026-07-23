@@ -192,6 +192,68 @@ struct ApuG2SubParams {
   uint64_t timings_l5;
 };
 
+enum ApuG2TypedOperation : uint32_t {
+  APUG2_TYPED_ADD = 1,
+  APUG2_TYPED_MUL = 2,
+  APUG2_TYPED_DIV = 3,
+  APUG2_TYPED_BLOCK_SUM = 4,
+  APUG2_TYPED_DOT = 5,
+};
+
+struct ApuG2TypedTimings {
+  uint64_t pipeline_ticks;
+  uint64_t final_pipeline_ticks;
+};
+
+struct ApuG2TypedParams {
+  uint32_t operation;
+  uint32_t lhs_l1_row;
+  uint32_t rhs_l1_row;
+  uint32_t out_l1_row;
+  uint32_t scratch_l1_row;
+  uint32_t lhs_bits;
+  uint32_t rhs_bits;
+  uint32_t out_bits;
+  uint32_t lhs_signed;
+  uint32_t rhs_signed;
+  uint32_t out_signed;
+  uint32_t log_reduction;
+  uint32_t repetitions;
+  uint64_t timings_l5;
+};
+
+enum ApuG2ComposedDotEpilogue : uint32_t {
+  APUG2_COMPOSED_DOT_IDENTITY = 0,
+  APUG2_COMPOSED_DOT_PAIR_AFFINE = 1,
+  APUG2_COMPOSED_DOT_ACCUMULATE = 2,
+};
+
+struct ApuG2ComposedDotTimings {
+  uint64_t pipeline_ticks;
+  uint64_t final_pipeline_ticks;
+};
+
+struct ApuG2ComposedDotParams {
+  uint32_t lhs_l1_row;
+  uint32_t rhs_l1_row;
+  uint32_t auxiliary_l1_row;
+  uint32_t out_l1_row;
+  uint32_t scratch_l1_row;
+  uint32_t lhs_bits;
+  uint32_t rhs_bits;
+  uint32_t dot_bits;
+  uint32_t auxiliary_bits;
+  uint32_t out_bits;
+  uint32_t lhs_signed;
+  uint32_t rhs_signed;
+  uint32_t auxiliary_signed;
+  uint32_t out_signed;
+  uint32_t log_reduction;
+  uint32_t epilogue;
+  uint32_t repetitions;
+  uint64_t timings_l5;
+};
+
 constexpr uint32_t APUG2_U16_GEMM_CHUNK = 128;
 constexpr uint32_t APUG2_U16_GEMM_BMAX = 31;
 
@@ -249,5 +311,9 @@ static_assert(sizeof(ApuG2SqrtTimings) == 16);
 static_assert(sizeof(ApuG2SqrtParams) == 20);
 static_assert(sizeof(ApuG2SubTimings) == 16);
 static_assert(sizeof(ApuG2SubParams) == 24);
+static_assert(sizeof(ApuG2TypedTimings) == 16);
+static_assert(sizeof(ApuG2TypedParams) == 60);
+static_assert(sizeof(ApuG2ComposedDotTimings) == 16);
+static_assert(sizeof(ApuG2ComposedDotParams) == 76);
 static_assert(sizeof(ApuG2U16GemmTimings) == 8);
 static_assert(sizeof(ApuG2U16GemmParams) == 28 + 2 * APUG2_U16_GEMM_BMAX * APUG2_U16_GEMM_CHUNK);

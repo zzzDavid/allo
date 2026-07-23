@@ -22,6 +22,16 @@ from .pim.apu_v1_vector_program import (
     compile_apu_v1_vector_workload,
 )
 from .pim.apu_g2_program import APUG2Callable, APUG2Program, compile_apu_g2_program
+from .pim.apu_g2_composed_program import (
+    APUG2ComposedContractionCallable,
+    APUG2ComposedContractionProgram,
+    compile_apu_g2_composed_program,
+)
+from .pim.apu_g2_typed_program import (
+    APUG2TypedCallable,
+    APUG2TypedProgram,
+    compile_apu_g2_typed_program,
+)
 from .pim.apu_g2_vector_program import (
     APUG2AtaxCallable,
     APUG2ChunkedGesummvCallable,
@@ -587,6 +597,8 @@ def compile(
     | UPMEMProgramCallable
     | APUv1VectorCallable
     | APUG2Callable
+    | APUG2ComposedContractionCallable
+    | APUG2TypedCallable
     | APUG2ChunkedGesummvCallable
     | APUG2GemvCallable
     | APUG2GemverCallable
@@ -678,6 +690,32 @@ def compile(
             target,
             cost=bound_cost,
             promotion_gate=promotion_gate,
+        )
+
+    if isinstance(workload, APUG2TypedProgram):
+        if promotion_gate is not None:
+            raise ValueError("APUG2TypedProgram has no schedule-search activation")
+        if host_moves is not None or layout is not None:
+            raise ValueError("APUG2TypedProgram owns its VL64 layout and hardware ABI")
+        return compile_apu_g2_typed_program(
+            workload,
+            target,
+            cost=bound_cost,
+            backend=backend,
+        )
+
+    if isinstance(workload, APUG2ComposedContractionProgram):
+        if promotion_gate is not None:
+            raise ValueError("APUG2ComposedContractionProgram has no search activation")
+        if host_moves is not None or layout is not None:
+            raise ValueError(
+                "APUG2ComposedContractionProgram owns its LinearLayout and ABI"
+            )
+        return compile_apu_g2_composed_program(
+            workload,
+            target,
+            cost=bound_cost,
+            backend=backend,
         )
 
     if isinstance(workload, APUG2Program):

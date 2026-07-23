@@ -101,6 +101,33 @@ from .pim.upmem_program import (
 )
 from .pim.apu_v1_program import APUv1Phase, APUv1PrecisionPolicy, APUv1Program
 from .pim.apu_g2_program import APUG2Callable, APUG2Operation, APUG2Program
+from .pim.apu_g2_composed_program import (
+    APUG2ComposedContractionCallable,
+    APUG2ComposedContractionProgram,
+    APUG2DotEpilogue,
+    APUG2DotEpilogueMode,
+)
+from .pim.apu_g2_composed_layout import (
+    APUG2ComposedHostFiles,
+    build_apu_g2_composed_host_command,
+    decode_apu_g2_u16_bitpatterns,
+    deinterleave_apu_g2_streams,
+    encode_apu_g2_u16_bitpatterns,
+    gather_apu_g2_composed_output,
+    interleave_apu_g2_dot_streams,
+    pack_apu_g2_batched_gemm_dots,
+    pack_apu_g2_composed_auxiliary,
+    pack_apu_g2_composed_operand,
+    pack_apu_g2_matrix_vector_dots,
+)
+from .pim.apu_g2_typed_program import (
+    APUG2ScalarType,
+    APUG2TypedCallable,
+    APUG2TypedOperation,
+    APUG2TypedProgram,
+    pack_apu_g2_gemm_as_independent_dots,
+    unpack_apu_g2_gemm_dots,
+)
 from .pim.apu_g2_vector_program import (
     APUG2AtaxCallable,
     APUG2GemvCallable,

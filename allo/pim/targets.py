@@ -1151,6 +1151,45 @@ def build_apu_v2_target():
                     fn=lambda x, y: (x - y) & 0xFFFF,
                     matchable=False,
                 )
+                # Width-polymorphic direct-VL64 primitives.  Exact scalar
+                # widths and signedness live on the emitted descriptors, not
+                # in workload-specific opcode names.  The older uint16 names
+                # remain stable for archived schedules and calibrations.
+                allo.op(
+                    "ADD_TYPED",
+                    src=(seg0, seg1),
+                    dst=seg1,
+                    fn=lambda x, y: x + y,
+                    matchable=False,
+                )
+                allo.op(
+                    "MUL_TYPED",
+                    src=(seg0, seg0),
+                    dst=seg1,
+                    fn=lambda x, y: x * y,
+                    matchable=False,
+                )
+                allo.op(
+                    "GROUP_REDUCE_ADD_TYPED",
+                    src=(seg0,),
+                    dst=seg1,
+                    fn=lambda x: x,
+                    matchable=False,
+                )
+                allo.op(
+                    "DIV_TYPED",
+                    src=(seg0, seg1),
+                    dst=l1,
+                    fn=lambda x, y: x // y,
+                    matchable=False,
+                )
+                allo.op(
+                    "COPY_ODD_TO_EVEN_VECTORS",
+                    src=(seg0,),
+                    dst=seg1,
+                    fn=lambda x: x,
+                    matchable=False,
+                )
                 allo.op(
                     "SEU_BARRIER",
                     src=(seg1,),

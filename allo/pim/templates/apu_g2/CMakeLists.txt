@@ -164,6 +164,46 @@ target_link_directories(tenon_apu_g2_u16_gemm PRIVATE
 target_link_libraries(tenon_apu_g2_u16_gemm PRIVATE
   gdml gsi_g2_api glog cyclic_buffer pthread)
 
+add_executable(tenon_apu_g2_typed host_typed.cc)
+target_include_directories(tenon_apu_g2_typed PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/device
+  /opt/gsi/include/64vl/g2_64vl
+  /opt/gsi/include/g2_common
+  /opt/gsi/include/gtml/g2_gtml
+  /opt/gsi/include/gsi
+  /opt/gsi/include/gsi/device
+  ${g2_transport_INCLUDE_DIRS}
+  ${g2_transport_TASK_INCLUDE_DIRS})
+target_compile_definitions(tenon_apu_g2_typed PRIVATE
+  DEVICE_SIDE_LIB_LOCATION="${BOARD_DEVICE_LIB}" TENON_APU_G2_HARDWARE=1)
+target_link_libraries(tenon_apu_g2_typed PRIVATE g2_device::g2_device)
+target_link_options(tenon_apu_g2_typed PRIVATE -Wl,--no-as-needed)
+target_link_directories(tenon_apu_g2_typed PRIVATE
+  /opt/gsi/g2/Linux/lib/amd64)
+target_link_libraries(tenon_apu_g2_typed PRIVATE
+  gdml gsi_g2_api glog cyclic_buffer pthread)
+
+add_executable(tenon_apu_g2_composed_dot host_composed_dot.cc)
+target_include_directories(tenon_apu_g2_composed_dot PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/device
+  /opt/gsi/include/64vl/g2_64vl
+  /opt/gsi/include/g2_common
+  /opt/gsi/include/gtml/g2_gtml
+  /opt/gsi/include/gsi
+  /opt/gsi/include/gsi/device
+  ${g2_transport_INCLUDE_DIRS}
+  ${g2_transport_TASK_INCLUDE_DIRS})
+target_compile_definitions(tenon_apu_g2_composed_dot PRIVATE
+  DEVICE_SIDE_LIB_LOCATION="${BOARD_DEVICE_LIB}" TENON_APU_G2_HARDWARE=1)
+target_link_libraries(tenon_apu_g2_composed_dot PRIVATE g2_device::g2_device)
+target_link_options(tenon_apu_g2_composed_dot PRIVATE -Wl,--no-as-needed)
+target_link_directories(tenon_apu_g2_composed_dot PRIVATE
+  /opt/gsi/g2/Linux/lib/amd64)
+target_link_libraries(tenon_apu_g2_composed_dot PRIVATE
+  gdml gsi_g2_api glog cyclic_buffer pthread)
+
 add_executable(tenon_apu_g2_u16_fill host_fill.cc)
 target_include_directories(tenon_apu_g2_u16_fill PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}

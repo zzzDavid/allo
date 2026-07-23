@@ -26,5 +26,8 @@ GSI_LIBRARY_ENTRY_POINT_FUNCTION_PROTOTYPE(tenon_apu_g2_u16_sqrt, uint64_t);
 GSI_LIBRARY_ENTRY_POINT_FUNCTION_PROTOTYPE(tenon_apu_g2_u16_sub, uint64_t);
 GSI_LIBRARY_ENTRY_POINT_FUNCTION_PROTOTYPE(tenon_apu_g2_u16_gemm_chunk,
                                            uint64_t);
+GSI_LIBRARY_ENTRY_POINT_FUNCTION_PROTOTYPE(tenon_apu_g2_typed, uint64_t);
+GSI_LIBRARY_ENTRY_POINT_FUNCTION_PROTOTYPE(tenon_apu_g2_composed_dot,
+                                           uint64_t);
 
 #endif

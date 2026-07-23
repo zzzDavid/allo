@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pure-Python structural gates for the Gemini-II target and VL64 layout."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -14,6 +16,29 @@ from allo.pim.apu_g2_layout import (
 )
 from allo.pim.targets import build_apu_g2_target
 from allo.spmw_linear_layout import LinearLayout
+
+
+def test_apu_g2_build_templates_keep_publication_optimization_parity():
+    template = (
+        Path(__file__).resolve().parents[2] / "allo" / "pim" / "templates" / "apu_g2"
+    )
+    device_cmake = (template / "device" / "CMakeLists.txt").read_text()
+    typed_runtime = (
+        Path(__file__).resolve().parents[2] / "allo" / "pim" / "apu_g2_typed_runtime.py"
+    ).read_text()
+    composed_runtime = (
+        Path(__file__).resolve().parents[2]
+        / "allo"
+        / "pim"
+        / "apu_g2_composed_runtime.py"
+    ).read_text()
+
+    assert "set(CMAKE_BUILD_TYPE ArcDebug)" in device_cmake
+    assert "set(GSI_SYSTEM_CMAKE_BUILD_TYPE Release)" in device_cmake
+    assert "target_compile_options(tenon_apu_g2_tasks PRIVATE" in device_cmake
+    assert "\n  -O3\n  -DNDEBUG)" in device_cmake
+    assert '"-DCMAKE_BUILD_TYPE=Release"' in typed_runtime
+    assert '"-DCMAKE_BUILD_TYPE=Release"' in composed_runtime
 
 
 def test_apu_g2_target_is_one_core_with_a_one_dimensional_16_pe_grid():
@@ -81,6 +106,11 @@ def test_apu_g2_target_exposes_the_validated_direct_vl64_compute_surface():
         "MAX_U16",
         "DIV_U16",
         "SUB_U16",
+        "ADD_TYPED",
+        "MUL_TYPED",
+        "GROUP_REDUCE_ADD_TYPED",
+        "DIV_TYPED",
+        "COPY_ODD_TO_EVEN_VECTORS",
         "SHIFT_LEFT_U16",
         "SHIFT_RIGHT_U16",
         "SEU_BARRIER",
