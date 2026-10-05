@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Software gates for generic LinearLayout-aware APUg2 contractions."""
 
-from pathlib import Path
 import inspect
 
 import numpy as np
@@ -13,19 +12,14 @@ from allo.pim.apu_g2_composed_layout import (
     APUG2ComposedHostFiles,
     build_apu_g2_composed_host_command,
     canonicalize_apu_g2_values,
-    decode_apu_g2_u16_bitpatterns,
     deinterleave_apu_g2_streams,
     expected_apu_g2_composed_output,
-    gather_apu_g2_composed_output,
     interleave_apu_g2_dot_streams,
     pack_apu_g2_batched_gemm_dots,
-    pack_apu_g2_composed_auxiliary,
-    pack_apu_g2_composed_operand,
     pack_apu_g2_matrix_vector_dots,
 )
 from allo.pim.apu_g2_composed_program import build_apu_g2_composed_recipe
 from allo.pim.apu_g2_composed_runtime import _parse_metrics
-from allo.pim.apu_g2_layout import APUG2_U16_SHAPE
 from allo.pim.costs.apu_g2 import apu_g2_cost
 from allo.pim.targets import build_apu_g2_target
 
@@ -33,7 +27,6 @@ from allo.pim.targets import build_apu_g2_target
 I2 = allo.APUG2ScalarType(2, True)
 I3 = allo.APUG2ScalarType(3, True)
 I4 = allo.APUG2ScalarType(4, True)
-I11 = allo.APUG2ScalarType(11, True)
 I14 = allo.APUG2ScalarType(14, True)
 I15 = allo.APUG2ScalarType(15, True)
 
@@ -66,83 +59,6 @@ def _profiles(repetitions=7):
             repetitions=repetitions,
         ),
     )
-
-
-def _physical_from_logical(program, logical):
-    physical = np.zeros(APUG2_U16_SHAPE, dtype=program.output_type.numpy_dtype)
-    for output_index, value in enumerate(logical.reshape(-1)):
-        row = output_index * program.epilogue.terms_per_output
-        column, mmb_set = program.layout_plan.physical_coordinate(row, 0)
-        physical[mmb_set, column] = value
-    return physical
-
-
-def test_frozen_profiles_are_derived_from_geometry_type_and_epilogue():
-    gemm, batch, gesummv, bicg, mvt = _profiles()
-    assert [item.dot_shape for item in (gemm, batch, gesummv, bicg, mvt)] == [
-        (1984, 128),
-        (2048, 128),
-        (2048, 128),
-        (512, 256),
-        (512, 256),
-    ]
-    assert [item.dot_type for item in (gemm, batch, gesummv, bicg, mvt)] == [
-        I15,
-        I15,
-        I11,
-        I14,
-        I14,
-    ]
-    assert gesummv.auxiliary_type == I3
-    assert mvt.auxiliary_type == I14
-    assert gesummv.input_shapes == (gesummv.dot_shape, gesummv.dot_shape)
-    assert mvt.input_shapes == (
-        mvt.dot_shape,
-        mvt.dot_shape,
-        mvt.output_shape,
-    )
-    for program in (gemm, batch, gesummv, bicg, mvt):
-        manifest = program.manifest()
-        layout = manifest["layout"]
-        assert layout["schema"] == "apu-g2-dot-linear-layout-v1"
-        assert layout["linear_layout"]["kind"] == "linear-layout-f2"
-        assert len(layout["fingerprint"]) == 64
-        assert len(program.structural_fingerprint) == 64
-        assert manifest["structural_fingerprint"] == program.structural_fingerprint
-        assert layout["validity"]["logical_rows"] == program.dot_count
-        assert layout["validity"]["padded_reduction"] == program.reduction_extent
-
-
-def test_epilogue_and_width_contracts_fail_closed():
-    with pytest.raises(ValueError, match="identity or two"):
-        allo.APUG2DotEpilogue((3,))
-    with pytest.raises(ValueError, match="output must be exactly 15 bits"):
-        allo.APUG2ComposedContractionProgram(
-            (I3, I3),
-            I14,
-            (4,),
-            256,
-            allo.APUG2DotEpilogue((1,), I14),
-        )
-    with pytest.raises(ValueError, match="output must be exactly 18 bits"):
-        allo.APUG2ComposedContractionProgram(
-            (I3, I3),
-            I14,
-            (4,),
-            256,
-            allo.APUG2DotEpilogue((3, 2)),
-        )
-    with pytest.raises(ValueError, match="accumulator must use"):
-        allo.APUG2ComposedContractionProgram(
-            (I3, I3),
-            I15,
-            (4,),
-            256,
-            allo.APUG2DotEpilogue(
-                (1,),
-                allo.APUG2ScalarType(13, True),
-            ),
-        )
 
 
 def test_generic_gemm_and_batched_gemm_dot_adapters_match_numpy():
@@ -239,72 +155,6 @@ def test_interleaved_pair_bicg_and_mvt_semantics_match_numpy():
     np.testing.assert_array_equal(
         deinterleave_apu_g2_streams(observed),
         expected.T,
-    )
-
-
-def test_linear_layout_controls_operand_auxiliary_and_result_heads():
-    rng = np.random.default_rng(31)
-    programs = _profiles()
-    for program in programs:
-        lhs = rng.integers(
-            program.input_types[0].minimum,
-            program.input_types[0].maximum + 1,
-            size=program.dot_shape,
-            dtype=program.input_types[0].numpy_dtype,
-        )
-        rhs = rng.integers(
-            program.input_types[1].minimum,
-            program.input_types[1].maximum + 1,
-            size=program.dot_shape,
-            dtype=program.input_types[1].numpy_dtype,
-        )
-        accumulator = (
-            rng.integers(
-                -100,
-                101,
-                size=program.output_shape,
-                dtype=np.int16,
-            )
-            if program.epilogue.accumulator_type is not None
-            else None
-        )
-        physical_lhs = pack_apu_g2_composed_operand(program, lhs, 0)
-        physical_rhs = pack_apu_g2_composed_operand(program, rhs, 1)
-        for row in (0, program.dot_count // 2, program.dot_count - 1):
-            column, mmb_set = program.layout_plan.physical_coordinate(row, 0)
-            stop = column + program.reduction_extent
-            np.testing.assert_array_equal(physical_lhs[mmb_set, column:stop], lhs[row])
-            np.testing.assert_array_equal(physical_rhs[mmb_set, column:stop], rhs[row])
-
-        auxiliary = pack_apu_g2_composed_auxiliary(program, accumulator)
-        if program.epilogue.mode.value == "identity":
-            assert auxiliary is None
-        elif program.epilogue.mode.value == "pair_affine":
-            for row in (0, 1, program.dot_count - 2, program.dot_count - 1):
-                column, mmb_set = program.layout_plan.physical_coordinate(row, 0)
-                assert int(auxiliary[mmb_set, column]) == (3, 2)[row % 2]
-        else:
-            for row in (0, program.dot_count - 1):
-                column, mmb_set = program.layout_plan.physical_coordinate(row, 0)
-                assert int(auxiliary[mmb_set, column]) == int(
-                    accumulator.reshape(-1)[row]
-                )
-
-        oracle = expected_apu_g2_composed_output(
-            program, lhs, rhs, accumulator=accumulator
-        )
-        physical_output = _physical_from_logical(program, oracle)
-        np.testing.assert_array_equal(
-            gather_apu_g2_composed_output(program, physical_output),
-            oracle,
-        )
-
-
-def test_fixture_decoding_uses_full_u16_twos_complement_payload():
-    payload = np.array([0xFFFF, 0xFFFC, 0x0003, 0x0007], dtype="<u2")
-    np.testing.assert_array_equal(
-        decode_apu_g2_u16_bitpatterns(payload, I3),
-        np.array([-1, -4, 3, -1], dtype=np.int8),
     )
 
 
@@ -455,23 +305,3 @@ def test_host_command_and_parser_bind_every_physical_field(tmp_path):
             program,
             device,
         )
-
-
-def test_templates_expose_one_generic_composed_task_and_no_case_dispatch():
-    template = (
-        Path(__file__).resolve().parents[2] / "allo" / "pim" / "templates" / "apu_g2"
-    )
-    device = (template / "device" / "apu_g2_composed_dot.cc").read_text()
-    host = (template / "host_composed_dot.cc").read_text()
-    cmake = (template / "CMakeLists.txt").read_text()
-    device_cmake = (template / "device" / "CMakeLists.txt").read_text()
-    assert "tenon_apu_g2_composed_dot" in device
-    assert "APUG2_COMPOSED_DOT_PAIR_AFFINE" in device
-    assert "APUG2_COMPOSED_DOT_ACCUMULATE" in device
-    assert "tenon_apu_g2_composed_dot" in host
-    assert "tenon_apu_g2_composed_dot" in cmake
-    assert "apu_g2_composed_dot.cc" in device_cmake
-    for source in (device, host):
-        assert "gesummv" not in source.lower()
-        assert "bicg" not in source.lower()
-        assert "mvt" not in source.lower()

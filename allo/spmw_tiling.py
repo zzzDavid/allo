@@ -18,8 +18,8 @@ when a legal one exists AND it fits a bounded tier -- otherwise the
 identity-only singleton (byte-identical, the regression default). The candidate
 set is a function of `bound` and `target` geometry, never a literal.
 
-This generalizes Mortise's single capacity constant `C` (`resident_cap_elems`)
-into a swept, argmin-ranked tile -- the choice rides a typed `tile` `Knob`
+This generalizes a single fixed capacity constant into a swept,
+argmin-ranked tile -- the choice rides a typed `tile` `Knob`
 (`spmw_knobs.py`); the sim-confirmed "retiling beats the user's nest" win is
 the verifier's.
 

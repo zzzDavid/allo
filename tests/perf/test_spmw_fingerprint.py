@@ -61,26 +61,26 @@ def _recipe_inline(value):
     ).hexdigest()
 
 
-@pytest.mark.parametrize("payload", PAYLOADS)
-def test_json_digest_matches_every_replaced_inline_digest(payload):
-    assert json_digest(payload, allow_nan=False) == _strict_inline(payload)
-    assert json_digest(payload) == _matcher_inline(payload)
-    assert json_digest(payload) == _cost_inline(payload)
-    assert json_digest(payload) == _recipe_inline(payload)
+def test_json_digest_matches_every_replaced_inline_digest():
+    for payload in PAYLOADS:
+        assert json_digest(payload, allow_nan=False) == _strict_inline(payload)
+        assert json_digest(payload) == _matcher_inline(payload)
+        assert json_digest(payload) == _cost_inline(payload)
+        assert json_digest(payload) == _recipe_inline(payload)
 
 
-@pytest.mark.parametrize("payload", PAYLOADS)
-def test_canonical_json_matches_replaced_text(payload):
-    assert canonical_json(payload) == json.dumps(
-        payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
-    )
-    assert canonical_json(payload, allow_nan=False) == json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    )
+def test_canonical_json_matches_replaced_text():
+    for payload in PAYLOADS:
+        assert canonical_json(payload) == json.dumps(
+            payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        )
+        assert canonical_json(payload, allow_nan=False) == json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
 
 
 def test_nan_payload_is_hashable_by_default_and_rejected_when_strict():

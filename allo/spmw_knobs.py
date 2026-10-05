@@ -311,11 +311,11 @@ def register_default_knobs():
     """Register the six live levers as typed knobs, in the per-target cross
     ORDER the hand-crossed enumerator applied them (the byte-identity anchor).
 
-    Samsung/Mortise: grf_residency -> crf_issue -> stage_resident (the
+    Samsung: grf_residency -> crf_issue -> stage_resident (the
     `fibers` lever is baked into the base candidates, not a cross).
     Idempotent (safe to call at import).
     """
-    for tname in ("samsung_hbm_pim", "mortise", "mortise_wide"):
+    for tname in ("samsung_hbm_pim",):
         register_knob(
             tname, Knob("grf_residency", _grf_residency_candidates, _grf_residency_emit)
         )
@@ -332,8 +332,6 @@ def register_default_knobs():
     # inter-kernel staging so the argmin earns it.
     for tname in (
         "samsung_hbm_pim",
-        "mortise",
-        "mortise_wide",
         "apu_v1",
         "apu_v2",
     ):
@@ -346,8 +344,6 @@ def register_default_knobs():
     # ...)`; the identity tiling is the default and writes no `extra`.
     for tname in (
         "samsung_hbm_pim",
-        "mortise",
-        "mortise_wide",
         "apu_v1",
         "apu_v2",
     ):
@@ -361,8 +357,6 @@ def register_default_knobs():
     # both), so the argmin default is byte-identical.
     for tname in (
         "samsung_hbm_pim",
-        "mortise",
-        "mortise_wide",
         "apu_v1",
         "apu_v2",
     ):

@@ -33,13 +33,7 @@ from ..perf.graph import ExecutionGraph
 from ..spmw_apu_v1_build import _apu_v1_build_config
 from ..spmw_codegen import RunResult
 from .upmem_analysis import analyze_upmem_mlir
-from .apu_v1_hybrid import (
-    APUv1PrecisionPolicy,
-    build_apu_v1_hybrid_execution_graph,
-    build_apu_v1_region_executables,
-    compile_apu_v1_hybrid,
-    discover_apu_v1_hybrid_manifest,
-)
+from .apu_v1_hybrid import APUv1PrecisionPolicy, discover_apu_v1_hybrid_manifest
 
 
 _C_TYPES = {
@@ -475,22 +469,11 @@ class CompiledAPUv1Program:
             cost=cost,
             program_name=program.name,
         )
-        self.hybrid_callable = None
         if self.hybrid_manifest.has_vector_regions:
-            executables = build_apu_v1_region_executables(
-                self.hybrid_manifest, self.schedule
-            )
-            device_runner = None
-            if backend is None:
-                from .apu_v1_hybrid_runtime import run_apu_v1_hybrid
-
-                device_runner = run_apu_v1_hybrid
-            self.hybrid_callable = compile_apu_v1_hybrid(
-                self.hybrid_manifest,
-                executables,
-                target,
-                backend="device" if backend is None else backend,
-                device_runner=device_runner,
+            raise NotImplementedError(
+                "APUv1Program vector regions (hybrid scalar/vector execution) were "
+                "removed; compile contractions as a plain callable through allo.compile "
+                "to use the APU v1 vector-program route"
             )
         transformed, scalar_scratch_bytes = _replace_local_arrays(
             self.artifact.c_source
@@ -515,17 +498,6 @@ class CompiledAPUv1Program:
             ):
                 self.execution_graph = (
                     self.native_vector_lowering.build_execution_graph(target, cost)
-                )
-            elif self.hybrid_manifest.has_vector_regions:
-                self.execution_graph = build_apu_v1_hybrid_execution_graph(
-                    self.hybrid_manifest,
-                    target,
-                    cost,
-                    partitions={
-                        region_id: executable.partition
-                        for region_id, executable in executables.items()
-                        if executable.partition is not None
-                    },
                 )
             else:
                 fallback = max(
@@ -684,19 +656,7 @@ class APUv1ProgramCallable:
 
     def __call__(self, *args, **kwargs):
         bound = self.signature.bind(*args, **kwargs)
-        if self.compiled.hybrid_callable is None:
-            result = self.compiled.run(**bound.arguments)
-        else:
-            hybrid = self.compiled.hybrid_callable
-            forwarded = {
-                name: value
-                for name, value in bound.arguments.items()
-                if name in hybrid.input_names
-            }
-            result = hybrid(**forwarded)
-            for name, value in result.extra.get("outputs", {}).items():
-                if name in bound.arguments:
-                    np.copyto(bound.arguments[name], value, casting="same_kind")
+        result = self.compiled.run(**bound.arguments)
         self.last_result = result
         return result
 

@@ -653,41 +653,6 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     return cross_with_knobs(target, base_candidates, matches, role_to_memref)
 
 
-@register_enumerator("mortise")
-def _mortise_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
-    """Enumerate Mortise layouts (design 06 §3.3).
-
-    Mortise is built Samsung-shaped (`tests/spmw/_mortise_target.py`:
-    grf_a/grf_b, nested tiles, the same moves/ops), so its layout
-    enumeration IS Samsung's: the same bank-row / grf-staged / dual-fiber
-    candidates crossed with residency / crf-issue / `stage_resident`. The
-    only Mortise-specific axis is the capacity lever `C`, which is a target
-    CONSTANT (`resident_cap_elems`) read by the host_staging compose -- not
-    a placement axis, so it does not multiply the candidate set.
-
-    This delegates to `_samsung_enumerate` rather than re-deriving the
-    bank algebra: Mortise's tree is Samsung's tree plus a const, so the
-    `stage_resident in {False, True}` candidate pair the autoscheduler
-    argmin-selects over is produced identically. Argmin picks the resident
-    arm at B>=2 (the Mortise faithful host_staging prices it cheaper).
-    """
-    return _samsung_enumerate(target, matches)
-
-
-@register_enumerator("mortise_wide")
-def _mortise_wide_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
-    """Enumerate the Mortise-WIDE (banks_per_pim==4) layouts (SPEC-022 D3).
-
-    Samsung-shaped, so it delegates to `_samsung_enumerate`. Because the
-    swizzle tile axis is now sized by `banks_per_pim` (= bank_out // pim_units),
-    a pim fanout of 4 over 16 banks yields a 2-bit tile -> `size_of("tile")==4`
-    -> FOUR materialised fiber handles `banks[4*pid + r]` for r in range(4).
-    This is the `banks_per_pim > 2` proof input the deleted two-class
-    `_bank_parity` matcher could never have classified.
-    """
-    return _samsung_enumerate(target, matches)
-
-
 def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
     """Construct the analyzable SBK and ABK layouts for SK-Hynix AiM.
 
