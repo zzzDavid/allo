@@ -2,9 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Buildable persistent-L4 project emitted by the public hybrid compiler."""
 
-from pathlib import Path
-import sys
-
 import allo
 
 from allo.pim.apu_v1_hybrid_runtime import (
@@ -15,8 +12,7 @@ from allo.pim.apu_v1_hybrid_runtime import (
 from allo.pim.targets import build_apu_v1_target
 
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "pim"))
-from lib.apu_v1 import (  # pylint: disable=wrong-import-position
+from _polybench_cases import (
     build_hybrid_program,
     get_case,
 )

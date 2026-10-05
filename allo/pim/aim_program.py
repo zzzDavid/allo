@@ -32,7 +32,8 @@ import hashlib
 import math
 from typing import Literal
 
-from ..spmw_codegen import RunResult, _run_aim
+from ..spmw_aim import _run_aim
+from ..spmw_codegen import RunResult
 
 
 def _positive(name: str, value: int) -> int:

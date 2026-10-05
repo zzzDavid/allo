@@ -4,46 +4,11 @@
 # Tenon/CENT SK hynix AiM comparison
 
 This package builds the 14 typed Tenon programs that correspond to the frozen
-CENT vendor cases, compiles every program twice, and refuses to measure unless
-the complete traces and manifests are byte-identical. Each trace must contain
-exactly one trailing `AiM EOC`.
-
-Run the campaign from the Allo repository root:
-
-```bash
-python -m benchmarks.cent_aim.run_campaign \
-  --simulator-root /path/to/aim_simulator \
-  --vendor-root /path/to/skhynix/vendor \
-  --output-root /path/to/new/evidence-directory
-```
-
-The runner requires the simulator checkout at commit
-`0f28a07bdb83e42b9305ad3d45410ebd3aa2c091`. It resolves the requested Docker
-tag to a content-addressed `sha256:` image ID and uses that immutable ID for all
-runs. The simulator and evidence directories are mounted read-only and network
-access is disabled. The output directory must be absent or empty.
-
-By default, the campaign also derives legal contraction-reuse candidates from
-`target.mac_reg.slots`, compiles each candidate twice, and measures it twice on
-the same simulator. `--skip-reuse-calibration` omits this diagnostic phase; no
-calibration cycle constant is embedded in the compiler or harness.
-
-Verify the completed campaign independently:
-
-```bash
-python -m benchmarks.cent_aim.verify_campaign \
-  /path/to/evidence-directory \
-  --vendor-root /path/to/skhynix/vendor \
-  --tenon-root . \
-  --simulator-root /path/to/aim_simulator
-```
-
-`--tenon-root` and `--simulator-root` are optional during verification because
-the bundle retains a compiler-source snapshot, config, and content hashes.
-Supplying them additionally requires the current local files to match the
-measurement. The vendor root remains required because the comparison table is
-cryptographically joined to its retained raw logs rather than copying or
-silently trusting vendor cycle constants.
+CENT vendor cases (`workloads.py::CENT_CASES`). Each program compiles through
+`allo.compile(build_case(case_id), build_aim_target())` and runs on ramulator2
+in Docker. The paper cycle counts are asserted by
+`tests/pim/test_paper_golden.py`. The archived campaign producer lives in the
+artifact bundle (`tenon-artifacts/skhynix/scripts/run_campaign.py`).
 
 The SK hynix Ramulator2 model used here is timing-only. It does not consume
 tensor payloads or produce numerical outputs. Consequently the bundle records
@@ -58,12 +23,11 @@ storage. The retained compiler manifest records the generic policy, selected
 layout, reason, row ownership, and logical work. No case ID or canonical model
 dimension participates in that selection.
 
-Evidence does not equate opcode counts with semantic completeness. For every
-typed operation, the verifier reconciles command spans and derives physical
-capacity from operation sizes, vector lanes, mask fanout, and target banks or
-bank groups. It also retains canonical vendor/Tenon command-shape signatures
-and their deltas while excluding addresses and command order, so legal linear
-layouts may differ physically without hiding an under-emitted logical tensor.
+`compiler_logical_work_coverage` reconciles command spans per typed operation
+and derives physical capacity from operation sizes, vector lanes, mask fanout,
+and target banks or bank groups. `command_shape_signature` excludes addresses
+and command order, so legal linear layouts may differ physically without
+hiding an under-emitted logical tensor.
 
 The frozen CENT attention traces issue V-cache `WR_ABK` writes only to the
 first 8-channel group (1/4 replica coverage). They remain untouched as vendor

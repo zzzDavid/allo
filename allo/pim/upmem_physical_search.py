@@ -23,38 +23,24 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import Enum
-import hashlib
 import itertools
-import json
 import math
-import struct
 from typing import Any
+
+from ..spmw_fingerprint import canonical_json, json_digest
 
 
 SEARCH_SCHEMA = "upmem-physical-search-v1"
 MODEL_SCHEMA = "upmem-upimulator-physical-cost-v1"
 ESTIMATE_SCHEMA = "upmem-physical-cost-estimate-v1"
 EVIDENCE_SCHEMA = "upmem-physical-calibration-evidence-v1"
-MMTV_ROW_LAYOUT_SEARCH_SCHEMA = "upmem-mmtv-row-layout-search-v1"
-MMTV_ROW_LAYOUT_EVIDENCE_SCHEMA = "upmem-mmtv-row-layout-evidence-v1"
 
-UPIMULATOR_BINARY_SHA256 = (
-    "0ab6af912dc641d0cf54551c64eeabbae9bd50aa9fc71f25922b7832dcd3563a"
-)
 UPMEM_MAX_TASKLETS = 24
 UPMEM_WRAM_BYTES = 64 * 1024
 UPMEM_MAX_DMA_BYTES = 2048
 UPMEM_DMA_ALIGNMENT = 8
 UPMEM_REVOLVER_CYCLES = 11
 UPMEM_PIPELINE_FILL_CYCLES = 13
-
-UPMEM_MMTV_CANONICAL_MATRIX_SHA256 = (
-    "2e16f1d967e9f05e00f5968346d51edbd3b992e123b048208101c13dc8f5ae77"
-)
-UPMEM_MMTV_CANONICAL_VECTORS_SHA256 = (
-    "50f73abaea041fdabc4cbe6e1b6ddadf6e3df1531cd7caf5ef46cdc5c04d9880"
-)
-UPMEM_MMTV_ROW_LAYOUT_PHASES = (0, 1, 15, 2, 3, 5, 7, 9)
 
 # These are analytical proxy constants, not fitted hardware latencies.  Their
 # provenance is recorded in ``UPMEMPhysicalCostModel.manifest``.  Calibration
@@ -82,17 +68,11 @@ _MRAM_COUNTERS = (
 
 
 def _canonical_json(value: object) -> str:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    )
+    return canonical_json(value, allow_nan=False)
 
 
 def _fingerprint(value: object) -> str:
-    return hashlib.sha256(_canonical_json(value).encode("ascii")).hexdigest()
+    return json_digest(value, allow_nan=False)
 
 
 def _positive_integer(value: object, name: str) -> int:
@@ -1010,15 +990,18 @@ class UPMEMCalibrationEvidence:
     simulator_log_sha256: str
     oracle_validation_status: str
     raw_counters: tuple[tuple[str, int], ...]
-    simulator_binary_sha256: str = UPIMULATOR_BINARY_SHA256
+    simulator_binary_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not self.evidence_id or not self.candidate_set:
             raise ValueError("calibration evidence strings must be non-empty")
         _positive_integer(self.logic_cycles, "logic_cycles")
-        if len(self.simulator_binary_sha256) != 64 or any(
-            character not in "0123456789abcdef"
-            for character in self.simulator_binary_sha256
+        if self.simulator_binary_sha256 is not None and (
+            len(self.simulator_binary_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.simulator_binary_sha256
+            )
         ):
             raise ValueError("simulator_binary_sha256 must be a SHA-256 hex digest")
         object.__setattr__(self, "raw_counters", tuple(self.raw_counters))
@@ -2171,438 +2154,13 @@ def select_upmem_physical_plan(
     return result.best
 
 
-def _require_sha256(value: str, name: str) -> str:
-    if len(value) != 64 or any(
-        character not in "0123456789abcdef" for character in value
-    ):
-        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
-    return value
-
-
-def _int32_sha256(values: tuple[int, ...]) -> str:
-    try:
-        payload = struct.pack(f"<{len(values)}i", *values)
-    except struct.error as error:
-        raise ValueError("MMTV inputs must fit signed int32") from error
-    return hashlib.sha256(payload).hexdigest()
-
-
-def upmem_mmtv_row_costs(
-    rows: int,
-    columns: int,
-    batches: int,
-    matrix_values,
-    vector_values,
-) -> tuple[int, ...]:
-    """Return the content-aware ``__mulsi3`` step proxy for each logical row."""
-
-    rows = _positive_integer(rows, "rows")
-    columns = _positive_integer(columns, "columns")
-    batches = _positive_integer(batches, "batches")
-    matrix = tuple(int(value) for value in matrix_values)
-    vectors = tuple(int(value) for value in vector_values)
-    total_rows = batches * rows
-    if len(matrix) != total_rows * columns:
-        raise ValueError("matrix_values has the wrong flattened MMTV extent")
-    if len(vectors) != batches * columns:
-        raise ValueError("vector_values has the wrong flattened MMTV extent")
-    mask = (1 << 32) - 1
-    return tuple(
-        sum(
-            min(
-                matrix[logical_row * columns + column] & mask,
-                vectors[(logical_row // rows) * columns + column] & mask,
-            ).bit_length()
-            for column in range(columns)
-        )
-        for logical_row in range(total_rows)
-    )
-
-
-def _balanced_mmtv_permutation(
-    row_costs: tuple[int, ...],
-    num_tasklets: int,
-    rows_per_tasklet: int,
-    phase_rotation: int,
-) -> tuple[int, ...]:
-    """Independent specification used to audit the physical-plan balancer."""
-
-    buckets: list[list[int]] = [[] for _ in range(num_tasklets)]
-    bucket_costs = [0] * num_tasklets
-    for logical_row in sorted(
-        range(len(row_costs)), key=lambda row: (-row_costs[row], row)
-    ):
-        eligible = [
-            tasklet
-            for tasklet in range(num_tasklets)
-            if len(buckets[tasklet]) < rows_per_tasklet
-        ]
-        if not eligible:
-            raise ValueError("MMTV LPT balancer exhausted all tasklet capacities")
-        tasklet = min(
-            eligible,
-            key=lambda item: (
-                bucket_costs[item],
-                len(buckets[item]),
-                item,
-            ),
-        )
-        buckets[tasklet].append(logical_row)
-        bucket_costs[tasklet] += row_costs[logical_row]
-    physical_rows: list[int] = []
-    for tasklet, bucket in enumerate(buckets):
-        rotation = (phase_rotation * tasklet) % rows_per_tasklet
-        physical_rows.extend(bucket[rotation:] + bucket[:rotation])
-    return tuple(physical_rows)
-
-
-@dataclass(frozen=True)
-class UPMEMMMTVRowLayoutEvidence:
-    """One exact uPIMulator observation for a canonical MMTV row layout."""
-
-    candidate_id: str
-    phase_rotation: int | None
-    logic_cycles: int
-    matrix_sha256: str = UPMEM_MMTV_CANONICAL_MATRIX_SHA256
-    vectors_sha256: str = UPMEM_MMTV_CANONICAL_VECTORS_SHA256
-    source: str = "tenon-mmtv-row-layout-sweep-2026-07-22"
-    simulator_binary_sha256: str = UPIMULATOR_BINARY_SHA256
-
-    def __post_init__(self) -> None:
-        if not self.candidate_id or not self.source:
-            raise ValueError("MMTV row-layout evidence strings must be non-empty")
-        if self.phase_rotation is not None and (
-            isinstance(self.phase_rotation, bool)
-            or not isinstance(self.phase_rotation, int)
-            or self.phase_rotation < 0
-        ):
-            raise ValueError("phase_rotation must be a nonnegative integer or None")
-        _positive_integer(self.logic_cycles, "logic_cycles")
-        _require_sha256(self.matrix_sha256, "matrix_sha256")
-        _require_sha256(self.vectors_sha256, "vectors_sha256")
-        _require_sha256(self.simulator_binary_sha256, "simulator_binary_sha256")
-
-    def manifest(self) -> dict[str, object]:
-        return {
-            "schema": MMTV_ROW_LAYOUT_EVIDENCE_SCHEMA,
-            "candidate_id": self.candidate_id,
-            "layout": (
-                "identity" if self.phase_rotation is None else "content_aware_lpt"
-            ),
-            "phase_rotation": self.phase_rotation,
-            "logic_cycles": self.logic_cycles,
-            "shape": {"batches": 12, "rows": 16, "columns": 32},
-            "canonical_inputs": {
-                "matrix_sha256": self.matrix_sha256,
-                "vectors_sha256": self.vectors_sha256,
-            },
-            "source": self.source,
-            "simulator": "uPIMulator Go software simulator",
-            "simulator_binary_sha256": self.simulator_binary_sha256,
-            "metric": "one-DPU cumulative logic_cycle",
-            "hardware_measurement": False,
-        }
-
-
-DEFAULT_UPMEM_MMTV_ROW_LAYOUT_EVIDENCE = (
-    UPMEMMMTVRowLayoutEvidence("identity", None, 216_866),
-    UPMEMMMTVRowLayoutEvidence("greedy-phase-0", 0, 216_181),
-    UPMEMMMTVRowLayoutEvidence("greedy-phase-1", 1, 215_684),
-    UPMEMMMTVRowLayoutEvidence("greedy-phase-15", 15, 215_980),
-    UPMEMMMTVRowLayoutEvidence("greedy-phase-2", 2, 215_805),
-    UPMEMMMTVRowLayoutEvidence("greedy-phase-3", 3, 215_825),
-    UPMEMMMTVRowLayoutEvidence("greedy-phase-5", 5, 216_342),
-    UPMEMMMTVRowLayoutEvidence("greedy-phase-7", 7, 216_127),
-    UPMEMMMTVRowLayoutEvidence("greedy-phase-9", 9, 216_120),
-)
-
-
-@dataclass(frozen=True)
-class UPMEMMMTVRowLayoutCandidate:
-    candidate_id: str
-    phase_rotation: int | None
-    physical_to_logical_rows: tuple[int, ...]
-    row_costs: tuple[int, ...]
-    num_tasklets: int
-    rows_per_tasklet: int
-    evidence: UPMEMMMTVRowLayoutEvidence
-
-    @property
-    def tasklet_cost_sums(self) -> tuple[int, ...]:
-        return tuple(
-            sum(
-                self.row_costs[logical_row]
-                for logical_row in self.physical_to_logical_rows[
-                    tasklet
-                    * self.rows_per_tasklet : (tasklet + 1)
-                    * self.rows_per_tasklet
-                ]
-            )
-            for tasklet in range(self.num_tasklets)
-        )
-
-    @property
-    def logic_cycles(self) -> int:
-        return self.evidence.logic_cycles
-
-    @property
-    def tasklet_cost_spread(self) -> int:
-        return max(self.tasklet_cost_sums) - min(self.tasklet_cost_sums)
-
-    def _body(self) -> dict[str, object]:
-        return {
-            "candidate_id": self.candidate_id,
-            "layout": (
-                "identity" if self.phase_rotation is None else "content_aware_lpt"
-            ),
-            "phase_rotation": self.phase_rotation,
-            "permutation_semantics": "physical_row_to_logical_flat_row",
-            "physical_to_logical_rows": list(self.physical_to_logical_rows),
-            "physical_to_logical_rows_i32_sha256": _int32_sha256(
-                self.physical_to_logical_rows
-            ),
-            "tasklet_cost_sums": list(self.tasklet_cost_sums),
-            "tasklet_cost_spread": self.tasklet_cost_spread,
-            "logic_cycles": self.logic_cycles,
-            "evidence_id": self.evidence.candidate_id,
-        }
-
-    @property
-    def fingerprint(self) -> str:
-        return _fingerprint(self._body())
-
-    def manifest(self) -> dict[str, object]:
-        return {**self._body(), "candidate_fingerprint": self.fingerprint}
-
-
-@dataclass(frozen=True)
-class UPMEMMMTVRowLayoutSearchResult:
-    batches: int
-    rows: int
-    columns: int
-    matrix_sha256: str
-    vectors_sha256: str
-    row_costs: tuple[int, ...]
-    ordered: tuple[UPMEMMMTVRowLayoutCandidate, ...]
-    evidence: tuple[UPMEMMMTVRowLayoutEvidence, ...]
-
-    @property
-    def ranked(self) -> tuple[UPMEMMMTVRowLayoutCandidate, ...]:
-        return tuple(
-            sorted(
-                self.ordered,
-                key=lambda candidate: (
-                    candidate.logic_cycles,
-                    candidate.candidate_id,
-                    candidate.fingerprint,
-                ),
-            )
-        )
-
-    @property
-    def best(self) -> UPMEMMMTVRowLayoutCandidate:
-        return self.ranked[0]
-
-    def _body(self) -> dict[str, object]:
-        return {
-            "schema": MMTV_ROW_LAYOUT_SEARCH_SCHEMA,
-            "objective": {
-                "metric": "uPIMulator one-DPU cumulative logic_cycle",
-                "direction": "minimize",
-                "scope": "device launch only",
-                "excluded": [
-                    "host row packing",
-                    "host output inverse permutation",
-                    "host transfers",
-                ],
-            },
-            "shape": {
-                "batches": self.batches,
-                "rows": self.rows,
-                "columns": self.columns,
-                "logical_flat_rows": self.batches * self.rows,
-                "num_tasklets": self.ordered[0].num_tasklets,
-                "rows_per_tasklet": self.ordered[0].rows_per_tasklet,
-            },
-            "canonical_inputs": {
-                "matrix_sha256": self.matrix_sha256,
-                "vectors_sha256": self.vectors_sha256,
-            },
-            "cost_formula": {
-                "per_term": ("bit_length(min(lhs & 0xffffffff, vector & 0xffffffff))"),
-                "per_logical_row": "sum(per_term for every reduction column)",
-                "interpretation": (
-                    "unsigned operand magnitude proxy for __mulsi3 early-exit steps"
-                ),
-                "logical_row_costs": list(self.row_costs),
-            },
-            "algorithm": {
-                "row_order": "stable (-cost, logical_flat_row)",
-                "assignment": (
-                    "capacity-constrained LPT to eligible minimum "
-                    "(current_cost_sum, current_len, tasklet_id)"
-                ),
-                "within_tasklet_order": "retain greedy assignment order",
-                "phase_rotation": (
-                    "rotate tasklet bucket left by "
-                    "(phase * tasklet_id) % rows_per_tasklet"
-                ),
-                "identity_is_separate_non_greedy_candidate": True,
-            },
-            "ordered_phases": [None, *UPMEM_MMTV_ROW_LAYOUT_PHASES],
-            "ordered_candidates": [candidate.manifest() for candidate in self.ordered],
-            "ranked_candidate_ids": [
-                candidate.candidate_id for candidate in self.ranked
-            ],
-            "selected": self.best.manifest(),
-            "evidence": [row.manifest() for row in self.evidence],
-            "claim_scope": {
-                "software_simulator_calibrated": True,
-                "hardware_calibrated": False,
-                "hardware_performance_claim": False,
-                "content_specific": True,
-                "host_unpack_excluded": True,
-            },
-        }
-
-    @property
-    def search_fingerprint(self) -> str:
-        return _fingerprint(self._body())
-
-    def manifest(self) -> dict[str, object]:
-        return {**self._body(), "search_fingerprint": self.search_fingerprint}
-
-
-def search_upmem_mmtv_row_layout(
-    matrix_values,
-    vector_values,
-    *,
-    rows: int = 16,
-    columns: int = 32,
-    batches: int = 12,
-    num_tasklets: int = 12,
-    phases: tuple[int, ...] = UPMEM_MMTV_ROW_LAYOUT_PHASES,
-    evidence: tuple[UPMEMMMTVRowLayoutEvidence, ...] = (
-        DEFAULT_UPMEM_MMTV_ROW_LAYOUT_EVIDENCE
-    ),
-) -> UPMEMMMTVRowLayoutSearchResult:
-    """Search the exact canonical MMTV layouts backed by simulator evidence."""
-
-    rows = _positive_integer(rows, "rows")
-    columns = _positive_integer(columns, "columns")
-    batches = _positive_integer(batches, "batches")
-    num_tasklets = _positive_integer(num_tasklets, "num_tasklets")
-    matrix = tuple(int(value) for value in matrix_values)
-    vectors = tuple(int(value) for value in vector_values)
-    total_rows = batches * rows
-    if total_rows % num_tasklets:
-        raise ValueError("MMTV logical rows must divide evenly across tasklets")
-    rows_per_tasklet = total_rows // num_tasklets
-    phases = tuple(phases)
-    if phases != UPMEM_MMTV_ROW_LAYOUT_PHASES:
-        raise ValueError("MMTV evidence requires the exact ordered phase domain")
-    matrix_sha256 = _int32_sha256(matrix)
-    vectors_sha256 = _int32_sha256(vectors)
-    if (
-        matrix_sha256 != UPMEM_MMTV_CANONICAL_MATRIX_SHA256
-        or vectors_sha256 != UPMEM_MMTV_CANONICAL_VECTORS_SHA256
-    ):
-        raise ValueError(
-            "MMTV row-layout simulator evidence is bound to the canonical inputs"
-        )
-    if (batches, rows, columns, num_tasklets) != (12, 16, 32, 12):
-        raise ValueError("MMTV row-layout evidence is bound to shape [12,16,32]")
-    evidence = tuple(evidence)
-    expected_ids = ("identity",) + tuple(f"greedy-phase-{phase}" for phase in phases)
-    if tuple(row.candidate_id for row in evidence) != expected_ids:
-        raise ValueError("MMTV row-layout evidence IDs/order do not match phase domain")
-    if any(
-        row.matrix_sha256 != matrix_sha256 or row.vectors_sha256 != vectors_sha256
-        for row in evidence
-    ):
-        raise ValueError("MMTV row-layout evidence input hashes do not match inputs")
-
-    row_costs = upmem_mmtv_row_costs(rows, columns, batches, matrix, vectors)
-    candidates = [
-        UPMEMMMTVRowLayoutCandidate(
-            "identity",
-            None,
-            tuple(range(total_rows)),
-            row_costs,
-            num_tasklets,
-            rows_per_tasklet,
-            evidence[0],
-        )
-    ]
-    from .upmem_physical import (
-        balance_matrix_vector_rows,
-        matrix_vector_row_mul_step_costs,
-    )
-
-    materialized_costs = matrix_vector_row_mul_step_costs(
-        rows, columns, batches, matrix, vectors
-    )
-    if materialized_costs != row_costs:
-        raise ValueError(
-            "physical-plan MMTV row costs differ from search cost specification"
-        )
-
-    for index, phase in enumerate(phases, start=1):
-        expected = _balanced_mmtv_permutation(
-            row_costs, num_tasklets, rows_per_tasklet, phase
-        )
-        materialized = balance_matrix_vector_rows(
-            rows,
-            columns,
-            batches,
-            matrix,
-            vectors,
-            phase_rotation=phase,
-        )
-        if materialized != expected:
-            raise ValueError(
-                "physical-plan MMTV balancer differs from search cost specification"
-            )
-        candidates.append(
-            UPMEMMMTVRowLayoutCandidate(
-                f"greedy-phase-{phase}",
-                phase,
-                materialized,
-                row_costs,
-                num_tasklets,
-                rows_per_tasklet,
-                evidence[index],
-            )
-        )
-    result = UPMEMMMTVRowLayoutSearchResult(
-        batches,
-        rows,
-        columns,
-        matrix_sha256,
-        vectors_sha256,
-        row_costs,
-        tuple(candidates),
-        evidence,
-    )
-    if result.best.candidate_id != "greedy-phase-1":
-        raise ValueError("canonical MMTV evidence no longer selects greedy phase 1")
-    return result
-
-
 __all__ = [
     "DEFAULT_UPMEM_CALIBRATION_EVIDENCE",
-    "DEFAULT_UPMEM_MMTV_ROW_LAYOUT_EVIDENCE",
     "DEFAULT_UPMEM_PHYSICAL_COST_MODEL",
     "MaskedF2TaskletLayout",
     "UPMEMCalibrationEvidence",
     "UPMEMDataLayout",
     "UPMEMKernelKind",
-    "UPMEMMMTVRowLayoutCandidate",
-    "UPMEMMMTVRowLayoutEvidence",
-    "UPMEMMMTVRowLayoutSearchResult",
-    "UPMEM_MMTV_CANONICAL_MATRIX_SHA256",
-    "UPMEM_MMTV_CANONICAL_VECTORS_SHA256",
-    "UPMEM_MMTV_ROW_LAYOUT_PHASES",
     "UPMEMNoLegalPhysicalPlan",
     "UPMEMOperandResidency",
     "UPMEMOwnership",
@@ -2621,7 +2179,5 @@ __all__ = [
     "UPMEMPlanBuilderRejected",
     "physical_features",
     "rank_upmem_physical_candidates",
-    "search_upmem_mmtv_row_layout",
     "select_upmem_physical_plan",
-    "upmem_mmtv_row_costs",
 ]

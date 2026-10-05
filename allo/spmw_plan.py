@@ -4,14 +4,13 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .perf import BoundCostSpec, CostEvent, CostSpec, ExecutionGraph
 from .spmw_autoschedule import _matcher_search_scope, _matcher_work_scope
+from .spmw_fingerprint import json_digest
 from .spmw_liveness import MatcherValueId, TraceLiveness, trace_liveness
 from .spmw_tripcount import resolve_trip_count
 
@@ -259,10 +258,7 @@ class BufferMetricManifest:
 
     @property
     def fingerprint(self) -> str:
-        payload = json.dumps(
-            self.manifest(), sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()
+        return json_digest(self.manifest())
 
     def metrics_for(self, value_id: MatcherValueId | None) -> dict | None:
         if value_id is None:

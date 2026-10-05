@@ -1,6 +1,6 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""PolyBench-on-PIM suite conftest (spec Answer 5).
+"""PIM suite conftest (spec Answer 5).
 
 Adds the `apu_v1_device` marker that gates every APU v1 test to this server
 (the only host with the board), a session fixture that skips + records
@@ -17,17 +17,10 @@ from __future__ import annotations
 
 import contextlib
 import pathlib
-import shutil
-import subprocess
 
 import pytest
 
-# Importing conftest's dir onto sys.path is automatic (pytest prepends the
-# rootdir of the conftest); that makes `import lib.<m>` resolve from any kernel
-# folder under tests/pim/.
-
 _BOARD_LOCK = pathlib.Path(__file__).resolve().parent / ".apu_v1.lock"
-_APU_G2_LOCK = pathlib.Path(__file__).resolve().parent / ".apu_g2.lock"
 
 
 def pytest_configure(config):
@@ -39,17 +32,26 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
-        "apu_g2_device: APUg2 real-device VL64 test; never simulation-substituted.",
+        "paper_full: long paper-golden rows; run with `-m paper_full`.",
     )
 
 
-def apu_v1_unavailable_reason() -> str | None:
-    """The device precondition (ARC toolchain / gvml template / GSI PCI node),
-    via the existing `_apu_v1_unavailable_reason()` -- re-exported, not
-    re-implemented. None means the board is reachable on this host."""
-    from allo.spmw_codegen import _apu_v1_unavailable_reason
+def pytest_collection_modifyitems(config, items):
+    """`paper_full` rows run only when selected with `-m paper_full`."""
+    if "paper_full" in (config.getoption("markexpr") or ""):
+        return
+    skip = pytest.mark.skip(reason="paper_full row; select with -m paper_full")
+    for item in items:
+        if "paper_full" in item.keywords:
+            item.add_marker(skip)
 
-    return _apu_v1_unavailable_reason()
+
+def apu_v1_unavailable_reason() -> str | None:
+    """The device precondition (ARC toolchain / gvml template / GSI PCI node /
+    GVML SDK). None means the board is reachable on this host."""
+    from allo.spmw_simenv import apu_v1_unavailable_reason as reason
+
+    return reason()
 
 
 @pytest.fixture
@@ -63,6 +65,36 @@ def apu_v1_device_gate():
     reason = apu_v1_unavailable_reason()
     if reason is not None:
         pytest.skip(f"BLOCKED-DEVICE({reason})")
+    yield
+
+
+def _simulator_gate(target_name: str):
+    from allo.spmw_codegen import simulator_unavailable_reason
+
+    reason = simulator_unavailable_reason(target_name)
+    if reason is not None:
+        pytest.skip(f"BLOCKED-SIM({reason})")
+
+
+@pytest.fixture
+def samsung_sim_gate():
+    """Skip when PIMSimulator's `pim_driver` cannot run here. A simulator test
+    that does not request its gate and hits `SimulatorUnavailable` fails."""
+    _simulator_gate("samsung_hbm_pim")
+    yield
+
+
+@pytest.fixture
+def aim_sim_gate():
+    """Skip when the ramulator2 AiM Docker image or its config is absent."""
+    _simulator_gate("aim")
+    yield
+
+
+@pytest.fixture
+def apu_v2_sim_gate():
+    """Skip when the `gsi-g2-l1sim` Docker image is absent."""
+    _simulator_gate("apu_v2")
     yield
 
 
@@ -85,56 +117,3 @@ def board_lock():
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
-def apu_g2_unavailable_reason() -> str | None:
-    """Return why the installed Gemini-II hardware path cannot run."""
-
-    required = (
-        pathlib.Path("/dev/gsi/g2apu/apu-00"),
-        pathlib.Path("/opt/gsi/g2/vector_core/lib/libg2_64vl.a"),
-        pathlib.Path("/opt/gsi/share/g2_transport"),
-    )
-    missing = [str(path) for path in required if not path.exists()]
-    if missing:
-        return "missing " + ", ".join(missing)
-    if shutil.which("gsi_tool") is None or shutil.which("cmake") is None:
-        return "gsi_tool/cmake is not on PATH"
-    try:
-        probe = subprocess.run(
-            ["gsi_tool", "info", "apu-00", "-v"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        return f"card probe failed: {error}"
-    if probe.returncode != 0:
-        return f"card probe exited {probe.returncode}"
-    if "Status          : Available" not in probe.stdout:
-        return "card is not Available"
-    return None
-
-
-@pytest.fixture
-def apu_g2_device_gate():
-    reason = apu_g2_unavailable_reason()
-    if reason is not None:
-        pytest.skip(f"BLOCKED-DEVICE({reason})")
-    yield
-
-
-@contextlib.contextmanager
-def apu_g2_board_lock():
-    """Serialize G2 card allocation without sharing the unrelated v1 lock."""
-
-    try:
-        import fcntl
-    except ImportError:
-        yield
-        return
-    with open(_APU_G2_LOCK, "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)

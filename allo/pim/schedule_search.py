@@ -706,159 +706,6 @@ class SearchResult(Generic[PayloadT, MaterializedT, ScoreT, ObjectiveT]):
         }
 
 
-@dataclass(frozen=True)
-class OpaqueScheduleIncumbent(Generic[PayloadT, MaterializedT]):
-    """A frozen incumbent retained outside the generated candidate domain."""
-
-    decisions: Decisions
-    payload: PayloadT
-    materialized: MaterializedT
-    fingerprint: Hashable
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "decisions", _freeze_decisions(self.decisions))
-        _decision_key(self.fingerprint, path="opaque incumbent fingerprint")
-
-
-@dataclass(frozen=True)
-class PromotionDecision:
-    """Result of an external correctness/performance promotion gate."""
-
-    eligible: bool
-    reason: str | None = None
-
-    def __post_init__(self) -> None:
-        if type(self.eligible) is not bool:
-            raise TypeError("promotion eligibility must be a bool")
-        if self.eligible and self.reason is not None:
-            raise ValueError(
-                "eligible promotion decisions cannot have a fallback reason"
-            )
-        if not self.eligible and (not isinstance(self.reason, str) or not self.reason):
-            raise ValueError("rejected promotion decisions require a fallback reason")
-
-
-@dataclass(frozen=True)
-class ScheduleActivation(Generic[PayloadT, MaterializedT, ScoreT, ObjectiveT]):
-    """Recommended and activated schedules plus fail-closed fallback evidence."""
-
-    search_result: SearchResult[PayloadT, MaterializedT, ScoreT, ObjectiveT]
-    recommended: ScheduleCandidate[PayloadT, MaterializedT, ScoreT, ObjectiveT]
-    incumbent: (
-        ScheduleCandidate[PayloadT, MaterializedT, ScoreT, ObjectiveT]
-        | OpaqueScheduleIncumbent[PayloadT, MaterializedT]
-    )
-    active: (
-        ScheduleCandidate[PayloadT, MaterializedT, ScoreT, ObjectiveT]
-        | OpaqueScheduleIncumbent[PayloadT, MaterializedT]
-    )
-    promoted: bool
-    fallback_reason: str | None
-
-    def __post_init__(self) -> None:
-        if self.recommended is not self.search_result.best:
-            raise ValueError("recommended schedule must be the search argmin")
-        if type(self.promoted) is not bool:
-            raise TypeError("promoted must be a bool")
-        if self.active is self.recommended:
-            if self.fallback_reason is not None:
-                raise ValueError(
-                    "activated recommendation cannot have a fallback reason"
-                )
-        else:
-            if self.active is not self.incumbent:
-                raise ValueError("active schedule must be recommendation or incumbent")
-            if not isinstance(self.fallback_reason, str) or not self.fallback_reason:
-                raise ValueError("incumbent fallback requires a reason")
-        if self.promoted != (
-            self.active is self.recommended and self.recommended is not self.incumbent
-        ):
-            raise ValueError("promoted must identify an activated challenger")
-
-    @property
-    def active_materialized(self) -> MaterializedT:
-        return self.active.materialized
-
-
-class MissingScheduleIncumbent(RuntimeError):
-    """Raised when guarded activation has no schedule to fall back to."""
-
-
-def guarded_schedule_activation(
-    search_result: SearchResult[PayloadT, MaterializedT, ScoreT, ObjectiveT],
-    *,
-    incumbent: (
-        ScheduleCandidate[PayloadT, MaterializedT, ScoreT, ObjectiveT]
-        | OpaqueScheduleIncumbent[PayloadT, MaterializedT]
-        | None
-    ) = None,
-    promotion_gate: (
-        Callable[
-            [
-                ScheduleCandidate[PayloadT, MaterializedT, ScoreT, ObjectiveT],
-                ScheduleCandidate[PayloadT, MaterializedT, ScoreT, ObjectiveT]
-                | OpaqueScheduleIncumbent[PayloadT, MaterializedT],
-            ],
-            PromotionDecision,
-        ]
-        | None
-    ) = None,
-) -> ScheduleActivation[PayloadT, MaterializedT, ScoreT, ObjectiveT]:
-    """Activate only a gated challenger; otherwise retain the incumbent."""
-
-    if not isinstance(search_result, SearchResult):
-        raise TypeError("guarded activation requires a SearchResult")
-    selected_incumbent = incumbent or search_result.best_incumbent
-    if selected_incumbent is None:
-        raise MissingScheduleIncumbent(
-            "guarded activation requires an explicit or searched incumbent"
-        )
-    if isinstance(selected_incumbent, ScheduleCandidate) and not any(
-        candidate is selected_incumbent for candidate in search_result.ranked
-    ):
-        raise ValueError("searched incumbent must belong to the SearchResult")
-
-    recommended = search_result.best
-    if recommended is selected_incumbent:
-        return ScheduleActivation(
-            search_result,
-            recommended,
-            selected_incumbent,
-            selected_incumbent,
-            False,
-            None,
-        )
-    if promotion_gate is None:
-        return ScheduleActivation(
-            search_result,
-            recommended,
-            selected_incumbent,
-            selected_incumbent,
-            False,
-            "shadow_only: promotion evidence was not requested",
-        )
-    decision = promotion_gate(recommended, selected_incumbent)
-    if not isinstance(decision, PromotionDecision):
-        raise TypeError("promotion gate must return PromotionDecision")
-    if decision.eligible:
-        return ScheduleActivation(
-            search_result,
-            recommended,
-            selected_incumbent,
-            recommended,
-            True,
-            None,
-        )
-    return ScheduleActivation(
-        search_result,
-        recommended,
-        selected_incumbent,
-        selected_incumbent,
-        False,
-        decision.reason,
-    )
-
-
 class InfeasibleIncumbent(RuntimeError):
     """Raised when the explicit incumbent cannot be retained as a candidate."""
 
@@ -1357,21 +1204,36 @@ def grid_search(
             if evaluate_exploration_assignment(decisions):
                 break
 
-    problem_assignment_keys = constraint_legal_assignment_keys()
-    covered_assignment_keys = problem_assignment_keys.intersection(
-        evaluated_assignment_keys
-    )
     if (
-        assignment_producer is not None
-        and counters.termination == "exhausted"
-        and covered_assignment_keys != problem_assignment_keys
+        not ordered_constraints
+        and assignment_producer is None
+        and not any(callable(domain.values) for domain in ordered_domains)
     ):
-        missing_count = len(problem_assignment_keys - covered_assignment_keys)
-        raise InvalidProducedAssignment(
-            "assignment producer claimed exhausted but omitted "
-            f"{missing_count} of {len(problem_assignment_keys)} "
-            "constraint-legal complete assignments"
+        # Unconstrained static grid: every assignment is legal, so the total is
+        # the domain product. Walking the product to count it never terminates
+        # on wide grids (e.g. 24**128 matcher buckets).
+        complete_assignments_total = math.prod(
+            len(domain.values) for domain in ordered_domains
         )
+        complete_assignments_covered = len(evaluated_assignment_keys)
+    else:
+        problem_assignment_keys = constraint_legal_assignment_keys()
+        covered_assignment_keys = problem_assignment_keys.intersection(
+            evaluated_assignment_keys
+        )
+        if (
+            assignment_producer is not None
+            and counters.termination == "exhausted"
+            and covered_assignment_keys != problem_assignment_keys
+        ):
+            missing_count = len(problem_assignment_keys - covered_assignment_keys)
+            raise InvalidProducedAssignment(
+                "assignment producer claimed exhausted but omitted "
+                f"{missing_count} of {len(problem_assignment_keys)} "
+                "constraint-legal complete assignments"
+            )
+        complete_assignments_total = len(problem_assignment_keys)
+        complete_assignments_covered = len(covered_assignment_keys)
     stats = SearchStats(
         partial_assignments=counters.partial_assignments,
         complete_assignments_considered=counters.complete_assignments_considered,
@@ -1381,8 +1243,8 @@ def grid_search(
         feasible_candidates=len(candidates),
         pruned_branches=counters.pruned_branches,
         incumbent_evaluated=incumbent_decisions is not None,
-        complete_assignments_covered=len(covered_assignment_keys),
-        complete_assignments_total=len(problem_assignment_keys),
+        complete_assignments_covered=complete_assignments_covered,
+        complete_assignments_total=complete_assignments_total,
         max_complete_assignments=max_complete_assignments,
         termination=counters.termination,
         elapsed_seconds=time.perf_counter() - started_at,
@@ -1425,23 +1287,18 @@ __all__ = [
     "InvalidObjectiveValue",
     "InvalidProducedAssignment",
     "LegalityConstraint",
-    "MissingScheduleIncumbent",
     "NoFeasibleSchedule",
     "NoFeasibleScheduleInPrefix",
     "NonFiniteObjective",
-    "OpaqueScheduleIncumbent",
     "ObjectiveDomainMismatch",
-    "PromotionDecision",
     "ProducedAssignments",
     "Rejection",
     "RejectionStage",
-    "ScheduleActivation",
     "ScheduleCandidate",
     "ScheduleObjectiveDomain",
     "SearchResult",
     "SearchStats",
     "SearchTermination",
-    "guarded_schedule_activation",
     "grid_search",
     "structural_decision_key",
 ]

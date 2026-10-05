@@ -15,7 +15,6 @@ import dis
 import hashlib
 from importlib import metadata as importlib_metadata
 import inspect
-import json
 import math
 import os
 import sys
@@ -23,6 +22,7 @@ from dataclasses import dataclass, field, fields as dataclass_fields, is_datacla
 from enum import Enum
 from types import CodeType, MappingProxyType, ModuleType
 
+from ..spmw_fingerprint import canonical_json
 from .evaluator import Evaluator
 from .graph import Activity, ExecutionGraph, HandleInstance, Occupancy
 
@@ -287,7 +287,7 @@ _DEPENDENCY_MANIFEST_METHOD = "__allo_fingerprint_manifest__"
 
 
 def _canonical_json(value):
-    return json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return canonical_json(value)
 
 
 class _FingerprintCanonicalizer:
@@ -1213,13 +1213,6 @@ class BoundCostSpec:
             raise ValueError(f"duplicate cost rule for {path!r}")
         self.rules[path] = function
 
-    def _require_current_fingerprint(self):
-        current = _cost_fingerprint(self.spec, self.target, self.rules)
-        if current != self._fingerprint:
-            raise RuntimeError(
-                f"cost spec {self.spec.name!r} changed after it was bound"
-            )
-
     def emit(self, graph, event, dependencies=()):
         path = handle_path(event.primitive)
         try:
@@ -1235,22 +1228,18 @@ class BoundCostSpec:
         return context.terminals
 
     def evaluate(self, graph):
-        self._require_current_fingerprint()
         graph.metadata["cost_fingerprint"] = self.fingerprint
         return Evaluator().evaluate(graph)
 
     def score_materialization(self, materialization):
         """Score one exact backend materialization through this cost spec."""
 
-        self._require_current_fingerprint()
         scorer = self._materialization_scorer
         if scorer is None:
             raise TypeError(
                 f"cost spec {self.spec.name!r} has no materialization scorer"
             )
-        result = scorer(self, materialization)
-        self._require_current_fingerprint()
-        return result
+        return scorer(self, materialization)
 
 
 class CostSpec:

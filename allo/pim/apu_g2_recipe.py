@@ -14,8 +14,6 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-import hashlib
-import json
 import math
 from numbers import Integral
 from types import MappingProxyType
@@ -23,6 +21,7 @@ from typing import Callable, Mapping
 
 from ..perf import Activity, ExecutionGraph, Occupancy
 from ..perf.cost import concrete_instance, handle_path
+from ..spmw_fingerprint import json_digest
 
 
 APUG2_GROUPS = 16
@@ -33,13 +32,7 @@ APUG2_MAX_REDUCTION_BLOCK = 256
 
 
 def _structural_digest(value) -> str:
-    payload = json.dumps(
-        value,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
-    return hashlib.sha256(payload).hexdigest()
+    return json_digest(value)
 
 
 class APUG2RecipeOpKind(str, Enum):

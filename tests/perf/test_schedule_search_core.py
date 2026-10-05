@@ -13,17 +13,13 @@ from allo.pim.schedule_search import (
     InvalidObjectiveValue,
     InvalidProducedAssignment,
     LegalityConstraint,
-    MissingScheduleIncumbent,
     NoFeasibleSchedule,
     NoFeasibleScheduleInPrefix,
     NonFiniteObjective,
-    OpaqueScheduleIncumbent,
     ObjectiveDomainMismatch,
-    PromotionDecision,
     ProducedAssignments,
     ScheduleCandidate,
     ScheduleObjectiveDomain,
-    guarded_schedule_activation,
     grid_search,
 )
 
@@ -363,102 +359,6 @@ def test_equal_objective_prefers_incumbent_not_first_in_domain():
         "last",
     ]
     assert result.best is result.best_incumbent
-
-
-def test_guarded_activation_keeps_incumbent_and_records_fallback_reason():
-    costs = {"baseline": 10, "challenger": 7}
-    result = grid_search(
-        (DecisionDomain("plan", tuple(costs)),),
-        build=lambda decisions: decisions["plan"],
-        materialize=lambda payload: f"artifact:{payload}",
-        score=lambda artifact: Estimate(
-            costs[artifact.removeprefix("artifact:")], artifact
-        ),
-        objective=lambda estimate: estimate.cycles,
-        objective_domain="cycles@test-model",
-        incumbent={"plan": "baseline"},
-    )
-
-    activation = guarded_schedule_activation(result)
-
-    assert activation.recommended.payload == "challenger"
-    assert activation.active is result.best_incumbent
-    assert activation.active_materialized == "artifact:baseline"
-    assert activation.fallback_reason == (
-        "shadow_only: promotion evidence was not requested"
-    )
-    assert activation.promoted is False
-
-
-def test_promotion_gate_can_accept_or_reject_a_challenger():
-    costs = {"baseline": 10, "challenger": 7}
-    result = grid_search(
-        (DecisionDomain("plan", tuple(costs)),),
-        build=lambda decisions: decisions["plan"],
-        materialize=lambda payload: payload,
-        score=lambda payload: Estimate(costs[payload], payload),
-        objective=lambda estimate: estimate.cycles,
-        objective_domain="cycles@test-model",
-        incumbent={"plan": "baseline"},
-    )
-
-    rejected = guarded_schedule_activation(
-        result,
-        promotion_gate=lambda recommended, incumbent: PromotionDecision(
-            False,
-            f"hardware evidence missing for {recommended.payload} over "
-            f"{incumbent.payload}",
-        ),
-    )
-    accepted = guarded_schedule_activation(
-        result,
-        promotion_gate=lambda _recommended, _incumbent: PromotionDecision(True),
-    )
-
-    assert rejected.active is result.best_incumbent
-    assert rejected.fallback_reason.startswith("hardware evidence missing")
-    assert accepted.active is result.best
-    assert accepted.fallback_reason is None
-    assert accepted.promoted is True
-
-
-def test_opaque_incumbent_can_fall_back_outside_generated_domain():
-    result = grid_search(
-        (DecisionDomain("plan", ("generated",)),),
-        build=lambda decisions: decisions["plan"],
-        materialize=lambda payload: f"artifact:{payload}",
-        score=lambda payload: Estimate(1, payload),
-        objective=lambda estimate: estimate.cycles,
-        objective_domain="cycles@test-model",
-    )
-    incumbent = OpaqueScheduleIncumbent(
-        decisions={"legacy_route": "pinned"},
-        payload="legacy",
-        materialized="artifact:legacy",
-        fingerprint=("sha256", "0" * 64),
-    )
-
-    activation = guarded_schedule_activation(result, incumbent=incumbent)
-
-    assert activation.recommended is result.best
-    assert activation.incumbent is incumbent
-    assert activation.active is incumbent
-    assert activation.active_materialized == "artifact:legacy"
-    assert activation.fallback_reason.startswith("shadow_only")
-
-
-def test_guarded_activation_fails_closed_without_any_incumbent():
-    result = grid_search(
-        (DecisionDomain("plan", ("only",)),),
-        build=lambda decisions: decisions["plan"],
-        materialize=lambda payload: payload,
-        score=lambda payload: Estimate(1, payload),
-        objective=lambda estimate: estimate.cycles,
-        objective_domain="cycles@test-model",
-    )
-
-    with pytest.raises(MissingScheduleIncumbent):
-        guarded_schedule_activation(result)
 
 
 def test_incumbent_is_evaluated_first_outside_cap_and_duplicate_is_skipped():

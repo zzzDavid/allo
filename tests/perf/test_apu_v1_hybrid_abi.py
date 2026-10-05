@@ -2,9 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Layout-exact vector ABI coverage for canonical hybrid SMALL regions."""
 
-from pathlib import Path
-import sys
-
 import numpy as np
 import pytest
 
@@ -18,8 +15,7 @@ from allo.pim.apu_v1_vector_codegen import APUVectorABI, VectorValue, VR_LANES
 from allo.pim.targets import build_apu_v1_target
 
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "pim"))
-from lib.apu_v1 import build_hybrid_program  # pylint: disable=wrong-import-position
+from _polybench_cases import build_hybrid_program
 
 
 @pytest.mark.parametrize("case", ["gemm", "2mm", "3mm"])

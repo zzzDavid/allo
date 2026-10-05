@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import allo
+import numpy as np
 import pytest
 from allo.ir.types import float16, int16, int32
 
@@ -215,12 +216,52 @@ def test_allo_popcount_dsl_reaches_mlir_analysis_and_gvml_lowering():
     assert "gvml_add_s16" in source
 
 
-def test_discovers_one_dimensional_polybench_style_reduction_but_plans_fail_closed():
+def test_discovers_one_dimensional_polybench_style_reduction_and_lifts_it():
     analysis = analyze_apu_v1_contraction(_module(matrix_vector))
     assert analysis.output_axes == ("row",)
     assert analysis.reduction_axis == "depth"
     assert analysis.lhs.indices == ("row", "depth")
     assert analysis.rhs.indices == ("depth",)
+    names = {plan.name for plan in generate_apu_v1_plans(analysis)}
+    assert "spatial_gemv_group_reduction" in names
+
+
+def row_dot(left: float16[8, 16], right: float16[8, 16], result: float16[8]):
+    for row in allo.grid(8):
+        for depth in allo.reduction(16):
+            result[row] += left[row, depth] * right[row, depth]
+
+
+def one_dimensional_gemv(W: float16[1024, 64], x: float16[64], y: float16[1024]):
+    for i in allo.grid(1024):
+        for k in allo.reduction(64):
+            y[i] += W[i, k] * x[k]
+
+
+def test_one_dimensional_gemv_lifts_to_singleton_plans():
+    from allo.pim.costs import apu_v1_cost
+    from allo.pim.targets import build_apu_v1_target
+
+    compiled = allo.compile(
+        one_dimensional_gemv, build_apu_v1_target(), apu_v1_cost, backend="functional"
+    )
+    assert compiled.selected_plan.name == "spatial_gemv_group_reduction"
+    assert compiled.realization is not None
+    rng = np.random.default_rng(0)
+    W = rng.uniform(-1.0, 1.0, (1024, 64)).astype(np.float16)
+    x = rng.uniform(-1.0, 1.0, 64).astype(np.float16)
+    y = np.zeros(1024, dtype=np.float16)
+    observed = compiled(W, x, y).extra["outputs"]["y"]
+    expected = W.astype(np.float32) @ x.astype(np.float32)
+    np.testing.assert_allclose(
+        np.asarray(observed, dtype=np.float32).reshape(-1), expected, rtol=5e-2, atol=5e-2
+    )
+
+
+def test_one_dimensional_lift_rejects_ambiguous_vector_operand():
+    analysis = analyze_apu_v1_contraction(_module(row_dot))
+    assert analysis.output_axes == ("row",)
+    assert "row" in analysis.lhs.indices and "row" in analysis.rhs.indices
     with pytest.raises(
         IllegalContractionError, match="matrix-vector reductions are the next"
     ):

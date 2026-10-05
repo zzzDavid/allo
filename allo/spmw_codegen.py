@@ -15,20 +15,13 @@ comments below and report 16 for the design.
 
 from __future__ import annotations
 
-import hashlib
+import functools
+import importlib
 import inspect
-import json
-import marshal
-import os
-import re
-import shutil
-import subprocess
-import tempfile
-import time
+import sys
 import warnings
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .spmw_autoschedule import (
     Placement,
@@ -38,7 +31,13 @@ from .spmw_autoschedule import (
     derive_layout_properties,
 )
 from .spmw_match import MatchTrace, MatchedOp
-from .spmw_target import MemoryRef, Register, SymExpr, UnitId
+from .spmw_simenv import (
+    aim_unavailable_reason as _aim_unavailable_reason,
+    apu_v1_unavailable_reason as _apu_v1_unavailable_reason,
+    docker_image_unavailable_reason as _docker_image_unavailable_reason,
+    samsung_unavailable_reason as _samsung_unavailable_reason,
+)
+from .spmw_target import SymExpr, UnitId
 
 
 # --------------------------------------------------------------------- #
@@ -148,20 +147,6 @@ def _matcher_command_manifest(commands) -> tuple:
     return tuple(manifest)
 
 
-def _matcher_host_schedule_manifest(schedule) -> tuple:
-    return tuple(
-        (
-            (
-                tuple(trigger.work_id)
-                if isinstance(trigger.work_id, tuple)
-                else trigger.work_id
-            ),
-            int(trigger.tile_count),
-        )
-        for trigger in schedule
-    )
-
-
 def _matcher_handle_path(handle) -> str:
     from .perf.cost import handle_path
 
@@ -185,89 +170,18 @@ def _matcher_resolved_host_move_manifest(moves) -> tuple:
     return tuple(manifest)
 
 
-def _matcher_emitted_host_move_manifest(moves) -> tuple:
-    return tuple((str(kind), _matcher_handle_path(handle)) for kind, handle in moves)
-
-
-def _matcher_artifact_digest(payload: object) -> str:
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
 @dataclass(frozen=True)
 class MatcherCodegenArtifact:
     """Frozen command/source stream and runtime contract for one candidate."""
 
     target_name: str
     commands: tuple
-    command_manifest: tuple
     host_schedule: tuple
-    host_schedule_manifest: tuple
     host_preloads: tuple
-    emitted_host_moves_manifest: tuple
     resolved_host_moves: tuple
-    resolved_host_moves_manifest: tuple
     runtime_abi: tuple
     runtime_segments: tuple
-    runtime_source_fingerprint: str
-    non_promotable_reason: str | None
     context: Any = field(compare=False, repr=False)
-    platform_fingerprint: object | None = field(default=None, compare=False)
-
-    @property
-    def promotion_materialization_fingerprint(self) -> str | None:
-        if self.non_promotable_reason is not None:
-            return None
-        try:
-            if _matcher_command_manifest(self.commands) != self.command_manifest:
-                return None
-            if _matcher_command_manifest(self.context.cmds) != self.command_manifest:
-                return None
-            if (
-                _matcher_host_schedule_manifest(self.context.host_schedule)
-                != self.host_schedule_manifest
-            ):
-                return None
-            if tuple(self.context.host_preloads) != self.host_preloads:
-                return None
-            if (
-                _matcher_emitted_host_move_manifest(
-                    getattr(self.context, "host_moves_emitted", ())
-                )
-                != self.emitted_host_moves_manifest
-            ):
-                return None
-            if (
-                _matcher_resolved_host_move_manifest(self.resolved_host_moves)
-                != self.resolved_host_moves_manifest
-            ):
-                return None
-        except (AttributeError, TypeError, ValueError):
-            return None
-        if (
-            _matcher_runtime_source_fingerprint(self.target_name)
-            != self.runtime_source_fingerprint
-        ):
-            return None
-        return _matcher_artifact_digest(
-            {
-                "kind": "matcher-codegen-materialization-v1",
-                "target": self.target_name,
-                "commands": self.command_manifest,
-                "host_schedule": self.host_schedule_manifest,
-                "host_preloads": self.host_preloads,
-                "emitted_host_moves": self.emitted_host_moves_manifest,
-                "resolved_host_moves": self.resolved_host_moves_manifest,
-                "runtime_abi": self.runtime_abi,
-                "runtime_segments": self.runtime_segments,
-                "runtime_source": self.runtime_source_fingerprint,
-            }
-        )
-
-    @property
-    def promotion_platform_fingerprint(self):
-        return self.platform_fingerprint
 
     def instantiate_commands(self) -> list:
         return [_clone_matcher_command(command) for command in self.commands]
@@ -277,35 +191,6 @@ class MatcherCodegenArtifact:
             HostTrigger(trigger.work_id, trigger.tile_count)
             for trigger in self.host_schedule
         ]
-
-    def validate_compiled(self, compiled) -> None:
-        if (
-            self.non_promotable_reason is None
-            and self.promotion_materialization_fingerprint is None
-        ):
-            raise RuntimeError(
-                "frozen matcher source/command evidence changed after scoring"
-            )
-        if _matcher_command_manifest(compiled.cmds) != self.command_manifest:
-            raise RuntimeError(
-                "compiled matcher command/source stream changed after scoring"
-            )
-        if (
-            _matcher_host_schedule_manifest(compiled.host_schedule)
-            != self.host_schedule_manifest
-        ):
-            raise RuntimeError("compiled matcher host schedule changed after scoring")
-        if (
-            _matcher_resolved_host_move_manifest(compiled.host_moves)
-            != self.resolved_host_moves_manifest
-        ):
-            raise RuntimeError("compiled matcher host transfers changed after scoring")
-        if tuple(getattr(compiled, "runtime_abi", ())) != self.runtime_abi:
-            raise RuntimeError("compiled matcher runtime ABI changed after scoring")
-        if tuple(getattr(compiled, "runtime_segments", ())) != self.runtime_segments:
-            raise RuntimeError(
-                "compiled matcher runtime command segments changed after scoring"
-            )
 
 
 # --------------------------------------------------------------------- #
@@ -499,653 +384,11 @@ def _bank_fiber_class(idx, stride: int | None = None) -> str | None:
     return f"BANK_{r}"
 
 
-class SamsungCtx(CodegenContext):
-    """Codegen ctx for Samsung HBM-PIM.
-
-    Translates Tenon `Register` / `MemoryRef` handles into Samsung's
-    `PIMOpdType` enum names (as strings), infers the is_auto column-
-    strobe flag from operand shapes, and accumulates the result as a
-    `list[PIMCmd]`.
-
-    Recognized opcodes: "MAC", "MUL", "ADD", "MAD", "MOV", "FILL",
-    "NOP", "JUMP", "EXIT" — i.e. the `PIMCmdType` enum from PIMCmd.h.
-    """
-
-    _REG_TO_OPD = {"grf_a": "GRF_A", "grf_b": "GRF_B"}
-
-    def __init__(self, target):
-        super().__init__(target)
-        # Host-move bookkeeping (spec 001 D5): the host-scope moves' `emit`
-        # closures (`host_broadcast`/`host_scatter`/`host_gather`/`program_crf`)
-        # append `(hook, device_handle)` records here -- parallel to `cmds`,
-        # consumed by the cost model for `host_staging`, NOT by the driver argv
-        # (Q2 option a: the driver keeps doing the transfer; these moves carry
-        # cost + operand-role only). Empty for every cell that does not yet
-        # express `host_xfer.*`.
-        self.host_moves_emitted: list[tuple[str, object]] = []
-
-    # ------------------------------------------------------------------ #
-    # Host-transfer ctx hooks (spec 001 D5). These are bookkeeping hooks the
-    # host-scope moves' `emit` closures call; none emit a compute `PIMCmd`.
-    # The driver still performs the real preload/readback over PIM_REG_RA, so
-    # the cmd stream that reaches `programCrf` is unchanged.
-    # ------------------------------------------------------------------ #
-
-    def drain(self, dst=None, src0=None):
-        """GRF->bank writeback as a NOP+WRITE column-command drain.
-
-        ISA-1.0 forbids a bank dst with a GRF src (PIMCmd.cpp:73-97), so this
-        is NOT a `MOV ODD_BANK<-GRF_B`. The proven drain (PIMRank.cpp:474-487,
-        samsung-pim-isa.md) is a `NOP` in the CRF stream; the conductor issues
-        the WRITE column command host-side. Emitting the NOP form directly means
-        the run-side `_crf_valid` filter (which strips the rejected MOV) now
-        finds nothing to drop -- resolving the SPEC-005 §8 followup. We keep the
-        canonical eight-cycle pipe hold (`NOP` plus loopCounter 7).  The
-        faithful GEMV conductor passes this emitted stream directly to
-        ``programCrf``; omitting the hold produces an invalid drain schedule.
-        """
-        self.cmds.append(PIMCmd(type_="NOP", loopCounter_=7))
-
-    def program_crf(self, crf_handle):
-        """Record that the <=32-word CRF microcode is uploaded for this group.
-
-        Host upload bookkeeping (the `STAGE_CRF` carrier); it does NOT emit a
-        compute `PIMCmd`. The CRF is already conveyed via `--cmds` (ELTWISE) or
-        the REDUCE minimal `--crf`, so this is a no-op on the cmd stream.
-        """
-        self.host_moves_emitted.append(("program_crf", crf_handle))
-
-    def host_broadcast(self, handle):
-        """Record a host->device broadcast (GRF_A/GRF_B/SRF). Bookkeeping +
-        operand-role tag; the driver performs the HAB broadcast."""
-        self.host_moves_emitted.append(("broadcast", handle))
-
-    def host_scatter(self, handle):
-        """Record a host->device per-bank scatter (the weight preload)."""
-        self.host_moves_emitted.append(("scatter", handle))
-
-    def host_gather(self, handle):
-        """Record a device->host gather (the output readback)."""
-        self.host_moves_emitted.append(("gather", handle))
-
-    def _fiber_stride(self):
-        """Bank fiber count (= banks-per-pim stride) for the active placement,
-        read from the carried `LinearLayout`'s segment axis (D3) or the
-        materialised fiber list, else `None` (the index's own coefficient is
-        used). The layout object is load-bearing: it is what determined how
-        many fibers the bank axis was swizzled into."""
-        pl = self._active_placement
-        if pl is None:
-            return None
-        layout = getattr(pl, "layout", None)
-        axis = (getattr(pl, "extra", {}) or {}).get("fiber_axis")
-        if layout is not None and axis is not None:
-            try:
-                return layout.size_of(axis)
-            except Exception:
-                pass
-        fibers = (getattr(pl, "extra", {}) or {}).get("fibers")
-        if fibers:
-            return len(fibers)
-        return None
-
-    def _opd(self, handle):
-        """Return (opd_name, idx) for a Tenon handle, or ("A_OUT", 0)."""
-        if handle is None:
-            return ("A_OUT", 0)
-        if isinstance(handle, Register):
-            opd = self._REG_TO_OPD.get(handle.name)
-            if opd is None:
-                raise NotImplementedError(
-                    f"SamsungCtx: register {handle.name!r} has no PIMOpdType "
-                    "mapping. Only grf_a/grf_b are supported."
-                )
-            return (opd, 0)
-        if isinstance(handle, MemoryRef):
-            # The bank-class name comes from the `range(stride)` fiber walk
-            # (SPEC-022 D3). `stride` is read off the carried LinearLayout's
-            # segment (fiber) axis when one is present; otherwise it is the
-            # index's own coefficient (self-describing). The F2 layout object,
-            # not a pattern matcher, is what determined the fiber geometry.
-            stride = self._fiber_stride()
-            cls = _bank_fiber_class(handle.idx, stride)
-            if cls is None:
-                raise NotImplementedError(
-                    f"SamsungCtx: memref index {handle.idx!r} is not the "
-                    "canonical stride*pid + r fiber form. Real layout "
-                    "decisions are the autoscheduler's job (Blocker 4)."
-                )
-            return (cls, 0)
-        raise NotImplementedError(
-            f"SamsungCtx: unknown handle type {type(handle).__name__}."
-        )
-
-    def cmd(self, name, dst=None, src0=None, src1=None, is_relu=0):
-        dst_name, dst_idx = self._opd(dst)
-        src0_name, src0_idx = self._opd(src0)
-        src1_name, src1_idx = self._opd(src1)
-        # Samsung's "is_auto" column-strobe modifier: set when src1 is
-        # bank-shaped (the bank stream is read in burst mode while the
-        # GRF source stays put). Inferred per report 16 §"is_auto".
-        is_auto = 1 if isinstance(src1, MemoryRef) else 0
-        self.cmds.append(
-            PIMCmd(
-                type_=name,
-                dst_=dst_name,
-                dstIdx_=dst_idx,
-                src0_=src0_name,
-                src0Idx_=src0_idx,
-                src1_=src1_name,
-                src1Idx_=src1_idx,
-                isAuto_=is_auto,
-                isRelu_=is_relu,
-            )
-        )
-
-    # Read-only roles emit LD only; read-write roles emit LD + ST.
-    # `acc` starts at 0 in the GEMV workload IR so its LD half is a
-    # zero-init, not a real memory move -- see spec 009 §E rule 3.
-    # TODO(task-015): revisit when accumulators carry across calls.
-    _ROLE_IS_READ_ONLY = {"x": True, "y": True, "acc": False, "dst": False}
-
-    def resolve_moves(self, role, src_handle=None, dst_handle=None):
-        # dst_handle is the placement-side handle. For Samsung that's
-        # either grf_a / grf_b (LD/ST target) or a bank-shaped MemoryRef
-        # (in-place; no LD/ST needed).
-        if isinstance(dst_handle, MemoryRef):
-            return (None, None)
-        if isinstance(dst_handle, Register):
-            if dst_handle.name == "grf_a":
-                ld, st = "LD_A", "ST_A"
-            elif dst_handle.name == "grf_b":
-                ld, st = "LD_B", "ST_B"
-            else:
-                return (None, None)
-            read_only = self._ROLE_IS_READ_ONLY.get(role, False)
-            if read_only:
-                return (ld, None)
-            # acc carries no prior value in the GEMV workload IR; emit
-            # only the storeback for now (see spec 009 §E rule 3).
-            if role == "acc":
-                return (None, st)
-            return (ld, st)
-        return (None, None)
-
-    def resolve_spill_moves(self, tier, home_handle, *, n_entries=1):
-        # Samsung spills to a bank row. The LD/ST pair keys off the home
-        # register side (grf_a -> LD_A/ST_A, grf_b -> LD_B/ST_B) -- the
-        # same `side` switch the spill cost factory prices.
-        if tier != "bank_row":
-            return super().resolve_spill_moves(tier, home_handle, n_entries=n_entries)
-        if isinstance(home_handle, Register) and home_handle.name == "grf_b":
-            return ("LD_B", "ST_B")
-        return ("LD_A", "ST_A")
-
-    # Active placement + resolved bindings for the current match, set by
-    # `_walk_and_emit` before each compute emit. Default None keeps the
-    # single-fiber path (no dual-fiber state) unchanged.
-    _active_placement = None
-    _active_bindings = None
-
-    def after_match(self, match, n_emitted):
-        # Inner-K JUMP -- the loop counter is computed off the
-        # just-emitted MAC body, so the call must stay inside the
-        # work-id window between compute and storeback.
-        placement = self._active_placement
-        fibers = tuple(getattr(placement, "extra", {}).get("fibers", ()))
-        if placement is not None and len(fibers) > 1 and match.target_op_name == "MAC":
-            self._emit_dual_fiber_jumps(match, n_emitted)
-            return
-        _emit_inner_loop_jump(match, self, n_emitted)
-
-    def _emit_dual_fiber_jumps(self, match, n_emitted):
-        """Materialise the alternating (JUMP even, MAC odd, JUMP odd, ...)
-        tail for a dual-fiber MAC.
-
-        The walker already emitted the canonical MAC against the EVEN
-        fiber (`placements[y]`). Here we close fiber 0's inner loop with
-        its split JUMP, then for each later fiber emit one MAC (same
-        dst/src0, src1 = that fiber's bank handle so `_bank_fiber_class`
-        stamps the per-fiber bank class) followed by its own split JUMP. Trip
-        counts come from `inner_ub // lanes` split across the fibers — no
-        shape literal. This walks `range(n_fibers)`, so it already generalizes
-        to a stride>2 fiber count with no structural change (SPEC-022 D3).
-        """
-        if not match.enclosing_loops:
-            return
-        ub = _parse_loop_bound(match.enclosing_loops[-1][2])
-        if ub is None:
-            return
-        folded = ub // _samsung_lane_burst(self)
-        fibers = self._active_placement.extra.get("fibers", [])
-        n_fibers = len(fibers)
-        if n_fibers <= 1:
-            _emit_inner_loop_jump(match, self, n_emitted)
-            return
-        split = _fiber_fold_split(folded, n_fibers)
-
-        bindings = self._active_bindings or {}
-        mac_dst = bindings.get("acc")
-        mac_src0 = bindings.get("x")
-
-        def emit_jump(trips):
-            # First MAC of the fiber is iteration 0; JUMP loops the rest.
-            loop_counter = trips - 1
-            if loop_counter <= 0:
-                return
-            self.cmds.append(
-                PIMCmd(
-                    type_="JUMP",
-                    loopCounter_=loop_counter,
-                    loopOffset_=n_emitted + 1,
-                )
-            )
-
-        # Fiber 0: the EVEN MAC the walker already emitted; just its JUMP.
-        emit_jump(split[0])
-        # Fibers 1..n-1: MAC against the fiber's bank handle, then JUMP.
-        for i in range(1, n_fibers):
-            self.cmd("MAC", dst=mac_dst, src0=mac_src0, src1=fibers[i])
-            emit_jump(split[i])
-
-
 # --------------------------------------------------------------------- #
 # SK-Hynix AiM (GDDR6 PIM) backend
 # --------------------------------------------------------------------- #
 
 
-class AimCtx(CodegenContext):
-    """Codegen ctx for AiM. Emits one text-format ISR line per `cmd(...)`.
-
-    Output is a list of strings on `self.cmds` (NOT `PIMCmd` records —
-    AiM's ramulator2 consumes a plain text trace). Each line is a
-    space-separated, positional sequence of integer fields in the order
-    ramulator2 expects per opcode (see `_ISR_FIELDS`). A side-channel
-    `_human_lines` mirror keeps the older `key=value` annotation that
-    `_operand_text` produces — useful for unit tests that inspect the
-    rendered trace by substring.
-    """
-
-    # Per-opcode field ordering (positional, matches
-    # ``Ramulator::AiMISRInfo::opcode_str_to_aim_ISR`` in request.h).
-    # Each tuple is the legal field sequence; values are pulled from
-    # the field map built by `_field_map(...)`.
-    _ISR_FIELDS = {
-        "WR_SBK": ("gpr_addr_0", "channel_mask", "bank_index", "row_addr"),
-        "WR_ABK": ("gpr_addr_0", "channel_mask", "row_addr"),
-        "WR_GB": ("opsize", "gpr_addr_0", "channel_mask"),
-        "WR_BIAS": ("gpr_addr_0", "channel_mask"),
-        "WR_AFLUT": ("opsize",),
-        "RD_MAC": ("gpr_addr_0", "channel_mask"),
-        "RD_AF": ("gpr_addr_0", "channel_mask"),
-        "RD_SBK": ("gpr_addr_0", "channel_mask", "bank_index", "row_addr"),
-        "COPY_BKGB": ("opsize", "channel_mask", "bank_index", "row_addr"),
-        "COPY_GBBK": ("opsize", "channel_mask", "bank_index", "row_addr"),
-        "MAC_SBK": ("opsize", "channel_mask", "bank_index", "row_addr"),
-        "MAC_ABK": ("opsize", "channel_mask", "row_addr"),
-        "AF": ("channel_mask",),
-        "EWMUL": ("opsize", "channel_mask", "row_addr"),
-        "EWADD": ("opsize", "gpr_addr_0", "gpr_addr_1"),
-        "SYNC": (),
-        "EOC": (),
-    }
-
-    def __init__(self, target):
-        super().__init__(target)
-        # Override the parent's PIMCmd list with a plain text-line list —
-        # AiM's ramulator2 frontend consumes a text trace.
-        self.cmds: list[str] = []
-        # Parallel list of the human-readable key=value annotation per
-        # emitted line; populated by `cmd()` so tests can introspect.
-        self._human_lines: list[str] = []
-
-    def _operand_text(self, handle, role: str) -> str:
-        """Render a Tenon handle as the AiM trace field set it implies.
-
-        This is the human-readable `key=value` annotation; positional
-        emission flows through `_handle_to_fields`. Tests that previously
-        asserted on this format inspect `self._human_lines`.
-        """
-        if handle is None:
-            return ""
-        if isinstance(handle, Register):
-            if handle.name == "gpr":
-                prefix = "gpr_in" if role.startswith("src") else "gpr_out"
-                return f"{prefix}=0"
-            if handle.name in ("mac_reg", "af_reg"):
-                return f"{handle.name}=0"
-            raise NotImplementedError(
-                f"AimCtx: register {handle.name!r} has no operand mapping."
-            )
-        if isinstance(handle, MemoryRef):
-            mem = handle.memory
-            if mem.name == "banks":
-                # `handle.idx` may be a symbolic SymExpr (e.g. autoscheduler
-                # produces `8*bg + bank` with placeholder UnitIds); collapse
-                # to a concrete int via `_eval_sym` so ramulator2 accepts it.
-                env = {
-                    level: value
-                    for level, value in enumerate(getattr(self, "_active_work_id", ()))
-                }
-                bank_int = _eval_sym(handle.idx, env)
-                if bank_int is None:
-                    raise NotImplementedError(
-                        f"AimCtx: bank index {handle.idx!r} cannot be reduced "
-                        "to an integer; supply concrete UnitId values."
-                    )
-                return f"bank={bank_int} row=0"
-            if mem.name == "gb":
-                return "gb=1"
-            raise NotImplementedError(
-                f"AimCtx: memory {mem.name!r} has no operand mapping."
-            )
-        # Memory (whole-memory broadcast operand, e.g. WR_ABK src0=banks).
-        from .spmw_target import Memory
-
-        if isinstance(handle, Memory):
-            if handle.name == "banks":
-                return "bank=ALL row=0"
-            if handle.name == "gb":
-                return "gb=1"
-            if handle.name == "gpr":
-                prefix = "gpr_in" if role.startswith("src") else "gpr_out"
-                return f"{prefix}=0"
-            raise NotImplementedError(
-                f"AimCtx: whole-memory {handle.name!r} has no operand mapping."
-            )
-        raise NotImplementedError(
-            f"AimCtx: unknown handle type {type(handle).__name__}."
-        )
-
-    def _handle_to_fields(self, handle, role: str, fields: dict) -> None:
-        """Update `fields` with the integer values implied by `handle`.
-
-        Keys written: `gpr_addr_0`, `gpr_addr_1`, `bank_index`, `row_addr`,
-        and `channel_mask` for whole-memory broadcasts. Unknown handles
-        are tolerated — the caller's ISR-field selector picks only the
-        fields the opcode declares as legal.
-        """
-        if handle is None:
-            return
-        from .spmw_target import Memory
-
-        if isinstance(handle, Register):
-            if handle.name in ("gpr", "mac_reg", "af_reg"):
-                # gpr_addr_1 hosts the second GPR for ISRs that need two
-                # (EWADD); the first src GPR routes to gpr_addr_0.
-                if role == "src1" and "gpr_addr_0" in fields:
-                    fields["gpr_addr_1"] = 0
-                else:
-                    fields.setdefault("gpr_addr_0", 0)
-            return
-        if isinstance(handle, MemoryRef):
-            mem = handle.memory
-            if mem.name == "banks":
-                env = {
-                    level: value
-                    for level, value in enumerate(getattr(self, "_active_work_id", ()))
-                }
-                bank_int = _eval_sym(handle.idx, env)
-                if bank_int is None:
-                    raise NotImplementedError(
-                        f"AimCtx: bank index {handle.idx!r} cannot be reduced "
-                        "to an integer; supply concrete UnitId values."
-                    )
-                fields["bank_index"] = bank_int
-                fields.setdefault("row_addr", 0)
-            elif mem.name == "gb":
-                fields.setdefault("channel_mask", 1)
-            return
-        if isinstance(handle, Memory):
-            if handle.name == "banks":
-                # WR_ABK / MAC_ABK target every bank in a channel; the
-                # parser still wants a row_addr field.
-                fields.setdefault("row_addr", 0)
-            elif handle.name == "gb":
-                fields.setdefault("channel_mask", 1)
-            elif handle.name == "gpr":
-                if role == "src1" and "gpr_addr_0" in fields:
-                    fields["gpr_addr_1"] = 0
-                else:
-                    fields.setdefault("gpr_addr_0", 0)
-            return
-
-    def cmd(self, name: str, dst=None, src0=None, src1=None, **fields):
-        """Emit one ISR line in ramulator2's positional format.
-
-        `fields` may carry overrides (e.g. `row_addr=8`, `opsize=2`);
-        unspecified fields default to 0 (or 1 for `channel_mask`).
-        Unknown opcodes fall back to the legacy key=value form so
-        callers using non-canonical opcode names still produce a
-        parseable diagnostic line.
-        """
-        # Build the integer field map from operand handles + overrides.
-        work_id = getattr(self, "_active_work_id", ())
-        channel_id = int(work_id[0]) if work_id else 0
-        field_map: dict = {"channel_mask": 1 << channel_id}
-        self._handle_to_fields(src0, "src0", field_map)
-        self._handle_to_fields(src1, "src1", field_map)
-        self._handle_to_fields(dst, "dst", field_map)
-        # Caller overrides (e.g. `row_addr=...`, `opsize=...`).
-        for k, v in fields.items():
-            field_map[k] = v
-
-        # Human-readable mirror — keeps the older key=value annotation so
-        # tests can introspect handle-derived field labels.
-        parts = [f"AiM {name}", f"ch={channel_id}"]
-        if src0 is not None:
-            parts.append(self._operand_text(src0, "src0"))
-        if src1 is not None:
-            parts.append(self._operand_text(src1, "src1"))
-        if dst is not None:
-            parts.append(self._operand_text(dst, "dst"))
-        for k, v in fields.items():
-            parts.append(f"{k}={v}")
-        human = "  ".join(p for p in parts if p)
-        self._human_lines.append(human)
-
-        # Positional output — ramulator2 expects space-separated ints in
-        # the order declared by `_ISR_FIELDS[opcode]`. Defaults:
-        # gpr/opsize/bank/row -> 0; channel_mask -> 1 (channel 0 enabled).
-        order = self._ISR_FIELDS.get(name)
-        if order is None:
-            # Unknown opcode -- preserve diagnostic mode by emitting the
-            # key=value annotation. ramulator2 will reject it, which is
-            # the correct behaviour (caller asked for an opcode the spec
-            # doesn't know about).
-            self.cmds.append(human)
-            return
-        defaults = {
-            "gpr_addr_0": 0,
-            "gpr_addr_1": 0,
-            "opsize": 1,
-            "bank_index": 0,
-            "row_addr": 0,
-            "channel_mask": 1,
-        }
-        tokens = [f"AiM {name}"]
-        for fld in order:
-            tokens.append(str(field_map.get(fld, defaults[fld])))
-        self.cmds.append(" ".join(tokens))
-
-    def append(self, line: str):
-        """Low-level escape hatch — append a raw trace line."""
-        self.cmds.append(line)
-
-    def emit_eoc(self):
-        """End-of-command marker — every AiM trace ends with EOC."""
-        self.cmds.append("AiM EOC")
-        self._human_lines.append("AiM EOC")
-
-    @staticmethod
-    def _memref_shape(type_text: str | None) -> tuple[int, ...]:
-        """Parse the static dimensions retained on an operand binding."""
-        if not type_text or not type_text.startswith("memref<"):
-            return ()
-        body = type_text[len("memref<") :].split(">", 1)[0]
-        dims = []
-        for token in body.split("x")[:-1]:
-            try:
-                dims.append(int(token))
-            except ValueError:
-                return ()
-        return tuple(dims)
-
-    def gemv_shape(self, match) -> tuple[int, int, int]:
-        """Recover ``(outputs, reduction, batches)`` from one MAC match.
-
-        The matcher retains the loop bounds and source memref shapes.  The
-        innermost loop is the reduction; an input-only loop is the independent
-        GEMV batch; the remaining axis of an operand containing the reduction
-        is the logical output extent.  This covers GEMV, transposed GEMV and
-        the batched-GEMV decomposition of GEMM without benchmark metadata.
-        """
-        if not match.enclosing_loops:
-            raise ValueError("AiM MAC match has no reduction loop")
-        reduction_var, _lb, reduction_ub, _step = match.enclosing_loops[-1]
-        reduction = _parse_loop_bound(reduction_ub)
-        if reduction is None or reduction <= 0:
-            raise ValueError(f"AiM reduction extent is not static: {reduction_ub}")
-        batch_var = match.extra.get("batch_loop_var")
-        batches = int(match.extra.get("batch_dim", 1) or 1)
-
-        output_candidates: list[int] = []
-        for operand in match.operands:
-            if operand.is_loop_carried:
-                continue
-            shape = self._memref_shape(getattr(operand, "memref_type", None))
-            if len(shape) != len(operand.indices):
-                continue
-            if reduction_var not in operand.indices:
-                continue
-            for extent, index in zip(shape, operand.indices):
-                if index == reduction_var or index == batch_var:
-                    continue
-                output_candidates.append(extent)
-        if not output_candidates:
-            # Compatibility for old/synthetic matches without retained types:
-            # use the per-work-item output loop and structural channel grid.
-            outer = _parse_loop_bound(match.enclosing_loops[0][2])
-            channels = int(
-                getattr(self.target.unit("channel"), "axes", {}).get("channel", 32)
-            )
-            if outer is None:
-                raise ValueError("AiM cannot recover output extent from match")
-            outputs = outer * channels
-        else:
-            outputs = output_candidates[0]
-        return outputs, reduction, batches
-
-    def emit_gemv(self, match) -> None:
-        """Emit a complete, native ABK GEMV trace segment from a MAC match."""
-        outputs, reduction, batches = self.gemv_shape(match)
-        groups = (outputs + 15) // 16
-        columns = (reduction + 15) // 16
-        all_channels = (1 << 32) - 1
-        # Keep batched GEMM compact. The runner profiles this exact native
-        # GEMV segment once and multiplies by the statically proven repeat
-        # count, matching the PolyBench AiM summed-leg methodology.
-        self.append(f"# TENON_GEMV {outputs} {reduction} repeat={batches}")
-        self.append("W CFR 0 1")
-        self.append(f"AiM WR_GB 2 2 {all_channels}")
-        for group in range(groups):
-            self.append(f"AiM WR_ABK 4 1 {group}")
-        for group in range(groups):
-            self.append(f"AiM MAC_ABK {columns} {all_channels} {group}")
-        self.append(f"AiM RD_MAC 8 {all_channels}")
-
-    def resolve_moves(self, role, src_handle=None, dst_handle=None):
-        from .spmw_target import Memory
-
-        if dst_handle is None:
-            return (None, None)
-        if isinstance(dst_handle, MemoryRef):
-            mem = dst_handle.memory
-            if mem.name == "banks":
-                # per-bank: WR_SBK in, RD_SBK out
-                return ("WR_SBK", "RD_SBK")
-            if mem.name == "gb":
-                return ("WR_GB", None)
-            return (None, None)
-        if isinstance(dst_handle, Memory):
-            if dst_handle.name == "banks":
-                # all-bank broadcast write; no readback path
-                return ("WR_ABK", None)
-            if dst_handle.name == "gb":
-                return ("WR_GB", None)
-            return (None, None)
-        if isinstance(dst_handle, Register):
-            if dst_handle.name == "mac_reg":
-                return (None, "RD_MAC")
-            if dst_handle.name == "af_reg":
-                return (None, "RD_AF")
-            if dst_handle.name == "gpr":
-                return (None, None)
-            return (None, None)
-        return (None, None)
-
-    def after_match(self, match, n_emitted):
-        """Fold the inner K reduction into the just-emitted MAC ISR's
-        ``opsize`` field. ramulator2 prices ``MAC_SBK opsize=N`` by
-        issuing N column-address requests (see SPEC-019 §3.1 for the
-        simulator citation). Tactical no-ops:
-
-        - non-MAC matches: nothing to fold;
-        - ``n_emitted != 1``: compound emits (e.g. a future MAC_ABK +
-          RD_MAC pair) need a wider fold -- until then leave opsize=1;
-        - empty ``enclosing_loops`` (synthetic traces from
-          ``test_run.py`` / ``test_target_aim.py``): preserve
-          pre-SPEC-019 behaviour;
-        - inner-loop ub not reducible to a positive constant > 1: same
-          fall-back, matching the existing Samsung JUMP path.
-        """
-        operation_name = getattr(
-            getattr(self, "_active_placement", None), "extra", {}
-        ).get("operation_name", match.target_op_name)
-        if operation_name not in ("MAC", "MAC_ABK"):
-            return
-        if n_emitted != 1:
-            return
-        if not match.enclosing_loops:
-            return
-        inner = match.enclosing_loops[-1]
-        k = _parse_loop_bound(inner[2])
-        if k is None or k <= 1:
-            return
-        # Rewrite the last emitted positional trace line. Expected shape:
-        # ``AiM MAC_SBK <opsize> <channel_mask> <bank_index> <row_addr>``
-        # (field order from ``_ISR_FIELDS["MAC_SBK"]``).
-        last = self.cmds[-1]
-        parts = last.split(" ")
-        if (
-            len(parts) < 3
-            or parts[0] != "AiM"
-            or parts[1]
-            not in (
-                "MAC_SBK",
-                "MAC_ABK",
-            )
-        ):
-            return
-        # ``opsize`` counts 256-bit DRAM columns, not scalar loop iterations.
-        # One column supplies 16 BF16 lanes in each targeted bank. MAC_ABK's
-        # banks hold independent output rows; they do not partition K. Keep
-        # this conversion identical to the AiM cost program's `_columns`.
-        lanes = 256 // int(getattr(self.target.banks, "width", 16))
-        columns = (k + lanes - 1) // lanes
-        parts[2] = str(columns)
-        self.cmds[-1] = " ".join(parts)
-        # Mirror the key=value annotation so ``_human_lines`` stays
-        # consistent with the positional trace for introspection.
-        import re
-
-        human_last = self._human_lines[-1]
-        if "opsize=" in human_last:
-            self._human_lines[-1] = re.sub(
-                r"opsize=\d+", f"opsize={columns}", human_last
-            )
-        else:
-            self._human_lines[-1] = f"{human_last}  opsize={columns}"
 
 
 # --------------------------------------------------------------------- #
@@ -1153,188 +396,6 @@ class AimCtx(CodegenContext):
 # --------------------------------------------------------------------- #
 
 
-class APUv1Ctx(CodegenContext):
-    """Codegen ctx for GSI APU v1.
-
-    Output is a list of C-source lines containing real GVML calls. Logical
-    reductions use an F2 layout-derived group size and lower to native FP16
-    multiply plus ``gvml_add_subgrps_f16_grp``.
-    """
-
-    _L4_PTR_BY_ROLE = {
-        "x": "inp_L4ptr",
-        "y": "wgt_L4ptr",
-        "acc": "out_L4ptr",
-        "dst": "out_L4ptr",
-    }
-
-    def __init__(self, target):
-        super().__init__(target)
-        # Override the parent's PIMCmd list -- APU v1 emits plain C text.
-        self.cmds: list[str] = []
-        # Reverse-handle map populated by the autoscheduler before
-        # walk_and_emit runs. Maps id(handle) -> C symbol. Also accepts
-        # string keys (e.g. "mac_tmp") for scratch slots that aren't
-        # backed by a Tenon handle.
-        self._handle_names: dict = {}
-        self._used_vr_names: list[str] = []
-        self.group_size: int = 32768
-        self.vector_batches: int = 1
-
-    def _enabled(self) -> bool:
-        """Emit one SPMD body; the host launches it on every APUC."""
-        work_id = tuple(getattr(self, "_active_work_id", ()))
-        return not work_id or all(int(value) == 0 for value in work_id)
-
-    def _append(self, line: str) -> None:
-        if self._enabled():
-            self.cmds.append(line)
-
-    def bind_handle(self, handle, c_name: str) -> None:
-        """Teach the ctx that `handle` lowers to the C identifier
-        `c_name`. Called by the autoscheduler (or the test harness) once
-        per placement -- e.g. `bind_handle(target.vrs, "inp_vr0")`.
-
-        `handle` may be a Tenon handle (`Register`/`MemoryRef`/`Memory`)
-        or a string label used to name scratch slots like `"mac_tmp"`.
-        """
-        key = handle if isinstance(handle, str) else id(handle)
-        self._handle_names[key] = c_name
-
-    def _name(self, handle, role: str = "") -> str:
-        from .spmw_target import Memory
-
-        if isinstance(handle, str):
-            return self._handle_names.get(handle, f"{handle}_vr")
-        cached = self._handle_names.get(id(handle))
-        if cached is not None:
-            return cached
-        if isinstance(handle, Register):
-            name = handle.name or "vr_unknown"
-            if name.startswith("vr") and name[2:].isdigit():
-                if name not in self._used_vr_names:
-                    self._used_vr_names.append(name)
-            return name
-        if isinstance(handle, MemoryRef):
-            mem = handle.memory
-            if mem.name == "l4":
-                return self._L4_PTR_BY_ROLE.get(role, "inp_L4ptr")
-            if mem.name == "l1":
-                return f"GVML_VM_{handle.idx!r}"
-            return f"{mem.name}_ref"
-        if isinstance(handle, Memory):
-            if handle.name == "l4":
-                return self._L4_PTR_BY_ROLE.get(role, "inp_L4ptr")
-            if handle.name == "l1":
-                return "GVML_VM_0"
-            return f"{handle.name}_ref"
-        raise NotImplementedError(
-            f"APUv1Ctx: unknown handle type {type(handle).__name__}."
-        )
-
-    def cmd(self, name: str, dst=None, src0=None, src1=None, **kwargs):
-        """Emit one GVML call as a C line."""
-        operands = []
-        if dst is not None:
-            operands.append(self._name(dst, "dst"))
-        if src0 is not None:
-            operands.append(self._name(src0, "src0"))
-        if src1 is not None:
-            operands.append(self._name(src1, "src1"))
-        for k, v in kwargs.items():
-            operands.append(f"/* {k}= */ {v!r}")
-        self._append(name + "(" + ", ".join(operands) + ");")
-
-    @staticmethod
-    def _group_enum(group_size: int) -> str:
-        if group_size <= 0 or group_size > 32768 or group_size & (group_size - 1):
-            raise ValueError(f"invalid GVML group size {group_size}")
-        suffix = f"{group_size // 1024}K" if group_size >= 1024 else str(group_size)
-        return f"GVML_P2_{suffix}"
-
-    def emit_l4_to_vr(self, role: str, vr, vm_index: int) -> None:
-        pointer = self._L4_PTR_BY_ROLE[role]
-        if self.vector_batches > 1:
-            pointer = f"({pointer} + batch * 32768)"
-        vr_name = self._name(vr, role)
-        self._append(f"direct_dma_l4_to_l1_32k(GVML_VM_{vm_index}, {pointer});")
-        self._append(f"gvml_load_16({vr_name}, GVML_VM_{vm_index});")
-
-    def emit_vr_to_l4(self, role: str, vr, vm_index: int) -> None:
-        pointer = self._L4_PTR_BY_ROLE[role]
-        if self.vector_batches > 1:
-            pointer = f"({pointer} + batch * 32768)"
-        vr_name = self._name(vr, role)
-        self._append(f"gvml_store_16(GVML_VM_{vm_index}, {vr_name});")
-        self._append(f"direct_dma_l1_to_l4_32k({pointer}, GVML_VM_{vm_index});")
-
-    def emit_group_reduce_f16(self, dst, src) -> None:
-        dst_name = self._name(dst, "acc")
-        src_name = self._name(src, "x")
-        group = self._group_enum(self.group_size)
-        self._append(
-            "gvml_add_subgrps_f16_grp("
-            f"{dst_name}, {src_name}, {group}, GVML_P2_1, 0, "
-            "GVML_VM_3, reduce_tmp_vr);"
-        )
-
-    def emit_grouped_f16_mac(self, acc, x, y) -> None:
-        self._append(
-            f"gvml_mul_f16(mac_tmp_vr, {self._name(x, 'x')}, " f"{self._name(y, 'y')});"
-        )
-        self.emit_group_reduce_f16(acc, "mac_tmp")
-
-    def append(self, line: str) -> None:
-        """Low-level escape hatch -- append a raw C source line."""
-        self._append(line)
-
-    def iter_vr_aliases(self) -> list[tuple[str, str]]:
-        """Return [(c_name, gvml_vr_enum), ...] in bind order.
-
-        Each entry becomes one line `enum gvml_vr16 <c_name> = <enum>;`
-        in the emitted device.c. Until the regalloc spec rebinds VRs
-        per live-range, the autoscheduler's bind list may be empty; in
-        that case the build harness substitutes a canonical default
-        (vrs + mac_tmp_vr) so the emitted body still compiles.
-        """
-        out: list[tuple[str, str]] = []
-        used_indices = set()
-        for name in self._used_vr_names:
-            index = int(name[2:])
-            used_indices.add(index)
-            out.append((name, f"GVML_VR16_{index}"))
-        for temporary in ("mac_tmp_vr", "reduce_tmp_vr"):
-            index = next(i for i in range(15) if i not in used_indices)
-            used_indices.add(index)
-            out.append((temporary, f"GVML_VR16_{index}"))
-        return out
-
-    def iter_l4_roles(self) -> list[str]:
-        """Return the L4 pointer C names referenced by `self.cmds`, in
-        canonical role-table order (inp, wgt, out). Used by the build
-        harness to emit one `gal_mem_handle_to_apu_ptr` decl per
-        actual reference (avoiding unused-variable warnings)."""
-        names: set[str] = set()
-        for line in self.cmds:
-            for ptr in self._L4_PTR_BY_ROLE.values():
-                if ptr in line:
-                    names.add(ptr)
-        role_order = ["inp_L4ptr", "wgt_L4ptr", "out_L4ptr"]
-        return [n for n in role_order if n in names]
-
-    def resolve_moves(self, role, src_handle=None, dst_handle=None):
-        if dst_handle is None:
-            return (None, None)
-        if isinstance(dst_handle, Register):
-            role_name = {"x": "X", "y": "Y", "acc": "ACC", "dst": "ACC"}.get(role)
-            if role_name is None:
-                return (None, None)
-            store = "ST_ACC_VR_TO_L4" if role_name == "ACC" else None
-            return (f"LD_{role_name}_L4_TO_VR", store)
-        return (None, None)
-
-    def resolve_spill_moves(self, tier, home_handle, *, n_entries=1):
-        return super().resolve_spill_moves(tier, home_handle, n_entries=n_entries)
 
 
 # --------------------------------------------------------------------- #
@@ -1342,97 +403,6 @@ class APUv1Ctx(CodegenContext):
 # --------------------------------------------------------------------- #
 
 
-class APUv2Ctx(CodegenContext):
-    """Codegen ctx for GSI APU v2.
-
-    Output is a list of C++ source lines on `self.cmds`. Each entry is
-    one GTML call (e.g. `g.add(out, lhs, rhs);`). `get_program_src()`
-    wraps them with the standard GTML singleton boilerplate to produce
-    a compilable `.cc` file.
-    """
-
-    def __init__(self, target):
-        super().__init__(target)
-        # Override the parent's PIMCmd list -- APU v2 emits C++ text.
-        self.cmds: list[str] = []
-        self._handle_names: dict[int, str] = {}
-        self._tmp_counter = 0
-
-    def bind_handle(self, handle, cpp_name: str) -> None:
-        """Teach the ctx a handle's C++ container variable name.
-
-        The autoscheduler populates this before walk_and_emit.
-        """
-        self._handle_names[id(handle)] = cpp_name
-
-    def _name(self, handle) -> str:
-        cached = self._handle_names.get(id(handle))
-        if cached is not None:
-            return cached
-        if isinstance(handle, MemoryRef):
-            mem = handle.memory
-            return f"{mem.name}_ref_{handle.idx!r}"
-        return f"opd_{id(handle)}"
-
-    def cmd(self, name: str, dst=None, src0=None, src1=None, **kwargs):
-        """Emit one GTML call as a C++ line.
-
-        `name` is the fully-qualified function name (e.g. `"g.matmul"`
-        or `"copy_to_l1"`). Operand order: dst first (out-parameter
-        convention in GTML), then src0, src1.
-        """
-        parts = []
-        if dst is not None:
-            parts.append(self._name(dst))
-        if src0 is not None:
-            parts.append(self._name(src0))
-        if src1 is not None:
-            parts.append(self._name(src1))
-        for k, v in kwargs.items():
-            parts.append(f"/* {k}= */ {v!r}")
-        self.cmds.append(f"{name}({', '.join(parts)});")
-
-    def emit_mac_matmul(self, acc, x, y) -> None:
-        """Expand MAC into the GTML matmul + add pattern.
-
-        For a length-K dot product per work-item, this is one
-        `g.matmul` (rank-1 x rank-1 -> scalar) followed by an add into
-        the running acc. The canonical declarative form emits the
-        per-iter expansion; a fully-vectorised matmul would replace
-        this with a single outer-granularity `g.matmul`.
-        """
-        acc_n = self._name(acc)
-        x_n = self._name(x)
-        y_n = self._name(y)
-        tmp = f"mac_tmp_{self._tmp_counter}"
-        self._tmp_counter += 1
-        self.cmds.append(f"L1Container {tmp} = g.alloc_vector();")
-        self.cmds.append(f"g.matmul({tmp}, {x_n}, {y_n});")
-        self.cmds.append(f"g.add({acc_n}, {acc_n}, {tmp});")
-
-    def append(self, line: str) -> None:
-        """Low-level escape hatch -- append a raw C++ source line."""
-        self.cmds.append(line)
-
-    def resolve_moves(self, role, src_handle=None, dst_handle=None):
-        # l1_sim ignores moves at functional level; the cost model
-        # already prices COPY_TO_L1 / COPY_FROM_L1 for autoschedule.
-        return (None, None)
-
-    def get_program_src(self) -> str:
-        """Return the assembled G2 program source.
-
-        Wraps `self.cmds` with the standard GTML singleton accessor
-        plus `main()`. The coder may replace this wrapper later.
-        """
-        header = (
-            '#include "gtml.h"\n\n'
-            "int main() {\n"
-            "    G2Gtml &g = G2Gtml::instance();\n"
-        )
-        body = "\n".join("    " + line for line in self.cmds)
-        footer = "\n    return 0;\n}\n"
-        return header + body + footer
 
 
 # --------------------------------------------------------------------- #
@@ -1486,102 +456,6 @@ def _parse_loop_bound(text: str) -> int | None:
     if len(nums) == 1:
         return int(nums[0])
     return None
-
-
-def _samsung_lane_burst(ctx) -> int:
-    """Samsung GRF lane count read from the target geometry.
-
-    Each MAC consumes this many fp16 elements per K-iteration, so the
-    inner-K loop folds `K` MACs into `K // lanes`. Sourced from
-    `target.grf_a.lanes` (the report-16 target spec, `lanes=8`); no
-    shape literal.
-    """
-    return ctx.target.grf_a.lanes
-
-
-def _fiber_fold_split(folded: int, n_fibers: int) -> list[int]:
-    """Round-robin split of `folded` burst-tiles across `n_fibers` banks.
-
-    Fiber `i` gets `ceil` for the first `folded % n_fibers` fibers and
-    `floor` after, so the busier fiber stays bounded (matches the cost
-    model's ceil `per_fiber`). For folded=128, n=2 -> [64, 64]; for an
-    odd folded=127, n=2 -> [64, 63].
-    """
-    return [(folded + (n_fibers - 1 - i)) // n_fibers for i in range(n_fibers)]
-
-
-def _emit_inner_loop_jump(
-    match: MatchedOp, ctx: CodegenContext, n_emitted: int
-) -> None:
-    """Append a Samsung-style JUMP that folds the innermost reduction
-    loop.
-
-    Loop counter is `(inner_ub // lanes) - 1` (the first MAC counts as
-    iteration 0; JUMP loops back the rest). Loop offset is the number of
-    instructions that comprise one iteration body — i.e. `n_emitted` for
-    the compute ops the match emitted, plus 1 for the JUMP itself.
-    """
-    if not match.enclosing_loops:
-        return
-    inner = match.enclosing_loops[-1]
-    ub = _parse_loop_bound(inner[2])
-    if ub is None:
-        return
-    loop_counter = ub // _samsung_lane_burst(ctx) - 1
-    if loop_counter <= 0:
-        return
-    ctx.cmds.append(
-        PIMCmd(
-            type_="JUMP",
-            loopCounter_=loop_counter,
-            loopOffset_=n_emitted + 1,
-        )
-    )
-
-
-def _is_samsung_storeback_mov(c: PIMCmd) -> bool:
-    """A bank<-GRF store MOV that closes a work-id (the `ST_A`/`ST_B`
-    storeback). `acc -> grf_b` is never host-eligible (lever 2), so this
-    MOV is always present and is the residency-robust work-id delimiter."""
-    if c.type_ not in ("MOV", "FILL"):
-        return False
-    bank_dst = c.dst_ in ("EVEN_BANK", "ODD_BANK")
-    grf_src = any(s in ("GRF_A", "GRF_B") for s in (c.src0_, c.src1_))
-    return bank_dst and grf_src
-
-
-def _split_samsung_layers(cmds: list[PIMCmd]) -> list[list[PIMCmd]]:
-    """Group a flat Samsung GEMV cmd stream into per-layer (work-id)
-    chunks, closed by the storeback MOV that ends each work-id.
-
-    NOTE (SPEC-05, 2026-06-30): the legacy multi-layer GEMV RUN path that consumed
-    this was deleted. It is KEPT because the layer-split + FFN cost-model tests
-    (test_samsung_loop_012, test_samsung_multi_layer_split) assert its behaviour;
-    it is a pure cmd-stream analysis helper (no run-path coupling).
-
-    A layer body is `[LD MOV?, (MAC, JUMP)+, ST MOV]`; under lever 1 the
-    `(MAC, JUMP)` part repeats once per bank fiber (so we must NOT split
-    at JUMP), and under lever 2 the opening LD MOV is *absent* for
-    host-resident preloads -- so the preload MOV is no longer a reliable
-    boundary. The storeback MOV (`acc -> grf_b -> bank`, never
-    host-eligible) always closes a work-id, so we split *after* it.
-    Trailing setup/terminator (NOP/EXIT) with no MAC attaches to the
-    last group; groups with no MAC are dropped.
-    """
-    groups: list[list[PIMCmd]] = []
-    cur: list[PIMCmd] = []
-    for c in cmds:
-        cur.append(c)
-        if _is_samsung_storeback_mov(c) and any(g.type_ == "MAC" for g in cur):
-            # This storeback closes the current work-id's body.
-            groups.append(cur)
-            cur = []
-    if cur:
-        if groups and not any(g.type_ == "MAC" for g in cur):
-            groups[-1].extend(cur)
-        else:
-            groups.append(cur)
-    return [g for g in groups if any(c.type_ == "MAC" for c in g)]
 
 
 def _bucket_by_work_id(trace: MatchTrace):
@@ -1695,7 +569,7 @@ def _walk_and_emit(
     # kernel, not once per unrolled work-id replica.  Materialise every MAC in
     # the representative bucket as a complete GEMV segment; its retained MLIR
     # loops encode output, reduction and independent-batch multiplicity.
-    if isinstance(ctx, AimCtx):
+    if _is_backend_ctx(ctx, "aim"):
         representatives: dict[int, list[MatchedOp]] = {}
         order: list[int] = []
         for match in trace.matches:
@@ -1743,7 +617,7 @@ def _walk_and_emit(
         # Backend contexts use this coordinate to materialise symbolic target
         # handles (for AiM: channel mask and 4*bank_group+bank index).
         ctx._active_work_id = _matcher_work_scope(matches[0]).work_id
-        if isinstance(ctx, APUv1Ctx):
+        if _is_backend_ctx(ctx, "apu_v1"):
             ctx.group_size = int(layout.extra.get("group_size", 32768))
             ctx.vector_batches = max(1, int(layout.extra.get("n_out_tiles", 1)))
 
@@ -1786,7 +660,7 @@ def _walk_and_emit(
             ctx.after_match(match, n_emitted)
         _schedule_moves(target, ctx, layout, role_to_memref, phase="post")
 
-    if isinstance(ctx, APUv1Ctx) and any(
+    if _is_backend_ctx(ctx, "apu_v1") and any(
         _matcher_work_scope(match).coalesced_axes for match in trace.matches
     ):
         buckets = [
@@ -1796,7 +670,7 @@ def _walk_and_emit(
     else:
         buckets = _bucket_by_work_id(trace)
 
-    if isinstance(ctx, SamsungCtx):
+    if _is_backend_ctx(ctx, "samsung_hbm_pim"):
         # Resolve CRF issue independently for every retained matcher group.
         # A prior implementation inspected the first placement carrying a
         # `crf_issue` field and silently imposed that choice on the complete
@@ -1909,10 +783,10 @@ def _walk_and_emit(
 class RunResult:
     """Outcome of running a `Compiled` artifact on a simulator/hardware.
 
-    `cycles` is `None` for backends that don't report cycle counts
-    (APU v2 / l1_sim is functional-only) or when the simulator was
-    unavailable. `stdout` is the captured stdout from the
-    sub-process / API call (or a short "simulator unavailable" note).
+    `cycles` is `None` only for a run that executed on a functional-only
+    backend (the UPMEM functional oracle, APU v2 l1_sim). A simulator or
+    device that cannot run raises `SimulatorUnavailable` instead.
+    `stdout` is the captured stdout from the sub-process / API call.
     `backend` is the target name -- a convenience for callers that
     don't want to dig through `compiled.target.name`.
     """
@@ -1923,82 +797,26 @@ class RunResult:
     extra: dict = field(default_factory=dict)
 
 
-# Per-backend simulator location overrides — tests / CI may patch these
-# environment variables before importing this module. The defaults
-# match the layout on this server (see `experiments/simulators/`).
-_DEFAULT_PIMSIM_ROOT = (
-    Path(__file__).resolve().parents[2] / "simulators" / "PIMSimulator"
-)
-_DEFAULT_AIM_ROOT = Path(__file__).resolve().parents[2] / "simulators" / "aim_simulator"
+class SimulatorUnavailable(RuntimeError):
+    """The target's simulator or device is not usable in this environment."""
+
+    def __init__(self, target_name: str, reason: str):
+        super().__init__(f"{target_name}: simulator unavailable: {reason}")
+        self.target_name = target_name
+        self.reason = reason
 
 
-def _pimsim_root() -> Path:
-    return Path(os.environ.get("PIMSIMULATOR_ROOT", str(_DEFAULT_PIMSIM_ROOT)))
-
-
-def _aim_root() -> Path:
-    return Path(os.environ.get("AIM_SIMULATOR_ROOT", str(_DEFAULT_AIM_ROOT)))
-
-
-def _docker_available() -> bool:
-    return shutil.which("docker") is not None
-
-
-def _docker_image_exists(name: str) -> bool:
-    if not _docker_available():
-        return False
-    try:
-        result = subprocess.run(
-            ["docker", "image", "inspect", name],
-            capture_output=True,
-            timeout=10,
-        )
-        return result.returncode == 0
-    except (subprocess.SubprocessError, OSError):
-        return False
-
-
-_DEFAULT_APU_V1_TOOLCHAIN_BASE = (
-    "/usr/local/gsi-apu/13.7.1/ubuntu_20_04/"
-    "arc_gnu_2021.09-release_elf32_le_linux_no_sdata"
-)
-_DEFAULT_APU_V1_TEMPLATE_DIR = "/home/nz264/shared/accelerator-hub/gsi-apu/example-gvml"
-_DEFAULT_APU_V1_PCI_NODE = "/sys/bus/pci/devices/0000:41:00.0"
-
-
-def _apu_v1_unavailable_reason() -> str | None:
-    """Return a short human-readable reason the APU v1 path can't run,
-    or None if all preconditions (ARC toolchain dir, example-gvml
-    template dir, GSI PCI sysfs node) are present.
-
-    Overridable via env vars TENON_APU_V1_TOOLCHAIN_BASE and
-    TENON_APU_V1_TEMPLATE_DIR.
-    """
-    arc_base = Path(
-        os.environ.get("TENON_APU_V1_TOOLCHAIN_BASE", _DEFAULT_APU_V1_TOOLCHAIN_BASE)
-    )
-    if not arc_base.exists():
-        return f"simulator unavailable: ARC toolchain missing at {arc_base}"
-    template = Path(
-        os.environ.get("TENON_APU_V1_TEMPLATE_DIR", _DEFAULT_APU_V1_TEMPLATE_DIR)
-    )
-    if not template.exists():
-        return f"simulator unavailable: example-gvml template missing at {template}"
-    pci = Path(_DEFAULT_APU_V1_PCI_NODE)
-    if not pci.exists():
-        return f"simulator unavailable: GSI device not present at {pci}"
-    # GVML SDK headers: a partial install (eltwise present, logical
-    # absent) makes the build fail mid-way; check both canaries up-front
-    # so the run path returns a clean RunResult(cycles=None, ...) skip
-    # instead of raising RuntimeError from `make`.
-    from .spmw_apu_v1_build import _gvml_sdk_available, _gvml_include_root
-
-    if not _gvml_sdk_available():
-        return (
-            f"simulator unavailable: GVML SDK headers missing under "
-            f"{_gvml_include_root()}"
-        )
-    return None
+def simulator_unavailable_reason(target_name: str) -> str | None:
+    """None when `run()` can execute for this target on this host."""
+    if target_name == "samsung_hbm_pim":
+        return _samsung_unavailable_reason()
+    if target_name == "aim":
+        return _aim_unavailable_reason()
+    if target_name == "apu_v1":
+        return _apu_v1_unavailable_reason()
+    if target_name == "apu_v2":
+        return _docker_image_unavailable_reason("gsi-g2-l1sim")
+    return f"no simulator runner for target {target_name!r}"
 
 
 # --------------------------------------------------------------------- #
@@ -2006,1534 +824,6 @@ def _apu_v1_unavailable_reason() -> str | None:
 # --------------------------------------------------------------------- #
 
 
-def _write_samsung_cmds(path: Path, cmds: list[PIMCmd]) -> None:
-    """Serialise a list of PIMCmd to the line-delimited format pim_driver
-    accepts via `--cmds`. See `_run_samsung` docstring for the grammar.
-    """
-    with open(path, "w") as f:
-        for c in cmds:
-            parts = [c.type_]
-            # Only emit fields that differ from PIMCmd's default ctor so
-            # the trace stays human-greppable.
-            if c.dst_ != "A_OUT":
-                parts.append(f"dst={c.dst_}")
-            if c.src0_ != "A_OUT":
-                parts.append(f"src0={c.src0_}")
-            if c.src1_ != "A_OUT":
-                parts.append(f"src1={c.src1_}")
-            if c.src2_ != "A_OUT":
-                parts.append(f"src2={c.src2_}")
-            if c.loopCounter_:
-                parts.append(f"loop_counter={c.loopCounter_}")
-            if c.loopOffset_:
-                parts.append(f"loop_offset={c.loopOffset_}")
-            if c.isAuto_:
-                parts.append(f"is_auto={c.isAuto_}")
-            if c.dstIdx_:
-                parts.append(f"dst_idx={c.dstIdx_}")
-            if c.src0Idx_:
-                parts.append(f"src0_idx={c.src0Idx_}")
-            if c.src1Idx_:
-                parts.append(f"src1_idx={c.src1Idx_}")
-            if c.isRelu_:
-                parts.append(f"is_relu={c.isRelu_}")
-            f.write(" ".join(parts) + "\n")
-
-
-def _samsung_num_pim_blocks(compiled) -> int:
-    """Inner `pim`-unit fanout (num PIM blocks per pseudo-channel) for the
-    Samsung tile-size derivation. Read off the unit tree's innermost mapping
-    factor (8 for the canonical fixture); falls back to 8 when unavailable so
-    elems_per_tile never collapses to a sub-tile size."""
-    try:
-        factors, _ = compiled.target.work_grid()
-        if factors:
-            return factors[-1]
-    except Exception:  # noqa: BLE001
-        pass
-    return 8
-
-
-def _samsung_read_generic_outbin(out_path, n):
-    """Flat fp16 readback for the GENERIC (ELTWISE) interpreter path: read `n`
-    fp16 elements from out.bin, NO reduce-sum (unlike the REDUCE readback's
-    per-element 16-lane tree reduction). Returns {"out": <fp32 array>} or {} when
-    the blob is absent/empty/all-zero (CYCLES-ONLY graceful fallback)."""
-    p = Path(out_path)
-    if not p.exists():
-        return {}
-    import numpy as np
-
-    raw = np.fromfile(str(p), dtype=np.float16)
-    if raw.size == 0:
-        return {}
-    out = raw[:n].astype(np.float32)
-    if not np.any(out):
-        return {}
-    return {"out": out}
-
-
-# SPEC-04: the PIMSimulator physical fabric row-tile = num_total_pim_blocks_ *
-# num_grfB_ = (64 channels * 8 PIM blocks) * 8 GRF_B = 4096. preloadGemv packs the
-# weight assuming M is a multiple of this (the y-loop strides output_tile_size =
-# num_grfB_*num_total_pim_blocks_); an M below it underfills the GRF_B slots and
-# reads OOB weight rows. The REDUCE run path pads A's rows up to this multiple
-# (zeros) and slices the real M back from the readback. It is a PIMSimulator
-# config constant (NUM_PIM_BLOCKS=8, 64 chans hardcoded in pim_driver make_kernel,
-# NUM_GRF=8), not a workload literal.
-_SAMSUNG_FABRIC_ROW_TILE = 4096
-
-# SPEC-04: pad the reduction extent K up to a multiple of this so computeGemv's
-# input-tile split (num_input_tiles = ceil(ceil(K/16)/8)) yields >= 2 tiles and
-# engages both even and odd banks. K below 256 (num_input_tiles==1) degenerates:
-# the odd bank's JUMP counter underflows and getResultColGemv's end_col collapses,
-# leaving the output undrained. 256 elems = 16 bursts = 2 input tiles. Zero-padding
-# K leaves A@B unchanged.
-_SAMSUNG_REDUCE_K_TILE = 256
-
-
-def _samsung_reduce_partition(compiled, inputs):
-    """SPEC-05 §2.1: derive the MAPPING-DRIVEN partition for a GENERIC_REDUCE run.
-
-    Returns `(ROWS, n_workids, K, N, M_real)`:
-      - ROWS      = per-PE output-row slice = bound(MAC enclosing_loops[-3]) for a
-                    3-deep slice nest [i(ROWS), j(N), k(K)], or [-2] for a 2-deep
-                    GEMV slice [i(ROWS), k(K)]. This is the partition primitive --
-                    it tracks `mapping` (a different mapping -> a different ROWS).
-      - n_workids = number of MAC work-id buckets = the realized PE count
-                    (= prod(mapping) once the dataflow expander materializes the
-                    grid). Cross-checked against target.work_grid()[1].
-      - K, N      = contraction / output-col loop bounds.
-      - M_real    = the true logical output rows = the operand A.shape[0] (the
-                    un-padded P); M_logical = ROWS * n_workids is the partition's
-                    total (>= M_real when the grid over-covers, e.g. P<128).
-
-    The PARTITION (ROWS, n_workids) is the trace's, NOT operand-shape tiling:
-    partition flows mapping -> trace -> codegen. Operand arrays still supply data
-    + the ground-truth K/N for the zero-pad. Returns None when no MAC match.
-    """
-    import numpy as np
-
-    trace = getattr(compiled, "trace", None)
-    if trace is None:
-        return None
-    macs = [m for m in trace.matches if m.target_op_name == "MAC"]
-    if not macs or not macs[0].enclosing_loops:
-        return None
-    mac = macs[0]
-    depth = len(mac.enclosing_loops)
-    K = _parse_loop_bound(mac.enclosing_loops[-1][2])
-    if K is None:
-        return None
-    if depth >= 3:
-        ROWS = _parse_loop_bound(mac.enclosing_loops[-3][2])
-        N = _parse_loop_bound(mac.enclosing_loops[-2][2])
-    elif depth == 2:
-        ROWS = _parse_loop_bound(mac.enclosing_loops[-2][2])
-        N = 1
-    else:
-        ROWS, N = 1, 1
-    if ROWS is None or N is None:
-        return None
-
-    # n_workids = MAC work-id bucket count (the realized PE grid). Cross-check
-    # against the declared grid; warn (gap-1 discipline), do not raise.
-    buckets = [
-        b
-        for b in _bucket_by_work_id(trace)
-        if any(m.target_op_name == "MAC" for m in b[1])
-    ]
-    n_workids = len(buckets)
-    try:
-        declared = compiled.target.work_grid()[1]
-        if n_workids != declared:
-            warnings.warn(
-                f"Samsung REDUCE partition: trace has {n_workids} MAC work-id "
-                f"buckets but target.work_grid() declares {declared} PEs; using "
-                f"the trace count (mapping-driven).",
-                stacklevel=2,
-            )
-    except Exception:  # noqa: BLE001
-        pass
-    if n_workids <= 0:
-        n_workids = 1
-
-    # M_real (the un-padded logical rows) from the operand; cross-check vs the
-    # partition product (ROWS * n_workids) -- a mismatch beyond the grid pad is
-    # advisory (the operand may legitimately be padded to the grid by the harness).
-    a = inputs.get("A")
-    if a is None:
-        a = inputs.get("a")
-    M_real = None
-    if a is not None:
-        a = np.asarray(a)
-        if a.ndim == 2:
-            M_real = int(a.shape[0])
-    M_logical = int(ROWS) * int(n_workids)
-    if M_real is None:
-        M_real = M_logical
-    elif M_real > M_logical:
-        warnings.warn(
-            f"Samsung REDUCE partition: operand rows {M_real} exceed the grid "
-            f"partition ROWS*n_workids = {ROWS}*{n_workids} = {M_logical}; the "
-            f"grid under-covers the operand (check mapping/ROWS).",
-            stacklevel=2,
-        )
-    return (int(ROWS), int(n_workids), int(K), int(N), int(M_real))
-
-
-def _samsung_read_reduce_outbin(out_path, M, N, m_pad):
-    """SPEC-04 §4.3: REDUCE readback. The driver writes M_pad*N partial-sum bursts
-    (16 lanes each), drained N-pass-major: pass n's M_pad outputs, then pass n+1's.
-    So the blob reshapes (N, M_pad, 16) -> sum the 16 lanes -> (N, M_pad) -> .T ->
-    (M_pad, N) -> slice [:M, :N]. For GEMV (N==1) this collapses to (M,). Graceful:
-    empty/all-zero -> {} (CYCLES-ONLY), mirroring the GEMV readback contract.
-    Surfaces "out" (GEMM, (M, N)) or "y" (GEMV, (M,)) so the harness finds it."""
-    p = Path(out_path)
-    if not p.exists():
-        return {}
-    import numpy as np
-
-    raw = np.fromfile(str(p), dtype=np.float16)
-    need = m_pad * N * 16
-    if raw.size < need:
-        return {}
-    partials = raw[:need].reshape(-1, 16).astype(np.float32).sum(axis=1)  # (N*m_pad,)
-    grid = partials.reshape(N, m_pad).T[:M, :N]  # (M, N)
-    if not np.any(grid):
-        return {}
-    if N == 1:
-        return {"y": grid.reshape(-1)}
-    return {"out": grid}
-
-
-def _samsung_run_reduce_driver(weight, vec, M, K, N):
-    """SPEC-04 cross-stage core: run ONE GENERIC REDUCE contraction `weight @ vec`
-    on real PIMSimulator and return `(readback_ndarray, cycles)`.
-
-    `weight` is the (M, K) bank-resident operand (already transposed by the caller
-    for an A^T stage); `vec` is the (K,) GEMV input or (K, N) GEMM second operand.
-    Pads K to a multiple of 256 and M to the fabric row-tile (zeros, leaving the
-    contraction unchanged), runs the driver, tree-reduces the 16-lane partial sums,
-    and slices [:M, :N]. Returns `(C, cycles)` where C is (M,) for N==1 else (M, N);
-    `(None, cycles)` if the readback is empty/all-zero; `(None, None)` if the driver
-    is unavailable. This is the reusable engine behind both the single-stage
-    GENERIC_REDUCE run path and `samsung_reduce_chain` (multi-stage threading)."""
-    import numpy as np
-
-    root = _pimsim_root()
-    driver = root / "pim_driver"
-    if not driver.exists():
-        return None, None
-
-    M, K, N = int(M), int(K), int(N)
-    weight = np.asarray(weight, dtype=np.float16).reshape(M, K)
-    if N > 1:
-        second = np.asarray(vec, dtype=np.float16).reshape(K, N)
-    else:
-        second = np.asarray(vec, dtype=np.float16).reshape(K, 1)
-
-    k_tile = _SAMSUNG_REDUCE_K_TILE
-    k_pad = ((K + k_tile - 1) // k_tile) * k_tile
-    if k_pad != K:
-        w_k = np.zeros((M, k_pad), dtype=np.float16)
-        w_k[:, :K] = weight
-        weight = w_k
-        s_k = np.zeros((k_pad, second.shape[1]), dtype=np.float16)
-        s_k[:K] = second
-        second = s_k
-    tile = _SAMSUNG_FABRIC_ROW_TILE
-    m_pad = ((M + tile - 1) // tile) * tile
-    w_pad = np.zeros((m_pad, k_pad), dtype=np.float16)
-    w_pad[:M] = weight
-    k_bursts = ((k_pad // 16) + 7) // 8
-
-    with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
-        a_path = td_path / "A.npy"
-        b_path = td_path / "B.npy"
-        out_path = td_path / "out.bin"
-        crf_path = td_path / "reduce.crf"
-        np.save(a_path, w_pad)
-        np.save(b_path, second)
-        # The REDUCE path rebuilds the canonical GEMV CRF internally (matched JUMP
-        # counters), but the driver's GENERIC parser still requires a non-empty
-        # CRF. Supply a minimal MAC body; its JUMP counter is inert for REDUCE.
-        crf_path.write_text(
-            "MAC dst=GRF_B src0=GRF_A src1=EVEN_BANK is_auto=1\n"
-            "JUMP loop_counter=0 loop_offset=2\n"
-            "MAC dst=GRF_B src0=GRF_A src1=ODD_BANK is_auto=1\n"
-            "JUMP loop_counter=0 loop_offset=2\n"
-            "MOV dst=ODD_BANK src0=GRF_B\n"
-        )
-        argv = [
-            str(driver),
-            "--op",
-            "GENERIC",
-            "--op-kind",
-            "REDUCE",
-            "--crf",
-            str(crf_path),
-            "--out",
-            str(out_path),
-            "--inputs",
-            f"{a_path},{b_path}",
-            "--out-rows",
-            str(m_pad),
-            "--out-cols",
-            str(N),
-            "--reduce-k",
-            str(k_pad),
-            "--num-tiles",
-            "1",
-            "--bank-type",
-            "ALL",
-            "--roles",
-            f"A:0:0:2:0:0:0:{k_bursts},B:0:0:2:0:0:0:0,out:0:0:1:1:0:8:0",
-        ]
-        try:
-            proc = subprocess.run(
-                argv, capture_output=True, cwd=str(root), timeout=600, check=False
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(
-                f"Samsung pim_driver REDUCE invocation failed: {exc}"
-            ) from exc
-        combined = proc.stdout.decode("utf-8", "replace") + proc.stderr.decode(
-            "utf-8", "replace"
-        )
-        m = re.search(r"PIM_CYCLES total=(\d+)", combined)
-        if not m:
-            raise RuntimeError(
-                "Samsung REDUCE driver missing PIM_CYCLES; tail: " + combined[-400:]
-            )
-        cycles = int(m.group(1))
-        outputs = _samsung_read_reduce_outbin(out_path, M, N, m_pad)
-    if not outputs:
-        return None, cycles
-    arr = outputs.get("out")
-    if arr is None:
-        arr = outputs.get("y")
-    return np.asarray(arr), cycles
-
-
-def run_samsung_reduce(weight, vec, M, K, N):
-    """Public entry for the harness cross-stage chain: run one Samsung GENERIC
-    REDUCE contraction `weight @ vec` and return `(readback_ndarray, cycles)`.
-    See `_samsung_run_reduce_driver`. The caller owns the numpy reference and any
-    host pre/post-pass (alpha/beta, transpose, centering)."""
-    return _samsung_run_reduce_driver(weight, vec, M, K, N)
-
-
-def execute_host_schedule_samsung(schedule, dev_inputs):
-    """Execute an analyzed host schedule on Samsung HBM-PIM (the run-path hook).
-
-    `schedule` is a `spmw_host_program.HostSchedule`; `dev_inputs` maps each
-    external-input buffer name to its float16 device array. Runs one
-    `run_samsung_reduce` per group -- a **batched (coalesced) group preloads its
-    resident weight ONCE** and stacks its B input vectors as the N=B columns of a
-    single contraction (the `P + B*(E+R)` schedule); a singleton group is a plain
-    contraction at its own N. Threads each group's real device readback forward
-    so a later group can consume a device-resident intermediate.
-
-    Returns `(dev, total_cycles)` where `dev` maps every buffer name to its
-    device value, or `(None, None)` if the driver is unavailable / surfaced
-    nothing. Backend execution only: NO reference composition (that is the
-    caller's concern), mirroring `run_samsung_reduce`.
-    """
-    import numpy as np
-
-    dev = {k: np.asarray(v, dtype=np.float16) for k, v in dev_inputs.items()}
-    total = 0
-    for g in schedule.groups:
-        M, K = g.weight_shape
-        W = dev[g.weight]
-        if not g.is_batched:
-            lx = g.launches[0]
-            out_dev, cyc = run_samsung_reduce(W, dev[lx.vec], M=M, K=K, N=lx.N)
-            if cyc is None:
-                return None, None
-            total += cyc
-            if out_dev is None:
-                return None, total
-            dev[lx.out] = np.asarray(out_dev, dtype=np.float16)
-        else:
-            # Batched GEMV: stack the B input vectors as the N columns of ONE
-            # contraction -> a single preload of the resident weight.
-            second = np.stack([dev[lx.vec] for lx in g.launches], axis=1)  # (K, B)
-            out_dev, cyc = run_samsung_reduce(W, second, M=M, K=K, N=len(g.launches))
-            if cyc is None:
-                return None, None
-            total += cyc
-            if out_dev is None:
-                return None, total
-            out_arr = np.asarray(out_dev)
-            for b, lx in enumerate(g.launches):
-                dev[lx.out] = out_arr[:, b].astype(np.float16)
-    return dev, total
-
-
-def _assert_host_move_roles(compiled, inputs) -> None:
-    """Assert the operand->role binding against the recorded host moves.
-
-    spec 001 D5 (Q2 option a): when `compiled.host_moves` is non-empty the
-    operand roles are *driven by the explicit moves* rather than purely inferred
-    -- the scatter buffer is the weight, the broadcast buffer is the input, the
-    gather buffer is the output. The driver still performs the transfer; this is
-    a consistency check that the recorded role names correspond to supplied
-    inputs. Advisory (warn, never raise): a buffer role may be unbound when the
-    workload passed a positional array rather than a named label, in which case
-    the run path's operand-shape inference is the fallback. When `host_moves` is
-    empty (today's path / non-Samsung) this is a no-op.
-    """
-    moves = getattr(compiled, "host_moves", None)
-    if not moves:
-        return
-    # Map verb name -> the buffer roles the moves bind it to.
-    by_verb: dict[str, list[str]] = {}
-    for rhm in moves:
-        verb_name = getattr(rhm.verb, "name", str(rhm.verb))
-        if rhm.buffer_role is not None:
-            by_verb.setdefault(verb_name, []).append(rhm.buffer_role)
-    supplied = {k for k, v in inputs.items() if v is not None}
-    for verb_name, roles in by_verb.items():
-        # A gather binds the OUTPUT buffer, which is legitimately absent from
-        # `inputs` (it is the readback target, supplied separately or inferred);
-        # only the input-side verbs (scatter weight / broadcast input) name
-        # buffers that must appear among the supplied inputs.
-        if verb_name == "gather":
-            continue
-        for role in roles:
-            # A named role that names no supplied input is suspicious only when
-            # SOME inputs were supplied (a bare `compiled.run()` probe supplies
-            # none and is exempt).
-            if supplied and role not in supplied:
-                warnings.warn(
-                    f"Samsung host move ({verb_name}) binds buffer role "
-                    f"{role!r} but no input named {role!r} was supplied "
-                    f"(supplied: {sorted(supplied)}); falling back to "
-                    f"operand-shape inference for that operand.",
-                    stacklevel=2,
-                )
-
-
-def _samsung_runtime_route(commands) -> str:
-    op_types = {command.type_ for command in commands if isinstance(command, PIMCmd)}
-    compute_types = op_types & {"MAC", "MUL", "ADD", "RELU"}
-    return "GENERIC_REDUCE" if compute_types == {"MAC"} else "GENERIC"
-
-
-def _samsung_main_runtime_command_valid(command: PIMCmd) -> bool:
-    if command.type_ in ("MOV", "FILL"):
-        bank_dst = command.dst_ in ("EVEN_BANK", "ODD_BANK")
-        grf_src = any(
-            source in ("GRF_A", "GRF_B")
-            for source in (command.src0_, command.src1_, command.src2_)
-        )
-        if bank_dst and grf_src:
-            return False
-    return True
-
-
-def _samsung_main_runtime_commands(commands) -> tuple[PIMCmd, ...]:
-    return tuple(
-        command
-        for command in commands
-        if isinstance(command, PIMCmd) and _samsung_main_runtime_command_valid(command)
-    )
-
-
-def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
-    """Run a compiled Samsung HBM-PIM artifact via `pim_driver`.
-
-    SPEC-05 routing (legacy GEMV/ADD/MUL/RELU paths DELETED, 2026-06-30): a MAC
-    kernel routes to the mapping-driven GENERIC REDUCE conductor; everything else
-    routes to the GENERIC ELTWISE conductor. There is no dedicated --op
-    GEMV/ADD/MUL/RELU branch and no multi-layer GEMV split.
-
-    Wire protocol (SPEC-005): for the GENERIC ELTWISE path the emitted PIMCmd
-    stream is serialised to a line-delimited `cmds.txt` and passed via
-    ``pim_driver --cmds <path>``; the C++ side uses it as the CRF microcode
-    (uploaded by `programCrf`) instead of regenerating it via
-    `PIMCmdGen::getPIMCmds`. The static ``--op`` choice only selects which numpy
-    inputs to wire up; the kernel choice no longer determines the CRF program
-    (placement does). The GENERIC REDUCE path supplies its own minimal --crf
-    (rebuilt canonical GEMV body) and does not pass --cmds.
-
-    Line-delimited cmd format:
-        MAC dst=GRF_B src0=GRF_A src1=EVEN_BANK is_auto=1
-        JUMP loop_counter=7 loop_offset=2
-        NOP loop_counter=7
-        EXIT
-    """
-    root = _pimsim_root()
-    driver = root / "pim_driver"
-    if not driver.exists():
-        return RunResult(
-            cycles=None,
-            stdout=f"simulator unavailable: pim_driver not found at {driver}",
-            backend="samsung_hbm_pim",
-        )
-
-    # spec 001 D5: assert operand->role binding against the recorded host moves
-    # (no-op when none recorded; advisory when bound). The driver argv below is
-    # unchanged -- the moves carry cost + role, not driver args (Q2 option a).
-    _assert_host_move_roles(compiled, inputs)
-
-    # The `--op` flag still picks the data-path scaffolding (eltwise vs
-    # GEMV) and which numpy inputs to wire up, but no longer determines
-    # the CRF microcode -- that comes from `compiled.cmds` via `--cmds`.
-    # The choice of which scaffolding to use is inferred from MAC-vs-eltwise
-    # opcodes in the emitted stream.
-    kernel = _samsung_runtime_route(compiled.cmds)
-
-    # numpy is a hard Tenon dependency; "no numpy" is a setup bug, not
-    # an env skip -- let the ImportError propagate.
-    import numpy as np
-
-    # ISA-valid filter (drop the ST_A/ST_B storeback MOVs the C++ validationCheck
-    # rejects) -> the cmd stream that reaches programCrf via --cmds for the GENERIC
-    # ELTWISE path. (The GENERIC_REDUCE path supplies its own minimal CRF and
-    # ignores this; see its argv branch.)
-    pim_cmds_all = list(_samsung_main_runtime_commands(compiled.cmds))
-
-    with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
-        out_path = td_path / "out.bin"
-        # SPEC-04 §3.2: GENERIC_REDUCE is not a new --op; it reuses --op GENERIC
-        # with --op-kind REDUCE (added in the branch below). All other kernels map
-        # their name 1:1 to --op.
-        op_arg = "GENERIC" if kernel == "GENERIC_REDUCE" else kernel
-        argv = [str(driver), "--op", op_arg, "--out", str(out_path)]
-        # REDUCE state threaded to the readback (set in the GENERIC_REDUCE branch).
-        reduce_shape = None  # (M, K, N, m_pad)
-
-        if kernel == "GENERIC_REDUCE":
-            # SPEC-05 §2: MAPPING-DRIVEN genuine fp16 matmul via --op GENERIC
-            # --op-kind REDUCE. The PARTITION (per-PE slice ROWS, PE count
-            # n_workids) comes from the TRACE (the work-id buckets + the MAC slice
-            # loop bound), NOT from operand-shape tiling: partition flows
-            # mapping -> trace -> codegen. M_logical = ROWS * n_workids; operands
-            # supply data + ground-truth K/N. A is padded to the logical grid
-            # (n_workids*ROWS) then to the physical fabric tile; --num-tiles =
-            # ceil(M_logical/4096) tiles the logical grid across fabric tiles.
-            part = _samsung_reduce_partition(compiled, inputs)
-            if part is None:
-                return RunResult(
-                    cycles=None,
-                    stdout="Samsung GENERIC_REDUCE: no MAC partition in trace",
-                    backend="samsung_hbm_pim",
-                )
-            ROWS, n_workids, K, N, M_real = part
-            M_logical = ROWS * n_workids
-            # Operand arrays (real A/B/x). Accept A/B, a/b, x/in role names.
-            A = inputs.get("A")
-            if A is None:
-                A = inputs.get("a")
-            B = inputs.get("B")
-            if B is None:
-                B = inputs.get("b")
-            xv = inputs.get("x")
-            if xv is None:
-                xv = inputs.get("in")
-            if A is None:
-                return RunResult(
-                    cycles=None,
-                    stdout="Samsung GENERIC_REDUCE needs A (and B for GEMM / x "
-                    "for GEMV) kwargs",
-                    backend="samsung_hbm_pim",
-                )
-            A = np.asarray(A, dtype=np.float16).reshape(int(M_real), int(K))
-            # The second operand: B[K,N] (GEMM) or x[K] (GEMV).
-            if N > 1:
-                if B is None:
-                    return RunResult(
-                        cycles=None,
-                        stdout="Samsung GENERIC_REDUCE GEMM needs B kwarg",
-                        backend="samsung_hbm_pim",
-                    )
-                second = np.asarray(B, dtype=np.float16).reshape(int(K), int(N))
-            else:
-                src = B if B is not None else xv
-                if src is None:
-                    return RunResult(
-                        cycles=None,
-                        stdout="Samsung GENERIC_REDUCE GEMV needs x (or B) kwarg",
-                        backend="samsung_hbm_pim",
-                    )
-                second = np.asarray(src, dtype=np.float16).reshape(int(K), 1)
-            # Partition-provenance assertion (SPEC-05 §2.3): M_logical is the grid
-            # product; the operand's real rows must fit within it (the harness pads
-            # the operand to the grid).
-            if M_real > M_logical:
-                warnings.warn(
-                    f"Samsung GENERIC_REDUCE: operand rows {M_real} exceed the "
-                    f"mapping partition ROWS*n_workids = {ROWS}*{n_workids} = "
-                    f"{M_logical}; the grid under-covers (check mapping).",
-                    stacklevel=2,
-                )
-            # Pad K up to a multiple of _SAMSUNG_REDUCE_K_TILE (256) so computeGemv's
-            # input-tile split engages both even and odd banks cleanly (K<256 /
-            # odd num_input_tiles degenerates -- zero-padding K leaves A@B unchanged).
-            k_tile = _SAMSUNG_REDUCE_K_TILE
-            k_pad = ((int(K) + k_tile - 1) // k_tile) * k_tile
-            # Pad A's rows: first to the LOGICAL grid (n_workids*ROWS = M_logical,
-            # so the partition divides evenly), then to the PHYSICAL fabric tile
-            # (preloadGemv requires it). The two pads compose (logical <= physical
-            # for SMALL/milestone). The readback slices [:M_real, :N].
-            tile = _SAMSUNG_FABRIC_ROW_TILE
-            m_pad = ((int(M_logical) + tile - 1) // tile) * tile
-            A_pad = np.zeros((m_pad, k_pad), dtype=np.float16)
-            A_pad[: int(M_real), : int(K)] = A  # zero-fill grid pad + K pad
-            second_pad = np.zeros((k_pad, second.shape[1]), dtype=np.float16)
-            second_pad[: int(K)] = second
-            second = second_pad
-            a_path = td_path / "A.npy"
-            b_path = td_path / "B.npy"
-            np.save(a_path, A_pad)
-            np.save(b_path, second)
-            # k_bursts on the weight role = ceil(K_pad_bursts/8); the C++ derives
-            # the JUMP counters itself from the weight shape (advisory here).
-            k_bursts = ((k_pad // 16) + 7) // 8
-            # --num-tiles tiles the LOGICAL grid across physical fabric tiles
-            # (derived from the partition, not hardcoded 1). For M_logical <= 4096
-            # this is 1 (the whole grid fits one fabric tile).
-            num_tiles = (m_pad + tile - 1) // tile
-            # The REDUCE path rebuilds the canonical GEMV CRF internally from the
-            # weight shape (matched JUMP counters), so the EMITTED cmd stream is
-            # irrelevant -- and a slice-form workload's emitted stream is
-            # prod(mapping)*body cmds (e.g. 512 for the 128-PE grid), which would
-            # trip the conductor's 32-cmd cap. Pass a minimal MAC CRF (inert for
-            # REDUCE) and SKIP the emitted --cmds block below.
-            crf_path = td_path / "reduce.crf"
-            crf_path.write_text(
-                "MAC dst=GRF_B src0=GRF_A src1=EVEN_BANK is_auto=1\n"
-                "JUMP loop_counter=0 loop_offset=2\n"
-                "MAC dst=GRF_B src0=GRF_A src1=ODD_BANK is_auto=1\n"
-                "JUMP loop_counter=0 loop_offset=2\n"
-                "MOV dst=ODD_BANK src0=GRF_B\n"
-            )
-            argv += [
-                "--inputs",
-                f"{a_path},{b_path}",
-                "--crf",
-                str(crf_path),
-                "--op-kind",
-                "REDUCE",
-                "--out-rows",
-                str(m_pad),
-                "--out-cols",
-                str(int(N)),
-                "--reduce-k",
-                str(k_pad),
-                "--num-tiles",
-                str(num_tiles),
-                "--bank-type",
-                "ALL",
-                "--roles",
-                f"A:0:0:2:0:0:0:{k_bursts},B:0:0:2:0:0:0:0,out:0:0:1:1:0:8:0",
-            ]
-            # readback slices the REAL P (M_real), not the grid/fabric pad.
-            reduce_shape = (int(M_real), int(K), int(N), m_pad)
-        else:  # GENERIC -- faithful multi-opcode interpreter (spec 01 §4)
-            # Flat-CLI contract (§5.1): role .npy paths joined comma-separated
-            # in role order, one flat fp16 out.bin, --num-tiles derived from
-            # the operand size (never a shape literal). No --faithful: GENERIC
-            # is always faithful (spec 01 §5.1).
-            generic_inputs = {
-                k: v
-                for k, v in inputs.items()
-                if v is not None and k not in ("layers",)
-            }
-            if not generic_inputs:
-                # Back-compat: compiled.run() with no kwargs returns cycles=None.
-                return RunResult(
-                    cycles=None,
-                    stdout="Samsung GENERIC needs operand kwargs",
-                    backend="samsung_hbm_pim",
-                )
-            in_paths = []
-            generic_n = None
-            for ri, (rname, rval) in enumerate(generic_inputs.items()):
-                arr = np.asarray(rval, dtype=np.float16).reshape(-1)
-                if generic_n is None:
-                    generic_n = int(arr.size)
-                rp = td_path / f"in{ri}.npy"
-                np.save(rp, arr)
-                in_paths.append(str(rp))
-            # elems_per_tile = 16 lanes x 8 GRF x num_pim_blocks; derive
-            # num_tiles from the operand size (spec 01 §4.3 / §5.2). Fall back
-            # to 1 tile for sub-tile operands.
-            elems_per_tile = 16 * 8 * _samsung_num_pim_blocks(compiled)
-            num_tiles = max(1, (generic_n + elems_per_tile - 1) // elems_per_tile)
-            argv += [
-                "--inputs",
-                ",".join(in_paths),
-                "--num-tiles",
-                str(num_tiles),
-                "--bank-type",
-                "ALL",
-            ]
-
-        # SPEC-005: serialise compiled.cmds to a line-delimited file and
-        # pass --cmds so the driver uses our CRF microcode instead of
-        # PIMCmdGen's canonical one. Layout/placement changes show up in
-        # cycles only because this file flows into programCrf().
-        # The ISA-valid filter was applied up-front into `pim_cmds_all`.
-        # SPEC-05: GENERIC_REDUCE supplies its OWN minimal --crf (the emitted
-        # stream is canonicalized internally + a slice-form stream blows the
-        # 32-cmd cap), so it skips this emitted-cmds block. The GENERIC ELTWISE
-        # path uses the emitted CRF microcode via --cmds.
-        if pim_cmds_all and kernel != "GENERIC_REDUCE":
-            cmds_path = td_path / "cmds.txt"
-            _write_samsung_cmds(cmds_path, pim_cmds_all)
-            argv += ["--cmds", str(cmds_path)]
-
-        try:
-            proc = subprocess.run(
-                argv,
-                capture_output=True,
-                cwd=str(root),  # pim_driver resolves ini/ paths relative to cwd
-                timeout=600,
-                check=False,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(f"Samsung pim_driver invocation failed: {exc}") from exc
-
-        stdout = proc.stdout.decode("utf-8", errors="replace")
-        stderr = proc.stderr.decode("utf-8", errors="replace")
-        combined = stdout + ("\n" + stderr if stderr else "")
-        match = re.search(r"PIM_CYCLES total=(\d+)", combined)
-        if not match:
-            raise RuntimeError(
-                "Samsung pim_driver returned but stdout missing "
-                "'PIM_CYCLES total=...' line; tail: " + combined[-400:]
-            )
-        cycles = int(match.group(1))
-        # SPEC-004b (additive readback): surface the GEMV result the driver
-        # already wrote to `out_path` into extra["outputs"], mirroring
-        # _run_apu_v1. Pure post-run file I/O -- cycles (parsed above) and the
-        # command stream are untouched; graceful when absent. Output role "y".
-        extra = {"kernel": kernel, "returncode": proc.returncode}
-        if kernel == "GENERIC_REDUCE":
-            # SPEC-04 §4.3: faithful matmul readback. The REDUCE column cadence
-            # drives the real PIMBlock::mac accumulator and the real drain, so
-            # out.bin holds genuine numerics (no dual-run / plain rerun needed).
-            M, K, N, m_pad = reduce_shape
-            outputs = _samsung_read_reduce_outbin(out_path, M, N, m_pad)
-            if outputs:
-                extra["outputs"] = outputs
-                extra["cycles_source"] = "PIMSimulator GENERIC REDUCE interpreter"
-                extra["correctness_source"] = "PIMSimulator GENERIC REDUCE interpreter"
-            return RunResult(
-                cycles=cycles,
-                stdout=combined,
-                backend="samsung_hbm_pim",
-                extra=extra,
-            )
-        # GENERIC (ELTWISE) flat fp16 readback (spec 01 §3.3): the faithful
-        # interpreter writes real numerics into out.bin. Role name "out". (The
-        # only two routes are GENERIC_REDUCE above and GENERIC here -- the legacy
-        # GEMV/ADD/MUL/RELU readbacks were deleted with the legacy routing.)
-        outputs = _samsung_read_generic_outbin(out_path, generic_n)
-        if outputs:
-            extra["outputs"] = outputs
-            extra["cycles_source"] = "PIMSimulator GENERIC interpreter"
-            extra["correctness_source"] = "PIMSimulator GENERIC interpreter"
-        return RunResult(
-            cycles=cycles,
-            stdout=combined,
-            backend="samsung_hbm_pim",
-            extra=extra,
-        )
-
-
-def _layout_stage_resident(layout) -> bool:
-    """Read the chosen placement's structural `stage_resident` flag.
-
-    Bridge option (b) (task-017): renamed off `weight_resident`; the
-    host_staging cost split and this run-path preload sequencing both read
-    the same flag. `Compiled.layout` is a single Placement (one kernel) or a
-    list. The batched run path is single-GEMV; default-absent key -> False
-    (the non-resident shape). Codegen materialises this decision; it does
-    not re-decide (I5).
-    """
-    if isinstance(layout, list):
-        layout = layout[0] if layout else None
-    if layout is None:
-        return False
-    return bool(getattr(layout, "extra", {}).get("stage_resident", False))
-
-
-def _samsung_batched_invoke(
-    driver: Path,
-    root: Path,
-    cmd_subset: list,
-    W,
-    X,
-    batch: int,
-    native_rebaseline: bool,
-    np_mod,
-) -> tuple[int, dict, str]:
-    """One batched pim_driver --batch invocation (SPEC-026 §4.2).
-
-    Returns `(total_cycles, phase_dict, combined_stdout)`. `phase_dict`
-    has preload/exec/readback so the caller can assert the per-phase
-    split against the cost model. `native_rebaseline=True` selects the
-    re-preload-per-vector comparator loop.
-    """
-    with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
-        out_path = td_path / "out.bin"
-        w_path = td_path / "W.npy"
-        x_path = td_path / "X.npy"
-        cmds_path = td_path / "cmds.txt"
-        # The vendor GEMV conductor addresses a complete 4096-row Samsung
-        # fabric tile and alternates even/odd 128-wide reduction tiles.  Small
-        # or ragged PolyBench legs therefore need the same zero padding as the
-        # generic REDUCE path; passing an underfilled matrix makes the reference
-        # PIMSimulator preload walk beyond ``NumpyBurstType::bData`` and abort.
-        # Zero padding preserves W@X and is part of the physical lowering, not
-        # a workload-size change.
-        m_real, k_real = int(W.shape[0]), int(W.shape[1])
-        m_pad = (
-            (m_real + _SAMSUNG_FABRIC_ROW_TILE - 1) // _SAMSUNG_FABRIC_ROW_TILE
-        ) * _SAMSUNG_FABRIC_ROW_TILE
-        k_pad = (
-            (k_real + _SAMSUNG_REDUCE_K_TILE - 1) // _SAMSUNG_REDUCE_K_TILE
-        ) * _SAMSUNG_REDUCE_K_TILE
-        if m_pad != m_real or k_pad != k_real:
-            W_physical = np_mod.zeros((m_pad, k_pad), dtype=np_mod.float16)
-            W_physical[:m_real, :k_real] = W
-            X_physical = np_mod.zeros((batch, k_pad), dtype=np_mod.float16)
-            X_physical[:, :k_real] = X
-        else:
-            W_physical = W
-            X_physical = X
-        np_mod.save(w_path, W_physical)
-        np_mod.save(x_path, X_physical)
-        _write_samsung_cmds(cmds_path, cmd_subset)
-
-        argv = [
-            str(driver),
-            "--op",
-            "GEMV",
-            "--out",
-            str(out_path),
-            "--weight",
-            str(w_path),
-            "--in",
-            str(x_path),
-            "--output-dim",
-            str(m_pad),
-            "--input-dim",
-            str(k_pad),
-            "--cmds",
-            str(cmds_path),
-            "--faithful",
-            "--batch",
-            str(batch),
-        ]
-        if native_rebaseline:
-            argv.append("--native-rebaseline")
-
-        try:
-            proc = subprocess.run(
-                argv,
-                capture_output=True,
-                cwd=str(root),
-                timeout=600,
-                check=False,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(
-                f"Samsung batched pim_driver invocation failed: {exc}"
-            ) from exc
-
-        stdout = proc.stdout.decode("utf-8", errors="replace")
-        stderr = proc.stderr.decode("utf-8", errors="replace")
-        combined = stdout + ("\n" + stderr if stderr else "")
-        m = re.search(
-            r"PIM_CYCLES total=(\d+)\s+preload=(\d+)\s+exec=(\d+)\s+readback=(\d+)",
-            combined,
-        )
-        if not m:
-            raise RuntimeError(
-                "Samsung batched pim_driver returned but stdout missing "
-                "'PIM_CYCLES total=...' line; tail: " + combined[-400:]
-            )
-        phases = {
-            "preload": int(m.group(2)),
-            "exec": int(m.group(3)),
-            "readback": int(m.group(4)),
-        }
-        return int(m.group(1)), phases, combined
-
-
-def _run_samsung_batched(
-    compiled: "Compiled",
-    W,
-    X,
-    compare_native: bool = True,
-) -> RunResult:
-    """Batched-GEMV run path (SPEC-026 §4.2/§4.3).
-
-    Emits the Tenon stream (preload once + B*(exec+readback), selected by
-    the chosen placement's `stage_resident` flag) AND, when
-    `compare_native` is set, the native rebaseline (B*(preload+exec+
-    readback)) under the SAME faithful instrument, cmd stream, W, and
-    X(B,K). Only the preload-loop placement differs (I2). B = X.shape[0]
-    is read off the operand shape, never a literal (I3).
-
-    `RunResult.cycles` is the Tenon total; `extra` carries the native
-    total + both per-phase splits so the gate-A comparison and the
-    cost-model assertion can be made by the caller.
-    """
-    import numpy as np
-
-    root = _pimsim_root()
-    driver = root / "pim_driver"
-    if not driver.exists():
-        return RunResult(
-            cycles=None,
-            stdout=f"simulator unavailable: pim_driver not found at {driver}",
-            backend="samsung_hbm_pim",
-        )
-
-    W = np.asarray(W, dtype=np.float16)
-    X = np.asarray(X, dtype=np.float16)
-    if X.ndim == 1:
-        X = X.reshape(1, -1)
-    B = int(X.shape[0])  # I3: B is operand geometry (X[B,K] leading dim).
-
-    pim_cmds = [c for c in compiled.cmds if isinstance(c, PIMCmd)]
-
-    # Same ISA-valid filter the single-vector run path applies.
-    def _crf_valid(c: PIMCmd) -> bool:
-        # GRF_A is populated by the faithful GEMV conductor before CRF
-        # execution.  ``SamsungCtx`` retains a FILL marker for the generic
-        # interpreter, but forwarding it to the vendor GEMV programCrf path
-        # makes PIMSimulator reject/abort the stream before reporting cycles.
-        # The canonical Samsung GEMV CRF begins with MAC for the same reason.
-        if c.type_ == "FILL":
-            return False
-        if c.type_ in ("MOV", "FILL"):
-            bank_dst = c.dst_ in ("EVEN_BANK", "ODD_BANK")
-            grf_src = any(s in ("GRF_A", "GRF_B") for s in (c.src0_, c.src1_, c.src2_))
-            if bank_dst and grf_src:
-                return False
-        return True
-
-    pim_cmds = [c for c in pim_cmds if _crf_valid(c)]
-
-    resident = _layout_stage_resident(compiled.layout)
-    # Tenon: resident mode preloads once when B>1; the driver reads the
-    # resident vs native loop from --native-rebaseline (absent => resident).
-    # If the chosen placement is NOT stage_resident, Tenon's own run is the
-    # native (re-preload-per-vector) sequencing -- codegen materialises the
-    # decision argmin made, it does not override it.
-    tenon_total, tenon_phases, tenon_out = _samsung_batched_invoke(
-        driver,
-        root,
-        pim_cmds,
-        W,
-        X,
-        B,
-        native_rebaseline=not resident,
-        np_mod=np,
-    )
-
-    extra = {
-        "kernel": "GEMV",
-        "batch": B,
-        "stage_resident": resident,
-        "tenon_total": tenon_total,
-        "tenon_phases": tenon_phases,
-    }
-    combined = tenon_out
-    if compare_native:
-        native_total, native_phases, native_out = _samsung_batched_invoke(
-            driver,
-            root,
-            pim_cmds,
-            W,
-            X,
-            B,
-            native_rebaseline=True,
-            np_mod=np,
-        )
-        extra["native_total"] = native_total
-        extra["native_phases"] = native_phases
-        combined = tenon_out + "\n--- native rebaseline ---\n" + native_out
-
-    return RunResult(
-        cycles=tenon_total,
-        stdout=combined,
-        backend="samsung_hbm_pim",
-        extra=extra,
-    )
-
-
-def _aim_runtime_segments(commands) -> tuple[tuple[str, int, tuple[str, ...]], ...]:
-    """Parse the exact pre-terminated AiM streams consumed by Ramulator2."""
-
-    segments: list[tuple[str, int, tuple[str, ...]]] = []
-    current_label = "program"
-    current_repeat = 1
-    current: list[str] = []
-
-    def finish_segment() -> None:
-        nonlocal current
-        if not current:
-            return
-        eoc_positions = [
-            index for index, line in enumerate(current) if line.strip() == "AiM EOC"
-        ]
-        if eoc_positions != [len(current) - 1]:
-            raise ValueError(
-                "AiM runtime segment must contain exactly one trailing EOC"
-            )
-        segments.append((current_label, current_repeat, tuple(current)))
-        current = []
-
-    for raw in map(str, commands):
-        if raw.startswith("# TENON_GEMV "):
-            finish_segment()
-            current_label = raw[2:]
-            repeat_match = re.search(r"repeat=(\d+)", raw)
-            current_repeat = int(repeat_match.group(1)) if repeat_match else 1
-            current = []
-        else:
-            current.append(raw)
-    finish_segment()
-    if not segments:
-        raise ValueError("AiM runtime requires at least one terminated segment")
-    return tuple(segments)
-
-
-def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
-    """Run a compiled AiM artifact through ramulator2 in Docker.
-
-    `compiled.cmds` is a list of already-terminated text trace lines. We
-    serialize those exact candidate-owned segments and invoke the ramulator2
-    binary inside the `aim-simulator-build` Docker image. The simulator's
-    YAML stdout carries per-channel `memory_system_cycles`; we parse
-    out the max across channels as the headline cycle count.
-    """
-    root = _aim_root()
-    yaml_cfg = root / "test" / "example.yaml"
-    if not _docker_image_exists("aim-simulator-build") or not yaml_cfg.exists():
-        return RunResult(
-            cycles=None,
-            stdout="simulator unavailable: aim-simulator-build docker image / config missing",
-            backend="aim",
-        )
-
-    cfg_rel = yaml_cfg.relative_to(root)
-
-    def run_segment(lines: list[str]) -> tuple[int, str, int]:
-        with tempfile.NamedTemporaryFile(
-            mode="w", delete=False, suffix=".trace", dir=str(root / "test")
-        ) as tf:
-            for line in lines:
-                tf.write(str(line) + "\n")
-            trace_path = Path(tf.name)
-        trace_rel = trace_path.relative_to(root)
-        try:
-            proc = subprocess.run(
-                [
-                    "docker",
-                    "run",
-                    "--rm",
-                    "-v",
-                    f"{root}:/work",
-                    "aim-simulator-build",
-                    "bash",
-                    "-c",
-                    f"cd /work && ./build/ramulator2 -f {cfg_rel} -t {trace_rel}",
-                ],
-                capture_output=True,
-                timeout=600,
-                check=False,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(f"AiM ramulator2 invocation failed: {exc}") from exc
-        finally:
-            trace_path.unlink(missing_ok=True)
-        stdout = proc.stdout.decode("utf-8", errors="replace")
-        stderr = proc.stderr.decode("utf-8", errors="replace")
-        combined = stdout + ("\n" + stderr if stderr else "")
-        values = [
-            int(m) for m in re.findall(r"memory_system_cycles:\s*(\d+)", combined)
-        ]
-        if not values:
-            raise RuntimeError(
-                "AiM ramulator2 returned but stdout missing "
-                "'memory_system_cycles: ...' line; tail: " + combined[-400:]
-            )
-        return max(values), combined, proc.returncode
-
-    # Compact traces carry independently dispatched GEMV templates. Profile
-    # every native segment once, then apply its compile-time repeat count. All
-    # base values are direct Ramulator2 measurements from this invocation.
-    segments = tuple(getattr(compiled, "runtime_segments", ()))
-    if not segments:
-        segments = _aim_runtime_segments(compiled.cmds)
-
-    total_cycles = 0
-    logs: list[str] = []
-    returncodes: list[int] = []
-    cache: dict[tuple[str, ...], tuple[int, str, int]] = {}
-    for label, repeat, lines in segments:
-        key = tuple(lines)
-        if key not in cache:
-            cache[key] = run_segment(lines)
-        raw_cycles, log, returncode = cache[key]
-        total_cycles += raw_cycles * repeat
-        returncodes.append(returncode)
-        logs.append(
-            f"=== {label}; repeat={repeat}; raw_cycles={raw_cycles}; "
-            f"composed_cycles={raw_cycles * repeat} ===\n{log}"
-        )
-    cycles = total_cycles
-    combined = "\n".join(logs)
-    return RunResult(
-        cycles=cycles,
-        stdout=combined,
-        backend="aim",
-        extra={
-            "returncode": max(returncodes, default=0),
-            "segments": len(segments),
-            "unique_segments": len(cache),
-        },
-    )
-
-
-def _apu_v1_kernel_src(compiled: "Compiled") -> str:
-    return "\n".join(str(c) for c in compiled.cmds if isinstance(c, str))
-
-
-def _parse_apu_v1_prof_print(text: str) -> int | None:
-    """Return the four-APUC parallel makespan from ``total`` PROF_PRINTs.
-
-    Hardware emits fields with a colon separator, e.g.
-    `ARCT[0]: ***  total - hits:1 seu:374 crun:170227 iall:37027 ...`.
-    ``ledag flo`` can include older buffered records, so only the final four
-    totals belong to the batch just launched. Those APUCs run concurrently;
-    their cost is the maximum CRUN, not their sum. Accept `=` as well for
-    forward compatibility. Returns None if no match.
-    """
-    totals = re.findall(r"\btotal\b[^\n]*?\bcrun\s*[:=]\s*(\d+)", text)
-    if totals:
-        return max(int(value) for value in totals[-4:])
-    counters = re.findall(r"\bcrun\s*[:=]\s*(\d+)", text)
-    if counters:
-        return max(int(value) for value in counters[-4:])
-    return None
-
-
-def _apu_v1_output_specs(compiled: "Compiled", inputs: dict) -> dict:
-    """Derive `output_specs: {role: (shape, dtype)}` from the trace.
-
-    This is the fallback for non-grouped operations. Grouped contractions use
-    `_apu_v1_prepare_io`, which knows the logical output shape and FP16 ABI.
-    """
-    import numpy as np
-
-    out: dict = {}
-    trace = getattr(compiled, "trace", None)
-    if trace is None:
-        return out
-
-    # Determine a fallback shape from the largest input.
-    fallback_shape: tuple = ()
-    fallback_size = -1
-    for arr in inputs.values():
-        sz = getattr(arr, "size", 0)
-        if sz > fallback_size:
-            fallback_size = sz
-            fallback_shape = tuple(getattr(arr, "shape", ()))
-
-    for m in trace.matches:
-        name = m.result_memref_name
-        if name and name.startswith("local_"):
-            name = name[len("local_") :]
-        if not name or name in out:
-            continue
-        # Prefer shape/dtype from an input that happens to share the name.
-        if name in inputs and hasattr(inputs[name], "shape"):
-            out[name] = (tuple(inputs[name].shape), inputs[name].dtype)
-        else:
-            # APU v1 output: derive from the first input as a 1D vector
-            # of the same element count (the GEMV `acc` is M-shaped, but
-            # the declarative trace doesn't pin that; the user can
-            # override via `output_specs` once exposed).
-            out[name] = (fallback_shape or (1,), np.dtype("uint16"))
-    return out
-
-
-def _apu_v1_prepare_io(compiled: "Compiled", inputs: dict):
-    """Normalize inputs and realize the grouped-contraction callable ABI.
-
-    Dense contractions are packed one output dot product per GVML group, split
-    over four APUCs, and streamed in 32K-lane batches. The returned metadata
-    drives group-head gathering after execution.
-    """
-    import numpy as np
-
-    normalized: dict = {}
-    for name, arr in inputs.items():
-        if not isinstance(arr, np.ndarray):
-            raise ValueError(
-                f"APU v1 run: input {name!r} must be a numpy.ndarray; "
-                f"got {type(arr).__name__}"
-            )
-        # APU v1 is uint16-native today; we view int16/float16 buffers
-        # as their raw bytes (host.c writes them straight into L4) so
-        # we don't impose a dtype cast here.
-        normalized[name] = arr
-
-    layout = getattr(compiled, "layout", None)
-    if isinstance(layout, list):
-        layout = layout[0] if layout else None
-    extra = getattr(layout, "extra", {}) or {}
-    group_size = int(extra.get("group_size", 0) or 0)
-    batches = max(1, int(extra.get("n_out_tiles", 1)))
-    if group_size and len(normalized) >= 2:
-        trace_output_names = []
-        operand_names = []
-        for match in compiled.trace.matches:
-            name = match.result_memref_name
-            if name:
-                name = name[len("local_") :] if name.startswith("local_") else name
-                if name not in trace_output_names:
-                    trace_output_names.append(name)
-            for operand in match.operands:
-                if operand.role not in ("x", "y") or not operand.memref_name:
-                    continue
-                operand_name = operand.memref_name
-                if operand_name.startswith("local_"):
-                    operand_name = operand_name[len("local_") :]
-                if operand_name not in operand_names:
-                    operand_names.append(operand_name)
-        # Reduction matchers name the loop-carried scalar ``acc`` as the
-        # result.  At the callable boundary, the real output is the source
-        # argument not bound to semantic x/y (C in GEMM, y in GEMV).
-        abi_output_names = [name for name in normalized if name not in operand_names]
-        operands = [
-            (name, arr)
-            for name, arr in normalized.items()
-            if name in operand_names and arr.ndim > 0
-        ]
-        matrices = [(name, arr) for name, arr in operands if arr.ndim == 2]
-        if len(matrices) >= 2:
-            # Grouped GEMM: one group is one output dot product.  Rows are
-            # partitioned over four APUCs; each core may stream several VRs.
-            (lhs_name, lhs), (rhs_name, rhs) = matrices[:2]
-            if lhs.shape[1] == rhs.shape[0]:
-                if lhs.dtype != np.float16 or rhs.dtype != np.float16:
-                    raise ValueError(
-                        "APU v1 grouped contractions require float16 inputs; "
-                        f"got {lhs.dtype} and {rhs.dtype}"
-                    )
-                rows, reduction = lhs.shape
-                cols = rhs.shape[1]
-                if reduction > group_size:
-                    raise ValueError("APU v1 group is smaller than GEMM reduction")
-                groups_per_vr = 32768 // group_size
-                rows_per_core = (rows + 3) // 4
-                required = (rows_per_core * cols + groups_per_vr - 1) // groups_per_vr
-                batches = max(batches, required)
-                packed_lhs = np.zeros((4, batches, 32768), dtype=lhs.dtype)
-                packed_rhs = np.zeros((4, batches, 32768), dtype=rhs.dtype)
-                for core in range(4):
-                    row0 = core * rows_per_core
-                    pairs = [
-                        (row, col)
-                        for row in range(row0, min(rows, row0 + rows_per_core))
-                        for col in range(cols)
-                    ]
-                    for output_index, (row, col) in enumerate(pairs):
-                        batch, group = divmod(output_index, groups_per_vr)
-                        base = group * group_size
-                        packed_lhs[core, batch, base : base + reduction] = lhs[row, :]
-                        packed_rhs[core, batch, base : base + reduction] = rhs[:, col]
-                normalized = {
-                    lhs_name: packed_lhs.reshape(-1),
-                    rhs_name: packed_rhs.reshape(-1),
-                }
-                output_name = (
-                    abi_output_names[0]
-                    if abi_output_names
-                    else trace_output_names[0] if trace_output_names else "output"
-                )
-                output_specs = {output_name: ((4, batches, 32768), np.dtype(lhs.dtype))}
-                return (
-                    normalized,
-                    output_specs,
-                    {
-                        "kind": "gemm",
-                        "output": output_name,
-                        "logical_shape": (rows, cols),
-                        "rows_per_core": rows_per_core,
-                        "group_size": group_size,
-                        "groups_per_vr": groups_per_vr,
-                    },
-                )
-
-        raise NotImplementedError(
-            "APU v1 physical execution currently supports a dense FP16 matrix "
-            "contraction with lhs.shape[1] == rhs.shape[0]"
-        )
-
-    output_specs = _apu_v1_output_specs(compiled, normalized)
-    return normalized, output_specs, None
-
-
-def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
-    """Run a compiled APU v1 artifact against real GSI hardware.
-
-    Materializes a build directory via `gen_apu_v1_low_mode_project`,
-    runs `make` with the ARC GNU toolchain, executes the resulting
-    binary against the Gemini PCI device, and parses cycle counts from
-    its PROF_PRINT stdout. Returns `RunResult(cycles=None, ...)` with
-    a "simulator unavailable" stdout when an environment gate
-    (toolchain, template dir, PCI sysfs node, GVML SDK headers) is
-    missing. Build failures past the gate raise `RuntimeError` so tests
-    cannot silently PASS on a cycles=None RunResult; a missing
-    PROF_PRINT 'total crun=' line, however, yields `cycles=None` rather
-    than raising -- the device program ran (or tried to) but produced
-    no profile output, which is observable through the returned
-    RunResult.stdout. See spec 017 and SPEC-001 §3.5.
-    """
-    kernel_src = _apu_v1_kernel_src(compiled)
-
-    skip_reason = _apu_v1_unavailable_reason()
-    if skip_reason:
-        return RunResult(
-            cycles=None,
-            stdout=skip_reason,
-            backend="apu_v1",
-            extra={"kernel_src": kernel_src},
-        )
-
-    from .spmw_apu_v1_build import (
-        _apu_v1_build_config,
-        _assert_gvml_sdk_present,
-        gen_apu_v1_low_mode_project,
-    )
-
-    # Build-harness probe: a missing SDK here means the toolchain gate
-    # passed but headers are absent; fail fast with a readable error
-    # rather than letting `make` emit a 200-line stderr blob below.
-    _assert_gvml_sdk_present()
-    build_config = _apu_v1_build_config()
-
-    tmpdir = tempfile.mkdtemp(prefix="tenon-apu-v1-")
-    try:
-        # prepare_io is build-harness Python; ValueError here is a Tenon
-        # bug or user-input contract violation, not an env skip.
-        inputs_np, output_specs, packing = _apu_v1_prepare_io(compiled, inputs)
-
-        # Write each input to <tmpdir>/in_<role>.bin so host.c can fread it.
-        input_bin_paths: dict[str, str] = {}
-        for role, arr in inputs_np.items():
-            p = Path(tmpdir) / f"in_{role}.bin"
-            arr.tofile(str(p))
-            input_bin_paths[role] = str(p)
-
-        output_bin_paths: dict[str, str] = {
-            role: str(Path(tmpdir) / f"out_{role}.bin") for role in output_specs
-        }
-
-        # Project emission. The toolchain/template gate above already
-        # ensured the template dir exists; if gen_apu_v1_low_mode_project
-        # still raises FileNotFoundError, that's a Tenon bug, not an
-        # env skip -- let it propagate.
-        project_dir = gen_apu_v1_low_mode_project(
-            dst_dir=Path(tmpdir) / "project",
-            compiled=compiled,
-            inputs=inputs_np,
-            output_specs=output_specs,
-            lab_name="tenon-kernel",
-        )
-
-        # Build. Past the toolchain/SDK gate, every failure below is a
-        # build- or runtime-bug, not an environment skip -- raise so
-        # the test does not silently PASS on a cycles=None RunResult.
-        try:
-            mk = subprocess.run(
-                build_config.make_command,
-                cwd=str(project_dir),
-                capture_output=True,
-                timeout=600,
-                check=False,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(
-                f"APU v1 make invocation failed: {exc}\n"
-                f"--- project_dir: {project_dir}"
-            ) from exc
-        if mk.returncode != 0:
-            raise RuntimeError(
-                "APU v1 make failed:\n"
-                + mk.stderr.decode("utf-8", errors="replace")
-                + "\n--- stdout ---\n"
-                + mk.stdout.decode("utf-8", errors="replace")
-                + f"\n--- project_dir: {project_dir}"
-            )
-
-        bin_path = build_config.binary_path(project_dir, "tenon-kernel")
-        if not bin_path.exists():
-            raise RuntimeError(
-                f"APU v1 build succeeded but binary not found at {bin_path} "
-                f"(project_dir: {project_dir})"
-            )
-
-        # Build argv: inputs first then outputs, in the same role order
-        # the build harness wrote into struct.h (sorted alpha).
-        sorted_in = sorted(input_bin_paths.keys())
-        sorted_out = sorted(output_bin_paths.keys())
-        argv = [str(bin_path)]
-        argv += [input_bin_paths[r] for r in sorted_in]
-        argv += [output_bin_paths[r] for r in sorted_out]
-
-        try:
-            proc = subprocess.run(
-                argv,
-                cwd=str(project_dir),
-                capture_output=True,
-                timeout=300,
-                check=False,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(
-                f"APU v1 binary invocation failed: {exc}\n"
-                f"--- project_dir: {project_dir}"
-            ) from exc
-
-        stdout_text = proc.stdout.decode("utf-8", errors="replace")
-        stderr_text = proc.stderr.decode("utf-8", errors="replace")
-        binary_output = stdout_text + ("\n" + stderr_text if stderr_text else "")
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"APU v1 device program failed with exit code {proc.returncode}:\n"
-                f"{binary_output[-2000:]}\n--- project_dir: {project_dir}"
-            )
-
-        # PROF_PRINT lines go to the device system log (the ledag
-        # channel), not to the binary's stdout. Drain that channel via
-        # `ledag-ssh flo` and concatenate the printable bytes so the
-        # `crun` parse below has something to match against. The ARC
-        # binary may need a moment to flush its PROF_END(total) entry
-        # to the device log after returncode is delivered to us, hence
-        # the brief sleep. Skill: see "Pattern B: scripted capture".
-        ledag_text = ""
-        if shutil.which("ledag-ssh") is not None:
-            time.sleep(0.5)
-            try:
-                ledag_proc = subprocess.run(
-                    ["ledag-ssh", "-o", "localhost"],
-                    input=b"flo\nquit\n",
-                    capture_output=True,
-                    timeout=30,
-                    check=False,
-                )
-                ledag_raw = ledag_proc.stdout or b""
-                # `| strings` equivalent: keep printable ASCII plus tab
-                # / newline / CR; the ledag wire format is otherwise
-                # binary-framed and decodes to mojibake.
-                ledag_text = "".join(
-                    chr(b) for b in ledag_raw if 32 <= b < 127 or b in (9, 10, 13)
-                )
-            except (subprocess.SubprocessError, OSError):
-                # ledag-ssh available but failed (timeout, device busy,
-                # auth) -- treat the same as missing-on-PATH: degrade
-                # to cycles=None rather than crash the run path.
-                ledag_text = ""
-
-        combined = binary_output + ("\n" + ledag_text if ledag_text else "")
-        cycles = _parse_apu_v1_prof_print(combined)
-        # A missing PROF_PRINT 'total crun=' line is *not* a build-harness
-        # bug: it means the device program ran (or attempted to) but
-        # produced no PROF_PRINT output -- typically because the GSI PCI
-        # device is absent, gated off, or returned an error before our
-        # PROF_END(total), or because `ledag-ssh` is not available on
-        # this host. Surface this as cycles=None so callers (and the
-        # cross-backend `test_run_returns_runresult_for_all_backends`
-        # contract) still receive a RunResult; build failures above
-        # already raise RuntimeError before we reach here.
-
-        # Read outputs back.
-        import numpy as np
-
-        outputs: dict = {}
-        for role, (shape, dtype) in output_specs.items():
-            p = Path(output_bin_paths[role])
-            if p.exists():
-                outputs[role] = np.fromfile(str(p), dtype=dtype).reshape(shape)
-
-        if packing and packing["kind"] == "gemm":
-            packed = outputs[packing["output"]]
-            rows, cols = packing["logical_shape"]
-            rows_per_core = packing["rows_per_core"]
-            group_size = packing["group_size"]
-            groups_per_vr = packing["groups_per_vr"]
-            logical = np.zeros((rows, cols), dtype=packed.dtype)
-            for core in range(4):
-                row0 = core * rows_per_core
-                pairs = [
-                    (row, col)
-                    for row in range(row0, min(rows, row0 + rows_per_core))
-                    for col in range(cols)
-                ]
-                for output_index, (row, col) in enumerate(pairs):
-                    batch, group = divmod(output_index, groups_per_vr)
-                    logical[row, col] = packed[core, batch, group * group_size]
-            outputs[packing["output"]] = logical
-
-        return RunResult(
-            cycles=cycles,
-            stdout=combined,
-            backend="apu_v1",
-            extra={
-                "outputs": outputs,
-                "kernel_src": kernel_src,
-                "build_mode": build_config.mode,
-                "project_dir": str(project_dir),
-                "returncode": proc.returncode,
-            },
-        )
-    finally:
-        if os.environ.get("TENON_APU_V1_KEEP_TMP") != "1":
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def _run_apu_v2(compiled: "Compiled", **inputs) -> RunResult:
-    """Run a compiled APU v2 artifact through the `gsi-g2-l1sim` image.
-
-    APU v2 / l1_sim is functional-only (no cycle counts; see report 13
-    §1, `caps["perf_is_placeholder"] = True`). We pass the emitted
-    C++ source through to the container so the user can inspect it,
-    but always return `cycles=None`.
-    """
-    cpp_src = "\n".join(str(c) for c in compiled.cmds if isinstance(c, str))
-    if not _docker_image_exists("gsi-g2-l1sim"):
-        return RunResult(
-            cycles=None,
-            stdout="simulator unavailable: gsi-g2-l1sim docker image missing",
-            backend="apu_v2",
-            extra={"program_src": cpp_src},
-        )
-    # l1_sim does not report cycles; we don't bother compiling here,
-    # since the GTML build pipeline needs a real project tree. The
-    # functional-correctness build flow is spec 014's territory.
-    return RunResult(
-        cycles=None,
-        stdout="apu_v2 l1_sim is functional-only; cycles=None by design",
-        backend="apu_v2",
-        extra={"program_src": cpp_src},
-    )
 
 
 def _run_virtual(compiled: "Compiled", **inputs) -> RunResult:
@@ -3556,13 +846,79 @@ def _run_virtual(compiled: "Compiled", **inputs) -> RunResult:
     )
 
 
-_BACKEND_RUN = {
-    "samsung_hbm_pim": _run_samsung,
-    "aim": _run_aim,
-    "apu_v1": _run_apu_v1,
-    "apu_v2": _run_apu_v2,
-    "virtual": _run_virtual,
-}
+
+
+@dataclass(frozen=True)
+class SourceBackendBinding:
+    """Workload-parameter names bound to backend runtime kwargs.
+
+    ``inputs`` maps a backend kwarg (e.g. ``"A"``) to the source parameter
+    name that supplies it. ``output`` names the source parameter receiving
+    the single backend output, or None.
+    """
+
+    inputs: "dict[str, str]" = field(default_factory=dict)
+    output: "str | None" = None
+
+
+# Samsung MAC operand role -> `_run_samsung` kwarg. `B` rather than `x` for the
+# broadcast vector because `_run_samsung` prefers `B` for both GEMV and GEMM.
+_SAMSUNG_MAC_ROLE_KWARGS = (("x", "A"), ("y", "B"))
+
+
+def source_backend_binding(target, trace, parameter_names) -> SourceBackendBinding:
+    """Bind workload parameters to the Samsung runtime roles structurally.
+
+    Uses the trace's retained source identities (`trace.source_value_refs`,
+    keyed by parameter ordinal) and the MAC operands' `value_ref`. Returns an
+    empty binding for other targets, multi-kernel traces, or when the MAC
+    matches disagree.
+    """
+    empty = SourceBackendBinding()
+    if getattr(target, "name", None) != "samsung_hbm_pim":
+        return empty
+    source_value_refs = getattr(trace, "source_value_refs", None) or {}
+    if not source_value_refs or not trace.matches:
+        return empty
+    if len({_matcher_work_scope(m).group_id for m in trace.matches}) != 1:
+        return empty
+    macs = [m for m in trace.matches if m.target_op_name == "MAC"]
+    if not macs:
+        return empty
+
+    parameter_names = tuple(parameter_names)
+    ordinal_by_ref = {}
+    for ordinal, ref in source_value_refs.items():
+        if 0 <= int(ordinal) < len(parameter_names):
+            ordinal_by_ref.setdefault(ref, int(ordinal))
+
+    inputs = {}
+    for role, kwarg in _SAMSUNG_MAC_ROLE_KWARGS:
+        refs = set()
+        for match in macs:
+            refs.update(
+                operand.value_ref for operand in match.operands if operand.role == role
+            )
+        if len(refs) != 1:
+            return empty
+        ordinal = ordinal_by_ref.get(next(iter(refs)))
+        if ordinal is None:
+            return empty
+        inputs[kwarg] = parameter_names[ordinal]
+
+    operand_refs = {
+        operand.value_ref
+        for match in trace.matches
+        for operand in match.operands
+        if operand.value_ref is not None
+    }
+    unreferenced = [
+        parameter_names[int(ordinal)]
+        for ordinal, ref in sorted(source_value_refs.items())
+        if 0 <= int(ordinal) < len(parameter_names) and ref not in operand_refs
+    ]
+    output = unreferenced[0] if len(unreferenced) == 1 else None
+    return SourceBackendBinding(inputs=inputs, output=output)
 
 
 class Compiled:
@@ -3581,13 +937,11 @@ class Compiled:
         host_moves: "list[ResolvedHostMove] | None" = None,
         execution_graph=None,
         cost=None,
-        schedule_search_result=None,
-        schedule_activation=None,
         host_schedule=None,
         runtime_abi=(),
         runtime_segments=(),
         matcher_codegen_artifact=None,
-        matcher_materialization=None,
+        placement_ranking=None,
     ):
         self.target = target
         self.trace = trace
@@ -3606,16 +960,11 @@ class Compiled:
         # unset and remain on their existing path during migration.
         self.execution_graph = execution_graph
         self.cost = cost
-        self.schedule_search_result = schedule_search_result
-        self.schedule_activation = schedule_activation
-        self.fallback_reason = (
-            None if schedule_activation is None else schedule_activation.fallback_reason
-        )
         self.backend = backend
         self.runtime_abi = tuple(runtime_abi)
         self.runtime_segments = tuple(runtime_segments)
         self.matcher_codegen_artifact = matcher_codegen_artifact
-        self.matcher_materialization = matcher_materialization
+        self.placement_ranking = placement_ranking
         # Lever 3 (SPEC-025 §5.4): shared-CRF host trigger schedule (one
         # HostTrigger per work-id), parallel to `cmds`. Empty for the
         # per-work-id path and every non-Samsung backend.
@@ -3625,43 +974,27 @@ class Compiled:
             else host_schedule
         )
 
-    @property
-    def promotion_materialization_fingerprint(self):
-        if self.matcher_materialization is None:
-            return None
-        try:
-            self._validate_matcher_materialization()
-        except RuntimeError:
-            return None
-        return self.matcher_materialization.promotion_materialization_fingerprint
-
-    def _validate_matcher_materialization(self) -> None:
-        if self.matcher_codegen_artifact is not None:
-            self.matcher_codegen_artifact.validate_compiled(self)
-
     def run(self, **inputs) -> RunResult:
         """Run this compiled artifact on its target backend.
 
         Returns a `RunResult` with cycle count (when the simulator
         provides one), the simulator's stdout, and the backend name.
-        If the simulator/hardware is unavailable, the call still
-        succeeds and returns `cycles=None` with a "simulator
-        unavailable" stdout — `run()` never raises for missing tooling.
+        Raises `SimulatorUnavailable` when the simulator/hardware cannot
+        run here, and `NotImplementedError` for a target with no run hook.
         """
-        self._validate_matcher_materialization()
         target_name = getattr(self.target, "name", None)
         # design 04 §2.1: a `backend="virtual"` Compiled dispatches to the
         # sim-free virtual runner regardless of target.name.
-        if self.backend == "virtual":
-            runner = _BACKEND_RUN["virtual"]
-        else:
-            runner = _BACKEND_RUN.get(target_name)
+        try:
+            runner = backend_runner(
+                "virtual" if self.backend == "virtual" else target_name
+            )
+        except KeyError:
+            runner = None
         if runner is None:
-            return RunResult(
-                cycles=None,
-                stdout=f"no run hook for target {target_name!r}; "
-                f"supported: {sorted(_BACKEND_RUN)}",
-                backend=str(target_name),
+            raise NotImplementedError(
+                f"no run hook for target {target_name!r}; "
+                f"supported: {_runnable_backends()}"
             )
         return runner(self, **inputs)
 
@@ -3675,26 +1008,115 @@ class Compiled:
         so the caller can assert the gate-A strict beat. B is read off
         `X.shape[0]`, never a literal.
         """
-        self._validate_matcher_materialization()
         target_name = getattr(self.target, "name", None)
         if target_name != "samsung_hbm_pim":
             raise NotImplementedError(
                 f"run_batched is Samsung-only; got target {target_name!r}"
             )
+        from .spmw_samsung import _run_samsung_batched
+
         return _run_samsung_batched(self, W, X, compare_native=compare_native)
 
 
-_BACKEND_CTX = {
-    "samsung_hbm_pim": SamsungCtx,
-    # mortise_wide (SPEC-022 D3 proof, banks_per_pim==4): Samsung-shaped, so it
-    # reuses SamsungCtx -- which now emits the per-fiber BANK_<r> classes via
-    # the `range(stride)` `_bank_fiber_class` walk. No simulator runs it (no
-    # _BACKEND_RUN entry beyond "virtual"); the proof inspects compiled.cmds.
-    "mortise_wide": SamsungCtx,
-    "aim": AimCtx,
-    "apu_v1": APUv1Ctx,
-    "apu_v2": APUv2Ctx,
+
+
+# Backend contexts and runners live in per-backend modules, imported only
+# when a target of that backend is compiled or run.
+_BACKENDS: dict[str, tuple[str, str, str | None]] = {
+    "samsung_hbm_pim": ("allo.spmw_samsung", "SamsungCtx", "_run_samsung"),
+    "aim": ("allo.spmw_aim", "AimCtx", "_run_aim"),
+    "apu_v1": ("allo.spmw_apu_v1", "APUv1Ctx", "_run_apu_v1"),
+    "apu_v2": ("allo.spmw_apu_v2", "APUv2Ctx", "_run_apu_v2"),
 }
+
+
+def _backend_entry(target_name: str) -> tuple[str, str, str | None]:
+    try:
+        return _BACKENDS[target_name]
+    except KeyError:
+        raise KeyError(
+            f"unknown backend target {target_name!r}; known: {sorted(_BACKENDS)}"
+        ) from None
+
+
+@functools.cache
+def backend_context_class(target_name: str) -> type[CodegenContext]:
+    module_name, class_name, _runner = _backend_entry(target_name)
+    return getattr(importlib.import_module(module_name), class_name)
+
+
+@functools.cache
+def backend_runner(target_name: str) -> Callable | None:
+    if target_name == "virtual":
+        return _run_virtual
+    module_name, _class_name, runner_name = _backend_entry(target_name)
+    if runner_name is None:
+        return None
+    return getattr(importlib.import_module(module_name), runner_name)
+
+
+def _runnable_backends() -> list[str]:
+    return sorted(
+        [name for name, entry in _BACKENDS.items() if entry[2] is not None]
+        + ["virtual"]
+    )
+
+
+def _is_backend_ctx(ctx, target_name: str) -> bool:
+    # A ctx of a backend implies its module is already imported; checking
+    # sys.modules keeps the walker from importing unrelated backends.
+    module_name, class_name, _runner = _BACKENDS[target_name]
+    module = sys.modules.get(module_name)
+    return module is not None and isinstance(ctx, getattr(module, class_name))
+
+
+_MOVED: dict[str, str] = {
+    "SamsungCtx": "allo.spmw_samsung",
+    "_samsung_lane_burst": "allo.spmw_samsung",
+    "_fiber_fold_split": "allo.spmw_samsung",
+    "_emit_inner_loop_jump": "allo.spmw_samsung",
+    "_is_samsung_storeback_mov": "allo.spmw_samsung",
+    "_split_samsung_layers": "allo.spmw_samsung",
+    "_write_samsung_cmds": "allo.spmw_samsung",
+    "_samsung_num_pim_blocks": "allo.spmw_samsung",
+    "_samsung_read_generic_outbin": "allo.spmw_samsung",
+    "_SAMSUNG_FABRIC_ROW_TILE": "allo.spmw_samsung",
+    "_samsung_reduce_row_tiling": "allo.spmw_samsung",
+    "_SAMSUNG_REDUCE_K_TILE": "allo.spmw_samsung",
+    "_samsung_reduce_partition": "allo.spmw_samsung",
+    "_samsung_read_reduce_outbin": "allo.spmw_samsung",
+    "_samsung_run_reduce_driver": "allo.spmw_samsung",
+    "run_samsung_reduce": "allo.spmw_samsung",
+    "execute_host_schedule_samsung": "allo.spmw_samsung",
+    "_assert_host_move_roles": "allo.spmw_samsung",
+    "_samsung_runtime_route": "allo.spmw_samsung",
+    "_samsung_main_runtime_command_valid": "allo.spmw_samsung",
+    "_samsung_main_runtime_commands": "allo.spmw_samsung",
+    "_run_samsung": "allo.spmw_samsung",
+    "_layout_stage_resident": "allo.spmw_samsung",
+    "_samsung_batched_invoke": "allo.spmw_samsung",
+    "_run_samsung_batched": "allo.spmw_samsung",
+    "AimCtx": "allo.spmw_aim",
+    "_aim_runtime_segments": "allo.spmw_aim",
+    "_run_aim": "allo.spmw_aim",
+    "APUv1Ctx": "allo.spmw_apu_v1",
+    "_apu_v1_kernel_src": "allo.spmw_apu_v1",
+    "_parse_apu_v1_prof_print": "allo.spmw_apu_v1",
+    "_apu_v1_output_specs": "allo.spmw_apu_v1",
+    "_apu_v1_prepare_io": "allo.spmw_apu_v1",
+    "_run_apu_v1": "allo.spmw_apu_v1",
+    "APUv2Ctx": "allo.spmw_apu_v2",
+    "_run_apu_v2": "allo.spmw_apu_v2",
+}
+
+
+def __getattr__(name):
+    # Forwarding for out-of-tree callers only; code in allo/ imports from the
+    # owning module.
+    module_name = _MOVED.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(importlib.import_module(module_name), name)
 
 
 def _check_work_grid(target, trace, *, auto_fill=True):
@@ -3855,34 +1277,6 @@ def _matcher_trace_runtime_abi(trace: MatchTrace) -> tuple:
     return tuple(matches)
 
 
-def _matcher_runtime_source_fingerprint(target_name: str) -> str:
-    functions = {
-        "aim": (_aim_runtime_segments, _run_aim),
-        "samsung_hbm_pim": (
-            _samsung_runtime_route,
-            _samsung_main_runtime_command_valid,
-            _samsung_main_runtime_commands,
-            _write_samsung_cmds,
-            _run_samsung,
-        ),
-        "apu_v1": (_run_apu_v1,),
-        "apu_v2": (_run_apu_v2,),
-    }.get(target_name, ())
-    runner = _BACKEND_RUN.get(target_name)
-    if runner is not None and runner not in functions:
-        functions = (*functions, runner)
-    digest = hashlib.sha256()
-    for function in functions:
-        code = getattr(function, "__code__", None)
-        if code is None:
-            return ""
-        digest.update(marshal.dumps(code))
-        digest.update(repr(getattr(function, "__defaults__", None)).encode("utf-8"))
-        digest.update(repr(getattr(function, "__kwdefaults__", None)).encode("utf-8"))
-        digest.update(repr(sorted(vars(function).items())).encode("utf-8"))
-    return digest.hexdigest()
-
-
 def _materialize_matcher_codegen(
     target,
     trace: MatchTrace,
@@ -3893,73 +1287,50 @@ def _materialize_matcher_codegen(
     """Emit and freeze the exact executable side of one scored candidate."""
 
     target_name = getattr(target, "name", None)
-    ctx_cls = _BACKEND_CTX.get(target_name)
-    if ctx_cls is None:
+    if target_name not in _BACKENDS:
         raise NotImplementedError(f"no matcher codegen context for {target_name!r}")
+    ctx_cls = backend_context_class(target_name)
 
     ctx = ctx_cls(target)
     _walk_and_emit(target, trace, ctx, layouts)
     commands = tuple(_clone_matcher_command(command) for command in ctx.cmds)
-    command_manifest = _matcher_command_manifest(commands)
     host_schedule = tuple(
         HostTrigger(trigger.work_id, trigger.tile_count)
         for trigger in getattr(ctx, "host_schedule", ())
     )
-    host_schedule_manifest = _matcher_host_schedule_manifest(host_schedule)
     host_preloads = tuple(getattr(ctx, "host_preloads", ()))
-    emitted_host_moves_manifest = _matcher_emitted_host_move_manifest(
-        getattr(ctx, "host_moves_emitted", ())
-    )
     resolved_host_moves = tuple(host_moves)
-    host_manifest_error = None
     try:
         resolved_host_moves_manifest = _matcher_resolved_host_move_manifest(
             resolved_host_moves
         )
-    except (AttributeError, TypeError, ValueError) as error:
+    except (AttributeError, TypeError, ValueError):
         resolved_host_moves_manifest = (
             ("unavailable", tuple(type(item).__name__ for item in resolved_host_moves)),
         )
-        host_manifest_error = str(error)
     trace_abi = _matcher_trace_runtime_abi(trace)
-    runtime_source_fingerprint = _matcher_runtime_source_fingerprint(target_name)
-    blockers = []
-    if host_manifest_error is not None:
-        blockers.append(
-            f"resolved host transfer ABI is unavailable: {host_manifest_error}"
-        )
 
     if target_name == "aim":
+        from .spmw_aim import _aim_runtime_segments
+
         try:
             runtime_segments = _aim_runtime_segments(commands)
-        except ValueError as error:
+        except ValueError:
             runtime_segments = ()
-            blockers.append(str(error))
         route = "ramulator2-preterminated-segments"
-        if host_schedule:
-            blockers.append("AiM runtime does not consume a host trigger side stream")
-        if host_preloads:
-            blockers.append("AiM runtime does not consume matcher host preloads")
     elif target_name == "samsung_hbm_pim":
+        from .spmw_samsung import (
+            _samsung_main_runtime_commands,
+            _samsung_runtime_route,
+        )
+
         route = _samsung_runtime_route(commands)
-        runtime_commands = _samsung_main_runtime_commands(commands)
-        runtime_segments = (_matcher_command_manifest(runtime_commands),)
-        if route == "GENERIC_REDUCE":
-            blockers.append(
-                "Samsung REDUCE runtime replaces the emitted CRF command stream"
-            )
-        if _matcher_command_manifest(runtime_commands) != command_manifest:
-            blockers.append("Samsung runtime filters the emitted command stream")
-        if host_schedule:
-            blockers.append("Samsung runtime does not consume shared-CRF triggers")
-        if host_preloads:
-            blockers.append("Samsung runtime does not consume matcher host preloads")
+        runtime_segments = (
+            _matcher_command_manifest(_samsung_main_runtime_commands(commands)),
+        )
     else:
         route = "unsupported-exact-matcher-runtime"
         runtime_segments = ()
-        blockers.append(
-            f"{target_name} matcher runtime is not an exact frozen command consumer"
-        )
 
     runtime_abi = (
         "matcher-runtime-abi-v1",
@@ -3971,17 +1342,11 @@ def _materialize_matcher_codegen(
     return MatcherCodegenArtifact(
         target_name=target_name,
         commands=commands,
-        command_manifest=command_manifest,
         host_schedule=host_schedule,
-        host_schedule_manifest=host_schedule_manifest,
         host_preloads=host_preloads,
-        emitted_host_moves_manifest=emitted_host_moves_manifest,
         resolved_host_moves=resolved_host_moves,
-        resolved_host_moves_manifest=resolved_host_moves_manifest,
         runtime_abi=runtime_abi,
         runtime_segments=runtime_segments,
-        runtime_source_fingerprint=runtime_source_fingerprint,
-        non_promotable_reason="; ".join(blockers) if blockers else None,
         context=ctx,
     )
 
@@ -3994,7 +1359,6 @@ def compile_for_target(
     host_moves: "list | None" = None,
     buffer_metrics: "dict | None" = None,
     cost=None,
-    promotion_gate=None,
 ) -> Compiled:
     """Lower a (target, trace) pair to a runnable backend artifact by
     walking the target's declarations.
@@ -4013,11 +1377,6 @@ def compile_for_target(
     resolved against the target (verb + device-handle identity) and stored on
     ``Compiled.host_moves`` so the run path asserts the operand->role binding.
     """
-    from .pim.schedule_promotion import validate_schedule_promotion_gate
-
-    promotion_gate = validate_schedule_promotion_gate(promotion_gate)
-    if promotion_gate is not None and layout is not None:
-        raise ValueError("promotion evidence cannot override an explicit layout")
     target_name = getattr(target, "name", None)
     if target_name == "upmem":
         raise TypeError(
@@ -4037,11 +1396,7 @@ def compile_for_target(
 
     # A virtual-only target needs no code generator. Its executable cost spec
     # lowers the trace directly to the retained handle-based graph.
-    if backend == "virtual" and _BACKEND_CTX.get(target_name) is None:
-        if promotion_gate is not None:
-            raise ValueError(
-                "the selected virtual lowering has no schedule-search activation"
-            )
+    if backend == "virtual" and target_name not in _BACKENDS:
         if layout is None:
             stored_layout = Placement(placements={})
         elif isinstance(layout, Placement):
@@ -4073,12 +1428,12 @@ def compile_for_target(
             cost=cost,
         )
 
-    ctx_cls = _BACKEND_CTX.get(target_name)
-    if ctx_cls is None:
+    if target_name not in _BACKENDS:
         raise NotImplementedError(
             f"no codegen ctx for target {target_name!r}; supported: "
-            f"{sorted(_BACKEND_CTX)}"
+            f"{sorted(_BACKENDS)}"
         )
+    ctx_cls = backend_context_class(target_name)
 
     from .spmw_autoschedule import _bucket_for_autoschedule
 
@@ -4092,7 +1447,6 @@ def compile_for_target(
             cost=cost,
             host_moves=resolved_host_moves,
             buffer_metrics=buffer_metrics,
-            promotion_gate=promotion_gate,
         )
     elif isinstance(layout, Placement):
         # Single layout: replicate across every kernel. Equivalent to
@@ -4105,39 +1459,6 @@ def compile_for_target(
         raise ValueError(
             f"layout list has {len(layouts)} entries but trace has "
             f"{len(buckets)} @allo.work kernels"
-        )
-
-    schedule_search_result = getattr(layouts, "schedule_search_result", None)
-    schedule_activation = getattr(layouts, "schedule_activation", None)
-    active_materialization = getattr(layouts, "active_materialization", None)
-    if active_materialization is not None:
-        executable = active_materialization.executable
-        if hasattr(active_materialization, "placement"):
-            exact_layouts = [active_materialization.placement]
-        else:
-            exact_layouts = list(active_materialization.placements)
-        if len(exact_layouts) != len(buckets):
-            raise RuntimeError(
-                "activated matcher materialization does not align with trace buckets"
-            )
-        stored_layout = exact_layouts[0] if len(exact_layouts) == 1 else exact_layouts
-        return Compiled(
-            target,
-            trace,
-            executable.instantiate_commands(),
-            stored_layout,
-            ctx=executable.context,
-            backend=backend,
-            host_moves=resolved_host_moves,
-            execution_graph=active_materialization.execution_graph,
-            cost=cost,
-            schedule_search_result=schedule_search_result,
-            schedule_activation=schedule_activation,
-            host_schedule=executable.instantiate_host_schedule(),
-            runtime_abi=executable.runtime_abi,
-            runtime_segments=executable.runtime_segments,
-            matcher_codegen_artifact=executable,
-            matcher_materialization=active_materialization,
         )
 
     ctx = ctx_cls(target)
@@ -4174,6 +1495,5 @@ def compile_for_target(
         host_moves=resolved_host_moves,
         execution_graph=execution_graph,
         cost=cost,
-        schedule_search_result=schedule_search_result,
-        schedule_activation=schedule_activation,
+        placement_ranking=getattr(layouts, "placement_ranking", None),
     )

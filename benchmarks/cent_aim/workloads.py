@@ -16,9 +16,10 @@ and replica dimensions.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from types import MappingProxyType
-from typing import Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from allo.pim.aim_program import (
     AimAllBankWrite,
@@ -31,10 +32,519 @@ from allo.pim.aim_program import (
     AimProgram,
     AimSync,
 )
-from benchmarks.cent_aim.evidence import (
-    command_shape_signature,
-    compiler_logical_work_coverage,
-)
+
+
+# Trace operands that describe work shape, as opposed to placement.  Row,
+# bank, channel, and GPR addresses are intentionally absent: two legal linear
+# layouts may move the same logical tensor work without using the same
+# addresses or command order.  A raw MEM request is one vector burst to one
+# explicit channel, hence its implicit active-channel fanout is one.
+_COMMAND_SHAPE_FIELDS: Mapping[str, tuple[int | None, int | None]] = {
+    "AiM_WR_GB": (2, 4),
+    "AiM_WR_BIAS": (None, 3),
+    "AiM_MAC_ABK": (2, 3),
+    "AiM_RD_MAC": (None, 3),
+    "AiM_AF": (None, 2),
+    "AiM_RD_AF": (None, 3),
+    "AiM_WR_ABK": (None, 3),
+    "AiM_EWMUL": (2, 3),
+    "AiM_EWADD": (2, None),
+    "AiM_COPY_BKGB": (2, 3),
+    "AiM_COPY_GBBK": (2, 3),
+    "AiM_SYNC": (None, None),
+    "AiM_EOC": (None, None),
+    "R_MEM": (None, None),
+    "W_MEM": (None, None),
+}
+
+
+def _trace_opcode(words: list[str]) -> str:
+    if words[0] == "AiM" and len(words) >= 2:
+        return f"AiM_{words[1]}"
+    if len(words) >= 2:
+        return f"{words[0]}_{words[1]}"
+    return words[0]
+
+
+def _command_shape(raw_line: str) -> tuple[str, int | None, int | None] | None:
+    words = raw_line.split()
+    if not words or words[0].startswith("#"):
+        return None
+    opcode = _trace_opcode(words)
+    try:
+        op_size_index, mask_index = _COMMAND_SHAPE_FIELDS[opcode]
+    except KeyError as error:
+        raise ValueError(
+            f"cannot fingerprint unknown trace opcode {opcode!r}"
+        ) from error
+    try:
+        op_size = None if op_size_index is None else int(words[op_size_index], 0)
+        if opcode in {"R_MEM", "W_MEM"}:
+            active_mask_fanout = 1
+        elif mask_index is None:
+            active_mask_fanout = None
+        else:
+            active_mask_fanout = int(words[mask_index], 0).bit_count()
+    except (IndexError, ValueError) as error:
+        raise ValueError(f"malformed {opcode} trace record: {raw_line!r}") from error
+    if op_size is not None and op_size <= 0:
+        raise ValueError(f"{opcode} has nonpositive op_size {op_size}")
+    if active_mask_fanout is not None and active_mask_fanout <= 0:
+        raise ValueError(
+            f"{opcode} has nonpositive active-mask fanout {active_mask_fanout}"
+        )
+    return opcode, op_size, active_mask_fanout
+
+
+def command_shape_signature(trace_text: str) -> dict[str, Any]:
+    """Fingerprint command shapes while excluding placement and order.
+
+    The histogram retains every opcode's operation size, active-mask popcount,
+    and multiplicity.  It is intentionally more discriminating than an opcode
+    inventory but less restrictive than byte-identical traces: address-only
+    linear-layout changes disappear, while a tail-width or mask-fanout change
+    remains visible.
+    """
+
+    histogram: Counter[tuple[str, int | None, int | None]] = Counter()
+    for raw_line in trace_text.splitlines():
+        shape = _command_shape(raw_line)
+        if shape is not None:
+            histogram[shape] += 1
+    if not histogram:
+        raise ValueError("cannot fingerprint an empty trace")
+    records = []
+    for (opcode, op_size, fanout), count in sorted(
+        histogram.items(),
+        key=lambda item: (
+            item[0][0],
+            -1 if item[0][1] is None else item[0][1],
+            -1 if item[0][2] is None else item[0][2],
+        ),
+    ):
+        records.append(
+            {
+                "opcode": opcode,
+                "op_size": op_size,
+                "active_mask_fanout": fanout,
+                "command_count": count,
+            }
+        )
+    return {
+        "schema": "tenon-aim-command-shape-signature-v1",
+        "addresses_excluded": True,
+        "command_order_excluded": True,
+        "record_fields": [
+            "opcode",
+            "op_size",
+            "active_mask_fanout",
+            "command_count",
+        ],
+        "command_count": sum(histogram.values()),
+        "records": records,
+    }
+
+
+def compiler_logical_work_coverage(
+    compiled: Mapping[str, Any], trace_text: str
+) -> dict[str, Any]:
+    """Reconcile typed operations and logical contractions with lowering.
+
+    This proof is deliberately independent from physical-signature equality.
+    It requires one lowering record for every typed operation, gap-free command
+    spans covering the complete trace body, and an exact compiler-declared
+    logical scalar-MAC count for every contraction.
+    """
+
+    source = compiled.get("source")
+    source_operations = (
+        source.get("operations") if isinstance(source, Mapping) else None
+    )
+    lowered_operations = compiled.get("operations")
+    trace = compiled.get("trace")
+    errors: list[str] = []
+    if not isinstance(source_operations, list):
+        source_operations = []
+        errors.append("compiled source manifest has no operation list")
+    if not isinstance(lowered_operations, list):
+        lowered_operations = []
+        errors.append("compiled manifest has no lowered operation list")
+    try:
+        body_commands = int(trace["body_command_count"])
+    except (KeyError, TypeError, ValueError):
+        body_commands = -1
+        errors.append("compiled trace has no body_command_count")
+    trace_records = [
+        line.strip()
+        for line in trace_text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not trace_records or trace_records[-1] != "AiM EOC":
+        errors.append("materialized trace has no trailing EOC")
+        body_records: list[str] = []
+    else:
+        body_records = trace_records[:-1]
+    if len(body_records) != body_commands:
+        errors.append("materialized trace body length differs from compiled manifest")
+    geometry = compiled.get("geometry")
+    try:
+        lanes = int(geometry["lanes"])
+        banks = int(geometry["banks"])
+        bank_groups = int(geometry["bank_groups"])
+    except (KeyError, TypeError, ValueError):
+        lanes = banks = bank_groups = 0
+        errors.append("compiled target lane/bank geometry is incomplete")
+
+    covered_operations = 0
+    cursor = 0
+    operation_coverage = []
+    logical_contractions = []
+    logical_elementwise = []
+    expected_scalar_macs = 0
+    compiled_scalar_macs = 0
+    for index, source_operation in enumerate(source_operations):
+        if index >= len(lowered_operations):
+            errors.append(f"typed operation {index} has no lowering record")
+            continue
+        lowered = lowered_operations[index]
+        operation_errors = []
+        ownership_coverage = None
+        elementwise_coverage = None
+        if lowered.get("index") != index:
+            operation_errors.append("lowering index differs")
+        for field in ("kind", "name"):
+            if lowered.get(field) != source_operation.get(field):
+                operation_errors.append(f"{field} differs")
+        span = lowered.get("command_span")
+        operation_signature = None
+        if (
+            not isinstance(span, list)
+            or len(span) != 2
+            or not all(isinstance(value, int) for value in span)
+        ):
+            operation_errors.append("command span is malformed")
+        else:
+            begin, end = span
+            if begin != cursor or end < begin:
+                operation_errors.append("command spans are not contiguous")
+            if lowered.get("command_count") != end - begin:
+                operation_errors.append("command count differs from span")
+            if 0 <= begin <= end <= len(body_records) and end > begin:
+                operation_signature = command_shape_signature(
+                    "\n".join(body_records[begin:end]) + "\n"
+                )
+            else:
+                operation_errors.append("command span exceeds materialized trace")
+            cursor = max(cursor, end)
+
+        if source_operation.get("kind") == "contraction":
+            requested_batch_mapping = source_operation.get("batch_mapping", "flattened")
+            effective_batch_mapping = lowered.get("batch_mapping", "flattened")
+            selection = lowered.get("batch_mapping_selection")
+            if requested_batch_mapping == "auto":
+                if (
+                    lowered.get("requested_batch_mapping") != "auto"
+                    or not isinstance(selection, Mapping)
+                    or selection.get("policy") != "shape_and_residency_v1"
+                    or selection.get("selected") != effective_batch_mapping
+                    or selection.get("uses_operation_name") is not False
+                    or not selection.get("reason")
+                ):
+                    operation_errors.append(
+                        "automatic batch-mapping selection evidence is incomplete"
+                    )
+            try:
+                expected = (
+                    int(source_operation["outputs"])
+                    * int(source_operation["reduction"])
+                    * int(source_operation.get("batches", 1))
+                    * int(source_operation.get("replicas", 1))
+                )
+                declared_logical = int(lowered["logical_scalar_macs"])
+            except (KeyError, TypeError, ValueError):
+                expected = 0
+                declared_logical = -1
+                operation_errors.append("logical scalar-MAC declaration is incomplete")
+            if expected <= 0 or declared_logical != expected:
+                operation_errors.append("logical scalar-MAC coverage differs")
+
+            physical_mac_slots = 0
+            physical_wr_gb_elements = 0
+            if operation_signature is not None and lanes > 0 and banks > 0:
+                for record in operation_signature["records"]:
+                    op_size = record["op_size"]
+                    fanout = record["active_mask_fanout"]
+                    count = record["command_count"]
+                    if record["opcode"] == "AiM_MAC_ABK":
+                        if op_size is None or fanout is None:
+                            operation_errors.append(
+                                "MAC shape fingerprint is incomplete"
+                            )
+                        else:
+                            physical_mac_slots += (
+                                op_size * lanes * fanout * banks * count
+                            )
+                    elif record["opcode"] == "AiM_WR_GB":
+                        if op_size is None or fanout is None:
+                            operation_errors.append(
+                                "WR_GB shape fingerprint is incomplete"
+                            )
+                        else:
+                            physical_wr_gb_elements += op_size * lanes * fanout * count
+            if physical_mac_slots < expected:
+                operation_errors.append(
+                    "materialized MAC capacity does not cover logical scalar MACs"
+                )
+            expected_unique_gb = (
+                int(source_operation["reduction"])
+                * int(source_operation.get("batches", 1))
+                * int(source_operation.get("replicas", 1))
+                if source_operation.get("input_source", "gb") == "gb"
+                else 0
+            )
+            declarations = {
+                "physical_mac_slots": physical_mac_slots,
+                "physical_padded_scalar_macs": physical_mac_slots,
+                "unique_logical_gb_payload_elements": expected_unique_gb,
+                "physical_wr_gb_elements": physical_wr_gb_elements,
+                "physical_gb_transfer_elements": physical_wr_gb_elements,
+            }
+            for field, derived in declarations.items():
+                try:
+                    declared = int(lowered[field])
+                except (KeyError, TypeError, ValueError):
+                    operation_errors.append(
+                        f"compiler declaration {field} is incomplete"
+                    )
+                    continue
+                if declared != derived:
+                    operation_errors.append(
+                        f"compiler declaration {field} differs from trace-derived work"
+                    )
+            expected_factor = (
+                physical_wr_gb_elements / expected_unique_gb
+                if expected_unique_gb
+                else 0.0
+            )
+            try:
+                declared_factor = float(lowered["gb_replication_and_reload_factor"])
+            except (KeyError, TypeError, ValueError):
+                operation_errors.append(
+                    "compiler declaration gb_replication_and_reload_factor is incomplete"
+                )
+                declared_factor = -1.0
+            if abs(declared_factor - expected_factor) > 1e-12:
+                operation_errors.append(
+                    "compiler GB replication/reload factor differs from trace"
+                )
+            expected_scalar_macs += expected
+            compiled_scalar_macs += max(0, declared_logical)
+            logical_contractions.append(
+                {
+                    "index": index,
+                    "name": source_operation.get("name"),
+                    "requested_batch_mapping": requested_batch_mapping,
+                    "effective_batch_mapping": effective_batch_mapping,
+                    "batch_mapping_selection": selection,
+                    "expected_scalar_macs": expected,
+                    "compiled_scalar_macs": declared_logical,
+                    "trace_derived_physical_mac_slots": physical_mac_slots,
+                    "trace_derived_unique_logical_gb_payload_elements": (
+                        expected_unique_gb
+                    ),
+                    "trace_derived_physical_wr_gb_elements": (physical_wr_gb_elements),
+                    "physical_to_logical_mac_ratio": (
+                        physical_mac_slots / expected if expected > 0 else None
+                    ),
+                    "gb_replication_and_reload_factor": expected_factor,
+                    "command_shape_signature": operation_signature,
+                    "complete": not operation_errors,
+                }
+            )
+
+        if source_operation.get("kind") == "elementwise":
+            elementwise_kind = source_operation.get("operation")
+            try:
+                expected_elements = int(source_operation["elements"])
+                if elementwise_kind == "mul":
+                    expected_elements *= int(source_operation.get("replicas", 1))
+            except (KeyError, TypeError, ValueError):
+                expected_elements = 0
+                operation_errors.append("logical elementwise work is incomplete")
+            physical_slots = 0
+            expected_opcode = "AiM_EWMUL" if elementwise_kind == "mul" else "AiM_EWADD"
+            if operation_signature is not None and lanes > 0:
+                for record in operation_signature["records"]:
+                    if record["opcode"] != expected_opcode:
+                        continue
+                    op_size = record["op_size"]
+                    count = record["command_count"]
+                    if op_size is None:
+                        operation_errors.append(
+                            "elementwise shape fingerprint has no op_size"
+                        )
+                        continue
+                    if elementwise_kind == "mul":
+                        fanout = record["active_mask_fanout"]
+                        if fanout is None or bank_groups <= 0:
+                            operation_errors.append(
+                                "EWMUL shape fingerprint has no physical fanout"
+                            )
+                            continue
+                        physical_slots += op_size * lanes * fanout * bank_groups * count
+                    else:
+                        physical_slots += op_size * lanes * count
+            if physical_slots < expected_elements:
+                operation_errors.append(
+                    "materialized elementwise capacity does not cover logical elements"
+                )
+            for field, derived in (
+                ("logical_elements", expected_elements),
+                ("physical_element_slots", physical_slots),
+            ):
+                try:
+                    declared = int(lowered[field])
+                except (KeyError, TypeError, ValueError):
+                    operation_errors.append(
+                        f"compiler declaration {field} is incomplete"
+                    )
+                    continue
+                if declared != derived:
+                    operation_errors.append(
+                        f"compiler declaration {field} differs from trace-derived work"
+                    )
+            elementwise_coverage = {
+                "operation": elementwise_kind,
+                "expected_logical_elements": expected_elements,
+                "trace_derived_physical_element_slots": physical_slots,
+                "physical_to_logical_ratio": (
+                    physical_slots / expected_elements
+                    if expected_elements > 0
+                    else None
+                ),
+                "complete": not operation_errors,
+            }
+            logical_elementwise.append(
+                {
+                    "index": index,
+                    "name": source_operation.get("name"),
+                    **elementwise_coverage,
+                }
+            )
+
+        if source_operation.get("kind") == "allbankwrite":
+            target_channels = 0
+            try:
+                target_channels = int(geometry["channels"])
+                requested_channels = source_operation.get("channels")
+                expected_channels = (
+                    list(range(target_channels))
+                    if requested_channels is None
+                    else [int(channel) for channel in requested_channels]
+                )
+                row = int(source_operation["row"])
+                rows = int(source_operation.get("rows", 1))
+                row_stride = int(source_operation.get("row_stride", 1))
+                copies = int(source_operation.get("copies", 1))
+                copy_stride_value = source_operation.get("copy_row_stride")
+                copy_stride = (
+                    rows * row_stride
+                    if copy_stride_value is None
+                    else int(copy_stride_value)
+                )
+                expected_rows = [
+                    row + copy * copy_stride + row_index * row_stride
+                    for copy in range(copies)
+                    for row_index in range(rows)
+                ]
+                expected_coordinates = {
+                    (channel, physical_row)
+                    for physical_row in expected_rows
+                    for channel in expected_channels
+                }
+            except (KeyError, TypeError, ValueError):
+                expected_channels = []
+                expected_rows = []
+                expected_coordinates = set()
+                operation_errors.append("all-bank-write source ownership is incomplete")
+            actual_coordinates = []
+            if isinstance(span, list) and len(span) == 2:
+                begin, end = span
+                for raw_line in body_records[max(0, begin) : max(0, end)]:
+                    words = raw_line.split()
+                    if _trace_opcode(words) != "AiM_WR_ABK":
+                        operation_errors.append(
+                            "all-bank-write span contains another opcode"
+                        )
+                        continue
+                    try:
+                        mask = int(words[3], 0)
+                        physical_row = int(words[4], 0)
+                    except (IndexError, ValueError):
+                        operation_errors.append("malformed WR_ABK ownership record")
+                        continue
+                    for channel in range(target_channels):
+                        if mask & (1 << (target_channels - 1 - channel)):
+                            actual_coordinates.append((channel, physical_row))
+            actual_coordinate_set = set(actual_coordinates)
+            ownership_complete = (
+                bool(expected_coordinates)
+                and len(actual_coordinates) == len(expected_coordinates)
+                and actual_coordinate_set == expected_coordinates
+            )
+            if not ownership_complete:
+                operation_errors.append(
+                    "all-bank-write trace does not cover every typed ownership coordinate"
+                )
+            ownership_coverage = {
+                "schema": "tenon-aim-all-bank-write-ownership-v1",
+                "expected_channels": expected_channels,
+                "expected_rows": expected_rows,
+                "expected_coordinate_count": len(expected_coordinates),
+                "materialized_coordinate_count": len(actual_coordinates),
+                "unique_materialized_coordinate_count": len(actual_coordinate_set),
+                "complete": ownership_complete,
+            }
+
+        if operation_errors:
+            errors.extend(
+                f"typed operation {index}: {message}" for message in operation_errors
+            )
+        else:
+            covered_operations += 1
+        operation_coverage.append(
+            {
+                "index": index,
+                "kind": source_operation.get("kind"),
+                "name": source_operation.get("name"),
+                "command_shape_signature": operation_signature,
+                "ownership_coverage": ownership_coverage,
+                "elementwise_coverage": elementwise_coverage,
+                "complete": not operation_errors,
+            }
+        )
+
+    if len(lowered_operations) > len(source_operations):
+        errors.append("compiled manifest has lowering records without typed operations")
+    if cursor != body_commands:
+        errors.append(
+            f"lowered command spans cover {cursor} body commands, expected {body_commands}"
+        )
+    return {
+        "schema": "tenon-aim-logical-work-coverage-v1",
+        "source_operation_count": len(source_operations),
+        "lowered_operation_count": len(lowered_operations),
+        "covered_operation_count": covered_operations,
+        "body_command_count": body_commands,
+        "covered_body_command_count": cursor,
+        "expected_logical_scalar_macs": expected_scalar_macs,
+        "compiled_logical_scalar_macs": compiled_scalar_macs,
+        "operations": operation_coverage,
+        "contractions": logical_contractions,
+        "elementwise": logical_elementwise,
+        "complete": not errors,
+        "errors": errors,
+    }
 
 
 # Fixed properties of the SK hynix AiM target, not workload tuning knobs.

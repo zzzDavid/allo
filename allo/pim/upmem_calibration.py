@@ -27,7 +27,6 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-import hashlib
 import json
 import math
 from numbers import Real
@@ -36,6 +35,8 @@ import re
 from statistics import median
 from types import MappingProxyType
 from typing import Any
+
+from ..spmw_fingerprint import canonical_json, json_digest
 
 
 COUNTER_SCHEMA = "upimulator-counter-decomposition-v1"
@@ -1061,7 +1062,7 @@ class UPMEMAggregateMetrics:
 
 
 def _canonical_json(value: object) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return canonical_json(value)
 
 
 @dataclass(frozen=True)
@@ -1095,7 +1096,7 @@ class UPMEMCalibrationReport:
 
     @property
     def report_fingerprint(self) -> str:
-        return hashlib.sha256(_canonical_json(self._body()).encode("ascii")).hexdigest()
+        return json_digest(self._body())
 
     def manifest(self) -> dict[str, object]:
         body = self._body()

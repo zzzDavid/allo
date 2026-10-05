@@ -17,23 +17,18 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .spmw_simenv import (
+    apu_v1_template_dir,
+    apu_v1_toolchain_base,
+    gvml_include_root,
+)
+
 if TYPE_CHECKING:  # pragma: no cover
     import numpy as np  # noqa: F401
 
     from .spmw_codegen import Compiled
 
 
-_DEFAULT_TEMPLATE_DIR = "/home/nz264/shared/accelerator-hub/gsi-apu/example-gvml"
-_DEFAULT_TOOLCHAIN_BASE = (
-    "/usr/local/gsi-apu/13.7.1/ubuntu_20_04/"
-    "arc_gnu_2021.09-release_elf32_le_linux_no_sdata/arc-snps-elf/"
-)
-
-# Default GVML SDK include root. GSI's stock `Common/common.mk` already
-# adds `-I $(GSI_USR_LOCAL_INCLUDE)` (= `/usr/local/include`) on every
-# dev_modules compile, so we do not pass an extra `-I` into the emitted
-# Makefile -- this constant is used only by the Python-side probe.
-_DEFAULT_GVML_INCLUDE_ROOT = "/usr/local/include"
 
 _APU_V1_BUILD_MODE_ENV = "TENON_APU_V1_BUILD_MODE"
 _DEFAULT_APU_V1_BUILD_MODE = "release"
@@ -107,28 +102,11 @@ def _apu_v1_build_config() -> _APUv1BuildConfig:
 
 
 def _template_dir() -> Path:
-    return Path(os.environ.get("TENON_APU_V1_TEMPLATE_DIR", _DEFAULT_TEMPLATE_DIR))
+    return apu_v1_template_dir()
 
 
 def _toolchain_base() -> str:
-    return os.environ.get("TENON_APU_V1_TOOLCHAIN_BASE", _DEFAULT_TOOLCHAIN_BASE)
-
-
-def _gvml_include_root() -> str:
-    """Return the directory under which `<gsi/libgvml_*.h>` headers live.
-
-    Resolution order:
-      1. env var `TENON_APU_V1_GVML_INCLUDE_ROOT` (override; not validated here).
-      2. `_DEFAULT_GVML_INCLUDE_ROOT` (= `/usr/local/include`) -- the path
-         GSI's stock `Common/common.mk` ships with for `product=x86_64`.
-
-    Validation is intentionally deferred to `_assert_gvml_sdk_present()`;
-    this getter is pure.
-    """
-    return os.environ.get(
-        "TENON_APU_V1_GVML_INCLUDE_ROOT",
-        _DEFAULT_GVML_INCLUDE_ROOT,
-    )
+    return f"{apu_v1_toolchain_base()}/arc-snps-elf/"
 
 
 def _assert_gvml_sdk_present() -> None:
@@ -140,7 +118,7 @@ def _assert_gvml_sdk_present() -> None:
     `_gvml_sdk_available()` (below) so that PASS/SKIP routing stays in
     one place.
     """
-    root = Path(_gvml_include_root())
+    root = Path(gvml_include_root())
     for rel in _GVML_CANARY_HEADERS:
         canary = root / rel
         if not canary.is_file():
@@ -152,7 +130,7 @@ def _assert_gvml_sdk_present() -> None:
 
 def _gvml_sdk_available() -> bool:
     """Non-raising counterpart of `_assert_gvml_sdk_present()`."""
-    root = Path(_gvml_include_root())
+    root = Path(gvml_include_root())
     return all((root / rel).is_file() for rel in _GVML_CANARY_HEADERS)
 
 

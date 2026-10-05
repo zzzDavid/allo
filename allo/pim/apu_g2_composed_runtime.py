@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 import os
 from pathlib import Path
@@ -15,6 +14,7 @@ import tempfile
 import numpy as np
 
 from ..spmw_codegen import RunResult
+from ..spmw_fingerprint import file_digest
 from .apu_g2_composed_contraction import APUG2ComposedContractionProgram
 from .apu_g2_composed_layout import (
     APUG2_COMPOSED_EPILOGUE_ABI,
@@ -39,11 +39,7 @@ from .apu_g2_runtime import (
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    return file_digest(path)
 
 
 def _unique_text(text: str, field: str) -> str:

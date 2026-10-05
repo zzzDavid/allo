@@ -2,9 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Retained-MLIR hybrid manifests for canonical PolyBench phases."""
 
-from pathlib import Path
-import sys
-
 import pytest
 
 import allo
@@ -12,8 +9,7 @@ from allo.pim.apu_v1_hybrid import APUv1PrecisionPolicy
 from allo.pim.targets import build_apu_v1_target
 
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "pim"))
-from lib.upmem_polybench import get_case  # pylint: disable=wrong-import-position
+from _polybench_cases import get_base_case as get_case
 
 
 def _program(name, *, precision=True, vectorize="required", **phase_kwargs):

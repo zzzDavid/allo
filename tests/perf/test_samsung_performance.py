@@ -16,8 +16,9 @@ from allo.spmw_autoschedule import (
     _samsung_enumerate,
     autoschedule,
 )
-from allo import spmw_codegen
-from allo.spmw_codegen import Compiled, PIMCmd, SamsungCtx
+from allo import spmw_codegen, spmw_samsung, spmw_simenv
+from allo.spmw_codegen import Compiled, PIMCmd
+from allo.spmw_samsung import SamsungCtx
 from allo.spmw_match import MatchTrace, MatchedOp, OperandBinding
 from allo.spmw_plan import build_execution_graph
 
@@ -364,6 +365,15 @@ def test_samsung_drain_emits_required_eight_cycle_hold():
     assert ctx.cmds == [PIMCmd(type_="NOP", loopCounter_=7)]
 
 
+def test_reduce_row_tiling_uses_per_tile_output_extent():
+    assert spmw_samsung._samsung_reduce_row_tiling(4096) == (4096, 4096, 1)
+    assert spmw_samsung._samsung_reduce_row_tiling(5000) == (8192, 4096, 2)
+    assert spmw_samsung._samsung_reduce_row_tiling(8192) == (8192, 4096, 2)
+
+    with np.testing.assert_raises_regex(ValueError, "must be positive"):
+        spmw_samsung._samsung_reduce_row_tiling(0)
+
+
 def test_batched_invoke_zero_pads_to_physical_fabric(monkeypatch, tmp_path):
     captured = {}
 
@@ -380,8 +390,8 @@ def test_batched_invoke_zero_pads_to_physical_fabric(monkeypatch, tmp_path):
             stderr=b"",
         )
 
-    monkeypatch.setattr(spmw_codegen.subprocess, "run", fake_run)
-    cycles, phases, _stdout = spmw_codegen._samsung_batched_invoke(
+    monkeypatch.setattr(spmw_samsung.subprocess, "run", fake_run)
+    cycles, phases, _stdout = spmw_samsung._samsung_batched_invoke(
         tmp_path / "pim_driver",
         tmp_path,
         [PIMCmd(type_="NOP", loopCounter_=7)],
@@ -409,9 +419,10 @@ def test_batched_runner_does_not_program_host_fill(monkeypatch, tmp_path):
         captured["types"] = [command.type_ for command in commands]
         return 11, {"preload": 5, "exec": 4, "readback": 2}, "raw"
 
-    monkeypatch.setattr(spmw_codegen, "_pimsim_root", lambda: tmp_path)
-    (tmp_path / "pim_driver").touch()
-    monkeypatch.setattr(spmw_codegen, "_samsung_batched_invoke", fake_invoke)
+    monkeypatch.setattr(spmw_samsung, "_pimsim_root", lambda: tmp_path)
+    monkeypatch.setattr(spmw_simenv, "pimsim_root", lambda: tmp_path)
+    (tmp_path / "pim_driver").touch(mode=0o755)
+    monkeypatch.setattr(spmw_samsung, "_samsung_batched_invoke", fake_invoke)
     target = build_samsung_target()
     trace = MatchTrace(target.name, "batched", [])
     compiled = Compiled(
@@ -431,7 +442,7 @@ def test_batched_runner_does_not_program_host_fill(monkeypatch, tmp_path):
         Placement(placements={}),
     )
 
-    result = spmw_codegen._run_samsung_batched(
+    result = spmw_samsung._run_samsung_batched(
         compiled,
         np.ones((128, 256), dtype=np.float16),
         np.ones((1, 256), dtype=np.float16),

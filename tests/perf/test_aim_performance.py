@@ -15,7 +15,8 @@ from allo.spmw_autoschedule import (
     _aim_layout_candidates,
     autoschedule,
 )
-from allo.spmw_codegen import AimCtx, _aim_runtime_segments, compile_for_target
+from allo.spmw_aim import AimCtx, _aim_runtime_segments
+from allo.spmw_codegen import compile_for_target
 from allo.spmw_linear_layout import LinearLayout
 from allo.spmw_match import MatchTrace, MatchedOp, OperandBinding
 from allo.spmw_match_engine import batch_dim

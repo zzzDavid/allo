@@ -46,91 +46,95 @@ from .spmw_target import (
     LaunchRecord,
     HostProgram,
 )
-from .spmw_host_program import (
-    HostSchedule,
-    HostGroup,
-    HostLaunch,
-    analyze as analyze_host_program,
-    resolve_shapes as resolve_host_program_shapes,
-    schedule_residency,
-    schedule_cost,
-)
-
 # HostXcel collective surface removed (2026-06-30): host<->device transfers
 # are now explicit `allo.move`s declared on an @allo.unit(mode="host") scope,
 # naming device memory (e.g. hbm_pim.banks) as an endpoint. See spmw_target.py
 # (@allo.device / DeviceScope) and allo/pim/targets.py (the Samsung host scope).
-from .perf import CostSpec, BoundCostSpec, cost, rule
-from .spmw_match_engine import (
-    compile_op_pattern,
-    compile_target_patterns,
-    match_workload,
-)
-from .spmw_autoschedule import Placement, autoschedule
-from .spmw_codegen import (
-    compile_for_target,
-    Compiled,
-    PIMCmd,
-    SamsungCtx,
-    ResolvedHostMove,
-)
-from .spmw_linear_layout import LinearLayout, materialise_handle
-from .compiler import compile, CompiledCallable
-from .pim.schedule_promotion import PromotionEvidence
-from .pim.aim_program import (
-    AimOp,
-    AimContraction,
-    AimElementwise,
-    AimActivation,
-    AimHostTransfer,
-    AimDistributedHostTransfer,
-    AimBankCopy,
-    AimAllBankWrite,
-    AimSync,
-    AimProgram,
-    AimProgramCallable,
-)
-from .pim.apu_v1_vector_program import APUv1VectorCallable
-from .pim.upmem_program import (
-    UPMEMArray,
-    UPMEMDenseTile,
-    UPMEMDotTile,
-    UPMEMRank1Tile,
-    UPMEMPhase,
-    UPMEMProgram,
-)
-from .pim.apu_v1_program import APUv1Phase, APUv1PrecisionPolicy, APUv1Program
-from .pim.apu_g2_program import APUG2Callable, APUG2Operation, APUG2Program
-from .pim.apu_g2_composed_program import (
-    APUG2ComposedContractionCallable,
-    APUG2ComposedContractionProgram,
-    APUG2DotEpilogue,
-    APUG2DotEpilogueMode,
-)
-from .pim.apu_g2_composed_layout import (
-    APUG2ComposedHostFiles,
-    build_apu_g2_composed_host_command,
-    decode_apu_g2_u16_bitpatterns,
-    deinterleave_apu_g2_streams,
-    encode_apu_g2_u16_bitpatterns,
-    gather_apu_g2_composed_output,
-    interleave_apu_g2_dot_streams,
-    pack_apu_g2_batched_gemm_dots,
-    pack_apu_g2_composed_auxiliary,
-    pack_apu_g2_composed_operand,
-    pack_apu_g2_matrix_vector_dots,
-)
-from .pim.apu_g2_typed_program import (
-    APUG2ScalarType,
-    APUG2TypedCallable,
-    APUG2TypedOperation,
-    APUG2TypedProgram,
-    pack_apu_g2_gemm_as_independent_dots,
-    unpack_apu_g2_gemm_dots,
-)
-from .pim.apu_g2_vector_program import (
-    APUG2AtaxCallable,
-    APUG2GemvCallable,
-    APUG2IndependentContractionsCallable,
-    APUG2RankNContractionCallable,
-)
+# SPMW/PIM exports below load on first attribute access (PEP 562), so
+# `import allo` does not import the PIM compiler stack.
+_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "HostSchedule": ("allo.spmw_host_program", "HostSchedule"),
+    "HostGroup": ("allo.spmw_host_program", "HostGroup"),
+    "HostLaunch": ("allo.spmw_host_program", "HostLaunch"),
+    "analyze_host_program": ("allo.spmw_host_program", "analyze"),
+    "resolve_host_program_shapes": ("allo.spmw_host_program", "resolve_shapes"),
+    "schedule_residency": ("allo.spmw_host_program", "schedule_residency"),
+    "schedule_cost": ("allo.spmw_host_program", "schedule_cost"),
+    "CostSpec": ("allo.perf", "CostSpec"),
+    "BoundCostSpec": ("allo.perf", "BoundCostSpec"),
+    "cost": ("allo.perf", "cost"),
+    "rule": ("allo.perf", "rule"),
+    "compile_op_pattern": ("allo.spmw_match_engine", "compile_op_pattern"),
+    "compile_target_patterns": ("allo.spmw_match_engine", "compile_target_patterns"),
+    "match_workload": ("allo.spmw_match_engine", "match_workload"),
+    "Placement": ("allo.spmw_autoschedule", "Placement"),
+    "autoschedule": ("allo.spmw_autoschedule", "autoschedule"),
+    "compile_for_target": ("allo.spmw_codegen", "compile_for_target"),
+    "Compiled": ("allo.spmw_codegen", "Compiled"),
+    "PIMCmd": ("allo.spmw_codegen", "PIMCmd"),
+    "SamsungCtx": ("allo.spmw_samsung", "SamsungCtx"),
+    "ResolvedHostMove": ("allo.spmw_codegen", "ResolvedHostMove"),
+    "LinearLayout": ("allo.spmw_linear_layout", "LinearLayout"),
+    "materialise_handle": ("allo.spmw_linear_layout", "materialise_handle"),
+    "compile": ("allo.compiler", "compile"),
+    "CompiledCallable": ("allo.compiler", "CompiledCallable"),
+    "AimOp": ("allo.pim.aim_program", "AimOp"),
+    "AimContraction": ("allo.pim.aim_program", "AimContraction"),
+    "AimElementwise": ("allo.pim.aim_program", "AimElementwise"),
+    "AimActivation": ("allo.pim.aim_program", "AimActivation"),
+    "AimHostTransfer": ("allo.pim.aim_program", "AimHostTransfer"),
+    "AimDistributedHostTransfer": ("allo.pim.aim_program", "AimDistributedHostTransfer"),
+    "AimBankCopy": ("allo.pim.aim_program", "AimBankCopy"),
+    "AimAllBankWrite": ("allo.pim.aim_program", "AimAllBankWrite"),
+    "AimSync": ("allo.pim.aim_program", "AimSync"),
+    "AimProgram": ("allo.pim.aim_program", "AimProgram"),
+    "AimProgramCallable": ("allo.pim.aim_program", "AimProgramCallable"),
+    "APUv1VectorCallable": ("allo.pim.apu_v1_vector_program", "APUv1VectorCallable"),
+    "UPMEMArray": ("allo.pim.upmem_program", "UPMEMArray"),
+    "UPMEMDenseTile": ("allo.pim.upmem_program", "UPMEMDenseTile"),
+    "UPMEMDotTile": ("allo.pim.upmem_program", "UPMEMDotTile"),
+    "UPMEMRank1Tile": ("allo.pim.upmem_program", "UPMEMRank1Tile"),
+    "UPMEMPhase": ("allo.pim.upmem_program", "UPMEMPhase"),
+    "UPMEMProgram": ("allo.pim.upmem_program", "UPMEMProgram"),
+    "APUv1Phase": ("allo.pim.apu_v1_program", "APUv1Phase"),
+    "APUv1PrecisionPolicy": ("allo.pim.apu_v1_program", "APUv1PrecisionPolicy"),
+    "APUv1Program": ("allo.pim.apu_v1_program", "APUv1Program"),
+    "APUG2ComposedContractionCallable": ("allo.pim.apu_g2_composed_program", "APUG2ComposedContractionCallable"),
+    "APUG2ComposedContractionProgram": ("allo.pim.apu_g2_composed_program", "APUG2ComposedContractionProgram"),
+    "APUG2DotEpilogue": ("allo.pim.apu_g2_composed_program", "APUG2DotEpilogue"),
+    "APUG2DotEpilogueMode": ("allo.pim.apu_g2_composed_program", "APUG2DotEpilogueMode"),
+    "APUG2ComposedHostFiles": ("allo.pim.apu_g2_composed_layout", "APUG2ComposedHostFiles"),
+    "build_apu_g2_composed_host_command": ("allo.pim.apu_g2_composed_layout", "build_apu_g2_composed_host_command"),
+    "decode_apu_g2_u16_bitpatterns": ("allo.pim.apu_g2_composed_layout", "decode_apu_g2_u16_bitpatterns"),
+    "deinterleave_apu_g2_streams": ("allo.pim.apu_g2_composed_layout", "deinterleave_apu_g2_streams"),
+    "encode_apu_g2_u16_bitpatterns": ("allo.pim.apu_g2_composed_layout", "encode_apu_g2_u16_bitpatterns"),
+    "gather_apu_g2_composed_output": ("allo.pim.apu_g2_composed_layout", "gather_apu_g2_composed_output"),
+    "interleave_apu_g2_dot_streams": ("allo.pim.apu_g2_composed_layout", "interleave_apu_g2_dot_streams"),
+    "pack_apu_g2_batched_gemm_dots": ("allo.pim.apu_g2_composed_layout", "pack_apu_g2_batched_gemm_dots"),
+    "pack_apu_g2_composed_auxiliary": ("allo.pim.apu_g2_composed_layout", "pack_apu_g2_composed_auxiliary"),
+    "pack_apu_g2_composed_operand": ("allo.pim.apu_g2_composed_layout", "pack_apu_g2_composed_operand"),
+    "pack_apu_g2_matrix_vector_dots": ("allo.pim.apu_g2_composed_layout", "pack_apu_g2_matrix_vector_dots"),
+    "APUG2ScalarType": ("allo.pim.apu_g2_typed_program", "APUG2ScalarType"),
+    "APUG2TypedCallable": ("allo.pim.apu_g2_typed_program", "APUG2TypedCallable"),
+    "APUG2TypedOperation": ("allo.pim.apu_g2_typed_program", "APUG2TypedOperation"),
+    "APUG2TypedProgram": ("allo.pim.apu_g2_typed_program", "APUG2TypedProgram"),
+    "pack_apu_g2_gemm_as_independent_dots": ("allo.pim.apu_g2_typed_program", "pack_apu_g2_gemm_as_independent_dots"),
+    "unpack_apu_g2_gemm_dots": ("allo.pim.apu_g2_typed_program", "unpack_apu_g2_gemm_dots"),
+    "CompiledWorkload": ("allo.compiler", "CompiledWorkload"),
+}
+
+
+def __getattr__(name):
+    try:
+        module_name, attribute = _LAZY_EXPORTS[name]
+    except KeyError:
+        raise AttributeError(f"module 'allo' has no attribute {name!r}") from None
+    import importlib
+
+    value = getattr(importlib.import_module(module_name), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))

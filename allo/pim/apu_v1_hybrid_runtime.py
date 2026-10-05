@@ -1073,11 +1073,12 @@ def emit_apu_v1_hybrid_three_mm_project(
 def run_apu_v1_hybrid(compiled, inputs, *, lab_name=None):
     """Build and run a supported physical hybrid without host intermediates."""
 
-    from ..spmw_codegen import _apu_v1_unavailable_reason
+    from ..spmw_codegen import SimulatorUnavailable
+    from ..spmw_simenv import apu_v1_unavailable_reason as _apu_v1_unavailable_reason
 
     reason = _apu_v1_unavailable_reason()
     if reason:
-        return RunResult(None, reason, "apu_v1")
+        raise SimulatorUnavailable("apu_v1", reason)
     root = tempfile.mkdtemp(prefix="tenon-apu-v1-hybrid-")
     try:
         build_config = _apu_v1_build_config()

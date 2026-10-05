@@ -3,7 +3,6 @@
 
 import importlib
 import inspect
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,18 +13,6 @@ import allo.dataflow as df
 from allo._mlir.ir import ArrayAttr, IntegerAttr, StringAttr
 from allo.ir.builder import _spmw_group_contract
 from allo.ir.types import bfloat16, float32
-from allo.pim.schedule_promotion import (
-    CorrectnessEvidence,
-    ExactCyclePolicy,
-    MetricMeasurements,
-    MetricPromotionCell,
-    ObjectiveMetricBridge,
-    PromotionEvidence,
-    ScheduleEvidence,
-    SchedulePromotionGate,
-    SemanticScope,
-)
-from allo.pim.schedule_search import ScheduleCandidate, ScheduleObjectiveDomain
 from allo.spmw_autoschedule import MatcherWorkScope, _bucket_for_autoschedule
 from allo.spmw_codegen import RunResult, _check_work_grid
 from allo.spmw_liveness import MatcherValueId, trace_liveness
@@ -39,9 +26,6 @@ class _FakeCompiled:
         self.host_moves = [
             SimpleNamespace(verb=SimpleNamespace(name="gather"), buffer_role="C")
         ]
-        self.schedule_search_result = object()
-        self.schedule_activation = object()
-        self.fallback_reason = "shadow_only:test"
         self.calls = []
 
     def run(self, **inputs):
@@ -154,6 +138,18 @@ def _duplicate_groups_reordered(
         result[0] = value[0] + value[1]
 
 
+@df.region()
+def _empty_corner(A: float32[4], C: float32[4]):
+    @df.kernel(mapping=[2], args=[A, C])
+    def k(a: float32[4], c: float32[4]):
+        i = df.get_pid()
+        with allo.meta_if(i == 0):
+            pass
+        with allo.meta_else():
+            for t in range(4):
+                c[t] = a[t] + 1.0
+
+
 def _retained_function(name, location, *, kernel, semantic="generic"):
     attributes = {
         "sym_name": SimpleNamespace(value=name),
@@ -210,76 +206,6 @@ def _matched_function(name, work_id, target_op_name="MAC"):
     )
 
 
-@dataclass(frozen=True)
-class _Materialization:
-    promotion_materialization_fingerprint: tuple[str, str]
-    promotion_platform_fingerprint: tuple[str, str] = ("platform", "test")
-
-
-def _promotion_evidence():
-    platform = ("platform", "test")
-    domain = ScheduleObjectiveDomain(
-        metric="cycles",
-        target="test-target",
-        target_revision="revision-1",
-        model_fingerprint=("model", 1),
-        fidelity="hardware",
-        scope="whole_program",
-        unit="cycles",
-        direction="minimize",
-    )
-
-    def candidate(name, incumbent):
-        return ScheduleCandidate(
-            decisions={"plan": name},
-            payload=name,
-            materialized=_Materialization(("artifact", name)),
-            score=100,
-            objective=100,
-            objective_domain=domain,
-            is_incumbent=incumbent,
-            enumeration_index=int(not incumbent),
-        )
-
-    recommended = candidate("recommended", False)
-    incumbent = candidate("incumbent", True)
-    correctness = CorrectnessEvidence.exact_pass(("oracle", 1))
-    scope = SemanticScope(("semantics", 1), (("complete", True),), complete=True)
-
-    def schedule_evidence(schedule):
-        fingerprint = schedule.materialized.promotion_materialization_fingerprint
-        return ScheduleEvidence.from_schedule(
-            schedule,
-            correctness=correctness,
-            semantic_scope=scope,
-            scored_fingerprint=fingerprint,
-            emitted_fingerprint=fingerprint,
-            platform_fingerprint=platform,
-        )
-
-    return PromotionEvidence(
-        schedule_evidence(recommended),
-        schedule_evidence(incumbent),
-        (
-            MetricPromotionCell(
-                MetricMeasurements(domain, (90,), None, platform),
-                MetricMeasurements(domain, (100,), None, platform),
-                ExactCyclePolicy(),
-                ObjectiveMetricBridge(
-                    domain,
-                    domain,
-                    domain.unit,
-                    domain.unit,
-                    domain.direction,
-                    domain.direction,
-                    "identity_metric",
-                    ("compile-interface-cycle-identity", 1),
-                ),
-            ),
-        ),
-    )
-
-
 def _patch_pipeline(monkeypatch):
     compiler_api = importlib.import_module("allo.compiler")
     fake = _FakeCompiled()
@@ -321,9 +247,66 @@ def test_allo_compile_returns_signature_compatible_numpy_callable(monkeypatch):
     np.testing.assert_array_equal(C, A + B)
     assert captured["backend"] == "virtual"
     assert captured["cost"] is None
-    assert module.schedule_search_result is fake.schedule_search_result
-    assert module.schedule_activation is fake.schedule_activation
-    assert module.fallback_reason == fake.fallback_reason
+    assert not hasattr(module, "schedule_search_result")
+    assert not hasattr(module, "schedule_activation")
+    assert not hasattr(module, "fallback_reason")
+    assert "promotion_evidence" not in inspect.signature(allo.compile).parameters
+
+
+def test_program_routes_are_disjoint_and_in_dispatch_order():
+    compiler_api = importlib.import_module("allo.compiler")
+    types = [route.program_type for route in compiler_api._PROGRAM_ROUTES]
+    assert [t.__name__ for t in types] == [
+        "AimProgram",
+        "APUv1Program",
+        "UPMEMProgram",
+        "APUG2TypedProgram",
+        "APUG2ComposedContractionProgram",
+    ]
+    for left in types:
+        for right in types:
+            if left is not right:
+                assert not issubclass(left, right)
+
+
+def test_typed_program_route_rejects_host_moves_and_foreign_backend(monkeypatch):
+    compiler_api = importlib.import_module("allo.compiler")
+    route = next(
+        r for r in compiler_api._PROGRAM_ROUTES if r.program_type is allo.UPMEMProgram
+    )
+    program = object.__new__(allo.UPMEMProgram)
+    monkeypatch.setattr(
+        compiler_api,
+        "_PROGRAM_ROUTES",
+        (
+            compiler_api._ProgramRoute(
+                allo.UPMEMProgram,
+                lambda *a, **k: pytest.fail("route must reject first"),
+                route.backends,
+                route.backend_error,
+                route.owner,
+            ),
+        ),
+    )
+    target = SimpleNamespace(name="upmem")
+    with pytest.raises(ValueError, match="prepare_upmem_tenon_campaign"):
+        allo.compile(program, target, backend="simulator")
+    with pytest.raises(ValueError, match="owns its phased ABI"):
+        allo.compile(program, target, host_moves=[])
+
+
+def test_compile_ignores_host_move_sidecars(monkeypatch):
+    _fake, captured = _patch_pipeline(monkeypatch)
+    sentinel = [SimpleNamespace(verb="scatter")]
+    monkeypatch.setattr(_workload, "HOST_MOVES", sentinel, raising=False)
+    monkeypatch.setattr(
+        importlib.import_module(_workload.__module__),
+        "HOST_MOVES",
+        sentinel,
+        raising=False,
+    )
+    allo.compile(_workload, SimpleNamespace(name="fake"), backend="virtual")
+    assert captured["host_moves"] == []
 
 
 def test_compile_rejects_missing_numpy_operand_before_backend(monkeypatch):
@@ -409,56 +392,6 @@ def test_run_backend_accepts_lowered_roles_outside_workload_signature(monkeypatc
 
     assert result.cycles == 17
     assert fake.calls[-1] == {"A": A, "B": B}
-
-
-def test_compile_forwards_only_evidence_backed_promotion_gate(monkeypatch):
-    _fake, captured = _patch_pipeline(monkeypatch)
-    from allo.pim.costs import samsung_cost
-    from allo.pim.targets import build_samsung_target
-
-    evidence = _promotion_evidence()
-    allo.compile(
-        _workload,
-        build_samsung_target(),
-        cost=samsung_cost,
-        promotion_evidence=evidence,
-    )
-
-    gate = captured["promotion_gate"]
-    assert allo.PromotionEvidence is PromotionEvidence
-    assert isinstance(gate, SchedulePromotionGate)
-    assert gate.evidence is evidence
-
-
-@pytest.mark.parametrize("invalid", [True, object(), "promote"])
-def test_compile_rejects_non_evidence_promotion_requests(monkeypatch, invalid):
-    _patch_pipeline(monkeypatch)
-    with pytest.raises(TypeError, match="PromotionEvidence"):
-        allo.compile(
-            _workload,
-            SimpleNamespace(name="fake"),
-            promotion_evidence=invalid,
-        )
-
-
-def test_compile_rejects_promotion_without_cost_or_with_explicit_layout(monkeypatch):
-    _patch_pipeline(monkeypatch)
-    evidence = _promotion_evidence()
-    target = SimpleNamespace(name="fake")
-    with pytest.raises(ValueError, match="executable cost model"):
-        allo.compile(_workload, target, promotion_evidence=evidence)
-
-    from allo.pim.costs import samsung_cost
-    from allo.pim.targets import build_samsung_target
-
-    with pytest.raises(ValueError, match="explicit layout"):
-        allo.compile(
-            _workload,
-            build_samsung_target(),
-            cost=samsung_cost,
-            layout=object(),
-            promotion_evidence=evidence,
-        )
 
 
 def test_structural_mapping_boundaries_define_relocation_invariant_apu_scopes():
@@ -611,13 +544,12 @@ def test_frontend_retains_stable_scopes_across_rename_relocation_and_reorder():
             _scope_order_relocated,
             allo.customize,
         )
-        rebuilt, rebuilt_domains = retained(_scope_order_original, df.customize)
     finally:
         _scope_order_original.mappings = original_metadata
         _scope_order_relocated.mappings = relocated_metadata
 
-    assert original == relocated == rebuilt
-    assert original_domains == relocated_domains == rebuilt_domains
+    assert original == relocated
+    assert original_domains == relocated_domains
     assert original["ADD"][0].group_id != original["MUL"][0].group_id
     assert tuple(scope.work_id for scope in original["ADD"]) == ((0,), (1,))
     assert tuple(scope.work_id for scope in original["MUL"]) == ((0,), (1,))
@@ -626,6 +558,20 @@ def test_frontend_retains_stable_scopes_across_rename_relocation_and_reorder():
     )
     assert all(scope.coalesced_axes == (0,) for scope in original["ADD"])
     assert all(scope.coalesced_axes == () for scope in original["MUL"])
+
+
+def test_dataflow_build_does_not_validate_retained_scopes():
+    # Frontend still stamps a complete group for the PIM path.
+    plain = allo.customize(_empty_corner, enable_tensor=False)
+    kernels = [f for f in plain.module.body.operations if "df.kernel" in f.attributes]
+    assert len(kernels) == 2 and all("spmw.group_id" in f.attributes for f in kernels)
+    # Dataflow build drops the empty PE and must not raise.
+    df.customize(_empty_corner)
+    mod = df.build(_empty_corner, target="simulator")
+    A = np.arange(4, dtype=np.float32)
+    C = np.zeros(4, dtype=np.float32)
+    mod(A, C)
+    np.testing.assert_allclose(C, A + 1.0)
 
 
 def test_duplicate_isomorphic_groups_use_explicit_abi_identity_not_occurrence():

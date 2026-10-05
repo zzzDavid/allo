@@ -1,6 +1,6 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Pinned schedule-search migration and physical UPMEM tile legality tests."""
+"""UPMEM tasklet schedule search and physical tile legality tests."""
 
 from types import SimpleNamespace
 
@@ -11,22 +11,6 @@ import allo
 from allo.ir.types import int32
 from allo.pim import upmem_program as upmem_program_module
 from allo.pim.costs.upmem import upmem_cost
-from allo.pim.schedule_promotion import (
-    CorrectnessEvidence,
-    ExactCyclePolicy,
-    MetricMeasurements,
-    MetricPromotionCell,
-    ObjectiveMetricBridge,
-    PromotionEvidence,
-    ScheduleEvidence,
-    SchedulePromotionGate,
-    SemanticScope,
-)
-from allo.pim.schedule_search import (
-    DecisionDomain,
-    ScheduleObjectiveDomain,
-    grid_search,
-)
 from allo.pim.targets import build_upmem_target
 from allo.pim.upmem_program import (
     CompiledUPMEMProgram,
@@ -85,59 +69,6 @@ def _program(num_tasklets=16):
     )
 
 
-def _promotion_evidence(result):
-    platform = ("platform", "upmem", "hardware-campaign-1")
-    domain = ScheduleObjectiveDomain(
-        metric="cycles",
-        target="upmem",
-        target_revision="hardware-campaign-1",
-        model_fingerprint=("repeated-runs", 1),
-        fidelity="hardware",
-        scope="whole_program",
-        unit="cycles",
-        direction="minimize",
-    )
-    correctness = CorrectnessEvidence.exact_pass(("int32-oracle", 1))
-    scope = SemanticScope(
-        ("upmem-program-semantics", 1),
-        (("complete-output", True),),
-        complete=True,
-    )
-
-    def schedule_evidence(candidate):
-        fingerprint = candidate.materialized.promotion_materialization_fingerprint
-        return ScheduleEvidence.from_schedule(
-            candidate,
-            correctness=correctness,
-            semantic_scope=scope,
-            scored_fingerprint=fingerprint,
-            emitted_fingerprint=fingerprint,
-            platform_fingerprint=platform,
-        )
-
-    return PromotionEvidence(
-        schedule_evidence(result.best),
-        schedule_evidence(result.best_incumbent),
-        (
-            MetricPromotionCell(
-                MetricMeasurements(domain, (90,), None, platform),
-                MetricMeasurements(domain, (100,), None, platform),
-                ExactCyclePolicy(),
-                ObjectiveMetricBridge(
-                    result.best.objective_domain,
-                    domain,
-                    result.best.objective_domain.unit,
-                    domain.unit,
-                    result.best.objective_domain.direction,
-                    domain.direction,
-                    "identity_metric",
-                    ("upmem-cycle-model-validation", 1),
-                ),
-            ),
-        ),
-    )
-
-
 def test_incomplete_generic_lowering_fails_before_candidate_scoring(monkeypatch):
     program = allo.UPMEMProgram(
         [allo.UPMEMPhase(_rank2_copy)],
@@ -163,7 +94,7 @@ def test_incomplete_generic_lowering_fails_before_candidate_scoring(monkeypatch)
     assert failure.value.incumbent.program is program
     assert failure.value.incumbent.schedule_realizable is False
     with pytest.raises(RuntimeError, match="no complete candidate-specific"):
-        failure.value.incumbent.promotion_materialization_fingerprint
+        failure.value.incumbent.require_schedule_realizable()
 
 
 @pytest.mark.parametrize(
@@ -245,7 +176,7 @@ def test_search_rejects_unbound_or_wrong_target_cost():
         )
 
 
-def test_dependence_carrying_phase_keeps_exact_legacy_incumbent():
+def test_dependence_carrying_phase_compiles_program_without_search():
     program = allo.UPMEMProgram(
         [allo.UPMEMPhase(_serial_accumulate)],
         name="serial_upmem_program",
@@ -259,8 +190,7 @@ def test_dependence_carrying_phase_keeps_exact_legacy_incumbent():
     compiled = compile_upmem_program(program, target, cost=bound_cost)
 
     assert compiled.schedule_search_result is None
-    assert compiled.schedule_activation is None
-    assert compiled.fallback_reason.startswith("autoschedule_unavailable:")
+    assert not hasattr(compiled, "fallback_reason")
     assert compiled.compiled.c_source == legacy.c_source
     assert (
         compiled.compiled.legacy_materialization_fingerprint
@@ -305,13 +235,12 @@ def test_structural_region_identity_and_tasklet_domain_ignore_names():
     } == set(range(1, 25))
 
 
-def test_costed_compile_keeps_candidate_phase_identity_and_matches_direct_legacy(
+def test_costed_compile_activates_argmin_and_keeps_candidate_phase_identity(
     monkeypatch,
 ):
     program = _program(num_tasklets=7)
     target = build_upmem_target()
     bound_cost = upmem_cost.bind(target)
-    legacy = CompiledUPMEMProgram(program, target, cost=bound_cost)
     original_compile_phase = upmem_program_module._compile_phase
     phase_compiles = []
 
@@ -356,98 +285,34 @@ def test_costed_compile_keeps_candidate_phase_identity_and_matches_direct_legacy
         )
         assert f"#define TENON_ACTIVE_TASKLETS {manifest.active_tasklets}" in source
     materialization_fingerprints = {
-        candidate.materialized.promotion_materialization_fingerprint
+        candidate.materialized.legacy_materialization_fingerprint
         for candidate in migrated.schedule_search_result.ranked
     }
     assert len(materialization_fingerprints) == 24
     assert all(len(fingerprint) == 64 for fingerprint in materialization_fingerprints)
     assert migrated.schedule_search_result.stats.complete_assignments_considered == 23
+    best = migrated.schedule_search_result.best
     assert incumbent is not None
-    assert migrated.schedule_activation.active is incumbent
-    assert migrated.schedule_activation.recommended is (
-        migrated.schedule_search_result.best
-    )
-    assert migrated.fallback_reason == (
-        None
-        if migrated.schedule_search_result.best is incumbent
-        else "shadow_only: promotion evidence was not requested"
-    )
-    assert incumbent.materialized is migrated.compiled
     assert incumbent.payload is program
     assert dict(incumbent.decisions) == {"num_tasklets": 7}
-    assert migrated.compiled.c_source == legacy.c_source
+    assert not hasattr(migrated, "schedule_activation")
+    assert migrated.compiled is best.materialized
+    assert migrated.program.num_tasklets == best.decisions["num_tasklets"]
+    direct = CompiledUPMEMProgram(best.payload, target, cost=bound_cost)
+    assert migrated.compiled.c_source == direct.c_source
     assert (
-        migrated.compiled.promotion_materialization_fingerprint
-        == legacy.promotion_materialization_fingerprint
+        migrated.compiled.legacy_materialization_fingerprint
+        == direct.legacy_materialization_fingerprint
     )
-    assert migrated.compiled.device_c_abi == legacy.device_c_abi
-    assert migrated.abi_manifest == legacy.abi_manifest
+    assert migrated.compiled.device_c_abi == direct.device_c_abi
+    assert migrated.abi_manifest == direct.abi_manifest
     assert (
-        migrated.estimate().cycles == bound_cost.evaluate(legacy.execution_graph).cycles
+        migrated.estimate().cycles == bound_cost.evaluate(direct.execution_graph).cycles
     )
     values = np.arange(16, dtype=np.int32)
     output = np.zeros_like(values)
     migrated(values, output)
     np.testing.assert_array_equal(output, values)
-
-
-def test_evidence_gate_fails_closed_without_upmem_platform_fingerprint(
-    monkeypatch,
-):
-    program = _program(num_tasklets=7)
-    target = build_upmem_target()
-    bound_cost = upmem_cost.bind(target)
-    programs = {
-        tasklets: upmem_program_module._with_upmem_tasklets(program, tasklets)
-        for tasklets in (7, 8)
-    }
-    result = grid_search(
-        (DecisionDomain("num_tasklets", (7, 8)),),
-        build=lambda decisions: programs[decisions["num_tasklets"]],
-        materialize=lambda selected: CompiledUPMEMProgram(
-            selected,
-            target,
-            cost=bound_cost,
-        ),
-        score=lambda compiled: SimpleNamespace(
-            cycles=80 if compiled.program.num_tasklets == 8 else 100
-        ),
-        objective=lambda estimate: estimate.cycles,
-        objective_domain=ScheduleObjectiveDomain.fingerprinted_target(
-            metric="cycles",
-            target="upmem",
-            model_fingerprint=bound_cost.fingerprint,
-            fidelity="analytical",
-            scope="whole_program",
-            unit="cycles",
-            direction="minimize",
-        ),
-        incumbent={"num_tasklets": 7},
-    )
-    assert result.best.payload.num_tasklets == 8
-    monkeypatch.setattr(
-        upmem_program_module,
-        "search_upmem_program_schedule",
-        lambda selected, selected_target, cost, **kwargs: result,
-    )
-
-    compiled = compile_upmem_program(
-        program,
-        target,
-        cost=bound_cost,
-        promotion_gate=SchedulePromotionGate(_promotion_evidence(result)),
-    )
-
-    assert compiled.schedule_activation.promoted is False
-    assert compiled.compiled is result.best_incumbent.materialized
-    assert compiled.program.num_tasklets == 7
-    assert compiled.fallback_reason.startswith(
-        "recommended_platform_fingerprint_unavailable"
-    )
-    assert (
-        compiled.schedule_activation.recommended.materialized.promotion_materialization_fingerprint
-        == result.best.materialized.promotion_materialization_fingerprint
-    )
 
 
 def test_cost_none_bypasses_search_and_preserves_legacy_callable(monkeypatch):

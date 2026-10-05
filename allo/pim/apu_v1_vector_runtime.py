@@ -11,10 +11,6 @@ machine without the proprietary SDK.
 
 from __future__ import annotations
 
-import hashlib
-import importlib
-import inspect
-import json
 import math
 import os
 from pathlib import Path
@@ -24,158 +20,18 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
-from types import CodeType, FunctionType
 
 import numpy as np
 
 from ..spmw_apu_v1_build import _apu_v1_build_config
 from ..spmw_codegen import RunResult
+from ..spmw_fingerprint import canonical_json
 from .apu_v1_program import _generate_project, _ledag_log
 from .apu_v1_vector_codegen import PointerOffsetRef, PointerRef, VR_LANES
 
 
 def _canonical_json(value: object) -> str:
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-
-
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _code_constant_manifest(value):
-    if value is None or type(value) in (bool, int, str):
-        return value
-    if type(value) is bytes:
-        return {"bytes": value.hex()}
-    if type(value) is float:
-        return {"float": value.hex()}
-    if type(value) is complex:
-        return {"complex": [value.real.hex(), value.imag.hex()]}
-    if type(value) is tuple:
-        return {"tuple": [_code_constant_manifest(item) for item in value]}
-    if type(value) is frozenset:
-        items = [_code_constant_manifest(item) for item in value]
-        return {"frozenset": sorted(items, key=_canonical_json)}
-    if value is Ellipsis:
-        return {"ellipsis": True}
-    if isinstance(value, CodeType):
-        return {"code": _code_manifest(value)}
-    raise TypeError(f"unsupported executor code constant {type(value).__name__!r}")
-
-
-def _code_manifest(code: CodeType):
-    return {
-        "argcount": code.co_argcount,
-        "posonlyargcount": code.co_posonlyargcount,
-        "kwonlyargcount": code.co_kwonlyargcount,
-        "nlocals": code.co_nlocals,
-        "stacksize": code.co_stacksize,
-        "flags": code.co_flags,
-        "code": code.co_code.hex(),
-        "constants": [_code_constant_manifest(value) for value in code.co_consts],
-        "names": list(code.co_names),
-        "varnames": list(code.co_varnames),
-        "freevars": list(code.co_freevars),
-        "cellvars": list(code.co_cellvars),
-        "exceptiontable": getattr(code, "co_exceptiontable", b"").hex(),
-    }
-
-
-def _callable_manifest(function: FunctionType) -> tuple[str, str, str]:
-    if not isinstance(function, FunctionType):
-        raise TypeError("APU v1 runtime dependencies must be Python functions")
-    return (
-        function.__module__,
-        function.__qualname__,
-        _sha256_bytes(
-            _canonical_json(_code_manifest(function.__code__)).encode("ascii")
-        ),
-    )
-
-
-def _promotion_platform_fingerprint():
-    """Return no promotion identity until trusted board attestation exists.
-
-    Caller-authored JSON and hashes of caller-selected software files cannot
-    prove the identity or current state of the board, driver, or loaded
-    firmware. They therefore must not authorize schedule activation.
-    """
-
-    return None
-
-
-def _module_source_hashes() -> tuple[tuple[str, str], ...]:
-    names = (
-        "allo.pim.apu_v1_layout",
-        "allo.pim.apu_v1_program",
-        "allo.pim.apu_v1_vector_codegen",
-        "allo.pim.apu_v1_vector_runtime",
-        "allo.spmw_apu_v1_build",
-        "allo.spmw_codegen",
-        "allo.spmw_linear_layout",
-    )
-    hashes = []
-    for name in names:
-        module = importlib.import_module(name)
-        source = inspect.getsourcefile(module)
-        if source is None:
-            raise RuntimeError(f"APU v1 runtime module {name!r} has no source")
-        path = Path(source).resolve()
-        if not path.is_file():
-            raise RuntimeError(f"APU v1 runtime source is missing: {path}")
-        hashes.append((name, _sha256_file(path)))
-    return tuple(hashes)
-
-
-def _implementation_manifest(realization) -> tuple[tuple[str, str, str], ...]:
-    return tuple(
-        sorted(
-            _callable_manifest(function)
-            for function in (
-                run_apu_v1_vector,
-                _full_device_source,
-                _generate_project,
-                _generate_runtime_project,
-                _pointer_values,
-                _parse_vector_profile,
-                type(realization).device_source,
-                type(realization.abi).pack,
-                type(realization.abi).transfer_input_images,
-                type(realization.abi).gather,
-            )
-        )
-    )
-
-
-def _template_inventory():
-    from ..spmw_apu_v1_build import _COPY_FILES, _template_dir
-
-    template = _template_dir()
-    paths = [item for item in (template / "Common").rglob("*") if item.is_file()]
-    paths.extend(template / name for name in _COPY_FILES)
-    hashes = []
-    modes = []
-    for path in sorted(paths):
-        if not path.is_file():
-            raise FileNotFoundError(f"APU v1 template source is missing: {path}")
-        relative = str(path.relative_to(template))
-        hashes.append((relative, _sha256_file(path)))
-        modes.append((relative, path.stat().st_mode & 0o777))
-    return tuple(hashes), tuple(modes)
+    return canonical_json(value, allow_nan=False)
 
 
 def _zero_arrays(realization):
@@ -286,48 +142,12 @@ def _generate_runtime_project(realization, lab_name: str):
     )
 
 
-def _runtime_source_hashes(
-    files,
-    modes,
-    module_hashes,
-    implementation,
-    build_json,
-    abi_json,
-):
-    inventory = [
-        (f"project/{relative}", _sha256_bytes(data)) for relative, data in files
-    ]
-    inventory.extend((f"runtime/{name}", digest) for name, digest in module_hashes)
-    inventory.extend(
-        (
-            (
-                "contract/executor.json",
-                _sha256_bytes(_canonical_json(implementation).encode("ascii")),
-            ),
-            ("contract/build.json", _sha256_bytes(build_json.encode("ascii"))),
-            ("contract/abi.json", _sha256_bytes(abi_json.encode("ascii"))),
-            (
-                "contract/modes.json",
-                _sha256_bytes(_canonical_json(modes).encode("ascii")),
-            ),
-        )
-    )
-    return tuple(sorted(inventory))
-
-
 @dataclass(frozen=True)
 class APUV1RuntimeArtifact:
     project_files: tuple[tuple[str, bytes], ...]
     project_modes: tuple[tuple[str, int], ...]
-    template_source_hashes: tuple[tuple[str, str], ...]
-    template_modes: tuple[tuple[str, int], ...]
-    module_source_hashes: tuple[tuple[str, str], ...]
-    implementation_manifest: tuple[tuple[str, str, str], ...]
     build_manifest_json: str
     abi_manifest_json: str
-    source_hashes: tuple[tuple[str, str], ...]
-    source_fingerprint: str
-    platform_fingerprint: object | None
     lab_name: str
 
     def write_project(self, destination: Path) -> Path:
@@ -343,83 +163,16 @@ class APUV1RuntimeArtifact:
             path.chmod(dict(self.project_modes)[relative])
         return destination
 
-    def current_platform_fingerprint(self):
-        return _promotion_platform_fingerprint()
-
-    def current_source_hashes(self, realization) -> tuple[tuple[str, str], ...]:
-        files, modes, abi = _generate_runtime_project(realization, self.lab_name)
-        return _runtime_source_hashes(
-            files,
-            modes,
-            _module_source_hashes(),
-            _implementation_manifest(realization),
-            _canonical_json(_build_manifest(self.lab_name)),
-            _canonical_json(abi),
-        )
-
-    def current_source_fingerprint(self, realization) -> str:
-        return _sha256_bytes(
-            _canonical_json(self.current_source_hashes(realization)).encode("ascii")
-        )
-
-    def promotion_source_fingerprint(self, realization) -> str | None:
-        try:
-            self.assert_current(realization)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            return None
-        return self.source_fingerprint
-
-    def assert_current(self, realization) -> None:
-        template_hashes, template_modes = _template_inventory()
-        if template_hashes != self.template_source_hashes:
-            raise RuntimeError("APU v1 runtime template changed after materialization")
-        if template_modes != self.template_modes:
-            raise RuntimeError(
-                "APU v1 runtime template modes changed after materialization"
-            )
-        if _module_source_hashes() != self.module_source_hashes:
-            raise RuntimeError("APU v1 runtime driver changed after materialization")
-        if _implementation_manifest(realization) != self.implementation_manifest:
-            raise RuntimeError(
-                "APU v1 executor implementation changed after materialization"
-            )
-        if self.current_source_fingerprint(realization) != self.source_fingerprint:
-            raise RuntimeError("APU v1 runtime project changed after materialization")
-        if self.platform_fingerprint != self.current_platform_fingerprint():
-            raise RuntimeError("APU v1 platform contract changed after materialization")
-
 
 def freeze_apu_v1_runtime_artifact(
     realization, *, lab_name: str = "tenon-vector"
 ) -> APUV1RuntimeArtifact:
     files, modes, abi = _generate_runtime_project(realization, lab_name)
-    template_hashes, template_modes = _template_inventory()
-    module_hashes = _module_source_hashes()
-    implementation = _implementation_manifest(realization)
-    build_json = _canonical_json(_build_manifest(lab_name))
-    abi_json = _canonical_json(abi)
-    source_hashes = _runtime_source_hashes(
-        files,
-        modes,
-        module_hashes,
-        implementation,
-        build_json,
-        abi_json,
-    )
     return APUV1RuntimeArtifact(
         project_files=files,
         project_modes=modes,
-        template_source_hashes=template_hashes,
-        template_modes=template_modes,
-        module_source_hashes=module_hashes,
-        implementation_manifest=implementation,
-        build_manifest_json=build_json,
-        abi_manifest_json=abi_json,
-        source_hashes=source_hashes,
-        source_fingerprint=_sha256_bytes(
-            _canonical_json(source_hashes).encode("ascii")
-        ),
-        platform_fingerprint=_promotion_platform_fingerprint(),
+        build_manifest_json=_canonical_json(_build_manifest(lab_name)),
+        abi_manifest_json=_canonical_json(abi),
         lab_name=lab_name,
     )
 
@@ -522,7 +275,8 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
     independent multicore extension and does not change this ABI.
     """
 
-    from ..spmw_codegen import _apu_v1_unavailable_reason
+    from ..spmw_codegen import SimulatorUnavailable
+    from ..spmw_simenv import apu_v1_unavailable_reason as _apu_v1_unavailable_reason
 
     realization = compiled.realization
     if realization is None:
@@ -535,10 +289,9 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
             raise RuntimeError(
                 "APU v1 launch name differs from the frozen materialization"
             )
-        runtime_artifact.assert_current(realization)
     reason = _apu_v1_unavailable_reason()
     if reason:
-        return RunResult(None, reason, "apu_v1")
+        raise SimulatorUnavailable("apu_v1", reason)
     if runtime_artifact is None:
         raise RuntimeError(
             "APU v1 device execution has no complete frozen runtime artifact"
@@ -667,12 +420,7 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
                 "device_source": dict(runtime_artifact.project_files)[
                     "device.c"
                 ].decode("utf-8"),
-                "source_sha256": dict(runtime_artifact.source_hashes),
-                "source_fingerprint": runtime_artifact.source_fingerprint,
                 "build_mode": build_config.mode,
-                "promotion_platform_fingerprint": (
-                    runtime_artifact.current_platform_fingerprint()
-                ),
                 "single_apuc": True,
             },
         )

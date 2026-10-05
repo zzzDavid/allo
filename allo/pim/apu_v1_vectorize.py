@@ -30,7 +30,7 @@ remain separate legality and program-composition concerns.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import product
 import re
 from typing import Iterable
@@ -823,6 +823,60 @@ def _candidate_recipes(analysis: ContractionAnalysis):
     )
 
 
+_UNIT_AXIS = "__apu_v1_unit"
+_ONE_DIMENSIONAL_SUBSET = (
+    "One-dimensional matrix-vector reductions are the next enabled vector subset."
+)
+
+
+def _lift_unit_output_axis(analysis: ContractionAnalysis) -> ContractionAnalysis:
+    """Give a 1-D-output contraction a trailing unit output axis.
+
+    ``y[i] += W[i, k] * x[k]`` becomes ``y[i, u] += W[i, k] * x[k, u]`` with
+    ``extent(u) == 1``, which is exactly the singleton-GEMV form the existing
+    ``spatial_gemv_group_reduction`` recipe plans. The operand without the
+    output axis is the vector that receives the unit axis.
+    """
+
+    if len(analysis.output_axes) != 1:
+        return analysis
+    (output_axis,) = analysis.output_axes
+    lhs_has = output_axis in analysis.lhs.indices
+    rhs_has = output_axis in analysis.rhs.indices
+    if lhs_has == rhs_has:
+        raise IllegalContractionError(
+            "APU v1 plan generation currently requires two output axes; "
+            f"analysis discovered {analysis.output_axes}. {_ONE_DIMENSIONAL_SUBSET}"
+        )
+
+    def lifted(access: ValueAccess) -> ValueAccess:
+        return replace(
+            access,
+            indices=access.indices + (_UNIT_AXIS,),
+            shape=tuple(access.shape) + (1,),
+        )
+
+    unit = LogicalAxis(
+        name=_UNIT_AXIS,
+        extent=1,
+        lower_bound=0,
+        upper_bound=1,
+        step=1,
+        reduction=False,
+        ssa_name="",
+    )
+    return replace(
+        analysis,
+        axes=analysis.axes + (unit,),
+        output_axes=analysis.output_axes + (_UNIT_AXIS,),
+        parallel_axes=analysis.parallel_axes + (_UNIT_AXIS,),
+        output=lifted(analysis.output),
+        accumulator=lifted(analysis.accumulator),
+        lhs=analysis.lhs if lhs_has else lifted(analysis.lhs),
+        rhs=analysis.rhs if rhs_has else lifted(analysis.rhs),
+    )
+
+
 def generate_apu_v1_vectorization_candidates(
     module_or_analysis,
 ) -> tuple[VectorizationCandidate, ...]:
@@ -832,6 +886,7 @@ def generate_apu_v1_vectorization_candidates(
         if isinstance(module_or_analysis, ContractionAnalysis)
         else analyze_apu_v1_contraction(module_or_analysis)
     )
+    analysis = _lift_unit_output_axis(analysis)
     if len(analysis.output_axes) != 2:
         next_subset = (
             "One-dimensional matrix-vector reductions are the next enabled "

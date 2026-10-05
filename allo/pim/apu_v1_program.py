@@ -548,11 +548,12 @@ class CompiledAPUv1Program:
                 cost.emit(self.execution_graph, event)
 
     def run(self, **inputs):
-        from ..spmw_codegen import _apu_v1_unavailable_reason
+        from ..spmw_codegen import SimulatorUnavailable
+        from ..spmw_simenv import apu_v1_unavailable_reason as _apu_v1_unavailable_reason
 
         reason = _apu_v1_unavailable_reason()
         if reason:
-            return RunResult(None, reason, "apu_v1")
+            raise SimulatorUnavailable("apu_v1", reason)
         normalized = {}
         for argument in self.source_arguments:
             value = inputs[argument.name]

@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Focused source, ABI, and numeric tests for the APU v1 plan realizer."""
 
-import hashlib
 import json
 
 import numpy as np
@@ -115,74 +114,15 @@ def test_runtime_artifact_freezes_complete_project_driver_build_and_abi(tmp_path
     assert project["struct.h"]
     assert realization.device_source().encode("utf-8") in project["device.c"]
     assert any(path.startswith("Common/") for path in project)
-    source_hashes = dict(artifact.source_hashes)
-    assert source_hashes["contract/build.json"]
-    assert source_hashes["contract/abi.json"]
-    assert source_hashes["contract/executor.json"]
-    assert any(path.startswith("runtime/") for path in source_hashes)
-    assert len(artifact.source_fingerprint) == 64
-    assert len(realization.promotion_materialization_fingerprint) == 64
-    assert realization.promotion_platform_fingerprint is None
+    assert json.loads(artifact.build_manifest_json)["schema"] == "apu-v1-make-build-v1"
+    assert (
+        json.loads(artifact.abi_manifest_json)["schema"]
+        == "apu-v1-vector-runtime-abi-v1"
+    )
+    assert artifact.lab_name == "tenon-vector"
     written = artifact.write_project(tmp_path / "project")
     for relative, mode in artifact.project_modes:
         assert (written / relative).stat().st_mode & 0o777 == mode
-
-
-def test_runtime_project_mutation_after_realization_fails_closed(monkeypatch):
-    from allo.pim import apu_v1_vector_runtime as runtime
-
-    realization = _simple_realization()
-    artifact = realization.runtime_artifact
-    assert len(realization.promotion_materialization_fingerprint) == 64
-    original_inventory = runtime._template_inventory
-
-    def mutated_inventory():
-        hashes, modes = original_inventory()
-        hashes = dict(hashes)
-        path = next(iter(hashes))
-        hashes[path] = "f" * 64
-        return tuple(sorted(hashes.items())), modes
-
-    monkeypatch.setattr(runtime, "_template_inventory", mutated_inventory)
-
-    assert realization.promotion_materialization_fingerprint is None
-    with pytest.raises(RuntimeError, match="template changed"):
-        artifact.assert_current(realization)
-
-
-def test_caller_supplied_g1_files_cannot_attest_hardware_platform(
-    monkeypatch, tmp_path
-):
-    components = {}
-    for category in ("sdk", "toolchain", "firmware"):
-        path = tmp_path / f"{category}.contract"
-        path.write_bytes(f"{category}-revision-1".encode("ascii"))
-        components[category] = {
-            category: {
-                "path": str(path),
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            }
-        }
-    manifest = {
-        "schema": "tenon-promotion-platform-v1",
-        "target": "apu_v1",
-        "hardware_family": "gemini-i",
-        **components,
-    }
-    contract = tmp_path / "platform.json"
-    contract.write_text(json.dumps(manifest), encoding="utf-8")
-    monkeypatch.setenv("TENON_APU_V1_PLATFORM_CONTRACT", str(contract))
-
-    realization = _simple_realization()
-    artifact = realization.runtime_artifact
-    assert artifact.platform_fingerprint is None
-    assert artifact.current_platform_fingerprint() is None
-    assert realization.promotion_platform_fingerprint is None
-    assert len(realization.promotion_materialization_fingerprint) == 64
-
-    (tmp_path / "firmware.contract").write_bytes(b"firmware-revision-2")
-    assert realization.promotion_platform_fingerprint is None
-    artifact.assert_current(realization)
 
 
 @pytest.mark.parametrize("extent", [32, 256, 4096, 32768])

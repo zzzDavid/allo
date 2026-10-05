@@ -2,17 +2,61 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression checks over canonical PolyBench modules retained by Allo."""
 
+import importlib
+import json
+import math
+from pathlib import Path
+from types import SimpleNamespace
+
 import allo
+from allo.ir.types import float32
 
 from allo.pim.upmem_analysis import analyze_upmem_mlir
-from lib.upmem_polybench import get_case
+
+_PSIZE = json.loads(
+    (Path(__file__).resolve().parents[2] / "examples" / "polybench" / "psize.json")
+    .read_text()
+)
+
+
+def _deriche_bindings():
+    alpha = 0.25
+    exp = math.exp
+    k = ((1.0 - exp(-alpha)) ** 2) / (
+        1.0 + 2.0 * alpha * exp(-alpha) - exp(2.0 * alpha)
+    )
+    return {
+        "a1": k,
+        "a2": k * exp(-alpha) * (alpha - 1.0),
+        "a3": k * exp(-alpha) * (alpha + 1.0),
+        "a4": -k * exp(-2.0 * alpha),
+        "a5": k,
+        "a6": k * exp(-alpha) * (alpha - 1.0),
+        "a7": k * exp(-alpha) * (alpha + 1.0),
+        "a8": -k * exp(-2.0 * alpha),
+        "b1": 2.0 ** (-alpha),
+        "b2": -exp(-2.0 * alpha),
+        "c1": 1.0,
+        "c2": 1.0,
+    }
+
+
+# name -> (kernel symbol, instantiate dimension order, ambient bindings)
+_CASES = {
+    "deriche": ("kernel_deriche", ("W", "H"), _deriche_bindings),
+    "gemm": ("kernel_gemm", ("P", "Q", "R"), lambda: {"beta": 0.1}),
+}
 
 
 def _summary(name):
-    case = get_case(name)
-    kernel, instantiate = case.kernel_and_instantiate()
-    schedule = allo.customize(kernel, instantiate=instantiate)
-    return case, analyze_upmem_mlir(schedule.module)
+    kernel_name, order, bindings = _CASES[name]
+    dims = {key: int(value) for key, value in _PSIZE[name]["small"].items()}
+    module = importlib.import_module(f"examples.polybench.{name}")
+    for key, value in bindings().items():
+        setattr(module, key, value)
+    instantiate = [float32, *(dims[key] for key in order)]
+    schedule = allo.customize(getattr(module, kernel_name), instantiate=instantiate)
+    return SimpleNamespace(dims=dims), analyze_upmem_mlir(schedule.module)
 
 
 def test_deriche_sequential_affine_phases_do_not_leak_loop_multipliers():

@@ -15,7 +15,7 @@ from allo.spmw_autoschedule import (
     _apu_v1_enumerate,
     derive_layout_properties,
 )
-from allo.spmw_codegen import APUv1Ctx, _parse_apu_v1_prof_print
+from allo.spmw_apu_v1 import APUv1Ctx, _parse_apu_v1_prof_print
 from allo.spmw_match import MatchedOp, OperandBinding
 
 

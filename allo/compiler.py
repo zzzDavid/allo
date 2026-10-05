@@ -9,53 +9,30 @@ from __future__ import annotations
 
 import inspect
 import math
+import typing
+from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 
 from .customize import customize
 from .ir.builder import _spmw_group_contract
 from .perf import BoundCostSpec, CostSpec
-from .pim.aim_program import AimProgram, AimProgramCallable, compile_aim_program
+from .pim.aim_program import AimProgram, compile_aim_program
 from .pim.apu_v1_program import APUv1Program, compile_apu_v1_program
-from .pim.apu_v1_vector_program import (
-    APUv1VectorCallable,
-    compile_apu_v1_vector_workload,
-)
-from .pim.apu_g2_program import APUG2Callable, APUG2Program, compile_apu_g2_program
+from .pim.apu_v1_vector_program import compile_apu_v1_vector_workload
+from .pim.apu_v1_vectorize import NoContractionError
 from .pim.apu_g2_composed_program import (
-    APUG2ComposedContractionCallable,
     APUG2ComposedContractionProgram,
     compile_apu_g2_composed_program,
 )
 from .pim.apu_g2_typed_program import (
-    APUG2TypedCallable,
     APUG2TypedProgram,
     compile_apu_g2_typed_program,
 )
-from .pim.apu_g2_vector_program import (
-    APUG2AtaxCallable,
-    APUG2ChunkedGesummvCallable,
-    APUG2ColumnBatchedGemmCallable,
-    APUG2ContractionChainCallable,
-    APUG2CorrelationCallable,
-    APUG2CovarianceCallable,
-    APUG2GemverCallable,
-    APUG2GemvCallable,
-    APUG2IndependentContractionsCallable,
-    APUG2RankNContractionCallable,
-    APUG2StreamingGemvCallable,
-    APUG2SymmCallable,
-    APUG2TrmmCallable,
-    compile_apu_g2_vector_workload,
-)
-from .pim.schedule_promotion import PromotionEvidence, SchedulePromotionGate
-from .pim.upmem_program import (
-    UPMEMProgram,
-    UPMEMProgramCallable,
-    compile_upmem_program,
-)
+from .pim.upmem_program import UPMEMProgram, compile_upmem_program
 from .spmw_autoschedule import MatcherWorkScope, _retain_matcher_work_scope
-from .spmw_codegen import RunResult, compile_for_target
+from .spmw_codegen import RunResult, compile_for_target, source_backend_binding
 from .spmw_liveness import MatcherValueId, trace_liveness
 from .spmw_match_engine import match_workload
 from .spmw_plan import BufferMetricManifest
@@ -91,18 +68,6 @@ def _resolve_cost(target, cost_spec):
     if not isinstance(cost_spec, CostSpec):
         raise TypeError("cost must be an executable CostSpec")
     return cost_spec.bind(target)
-
-
-def _discover_host_moves(workload):
-    direct = getattr(workload, "HOST_MOVES", None)
-    if direct is not None:
-        return list(direct)
-    module = inspect.getmodule(workload)
-    if module is not None:
-        records = getattr(module, "HOST_MOVES", None)
-        if records is not None:
-            return list(records)
-    return None
 
 
 def _buffer_metrics(workload):
@@ -507,19 +472,26 @@ class CompiledCallable:
         self.__signature__ = self.signature
         self.__name__ = getattr(workload, "__name__", "compiled_workload")
         self.__doc__ = getattr(workload, "__doc__", None)
-        self.schedule_search_result = getattr(
-            compiled,
-            "schedule_search_result",
-            None,
+        self.placement_ranking = getattr(compiled, "placement_ranking", None)
+        self._source_binding = source_backend_binding(
+            target, trace, tuple(self.signature.parameters)
         )
-        self.schedule_activation = getattr(compiled, "schedule_activation", None)
-        self.fallback_reason = getattr(compiled, "fallback_reason", None)
         self.last_result: RunResult | None = None
 
     def __call__(self, *args, **kwargs) -> RunResult:
         bound = self.signature.bind(*args, **kwargs)
         bound.apply_defaults()
-        return self.run_backend(**bound.arguments)
+        inputs = dict(bound.arguments)
+        for backend_kwarg, parameter in self._source_binding.inputs.items():
+            value = bound.arguments[parameter]
+            if backend_kwarg in inputs and inputs[backend_kwarg] is not value:
+                raise ValueError(
+                    f"argument {backend_kwarg!r} collides with the Samsung runtime "
+                    f"role {backend_kwarg!r}, which is bound to parameter "
+                    f"{parameter!r}"
+                )
+            inputs[backend_kwarg] = value
+        return self.run_backend(**inputs)
 
     def run_backend(self, **inputs) -> RunResult:
         """Invoke with explicit backend-role arrays.
@@ -547,6 +519,24 @@ class CompiledCallable:
             raise RuntimeError("compiled workload has no retained execution graph")
         return self.cost.evaluate(self.execution_graph)
 
+    @staticmethod
+    def _bound_output_assignment(outputs, arguments, gather_roles, binding):
+        """Destination for a single backend output under a source binding:
+        the gather role, then the bound output parameter, then a name match
+        that is not a bound input."""
+        output_name, value = next(iter(outputs.items()))
+        if len(gather_roles) == 1:
+            return {gather_roles[0]: value}
+        if binding.output is not None and binding.output in arguments:
+            return {binding.output: value}
+        bound_inputs = set(binding.inputs) | set(binding.inputs.values())
+        if output_name in arguments and output_name not in bound_inputs:
+            return {output_name: value}
+        for name in arguments:
+            if name not in bound_inputs and name.lower() == output_name.lower():
+                return {name: value}
+        return {}
+
     def _copy_outputs(self, result, arguments):
         outputs = result.extra.get("outputs", {}) if result.extra else {}
         if not outputs:
@@ -557,15 +547,25 @@ class CompiledCallable:
             if verb == "gather" and resolved.buffer_role in arguments:
                 gather_roles.append(resolved.buffer_role)
 
-        assignments = {}
-        lower_names = {name.lower(): name for name in arguments}
-        for output_name, value in outputs.items():
-            if output_name in arguments:
-                assignments[output_name] = value
-            elif output_name.lower() in lower_names:
-                assignments[lower_names[output_name.lower()]] = value
-        if len(outputs) == 1 and len(gather_roles) == 1:
-            assignments.setdefault(gather_roles[0], next(iter(outputs.values())))
+        binding = getattr(self, "_source_binding", None)
+        if (
+            binding is not None
+            and (binding.inputs or binding.output is not None)
+            and len(outputs) == 1
+        ):
+            assignments = self._bound_output_assignment(
+                outputs, arguments, gather_roles, binding
+            )
+        else:
+            assignments = {}
+            lower_names = {name.lower(): name for name in arguments}
+            for output_name, value in outputs.items():
+                if output_name in arguments:
+                    assignments[output_name] = value
+                elif output_name.lower() in lower_names:
+                    assignments[lower_names[output_name.lower()]] = value
+            if len(outputs) == 1 and len(gather_roles) == 1:
+                assignments.setdefault(gather_roles[0], next(iter(outputs.values())))
 
         for name, value in assignments.items():
             destination = arguments[name]
@@ -582,6 +582,77 @@ class CompiledCallable:
             np.copyto(destination, source, casting="same_kind")
 
 
+class CompiledWorkload(typing.Protocol):
+    """What every allo.compile result supports."""
+
+    def __call__(self, *args, **kwargs) -> RunResult: ...
+
+    def run(self, *args, **kwargs) -> RunResult: ...
+
+
+@dataclass(frozen=True)
+class _ProgramRoute:
+    program_type: type
+    compile_fn: Callable[..., CompiledWorkload]  # (program, target, *, cost, backend)
+    backends: frozenset | None  # None: compile_fn validates backend itself
+    backend_error: str | None  # ValueError text for a backend outside ``backends``
+    owner: str  # ValueError text when host_moves/layout are passed
+
+
+def _compile_upmem_route(program, target, *, cost=None, backend=None):
+    del backend  # validated by the route; compile_upmem_program takes none
+    return compile_upmem_program(program, target, cost=cost)
+
+
+_PROGRAM_ROUTES: tuple[_ProgramRoute, ...] = (
+    _ProgramRoute(
+        AimProgram,
+        compile_aim_program,
+        None,
+        None,
+        "AimProgram owns its ordered trace and placement",
+    ),
+    _ProgramRoute(
+        APUv1Program,
+        compile_apu_v1_program,
+        frozenset({None, "virtual", "functional"}),
+        "APUv1Program supports the device, virtual, or functional backend",
+        "APUv1Program owns its scalar L4 ABI",
+    ),
+    _ProgramRoute(
+        UPMEMProgram,
+        _compile_upmem_route,
+        frozenset({None, "virtual", "functional"}),
+        "MLIR-driven UPMEMProgram currently supports only the functional "
+        "portable-C runtime (backend=None, 'virtual', or 'functional'); "
+        "uPIMulator cycles come from scripts/prepare_upmem_tenon_campaign.py",
+        "UPMEMProgram owns its phased ABI; host_moves/layout are not accepted",
+    ),
+    _ProgramRoute(
+        APUG2TypedProgram,
+        compile_apu_g2_typed_program,
+        None,
+        None,
+        "APUG2TypedProgram owns its VL64 layout and hardware ABI",
+    ),
+    _ProgramRoute(
+        APUG2ComposedContractionProgram,
+        compile_apu_g2_composed_program,
+        None,
+        None,
+        "APUG2ComposedContractionProgram owns its LinearLayout and ABI",
+    ),
+)
+
+
+def _compile_program(route, workload, target, bound_cost, backend, host_moves, layout):
+    if route.backends is not None and backend not in route.backends:
+        raise ValueError(route.backend_error)
+    if host_moves is not None or layout is not None:
+        raise ValueError(route.owner)
+    return route.compile_fn(workload, target, cost=bound_cost, backend=backend)
+
+
 def compile(
     workload,
     target,
@@ -590,31 +661,36 @@ def compile(
     backend=None,
     host_moves=None,
     layout=None,
-    promotion_evidence=None,
-) -> (
-    CompiledCallable
-    | AimProgramCallable
-    | UPMEMProgramCallable
-    | APUv1VectorCallable
-    | APUG2Callable
-    | APUG2ComposedContractionCallable
-    | APUG2TypedCallable
-    | APUG2ChunkedGesummvCallable
-    | APUG2GemvCallable
-    | APUG2GemverCallable
-    | APUG2ContractionChainCallable
-    | APUG2CorrelationCallable
-    | APUG2CovarianceCallable
-    | APUG2RankNContractionCallable
-    | APUG2SymmCallable
-    | APUG2TrmmCallable
-):
+) -> CompiledWorkload:
     """Compile ``workload`` for ``target`` and return a NumPy-callable object.
+
+    The pipeline has four stages:
+
+    1. Typed program frontends. ``AimProgram``, ``APUv1Program``,
+       ``UPMEMProgram``, ``APUG2TypedProgram`` and
+       ``APUG2ComposedContractionProgram`` each compile through their own
+       route. ``APUv1Program`` and ``UPMEMProgram`` accept
+       ``backend in (None, "virtual", "functional")``; the AiM and APU v2
+       routes validate ``backend`` themselves. No typed route accepts
+       ``host_moves`` or ``layout``.
+    2. Source frontend. A plain ``@allo`` workload is customized to MLIR.
+       Source workloads cannot target UPMEM; wrap them in ``UPMEMProgram``.
+    3. Contraction frontend (APU v1, non-dataflow only). Contractions go
+       through the APU v1 layout-plan vector path; anything else falls through.
+    4. Matcher. The workload is matched against the target, the ranked
+       autoscheduler picks placements, and backend codegen emits commands.
+
+    UPMEM through ``allo.compile`` is a functional oracle plus an analytical
+    estimate: a run returns ``cycles=None`` with
+    ``extra["functional_oracle"] is True``, and ``estimate()`` gives the cost
+    model's cycles. The paper's UPMEM cycles come from
+    ``scripts/prepare_upmem_tenon_campaign.py`` and uPIMulator.
 
     Parameters
     ----------
     workload : callable or object
-        An Allo workload callable, or a module/object exposing ``build()``.
+        An Allo workload callable, a typed PIM program, or an object exposing
+        ``build()``.
     target : Target or callable
         A built Tenon target or a zero-argument target builder.
     cost : CostSpec
@@ -623,112 +699,19 @@ def compile(
         ``None`` selects the target's normal simulator/device runner;
         ``"virtual"`` evaluates only the analytical performance graph.
     host_moves : sequence or None
-        Optional explicit host-transfer records. If omitted, ``HOST_MOVES`` is
-        discovered beside the workload.
+        Explicit host-transfer records. They are never discovered implicitly.
     layout : object
         Optional preselected placement or placement list.
-    promotion_evidence : PromotionEvidence or None
-        Exact correctness, materialization, and repeated-performance evidence
-        for an already inspected search challenger. ``None`` always retains
-        the incumbent when the search recommendation differs.
     """
     workload = _materialize_workload(workload)
     target = _materialize_target(target)
     bound_cost = _resolve_cost(target, cost)
-    if promotion_evidence is not None and not isinstance(
-        promotion_evidence,
-        PromotionEvidence,
-    ):
-        raise TypeError("promotion_evidence must be a PromotionEvidence record")
-    promotion_gate = (
-        None
-        if promotion_evidence is None
-        else SchedulePromotionGate(promotion_evidence)
-    )
-    if promotion_gate is not None and bound_cost is None:
-        raise ValueError("promotion evidence requires an executable cost model")
-    if promotion_gate is not None and layout is not None:
-        raise ValueError("promotion evidence cannot override an explicit layout")
 
-    if isinstance(workload, AimProgram):
-        if promotion_gate is not None:
-            raise ValueError("AimProgram has no schedule-search activation")
-        if host_moves is not None or layout is not None:
-            raise ValueError("AimProgram owns its ordered trace and placement")
-        return compile_aim_program(
-            workload,
-            target,
-            cost=bound_cost,
-            backend=backend,
-        )
-
-    if isinstance(workload, APUv1Program):
-        if promotion_gate is not None:
-            raise ValueError("APUv1Program has no schedule-search activation")
-        if backend not in (None, "virtual", "functional"):
-            raise ValueError(
-                "APUv1Program supports the device, virtual, or functional backend"
+    for route in _PROGRAM_ROUTES:
+        if isinstance(workload, route.program_type):
+            return _compile_program(
+                route, workload, target, bound_cost, backend, host_moves, layout
             )
-        if host_moves is not None or layout is not None:
-            raise ValueError("APUv1Program owns its scalar L4 ABI")
-        return compile_apu_v1_program(
-            workload, target, cost=bound_cost, backend=backend
-        )
-
-    if isinstance(workload, UPMEMProgram):
-        if backend not in (None, "virtual", "functional"):
-            raise ValueError(
-                "MLIR-driven UPMEMProgram currently supports only the functional "
-                "portable-C runtime (backend=None, 'virtual', or 'functional')"
-            )
-        if host_moves is not None or layout is not None:
-            raise ValueError(
-                "UPMEMProgram owns its phased ABI; host_moves/layout are not accepted"
-            )
-        return compile_upmem_program(
-            workload,
-            target,
-            cost=bound_cost,
-            promotion_gate=promotion_gate,
-        )
-
-    if isinstance(workload, APUG2TypedProgram):
-        if promotion_gate is not None:
-            raise ValueError("APUG2TypedProgram has no schedule-search activation")
-        if host_moves is not None or layout is not None:
-            raise ValueError("APUG2TypedProgram owns its VL64 layout and hardware ABI")
-        return compile_apu_g2_typed_program(
-            workload,
-            target,
-            cost=bound_cost,
-            backend=backend,
-        )
-
-    if isinstance(workload, APUG2ComposedContractionProgram):
-        if promotion_gate is not None:
-            raise ValueError("APUG2ComposedContractionProgram has no search activation")
-        if host_moves is not None or layout is not None:
-            raise ValueError(
-                "APUG2ComposedContractionProgram owns its LinearLayout and ABI"
-            )
-        return compile_apu_g2_composed_program(
-            workload,
-            target,
-            cost=bound_cost,
-            backend=backend,
-        )
-
-    if isinstance(workload, APUG2Program):
-        if promotion_gate is not None:
-            raise ValueError("APUG2Program has no schedule-search activation")
-        if host_moves is not None or layout is not None:
-            raise ValueError("APUG2Program owns its VL64 layout and hardware ABI")
-        return compile_apu_g2_program(
-            workload,
-            target,
-            cost=bound_cost,
-            backend=backend,
-        )
 
     if target.name == "upmem":
         raise TypeError(
@@ -736,17 +719,12 @@ def compile(
             "or more MLIR callables in allo.UPMEMProgram"
         )
 
-    if host_moves is None:
-        host_moves = _discover_host_moves(workload)
-
     schedule = customize(workload, enable_tensor=False)
-    retained_matcher_dataflow = _module_has_retained_matcher_scopes(schedule.module)
-    # Ordinary contractions use the new MLIR -> layout-plan -> vector path.
     # Dataflow regions retain their matcher/group implementation through typed
     # structural scope attributes stamped on retained IR kernel functions.
-    if target.name == "apu_v1" and not retained_matcher_dataflow:
-        from .pim.contraction_analysis import NoContractionError
-
+    if target.name == "apu_v1" and not _module_has_retained_matcher_scopes(
+        schedule.module
+    ):
         try:
             return compile_apu_v1_vector_workload(
                 workload,
@@ -755,33 +733,13 @@ def compile(
                 cost=bound_cost,
                 layout=layout,
                 backend=backend,
-                promotion_gate=promotion_gate,
             )
         except NoContractionError:
-            # Non-contraction APU workloads continue through the existing
-            # matcher path; this dispatch is deliberately additive.
             pass
-    if target.name == "apu_v2" and not retained_matcher_dataflow:
-        from .pim.contraction_analysis import NoContractionError
 
-        try:
-            if host_moves is not None or layout is not None:
-                raise ValueError(
-                    "MLIR-driven APUg2 GEMV owns its reduction layout and hardware ABI"
-                )
-            return compile_apu_g2_vector_workload(
-                workload,
-                target,
-                schedule,
-                cost=bound_cost,
-                backend=backend,
-                promotion_gate=promotion_gate,
-            )
-        except NoContractionError:
-            # Non-contractions retain the established matcher path.
-            pass
     trace = match_workload(target, schedule.module)
     _stamp_matcher_work_scopes(target, schedule.module, trace)
+    host_moves = list(host_moves or ())
     compiled = compile_for_target(
         target,
         trace,
@@ -790,7 +748,6 @@ def compile(
         host_moves=host_moves,
         buffer_metrics=_buffer_metric_manifest(workload, trace, host_moves),
         cost=bound_cost,
-        promotion_gate=promotion_gate,
     )
     return CompiledCallable(
         workload,

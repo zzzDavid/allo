@@ -12,7 +12,6 @@ import pytest
 from allo.pim.upmem_physical import UPMEMElementwisePlan
 from allo.pim.upmem_physical_search import (
     DEFAULT_UPMEM_PHYSICAL_COST_MODEL,
-    UPMEM_MMTV_ROW_LAYOUT_PHASES,
     MaskedF2TaskletLayout,
     UPMEMDataLayout,
     UPMEMCalibrationEvidence,
@@ -26,9 +25,7 @@ from allo.pim.upmem_physical_search import (
     UPMEMPredicateLowering,
     physical_features,
     rank_upmem_physical_candidates,
-    search_upmem_mmtv_row_layout,
     select_upmem_physical_plan,
-    upmem_mmtv_row_costs,
 )
 
 
@@ -145,12 +142,6 @@ def selection_candidates():
             )
         )
     return tuple(candidates)
-
-
-def canonical_mmtv_inputs():
-    matrix = tuple(((index * 7 + 2) % 13) - 6 for index in range(12 * 16 * 32))
-    vectors = tuple(((index * 9 + 4) % 17) - 8 for index in range(12 * 32))
-    return matrix, vectors
 
 
 def test_masked_f2_layout_represents_exactly_twelve_active_tasklets():
@@ -497,77 +488,3 @@ def test_unrepresented_but_legal_stratum_is_explicitly_analytical_not_hardware()
     assert estimate.calibration_factor == 1.0
     assert estimate.calibration_evidence_ids == ()
     assert estimate.predicted_logic_cycles == estimate.predicted.logic_cycles
-
-
-def test_mmtv_content_aware_row_layout_search_selects_measured_phase_one():
-    matrix, vectors = canonical_mmtv_inputs()
-    result = search_upmem_mmtv_row_layout(matrix, vectors)
-
-    expected_measurements = {
-        "identity": 216_866,
-        "greedy-phase-0": 216_181,
-        "greedy-phase-1": 215_684,
-        "greedy-phase-15": 215_980,
-        "greedy-phase-2": 215_805,
-        "greedy-phase-3": 215_825,
-        "greedy-phase-5": 216_342,
-        "greedy-phase-7": 216_127,
-        "greedy-phase-9": 216_120,
-    }
-    assert [candidate.candidate_id for candidate in result.ordered] == list(
-        expected_measurements
-    )
-    assert {
-        candidate.candidate_id: candidate.logic_cycles for candidate in result.ordered
-    } == expected_measurements
-    assert result.best.candidate_id == "greedy-phase-1"
-    assert result.best.phase_rotation == 1
-    assert result.best.logic_cycles == 215_684
-    assert sorted(result.best.physical_to_logical_rows) == list(range(192))
-    assert result.best.physical_to_logical_rows != tuple(range(192))
-    assert result.best.manifest()["physical_to_logical_rows_i32_sha256"] == (
-        "14df9fb1c954296c4937691472c66cce0617bc5788459c33d77e79bf2769206c"
-    )
-    assert result.best.tasklet_cost_spread == 20
-
-
-def test_mmtv_row_cost_formula_manifest_and_search_are_deterministic():
-    matrix, vectors = canonical_mmtv_inputs()
-    row_costs = upmem_mmtv_row_costs(16, 32, 12, matrix, vectors)
-    manual_row_zero = sum(
-        min(matrix[column] & 0xFFFFFFFF, vectors[column] & 0xFFFFFFFF).bit_length()
-        for column in range(32)
-    )
-    assert len(row_costs) == 192
-    assert row_costs[0] == manual_row_zero
-
-    first = search_upmem_mmtv_row_layout(matrix, vectors)
-    second = search_upmem_mmtv_row_layout(matrix, vectors)
-    assert first.search_fingerprint == second.search_fingerprint
-    assert first.manifest() == second.manifest()
-    manifest = first.manifest()
-    assert manifest["ordered_phases"] == [None, *UPMEM_MMTV_ROW_LAYOUT_PHASES]
-    assert manifest["cost_formula"]["logical_row_costs"] == list(row_costs)
-    assert manifest["selected"]["physical_to_logical_rows"] == list(
-        first.best.physical_to_logical_rows
-    )
-    assert manifest["claim_scope"] == {
-        "software_simulator_calibrated": True,
-        "hardware_calibrated": False,
-        "hardware_performance_claim": False,
-        "content_specific": True,
-        "host_unpack_excluded": True,
-    }
-    assert "host output inverse permutation" in manifest["objective"]["excluded"]
-    assert all(not row["hardware_measurement"] for row in manifest["evidence"])
-
-
-def test_mmtv_row_layout_evidence_rejects_noncanonical_content_and_phase_domain():
-    matrix, vectors = canonical_mmtv_inputs()
-    changed = list(matrix)
-    changed[0] += 1
-
-    with pytest.raises(ValueError, match="bound to the canonical inputs"):
-        search_upmem_mmtv_row_layout(changed, vectors)
-    with pytest.raises(ValueError, match="exact ordered phase domain"):
-        search_upmem_mmtv_row_layout(matrix, vectors, phases=(0, 1))

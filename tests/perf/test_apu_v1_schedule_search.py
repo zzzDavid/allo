@@ -340,7 +340,7 @@ def test_incumbent_and_materialization_identity_fail_closed(monkeypatch):
 
 
 @pytest.mark.parametrize("workload", [representative_gemm, representative_gemv])
-def test_search_selection_matches_legacy_rank_then_realize(workload):
+def test_search_activates_argmin_matching_rank_then_realize(workload):
     schedule = allo.customize(workload, enable_tensor=False)
     candidates = generate_apu_v1_vectorization_candidates(schedule.module)
     plans = tuple(candidate.plan for candidate in candidates)
@@ -363,17 +363,10 @@ def test_search_selection_matches_legacy_rank_then_realize(workload):
 
     assert compiled.selected_plan is legacy_selected
     assert compiled.schedule_search_result is not None
-    assert compiled.schedule_activation.recommended is (
-        compiled.schedule_search_result.best
-    )
-    assert compiled.schedule_activation.active is compiled.schedule_search_result.best
-    assert compiled.fallback_reason is None
+    assert compiled.selected_plan is compiled.schedule_search_result.best.payload
+    assert not hasattr(compiled, "schedule_activation")
+    assert not hasattr(compiled, "fallback_reason")
     assert compiled.realization is compiled.schedule_search_result.best.materialized
-    assert len(compiled.realization.promotion_materialization_fingerprint) == 64
-    assert (
-        compiled.realization.promotion_materialization_fingerprint
-        == compiled.realization.promotion_materialization_fingerprint
-    )
     assert compiled.selected_estimate is compiled.schedule_search_result.best.score
     assert compiled.candidate_estimates == tuple(
         candidate.score for candidate in compiled.schedule_search_result.ranked
@@ -496,13 +489,14 @@ def test_explicit_layout_pins_plan_and_bypasses_search(monkeypatch):
     )
 
     assert compiled.schedule_search_result is None
-    assert compiled.schedule_activation is None
     assert compiled.selected_plan is plans[1]
     assert compiled.realization.plan is plans[1]
     assert compiled.candidate_estimates == estimates
 
 
-def test_corrected_shadow_ranking_retains_preinventory_incumbent(monkeypatch):
+def test_corrected_ranking_activates_challenger_over_preinventory_incumbent(
+    monkeypatch,
+):
     plans = (_Plan("legacy"), _Plan("corrected_challenger"))
     analysis = object()
     candidates = tuple(
@@ -545,7 +539,5 @@ def test_corrected_shadow_ranking_retains_preinventory_incumbent(monkeypatch):
 
     assert compiled.schedule_search_result.best.payload is plans[1]
     assert compiled.schedule_search_result.best_incumbent.payload is plans[0]
-    assert compiled.schedule_activation.recommended.payload is plans[1]
-    assert compiled.schedule_activation.active.payload is plans[0]
-    assert compiled.selected_plan is plans[0]
-    assert compiled.fallback_reason.startswith("shadow_only:")
+    assert compiled.selected_plan is plans[1]
+    assert compiled.realization.plan is plans[1]

@@ -14,7 +14,7 @@ from allo.pim.aim_program import (
     AimHostTransfer,
 )
 from allo.pim.targets import build_aim_target
-from benchmarks.cent_aim.evidence import compiler_logical_work_coverage
+from benchmarks.cent_aim.workloads import compiler_logical_work_coverage
 from benchmarks.cent_aim.vendor_contract import VENDOR_TRACE_CONTRACTS
 from benchmarks.cent_aim.workloads import (
     CENT_CASES,

@@ -36,13 +36,11 @@ from .upmem_abi import (
     TensorLayout,
 )
 from .upmem_analysis import analyze_upmem_mlir
-from .schedule_promotion import validate_schedule_promotion_gate
 from .schedule_search import (
     DecisionDomain,
     InfeasibleSchedule,
     ScheduleObjectiveDomain,
     grid_search,
-    guarded_schedule_activation,
 )
 
 
@@ -910,7 +908,7 @@ class UPMEMDeviceCFragment:
     """Frozen DPU source artifact, complete only when capabilities are proven.
 
     Unsupported generic phases retain an exact ABI and compute fragment, but
-    cannot enter schedule search or promotion.  Supported structural lowering
+    cannot enter schedule search.  Supported structural lowering
     supplies a complete translation unit, compile flags, and exact tasklet count.
     """
 
@@ -1738,11 +1736,6 @@ class CompiledUPMEMProgram:
             ).encode()
         ).hexdigest()
 
-    @property
-    def promotion_materialization_fingerprint(self) -> str:
-        self.require_schedule_realizable()
-        return self.legacy_materialization_fingerprint
-
     def run(self, **inputs) -> RunResult:
         environment = dict(inputs)
         packed_manifests = []
@@ -1912,8 +1905,6 @@ class UPMEMProgramCallable:
         self,
         compiled: CompiledUPMEMProgram,
         schedule_search_result=None,
-        schedule_activation=None,
-        fallback_reason=None,
     ):
         self.compiled = compiled
         self.program = compiled.program
@@ -1932,10 +1923,6 @@ class UPMEMProgramCallable:
         self.__name__ = self.program.name
         self.last_result = None
         self.schedule_search_result = schedule_search_result
-        self.schedule_activation = schedule_activation
-        self.fallback_reason = fallback_reason
-        if schedule_activation is not None:
-            self.fallback_reason = schedule_activation.fallback_reason
 
     @property
     def execution_graph(self):
@@ -1965,18 +1952,12 @@ def compile_upmem_program(
     target,
     *,
     cost=None,
-    promotion_gate=None,
 ) -> UPMEMProgramCallable:
     """Compile a general UPMEM program without invoking the SPMW matcher."""
 
-    promotion_gate = validate_schedule_promotion_gate(promotion_gate)
     if target.name != "upmem":
         raise ValueError("UPMEMProgram can only be compiled for the upmem target")
     if cost is None:
-        if promotion_gate is not None:
-            raise ValueError(
-                "promotion_gate requires automatic cost-ranked UPMEM search"
-            )
         return UPMEMProgramCallable(
             CompiledUPMEMProgram(program, target, cost=None),
             schedule_search_result=None,
@@ -1990,19 +1971,10 @@ def compile_upmem_program(
             incumbent_materialized=incumbent,
         )
     except UPMEMScheduleUnavailable as error:
-        return UPMEMProgramCallable(
-            error.incumbent,
-            schedule_search_result=None,
-            fallback_reason=f"autoschedule_unavailable: {error}",
-        )
-    activation = guarded_schedule_activation(
-        search_result,
-        promotion_gate=promotion_gate,
-    )
+        return UPMEMProgramCallable(error.incumbent, schedule_search_result=None)
     return UPMEMProgramCallable(
-        activation.active_materialized,
+        search_result.best.materialized,
         schedule_search_result=search_result,
-        schedule_activation=activation,
     )
 
 

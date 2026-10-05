@@ -38,13 +38,11 @@ from .apu_v1_vector_cost import (
     rank_apu_v1_plans,
 )
 from .apu_v1_vectorize import generate_apu_v1_vectorization_candidates
-from .schedule_promotion import validate_schedule_promotion_gate
 from .schedule_search import (
     DecisionDomain,
     InfeasibleSchedule,
     ScheduleObjectiveDomain,
     grid_search,
-    guarded_schedule_activation,
 )
 
 
@@ -443,13 +441,7 @@ class APUv1VectorCallable:
         cost=None,
         layout=None,
         backend=None,
-        promotion_gate=None,
     ):
-        promotion_gate = validate_schedule_promotion_gate(promotion_gate)
-        if promotion_gate is not None and (cost is None or layout is not None):
-            raise ValueError(
-                "promotion_gate requires automatic cost-ranked APU v1 search"
-            )
         self.workload = workload
         self.target = target
         self.schedule = schedule
@@ -459,8 +451,6 @@ class APUv1VectorCallable:
         self.plans = tuple(candidate.plan for candidate in candidates)
         self.cost = cost
         self.schedule_search_result = None
-        self.schedule_activation = None
-        self.fallback_reason = None
         if layout is None and cost is not None:
             incumbent_plan = _legacy_realizable_incumbent(
                 self.analysis,
@@ -475,12 +465,7 @@ class APUv1VectorCallable:
                 cost,
                 incumbent_plan=incumbent_plan,
             )
-            self.schedule_activation = guarded_schedule_activation(
-                self.schedule_search_result,
-                promotion_gate=promotion_gate,
-            )
-            selected = self.schedule_activation.active
-            self.fallback_reason = self.schedule_activation.fallback_reason
+            selected = self.schedule_search_result.best
             self.candidate_estimates = _feasible_candidate_estimates(
                 self.schedule_search_result
             )
@@ -644,7 +629,31 @@ class APUv1VectorCallable:
                 "APU v1 vector device runtime is unavailable; use "
                 "backend='functional' or backend='virtual'"
             ) from error
-        return run(self, dict(inputs))
+        # A lifted 1-D contraction plans its values with a trailing unit axis.
+        arrays = dict(inputs)
+        lifted = {}
+        for value in self.realization.values:
+            source = arrays.get(value.name)
+            if (
+                isinstance(source, np.ndarray)
+                and tuple(source.shape) + (1,) == tuple(value.shape)
+            ):
+                lifted[value.name] = source
+                arrays[value.name] = np.reshape(source, tuple(value.shape))
+        result = run(self, arrays)
+        for value in self.realization.values:
+            source = lifted.get(value.name)
+            if (
+                source is not None
+                and value.intent in {"out", "inout"}
+                and not np.shares_memory(source, arrays[value.name])
+            ):
+                np.copyto(
+                    source,
+                    np.reshape(arrays[value.name], source.shape),
+                    casting="same_kind",
+                )
+        return result
 
 
 def compile_apu_v1_vector_workload(
@@ -655,7 +664,6 @@ def compile_apu_v1_vector_workload(
     cost=None,
     layout=None,
     backend=None,
-    promotion_gate=None,
 ):
     """Analyze one ordinary Allo contraction and return its public callable."""
 
@@ -670,7 +678,6 @@ def compile_apu_v1_vector_workload(
         cost=cost,
         layout=layout,
         backend=backend,
-        promotion_gate=promotion_gate,
     )
 
 

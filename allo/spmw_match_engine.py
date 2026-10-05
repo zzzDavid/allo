@@ -34,6 +34,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._mlir.ir import AsmState
 from .spmw_match import IRValueRef, MatchedOp, MatchTrace, OperandBinding
 
 
@@ -241,24 +242,24 @@ def _attr_str(a) -> str | None:
     return s
 
 
-def _operand_names(op) -> list[str]:
-    return [o.get_name() for o in op.operands]
+def _operand_names(op, *, state) -> list[str]:
+    return [o.get_name(state) for o in op.operands]
 
 
-def _result_names(op) -> list[str]:
-    return [r.get_name() for r in op.results]
+def _result_names(op, *, state) -> list[str]:
+    return [r.get_name(state) for r in op.results]
 
 
-def _build_load_term(load_op, value_refs) -> WLoad:
+def _build_load_term(load_op, value_refs, *, state) -> WLoad:
     name = load_op.operation.name
     attrs = load_op.attributes
     memref_name = None
     if "from" in attrs:
         memref_name = _attr_str(attrs["from"])
-    operands = _operand_names(load_op)
+    operands = _operand_names(load_op, state=state)
     # operands[0] is the memref; the rest are the indices.
     indices = operands[1:] if len(operands) > 1 else []
-    ssa = _result_names(load_op)[0] if load_op.results else "<no-result>"
+    ssa = _result_names(load_op, state=state)[0] if load_op.results else "<no-result>"
     memref_type = str(load_op.operands[0].type) if load_op.operands else None
     return WLoad(
         memref_name=memref_name,
@@ -270,7 +271,9 @@ def _build_load_term(load_op, value_refs) -> WLoad:
     )
 
 
-def _trace_value(ssa_name: str, defining_map: dict[str, Any], value_refs) -> Any:
+def _trace_value(
+    ssa_name: str, defining_map: dict[str, Any], value_refs, *, state
+) -> Any:
     """Build a WTerm for the SSA value named ``ssa_name``.
 
     ``defining_map`` maps SSA result names to the MLIR op that defines them.
@@ -283,13 +286,13 @@ def _trace_value(ssa_name: str, defining_map: dict[str, Any], value_refs) -> Any
 
     op_name = src.operation.name
     if op_name in _LOAD_OPS:
-        return _build_load_term(src, value_refs)
+        return _build_load_term(src, value_refs, state=state)
     if op_name in _FP_BINOPS:
         kind = _FP_BINOPS[op_name]
-        ops = _operand_names(src)
-        lhs = _trace_value(ops[0], defining_map, value_refs)
-        rhs = _trace_value(ops[1], defining_map, value_refs)
-        return WBinOp(kind, lhs, rhs, _result_names(src)[0])
+        ops = _operand_names(src, state=state)
+        lhs = _trace_value(ops[0], defining_map, value_refs, state=state)
+        rhs = _trace_value(ops[1], defining_map, value_refs, state=state)
+        return WBinOp(kind, lhs, rhs, _result_names(src, state=state)[0])
     if op_name == "arith.constant":
         # Try to extract the literal; not strictly needed for matching.
         try:
@@ -302,18 +305,22 @@ def _trace_value(ssa_name: str, defining_map: dict[str, Any], value_refs) -> Any
                     v = float(sval)
                 except ValueError:
                     v = sval
-            return WConst(v, _result_names(src)[0])
+            return WConst(v, _result_names(src, state=state)[0])
         except Exception:  # noqa: BLE001
-            return WConst(None, _result_names(src)[0])
+            return WConst(None, _result_names(src, state=state)[0])
     # Anything else (extsi, index_cast, sitofp, ...) is treated as opaque.
     # We trace through single-input casts so that constants on the other
     # side still appear as constants when the pattern needs them.
     if len(src.operands) == 1 and src.results:
-        inner = _trace_value(_operand_names(src)[0], defining_map, value_refs)
+        inner = _trace_value(
+            _operand_names(src, state=state)[0], defining_map, value_refs, state=state
+        )
         # Wrap-through: keep the original ssa name so codegen can audit.
         if isinstance(inner, (WLoad, WBlockArg, WConst, WBinOp)):
             return inner
-    return WBlockArg(ssa_name=_result_names(src)[0] if src.results else ssa_name)
+    return WBlockArg(
+        ssa_name=_result_names(src, state=state)[0] if src.results else ssa_name
+    )
 
 
 # --------------------------------------------------------------------- #
@@ -413,7 +420,7 @@ def _affine_map_text(attr) -> str:
     return str(attr)
 
 
-def _walk_loops(block, prefix: list[tuple[str, str, str, int]], collector):
+def _walk_loops(block, prefix: list[tuple[str, str, str, int]], collector, *, state):
     """Recurse into ``block``'s ops, collecting affine.for loops in ``prefix``
     and yielding (op, current_loop_stack) for every non-loop op via
     ``collector.append``.
@@ -421,7 +428,7 @@ def _walk_loops(block, prefix: list[tuple[str, str, str, int]], collector):
     for op in block.operations:
         if op.operation.name == "affine.for":
             attrs = op.attributes
-            iv_name = op.regions[0].blocks[0].arguments[0].get_name()
+            iv_name = op.regions[0].blocks[0].arguments[0].get_name(state)
             lb = (
                 _affine_map_text(attrs["lowerBoundMap"])
                 if "lowerBoundMap" in attrs
@@ -443,21 +450,21 @@ def _walk_loops(block, prefix: list[tuple[str, str, str, int]], collector):
                 step = 1
             loop = (iv_name, lb, ub, step)
             for inner_block in op.regions[0].blocks:
-                _walk_loops(inner_block, prefix + [loop], collector)
+                _walk_loops(inner_block, prefix + [loop], collector, state=state)
         else:
             collector.append((op, list(prefix)))
             for r in op.regions:
                 for blk in r.blocks:
-                    _walk_loops(blk, prefix, collector)
+                    _walk_loops(blk, prefix, collector, state=state)
 
 
-def _build_defining_map(func) -> dict[str, Any]:
+def _build_defining_map(func, *, state) -> dict[str, Any]:
     m: dict[str, Any] = {}
 
     def visit(block):
         for op in block.operations:
             for r in op.results:
-                m[r.get_name()] = op
+                m[r.get_name(state)] = op
             for region in op.regions:
                 for blk in region.blocks:
                     visit(blk)
@@ -735,6 +742,8 @@ def _try_match_at_store(
     work_id: tuple[int, ...],
     defining_map: dict[str, Any],
     value_refs: dict[Any, IRValueRef],
+    *,
+    state,
 ) -> list[MatchedOp]:
     """If ``store_op`` (a memref.store / affine.store) writes a value that
     matches one of the target's compiled op patterns, emit MatchedOps for it.
@@ -742,7 +751,7 @@ def _try_match_at_store(
     op_name = store_op.operation.name
     if op_name not in _STORE_OPS:
         return []
-    operands = _operand_names(store_op)
+    operands = _operand_names(store_op, state=state)
     if not operands:
         return []
     stored_ssa = operands[0]
@@ -760,7 +769,7 @@ def _try_match_at_store(
         value_refs.get(store_op.operands[1]) if len(store_op.operands) > 1 else None
     )
 
-    term = _trace_value(stored_ssa, defining_map, value_refs)
+    term = _trace_value(stored_ssa, defining_map, value_refs, state=state)
     # Only a binop term is interesting for the patterns we care about.
     if not isinstance(term, WBinOp):
         return []
@@ -957,11 +966,15 @@ def match_workload(target, mlir_module) -> MatchTrace:
 
         _, work_id = _parse_work_id(func_name)
         # Be permissive: also accept funcs with no numeric tail.
-        defining_map = _build_defining_map(func)
+        # Value.get_name() without an AsmState re-prints the enclosing
+        # function on every call (quadratic in function size); one shared
+        # state per function yields the same names in linear time.
+        state = AsmState(func)
+        defining_map = _build_defining_map(func, state=state)
 
         body = func.regions[0].blocks[0]
         sites: list[tuple[Any, list[tuple[str, str, str, int]]]] = []
-        _walk_loops(body, [], sites)
+        _walk_loops(body, [], sites, state=state)
 
         for op, loops in sites:
             if op.operation.name not in _STORE_OPS:
@@ -974,6 +987,7 @@ def match_workload(target, mlir_module) -> MatchTrace:
                 work_id,
                 defining_map,
                 value_refs,
+                state=state,
             )
             trace.matches.extend(ms)
 

@@ -12,26 +12,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-import hashlib
-import json
 import math
 from numbers import Integral
 
 import numpy as np
 
+from ..spmw_fingerprint import json_digest
 from .apu_g2_layout import APUG2DotTilePlan
 from .apu_g2_typed_program import APUG2ScalarType
 
 
 def _canonical_digest(value: object) -> str:
-    payload = json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
-    return hashlib.sha256(payload).hexdigest()
+    return json_digest(value, allow_nan=False)
 
 
 def _positive_shape(shape) -> tuple[int, ...]:

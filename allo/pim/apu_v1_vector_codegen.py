@@ -26,9 +26,7 @@ Unknown operations, dtypes wider than one 16-bit lane, layouts without a
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import hashlib
 from itertools import product
-import json
 import math
 import re
 from types import MappingProxyType
@@ -2324,39 +2322,6 @@ class APUVectorRealization:
             return None
         object.__setattr__(self, "_runtime_artifact", artifact)
         return artifact
-
-    @property
-    def promotion_materialization_fingerprint(self) -> str | None:
-        artifact = self.runtime_artifact
-        if artifact is None:
-            return None
-        runtime_source_fingerprint = artifact.promotion_source_fingerprint(self)
-        if runtime_source_fingerprint is None:
-            return None
-        payload = {
-            "kind": "apu-v1-vector-materialization-v2",
-            "plan": self.plan.manifest(),
-            "values": [
-                {
-                    "name": value.name,
-                    "shape": list(value.shape),
-                    "dtype": value.dtype.str,
-                    "intent": value.intent,
-                }
-                for value in self.values
-            ],
-            "runtime_source_fingerprint": runtime_source_fingerprint,
-        }
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-
-    @property
-    def promotion_platform_fingerprint(self):
-        artifact = self.runtime_artifact
-        if artifact is None or artifact.platform_fingerprint is None:
-            return None
-        return artifact.current_platform_fingerprint()
 
     @property
     def binding_map(self) -> dict[str, VRBinding]:

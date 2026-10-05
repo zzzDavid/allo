@@ -29,33 +29,6 @@ from .passes import df_pipeline
 from .backend import AIE_MLIRModule
 
 
-_SPMW_SCOPE_ATTRS = (
-    "spmw.group_id",
-    "spmw.work_id",
-    "spmw.group_shape",
-    "spmw.coalesced_axes",
-    "spmw.group_fingerprint",
-    "spmw.body_fingerprint",
-)
-_SPMW_COPY_ATTRS = _SPMW_SCOPE_ATTRS + ("spmw.abi_value_ids",)
-
-
-def _copy_spmw_scope_attributes(source, destination):
-    present = tuple(name in source.attributes for name in _SPMW_SCOPE_ATTRS)
-    if any(present) and not all(present):
-        raise ValueError("retained matcher scope attributes are incomplete")
-    for name in _SPMW_COPY_ATTRS:
-        if name in source.attributes:
-            destination.attributes[name] = source.attributes[name]
-
-
-def _restamp_spmw_scope_attributes(module):
-    from .ir.builder import _restamp_spmw_scope_contract
-
-    with module.context, Location.unknown():
-        _restamp_spmw_scope_contract(module)
-
-
 def gather(pipes: list):
     """
     Collect all pipe objects from the given list (explicit list or slice) in their original order.
@@ -273,7 +246,6 @@ def move_stream_to_interface(
             new_func.attributes["stypes"] = StringAttr.get(s_type_str)
             if "df.kernel" in func.attributes:
                 new_func.attributes["df.kernel"] = UnitAttr.get()
-            _copy_spmw_scope_attributes(func, new_func)
             if "tag" in func.attributes:
                 new_func.attributes["tag"] = StringAttr.get(
                     func.attributes["tag"].value
@@ -366,7 +338,6 @@ def move_stream_to_interface(
                 new_func.attributes["df.kernel"] = UnitAttr.get()
             if "df.nested_kernel" in func.attributes:
                 new_func.attributes["df.nested_kernel"] = UnitAttr.get()
-            _copy_spmw_scope_attributes(func, new_func)
             if "tag" in func.attributes:
                 new_func.attributes["tag"] = StringAttr.get(
                     func.attributes["tag"].value
@@ -448,7 +419,6 @@ def move_stream_to_interface(
                 old_call.operation.erase()
 
     s.func_args = new_func_args
-    _restamp_spmw_scope_attributes(s.module)
     if with_stream_type:
         if with_extra_info:
             return stream_info, stream_types_dict, extra_stream_info
@@ -560,7 +530,6 @@ def _build_top(s, stream_info, enable_layout=False):
                     call_op.attributes["last"] = UnitAttr.get()
         new_top.attributes["dataflow"] = UnitAttr.get()
     s.top_func = new_top
-    _restamp_spmw_scope_attributes(s.module)
     return s
 
 
@@ -630,7 +599,6 @@ def customize(func, enable_tensor=False, opt_default=False):
 
     if opt_default:
         df_primitive_default(s)
-        _restamp_spmw_scope_attributes(s.module)
 
     return s
 

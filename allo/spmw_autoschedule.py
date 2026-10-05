@@ -14,9 +14,7 @@ its own enumerator under the target name.
 
 from __future__ import annotations
 
-import hashlib
-import json
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .spmw_linear_layout import LinearLayout, materialise_handle
@@ -100,126 +98,6 @@ def _matcher_search_scope(match: MatchedOp) -> tuple:
     if scope.coalesced_axes:
         return (scope.group_id,)
     return (scope.group_id, scope.work_id)
-
-
-@dataclass(frozen=True)
-class MatcherPlacementMaterialization:
-    """Candidate-owned placement, score graph, and frozen executable."""
-
-    placement: Placement
-    execution_graph: Any
-    score_graph_fingerprint: str | None = None
-    executable: Any = None
-
-    @property
-    def promotion_materialization_fingerprint(self) -> str | None:
-        executable_fingerprint = getattr(
-            self.executable,
-            "promotion_materialization_fingerprint",
-            None,
-        )
-        if not executable_fingerprint or not self.score_graph_fingerprint:
-            return None
-        return _matcher_digest(
-            {
-                "kind": "matcher-placement-materialization-v1",
-                "score_graph": self.score_graph_fingerprint,
-                "executable": executable_fingerprint,
-            }
-        )
-
-    @property
-    def promotion_platform_fingerprint(self):
-        return getattr(self.executable, "promotion_platform_fingerprint", None)
-
-
-@dataclass(frozen=True)
-class MatcherProgramMaterialization:
-    """Candidate-owned placements, score graph, and frozen executable."""
-
-    placements: tuple[Placement, ...]
-    execution_graph: Any
-    score_graph_fingerprint: str | None = None
-    executable: Any = None
-
-    @property
-    def promotion_materialization_fingerprint(self) -> str | None:
-        executable_fingerprint = getattr(
-            self.executable,
-            "promotion_materialization_fingerprint",
-            None,
-        )
-        if not executable_fingerprint or not self.score_graph_fingerprint:
-            return None
-        return _matcher_digest(
-            {
-                "kind": "matcher-program-materialization-v1",
-                "score_graph": self.score_graph_fingerprint,
-                "executable": executable_fingerprint,
-            }
-        )
-
-    @property
-    def promotion_platform_fingerprint(self):
-        return getattr(self.executable, "promotion_platform_fingerprint", None)
-
-
-def _matcher_digest(payload: object) -> str:
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
-def _freeze_score_manifest(value: object) -> object:
-    if value is None or type(value) in (bool, int, float, str):
-        return value
-    if type(value) is bytes:
-        return {"bytes": value.hex()}
-    if isinstance(value, dict):
-        return {
-            str(key): _freeze_score_manifest(item)
-            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
-        }
-    if isinstance(value, (tuple, list)):
-        return [_freeze_score_manifest(item) for item in value]
-    if isinstance(value, (set, frozenset)):
-        return sorted(
-            (_freeze_score_manifest(item) for item in value),
-            key=lambda item: json.dumps(item, sort_keys=True),
-        )
-    if is_dataclass(value) and not isinstance(value, type):
-        return {
-            "type": f"{type(value).__module__}.{type(value).__qualname__}",
-            "fields": {
-                item.name: _freeze_score_manifest(getattr(value, item.name))
-                for item in fields(value)
-            },
-        }
-    manifest = getattr(value, "manifest", None)
-    if callable(manifest):
-        return _freeze_score_manifest(manifest())
-    raise TypeError(
-        f"score manifest contains unsupported type {type(value).__name__!r}"
-    )
-
-
-def _score_graph_fingerprint(graph: object) -> str | None:
-    """Fingerprint the exact graph scored by a matcher candidate.
-
-    Test doubles and legacy graph objects that cannot be represented
-    structurally remain searchable but are deliberately non-promotable.
-    """
-
-    try:
-        activities = getattr(graph, "activities")
-        payload = {
-            "name": str(getattr(graph, "name", "")),
-            "metadata": _freeze_score_manifest(getattr(graph, "metadata", {})),
-            "activities": [_freeze_score_manifest(item) for item in activities],
-        }
-    except (AttributeError, TypeError, ValueError):
-        return None
-    return _matcher_digest(payload)
 
 
 @dataclass(frozen=True)
@@ -381,23 +259,16 @@ def _matcher_placement_decision(trace, placement, operand_roles=None):
 
 
 class MatcherScheduledPlacements(list):
-    """List-compatible result carrying shadow whole-program search evidence."""
+    """List-compatible result carrying whole-program search evidence."""
 
     def __init__(
         self,
         placements=(),
         *,
-        schedule_search_result=None,
-        schedule_activation=None,
-        active_materialization=None,
+        placement_ranking=None,
     ):
         super().__init__(placements)
-        self.schedule_search_result = schedule_search_result
-        self.schedule_activation = schedule_activation
-        self.active_materialization = active_materialization
-        self.fallback_reason = (
-            None if schedule_activation is None else schedule_activation.fallback_reason
-        )
+        self.placement_ranking = placement_ranking
 
 
 def _clone_placement_value(value):
@@ -1210,7 +1081,6 @@ def autoschedule(
     *,
     host_moves=(),
     buffer_metrics=None,
-    promotion_gate=None,
 ) -> list[Placement]:
     """Pick one `Placement` per `@allo.work` kernel in `trace`.
 
@@ -1220,6 +1090,7 @@ def autoschedule(
 
     Every candidate is lowered through the same executable cost program used
     by the virtual backend. Target declarations never supply timing data.
+    Selection ranks one decision per kernel (`rank_matcher_placements`).
     """
     target_name = getattr(target, "name", None)
     enumerator = _ENUMERATORS.get(target_name)
@@ -1230,9 +1101,6 @@ def autoschedule(
         )
     if cost is None:
         raise TypeError("autoschedule() requires an executable CostSpec")
-    from .pim.schedule_promotion import validate_schedule_promotion_gate
-
-    promotion_gate = validate_schedule_promotion_gate(promotion_gate)
 
     # The executable cost program is shared by autoscheduling and virtual
     # execution. It interprets each candidate over concrete target handles.
@@ -1254,23 +1122,209 @@ def autoschedule(
     liveness = trace_liveness(trace)
     _liveness_token = set_active_liveness(liveness)
     try:
-        placements = _autoschedule_groups(
+        return rank_matcher_placements(
             target,
-            target_name,
             trace,
             enumerator,
             bound_cost,
-            host_moves,
-            buffer_metrics,
-            liveness,
-            promotion_gate,
+            host_moves=host_moves,
+            buffer_metrics=buffer_metrics,
+            liveness=liveness,
         )
     finally:
         reset_active_liveness(_liveness_token)
-    # Every activation returns the already-finalized candidate materialization.
-    # Workload staging and resident-pair reconciliation happen before scoring
-    # and code emission inside the candidate materializer, never afterward.
-    return placements
+
+
+@dataclass(frozen=True)
+class KernelRanking:
+    """Per-kernel record of the ranked placement selection."""
+
+    group_id: int
+    bucket_count: int
+    fallback: str | None
+    # One ``(position in the kernel choice set, cycles, mode)`` per key, in
+    # rank order. Empty for the per-bucket fallback.
+    scores: tuple[tuple[int, int, str], ...]
+    chosen_position: int | None
+    rejections: tuple[tuple[int, str], ...]
+
+
+@dataclass(frozen=True)
+class PlacementRanking:
+    kernels: tuple[KernelRanking, ...]
+
+
+def _bucket_decision_map(target, trace, enumerator, matches):
+    """Enumerate one bucket; return its sub-trace, candidates, and the
+    first-occurrence ``decision key -> candidate`` map in enumeration order."""
+
+    candidates = enumerator(target, matches)
+    if not candidates:
+        func_name = matches[0].func_name if matches else "<empty>"
+        raise RuntimeError(
+            f"no candidate layouts produced for kernel {func_name!r} "
+            f"on target {getattr(target, 'name', None)!r}"
+        )
+    bucket_trace = MatchTrace(
+        target_name=trace.target_name,
+        module_name=trace.module_name,
+        matches=matches,
+    )
+    roles = _matcher_operand_roles(bucket_trace, candidates)
+    key_map = {}
+    for candidate in candidates:
+        key = _matcher_placement_decision(bucket_trace, candidate, roles)
+        key_map.setdefault(key, candidate)
+    return bucket_trace, candidates, key_map
+
+
+def rank_matcher_placements(
+    target,
+    trace,
+    enumerator,
+    bound_cost,
+    *,
+    host_moves=(),
+    buffer_metrics=None,
+    liveness=None,
+) -> MatcherScheduledPlacements:
+    """Choose one placement decision per `@allo.work` kernel by cost rank.
+
+    The kernel choice set is the decision keys every bucket of the kernel
+    enumerates. Keys are scored over the kernel's stamped placements and
+    ranked by ``(cycles, position)``; the first key whose codegen is feasible
+    wins. Kernels with an empty choice set fall back to each bucket's own
+    stable argmin. Cross-kernel residency is reconciled once afterwards.
+    """
+
+    from . import spmw_plan
+    from .pim.schedule_search import InfeasibleSchedule
+    from .spmw_codegen import _materialize_matcher_codegen, _stamp_host_moves
+
+    buckets = _bucket_for_autoschedule(trace)
+    kernels: dict[int, list[int]] = {}
+    for index, (_scope, matches) in enumerate(buckets):
+        group_id = _matcher_work_scope(matches[0]).group_id
+        kernels.setdefault(group_id, []).append(index)
+
+    chosen: dict[int, Placement] = {}
+    records = []
+
+    def realize(kernel_trace, templates):
+        placements = [_clone_placement(template) for template in templates]
+        for placement in placements:
+            placement.extra = derive_layout_properties(target, placement)
+        _stamp_xkernel(kernel_trace, placements, liveness)
+        if host_moves:
+            _stamp_host_moves(placements, host_moves)
+        return placements
+
+    for group_id, bucket_indices in kernels.items():
+        kernel_trace = MatchTrace(
+            target_name=trace.target_name,
+            module_name=trace.module_name,
+            matches=[
+                match for index in bucket_indices for match in buckets[index][1]
+            ],
+        )
+        infos = [
+            _bucket_decision_map(target, trace, enumerator, buckets[index][1])
+            for index in bucket_indices
+        ]
+        choice_set = [
+            key
+            for key in infos[0][2]
+            if all(key in key_map for _t, _c, key_map in infos[1:])
+        ]
+
+        if not choice_set:
+            templates = []
+            for bucket_trace, candidates, _key_map in infos:
+                best = _per_bucket_argmin_index(
+                    target,
+                    bucket_trace,
+                    candidates,
+                    bound_cost,
+                    host_moves=host_moves,
+                    buffer_metrics=buffer_metrics,
+                )
+                templates.append(candidates[best])
+            placements = realize(kernel_trace, templates)
+            for index, placement in zip(bucket_indices, placements):
+                chosen[index] = placement
+            records.append(
+                KernelRanking(
+                    group_id=group_id,
+                    bucket_count=len(bucket_indices),
+                    fallback="per_bucket",
+                    scores=(),
+                    chosen_position=None,
+                    rejections=(),
+                )
+            )
+            continue
+
+        scored = []
+        realized = {}
+        for position, key in enumerate(choice_set):
+            placements = realize(
+                kernel_trace, [key_map[key] for _t, _c, key_map in infos]
+            )
+            graph = spmw_plan.build_execution_graph(
+                target,
+                kernel_trace,
+                placements[0] if len(placements) == 1 else placements,
+                bound_cost,
+                host_moves=host_moves,
+                buffer_metrics=buffer_metrics,
+            )
+            cycles = int(bound_cost.evaluate(graph).cycles)
+            scored.append((cycles, position))
+            realized[position] = placements
+        scored.sort()
+
+        rejections = []
+        winner = None
+        for cycles, position in scored:
+            try:
+                _materialize_matcher_codegen(
+                    target,
+                    kernel_trace,
+                    realized[position],
+                    host_moves=host_moves,
+                )
+            except InfeasibleSchedule as error:
+                rejections.append((position, str(error)))
+                continue
+            winner = position
+            break
+        if winner is None:
+            raise RuntimeError(
+                f"no feasible placement for kernel group {group_id} on target "
+                f"{getattr(target, 'name', None)!r}; rejections: {rejections}"
+            )
+        for index, placement in zip(bucket_indices, realized[winner]):
+            chosen[index] = placement
+        records.append(
+            KernelRanking(
+                group_id=group_id,
+                bucket_count=len(bucket_indices),
+                fallback=None,
+                scores=tuple(
+                    (position, cycles, infos[0][2][choice_set[position]].mode)
+                    for cycles, position in scored
+                ),
+                chosen_position=winner,
+                rejections=tuple(rejections),
+            )
+        )
+
+    placements = [chosen[index] for index in range(len(buckets))]
+    _reconcile_resident_pairs(trace, placements, liveness)
+    return MatcherScheduledPlacements(
+        placements,
+        placement_ranking=PlacementRanking(tuple(records)),
+    )
 
 
 def _stamp_xkernel(trace, placements, liveness) -> None:
@@ -1297,101 +1351,7 @@ def _stamp_xkernel(trace, placements, liveness) -> None:
             pl.extra = new_extra
 
 
-def _autoschedule_groups(
-    target,
-    target_name,
-    trace,
-    enumerator,
-    bound_cost,
-    host_moves,
-    buffer_metrics,
-    liveness,
-    promotion_gate,
-) -> "list[Placement]":
-    """Retain explicit legacy incumbents and rank independent challengers."""
-    from .pim.schedule_search import guarded_schedule_activation
-
-    buckets = tuple(_bucket_for_autoschedule(trace))
-    candidate_groups = []
-    incumbent_indices = []
-    legacy_results = []
-    for func_name, matches in buckets:
-        candidates = enumerator(target, matches)
-        if not candidates:
-            raise RuntimeError(
-                f"no candidate layouts produced for kernel {func_name!r} "
-                f"on target {target_name!r}"
-            )
-        sub_trace = MatchTrace(
-            target_name=trace.target_name,
-            module_name=trace.module_name,
-            matches=matches,
-        )
-
-        # Freeze the exact public scheduler incumbent before the new shared
-        # search ranks anything. This is the former stable `(cycles, index)`
-        # argmin, kept as an independent lifecycle input rather than declaring
-        # the new recommendation to be its own incumbent.
-        incumbent_index = _legacy_autoschedule_group_index(
-            target,
-            sub_trace,
-            candidates,
-            bound_cost,
-            host_moves=host_moves,
-            buffer_metrics=buffer_metrics,
-        )
-
-        result = _search_autoschedule_group(
-            target,
-            sub_trace,
-            candidates,
-            bound_cost,
-            host_moves=host_moves,
-            buffer_metrics=buffer_metrics,
-            incumbent_index=incumbent_index,
-            liveness=liveness if len(buckets) == 1 else None,
-        )
-        candidate_groups.append(tuple(candidates))
-        incumbent_indices.append(incumbent_index)
-        legacy_results.append(result)
-
-    if len(candidate_groups) == 1:
-        activation = guarded_schedule_activation(
-            legacy_results[0],
-            promotion_gate=promotion_gate,
-        )
-        materialized = activation.active.materialized
-        return MatcherScheduledPlacements(
-            (_clone_placement(materialized.placement),),
-            schedule_search_result=legacy_results[0],
-            schedule_activation=activation,
-            active_materialization=materialized,
-        )
-
-    joint_result = _search_autoschedule_program(
-        target,
-        trace,
-        candidate_groups,
-        bound_cost,
-        liveness=liveness,
-        host_moves=host_moves,
-        buffer_metrics=buffer_metrics,
-        incumbent_indices=incumbent_indices,
-    )
-    activation = guarded_schedule_activation(
-        joint_result,
-        promotion_gate=promotion_gate,
-    )
-    materialized = activation.active.materialized
-    return MatcherScheduledPlacements(
-        (_clone_placement(item) for item in materialized.placements),
-        schedule_search_result=joint_result,
-        schedule_activation=activation,
-        active_materialization=materialized,
-    )
-
-
-def _legacy_autoschedule_group_index(
+def _per_bucket_argmin_index(
     target,
     trace,
     candidates,
@@ -1417,224 +1377,6 @@ def _legacy_autoschedule_group_index(
         scored.append((bound_cost.evaluate(graph).cycles, index))
     scored.sort()
     return int(scored[0][1])
-
-
-def _search_autoschedule_group(
-    target,
-    trace,
-    candidates,
-    bound_cost,
-    *,
-    host_moves=(),
-    buffer_metrics=None,
-    incumbent_index=None,
-    liveness=None,
-):
-    """Run one matcher bucket through the shared schedule-search lifecycle."""
-
-    from .pim.schedule_search import (
-        DecisionDomain,
-        ScheduleObjectiveDomain,
-        grid_search,
-    )
-    from .spmw_codegen import _materialize_matcher_codegen, _stamp_host_moves
-    from .spmw_plan import build_execution_graph
-
-    candidates = tuple(candidates)
-    if not candidates:
-        raise ValueError("matcher schedule search requires at least one candidate")
-    if incumbent_index is not None and not 0 <= int(incumbent_index) < len(candidates):
-        raise ValueError("incumbent_index is outside the candidate domain")
-    operand_roles = _matcher_operand_roles(trace, candidates)
-    choice_to_candidate = {}
-    for candidate in candidates:
-        choice = _matcher_placement_decision(trace, candidate, operand_roles)
-        choice_to_candidate.setdefault(choice, candidate)
-    choices = tuple(choice_to_candidate)
-
-    def materialize(template):
-        placement = _clone_placement(template)
-        placement.extra = derive_layout_properties(target, placement)
-        _stamp_xkernel(trace, [placement], liveness)
-        _reconcile_resident_pairs(trace, [placement], liveness)
-        if host_moves:
-            _stamp_host_moves(placement, host_moves)
-        executable = _materialize_matcher_codegen(
-            target,
-            trace,
-            [placement],
-            host_moves=host_moves,
-        )
-        graph = build_execution_graph(
-            target,
-            trace,
-            placement,
-            bound_cost,
-            host_moves=host_moves,
-            buffer_metrics=buffer_metrics,
-        )
-        return MatcherPlacementMaterialization(
-            placement,
-            graph,
-            _score_graph_fingerprint(graph),
-            executable,
-        )
-
-    return grid_search(
-        (DecisionDomain("placement", choices),),
-        build=lambda decisions: choice_to_candidate[decisions["placement"]],
-        materialize=materialize,
-        score=lambda realized: bound_cost.evaluate(realized.execution_graph),
-        objective=lambda estimate: int(estimate.cycles),
-        objective_domain=ScheduleObjectiveDomain.fingerprinted_target(
-            metric="cycles",
-            target=getattr(target, "name", ""),
-            model_fingerprint=bound_cost.fingerprint,
-            fidelity="analytical",
-            scope="region",
-            unit="cycles",
-            direction="minimize",
-        ),
-        incumbent=(
-            None
-            if incumbent_index is None
-            else {
-                "placement": _matcher_placement_decision(
-                    trace,
-                    candidates[int(incumbent_index)],
-                    operand_roles,
-                )
-            }
-        ),
-    )
-
-
-def _search_autoschedule_program(
-    target,
-    trace,
-    candidate_groups,
-    bound_cost,
-    *,
-    liveness=None,
-    host_moves=(),
-    buffer_metrics=None,
-    incumbent_indices=None,
-    max_complete_assignments=256,
-):
-    """Score one immutable placement tuple over the completed trace graph.
-
-    Multi-group winners remain shadow-only: callers activate the explicit
-    legacy per-group incumbent until executable equivalence or hardware
-    non-regression promotes a joint challenger.
-    """
-
-    from .pim.schedule_search import (
-        DecisionDomain,
-        ScheduleObjectiveDomain,
-        grid_search,
-    )
-    from .spmw_codegen import _materialize_matcher_codegen, _stamp_host_moves
-    from .spmw_plan import build_execution_graph
-
-    candidate_groups = tuple(tuple(group) for group in candidate_groups)
-    if not candidate_groups or any(not group for group in candidate_groups):
-        raise ValueError("matcher program search requires nonempty candidate groups")
-    buckets = tuple(_bucket_for_autoschedule(trace))
-    if len(buckets) != len(candidate_groups):
-        raise ValueError("matcher candidate groups do not align with trace buckets")
-    group_traces = tuple(
-        MatchTrace(
-            target_name=trace.target_name,
-            module_name=trace.module_name,
-            matches=matches,
-        )
-        for _function, matches in buckets
-    )
-    choice_maps = []
-    for group_trace, group in zip(group_traces, candidate_groups):
-        operand_roles = _matcher_operand_roles(group_trace, group)
-        choices = {}
-        for candidate in group:
-            choice = _matcher_placement_decision(group_trace, candidate, operand_roles)
-            choices.setdefault(choice, candidate)
-        choice_maps.append(choices)
-    choice_maps = tuple(choice_maps)
-    domains = tuple(
-        DecisionDomain(f"group_{index}_placement", tuple(choices))
-        for index, choices in enumerate(choice_maps)
-    )
-    incumbent = None
-    if incumbent_indices is not None:
-        incumbent_indices = tuple(int(value) for value in incumbent_indices)
-        if len(incumbent_indices) != len(candidate_groups):
-            raise ValueError("incumbent indices must align with candidate groups")
-        if any(
-            not 0 <= value < len(candidate_groups[index])
-            for index, value in enumerate(incumbent_indices)
-        ):
-            raise ValueError("an incumbent index is outside its candidate domain")
-        incumbent = {
-            f"group_{index}_placement": _matcher_placement_decision(
-                group_traces[index],
-                candidate_groups[index][value],
-                _matcher_operand_roles(group_traces[index], candidate_groups[index]),
-            )
-            for index, value in enumerate(incumbent_indices)
-        }
-
-    def build(decisions):
-        return tuple(
-            choice_maps[index][decisions[f"group_{index}_placement"]]
-            for index in range(len(choice_maps))
-        )
-
-    def materialize(templates):
-        placements = [_clone_placement(template) for template in templates]
-        for placement in placements:
-            placement.extra = derive_layout_properties(target, placement)
-        _stamp_xkernel(trace, placements, liveness)
-        _reconcile_resident_pairs(trace, placements, liveness)
-        if host_moves:
-            _stamp_host_moves(placements, host_moves)
-        executable = _materialize_matcher_codegen(
-            target,
-            trace,
-            placements,
-            host_moves=host_moves,
-        )
-        graph = build_execution_graph(
-            target,
-            trace,
-            placements,
-            bound_cost,
-            host_moves=host_moves,
-            buffer_metrics=buffer_metrics,
-        )
-        return MatcherProgramMaterialization(
-            tuple(placements),
-            graph,
-            _score_graph_fingerprint(graph),
-            executable,
-        )
-
-    return grid_search(
-        domains,
-        build=build,
-        materialize=materialize,
-        score=lambda realized: bound_cost.evaluate(realized.execution_graph),
-        objective=lambda estimate: int(estimate.cycles),
-        objective_domain=ScheduleObjectiveDomain.fingerprinted_target(
-            metric="cycles",
-            target=getattr(target, "name", ""),
-            model_fingerprint=bound_cost.fingerprint,
-            fidelity="analytical",
-            scope="whole_program",
-            unit="cycles",
-            direction="minimize",
-        ),
-        incumbent=incumbent,
-        max_complete_assignments=max_complete_assignments,
-    )
 
 
 def _reconcile_resident_pairs(trace, placements, liveness) -> None:

@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import allo
 from allo.pim import targets as T
-from allo.spmw_codegen import SamsungCtx, ResolvedHostMove
+from allo.spmw_codegen import ResolvedHostMove
+from allo.spmw_samsung import SamsungCtx
 from allo.spmw_target import HostMoveRecord, broadcast, scatter, gather, move_only
 
 
