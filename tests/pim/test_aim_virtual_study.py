@@ -6,6 +6,7 @@ from collections import Counter
 import pytest
 
 import allo
+from allo.pim.costs import aim_cost
 from allo.pim.targets import build_aim_target
 from benchmarks.cent_aim.workloads import build_case
 
@@ -23,6 +24,8 @@ def test_aim_geometry_variant_opcode_counts(rows, cols, entries, mac, wr_gb, lin
     banks.geometry["rows"] = banks.rows = rows
     banks.geometry["cols"] = banks.cols = cols
     gb.geometry["entries"] = entries
-    trace = str(allo.compile(build_case("ffn_fc_l128"), target).trace).splitlines()
+    case = build_case("ffn_fc_l128")
+    compiled = allo.compile(case.region, target, aim_cost, host_moves=case.host_program)
+    trace = [str(line) for line in compiled.compiled.cmds]
     ops = Counter(line.split()[1] for line in trace if len(line.split()) > 1)
     assert (ops["MAC_ABK"], ops["WR_GB"], len(trace)) == (mac, wr_gb, lines)

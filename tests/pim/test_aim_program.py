@@ -1,14 +1,12 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Typed SK hynix AiM whole-program lowering tests."""
+"""SK hynix AiM lowering tests: AimOp records through ``_AimLowerer``."""
 
-import json
+from types import SimpleNamespace
 
 import pytest
 
-import allo
-from allo.pim import aim_program as aim_program_module
-from allo.pim.aim_program import (
+from allo.pim.aim_lowering import (
     AimActivation,
     AimAllBankWrite,
     AimBankCopy,
@@ -16,20 +14,31 @@ from allo.pim.aim_program import (
     AimDistributedHostTransfer,
     AimElementwise,
     AimHostTransfer,
-    AimProgram,
-    AimProgramCallable,
     AimSync,
-    compile_aim_program,
+    _AimLowerer,
 )
 from allo.pim.targets import build_aim_target
-from allo.spmw_codegen import RunResult
+from allo.spmw_aim import _aim_runtime_segments
 
 
-def _compile(*operations, name="test"):
-    return compile_aim_program(
-        AimProgram(operations, name=name),
-        build_aim_target(),
+def _lower(operations, target=None):
+    lowerer = _AimLowerer(target or build_aim_target())
+    for index, operation in enumerate(operations):
+        lowerer.lower(operation, index)
+    lowerer.commands.append("AiM EOC")
+    commands = tuple(lowerer.commands)
+    return SimpleNamespace(
+        commands=commands,
+        trace="\n".join(commands) + "\n",
+        manifest={
+            "operations": lowerer.operations,
+            "trace": {"eoc_count": commands.count("AiM EOC")},
+        },
     )
+
+
+def _compile(*operations):
+    return _lower(operations)
 
 
 def _physical_contraction_work(commands):
@@ -216,7 +225,7 @@ def test_row_packed_batches_match_canonical_score_layout_and_scoped_reuse():
         lowering["physical_wr_gb_elements"],
     )
     assert lowering["physical_mac_slots"] == lowering["logical_scalar_macs"]
-    assert compiled.compiled.runtime_segments[0][1] == 1
+    assert _aim_runtime_segments(compiled.commands)[0][1] == 1
 
 
 def test_row_packed_batches_derive_batch_and_output_tails_without_overcompute_channels():
@@ -512,13 +521,9 @@ def test_reuse_groups_are_target_derived_balanced_and_activation_aware():
     # reuse window, so the generic balanced schedule uses 29/29/28.  Activation
     # budgets two entries per live launch and therefore uses 15x5 plus 11.
     outputs = 86 * 32 * 16
-    plain = compile_aim_program(
-        AimProgram([AimContraction(outputs=outputs, reduction=16)]),
-        target,
-    )
-    activated = compile_aim_program(
-        AimProgram([AimContraction(outputs=outputs, reduction=16, activation=True)]),
-        target,
+    plain = _lower([AimContraction(outputs=outputs, reduction=16)], target)
+    activated = _lower(
+        [AimContraction(outputs=outputs, reduction=16, activation=True)], target
     )
 
     plain_lowering = plain.manifest["operations"][0]
@@ -852,26 +857,3 @@ def test_negative_channel_indices_fail_before_mask_encoding():
     with pytest.raises(ValueError, match="channel indices must be nonnegative"):
         AimContraction(outputs=16, reduction=16, channels=(-1,))
 
-
-def test_public_compile_returns_inspectable_no_argument_runner(monkeypatch):
-    compiled = allo.compile(
-        AimProgram([AimSync()], name="public_dispatch"),
-        build_aim_target(),
-    )
-    assert isinstance(compiled, AimProgramCallable)
-    assert compiled.commands == ("AiM SYNC", "AiM EOC")
-    assert compiled.manifest["name"] == "public_dispatch"
-    assert compiled.manifest["trace"]["command_count"] == 2
-    assert json.loads(json.dumps(compiled.manifest))["name"] == "public_dispatch"
-
-    seen = {}
-
-    def fake_run(materialization, **_inputs):
-        seen["commands"] = materialization.commands
-        return RunResult(123, "measured", "aim")
-
-    monkeypatch.setattr(aim_program_module, "_run_aim", fake_run)
-    result = compiled()
-    assert result.cycles == 123
-    assert compiled.last_result is result
-    assert seen["commands"] == compiled.commands

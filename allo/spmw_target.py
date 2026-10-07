@@ -258,6 +258,11 @@ class Op:
         emit=None,
         capacity=1,
         matchable=True,
+        vector_width=1,
+        const_params=(),
+        guarded=False,
+        dst_index="affine",
+        iv_params=(),
     ):
         self.owner = owner
         self.name = name
@@ -270,6 +275,44 @@ class Op:
         self.matchable = bool(matchable)
         if self.capacity <= 0:
             raise ValueError("operation capacity must be positive")
+        if (
+            not isinstance(vector_width, int)
+            or isinstance(vector_width, bool)
+            or vector_width <= 0
+        ):
+            raise ValueError("operation vector_width must be a positive integer")
+        self.vector_width = vector_width
+        if isinstance(const_params, str):
+            raise ValueError("operation const_params must be a sequence of names")
+        self.const_params = tuple(const_params)
+        if self.const_params:
+            import inspect
+
+            fn_params = set(inspect.signature(fn).parameters)
+            unknown = [p for p in self.const_params if p not in fn_params]
+            if unknown:
+                raise ValueError(
+                    f"operation {name!r} const_params {unknown} are not parameters of fn"
+                )
+        # Spec 004 M5: only an op that opts in may match a store under an
+        # `if`; M6: "any" admits computed destination indices; M7: listed
+        # parameters bind enclosing loop variables.
+        self.guarded = bool(guarded)
+        if dst_index not in ("affine", "any"):
+            raise ValueError("operation dst_index must be 'affine' or 'any'")
+        self.dst_index = dst_index
+        if isinstance(iv_params, str):
+            raise ValueError("operation iv_params must be a sequence of names")
+        self.iv_params = tuple(iv_params)
+        if self.iv_params:
+            import inspect
+
+            fn_params = set(inspect.signature(fn).parameters)
+            unknown = [p for p in self.iv_params if p not in fn_params]
+            if unknown:
+                raise ValueError(
+                    f"operation {name!r} iv_params {unknown} are not parameters of fn"
+                )
 
     def __repr__(self):
         return f"Op({self.name!r}, accumulates={self.accumulates})"
@@ -674,6 +717,11 @@ def op(
     emit=None,
     capacity=1,
     matchable=True,
+    vector_width=1,
+    const_params=(),
+    guarded=False,
+    dst_index="affine",
+    iv_params=(),
 ):
     """Attach an Op to the current unit; return the handle."""
     if not _target_stack:
@@ -691,6 +739,11 @@ def op(
         emit=emit,
         capacity=capacity,
         matchable=matchable,
+        vector_width=vector_width,
+        const_params=const_params,
+        guarded=guarded,
+        dst_index=dst_index,
+        iv_params=iv_params,
     )
     cur.ops[name] = o
     return o
@@ -927,19 +980,56 @@ class BufferToken:
     buffer (data) side of a move, not the device endpoint.
     """
 
-    __slots__ = ("name",)
+    __slots__ = ("name", "base", "index")
 
-    def __init__(self, name):
+    def __init__(self, name, *, base=None, index=None):
         self.name = name
+        # `base` is the workload parameter the token addresses; `index` is the
+        # normalized tuple index of a sliced reference (None when unindexed).
+        self.base = name if base is None else base
+        self.index = index
 
     def __getitem__(self, idx):
         # A batched/sliced operand reference, e.g. `X[b]` in a batch loop ->
         # `BufferToken("X[b]")`. Keeps identity addressing while letting a host
-        # program iterate over a batch dimension.
-        return BufferToken(f"{self.name}[{idx}]")
+        # program iterate over a batch dimension. Integer tuples and slices
+        # (`k_cache[:, 127, :]`, `a[0:4096]`) carry a normalized `index`;
+        # their `name` is the canonical text of that index.
+        if isinstance(idx, (tuple, slice)):
+            items = idx if isinstance(idx, tuple) else (idx,)
+            index = tuple(_normalize_token_index(item) for item in items)
+            text = ", ".join(_token_index_text(item) for item in index)
+            return BufferToken(f"{self.base}[{text}]", base=self.base, index=index)
+        return BufferToken(f"{self.name}[{idx}]", base=self.base)
 
     def __repr__(self):
         return f"BufferToken({self.name!r})"
+
+
+def _normalize_token_index(item):
+    """An int, a full slice ``None``, or a bounded ``(start, stop)`` pair."""
+    if isinstance(item, bool):
+        raise TypeError("buffer token index cannot be a bool")
+    if isinstance(item, int):
+        return item
+    if isinstance(item, slice):
+        if item.step not in (None, 1):
+            raise ValueError("buffer token slices cannot carry a step")
+        if item.start is None and item.stop is None:
+            return None
+        start = 0 if item.start is None else item.start
+        if not isinstance(start, int) or not isinstance(item.stop, int):
+            raise ValueError("buffer token slices must be full or int-bounded")
+        return (start, item.stop)
+    raise TypeError(f"unsupported buffer token index {item!r}")
+
+
+def _token_index_text(item):
+    if item is None:
+        return ":"
+    if isinstance(item, tuple):
+        return f"{item[0]}:{item[1]}"
+    return str(item)
 
 
 class LaunchRecord:
@@ -987,9 +1077,9 @@ class HostProgram:
     host` works.
     """
 
-    __slots__ = ("region", "moves", "launches", "steps")
+    __slots__ = ("region", "moves", "launches", "steps", "subset", "resident")
 
-    def __init__(self, region, fn):
+    def __init__(self, region, fn, *, subset=False, resident=()):
         import inspect
 
         params = list(inspect.signature(fn).parameters)
@@ -1024,6 +1114,12 @@ class HostProgram:
         self.moves = moves
         self.launches = launches
         self.steps = steps
+        # `subset`: the program may leave matched kernels unlaunched.
+        # `resident`: buffers loaded before the measured region.
+        self.subset = bool(subset)
+        self.resident = frozenset(
+            getattr(item, "base", item) for item in (resident or ())
+        )
 
     def __iter__(self):
         return iter(self.moves)
@@ -1032,7 +1128,7 @@ class HostProgram:
         return len(self.moves)
 
 
-def host_program(region):
+def host_program(region, *, subset=False, resident=()):
     """Decorator: declare a host program (host-xcel driver) for `region`.
 
     Usage::
@@ -1048,11 +1144,13 @@ def host_program(region):
         HOST_MOVES = host.moves
 
     `host` is run once here to record; `host.moves` threads into
-    `compile_for_target(host_moves=...)`.
+    `compile_for_target(host_moves=...)`. With ``subset=True`` the program may
+    leave some of the region's kernels unlaunched; ``resident`` names buffers
+    already on the device before the program runs.
     """
 
     def deco(fn):
-        return HostProgram(region, fn)
+        return HostProgram(region, fn, subset=subset, resident=resident)
 
     return deco
 

@@ -130,6 +130,18 @@ _MATCHER_PHYSICAL_EXTRA_FIELDS = (
     "residency_pairs",
     "tile",
     "double_buffer",
+    "bank_scope",
+    "batch_mapping",
+    "reuse_group",
+    "replica_partitions",
+    "data_layout",
+    "tasklets",
+    "dma_bytes",
+    "chunk",
+    "wram_residency",
+    "nc",
+    "kc",
+    "predicate_lowering",
 )
 
 
@@ -308,6 +320,14 @@ def derive_layout_properties(target, placement: Placement) -> dict[str, Any]:
     if not isinstance(layout, LinearLayout):
         return properties
     target_name = getattr(target, "name", None)
+    if target_name == "upmem" and "upmem_family" in properties:
+        from .spmw_upmem import upmem_kernel_features
+
+        properties.update(
+            tasklet_fanout=int(properties["tasklets"]),
+            tasklet_mapping=True,
+            upmem_features=upmem_kernel_features(properties),
+        )
     if (
         target_name == "aim"
         and {
@@ -667,15 +687,21 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
     either the bank-scoped ``MAC`` or channel-scoped ``MAC_ABK`` primitive;
     both accumulate into the physical MAC register file.
     """
-    role_to_memref = _trace_memrefs_by_role(matches)
-    x_mref = role_to_memref.get("x")
-    y_mref = role_to_memref.get("y")
+    from .pim.aim_lowering import mac_operands
+
+    mac_matches = [match for match in matches if match.target_op_name == "MAC"]
+    # AF also binds an ``x`` role; only MAC roles name the contraction operands.
+    role_to_memref = _trace_memrefs_by_role(mac_matches or matches)
     acc_mref = role_to_memref.get("acc")
-    if x_mref is None or y_mref is None or acc_mref is None:
+    if not mac_matches or acc_mref is None:
         raise NotImplementedError(
             "aim enumerator: trace is missing one of x/y/acc roles; "
             f"got {sorted(role_to_memref)}"
         )
+    matrix, vector = mac_operands(mac_matches[0])
+    x_mref = matrix.memref_name
+    y_mref = vector.memref_name
+    input_source = "banks" if x_mref == y_mref else "gb"
 
     # Device grouping nodes are transparent to work coordinates, so the
     # spatial levels are channel=0, bank_group=1, bank=2.
@@ -742,20 +768,24 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
         handle_table={"bank": banks},
     )
 
+    def operand_placements(matrix_handle):
+        # A bank-pair MAC reads both inputs from banks; the dict keeps one
+        # entry per memref, so the shared memref must map to the bank handle.
+        if input_source == "banks":
+            return {x_mref: matrix_handle, acc_mref: mac_reg}
+        return {x_mref: matrix_handle, y_mref: gb, acc_mref: mac_reg}
+
     layouts: list[Placement] = []
     # Candidate 1: per-bank MAC (no_bank_layout -- y stays in its bank).
     layouts.append(
         Placement(
-            placements={
-                x_mref: bank_handle,
-                y_mref: gb,
-                acc_mref: mac_reg,
-            },
+            placements=operand_placements(bank_handle),
             mode="single_bank",
             extra={
                 "operation_name": "MAC" if single_fanout == 1 else "MAC_ABK",
                 "bank_fanout": single_fanout,
                 "bank_conflicts": single_conflicts,
+                "input_source": input_source,
             },
             layout=single_bank_layout,
         )
@@ -763,16 +793,13 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
     # Candidate 2: all-bank-broadcast MAC (all_bank_layout -- y rides gb).
     layouts.append(
         Placement(
-            placements={
-                x_mref: banks,
-                y_mref: gb,
-                acc_mref: mac_reg,
-            },
+            placements=operand_placements(banks),
             mode="all_bank",
             extra={
                 "operation_name": "MAC" if all_fanout == 1 else "MAC_ABK",
                 "bank_fanout": all_fanout,
                 "bank_conflicts": all_conflicts,
+                "input_source": input_source,
             },
             layout=all_bank_layout,
         )
@@ -780,30 +807,82 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
     return layouts
 
 
+def _aim_contraction_shape(target, matches: list[MatchedOp]) -> dict:
+    """Shape of the bucket's first MAC match, as the knobs and cost see it."""
+    import math
+
+    from .pim.aim_lowering import contraction_shape, group_replication
+
+    mac = next(match for match in matches if match.target_op_name == "MAC")
+    channels = math.prod(int(v) for v in target.unit("channel").axes.values())
+    replicated, buckets = group_replication(mac)
+    shape = contraction_shape(
+        mac,
+        replicated=replicated,
+        replicas=buckets if replicated else 1,
+        channels=channels,
+    )
+    acc = next(op for op in mac.operands if op.role == "acc")
+    shape["activation"] = any(
+        other.target_op_name == "AF"
+        and other.func_name == mac.func_name
+        and any(
+            op.role == "x" and op.memref_name == acc.memref_name
+            for op in other.operands
+        )
+        for other in matches
+    )
+    return shape
+
+
+def _aim_elementwise_base(target, matches: list[MatchedOp], name: str) -> Placement:
+    """The single base placement of an AiM MUL (banks) or ADD (gpr) kernel."""
+    home = target.banks if name == "MUL" else target.gpr
+    placements = {}
+    for match in matches:
+        for operand in match.operands:
+            if operand.memref_name is not None:
+                placements.setdefault(operand.memref_name, home)
+        if match.result_memref_name is not None:
+            placements.setdefault(match.result_memref_name, home)
+    return Placement(
+        placements=placements,
+        mode="elementwise",
+        extra={"operation_name": name},
+    )
+
+
 @register_enumerator("aim")
 def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
-    """Return only AiM layouts the current whole-program emitter realizes.
+    """Return AiM placements crossed with the registered AiM knobs.
 
-    ``AimCtx.emit_gemv`` emits one channel-scoped native ``MAC_ABK`` segment.
-    The bank-scoped layout remains available through
-    :func:`_aim_layout_candidates` for structural and cost tests, but it must
-    not compete in autoscheduling until whole-program SBK emission consumes
-    the selected bank coordinates.  Keeping a scored SBK candidate here would
-    select one program and emit a different one.
+    MAC kernels start from the SBK and ABK layouts; ``AimCtx.emit_program``
+    realizes either one (a bank fanout of 1 expands each lowered ``MAC_ABK``
+    into per-bank ``MAC_SBK`` lines taken from the LinearLayout). MUL and ADD
+    kernels have one base placement each.
     """
+    from .spmw_knobs import cross_with_knobs
 
-    candidates = _aim_layout_candidates(target, matches)
-    materializable = [
-        candidate
-        for candidate in candidates
-        if candidate.extra.get("operation_name") == "MAC_ABK"
-    ]
-    if len(materializable) != 1:
-        raise RuntimeError(
-            "AiM native whole-program lowering requires exactly one "
-            "materializable MAC_ABK layout"
+    names = {match.target_op_name for match in matches}
+    if "MAC" in names:
+        shape = _aim_contraction_shape(target, matches)
+        bases = []
+        for candidate in _aim_layout_candidates(target, matches):
+            candidate.extra["aim_shape"] = dict(shape)
+            bases.append(candidate)
+        role_to_memref = _trace_memrefs_by_role(
+            [match for match in matches if match.target_op_name == "MAC"]
         )
-    return materializable
+    elif "MUL" in names or "ADD" in names:
+        name = "MUL" if "MUL" in names else "ADD"
+        bases = [_aim_elementwise_base(target, matches, name)]
+        role_to_memref = {}
+    else:
+        raise NotImplementedError(
+            "aim enumerator: kernel has no MAC, MUL or ADD match; "
+            f"got {sorted(names)}"
+        )
+    return cross_with_knobs(target, bases, matches, role_to_memref)
 
 
 def _trace_reduction_trip(matches: list[MatchedOp]) -> int | None:
@@ -918,6 +997,27 @@ def _bank_out_size(target) -> int | None:
         return None
     n = getattr(banks, "banks", None)
     return int(n) if n else None
+
+
+@register_enumerator("upmem")
+def _upmem_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
+    """UPMEM physical decisions as base layouts crossed with the six knobs.
+
+    Each base placement is one data layout of the matched kernel family; the
+    knobs fan out only legal decisions of the family domain, and the last one
+    attaches the plan's masked 12-of-16 tasklet layout (spec 003 U5).
+    """
+    from .spmw_knobs import cross_with_knobs
+    from .spmw_upmem import upmem_base_placements
+
+    # UPMEM knobs never read roles; a scaled GEMV binds role "x" to both the
+    # matrix (MAC) and the accumulator (SCALE), which the role map rejects.
+    return cross_with_knobs(
+        target,
+        upmem_base_placements(target, matches),
+        matches,
+        {},
+    )
 
 
 @register_enumerator("apu_v1")
@@ -1143,6 +1243,21 @@ def _bucket_decision_map(target, trace, enumerator, matches):
     return bucket_trace, candidates, key_map
 
 
+def _stamp_group_replication(matches: list[MatchedOp]) -> None:
+    """Record whether a kernel group's buckets are replicas of one body.
+
+    Enumerators see one bucket; this whole-group fact lets them size
+    per-replica problems. Needs every match's retained body fingerprint and
+    stamps nothing otherwise.
+    """
+    fingerprints = [match.extra.get("spmw_body_fingerprint") for match in matches]
+    if not fingerprints or None in fingerprints:
+        return
+    replicated = len(set(fingerprints)) == 1
+    for match in matches:
+        match.extra["spmw_group_replicated"] = replicated
+
+
 def rank_matcher_placements(
     target,
     trace,
@@ -1192,6 +1307,7 @@ def rank_matcher_placements(
                 match for index in bucket_indices for match in buckets[index][1]
             ],
         )
+        _stamp_group_replication(kernel_trace.matches)
         infos = [
             _bucket_decision_map(target, trace, enumerator, buckets[index][1])
             for index in bucket_indices
@@ -1231,24 +1347,30 @@ def rank_matcher_placements(
 
         scored = []
         realized = {}
+        rejections = []
         for position, key in enumerate(choice_set):
             placements = realize(
                 kernel_trace, [key_map[key] for _t, _c, key_map in infos]
             )
-            graph = spmw_plan.build_execution_graph(
-                target,
-                kernel_trace,
-                placements[0] if len(placements) == 1 else placements,
-                bound_cost,
-                host_moves=host_moves,
-                buffer_metrics=buffer_metrics,
-            )
-            cycles = int(bound_cost.evaluate(graph).cycles)
+            # A cost rule may find a knob combination unrealizable; it is
+            # dropped like a codegen-probe rejection (spec 001 D1 rule 2).
+            try:
+                graph = spmw_plan.build_execution_graph(
+                    target,
+                    kernel_trace,
+                    placements[0] if len(placements) == 1 else placements,
+                    bound_cost,
+                    host_moves=host_moves,
+                    buffer_metrics=buffer_metrics,
+                )
+                cycles = int(bound_cost.evaluate(graph).cycles)
+            except InfeasibleSchedule as error:
+                rejections.append((position, str(error)))
+                continue
             scored.append((cycles, position))
             realized[position] = placements
         scored.sort()
 
-        rejections = []
         winner = None
         for cycles, position in scored:
             try:

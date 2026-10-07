@@ -36,6 +36,7 @@ from .spmw_simenv import (
     apu_v1_unavailable_reason as _apu_v1_unavailable_reason,
     docker_image_unavailable_reason as _docker_image_unavailable_reason,
     samsung_unavailable_reason as _samsung_unavailable_reason,
+    upmem_unavailable_reason as _upmem_unavailable_reason,
 )
 from .spmw_target import SymExpr, UnitId
 
@@ -276,6 +277,38 @@ class CodegenContext:
         inner-K JUMP that folds the reduction loop (spec 009 §E rule 4).
         """
         return None
+
+    # ------------------------------------------------------------------ #
+    # Program-lowering hooks (matcher-path-shared-infra D1).
+    # ------------------------------------------------------------------ #
+
+    def emit_program(
+        self, trace, layouts, *, schedule=None, host_moves=(), module=None
+    ) -> None:
+        """Lower the matched program into this context. Default: per-bucket walk.
+
+        Contract for overrides:
+
+        1. Sub-trace validity. ``rank_matcher_placements`` calls this on one
+           kernel's sub-trace with ``schedule=None, host_moves=(),
+           module=None``. An override must lower or reject such a sub-trace
+           without the whole program, the schedule or the MLIR module, so a
+           whole-program emitter needs a device-only path for feasibility.
+        2. Rejection type. A layout the backend cannot realize raises
+           ``pim.schedule_search.InfeasibleSchedule`` (ranking falls through to
+           the next candidate). An op the backend cannot lower at all raises
+           ``NotImplementedError`` (a compile error, not a ranking outcome).
+        3. Output. Write whatever the backend's ``_run_<backend>`` consumes,
+           ``self.cmds`` or additional ctx state, deterministically for a
+           given input.
+        4. Schedule honoring. When ``schedule`` is not None, issue launches
+           and host transfers in ``schedule.steps`` order.
+        """
+        _walk_buckets(self.target, trace, self, layouts)
+
+    def runtime_route(self, commands) -> tuple[str, tuple]:
+        """(route name, runtime segments) recorded in the matcher runtime ABI."""
+        return "unsupported-exact-matcher-runtime", ()
 
 
 # --------------------------------------------------------------------- #
@@ -547,6 +580,22 @@ def _walk_and_emit(
     trace: MatchTrace,
     ctx: CodegenContext,
     layouts: list[Placement],
+    *,
+    schedule=None,
+    host_moves=(),
+    module=None,
+) -> None:
+    """Lower ``trace`` into ``ctx`` through the backend's ``emit_program`` hook."""
+    ctx.emit_program(
+        trace, layouts, schedule=schedule, host_moves=host_moves, module=module
+    )
+
+
+def _walk_buckets(
+    target,
+    trace: MatchTrace,
+    ctx: CodegenContext,
+    layouts: list[Placement],
 ) -> None:
     """Walk every match in ``trace``, bucketed by work-id, and dispatch
     each match to its target op's ``emit`` callback.
@@ -563,43 +612,6 @@ def _walk_and_emit(
     JUMP) flows through ``ctx.after_match``.
     """
     from .spmw_autoschedule import _bucket_for_autoschedule, _trace_memrefs_by_role
-
-    # AiM's native MAC command is already broadcast over all 32 channels and
-    # all 16 banks.  A matched SPMW grid therefore lowers once per logical
-    # kernel, not once per unrolled work-id replica.  Materialise every MAC in
-    # the representative bucket as a complete GEMV segment; its retained MLIR
-    # loops encode output, reduction and independent-batch multiplicity.
-    if _is_backend_ctx(ctx, "aim"):
-        representatives: dict[int, list[MatchedOp]] = {}
-        order: list[int] = []
-        for match in trace.matches:
-            scope = _matcher_work_scope(match)
-            if scope.group_id not in representatives:
-                representatives[scope.group_id] = []
-                order.append(scope.group_id)
-            if scope.work_id in ((), (0,)):
-                representatives[scope.group_id].append(match)
-        for group_id in order:
-            reps = representatives[group_id]
-            if not reps:
-                reps = [
-                    next(
-                        match
-                        for match in trace.matches
-                        if _matcher_work_scope(match).group_id == group_id
-                    )
-                ]
-            for match in reps:
-                if match.target_op_name != "MAC":
-                    raise NotImplementedError(
-                        "AiM native whole-program lowering currently supports "
-                        f"MAC reductions; {match.func_name} contains "
-                        f"{match.target_op_name}. "
-                        "Keep unsupported broadcast/normalization work on the host."
-                    )
-                ctx.emit_gemv(match)
-                ctx.emit_eoc()
-        return
 
     layout_by_scope: dict[tuple, Placement] = {
         search_scope: layout
@@ -816,6 +828,8 @@ def simulator_unavailable_reason(target_name: str) -> str | None:
         return _apu_v1_unavailable_reason()
     if target_name == "apu_v2":
         return _docker_image_unavailable_reason("gsi-g2-l1sim")
+    if target_name == "upmem":
+        return _upmem_unavailable_reason()
     return f"no simulator runner for target {target_name!r}"
 
 
@@ -942,6 +956,7 @@ class Compiled:
         runtime_segments=(),
         matcher_codegen_artifact=None,
         placement_ranking=None,
+        launch_schedule=None,
     ):
         self.target = target
         self.trace = trace
@@ -965,6 +980,7 @@ class Compiled:
         self.runtime_segments = tuple(runtime_segments)
         self.matcher_codegen_artifact = matcher_codegen_artifact
         self.placement_ranking = placement_ranking
+        self.launch_schedule = launch_schedule
         # Lever 3 (SPEC-025 §5.4): shared-CRF host trigger schedule (one
         # HostTrigger per work-id), parallel to `cmds`. Empty for the
         # per-work-id path and every non-Samsung backend.
@@ -1027,6 +1043,7 @@ _BACKENDS: dict[str, tuple[str, str, str | None]] = {
     "aim": ("allo.spmw_aim", "AimCtx", "_run_aim"),
     "apu_v1": ("allo.spmw_apu_v1", "APUv1Ctx", "_run_apu_v1"),
     "apu_v2": ("allo.spmw_apu_v2", "APUv2Ctx", "_run_apu_v2"),
+    "upmem": ("allo.spmw_upmem", "UpmemCtx", "_run_upmem"),
 }
 
 
@@ -1310,27 +1327,7 @@ def _materialize_matcher_codegen(
         )
     trace_abi = _matcher_trace_runtime_abi(trace)
 
-    if target_name == "aim":
-        from .spmw_aim import _aim_runtime_segments
-
-        try:
-            runtime_segments = _aim_runtime_segments(commands)
-        except ValueError:
-            runtime_segments = ()
-        route = "ramulator2-preterminated-segments"
-    elif target_name == "samsung_hbm_pim":
-        from .spmw_samsung import (
-            _samsung_main_runtime_commands,
-            _samsung_runtime_route,
-        )
-
-        route = _samsung_runtime_route(commands)
-        runtime_segments = (
-            _matcher_command_manifest(_samsung_main_runtime_commands(commands)),
-        )
-    else:
-        route = "unsupported-exact-matcher-runtime"
-        runtime_segments = ()
+    route, runtime_segments = ctx.runtime_route(commands)
 
     runtime_abi = (
         "matcher-runtime-abi-v1",
@@ -1359,6 +1356,8 @@ def compile_for_target(
     host_moves: "list | None" = None,
     buffer_metrics: "dict | None" = None,
     cost=None,
+    module=None,
+    launch_schedule=None,
 ) -> Compiled:
     """Lower a (target, trace) pair to a runnable backend artifact by
     walking the target's declarations.
@@ -1376,14 +1375,27 @@ def compile_for_target(
     default) preserves today's inferred-role path. When supplied they are
     resolved against the target (verb + device-handle identity) and stored on
     ``Compiled.host_moves`` so the run path asserts the operand->role binding.
+
+    ``module`` is the customized MLIR module, forwarded to the backend's
+    ``emit_program`` hook. It is None when the caller has no module.
+
+    ``launch_schedule`` (a ``spmw_plan.LaunchSchedule``) orders host transfers
+    and kernel launches for codegen and the execution graph. Its host steps
+    must index ``host_moves`` one to one. None keeps the legacy order.
     """
     target_name = getattr(target, "name", None)
-    if target_name == "upmem":
-        raise TypeError(
-            "compile_for_target no longer accepts matcher traces for UPMEM; "
-            "use allo.compile(UPMEMProgram(...), target, cost)"
-        )
     resolved_host_moves = _resolve_host_moves(target, host_moves)
+    if launch_schedule is not None:
+        from .spmw_plan import HostStep
+
+        n_host_steps = sum(
+            isinstance(step, HostStep) for step in launch_schedule.steps
+        )
+        if n_host_steps != len(resolved_host_moves):
+            raise ValueError(
+                f"launch schedule has {n_host_steps} host steps but "
+                f"{len(resolved_host_moves)} host moves were resolved"
+            )
     if trace.target_name != target_name:
         raise ValueError(
             f"trace.target_name {trace.target_name!r} != target.name {target_name!r}"
@@ -1415,6 +1427,7 @@ def compile_for_target(
                 cost,
                 host_moves=resolved_host_moves,
                 buffer_metrics=buffer_metrics,
+                launch_schedule=launch_schedule,
             )
         return Compiled(
             target,
@@ -1426,6 +1439,7 @@ def compile_for_target(
             host_moves=resolved_host_moves,
             execution_graph=execution_graph,
             cost=cost,
+            launch_schedule=launch_schedule,
         )
 
     if target_name not in _BACKENDS:
@@ -1462,7 +1476,15 @@ def compile_for_target(
         )
 
     ctx = ctx_cls(target)
-    _walk_and_emit(target, trace, ctx, layouts)
+    _walk_and_emit(
+        target,
+        trace,
+        ctx,
+        layouts,
+        schedule=launch_schedule,
+        host_moves=resolved_host_moves,
+        module=module,
+    )
 
     # `Compiled.layout` historically held a single Placement; preserve
     # that for back-compat when there's only one kernel.
@@ -1484,6 +1506,7 @@ def compile_for_target(
             cost,
             host_moves=resolved_host_moves,
             buffer_metrics=buffer_metrics,
+            launch_schedule=launch_schedule,
         )
     return Compiled(
         target,
@@ -1496,4 +1519,5 @@ def compile_for_target(
         execution_graph=execution_graph,
         cost=cost,
         placement_ranking=getattr(layouts, "placement_ranking", None),
+        launch_schedule=launch_schedule,
     )

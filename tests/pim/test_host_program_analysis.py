@@ -112,3 +112,138 @@ def test_batch_one_is_parity():
     preload = lambda m, k: _P
     er = lambda m, k, n: _E + _R
     assert schedule_cost(s, preload, er) == _P + _E + _R   # 15251
+
+
+# --------------------------------------------------------------------- #
+# Launch order into the execution graph (spec 001 D3)
+# --------------------------------------------------------------------- #
+
+from types import SimpleNamespace
+
+import pytest
+
+from allo.ir.types import float16
+from allo.pim.costs import samsung_cost
+from allo.pim.targets import build_samsung_target
+from allo.spmw_plan import launch_schedule
+from allo.spmw_target import LaunchRecord
+
+_LM, _LK, _LR = 64, 64, 32
+_hx = allo.host_xfer
+
+
+@_df_region()
+def _two_kernels(
+    W: float16[_LM, _LK],
+    V: float16[_LM, _LK],
+    x: float16[_LK],
+    y: float16[_LM],
+    z: float16[_LM],
+):
+    @allo.work(mapping=[2], args=[W, x, y])
+    def mv1(lW: float16[_LM, _LK], lx: float16[_LK], ly: float16[_LM]):
+        (c,) = allo.get_wid()
+        for i in range(_LR):
+            acc: float16 = 0
+            for k in range(_LK):
+                acc += lW[c * _LR + i, k] * lx[k]
+            ly[c * _LR + i] = acc
+
+    @allo.work(mapping=[2], args=[V, y, z])
+    def mv2(lV: float16[_LM, _LK], ly: float16[_LK], lz: float16[_LM]):
+        (c,) = allo.get_wid()
+        for i in range(_LR):
+            acc: float16 = 0
+            for k in range(_LK):
+                acc += lV[c * _LR + i, k] * ly[k]
+            lz[c * _LR + i] = acc
+
+
+@allo.host_program(_two_kernels)
+def _chained(W, V, x, y, z):
+    _hx.scatter(W, _hx.banks)
+    _hx.scatter(V, _hx.banks)
+    _hx.broadcast(x, _hx.grf_a)
+    allo.launch("mv1", W, x, y)
+    _hx.gather(y, _hx.banks)
+    _hx.broadcast(y, _hx.grf_a)
+    allo.launch("mv2", V, y, z)
+    _hx.gather(z, _hx.banks)
+
+
+@allo.host_program(_two_kernels)
+def _legacy_order(W, V, x, y, z):
+    _hx.scatter(W, _hx.banks)
+    _hx.scatter(V, _hx.banks)
+    _hx.broadcast(x, _hx.grf_a)
+    allo.launch("mv1", W, x, y)
+    allo.launch("mv2", V, y, z)
+    _hx.gather(y, _hx.banks)
+    _hx.gather(z, _hx.banks)
+
+
+def _virtual(host_moves):
+    return allo.compile(
+        _two_kernels,
+        build_samsung_target(),
+        samsung_cost,
+        backend="virtual",
+        host_moves=host_moves,
+    )
+
+
+def _graph_rows(compiled):
+    return [
+        (a.id, a.depends_on, a.latency_cycles)
+        for a in compiled.execution_graph.activities
+    ]
+
+
+def test_launch_schedule_orders_host_transfers_between_kernels():
+    """gather(y)/broadcast(y) between the launches sit after kernel 1's
+    terminals and before kernel 2's first activity."""
+    compiled = _virtual(_chained)
+    assert compiled.compiled.launch_schedule is not None
+    acts = list(compiled.execution_graph.activities)
+    by_id = {a.id: a for a in acts}
+    group_of = lambda a: a.metadata.get("group_id")
+    g1, g2 = dict.fromkeys(group_of(a) for a in acts if group_of(a) is not None)
+
+    gather_y = next(a for a in acts if a.id.startswith("host:egress:0:"))
+    bcast_y = next(a for a in acts if a.id.startswith("host:ingress:3:"))
+    g1_terminals = {
+        a.id for a in acts if group_of(a) == g1 and a.metadata["phase"] == "post"
+    }
+    assert set(gather_y.depends_on) == g1_terminals and len(g1_terminals) == 2
+    assert bcast_y.depends_on == (gather_y.id,)
+
+    g2_first = [
+        a
+        for a in acts
+        if group_of(a) == g2
+        and not any(group_of(by_id[d]) == g2 for d in a.depends_on)
+    ]
+    assert g2_first and all(a.depends_on == (bcast_y.id,) for a in g2_first)
+
+
+def test_legacy_order_schedule_matches_unscheduled_graph():
+    """A schedule equal to the legacy order (ingress, launches in group order,
+    gathers) reproduces the launch_schedule=None graph and cycles."""
+    scheduled = _virtual(_legacy_order)
+    legacy = _virtual(list(_legacy_order.moves))
+    assert scheduled.compiled.launch_schedule is not None
+    assert legacy.compiled.launch_schedule is None
+    assert _graph_rows(scheduled) == _graph_rows(legacy)
+    assert scheduled.estimate().cycles == legacy.estimate().cycles
+
+
+def test_launch_schedule_binding_errors():
+    trace = _virtual(list(_legacy_order.moves)).trace
+    unknown = SimpleNamespace(
+        steps=[LaunchRecord("mv1", ()), LaunchRecord("mv3", ()), LaunchRecord("mv2", ())]
+    )
+    with pytest.raises(ValueError, match="no matched implementation"):
+        launch_schedule(unknown, trace)
+    unlaunched = SimpleNamespace(steps=[LaunchRecord("mv1", ())])
+    with pytest.raises(ValueError, match="never launched"):
+        launch_schedule(unlaunched, trace)

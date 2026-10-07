@@ -19,18 +19,13 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
-from allo.pim.aim_program import (
-    AimAllBankWrite,
-    AimBankCopy,
-    AimContraction,
-    AimDistributedHostTransfer,
-    AimElementwise,
-    AimHostTransfer,
-    AimOp,
-    AimProgram,
-    AimSync,
+from benchmarks.cent_aim.decode_region import (
+    RESIDENT,
+    CentCase,
+    build_decode_region,
+    build_host_program,
 )
 
 
@@ -789,527 +784,6 @@ def build_layout(spec: DecodeSpec) -> DecodeLayout:
     return DecodeLayout(allocator.regions, allocator.next_row)
 
 
-def distributed_transfer(
-    spec: DecodeSpec,
-    direction: str,
-    elements: int,
-    row: int,
-    *,
-    bank_stride: int = 4,
-    bank_offset: int = 0,
-    copies: int = 1,
-    name: str,
-) -> AimDistributedHostTransfer:
-    """Create regular replica- and bank-group-aware dynamic host traffic."""
-
-    return AimDistributedHostTransfer(
-        direction,
-        elements=elements,
-        replicas=spec.replicas,
-        channels_per_replica=spec.channels_per_replica,
-        row=row,
-        bank_stride=bank_stride,
-        bank_offset=bank_offset,
-        copies=copies,
-        name=name,
-    )
-
-
-def contraction(
-    spec: DecodeSpec,
-    *,
-    outputs: int,
-    reduction: int,
-    row: int,
-    batches: int = 1,
-    input_source: str = "gb",
-    batch_mapping: str = "flattened",
-    reduction_storage_extent: int | None = None,
-    activation: bool = False,
-    name: str,
-) -> AimContraction:
-    """Create a dense contraction across all disjoint replica channels."""
-
-    return AimContraction(
-        outputs=outputs,
-        reduction=reduction,
-        batches=batches,
-        replicas=spec.replicas,
-        row=row,
-        channels=spec.channels,
-        channels_per_replica=spec.channels_per_replica,
-        input_source=input_source,
-        batch_mapping=batch_mapping,
-        reduction_storage_extent=reduction_storage_extent,
-        activation=activation,
-        name=name,
-    )
-
-
-def _paired_bank_group_copies(
-    spec: DecodeSpec,
-    *,
-    elements: int,
-    source_row: int,
-    destination_row: int,
-    name: str,
-) -> tuple[AimOp, ...]:
-    """Relocate four bank groups through their shared GB in safe pair order."""
-
-    operations: list[AimOp] = []
-    for source_bank in range(2, BANKS_PER_CHANNEL, BANK_GROUPS_PER_CHANNEL):
-        operations.append(
-            AimBankCopy(
-                "bank_to_gb",
-                elements=elements,
-                bank=source_bank,
-                row=source_row,
-                replicas=spec.replicas,
-                channels_per_replica=spec.channels_per_replica,
-                partitions_per_replica=(
-                    spec.channels_per_replica * BANK_GROUPS_PER_CHANNEL
-                ),
-                name=f"{name}.bank_{source_bank}.to_gb",
-            )
-        )
-        operations.append(
-            AimBankCopy(
-                "gb_to_bank",
-                elements=elements,
-                bank=source_bank - 1,
-                row=destination_row,
-                replicas=spec.replicas,
-                channels_per_replica=spec.channels_per_replica,
-                partitions_per_replica=(
-                    spec.channels_per_replica * BANK_GROUPS_PER_CHANNEL
-                ),
-                name=f"{name}.gb_to_bank_{source_bank - 1}",
-            )
-        )
-    return tuple(operations)
-
-
-def rms_device_piece(
-    spec: DecodeSpec,
-    layout: DecodeLayout,
-    *,
-    prefix: str,
-) -> tuple[AimOp, ...]:
-    """CENT's device-side RMS partial, scale, relocation, and readback."""
-
-    source = layout[f"rms_{prefix}_work"]
-    scaled = source
-    output = layout[f"rms_{prefix}_output"]
-    partial_reduction = _ceil_div(
-        spec.D,
-        spec.channels_per_replica * (BANKS_PER_CHANNEL // 2),
-    )
-    operations: list[AimOp] = [
-        distributed_transfer(
-            spec,
-            "write",
-            spec.D,
-            source.row,
-            bank_stride=2,
-            copies=2,
-            name=f"rms.{prefix}.dynamic_inputs",
-        ),
-        contraction(
-            spec,
-            outputs=spec.channels_per_replica * BANKS_PER_CHANNEL,
-            reduction=partial_reduction,
-            row=source.row,
-            input_source="banks",
-            name=f"rms.{prefix}.sum_of_squares_partial",
-        ),
-        distributed_transfer(
-            spec,
-            "write",
-            spec.D,
-            scaled.row,
-            copies=2,
-            name=f"rms.{prefix}.host_scale_and_vector",
-        ),
-        AimElementwise(
-            "mul",
-            elements=spec.D,
-            row=scaled.row,
-            replicas=spec.replicas,
-            channels_per_replica=spec.channels_per_replica,
-            name=f"rms.{prefix}.scale",
-        ),
-    ]
-    operations.extend(
-        _paired_bank_group_copies(
-            spec,
-            elements=spec.D,
-            source_row=scaled.row,
-            destination_row=output.row,
-            name=f"rms.{prefix}.norm_weight_relocation",
-        )
-    )
-    operations.extend(
-        (
-            AimElementwise(
-                "mul",
-                elements=spec.D,
-                row=output.row,
-                replicas=spec.replicas,
-                channels_per_replica=spec.channels_per_replica,
-                name=f"rms.{prefix}.norm_weight",
-            ),
-            distributed_transfer(
-                spec,
-                "read",
-                spec.D,
-                output.row,
-                bank_offset=2,
-                name=f"rms.{prefix}.result",
-            ),
-            AimSync(name=f"rms.{prefix}.host_split"),
-        )
-    )
-    return tuple(operations)
-
-
-def residual_device_piece(spec: DecodeSpec, *, name: str) -> tuple[AimOp, ...]:
-    """One hidden-vector residual addition."""
-
-    columns = _ceil_div(spec.D, VECTOR_LANES)
-    return (
-        AimElementwise(
-            "add",
-            elements=spec.D,
-            gpr_addr_0=0,
-            gpr_addr_1=columns,
-            name=name,
-        ),
-    )
-
-
-def projection_device_piece(
-    spec: DecodeSpec,
-    layout: DecodeLayout,
-    *,
-    weight: str,
-    outputs: int,
-    reduction: int,
-    activation: bool = False,
-) -> tuple[AimOp, ...]:
-    """Apply one statically resident projection matrix."""
-
-    return (
-        contraction(
-            spec,
-            outputs=outputs,
-            reduction=reduction,
-            row=layout[weight].row,
-            activation=activation,
-            name=f"resident_weight.{weight}",
-        ),
-    )
-
-
-def rope_device_piece(spec: DecodeSpec, layout: DecodeLayout) -> tuple[AimOp, ...]:
-    """CENT's physical remap/EWMUL contract for Q and K rotary embedding.
-
-    CENT emits the two post-EWMUL host-visible transfers through its store
-    helper as ``W MEM`` records too.  We preserve that measured physical
-    contract here; the semantic caveat is surfaced in :func:`semantic_manifest`.
-    """
-
-    operations: list[AimOp] = []
-    for tensor in ("q", "k"):
-        operations.append(
-            distributed_transfer(
-                spec,
-                "write",
-                2 * spec.D,
-                layout[f"rope_{tensor}"].row,
-                bank_offset=1,
-                name=f"rope.{tensor}.remapped_inputs",
-            )
-        )
-    for tensor in ("q", "k"):
-        operations.append(
-            AimElementwise(
-                "mul",
-                elements=spec.D,
-                row=layout[f"rope_{tensor}"].row,
-                replicas=spec.replicas,
-                channels_per_replica=spec.channels_per_replica,
-                name=f"rope.{tensor}.device_mul",
-            )
-        )
-    for tensor in ("q", "k"):
-        operations.append(
-            distributed_transfer(
-                spec,
-                "write",
-                2 * spec.D,
-                layout[f"rope_{tensor}"].row,
-                bank_offset=2,
-                name=f"rope.{tensor}.cent_post_result_transfer",
-            )
-        )
-    return tuple(operations)
-
-
-def attention_cache_append(spec: DecodeSpec, layout: DecodeLayout) -> tuple[AimOp, ...]:
-    """Append the current K and V token to their shape-derived cache layouts."""
-
-    position = spec.L - 1
-    tile = spec.channels_per_replica * BANKS_PER_CHANNEL
-    position_tile, position_in_tile = divmod(position, tile)
-    local_channel, bank = divmod(position_in_tile, BANKS_PER_CHANNEL)
-    batch_pack = _qk_batch_pack(spec)
-    batch_groups = _qk_batch_groups(spec)
-
-    operations: list[AimOp] = []
-    # Rows are the outer traversal so transfers to the same packed cache row
-    # stay adjacent across replicas.  This is a general dependency-neutral
-    # coalescing order, not a sequence-length-specific schedule.
-    for batch_group in range(batch_groups):
-        packed_heads = min(
-            batch_pack,
-            spec.H - batch_group * batch_pack,
-        )
-        aligned_reduction = _ceil_div(spec.Dh, VECTOR_LANES) * VECTOR_LANES
-        key_bursts = packed_heads * aligned_reduction // VECTOR_LANES
-        key_row = layout["k_cache"].row + position_tile * batch_groups + batch_group
-        for replica in range(spec.replicas):
-            channel = replica * spec.channels_per_replica + local_channel
-            operations.append(
-                AimHostTransfer(
-                    "write",
-                    channel=channel,
-                    bank=bank,
-                    row=key_row,
-                    bursts=key_bursts,
-                    name=(f"attention.k_append.group{batch_group}." f"r{replica}"),
-                )
-            )
-
-    sequence_row = position // ROW_ELEMENTS
-    rows_per_dimension = _ceil_div(spec.max_seq_len, ROW_ELEMENTS)
-    dimension_iterations = spec.Dh // BANKS_PER_CHANNEL
-    operations.append(
-        AimAllBankWrite(
-            row=layout["v_cache"].row + sequence_row,
-            rows=dimension_iterations,
-            row_stride=rows_per_dimension,
-            copies=spec.H // spec.channels_per_replica,
-            copy_row_stride=rows_per_dimension * dimension_iterations,
-            channels=spec.channels,
-            name="attention.v_append",
-        )
-    )
-    return tuple(operations)
-
-
-def attention_qk_device_piece(
-    spec: DecodeSpec, layout: DecodeLayout
-) -> tuple[AimOp, ...]:
-    """Compute Q dot K-cache with shape-derived row-packed head batches."""
-
-    return (
-        contraction(
-            spec,
-            outputs=spec.L,
-            reduction=spec.Dh,
-            batches=spec.H,
-            row=layout["k_cache"].row,
-            batch_mapping="auto",
-            name="attention.qk",
-        ),
-    )
-
-
-def attention_sv_device_piece(
-    spec: DecodeSpec, layout: DecodeLayout
-) -> tuple[AimOp, ...]:
-    """Compute softmax-score dot V-cache for every head and replica."""
-
-    return (
-        contraction(
-            spec,
-            outputs=spec.Dh,
-            reduction=spec.L,
-            batches=spec.H,
-            row=layout["v_cache"].row,
-            batch_mapping="auto",
-            reduction_storage_extent=spec.max_seq_len,
-            name="attention.sv",
-        ),
-    )
-
-
-def softmax_host_split_device_piece(
-    spec: DecodeSpec, layout: DecodeLayout
-) -> tuple[AimOp, ...]:
-    """Two score EWMUL phases around host exponentiation/reductions."""
-
-    operations: list[AimOp] = []
-    score_elements = spec.H * spec.L
-    for phase in ("scale", "normalize_exp"):
-        operations.extend(
-            (
-                distributed_transfer(
-                    spec,
-                    "write",
-                    score_elements,
-                    layout["scores"].row,
-                    copies=2,
-                    name=f"softmax.{phase}.inputs",
-                ),
-                AimElementwise(
-                    "mul",
-                    elements=score_elements,
-                    row=layout["scores"].row,
-                    replicas=spec.replicas,
-                    channels_per_replica=spec.channels_per_replica,
-                    name=f"softmax.{phase}.device_mul",
-                ),
-                distributed_transfer(
-                    spec,
-                    "read",
-                    score_elements,
-                    layout["scores"].row,
-                    bank_offset=2,
-                    name=f"softmax.{phase}.host_result",
-                ),
-                AimSync(name=f"softmax.{phase}.host_split"),
-            )
-        )
-    return tuple(operations)
-
-
-def ffn_activation_device_piece(
-    spec: DecodeSpec, layout: DecodeLayout
-) -> tuple[AimOp, ...]:
-    """CENT's SiLU and gate multiplication movement/compute chain."""
-
-    row = layout["ffn_activation"].row
-    operations: list[AimOp] = [
-        distributed_transfer(
-            spec,
-            "write",
-            spec.F,
-            row,
-            copies=2,
-            name="ffn_activation.x1_and_sigmoid",
-        ),
-        AimElementwise(
-            "mul",
-            elements=spec.F,
-            row=row,
-            replicas=spec.replicas,
-            channels_per_replica=spec.channels_per_replica,
-            name="ffn_activation.silu",
-        ),
-    ]
-    operations.extend(
-        _paired_bank_group_copies(
-            spec,
-            elements=spec.F,
-            source_row=row,
-            destination_row=row,
-            name="ffn_activation.silu_relocation",
-        )
-    )
-    operations.extend(
-        (
-            distributed_transfer(
-                spec,
-                "write",
-                spec.F,
-                row,
-                name="ffn_activation.w3",
-            ),
-            AimElementwise(
-                "mul",
-                elements=spec.F,
-                row=row,
-                replicas=spec.replicas,
-                channels_per_replica=spec.channels_per_replica,
-                name="ffn_activation.gate",
-            ),
-            distributed_transfer(
-                spec,
-                "read",
-                spec.F,
-                row,
-                bank_offset=2,
-                name="ffn_activation.result",
-            ),
-            AimSync(name="ffn_activation.complete"),
-        )
-    )
-    return tuple(operations)
-
-
-StageBuilder = Callable[[DecodeSpec, DecodeLayout], tuple[AimOp, ...]]
-
-
-def _projection_builder(
-    weight: str,
-    output: Callable[[DecodeSpec], int],
-    reduction: Callable[[DecodeSpec], int],
-    *,
-    activation: bool = False,
-) -> StageBuilder:
-    def build(spec: DecodeSpec, layout: DecodeLayout) -> tuple[AimOp, ...]:
-        return projection_device_piece(
-            spec,
-            layout,
-            weight=weight,
-            outputs=output(spec),
-            reduction=reduction(spec),
-            activation=activation,
-        )
-
-    return build
-
-
-def _rms_builder(prefix: str) -> StageBuilder:
-    def build(spec: DecodeSpec, layout: DecodeLayout) -> tuple[AimOp, ...]:
-        return rms_device_piece(spec, layout, prefix=prefix)
-
-    return build
-
-
-def _residual_builder(name: str) -> StageBuilder:
-    def build(spec: DecodeSpec, _layout: DecodeLayout) -> tuple[AimOp, ...]:
-        return residual_device_piece(spec, name=name)
-
-    return build
-
-
-_STAGE_BUILDERS: Mapping[str, StageBuilder] = MappingProxyType(
-    {
-        "rms_x": _rms_builder("x"),
-        "q_projection": _projection_builder("wq", lambda s: s.D, lambda s: s.D),
-        "k_projection": _projection_builder("wk", lambda s: s.D, lambda s: s.D),
-        "v_projection": _projection_builder("wv", lambda s: s.D, lambda s: s.D),
-        "rope": rope_device_piece,
-        "attention_cache_append": attention_cache_append,
-        "attention_qk": attention_qk_device_piece,
-        "softmax_host_split": softmax_host_split_device_piece,
-        "attention_sv": attention_sv_device_piece,
-        "o_projection": _projection_builder("wo", lambda s: s.D, lambda s: s.D),
-        "attention_residual": _residual_builder("attention.residual"),
-        "rms_sa": _rms_builder("sa"),
-        "w1_projection_af": _projection_builder(
-            "w1", lambda s: s.F, lambda s: s.D, activation=True
-        ),
-        "w3_projection": _projection_builder("w3", lambda s: s.F, lambda s: s.D),
-        "ffn_activation": ffn_activation_device_piece,
-        "w2_projection": _projection_builder("w2", lambda s: s.D, lambda s: s.F),
-        "ffn_residual": _residual_builder("ffn.residual"),
-    }
-)
-
-
 @dataclass(frozen=True)
 class CentAimCase:
     """A declarative case label and ordered list of reusable device stages."""
@@ -1485,32 +959,7 @@ CENT_CASES: Mapping[str, CentAimCase] = MappingProxyType(
 )
 
 
-def compose_program(
-    stages: Iterable[str],
-    spec: DecodeSpec,
-    *,
-    name: str = "cent_aim_program",
-    layout: DecodeLayout | None = None,
-) -> AimProgram:
-    """Compose reusable stage builders into one EOC-terminated program."""
-
-    layout = build_layout(spec) if layout is None else layout
-    operations: list[AimOp] = []
-    for stage in stages:
-        try:
-            builder = _STAGE_BUILDERS[stage]
-        except KeyError as error:
-            raise KeyError(f"unknown CENT AiM stage {stage!r}") from error
-        operations.extend(builder(spec, layout))
-    return AimProgram(operations, name=name)
-
-
-def build_case(
-    case_id: str,
-    spec: DecodeSpec | None = None,
-) -> AimProgram:
-    """Build one exact benchmark case without branching on its kernel name."""
-
+def _case_spec(case_id: str, spec: DecodeSpec | None) -> tuple[CentAimCase, DecodeSpec]:
     try:
         case = CENT_CASES[case_id]
     except KeyError as error:
@@ -1521,17 +970,58 @@ def build_case(
         raise ValueError(
             f"case {case_id} requires L={case.L}, supplied spec has L={spec.L}"
         )
-    return compose_program(case.stages, spec, name=case.case_id)
+    return case, spec
+
+
+def build_case(case_id: str, spec: DecodeSpec | None = None) -> CentCase:
+    """One benchmark case: the decode region and the host program that
+    launches the case's stages. Compile with
+    ``allo.compile(case.region, target, host_moves=case.host_program)``."""
+
+    case, spec = _case_spec(case_id, spec)
+    decode_region = build_decode_region(spec)
+    return CentCase(
+        decode_region, build_host_program(decode_region, case.stages, spec)
+    )
 
 
 def iter_case_programs(
     base_spec: DecodeSpec = DEFAULT_DECODE_SPEC,
 ):
-    """Yield ``(case, concrete_spec, program)`` for all fourteen cases."""
+    """Yield ``(case, concrete_spec, CentCase)`` for all fourteen cases."""
 
     for case in CENT_CASES.values():
         spec = replace(base_spec, L=case.L)
         yield case, spec, build_case(case.case_id, spec)
+
+
+def compiled_manifest(compiled) -> tuple[dict, str, tuple[str, ...]]:
+    """``(manifest, trace_text, commands)`` of a matcher-compiled case.
+
+    The manifest has the typed route's shape (``source``, ``operations``,
+    ``trace``, ``geometry``) so the logical-work coverage proof applies.
+    """
+    import hashlib
+
+    from allo.pim.aim_lowering import _target_geometry
+
+    artifact = getattr(compiled, "compiled", compiled)
+    ctx = artifact.layout_ctx
+    commands = tuple(str(command) for command in artifact.cmds)
+    trace_text = "\n".join(commands) + "\n"
+    manifest = {
+        "source": {"operations": [op.manifest() for op in ctx.lowered_operations]},
+        "operations": list(ctx.lowering_manifest),
+        "geometry": asdict(_target_geometry(artifact.target)),
+        "row_regions": list(getattr(ctx, "row_regions", ())),
+        "trace": {
+            "command_count": len(commands),
+            "body_command_count": len(commands) - 1,
+            "eoc_count": commands.count("AiM EOC"),
+            "sha256": hashlib.sha256(trace_text.encode("utf-8")).hexdigest(),
+        },
+    }
+    return manifest, trace_text, commands
 
 
 def _opcode_counts(commands: Iterable[str]) -> dict[str, int]:
@@ -1652,15 +1142,23 @@ def semantic_manifest(
                 "the timing trace establishes disjoint channel ownership and "
                 "work volume, but cannot establish distinct replica payload values"
             ),
+            "residuals_counted_once": (
+                "each residual is one EWADD kernel with mapping [1], as in the "
+                "vendor trace; the four replicas' residuals are not repeated"
+            ),
+            "complete_v_cache_append_wr_abk": (
+                "the V-cache append writes every (row, channel) of the "
+                "channel-batched layout with WR_ABK (1,024 commands), where the "
+                "vendor trace issues 256"
+            ),
         },
     }
     if compiled is not None:
-        counts = _opcode_counts(compiled.commands)
-        if counts.get("AiM_EOC") != 1 or compiled.commands[-1] != "AiM EOC":
+        compiled_record, trace_text, commands = compiled_manifest(compiled)
+        counts = _opcode_counts(commands)
+        if counts.get("AiM_EOC") != 1 or commands[-1] != "AiM EOC":
             raise ValueError("compiled case must contain exactly one trailing EOC")
-        logical_coverage = compiler_logical_work_coverage(
-            compiled.manifest, compiled.trace
-        )
+        logical_coverage = compiler_logical_work_coverage(compiled_record, trace_text)
         if not logical_coverage["complete"]:
             raise ValueError(
                 "compiled case has incomplete typed logical-work coverage: "
@@ -1669,9 +1167,8 @@ def semantic_manifest(
         if cache_layout is not None:
             lowered_contractions = [
                 operation
-                for operation in compiled.manifest["operations"]
+                for operation in compiled_record["operations"]
                 if operation["kind"] == "contraction"
-                and operation.get("requested_batch_mapping") == "auto"
             ]
             packed = [
                 operation
@@ -1747,9 +1244,10 @@ def semantic_manifest(
         manifest["compiled_trace"] = {
             "opcode_counts": counts,
             "eoc_count": counts["AiM_EOC"],
-            "command_count": len(compiled.commands),
-            "sha256": compiled.manifest["trace"]["sha256"],
-            "command_shape_signature": command_shape_signature(compiled.trace),
+            "command_count": len(commands),
+            "sha256": compiled_record["trace"]["sha256"],
+            "command_shape_signature": command_shape_signature(trace_text),
+            "row_regions": compiled_record["row_regions"],
         }
         manifest["logical_work_coverage"] = logical_coverage
     return manifest
@@ -1768,19 +1266,10 @@ __all__ = [
     "CentAimCase",
     "CENT_CASES",
     "build_layout",
-    "distributed_transfer",
-    "contraction",
-    "rms_device_piece",
-    "residual_device_piece",
-    "projection_device_piece",
-    "rope_device_piece",
-    "attention_cache_append",
-    "attention_qk_device_piece",
-    "attention_sv_device_piece",
-    "softmax_host_split_device_piece",
-    "ffn_activation_device_piece",
-    "compose_program",
+    "RESIDENT",
+    "CentCase",
     "build_case",
     "iter_case_programs",
+    "compiled_manifest",
     "semantic_manifest",
 ]

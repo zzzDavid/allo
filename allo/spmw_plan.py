@@ -385,6 +385,126 @@ def _coerce_buffer_metric_manifest(trace, host_moves, buffer_metrics):
     )
 
 
+@dataclass(frozen=True)
+class HostStep:
+    """One host transfer in program order; ``host_index`` indexes ``host_moves``."""
+
+    host_index: int
+
+
+@dataclass(frozen=True)
+class LaunchStep:
+    """One kernel launch bound to its matcher group."""
+
+    kernel: str
+    group_id: int
+    ordinal: int
+
+
+@dataclass(frozen=True)
+class LaunchSchedule:
+    """Host transfers and kernel launches in recorded host-program order.
+
+    ``resident`` names buffers already on the device before the program runs.
+    ``parameters`` lists the region's ``(name, shape)`` pairs in declaration
+    order; its index is the ABI ordinal of ``trace.source_value_refs``.
+    """
+
+    steps: tuple
+    resident: frozenset = frozenset()
+    parameters: tuple = ()
+
+    def manifest(self) -> tuple:
+        steps = tuple(
+            ("host", step.host_index)
+            if isinstance(step, HostStep)
+            else ("launch", step.kernel, step.group_id, step.ordinal)
+            for step in self.steps
+        )
+        if self.resident:
+            return steps + (("resident", tuple(sorted(self.resident))),)
+        return steps
+
+
+def launch_schedule(host_program, trace) -> LaunchSchedule:
+    """Bind a recorded ``HostProgram`` to the matcher groups of ``trace``."""
+    from .spmw_match_engine import _parse_work_id
+    from .spmw_target import HostMoveRecord, LaunchRecord
+
+    groups_by_kernel = {}
+    group_order = []
+    for match in trace.matches:
+        group_id = _matcher_work_scope(match).group_id
+        if group_id not in group_order:
+            group_order.append(group_id)
+        kernel = _parse_work_id(match.func_name)[0]
+        groups = groups_by_kernel.setdefault(kernel, [])
+        if group_id not in groups:
+            groups.append(group_id)
+
+    steps = []
+    host_index = 0
+    ordinals = {}
+    for record in host_program.steps:
+        if isinstance(record, HostMoveRecord):
+            steps.append(HostStep(host_index))
+            host_index += 1
+        elif isinstance(record, LaunchRecord):
+            groups = groups_by_kernel.get(record.kernel, [])
+            if not groups:
+                raise ValueError(
+                    f"host program launches kernel {record.kernel!r} with no "
+                    "matched implementation"
+                )
+            if len(groups) > 1:
+                raise ValueError(
+                    f"host program launch of kernel {record.kernel!r} is "
+                    f"ambiguous: it matches groups {groups}"
+                )
+            group_id = groups[0]
+            ordinal = ordinals.get(group_id, 0)
+            ordinals[group_id] = ordinal + 1
+            steps.append(LaunchStep(record.kernel, group_id, ordinal))
+        else:
+            raise ValueError(f"unknown host program step {record!r}")
+
+    unlaunched = [group_id for group_id in group_order if group_id not in ordinals]
+    if unlaunched and not getattr(host_program, "subset", False):
+        raise ValueError(
+            f"matched kernel group never launched by the host program: {unlaunched}"
+        )
+    return LaunchSchedule(
+        tuple(steps),
+        frozenset(getattr(host_program, "resident", ()) or ()),
+        _region_parameters(getattr(host_program, "region", None)),
+    )
+
+
+def _region_parameters(region) -> tuple:
+    """``(name, shape)`` for each region parameter, shape None if unknown."""
+    import inspect
+
+    if region is None:
+        return ()
+    try:
+        names = tuple(inspect.signature(region).parameters)
+    except (TypeError, ValueError):
+        return ()
+    try:
+        annotations = inspect.get_annotations(region, eval_str=True)
+    except (NameError, TypeError):
+        annotations = getattr(region, "__annotations__", {}) or {}
+    parameters = []
+    for name in names:
+        shape = getattr(annotations.get(name), "shape", None)
+        try:
+            shape = None if shape is None else tuple(int(v) for v in shape)
+        except (TypeError, ValueError):
+            shape = None
+        parameters.append((name, shape))
+    return tuple(parameters)
+
+
 def build_execution_graph(
     target,
     trace,
@@ -393,8 +513,14 @@ def build_execution_graph(
     *,
     host_moves=(),
     buffer_metrics=None,
+    launch_schedule=None,
 ):
-    """Execute a cost program over one target-bound autoscheduler candidate."""
+    """Execute a cost program over one target-bound autoscheduler candidate.
+
+    With ``launch_schedule`` None, host ingress is a serial prefix and gathers
+    a serial suffix around the groups. With a ``LaunchSchedule``, host
+    transfers and launches run serially in its program order.
+    """
     bound_cost = _bind_cost(cost_spec, target)
     buffer_manifest, trace_values = _coerce_buffer_metric_manifest(
         trace, host_moves, buffer_metrics
@@ -417,42 +543,28 @@ def build_execution_graph(
         if group_id not in group_order:
             group_order.append(group_id)
 
-    # Host-to-device transfers are an explicit prefix. The current recorded
-    # host-move surface does not retain launch positions, so intermediate
-    # ingress transfers are conservatively complete before device execution.
-    # Gathers form an explicit suffix below.
-    previous_function_terminals = ()
-    indexed_host_moves = tuple(enumerate(host_moves))
-    ingress = [
-        item
-        for item in indexed_host_moves
-        if getattr(getattr(item[1], "verb", None), "name", None) != "gather"
-    ]
-    egress = [
-        item
-        for item in indexed_host_moves
-        if getattr(getattr(item[1], "verb", None), "name", None) == "gather"
-    ]
-    for phase_index, (host_index, resolved) in enumerate(ingress):
-        previous_function_terminals = tuple(
+    def _emit_host(host_index, resolved, phase_index, dependencies):
+        egress = _is_gather(resolved)
+        direction = "egress" if egress else "ingress"
+        return tuple(
             _emit_event(
                 bound_cost,
                 graph,
                 resolved.move,
-                f"host:ingress:{phase_index}:{resolved.move.name}",
+                f"host:{direction}:{phase_index}:{resolved.move.name}",
                 (),
                 buffer_manifest.metrics_for_host_transfer(host_index),
                 {
                     "buffer_value": buffer_manifest.value_id_for_host_transfer(
                         host_index
                     ).manifest(),
-                    "phase": "host_ingress",
+                    "phase": f"host_{direction}",
                 },
-                previous_function_terminals,
+                dependencies,
             )
         )
 
-    for group_id in group_order:
+    def _emit_group(group_id, dependencies_in, label_prefix):
         matches = [
             match
             for match in trace.matches
@@ -490,8 +602,8 @@ def build_execution_graph(
             }
             coordinate_text = ".".join(str(value) for value in work_id)
             group_label = f"group{group_id}"
-            prefix = f"{group_label}:{coordinate_text or 'root'}"
-            dependencies = list(previous_function_terminals)
+            prefix = f"{label_prefix}:{coordinate_text or 'root'}"
+            dependencies = list(dependencies_in)
 
             operand_memrefs = []
             result_memrefs = []
@@ -561,6 +673,9 @@ def build_execution_graph(
                     ),
                     candidate=dict(extra),
                 )
+                vector_width = getattr(match, "vector_width", 1)
+                if vector_width != 1:
+                    metrics["vector_width"] = vector_width
                 dependencies = _emit_event(
                     bound_cost,
                     graph,
@@ -595,27 +710,74 @@ def build_execution_graph(
                     dependencies,
                 )
             function_terminals.extend(dependencies)
-        previous_function_terminals = tuple(function_terminals)
+        return tuple(function_terminals)
+
+    indexed_host_moves = tuple(enumerate(host_moves))
+
+    if launch_schedule is not None:
+        host_steps = [s for s in launch_schedule.steps if isinstance(s, HostStep)]
+        if len(host_steps) != len(indexed_host_moves):
+            raise ValueError(
+                f"launch schedule has {len(host_steps)} host steps but "
+                f"{len(indexed_host_moves)} host moves were supplied"
+            )
+        frontier = ()
+        direction_counts = {False: 0, True: 0}
+        for step in launch_schedule.steps:
+            if isinstance(step, HostStep):
+                if not 0 <= step.host_index < len(indexed_host_moves):
+                    raise ValueError(
+                        f"launch schedule host index {step.host_index} is out "
+                        f"of range for {len(indexed_host_moves)} host moves"
+                    )
+                resolved = indexed_host_moves[step.host_index][1]
+                egress = _is_gather(resolved)
+                frontier = _emit_host(
+                    step.host_index, resolved, direction_counts[egress], frontier
+                )
+                direction_counts[egress] += 1
+            elif isinstance(step, LaunchStep):
+                if step.group_id not in group_order:
+                    raise ValueError(
+                        f"launch schedule names group {step.group_id}, which is "
+                        "not in the trace"
+                    )
+                label_prefix = (
+                    f"group{step.group_id}"
+                    if step.ordinal == 0
+                    else f"group{step.group_id}#{step.ordinal}"
+                )
+                frontier = _emit_group(step.group_id, frontier, label_prefix)
+            else:
+                raise TypeError(f"unknown launch schedule step {step!r}")
+        return graph
+
+    # Host-to-device transfers are an explicit prefix. Without a launch
+    # schedule, launch positions are unknown, so intermediate ingress
+    # transfers are conservatively complete before device execution.
+    # Gathers form an explicit suffix below.
+    previous_function_terminals = ()
+    ingress = [item for item in indexed_host_moves if not _is_gather(item[1])]
+    egress = [item for item in indexed_host_moves if _is_gather(item[1])]
+    for phase_index, (host_index, resolved) in enumerate(ingress):
+        previous_function_terminals = _emit_host(
+            host_index, resolved, phase_index, previous_function_terminals
+        )
+
+    for group_id in group_order:
+        previous_function_terminals = _emit_group(
+            group_id, previous_function_terminals, f"group{group_id}"
+        )
 
     for phase_index, (host_index, resolved) in enumerate(egress):
-        previous_function_terminals = tuple(
-            _emit_event(
-                bound_cost,
-                graph,
-                resolved.move,
-                f"host:egress:{phase_index}:{resolved.move.name}",
-                (),
-                buffer_manifest.metrics_for_host_transfer(host_index),
-                {
-                    "buffer_value": buffer_manifest.value_id_for_host_transfer(
-                        host_index
-                    ).manifest(),
-                    "phase": "host_egress",
-                },
-                previous_function_terminals,
-            )
+        previous_function_terminals = _emit_host(
+            host_index, resolved, phase_index, previous_function_terminals
         )
     return graph
+
+
+def _is_gather(resolved) -> bool:
+    return getattr(getattr(resolved, "verb", None), "name", None) == "gather"
 
 
 def estimate_candidate(target, trace, layout, cost_spec):

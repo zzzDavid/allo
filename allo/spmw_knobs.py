@@ -307,6 +307,142 @@ def _double_buffer_emit(value, base, ctx: KnobCtx):
     )
 
 
+# --------------------------------------------------------------------- #
+# SK hynix AiM levers (spec 002 A7). Domains come from the target tree and
+# the contraction shape the enumerator stamps as ``extra["aim_shape"]``.
+# --------------------------------------------------------------------- #
+
+
+def _with_knob(base, name, value):
+    from .spmw_autoschedule import Placement
+
+    new_extra = dict(base.extra)
+    new_extra[name] = value
+    return Placement(
+        placements=dict(base.placements),
+        mode=f"{base.mode}+{name}={value}",
+        extra=new_extra,
+        layout=getattr(base, "layout", None),
+    )
+
+
+def _aim_shape(ctx: KnobCtx):
+    return (getattr(ctx.base, "extra", {}) or {}).get("aim_shape")
+
+
+def _aim_bank_scope_candidates(ctx: KnobCtx) -> list:
+    from .spmw_autoschedule import derive_layout_properties
+
+    if _aim_shape(ctx) is None:
+        return ["none"]
+    fanout = derive_layout_properties(ctx.target, ctx.base).get("bank_fanout")
+    from .pim.aim_lowering import _target_geometry
+
+    return ["abk" if fanout == _target_geometry(ctx.target).banks else "sbk"]
+
+
+def _aim_batch_mapping_candidates(ctx: KnobCtx) -> list:
+    from .pim.aim_lowering import aligned_reduction
+    from .pim.aim_lowering import _target_geometry
+
+    shape = _aim_shape(ctx)
+    if shape is None:
+        return ["none"]
+    geometry = _target_geometry(ctx.target)
+    lanes, cols = geometry.lanes, geometry.row_elements
+    gb_input = shape["input_source"] == "gb"
+    storage = shape["storage_extent"]
+    values = []
+    # The lowerer accepts a reduction storage extent only for "channels".
+    if (not gb_input or shape["batches"] == 1) and storage is None:
+        values.append("flattened")
+    if gb_input and storage is None and aligned_reduction(shape["reduction"], lanes) <= cols:
+        values.append("row_packed")
+    if gb_input:
+        values.append("channels")
+    return values
+
+
+def _aim_reuse_group_candidates(ctx: KnobCtx) -> list:
+    from .pim.aim_lowering import _default_reuse_candidates
+
+    shape = _aim_shape(ctx)
+    if shape is None:
+        return [0]
+    from .pim.aim_lowering import _target_geometry
+
+    slots = _target_geometry(ctx.target).reuse_window
+    return list(_default_reuse_candidates(slots // (2 if shape["activation"] else 1)))
+
+
+def _aim_replica_partitions_candidates(ctx: KnobCtx) -> list:
+    import math
+
+    from .pim.aim_lowering import replica_partition_domain
+
+    if (getattr(ctx.base, "extra", {}) or {}).get("operation_name") == "ADD":
+        return [1]
+    from .pim.aim_lowering import _target_geometry
+
+    channels = _target_geometry(ctx.target).channels
+    shape = _aim_shape(ctx)
+    if shape is not None:
+        replicas = int(shape["replicas"])
+    else:
+        scope = next(
+            (m.extra.get("spmw_work_scope") for m in ctx.matches), None
+        )
+        group_shape = tuple(getattr(scope, "group_shape", ()) or ())
+        replicas = math.prod(group_shape) if group_shape else 1
+    return replica_partition_domain(replicas, channels)
+
+
+def _aim_knob_emit(name):
+    def emit(value, base, ctx: KnobCtx):
+        del ctx
+        return _with_knob(base, name, value)
+
+    emit.__name__ = f"_aim_{name}_emit"
+    return emit
+
+
+_AIM_KNOB_EMITS = {
+    name: _aim_knob_emit(name)
+    for name in ("bank_scope", "batch_mapping", "reuse_group", "replica_partitions")
+}
+
+
+def _upmem_knob(name):
+    """UPMEM physical-decision knob (spec 003 U5): values come from the
+    family's legal decision domain, filtered by the knobs already chosen."""
+
+    def candidates(ctx: KnobCtx) -> list:
+        from .spmw_upmem import upmem_knob_candidates
+
+        return upmem_knob_candidates(name, ctx.base.extra or {})
+
+    def emit(value, base, ctx: KnobCtx):
+        del ctx
+        from .spmw_upmem import upmem_knob_emit
+
+        return upmem_knob_emit(name, value, base)
+
+    candidates.__name__ = f"_upmem_{name}_candidates"
+    emit.__name__ = f"_upmem_{name}_emit"
+    return Knob(name, candidates, emit)
+
+
+_UPMEM_KNOB_NAMES = (
+    "tasklets",
+    "dma_bytes",
+    "chunk",
+    "wram_residency",
+    "nc",
+    "kc",
+    "predicate_lowering",
+)
+
+
 def register_default_knobs():
     """Register the six live levers as typed knobs, in the per-target cross
     ORDER the hand-crossed enumerator applied them (the byte-identity anchor).
@@ -363,6 +499,20 @@ def register_default_knobs():
         register_knob(
             tname, Knob("double_buffer", _double_buffer_candidates, _double_buffer_emit)
         )
+
+    # AiM placement-realization levers (spec 002 A7, spec 001 D5 order). Not
+    # schedule-search knobs: SPMW_DISABLE_SCHEDULE_SEARCH leaves them on.
+    for name, candidates in (
+        ("bank_scope", _aim_bank_scope_candidates),
+        ("batch_mapping", _aim_batch_mapping_candidates),
+        ("reuse_group", _aim_reuse_group_candidates),
+        ("replica_partitions", _aim_replica_partitions_candidates),
+    ):
+        register_knob("aim", Knob(name, candidates, _AIM_KNOB_EMITS[name]))
+
+    # UPMEM placement-realization levers (spec 003 U5, spec 001 D5 order).
+    for name in _UPMEM_KNOB_NAMES:
+        register_knob("upmem", _upmem_knob(name))
 
 
 def cross_with_knobs(

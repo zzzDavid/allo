@@ -18,6 +18,7 @@ from .spmw_codegen import (
     _bank_fiber_class,
     _parse_loop_bound,
     _bucket_by_work_id,
+    _matcher_command_manifest,
     RunResult,
     SimulatorUnavailable,
     Compiled,
@@ -274,6 +275,12 @@ class SamsungCtx(CodegenContext):
         for i in range(1, n_fibers):
             self.cmd("MAC", dst=mac_dst, src0=mac_src0, src1=fibers[i])
             emit_jump(split[i])
+
+    def runtime_route(self, commands) -> tuple[str, tuple]:
+        return (
+            _samsung_runtime_route(commands),
+            (_matcher_command_manifest(_samsung_main_runtime_commands(commands)),),
+        )
 
 
 def _samsung_lane_burst(ctx) -> int:

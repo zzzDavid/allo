@@ -15,7 +15,10 @@ keyed by ``target.name`` so a kernel folder names a backend, never a tree.
 
 from __future__ import annotations
 
+import math
+
 import allo
+from allo.spmw_match import select
 
 
 def build_samsung_target():
@@ -366,26 +369,33 @@ def build_aim_target():
                     emit=lambda x, y, dst, ctx: ctx.cmd(
                         "EWADD", dst=dst, src0=x, src1=y
                     ),
+                    vector_width=16,
                 )
+                # The installed AF LUT is CENT's logistic sigmoid, written in
+                # its exact tanh identity. The matcher keys on the callee name
+                # ``tanh``.
                 allo.op(
                     "AF",
                     src=(gpr,),
                     dst=af_reg,
-                    fn=lambda x: x,
+                    fn=lambda x: 0.5 * math.tanh(0.5 * x) + 0.5,
                     emit=lambda x, dst, ctx: ctx.cmd("AF", dst=dst, src0=x),
+                    vector_width=16,
                 )
 
                 @allo.unit(mapping={"bank_group": 4})
                 def bank_group():
-                    # EWMUL operates on the selected four-bank group.
+                    # EWMUL multiplies two banks of the selected four-bank
+                    # group into a third bank of the same group.
                     allo.op(
                         "MUL",
-                        src=(any_bank, gb),
-                        dst=gpr,
+                        src=(any_bank, any_bank),
+                        dst=any_bank,
                         fn=lambda x, y: x * y,
                         emit=lambda x, y, dst, ctx: ctx.cmd(
                             "EWMUL", dst=dst, src0=x, src1=y
                         ),
+                        vector_width=16,
                     )
 
                     @allo.unit(mapping={"bank": 4})
@@ -421,6 +431,33 @@ def build_aim_target():
                                 "MAC_SBK", dst=acc, src0=x, src1=y
                             ),
                         )
+
+        # Host DRAM traffic. Scatter and gather are raw W/R MEM bursts into
+        # bank rows; broadcast stages one GPR vector and writes it with WR_ABK.
+        @allo.unit(mode="host")
+        def host():
+            host_dram = allo.mem(name="host_dram", bytes=1 << 34)
+            allo.move(
+                "SCATTER_BANKS",
+                src=host_dram,
+                dst=gddr6_aim.banks,
+                verb=allo.scatter,
+                emit=lambda ctx: ctx.host_scatter(gddr6_aim.banks),
+            )
+            allo.move(
+                "GATHER_BANKS",
+                src=gddr6_aim.banks,
+                dst=host_dram,
+                verb=allo.gather,
+                emit=lambda ctx: ctx.host_gather(gddr6_aim.banks),
+            )
+            allo.move(
+                "BCAST_BANKS",
+                src=host_dram,
+                dst=gddr6_aim.banks,
+                verb=allo.broadcast,
+                emit=lambda ctx: ctx.host_broadcast(gddr6_aim.banks),
+            )
 
     return aim
 
@@ -703,6 +740,131 @@ def build_upmem_target():
                                     y=ctx.handle_c_name(y),
                                 )
                             ),
+                        )
+
+                        # Compile-time coefficients (spec 003 U4): GEVA's
+                        # alpha*A + beta*B and scaled GEMV's alpha*acc.
+                        allo.op(
+                            "AXPBY",
+                            src=(
+                                allo.or_(any_wram, any_gpr),
+                                allo.or_(any_wram, any_gpr),
+                            ),
+                            dst=any_gpr,
+                            fn=lambda x, y, alpha, beta: alpha * x + beta * y,
+                            const_params=("alpha", "beta"),
+                            emit=lambda x, y, dst, ctx: ctx.emit_c_line(
+                                "{d} = alpha * {a} + beta * {b};".format(
+                                    d=ctx.handle_c_name(dst),
+                                    a=ctx.handle_c_name(x),
+                                    b=ctx.handle_c_name(y),
+                                )
+                            ),
+                        )
+
+                        allo.op(
+                            "SCALE",
+                            src=(allo.or_(any_wram, any_gpr),),
+                            dst=any_gpr,
+                            fn=lambda x, alpha: alpha * x,
+                            const_params=("alpha",),
+                            emit=lambda x, dst, ctx: ctx.emit_c_line(
+                                "{d} = alpha * {a};".format(
+                                    d=ctx.handle_c_name(dst),
+                                    a=ctx.handle_c_name(x),
+                                )
+                            ),
+                        )
+
+                        # Spec 004: irregular-kernel ops. Guarded ops may
+                        # match stores under an `if` (M5), "any" ops write a
+                        # computed destination (M6), iv_params bind loop
+                        # variables (M7). Families price them once per stream.
+                        def _emit_assign(expression):
+                            return lambda *args: args[-1].emit_c_line(
+                                "/* " + expression + " */"
+                            )
+
+                        allo.op(
+                            "INC",
+                            src=(allo.or_(any_wram, any_gpr),),
+                            dst=any_gpr,
+                            accumulates=True,
+                            guarded=True,
+                            dst_index="any",
+                            fn=lambda acc: acc + 1,
+                            emit=_emit_assign("acc += 1"),
+                        )
+                        allo.op(
+                            "SCATTER_ADD",
+                            src=(allo.or_(any_wram, any_gpr),) * 2,
+                            dst=any_gpr,
+                            accumulates=True,
+                            guarded=True,
+                            dst_index="any",
+                            fn=lambda x, acc: acc + x,
+                            emit=_emit_assign("acc[idx] += x"),
+                        )
+                        allo.op(
+                            "COMPACT",
+                            src=(allo.or_(any_wram, any_gpr),),
+                            dst=any_gpr,
+                            guarded=True,
+                            dst_index="any",
+                            fn=lambda x: x,
+                            emit=_emit_assign("out[cursor] = x"),
+                        )
+                        allo.op(
+                            "SQDIST_ACC",
+                            src=(allo.or_(any_wram, any_gpr),) * 3,
+                            dst=any_gpr,
+                            accumulates=True,
+                            fn=lambda x, y, acc: acc + (x - y) * (x - y),
+                            emit=_emit_assign("acc += (x - y) * (x - y)"),
+                        )
+                        allo.op(
+                            "GRAD_LINEAR",
+                            src=(allo.or_(any_wram, any_gpr),) * 3,
+                            dst=any_gpr,
+                            accumulates=True,
+                            const_params=("alpha", "beta"),
+                            fn=lambda x, y, acc, alpha, beta: acc
+                            + (((x * y) * alpha) >> beta),
+                            emit=_emit_assign("acc += ((x * y) * alpha) >> beta"),
+                        )
+                        allo.op(
+                            "GRAD_LOGISTIC",
+                            src=(allo.or_(any_wram, any_gpr),) * 3,
+                            dst=any_gpr,
+                            accumulates=True,
+                            const_params=("alpha", "beta"),
+                            fn=lambda x, y, acc, alpha, beta: acc
+                            + x * (alpha - beta * y),
+                            emit=_emit_assign("acc += x * (alpha - beta * y)"),
+                        )
+                        allo.op(
+                            "MIN_SEL",
+                            src=(allo.or_(any_wram, any_gpr),) * 2,
+                            dst=any_gpr,
+                            accumulates=True,
+                            fn=lambda x, acc: select(x < acc, x, acc),
+                            emit=_emit_assign("acc = x < acc ? x : acc"),
+                        )
+                        allo.op(
+                            "ARGMIN_IDX",
+                            src=(allo.or_(any_wram, any_gpr),) * 3,
+                            dst=any_gpr,
+                            accumulates=True,
+                            iv_params=("i",),
+                            fn=lambda x, best, i, acc: select(x < best, i, acc),
+                            emit=_emit_assign("acc = x < best ? i : acc"),
+                        )
+                        allo.op(
+                            "SELECT_ODD",
+                            src=(allo.or_(any_wram, any_gpr),),
+                            dst=any_gpr,
+                            fn=lambda x: select((x & 1) != 0, x, 0),
+                            emit=_emit_assign("y = (x & 1) ? x : 0"),
                         )
 
         # ============================= host ============================= #

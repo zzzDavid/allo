@@ -257,9 +257,7 @@ def test_program_routes_are_disjoint_and_in_dispatch_order():
     compiler_api = importlib.import_module("allo.compiler")
     types = [route.program_type for route in compiler_api._PROGRAM_ROUTES]
     assert [t.__name__ for t in types] == [
-        "AimProgram",
         "APUv1Program",
-        "UPMEMProgram",
         "APUG2TypedProgram",
         "APUG2ComposedContractionProgram",
     ]
@@ -267,20 +265,23 @@ def test_program_routes_are_disjoint_and_in_dispatch_order():
         for right in types:
             if left is not right:
                 assert not issubclass(left, right)
+    # AiM and UPMEM compile only through the matcher.
+    for removed in ("AimProgram", "UPMEMProgram"):
+        assert not hasattr(allo, removed)
 
 
 def test_typed_program_route_rejects_host_moves_and_foreign_backend(monkeypatch):
     compiler_api = importlib.import_module("allo.compiler")
     route = next(
-        r for r in compiler_api._PROGRAM_ROUTES if r.program_type is allo.UPMEMProgram
+        r for r in compiler_api._PROGRAM_ROUTES if r.program_type is allo.APUv1Program
     )
-    program = object.__new__(allo.UPMEMProgram)
+    program = object.__new__(allo.APUv1Program)
     monkeypatch.setattr(
         compiler_api,
         "_PROGRAM_ROUTES",
         (
             compiler_api._ProgramRoute(
-                allo.UPMEMProgram,
+                allo.APUv1Program,
                 lambda *a, **k: pytest.fail("route must reject first"),
                 route.backends,
                 route.backend_error,
@@ -288,10 +289,10 @@ def test_typed_program_route_rejects_host_moves_and_foreign_backend(monkeypatch)
             ),
         ),
     )
-    target = SimpleNamespace(name="upmem")
-    with pytest.raises(ValueError, match="prepare_upmem_tenon_campaign"):
+    target = SimpleNamespace(name="apu_v1")
+    with pytest.raises(ValueError, match="device, virtual, or functional"):
         allo.compile(program, target, backend="simulator")
-    with pytest.raises(ValueError, match="owns its phased ABI"):
+    with pytest.raises(ValueError, match="owns its scalar L4 ABI"):
         allo.compile(program, target, host_moves=[])
 
 

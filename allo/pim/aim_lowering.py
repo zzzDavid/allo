@@ -1,39 +1,25 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Typed whole-program lowering for SK hynix GDDR6-AiM.
+"""AiM lowering IR and the shared lowerer.
 
-The matcher path is useful for isolated reductions, but a transformer stage is
-an ordered mixture of host traffic, reductions, elementwise instructions, and
-barriers.  :class:`AimProgram` retains that order as typed data and lowers it
-to one simulator trace.  Geometry (channels, banks, row width, vector lanes,
-and accumulator depth) comes from the target; no model dimensions live here.
+The AimOp records are the AiM lowering IR: ``AimCtx.emit_program`` derives them
+from matched kernels and ``_AimLowerer`` expands each record into simulator
+commands.  The helpers below are shared by the enumerator, the cost program and
+codegen.
 
-The AiM simulator is timing-only.  Consequently this surface describes the
-shape and placement of data, not its values, and its callable accepts no NumPy
-arguments.  The emitted commands, source-to-command manifest, and exact trace
-text remain available for audit before or after a simulator run.
-
-This distinction matters for explicit layout fields.  Batched GB contractions
-must select a mapping that preserves each distinct payload until its MACs have
-consumed it; unsupported forms fail closed.  ``input_source="banks"`` records
-the intended source but the timing simulator does not check payload routing,
-and ``partitions_per_replica`` is a caller-supplied layout assertion, not a
-numerical coverage proof.  Likewise, custom multi-row reductions with
-different bias/result GPR addresses are timing descriptions rather than a
-functional test of partial-sum carry.  Benchmark manifests must therefore
-retain these assumptions and must not claim simulator-backed numerical
-correctness.
+The AiM simulator is timing-only, so the records describe the shape and
+placement of data, not its values.  ``input_source="banks"`` records the
+intended source but the timing simulator does not check payload routing, and
+``partitions_per_replica`` is a layout assertion, not a numerical coverage
+proof.  Benchmark manifests must retain these assumptions and must not claim
+simulator-backed numerical correctness.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import hashlib
 import math
 from typing import Literal
-
-from ..spmw_aim import _run_aim
-from ..spmw_codegen import RunResult
 
 
 def _positive(name: str, value: int) -> int:
@@ -425,39 +411,6 @@ class AimSync(AimOp):
             raise ValueError("sync name must be non-empty")
 
 
-class AimProgram:
-    """An ordered, typed SK hynix AiM program."""
-
-    def __init__(self, operations, *, name: str = "aim_program"):
-        operations = tuple(operations)
-        if not operations:
-            raise ValueError("AimProgram requires at least one operation")
-        if not all(isinstance(operation, AimOp) for operation in operations):
-            bad = next(
-                operation
-                for operation in operations
-                if not isinstance(operation, AimOp)
-            )
-            raise TypeError(
-                "AimProgram operations must be AimOp values; got "
-                f"{type(bad).__name__}"
-            )
-        if not name:
-            raise ValueError("AimProgram name must be non-empty")
-        self.operations = operations
-        self.name = str(name)
-
-    def build(self):
-        return self
-
-    def manifest(self) -> dict:
-        return {
-            "schema": "tenon-aim-source-program-v1",
-            "name": self.name,
-            "operations": [operation.manifest() for operation in self.operations],
-        }
-
-
 @dataclass(frozen=True)
 class _AimGeometry:
     channels: int
@@ -475,7 +428,7 @@ class _AimGeometry:
 
 def _target_geometry(target) -> _AimGeometry:
     if getattr(target, "name", None) != "aim":
-        raise ValueError("AimProgram requires the aim target")
+        raise ValueError("AiM lowering requires the aim target")
     banks = getattr(target, "banks", None)
     gb = getattr(target, "gb", None)
     mac_reg = getattr(target, "mac_reg", None)
@@ -681,7 +634,7 @@ class _AimLowerer:
         elif isinstance(operation, AimSync):
             self.emit("AiM SYNC")
             details = {"barrier": "device"}
-        else:  # pragma: no cover - AimProgram rejects foreign values
+        else:
             raise TypeError(f"unsupported AiM operation {type(operation).__name__}")
         end = len(self.commands)
         self.operations.append(
@@ -1749,108 +1702,312 @@ class _AimLowerer:
         }
 
 
-class CompiledAimProgram:
-    """Exact typed-program materialization consumed by Ramulator2."""
+def _loop_extent(bound) -> int | None:
+    from ..spmw_tripcount import _parse_loop_bound
 
-    def __init__(self, program: AimProgram, target, *, cost=None, backend=None):
-        if backend not in (None, "simulator"):
-            raise ValueError("AimProgram supports backend=None or 'simulator'")
-        self.program = program
-        self.target = target
-        self.cost = cost
-        lowerer = _AimLowerer(target)
-        for index, operation in enumerate(program.operations):
-            lowerer.lower(operation, index)
-        lowerer.commands.append("AiM EOC")
-        self.commands = tuple(lowerer.commands)
-        # Existing backend code uses ``cmds``.  Both names intentionally expose
-        # the same immutable trace materialization.
-        self.cmds = self.commands
-        self.trace = "\n".join(self.commands) + "\n"
-        trace_sha256 = hashlib.sha256(self.trace.encode("utf-8")).hexdigest()
-        geometry = asdict(lowerer.geometry)
-        self.manifest = {
-            "schema": "tenon-aim-compiled-program-v1",
-            "name": program.name,
-            "target": getattr(target, "name", None),
-            "geometry": geometry,
-            "source": program.manifest(),
-            "operations": lowerer.operations,
-            "trace": {
-                "command_count": len(self.commands),
-                "body_command_count": len(self.commands) - 1,
-                "eoc_count": self.commands.count("AiM EOC"),
-                "sha256": trace_sha256,
-            },
-        }
-        # `_run_aim` consumes exact pre-terminated segments.  A typed program
-        # is deliberately one segment with repeat=1; no analytical cycle
-        # multiplication can enter the measurement path.
-        self.runtime_segments = (
-            (f"TENON_AIM_PROGRAM {program.name}", 1, self.commands),
+    return _parse_loop_bound(bound)
+
+
+def _memref_shape(type_text: str | None) -> tuple[int, ...]:
+    if not type_text or not type_text.startswith("memref<"):
+        return ()
+    body = type_text[len("memref<") :].split(">", 1)[0]
+    dims = []
+    for token in body.split("x")[:-1]:
+        try:
+            dims.append(int(token))
+        except ValueError:
+            return ()
+    return tuple(dims)
+
+
+def mac_operands(match):
+    """Return ``(matrix, vector)`` operand bindings of one MAC match.
+
+    The matrix is the bank-resident operand.  It is the input whose index set
+    strictly contains the other input's (``K[h, s, d]`` over ``q[h, d]``,
+    ``W[i, j]`` over ``x[j]``); otherwise the pattern's ``x`` role.  When both
+    roles bind one memref, both entries are that operand.
+    """
+    roles = {operand.role: operand for operand in match.operands}
+    x_operand, y_operand = roles.get("x"), roles.get("y")
+    if x_operand is None or y_operand is None:
+        raise NotImplementedError(
+            f"AiM MAC match in {match.func_name} lacks an x or y operand"
         )
-        self.backend = "aim"
-
-    def run(self) -> RunResult:
-        return _run_aim(self)
-
-    run_backend = run
-
-
-class AimProgramCallable:
-    """No-argument timing callable returned by :func:`allo.compile`."""
-
-    def __init__(self, compiled: CompiledAimProgram):
-        self.compiled = compiled
-        self.program = compiled.program
-        self.target = compiled.target
-        self.cost = compiled.cost
-        self.last_result: RunResult | None = None
-
-    @property
-    def commands(self) -> tuple[str, ...]:
-        return self.compiled.commands
-
-    @property
-    def cmds(self) -> tuple[str, ...]:
-        return self.compiled.cmds
-
-    @property
-    def trace(self) -> str:
-        return self.compiled.trace
-
-    @property
-    def manifest(self):
-        return self.compiled.manifest
-
-    def __call__(self) -> RunResult:
-        result = self.compiled.run()
-        self.last_result = result
-        return result
-
-    run = __call__
-    run_backend = __call__
+    if x_operand.memref_name == y_operand.memref_name:
+        return x_operand, y_operand
+    x_indices, y_indices = set(x_operand.indices), set(y_operand.indices)
+    if y_indices > x_indices:
+        return y_operand, x_operand
+    return x_operand, y_operand
 
 
-def compile_aim_program(program, target, *, cost=None, backend=None):
-    """Compile an :class:`AimProgram` against structural target geometry."""
-    return AimProgramCallable(
-        CompiledAimProgram(program, target, cost=cost, backend=backend)
+def contraction_shape(
+    match, *, replicated: bool, replicas: int, channels: int
+) -> dict:
+    """Shape of one AiM contraction from one bucket's MAC match.
+
+    A replicated group takes its shape from the bucket's loop extents: the
+    innermost loop is the reduction, loops indexing the GB vector are the
+    batch, and the remaining loops are the outputs.  A partitioned group's
+    buckets cover one aggregate problem, so its shape comes from the matrix's
+    memref extents.  ``storage_extent`` is the matrix extent along the
+    reduction axis when it exceeds the reduction.
+    """
+    if not match.enclosing_loops:
+        raise ValueError("AiM MAC match has no reduction loop")
+    matrix, vector = mac_operands(match)
+    reduction_var, _lb, reduction_ub, _step = match.enclosing_loops[-1]
+    reduction = _loop_extent(reduction_ub)
+    if reduction is None or reduction <= 0:
+        raise ValueError(f"AiM reduction extent is not static: {reduction_ub}")
+
+    # A bank-pair MAC (x and y bind one buffer) has no GB vector, so no batch.
+    same_buffer = matrix.memref_name == vector.memref_name
+    if replicated:
+        batches = 1
+        outputs = 1
+        for var, _lb, ub, _step in match.enclosing_loops[:-1]:
+            extent = _loop_extent(ub)
+            if extent is None or extent <= 0:
+                raise ValueError(f"AiM loop extent is not static: {ub}")
+            if not same_buffer and var in vector.indices:
+                batches *= extent
+            else:
+                outputs *= extent
+    else:
+        replicas = 1
+        batch_var = match.extra.get("batch_loop_var")
+        batches = 1 if same_buffer else int(match.extra.get("batch_dim", 1) or 1)
+        outputs = None
+        for operand in match.operands:
+            if operand.is_loop_carried:
+                continue
+            shape = _memref_shape(getattr(operand, "memref_type", None))
+            if len(shape) != len(operand.indices):
+                continue
+            if reduction_var not in operand.indices:
+                continue
+            for extent, index in zip(shape, operand.indices):
+                if index in (reduction_var, batch_var):
+                    continue
+                outputs = extent
+                break
+            if outputs is not None:
+                break
+        if outputs is None:
+            outer = _loop_extent(match.enclosing_loops[0][2])
+            if outer is None:
+                raise ValueError("AiM cannot recover output extent from match")
+            outputs = outer * channels
+
+    storage_extent = None
+    shape = _memref_shape(getattr(matrix, "memref_type", None))
+    if len(shape) == len(matrix.indices):
+        for extent, index in zip(shape, matrix.indices):
+            if index == reduction_var and extent > reduction:
+                storage_extent = extent
+    return {
+        "outputs": int(outputs),
+        "reduction": int(reduction),
+        "batches": int(batches),
+        "replicas": int(replicas),
+        "storage_extent": storage_extent,
+        "input_source": "banks" if same_buffer else "gb",
+        "matrix": matrix.memref_name,
+        "vector": vector.memref_name,
+    }
+
+
+def build_contraction(shape: dict, knobs: dict, *, activation=False, name=None):
+    """The AimContraction one kernel lowers to under the given knob values.
+
+    ``knobs`` maps ``batch_mapping``, ``reuse_group`` and
+    ``replica_partitions``; a missing knob keeps the typed default.
+    ``replicas`` overrides the shape's replica count (the profile prices one).
+    """
+    partitions = knobs.get("replica_partitions")
+    replicas = int(knobs.get("replicas", shape["replicas"]))
+    batch_mapping = knobs.get("batch_mapping") or "auto"
+    reuse = knobs.get("reuse_group")
+    return AimContraction(
+        outputs=shape["outputs"],
+        reduction=shape["reduction"],
+        batches=shape["batches"],
+        replicas=replicas,
+        row=0,
+        channels=(
+            None if partitions is None else tuple(range(replicas * int(partitions)))
+        ),
+        channels_per_replica=None if partitions is None else int(partitions),
+        input_source=shape["input_source"],
+        batch_mapping=batch_mapping,
+        reduction_storage_extent=shape["storage_extent"],
+        reuse_group_size=None if not reuse else int(reuse),
+        activation=bool(activation),
+        name=name,
     )
 
 
-__all__ = [
-    "AimOp",
-    "AimContraction",
-    "AimElementwise",
-    "AimActivation",
-    "AimHostTransfer",
-    "AimDistributedHostTransfer",
-    "AimBankCopy",
-    "AimAllBankWrite",
-    "AimSync",
-    "AimProgram",
-    "CompiledAimProgram",
-    "AimProgramCallable",
-    "compile_aim_program",
-]
+class _ProfileCache:
+    """Memo for ``aim_contraction_profile`` keyed on frozen record + geometry.
+
+    The cost fingerprint walks every object a rule references; this cache is
+    pure memoization of a deterministic function, so its manifest is constant.
+    """
+
+    def __init__(self):
+        self.entries: dict = {}
+
+    def __allo_fingerprint_manifest__(self):
+        return "aim-contraction-profile-cache-v1"
+
+
+_PROFILE_CACHE = _ProfileCache()
+
+
+def lower_contraction(operation, geometry) -> list[str]:
+    """Lower one AimContraction with the shared expander; raise ValueError if
+    the record is unrealizable on ``geometry``."""
+    lowerer = _AimLowerer.__new__(_AimLowerer)
+    lowerer.target = None
+    lowerer.geometry = geometry
+    lowerer.commands = []
+    lowerer.operations = []
+    lowerer.lower(operation, 0)
+    return lowerer.commands
+
+
+def aim_contraction_profile(operation, geometry) -> dict:
+    """Opcode counts, MAC column total, reuse groups and row activations.
+
+    ``row_activations`` counts MAC lines whose ``(mask, row)`` differs from the
+    previous MAC line; ``reuse_groups`` counts maximal WR_BIAS runs.
+    """
+    key = (operation, geometry)
+    cached = _PROFILE_CACHE.entries.get(key)
+    if cached is not None:
+        return cached
+    counts: dict[str, int] = {}
+    mac_columns = 0
+    mac_lines = 0
+    row_activations = 0
+    reuse_groups = 0
+    previous_open = None
+    previous_opcode = None
+    for line in lower_contraction(operation, geometry):
+        fields = line.split(" ")
+        opcode = fields[1]
+        counts[opcode] = counts.get(opcode, 0) + 1
+        if opcode == "WR_BIAS" and previous_opcode != "WR_BIAS":
+            reuse_groups += 1
+        if opcode == "MAC_ABK":
+            op_size, mask, row = (int(value) for value in fields[2:5])
+            mac_lines += 1
+            mac_columns += op_size
+            if (mask, row) != previous_open:
+                row_activations += 1
+                previous_open = (mask, row)
+        previous_opcode = opcode
+    profile = {
+        "counts": counts,
+        "mac_lines": mac_lines,
+        "mac_columns": mac_columns,
+        "row_activations": row_activations,
+        "reuse_groups": reuse_groups,
+    }
+    _PROFILE_CACHE.entries[key] = profile
+    return profile
+
+
+def _missing_fingerprint(match) -> ValueError:
+    return ValueError(
+        f"AiM kernel {match.func_name} carries a matcher work scope but no "
+        "spmw_body_fingerprint; allo.compile must stamp it so replication is "
+        "known (spec 002 A2)"
+    )
+
+
+def group_replicated(group_matches) -> bool:
+    """Whether every bucket of one kernel group runs the same body.
+
+    Reads the retained ``spmw_body_fingerprint`` of each match. A match that
+    has a work scope but no fingerprint is an error, never a guess. Matches
+    without any scope (synthetic traces) form one bucket per function.
+    """
+    functions = {match.func_name for match in group_matches}
+    fingerprints = set()
+    for match in group_matches:
+        fingerprint = match.extra.get("spmw_body_fingerprint")
+        if fingerprint is None:
+            if "spmw_work_scope" in match.extra:
+                raise _missing_fingerprint(match)
+            return len(functions) == 1
+        fingerprints.add(fingerprint)
+    return len(fingerprints) == 1
+
+
+def group_replication(match) -> tuple[bool, int]:
+    """``(replicated, bucket_count)`` of the group owning one bucket's match.
+
+    The whole-group flag ``spmw_group_replicated`` is stamped by
+    ``rank_matcher_placements`` from the per-match fingerprints.
+    """
+    scope = match.extra.get("spmw_work_scope")
+    shape = tuple(getattr(scope, "group_shape", ()) or ())
+    buckets = math.prod(shape) if shape else 1
+    replicated = match.extra.get("spmw_group_replicated")
+    if replicated is not None:
+        return bool(replicated), buckets
+    if buckets == 1:
+        return True, buckets
+    if match.extra.get("spmw_body_fingerprint") is None:
+        raise _missing_fingerprint(match)
+    raise ValueError(
+        f"AiM kernel {match.func_name}: group replication was not stamped; "
+        "enumerate through rank_matcher_placements"
+    )
+
+
+def replica_partition_domain(replicas: int, channels: int) -> list[int]:
+    """Powers of two ``p`` with ``replicas * p <= channels``, ascending."""
+    values = []
+    p = 1
+    while replicas * p <= channels:
+        values.append(p)
+        p *= 2
+    return values
+
+
+def aligned_reduction(reduction: int, lanes: int) -> int:
+    return math.ceil(reduction / lanes) * lanes
+
+
+def resolve_batch_mapping(shape: dict, requested, geometry) -> str:
+    """The batch mapping the lowerer realizes (its ``auto`` rule otherwise)."""
+    if requested not in (None, "auto", "none"):
+        return requested
+    if shape["input_source"] == "banks":
+        return "flattened"
+    if shape["storage_extent"] is not None:
+        return "channels"
+    if shape["batches"] == 1:
+        return "flattened"
+    return "row_packed"
+
+
+def matrix_axes(match) -> list[str]:
+    """Role of each matrix dimension: ``reduction``, ``batch`` or ``output``."""
+    matrix, vector = mac_operands(match)
+    reduction_var = match.enclosing_loops[-1][0]
+    same_buffer = matrix.memref_name == vector.memref_name
+    roles = []
+    for index in matrix.indices:
+        if index == reduction_var:
+            roles.append("reduction")
+        elif not same_buffer and index in vector.indices:
+            roles.append("batch")
+        else:
+            roles.append("output")
+    return roles

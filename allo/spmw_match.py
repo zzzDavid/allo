@@ -8,11 +8,52 @@ produce a list of `MatchedOp`s, each pointing at a contiguous chunk of
 IR that implements one target Op (e.g. MAC). Codegen consumes the list
 and emits backend-specific instructions.
 
-Both sides import from this module; nothing else lives here.
+Both sides import from this module. It also hosts the pattern
+vocabulary (``exp``, ``select``, ...) that target ``fn`` lambdas call.
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
+
+
+# --------------------------------------------------------------------- #
+# Pattern vocabulary for target ``fn`` lambdas.  The matcher recognizes a
+# call by the callee name.  Bodies are scalar and use only ``math`` and
+# builtins, because the cost fingerprint rejects NumPy ufuncs (ruling 028).
+# --------------------------------------------------------------------- #
+
+
+def exp(x):
+    return math.exp(x)
+
+
+def log(x):
+    return math.log(x)
+
+
+def sqrt(x):
+    return math.sqrt(x)
+
+
+def rsqrt(x):
+    return 1.0 / math.sqrt(x)
+
+
+def tanh(x):
+    return math.tanh(x)
+
+
+def erf(x):
+    return math.erf(x)
+
+
+def abs_(x):
+    return abs(x)
+
+
+def select(cond, a, b):
+    return a if cond else b
 
 
 @dataclass(frozen=True, order=True)
@@ -73,6 +114,9 @@ class OperandBinding:
     # Exact source SSA/storage identity retained from MLIR def-use and call/ABI
     # edges. Diagnostic memref names and textual types never substitute for it.
     value_ref: IRValueRef | None = None
+    # ``affine.load`` access-map text (None for ``memref.load``), so a family
+    # can read constant coordinates such as a label column ``S[s, 8]``.
+    index_map: str | None = None
 
 
 @dataclass
@@ -114,6 +158,10 @@ class MatchedOp:
     # Exact SSA/storage identity of the store destination. Synthetic or legacy
     # traces may leave it unset; cross-boundary analysis then fails closed.
     result_value_ref: IRValueRef | None = None
+    # Number of consecutive innermost-loop iterations one issue of the target
+    # op consumes.  It is the op's declared ``vector_width`` only when the
+    # innermost loop walks some non-accumulator operand contiguously.
+    vector_width: int = 1
 
 
 @dataclass

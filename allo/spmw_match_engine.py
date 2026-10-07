@@ -16,11 +16,17 @@ The OpPattern tree uses these node kinds:
 
   - ``PVar(name)``           a free parameter (e.g. ``x``, ``y``, ``acc``)
   - ``PConst(value)``        a literal numeric constant
-  - ``PBinOp(op, lhs, rhs)`` op in {"add","sub","mul","div"};
-                             ``add``/``mul`` are commutative.
+  - ``PBinOp(op, lhs, rhs)`` op in {"add","sub","mul","div","max","min"};
+                             ``add``/``mul``/``max``/``min`` are commutative.
+  - ``PUnary(fn, arg)``      fn in {"exp","log","sqrt","rsqrt","tanh",
+                             "erf","abs"} (the ``allo.spmw_match`` calls),
+                             or "neg" for Python unary minus.
+  - ``PCmp(pred, lhs, rhs)`` pred in {"lt","le","gt","ge","eq","ne"}.
+  - ``PSelect(cond, a, b)``  ``select(cond, a, b)``.
 
 The matcher reflects each candidate workload site as a similar tree of
-``WTerm`` nodes (``WLoad`` / ``WConst`` / ``WBinOp``) by tracing the SSA
+``WTerm`` nodes (``WLoad`` / ``WConst`` / ``WBinOp`` / ``WUnary`` /
+``WCmp`` / ``WSelect``) by tracing the SSA
 def-use chain backward from the value being stored. Unification is then
 a structural walk that, for each commutative binop, tries both operand
 orderings.
@@ -61,6 +67,26 @@ class PBinOp:
 
 
 @dataclass
+class PUnary:
+    fn: str  # "exp" | "log" | "sqrt" | "rsqrt" | "tanh" | "erf" | "abs" | "neg"
+    arg: Any
+
+
+@dataclass
+class PCmp:
+    pred: str  # "lt" | "le" | "gt" | "ge" | "eq" | "ne"
+    lhs: Any
+    rhs: Any
+
+
+@dataclass
+class PSelect:
+    cond: Any
+    a: Any
+    b: Any
+
+
+@dataclass
 class OpPattern:
     """Compiled pattern for one target Op.
 
@@ -69,7 +95,7 @@ class OpPattern:
     """
 
     param_names: list[str]
-    body: Any  # PVar | PConst | PBinOp
+    body: Any  # PVar | PConst | PBinOp | PUnary | PCmp | PSelect
 
 
 _AST_BINOP_TO_NAME = {
@@ -77,7 +103,40 @@ _AST_BINOP_TO_NAME = {
     ast.Sub: "sub",
     ast.Mult: "mul",
     ast.Div: "div",
+    ast.BitAnd: "and",
+    ast.BitOr: "or",
+    ast.BitXor: "xor",
+    ast.LShift: "shl",
+    ast.RShift: "shr",
 }
+
+# Callee name in a target lambda -> normalized unary function name.
+_PATTERN_UNARY_CALLS = {
+    "exp": "exp",
+    "log": "log",
+    "sqrt": "sqrt",
+    "rsqrt": "rsqrt",
+    "tanh": "tanh",
+    "erf": "erf",
+    "abs_": "abs",
+}
+
+_AST_CMPOP_TO_PRED = {
+    ast.Lt: "lt",
+    ast.LtE: "le",
+    ast.Gt: "gt",
+    ast.GtE: "ge",
+    ast.Eq: "eq",
+    ast.NotEq: "ne",
+}
+
+
+def _callee_name(node: ast.Call) -> str | None:
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return None
 
 
 def _compile_expr(node: ast.AST, params: set[str]) -> Any:
@@ -89,20 +148,37 @@ def _compile_expr(node: ast.AST, params: set[str]) -> Any:
             kind, _compile_expr(node.left, params), _compile_expr(node.right, params)
         )
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        # -x  =>  0 - x   (keeps the AST simple)
-        return PBinOp("sub", PConst(0), _compile_expr(node.operand, params))
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in {"max", "min"}
-    ):
+        return PUnary("neg", _compile_expr(node.operand, params))
+    callee = _callee_name(node) if isinstance(node, ast.Call) else None
+    if callee in {"max", "min"}:
         # max(x, 0) / min(x, 0) -> binary PBinOp (allo lowers max -> arith.maximumf).
         if len(node.args) != 2:
-            raise ValueError(f"{node.func.id} in lambda body requires exactly 2 args")
+            raise ValueError(f"{callee} in lambda body requires exactly 2 args")
         return PBinOp(
-            node.func.id,
+            callee,
             _compile_expr(node.args[0], params),
             _compile_expr(node.args[1], params),
+        )
+    if callee in _PATTERN_UNARY_CALLS:
+        if len(node.args) != 1 or node.keywords:
+            raise ValueError(f"{callee} in lambda body requires exactly 1 arg")
+        return PUnary(_PATTERN_UNARY_CALLS[callee], _compile_expr(node.args[0], params))
+    if callee == "select":
+        if len(node.args) != 3 or node.keywords:
+            raise ValueError("select in lambda body requires exactly 3 args")
+        return PSelect(*(_compile_expr(arg, params) for arg in node.args))
+    if isinstance(node, ast.Compare):
+        if len(node.ops) != 1 or len(node.comparators) != 1:
+            raise ValueError("chained comparison in lambda body is unsupported")
+        pred = _AST_CMPOP_TO_PRED.get(type(node.ops[0]))
+        if pred is None:
+            raise ValueError(
+                f"unsupported comparison in lambda: {ast.dump(node.ops[0])}"
+            )
+        return PCmp(
+            pred,
+            _compile_expr(node.left, params),
+            _compile_expr(node.comparators[0], params),
         )
     if isinstance(node, ast.Name):
         if node.id in params:
@@ -189,6 +265,16 @@ class WLoad:
     source_op_name: str  # MLIR op name, e.g. "memref.load"
     memref_type: str | None = None
     value_ref: IRValueRef | None = None
+    # ``affine.load`` access-map text, e.g. ``affine_map<(d0) -> (d0 * 2)>``;
+    # None for ``memref.load``.
+    index_map: str | None = None
+    # Memory state of the memref at this load (spec 004 M2): ``("nostore",)``
+    # when the function never stores to it, else ``(block, stores before)``.
+    # Two loads with equal versions see no intervening store. None outside a
+    # function scope, which keeps SSA-name equality.
+    version: tuple | None = None
+    # Traced index operands (spec 004 M6), filled inside a function scope.
+    index_terms: tuple | None = None
 
 
 @dataclass
@@ -212,6 +298,30 @@ class WBinOp:
     ssa_name: str
 
 
+@dataclass
+class WUnary:
+    fn: str  # normalized name, see _MATH_UNARY; "neg" for arith.negf
+    arg: Any
+    ssa_name: str
+
+
+@dataclass
+class WCmp:
+    pred: str  # normalized: "lt" | "le" | "gt" | "ge" | "eq" | "ne"
+    lhs: Any
+    rhs: Any
+    ssa_name: str
+    raw: str  # original MLIR predicate, e.g. "ogt" / "slt", for emitters
+
+
+@dataclass
+class WSelect:
+    cond: Any
+    a: Any
+    b: Any
+    ssa_name: str
+
+
 _FP_BINOPS = {
     "arith.mulf": "mul",
     "arith.addf": "add",
@@ -222,10 +332,61 @@ _FP_BINOPS = {
     "arith.subi": "sub",
     "arith.maximumf": "max",
     "arith.minimumf": "min",
+    "arith.maxnumf": "max",
+    "arith.minnumf": "min",
     "arith.maxsi": "max",
     "arith.maxui": "max",
     "arith.minsi": "min",
     "arith.minui": "min",
+    "arith.andi": "and",
+    "arith.ori": "or",
+    "arith.xori": "xor",
+    "arith.shli": "shl",
+    "arith.shrsi": "shr",
+    # No Python spelling, so no pattern ever matches it.
+    "arith.shrui": "shru",
+}
+
+_MATH_UNARY = {
+    "math.exp": "exp",
+    "math.log": "log",
+    "math.sqrt": "sqrt",
+    "math.rsqrt": "rsqrt",
+    "math.tanh": "tanh",
+    "math.erf": "erf",
+    "math.absf": "abs",
+}
+
+# arith.CmpFPredicate / arith.CmpIPredicate enum order; the IR attribute is
+# the integer case.
+_CMPF_PREDICATES = (
+    "false", "oeq", "ogt", "oge", "olt", "ole", "one", "ord",
+    "ueq", "ugt", "uge", "ult", "ule", "une", "uno", "true",
+)  # fmt: skip
+_CMPI_PREDICATES = (
+    "eq", "ne", "slt", "sle", "sgt", "sge", "ult", "ule", "ugt", "uge",
+)  # fmt: skip
+_NORMALIZED_PREDICATES = {"lt", "le", "gt", "ge", "eq", "ne"}
+_MIRRORED_PREDICATE = {
+    "lt": "gt",
+    "gt": "lt",
+    "le": "ge",
+    "ge": "le",
+    "eq": "eq",
+    "ne": "ne",
+}
+
+_CAST_OPS = {
+    "arith.extsi",
+    "arith.extui",
+    "arith.trunci",
+    "arith.extf",
+    "arith.truncf",
+    "arith.sitofp",
+    "arith.uitofp",
+    "arith.fptosi",
+    "arith.fptoui",
+    "arith.index_cast",
 }
 
 _LOAD_OPS = {"memref.load", "affine.load"}
@@ -242,15 +403,140 @@ def _attr_str(a) -> str | None:
     return s
 
 
+class ValueNames:
+    """Function-unique SSA names.
+
+    The printer restarts numbering in each region, so ``Value.get_name`` can
+    give two values of one function the same name (``%0`` in two sibling
+    loops). Name-keyed lookups (``defining_map``) would then resolve to the
+    wrong op. The first value keeps its printed name; later ones with the same
+    name get a ``#k`` suffix, assigned in program order.
+    """
+
+    def __init__(self, func, state):
+        self.state = state
+        self._names: dict = {}
+        taken: set = set()
+
+        def assign(value):
+            base = value.get_name(state)
+            name, k = base, 1
+            while name in taken:
+                name = f"{base}#{k}"
+                k += 1
+            taken.add(name)
+            self._names[value] = name
+
+        def visit(block):
+            for argument in block.arguments:
+                assign(argument)
+            for op in block.operations:
+                for result in op.results:
+                    assign(result)
+                for region in op.regions:
+                    for nested in region.blocks:
+                        visit(nested)
+
+        for argument in func.arguments:
+            if argument not in self._names:
+                assign(argument)
+        visit(func.regions[0].blocks[0])
+
+    def __call__(self, value) -> str:
+        name = self._names.get(value)
+        return name if name is not None else value.get_name(self.state)
+
+
+def _value_name(value, state) -> str:
+    return state(value) if isinstance(state, ValueNames) else value.get_name(state)
+
+
 def _operand_names(op, *, state) -> list[str]:
-    return [o.get_name(state) for o in op.operands]
+    return [_value_name(o, state) for o in op.operands]
 
 
 def _result_names(op, *, state) -> list[str]:
-    return [r.get_name(state) for r in op.results]
+    return [_value_name(r, state) for r in op.results]
 
 
-def _build_load_term(load_op, value_refs, *, state) -> WLoad:
+@dataclass
+class _FunctionScope:
+    """Per-function facts for the spec 004 matcher extensions.
+
+    ``versions``: load result name -> memory-state version (M2).
+    ``forward``: load result name -> stored SSA name of the single dominating
+    store into a scalar ``memref.alloc`` (M3).
+    """
+
+    versions: dict
+    forward: dict
+
+
+def _scalar_alloc(value) -> bool:
+    owner = getattr(value, "owner", None)
+    if getattr(getattr(owner, "operation", owner), "name", None) != "memref.alloc":
+        return False
+    shape = getattr(value.type, "shape", None)
+    try:
+        shape = list(shape)
+    except TypeError:
+        return False
+    return len(shape) == 0 or (len(shape) == 1 and shape[0] == 1)
+
+
+def _build_function_scope(func, value_refs, *, state) -> _FunctionScope:
+    """Walk ``func`` once, in program order, recording op paths."""
+    loads, stores = [], []
+
+    def visit(block, prefix):
+        for index, op in enumerate(block.operations):
+            path = prefix + (index,)
+            name = op.operation.name
+            if name in _LOAD_OPS and op.operands and op.results:
+                loads.append((op, path))
+            elif name in _STORE_OPS and len(op.operands) > 1:
+                stores.append((op, path))
+            for region_index, region in enumerate(op.regions):
+                for block_index, nested in enumerate(region.blocks):
+                    visit(nested, path + (region_index, block_index))
+
+    visit(func.regions[0].blocks[0], ())
+
+    def key(memref):
+        return value_refs.get(memref, memref)
+
+    stored: dict = {}
+    for op, path in stores:
+        stored.setdefault(key(op.operands[1]), []).append((op, path))
+
+    versions, forward = {}, {}
+    for op, path in loads:
+        memref = op.operands[0]
+        result = _value_name(op.results[0], state)
+        writes = stored.get(key(memref), [])
+        if not writes:
+            versions[result] = ("nostore",)
+        else:
+            block = path[:-1]
+            before = sum(
+                1 for _w, wpath in writes if wpath[:-1] == block and wpath[-1] < path[-1]
+            )
+            versions[result] = (block, before)
+        # M3: one store into a scalar alloc, in this block or an enclosing one,
+        # before the load in program order.
+        if len(writes) == 1 and len(op.operands) - 1 <= 1 and _scalar_alloc(memref):
+            store, spath = writes[0]
+            depth = len(spath) - 1
+            if (
+                len(path) > depth
+                and path[:depth] == spath[:depth]
+                and spath[depth] < path[depth]
+            ):
+                forward[result] = _value_name(store.operands[0], state)
+    return _FunctionScope(versions, forward)
+
+
+def _build_load_term(load_op, value_refs, *, state, scope=None, defining_map=None) -> WLoad:
     name = load_op.operation.name
     attrs = load_op.attributes
     memref_name = None
@@ -261,6 +547,15 @@ def _build_load_term(load_op, value_refs, *, state) -> WLoad:
     indices = operands[1:] if len(operands) > 1 else []
     ssa = _result_names(load_op, state=state)[0] if load_op.results else "<no-result>"
     memref_type = str(load_op.operands[0].type) if load_op.operands else None
+    index_map = str(attrs["map"]) if "map" in attrs else None
+    version = None
+    index_terms = None
+    if scope is not None:
+        version = scope.versions.get(ssa)
+        index_terms = tuple(
+            _trace_value(index, defining_map, value_refs, state=state, scope=scope)
+            for index in indices
+        )
     return WLoad(
         memref_name=memref_name,
         ssa_name=ssa,
@@ -268,11 +563,36 @@ def _build_load_term(load_op, value_refs, *, state) -> WLoad:
         source_op_name=name,
         memref_type=memref_type,
         value_ref=value_refs.get(load_op.operands[0]) if load_op.operands else None,
+        index_map=index_map,
+        version=version,
+        index_terms=index_terms,
     )
 
 
+def _compare_predicate(cmp_op) -> tuple[str, str] | None:
+    """Return ``(normalized, raw)`` for an ``arith.cmpf``/``arith.cmpi``.
+
+    None for predicates with no single-comparison form (``ord``, ``uno``,
+    ``true``, ``false``) or an unreadable attribute.
+    """
+    table = (
+        _CMPF_PREDICATES if cmp_op.operation.name == "arith.cmpf" else _CMPI_PREDICATES
+    )
+    try:
+        case = int(str(cmp_op.attributes["predicate"]).split(":")[0].strip())
+        raw = table[case]
+    except (KeyError, ValueError, IndexError):
+        return None
+    if raw in _NORMALIZED_PREDICATES:
+        return raw, raw
+    normalized = raw[1:]
+    if normalized not in _NORMALIZED_PREDICATES:
+        return None
+    return normalized, raw
+
+
 def _trace_value(
-    ssa_name: str, defining_map: dict[str, Any], value_refs, *, state
+    ssa_name: str, defining_map: dict[str, Any], value_refs, *, state, scope=None
 ) -> Any:
     """Build a WTerm for the SSA value named ``ssa_name``.
 
@@ -286,13 +606,40 @@ def _trace_value(
 
     op_name = src.operation.name
     if op_name in _LOAD_OPS:
-        return _build_load_term(src, value_refs, state=state)
+        if scope is not None and ssa_name in scope.forward:
+            return _trace_value(
+                scope.forward[ssa_name], defining_map, value_refs, state=state, scope=scope
+            )
+        return _build_load_term(
+            src, value_refs, state=state, scope=scope, defining_map=defining_map
+        )
     if op_name in _FP_BINOPS:
         kind = _FP_BINOPS[op_name]
         ops = _operand_names(src, state=state)
-        lhs = _trace_value(ops[0], defining_map, value_refs, state=state)
-        rhs = _trace_value(ops[1], defining_map, value_refs, state=state)
+        lhs = _trace_value(ops[0], defining_map, value_refs, state=state, scope=scope)
+        rhs = _trace_value(ops[1], defining_map, value_refs, state=state, scope=scope)
         return WBinOp(kind, lhs, rhs, _result_names(src, state=state)[0])
+    if op_name in _MATH_UNARY:
+        arg = _trace_value(
+            _operand_names(src, state=state)[0], defining_map, value_refs, state=state, scope=scope
+        )
+        return WUnary(_MATH_UNARY[op_name], arg, _result_names(src, state=state)[0])
+    if op_name in {"arith.cmpf", "arith.cmpi"}:
+        predicate = _compare_predicate(src)
+        if predicate is not None:
+            ops = _operand_names(src, state=state)
+            lhs = _trace_value(ops[0], defining_map, value_refs, state=state, scope=scope)
+            rhs = _trace_value(ops[1], defining_map, value_refs, state=state, scope=scope)
+            return WCmp(
+                predicate[0], lhs, rhs, _result_names(src, state=state)[0], predicate[1]
+            )
+        return WBlockArg(ssa_name=_result_names(src, state=state)[0])
+    if op_name == "arith.select":
+        ops = _operand_names(src, state=state)
+        cond, a, b = (
+            _trace_value(name, defining_map, value_refs, state=state, scope=scope) for name in ops
+        )
+        return WSelect(cond, a, b, _result_names(src, state=state)[0])
     if op_name == "arith.constant":
         # Try to extract the literal; not strictly needed for matching.
         try:
@@ -308,15 +655,32 @@ def _trace_value(
             return WConst(v, _result_names(src, state=state)[0])
         except Exception:  # noqa: BLE001
             return WConst(None, _result_names(src, state=state)[0])
-    # Anything else (extsi, index_cast, sitofp, ...) is treated as opaque.
-    # We trace through single-input casts so that constants on the other
-    # side still appear as constants when the pattern needs them.
-    if len(src.operands) == 1 and src.results:
+    # Any other math.* op computes a value; tracing through it as a cast
+    # would let e.g. ``a + exp(b)`` match ``x + y`` with ``y = b``.
+    if op_name.startswith("math."):
+        return WBlockArg(
+            ssa_name=_result_names(src, state=state)[0] if src.results else ssa_name
+        )
+    # `(-1.0) * x` lowers to `negf 1.0`: fold a negated constant, and keep
+    # any other negation as a real term so `-x` never traces as `x`.
+    if op_name == "arith.negf" and len(src.operands) == 1 and src.results:
         inner = _trace_value(
-            _operand_names(src, state=state)[0], defining_map, value_refs, state=state
+            _operand_names(src, state=state)[0], defining_map, value_refs, state=state, scope=scope
+        )
+        value = _const_value(inner)
+        result = _result_names(src, state=state)[0]
+        if value is not None:
+            return WConst(-value, result)
+        return WUnary("neg", inner, result)
+    # Only value-preserving casts are traced through, so that constants on
+    # the other side still appear as constants when the pattern needs them.
+    # Every other single-operand op is opaque.
+    if op_name in _CAST_OPS and len(src.operands) == 1 and src.results:
+        inner = _trace_value(
+            _operand_names(src, state=state)[0], defining_map, value_refs, state=state, scope=scope
         )
         # Wrap-through: keep the original ssa name so codegen can audit.
-        if isinstance(inner, (WLoad, WBlockArg, WConst, WBinOp)):
+        if isinstance(inner, (WLoad, WBlockArg, WConst, WBinOp, WSelect)):
             return inner
     return WBlockArg(
         ssa_name=_result_names(src, state=state)[0] if src.results else ssa_name
@@ -328,17 +692,100 @@ def _trace_value(
 # --------------------------------------------------------------------- #
 
 
-_COMMUTATIVE = {"add", "mul", "max", "min"}
+_COMMUTATIVE = {"add", "mul", "max", "min", "and", "or", "xor"}
+
+_CONST_FOLD = {
+    "add": lambda a, b: a + b,
+    "sub": lambda a, b: a - b,
+    "mul": lambda a, b: a * b,
+    "and": lambda a, b: a & b,
+    "or": lambda a, b: a | b,
+    "xor": lambda a, b: a ^ b,
+    "shl": lambda a, b: a << b,
+    "shr": lambda a, b: a >> b,
+}
 
 
-def _unify(pattern, term, bindings: dict[str, Any]) -> bool:
+def _const_value(term):
+    """Numeric value of a constant-only term, else None.
+
+    Literals such as ``-1`` reach the IR as ``subi 0, 1`` rather than a
+    single ``arith.constant``, so add/sub/mul over constants are evaluated.
+    """
+    if isinstance(term, WConst):
+        value = term.value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+        return None
+    if isinstance(term, WBinOp) and term.op in _CONST_FOLD:
+        lhs = _const_value(term.lhs)
+        rhs = _const_value(term.rhs)
+        if lhs is None or rhs is None:
+            return None
+        try:
+            return _CONST_FOLD[term.op](lhs, rhs)
+        except TypeError:  # bitwise op on a float constant
+            return None
+    if isinstance(term, WUnary) and term.fn == "neg":
+        value = _const_value(term.arg)
+        return None if value is None else -value
+    return None
+
+
+def _acc_param(op_obj, pattern) -> str | None:
+    """The accumulator: the last parameter that is not a ``const_params`` or
+    ``iv_params`` entry (``GRAD_LINEAR(x, y, acc, alpha, beta)``)."""
+    if not op_obj.accumulates:
+        return None
+    skip = set(getattr(op_obj, "const_params", ())) | set(
+        getattr(op_obj, "iv_params", ())
+    )
+    names = [name for name in pattern.param_names if name not in skip]
+    return names[-1] if names else None
+
+
+def _param_kinds(op_obj, pattern) -> dict[str, str] | None:
+    """Per-parameter binding kind for an op with ``const_params``.
+
+    None for every other op, which keeps the legacy unify-then-filter path.
+    """
+    const_params = getattr(op_obj, "const_params", ())
+    iv_params = getattr(op_obj, "iv_params", ())
+    if not const_params and not iv_params:
+        return None
+    return {
+        name: (
+            "const"
+            if name in const_params
+            else "iv"
+            if name in iv_params
+            else "load"
+        )
+        for name in pattern.param_names
+    }
+
+
+def _unify(pattern, term, bindings: dict[str, Any], kinds=None) -> bool:
     """Try to unify a pattern node against a workload term.
 
     On success ``bindings`` is populated with ``{param_name: WTerm}`` and
     True is returned. On failure ``bindings`` is left in an undefined
     state — callers should pass a fresh dict each top-level call.
+
+    ``kinds`` (from :func:`_param_kinds`) constrains each parameter to a
+    load or a constant during the search, so a commutative operand order
+    that binds a constant parameter to a load is rejected and the other
+    order is tried.
     """
     if isinstance(pattern, PVar):
+        if kinds is not None:
+            kind = kinds.get(pattern.name)
+            if kind == "const" and _const_value(term) is None:
+                return False
+            if kind == "load" and not isinstance(term, WLoad):
+                return False
+            if kind == "iv" and not isinstance(term, WBlockArg):
+                return False
         existing = bindings.get(pattern.name)
         if existing is None:
             bindings[pattern.name] = term
@@ -363,33 +810,140 @@ def _unify(pattern, term, bindings: dict[str, Any]) -> bool:
             return False
         # Try direct order
         b = dict(bindings)
-        if _unify(pattern.lhs, term.lhs, b) and _unify(pattern.rhs, term.rhs, b):
+        if _unify(pattern.lhs, term.lhs, b, kinds) and _unify(
+            pattern.rhs, term.rhs, b, kinds
+        ):
             bindings.clear()
             bindings.update(b)
             return True
         if pattern.op in _COMMUTATIVE:
             b = dict(bindings)
-            if _unify(pattern.lhs, term.rhs, b) and _unify(pattern.rhs, term.lhs, b):
+            if _unify(pattern.lhs, term.rhs, b, kinds) and _unify(
+                pattern.rhs, term.lhs, b, kinds
+            ):
                 bindings.clear()
                 bindings.update(b)
                 return True
         return False
 
+    if isinstance(pattern, PUnary):
+        if pattern.fn == "neg":
+            # Float negation is `negf x`; integer negation lowers to
+            # `subi 0, x`; a negated literal is already folded to a constant.
+            if isinstance(term, WBinOp) and term.op == "sub":
+                if _const_value(term.lhs) == 0:
+                    return _unify_in_order([(pattern.arg, term.rhs)], bindings, kinds)
+            if isinstance(pattern.arg, PConst) and not isinstance(term, WUnary):
+                value = _const_value(term)
+                try:
+                    return value is not None and value == -pattern.arg.value
+                except TypeError:
+                    return False
+        if not isinstance(term, WUnary) or pattern.fn != term.fn:
+            return False
+        return _unify_in_order([(pattern.arg, term.arg)], bindings, kinds)
+
+    if isinstance(pattern, PSelect):
+        if not isinstance(term, WSelect):
+            return False
+        return _unify_in_order(
+            [(pattern.cond, term.cond), (pattern.a, term.a), (pattern.b, term.b)],
+            bindings,
+            kinds,
+        )
+
+    if isinstance(pattern, PCmp):
+        if not isinstance(term, WCmp):
+            return False
+        if pattern.pred == term.pred and _unify_in_order(
+            [(pattern.lhs, term.lhs), (pattern.rhs, term.rhs)], bindings, kinds
+        ):
+            return True
+        # `x > y` is `y < x`; eq/ne mirror onto themselves.
+        if _MIRRORED_PREDICATE[pattern.pred] == term.pred and _unify_in_order(
+            [(pattern.lhs, term.rhs), (pattern.rhs, term.lhs)], bindings, kinds
+        ):
+            return True
+        return False
+
+    return False
+
+
+def _unify_in_order(pairs, bindings: dict[str, Any], kinds=None) -> bool:
+    b = dict(bindings)
+    if all(_unify(p, t, b, kinds) for p, t in pairs):
+        bindings.clear()
+        bindings.update(b)
+        return True
     return False
 
 
 def _term_eq(a, b) -> bool:
+    """Structural term equality (spec 004 M2).
+
+    Two loads are equal when they read the same memref at the same index
+    operands and map, and no store to that memref separates them (equal
+    ``version``). Loads traced outside a function scope compare by SSA name.
+    """
     if type(a) is not type(b):
         return False
     if isinstance(a, WLoad):
-        return a.ssa_name == b.ssa_name
+        if a.ssa_name == b.ssa_name:
+            return True
+        if a.version is None or a.version != b.version:
+            return False
+        same_memref = (
+            a.value_ref == b.value_ref
+            if a.value_ref is not None and b.value_ref is not None
+            else a.memref_name == b.memref_name
+        )
+        return (
+            same_memref
+            and list(a.indices) == list(b.indices)
+            and a.index_map == b.index_map
+        )
     if isinstance(a, WBlockArg):
         return a.ssa_name == b.ssa_name
     if isinstance(a, WConst):
         return a.value == b.value
     if isinstance(a, WBinOp):
-        return a.ssa_name == b.ssa_name
+        return a.op == b.op and _term_eq(a.lhs, b.lhs) and _term_eq(a.rhs, b.rhs)
+    if isinstance(a, WUnary):
+        return a.fn == b.fn and _term_eq(a.arg, b.arg)
+    if isinstance(a, WCmp):
+        return a.pred == b.pred and _term_eq(a.lhs, b.lhs) and _term_eq(a.rhs, b.rhs)
+    if isinstance(a, WSelect):
+        return (
+            _term_eq(a.cond, b.cond)
+            and _term_eq(a.a, b.a)
+            and _term_eq(a.b, b.b)
+        )
     return False
+
+
+def _contains_load(term) -> bool:
+    if isinstance(term, WLoad):
+        return True
+    if isinstance(term, WBinOp):
+        return _contains_load(term.lhs) or _contains_load(term.rhs)
+    if isinstance(term, WUnary):
+        return _contains_load(term.arg)
+    if isinstance(term, (WCmp,)):
+        return _contains_load(term.lhs) or _contains_load(term.rhs)
+    if isinstance(term, WSelect):
+        return any(_contains_load(t) for t in (term.cond, term.a, term.b))
+    return False
+
+
+def _data_dependent(source_op_name, index_terms) -> bool:
+    """An index that depends on loaded data. ``affine`` accesses never do."""
+    if source_op_name.startswith("affine.") or not index_terms:
+        return False
+    return any(_contains_load(term) for term in index_terms)
+
+
+def _terms_eq(a, b) -> bool:
+    return len(a) == len(b) and all(_term_eq(x, y) for x, y in zip(a, b))
 
 
 # --------------------------------------------------------------------- #
@@ -420,15 +974,22 @@ def _affine_map_text(attr) -> str:
     return str(attr)
 
 
-def _walk_loops(block, prefix: list[tuple[str, str, str, int]], collector, *, state):
+def _walk_loops(
+    block, prefix: list[tuple[str, str, str, int]], collector, *, state, guards=()
+):
     """Recurse into ``block``'s ops, collecting affine.for loops in ``prefix``
-    and yielding (op, current_loop_stack) for every non-loop op via
-    ``collector.append``.
+    and yielding (op, current_loop_stack, guard_frames) for every non-loop op
+    via ``collector.append``.
+
+    Guard frames (spec 004 M5): the then region of ``scf.if`` pushes
+    ``("if", cond_ssa)``, the else region ``("not", cond_ssa)``; ``affine.if``
+    pushes ``("affine_if", set_text, operand_names)`` (negated as
+    ``("not_affine_if", ...)``). Frames are outermost first.
     """
     for op in block.operations:
         if op.operation.name == "affine.for":
             attrs = op.attributes
-            iv_name = op.regions[0].blocks[0].arguments[0].get_name(state)
+            iv_name = _value_name(op.regions[0].blocks[0].arguments[0], state)
             lb = (
                 _affine_map_text(attrs["lowerBoundMap"])
                 if "lowerBoundMap" in attrs
@@ -450,12 +1011,28 @@ def _walk_loops(block, prefix: list[tuple[str, str, str, int]], collector, *, st
                 step = 1
             loop = (iv_name, lb, ub, step)
             for inner_block in op.regions[0].blocks:
-                _walk_loops(inner_block, prefix + [loop], collector, state=state)
+                _walk_loops(
+                    inner_block, prefix + [loop], collector, state=state, guards=guards
+                )
         else:
-            collector.append((op, list(prefix)))
-            for r in op.regions:
+            collector.append((op, list(prefix), tuple(guards)))
+            name = op.operation.name
+            for region_index, r in enumerate(op.regions):
+                frames = guards
+                if name == "scf.if":
+                    cond = _value_name(op.operands[0], state)
+                    frames = guards + ((("if", cond) if region_index == 0 else ("not", cond)),)
+                elif name == "affine.if":
+                    condition = (
+                        str(op.attributes["condition"])
+                        if "condition" in op.attributes
+                        else "?"
+                    )
+                    operands = tuple(_value_name(o, state) for o in op.operands)
+                    tag = "affine_if" if region_index == 0 else "not_affine_if"
+                    frames = guards + ((tag, condition, operands),)
                 for blk in r.blocks:
-                    _walk_loops(blk, prefix, collector, state=state)
+                    _walk_loops(blk, prefix, collector, state=state, guards=frames)
 
 
 def _build_defining_map(func, *, state) -> dict[str, Any]:
@@ -464,7 +1041,7 @@ def _build_defining_map(func, *, state) -> dict[str, Any]:
     def visit(block):
         for op in block.operations:
             for r in op.results:
-                m[r.get_name(state)] = op
+                m[_value_name(r, state)] = op
             for region in op.regions:
                 for blk in region.blocks:
                     visit(blk)
@@ -649,16 +1226,14 @@ def _build_ir_value_refs(
 def _operand_bindings(
     pattern: OpPattern,
     bindings: dict[str, Any],
-    accumulates: bool,
+    acc_name: str | None,
 ) -> list[OperandBinding]:
-    """Build OperandBindings (in fn signature order) from a successful unify."""
+    """Build OperandBindings (in fn signature order) from a successful unify.
+
+    ``acc_name`` is the loop-carried accumulator parameter (see
+    :func:`_acc_param`), or None for a non-accumulating op.
+    """
     out: list[OperandBinding] = []
-    # The accumulator parameter — convention: if accumulates, the last
-    # parameter is the loop-carried accumulator. Allo's frontend names it
-    # "acc" via the {from = "acc"} attr; we mark it as such.
-    acc_name = (
-        pattern.param_names[-1] if (accumulates and pattern.param_names) else None
-    )
     for name in pattern.param_names:
         term = bindings.get(name)
         if isinstance(term, WLoad):
@@ -670,6 +1245,7 @@ def _operand_bindings(
                     is_loop_carried=(name == acc_name),
                     memref_type=term.memref_type,
                     value_ref=term.value_ref,
+                    index_map=term.index_map,
                 )
             )
         elif isinstance(term, WBlockArg):
@@ -734,6 +1310,67 @@ def _flatten_add_chain(term, result_memref_name):
     return node, summands
 
 
+_AFFINE_MAP_RE = re.compile(
+    r"^affine_map<\((?P<dims>[^)]*)\)(?:\[[^\]]*\])?\s*->\s*\((?P<results>.*)\)>$"
+)
+
+
+def _affine_map_last_result(text: str) -> tuple[int, str] | None:
+    """Return ``(dim_count, last_result)`` of an affine-map attribute text."""
+    m = _AFFINE_MAP_RE.match(text.strip())
+    if m is None:
+        return None
+    dims = [d for d in m.group("dims").split(",") if d.strip()]
+    results, depth, start = [], 0, 0
+    body = m.group("results")
+    for i, ch in enumerate(body):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            results.append(body[start:i])
+            start = i + 1
+    results.append(body[start:])
+    last = results[-1].strip()
+    if not last:
+        return None
+    return len(dims), last
+
+
+def _load_last_axis_is(load: WLoad, iv: str) -> bool:
+    """True iff ``load``'s last access coordinate is exactly ``iv``."""
+    if not load.indices:
+        return False
+    if load.source_op_name == "memref.load":
+        return load.indices[-1] == iv
+    if load.index_map is None:
+        return False
+    parsed = _affine_map_last_result(load.index_map)
+    if parsed is None:
+        return False
+    dim_count, last = parsed
+    return any(
+        index == iv and position < dim_count and last == f"d{position}"
+        for position, index in enumerate(load.indices)
+    )
+
+
+def _matched_vector_width(op_obj, pattern, bindings, enclosing_loops) -> int:
+    width = getattr(op_obj, "vector_width", 1)
+    if width == 1 or not enclosing_loops:
+        return 1
+    innermost_iv = enclosing_loops[-1][0]
+    acc_name = _acc_param(op_obj, pattern)
+    for name in pattern.param_names:
+        if name == acc_name:
+            continue
+        term = bindings.get(name)
+        if isinstance(term, WLoad) and _load_last_axis_is(term, innermost_iv):
+            return width
+    return 1
+
+
 def _try_match_at_store(
     store_op,
     enclosing_loops: list[tuple[str, str, str, int]],
@@ -744,6 +1381,8 @@ def _try_match_at_store(
     value_refs: dict[Any, IRValueRef],
     *,
     state,
+    scope=None,
+    guards=(),
 ) -> list[MatchedOp]:
     """If ``store_op`` (a memref.store / affine.store) writes a value that
     matches one of the target's compiled op patterns, emit MatchedOps for it.
@@ -769,35 +1408,95 @@ def _try_match_at_store(
         value_refs.get(store_op.operands[1]) if len(store_op.operands) > 1 else None
     )
 
-    term = _trace_value(stored_ssa, defining_map, value_refs, state=state)
-    # Only a binop term is interesting for the patterns we care about.
-    if not isinstance(term, WBinOp):
+    term = _trace_value(stored_ssa, defining_map, value_refs, state=state, scope=scope)
+    # Only a computed term is interesting; a bare load/const store is a copy,
+    # except for ops that move data to a computed destination (M6).
+    computed = isinstance(term, (WBinOp, WUnary, WSelect, WCmp))
+    if not computed and not isinstance(term, WLoad):
         return []
 
     store_handle = f"{op_name}@{stored_ssa}"
+    store_data_dependent = False
+    store_map = (
+        str(store_op.attributes["map"]) if "map" in store_op.attributes else None
+    )
+    index_terms = None
+    guard_terms = ()
+    if scope is not None:
+        index_terms = tuple(
+            _trace_value(index, defining_map, value_refs, state=state, scope=scope)
+            for index in store_indices
+        )
+        store_data_dependent = _data_dependent(op_name, index_terms)
+        guard_terms = tuple(
+            (
+                (frame[0], _trace_value(
+                    frame[1], defining_map, value_refs, state=state, scope=scope
+                ))
+                if frame[0] in ("if", "not")
+                else frame
+            )
+            for frame in guards
+        )
 
-    def _match_term(t: "WBinOp") -> MatchedOp | None:
-        """Unify one binop term against the target's op patterns; return the
-        first matching MatchedOp (the existing single-term logic), or None."""
+    def _match_term(t) -> MatchedOp | None:
+        """Unify one computed term against the target's op patterns; return
+        the first matching MatchedOp (the existing single-term logic), or None."""
         for unit in target._walk():
             for op_obj in unit.ops.values():
                 if not op_obj.matchable:
                     continue
+                # M5: a guarded store matches only ops that opt in.
+                if guards and not getattr(op_obj, "guarded", False):
+                    continue
+                any_index = getattr(op_obj, "dst_index", "affine") == "any"
+                if not computed and not any_index:
+                    continue
+                # An ordinary-index op never writes a data-dependent element
+                # (that is a scatter, spec 004 M6 and its 016 review).
+                if not any_index and store_data_dependent:
+                    continue
                 pat = compile_op_pattern(op_obj)
                 bindings: dict[str, Any] = {}
-                if not _unify(pat.body, t, bindings):
+                kinds = _param_kinds(op_obj, pat)
+                if not _unify(pat.body, t, bindings, kinds):
                     continue
-                # Conservative filter: every parameter must bind to a memref
-                # load. Block-arg / constant / opaque-cast bindings are
-                # rejected so we don't match index-arithmetic chains (e.g.
-                # `pid * 8` computing `row0`) against data-plane ops.
-                if not all(isinstance(bindings.get(n), WLoad) for n in pat.param_names):
-                    continue
+                constants = None
+                if kinds is None:
+                    # Conservative filter: every parameter must bind to a memref
+                    # load. Block-arg / constant / opaque-cast bindings are
+                    # rejected so we don't match index-arithmetic chains (e.g.
+                    # `pid * 8` computing `row0`) against data-plane ops.
+                    if not all(
+                        isinstance(bindings.get(n), WLoad) for n in pat.param_names
+                    ):
+                        continue
+                else:
+                    # `const_params` bind to compile-time constants and
+                    # `iv_params` to enclosing loop variables; every other
+                    # parameter keeps the memref-load rule.
+                    if not all(n in bindings for n in pat.param_names):
+                        continue
+                    constants = {}
+                    iv_positions = {}
+                    loop_names = [loop[0] for loop in enclosing_loops]
+                    for n in pat.param_names:
+                        if kinds[n] == "const":
+                            constants[n] = _const_value(bindings[n])
+                            bindings[n] = WConst(constants[n], bindings[n].ssa_name)
+                        elif kinds[n] == "iv" and bindings[n].ssa_name in loop_names:
+                            iv_positions[n] = loop_names.index(bindings[n].ssa_name)
+                    if any(
+                        kinds[n] == "iv" and n not in iv_positions
+                        for n in pat.param_names
+                    ):
+                        continue
                 # If this op accumulates, validate the accumulator: the last
                 # parameter must bind to a WLoad whose memref equals the
                 # store's "to" memref (i.e. the same accumulator memref).
-                if op_obj.accumulates and pat.param_names:
-                    acc_term = bindings[pat.param_names[-1]]
+                acc_name = _acc_param(op_obj, pat)
+                if acc_name is not None:
+                    acc_term = bindings[acc_name]
                     if not isinstance(acc_term, WLoad):
                         continue
                     if (
@@ -812,17 +1511,44 @@ def _try_match_at_store(
                         and acc_term.value_ref != result_value_ref
                     ):
                         continue
+                    # M6: the accumulator is read at the stored element.
+                    if any_index:
+                        if (
+                            index_terms is None
+                            or acc_term.index_terms is None
+                            or acc_term.index_map != store_map
+                            or not _terms_eq(acc_term.index_terms, index_terms)
+                        ):
+                            continue
+                    elif (
+                        list(acc_term.indices) != list(store_indices)
+                        or acc_term.index_map != store_map
+                        or _data_dependent(acc_term.source_op_name, acc_term.index_terms)
+                    ):
+                        continue
+                extra = {"store_indices": list(store_indices)}
+                if constants is not None and getattr(op_obj, "const_params", ()):
+                    extra["constants"] = constants
+                if kinds is not None and any(k == "iv" for k in kinds.values()):
+                    extra["iv_params"] = iv_positions
+                if any_index:
+                    extra["index_terms"] = index_terms
+                if guards:
+                    extra["guards"] = guard_terms
                 # op_range — first contributing load through the store.
                 return MatchedOp(
                     target_op_name=op_obj.name,
                     func_name=func_name,
                     work_id=work_id,
                     enclosing_loops=list(enclosing_loops),
-                    operands=_operand_bindings(pat, bindings, op_obj.accumulates),
+                    operands=_operand_bindings(pat, bindings, _acc_param(op_obj, pat)),
                     result_memref_name=result_memref_name,
                     op_range=(t.ssa_name, store_handle),
-                    extra={"store_indices": list(store_indices)},
+                    extra=extra,
                     result_value_ref=result_value_ref,
+                    vector_width=_matched_vector_width(
+                        op_obj, pat, bindings, enclosing_loops
+                    ),
                 )
             # (no break needed — return above exits on first match)
         return None
@@ -969,14 +1695,15 @@ def match_workload(target, mlir_module) -> MatchTrace:
         # Value.get_name() without an AsmState re-prints the enclosing
         # function on every call (quadratic in function size); one shared
         # state per function yields the same names in linear time.
-        state = AsmState(func)
+        state = ValueNames(func, AsmState(func))
         defining_map = _build_defining_map(func, state=state)
 
         body = func.regions[0].blocks[0]
-        sites: list[tuple[Any, list[tuple[str, str, str, int]]]] = []
+        scope = _build_function_scope(func, value_refs, state=state)
+        sites: list = []
         _walk_loops(body, [], sites, state=state)
 
-        for op, loops in sites:
+        for op, loops, guards in sites:
             if op.operation.name not in _STORE_OPS:
                 continue
             ms = _try_match_at_store(
@@ -988,6 +1715,8 @@ def match_workload(target, mlir_module) -> MatchTrace:
                 defining_map,
                 value_refs,
                 state=state,
+                scope=scope,
+                guards=guards,
             )
             trace.matches.extend(ms)
 
@@ -1002,10 +1731,16 @@ __all__ = [
     "PVar",
     "PConst",
     "PBinOp",
+    "PUnary",
+    "PCmp",
+    "PSelect",
     "WLoad",
     "WBlockArg",
     "WConst",
     "WBinOp",
+    "WUnary",
+    "WCmp",
+    "WSelect",
     "compile_op_pattern",
     "compile_target_patterns",
     "match_workload",

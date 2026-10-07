@@ -18,7 +18,6 @@ import numpy as np
 from .customize import customize
 from .ir.builder import _spmw_group_contract
 from .perf import BoundCostSpec, CostSpec
-from .pim.aim_program import AimProgram, compile_aim_program
 from .pim.apu_v1_program import APUv1Program, compile_apu_v1_program
 from .pim.apu_v1_vector_program import compile_apu_v1_vector_workload
 from .pim.apu_v1_vectorize import NoContractionError
@@ -30,12 +29,12 @@ from .pim.apu_g2_typed_program import (
     APUG2TypedProgram,
     compile_apu_g2_typed_program,
 )
-from .pim.upmem_program import UPMEMProgram, compile_upmem_program
 from .spmw_autoschedule import MatcherWorkScope, _retain_matcher_work_scope
 from .spmw_codegen import RunResult, compile_for_target, source_backend_binding
 from .spmw_liveness import MatcherValueId, trace_liveness
 from .spmw_match_engine import match_workload
-from .spmw_plan import BufferMetricManifest
+from .spmw_plan import BufferMetricManifest, launch_schedule
+from .spmw_target import HostProgram
 
 
 def _materialize_workload(workload):
@@ -113,7 +112,7 @@ def _host_move_buffer_role(record):
 
     for argument in getattr(record, "args", ()):
         if isinstance(argument, BufferToken):
-            return argument.name
+            return getattr(argument, "base", argument.name)
         if isinstance(argument, str):
             return argument
         if not isinstance(argument, HandleToken):
@@ -442,6 +441,7 @@ def _stamp_matcher_work_scopes(
         for match in record["matches"]:
             match.work_id = effective_scope.work_id
             _retain_matcher_work_scope(match, effective_scope)
+            match.extra["spmw_body_fingerprint"] = record["body_fingerprint"]
 
 
 class CompiledCallable:
@@ -599,34 +599,13 @@ class _ProgramRoute:
     owner: str  # ValueError text when host_moves/layout are passed
 
 
-def _compile_upmem_route(program, target, *, cost=None, backend=None):
-    del backend  # validated by the route; compile_upmem_program takes none
-    return compile_upmem_program(program, target, cost=cost)
-
-
 _PROGRAM_ROUTES: tuple[_ProgramRoute, ...] = (
-    _ProgramRoute(
-        AimProgram,
-        compile_aim_program,
-        None,
-        None,
-        "AimProgram owns its ordered trace and placement",
-    ),
     _ProgramRoute(
         APUv1Program,
         compile_apu_v1_program,
         frozenset({None, "virtual", "functional"}),
         "APUv1Program supports the device, virtual, or functional backend",
         "APUv1Program owns its scalar L4 ABI",
-    ),
-    _ProgramRoute(
-        UPMEMProgram,
-        _compile_upmem_route,
-        frozenset({None, "virtual", "functional"}),
-        "MLIR-driven UPMEMProgram currently supports only the functional "
-        "portable-C runtime (backend=None, 'virtual', or 'functional'); "
-        "uPIMulator cycles come from scripts/prepare_upmem_tenon_campaign.py",
-        "UPMEMProgram owns its phased ABI; host_moves/layout are not accepted",
     ),
     _ProgramRoute(
         APUG2TypedProgram,
@@ -666,25 +645,22 @@ def compile(
 
     The pipeline has four stages:
 
-    1. Typed program frontends. ``AimProgram``, ``APUv1Program``,
-       ``UPMEMProgram``, ``APUG2TypedProgram`` and
+    1. Typed program frontends. ``APUv1Program``, ``APUG2TypedProgram`` and
        ``APUG2ComposedContractionProgram`` each compile through their own
-       route. ``APUv1Program`` and ``UPMEMProgram`` accept
-       ``backend in (None, "virtual", "functional")``; the AiM and APU v2
-       routes validate ``backend`` themselves. No typed route accepts
+       route. ``APUv1Program`` accepts
+       ``backend in (None, "virtual", "functional")``; the APU v2 routes
+       validate ``backend`` themselves. No typed route accepts
        ``host_moves`` or ``layout``.
     2. Source frontend. A plain ``@allo`` workload is customized to MLIR.
-       Source workloads cannot target UPMEM; wrap them in ``UPMEMProgram``.
     3. Contraction frontend (APU v1, non-dataflow only). Contractions go
        through the APU v1 layout-plan vector path; anything else falls through.
     4. Matcher. The workload is matched against the target, the ranked
        autoscheduler picks placements, and backend codegen emits commands.
 
-    UPMEM through ``allo.compile`` is a functional oracle plus an analytical
-    estimate: a run returns ``cycles=None`` with
-    ``extra["functional_oracle"] is True``, and ``estimate()`` gives the cost
-    model's cycles. The paper's UPMEM cycles come from
-    ``scripts/prepare_upmem_tenon_campaign.py`` and uPIMulator.
+    A source workload on UPMEM lowers each matched kernel group to a
+    calibrated physical plan and runs it on the provenance uPIMulator; a run
+    reports DPU logic cycles. AiM and UPMEM have no typed route: both compile
+    through the matcher.
 
     Parameters
     ----------
@@ -713,12 +689,6 @@ def compile(
                 route, workload, target, bound_cost, backend, host_moves, layout
             )
 
-    if target.name == "upmem":
-        raise TypeError(
-            "the contraction-only UPMEM matcher backend was removed; wrap one "
-            "or more MLIR callables in allo.UPMEMProgram"
-        )
-
     schedule = customize(workload, enable_tensor=False)
     # Dataflow regions retain their matcher/group implementation through typed
     # structural scope attributes stamped on retained IR kernel functions.
@@ -739,15 +709,23 @@ def compile(
 
     trace = match_workload(target, schedule.module)
     _stamp_matcher_work_scopes(target, schedule.module, trace)
-    host_moves = list(host_moves or ())
+    launch_order = None
+    if isinstance(host_moves, HostProgram):
+        if host_moves.launches:
+            launch_order = launch_schedule(host_moves, trace)
+        records = list(host_moves.moves)
+    else:
+        records = list(host_moves or ())
     compiled = compile_for_target(
         target,
         trace,
         layout=layout,
         backend=backend,
-        host_moves=host_moves,
-        buffer_metrics=_buffer_metric_manifest(workload, trace, host_moves),
+        host_moves=records,
+        buffer_metrics=_buffer_metric_manifest(workload, trace, records),
         cost=bound_cost,
+        module=schedule.module,
+        launch_schedule=launch_order,
     )
     return CompiledCallable(
         workload,
