@@ -1,0 +1,307 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Software gates for generic LinearLayout-aware APUg2 contractions."""
+
+import inspect
+
+import numpy as np
+import pytest
+
+import allo
+from allo.pim.apu_g2_composed_layout import (
+    APUG2ComposedHostFiles,
+    build_apu_g2_composed_host_command,
+    canonicalize_apu_g2_values,
+    deinterleave_apu_g2_streams,
+    expected_apu_g2_composed_output,
+    interleave_apu_g2_dot_streams,
+    pack_apu_g2_batched_gemm_dots,
+    pack_apu_g2_matrix_vector_dots,
+)
+from allo.pim.apu_g2_composed_program import build_apu_g2_composed_recipe
+from allo.pim.apu_g2_composed_runtime import _parse_metrics
+from allo.pim.costs.apu_g2 import apu_g2_cost
+from allo.pim.targets import build_apu_g2_target
+
+
+I2 = allo.APUG2ScalarType(2, True)
+I3 = allo.APUG2ScalarType(3, True)
+I4 = allo.APUG2ScalarType(4, True)
+I14 = allo.APUG2ScalarType(14, True)
+I15 = allo.APUG2ScalarType(15, True)
+
+
+def _profiles(repetitions=7):
+    return (
+        allo.APUG2ComposedContractionProgram(
+            (I4, I4), I15, (64, 31), 128, repetitions=repetitions
+        ),
+        allo.APUG2ComposedContractionProgram(
+            (I4, I4), I15, (4, 32, 16), 128, repetitions=repetitions
+        ),
+        allo.APUG2ComposedContractionProgram(
+            (I2, I2),
+            I15,
+            (1024,),
+            128,
+            allo.APUG2DotEpilogue((3, 2)),
+            repetitions=repetitions,
+        ),
+        allo.APUG2ComposedContractionProgram(
+            (I3, I3), I14, (256, 2), 256, repetitions=repetitions
+        ),
+        allo.APUG2ComposedContractionProgram(
+            (I3, I3),
+            I15,
+            (256, 2),
+            256,
+            allo.APUG2DotEpilogue((1,), I14),
+            repetitions=repetitions,
+        ),
+    )
+
+
+def test_generic_gemm_and_batched_gemm_dot_adapters_match_numpy():
+    rng = np.random.default_rng(11)
+    gemm, batch = _profiles()[:2]
+    lhs = rng.integers(-8, 8, size=(64, 128), dtype=np.int8)
+    rhs = rng.integers(-8, 8, size=(128, 31), dtype=np.int8)
+    left_dots, right_dots = pack_apu_g2_batched_gemm_dots(lhs, rhs)
+    assert left_dots.shape == right_dots.shape == gemm.dot_shape
+    observed = expected_apu_g2_composed_output(gemm, left_dots, right_dots)
+    expected = canonicalize_apu_g2_values(
+        lhs.astype(np.int64) @ rhs.astype(np.int64),
+        I15,
+    )
+    np.testing.assert_array_equal(observed, expected)
+
+    lhs_batch = rng.integers(-8, 8, size=(4, 32, 128), dtype=np.int8)
+    rhs_batch = rng.integers(-8, 8, size=(4, 128, 16), dtype=np.int8)
+    left_dots, right_dots = pack_apu_g2_batched_gemm_dots(lhs_batch, rhs_batch)
+    assert left_dots.shape == right_dots.shape == batch.dot_shape
+    observed = expected_apu_g2_composed_output(batch, left_dots, right_dots)
+    expected = canonicalize_apu_g2_values(
+        np.matmul(lhs_batch.astype(np.int64), rhs_batch.astype(np.int64)),
+        I15,
+    )
+    np.testing.assert_array_equal(observed, expected)
+
+
+def test_interleaved_pair_bicg_and_mvt_semantics_match_numpy():
+    rng = np.random.default_rng(23)
+    _gemm, _batch, gesummv, bicg, mvt = _profiles()
+
+    matrix_a = rng.integers(-2, 2, size=(1024, 128), dtype=np.int8)
+    matrix_b = rng.integers(-2, 2, size=(1024, 128), dtype=np.int8)
+    vector = rng.integers(-2, 2, size=(128,), dtype=np.int8)
+    left, right = interleave_apu_g2_dot_streams(
+        pack_apu_g2_matrix_vector_dots(matrix_a, vector),
+        pack_apu_g2_matrix_vector_dots(matrix_b, vector),
+    )
+    observed = expected_apu_g2_composed_output(gesummv, left, right)
+    expected = canonicalize_apu_g2_values(
+        3 * (matrix_a.astype(np.int64) @ vector.astype(np.int64))
+        + 2 * (matrix_b.astype(np.int64) @ vector.astype(np.int64)),
+        I15,
+    )
+    np.testing.assert_array_equal(observed, expected)
+
+    matrix = rng.integers(-4, 4, size=(256, 256), dtype=np.int8)
+    p = rng.integers(-4, 4, size=(256,), dtype=np.int8)
+    r = rng.integers(-4, 4, size=(256,), dtype=np.int8)
+    left, right = interleave_apu_g2_dot_streams(
+        pack_apu_g2_matrix_vector_dots(matrix, p),
+        pack_apu_g2_matrix_vector_dots(matrix, r, transpose=True),
+    )
+    observed = expected_apu_g2_composed_output(bicg, left, right)
+    expected = canonicalize_apu_g2_values(
+        np.stack(
+            (
+                matrix.astype(np.int64) @ p.astype(np.int64),
+                matrix.T.astype(np.int64) @ r.astype(np.int64),
+            ),
+            axis=1,
+        ),
+        I14,
+    )
+    np.testing.assert_array_equal(observed, expected)
+    np.testing.assert_array_equal(
+        deinterleave_apu_g2_streams(observed),
+        expected.T,
+    )
+
+    y1 = rng.integers(-4, 4, size=(256,), dtype=np.int8)
+    y2 = rng.integers(-4, 4, size=(256,), dtype=np.int8)
+    accumulator = rng.integers(-200, 201, size=(256, 2), dtype=np.int16)
+    left, right = interleave_apu_g2_dot_streams(
+        pack_apu_g2_matrix_vector_dots(matrix, y1),
+        pack_apu_g2_matrix_vector_dots(matrix, y2, transpose=True),
+    )
+    observed = expected_apu_g2_composed_output(
+        mvt, left, right, accumulator=accumulator
+    )
+    expected = canonicalize_apu_g2_values(
+        np.stack(
+            (
+                matrix.astype(np.int64) @ y1.astype(np.int64),
+                matrix.T.astype(np.int64) @ y2.astype(np.int64),
+            ),
+            axis=1,
+        )
+        + accumulator.astype(np.int64),
+        I15,
+    )
+    np.testing.assert_array_equal(observed, expected)
+    np.testing.assert_array_equal(
+        deinterleave_apu_g2_streams(observed),
+        expected.T,
+    )
+
+
+def test_recipe_inventory_and_fingerprints_cover_layout_and_epilogue():
+    expected = (
+        (8, {"MUL_TYPED": 1, "GROUP_REDUCE_ADD_TYPED": 1}),
+        (8, {"MUL_TYPED": 1, "GROUP_REDUCE_ADD_TYPED": 1}),
+        (
+            16,
+            {
+                "MUL_TYPED": 2,
+                "GROUP_REDUCE_ADD_TYPED": 1,
+                "COPY_ODD_TO_EVEN_VECTORS": 1,
+                "ADD_TYPED": 1,
+            },
+        ),
+        (8, {"MUL_TYPED": 1, "GROUP_REDUCE_ADD_TYPED": 1}),
+        (
+            12,
+            {
+                "MUL_TYPED": 1,
+                "GROUP_REDUCE_ADD_TYPED": 1,
+                "ADD_TYPED": 1,
+            },
+        ),
+    )
+    fingerprints = set()
+    for program, (operation_count, inventory) in zip(_profiles(), expected):
+        recipe = build_apu_g2_composed_recipe(program)
+        assert len(recipe.operations) == operation_count
+        assert recipe.inventory["SEU_BARRIER"] == 1
+        assert recipe.certificate.fully_vectorized
+        assert recipe.certificate.vector_lane_updates == 4 * 65536
+        assert recipe.metadata["layout_fingerprint"] == (
+            program.layout_manifest()["fingerprint"]
+        )
+        for opcode, calls in inventory.items():
+            assert recipe.inventory[opcode] == calls
+        fingerprints.add(recipe.structural_fingerprint)
+    assert len(fingerprints) == 5
+
+    original = _profiles()[0]
+    renamed = allo.APUG2ComposedContractionProgram(
+        original.input_types,
+        original.output_type,
+        original.output_shape,
+        original.reduction_extent,
+        name="renamed_without_physical_effect",
+    )
+    assert renamed.structural_fingerprint == original.structural_fingerprint
+    assert (
+        build_apu_g2_composed_recipe(renamed).structural_fingerprint
+        == build_apu_g2_composed_recipe(original).structural_fingerprint
+    )
+
+
+def test_compile_exports_and_semantic_signatures_are_exact():
+    target = build_apu_g2_target()
+    for program in _profiles():
+        compiled = allo.compile(
+            program,
+            target,
+            apu_g2_cost,
+            backend="virtual",
+        )
+        assert isinstance(compiled, allo.APUG2ComposedContractionCallable)
+        assert compiled.estimate().cycles > 0
+        names = tuple(inspect.signature(compiled).parameters)
+        if program.epilogue.mode.value == "accumulate":
+            assert names == ("lhs", "rhs", "accumulator", "out")
+        else:
+            assert names == ("lhs", "rhs", "out")
+        assert (
+            compiled.execution_graph.metadata["layout_fingerprint"]
+            == program.layout_manifest()["fingerprint"]
+        )
+
+
+def test_host_command_and_parser_bind_every_physical_field(tmp_path):
+    program = _profiles(repetitions=13)[2]
+    files = APUG2ComposedHostFiles(
+        tmp_path / "lhs.bin",
+        tmp_path / "rhs.bin",
+        tmp_path / "aux.bin",
+        tmp_path / "out.bin",
+    )
+    command = build_apu_g2_composed_host_command(program, tmp_path / "host", files)
+    assert len(command) == 18
+    assert command[1:5] == tuple(
+        str(path) for path in (files.lhs, files.rhs, files.auxiliary, files.output)
+    )
+    assert command[5:17] == (
+        "2",
+        "1",
+        "2",
+        "1",
+        "11",
+        "3",
+        "1",
+        "15",
+        "1",
+        "7",
+        "1",
+        "13",
+    )
+    assert command[17] == program.layout_manifest()["fingerprint"]
+
+    device = (tmp_path / "device.update.bin").resolve()
+    text = "\n".join(
+        (
+            "device_pipeline_ticks=3900",
+            "device_final_pipeline_ticks=2000",
+            "h2d_us=1.25",
+            "host_task_us=2.5",
+            "d2h_us=0.75",
+            "end_to_end_us=5.0",
+            "target=hardware",
+            f"device_library={device}",
+            "task_status=0",
+            "timed_scope=composed_dot_vl64_pipeline",
+            "completion_barrier_included=1",
+            "independent_final_correctness_call=1",
+            f"layout_fingerprint={program.layout_manifest()['fingerprint']}",
+            "epilogue_mode=1",
+            "lhs_bits=2",
+            "lhs_signed=1",
+            "rhs_bits=2",
+            "rhs_signed=1",
+            "dot_bits=11",
+            "auxiliary_bits=3",
+            "auxiliary_signed=1",
+            "out_bits=15",
+            "out_signed=1",
+            "log_reduction=7",
+            "repetitions=13",
+            "PASS physical_outputs=262144",
+        )
+    )
+    ticks, host = _parse_metrics(text, program, device)
+    assert ticks == {"pipeline": 3900, "final_pipeline": 2000}
+    assert host["end_to_end"] == 5.0
+    with pytest.raises(RuntimeError, match="layout_fingerprint"):
+        _parse_metrics(
+            text.replace(
+                program.layout_manifest()["fingerprint"],
+                "0" * 64,
+            ),
+            program,
+            device,
+        )
