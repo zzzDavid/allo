@@ -54,7 +54,7 @@ public:
             math::AbsFOp, math::AbsIOp, math::CeilOp, math::CosOp, math::SinOp,
             math::TanhOp, math::SqrtOp, math::RsqrtOp, math::ExpOp,
             math::Exp2Op, math::PowFOp, math::LogOp, math::Log2Op,
-            math::Log10Op, arith::NegFOp,
+            math::Log10Op, math::CtPopOp, arith::NegFOp,
             // Float binary expressions.
             arith::CmpFOp, arith::AddFOp, arith::SubFOp, arith::MulFOp,
             arith::DivFOp, arith::RemFOp,
@@ -172,6 +172,7 @@ public:
   HANDLE(math::LogOp);
   HANDLE(math::Log2Op);
   HANDLE(math::Log10Op);
+  HANDLE(math::CtPopOp);
   HANDLE(arith::NegFOp);
 
   // Float binary expressions.

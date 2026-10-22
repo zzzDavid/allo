@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -18,7 +18,7 @@ def two_mm_np(A, B, C, D, alpha, beta):
 
 
 def mm1[
-    T: (float32, int32), P: int32, Q: int32, R: int32
+    T: (float32, int32, uint16), P: int32, Q: int32, R: int32
 ](A: "T[P, Q]", B: "T[Q, R]", out_AB: "T[P, R]"):
     for i0, j0 in allo.grid(P, R, name="mm1"):
         for k0 in allo.reduction(Q):
@@ -26,7 +26,7 @@ def mm1[
 
 
 def mm2[
-    T: (float32, int32), P: int32, R: int32, S: int32
+    T: (float32, int32, uint16), P: int32, R: int32, S: int32
 ](out_AB: "T[P, R]", C: "T[R, S]", out_ABC: "T[P, S]"):
     for i1, j1 in allo.grid(P, S, name="mm2"):
         for k1 in allo.reduction(R):
@@ -34,14 +34,14 @@ def mm2[
 
 
 def ele_add[
-    T: (float32, int32), P: int32, S: int32
+    T: (float32, int32, uint16), P: int32, S: int32
 ](out_ABC: "T[P, S]", D: "T[P, S]", output: "T[P, S]"):
     for i2, j2 in allo.grid(P, S):
         output[i2, j2] = out_ABC[i2, j2] * beta + D[i2, j2] * alpha
 
 
 def kernel_2mm[
-    T: (float32, int32), P: int32, R: int32, Q: int32, S: int32
+    T: (float32, int32, uint16), P: int32, R: int32, Q: int32, S: int32
 ](A: "T[P, Q]", B: "T[Q, R]", C: "T[R, S]", D: "T[P, S]") -> "T[P, S]":
     out_AB: T[P, R] = 0
     out_ABC: T[P, S] = 0

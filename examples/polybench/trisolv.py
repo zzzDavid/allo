@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -21,8 +21,8 @@ def trisolv_np(L, x, b):
 
 
 def kernel_trisolv[
-    T: (float32, int32), N: int32
-](L: float32[N, N], b: float32[N], x: float32[N]):
+    T: (float32, int32, uint16), N: int32
+](L: "T[N, N]", b: "T[N]", x: "T[N]"):
     for i in range(N):
         x[i] = b[i]
         for j in range(i):

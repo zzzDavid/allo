@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -20,7 +20,7 @@ def syrk_np(A, C, alpha, beta):
     return C
 
 
-def update_C[T: (float32, int32), N: int32](Cin: "T[N, N]", Cout: "T[N, N]"):
+def update_C[T: (float32, int32, uint16), N: int32](Cin: "T[N, N]", Cout: "T[N, N]"):
     for i0, j0 in allo.grid(N, N, name="update"):
         if j0 <= i0:
             Cout[i0, j0] = beta * Cin[i0, j0]
@@ -29,7 +29,7 @@ def update_C[T: (float32, int32), N: int32](Cin: "T[N, N]", Cout: "T[N, N]"):
 
 
 def compute_sum[
-    T: (float32, int32), N: int32, M: int32
+    T: (float32, int32, uint16), N: int32, M: int32
 ](A: "T[N, M]", A_copy: "T[N, M]", Cin: "T[N, N]", Cout: "T[N, N]"):
     buffer: T[N, N] = 0
     for i0, j0 in allo.grid(N, N, name="load"):
@@ -42,7 +42,7 @@ def compute_sum[
 
 
 def kernel_syr2k[
-    T: (float32, int32), N: int32, M: int32
+    T: (float32, int32, uint16), N: int32, M: int32
 ](A: "T[N, M]", A_copy: "T[N, M]", Cin: "T[N, N]", Cout: "T[N, N]"):
     C: T[N, N] = 0
     update_C[T, N](Cin, C)

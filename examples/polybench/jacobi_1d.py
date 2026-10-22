@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -21,7 +21,7 @@ def jacobi_1d_np(A, B, TSTEPS, N):
 
 
 def kernel_jacobi_1d[
-    T: (float32, int32), TSTEPS: int32, N: int32
+    T: (float32, int32, uint16), TSTEPS: int32, N: int32
 ](A: "T[N]", B: "T[N]"):
     for m in range(TSTEPS):
         for i0 in range(1, N - 1):

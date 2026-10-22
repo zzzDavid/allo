@@ -7,7 +7,7 @@ import pytest
 import numpy as np
 import allo
 import allo.ir.types as T
-from allo.ir.types import float32, int32
+from allo.ir.types import float32, int32, uint16
 
 
 def covariance_np(data, mean, cov, M, N):
@@ -31,7 +31,7 @@ def covariance_np(data, mean, cov, M, N):
 
 
 def kernel_covariance[
-    T: (float32, int32), M: int32, N: int32
+    T: (float32, int32, uint16), M: int32, N: int32
 ](data: "T[N, M]", mean: "T[M]", cov: "T[M, M]"):
     # Compute mean
     for x in allo.grid(M):

@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32, index
+from allo.ir.types import int32, float32, index, uint16
 import allo.ir.types as T
 import math
 
@@ -76,7 +76,7 @@ a1 = a2 = a3 = a4 = a5 = a6 = a7 = a8 = b1 = b2 = c1 = c2 = 0.0
 
 
 def kernel_deriche[
-    T: (float32, int32), W: int32, H: int32
+    T: (float32, int32, uint16), W: int32, H: int32
 ](imgIn: "T[W, H]", imgOut: "T[W, H]", y1: "T[W, H]", y2: "T[W, H]"):
     for i in range(W):
         ym1: T = 0.0

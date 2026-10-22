@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -34,7 +34,7 @@ def gramschmidt_np(A, Q, R):
 
 
 def kernel_gramschmidt[
-    T: (float32, int32), M: int32, N: int32
+    T: (float32, int32, uint16), M: int32, N: int32
 ](A: "T[M, N]", Q: "T[M, N]", R: "T[N, N]"):
     for k in range(N):
         nrm: T = 0.0

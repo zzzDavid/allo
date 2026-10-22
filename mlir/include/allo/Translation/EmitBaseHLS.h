@@ -63,6 +63,7 @@ public:
   /// Standard operation emitters.
   virtual void emitBinary(Operation *op, const char *syntax);
   virtual void emitUnary(Operation *op, const char *syntax);
+  virtual void emitPopcount(Operation *op, unsigned bitwidth);
   virtual void emitPower(Operation *op);
   virtual void emitMaxMin(Operation *op, const char *syntax);
 

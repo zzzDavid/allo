@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -24,7 +24,7 @@ def lu_np(A):
     return A
 
 
-def kernel_lu[T: (float32, int32), N: int32](A: "T[N, N]"):
+def kernel_lu[T: (float32, int32, uint16), N: int32](A: "T[N, N]"):
     for i in range(N):
         for j in range(i):
             for k in range(j):

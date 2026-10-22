@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32, index
+from allo.ir.types import int32, float32, index, uint16
 import allo.ir.types as T
 
 
@@ -39,7 +39,7 @@ def ludcmp_np(A, b, x, y):
 
 
 def kernel_ludcmp[
-    T: (float32, int32), N: int32
+    T: (float32, int32, uint16), N: int32
 ](A: "T[N, N]", b: "T[N]", x: "T[N]", y: "T[N]"):
     # LU decomposition of A
     for i in range(N):

@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -18,7 +18,7 @@ def three_mm_np(A, B, C, D):
 
 
 def mm1[
-    DType: (float32, int32), P: int32, Q: int32, R: int32
+    DType: (float32, int32, uint16), P: int32, Q: int32, R: int32
 ](A: "DType[P, Q]", B: "DType[Q, R]", out_AB: "DType[P, R]"):
     for i0, j0 in allo.grid(P, R, name="mm1"):
         for k0 in allo.reduction(Q):
@@ -26,7 +26,7 @@ def mm1[
 
 
 def mm2[
-    DType: (float32, int32), R: int32, S: int32, T: int32
+    DType: (float32, int32, uint16), R: int32, S: int32, T: int32
 ](C: "DType[R, S]", D: "DType[S, T]", out_CD: "DType[R, T]"):
     for i1, j1 in allo.grid(R, T, name="mm2"):
         for k1 in allo.reduction(S):
@@ -34,7 +34,7 @@ def mm2[
 
 
 def mm3[
-    DType: (float32, int32), P: int32, R: int32, T: int32
+    DType: (float32, int32, uint16), P: int32, R: int32, T: int32
 ](out_AB: "DType[P, R]", out_CD: "DType[R, T]", out_ABC: "DType[P, T]"):
     for i2, j2 in allo.grid(P, T, name="mm3"):
         for k2 in allo.reduction(R):
@@ -42,7 +42,7 @@ def mm3[
 
 
 def kernel_3mm[
-    DType: (float32, int32), P: int32, Q: int32, R: int32, S: int32, T: int32
+    DType: (float32, int32, uint16), P: int32, Q: int32, R: int32, S: int32, T: int32
 ](
     A: "DType[P, Q]", B: "DType[Q, R]", C: "DType[R, S]", D: "DType[S, T]"
 ) -> "DType[P, T]":

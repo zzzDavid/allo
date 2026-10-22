@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -25,7 +25,7 @@ def cholesky_np(A):
     return A
 
 
-def kernel_cholesky[T: (int32, float32), N: int32](A: "T[N, N]"):
+def kernel_cholesky[T: (int32, float32, uint16), N: int32](A: "T[N, N]"):
     for i in range(N):
         # Case: j < i
         for j in range(i):

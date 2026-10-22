@@ -712,6 +712,19 @@ def intrin_rule():
     return TypingRule([unaryrules])
 
 
+def invert_rule():
+    """Fixed-width bitwise complement preserves integer signedness and width."""
+
+    return TypingRule(
+        [
+            {
+                (Int,): lambda t: t,
+                (UInt,): lambda t: t,
+            }
+        ]
+    )
+
+
 registry = {
     ast.Add: add_sub_rule(),
     ast.Sub: add_sub_rule(),
@@ -735,7 +748,7 @@ registry = {
     ast.GtE: cmp_rule(),
     ast.USub: intrin_rule(),
     ast.UAdd: intrin_rule(),
-    ast.Invert: intrin_rule(),
+    ast.Invert: invert_rule(),
     ast.IfExp: select_rule(),
     "minmax": select_rule(),
 }
@@ -869,7 +882,9 @@ cpp_style_registry = {
     ast.GtE: cpp_style_binary_arith_rule(),
     ast.USub: cpp_style_intrin_rule(),
     ast.UAdd: cpp_style_intrin_rule(),
-    ast.Invert: cpp_style_intrin_rule(),
+    # Allo integer types have explicit widths.  Unlike C's integral promotion,
+    # complement is an element-wise operation over that declared bit vector.
+    ast.Invert: invert_rule(),
     # ast.IfExp: select_rule(), # TODO
     # "minmax": select_rule(), # TODO
 }

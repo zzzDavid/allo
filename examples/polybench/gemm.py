@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -17,7 +17,7 @@ def gemm_np(A, B, C, beta):
 
 
 def mm1[
-    T: (float32, int32), P: int32, Q: int32, R: int32
+    T: (float32, int32, uint16), P: int32, Q: int32, R: int32
 ](A: "T[P, Q]", B: "T[Q, R]", out_AB: "T[P, R]"):
     for i0, j0 in allo.grid(P, R, name="mm1"):
         for k0 in allo.reduction(Q):
@@ -25,14 +25,14 @@ def mm1[
 
 
 def ele_add[
-    T: (float32, int32), P: int32, R: int32
+    T: (float32, int32, uint16), P: int32, R: int32
 ](out_AB: "T[P, R]", C: "T[P, R]", output: "T[P, R]"):
     for i2, j2 in allo.grid(P, R):
         output[i2, j2] = beta * C[i2, j2] + out_AB[i2, j2]
 
 
 def kernel_gemm[
-    T: (float32, int32), P: int32, Q: int32, R: int32
+    T: (float32, int32, uint16), P: int32, Q: int32, R: int32
 ](A: "T[P, Q]", B: "T[Q, R]", C: "T[P, R]", output: "T[P, R]"):
     out_AB: T[P, R] = 0
     mm1[T, P, Q, R](A, B, out_AB)

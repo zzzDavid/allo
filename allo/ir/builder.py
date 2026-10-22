@@ -924,6 +924,56 @@ class ASTTransformer(ASTBuilder):
     def build_UnaryOp(ctx: ASTContext, node: ast.UnaryOp):
         value = build_stmt(ctx, node.operand)
         value_result = ASTTransformer.get_mlir_op_result(ctx, value)
+        if isinstance(node.op, ast.Invert):
+            if not isinstance(node.dtype, (Int, UInt)):
+                raise DTypeError(
+                    f"bitwise invert requires an integer operand, got {node.dtype}"
+                )
+            if len(node.shape) == 0:
+                all_ones = arith_d.ConstantOp(node.dtype.build(), -1, ip=ctx.get_ip())
+                op = arith_d.XOrIOp(value_result, all_ones.result, ip=ctx.get_ip())
+                if isinstance(node.dtype, UInt):
+                    op.attributes["unsigned"] = UnitAttr.get()
+                return op
+
+            # Shaped expressions retain the same element-wise semantics in
+            # both memref and tensor modes.  A linalg.generic keeps the
+            # complement visible as arith.xori in retained MLIR.
+            output = ASTTransformer.build_array(ctx, node.dtype, node.shape)
+            identity = AffineMap.get_identity(len(node.shape))
+            generic = linalg_d.GenericOp(
+                indexing_maps=ArrayAttr.get(
+                    [AffineMapAttr.get(identity), AffineMapAttr.get(identity)]
+                ),
+                ip=ctx.get_ip(),
+                inputs=[value_result],
+                outputs=[output.result],
+                result_tensors=(
+                    [RankedTensorType.get(node.shape, node.dtype.build())]
+                    if ctx.enable_tensor
+                    else []
+                ),
+                iterator_types=ArrayAttr.get(
+                    [Attribute.parse("#linalg.iterator_type<parallel>")]
+                    * len(node.shape)
+                ),
+            )
+            block = generic.regions[0].blocks.append(
+                node.dtype.build(), node.dtype.build()
+            )
+            ctx.set_ip(block)
+            all_ones = arith_d.ConstantOp(node.dtype.build(), -1, ip=ctx.get_ip())
+            inverted = arith_d.XOrIOp(
+                block.arguments[0], all_ones.result, ip=ctx.get_ip()
+            )
+            if isinstance(node.dtype, UInt):
+                inverted.attributes["unsigned"] = UnitAttr.get()
+            linalg_d.YieldOp([inverted.result], ip=ctx.get_ip())
+            ctx.pop_ip()
+            result = generic if ctx.enable_tensor else output
+            if isinstance(node.dtype, UInt):
+                result.attributes["unsigned"] = UnitAttr.get()
+            return result
         if isinstance(node.op, ast.USub):
             # MLIR does not provide integer negation
             if isinstance(node.dtype, (Int, UInt)):
@@ -1384,6 +1434,26 @@ class ASTTransformer(ASTBuilder):
                 else:
                     raise RuntimeError("Unsupported step type")
                 if lower is None:
+                    # Slice with a non-constant lower bound. If the static
+                    # length (upper - lower) is symbolically determinable
+                    # (e.g., `row0 : row0 + ROWS`), we can keep the size
+                    # static and only the offset dynamic — that's compatible
+                    # with extract_slice / subview lowering.
+                    static_len = TypeInferer._try_static_slice_length(ctx, index)
+                    if static_len is not None and static_len > 0:
+                        offset_expr = build_stmt(ctx, index.lower)
+                        # Cast to index type for offsets operand list.
+                        offset_op = ASTTransformer.build_cast_op(
+                            ctx,
+                            offset_expr,
+                            getattr(index.lower, "dtype", Index()),
+                            Index(),
+                        )
+                        offsets.append(offset_op.result)
+                        static_offsets.append(ShapedType.get_dynamic_size())
+                        static_sizes.append(static_len // step)
+                        static_strides.append(step)
+                        continue
                     static_offsets.append(ShapedType.get_dynamic_size())
                     offset_expr = build_stmt(ctx, index.lower)
                     static_sizes.append(ShapedType.get_dynamic_size())
@@ -3037,6 +3107,41 @@ class ASTTransformer(ASTBuilder):
                     return for_op if not ctx.unroll else None
             # Allo library functions
             new_args = build_stmts(ctx, node.args)
+            if fn_name == "popcount":
+                if len(node.shape) == 0:
+                    return math_d.CtPopOp(
+                        ASTTransformer.get_mlir_op_result(ctx, new_args[0]),
+                        ip=ctx.get_ip(),
+                    )
+                return ASTTransformer.build_library_op(
+                    ctx,
+                    node=node,
+                    attr="popcount",
+                    new_args=new_args,
+                    out_buffer=out_buffer,
+                )
+            if fn_name == "xnor":
+                if len(node.shape) == 0:
+                    lhs = ASTTransformer.get_mlir_op_result(ctx, new_args[0])
+                    rhs = ASTTransformer.get_mlir_op_result(ctx, new_args[1])
+                    xor = arith_d.XOrIOp(lhs, rhs, ip=ctx.get_ip())
+                    all_ones = arith_d.ConstantOp(
+                        node.dtype.build(), -1, ip=ctx.get_ip()
+                    )
+                    result = arith_d.XOrIOp(
+                        xor.result, all_ones.result, ip=ctx.get_ip()
+                    )
+                    if isinstance(node.dtype, UInt):
+                        xor.attributes["unsigned"] = UnitAttr.get()
+                        result.attributes["unsigned"] = UnitAttr.get()
+                    return result
+                return ASTTransformer.build_library_op(
+                    ctx,
+                    node=node,
+                    attr="xnor",
+                    new_args=new_args,
+                    out_buffer=out_buffer,
+                )
             if isinstance(obj, (IPModule, ExternalModule)):
                 input_idx = obj.input_idx if isinstance(obj, ExternalModule) else None
                 input_types = []
@@ -3142,6 +3247,29 @@ class ASTTransformer(ASTBuilder):
                     "power": math_d.PowFOp,
                     "abs": math_d.AbsIOp,
                 }.get(fn_name)
+                # MLIR's floating math operations do not accept signless
+                # integers.  Allo permits integer arguments to these
+                # intrinsics (the typing rule promotes them to float), and a
+                # surrounding fixed-width assignment may subsequently cast
+                # the result back.  Materialize both conversions explicitly
+                # instead of constructing invalid ``math.sqrt iN`` IR.
+                if fn_name == "sqrt" and any(
+                    isinstance(arg_type, IntegerType) for arg_type in arg_types
+                ):
+                    source_dtype = node.args[0].dtype
+                    float_dtype = float32 if source_dtype.bits <= 32 else float64
+                    operand = ASTTransformer.build_cast_op(
+                        ctx, new_args[0], source_dtype, float_dtype
+                    )
+                    result = opcls(
+                        ASTTransformer.get_mlir_op_result(ctx, operand),
+                        ip=ctx.get_ip(),
+                    )
+                    if isinstance(node.dtype, (Int, UInt, Index)):
+                        return ASTTransformer.build_cast_op(
+                            ctx, result, float_dtype, node.dtype
+                        )
+                    return result
                 return opcls(
                     *[ASTTransformer.get_mlir_op_result(ctx, x) for x in new_args],
                     ip=ctx.get_ip(),
@@ -3277,6 +3405,69 @@ class ASTTransformer(ASTBuilder):
             else ASTTransformer.build_array(ctx, dtype, shape)
         )
         with ip:
+            if attr == "xnor":
+                identity = AffineMap.get_identity(len(shape))
+                op = linalg_d.GenericOp(
+                    indexing_maps=ArrayAttr.get([AffineMapAttr.get(identity)] * 3),
+                    inputs=[
+                        ASTTransformer.get_mlir_op_result(ctx, new_args[0]),
+                        ASTTransformer.get_mlir_op_result(ctx, new_args[1]),
+                    ],
+                    outputs=[ASTTransformer.get_mlir_op_result(ctx, buf_op)],
+                    result_tensors=(
+                        [RankedTensorType.get(shape, dtype.build())]
+                        if ctx.enable_tensor
+                        else []
+                    ),
+                    iterator_types=ArrayAttr.get(
+                        [Attribute.parse("#linalg.iterator_type<parallel>")]
+                        * len(shape)
+                    ),
+                    ip=ctx.get_ip(),
+                )
+                block = op.regions[0].blocks.append(
+                    dtype.build(), dtype.build(), dtype.build()
+                )
+                ctx.set_ip(block)
+                xor = arith_d.XOrIOp(
+                    block.arguments[0], block.arguments[1], ip=ctx.get_ip()
+                )
+                all_ones = arith_d.ConstantOp(dtype.build(), -1, ip=ctx.get_ip())
+                result = arith_d.XOrIOp(xor.result, all_ones.result, ip=ctx.get_ip())
+                if isinstance(dtype, UInt):
+                    xor.attributes["unsigned"] = UnitAttr.get()
+                    result.attributes["unsigned"] = UnitAttr.get()
+                linalg_d.YieldOp([result.result], ip=ctx.get_ip())
+                ctx.pop_ip()
+                return op if ctx.enable_tensor else buf_op
+            if attr == "popcount":
+                index_exprs = [AffineExpr.get_dim(dim) for dim in range(len(shape))]
+                affine_map = AffineMap.get(
+                    dim_count=len(shape), symbol_count=0, exprs=index_exprs
+                )
+                op = linalg_d.GenericOp(
+                    indexing_maps=ArrayAttr.get(
+                        [AffineMapAttr.get(affine_map), AffineMapAttr.get(affine_map)]
+                    ),
+                    inputs=[ASTTransformer.get_mlir_op_result(ctx, new_args[0])],
+                    outputs=[ASTTransformer.get_mlir_op_result(ctx, buf_op)],
+                    result_tensors=(
+                        [RankedTensorType.get(shape, dtype.build())]
+                        if ctx.enable_tensor
+                        else []
+                    ),
+                    iterator_types=ArrayAttr.get(
+                        [Attribute.parse("#linalg.iterator_type<parallel>")]
+                        * len(shape)
+                    ),
+                    ip=ctx.get_ip(),
+                )
+                block = op.regions[0].blocks.append(dtype.build(), dtype.build())
+                ctx.set_ip(block)
+                count = math_d.CtPopOp(block.arguments[0], ip=ctx.get_ip())
+                linalg_d.YieldOp([count], ip=ctx.get_ip())
+                ctx.pop_ip()
+                return op if ctx.enable_tensor else buf_op
             if attr == "concat":
                 axis = node.keywords[0].value.value
                 strides = [1] * len(shape)

@@ -6,7 +6,7 @@ import json
 import pytest
 import allo
 import numpy as np
-from allo.ir.types import int32, float32
+from allo.ir.types import int32, float32, uint16
 import allo.ir.types as T
 
 
@@ -32,7 +32,7 @@ def fdtd_2d_np(ex, ey, hz, fict):
 
 
 def kernel_fdtd_2d[
-    T: (float32, int32), Nx: int32, Ny: int32, Tmax: int32
+    T: (float32, int32, uint16), Nx: int32, Ny: int32, Tmax: int32
 ](ex: "T[Nx, Ny]", ey: "T[Nx, Ny]", hz: "T[Nx, Ny]", fict: "T[Tmax]",):
     for m in allo.grid(Tmax):
         for j in allo.grid(Ny):

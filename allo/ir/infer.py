@@ -347,7 +347,10 @@ class TypeInferer(ASTVisitor):
     def visit_UnaryOp(ctx: ASTContext, node: ast.UnaryOp):
         operand = visit_stmt(ctx, node.operand)
         node.shape = operand.shape
-        if isinstance(operand.dtype, UInt):
+        if isinstance(node.op, ast.Invert):
+            typing_rule = get_typing_rule(ast.Invert, ctx.typing_rule_set)
+            node.dtype = typing_rule(operand.dtype)
+        elif isinstance(operand.dtype, UInt):
             # need to create a corresponding Int type
             node.dtype = Int(operand.dtype.bits)
         else:
@@ -509,6 +512,41 @@ class TypeInferer(ASTVisitor):
         raise None
 
     @staticmethod
+    def _try_static_slice_length(ctx: ASTContext, sl: ast.Slice):
+        """Attempt to infer the *static* length of `sl.upper - sl.lower` using
+        sympy, substituting any free symbols from `ctx.global_vars` if they map
+        to plain Python ints. Returns an int or None.
+
+        This lets us narrow the shape of slice-binding forms like
+        `W[row0 : row0 + ROWS, :]` even when `row0` is a runtime expression,
+        as long as `(row0 + ROWS) - row0 = ROWS` is a known integer.
+        """
+        if sl.lower is None or sl.upper is None:
+            return None
+        try:
+            lo = TypeInferer.visit_symbol(ctx, sl.lower)
+            hi = TypeInferer.visit_symbol(ctx, sl.upper)
+            if lo is None or hi is None:
+                return None
+            diff = sympy.simplify(hi - lo)
+            # Substitute any remaining free symbols from ctx.global_vars
+            subs = {}
+            for sym in diff.free_symbols:
+                name = sym.name
+                if name in ctx.global_vars and isinstance(ctx.global_vars[name], int):
+                    subs[sym] = ctx.global_vars[name]
+            if subs:
+                diff = sympy.simplify(diff.subs(subs))
+            if isinstance(diff, sympy.Integer) or (
+                hasattr(diff, "is_Integer") and diff.is_Integer
+            ):
+                return int(diff)
+        # pylint: disable=broad-exception-caught
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
     def visit_Subscript(ctx: ASTContext, node: ast.Subscript):
         value = visit_stmt(ctx, node.value)
         # Handle struct field access
@@ -555,6 +593,22 @@ class TypeInferer(ASTVisitor):
                         step = (
                             index[2] if (len(index) > 2 and index[2] is not None) else 1
                         )
+                        # If lower/upper failed to resolve as Python constants but the
+                        # slice length (upper - lower) is statically determinable
+                        # (e.g., `row0 : row0 + ROWS` where ROWS is a module global int),
+                        # recover the static length symbolically. The offset can stay
+                        # dynamic; only the size is needed for type inference.
+                        if (index[0] is None or index[1] is None) and isinstance(
+                            elts[dim], ast.Slice
+                        ):
+                            sl = elts[dim]
+                            static_len = TypeInferer._try_static_slice_length(ctx, sl)
+                            if static_len is not None:
+                                step_val = step if isinstance(step, int) else 1
+                                size = static_len // step_val
+                                if size > 0:
+                                    shape.append(size)
+                                continue
                         size = (upper - lower) // step
                         if size > 0:
                             shape.append(size)
@@ -1229,6 +1283,31 @@ class TypeInferer(ASTVisitor):
                 assert buffer_arg.dtype == node.dtype and buffer_arg.shape == node.shape
                 return node
             new_args = visit_stmts(ctx, node.args)
+            if fn_name == "popcount":
+                if len(new_args) != 1:
+                    raise TypeError("allo.popcount expects exactly one operand")
+                if not isinstance(new_args[0].dtype, (Int, UInt)):
+                    raise TypeError("allo.popcount expects an Int or UInt operand")
+                node.shape = new_args[0].shape
+                node.dtype = new_args[0].dtype
+                return node
+            if fn_name == "xnor":
+                if len(new_args) != 2:
+                    raise TypeError("allo.xnor expects exactly two operands")
+                lhs, rhs = new_args
+                if not isinstance(lhs.dtype, (Int, UInt)) or not isinstance(
+                    rhs.dtype, (Int, UInt)
+                ):
+                    raise TypeError("allo.xnor expects Int or UInt operands")
+                if lhs.dtype != rhs.dtype:
+                    raise TypeError(
+                        "allo.xnor operands must have the same signedness and width"
+                    )
+                if lhs.shape != rhs.shape:
+                    raise TypeError("allo.xnor operands must have the same shape")
+                node.shape = lhs.shape
+                node.dtype = lhs.dtype
+                return node
             if len(new_args) == 0:
                 # No argument
                 if fn_name == "get_pid":

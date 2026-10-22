@@ -7,7 +7,7 @@ import os
 import json
 import numpy as np
 import allo.ir.types as T
-from allo.ir.types import float32, int32, index
+from allo.ir.types import float32, int32, index, uint16
 
 
 def adi_np(u, v, p, q, TSTEPS, N):
@@ -71,7 +71,7 @@ f = 0.0
 
 
 def kernel_adi[
-    T: (float32, int32), TSTEPS: int32, N: int32
+    T: (float32, int32, uint16), TSTEPS: int32, N: int32
 ](u: "T[N, N]", v: "T[N, N]", p: "T[N, N]", q: "T[N, N]"):
     for t in range(1, TSTEPS + 1):
         for i in range(1, N - 1):
