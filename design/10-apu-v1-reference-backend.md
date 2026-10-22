@@ -1,0 +1,528 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
+# GSI APU v1 reference backend
+
+This document describes the APU v1 implementation in the current tree. It is
+the reference for the target, cost, and workload abstractions; superseded
+fixed-tiling and binary-LUT designs are intentionally omitted.
+
+## Sources
+
+- GSI manuals, headers, examples, profiling tutorial, and multicore tutorial in
+  `/home/nz264/shared/accelerator-hub/gsi-apu`.
+- [APU Performance Modeling](https://github.com/liya-mei/APU-Performance-Modeling),
+  inspected at commit `20161ca64985b234b35b0028b633cbea21c922f4`.
+- [GVML semantics](https://github.com/zzzDavid/gvml-semantics), inspected at
+  commit `dd39afdc548c46a1262fc05081cb0414a1f2b86d`.
+- A Gemini board running GSI 13.7.1, profiled on 2026-07-01 and
+  2026-07-07.
+
+## Target specification
+
+`build_apu_v1_target()` describes structure and legality only. The device has
+four APUCs. Each APUC contains an ARC controller, an asynchronous SEU, a DMA
+engine, fifteen writable 32K x 16-bit vector registers, the read-only index
+VR, forty-eight VMRs, one VIOR, and eight marker vectors. L4 is shared and has
+four DMA ports so independent APUC transfers can overlap.
+
+APU v1 vector code targets GVML. VL64 is a Gemini-II/APU-G2 interface and is
+not part of this backend's lowering, runtime, or cost specification.
+
+The target exposes two fixed spatial axes:
+
+- `apuc`, with extent 4;
+- `lane`, with extent 32,768 on every VR-like register.
+
+A GVML group is not a hardware unit and is therefore not a child in the target
+tree. It is a workload-selected partition of the `lane` axis. No latency or
+throughput number appears in the target specification.
+
+## Scalar mapping means group count
+
+The minimal user interface is a scalar mapping:
+
+```python
+@allo.work(mapping=8, args=[A, B, C])
+def gemm_k(A, B, C):
+    ...
+```
+
+For APU v1, `mapping=N` means that every 32K VR is divided into exactly `N`
+groups:
+
+```text
+group_count = N
+group_size  = 32768 / N
+vr_lane     = group * group_size + lane_in_group
+```
+
+`N` must be a power-of-two divisor of 32,768. The compiler coalesces the `N`
+source work replicas into one GVML operation and constructs a `LinearLayout`
+from logical `(group, lane_in_group)` to physical `vr_lane`. Thus `mapping=8`
+selects eight 4K groups and emits one `GVML_P2_4K` operation, not eight serial
+operations. A grouped reduction is legal only when its reduction extent fits
+within `group_size`.
+
+The four APUCs are an implicit physical launch dimension. Users do not include
+them in `mapping`; the grouped callable partitions output rows across all four
+cores.
+
+## Three MLIR compilation paths
+
+All supported paths use the same public composition point:
+
+```python
+compiled = allo.compile(workload, target, cost)
+result = compiled(*numpy_arrays)
+estimate = compiled.estimate()
+```
+
+### Group-parallel GVML
+
+A plain dataflow workload with scalar mapping is customized to MLIR, matched,
+and autoscheduled. The grouped compatibility path supports dense FP16
+contractions. It binds the two inputs and accumulator to distinct VRs and
+emits:
+
+```c
+gvml_mul_f16(mac_tmp_vr, vr0, vr1);
+gvml_add_subgrps_f16_grp(
+    vr2, mac_tmp_vr, GROUP_SIZE, GVML_P2_1, 0, GVML_VM_3, reduce_tmp_vr);
+```
+
+The NumPy ABI packs one dot product into each group, streams as many complete
+VR batches as required, and gathers each result from its group head. The host
+launches four GDL tasks as one batch using per-APUC L4 slices.
+
+The `mapping=8` GEMM integration test emits `GVML_P2_4K`, uses all four APUCs,
+and matches the NumPy result. Its calibration run measured 14,947,831 CRUN
+against a 14,906,715-cycle analytical estimate.
+
+### Ordinary contraction vector planning
+
+An ordinary, non-dataflow Allo contraction now takes a separate retained-MLIR
+path. `apu_v1_vectorize.py` proves the two parallel output axes and one
+reduction axis from SSA accesses, then creates immutable plans inspired by the
+MICRO'25 mapping progression:
+
+1. spatial group reduction;
+2. temporal/SVP reduction;
+3. temporal reduction with 32K DMA coalescing;
+4. a broadcast-friendly temporal layout;
+5. broadcast-friendly temporal layouts with two, four, or eight simultaneous
+   output accumulators, when the physical output batching makes that factor
+   legal.
+
+`accumulator_block` is a temporal register-reuse decision, not a synonym for
+`mapping`. `mapping=8` still means eight spatial groups within one 32K VR. An
+accumulator block of eight means eight distinct output VRs stay live while one
+RHS reduction chunk is loaded and expanded once. For each reduction step the
+generated GVML updates all eight accumulators, then commits them after the
+reduction. Tail predicates make the same lowering valid when the number of
+physical output batches is not divisible by the block.
+
+The plans use the same F2 `LinearLayout` algebra as AiM and UPMEM. Low tile
+bits map to `vr_lane`; high output/reduction/temporal bits map injectively to
+`vr_batch`. `ValueLayout` records operand axes and replica axes separately, so
+the NumPy ABI, VR allocation, code generator, and cost program consume the
+same physical meaning rather than each reconstructing a GEMM packing rule.
+
+`allo.compile` ranks these plans with `apu_v1_vector_cost.py`, accepts a plan
+name or plan object through `layout=`, and exposes `candidates`,
+`selected_plan`, `realization`, `device_source()`, and `estimate()` on the
+returned callable. Unknown arithmetic, unsafe reductions, unsupported dtypes,
+and VR pressure above VR16_0..14 fail closed.
+
+Accumulator-blocked plans expose both L3-resident and direct-L4 lookup routes.
+L3 is faster when the compact image fits; direct L4 avoids copying an oversized
+dense image into the ARC cache and matches the route used by the hand-tuned
+large-shape implementation. The cost program prices the lookup source from the
+explicit route. Its L4 increment is a board-calibrated 42.8 CRUN per table
+entry, derived from otherwise identical L3/L4 blocked kernels. Arithmetic and
+lookup counts stay unchanged, while streamed RHS DMA/load replay and
+subgroup-duplicate calls are divided by the legal accumulator block. Plan
+selection realizes candidates in cost order, so an otherwise attractive block
+is rejected if either its lookup image exceeds the safe L3 budget or its live
+accumulators do not fit beside indices, streamed operands, and compute
+temporaries in the fifteen writable VRs.
+
+The original full real-device milestone is
+`tests/pim/apu_v1/vector_gemm/test_vector_gemm_apu_v1.py`: one ordinary Allo
+1024x1024x64 FP16 contraction generates the four base candidates plus legal
+accumulator-blocked candidates. Every base candidate
+compiles through MLIR to GVML and matches all 1,048,576 NumPy outputs on the
+Gemini board.
+
+The same plan abstraction now realizes canonical `uint16` contractions with
+`gvml_mul_u16`, `gvml_add_u16`, and `gvml_add_subgrps_u16_grp`. Unsignedness is
+recovered from Allo's function ABI and load attributes even though MLIR stores
+the element type as signless `i16`.
+
+Transfers relate explicit `TransferLayout` values through ordered
+`TransferRouteStep` objects. A `ReuseWindow` states where a representation is
+created and across which logical tiles it remains resident. The optimized plan
+therefore represents and realizes the MICRO mapping directly:
+
+- one compact 128 KiB LHS image is copied to L3;
+- 2,048 32-entry lookup tables expand to 32K compute layouts;
+- eight RHS VRs each retain eight 1K rows, repeated across four 8K groups;
+- those RHS VRs are loaded once and reused across 32 output batches;
+- 2,048 subgroup operations select `k/8`'s resident VR and subgroup `k%8`;
+- `OutputBatching` distinguishes 2,048 compute batches from 32 physical C
+  batches and records every work-tile-to-output-lane placement.
+
+Measured CRUN is 7,349,987 for the broadcast-friendly plan, 93,449,834 for
+coalesced DMA, 6,254,825,903 for spatial baseline, and 6,258,832,854 for
+temporal SVP. The executable model predicts the same ordering. The optimized
+layout is 12.71x faster than coalesced DMA. Full evidence is retained in
+`tests/pim/apu_v1/vector_gemm/{results.json,RESULTS.md}`.
+
+### Target-neutral XNOR/popcount
+
+Packed binary arithmetic is expressed in ordinary Allo rather than selected
+by a backend-specific helper:
+
+```python
+result[row, column] += allo.popcount(
+    ~(left[row, depth] ^ right[depth, column])
+)
+```
+
+The frontend retains the popcount as `math.ctpop`. The contraction analyzer
+then proves the SSA dataflow `xori(xori(lhs, rhs), all_ones) -> ctpop` and
+records `allo.xnor_popcount` plus the packed operand width. The APU realization
+lowers that neutral operation to GVML XOR, NOT, POPCOUNT, and signed ADD. Raw
+popcount semantics remain distinct from the MICRO binary-dot expression
+`2*popcount-word_bits`, whose shift/subtract sequence is only emitted when
+that bipolar operation is requested explicitly.
+
+The LLVM execution path lowers `math.ctpop` directly. The structured HLS/C
+emitter also handles it with a width-preserving unsigned cast before the
+compiler builtin, so negative narrow integers count their declared
+two's-complement width rather than the width introduced by C integer
+promotion. This keeps the APU scalar baseline and UPMEM portable-C path
+semantically aligned with the vector path.
+
+The real-device leaf
+`tests/pim/apu_v1/vector_binary/test_vector_binary_apu_v1.py` compiles a
+32x1024xK8 `int16` contraction through retained MLIR. It measured 248,424 CRUN
+on GSI 13.7.1 and matched all 32,768 NumPy outputs bit-for-bit. The workload,
+run command, environment, and evidence are retained in
+`tests/pim/apu_v1/vector_binary/{results.json,RESULTS.md}`.
+
+### Complete scalar ARC program
+
+Control-heavy and non-vectorized programs are represented explicitly as an
+`APUv1Program` containing one `APUv1Phase`:
+
+```python
+program = allo.APUv1Program((allo.APUv1Phase(kernel),))
+compiled = allo.compile(program, target, cost)
+```
+
+The phase is customized to Allo MLIR and lowered by the portable C backend.
+The real GSI ARC toolchain then compiles and links the result. NumPy argument
+and result arrays are L4-backed; emitted local arrays are moved from the small
+ARC stack to aligned L4 scratch. In-place results are copied to explicit result
+buffers for host readback. A local Newton implementation supplies scalar square
+root for kernels such as Cholesky and correlation.
+
+All real-device vector, hybrid, and scalar runners select the GSI build mode
+through `TENON_APU_V1_BUILD_MODE`. The default is `release`, which applies the
+stock harness's `-O3 -DNDEBUG` flags to both host and ARC code; `debug` is the
+only supported override. Each runner passes the selected mode explicitly to
+`make` and launches `build/<mode>/<lab_name>`, so campaign measurements cannot
+silently fall back to the harness's `-O0` debug default. Invalid values fail
+before the external build starts, and each successful `RunResult` records the
+selection as `extra["build_mode"]`.
+
+This path currently executes on APUC 0. It is an explicit,
+correctness-complete scalar baseline, not a performance claim: using four APUCs
+faithfully requires phase boundaries, partition ownership, and cross-APUC
+barrier semantics that arbitrary scalar programs do not yet declare.
+
+### Required-vector native structural recipes
+
+Complete vector computations with non-contraction control flow use the native
+structural registry in `allo/pim/apu_v1_native_vector.py`. A caller retains one
+ordinary Allo kernel as the semantic source and requests a fail-closed route:
+
+```python
+phase = allo.APUv1Phase(
+    kernel,
+    vectorize="required",
+    argument_bounds={"points": (0, 31), "centers": (0, 31)},
+)
+```
+
+Each registered discoverer receives retained MLIR plus the decoded argument
+ABI. It must prove its complete loop, access, arithmetic, control-flow, shape,
+dtype, and output skeleton before returning a lowering. Zero matches fall
+through to the existing contraction requirement and fail if that also cannot
+prove a vector route; multiple matches are an error. Function and benchmark
+names are never selection inputs. The registry currently contains structural
+recipes for squared-L2 argmin, dense histograms, fixed-record frequency, and
+bivariate moments. The latter recipes are compiler capabilities only here;
+their hardware results are reported separately after their campaigns finish.
+
+The squared-L2 recipe recognizes the strict first-index computation
+
+```text
+labels[p] = argmin_c sum_d (points[p,d] - centers[c,d])**2
+```
+
+and packs the logical row-major points into one dimension-major 32K-lane VMR
+per coordinate. Its selected center-streaming plan computes the point norm
+once and applies `sum(p*p) + sum(c*c) - 2*sum(p*c)` in the uint16 ring for each
+candidate. The identity is exact modulo 2^16. For a retained signed comparison,
+the generic unbounded route flips the distance sign bit before `gvml_lt_u16`.
+An optional `APUv1Phase.argument_bounds` contract can remove that transform
+only when the compiler proves every squared distance is at most `INT16_MAX`.
+For 24 coordinates in `[0,31]`, the proof is `24 * 31^2 = 23,064`, so signed
+and unsigned order are identical while strict comparison still preserves the
+lowest candidate on ties.
+
+The lowering owns its physical input transforms, direct result egress, emitted
+GVML source, and operation inventory. Its calibrated graph prices the exact
+center L4-to-L3 transfer, 24 point L4-to-L1 transfers, vector loads and uint16
+arithmetic, comparison/masked-copy issue proxy, and label egress. On the
+Phoenix shape it predicts 643,130 CRUN instead of the scalar fallback's former
+8.823-billion-cycle estimate. The first compiler-emitted release calibration
+measured 624,472 CRUN with all 32,768 labels bit-exact. A seemingly cheaper
+all-dots-resident candidate measured 631,701 and 633,253 CRUN; real profiles
+therefore select center streaming and expose why primitive-call count alone is
+not a sufficient cost objective.
+
+### Structurally discovered hybrid programs
+
+An `APUv1Phase` may request structural vectorization while retaining the
+canonical Allo program as its only source of semantics:
+
+```python
+phase = allo.APUv1Phase(
+    kernel,
+    vectorize=True,
+    vector_layout="temporal_dma_coalescing",
+)
+compiled = allo.compile(
+    allo.APUv1Program((phase,)), target, cost, backend="functional"
+)
+```
+
+The compiler walks retained MLIR, discovers dense contraction regions from SSA
+accesses, and leaves all other functions as scalar ARC regions. It derives
+dependencies from produced and consumed values, inserts barriers only at
+cross-region boundaries. Canonical APU v1 PolyBench storage and vector compute
+are both `uint16`, so these programs require no precision-conversion phases.
+Selection is structural; neither discovery nor code generation switches on a
+benchmark name.
+
+The first canonical hybrid milestone covers GEMM, 2mm, and 3mm:
+
+| program | discovered regions | resident boundary |
+|---|---|---|
+| GEMM | `mm1: vector -> ele_add: scalar` | `out_AB` |
+| 2mm | `mm1: vector -> mm2: vector -> ele_add: scalar` | `out_AB`, `out_ABC` |
+| 3mm | independent `mm1`/`mm2: vector -> mm3: vector` | join on `out_AB`, `out_CD` |
+
+The functional executor uses the same region graph and modular arithmetic. It
+keeps intermediates in its program arena, so all three programs report zero
+host intermediate round trips. Each leaf compares bit-for-bit with a staged
+`uint16` matrix-product reference; unlike the former FP16 policy, this is the
+canonical program contract rather than an approximate precision mode.
+
+Lowering also materializes a physical manifest with persistent-L4 values,
+region artifacts, conversions, barriers, and inspectable host/device source.
+Every vector region derives a balanced four-APUC row partition. The compiler
+then replans each shard with a local zero-based row axis; LHS and output slices
+shrink to the declared half-open interval, RHS values remain replicated, and
+the ordinary `APUVectorABI` owns padding, ingress packing, and output
+coordinates.
+
+Canonical GEMM has a buildable unified GDL realization. Host ingress packing
+creates four shard-local A/B images. One stitched 67 MB L4 arena holds those
+images, four packed outputs, gather maps, dense `out_AB`, `C`, and the final
+output for the complete run. A blocking four-task GVML batch covers row shards
+`[0,15)`, `[15,30)`, `[30,45)`, and `[45,60)`; a second task on APUC 0 gathers
+the packed uint16 values and calls the retained-MLIR `ele_add`. Only the final
+output returns to the host.
+
+The 2026-07-08 uint16 real-board critical path is 5,110,640 cycles. Per-APUC
+vector CRUN is 4,398,074, 4,400,581, 4,419,068, and 4,415,788 cycles, followed
+by 691,572 cycles for gather plus scalar epilogue. Output is bit-exact against
+the modular reference. This is separate from the scalar-baseline record.
+
+The same mechanism realizes the multi-vector programs without a host
+intermediate. 2mm inserts a four-core ARC repack from `mm1` packed output to
+`mm2` ingress, then runs the second vector batch and retained scalar epilogue.
+Its measured uint16 critical path is 16,788,652 cycles and it is bit-exact.
+3mm inserts a four-core join: `out_AB` is repacked between
+matching row shards, while the differently partitioned `out_CD` is all-gathered
+from its four producers into each `mm3` RHS image. It then runs `mm3` and a
+core-0 final gather for 31,577,401 cycles. It is now bit-exact: the old
+compounded-FP16 out-of-tolerance result is obsolete. The join/all-gather remains
+the dominant phase at 20,873,332 cycles, exposing the next layout/residency
+optimization target.
+
+### Structural native vector routes
+
+APUv1 also has a benchmark-name-independent native-vector registry for loop
+nests whose best physical plan is not a dense contraction. Discoverers inspect
+the retained MLIR, ABI, loop bounds, operator inventory, value origins, and
+output indexing, then return a complete physical lowering only when every
+required condition holds. The current registry covers four families:
+
+| retained computation | native route |
+|---|---|
+| bounded uint16 squared-L2 plus strict argmin | `gvml_squared_l2_argmin_center_streaming` |
+| dense 256-bin histogram over one 32K frontier | `gvml_dense_histogram_pair_count` |
+| fixed-width record/query frequency | `gvml_record_frequency_resident_chunks_pair_count` |
+| batched bivariate sufficient statistics | `gvml_bivariate_moments_fused_group_reduce` |
+
+The squared-L2 route uses phase argument bounds to prove when signed retained
+comparison is equivalent to native unsigned ordering. It forms the point norm
+once and streams candidate dot products using
+`||p-c||^2 = ||p||^2 + ||c||^2 - 2 p.c` in the uint16 ring. The other routes
+select paired marker counts, resident record chunks, or native group reductions
+from structural facts. With `vectorize="required"`, losing any proof or ABI
+condition rejects compilation instead of silently choosing the scalar ARC
+fallback.
+
+Each native lowering also builds an operation-level execution graph through
+`apu_v1_native_cost.py`. The graph uses the exact emitted inventory and
+calibrated target primitives for DMA, marker operations, paired counts, group
+reductions, extraction, and scalar stores; it does not cost the original scalar
+loop nest. The 2026-07-22 APUv1 comparison produced:
+
+| route | estimated CRUN | measured median CRUN |
+|---|---:|---:|
+| squared-L2 argmin | 643,130 | 624,677 |
+| dense histogram | 72,605 | 166,783 |
+| bivariate moments | 54,299 | 94,618.5 |
+| record frequency | 140,070 | 171,988 |
+
+These estimates are compiler selection signals, not reported measurements.
+Their remaining route-dependent error is explicit calibration work; the
+important correction is that native candidates are no longer ranked with the
+multi-million- or multi-billion-cycle scalar fallback estimate for their
+source loop.
+
+## Executable cost specification
+
+`allo/pim/costs/apu_v1.py` is ordinary Python and is independent of the target
+specification. It is the calibration surface an agent edits after running
+microprofiles. All values are cycles. CRUN is end-to-end latency and SEU is
+retained as asynchronous resource occupancy; no clock conversion is used.
+
+Measured primitive values include:
+
+| operation | SEU | CRUN |
+|---|---:|---:|
+| `gvml_add_f16` | 204 | 264 |
+| `gvml_sub_f16` | 209 | 290 |
+| `gvml_mul_f16` | 196 | 254 |
+| group-reduce FP16, group 64 | 1,724 | 4,931 |
+| group-reduce FP16, group 128 | 1,962 | 5,308 |
+| group-reduce FP16, group 256 | 2,213 | 5,652 |
+| `gvml_add_u16` | — | 12 |
+| `gvml_sub_u16` | — | 13 |
+| `gvml_mul_u16` | — | 114 |
+| uint16 reduction, group 128 | — | 527 |
+| direct L4-to-L1 32K DMA | 81 | 22,731 |
+| direct L1-to-L4 32K DMA | 81 | 21,886 |
+
+Unmeasured legal group sizes use a linear fit in `log2(group_size)`. Complete
+grouped-kernel measurements separate a 72,555-cycle startup term from 14,651
+cycles of ARC control per VR batch. The scalar ARC rule currently uses 52 CRUN
+per retained MLIR operation plus startup, calibrated from canonical SMALL GEMM;
+it should be replaced by an operation-mix regression as more profiles are
+collected.
+
+Cost events occupy named APUC, ARC, SEU, DMA, L4, operation, and move resources.
+This lets the evaluator serialize contention and overlap independent APUCs or
+DMA paths without encoding performance inside the target.
+
+## PolyBench organization and coverage
+
+`tests/pim/apu_v1` contains all 30 canonical PolyBench kernels. Every kernel
+has the same leaf structure used by the other reference backends:
+
+```text
+<kernel>/
+  workload.py
+  test_<kernel>_apu_v1.py
+  results.json
+  RESULTS.md
+```
+
+Each leaf loads its local workload, constructs the target and cost, and calls
+`allo.compile` visibly. A shared APU workload adapter specializes all 30 kernels
+to `uint16`, quantizes deterministic inputs and coefficients, and preserves
+modulo-2^16 stores. The canonical complete program runs through MLIR and the
+scalar ARC path on the real board. Twenty-five kernels retain their repository
+NumPy oracle. ADI, correlation, covariance, Durbin, and FDTD-2D mix widened
+integers, modular arrays, and floating temporaries; for those, retained MLIR
+compiled to host C is the exact scalar oracle used to differentially validate
+the independent ARC/GVML lowering. All 30 SMALL cases compile and match their
+oracle exactly. `results.json` stores measured CRUN and `RESULTS.md` mirrors it;
+`tests/pim/COVERAGE.tsv` is regenerated from those records.
+
+GEMM, 2mm, and 3mm additionally exercise structural hybrid discovery through
+the same visible `allo.compile` call in each leaf. Their functional and
+real-device evidence records exact uint16 results, explicit region/barrier
+graphs, persistent-L4 execution, and zero host intermediate round trips.
+
+GEMM additionally contains `group_workload.py` and a physical grouped-GVML
+test for `mapping=8`. This keeps correctness coverage of arbitrary programs
+separate from the optimized vector path.
+
+The retained-MLIR analyzer discovers dense contractions with one or more
+parallel output axes. A two-axis contraction whose second output extent is one
+now receives a dedicated `spatial_gemv_group_reduction` candidate. Its F2
+layout maps one matrix row group and one reduction tile into a VR, packs up to
+ten reduction-vector tiles into resident VRs, streams each matrix tile once,
+and reduces every row group with `GROUP_REDUCE_ADD_U16`. The planner searches
+power-of-two reduction tiles from 32 through 2,048 and minimizes the number of
+full-VR matrix transfers subject to VR capacity. Group heads are scattered to
+the dense output vector only after all resident reduction tiles accumulate.
+
+This is distinct from treating GEMV as a dense `M x 1 x K` temporal
+contraction, which issued two full-VR input transfers for every scalar `k`.
+For a 2,000 x 2,000 GEMV, the native plan uses one resident-vector transfer and
+125 matrix transfers instead of 4,000 input transfers.
+
+| PolyBench vector pattern | analysis | native APU vector plan | missing abstraction |
+|---|---|---|---|
+| GEMM and GEMM stages in 2mm/3mm | supported | supported | — |
+| ATAX, BiCG, GESUMMV, and MVT matrix-vector reductions | supported | supported through singleton output axis | — |
+| Doitgen batched contraction | supported | fail closed | batched output-layout axis |
+| SYRK/SYR2K triangular updates | not yet legal | fail closed | triangular-domain validity and symmetric ownership |
+| Gemver multi-stage reductions/updates | individual contractions supported | GEMV and rank-1 stages supported | phase fusion and vector epilogues |
+
+Genuinely rank-1 MLIR outputs still need normalization to the explicit
+singleton-axis representation before plan generation. Doitgen's canonical
+artifact currently flattens its independent outer dimensions into one output
+axis; a general batched-output layout remains future work. Triangular and fused
+programs remain separate legality work.
+
+## Current boundaries
+
+- Native group-parallel lowering currently recognizes dense FP16
+  contractions; canonical uint16 contractions use the ordinary retained-MLIR
+  planner.
+- Ordinary vector planning realizes rank-2 FP16 and uint16 contractions,
+  singleton-axis GEMV, and packed XNOR/popcount contractions. Genuine rank-1
+  and general batched contractions are analyzed but require output-layout
+  normalization or extension before plan generation.
+  The spatial group-reduction realization requires a zero-initialized `C` and
+  rejects nonzero accumulators until group-head input placement is modeled.
+- The complete scalar realization currently accepts one phase and runs it on
+  APUC 0.
+- Hybrid functional execution supports persistent intermediates across vector,
+  conversion, barrier, and scalar regions. Physical four-APUC execution is
+  bit-exact for canonical uint16 GEMM, 2mm, and 3mm.
+- The scalar cost is a coarse retained-operation model, not yet a per-op ARC
+  regression.
+- Device-context acquisition is an external GDL resource and may require a
+  retry when another process has just released the board.
