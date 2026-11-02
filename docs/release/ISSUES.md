@@ -29,7 +29,7 @@ G2 guarantees.
 | C-08 | major | `lanes=8` Samsung GRF width hard-coded in target-neutral `spmw_plan.py` | G3 G5 | open |
 | C-09 | blocker | No floating-point reduction-order / reassociation permission anywhere; `dual_fiber`, UPMEM `nc/kc` split reductions unconditionally | G1 G2 | open |
 | C-10 | minor | Host program: Python orchestration, no lowered host computation; `schedule_residency`/`schedule_cost` exported without production caller | G2 G7 | open |
-| C-11 | major | Minimum-movement layout machinery (rank formula, chains, bound, ties, masked exact count) absent from the package (A01) | G1 G4 | open; salvage plan in audit/core.md §3.3 |
+| C-11 | major | Minimum-movement layout machinery (rank formula, chains, bound, ties, masked exact count) absent from the package (A01) | G1 G4 | partially fixed: Section IV algebra and searches ported into `allo/pim/{gf2,layout_problem,layout_movement,layout_search}.py` with the paper numbers reproduced (20,160 / 315 / 576; 121,968 masked oracle; GEMV example counts); `design/layout-search.md`; not yet wired into `rank_matcher_placements` and `LayoutAccess` rows are not yet derived from `MatchedOp` |
 | C-12 | minor | `LinearLayout.identity` silently zero-maps unmatched dims | G2 | open |
 | C-13 | minor | Broad exception swallowing in matcher/codegen/autoschedule | G2 | open |
 | C-14 | major | Nonzero or non-dominating accumulator initializers silently dropped (S-08, M-09, V1-02 share the root cause) | G2 | fixed at the matcher: `extra["accumulator_init"]` in {zero, carried}; nonzero/guarded/inside-loop initializers raise; Samsung/AiM/APU-v1 matcher routes reject `carried` (they zero the accumulator) |
@@ -38,25 +38,25 @@ G2 guarantees.
 
 | ID | Sev | Finding | Gate | Status |
 |---|---|---|---|---|
-| F-01 (M-02) | blocker | Shape names in annotations resolved from the caller's call stack (`allo/ir/utils.py:_get_global_vars`): an unrelated `M = 256` in the calling script silently compiles `attention_l128` with a wrong K/V-cache geometry | G2 G6 G7 | open; shared-file change, needs upstream-compatibility review |
+| F-01 (M-02) | blocker | Shape names in annotations resolved from the caller's call stack (`allo/ir/utils.py:_get_global_vars`): an unrelated `M = 256` in the calling script silently compiles `attention_l128` with a wrong K/V-cache geometry | G2 G6 G7 | fixed: `allo/ir/utils._get_global_vars` consults only frames whose code lexically encloses the function definition (unwrapping `functools.wraps`), nearest scope first, then closure cells; tests `tests/test_global_vars_scope.py`; upstream and dataflow suites unchanged (the 4 upstream and 6 dataflow failures pre-exist at 8160d6d: missing `slice` builtin and OpenMP JIT symbols on this host) |
 | F-02 | blocker | Integer literals typed as i32 and silently truncated (`-(1 << 40)` and `m: int64 = -1099511627776` become `arith.constant 0 : i32`); `1 << 40` on an i32 value lowers to an undefined C shift | G2 | open (found while fixing U-02) |
 
 ## Samsung HBM-PIM (audit/samsung.md)
 
 | ID | Sev | Finding | Gate | Status |
 |---|---|---|---|---|
-| S-01 (A03) | blocker | Selected placement/layout never determines the executed REDUCE program: `_run_samsung` writes a fixed 5-line CRF and the conductor regenerates the vendor GEMV microcode; cycles/outputs identical across placements | G4 | open |
+| S-01 (A03) | blocker | Selected placement/layout never determines the executed REDUCE program: `_run_samsung` writes a fixed 5-line CRF and the conductor regenerates the vendor GEMV microcode; cycles/outputs identical across placements | G4 | fixed: `SamsungCtx.emit_program` lowers each placement to a per-pass CRF; the conductor (`TenonConductor.inc`, `pim_driver --op GENERIC`) uploads it verbatim and never calls PIMCmdGen; unrealizable levers (grf_staged, per_workid with >1 item, >32 CRF words, non-identity tile, double_buffer) are rejected at materialization; executed table in `design/samsung-execution.md` section 7; tests `tests/pim/samsung_hbm_pim/test_samsung_lowering.py`, `test_samsung_conductor_runs.py` |
 | S-02 (A04) | blocker | All-zero or truncated outputs returned as success without outputs | G2 | fixed: readback returns arrays unconditionally; absent/short `out.bin` raises; `CompiledCallable` raises on missing gathered outputs; test `tests/pim/samsung_hbm_pim/gemv/test_gemv_samsung_readback.py` |
 | S-03 | blocker | Paper's source-order FP16 "ordered fallback" exists only in the uncommitted simulator overlay (`TEMPORAL_REDUCE`) and a snapshot-only driver; unreachable from `allo.compile` | G1 | open |
-| S-04 | blocker | The `pim_driver` that runs is built from uncommitted `dev/` conductor sources; the committed overlay lacks `--op GENERIC`/REDUCE | G7 G8 | open |
-| S-05 | major | Operand roles depend on source operand order (`x[k]*W[i,k]` fails at run); host-eligibility lever inverted vs executed program | G6 G3 G2 | open |
-| S-06 | major | Reported cycles are those of the zero-padded canonical program (K=128/100, M=2048/128 all report 4435) without disclosure | G5 G8 | open |
-| S-07 | major | Elementwise ops advertised but unreachable; GENERIC runtime mis-tiles | G1 G8 | open |
+| S-04 | blocker | The `pim_driver` that runs is built from uncommitted `dev/` conductor sources; the committed overlay lacks `--op GENERIC`/REDUCE | G7 G8 | partially fixed: the overlay `experiments/simulators/setup/PIMSimulator/` (containing repository) now holds the exact sources of the running `pim_driver` (our files in full, Samsung-licensed files as patches, README with upstream commit 3703d1f and build command); not yet committed in the containing repository (user decision, see STATUS.md) |
+| S-05 | major | Operand roles depend on source operand order (`x[k]*W[i,k]` fails at run); host-eligibility lever inverted vs executed program | G6 G3 G2 | fixed: structural operand classification `samsung_contraction` (matrix indexed by row and reduction, vector by reduction only); both operand orders compile and run identically; ambiguous cases rejected |
+| S-06 | major | Reported cycles are those of the zero-padded canonical program (K=128/100, M=2048/128 all report 4435) without disclosure | G5 G8 | fixed: `RunResult.extra` carries logical shape, padded shape, padding fraction, timing scope, plan and CRF; K pads to 128-element tiles; cost docstring states its scope |
+| S-07 | major | Elementwise ops advertised but unreachable; GENERIC runtime mis-tiles | G1 G8 | fixed: ADD/MUL/MAD/RELU reachable and bit-exact against NumPy FP16 for one work item walking a 1-D extent; partitioned grids rejected with the reason |
 | S-08 | major | `acc: f16 = 0.5` silently dropped | G2 | fixed (C-14) |
-| S-09 | minor | `_samsung_num_pim_blocks` broad-except -> 8 (reachable only on GENERIC route) | G2 | open |
-| S-10 | minor | Work-grid/partition mismatches warn only | G2 | open (see C-04) |
+| S-09 | minor | `_samsung_num_pim_blocks` broad-except -> 8 (reachable only on GENERIC route) | G2 | fixed: geometry from the target and `pim_driver --describe`; missing declarations raise |
+| S-10 | minor | Work-grid/partition mismatches warn only | G2 | fixed for Samsung: work items must partition the output rows exactly (error), see also C-04 |
 | S-11 | minor | No Samsung docs page; stale skill doc; simulator discovery outside package | G7 | open |
-| S-12 | minor | Cost constants lack provenance; ties by position; cost changes cannot reach the simulator (S-01) | G5 | open |
+| S-12 | minor | Cost constants lack provenance; ties by position; cost changes cannot reach the simulator (S-01) | G5 | partially fixed: MAC rule corrected to serialize both bank fibers on the channel bus (calibrated 2026-11-02, provenance in `costs/samsung.py`); the default selection is now bank_row + host fill (1.0-1.2% faster than the vendor program); CRF-fill preload cost still outside the model (2 of 6 pairs per shape disagree) |
 | S-13 | minor | XOR swizzle 148->116 reachable only via a test harness | G1 | open |
 
 ## UPMEM (audit/upmem.md)
@@ -69,7 +69,7 @@ G2 guarantees.
 | U-04 | major | Paper's 391x65 GEMV 1-32 DPU scaling with uneven partitions not reproducible (even division required) | G1 | open |
 | U-05 | major | Legality comes from cost-model feature functions (divisibility), not the padding-capable templates; realizable shapes rejected | G3 G4 | open |
 | U-06 | major | Shape-exact paths (`tasklet_private_wram` only at the paper MMTV shape; pointwise only ADD and literal `a*A + b*B`) | G3 | open |
-| U-07 (A11) | major | Execution requires the archived uPIMulator binary, the `GENERIC` slot from the snapshot tar, and the pinned SDK manifest | G7 | open |
+| U-07 (A11) | major | Execution requires the archived uPIMulator binary, the `GENERIC` slot from the snapshot tar, and the pinned SDK manifest | G7 | partially fixed: `UPIMULATOR_ROOT` + `UPIMULATOR_BIN` select a user build and bypass the pinned manifest; the run record carries `sdk_build` (`pinned-campaign` or `user-build:<manifest12>`); the Tenon uPIMulator patch (GENERIC slot, fixture loader) is still only in the artifact archive (P-06) |
 | U-08 | major | `SPMW_ARCHITECTURE.md`, `design/06`, `design/08`, skill doc describe the deleted `UPMEMProgram` route | G7 | open |
 | U-09 | major | Virtual cycles outside the calibration stratum carry no validity status (1.39x-1.53x off) | G5 | open |
 | U-10 | major | `kmeans_update` recognizer admits any op-superset kernel and runs it on the host at cost 0 | G3 G5 | open |
@@ -80,7 +80,7 @@ G2 guarantees.
 | ID | Sev | Finding | Gate | Status |
 |---|---|---|---|---|
 | M-01 | blocker | Output axis mis-derived as batch; 8x to 341x MAC over-issue for syntactic variants; fallback used `target.channels` | G2 G4 G6 | fixed: structural `axis_roles` in the matcher, `contraction_shape` from roles and work grid, `AimCoverageError` invariant on issued vs program MACs; tests `tests/pim/test_aim_axis_roles.py` |
-| M-02 | blocker | Shape names from caller frames | G2 | see F-01 |
+| M-02 | blocker | Shape names from caller frames | G2 | fixed, see F-01 |
 | M-03 | blocker | Token partitioning (paper subsection) not in the release; `replica_partitions` splits outputs, not a reduction with host reduce | G1 G2 | open |
 | M-04 | blocker | AttAcc compiler/virtual-model path entirely outside the release | G1 | open; options in audit §5 |
 | M-05 | major | Host-transfer cost slice-blind (virtual estimate 380x simulated) | G5 | open |
@@ -95,16 +95,16 @@ G2 guarantees.
 
 | ID | Sev | Finding | Gate | Status |
 |---|---|---|---|---|
-| V1-01 | blocker | Native recipes (`apu_v1_histogram/record_frequency/moments/distance_argmin`) are regex recognizers that fail open on semantic mutations (`counts += 2`, nonzero init, swapped columns emit the paper kernel) | G2 G3 G6 | open |
-| V1-02 | blocker | Vector device route never transfers the carried output (`C += A@B` with nonzero C returns `A@B` on hardware; virtual/functional disagree) | G2 | open (matcher-level `carried` rejection covers only the matcher route) |
+| V1-01 | blocker | Native recipes (`apu_v1_histogram/record_frequency/moments/distance_argmin`) are regex recognizers that fail open on semantic mutations (`counts += 2`, nonzero init, swapped columns emit the paper kernel) | G2 G3 G6 | fixed: native recipes parse the retained MLIR with a symbolic executor (`apu_v1_native_vector.py`) and prove every element the template implements (constants, fill values, stored locals, predicates, roles, dtypes, shapes); mismatches raise `APUv1NativeRecipeMismatch`; renames keep byte-identical GVML; tests `tests/perf/test_apu_v1_recognizers.py` (device re-validation pending, see VALIDATION.md) |
+| V1-02 | blocker | Vector device route never transfers the carried output (`C += A@B` with nonzero C returns `A@B` on hardware; virtual/functional disagree) | G2 | fixed: temporal plans upload the packed initial output (runtime manifest v2) and accumulate onto it; spatial group-reduction plans reject a nonzero initial output identically on device, functional and virtual routes |
 | V1-03 | major | FP16 GEMV default selects a reassociating tree plan; no reassociation permission in the API; paper's source-order run came from an external script | G2 G1 | open (see C-09) |
 | V1-04 | major | `APUv1Program` ignored `backend`; virtual/functional launched hardware | G2 G8 | fixed: `CompiledAPUv1Program` honours `virtual` (cost graph) and `functional` (host execution of the retained portable C); tests `tests/perf/test_run_result_contract.py` |
 | V1-05 | major | Paper's fitted count rule absent from the released cost program; native estimates off 19-56% without validity flag | G1 G5 | open |
 | V1-06 | major | Tile choice is a fixed `min(choices)` heuristic; 12.71x row plans not the default winner; golden 7,145,109 vs paper 7,349,987 | G4 G1 | open |
-| V1-07 | major | No board lock in production runtimes; profile parsed as last cumulative `total` with no freshness proof | G8 | open |
+| V1-07 | major | No board lock in production runtimes; profile parsed as last cumulative `total` with no freshness proof | G8 | fixed: `apu_v1_board_lock` (`flock` on `/tmp/tenon-apu-v1-<pci>.lock`, `TENON_APU_V1_LOCK`) in every production launch; profile freshness proven by diffing the device log read before and after the launch (exactly the expected `total` records, `hits:1`, positive CRUN); device re-validation pending |
 | V1-08 | major | Template default under `Path.home()/shared/...`; 12 GSI/Synopsys files copied verbatim without license headers | G7 | open |
-| V1-09 | major | Legacy matcher runner guesses output shapes and skips missing output files | G2 | open |
-| V1-10..V1-14 | minor | cost=None picks slowest plan; dead API surface; Newton sqrt error; misleading errors; short-readback reshape errors | | open |
+| V1-09 | major | Legacy matcher runner guesses output shapes and skips missing output files | G2 | fixed: output shapes from the compiled ABI or the caller array; missing or short output files raise |
+| V1-10..V1-14 | minor | cost=None picks slowest plan; dead API surface; Newton sqrt error; misleading errors; short-readback reshape errors | | V1-10 fixed (`cost=None` without `layout=` is an error; `RunResult.extra["plan_selection"]`), V1-13 fixed (native rejections surface their own reason), V1-14 fixed (role-named readback errors); V1-11, V1-12 open |
 
 ## GSI Gemini-II / APU G2 (audit/apu-g2.md)
 
@@ -113,9 +113,9 @@ G2 guarantees.
 | G2-01 (A06) | blocker | Matcher route returned success for source without compiling or executing | G2 G8 | fixed: `spmw_apu_v2.py`, enumerator, knobs and `_BACKENDS` entry removed; `allo.compile` raises `NotImplementedError` for source on `apu_v2`; test `test_gemv_apu_v2_source_rejected` |
 | G2-02 | blocker | No source route to Gemini-II; paper kernels are typed records built by a per-case switch in an artifact adapter; nothing searched or ranked | G1 G3 | open |
 | G2-03 | major | Typed/composed cost "cycles" are an op count; no rule covers typed opcodes; real-card calibrations unreachable | G5 | open |
-| G2-04 | major | No hardware tests; no hardware evidence at the candidate revision | G8 | open (remote validation pending) |
+| G2-04 | major | No hardware tests; no hardware evidence at the candidate revision | G8 | in-progress: hardware evidence collected on zhang-x4 at ffb4a78 + wave 2 working tree (u16 add runner, five typed programs, five composed paper programs; all bit-exact, see VALIDATION.md); no hardware test in the suite yet |
 | G2-05 | major | Composed route single-carrier; `APUG2DotTiling` disconnected | G3 | open |
-| G2-06 | major | Hard-coded `/opt/gsi/...` paths; `gsi_tool` on PATH; device literal `apu-00`; no `flock` | G7 G8 | open |
+| G2-06 | major | Hard-coded `/opt/gsi/...` paths; `gsi_tool` on PATH; device literal `apu-00`; no `flock` | G7 G8 | partially fixed: SDK root, `gsi_tool`, device name routed through `spmw_simenv` (`TENON_APU_G2_SDK_ROOT`, `TENON_APU_G2_GSI_TOOL`, `TENON_APU_G2_DEVICE`); the project templates still hard-code `/opt/gsi` and device 0, so non-default values are rejected with a clear error; no `flock` in the runtime yet (validation used an external `flock`) |
 | G2-07 | major | No-op, virtual and hardware results indistinguishable | G2 | fixed by `RunResult.kind` |
 | G2-08..G2-12 | minor | Fingerprint only echoed; mod-2^bits wrap in decode; padded-lane division; dead uint16 templates; docs never mention Gemini-II | | open |
 
@@ -123,13 +123,13 @@ G2 guarantees.
 
 | ID | Sev | Finding | Gate | Status |
 |---|---|---|---|---|
-| P-01 | blocker | No `package_data`/`MANIFEST.in`: sdist/wheel ship zero non-`.py` assets (`allo/pim/templates/apu_g2/**`, `.mlir` templates) | G7 | open |
-| P-02 | blocker | `allo/_mlir` is a symlink into `mlir/build`; wheel has no extension; sdist omits `mlir/`; only editable install works | G7 | open |
-| P-03 | blocker | UPMEM SDK manifest hash hard-required; fresh correct build can never run (A11) | G7 | open |
+| P-01 | blocker | No `package_data`/`MANIFEST.in`: sdist/wheel ship zero non-`.py` assets (`allo/pim/templates/apu_g2/**`, `.mlir` templates) | G7 | fixed: `package_data` + `MANIFEST.in` ship every runtime asset; `tests/perf/test_packaging.py` checks the sdist |
+| P-02 | blocker | `allo/_mlir` is a symlink into `mlir/build`; wheel has no extension; sdist omits `mlir/`; only editable install works | G7 | fixed: `build_ext` copies the CMake-built bindings into the wheel with origin-relative RPATHs; fresh-venv install verified (INSTALL.md section 6); the wheel is host-specific (libstdc++), not a portable wheel |
+| P-03 | blocker | UPMEM SDK manifest hash hard-required; fresh correct build can never run (A11) | G7 | partially fixed: user-build route (`UPIMULATOR_ROOT` + `UPIMULATOR_BIN`) bypasses the pin; public uPIMulator patch still unpublished (P-06) |
 | P-04 | blocker | Modified Samsung PIMSimulator sources with Samsung's non-redistribution notice committed under `dev/` in the containing repository | G7 | open (containing repo; not in the release payload) |
 | P-05 | major | Committed `pim_driver.cc` overlay stale (323 vs 721 lines); installed PIMSimulator has uncommitted modifications; cannot be rebuilt from committed source | G7 G8 | open (same as S-04) |
 | P-06 | major | uPIMulator checkout has 24 modified + 22 untracked files not captured by `setup/`; no simulator commit pins documented | G7 | open |
-| P-07 | major | Release identity is upstream Allo (`allo 0.5`, upstream README, no Tenon mention) | G7 | open |
+| P-07 | major | Release identity is upstream Allo (`allo 0.5`, upstream README, no Tenon mention) | G7 | partially fixed: README gains a Tenon section pointing to INSTALL.md / CAPABILITIES.md / simulators.md; package name stays `allo` (this is a fork of Allo) |
 | P-08 | major | `SPMW_ARCHITECTURE.md` references nonexistent modules and a removed API; omits APU v2 | G7 | open |
-| P-09 | major | No install guide, capability matrix, env-var documentation, or test-run instructions | G7 G8 | open |
-| P-10..P-21 | minor/medium | `/opt/gsi` paths outside `spmw_simenv`; docker image literals; `examples`/`benchmarks` installed as packages; dev tooling in `install_requires`; private calibration script; home-share defaults; proprietary UPMEM SDK image naming; stray tracked files; stale APU v2 docs; `bdist_wheel` fails with cmake 3.16; AiM temp traces in checkout | G7 | open |
+| P-09 | major | No install guide, capability matrix, env-var documentation, or test-run instructions | G7 G8 | fixed: `docs/release/INSTALL.md`, `CAPABILITIES.md`, `simulators.md` |
+| P-10..P-21 | minor/medium | `/opt/gsi` paths outside `spmw_simenv`; docker image literals; `examples`/`benchmarks` installed as packages; dev tooling in `install_requires`; private calibration script; home-share defaults; proprietary UPMEM SDK image naming; stray tracked files; stale APU v2 docs; `bdist_wheel` fails with cmake 3.16; AiM temp traces in checkout | G7 | P-10, P-11, P-12, P-15, P-16, P-21 fixed (paths and images through `spmw_simenv`, `examples`/`benchmarks` not installed, AiM traces in a temp dir, `/home/nz264` literal removed); P-13, P-14, P-17, P-18 (recommended `git rm --cached` list in audit/packaging.md), P-19, P-20 open |

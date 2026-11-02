@@ -65,5 +65,53 @@ the executed outputs. Key executed observations at `8160d6d`:
 
 | Host | Device | Status at this revision |
 |---|---|---|
-| this server | GSI Gemini-I (APU v1), PCI 0000:41:00.0 | baseline suite ran `test_gemv_apu_v1` on the board (15 s). No post-repair device run yet. |
-| zhang-x4 (en-ec-zhang-x4) | GSI Gemini-II `apu-00`, PCI 0000:61:00.0, FW `GSI_G2_Infrastructure_V1.24.1`, 4 cores idle, Status Available; SDK `/opt/gsi` (`g2`, `include/64vl`, `gsi_tool`), docker present, Python 3.10 system; shared home visible (`/work/shared/users/phd/nz264/spmw-for-pim` is mounted there too) | inspected 2026-11-01 via the user's SSH config (host key for `zhang-x4.ece.cornell.edu` already in `known_hosts`; the IP alias `128.253.128.31` lacked the ED25519 entry, which caused `Host key verification failed` under `CheckHostIP`; the trusted key was appended for the IP, backup `~/.ssh/known_hosts.bak-20261101`). No build or run yet. Plan: `audit/apu-g2.md` §5. |
+| this server | GSI Gemini-I (APU v1), PCI 0000:41:00.0 | baseline suite ran `test_gemv_apu_v1` on the board (15 s). Post-repair device run (round 2): see "Round 2 device evidence" below. |
+| zhang-x4 (en-ec-zhang-x4) | GSI Gemini-II `apu-00`, PCI 0000:61:00.0, FW `GSI_G2_Infrastructure_V1.24.1`, 4 cores idle, Status Available; SDK `/opt/gsi` (`g2`, `include/64vl`, `gsi_tool`), docker present, Python 3.10 system; shared home visible (`/work/shared/users/phd/nz264/spmw-for-pim` is mounted there too) | inspected 2026-11-01 via the user's SSH config (host key for `zhang-x4.ece.cornell.edu` already in `known_hosts`; the IP alias `128.253.128.31` lacked the ED25519 entry, which caused `Host key verification failed` under `CheckHostIP`; the trusted key was appended for the IP, backup `~/.ssh/known_hosts.bak-20261101`). Executed 2026-11-02: see "Round 2 device evidence". |
+
+## Round 2 device evidence (2026-11-02)
+
+### Gemini-II on zhang-x4 (raw logs: `/work/shared/users/phd/nz264/tenon-release-evidence/g2/`)
+
+Environment: host `en-ec-zhang-x4`, card `apu-00` PCI 0000:61:00.0, FW
+`GSI_G2_Infrastructure_V1.24.1`, Status Available, 4 cores idle; SDK
+`/opt/gsi` (`gsi_tool` at `/opt/gsi/g2/bin/amd64`); interpreter
+`/work/shared/users/phd/nz264/anaconda3/envs/allo-dev/bin/python` (3.12.12,
+numpy 2.4.3); the checkout is the same shared working tree as this server
+(`ffb4a78` plus the uncommitted wave 2 tree, 59 dirty paths at run time);
+every launch wrapped in `flock /tmp/tenon-apu-g2.lock` on the device host.
+Scripts: `step2_3.sh`, `step4.sh` in the evidence directory.
+
+| Step | Program | kind | cycles (ticks per call, batch of 20) | Check |
+|---|---|---|---|---|
+| software gates | `tests/perf/test_apu_g2_typed_program.py`, `test_apu_g2_composed_contraction.py`, `test_apu_g2_target_layout.py` | | | 13 passed |
+| 2 | `run_apu_g2_u16_add` (4 x 65536 u16) | device | 236 (pipeline 4,710 raw ticks / 20) | outputs returned, exact |
+| 3 | typed add i16+i16->i16 | device | 333 | exact (runtime oracle) |
+| 3 | typed mul i8*i8->i16 | device | 312 | exact |
+| 3 | typed div u16/u16->u16 | device | 1,019 | exact |
+| 3 | typed block_sum u8->u16, K=256 | device | 2,614 | exact |
+| 3 | typed dot i4.i4->i15, 1985x128 | device | 1,713 | exact |
+| 4 | composed GEMM INT4 64x128x31 | device | 1,711 (paper median 1,733) | exact |
+| 4 | composed batched GEMM INT4 4x32x128x16 | device | 1,720 (1,739) | exact |
+| 4 | composed GESUMMV INT2 M1024 K128 | device | 1,876 (1,860) | exact |
+| 4 | composed BiCG INT3 N256 | device | 2,569 (2,549) | exact |
+| 4 | composed MVT INT3 N256 | device | 2,754 (2,767) | exact |
+
+"exact" means the runtime's int64 NumPy oracle comparison passed on the
+device readback (the runtime raises otherwise; device values are what is
+returned). Cycles are device ARC running-state ticks per call, never host
+time; host h2d/d2h/end-to-end microseconds are in the logs separately. The
+device library sha256 for all step 4 runs is
+`8ea3600c0a60ccc78dd2d1a9f8d1fd9b71ee05912e4f9d5f208d45331a57ffc5`. The
+paper medians are listed for orientation only; they were not a pass
+criterion. Negative controls (step 5 of `audit/apu-g2.md`) have not been
+run yet.
+
+### APU v1 on this server (raw logs: `/work/shared/users/phd/nz264/tenon-release-evidence/apuv1/`)
+
+First post-repair device run (`w2-device-tests.log`): 4 failed, all with the
+new profile-freshness check reporting ~2,058 `total` records: each
+`ledag-ssh` session's `flo` prints the whole retained device log, so a
+"drain before, read after" scheme sees every historical record. Repaired by
+diffing the log read before the launch against the log read after it
+(`allo.pim.apu_v1_program.fresh_profile_records`). Second run:
+`w2-device-tests-2.log` (result recorded in STATUS.md when complete).

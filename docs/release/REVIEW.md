@@ -84,6 +84,35 @@ what was accepted and why.
   low 64 bits are unchanged and any later observation of high bits is
   rejected at that op. The k-means paper kernel's oracle needs this.
 
+## Accepted repairs (round 2) and review notes
+
+- Defining-scope name resolution (`allo/ir/utils.py`). Shared Allo frontend
+  file. Accepted because it implements Python scoping (module globals,
+  lexically enclosing frames nearest first, closure cells) and the upstream
+  suites that exercise `customize` and dataflow regions are unchanged; the
+  remaining upstream failures pre-exist at `8160d6d` on this host.
+- Section IV port. Accepted: `gf2.py` verbatim; the search, bound and masked
+  mode carry their telemetry and the paper's reproduction tests. Two
+  deliberate departures are documented in `design/layout-search.md`: a
+  faster child generator in the scalable search (checked against brute force
+  on 1,196 prefixes) and a fallback incumbent on budget exit (the snapshot
+  could return none, which fails G4). Not yet a selection stage.
+- Samsung selected-program execution. Accepted. Reviewer note: the old
+  emitted stream was not a valid program (JUMP counts ignored lanes and GRF
+  depth; roles inverted), which is why the conductor had regenerated the
+  vendor microcode. The corrected MAC rule changes the default selection
+  away from the vendor-equivalent program; the paper rows are pinned by an
+  explicit selector rather than by weakening the model, and the default's
+  cycles are recorded beside them.
+- APU v1 recognizers. Accepted: a strict MLIR parser plus a symbolic
+  executor replaces regex counting; every recipe documents the exact
+  semantics it implements. Reviewer repair after the device run: the
+  profile-freshness scheme assumed `flo` returns unread records only; it
+  prints the whole retained log, so the check now diffs the before/after
+  reads (`fresh_profile_records`).
+- Packaging. Accepted; the wheel is host-specific (libstdc++) and the
+  supported installation remains the source build, which INSTALL.md states.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -93,6 +122,11 @@ what was accepted and why.
   a precise category (`copy`, whole-buffer zero fill, host-executed function).
 - Editing golden rows or widening tolerances: no golden value changed in
   increment 1; the 4 upstream failures were verified to pre-exist.
+- Keeping the Samsung dual-fiber cost rule because it reproduced the paper's
+  default selection: rejected in round 2; the rule now matches the
+  simulator and the paper placement is selected explicitly in the tests.
+- Treating the Gemini-II typed-record runs as evidence for a source route:
+  they validate the typed routes only; G2-02 stays open.
 
 ## Constants and specialization inventory
 
@@ -106,13 +140,13 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 | Gate | Judgment | Basis |
 |---|---|---|
-| G1 correspondence | **FAIL** | CLAIMS.md rows 3, 13, 15-22 missing or external; E2, E5, E8, E11, E12, E14-E16 external |
-| G2 semantic preservation / explicit failure | **FAIL** (improved) | fixed: unmatched effects, accumulator init, zero outputs, result kinds, UPMEM dtypes, wide ints, AiM over-issue; open: S-01, C-01, C-09, V1-01, V1-02, F-01, F-02 |
-| G3 general mechanisms | **FAIL** | V1-01 fail-open recognizers; U-05/U-06 shape-exact paths; G2-02 per-case adapter |
-| G4 search/layout/selected-program integrity | **FAIL** | S-01; C-03/C-05/C-06; C-11 |
-| G5 cost models | **FAIL** | M-05/M-06, U-09, V1-05, G2-03, S-12 |
-| G6 evidence beyond examples | **FAIL** (partial) | new variant/rename regressions for the matcher, AiM and UPMEM; no independent-oracle campaign yet |
-| G7 install/interfaces/maintainability | **FAIL** | P-01..P-09 |
-| G8 backend execution | **UNVERIFIED** | simulators ran at 8160d6d; APU v1 device ran only in the baseline suite; Gemini-II not yet built or run at the candidate |
+| G1 correspondence | **FAIL** (improved) | Section IV mechanisms now in the package (rows 17-22) but not driving selection (row 16); rows 3, 13, 15 missing; E2, E5, E8, E11, E12, E14-E16 external |
+| G2 semantic preservation / explicit failure | **FAIL** (improved) | fixed: unmatched effects, accumulator init, zero outputs, result kinds, UPMEM dtypes, wide ints, AiM over-issue, Samsung selected program, APU v1 recognizers and carried outputs, scope resolution; open: C-01, C-09, F-02 |
+| G3 general mechanisms | **FAIL** (improved) | APU v1 recognizers structural; Samsung roles structural; open: U-05/U-06 shape-exact paths, G2-02 per-case adapter |
+| G4 search/layout/selected-program integrity | **FAIL** (improved) | S-01 closed; C-03/C-05/C-06 open; C-11 search present but not wired |
+| G5 cost models | **FAIL** (improved) | Samsung MAC rule calibrated with provenance; open: M-05/M-06, U-09, V1-05, G2-03 |
+| G6 evidence beyond examples | **FAIL** (partial) | variant/rename regressions for matcher, AiM, Samsung, UPMEM, APU v1 recipes; Gemini-II fresh random fixtures; no systematic independent-oracle campaign yet |
+| G7 install/interfaces/maintainability | **FAIL** (improved) | fresh-venv install verified; docs added; open: P-04/P-06/S-04 simulator reproducibility, P-13/P-14/P-17/P-18/P-19/P-20, architecture doc rewrite (P-08) |
+| G8 backend execution | **PARTIAL** | simulators ran at the candidate; APU v1 device: 4 device tests pass after repairs; Gemini-II: 11 programs exact on the card; still no Gemini-II test in the suite and no negative controls |
 
 Verdict: **NOT READY.**
