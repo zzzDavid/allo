@@ -212,6 +212,100 @@ def expected_apu_g2_composed_output(
     )
 
 
+def apu_g2_composed_layout_image(program: APUG2ComposedContractionProgram):
+    """Physical lanes of every logical ``(dot, k)`` under the program layout.
+
+    The layout is F2-linear, so ``coordinate(row, k)`` is
+    ``coordinate(row, 0) XOR coordinate(0, k)``; both factors come from the
+    program's own :class:`~allo.pim.apu_g2_layout.APUG2DotTilePlan`.  Returns
+    ``(sets, columns)`` arrays of shape ``(dot_count, K)``.
+    """
+
+    plan = program.layout_plan
+    heads = np.array(
+        [plan.physical_coordinate(row, 0) for row in range(program.dot_count)],
+        dtype=np.int64,
+    )
+    offsets = np.array(
+        [plan.physical_coordinate(0, k) for k in range(program.reduction_extent)],
+        dtype=np.int64,
+    )
+    columns = heads[:, 0:1] ^ offsets[np.newaxis, :, 0]
+    sets = heads[:, 1:2] ^ offsets[np.newaxis, :, 1]
+    return sets, columns
+
+
+def attest_apu_g2_composed_packing(
+    program: APUG2ComposedContractionProgram,
+    lhs,
+    rhs,
+    physical_lhs,
+    physical_rhs,
+    physical_auxiliary=None,
+    *,
+    accumulator=None,
+) -> dict[str, object]:
+    """Check that the physical carriers realize the program's layout.
+
+    The carriers must hold every logical operand value exactly at its layout
+    lane, zeros on every other lane, and (for non-identity epilogues) the
+    auxiliary values only at the semantic dot heads.  The returned record
+    binds the layout fingerprint the host binary echoes to the digest of the
+    occupied lane image actually packed.  Raises RuntimeError otherwise.
+    """
+
+    import hashlib
+
+    sets, columns = apu_g2_composed_layout_image(program)
+    image = np.zeros(APUG2_U16_SHAPE, dtype=bool)
+    image[sets, columns] = True
+    if int(image.sum()) != program.dot_count * program.reduction_extent:
+        raise RuntimeError("APUg2 composed layout maps two logical lanes together")
+    for index, (logical, physical) in enumerate(
+        ((lhs, physical_lhs), (rhs, physical_rhs))
+    ):
+        logical = _logical_operand(program, logical, index)
+        physical = np.asarray(physical)
+        if physical.shape != APUG2_U16_SHAPE:
+            raise RuntimeError("packed composed operand has the wrong carrier shape")
+        if not np.array_equal(physical[sets, columns], logical):
+            raise RuntimeError(
+                f"packed operand {index} does not hold the logical dots at the "
+                "lanes of the program layout"
+            )
+        if np.any(physical[~image]):
+            raise RuntimeError(
+                f"packed operand {index} has nonzero lanes outside the layout"
+            )
+    heads = np.zeros(APUG2_U16_SHAPE, dtype=bool)
+    heads[sets[:, 0], columns[:, 0]] = True
+    if program.epilogue.mode is not APUG2DotEpilogueMode.IDENTITY:
+        expected = pack_apu_g2_composed_auxiliary(program, accumulator)
+        if physical_auxiliary is None or not np.array_equal(
+            np.asarray(physical_auxiliary), expected
+        ):
+            raise RuntimeError("packed auxiliary does not match the epilogue")
+        if np.any(np.asarray(physical_auxiliary)[~heads]):
+            raise RuntimeError("packed auxiliary has values off the dot heads")
+    elif physical_auxiliary is not None:
+        raise RuntimeError("identity epilogue packs no auxiliary carrier")
+    fingerprint = program.layout_manifest()["fingerprint"]
+    digest = hashlib.sha256(
+        fingerprint.encode("ascii") + np.packbits(image).tobytes()
+    ).hexdigest()
+    return {
+        "layout_fingerprint": fingerprint,
+        "occupied_lanes": int(image.sum()),
+        "dot_heads": int(heads.sum()),
+        "lane_image_sha256": digest,
+        "checks": [
+            "logical values at layout lanes",
+            "zero padding off the layout image",
+            "auxiliary only at dot heads",
+        ],
+    }
+
+
 def pack_apu_g2_batched_gemm_dots(
     lhs,
     rhs,
@@ -366,6 +460,8 @@ def build_apu_g2_composed_host_command(
 
 __all__ = [
     "APUG2_COMPOSED_EPILOGUE_ABI",
+    "apu_g2_composed_layout_image",
+    "attest_apu_g2_composed_packing",
     "APUG2ComposedHostFiles",
     "build_apu_g2_composed_host_command",
     "canonicalize_apu_g2_values",

@@ -19,6 +19,7 @@ from .apu_g2_composed_contraction import APUG2ComposedContractionProgram
 from .apu_g2_composed_layout import (
     APUG2_COMPOSED_EPILOGUE_ABI,
     APUG2ComposedHostFiles,
+    attest_apu_g2_composed_packing,
     build_apu_g2_composed_host_command,
     expected_apu_g2_composed_output,
     gather_apu_g2_composed_output,
@@ -33,6 +34,8 @@ from .apu_g2_runtime import (
     _KEEP_ENV,
     _TEMPLATE,
     _require_hardware_stack,
+    apu_g2_cmake_arguments,
+    holding_apu_g2_device_lock,
     _run_command,
     _source_snapshot,
 )
@@ -120,20 +123,48 @@ def _parse_metrics(
     return ticks, host
 
 
+@holding_apu_g2_device_lock
 def run_apu_g2_composed(
     program: APUG2ComposedContractionProgram,
     lhs,
     rhs,
     *,
     accumulator=None,
+    expected_layout_fingerprint=None,
 ) -> RunResult:
-    """Build, execute, and independently verify one composed-dot program."""
+    """Build, execute, and independently verify one composed-dot program.
+
+    ``expected_layout_fingerprint`` is the layout the compiler selected; a
+    program whose layout differs is refused before anything is built.  The
+    packed carriers are checked against the program layout
+    (:func:`attest_apu_g2_composed_packing`) before launch, and the host
+    binary must echo the same fingerprint.
+    """
 
     if not isinstance(program, APUG2ComposedContractionProgram):
         raise TypeError("program must be APUG2ComposedContractionProgram")
+    layout_fingerprint = program.layout_manifest()["fingerprint"]
+    if (
+        expected_layout_fingerprint is not None
+        and expected_layout_fingerprint != layout_fingerprint
+    ):
+        raise RuntimeError(
+            "APUg2 composed layout fingerprint mismatch: selected "
+            f"{expected_layout_fingerprint}, program packs {layout_fingerprint}; "
+            "refusing to launch"
+        )
     physical_lhs = pack_apu_g2_composed_operand(program, lhs, 0)
     physical_rhs = pack_apu_g2_composed_operand(program, rhs, 1)
     physical_auxiliary = pack_apu_g2_composed_auxiliary(program, accumulator)
+    packing_attestation = attest_apu_g2_composed_packing(
+        program,
+        lhs,
+        rhs,
+        physical_lhs,
+        physical_rhs,
+        physical_auxiliary,
+        accumulator=accumulator,
+    )
     oracle = expected_apu_g2_composed_output(
         program,
         lhs,
@@ -171,6 +202,7 @@ def run_apu_g2_composed(
             project / "device",
             "-B",
             device_build,
+            *apu_g2_cmake_arguments(),
         ]
         device_compile = [
             "cmake",
@@ -205,6 +237,7 @@ def run_apu_g2_composed(
             "-DGSI_TARGET=DEVICE",
             f"-DBOARD_DEVICE_LIB={device_library}",
             "-DCMAKE_BUILD_TYPE=Release",
+            *apu_g2_cmake_arguments(),
         ]
         host_compile = [
             "cmake",
@@ -298,7 +331,8 @@ def run_apu_g2_composed(
                 "program": program.manifest(),
                 "program_fingerprint": program.structural_fingerprint,
                 "layout": program.layout_manifest(),
-                "layout_fingerprint": program.layout_manifest()["fingerprint"],
+                "layout_fingerprint": layout_fingerprint,
+                "packing_attestation": packing_attestation,
                 "recipe": recipe.manifest(),
                 "recipe_fingerprint": recipe.structural_fingerprint,
                 "operation_inventory": dict(recipe.inventory),

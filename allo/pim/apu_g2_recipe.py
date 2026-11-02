@@ -930,6 +930,134 @@ def build_apu_g2_recipe_graph(
     return graph
 
 
+
+def _typed_call_feature_arguments(operation: APUG2RecipeOperation) -> dict:
+    """Widths and depth that :func:`apu_g2_typed_call_features` prices."""
+
+    descriptors = {item.role: item.descriptor for item in operation.descriptors}
+    opcode = operation.opcode
+    if opcode == "SEU_BARRIER":
+        return {}
+    if opcode == "MUL_TYPED":
+        return {
+            "lhs_bits": descriptors["lhs"].num_bits,
+            "rhs_bits": descriptors["rhs"].num_bits,
+        }
+    if opcode == "GROUP_REDUCE_ADD_TYPED":
+        attributes = dict(operation.attributes)
+        if "log_reduction" in attributes:
+            log_reduction = int(attributes["log_reduction"])
+        else:
+            extent = int(attributes["reduction_extent"])
+            if extent < 2 or extent & (extent - 1):
+                raise ValueError("typed reduction extent must be a power of two")
+            log_reduction = extent.bit_length() - 1
+        return {"log_reduction": log_reduction}
+    return {"bits": descriptors["dst"].num_bits}
+
+
+def emit_apu_g2_priced_recipe(
+    graph: ExecutionGraph,
+    recipe: APUG2Recipe,
+    target,
+    cost,
+    *,
+    prefix: str = "",
+    dependencies: tuple[str, ...] = (),
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    """Emit every issued typed/composed call through the bound cost program.
+
+    Each recipe call becomes one :class:`~allo.perf.CostEvent` on its target
+    primitive, carrying the structural features of
+    :func:`~allo.pim.apu_g2_pipeline.apu_g2_typed_call_features`; the cost
+    rules turn them into device ticks.  Calls run in recipe order after
+    ``dependencies``.  Returns the terminal activity ids and a summary with
+    the per-feature totals of the recipe.
+    """
+
+    from ..perf import CostEvent
+    from .apu_g2_pipeline import APUG2_TYPED_TICK_FEATURES, apu_g2_typed_call_features
+
+    if not isinstance(recipe, APUG2Recipe):
+        raise TypeError("recipe must be an APUG2Recipe")
+    if getattr(target, "name", None) != "apu_v2":
+        raise ValueError("APUg2 recipes require the apu_v2 target")
+    tick_model = apu_g2_cost_tick_model(cost)
+    totals = dict.fromkeys(APUG2_TYPED_TICK_FEATURES, 0)
+    validity = "calibrated"
+    terminals = tuple(dependencies)
+    for operation in recipe.operations:
+        features = apu_g2_typed_call_features(
+            operation.opcode, **_typed_call_feature_arguments(operation)
+        )
+        for name, value in features.items():
+            totals[name] += value
+        if tick_model.validity(features) != "calibrated":
+            validity = "extrapolated"
+        event = CostEvent.create(
+            f"{prefix}{operation.id}",
+            _target_primitive(target, operation),
+            metrics={
+                "typed_call_features": features,
+                "opcode": operation.opcode,
+            },
+            attributes={
+                "opcode": operation.opcode,
+                "kind": operation.kind.value,
+                "descriptors": [
+                    descriptor.manifest() for descriptor in operation.descriptors
+                ],
+                "features": dict(features),
+            },
+        )
+        terminals = cost.emit(graph, event, terminals)
+    return terminals, {
+        "features": totals,
+        "calls": len(recipe.operations),
+        "validity": validity,
+    }
+
+
+def apu_g2_cost_tick_model(cost):
+    """The typed tick model carried by a bound ``build_apu_g2_cost`` program."""
+
+    model = getattr(getattr(cost, "spec", None), "apu_g2_tick_model", None)
+    if model is None:
+        raise TypeError(
+            "typed/composed APUg2 recipes need a cost program built by "
+            "allo.pim.costs.apu_g2.build_apu_g2_cost (e.g. apu_g2_cost)"
+        )
+    return model
+
+
+def build_apu_g2_priced_recipe_graph(recipe: APUG2Recipe, target, cost):
+    """One recipe priced by ``cost`` (a target-bound ``apu_g2_cost``)."""
+
+    graph = ExecutionGraph(
+        recipe.name,
+        metadata={
+            "target": "apu_v2",
+            "physical_recipe": True,
+            "latency_unit": "device_ticks_per_pipeline_body",
+            "calibrated_device_ticks": True,
+            "inventory": dict(recipe.inventory),
+            "vectorization_certificate": recipe.certificate.manifest(),
+            **dict(recipe.metadata),
+        },
+    )
+    _terminals, summary = emit_apu_g2_priced_recipe(graph, recipe, target, cost)
+    tick_model = apu_g2_cost_tick_model(cost)
+    graph.metadata.update(
+        {
+            "tick_features": summary["features"],
+            "estimate_validity": summary["validity"],
+            "cost_model": cost.spec.name,
+            "tick_model_fingerprint": tick_model.fingerprint,
+        }
+    )
+    return graph
+
+
 class _RecipeBuilder:
     def __init__(self):
         self.operations: list[APUG2RecipeOperation] = []
@@ -2351,6 +2479,8 @@ __all__ = [
     "APUG2RecipeOpKind",
     "APUG2RecipeOperation",
     "APUG2VectorizationCertificate",
+    "apu_g2_cost_tick_model",
+    "build_apu_g2_priced_recipe_graph",
     "build_apu_g2_recipe_graph",
     "build_apu_g2_u16_block_sum_recipe",
     "build_apu_g2_u16_shift_right_recipe",
@@ -2365,4 +2495,5 @@ __all__ = [
     "build_apu_g2_u16_dot_tile_recipe",
     "calibrate_apu_g2_recipe_from_measured_tile",
     "chain_apu_g2_recipes",
+    "emit_apu_g2_priced_recipe",
 ]

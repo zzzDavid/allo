@@ -464,7 +464,297 @@ NORMALIZED_RESIDENT_TWO_STAGE_REDUCTION_CALIBRATION = PipelineCalibration(
 )
 
 
+
+# --------------------------------------------------------------------------- #
+# Typed/composed direct-VL64 tick model (release audit G2-03)
+# --------------------------------------------------------------------------- #
+#
+# The typed (``APUG2TypedProgram``) and composed (``APUG2ComposedContractionProgram``)
+# routes issue width-polymorphic calls: COPY_L1_VECTORS_TO_MMB,
+# COPY_MMB_TO_L1_VECTORS, MUL_TYPED, GROUP_REDUCE_ADD_TYPED, ADD_TYPED,
+# COPY_ODD_TO_EVEN_VECTORS, DIV_TYPED and one SEU_BARRIER per pipeline body.
+# Every call covers the whole (4, 65536) carrier, so device time depends on the
+# bit widths, the reduction depth, and the number of pipeline bodies, not on
+# how many logical dots occupy the carrier.
+#
+# The model attributes one pipeline's device ticks to these structural
+# features of its issued calls.  It is a normalized attribution fitted to whole
+# pipelines, not a set of isolated instruction latencies.
+
+APUG2_TYPED_TICK_FEATURES = (
+    "pipeline_bodies",
+    "issued_calls",
+    "row_bits",
+    "multiply_bit_products",
+    "reduce_levels",
+    "reduce_shift_columns",
+    "divide_bits_squared",
+)
+
+_TRANSFER_OPCODES = frozenset({"COPY_L1_VECTORS_TO_MMB", "COPY_MMB_TO_L1_VECTORS"})
+_ROW_SWEEP_OPCODES = frozenset({"ADD_TYPED", "COPY_ODD_TO_EVEN_VECTORS"})
+APUG2_TYPED_TICK_OPCODES = frozenset(
+    _TRANSFER_OPCODES
+    | _ROW_SWEEP_OPCODES
+    | {"MUL_TYPED", "GROUP_REDUCE_ADD_TYPED", "DIV_TYPED", "SEU_BARRIER"}
+)
+
+
+def apu_g2_typed_call_features(
+    opcode: str,
+    *,
+    bits: int = 0,
+    lhs_bits: int = 0,
+    rhs_bits: int = 0,
+    log_reduction: int = 0,
+) -> dict[str, int]:
+    """Structural tick features of one issued typed/composed call.
+
+    ``bits`` is the destination value width of a transfer or row-sweep call
+    (each of its rows is swept across all four vectors), ``lhs_bits`` and
+    ``rhs_bits`` are the multiplicand widths of MUL_TYPED (bit-serial
+    multiplication touches ``lhs_bits * rhs_bits`` partial-product rows), and
+    ``log_reduction`` is the depth of the GROUP_REDUCE_ADD_TYPED tree, whose
+    level ``l`` shifts by ``2**l`` columns.
+    """
+
+    features = dict.fromkeys(APUG2_TYPED_TICK_FEATURES, 0)
+    if opcode == "SEU_BARRIER":
+        features["pipeline_bodies"] = 1
+        return features
+    if opcode not in APUG2_TYPED_TICK_OPCODES:
+        raise KeyError(f"no typed tick features for APUg2 opcode {opcode!r}")
+    features["issued_calls"] = 1
+    if opcode in _TRANSFER_OPCODES or opcode in _ROW_SWEEP_OPCODES:
+        features["row_bits"] = _integer(bits, "bits", minimum=1)
+    elif opcode == "MUL_TYPED":
+        features["multiply_bit_products"] = _integer(
+            lhs_bits, "lhs_bits", minimum=1
+        ) * _integer(rhs_bits, "rhs_bits", minimum=1)
+    elif opcode == "GROUP_REDUCE_ADD_TYPED":
+        levels = _integer(log_reduction, "log_reduction", minimum=1)
+        features["reduce_levels"] = levels
+        features["reduce_shift_columns"] = (1 << levels) - 1
+    else:
+        width = _integer(bits, "bits", minimum=1)
+        features["divide_bits_squared"] = width * width
+    return features
+
+
+@dataclass(frozen=True)
+class APUG2TypedTickMeasurement(_CanonicalModel):
+    """One real-card typed/composed program measurement (ticks per body)."""
+
+    program: str
+    route: str
+    ticks_per_pipeline: int
+    final_pipeline_ticks: int
+
+    def __post_init__(self) -> None:
+        if self.route not in ("typed", "composed"):
+            raise ValueError("measurement route must be 'typed' or 'composed'")
+        for name in ("ticks_per_pipeline", "final_pipeline_ticks"):
+            object.__setattr__(
+                self, name, _integer(getattr(self, name), name, minimum=1)
+            )
+
+    @property
+    def canonical_manifest(self) -> dict[str, object]:
+        return {
+            "program": self.program,
+            "route": self.route,
+            "ticks_per_pipeline": self.ticks_per_pipeline,
+            "final_pipeline_ticks": self.final_pipeline_ticks,
+        }
+
+
+# Round 2 device evidence (docs/release/VALIDATION.md): host en-ec-zhang-x4,
+# card apu-00 (PCI 0000:61:00.0), firmware GSI_G2_Infrastructure_V1.24.1, SDK
+# /opt/gsi, 2026-11-02, checkout ffb4a78 plus the wave-2 tree.  Every value is
+# round(device_pipeline_ticks / 20): twenty pipeline bodies and one completion
+# barrier per timed batch, transfers outside the timer, fresh random inputs,
+# all outputs bit-exact against the runtime oracle.  Raw logs:
+# tenon-release-evidence/g2/step2_3.log and step4.log.  The program keys name
+# records rebuilt by ``apu_g2_typed_calibration_programs`` in
+# ``allo.pim.costs.apu_g2``.
+APUG2_TYPED_TICK_PROVENANCE = (
+    ("source", "docs/release/VALIDATION.md Round 2 device evidence"),
+    ("date", "2026-11-02"),
+    ("host", "en-ec-zhang-x4"),
+    ("card", "apu-00 PCI 0000:61:00.0"),
+    ("firmware", "GSI_G2_Infrastructure_V1.24.1"),
+    ("sdk", "/opt/gsi"),
+    ("metric", "round(device_pipeline_ticks / repetitions), repetitions=20"),
+    ("timed_scope", "pipeline bodies plus one completion barrier; no transfers"),
+    ("logs", "tenon-release-evidence/g2/step2_3.log, step4.log"),
+)
+
+APUG2_TYPED_TICK_MEASUREMENTS = (
+    APUG2TypedTickMeasurement("typed_add_i16", "typed", 333, 602),
+    APUG2TypedTickMeasurement("typed_mul_i8_to_i16", "typed", 312, 451),
+    APUG2TypedTickMeasurement("typed_div_u16", "typed", 1_019, 1_092),
+    APUG2TypedTickMeasurement("typed_block_sum_u8_k256", "typed", 2_614, 2_676),
+    APUG2TypedTickMeasurement("typed_dot_i4_k128", "typed", 1_713, 1_775),
+    APUG2TypedTickMeasurement("composed_gemm_i4_k128", "composed", 1_711, 1_746),
+    APUG2TypedTickMeasurement(
+        "composed_batched_gemm_i4_k128", "composed", 1_720, 1_750
+    ),
+    APUG2TypedTickMeasurement(
+        "composed_pair_affine_i2_k128", "composed", 1_876, 1_838
+    ),
+    APUG2TypedTickMeasurement("composed_two_stream_i3_k256", "composed", 2_569, 2_554),
+    APUG2TypedTickMeasurement(
+        "composed_two_stream_accumulate_i3_k256", "composed", 2_754, 2_754
+    ),
+)
+
+
+@dataclass(frozen=True)
+class APUG2TypedTickModel(_CanonicalModel):
+    """Calibrated device-tick attribution for typed/composed recipe calls.
+
+    ``coefficients`` maps every name in :data:`APUG2_TYPED_TICK_FEATURES` to
+    ticks per unit of that feature.  ``calibrated_reduce_levels``,
+    ``calibrated_divide_bits`` and ``calibrated_row_bits`` bound the measured
+    domain: estimates for calls outside it are still produced (the selection
+    needs a total order) but are labelled ``"extrapolated"`` by
+    :meth:`validity`.
+    """
+
+    coefficients: tuple[tuple[str, float], ...]
+    calibrated_reduce_levels: tuple[int, ...]
+    calibrated_divide_bits: tuple[int, ...]
+    calibrated_row_bits: tuple[int, int]
+    calibrated_multiply_bit_products: tuple[int, int]
+    fit: str
+    provenance: tuple[tuple[str, str], ...] = APUG2_TYPED_TICK_PROVENANCE
+
+    def __post_init__(self) -> None:
+        names = tuple(name for name, _value in self.coefficients)
+        if names != APUG2_TYPED_TICK_FEATURES:
+            raise ValueError(
+                "tick model coefficients must cover APUG2_TYPED_TICK_FEATURES in order"
+            )
+        for name, value in self.coefficients:
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise TypeError(f"tick coefficient {name} must be a number")
+            if value < 0:
+                raise ValueError(f"tick coefficient {name} must be nonnegative")
+
+    @property
+    def coefficient_map(self) -> dict[str, float]:
+        return {name: float(value) for name, value in self.coefficients}
+
+    def call_ticks(self, features) -> int:
+        """Integer device ticks attributed to one issued call."""
+
+        coefficients = self.coefficient_map
+        unknown = set(features) - set(coefficients)
+        if unknown:
+            raise KeyError(f"unknown typed tick features {sorted(unknown)}")
+        value = sum(coefficients[name] * features[name] for name in features)
+        return int(round(value))
+
+    def validity(self, features) -> str:
+        """``"calibrated"`` inside the measured feature ranges, else
+        ``"extrapolated"``."""
+
+        if features.get("reduce_levels", 0) and (
+            features["reduce_levels"] not in self.calibrated_reduce_levels
+        ):
+            return "extrapolated"
+        divide = features.get("divide_bits_squared", 0)
+        if divide and divide not in tuple(
+            bits * bits for bits in self.calibrated_divide_bits
+        ):
+            return "extrapolated"
+        low, high = self.calibrated_row_bits
+        rows = features.get("row_bits", 0)
+        if rows and not low <= rows <= high:
+            return "extrapolated"
+        low, high = self.calibrated_multiply_bit_products
+        products = features.get("multiply_bit_products", 0)
+        if products and not low <= products <= high:
+            return "extrapolated"
+        return "calibrated"
+
+    def scaled(self, **factors: float) -> "APUG2TypedTickModel":
+        """Return a perturbed copy with selected coefficients multiplied."""
+
+        unknown = set(factors) - set(APUG2_TYPED_TICK_FEATURES)
+        if unknown:
+            raise KeyError(f"unknown typed tick features {sorted(unknown)}")
+        return APUG2TypedTickModel(
+            coefficients=tuple(
+                (name, value * float(factors.get(name, 1.0)))
+                for name, value in self.coefficients
+            ),
+            calibrated_reduce_levels=self.calibrated_reduce_levels,
+            calibrated_divide_bits=self.calibrated_divide_bits,
+            calibrated_row_bits=self.calibrated_row_bits,
+            calibrated_multiply_bit_products=self.calibrated_multiply_bit_products,
+            fit=f"{self.fit}; perturbed {sorted(factors.items())}",
+            provenance=self.provenance,
+        )
+
+    @property
+    def canonical_manifest(self) -> dict[str, object]:
+        return {
+            "schema": "apu-g2-typed-tick-model-v1",
+            "unit": "device ARC ticks per pipeline body",
+            "coefficients": dict(self.coefficients),
+            "calibrated_reduce_levels": list(self.calibrated_reduce_levels),
+            "calibrated_divide_bits": list(self.calibrated_divide_bits),
+            "calibrated_row_bits": list(self.calibrated_row_bits),
+            "calibrated_multiply_bit_products": list(
+                self.calibrated_multiply_bit_products
+            ),
+            "fit": self.fit,
+            "provenance": dict(self.provenance),
+            "measurements": [
+                item.canonical_manifest for item in APUG2_TYPED_TICK_MEASUREMENTS
+            ],
+        }
+
+
+# Coefficients from ``fit_apu_g2_typed_tick_model()`` (allo.pim.costs.apu_g2)
+# over APUG2_TYPED_TICK_MEASUREMENTS, rounded to three decimals; the release
+# test re-fits and compares.  In-sample error <= 1.9% on all ten programs;
+# leave-one-out error <= 2.6% on the five composed programs (see
+# docs/release/design/apu-g2-source-route.md).  The calibrated reduction
+# depths are only 7 and 8; the per-level 2**l shift scaling below them is an
+# extrapolation whose shape agrees with the 2026-07-08 uint16 dot-tile points
+# (APUG2_DOT_TILE_MEASURED_POINTS: increments 2,246 ticks from depth 6 to 7
+# and 4,793 from 7 to 8).
+APUG2_TYPED_TICK_MODEL = APUG2TypedTickModel(
+    coefficients=(
+        ("pipeline_bodies", 195.704),
+        ("issued_calls", 0.0),
+        ("row_bits", 2.235),
+        ("multiply_bit_products", 0.609),
+        ("reduce_levels", 84.848),
+        ("reduce_shift_columns", 6.505),
+        ("divide_bits_squared", 2.937),
+    ),
+    calibrated_reduce_levels=(7, 8),
+    calibrated_divide_bits=(16,),
+    calibrated_row_bits=(2, 16),
+    calibrated_multiply_bit_products=(4, 64),
+    fit=(
+        "exhaustive active-set nonnegative least squares over the ten Round 2 "
+        "programs; features from their issued recipes"
+    ),
+)
+
 __all__ = [
+    "APUG2_TYPED_TICK_FEATURES",
+    "APUG2_TYPED_TICK_MEASUREMENTS",
+    "APUG2_TYPED_TICK_MODEL",
+    "APUG2_TYPED_TICK_OPCODES",
+    "APUG2_TYPED_TICK_PROVENANCE",
+    "APUG2TypedTickMeasurement",
+    "APUG2TypedTickModel",
+    "apu_g2_typed_call_features",
     "CallInventoryEntry",
     "NORMALIZED_DUAL_STREAM_REDUCTION_CALIBRATION",
     "NORMALIZED_RESIDENT_TWO_STAGE_REDUCTION_CALIBRATION",

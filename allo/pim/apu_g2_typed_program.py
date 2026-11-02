@@ -28,7 +28,7 @@ from .apu_g2_recipe import (
     APUG2RecipeOpKind,
     APUG2RecipeOperation,
     APUG2VectorizationCertificate,
-    build_apu_g2_recipe_graph,
+    build_apu_g2_priced_recipe_graph,
 )
 
 
@@ -673,7 +673,7 @@ def build_apu_g2_typed_execution_graph(
     if not isinstance(cost, BoundCostSpec) or cost.target is not target:
         raise TypeError("APUg2 typed programs require a target-bound cost")
     recipe = build_apu_g2_typed_recipe(program)
-    graph = build_apu_g2_recipe_graph(recipe, target)
+    graph = build_apu_g2_priced_recipe_graph(recipe, target, cost)
     graph.metadata.update(
         {
             "cost": cost.spec.name,
@@ -681,7 +681,6 @@ def build_apu_g2_typed_execution_graph(
             "recipe": recipe.manifest(),
             "recipe_fingerprint": recipe.structural_fingerprint,
             "execution": "direct_vl64",
-            "analytical": True,
         }
     )
     return graph
@@ -797,10 +796,18 @@ class APUG2TypedCallable:
             result = RunResult(
                 kind="virtual",
                 cycles=int(self.estimate_result.cycles),
-                stdout="virtual APUg2 typed cost evaluation; hardware not executed",
+                stdout=(
+                    "virtual APUg2 typed cost evaluation with "
+                    f"{self.cost.spec.name!r}; hardware not executed"
+                ),
                 backend="virtual",
                 extra={
                     "outputs": {},
+                    "cost_model": self.cost.spec.name,
+                    "latency_unit": "device_ticks_per_pipeline_body",
+                    "estimate_validity": self.execution_graph.metadata[
+                        "estimate_validity"
+                    ],
                     "program": self.program.manifest(),
                     "recipe": self.execution_graph.metadata["recipe"],
                 },

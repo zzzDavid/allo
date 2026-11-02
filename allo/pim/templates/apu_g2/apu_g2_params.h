@@ -5,6 +5,12 @@
 
 #include <cstdint>
 
+// Card index passed as the first DeviceConfig field by every host program;
+// the build defines it from TENON_APU_G2_DEVICE (apu-NN -> NN).
+#ifndef TENON_APU_G2_DEVICE_INDEX
+#define TENON_APU_G2_DEVICE_INDEX 0
+#endif
+
 #pragma pack(push, 1)
 struct ApuG2AddTimings {
   uint64_t input_copy_ticks;

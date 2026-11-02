@@ -5,6 +5,10 @@ cmake_minimum_required(VERSION 3.20...3.30)
 project(tenon_apu_g2_tasks LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
+# Passed by the runtime from allo.spmw_simenv.apu_g2_sdk_root().  The
+# GSI_SYSTEM_g2/GSI_GTML_g2 config packages (and the ARC toolchain they
+# select) are found by CMake's default search, not under this root.
+set(TENON_APU_G2_SDK_ROOT "/opt/gsi" CACHE PATH "GSI Gemini-II SDK root")
 
 set(CMAKE_BUILD_TYPE ArcDebug)
 # ArcDebug is required to select the ARC toolchain, but the GSI runtime and
@@ -19,18 +23,18 @@ set(GSI_SYSTEM_TARGET_NAME vector_core)
 find_package(GSI_SYSTEM_g2 REQUIRED CONFIG)
 find_package(GSI_GTML_g2 REQUIRED CONFIG)
 find_package(g2_transport REQUIRED CONFIG
-  PATHS /opt/gsi/lib/cmake/g2_transport NO_DEFAULT_PATH)
+  PATHS ${TENON_APU_G2_SDK_ROOT}/lib/cmake/g2_transport NO_DEFAULT_PATH)
 find_file(GTML_MD_UPDATE_SCRIPT g2_md_update.py
-  PATHS /opt/gsi/g2/vector_core/bin NO_DEFAULT_PATH REQUIRED)
+  PATHS ${TENON_APU_G2_SDK_ROOT}/g2/vector_core/bin NO_DEFAULT_PATH REQUIRED)
 
 include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/..
-  /opt/gsi/include/64vl/g2_64vl
-  /opt/gsi/include/g2_common
-  /opt/gsi/include/gtml/g2_gtml
-  /opt/gsi/include/gsi
-  /opt/gsi/include/gsi/device
+  ${TENON_APU_G2_SDK_ROOT}/include/64vl/g2_64vl
+  ${TENON_APU_G2_SDK_ROOT}/include/g2_common
+  ${TENON_APU_G2_SDK_ROOT}/include/gtml/g2_gtml
+  ${TENON_APU_G2_SDK_ROOT}/include/gsi
+  ${TENON_APU_G2_SDK_ROOT}/include/gsi/device
   ${g2_transport_INCLUDE_DIRS}
   ${g2_transport_TASK_INCLUDE_DIRS})
 
@@ -61,11 +65,11 @@ gsi_system_set_c_and_cxx_compiler_options()
 target_include_directories(tenon_apu_g2_tasks PRIVATE
   ${GTML_INCLUDE_DIRS}
   ${GSI_SYSTEM_INCLUDE_DIRS}
-  /opt/gsi/include/64vl/g2_64vl
-  /opt/gsi/include/g2_common
-  /opt/gsi/include/gtml/g2_gtml
-  /opt/gsi/include/gsi
-  /opt/gsi/include/gsi/device
+  ${TENON_APU_G2_SDK_ROOT}/include/64vl/g2_64vl
+  ${TENON_APU_G2_SDK_ROOT}/include/g2_common
+  ${TENON_APU_G2_SDK_ROOT}/include/gtml/g2_gtml
+  ${TENON_APU_G2_SDK_ROOT}/include/gsi
+  ${TENON_APU_G2_SDK_ROOT}/include/gsi/device
   ${g2_transport_INCLUDE_DIRS}
   ${g2_transport_TASK_INCLUDE_DIRS})
 target_compile_options(tenon_apu_g2_tasks PRIVATE

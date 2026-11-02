@@ -106,7 +106,7 @@ int main(int argc, char **argv) {
     std::vector<uint16_t> output(uint64_t{M} * N);
 
     using namespace gtml_transport;
-    Device device(DEVICE_SIDE_LIB_LOCATION, DeviceConfig{0, 0});
+    Device device(DEVICE_SIDE_LIB_LOCATION, DeviceConfig{TENON_APU_G2_DEVICE_INDEX, 0});
     device.init_gtml({kTempRow, 128, kIndexRow, 16});
 
     const uint32_t groups = (M + kColumnsPerGroup - 1) / kColumnsPerGroup;

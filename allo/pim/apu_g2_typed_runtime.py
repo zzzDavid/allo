@@ -20,6 +20,8 @@ from .apu_g2_runtime import (
     _KEEP_ENV,
     _TEMPLATE,
     _require_hardware_stack,
+    apu_g2_cmake_arguments,
+    holding_apu_g2_device_lock,
     _run_command,
     _source_snapshot,
 )
@@ -104,6 +106,13 @@ def _expected_output(program: APUG2TypedProgram, operands) -> np.ndarray:
     return _canonicalize(values, program.output_type)
 
 
+def _artifact_sha256(path: Path) -> str:
+    """SHA-256 of a built artifact (device library or host binary)."""
+    import hashlib
+
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 def _parse_metrics(
     text: str, device_library: Path
 ) -> tuple[dict[str, int], dict[str, float]]:
@@ -166,6 +175,7 @@ def _parse_metrics(
     return ticks, host
 
 
+@holding_apu_g2_device_lock
 def run_apu_g2_typed(program: APUG2TypedProgram, *operands) -> RunResult:
     """Build and run one legality-checked typed program on ``apu-00``.
 
@@ -234,7 +244,14 @@ def run_apu_g2_typed(program: APUG2TypedProgram, *operands) -> RunResult:
 
         device_build = project / "build" / "device"
         host_build = project / "build" / "host"
-        device_configure = ["cmake", "-S", project / "device", "-B", device_build]
+        device_configure = [
+            "cmake",
+            "-S",
+            project / "device",
+            "-B",
+            device_build,
+            *apu_g2_cmake_arguments(),
+        ]
         device_compile = ["cmake", "--build", device_build, "-j", str(jobs)]
         commands.extend((device_configure, device_compile))
         _run_command(
@@ -262,6 +279,7 @@ def run_apu_g2_typed(program: APUG2TypedProgram, *operands) -> RunResult:
             "-DGSI_TARGET=DEVICE",
             f"-DBOARD_DEVICE_LIB={device_library}",
             "-DCMAKE_BUILD_TYPE=Release",
+            *apu_g2_cmake_arguments(),
         ]
         host_compile = ["cmake", "--build", host_build, "-j", str(jobs)]
         commands.extend((host_configure, host_compile))
@@ -365,6 +383,11 @@ def run_apu_g2_typed(program: APUG2TypedProgram, *operands) -> RunResult:
                     "device_library": (
                         str(device_library) if keep else device_library.name
                     ),
+                    "host_binary": (str(host_binary) if keep else host_binary.name),
+                    "artifact_sha256": {
+                        "device_library": _artifact_sha256(device_library),
+                        "host_binary": _artifact_sha256(host_binary),
+                    },
                     "source_sha256": source_hashes,
                     "commands": [
                         [str(part) for part in command] for command in commands

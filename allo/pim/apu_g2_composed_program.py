@@ -24,7 +24,7 @@ from .apu_g2_recipe import (
     APUG2RecipeOperation,
     APUG2RecipeOpKind,
     APUG2VectorizationCertificate,
-    build_apu_g2_recipe_graph,
+    build_apu_g2_priced_recipe_graph,
 )
 
 
@@ -306,7 +306,7 @@ def build_apu_g2_composed_execution_graph(program, target, cost):
     if not isinstance(cost, BoundCostSpec) or cost.target is not target:
         raise TypeError("composed contractions require a target-bound cost")
     recipe = build_apu_g2_composed_recipe(program)
-    graph = build_apu_g2_recipe_graph(recipe, target)
+    graph = build_apu_g2_priced_recipe_graph(recipe, target, cost)
     graph.metadata.update(
         {
             "cost": cost.spec.name,
@@ -316,7 +316,6 @@ def build_apu_g2_composed_execution_graph(program, target, cost):
             "program_fingerprint": program.structural_fingerprint,
             "layout_fingerprint": program.layout_manifest()["fingerprint"],
             "execution": "composed_direct_vl64",
-            "analytical": True,
         }
     )
     return graph
@@ -412,11 +411,17 @@ class APUG2ComposedContractionCallable:
                 kind="virtual",
                 cycles=int(self.estimate_result.cycles),
                 stdout=(
-                    "virtual APUg2 composed cost evaluation; hardware not executed"
+                    "virtual APUg2 composed cost evaluation with "
+                    f"{self.cost.spec.name!r}; hardware not executed"
                 ),
                 backend="virtual",
                 extra={
                     "outputs": {},
+                    "cost_model": self.cost.spec.name,
+                    "latency_unit": "device_ticks_per_pipeline_body",
+                    "estimate_validity": self.execution_graph.metadata[
+                        "estimate_validity"
+                    ],
                     "oracle": expected_output,
                     "program": self.program.manifest(),
                     "recipe": self.execution_graph.metadata["recipe"],

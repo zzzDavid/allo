@@ -1,6 +1,16 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Executable compute costs for Gemini-II uint16 direct-VL64 kernels.
+"""Executable compute costs for Gemini-II direct-VL64 kernels.
+
+Typed and composed recipes (``APUG2TypedProgram``,
+``APUG2ComposedContractionProgram`` and the source route built on them) emit
+one cost event per issued call carrying ``typed_call_features``; the rules
+registered by :func:`build_apu_g2_cost` price them with an
+:class:`~allo.pim.apu_g2_pipeline.APUG2TypedTickModel` (device ticks per
+pipeline body, calibrated on the 2026-11-02 real-card runs; provenance,
+validity domain and fit in ``allo/pim/apu_g2_pipeline.py`` and
+``docs/release/design/apu-g2-source-route.md``).  The uint16 kernels below
+keep their pipeline calibrations.
 
 One ``ADD_U16`` cost event represents the complete core-wide sequence: two
 L1-to-MMB copies, one add, one MMB-to-L1 copy, and the mandatory SEU barrier.
@@ -32,9 +42,14 @@ from __future__ import annotations
 
 from numbers import Integral
 
-from ...perf import BoundCostSpec, CostEvent, CostSpec, ExecutionGraph, cost, rule
+from ...perf import BoundCostSpec, CostEvent, CostSpec, ExecutionGraph, rule
 from ..apu_g2_layout import APUG2ReductionPlan
 from ..apu_g2_pipeline import (
+    APUG2_TYPED_TICK_FEATURES,
+    APUG2_TYPED_TICK_MEASUREMENTS,
+    APUG2_TYPED_TICK_MODEL,
+    APUG2TypedTickModel,
+    apu_g2_typed_call_features,
     NORMALIZED_DUAL_STREAM_REDUCTION_CALIBRATION,
     NORMALIZED_RESIDENT_TWO_STAGE_REDUCTION_CALIBRATION,
     NORMALIZED_SINGLE_STREAM_REDUCTION_CALIBRATION,
@@ -494,14 +509,75 @@ def _emit_normalized_vl64_primitive(
     ctx.step(latency=latency, occupy=occupy, name=name)
 
 
-@cost(
-    target="apu_v2",
-    fingerprint_data=APUG2_GEMM_WALL_FINGERPRINT_DATA,
-    materialization_scorer=_score_apu_g2_persistent_materialization,
-)
-def apu_g2_cost(target):
-    """Expand coalesced uint16 kernels onto core-wide VL64 resources."""
+def _typed_call_features(event: CostEvent):
+    features = event.metrics.get("typed_call_features")
+    if features is None:
+        return None
+    if not isinstance(features, dict):
+        raise TypeError("typed_call_features must be a feature mapping")
+    return features
 
+
+def _emit_typed_call(ctx, target, primitive, tick_model, features, name):
+    """One issued typed/composed call priced by the typed tick model."""
+
+    kind_occupancy = [ctx.use(primitive), ctx.use(target.unit("core"))]
+    kind_occupancy.append(ctx.use(target.unit("arc")))
+    if not features["pipeline_bodies"]:
+        kind_occupancy.append(ctx.use(target.unit("vector_engine")))
+        kind_occupancy.append(ctx.use(target.mmb))
+    if features["row_bits"] and name.startswith("copy_"):
+        kind_occupancy.append(ctx.use(target.l1))
+    ctx.step(
+        latency=tick_model.call_ticks(features),
+        occupy=kind_occupancy,
+        name=name,
+    )
+
+
+def _apu_g2_cost_builder(tick_model: APUG2TypedTickModel):
+    def apu_g2_cost(target):
+        """Expand Gemini-II kernels onto core-wide VL64 resources.
+
+        uint16 events carry a ``pipeline_calibration``; typed/composed recipe
+        calls carry ``typed_call_features`` and are priced by ``tick_model``.
+        """
+
+        _register_apu_g2_rules(target, tick_model)
+
+    return apu_g2_cost
+
+
+def build_apu_g2_cost(
+    tick_model: APUG2TypedTickModel = APUG2_TYPED_TICK_MODEL,
+    *,
+    name: str = "apu_g2_cost",
+) -> CostSpec:
+    """The Gemini-II executable cost program for one typed tick model.
+
+    ``apu_g2_cost`` is this program with :data:`APUG2_TYPED_TICK_MODEL`.  A
+    perturbed model (``APUG2_TYPED_TICK_MODEL.scaled(...)``) yields a distinct
+    cost program and fingerprint; legality and lowering do not depend on it.
+    """
+
+    if not isinstance(tick_model, APUG2TypedTickModel):
+        raise TypeError("tick_model must be an APUG2TypedTickModel")
+    spec = CostSpec(
+        _apu_g2_cost_builder(tick_model),
+        target="apu_v2",
+        name=name,
+        fingerprint_data={
+            **APUG2_GEMM_WALL_FINGERPRINT_DATA,
+            "typed_tick_model": tick_model.canonical_manifest,
+        },
+        materialization_scorer=_score_apu_g2_persistent_materialization,
+    )
+    # Read by the typed/composed graph builders for the estimate validity.
+    spec.apu_g2_tick_model = tick_model
+    return spec
+
+
+def _register_apu_g2_rules(target, tick_model):
     core = target.unit("core")
     arc = target.unit("arc")
     vector_engine = target.unit("vector_engine")
@@ -613,6 +689,12 @@ def apu_g2_cost(target):
 
     @rule(seu_barrier)
     def normalized_seu_barrier(event, ctx):
+        features = _typed_call_features(event)
+        if features is not None:
+            _emit_typed_call(
+                ctx, target, seu_barrier, tick_model, features, "seu_barrier"
+            )
+            return
         calibration = _event_pipeline_calibration(event)
         if calibration.signature.topology is not PipelineTopology.NORMALIZED:
             raise ValueError("standalone barriers are expanded by the ADD rule")
@@ -645,6 +727,183 @@ def apu_g2_cost(target):
             "spread_block",
             uses_l1=True,
         )
+
+    def typed_rule(primitive, label):
+        def price(event, ctx):
+            features = _typed_call_features(event)
+            if features is None:
+                raise ValueError(
+                    f"{label} is a typed/composed call and requires "
+                    "typed_call_features"
+                )
+            _emit_typed_call(ctx, target, primitive, tick_model, features, label)
+
+        rule(primitive)(price)
+
+    for move_name in ("L1_TO_MMB_SEG0", "L1_TO_MMB_SEG1", "MMB_TO_L1"):
+        typed_rule(target.move(move_name), f"copy_{move_name.lower()}")
+    for op_name in (
+        "MUL_TYPED",
+        "GROUP_REDUCE_ADD_TYPED",
+        "ADD_TYPED",
+        "COPY_ODD_TO_EVEN_VECTORS",
+        "DIV_TYPED",
+    ):
+        typed_rule(target.op(op_name), op_name.lower())
+
+
+apu_g2_cost = build_apu_g2_cost()
+
+
+def apu_g2_typed_calibration_programs():
+    """The ten Round 2 programs of :data:`APUG2_TYPED_TICK_MEASUREMENTS`.
+
+    Returns ``{measurement program key: recipe}``; the recipes are rebuilt from
+    the public typed/composed program records, so a recipe change shows up as a
+    feature change in the calibration fit.
+    """
+
+    from ..apu_g2_composed_contraction import (
+        APUG2ComposedContractionProgram,
+        APUG2DotEpilogue,
+    )
+    from ..apu_g2_composed_program import build_apu_g2_composed_recipe
+    from ..apu_g2_typed_program import (
+        APUG2ScalarType,
+        APUG2TypedProgram,
+        build_apu_g2_typed_recipe,
+    )
+
+    def scalar(bits, signed=True):
+        return APUG2ScalarType(bits, signed)
+
+    full = (4, 65_536)
+    typed = {
+        "typed_add_i16": APUG2TypedProgram(
+            "add", (scalar(16), scalar(16)), scalar(16), full
+        ),
+        "typed_mul_i8_to_i16": APUG2TypedProgram(
+            "mul", (scalar(8), scalar(8)), scalar(16), full
+        ),
+        "typed_div_u16": APUG2TypedProgram(
+            "div", (scalar(16, False), scalar(16, False)), scalar(16, False), full
+        ),
+        "typed_block_sum_u8_k256": APUG2TypedProgram(
+            "block_sum", (scalar(8, False),), scalar(16, False), full, 256
+        ),
+        "typed_dot_i4_k128": APUG2TypedProgram(
+            "dot", (scalar(4), scalar(4)), scalar(15), (1985, 128), 128
+        ),
+    }
+    composed = {
+        "composed_gemm_i4_k128": APUG2ComposedContractionProgram(
+            (scalar(4), scalar(4)), scalar(15), (64, 31), 128
+        ),
+        "composed_batched_gemm_i4_k128": APUG2ComposedContractionProgram(
+            (scalar(4), scalar(4)), scalar(15), (4, 32, 16), 128
+        ),
+        "composed_pair_affine_i2_k128": APUG2ComposedContractionProgram(
+            (scalar(2), scalar(2)),
+            scalar(15),
+            (1024,),
+            128,
+            APUG2DotEpilogue((3, 2)),
+        ),
+        "composed_two_stream_i3_k256": APUG2ComposedContractionProgram(
+            (scalar(3), scalar(3)), scalar(14), (256, 2), 256
+        ),
+        "composed_two_stream_accumulate_i3_k256": APUG2ComposedContractionProgram(
+            (scalar(3), scalar(3)),
+            scalar(15),
+            (256, 2),
+            256,
+            APUG2DotEpilogue(accumulator_type=scalar(14)),
+        ),
+    }
+    recipes = {key: build_apu_g2_typed_recipe(item) for key, item in typed.items()}
+    recipes.update(
+        {key: build_apu_g2_composed_recipe(item) for key, item in composed.items()}
+    )
+    return recipes
+
+
+def apu_g2_recipe_tick_features(recipe) -> dict[str, int]:
+    """Per-feature totals of every issued call of one recipe."""
+
+    from ..apu_g2_recipe import _typed_call_feature_arguments
+
+    totals = dict.fromkeys(APUG2_TYPED_TICK_FEATURES, 0)
+    for operation in recipe.operations:
+        features = apu_g2_typed_call_features(
+            operation.opcode, **_typed_call_feature_arguments(operation)
+        )
+        for name, value in features.items():
+            totals[name] += value
+    return totals
+
+
+def _nonnegative_least_squares(matrix, values):
+    """Exact NNLS by enumerating active sets (seven features: 128 sets)."""
+
+    import itertools
+
+    import numpy as np
+
+    columns = matrix.shape[1]
+    best = None
+    for size in range(columns + 1):
+        for active in itertools.combinations(range(columns), size):
+            solution = np.zeros(columns)
+            if active:
+                fitted, *_ = np.linalg.lstsq(
+                    matrix[:, list(active)], values, rcond=None
+                )
+                if np.any(fitted < 0):
+                    continue
+                solution[list(active)] = fitted
+            residual = float(np.sum((matrix @ solution - values) ** 2))
+            if best is None or residual < best[0] - 1e-9:
+                best = (residual, solution)
+    return best[1]
+
+
+def fit_apu_g2_typed_tick_model(measurements=APUG2_TYPED_TICK_MEASUREMENTS):
+    """Re-derive the typed tick coefficients from device measurements.
+
+    Returns ``(coefficients, report)``: the NNLS coefficients per feature and,
+    per program, the in-sample and leave-one-out relative errors.
+    """
+
+    import numpy as np
+
+    recipes = apu_g2_typed_calibration_programs()
+    names = [item.program for item in measurements]
+    matrix = np.array(
+        [
+            [
+                apu_g2_recipe_tick_features(recipes[name])[feature]
+                for feature in APUG2_TYPED_TICK_FEATURES
+            ]
+            for name in names
+        ],
+        dtype=float,
+    )
+    values = np.array([item.ticks_per_pipeline for item in measurements], float)
+    solution = _nonnegative_least_squares(matrix, values)
+    report = {}
+    for index, name in enumerate(names):
+        keep = [row for row in range(len(names)) if row != index]
+        held_out = _nonnegative_least_squares(matrix[keep], values[keep])
+        report[name] = {
+            "measured": float(values[index]),
+            "in_sample_relative_error": float(
+                matrix[index] @ solution / values[index] - 1
+            ),
+            "leave_one_out_relative_error": float(
+                matrix[index] @ held_out / values[index] - 1
+            ),
+        }
+    return dict(zip(APUG2_TYPED_TICK_FEATURES, map(float, solution))), report
 
 
 def _bind_cost(target, cost_spec) -> BoundCostSpec:
@@ -1010,7 +1269,10 @@ __all__ = [
     "APUG2_GESUMMV_SHIFT_LEFT_U16_TICKS",
     "APUG2_SEU_BARRIER_TICKS",
     "apu_g2_cost",
+    "apu_g2_recipe_tick_features",
+    "apu_g2_typed_calibration_programs",
     "build_apu_g2_add_graph",
+    "build_apu_g2_cost",
     "build_apu_g2_atax_graph",
     "build_apu_g2_gemv_graph",
     "build_apu_g2_gesummv_graph",
@@ -1018,4 +1280,5 @@ __all__ = [
     "estimate_apu_g2_atax",
     "estimate_apu_g2_gemv",
     "estimate_apu_g2_gesummv",
+    "fit_apu_g2_typed_tick_model",
 ]

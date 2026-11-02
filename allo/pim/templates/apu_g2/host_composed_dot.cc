@@ -220,7 +220,7 @@ int main(int argc, char **argv) {
       auxiliary_values = read_pack(argv[3], auxiliary_bits, auxiliary_signed);
 
     using namespace gtml_transport;
-    Device device(DEVICE_SIDE_LIB_LOCATION, DeviceConfig{0, 0});
+    Device device(DEVICE_SIDE_LIB_LOCATION, DeviceConfig{TENON_APU_G2_DEVICE_INDEX, 0});
     device.init_gtml({kTempRow, kTempRows, kIndexRow, kIndexRows});
 
     const gsi::VectorPackDescriptor lhs_descriptor(

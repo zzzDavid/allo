@@ -11,6 +11,9 @@ error rather than silently changing the execution backend.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import functools
 import hashlib
 import os
 from pathlib import Path
@@ -18,6 +21,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
@@ -33,6 +37,104 @@ _SHAPE = (4, 65536)
 _TEMPLATE = Path(__file__).resolve().parent / "templates" / "apu_g2"
 _KEEP_ENV = "TENON_APU_G2_KEEP_TMP"
 _BUILD_JOBS_ENV = "TENON_APU_G2_BUILD_JOBS"
+_LOCK_ENV = "TENON_APU_G2_LOCK"
+_DEVICE_NAME = re.compile(r"^apu-(\d+)$")
+
+
+def apu_g2_device_index() -> int:
+    """Card index of ``spmw_simenv.apu_g2_device()`` (``apu-NN`` -> ``NN``)."""
+
+    name = spmw_simenv.apu_g2_device()
+    match = _DEVICE_NAME.match(name)
+    if match is None:
+        raise RuntimeError(
+            f"TENON_APU_G2_DEVICE={name!r} is not a gsi_tool card name 'apu-NN'"
+        )
+    return int(match.group(1))
+
+
+def apu_g2_lock_path() -> Path:
+    """Device lock: ``$TENON_APU_G2_LOCK`` or ``/tmp/tenon-apu-g2-<device>.lock``.
+
+    A fixed directory (not ``$TMPDIR``) so every user and process on the
+    device host agrees on one file per card.
+    """
+
+    override = os.environ.get(_LOCK_ENV)
+    if override:
+        return Path(override)
+    identity = re.sub(r"[^\w.:-]", "_", spmw_simenv.apu_g2_device())
+    return Path("/tmp") / f"tenon-apu-g2-{identity}.lock"
+
+
+_lock_guard = threading.RLock()
+_lock_state = {"depth": 0, "fd": None, "path": None}
+
+
+def _open_lock_file(path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    except PermissionError:
+        # Another user created it; flock works on a read-only descriptor.
+        return os.open(path, os.O_RDONLY)
+    with contextlib.suppress(OSError):
+        os.fchmod(fd, 0o666)
+    return fd
+
+
+@contextmanager
+def apu_g2_device_lock():
+    """Exclusive ``flock`` serializing card status check, build and launch.
+
+    Reentrant within one process (a test fixture and the runtime may both
+    hold it); other threads wait, other processes block in ``flock``.
+    """
+
+    with _lock_guard:
+        if _lock_state["depth"] == 0:
+            path = apu_g2_lock_path()
+            fd = _open_lock_file(path)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except BaseException:
+                os.close(fd)
+                raise
+            _lock_state.update(fd=fd, path=path)
+        _lock_state["depth"] += 1
+        try:
+            yield _lock_state["path"]
+        finally:
+            _lock_state["depth"] -= 1
+            if _lock_state["depth"] == 0:
+                fd = _lock_state["fd"]
+                _lock_state.update(fd=None, path=None)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+
+
+def holding_apu_g2_device_lock(function):
+    """Run a hardware entry point under :func:`apu_g2_device_lock`."""
+
+    @functools.wraps(function)
+    def locked(*args, **kwargs):
+        with apu_g2_device_lock() as path:
+            result = function(*args, **kwargs)
+        result.extra["device_lock"] = str(path)
+        return result
+
+    return locked
+
+
+def apu_g2_cmake_arguments() -> list[str]:
+    """CMake cache values that bind the templates to the resolved SDK/card."""
+
+    return [
+        f"-DTENON_APU_G2_SDK_ROOT={spmw_simenv.apu_g2_sdk_root()}",
+        f"-DTENON_APU_G2_DEVICE_INDEX={apu_g2_device_index()}",
+    ]
 
 _TICK_FIELDS = {
     "input_copy": "device_input_copy_ticks",
@@ -176,9 +278,13 @@ def _source_snapshot() -> tuple[dict[str, str], dict[str, str]]:
 def _require_hardware_stack() -> str:
     if not _TEMPLATE.is_dir():
         raise RuntimeError(f"APUg2 project template is missing: {_TEMPLATE}")
-    unsupported = spmw_simenv.apu_g2_unsupported_override_reason()
-    if unsupported is not None:
-        raise RuntimeError(unsupported)
+    if apu_g2_device_index() != 0:
+        # The host programs pass the index as DeviceConfig's first field; that
+        # this field selects the card has only been exercised with apu-00.
+        raise RuntimeError(
+            f"TENON_APU_G2_DEVICE={spmw_simenv.apu_g2_device()} is not supported "
+            "yet: only apu-00 has been validated as DeviceConfig{index, 0}"
+        )
     missing = [
         str(path)
         for path in spmw_simenv.apu_g2_required_sdk_paths()
@@ -297,6 +403,8 @@ def _u16_add_build_manifest():
             "-j",
             "{jobs}",
         ],
+        "cmake_cache_arguments": "apu_g2_cmake_arguments() on both configures",
+        "device_lock": "apu_g2_device_lock() around status check, build, launch",
         "jobs_policy": "TENON_APU_G2_BUILD_JOBS_or_min_cpu_count_8",
         "device_library": "build/device/bin/tenon_apu_g2_tasks.update.bin",
         "host_binary": "build/host/tenon_apu_g2_u16_add",
@@ -323,6 +431,7 @@ def freeze_apu_g2_u16_add_runtime_artifact() -> APUG2RuntimeArtifact:
     )
 
 
+@holding_apu_g2_device_lock
 def run_apu_g2_u16_add(
     lhs, rhs, *, repetitions=256, runtime_artifact=None
 ) -> RunResult:
@@ -367,7 +476,14 @@ def run_apu_g2_u16_add(
 
         device_build = project / "build" / "device"
         host_build = project / "build" / "host"
-        device_configure = ["cmake", "-S", project / "device", "-B", device_build]
+        device_configure = [
+            "cmake",
+            "-S",
+            project / "device",
+            "-B",
+            device_build,
+            *apu_g2_cmake_arguments(),
+        ]
         device_compile = ["cmake", "--build", device_build, "-j", str(jobs)]
         commands.extend((device_configure, device_compile))
         _run_command(
@@ -388,6 +504,7 @@ def run_apu_g2_u16_add(
             "-DGSI_TARGET=DEVICE",
             f"-DBOARD_DEVICE_LIB={device_library}",
             "-DCMAKE_BUILD_TYPE=Release",
+            *apu_g2_cmake_arguments(),
         ]
         host_compile = ["cmake", "--build", host_build, "-j", str(jobs)]
         commands.extend((host_configure, host_compile))
@@ -475,6 +592,11 @@ def run_apu_g2_u16_add(
 
 __all__ = [
     "APUG2RuntimeArtifact",
+    "apu_g2_cmake_arguments",
+    "apu_g2_device_index",
+    "apu_g2_device_lock",
+    "apu_g2_lock_path",
+    "holding_apu_g2_device_lock",
     "freeze_apu_g2_runtime_artifact",
     "freeze_apu_g2_u16_add_runtime_artifact",
     "run_apu_g2_u16_add",

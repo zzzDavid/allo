@@ -126,7 +126,7 @@ int main(int argc, char **argv) {
     const auto rhs_values = read_u16_file(argv[2]);
 
     using namespace gtml_transport;
-    Device device(DEVICE_SIDE_LIB_LOCATION, DeviceConfig{0, 0});
+    Device device(DEVICE_SIDE_LIB_LOCATION, DeviceConfig{TENON_APU_G2_DEVICE_INDEX, 0});
     device.init_gtml({kTempRow, 128, kIndexRow, 16});
 
     const gsi::VectorPackDescriptor descriptor(kVectors, kBits,
