@@ -1,0 +1,82 @@
+# Paper-to-implementation claim matrix (G1)
+
+Frozen paper: `zzzDavid/tenon-hpca27` `main` @ `30b6f49e64583b5d301d2a5e8b902498f5578e4e`
+(mirrored in the containing repository's `paper/latex/`, locked by
+`paper/SUBMITTED_VERSION.json`). Code: `experiments/allo` branch `tenon`.
+Paper locations are `paper/latex/sections/<file>.tex`; symbols are under
+`allo/`. Status: **implemented**, **partial**, **missing**, **external**
+(exists only outside the release package: snapshot worktree, `dev/`,
+`tenon-artifacts/`, `reviews/experiments/`), **boundary** (documented
+non-core support boundary). Column "Kind" distinguishes compiler mechanism
+(M), benchmark driver (B), empirical model (E), reproduction-only path (R).
+
+Detailed per-row evidence is in `audit/core.md` §1 (rows 1-25) and the
+backend audits.
+
+## Section III: languages and compilation flow
+
+| # | Claim | Paper | Kind | Public API / symbols | Domain enforced | Status |
+|---|---|---|---|---|---|---|
+| 1 | `@tn.target`, `@tn.unit(mapping)` nested physical axes | III-A | M | `allo.target`, `allo.unit` (`spmw_target.py` `target`, `unit`, `Unit`) | any nesting | implemented |
+| 2 | `tn.mem`/`tn.reg` handles record owner unit and dims | III-A | M | `allo.mem`, `allo.reg` (`Memory`, `Register`) | | implemented |
+| 3 | Nesting states which units may access a memory; handles decide placement legality | III-A, Table I | M | no symbol: `Op.src/dst` stored but never checked against the unit tree; legality only inside per-backend enumerators and emitter name checks | | **missing** (C-01) |
+| 4 | `tn.op(fn, emit, src, dst)`, `tn.any_` | III-A | M | `allo.op`, `allo.any_`, `allo.or_`; `spmw_match_engine.compile_op_pattern` | pattern AST of the lambda | implemented |
+| 5 | `tn.move` legal data paths; host collectives scatter/broadcast/gather are moves | III-A | M | `allo.move`, verbs; `spmw_codegen._resolve_host_moves`; `spmw_plan._moves_for_handles` | | implemented |
+| 6 | `@tn.device`, `mode="host"` | III-A | M | `allo.device`, `Unit.mode` | | implemented |
+| 7 | `@tn.work(mapping)`, `tn.get_wid()`; typed ops, loops, accesses, dependences recorded | III-B | M | `allo.work` (= `dataflow.kernel`), `allo.get_wid`; retained `spmw.*` scope attributes (`ir/builder.py`, `compiler._stamp_matcher_work_scopes`) | | implemented |
+| 8 | Matching replaces supported expression graphs with target ops preserving loops, accesses, dependences | III-E | M | `spmw_match_engine.match_workload`, `MatchedOp` (`enclosing_loops`, operands with index maps, accumulator flag) | stores whose term matches a pattern; **every store must now be covered** (`require_match_coverage`), accumulator initialization recorded (`accumulator_init`) | partial: dependences beyond the accumulator flag are not a graph |
+| 9 | `@tn.cost`, `@tn.rule`, `ctx.step(latency, occupy=[ctx.use(...)])` | III-C | M | `allo.cost`, `allo.rule`, `perf/cost.py` `CostContext.use/step` | | implemented |
+| 10 | Evaluator schedules under dependencies and resource capacity, exposing serialization and overlap | III-C | M | `perf/evaluator.py` (ASAP over `depends_on` + per-instance calendars) | | implemented (probe-verified) |
+| 11 | Replacing the cost program changes the winner but cannot legalize an op or transfer | III-C | M | enumerators are the only legality source | | partial: true on the autoscheduler route, false for user `layout=` (C-01) |
+| 12 | `tn.compile(workload, target, cost)`; `estimate()`; virtual execution returns only the cost | III-D, III-E | M | `allo.compile`, `CompiledCallable.estimate`, `backend="virtual"` (`RunResult.kind="virtual"`) | | implemented |
+| 13 | Combining partial sums in a different order requires explicit permission; strict FP order can rule out splitting a reduction before search | III-D, III-E, VI | M | no symbol | | **missing** (C-09, V1-03) |
+| 14 | Autoscheduler lifecycle: decision domains, legality/pruning, layout construction, materialization, rank only materialized candidates, deterministic tie-breaking | III-F, Fig. 2 | M | `spmw_knobs.register_default_knobs`, `cross_with_knobs`; `spmw_autoschedule.rank_matcher_placements`; `spmw_codegen._materialize_matcher_codegen` | | partial: ranking before materialization, only `InfeasibleSchedule` rejects, per-group (C-03, C-05, C-06) |
+| 15 | Each surviving complete assignment is evaluated as one program | III-F | M | per-kernel-group scoring then `_reconcile_resident_pairs` | | partial (A02/C-05); `pim/schedule_search.grid_search` exists but is unused by the matcher route |
+| 16 | Ties in movement survive to final cost ranking | III-E | M | no movement stage | | **missing** (C-11) |
+| 23 | Materialized program includes buffers, transfers, code, host ABI | III-F | M | `_materialize_matcher_codegen` manifest | | implemented (Samsung REDUCE runtime ignores it: S-01) |
+| 24 | Backend code generators and runtimes are target-specific | III-E | M | `spmw_codegen._BACKENDS`: samsung_hbm_pim, aim, apu_v1, upmem; typed routes for apu_v1 and apu_v2 | | implemented |
+| 25 | Public surface | III | M | `allo/__init__.py` eager + lazy exports; `tests/pim/test_import_surface.py` | | implemented |
+
+## Section IV: minimum-movement layouts
+
+| # | Claim | Paper | Kind | Symbols | Status |
+|---|---|---|---|---|---|
+| 17 | Linear layout over F2; `D_x = A_x L_W` | II-C, IV-A | M | `spmw_linear_layout.LinearLayout` (compose, product, invert, image_size, optimal_swizzle, materialise_handle); power-of-two only; no access-matrix type, no kernel/rank API | partial |
+| 18 | Rank formula `r_{j,s} = rank(Q_s restricted to K_j)`; movement cost `sum c B (2^r - 1)` | IV-B | M | none in package; snapshot `prelayout_movement_algebra.py` | **external** (A01) |
+| 19 | Locality-chain search, optimistic bound, best-first with ties retained, budget exit with remaining bounds; bounded (<=4 bits, 3 levels) and scalable implementations | IV-C, Alg. 1 | M | none in package; snapshot `paper_partial_basis_search.py`, `canonical_layout_enumeration.py`, `scalable_layout_synthesis.py` | **external** (A01) |
+| 20 | Masked domains: exact active-owner count, rank bound disabled, exact only when complete; non-power-of-two padded with mask | VI, V-B | M | none; `LinearLayout` rejects non-power-of-two sizes | **external** |
+| 21 | 4-bit example: 20,160 layouts, 315 chains, 576 visited | IV-C | R | snapshot tests only | **external** |
+| 22 | 121,968 small masked layouts checked exhaustively | V-B | R | `reviews/experiments/irregular_audit.py` against snapshot APIs | **external** |
+
+## Section V: evaluation paths and advertised backend examples
+
+| Row | Claim | Paper | Kind | Release route | Execution mode | Status |
+|---|---|---|---|---|---|---|
+| E1 | Samsung GEMV matches PIMSimulator vendor path (4,435 / 8,041 / 8,247 cycles) via GENERIC_REDUCE reconstructing the standard command sequence | V-A2, Tab. eval-samsung | B+M | `allo.compile(gemv, build_samsung_target(), samsung_cost)` -> `_run_samsung` REDUCE | simulator (functional numerics + cycles) | reproduces, but the selected placement does not determine the executed program (S-01); cycles are those of the padded canonical program (S-06) |
+| E2 | Samsung source-order FP16 "ordered fallback" (4096x256) | V-B | M | none (`TEMPORAL_REDUCE` only in uncommitted simulator sources and a snapshot driver) | | **external** (S-03) |
+| E3 | Samsung identity vs synthesized XOR packing, 148 -> 116 cycles | Tab. eval-layout-mechanisms | R | `tests/pim/samsung_hbm_pim/layout_swizzle/` harness with a synthetic `MatchedOp` | simulator | reproduces as a harness; not a compiler route for the GEMV program (S-13) |
+| E4 | AiM vs CENT traces (14 rows; attention 1.30x/1.48x/1.68x) | V-A3, Tab. eval-skhynix | B+M | `benchmarks/cent_aim/workloads.py` through `allo.compile(..., build_aim_target(), aim_cost)` -> ramulator2 | simulator, timing-only (`kind="simulator-timing-only"`) | reproduces: all 14 traces byte-identical to pins, golden cycles match (default and `paper_full` rows) |
+| E5 | AiM token partitioning (PIMphony), 1/2/4/8 partitions, 45 numerical variants | V-C4 | M+R | none; snapshot `aim_sv_partition.py` + `reviews/experiments/aim_attention_campaign.py` | | **external** (M-03) |
+| E6 | AiM virtual-backend study: row payload and GB capacity sweep (1.30x predicted vs 1.27x simulated, etc.) | V-F | M+E | `tests/pim/test_aim_virtual_study.py` (target variants through `allo.compile`) | virtual + simulator | implemented (opcode counts and variants compile; exact paper ratios not re-derived here) |
+| E7 | UPMEM 16 kernels fastest on all 16, geomean 1.20x vs ATiM/SimplePIM/CINM | V-A4, Fig. eval-upmem | B+M | `benchmarks/upmem/workloads.py` through `allo.compile(..., build_upmem_target(), upmem_cost)` -> docker SDK build -> uPIMulator | simulator (functional + cycles) | golden rows reproduce (13 `paper_full` rows); requires the archived provenance snapshot (U-07/P-03) |
+| E8 | UPMEM 391x65 GEMV scaling over 1-32 DPUs incl. uneven partitions | V-A4 | M | `mapping=[N]` partition | simulator | **not reproducible**: even division required (U-04); the test uses 1152x128 |
+| E9 | Gemini-I vs expert Phoenix kernels (5 kernels, geomean 1.013x) | V-A5, Tab. eval-apuv1 | B+M | `APUv1Program` typed route -> native recipes (`apu_v1_histogram/record_frequency/moments/distance_argmin`) and vector GEMM | device | routes exist; recognizers fail open on semantic mutations (V-01); production runtime lacks lock and profile freshness (V1-07); paper numbers came from `tenon-artifacts/apuv1` runner |
+| E10 | Gemini-I 12.71x layout-mechanism row (1024x64x1024 one APUC) | Tab. eval-layout-mechanisms | M | `tests/pim/apu_v1/vector_gemm` (`layout=` forced plans) | device | both plans reachable by `layout=`; default ranking picks a third plan; golden drift 2.9% (V1-06) |
+| E11 | Gemini-I source-order FP16 GEMV matches 4,096 outputs | V-B | R | `reviews/experiments/strict_fp16_gemv_audit.py` | device | **external**; default plan reassociates (V1-03) |
+| E12 | Gemini-I agent-assisted calibration (10.67% -> 1.29%; 5,887.79 + 876.21/call) | V-E | E+R | `tenon-artifacts/agent-cost-calibration`; production `costs/apu_v1.py` prices paired count flat | | **external** (V1-05) |
+| E13 | Gemini-II vs GTML (5 kernels, geomean 1.191x) | V-A6, Tab. eval-apuv2 | B | `APUG2ComposedContractionProgram` / `APUG2TypedProgram` typed routes -> GTML project template -> card | device | routes exist; kernels built by a per-case artifact adapter, nothing searched (G2-02); no hardware evidence at this revision (G2-04) |
+| E14 | "Shared selection": four Gemini-I tiles and five DRAM partitions; tile 64 is 3.845% slower than tile 256 | V-C1 | R | `reviews/experiments/run_common_gemv_apu.py` | | **external** (V1-06) |
+| E15 | Packing effects (HBM3 model, 1.000-1.564x) and DCC comparison (68 mappings) | V-C2, V-C3 | R | `reviews/experiments/` | analytical | **external** |
+| E16 | AttAcc tiling selector vs DCC (398/500), GPT-13B decode, compile cost table | V-D, Tab. eval-attacc-compile | M+E+R | `tenon-artifacts/attacc-llm-e2e/tenon/infra/*`; no `attacc` target or cost in the package | analytical + Ramulator2-AttAcc | **external** (M-04); release options in `audit/aim-attacc.md` §5 |
+
+## Summary
+
+Implemented and reachable through `allo.compile`: the three languages, the
+matcher (now with store coverage and accumulator-init facts), the cost
+evaluator, per-group placement ranking, four backend code generators and the
+typed APU routes, the Samsung/AiM/UPMEM golden reproductions (E1, E4, E6,
+E7). Missing from the package but described as mechanisms in the frozen
+paper: access-scope legality (3), reassociation permission (13), joint
+complete-assignment evaluation (15), and the whole of Section IV (16-22).
+External evaluation-only paths that must be either ported or declared as
+documented reproduction routes: E2, E5, E8, E11, E12, E14, E15, E16.
