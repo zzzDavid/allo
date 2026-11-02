@@ -525,6 +525,17 @@ def _upmem_knob(name):
     return Knob(name, candidates, emit)
 
 
+def _attacc_tiling_candidates(ctx: KnobCtx) -> list:
+    from .spmw_attacc import attacc_tiling_candidates
+
+    return attacc_tiling_candidates(ctx.target, ctx.base)
+
+
+def _attacc_tiling_emit(value, base, ctx: KnobCtx):
+    del ctx
+    return _with_knob(base, "attacc_tiling", value)
+
+
 _UPMEM_KNOB_NAMES = (
     "tasklets",
     "dma_bytes",
@@ -606,6 +617,12 @@ def register_default_knobs():
     # UPMEM placement-realization levers (spec 003 U5, spec 001 D5 order).
     for name in _UPMEM_KNOB_NAMES:
         register_knob("upmem", _upmem_knob(name))
+
+    # AttAcc: every legal tiling of the kernel is a candidate ranked by the
+    # cost program. Not a schedule-search knob.
+    register_knob(
+        "attacc", Knob("attacc_tiling", _attacc_tiling_candidates, _attacc_tiling_emit)
+    )
 
 
 def cross_with_knobs(

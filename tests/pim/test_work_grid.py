@@ -138,7 +138,7 @@ def test_work_grid_rule_table(name, factors, shape, ok):
 
 
 def test_single_item_backends_are_declared():
-    assert _SINGLE_ITEM_LAUNCH_BACKENDS == {"samsung_hbm_pim", "upmem", "aim"}
+    assert _SINGLE_ITEM_LAUNCH_BACKENDS == {"samsung_hbm_pim", "upmem", "aim", "attacc"}
     assert _OUTER_SUBSET_LAUNCH_BACKENDS == {"upmem", "aim"}
 
 

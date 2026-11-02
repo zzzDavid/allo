@@ -1468,3 +1468,113 @@ def build_apu_g2_target():
     """
 
     return build_apu_v2_target()
+
+
+# --------------------------------------------------------------------- #
+# AttAcc (HBM3 PIM for attention, Park et al., ASPLOS 2024)
+# --------------------------------------------------------------------- #
+
+
+def build_attacc_target():
+    """Return the structural AttAcc HBM3-PIM target (analytical backend).
+
+    Geometry, all from sources the paper's study used:
+
+    * five HBM3 PIM devices, 16 channels per device, 64 banks per channel,
+      FP16 (paper ``tables/eval-platforms.tex:53-56``, "A100 + 5 HBM3 PIM
+      devices; 16 pCH/device; 64 banks/pCH; FP16"; DCC ``inference/config.py``
+      ``num_hbm=5``).  The paper's "pCH" is the Ramulator2 ``channel`` level
+      below: Ramulator2-AttAcc runs one device with ``channel: 16``.
+    * one channel = 2 pseudo-channels x 2 ranks x 4 bank groups x 4 banks
+      = 64 banks of 2^14 rows x 2^5 columns, 32 B per column: Ramulator2-AttAcc
+      ``src/dram/impl/HBM3-PIM.cpp`` preset ``HBM3_8Gb_2R``
+      (``{8<<10, 32, {1, 2, 2, 4, 4, 1<<14, 1<<5}}``, MIT, SAFARI 2023).
+    * one PIM unit per bank with a 16-lane FP16 MAC (``n_mac = 16``) fed from
+      a per-bank GEMV buffer, one softmax unit per channel, and the commands
+      ``WRGB`` / ``MVSB`` / ``MVGB`` / ``SFM`` / ``MACAB`` of the same
+      ``HBM3-PIM.cpp`` and of the AttAcc trace generator
+      (``pim_ramulator_src/trace_gen/gen_trace_attacc_bank.py`` of
+      scale-snu/attacc_simulator, MIT: ``prefetch_size = 32``, ``n_mac = 16``).
+
+    A kernel instance (one ``@allo.work(mapping=[1])`` item) is tiled onto one
+    device's 16 channels x 64 units by the ``attacc_tiling`` knob
+    (:mod:`allo.pim.attacc_tiling`); spreading heads over the five devices is
+    the decode composition's split (DCC ``inference/devices.py`` divides the
+    heads by ``NUM_HBM``), which is not a compiler decision here.
+
+    The softmax unit declares the un-stabilized form (``exp``, ``sum``,
+    ``divide``).  The max-subtracted form needs a ``SFM_MAX`` op whose
+    accumulator starts at ``-inf``; the matcher accepts only literal-zero
+    accumulator initializers today, so it is not declared.
+
+    No timing: the closed-form cost lives in :mod:`allo.pim.costs.attacc`.
+    There is no device or simulator runner; see ``docs/release/simulators.md``.
+    """
+    from allo.spmw_match import exp
+
+    @allo.target("attacc")
+    def attacc():
+        @allo.device
+        def hbm3_pim():
+            @allo.unit(mapping={"stack": 5})
+            def stack():
+                @allo.unit(mapping={"channel": 16})
+                def channel():
+                    banks = allo.mem(
+                        banks=64,
+                        pseudochannels=2,
+                        ranks=2,
+                        bank_groups=4,
+                        rows=1 << 14,
+                        cols=1 << 5,
+                        width=256,
+                        element_bits=16,
+                        name="banks",
+                    )
+                    # PIM_SFM is a channel-level command (HBM3-PIM.cpp:88).
+                    softmax_buffer = allo.mem(width=256, name="softmax_buffer")
+                    allo.op(
+                        "SFM_EXP",
+                        src=(softmax_buffer,),
+                        dst=softmax_buffer,
+                        fn=lambda x: exp(x),
+                    )
+                    allo.op(
+                        "SFM_SUM",
+                        src=(softmax_buffer,),
+                        dst=softmax_buffer,
+                        accumulates=True,
+                        fn=lambda x, acc: acc + x,
+                    )
+                    allo.op(
+                        "SFM_DIV",
+                        src=(softmax_buffer, softmax_buffer),
+                        dst=softmax_buffer,
+                        fn=lambda x, s: x / s,
+                    )
+
+                    @allo.unit(mapping={"pim": 64})
+                    def pim():
+                        # WRGB / MVSB / MVGB are bank-level commands
+                        # (HBM3-PIM.cpp:86-87): each bank's PIM unit owns its
+                        # GEMV buffer and its 16-lane accumulator.
+                        gemv_buffer = allo.mem(width=256, name="gemv_buffer")
+                        acc = allo.reg(16, 16, name="acc")
+                        allo.move("WR_GB", src=banks, dst=gemv_buffer)
+                        allo.move("MV_SB", src=acc, dst=softmax_buffer)
+                        allo.move("MV_GB", src=softmax_buffer, dst=gemv_buffer)
+                        allo.op(
+                            "MAC",
+                            src=(banks, gemv_buffer),
+                            dst=acc,
+                            accumulates=True,
+                            fn=lambda x, y, acc: acc + x * y,
+                        )
+
+        @allo.unit(mode="host")
+        def host():
+            host_dram = allo.mem(name="host_dram", bytes=1 << 34)
+            allo.move("H2D", src=host_dram, dst=hbm3_pim.banks, verb=allo.scatter)
+            allo.move("D2H", src=hbm3_pim.banks, dst=host_dram, verb=allo.gather)
+
+    return attacc
