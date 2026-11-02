@@ -74,12 +74,27 @@ included).  Larger problems run the exact coordinate-variable search
 full carrier is exact over all one-to-one layouts, and on a mask over
 coordinate layouts only.
 
-Realization.  Every backend emits one program per work item, placed on the
-unit the work grid names; none rewrites the work decomposition.  A tie is
-therefore realizable exactly when its owner flag (``T_s`` per level) equals
-the flag of the program layout (work axis ``d``'s bits on owner axis ``d``,
-loop bits local).  Unrealizable ties are still crossed with the backend
-candidates and are rejected before emission with that reason.
+Realization.  AiM, UPMEM and APU v1 emit one program per work item, placed
+on the unit the work grid names; none rewrites the work decomposition.  On
+those targets a tie is realizable exactly when its owner flag (``T_s`` per
+level) equals the flag of the program layout (work axis ``d``'s bits on
+owner axis ``d``, loop bits local).
+
+Targets in :data:`ROW_MAP_TARGETS` (Samsung HBM-PIM) place the output rows
+of a contraction by the selected owner map: the lowering turns the tie into
+a row-to-slot table (rows that share an owner unit occupy that unit's slot
+range) that the conductor applies when it stages the matrix and drains the
+results.  There a tie is realizable when it keeps every row's reduction
+inside one owner unit (the accumulator's kernel lies in the innermost local
+space ``T_h``), the accumulator has one output-row coordinate and the row
+variables are not masked (:func:`row_map_unrealizable_reason`).  A tie
+that splits a row's reduction across units is a reduction split, which
+belongs to the reduction policy, and is rejected with that reason.  The
+program's tie class is also expanded into its per-level BLOCK/CYCLIC row
+distributions (:func:`row_distributions`), so distinct realizable owner maps
+reach the cost ranking as separate ties.  Unrealizable ties are still
+crossed with the backend candidates and are rejected before emission with
+the reason.
 """
 
 from __future__ import annotations
@@ -87,6 +102,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import contextvars
+import itertools
 import math
 import re
 from dataclasses import dataclass, field, replace
@@ -123,6 +139,10 @@ COMPUTE_LEVELS: dict[str, tuple[str, ...]] = {
     "apu_v1": ("vr0.lane",),
 }
 
+#: Targets whose contraction lowering places output rows by the selected owner
+#: map (``spmw_samsung`` row-to-slot table); see the module docstring.
+ROW_MAP_TARGETS = frozenset({"samsung_hbm_pim"})
+
 MOVEMENT_WEIGHTS_UNIFORM = "uniform"
 MOVEMENT_WEIGHTS_COST_PROGRAM = "cost-program"
 
@@ -153,6 +173,8 @@ class DerivedAccess:
     element_bytes: Fraction
     reassociation_allowed: bool
     coordinates: tuple[str, ...]  # bucket-0 coordinate text, for diagnostics
+    # Per coordinate: ((coefficient, variable), ...) sorted by coefficient.
+    terms: tuple[tuple[tuple[int, int], ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -177,6 +199,7 @@ class DerivedLayoutProblem:
     assumptions: tuple[str, ...]
     hierarchy: Any = field(repr=False)
     coordinate_problem: CoordinateLayoutProblem = field(repr=False)
+    op_name: str | None = None
 
     @property
     def carrier_bits(self) -> int:
@@ -243,6 +266,49 @@ class DerivedLayoutProblem:
             if variable.bits
         ]
         return LinearLayout.from_gf2(work_to_iteration, in_dims, out_dims)
+
+    def accumulator(self) -> DerivedAccess | None:
+        """The single WRITE_ACCUMULATE access, or None."""
+
+        found = [a for a in self.accesses if a.mode is AccessMode.WRITE_ACCUMULATE]
+        return found[0] if len(found) == 1 else None
+
+    def owner_unit(self, inverse: GF2Matrix, values: dict[int, int]) -> int:
+        """Flat owner unit (level 0 most significant) of one iteration point.
+
+        ``inverse`` is the inverse of a work-to-iteration layout; ``values``
+        maps variable indices to their values (absent variables are 0).
+        """
+
+        problem = self.coordinate_problem
+        iteration = 0
+        for variable, value in values.items():
+            iteration |= int(value) << problem.bit_offset(variable)
+        work = inverse.apply(iteration)
+        unit, offset = 0, 0
+        for bits in problem.level_bits:
+            unit = (unit << bits) | ((work >> offset) & ((1 << bits) - 1))
+            offset += bits
+        return unit
+
+    def movement_matrix(self, layout) -> GF2Matrix:
+        """The work-to-iteration matrix of a carried movement layout.
+
+        Raises :class:`LayoutDerivationError` when ``layout`` is not a
+        one-to-one layout over this problem's ``mm.`` dims.
+        """
+
+        try:
+            matrix = layout.to_gf2()
+            if self.linear_layout(matrix) != layout:
+                raise ValueError("dims differ")
+            matrix.inverse()
+        except (ValueError, KeyError) as error:
+            raise LayoutDerivationError(
+                "the carried movement layout is not a one-to-one layout over the "
+                f"kernel's derived dims ({type(error).__name__}: {error})"
+            ) from error
+        return matrix
 
     def describe_assignment(self, assignment: CoordinateAssignment) -> str:
         parts = []
@@ -674,6 +740,7 @@ def derive_layout_problem(target, matches, *, bound_cost=None) -> DerivedLayoutP
     used_names: dict[str, int] = {}
     for index, (memref, mode, mtype, coords0, texts0) in enumerate(base):
         variables_used: set[int] = set()
+        coordinate_terms = []
         for c, (loop_coefs, c0) in enumerate(coords0):
             work_coefs = []
             for d in range(n_work):
@@ -711,6 +778,7 @@ def derive_layout_problem(target, matches, *, bound_cost=None) -> DerivedLayoutP
                     )
                 reach += a * (variables[v].extent - 1)
             variables_used.update(v for _a, v in terms)
+            coordinate_terms.append(tuple(sorted(terms)))
         if mtype is None:
             raise LayoutDerivationError(f"{memref}: element type is not retained")
         name = memref
@@ -730,6 +798,7 @@ def derive_layout_problem(target, matches, *, bound_cost=None) -> DerivedLayoutP
                     True if mode is AccessMode.READ else reassociation
                 ),
                 coordinates=tuple(texts0),
+                terms=tuple(coordinate_terms),
             )
         )
 
@@ -779,6 +848,7 @@ def derive_layout_problem(target, matches, *, bound_cost=None) -> DerivedLayoutP
         assumptions=tuple(dict.fromkeys(assumptions)),
         hierarchy=hierarchy,
         coordinate_problem=coordinate_problem,
+        op_name=next(iter(ops)),
     )
 
 
@@ -831,6 +901,150 @@ def _resolve_opaque(match, op, memref, coords, parsed, opaque, loop_pos, assumpt
     resolved = list(parsed)
     resolved[position] = sink_form
     return resolved
+
+
+# --------------------------------------------------------------------- #
+# Row-map realization (ROW_MAP_TARGETS)
+# --------------------------------------------------------------------- #
+
+
+def split_movement_layout(layout):
+    """``(backend part, movement part or None)`` of a carried layout.
+
+    The movement part is the block of ``mm.``-prefixed dims that the
+    selection stage joins to the backend layout with ``product``.
+    """
+
+    from .spmw_linear_layout import LinearLayout
+
+    if not isinstance(layout, LinearLayout):
+        return layout, None
+    keep = [i for i, n in enumerate(layout.out_dims) if not n.startswith(LAYOUT_DIM_PREFIX)]
+    moved = [i for i, n in enumerate(layout.out_dims) if n.startswith(LAYOUT_DIM_PREFIX)]
+    if not moved:
+        return layout, None
+
+    def part(indices, prefixed):
+        return LinearLayout(
+            {
+                name: [tuple(v[i] for i in indices) for v in vectors]
+                for name, vectors in layout.bases.items()
+                if name.startswith(LAYOUT_DIM_PREFIX) == prefixed
+            },
+            tuple(layout.out_dims[i] for i in indices),
+            tuple(layout.out_sizes[i] for i in indices),
+        )
+
+    return part(keep, False), part(moved, True)
+
+
+def row_map_unrealizable_reason(derived: DerivedLayoutProblem, matrix) -> str | None:
+    """Why a row-map target cannot realize ``matrix``; None when it can.
+
+    Realizable: the kernel is a contraction (``MAC``) with one accumulator
+    of one output-row coordinate, every bit of a variable the accumulator
+    does not depend on (the reduction) is local at the innermost owner
+    level, so each row's reduction stays in one unit, and the row variables
+    are not masked (every unit then owns the same number of rows).
+    """
+
+    if derived.target_name not in ROW_MAP_TARGETS:
+        return f"{derived.target_name} does not place rows by the owner map"
+    acc = derived.accumulator()
+    if derived.op_name != "MAC" or acc is None:
+        return (
+            f"only contractions are placed by the owner map (op {derived.op_name}); "
+            "the elementwise placement is fixed"
+        )
+    if len(acc.coordinates) != 1:
+        return (
+            f"the accumulator {acc.memref} has {len(acc.coordinates)} coordinates; "
+            "the row map places one output-row index"
+        )
+    problem = derived.coordinate_problem
+    innermost = derived.owner_flag(matrix)[-1]
+    split = []
+    for v, variable in enumerate(derived.variables):
+        if v in acc.variables:
+            continue
+        offset = problem.bit_offset(v)
+        bits = [b for b in range(variable.bits) if not innermost.contains(1 << (offset + b))]
+        if bits:
+            split.append(f"{variable.name}[{','.join(map(str, bits))}]")
+    if split:
+        return (
+            f"it splits the reduction of each {acc.memref} row across owner units "
+            f"(owner bits from {'+'.join(split)}); a reduction split needs a "
+            "partial-sum combine, which belongs to the reduction policy, not to "
+            "the row placement"
+        )
+    masked = [derived.variables[v].name for v in acc.variables if derived.variables[v].masked]
+    if masked:
+        return (
+            f"the row variables {masked} are masked, so units would own unequal "
+            "row counts"
+        )
+    return None
+
+
+def row_distributions(derived: DerivedLayoutProblem):
+    """Per-level BLOCK/CYCLIC distributions of the output-row index.
+
+    Returns ``[(name, CoordinateAssignment)]``, one per choice of BLOCK or
+    CYCLIC at each owner level (outermost first).  The row bits are the
+    accumulator coordinate's variable bits ordered by significance; a BLOCK
+    level takes the most significant remaining bits, a CYCLIC level the
+    least significant.  Empty when the accumulator has no single row
+    coordinate or too few row bits.
+    """
+
+    acc = derived.accumulator()
+    if acc is None or len(acc.terms) != 1:
+        return []
+    bits = [
+        (v, b) for _coefficient, v in acc.terms[0] for b in range(derived.variables[v].bits)
+    ]
+    level_bits = derived.coordinate_problem.level_bits
+    if sum(level_bits) > len(bits):
+        return []
+    out = []
+    for kinds in itertools.product(("block", "cyclic"), repeat=len(level_bits)):
+        low, high, levels = 0, len(bits), []
+        for width, kind in zip(level_bits, kinds):
+            if kind == "block":
+                taken, high = bits[high - width : high], high - width
+            else:
+                taken, low = bits[low : low + width], low + width
+            per_variable = [[] for _ in derived.variables]
+            for v, b in taken:
+                per_variable[v].append(b)
+            levels.append(tuple(tuple(sorted(p)) for p in per_variable))
+        name = "rows " + ", ".join(
+            f"{kind} over {level}" for kind, level in zip(kinds, derived.level_names)
+        )
+        out.append((name, CoordinateAssignment(tuple(levels))))
+    return out
+
+
+def _realization(derived, matrix, program_flag, program, description):
+    """``(realizable, reason)`` of one tie (module docstring, Realization)."""
+
+    if derived.owner_flag(matrix) == program_flag:
+        return True, None
+    if derived.target_name in ROW_MAP_TARGETS:
+        reason = row_map_unrealizable_reason(derived, matrix)
+        if reason is None:
+            return True, None
+        return False, (
+            f"{derived.target_name} places contraction rows by the owner map but "
+            f"cannot realize owner map {description}: {reason}"
+        )
+    return False, (
+        f"{derived.target_name} emits one program per work item on the "
+        "unit its work id names and does not re-map iterations to owners; "
+        f"this tie needs owner map {description}, the program has "
+        f"{derived.describe_assignment(program)}"
+    )
 
 
 # --------------------------------------------------------------------- #
@@ -1071,6 +1285,38 @@ def _search_and_classify(derived: DerivedLayoutProblem, policy) -> KernelMovemen
             "layouts with the same movement exist and are not counted"
         )
 
+    if derived.target_name in ROW_MAP_TARGETS and min_cost is not None:
+        # Realizable members of a minimum class that differ in which rows
+        # share a unit are distinct placements on a row-map target: cross
+        # them separately (multiplicity 1; they stay counted in tie_layouts).
+        seen = {derived.owner_flag(c[2]) for c in classes}
+        added = 0
+        for name, assignment in row_distributions(derived):
+            cost, profile = coordinate_assignment_cost(problem, assignment)
+            if cost is None or cost != min_cost:
+                continue
+            matrix = assignment.matrix(problem)
+            flag = derived.owner_flag(matrix)
+            if flag in seen or row_map_unrealizable_reason(derived, matrix):
+                continue
+            seen.add(flag)
+            added += 1
+            classes.append(
+                (
+                    cost,
+                    profile,
+                    matrix,
+                    1,
+                    f"{name}: {derived.describe_assignment(assignment)}",
+                    False,
+                )
+            )
+        if added:
+            notes.append(
+                f"{added} row distribution(s) of a minimum tie class crossed as "
+                "separate ties: the backend places rows by the owner map"
+            )
+
     ties = []
     for index, (
         cost,
@@ -1080,15 +1326,9 @@ def _search_and_classify(derived: DerivedLayoutProblem, policy) -> KernelMovemen
         description,
         is_program,
     ) in enumerate(sorted(classes, key=lambda c: (not c[5], repr(c[1]), c[2].rows))):
-        realizable = derived.owner_flag(matrix) == program_flag
-        reason = None
-        if not realizable:
-            reason = (
-                f"{derived.target_name} emits one program per work item on the "
-                "unit its work id names and does not re-map iterations to owners; "
-                f"this tie needs owner map {description}, the program has "
-                f"{derived.describe_assignment(program)}"
-            )
+        realizable, reason = _realization(
+            derived, matrix, program_flag, program, description
+        )
         ties.append(
             MovementTie(
                 index=index,
@@ -1155,8 +1395,12 @@ __all__ = [
     "LayoutDerivationError",
     "MovementSelectionPolicy",
     "MovementTie",
+    "ROW_MAP_TARGETS",
     "analyze_kernel_movement",
     "derive_layout_problem",
     "label_for_cost",
     "movement_selection_policy",
+    "row_distributions",
+    "row_map_unrealizable_reason",
+    "split_movement_layout",
 ]

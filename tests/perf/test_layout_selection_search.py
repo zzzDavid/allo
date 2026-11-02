@@ -432,8 +432,14 @@ def test_bounded_problems_use_algorithm_1():
     assert movement.implementation == "bounded"
     assert movement.termination in ("exhausted", "bound-proved")
     assert movement.optimality_proven
+    # Samsung realizes every minimum tie whose owner bits come from the
+    # output-row bits (each row's k reduction stays inside one unit); under
+    # the strict default these are all the minimum ties.
     realizable = [t for t in movement.ties if t.realizable]
-    assert len(realizable) <= 1
+    assert realizable
+    assert all(t.realizable_reason is None for t in realizable) if hasattr(
+        realizable[0], "realizable_reason"
+    ) else True
 
 
 def test_tiny_budget_marks_the_analysis_incomplete():

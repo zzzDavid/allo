@@ -550,6 +550,10 @@ class SamsungProgram:
     elementwise: SamsungElementwise | None = None
     swap_parity: tuple = ()
     lever_record: dict = field(default_factory=dict)
+    # Slot of each output row (row -> slot) when the selected owner map is not
+    # the row-order packing; None means rows occupy slots in row order.
+    row_slots: tuple | None = None
+    row_map: str = "identity"
 
 
 def _infeasible(message):
@@ -843,6 +847,103 @@ class SamsungCtx(CodegenContext):
             )
         return rep, rows_total
 
+    def _check_fixed_owner_map(self, buckets, layout):
+        """The elementwise placement is fixed: reject a carried owner map
+        other than the program's work-grid map."""
+        from .pim.layout_problem import TargetHierarchyError
+        from .spmw_layout_problem import (
+            LayoutDerivationError,
+            derive_layout_problem,
+            split_movement_layout,
+        )
+
+        _backend, movement = split_movement_layout(getattr(layout, "layout", None))
+        if movement is None:
+            return
+        try:
+            derived = derive_layout_problem(
+                self.target, [m for _w, ms in buckets for m in ms]
+            )
+            matrix = derived.movement_matrix(movement)
+        except (LayoutDerivationError, TargetHierarchyError) as error:
+            raise _infeasible(f"the carried movement layout cannot be placed: {error}")
+        program = derived.program_layout()
+        if derived.owner_flag(matrix) != derived.owner_flag(program):
+            raise _infeasible(
+                "the elementwise placement is fixed (flat channel and bank order); "
+                "owner maps other than the work grid's are not realized"
+            )
+
+    def _row_slots(self, buckets, layout, rows_total):
+        """Row-to-slot table of the owner map the placement carries.
+
+        Returns ``(None, "identity")`` when the placement carries no movement
+        layout or carries the program's own work-grid map.  Otherwise rows
+        that the map assigns to one owner unit (``pseudo_channel`` x ``pim``,
+        flattened with the outer level most significant) occupy that unit's
+        contiguous slot range ``[unit * R, (unit + 1) * R)`` in ascending row
+        order, ``R`` rows per unit.  The program map therefore reproduces the
+        row-order packing exactly.  Raises InfeasibleSchedule with the reason
+        when the map is not realizable (``row_map_unrealizable_reason``).
+        """
+        from .pim.layout_problem import TargetHierarchyError
+        from .spmw_autoschedule import _matcher_work_scope
+        from .spmw_layout_problem import (
+            LayoutDerivationError,
+            derive_layout_problem,
+            row_map_unrealizable_reason,
+            split_movement_layout,
+        )
+
+        _backend, movement = split_movement_layout(getattr(layout, "layout", None))
+        if movement is None:
+            return None, "identity"
+        matches = [m for _w, ms in buckets for m in ms]
+        try:
+            derived = derive_layout_problem(self.target, matches)
+            matrix = derived.movement_matrix(movement)
+        except (LayoutDerivationError, TargetHierarchyError) as error:
+            raise _infeasible(f"the carried movement layout cannot be placed: {error}")
+        program = derived.program_layout()
+        if matrix == program:
+            return None, "identity"
+        if derived.owner_flag(matrix) != derived.owner_flag(program):
+            reason = row_map_unrealizable_reason(derived, matrix)
+            if reason is not None:
+                raise _infeasible(f"owner map not realizable: {reason}")
+        inverse = matrix.inverse()
+        n_work = len(derived.work_levels)
+        units: dict[int, list[int]] = {}
+        for _work_id, ms in buckets:
+            c = samsung_contraction_roles(ms)
+            mac = next(m for m in ms if m.target_op_name == "MAC")
+            work_id = tuple(_matcher_work_scope(mac).work_id)
+            loops = [loop[0] for loop in mac.enclosing_loops]
+            row_loop = loops.index(c.row_var) if c.row_var is not None else None
+            for i in range(c.rows_per_item):
+                values = {d: work_id[d] for d in range(n_work)}
+                if row_loop is not None:
+                    values[n_work + row_loop] = i
+                unit = derived.owner_unit(inverse, values)
+                units.setdefault(unit, []).append(c.row_offset + i)
+        per_unit = {len(rows) for rows in units.values()}
+        if len(per_unit) != 1 or sorted(units) != list(range(len(units))):
+            raise _infeasible(
+                "owner map not realizable: its units own unequal row counts "
+                f"({sorted(per_unit)})"
+            )
+        (R,) = per_unit
+        slots = [0] * rows_total
+        for unit, rows in units.items():
+            for rank, row in enumerate(sorted(rows)):
+                slots[row] = unit * R + rank
+        if sorted(slots) != list(range(rows_total)):
+            raise _infeasible("owner map does not place every row in one slot")
+        if slots == list(range(rows_total)):
+            return None, "identity"
+        moved = sum(1 for row, slot in enumerate(slots) if row != slot)
+        return tuple(slots), f"permuted ({moved} of {rows_total} rows moved, {R} per unit)"
+
     def _emit_reduce(self, group_id, buckets, layout, issue):
         from .spmw_reduction_policy import may_regroup, no_strict_program_error
 
@@ -867,6 +968,7 @@ class SamsungCtx(CodegenContext):
             )
 
         self._check_unrealized_levers(layout)
+        row_slots, row_map = self._row_slots(buckets, layout, rows_total)
         handles = layout.placements
         matrix_h = handles.get(rep.matrix_memref)
         vector_h = handles.get(rep.vector_memref)
@@ -947,7 +1049,10 @@ class SamsungCtx(CodegenContext):
                 "crf_issue": issue,
                 "stage_resident": bool(extra.get("stage_resident", False)),
                 "residency": extra.get("residency"),
+                "row_map": row_map,
             },
+            row_slots=row_slots,
+            row_map=row_map,
         )
 
     def _emit_temporal(self, group_id, buckets, layout, issue):
@@ -965,6 +1070,7 @@ class SamsungCtx(CodegenContext):
         facts = samsung_target_facts(target)
         rep, rows_total = self._covered_contraction(buckets)
         self._check_unrealized_levers(layout)
+        row_slots, row_map = self._row_slots(buckets, layout, rows_total)
         extra = layout.extra or {}
         handles = layout.placements
         matrix_h = handles.get(rep.matrix_memref)
@@ -1029,7 +1135,10 @@ class SamsungCtx(CodegenContext):
                 "stage_resident": False,
                 "residency": extra.get("residency"),
                 "accumulator_init": rep.accumulator_init,
+                "row_map": row_map,
             },
+            row_slots=row_slots,
+            row_map=row_map,
         )
 
     def _register_moves(self):
@@ -1057,6 +1166,7 @@ class SamsungCtx(CodegenContext):
         all_matches = [m for _w, matches in buckets for m in matches]
         el = samsung_elementwise(all_matches)
         self._check_unrealized_levers(layout)
+        self._check_fixed_owner_map(buckets, layout)
         handles = layout.placements
         anchor = handles.get(el.input_memrefs[1]) if len(el.input_memrefs) > 1 else None
         anchor = anchor if isinstance(anchor, MemoryRef) else None
@@ -1334,13 +1444,37 @@ def _plan_binds(program):
     ]
 
 
+def _row_map_digest(values) -> str:
+    """FNV-1a 64 over the table values; the conductor reports the same digest."""
+    digest = 0xCBF29CE484222325
+    for value in values:
+        digest ^= int(value)
+        digest = (digest * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{digest:016x}"
+
+
+def samsung_slot_position(slot: int, geometry: dict, facts, rows_per_block: int) -> dict:
+    """Physical position of one REDUCE slot: pass, channel, PIM block, GRF_B entry."""
+    C, P, G = geometry["channels"], facts.pim_blocks, rows_per_block
+    return {
+        "pass": slot // (C * P * G),
+        "channel": slot // (P * G) % C,
+        "block": slot // G % P,
+        "entry": slot % G,
+    }
+
+
 def samsung_reduce_plan(program: SamsungProgram, geometry: dict, columns: int,
                         weight_resident: bool | None = None) -> dict:
     """Physical plan of a REDUCE program on the simulated geometry.
 
-    Rows are packed into slots ((pass * channels + channel) * blocks + block)
-    * rows_per_block + entry in row order; the work grid is a logical
-    partition and this packing is the backend's fixed placement policy.
+    Slot s is ((pass * channels + channel) * blocks + block) * rows_per_block
+    + entry.  Without a row map, row r occupies slot r (row-order packing,
+    the vendor placement).  When the selected owner map places rows
+    elsewhere (``program.row_slots``), the plan carries ``row_slots``: the
+    slot of every row of the zero-padded matrix (padding rows keep their own
+    slots), a permutation the conductor applies when it stages the matrix and
+    when it drains the results, which it returns in row order.
     """
     facts = program.facts
     C, P, G = geometry["channels"], facts.pim_blocks, program.rows_per_block
@@ -1355,13 +1489,21 @@ def samsung_reduce_plan(program: SamsungProgram, geometry: dict, columns: int,
         f"vector_from_bank {int(program.vector_from_bank)}",
         f"columns {columns}",
         f"weight_resident {int(bool(resident))}",
-    ] + _plan_binds(program)
+    ]
+    slots = passes * C * P * G
+    table = None
+    if program.row_slots is not None:
+        table = list(program.row_slots) + list(range(len(program.row_slots), slots))
+        lines.append("row_slots " + " ".join(str(slot) for slot in table))
+    lines += _plan_binds(program)
     return {
         "text": "\n".join(lines) + "\n",
         "passes": passes,
-        "slots": passes * C * P * G,
+        "slots": slots,
         "padded_k": program.k_tiles * E * L,
         "weight_resident": bool(resident),
+        "row_map": program.row_map,
+        "row_map_digest": _row_map_digest(table) if table is not None else None,
     }
 
 
@@ -1420,6 +1562,14 @@ def _invoke_conductor(root, argv, what):
         if receipt
         else {}
     )
+    row_map = re.search(r"TENON_ROW_MAP (.*)", combined)
+    if row_map:
+        conductor.update(
+            {
+                f"row_map_{k}": (int(v) if v.isdigit() and k != "digest" else v)
+                for k, v in re.findall(r"(\w+)=(\S+)", row_map.group(1))
+            }
+        )
     phases = {
         "preload": int(m.group(2)),
         "exec": int(m.group(3)),
@@ -1478,11 +1628,31 @@ def _samsung_run_reduce(compiled, program, crf_words, root, geometry, matrix, ve
         ]
         cycles, phases, conductor, log = _invoke_conductor(root, argv, "REDUCE")
         bursts = _samsung_read_bursts(out_path, N * slots, "REDUCE", log)
+    if plan["row_map_digest"] is not None and (
+        conductor.get("row_map_map") != "permuted"
+        or conductor.get("row_map_digest") != plan["row_map_digest"]
+    ):
+        raise RuntimeError(
+            "Samsung pim_driver did not confirm the plan's row map (expected "
+            f"digest {plan['row_map_digest']}, receipt {conductor}); rebuild "
+            "pim_driver from experiments/simulators/setup/PIMSimulator"
+        )
     # Host reduction of the 16 lane partial sums (the regrouping the paper
-    # permits), then slot -> row (rows occupy slots in order).
+    # permits).  The conductor returns the drained slots in row order (the
+    # plan's row_slots permutation, identity without one).
     sums = bursts.astype(np.float32).sum(axis=1).reshape(N, slots)[:, :M]
     issued = slots * Kp
+    slot_of = program.row_slots or range(M)
+    row_map = {
+        "map": program.row_map,
+        "digest": plan["row_map_digest"],
+        "placement": {
+            row: samsung_slot_position(slot_of[row], geometry, facts, program.rows_per_block)
+            for row in sorted({0, 1, 2, 31, 32, M // 2, M - 1} & set(range(M)))
+        },
+    }
     return {
+        "row_map": row_map,
         "rows": sums,
         "cycles": cycles,
         "phases": phases,
@@ -1681,6 +1851,7 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             "plan": res["plan"]["text"],
             "crf": res["crf"],
             "conductor": res["conductor"],
+            "row_map": res["row_map"],
             "simulator_geometry": geometry,
             "levers": dict(program.lever_record),
             "cycles_source": "PIMSimulator, Tenon conductor executing the uploaded CRF",
@@ -1809,8 +1980,36 @@ def _run_samsung_temporal(program, crf_words, root, geometry, inputs) -> RunResu
         initial = (init.reshape(M, 1) if c.column_var is None else init.reshape(M, N))
     else:
         initial = np.zeros((M, N), dtype=np.float16)
+    slots = None
+    if program.row_slots is not None:
+        # The ordered conductor gives physical lane slot s to input row s; the
+        # owner map is realized by staging row r at slot row_slots[r] and
+        # reading it back from there.
+        slots = np.asarray(program.row_slots, dtype=np.int64)
+        staged, staged_init = np.empty_like(matrix), np.empty_like(initial)
+        staged[slots], staged_init[slots] = matrix, initial
+        matrix, initial = staged, staged_init
     res = _samsung_run_temporal(program, crf_words, root, geometry, matrix, vectors, initial)
-    rows = res["rows"]
+    rows = res["rows"] if slots is None else res["rows"][slots]
+    tile_rows = geometry["channels"] * program.facts.pim_blocks * program.facts.lanes
+
+    def lane(slot):
+        return {
+            "tile": slot // tile_rows,
+            "channel": slot % tile_rows // 16 // program.facts.pim_blocks,
+            "block": slot % tile_rows // 16 % program.facts.pim_blocks,
+            "lane": slot % 16,
+        }
+
+    row_map = {
+        "map": program.row_map,
+        "digest": None if slots is None else _row_map_digest(program.row_slots),
+        "placement": {
+            row: lane(row if slots is None else int(slots[row]))
+            for row in sorted({0, 1, 2, 31, 32, M // 2, M - 1} & set(range(M)))
+        },
+        "applied_by": "host staging (TEMPORAL_REDUCE inputs in lane-slot order)",
+    }
     outputs = {"y": rows[:, 0]} if c.column_var is None else {"out": rows}
     extra = {
         "kernel": "GENERIC_TEMPORAL_REDUCE",
@@ -1823,6 +2022,7 @@ def _run_samsung_temporal(program, crf_words, root, geometry, inputs) -> RunResu
         "cycle_phases": res["phases"],
         "crf": res["crf"],
         "conductor": res["conductor"],
+        "row_map": row_map,
         "simulator_geometry": geometry,
         "levers": dict(program.lever_record),
         "accumulation": "source-order FP16 (one GRF_B entry per output row, "

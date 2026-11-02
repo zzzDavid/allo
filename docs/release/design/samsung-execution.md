@@ -181,9 +181,11 @@ source_backend_binding`, conductor `tests/TenonConductor.{h,inc}` +
    (`output_sinks`) must partition the matrix rows exactly; a gap, overlap
    or partial cover is a compile error naming the rows. The work grid is
    a logical partition; physically, rows are packed into slots
-   `((pass * channels + channel) * blocks + block) * grf_b + entry` in row
-   order (the backend's fixed placement policy; all blocks run in
-   lockstep, so the packing does not change the command stream).
+   `((pass * channels + channel) * blocks + block) * grf_b + entry`. With
+   the program's work-grid owner map rows occupy slots in row order (the
+   vendor packing). A movement tie carried on the placement places rows
+   by its owner map instead (section 8); all blocks run in lockstep, so
+   the packing does not change the command stream.
 3. **Per-pass CRF** (`SamsungCtx._emit_reduce`), built from the target's
    own op/move `emit` callbacks: with `T = ceil(K / (grf_a.slots *
    grf_a.width/16))` tiles and tile `t` on fiber `t mod n_fibers`, for each
@@ -500,3 +502,132 @@ fill, which runs in 4,389 / 7,947 / 8,153 cycles, 1.0-1.2% fewer than the
 vendor program, with correct outputs. The paper's 1.00x rows therefore
 describe the vendor-equivalent placement, not the default selection; the
 default beats the vendor path by about 1% on these shapes.
+
+## 8. Owner-map row placement (movement ties, 2026-11-02)
+
+Claim row 16 (ties in movement survive to the final cost ranking) needs a
+backend that executes a tie other than the work-grid map. Samsung REDUCE
+and the ordered program now do.
+
+### 8.1 Realizable family
+
+The movement stage (`allo/spmw_layout_problem.py`, `layout-search.md`
+section 8) states a contraction's layout as a one-to-one GF(2) map from
+work bits (owner levels `pseudo_channel`, `pim`, then local bits) to
+iteration bits (`work0`, `work1`, the row loop, the reduction loop). On
+Samsung (`ROW_MAP_TARGETS`) a tie is realizable when
+(`row_map_unrealizable_reason`):
+
+* the kernel is a contraction (`MAC`) with one accumulator of one
+  output-row coordinate (GEMM's two-coordinate output, elementwise kernels:
+  only the program map);
+* every bit of a variable the accumulator does not depend on (the
+  reduction `k`) is local at the innermost owner level, i.e. the owner
+  coordinates depend on the row bits only. A tie with an owner bit from
+  `k` splits one row's reduction across units; that needs a partial-sum
+  combine, which belongs to the reduction policy, and is rejected with
+  that reason (all minimum ties of the paper GEMV under `reassociate`);
+* the row variables are not masked (every unit then owns the same number
+  of rows).
+
+The program's own map is always realizable. Besides the classes the
+search returns, the realizable members of a minimum class that group rows
+differently are crossed as separate ties: the per-level BLOCK/CYCLIC
+distributions of the row index (`row_distributions`; the row bits ordered
+by coefficient, a BLOCK level takes the most significant remaining bits, a
+CYCLIC level the least significant). For the paper GEMV (`row =
+(pid * 8 + uid) * 32 + i`, 12 row bits) under the default strict order:
+
+| Tie | pseudo_channel bits | pim bits | rows of one unit |
+|---|---|---|---|
+| program = block x block | row[8..11] (`work0`) | row[5..7] (`work1`) | 32 consecutive rows |
+| block x cyclic | row[8..11] | row[0..2] | rows `256 p + 8 j + u`, `j < 32` |
+| cyclic x block | row[0..3] | row[9..11] | 32 rows `r = c (mod 16)` inside one 512-row block |
+| cyclic x cyclic | row[0..3] | row[4..6] | rows `r = u (mod 128)` |
+
+All four have movement 72,704 B (the proven minimum; x is replicated on
+every unit whichever row bits name the units), so `tie_count == 4`,
+`chosen_label == "minimal"`, each tie crossed with the 4 decision keys
+(16 scored candidates, all realized).
+
+### 8.2 Row-to-slot map and plan encoding
+
+`SamsungCtx._row_slots` derives the problem again from the group's
+matches, reads the movement part of `Placement.layout`
+(`split_movement_layout`, the `mm.` block of the product) and evaluates the
+inverse map on every `(work id, row loop value)`: owner unit `u =
+pseudo_channel * 8 + pim` (outer level most significant), `R = rows / units`
+rows per unit, and the rows of unit `u` occupy slots `u * R .. u * R + R -
+1` in ascending row order. The program map yields slot = row, so it is
+recorded as `identity` and emits nothing new.
+
+* REDUCE: `samsung_reduce_plan` appends `row_slots s_0 ... s_{S-1}` (the
+  slot of every row of the zero-padded matrix, padding rows keep their own
+  slots; a permutation of the `S` slots) only when rows move. The conductor
+  (`TenonConductor.inc::tenonRunReduce`) validates the permutation, stages
+  matrix row `r` at slot `row_slots[r]`, drains each slot's result to its
+  row's position, and prints `TENON_ROW_MAP map=identity|permuted
+  rows_moved=N digest=<FNV-1a 64 of the table>`; the runtime checks the
+  digest against the plan's and records it in `RunResult.extra["conductor"]`
+  (`row_map_*` keys) and `extra["row_map"]` (map, digest, physical position
+  of sample rows). Addresses and command order depend on slots only, so the
+  stream is unchanged.
+* TEMPORAL_REDUCE: the ordered conductor (`TemporalReduce.inc`, not
+  changed) gives lane slot `s` to input row `s`; the runtime stages row `r`
+  at slot `row_slots[r]` (matrix and initial accumulator) and reads it back
+  from there (`extra["row_map"]["applied_by"]`).
+* Elementwise: a carried owner map other than the program's is rejected at
+  materialization (fixed flat channel-bank order).
+
+The installed `pim_driver` was rebuilt from the overlay in a scratch copy
+of the pinned clone (`/tmp/rowmap-sim/pimsim`, `scons pim_driver`, about
+10 s); stripped sha256 (`objcopy --strip-all
+--remove-section=.note.gnu.build-id`) `9780b17c7396...` for both the
+scratch and the installed binary. Previous binary kept as
+`PIMSimulator/pim_driver.bak-20261102-rowmap` (sha256 `0ae6a3d9bc0a...`).
+`pim_driver.cc` and `TenonConductor.h` are unchanged.
+
+### 8.3 Two tied layouts: predicted versus measured
+
+Expected before running: equal cycles. The tied layouts have equal movement
+by construction; no Samsung cost rule reads the row map (the MAC, fill and
+drain rules count passes, tiles and column commands, which a row
+permutation does not change); and in the simulator every PIM block of every
+channel executes the lockstep CRF on every slot of every pass, so the
+conductor issues the same addresses in the same order and only the data in
+each slot differs. Outputs must be correct for both (REDUCE within 1e-2;
+the ordered program bit-identical, since each row is still reduced in
+source order in FP16).
+
+| Program (M x K = 4096 x 256) | Tie | Cost program | PIMSimulator | Max abs err | Row 1 placed at |
+|---|---|---|---|---|---|
+| vendor REDUCE (`dual_fiber`, host fill, shared CRF), reassociate | program (identity) | 301 | 4,435 | 4.5e-4 | channel 0, block 0, entry 1 |
+| same | cyclic x cyclic (4,088 of 4,096 rows moved) | 301 | 4,435 | 4.5e-4 | channel 4, block 0, entry 0 |
+| default strict (TEMPORAL, shared CRF) | program (identity) | 27,598 | 26,807 | 2.2e-3 | channel 0, block 0, lane 1 |
+| same | block x cyclic / cyclic x block / cyclic x cyclic | 27,598 | 26,807 | 2.2e-3 (outputs bit-identical) | block 2 / channel 2 / channel 2 |
+
+The cost program's REDUCE estimate (301) excludes preload and readback
+(section 6.3); the comparison here is between ties, which the cost program
+and the simulator both rank equal. The ranking therefore breaks the tie by
+the structural key (`TIE_BREAK_RULE`), which selects the program map on
+the paper GEMV, so the default program and its cycles are unchanged.
+
+Tests: `tests/pim/samsung_hbm_pim/test_samsung_owner_maps.py` (static:
+four realizable ties, identity table for the program, row table only when
+rows move, reduction-split ties rejected at ranking and at a forced
+emission, equal predictions; simulator: vendor REDUCE with the identity
+and the cyclic map, ordered program with two ties),
+`tests/pim/test_layout_selection.py` (Samsung tie count and reasons,
+AiM/UPMEM keep the one-program-per-work-item reason).
+
+### 8.4 Open
+
+* No Samsung tie is cycle-distinguishable on this simulator. A placement
+  that changes cost would need the conductor to skip unoccupied channels or
+  blocks (occupancy) or a different row-open pattern per unit; neither is
+  modelled.
+* Reduction splits (the `reassociate` minimum, 48,128 B versus 72,704 B)
+  need a partial-sum combine across PIM units: reduction-policy work.
+* GEMM (two output coordinates), masked row counts and elementwise kernels
+  run only the program map.
+

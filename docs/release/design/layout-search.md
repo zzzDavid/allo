@@ -245,10 +245,19 @@ per group and crosses its ties with the backend's decision keys.
   it enters the decision key and the backend's own dims are unchanged. When
   no tie class contains the program's layout, that layout is crossed as well,
   labelled `extra["movement"]="not-minimal"`. Unanalyzable groups keep the
-  hand-built layouts, labelled `not-analyzed: <reason>`. Realizability: every
-  backend emits one program per work item on the unit its work id names, so
-  a tie is realizable exactly when its owner flag equals the program's.
-  Other ties are rejected before emission and recorded in
+  hand-built layouts, labelled `not-analyzed: <reason>`. Realizability: AiM,
+  UPMEM and APU v1 emit one program per work item on the unit its work id
+  names, so there a tie is realizable exactly when its owner flag equals
+  the program's. Samsung (`ROW_MAP_TARGETS`) places contraction rows by the
+  owner map (row-to-slot table, `samsung-execution.md` section 8): a tie is
+  realizable when its owner coordinates depend on the output-row bits only
+  (the accumulator's kernel lies in `T_h`, so no unit splits a row's
+  reduction), the accumulator has one row coordinate and the rows are not
+  masked (`row_map_unrealizable_reason`). On Samsung the realizable members
+  of a minimum class that group rows differently are crossed as separate
+  ties: the per-level BLOCK/CYCLIC row distributions (`row_distributions`,
+  multiplicity 1, still counted in `tie_layouts`). Other ties are rejected
+  before emission with the reason and recorded in
   `KernelRanking.movement_rejections`. Ties are broken by cycles, then by a
   structural key: layout text, knob and feature values, handle paths
   (`TIE_BREAK_RULE`, C-06). `KernelRanking.cost_ties` exposes the full
@@ -262,12 +271,20 @@ per group and crosses its ties with the backend's decision keys.
 
 ### 8.2 Findings
 
-* **No backend can realize a layout other than the program's work-grid owner
-  map.** On the measured GEMVs every alternative tie is rejected. Samsung
-  under strict FP16: the program layout is the unique minimum profile
-  (72,704 B, proven), so nothing changes. Samsung under reassociation: the
-  minimum is 48,128 against the program's 72,704 (one or two `k` bits split
-  across PIM units); 2 tie classes are rejected. AiM (`reassociate`): 5,120
+* **Samsung realizes ties; AiM, UPMEM and APU v1 realize only the program's
+  work-grid owner map.** Samsung under strict FP16 (the default): the
+  program's profile is the unique minimum (72,704 B, proven); its four row
+  distributions (block/cyclic per level; the program is block x block) are
+  distinct owner maps with that movement, all realizable, so
+  `tie_count == 4`, `chosen_label == "minimal"` and 16 candidates are scored
+  (4 ties x 4 keys). The cost program and PIMSimulator both rank the ties
+  equal (vendor REDUCE 4,435 cycles, ordered program 26,807, for the
+  identity and the cyclic map, outputs correct), and the structural
+  tie-break selects the program map, so the default program is unchanged.
+  Samsung under reassociation: the minimum is 48,128 against the program's
+  72,704 (one or two `k` bits split across PIM units); both tie classes
+  split a row's reduction and are rejected with that reason (reduction
+  policy). AiM (`reassociate`): 5,120
   against 15,872; 2 classes are rejected. UPMEM 64 x 12 rows (masked): 14,848
   against 32,256; 2 classes are rejected. Selected programs, cycles and
   emitted commands are identical to HEAD on all five GEMVs (Samsung 253, 381,
@@ -279,15 +296,18 @@ per group and crosses its ties with the backend's decision keys.
   UPMEM checks only that a `LinearLayout` is present. A tie can therefore
   never "equal the swizzled layout"; the product keeps both.
 * A user `compile(layout=...)` whose carried movement part is not the
-  program's owner map is not checked, and backends ignore it (needs the C-01
-  legality pass).
+  program's owner map is executed by Samsung contractions (rejected at
+  emission with the reason when not realizable, and for elementwise
+  kernels); AiM, UPMEM and APU v1 ignore it (needs the C-01 legality pass).
 
 ### 8.3 What remains
 
-* Backends that re-map iterations to owners (for example splitting `k`
-  across PIM units with a partial-sum combine) would turn the rejected ties
-  into real candidates; until then the claim holds only in the narrow sense
-  that ties reach the ranking and are rejected for a stated reason.
+* Samsung realizes row-placement ties, but no tie is cycle-distinguishable
+  there (every slot is issued in lockstep). Ties that split `k` across PIM
+  units need a partial-sum combine (reduction policy) on every backend.
+  AiM, UPMEM and APU v1 would need a per-unit row re-map in their lowering;
+  until then their ties reach the ranking and are rejected for the stated
+  reason.
 * Movement weights from the cost programs (`movement_cost_per_byte`).
 * Levels below the work grid (AiM banks, UPMEM tasklets, Samsung bank
   fibers) are chosen inside the backends and are not part of the problem.

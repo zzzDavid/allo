@@ -9,6 +9,9 @@
 (d) A tiny budget ends at ``NODE_BUDGET``: incomplete, feasible incumbent.
 (e) AiM and UPMEM GEMVs report movement without changing cycles; their
     strictly better-movement ties are not realizable and are rejected.
+(f) Samsung places contraction rows by the owner map: the paper GEMV's
+    row-distribution ties are realizable and ranked (simulator runs in
+    ``samsung_hbm_pim/test_samsung_owner_maps.py``).
 """
 
 from __future__ import annotations
@@ -120,15 +123,20 @@ def test_samsung_paper_gemv_movement_stage():
     assert movement.min_cost == movement.program_cost == 72704
     assert movement.chosen_cost == movement.min_cost
     assert movement.chosen_label == "minimal"
-    (tie,) = movement.ties
-    assert tie.realizable and movement.tie_count == 1
+    # One movement profile (the program's); Samsung places rows by the owner
+    # map, so its per-level block/cyclic row distributions are crossed as
+    # separate realizable ties (layout-search.md section 8).
+    assert movement.ties[0].description == "pseudo_channel<-work0[0,1,2,3]; pim<-work1[0,1,2]"
+    assert movement.tie_count == 4 and len(movement.ties) == 4
+    assert all(tie.realizable for tie in movement.ties)
+    assert {tie.cost for tie in movement.ties} == {72704}
     assert not kernel.movement_rejections
 
-    # The chosen layout is the tie: its movement part is the tie's layout.
+    # The chosen layout is a tie: its movement part is that tie's layout.
     chosen = compiled.compiled.layout[0]
     assert chosen.extra["movement"] == "minimal"
     _backend, carried = _split(chosen.layout)
-    assert carried == tie.layout
+    assert carried in [tie.layout for tie in movement.ties]
 
     # Same program and cycles with the stage disabled.
     baseline = _compile(
@@ -136,14 +144,16 @@ def test_samsung_paper_gemv_movement_stage():
     )
     assert list(compiled.compiled.cmds) == list(baseline.compiled.cmds)
     assert compiled.estimate().cycles == baseline.estimate().cycles
-    assert len(kernel.scores) == len(_kernel(baseline).scores)
+    assert len(kernel.scores) == movement.tie_count * len(_kernel(baseline).scores)
     assert _split(chosen.layout)[0] == baseline.compiled.layout[0].layout
 
 
 def test_samsung_unrealizable_ties_are_rejected_before_emission():
     """Reassociation lets the minimum split k across PIM units; the backend
-    runs the program's work-grid owner map only, so those ties are rejected
-    with the reason and the program layout ranks, marked not-minimal."""
+    places rows by the owner map but does not split a row's reduction (that
+    is the reduction policy's partial-sum combine), so those ties are
+    rejected with the reason and the program layout ranks, marked
+    not-minimal."""
     target = build_samsung_target()
     order = "reassociate" if _HAS_ORDER else None
     compiled = _compile(_SAMSUNG.gemv_m4096_k256, target, samsung_cost, order)
@@ -154,7 +164,7 @@ def test_samsung_unrealizable_ties_are_rejected_before_emission():
     assert not any(tie.realizable for tie in movement.ties)
     assert len(kernel.movement_rejections) == 2 * len(kernel.scores)
     assert all(
-        "does not re-map iterations to owners" in reason
+        "splits the reduction" in reason and "reduction policy" in reason
         for _position, reason in kernel.movement_rejections
     )
     assert movement.chosen_label == "not-minimal"
@@ -319,6 +329,12 @@ def test_aim_and_upmem_report_movement_without_changing_cycles(
     assert movement.chosen_label == "not-minimal"
     assert movement.ties and not any(tie.realizable for tie in movement.ties)
     assert kernel.movement_rejections
+    # Only row-map targets (Samsung) realize owner maps other than the work
+    # grid's; AiM and UPMEM keep the one-program-per-work-item reason.
+    assert all(
+        "does not re-map iterations to owners" in reason
+        for _position, reason in kernel.movement_rejections
+    )
     if target.name == "upmem":
         assert movement.optimality_scope == "coordinate layouts"
         assert movement.derived.is_masked
@@ -327,3 +343,35 @@ def test_aim_and_upmem_report_movement_without_changing_cycles(
     else:
         assert movement.optimality_proven
         assert movement.derived.unmodelled_levels == ("bank_group", "bank")
+
+
+# --------------------------------------------------------------------- #
+# (f) Samsung row-distribution ties
+# --------------------------------------------------------------------- #
+
+
+def test_samsung_row_distribution_ties_are_distinct_owner_maps():
+    """The four per-level block/cyclic distributions of the 12 row bits are
+    distinct owner flags with the program's movement, all realizable; the
+    k bits stay local in every one (the strict reduction is not split)."""
+    from allo.spmw_layout_problem import row_distributions, row_map_unrealizable_reason
+
+    compiled = _compile(_SAMSUNG.gemv_m4096_k256, build_samsung_target(), samsung_cost)
+    movement = _kernel(compiled).movement
+    derived = movement.derived
+    names = [name for name, _assignment in row_distributions(derived)]
+    assert names == [
+        "rows block over pseudo_channel, block over pim",
+        "rows block over pseudo_channel, cyclic over pim",
+        "rows cyclic over pseudo_channel, block over pim",
+        "rows cyclic over pseudo_channel, cyclic over pim",
+    ]
+    flags = {derived.owner_flag(tie.work_to_iteration) for tie in movement.ties}
+    assert len(flags) == movement.tie_count == 4
+    for tie in movement.ties:
+        assert row_map_unrealizable_reason(derived, tie.work_to_iteration) is None
+        # loop1 (k) carries no owner bit.
+        assert "loop1" not in tie.description
+    # The program is the block x block distribution.
+    (_name, block_block), *_ = row_distributions(derived)
+    assert block_block.matrix(derived.coordinate_problem) == derived.program_layout()
