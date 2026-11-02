@@ -160,6 +160,23 @@ without coefficients.
 
 ## Cross-cutting status
 
+- Source semantics the matcher enforces before any backend is consulted
+  (C-02, C-14, C-17, C-19, C-20, C-21): every store of every work-item
+  function is classified and an unmatched effect raises
+  `UnsupportedWorkloadError`; accumulators are `zero` or `carried`; an
+  operand may not alias its own result at another element; a conversion is
+  looked through only when it is exact (`cast_is_exact`), a constant only
+  when proven representable, a store-side narrowing only when proven exact
+  (integer: the leaves fit the destination width or the value provably
+  fits; float: every leaf is a destination-type value, recorded in
+  `MatchTrace.precision_notes`), and any other conversion (`int(acc)` on an
+  FP16 output, `fptosi`, an unproven `trunci`) matches no target op and is
+  rejected naming the conversion; an output copy must run under exactly its
+  producer's guards, exactly once per produced element (never inside the
+  reduction loop) and into a buffer of the producer's type, otherwise it is
+  rejected (`if cond: out[i] = acc` is unsupported, not silently
+  unconditional). Signless loads are read as signed or unsigned according
+  to the frontend's extension; unknown signedness uses the union range.
 - Placement legality (`allo/spmw_legality.py`) filters enumerated
   candidates and rejects illegal `layout=` (C-01 fixed); the work grid must
   map onto the unit tree in a documented form (C-04 fixed).
@@ -168,15 +185,23 @@ without coefficients.
 - Ties are broken by a documented structural key and exposed as
   `KernelRanking.cost_ties` (C-06 fixed).
 - The minimum-movement layout stage runs per kernel group and records
-  ties, termination and optimality (`KernelRanking.movement`, C-11 fixed),
-  but no backend can realize an owner map other than the program's
-  work-grid map, so alternative ties are rejected with a stated reason
-  (CLAIMS row 16 partial).
-- Ranking is per kernel group and precedes materialization (only a
-  codegen probe runs on the ranked list); the reconciled whole program is
-  not re-costed (C-03, C-05 open).
+  ties, termination and optimality (`KernelRanking.movement`, C-11 fixed);
+  owner maps other than the work-grid map are realized on Samsung, UPMEM
+  and AiM; APU v1 realizes only the work-grid map and rejects other ties
+  with a stated reason (CLAIMS row 16 partial on APU v1).
+- Candidates are materialized in cost order and backend rejections are
+  recorded (C-03 fixed); the reconciled whole program is re-priced and,
+  within `SelectionPolicy.joint_budget`, every complete assignment is
+  evaluated as one program (C-05 fixed, bounded and labelled).
 - Shared frontend: annotation names resolve from the defining scope only
-  (F-01 fixed); wide integer literals are still truncated to i32 (F-02
-  open).
+  (F-01 fixed); integer literals compile to their exact value or raise
+  (F-02 fixed).
 - `RunResult.kind` is set on every route and validated; non-executed kinds
   never write caller arrays (G2-07, S-02, V1-09, M-08 fixed).
+- Not one pipeline yet (gate G9, ISSUES X-01): Samsung, AiM, UPMEM and
+  AttAcc share the matcher/legality/placement path; the APU v1 vector route
+  and the Gemini-II source route plan and launch through their own
+  end-to-end paths (the Gemini-II route runs the shared matcher checks
+  above, the APU v1 vector route does not). The typed APU records are
+  frontends to those routes. Until the migration lands, "supported" for the
+  APUs means supported by those routes.

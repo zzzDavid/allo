@@ -258,3 +258,45 @@ the documentation commit that records them changes no code.
 | APU v1 board (this server, `tests/pim/apu_v1`, `test_gemv_apu_v1`, histogram golden median) | 11 passed, 2 xfailed (V1-16 bit-model checks), 485 s (`apuv1/final-device-tests.log`) |
 | Gemini-II card (zhang-x4 `apu-00`, `tests/pim/test_apu_g2_hardware.py`) | 15 passed, 124 s (`g2/final-hardware.log`) |
 | upstream smoke | 313 passed at the round 6 tree; the only files changed since are AiM backend and evaluator files not imported by those tests |
+
+## Round 8 (2026-11-02): reviewer probes, matcher cast/copy contracts, simulator recipes
+
+Environment as above (`spmw` env, `PYTHONPATH=$PWD`,
+`LLVM_BUILD_DIR=/work/shared/common/llvm-project-main/build-rhel8`). Raw
+logs: `/tmp/tenon-release/r9/*.log` on this server (copied to
+`/work/shared/users/phd/nz264/tenon-release-evidence/r8/` when the round
+closes).
+
+Independent reviewer's probes (their scripts, unchanged:
+`/tmp/tenon_reviewer_samsung_cast.py`, `/tmp/tenon_reviewer_samsung_guard.py`):
+
+| Probe | At e41ebbd (reviewer's run) | Round 8 tree |
+|---|---|---|
+| FP16 GEMV, `out[row] = int(acc)`, W[:,0]=0.25, x=1 (source: all outputs 0) | compiled, `kind='simulator'`, returned 0.25 everywhere | `UnsupportedWorkloadError`: "computes arith.sitofp<i32->f16>(arith.fptosi<f16->i32>(acc[])) ... which matches no target op" (`probe-cast.log`) |
+| FP16 GEMV, `if v[0] > 0: out[row] = acc`, x=-1, y initialized to 99 (source: all outputs stay 99) | compiled, overwrote every output with -0.25 | `UnsupportedWorkloadError`: "is a copy of a matched result under a different guard than its producer (copy guards if(%9), producer guards none); a conditional output copy would be executed unconditionally by the device" (`probe-guard.log`) |
+
+Both probes are regressions in `tests/pim/test_match_coverage.py`
+(`test_value_changing_conversion_on_the_output_is_rejected`,
+`test_conditional_output_copy_is_rejected`), with the neighbours that must
+keep compiling (`acc: fp16 = 0` constant initializer, `i4*i4` accumulation
+truncated to i15, `i32 + i32` pointwise, bf16 activation rounded at the
+store, loop-index narrowing) and the neighbours that must be refused (copy
+inside the reduction loop, truncating copy of an unbounded int64
+accumulator, f32 constant stored into bf16, `uint8` products copied into
+int17).
+
+Suites on the round 8 tree (before the commit; the committed tree differs
+only by the ledger text written after these runs):
+
+| Suite | Command | Result |
+|---|---|---|
+| matcher contracts, legality, run-result contract | `pytest tests/pim/test_match_coverage.py tests/perf/test_legality.py tests/perf/test_run_result_contract.py` | 59 passed (`core.log`), plus the later `test_unsigned_loads_use_the_unsigned_range` (1 passed) |
+| CENT AiM traces and UPMEM dtypes | `pytest tests/pim/test_cent_aim_workloads.py tests/pim/test_upmem_dtypes.py` | 25 passed, 11 skipped (`cent-upmem.log`; the skips are `paper_full` rows) |
+| Gemini-II source route | `pytest tests/perf/test_apu_g2_source_route.py` | 48 passed (`g2.log`) |
+| perf | `pytest tests/perf -q -rfxs` | 534 passed in 614.91 s (`final-perf.log`) |
+| PIM non-device (`tests/pim -m "not apu_v1_device"`) | `pytest tests/pim -q -rfxs -m "not apu_v1_device"` | 438 passed, 54 skipped, 12 deselected, 3 failed in 4033.60 s (`final-pim.log`). The three failures were test expectations overtaken by the new contracts, each re-judged on its semantics: the Gemini-II alias probe used an `int16` operand with an `int15` accumulator (now refused visibly for the truncation; the alias probe keeps `int15` and the wide-operand case is its own test); a `uint32` pointwise add and an `int32` affine form with the constant 2,147,483,648 were refused by the first narrowing rule before UPMEM's ABI and literal checks could name the real problem, fixed by judging narrowing leaves by bit width (ISSUES C-19) |
+| re-run after those fixes | `pytest tests/pim/test_upmem_dtypes.py tests/pim/test_upmem_generality.py tests/pim/test_g6_semantics.py -m "not apu_v1_device"` | 119 passed, 1 skipped (`refix-a.log`) |
+| re-run after those fixes | `pytest tests/pim/test_match_coverage.py tests/perf/test_apu_g2_source_route.py tests/pim/test_cent_aim_workloads.py tests/perf/test_legality.py` | 96 passed, 11 skipped (`refix-b.log`) |
+
+A full `tests/pim` and `tests/perf` run on the committed tree and the
+installed-artifact runs are recorded below when they complete.

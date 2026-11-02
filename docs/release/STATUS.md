@@ -1,6 +1,6 @@
 # Release status
 
-Updated: 2026-11-02 (round 7, final evidence at `1ea8756`). Read `TASK.md` in the containing repository,
+Updated: 2026-11-02 (round 8: reviewer rejection of `e41ebbd`, matcher cast/copy contracts, simulator recipes in the release repository, gate G9 added). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -28,24 +28,57 @@ then this file, then `ISSUES.md` for the next action.
 
 ## Verdict
 
-**NOT READY** pending user decisions and the final hardware re-runs
-recorded below; the compiler-side blockers identified by the audits are
-closed. Gate judgments are in `REVIEW.md`. What remains:
+**NOT READY.** Gate judgments are in `REVIEW.md`. Blockers, in order:
 
-1. User decisions: redistribution of the Samsung-derived simulator patches
-   (P-04); whether to seek a license from the DCC authors for the AttAcc
-   evaluation scripts; committing the simulator overlays and skill-doc
-   corrections in the containing repository; running the index removals in
-   `RELEASE_CHECKLIST.md`.
-2. Open minor items: V1-16 (Gemini-I FP16 arithmetic not bit-reproducible
-   by an IEEE model; characterized on the board, needs GSI's GVML
-   definition), APU v1 realizes only the work-grid owner map, P-17
-   (proprietary UPMEM SDK, documented). C-18 is a documented evaluator
-   policy and M-14 (an AiM elementwise lowering that dropped work on
-   partitioned grids) is fixed.
-3. Final evidence at `1ea8756` is recorded in `VALIDATION.md` (PIM suite,
-   APU v1 board, Gemini-II card). Any later code commit requires a re-run
-   before a READY verdict.
+1. **G9 (X-01)**: the shared compilation pipeline for all targets including
+   APU v1 and Gemini-II is required by the user (2026-11-02) and not
+   implemented. Design seed: `design/shared-compilation-path.md`.
+2. **G2**: the independent reviewer disproved the round 7 PASS with two
+   executed wrong-code probes at `e41ebbd` (C-19 casts erased, C-20 guarded
+   copies). Repaired in round 8 with a signedness fix found during the
+   review of the repair (C-21); awaiting independent review and execution
+   evidence at the new revision.
+3. **G7/G8 evidence**: installed-artifact runs (wheel built from the
+   candidate, installed outside the checkout) on the simulators, the APU v1
+   board and the Gemini-II card are required at the candidate revision; the
+   last hardware runs were at `1ea8756`. The Samsung simulator route is not
+   buildable from the release repository without Samsung's permission for
+   the five patches (P-04); AiM and UPMEM are.
+4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+
+## Round 8 (2026-11-02): what was done
+
+- Reproduced the reviewer's two probes (`/tmp/tenon_reviewer_samsung_{cast,guard}.py`)
+  and kept them as regressions in `tests/pim/test_match_coverage.py`.
+- Matcher contracts (`allo/spmw_match_engine.py`): `cast_is_exact`,
+  per-value constant proofs, store-side integer narrowing accepted only as
+  the destination-width evaluation of fitting leaves or a proven range,
+  store-side float narrowing accepted only over destination-type leaves and
+  recorded in `MatchTrace.precision_notes`, every other conversion a visible
+  unary term that fails coverage; `_copy_contract_problem` (guards, result
+  loops, element type, truncation range proof via `_carried_interval`);
+  `WLoad.signed` from the frontend's extension (C-21). UPMEM histogram names
+  an unproven bin-index truncation; one Gemini-II expectation updated to the
+  shared copy contract's message.
+- Simulator recipes distributed in the release repository under
+  `simulators/` with `tests/perf/test_simulator_recipes.py`; the Samsung
+  patches are excluded by `.gitignore` and `MANIFEST.in` (P-04).
+- Ledgers made consistent: ISSUES C-19/C-20/C-21/X-01; REVIEW gate table
+  (G2 FAIL-then-repaired, G8 UNVERIFIED at this revision, G9 FAIL);
+  CLAIMS evaluation rows updated for closed issues; CAPABILITIES
+  cross-cutting status rewritten.
+
+## Next concrete actions (in order)
+
+1. Independent review of the round 8 matcher contracts.
+2. Installed-artifact evidence at this revision: build the wheel, install
+   outside the checkout, run virtual + Samsung + AiM + UPMEM through it;
+   then APU v1 board (local lock) and Gemini-II card on zhang-x4 (remote
+   lock). Record in `VALIDATION.md`.
+3. G9: refine `design/shared-compilation-path.md` from source (stage
+   inventory, reusable pieces, missing contracts), then the first vertical
+   slice through one matcher backend, then the APU routes; remove the
+   public bypasses once covered.
 
 ## Round 6 (2026-11-02): what was done
 

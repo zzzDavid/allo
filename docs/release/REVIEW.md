@@ -22,16 +22,26 @@ what was accepted and why.
    `accumulator_init`, `local`, `unmatched`) and raises
    `UnsupportedWorkloadError` for any unmatched effect. Every accumulating
    match carries `accumulator_init` in {`zero`, `carried`}; anything else
-   raises. Invariant: a trace that reaches codegen implements every store of
-   the source, and the device may zero an accumulator only when the source
-   does.
+   raises. Round 8 (C-19 to C-21): a conversion is transparent only when
+   `cast_is_exact` holds or the matcher proves it for the value (constant,
+   provable range, destination-width ring evaluation, destination-type
+   float leaves); an output copy is accepted only under its producer's
+   guards, once per produced element, into the producer's type. Invariant:
+   a trace that reaches codegen implements every store of the source with
+   the source's values (up to the recorded float precision contract), and
+   the device may zero an accumulator only when the source does.
 2. **Matcher to autoscheduler.** Axis roles (`axis_roles`: reduction,
    output, batch, matrix/vector operand, work-axis) are stamped structurally
    from index sets including the store index. Consumers must not re-derive
    them from memref extents or target counts.
-3. **Autoscheduler to codegen.** Still per-kernel-group ranking before
-   materialization (C-03, C-05); no access-scope legality (C-01). Not yet an
-   invariant.
+3. **Autoscheduler to codegen.** Candidates pass the target-neutral
+   legality pass (C-01) before ranking; materialization runs in cost order
+   with rejections recorded (C-03); the reconciled whole program is
+   re-priced and bounded joint evaluation is labelled (C-05). Invariant: the
+   selected placement is legal, materialized, and priced from the graph of
+   the program that is emitted. This holds for the matcher backends; the
+   APU v1 vector route and the Gemini-II source route have their own
+   planners (G9, X-01).
 4. **Codegen to runtime.** `RunResult.kind` states what a result evidences
    (`device`, `simulator`, `simulator-timing-only`, `functional`, `virtual`).
    Executed kinds must carry `extra["outputs"]` for every gathered role;
@@ -217,6 +227,53 @@ what was accepted and why.
   as accumulation order rather than bit-exactness, and the issue stays open
   until the GVML arithmetic is characterized.
 
+## Round 8 (2026-11-02): independent reviewer's rejection of e41ebbd and the repairs
+
+The independent reviewer reproduced two silent wrong-code cases through
+`allo.compile` and the Samsung simulator at `e41ebbd`, which disproved the
+round 7 judgment that G2 had passed and that no compiler-side blocker
+remained. Both were mechanism defects in the shared matcher, not Samsung
+spellings:
+
+- Casts erased during matching (C-19). `_trace_value` and `_copy_source`
+  treated every `_CAST_OPS` member as transparent. The repair makes
+  exactness the only permission to look through a cast (`cast_is_exact`),
+  proves constants per value, accepts store-side integer narrowing only as
+  the destination-width evaluation of an expression whose leaves provably
+  fit (truncation distributes over the ring ops; anything else needs a
+  proven range), accepts store-side float narrowing only over leaves of the
+  destination type and records it as a precision contract
+  (`MatchTrace.precision_notes`), and otherwise keeps the conversion as a
+  visible unary term that no target op matches. Review note: the legitimate
+  frontend forms (`acc: fp16 = 0` as `sitofp(0)`, `i4*i4` evaluated in i8/i16
+  and truncated at the i15 store, `i32 + i32` in i33, bf16 arithmetic in
+  f32) all had to be proven rather than special-cased; the proofs are the
+  interval analysis and the ring-homomorphism argument in the source
+  docstrings. Reviewer-side finding during this round: the interval
+  analysis first read every signless load as signed, which understates a
+  `uint8` operand; fixed by carrying the extension kind on the load (C-21).
+- Guarded or misplaced output copies (C-20). A copy of a matched result was
+  accepted without comparing its guards or loop position to its producer.
+  The repair is a copy contract: identical guard frames (then/else
+  distinguished), exactly the producers' result loops (once per produced
+  element, never inside the reduction) and the producers' element type (or
+  a proven-exact truncation). Unsupported copies fail before any backend
+  is consulted; the Samsung sink consumer is unchanged because it never
+  sees them.
+
+Scope of the review: the repair was checked on the four matcher backends
+(Samsung, UPMEM, AiM, AttAcc share `match_workload`) and the Gemini-II source
+route, which uses the same matcher; one UPMEM recognizer (histogram bin
+index) and one Gemini-II test expectation changed because the copy contract
+now names the real problem first. The APU v1 vector route does not run the
+matcher and therefore does not run these checks; that is part of G9 (X-01).
+
+Also in this round: the redistributable simulator recipes moved into the
+release repository (`simulators/`, `tests/perf/test_simulator_recipes.py`);
+the Samsung-derived patches stay out (P-04) and `apply.sh` refuses without
+them, so the Samsung simulator route is documented as not buildable from
+the release repository alone.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -235,6 +292,11 @@ what was accepted and why.
 - Presenting the 26-minute 500-instance AttAcc sweep as the paper's 24 s
   selector time, or ranking AttAcc tilings with the archived replay model
   that contradicts the paper.
+- Round 8: rejecting the reviewer's two source spellings by name (an
+  `int()` call on the output, a guard on the final store) instead of
+  restating the cast and copy contracts; and removing the store-side
+  narrowing check to keep the integer kernels compiling instead of proving
+  when the narrowing is exact.
 
 ## Constants and specialization inventory
 
@@ -248,13 +310,14 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 | Gate | Judgment | Basis |
 |---|---|---|
-| G1 correspondence | **PASS (candidate)** | every substantive mechanism of Sections III and IV has a maintained implementation reachable through `allo.compile` (CLAIMS.md); row 16 realized on Samsung, UPMEM and AiM; the remaining external items are evaluation scripts documented as such (E11, E14 DRAM half, E15, the AttAcc reference-best study and e2e composition) |
-| G2 semantic preservation / explicit failure | **PASS (candidate)** | all identified silent-wrong-code paths repaired with regressions, including the round 6 alias and zero-fill findings; nonzero initial outputs, zero results and boundary cases executed on every numeric backend |
-| G3 general mechanisms | **PASS (candidate)** | structural recognizers and template-derived legality on every backend; renamed and neighbouring programs compile to the same normalized decisions; open minor: M-14 |
-| G4 search/layout/selected-program integrity | **PASS (candidate)** | legality pass, movement stage with realized ties on three backends, lazy materialization with recorded rejections, bounded joint evaluation, selected program executed on Samsung and verified on the devices |
+| G1 correspondence | **PASS (round 7 judgment, to be re-challenged under G9)** | every substantive mechanism of Sections III and IV has a maintained implementation reachable through `allo.compile` (CLAIMS.md); row 16 realized on Samsung, UPMEM and AiM; the remaining external items are evaluation scripts documented as such (E11, E14 DRAM half, E15, the AttAcc reference-best study and e2e composition); under the user's G9 framing the APU v1 vector route and the Gemini-II source route are release APIs but not the shared pipeline (X-01) |
+| G2 semantic preservation / explicit failure | **FAIL at e41ebbd; repaired in round 8, pending independent review and the re-runs below** | the reviewer's cast and guard probes returned wrong results through the public route at e41ebbd (C-19, C-20); the matcher contracts now reject both with the semantic reason and the accepted frontend forms are proven (C-21 closes the signedness gap found while reviewing the repair); evidence at the new revision: `VALIDATION.md` round 8; hardware re-runs at this revision not yet made |
+| G3 general mechanisms | **PASS (round 7 judgment, to be re-challenged)** | structural recognizers and template-derived legality on every backend; renamed and neighbouring programs compile to the same normalized decisions; open minor: M-14; round 8 added no case entries: the cast and copy contracts are proofs over the IR, not spellings |
+| G4 search/layout/selected-program integrity | **PASS (round 7 judgment, matcher backends only)** | legality pass, movement stage with realized ties on three backends, lazy materialization with recorded rejections, bounded joint evaluation, selected program executed on Samsung and verified on the devices; the APU routes' planners are outside the shared selection stage until G9 |
 | G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1; open: C-18 evaluator anomaly, uniform movement weights |
-| G6 evidence beyond examples | **PASS (candidate)** | EVIDENCE.md tables plus the round 6 probe files; remaining gaps are hardware-only confirmations listed in VALIDATION.md |
-| G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install, verified simulator recipes, architecture doc; open: user decisions P-04 and DCC license, RELEASE_CHECKLIST index removals, P-17 documented proprietary SDK |
-| G8 backend execution | **PASS (candidate)** | simulators at the candidate; APU v1 board and Gemini-II card runs at round 6 (VALIDATION.md); AttAcc analytical by design |
+| G6 evidence beyond examples | **PARTIAL (reopened in round 8)** | EVIDENCE.md tables plus the round 6 probe files; remaining gaps are hardware-only confirmations listed in VALIDATION.md; the independent reviewer's probes varied the output conversion and a store guard, which the round 6 campaign had not, and found two silent defects; the campaign is kept as regression evidence, not as proof of generality; new probes must target the shared semantic contracts on every route |
+| G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install at ffb4a78 (needs repeating at the candidate, INSTALL.md section 6); AiM and UPMEM simulator recipes now ship in `simulators/` and were rebuilt from the release copies; Samsung's route is not buildable from the release repository without Samsung's permission for the five patches (P-04, documented, `apply.sh` refuses); architecture doc update for the shared pipeline pending (G9); P-17 documented proprietary SDK |
+| G8 backend execution | **UNVERIFIED at the round 8 revision** | round 7 evidence was at 1ea8756; the matcher changed since, so simulator, APU v1 board and Gemini-II card runs must be repeated from the installed artifact at the new revision; APU v1 board and Gemini-II card runs at round 6 (VALIDATION.md); AttAcc analytical by design |
+| G9 one shared compilation pipeline incl. both APUs | **FAIL** | required by the user on 2026-11-02; three end-to-end routes remain in `allo/compiler.py` (ISSUES X-01); design seed in `design/shared-compilation-path.md` |
 
-Verdict: **NOT READY** until the user decisions in STATUS.md are taken and the final hardware re-runs are recorded at the release revision; no compiler-side blocker remains open.
+Verdict: **NOT READY**. Blockers: G9 (X-01) is not implemented; G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.
