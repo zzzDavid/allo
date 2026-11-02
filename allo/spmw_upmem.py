@@ -2721,8 +2721,9 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                     + "\n".join((built.stdout + built.stderr).splitlines()[-40:])
                 )
             sdk_sha = spmw_simenv.sdk_build_manifest_sha256(root)
-            if sdk_sha != spmw_simenv.UPMEM_SDK_BUILD_MANIFEST_SHA256:
-                raise RuntimeError("UPMEM SDK build drifted from the pinned campaign build")
+            # "pinned-campaign" (raises on drift) or "user-build:<manifest12>"
+            # when UPIMULATOR_ROOT and UPIMULATOR_BIN name a user's own build.
+            sdk_build = spmw_simenv.upmem_sdk_build_identity(sdk_sha)
             task_object = (
                 root / "benchmark" / "build" / slot / "dpu" / "CMakeFiles"
                 / f"{slot}_device.dir" / "task.c.o"
@@ -2787,6 +2788,7 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                 "simulator_sha256": simulator_sha,
                 "snapshot_sha256": snapshot_sha,
                 "sdk_build_sha256": sdk_sha,
+                "sdk_build": sdk_build,
                 "commands": {"compile": build, "simulate": simulate},
                 "num_dpus": dpus,
                 "num_tasklets": tasklets,

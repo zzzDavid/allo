@@ -1,0 +1,34 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Source distribution contents. The sdist must be able to rebuild the MLIR
+# bindings (mlir/ C++ sources) and must carry every non-Python file the
+# package reads at runtime (see PACKAGE_DATA in setup.py).
+
+include README.md LICENSE requirements.txt pyproject.toml setup.py MANIFEST.in
+
+# MLIR dialect + Python-binding sources built by setup.py's CMakeBuild.
+graft mlir
+prune mlir/build
+
+# Runtime assets inside the package.
+recursive-include allo/ir/template *.mlir
+include allo/autoscheduler/outline_loops.mlir
+recursive-include allo/harness *
+recursive-include allo/library/aie/kernels *.cc
+recursive-include allo/library/aie/modules *.py
+include allo/backend/aie/README.md
+recursive-include allo/pim/templates *
+
+# allo/_mlir is a symlink into the local CMake build (mlir/build); the sdist
+# rebuilds it instead of shipping a partial copy of one developer's build.
+prune allo/_mlir
+
+# Repository trees that are not part of the installed package.
+prune tests
+prune examples
+prune benchmarks
+prune tutorials
+prune playground
+
+global-exclude __pycache__ *.py[cod] *.so *.so.* *.o *.a *.lock

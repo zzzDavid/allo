@@ -23,6 +23,28 @@ If you encounter any problems, please feel free to open an [issue](https://githu
 **IMPORTANT:** If you are using a coding agent for our codebase, please import [AGENTS.md](AGENTS.md).
 
 
+## Tenon: PIM extensions
+
+This fork adds **Tenon**, a description language and compiler for
+processing-in-memory (PIM) accelerators, built on Allo's frontend and MLIR
+infrastructure (`allo/spmw_*.py`, `allo/pim/`, `allo/perf/`). One workload,
+a target description and an executable cost program are compiled through
+`allo.compile(workload, target, cost)` for Samsung HBM-PIM, SK hynix AiM,
+UPMEM, and GSI APU v1/v2 (Gemini-I/II), with the compiler choosing placement
+and layout by cost. `backend="virtual"` evaluates the cost program without a
+simulator or device.
+
+* Installation, backend discovery variables and test instructions:
+  [docs/release/INSTALL.md](docs/release/INSTALL.md)
+* What each backend supports (input kinds, analytical/simulator/hardware
+  modes, numerical and performance scope, evidence status):
+  [docs/release/CAPABILITIES.md](docs/release/CAPABILITIES.md)
+* External simulators and vendor SDKs (sources, revisions, licenses):
+  [docs/release/simulators.md](docs/release/simulators.md)
+
+Tenon is installed exactly like Allo (MLIR bindings built from source); the
+upstream Allo features and documentation are unchanged.
+
 ## Publications
 Please refer to our [PLDI'24 paper](https://dl.acm.org/doi/10.1145/3656401) for more details. If you use Allo in your research, please cite our paper:
 > Hongzheng Chen, Niansong Zhang, Shaojie Xiang, Zhichen Zeng, Mengjia Dai, and Zhiru Zhang, "**Allo: A Programming Model for Composable Accelerator Design**", Proc. ACM Program. Lang. 8, PLDI, Article 171 (June 2024), 2024.

@@ -24,6 +24,7 @@ from .spmw_codegen import (
     Compiled,
 )
 from .spmw_simenv import aim_root as _aim_root
+from .spmw_simenv import aim_sim_image as _aim_sim_image
 from .spmw_simenv import aim_unavailable_reason as _aim_unavailable_reason
 from .pim.aim_lowering import (
     AimAllBankWrite,
@@ -1202,7 +1203,9 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
 
     `compiled.cmds` is a list of already-terminated text trace lines. We
     serialize those exact candidate-owned segments and invoke the ramulator2
-    binary inside the `aim-simulator-build` Docker image. The simulator's
+    binary inside the `aim-simulator-build` Docker image (`TENON_AIM_SIM_IMAGE`).
+    Each trace is written to a private temp directory mounted read-only at
+    `/trace`, so the simulator checkout is never written. The simulator's
     YAML stdout carries per-channel `memory_system_cycles`; we parse
     out the max across channels as the headline cycle count.
 
@@ -1219,35 +1222,34 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
 
     cfg_rel = yaml_cfg.relative_to(root)
 
+    image = _aim_sim_image()
+
     def run_segment(lines: list[str]) -> tuple[int, str, int]:
-        with tempfile.NamedTemporaryFile(
-            mode="w", delete=False, suffix=".trace", dir=str(root / "test")
-        ) as tf:
-            for line in lines:
-                tf.write(str(line) + "\n")
-            trace_path = Path(tf.name)
-        trace_rel = trace_path.relative_to(root)
-        try:
-            proc = subprocess.run(
-                [
-                    "docker",
-                    "run",
-                    "--rm",
-                    "-v",
-                    f"{root}:/work",
-                    "aim-simulator-build",
-                    "bash",
-                    "-c",
-                    f"cd /work && ./build/ramulator2 -f {cfg_rel} -t {trace_rel}",
-                ],
-                capture_output=True,
-                timeout=600,
-                check=False,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(f"AiM ramulator2 invocation failed: {exc}") from exc
-        finally:
-            trace_path.unlink(missing_ok=True)
+        with tempfile.TemporaryDirectory(prefix="tenon-aim-") as trace_dir:
+            trace_path = Path(trace_dir) / "segment.trace"
+            trace_path.write_text("".join(str(line) + "\n" for line in lines))
+            try:
+                proc = subprocess.run(
+                    [
+                        "docker",
+                        "run",
+                        "--rm",
+                        "-v",
+                        f"{root}:/work",
+                        "-v",
+                        f"{trace_dir}:/trace:ro",
+                        image,
+                        "bash",
+                        "-c",
+                        f"cd /work && ./build/ramulator2 -f {cfg_rel} "
+                        f"-t /trace/{trace_path.name}",
+                    ],
+                    capture_output=True,
+                    timeout=600,
+                    check=False,
+                )
+            except (subprocess.SubprocessError, OSError) as exc:
+                raise RuntimeError(f"AiM ramulator2 invocation failed: {exc}") from exc
         stdout = proc.stdout.decode("utf-8", errors="replace")
         stderr = proc.stderr.decode("utf-8", errors="replace")
         combined = stdout + ("\n" + stderr if stderr else "")

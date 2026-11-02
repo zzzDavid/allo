@@ -94,3 +94,8 @@ sg_execution_times.rst
 tests/xlscc_tests/**/test.cpp
 tests/xlscc_tests/**/test_block.cpp
 tests/xlscc_tests/**/test
+
+# Tenon: runtime lock files (the former tests/pim/.apu_v1.lock) and packaging
+# outputs
+*.lock
+dist/

@@ -24,6 +24,7 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
+from .. import spmw_simenv
 from ..spmw_codegen import RunResult
 from ..spmw_fingerprint import bytes_digest, canonical_json
 
@@ -32,13 +33,6 @@ _SHAPE = (4, 65536)
 _TEMPLATE = Path(__file__).resolve().parent / "templates" / "apu_g2"
 _KEEP_ENV = "TENON_APU_G2_KEEP_TMP"
 _BUILD_JOBS_ENV = "TENON_APU_G2_BUILD_JOBS"
-
-_REQUIRED_SDK_PATHS = (
-    Path("/opt/gsi/include/64vl/g2_64vl/g2_64vl_types.h"),
-    Path("/opt/gsi/g2/vector_core/lib/libg2_64vl.a"),
-    Path("/opt/gsi/g2/vector_core/bin/g2_md_update.py"),
-    Path("/opt/gsi/lib/libg2_device_core.a"),
-)
 
 _TICK_FIELDS = {
     "input_copy": "device_input_copy_ticks",
@@ -182,14 +176,29 @@ def _source_snapshot() -> tuple[dict[str, str], dict[str, str]]:
 def _require_hardware_stack() -> str:
     if not _TEMPLATE.is_dir():
         raise RuntimeError(f"APUg2 project template is missing: {_TEMPLATE}")
-    missing = [str(path) for path in _REQUIRED_SDK_PATHS if not path.is_file()]
+    unsupported = spmw_simenv.apu_g2_unsupported_override_reason()
+    if unsupported is not None:
+        raise RuntimeError(unsupported)
+    missing = [
+        str(path)
+        for path in spmw_simenv.apu_g2_required_sdk_paths()
+        if not path.is_file()
+    ]
     if missing:
-        raise RuntimeError("APUg2 SDK is incomplete; missing: " + ", ".join(missing))
-    tool = shutil.which("gsi_tool")
+        raise RuntimeError(
+            "APUg2 SDK is incomplete; missing: "
+            + ", ".join(missing)
+            + " (set TENON_APU_G2_SDK_ROOT)"
+        )
+    tool = spmw_simenv.apu_g2_gsi_tool()
     if tool is None:
-        raise RuntimeError("gsi_tool is unavailable; cannot verify real-card ownership")
+        raise RuntimeError(
+            "gsi_tool is unavailable; cannot verify real-card ownership "
+            "(put gsi_tool on PATH or set TENON_APU_G2_GSI_TOOL)"
+        )
+    device = spmw_simenv.apu_g2_device()
     status = subprocess.run(
-        [tool, "info", "apu-00", "-v"],
+        [tool, "info", device, "-v"],
         capture_output=True,
         text=True,
         timeout=15,
@@ -198,17 +207,17 @@ def _require_hardware_stack() -> str:
     text = status.stdout + status.stderr
     if status.returncode:
         raise RuntimeError(
-            f"cannot inspect apu-00 ({status.returncode}):\n{text[-3000:]}"
+            f"cannot inspect {device} ({status.returncode}):\n{text[-3000:]}"
         )
     match = re.search(r"^Status\s*:\s*(.+?)\s*$", text, re.MULTILINE)
     if match is None or match.group(1) != "Available":
         observed = "unknown" if match is None else match.group(1)
         raise RuntimeError(
-            f"apu-00 is not available (status={observed}); another process may own it"
+            f"{device} is not available (status={observed}); another process may own it"
         )
     core = re.search(r"^Core 0 is (.+?)\s*$", text, re.MULTILINE)
     if core is not None and core.group(1) != "idle":
-        raise RuntimeError(f"apu-00 core 0 is not idle ({core.group(1)})")
+        raise RuntimeError(f"{device} core 0 is not idle ({core.group(1)})")
     return text
 
 
