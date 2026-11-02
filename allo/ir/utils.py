@@ -4,6 +4,7 @@
 
 import ast
 import inspect
+import types
 import textwrap
 from collections.abc import Callable
 from types import FunctionType as PyFunctionType
@@ -28,9 +29,36 @@ from .types import AlloType, Int, UInt, Fixed, UFixed, Index, Float
 from .symbol_resolver import ASTResolver
 
 
+def _code_encloses(outer_code, inner_code) -> bool:
+    """True when ``inner_code`` is defined, directly or through nested
+    functions/classes, inside ``outer_code``."""
+    stack = [outer_code]
+    seen = set()
+    while stack:
+        code = stack.pop()
+        if code in seen:
+            continue
+        seen.add(code)
+        for const in code.co_consts:
+            if isinstance(const, types.CodeType):
+                if const is inner_code:
+                    return True
+                stack.append(const)
+    return False
+
+
 def _get_global_vars(_func, skip: set[str] = None, stop: set[str] = None):
     """
-    Collect global variables from the call stack of a Python function.
+    Collect the names a Python function's annotations and body may refer to.
+
+    Resolution follows Python scoping: the function's module globals, then
+    the locals of the call-stack frames whose code *lexically encloses* the
+    function definition (its enclosing functions, when they are still
+    executing), with the nearest enclosing frame taking precedence, then the
+    function's closure cells. Frames that do not enclose the definition
+    (callers, test harnesses, library internals) contribute nothing, so an
+    unrelated variable in the calling script cannot silently redefine a shape
+    or type name.
 
     Args:
         skip: Set of frame names to skip over when walking the call stack.
@@ -43,32 +71,43 @@ def _get_global_vars(_func, skip: set[str] = None, stop: set[str] = None):
         skip = {"get_global_vars", "customize", "build"}
     if stop is None:
         stop = {"<module>"}
+    target = None
+    code = None
     if isinstance(_func, Callable):
+        # Decorated functions (``@df.kernel``, ``@df.region``) hand in a
+        # functools.wraps wrapper; the user's function is the one whose scope
+        # matters.
+        target = inspect.unwrap(_func)
         # Discussions: https://github.com/taichi-dev/taichi/issues/282
-        global_vars = _func.__globals__.copy()
+        global_vars = getattr(target, "__globals__", {}).copy()
+        code = getattr(target, "__code__", None)
     else:
         global_vars = {}
 
-    # Get back to outer scopes
-    # Mainly used to get the annotation definitions (shape and type),
-    # which are probably not defined in __globals__
+    # Enclosing-scope locals. Mainly used to get the annotation definitions
+    # (shape and type), which are probably not defined in __globals__. Only
+    # frames whose code encloses the function's definition are consulted; a
+    # non-callable source (string) has no definition, so every frame counts.
+    frame_vars = {}
     frame = inspect.currentframe().f_back
     while frame:
         if frame.f_code.co_name in skip:
             frame = frame.f_back
             continue
-        # collect allowed types
-        for name, var in frame.f_locals.items():
-            if isinstance(var, (int, float, AlloType)) or inspect.isfunction(var):
-                global_vars[name] = var
+        if code is None or _code_encloses(frame.f_code, code):
+            # collect allowed types; the nearest enclosing frame wins
+            for name, var in frame.f_locals.items():
+                if isinstance(var, (int, float, AlloType)) or inspect.isfunction(var):
+                    frame_vars.setdefault(name, var)
         # boundary
         if frame.f_code.co_name in stop:
             break
         frame = frame.f_back
+    global_vars.update(frame_vars)
 
-    if isinstance(_func, Callable):
-        freevar_names = _func.__code__.co_freevars
-        closure = _func.__closure__
+    if target is not None and getattr(target, "__code__", None) is not None:
+        freevar_names = target.__code__.co_freevars
+        closure = target.__closure__
         if closure:
             freevar_values = [x.cell_contents for x in closure]
             for name, value in zip(freevar_names, freevar_values):
