@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -304,9 +305,7 @@ def test_no_user_home_literals_in_the_package():
         if "_mlir" in path.parts:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        # allo/pim/costs/upmem.py still cites a private generator path in a
-        # comment (audit P-14); that is provenance text, not a runtime path.
-        if "/home/nz264" in text:
+        if "/home/nz264" in text or "/work/shared/users" in text:
             offenders.append(path.relative_to(REPO).as_posix())
     assert not offenders, offenders
 
@@ -320,3 +319,46 @@ def test_paper_golden_artifacts_default_comes_from_simenv(monkeypatch, tmp_path)
     assert spmw_simenv.tenon_artifacts_root() == (
         Path(os.path.expanduser("~")) / "shared" / "tenon-artifacts"
     )
+
+
+def test_install_requires_is_the_runtime_list_only():
+    """P-13: dev tooling and direct-URL wheels stay out of install_requires."""
+    import runpy
+
+    setup = runpy.run_path(str(REPO / "setup.py"), run_name="allo_setup")
+    runtime = setup["parse_requirements"](str(REPO / "requirements.txt"))
+    names = {re.split(r"[<>=@ ]", line)[0].lower() for line in runtime}
+    assert not names & {"pytest", "black", "pylint", "clang-format", "gurobipy", "past"}
+    assert {"numpy", "sympy", "ml_dtypes", "pyyaml"} <= names
+    dev = (REPO / "requirements-dev.txt").read_text().splitlines()
+    assert "-r requirements.txt" in dev
+    with pytest.raises(RuntimeError, match="requirements-dev.txt"):
+        setup["parse_requirements"](str(REPO / "requirements-dev.txt"))
+
+
+def test_old_cmake_error_names_the_pip_fix(monkeypatch):
+    """P-20: a system cmake older than 3.20 fails with the pip install hint."""
+    import runpy
+
+    setup = runpy.run_path(str(REPO / "setup.py"), run_name="allo_setup")
+    monkeypatch.setattr(
+        subprocess, "check_output", lambda *args, **kwargs: "cmake version 3.16.3\n"
+    )
+    command = setup["CMakeBuild"].__new__(setup["CMakeBuild"])
+    command.extensions = []
+    with pytest.raises(RuntimeError, match="pip install cmake"):
+        command.run()
+
+
+def test_upmem_calibration_table_regenerates():
+    """P-14: the committed regenerator reproduces PHYSICAL_CALIBRATION_FACTORS."""
+    import runpy
+
+    from allo.pim.costs import upmem as upmem_costs
+
+    script = runpy.run_path(
+        str(REPO / "scripts" / "regenerate_upmem_calibration.py"), run_name="regen"
+    )
+    table = script["factors"]()
+    assert table == upmem_costs.PHYSICAL_CALIBRATION_FACTORS
+    assert list(table) == list(upmem_costs.PHYSICAL_CALIBRATION_FACTORS)

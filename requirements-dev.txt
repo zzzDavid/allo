@@ -1,0 +1,28 @@
+# Development, test and optional-feature dependencies. The installed package
+# needs only requirements.txt (setup.py reads that file for install_requires).
+-r requirements.txt
+
+# Building the MLIR bindings without build isolation (pyproject.toml lists the
+# same tools for isolated builds).
+cmake>=3.20
+ninja
+nanobind>=2.9,<3.0
+pybind11>=2.8.0
+
+# Tests and lint (scripts/lint/task_lint.sh).
+pytest
+clang-format
+black==24.8.0
+pylint==3.0.2
+
+# Optional features of upstream Allo, imported only when used:
+# gurobipy (commercial solver client) by allo/autoscheduler/dfg.py;
+# past (PAST verifier, cp312 Linux wheel) by allo/verify.py.
+gurobipy
+past @ https://github.com/cornell-zhang/past-python-bindings/releases/download/65f989b/past-0.7.2-cp312-cp312-linux_x86_64.whl
+
+# Debug/analysis helpers carried over from upstream's former install list.
+astpretty
+matplotlib
+packaging
+psutil

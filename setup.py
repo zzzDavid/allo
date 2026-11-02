@@ -181,9 +181,21 @@ class CMakeBuild(build_ext):
 
 
 def parse_requirements(filename):
-    """Load requirements from a pip requirements file."""
+    """Load requirements from a pip requirements file.
+
+    Only the runtime list (requirements.txt) is read; development, test and
+    optional-feature tools live in requirements-dev.txt, which pip options
+    such as ``-r`` or direct URLs make unsuitable for install_requires.
+    """
     lineiter = (line.strip() for line in open(filename))
-    return [line for line in lineiter if line and not line.startswith("#")]
+    requirements = [line for line in lineiter if line and not line.startswith("#")]
+    for line in requirements:
+        if line.startswith("-") or " @ " in line:
+            raise RuntimeError(
+                f"{filename}: '{line}' is not a plain requirement; keep pip "
+                "options and direct URLs in requirements-dev.txt"
+            )
+    return requirements
 
 
 if __name__ == "__main__":

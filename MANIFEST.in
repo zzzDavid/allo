@@ -5,7 +5,7 @@
 # bindings (mlir/ C++ sources) and must carry every non-Python file the
 # package reads at runtime (see PACKAGE_DATA in setup.py).
 
-include README.md LICENSE requirements.txt pyproject.toml setup.py MANIFEST.in
+include README.md LICENSE requirements.txt requirements-dev.txt pyproject.toml setup.py MANIFEST.in
 
 # MLIR dialect + Python-binding sources built by setup.py's CMakeBuild.
 graft mlir
