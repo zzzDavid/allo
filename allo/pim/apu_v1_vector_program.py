@@ -226,10 +226,12 @@ def _select_plan(candidates, ranked, layout):
         raise TypeError("APU v1 vector layout must be an APUV1Plan, plan name, or None")
     if ranked:
         return ranked[0].plan
-    # A cost program is optional for functional development.  In that case the
-    # most capable MICRO recipe is the deterministic default, not a pretend
-    # analytical ranking.
-    return candidates[-1].plan
+    raise ValueError(
+        "APU v1 vector plans are selected by cost ranking; pass an executable "
+        "cost program (e.g. allo.pim.costs.apu_v1_cost) or choose a plan with "
+        "layout=<name>; candidates: "
+        + ", ".join(candidate.name for candidate in candidates)
+    )
 
 
 def _numpy_dtype(dtype: str):
@@ -492,25 +494,7 @@ class APUv1VectorCallable:
             self.realization, self.realization_error = _realize(
                 self.analysis, self.selected_plan
             )
-            if layout is None and self.realization is None:
-                # A cost-free compile retains the historical deterministic
-                # candidate fallback when its default cannot be realized.
-                seen = {_apu_v1_plan_decision(self.selected_plan)}
-                failures = [f"{self.selected_plan.name}: {self.realization_error}"]
-                for candidate_plan in self.plans:
-                    decision = _apu_v1_plan_decision(candidate_plan)
-                    if decision in seen:
-                        continue
-                    seen.add(decision)
-                    realization, error = _realize(self.analysis, candidate_plan)
-                    if realization is not None:
-                        self.selected_plan = candidate_plan
-                        self.realization = realization
-                        self.realization_error = None
-                        break
-                    failures.append(f"{candidate_plan.name}: {error}")
-                else:
-                    self.realization_error = "; ".join(failures)
+        self.plan_selection = "cost_ranked" if layout is None else "explicit_layout"
         self.backend = "device" if backend is None else str(backend)
         if self.backend not in _FUNCTIONAL_BACKENDS | {"device"}:
             raise ValueError(
@@ -582,6 +566,10 @@ class APUv1VectorCallable:
                     f"APU v1 vector operand {name!r} must be a NumPy array, "
                     f"got {type(value).__name__}"
                 )
+        if self.realization is not None:
+            # Same contract as the device route: a plan without output ingress
+            # rejects a nonzero initial output instead of diverging from it.
+            self.realization.check_initial_outputs(arguments)
         # ``allo.reduction(1-D)`` is represented by ``np.ndindex`` when an
         # Allo DSL function is executed directly, so its induction variable is
         # a one-element tuple.  NumPy currently accepts that scalar-shaped
@@ -614,6 +602,7 @@ class APUv1VectorCallable:
             extra={
                 "outputs": outputs,
                 "plan": self.selected_plan.name,
+                "plan_selection": self.plan_selection,
                 "analytical": self.selected_estimate is not None,
                 "functional": True,
             },

@@ -9,7 +9,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 from pathlib import Path
 
 from .spmw_target import MemoryRef, Register
@@ -210,62 +209,80 @@ def _apu_v1_kernel_src(compiled: "Compiled") -> str:
     return "\n".join(str(c) for c in compiled.cmds if isinstance(c, str))
 
 
-def _parse_apu_v1_prof_print(text: str) -> int | None:
-    """Return the four-APUC parallel makespan from ``total`` PROF_PRINTs.
+_APU_V1_MATCHER_APUCS = 4
 
-    Hardware emits fields with a colon separator, e.g.
-    `ARCT[0]: ***  total - hits:1 seu:374 crun:170227 iall:37027 ...`.
-    ``ledag flo`` can include older buffered records, so only the final four
-    totals belong to the batch just launched. Those APUCs run concurrently;
-    their cost is the maximum CRUN, not their sum. Accept `=` as well for
-    forward compatibility. Returns None if no match.
+
+def _parse_apu_v1_prof_print(text: str) -> int:
+    """Return the four-APUC parallel makespan from the ``total`` records in
+    ``text``, which must hold exactly the records this launch appended (one
+    per APUC; see :func:`allo.pim.apu_v1_program.fresh_profile_records`).
+    The APUCs run concurrently, so the cost is their maximum CRUN.
     """
-    totals = re.findall(r"\btotal\b[^\n]*?\bcrun\s*[:=]\s*(\d+)", text)
-    if totals:
-        return max(int(value) for value in totals[-4:])
-    counters = re.findall(r"\bcrun\s*[:=]\s*(\d+)", text)
-    if counters:
-        return max(int(value) for value in counters[-4:])
-    return None
+    from .pim.apu_v1_program import parse_fresh_profile
+
+    return max(parse_fresh_profile("", text, _APU_V1_MATCHER_APUCS))
+
+
+_FLOAT_MEMREF_DTYPES = {"f16": "float16", "f32": "float32", "f64": "float64"}
+
+
+def _memref_shape_dtype(memref_type):
+    match = re.fullmatch(r"memref<((?:\d+x)*)([a-z]\w*)>", str(memref_type or ""))
+    if match is None:
+        return None
+    dims = tuple(int(item) for item in match.group(1).split("x") if item)
+    return dims, match.group(2)
 
 
 def _apu_v1_output_specs(compiled: "Compiled", inputs: dict) -> dict:
-    """Derive `output_specs: {role: (shape, dtype)}` from the trace.
+    """Derive `output_specs: {role: (shape, dtype)}` from the compiled ABI.
 
     This is the fallback for non-grouped operations. Grouped contractions use
     `_apu_v1_prepare_io`, which knows the logical output shape and FP16 ABI.
+    Each output role is a matched result memref. Its shape and dtype come
+    from the caller's in-place array of that name or, for a float memref,
+    from the retained memref type; anything else raises rather than guessing.
     """
     import numpy as np
 
     out: dict = {}
     trace = getattr(compiled, "trace", None)
     if trace is None:
-        return out
+        raise NotImplementedError(
+            "APU v1 matcher route: compiled artifact has no match trace, so its "
+            "output ABI cannot be derived"
+        )
 
-    # Determine a fallback shape from the largest input.
-    fallback_shape: tuple = ()
-    fallback_size = -1
-    for arr in inputs.values():
-        sz = getattr(arr, "size", 0)
-        if sz > fallback_size:
-            fallback_size = sz
-            fallback_shape = tuple(getattr(arr, "shape", ()))
+    def _strip(name):
+        return name[len("local_") :] if name and name.startswith("local_") else name
+
+    memref_types = {}
+    for match in trace.matches:
+        for operand in match.operands:
+            name = _strip(operand.memref_name)
+            if name and operand.memref_type:
+                memref_types.setdefault(name, operand.memref_type)
 
     for m in trace.matches:
-        name = m.result_memref_name
-        if name and name.startswith("local_"):
-            name = name[len("local_") :]
+        name = _strip(m.result_memref_name)
         if not name or name in out:
             continue
-        # Prefer shape/dtype from an input that happens to share the name.
         if name in inputs and hasattr(inputs[name], "shape"):
             out[name] = (tuple(inputs[name].shape), inputs[name].dtype)
-        else:
-            # APU v1 output: derive from the first input as a 1D vector
-            # of the same element count (the GEMV `acc` is M-shaped, but
-            # the declarative trace doesn't pin that; the user can
-            # override via `output_specs` once exposed).
-            out[name] = (fallback_shape or (1,), np.dtype("uint16"))
+            continue
+        parsed = _memref_shape_dtype(memref_types.get(name))
+        if parsed is not None and parsed[1] in _FLOAT_MEMREF_DTYPES:
+            out[name] = (parsed[0], np.dtype(_FLOAT_MEMREF_DTYPES[parsed[1]]))
+            continue
+        raise NotImplementedError(
+            f"APU v1 matcher route cannot derive the shape/dtype of output "
+            f"{name!r} from the compiled ABI (memref type "
+            f"{memref_types.get(name)!r}); pass it as an in-place array argument"
+        )
+    if not out:
+        raise NotImplementedError(
+            "APU v1 matcher route: the match trace names no output memref"
+        )
     return out
 
 
@@ -396,15 +413,17 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
     its PROF_PRINT stdout. Raises `SimulatorUnavailable` when an
     environment gate (toolchain, template dir, PCI sysfs node, GVML SDK
     headers) is missing. Build failures past the gate raise
-    `RuntimeError` so tests cannot silently PASS; a missing
-    PROF_PRINT 'total crun=' line, however, yields `cycles=None` rather
-    than raising -- the device program ran (or tried to) but produced
-    no profile output, which is observable through the returned
-    RunResult.stdout. See spec 017 and SPEC-001 §3.5.
+    `RuntimeError` so tests cannot silently PASS. The launch holds the
+    APU v1 board lock and drains the device log before and after it; exactly
+    one fresh `total` record per APUC is required, and a missing, stale, or
+    ambiguous profile raises. Missing or short output files raise with the
+    role name.
     """
     kernel_src = _apu_v1_kernel_src(compiled)
 
-    skip_reason = _apu_v1_unavailable_reason()
+    from .pim.apu_v1_program import _ledag_available_reason
+
+    skip_reason = _apu_v1_unavailable_reason() or _ledag_available_reason()
     if skip_reason:
         raise SimulatorUnavailable("apu_v1", skip_reason)
 
@@ -489,80 +508,31 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
         argv += [input_bin_paths[r] for r in sorted_in]
         argv += [output_bin_paths[r] for r in sorted_out]
 
-        try:
-            proc = subprocess.run(
-                argv,
-                cwd=str(project_dir),
-                capture_output=True,
-                timeout=300,
-                check=False,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(
-                f"APU v1 binary invocation failed: {exc}\n"
-                f"--- project_dir: {project_dir}"
-            ) from exc
-
-        stdout_text = proc.stdout.decode("utf-8", errors="replace")
-        stderr_text = proc.stderr.decode("utf-8", errors="replace")
-        binary_output = stdout_text + ("\n" + stderr_text if stderr_text else "")
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"APU v1 device program failed with exit code {proc.returncode}:\n"
-                f"{binary_output[-2000:]}\n--- project_dir: {project_dir}"
-            )
-
-        # PROF_PRINT lines go to the device system log (the ledag
-        # channel), not to the binary's stdout. Drain that channel via
-        # `ledag-ssh flo` and concatenate the printable bytes so the
-        # `crun` parse below has something to match against. The ARC
-        # binary may need a moment to flush its PROF_END(total) entry
-        # to the device log after returncode is delivered to us, hence
-        # the brief sleep. Skill: see "Pattern B: scripted capture".
-        ledag_text = ""
-        if shutil.which("ledag-ssh") is not None:
-            time.sleep(0.5)
-            try:
-                ledag_proc = subprocess.run(
-                    ["ledag-ssh", "-o", "localhost"],
-                    input=b"flo\nquit\n",
-                    capture_output=True,
-                    timeout=30,
-                    check=False,
-                )
-                ledag_raw = ledag_proc.stdout or b""
-                # `| strings` equivalent: keep printable ASCII plus tab
-                # / newline / CR; the ledag wire format is otherwise
-                # binary-framed and decodes to mojibake.
-                ledag_text = "".join(
-                    chr(b) for b in ledag_raw if 32 <= b < 127 or b in (9, 10, 13)
-                )
-            except (subprocess.SubprocessError, OSError):
-                # ledag-ssh available but failed (timeout, device busy,
-                # auth) -- treat the same as missing-on-PATH: degrade
-                # to cycles=None rather than crash the run path.
-                ledag_text = ""
-
-        combined = binary_output + ("\n" + ledag_text if ledag_text else "")
-        cycles = _parse_apu_v1_prof_print(combined)
-        # A missing PROF_PRINT 'total crun=' line is *not* a build-harness
-        # bug: it means the device program ran (or attempted to) but
-        # produced no PROF_PRINT output -- typically because the GSI PCI
-        # device is absent, gated off, or returned an error before our
-        # PROF_END(total), or because `ledag-ssh` is not available on
-        # this host. Surface this as cycles=None so callers (and the
-        # cross-backend `test_run_returns_runresult_for_all_backends`
-        # contract) still receive a RunResult; build failures above
-        # already raise RuntimeError before we reach here.
-
-        # Read outputs back.
         import numpy as np
+
+        from .pim.apu_v1_program import (
+            apu_v1_lock_path,
+            launch_on_board,
+            read_output_image,
+        )
+
+        # The board lock is held across launch and the pre/post device-log
+        # drains, so the parsed totals belong to this launch only.
+        binary_output, ledag_text, apuc_cycles = launch_on_board(
+            argv,
+            str(project_dir),
+            expected_records=_APU_V1_MATCHER_APUCS,
+            timeout=300,
+            attempts=1,
+        )
+        combined = binary_output + ("\n" + ledag_text if ledag_text else "")
+        cycles = max(apuc_cycles)
 
         outputs: dict = {}
         for role, (shape, dtype) in output_specs.items():
-            p = Path(output_bin_paths[role])
-            if p.exists():
-                outputs[role] = np.fromfile(str(p), dtype=dtype).reshape(shape)
+            outputs[role] = read_output_image(
+                output_bin_paths[role], role, dtype, shape
+            )
 
         if packing and packing["kind"] == "gemm":
             packed = outputs[packing["output"]]
@@ -593,7 +563,9 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
                 "kernel_src": kernel_src,
                 "build_mode": build_config.mode,
                 "project_dir": str(project_dir),
-                "returncode": proc.returncode,
+                "returncode": 0,
+                "board_lock": str(apu_v1_lock_path()),
+                "profile_records": _APU_V1_MATCHER_APUCS,
             },
         )
     finally:

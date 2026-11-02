@@ -2324,6 +2324,53 @@ class APUVectorRealization:
         return artifact
 
     @property
+    def carries_output_ingress(self) -> bool:
+        """Whether the device program accumulates onto the incoming output.
+
+        Temporal plans load each output tile from L4 before the reduction, so
+        a carried (nonzero) initial output is accumulated exactly once the
+        host transfers its packed image.  Spatial group-reduction plans reset
+        the output VR and scatter group heads, so they cannot carry one.
+        """
+
+        if isinstance(self.physical_emission, SpatialResidentReductionEmission):
+            return False
+        if self._spatial_scatter_elements() is not None:
+            return False
+        output_names = {
+            value.name for value in self.values if value.intent in {"out", "inout"}
+        }
+        return any(
+            isinstance(argument, (PointerRef, PointerOffsetRef))
+            and argument.name in output_names
+            for instruction in self.instructions
+            if instruction.phase == "transfer_in"
+            for argument in instruction.args
+        )
+
+    def check_initial_outputs(self, arrays) -> None:
+        """Reject a nonzero initial output this plan cannot accumulate onto.
+
+        Every route (device, functional, virtual) calls this, so a plan that
+        resets its output never silently returns ``A@B`` for ``C0 + A@B``.
+        """
+
+        if self.carries_output_ingress:
+            return
+        for value in self.values:
+            if value.intent not in {"out", "inout"} or value.name not in arrays:
+                continue
+            if np.any(np.asarray(arrays[value.name]) != 0):
+                plan = getattr(self.plan, "name", "selected plan")
+                raise ValueError(
+                    f"APU v1 plan {plan!r} resets output {value.name!r} on the "
+                    "device (spatial group reduction has no output ingress), so "
+                    "a nonzero initial value cannot be accumulated; pass a "
+                    "zero-initialized output or select a temporal plan with "
+                    "layout="
+                )
+
+    @property
     def binding_map(self) -> dict[str, VRBinding]:
         return {binding.logical_name: binding for binding in self.vr_bindings}
 

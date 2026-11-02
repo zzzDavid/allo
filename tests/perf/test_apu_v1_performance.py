@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """APU v1 target, group layout, codegen, and calibrated-cost tests."""
 
+import pytest
+
 from allo.pim.targets import build_apu_v1_target
 from allo.spmw_apu_v1 import APUv1Ctx, _parse_apu_v1_prof_print
 
@@ -29,14 +31,19 @@ def test_codegen_uses_native_f16_group_operations():
     ]
 
 
-def test_profile_parser_uses_latest_parallel_batch_makespan():
-    text = "\n".join(
-        [
-            "ARCT[0]: total - crun:3609445",
-            "ARCT[0]: total - crun:628100",
-            "ARCT[1]: total - crun:628182",
-            "ARCT[2]: total - crun:625945",
-            "ARCT[3]: total - crun:626624",
-        ]
-    )
-    assert _parse_apu_v1_prof_print(text) == 628182
+def test_profile_parser_requires_one_fresh_total_per_apuc():
+    fresh = [
+        "ARCT[0]: total - hits:1 crun:628100",
+        "ARCT[1]: total - hits:1 crun:628182",
+        "ARCT[2]: total - hits:1 crun:625945",
+        "ARCT[3]: total - hits:1 crun:626624",
+    ]
+    assert _parse_apu_v1_prof_print("\n".join(fresh)) == 628182
+
+    # A buffered record from an earlier launch makes the drain ambiguous.
+    with pytest.raises(RuntimeError, match="freshness check failed"):
+        _parse_apu_v1_prof_print("\n".join(["ARCT[0]: total - crun:3609445", *fresh]))
+    with pytest.raises(RuntimeError, match="expected 4 fresh"):
+        _parse_apu_v1_prof_print("\n".join(fresh[:3]))
+    with pytest.raises(RuntimeError, match="not one fresh measurement"):
+        _parse_apu_v1_prof_print("\n".join([*fresh[:3], "total - hits:2 crun:5"]))

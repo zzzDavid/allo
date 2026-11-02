@@ -16,11 +16,8 @@ apu_v1 cell is `BLOCKED-DEVICE`, never an `l1_sim`/`virtual`/analytical number.
 from __future__ import annotations
 
 import contextlib
-import pathlib
 
 import pytest
-
-_BOARD_LOCK = pathlib.Path(__file__).resolve().parent / ".apu_v1.lock"
 
 
 def pytest_configure(config):
@@ -93,20 +90,15 @@ def aim_sim_gate():
 
 @contextlib.contextmanager
 def board_lock():
-    """Serialize APU v1 board access across pytest workers (shared resource).
+    """Serialize APU v1 board access across pytest workers and ad hoc runs.
 
-    Uses an flock on `.apu_v1.lock`; a no-op fallback where flock is
-    unavailable. The lock lives in the suite's conftest, not in `spmw_*`."""
-    try:
-        import fcntl
-    except ImportError:  # non-POSIX: best-effort, no lock
+    Delegates to the production lock (`allo.pim.apu_v1_program.
+    apu_v1_board_lock`: one flock per PCI device node, overridable with
+    `TENON_APU_V1_LOCK`), which every device launch also takes; it is
+    reentrant within a process, so holding it around `compiled(...)` is safe."""
+    from allo.pim.apu_v1_program import apu_v1_board_lock
+
+    with apu_v1_board_lock():
         yield
-        return
-    with open(_BOARD_LOCK, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
 
 

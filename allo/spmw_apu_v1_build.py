@@ -422,17 +422,33 @@ def _emit_host_c(
     out_roles: list[str],
     input_byte_sizes: dict[str, int],
     output_byte_sizes: dict[str, int],
+    *,
+    initial_output_roles: tuple[str, ...] = (),
 ) -> str:
     """Emit a host.c that reads inputs from raw binary files, copies
     them to L4, runs the kernel, and writes outputs back to raw binary
-    files. Argv order is `<bin> <in_role0_path> ... <out_role0_path> ...`.
+    files. Argv order is `<bin> <in_role0_path> ... <out_role0_path> ...
+    <initial_role0_path> ...`.
+
+    Output roles listed in `initial_output_roles` are carried: their initial
+    L4 image is read from the trailing argv files (exact byte count) instead
+    of being zero filled, so a plan that accumulates onto its output sees the
+    caller's value.
     """
     all_roles = in_roles + out_roles
+    initial_output_roles = tuple(initial_output_roles)
+    unknown = set(initial_output_roles) - set(out_roles)
+    if unknown:
+        raise ValueError(f"initial output roles are not outputs: {sorted(unknown)}")
 
     # Argv parsing: argv[1..N] are file paths, in role order.
     argv_decls = []
     for i, role in enumerate(all_roles):
         argv_decls.append(f"    const char *path_{role} = argv[{i + 1}];")
+    for i, role in enumerate(initial_output_roles):
+        argv_decls.append(
+            f"    const char *path_init_{role} = argv[{len(all_roles) + i + 1}];"
+        )
 
     # Allocate one combined L4 buffer (mirrors the example-gvml stitched
     # layout). For each role, gdl_add_to_mem_handle chains from the
@@ -478,10 +494,31 @@ def _emit_host_c(
             f"        if (ret) goto CLEAN_UP;\n"
             f"    }}"
         )
-    # The matcher exposes a zero-initialized loop-carried accumulator. Ensure
-    # its backing L4 slice has the same semantics before LD_ACC reads it; this
-    # also makes padding lanes deterministic on readback.
+    for role in initial_output_roles:
+        copy_to_dev_lines.append(
+            f"    {{\n"
+            f'        FILE *f = fopen(path_init_{role}, "rb");\n'
+            f'        if (!f) {{ gsi_error("open %s\\n", path_init_{role}); '
+            f"ret = -1; goto CLEAN_UP; }}\n"
+            f"        void *buf = malloc(sz_{role});\n"
+            f"        size_t n = buf ? fread(buf, 1, sz_{role}, f) : 0;\n"
+            f"        int extra = fgetc(f);\n"
+            f"        fclose(f);\n"
+            f"        if (n != sz_{role} || extra != EOF) {{ free(buf); "
+            f'gsi_error("initial image size mismatch %s\\n", path_init_{role}); '
+            f"ret = -1; goto CLEAN_UP; }}\n"
+            f"        ret = gdl_mem_cpy_to_dev(base_cmd.data.mem_hndl_{role}, "
+            f"buf, sz_{role});\n"
+            f"        free(buf);\n"
+            f"        if (ret) goto CLEAN_UP;\n"
+            f"    }}"
+        )
+    # Other outputs are written before they are read (or are zero-initialized
+    # accumulators on the matcher route); zero fill keeps padding lanes
+    # deterministic on readback.
     for role in out_roles:
+        if role in initial_output_roles:
+            continue
         copy_to_dev_lines.append(
             f"    {{\n"
             f"        void *buf = calloc(1, sz_{role});\n"

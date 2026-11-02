@@ -2,45 +2,97 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exact GVML lowering for batched squared-distance argmin programs.
 
-This is a structural compiler route, not a benchmark implementation.  It
-recognizes the canonical retained-MLIR form of
+Supported semantics (proved structurally from the retained MLIR; see
+:mod:`apu_v1_native_vector`)::
 
-``labels[p] = argmin_c sum_d (points[p, d] - centers[c, d])**2``
+    for p in range(P):
+        best: uint16 = 0
+        for d in range(D):
+            best += (points[p, d] - centers[0, d]) ** 2      # via any temps
+        index: uint16 = 0
+        for k in range(1, K):
+            dist: uint16 = 0
+            for d in range(D):
+                dist += (points[p, d] - centers[k, d]) ** 2
+            if dist < best:          # strict; or `best > dist`
+                best = dist
+                index = k
+        labels[p] = index
 
-with strict first-index tie breaking.  One 32K point frontier maps directly to
-the APUv1 lanes.  The physical ABI transposes points to dimension-major order
-so each dimension is one VMR.
+all arithmetic modulo ``2**16`` with ``points: uint16[P, D]``,
+``centers: uint16[K, D]``, ``labels: uint16[P]`` (an output argument that is
+completely overwritten).  The difference may be written either way round and
+through scalar temporaries.  The comparison is the 16-bit signed (``slt``,
+Allo's lowering of ``uint16 <``) or unsigned (``ult``, after zero extension)
+order of the wrapped distances; the template reproduces either exactly.
+Roles are bound from the access pattern (which array is indexed by the point
+loop), not from argument order or names.
 
-The selected plan applies the ring identity
+Rejected with :class:`APUv1NativeRecipeMismatch` naming the difference: a
+nonzero initial distance or index, ``labels`` storing anything but the argmin
+index (e.g. the running minimum distance), a non-strict or reversed
+predicate, a candidate loop not starting at 1, any other distance term,
+extra stores, guarded label writes, non-16-bit locals, non-uint16 dtypes.
 
-``(p - c)^2 == p^2 + c^2 - 2*p*c (mod 2**16)``.
+Shape domain: ``P`` equals the VR lane count (one point per lane);
+``1 <= D <= VMR slots`` (one resident VMR per dimension, 48 on Gemini-I);
+``2 <= K <= 65535`` (uint16 labels); the 512-byte-padded center image fits in
+the per-APUC L3.
 
-It computes the point norm once and streams one candidate dot product through
-low-numbered VRs.  This plan has a larger primitive count than keeping every
-dot resident, but real APUv1 profiles show lower end-to-end CRUN because it
-avoids the resident plan's dependency/register-scheduling penalty.  Signed i16
-ordering is preserved exactly by flipping the sign bit before the unsigned
-GVML comparison.  Consequently the lowering does not depend on a
-benchmark-specific value bound; bounds are only needed when a caller wants to
-interpret the wrapped i16 program as mathematical squared L2.
+The physical ABI transposes points to dimension-major order so each dimension
+is one VMR.  The plan applies ``(p - c)^2 == p^2 + c^2 - 2*p*c (mod 2**16)``,
+computes the point norm once, and streams one candidate dot product through
+low-numbered VRs.  Signed i16 ordering is preserved by flipping the sign bit
+before the unsigned GVML comparison unless ``argument_bounds`` prove every
+distance below ``2**15`` (then signed and unsigned orders coincide).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-import re
 
 import numpy as np
 
+from .apu_v1_native_vector import (
+    APUv1NativeRecipeMismatch,
+    APUv1NativeTargetFacts,
+    E,
+    bind_abi,
+    compare_view,
+    describe,
+    effective_predicate,
+    loop_name,
+    predicate_text,
+    require_loop,
+    ring16,
+    summarize_native_function,
+)
 
-VR_LANES = 32768
+
+RECIPE = "squared_l2_argmin"
 MAX_CANDIDATES = 65535
+_MIRROR = {
+    "slt": "sgt",
+    "sgt": "slt",
+    "sle": "sge",
+    "sge": "sle",
+    "ult": "ugt",
+    "ugt": "ult",
+    "ule": "uge",
+    "uge": "ule",
+    "eq": "eq",
+    "ne": "ne",
+}
+
+
+def _mismatch(reason: str, stage: int = 2) -> APUv1NativeRecipeMismatch:
+    return APUv1NativeRecipeMismatch(RECIPE, reason, stage=stage)
 
 
 @dataclass(frozen=True)
 class APUv1SquaredL2ArgminAnalysis:
-    """A proven canonical squared-L2/strict-argmin loop nest."""
+    """A proven squared-L2/strict-argmin loop nest."""
 
     function: str
     points_role: str
@@ -77,6 +129,7 @@ class APUv1SquaredL2ArgminAnalysis:
             "dimensions": self.dimensions,
             "candidates": self.candidates,
             "comparison": self.comparison,
+            "tie_breaking": "first_minimum",
             "unsigned_order_proven": self.unsigned_order_proven,
             "maximum_squared_distance": self.maximum_squared_distance,
             "point_layout": "dimension_major_32k_vmr",
@@ -86,123 +139,308 @@ class APUv1SquaredL2ArgminAnalysis:
         }
 
 
-def _count_opcode(text: str, opcode: str) -> int:
-    return len(re.findall(rf"\b{re.escape(opcode)}\b", text))
+def _squared_difference(term, point_loop, dim_loop, center_index, formals):
+    """Return (points formal, centers formal) when ``term`` is the squared delta."""
+
+    if term.kind != "mul" or term.args[0] != term.args[1]:
+        return None
+    delta = term.args[0]
+    if delta.kind != "sub":
+        return None
+    point_indices = (("iv", point_loop), ("iv", dim_loop))
+    center_indices = (center_index, ("iv", dim_loop))
+    loads = delta.args
+    if any(item.kind != "load" or item.args[0] not in formals for item in loads):
+        return None
+    by_indices = {item.args[1]: item.args[0] for item in loads}
+    if set(by_indices) != {point_indices, center_indices}:
+        return None
+    return by_indices[point_indices], by_indices[center_indices]
 
 
-def _loop_count(text: str, lower: int, upper: int) -> int:
-    return len(
-        re.findall(
-            rf"\baffine\.for\s+%[-\w.$]+\s*=\s*{lower}\s+to\s+{upper}\b",
-            text,
-        )
-    )
+def _distance_reduction(summary, value, parents):
+    """Return (loop, local, term, init) when ``value`` is a summed reduction."""
+
+    if value.kind != "loopout":
+        return None
+    loop, local = value.args
+    loop_summary = summary.summaries.get(loop)
+    if loop_summary is None or tuple(loop_summary.parent_loops) != parents:
+        return None
+    if set(loop_summary.updates) != {local}:
+        return None
+    update = ring16(loop_summary.updates[local])
+    carry = E("carry", (local, loop), 16)
+    if update.kind != "add" or carry not in update.args:
+        return None
+    lhs, rhs = update.args
+    term = rhs if lhs == carry else lhs
+    return loop, local, term, ring16(loop_summary.init[local])
 
 
-# The recognizer deliberately rejects every structural mismatch independently.
-# pylint: disable=too-many-return-statements
+# The recognizer deliberately rejects every semantic mismatch independently.
+# pylint: disable=too-many-locals,too-many-branches,too-many-statements
 def analyze_apu_v1_squared_l2_argmin(
     source_mlir: str,
     arguments,
     *,
     function: str,
     argument_bounds=None,
-) -> APUv1SquaredL2ArgminAnalysis | None:
-    """Recognize the exact canonical Allo loop/def-use skeleton.
+    target=None,
+) -> APUv1SquaredL2ArgminAnalysis:
+    """Prove the squared-L2 strict-argmin semantics or raise a named mismatch."""
 
-    Shape matching alone is intentionally insufficient.  The accepted module
-    must contain the two canonical squared-distance reductions (candidate zero
-    and the remaining candidates), one strict conditional update, and no
-    additional arithmetic/control-flow operations of those classes.
-    """
-
-    source_arguments = [arg for arg in arguments if arg.source == "argument"]
-    if len(source_arguments) != 3:
-        return None
-    if any(arg.dtype != "ui16" for arg in source_arguments):
-        return None
-
-    rank1 = [arg for arg in source_arguments if len(arg.shape) == 1]
-    rank2 = [arg for arg in source_arguments if len(arg.shape) == 2]
-    if len(rank1) != 1 or len(rank2) != 2:
-        return None
-    labels = rank1[0]
-    points = labels.shape[0]
-    if points != VR_LANES or labels.mode not in {"out", "both"}:
-        return None
-
-    point_arrays = [arg for arg in rank2 if arg.shape[0] == points]
-    if len(point_arrays) != 1:
-        return None
-    point_array = point_arrays[0]
-    dimensions = point_array.shape[1]
-    center_arrays = [
-        arg for arg in rank2 if arg is not point_array and arg.shape[1] == dimensions
-    ]
-    if len(center_arrays) != 1:
-        return None
-    centers = center_arrays[0]
-    candidates = centers.shape[0]
-    if not (2 <= candidates <= MAX_CANDIDATES):
-        return None
-    if not (1 <= dimensions <= 48):
-        return None
-    if math.ceil(candidates * dimensions * 2 / 512) * 512 > (1 << 20):
-        return None
-
-    # Canonical Allo emits one outer loop, two statically represented distance
-    # reductions, and one candidate loop.  Requiring the complete inventory
-    # makes this recognizer fail closed if the source computation changes.
-    required_counts = {
-        "affine.for": 4,
-        "arith.subi": 2,
-        "arith.muli": 2,
-        "arith.addi": 2,
-        "arith.trunci": 7,
-        "scf.if": 1,
-    }
-    if any(
-        _count_opcode(source_mlir, op) != count for op, count in required_counts.items()
-    ):
-        return None
-    comparisons = re.findall(r"\barith\.cmpi\s+(slt|ult)\b", source_mlir)
-    if comparisons not in (["slt"], ["ult"]):
-        return None
-    if _loop_count(source_mlir, 0, points) != 1:
-        return None
-    if _loop_count(source_mlir, 0, dimensions) != 2:
-        return None
-    if _loop_count(source_mlir, 1, candidates) != 1:
-        return None
-
-    # Tie the operation skeleton to the three formal SSA values.  The
-    # canonical top-level ABI numbers formals in argument order.
-    positions = {id(arg): index for index, arg in enumerate(source_arguments)}
-    point_ssa = rf"%arg{positions[id(point_array)]}"
-    center_ssa = rf"%arg{positions[id(centers)]}"
-    label_ssa = rf"%arg{positions[id(labels)]}"
-    if len(re.findall(rf"\baffine\.load\s+{point_ssa}\[", source_mlir)) != 2:
-        return None
-    if len(re.findall(rf"\baffine\.load\s+{center_ssa}\[", source_mlir)) != 2:
-        return None
-    if (
-        len(
-            re.findall(rf"\baffine\.store\s+%[-\w.$]+\s*,\s*{label_ssa}\[", source_mlir)
+    facts = APUv1NativeTargetFacts.from_target(target)
+    sources = [arg for arg in arguments if arg.source == "argument"]
+    results = [arg for arg in arguments if arg.source == "result"]
+    if len(sources) != 3 or results:
+        raise _mismatch(
+            "expects three source arrays (points, centers, labels) and no "
+            f"returned array; got {len(sources)} source and {len(results)} returned",
+            stage=0,
         )
-        != 1
+    if sorted(len(arg.shape) for arg in sources) != [1, 2, 2]:
+        raise _mismatch(
+            "expects one rank-1 labels array and two rank-2 point/center arrays",
+            stage=0,
+        )
+
+    if any(arg.dtype != "ui16" for arg in sources):
+        raise _mismatch(
+            "the template implements uint16 points, centers, and labels; got "
+            + ", ".join(f"{arg.name}:{arg.dtype}" for arg in sources)
+        )
+
+    summary = summarize_native_function(source_mlir, function, RECIPE)
+    abi = bind_abi(summary, arguments, RECIPE)
+    names = abi.names
+    formals = dict(abi.sources)
+
+    if len(summary.effects) != 1:
+        raise _mismatch(
+            f"expects exactly one array store (labels[point]); found "
+            f"{len(summary.effects)}",
+            stage=1,
+        )
+    (effect,) = summary.effects
+    if effect.base not in formals or len(formals[effect.base].shape) != 1:
+        raise _mismatch("the only store must write the rank-1 labels argument", stage=1)
+    labels_formal = effect.base
+    labels = formals[labels_formal]
+    if len(effect.loops) != 1 or effect.guards:
+        raise _mismatch(
+            f"{labels.name}[point] must be written unconditionally inside exactly "
+            "one loop (the point loop)",
+            stage=1,
+        )
+    (point_loop,) = effect.loops
+    if effect.indices != (("iv", point_loop),):
+        raise _mismatch(f"{labels.name} must be indexed by the point loop variable")
+
+    stored = ring16(effect.value)
+    if stored.kind != "loopout":
+        raise _mismatch(
+            f"{labels.name}[point] stores {describe(stored, names)}; the template "
+            "stores the argmin candidate index"
+        )
+    candidate_loop, stored_local = stored.args
+    candidate_summary = summary.summaries[candidate_loop]
+    if tuple(candidate_summary.parent_loops) != (point_loop,):
+        raise _mismatch("the candidate loop must be nested directly in the point loop")
+    if len(candidate_summary.updates) != 2:
+        raise _mismatch(
+            f"candidate loop {loop_name(candidate_loop)!r} must update exactly two "
+            "locals (best distance and best index); it updates "
+            f"{sorted(local.name or 'local' for local in candidate_summary.updates)}"
+        )
+    updates = {
+        local: ring16(value) for local, value in candidate_summary.updates.items()
+    }
+    candidate_index = E("iv", (candidate_loop,), 16)
+    index_locals = [
+        local
+        for local, value in updates.items()
+        if value.kind == "select" and value.args[1] == candidate_index
+    ]
+    if len(index_locals) != 1:
+        raise _mismatch("no local records the candidate index on a strict improvement")
+    (index_local,) = index_locals
+    (best_local,) = [local for local in updates if local is not index_local]
+    if stored_local is not index_local:
+        raise _mismatch(
+            f"{labels.name}[point] stores {stored_local.name or 'a local'!r} (the "
+            f"running minimum distance), not the argmin index "
+            f"{index_local.name or 'local'!r}"
+        )
+    for local in (index_local, best_local):
+        if local.width != 16:
+            raise _mismatch(
+                f"local {local.name!r} is i{local.width}; the template keeps "
+                "16-bit distances and indices"
+            )
+
+    index_update = updates[index_local]
+    best_update = updates[best_local]
+    condition = index_update.args[0]
+    best_carry = E("carry", (best_local, candidate_loop), 16)
+    index_carry = E("carry", (index_local, candidate_loop), 16)
+    if index_update.args[2] != index_carry:
+        raise _mismatch(
+            f"{index_local.name!r} is not kept when the candidate does not improve"
+        )
+    if (
+        best_update.kind != "select"
+        or best_update.args[0] != condition
+        or best_update.args[2] != best_carry
     ):
-        return None
+        raise _mismatch(
+            f"{best_local.name!r} is not replaced under the same condition that "
+            f"records the index (update: {describe(best_update, names)})"
+        )
+    candidate_distance = best_update.args[1]
+    reduction = _distance_reduction(
+        summary, candidate_distance, (point_loop, candidate_loop)
+    )
+    if reduction is None:
+        raise _mismatch(
+            f"{best_local.name!r} is replaced by {describe(candidate_distance, names)}"
+            "; the template replaces it by the candidate's summed distance"
+        )
+    dim_loop, distance_local, term, distance_init = reduction
+    if distance_local.width != 16:
+        raise _mismatch(f"local {distance_local.name!r} is not a 16-bit distance")
+    if distance_init != E("const", (0,), 16):
+        raise _mismatch(
+            f"candidate distance {distance_local.name!r} starts at "
+            f"{describe(distance_init, names)}; the template requires 0"
+        )
+    roles = _squared_difference(
+        term, point_loop, dim_loop, ("iv", candidate_loop), formals
+    )
+    if roles is None:
+        raise _mismatch(
+            f"candidate distance accumulates {describe(term, names)}; the template "
+            "accumulates (points[point, d] - centers[candidate, d])**2"
+        )
+    points_formal, centers_formal = roles
+
+    if condition.kind != "cmp":
+        raise _mismatch("the improvement condition is not an integer comparison")
+    predicate, lhs, rhs = condition.args
+    (lhs_value, lhs_extension), (rhs_value, rhs_extension) = (
+        compare_view(lhs),
+        compare_view(rhs),
+    )
+    meaning = effective_predicate(predicate, lhs_extension, rhs_extension)
+    if meaning is None:
+        raise _mismatch("the comparison mixes signed and unsigned extensions")
+    if lhs_value == candidate_distance and rhs_value == best_carry:
+        normalized = meaning
+    elif lhs_value == best_carry and rhs_value == candidate_distance:
+        normalized = _MIRROR[meaning]
+    else:
+        raise _mismatch(
+            f"the condition compares {describe(lhs_value, names)} with "
+            f"{describe(rhs_value, names)}; the template compares the candidate "
+            f"distance with {best_local.name!r}"
+        )
+    if normalized not in {"slt", "ult"}:
+        detail = {
+            "sle": "non-strict <= keeps the last minimum on ties",
+            "ule": "non-strict <= keeps the last minimum on ties",
+            "sgt": "> selects the maximum",
+            "ugt": "> selects the maximum",
+            "sge": ">= selects the last maximum",
+            "uge": ">= selects the last maximum",
+        }.get(normalized, "it is not an ordering")
+        raise _mismatch(
+            f"candidate distance {predicate_text(normalized)} best: {detail}; the "
+            "template implements strict < with first-minimum tie breaking"
+        )
+
+    initial_best = ring16(candidate_summary.init[best_local])
+    first = _distance_reduction(summary, initial_best, (point_loop,))
+    if first is None or first[1] is not best_local:
+        raise _mismatch(
+            f"{best_local.name!r} enters the candidate loop as "
+            f"{describe(initial_best, names)}; the template starts from candidate "
+            "0's summed distance"
+        )
+    first_dim_loop, _, first_term, first_init = first
+    if first_init != E("const", (0,), 16):
+        raise _mismatch(
+            f"{best_local.name!r} starts at {describe(first_init, names)} before "
+            "accumulating candidate 0; the template requires 0"
+        )
+    if _squared_difference(
+        first_term, point_loop, first_dim_loop, ("const", 0), formals
+    ) != (points_formal, centers_formal):
+        raise _mismatch(
+            f"candidate 0's distance accumulates {describe(first_term, names)}; "
+            "the template accumulates (points[point, d] - centers[0, d])**2"
+        )
+    initial_index = ring16(candidate_summary.init[index_local])
+    if initial_index != E("const", (0,), 16):
+        raise _mismatch(
+            f"{index_local.name!r} starts at {describe(initial_index, names)}; "
+            "candidate 0 must be the initial index"
+        )
+
+    points_record = formals[points_formal]
+    centers_record = formals[centers_formal]
+    if points_record.mode != "in" or centers_record.mode != "in":
+        raise _mismatch("points and centers must be read-only")
+    point_count, dimensions = points_record.shape
+    candidates, center_dimensions = centers_record.shape
+    if center_dimensions != dimensions or labels.shape != (point_count,):
+        raise _mismatch(
+            f"shapes {points_record.shape}, {centers_record.shape}, {labels.shape} "
+            "do not form points[P, D], centers[K, D], labels[P]"
+        )
+    require_loop(point_loop, lower=0, upper=point_count, what="point", recipe=RECIPE)
+    require_loop(
+        candidate_loop, lower=1, upper=candidates, what="candidate", recipe=RECIPE
+    )
+    for loop in (first_dim_loop, dim_loop):
+        require_loop(loop, lower=0, upper=dimensions, what="dimension", recipe=RECIPE)
+
+    if point_count != facts.lanes:
+        raise _mismatch(
+            f"{point_count} points; the template maps one point per lane of one "
+            f"{facts.lanes}-lane frontier",
+            stage=3,
+        )
+    if not 2 <= candidates <= min(MAX_CANDIDATES, (1 << facts.lane_bits) - 1):
+        raise _mismatch(
+            f"{candidates} candidates; the template needs 2..{MAX_CANDIDATES} "
+            "(uint16 labels)",
+            stage=3,
+        )
+    if not 1 <= dimensions <= facts.vmr_slots:
+        raise _mismatch(
+            f"{dimensions} dimensions; each dimension stays resident in one of "
+            f"{facts.vmr_slots} VMRs",
+            stage=3,
+        )
+    center_image = math.ceil(candidates * dimensions * 2 / 512) * 512
+    if center_image > facts.l3_bytes:
+        raise _mismatch(
+            f"the center image needs {center_image} bytes of L3; the target has "
+            f"{facts.l3_bytes}",
+            stage=3,
+        )
 
     maximum_squared_distance = None
     bounds = dict(argument_bounds or ())
-    point_bounds = bounds.get(point_array.name)
-    center_bounds = bounds.get(centers.name)
+    point_bounds = bounds.get(points_record.name)
+    center_bounds = bounds.get(centers_record.name)
     if point_bounds is not None and center_bounds is not None:
+        limit = np.iinfo(np.uint16).max
         if not (
-            0 <= point_bounds[0] <= point_bounds[1] <= np.iinfo(np.uint16).max
-            and 0 <= center_bounds[0] <= center_bounds[1] <= np.iinfo(np.uint16).max
+            0 <= point_bounds[0] <= point_bounds[1] <= limit
+            and 0 <= center_bounds[0] <= center_bounds[1] <= limit
         ):
-            return None
+            raise _mismatch("argument_bounds for points/centers must lie within uint16")
         maximum_delta = max(
             abs(point_bounds[0] - center_bounds[1]),
             abs(point_bounds[1] - center_bounds[0]),
@@ -211,15 +449,15 @@ def analyze_apu_v1_squared_l2_argmin(
 
     return APUv1SquaredL2ArgminAnalysis(
         function=function,
-        points_role=point_array.name,
-        centers_role=centers.name,
+        points_role=points_record.name,
+        centers_role=centers_record.name,
         labels_role=labels.name,
-        points=points,
+        points=point_count,
         dimensions=dimensions,
         candidates=candidates,
-        comparison=comparisons[0],
+        comparison=normalized,
         unsigned_order_proven=(
-            comparisons[0] == "ult"
+            normalized == "ult"
             or (
                 maximum_squared_distance is not None
                 and maximum_squared_distance <= np.iinfo(np.int16).max

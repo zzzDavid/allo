@@ -12,7 +12,9 @@ device-wide barrier plan.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, replace
+import fcntl
 import inspect
 import math
 import os
@@ -21,6 +23,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from types import MappingProxyType
 
@@ -336,6 +339,7 @@ def _generate_project(
     *,
     host_source=None,
     struct_source=None,
+    initial_outputs=(),
 ):
     from ..spmw_apu_v1_build import (
         _COPY_FILES,
@@ -359,7 +363,13 @@ def _generate_project(
         for name, (shape, dtype) in output_specs.items()
     }
     if host_source is None:
-        host = _emit_host_c(in_roles, out_roles, input_sizes, output_sizes)
+        host = _emit_host_c(
+            in_roles,
+            out_roles,
+            input_sizes,
+            output_sizes,
+            initial_output_roles=tuple(sorted(initial_outputs)),
+        )
         # The explicit scalar baseline is deliberately single-core until a
         # phase carries a proven partition plus cross-APUC barrier plan.
         host = host.replace("enum { NUM_APUC = 4 };", "enum { NUM_APUC = 1 };")
@@ -376,17 +386,99 @@ def _generate_project(
     return dst
 
 
-def _ledag_log():
+_APU_V1_LOCK_ENV = "TENON_APU_V1_LOCK"
+_board_lock_guard = threading.RLock()
+_board_lock_state = {"depth": 0, "fd": None, "path": None}
+
+
+def apu_v1_lock_path() -> Path:
+    """Board lock file: ``$TENON_APU_V1_LOCK`` or one per PCI device node."""
+
+    override = os.environ.get(_APU_V1_LOCK_ENV)
+    if override:
+        return Path(override)
+    from ..spmw_simenv import apu_v1_pci_node
+
+    node = apu_v1_pci_node()
+    identity = "unknown" if node is None else re.sub(r"[^\w.:-]", "_", node.name)
+    # A fixed directory (not $TMPDIR) so every user and process agrees.
+    return Path("/tmp") / f"tenon-apu-v1-{identity}.lock"
+
+
+def _open_lock_file(path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    except PermissionError:
+        # Another user created it; flock works on a read-only descriptor.
+        return os.open(path, os.O_RDONLY)
+    with contextlib.suppress(OSError):
+        os.fchmod(fd, 0o666)
+    return fd
+
+
+@contextlib.contextmanager
+def apu_v1_board_lock():
+    """Exclusive advisory lock serializing every APU v1 board launch.
+
+    Reentrant within one process (the pytest fixture and the runtime both
+    take it); other threads of the process wait, other processes block on
+    ``flock``.
+    """
+
+    with _board_lock_guard:
+        state = _board_lock_state
+        if state["depth"] == 0:
+            path = apu_v1_lock_path()
+            fd = _open_lock_file(path)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except BaseException:
+                os.close(fd)
+                raise
+            state.update(fd=fd, path=path)
+        state["depth"] += 1
+        try:
+            yield state["path"]
+        finally:
+            state["depth"] -= 1
+            if state["depth"] == 0:
+                fd = state["fd"]
+                state.update(fd=None, path=None)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+
+
+def _ledag_available_reason() -> str | None:
     if shutil.which("ledag-ssh") is None:
-        return ""
-    time.sleep(0.5)
-    process = subprocess.run(
-        ["ledag-ssh", "-o", "localhost"],
-        input=b"flo\nquit\n",
-        capture_output=True,
-        timeout=30,
-        check=False,
-    )
+        return "ledag-ssh is not on PATH, so the device profile cannot be read"
+    return None
+
+
+def _ledag_drain() -> str:
+    """Read the device log through one ``ledag-ssh`` session.
+
+    Each session's ``flo`` prints the whole log the device still holds (the
+    read pointer is per session), so two reads differ only by the records
+    appended between them.
+    """
+
+    try:
+        process = subprocess.run(
+            ["ledag-ssh", "-o", "localhost"],
+            input=b"flo\nquit\n",
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as error:
+        raise RuntimeError(f"ledag-ssh failed while reading the device log: {error}")
+    if process.returncode:
+        raise RuntimeError(
+            f"ledag-ssh exited with {process.returncode} while reading the device log"
+        )
     return "".join(
         chr(byte)
         for byte in process.stdout or b""
@@ -394,10 +486,118 @@ def _ledag_log():
     )
 
 
-def _parse_scalar_profile(text):
-    """The scalar baseline launches one APUC, so the newest total is the result."""
-    totals = re.findall(r"\btotal\b[^\n]*?\bcrun\s*[:=]\s*(\d+)", text)
-    return int(totals[-1]) if totals else None
+_TOTAL_RECORD = re.compile(r"\btotal\b[^\n]*?\bcrun\s*[:=]\s*(\d+)[^\n]*")
+_HITS_FIELD = re.compile(r"\bhits\s*[:=]\s*(\d+)")
+
+
+def fresh_profile_records(before: str, after: str) -> list:
+    """The ``total`` PROF_PRINT records of ``after`` that are not in ``before``.
+
+    ``before`` is the device log read immediately before the launch and
+    ``after`` the log read after it.  The log is append-only (older records
+    may age out at the front), so the fresh records are those following the
+    last record of ``before`` within ``after``.  The anchor is the text of the
+    last three ``before`` records; if it cannot be found in ``after`` the log
+    rotated past the launch window and the measurement is not attributable.
+    """
+
+    after_records = list(_TOTAL_RECORD.finditer(after))
+    before_records = list(_TOTAL_RECORD.finditer(before))
+    if not before_records:
+        return after_records
+    anchor = before[before_records[max(0, len(before_records) - 3)].start() : before_records[-1].end()]
+    position = after.rfind(anchor)
+    if position < 0:
+        raise RuntimeError(
+            "APU v1 profile freshness check failed: the device log read before the "
+            "launch is not a prefix of the log read after it, so this launch's "
+            "PROF_PRINT records cannot be told from older ones"
+        )
+    boundary = position + len(anchor)
+    return [record for record in after_records if record.start() >= boundary]
+
+
+def parse_fresh_profile(before: str, after: str, expected_records: int) -> tuple[int, ...]:
+    """Return the CRUN of exactly ``expected_records`` fresh ``total`` records.
+
+    Anything but exactly the expected number of records appended by the
+    launch, each a single measurement (``hits`` 1) with a positive CRUN, is a
+    stale, missing, or ambiguous profile and raises.
+    """
+
+    records = fresh_profile_records(before, after)
+    if len(records) != expected_records:
+        raise RuntimeError(
+            f"APU v1 profile freshness check failed: expected {expected_records} "
+            f"fresh 'total' PROF_PRINT record(s) after the launch, found "
+            f"{len(records)}; the cycle count would be stale or missing"
+        )
+    cycles = []
+    for record in records:
+        hits = _HITS_FIELD.search(record.group(0))
+        crun = int(record.group(1))
+        if (hits is not None and int(hits.group(1)) != 1) or crun <= 0:
+            raise RuntimeError(
+                f"APU v1 profile record is not one fresh measurement: {record.group(0)!r}"
+            )
+        cycles.append(crun)
+    return tuple(cycles)
+
+
+def launch_on_board(argv, cwd, *, expected_records, timeout, attempts=3):
+    """Run one built APU v1 binary under the board lock with a fresh profile.
+
+    Returns ``(run text, profile text, crun tuple)``.  The device log is read
+    before every attempt and after the run; :func:`parse_fresh_profile`
+    proves that exactly the expected PROF_PRINT records were appended by this
+    launch.
+    """
+
+    process = None
+    text = ""
+    before = ""
+    with apu_v1_board_lock():
+        for attempt in range(attempts):
+            before = _ledag_drain()
+            process = subprocess.run(
+                argv, cwd=cwd, capture_output=True, timeout=timeout, check=False
+            )
+            text = process.stdout.decode(errors="replace") + process.stderr.decode(
+                errors="replace"
+            )
+            if process.returncode == 0 or "no valid context" not in text:
+                break
+            time.sleep(attempt + 1)
+        if process is None or process.returncode:
+            code = None if process is None else process.returncode
+            raise RuntimeError(f"APU v1 device run failed ({code}):\n{text[-6000:]}")
+        profile = ""
+        for _ in range(4):
+            time.sleep(0.75)
+            profile = _ledag_drain()
+            if len(fresh_profile_records(before, profile)) >= expected_records:
+                break
+    return text, profile, parse_fresh_profile(before, profile, expected_records)
+
+
+def read_output_image(path, role: str, dtype, shape) -> np.ndarray:
+    """Read one device output file, naming the role on a missing/short image."""
+
+    path = Path(path)
+    dtype = np.dtype(dtype)
+    expected = math.prod(shape) * dtype.itemsize
+    if not path.is_file():
+        raise RuntimeError(
+            f"APU v1 output {role!r}: the device run wrote no file {path} "
+            f"(expected {expected} bytes for {tuple(shape)} {dtype})"
+        )
+    actual = path.stat().st_size
+    if actual != expected:
+        raise RuntimeError(
+            f"APU v1 output {role!r}: {path} holds {actual} bytes, expected "
+            f"{expected} bytes for {tuple(shape)} {dtype}"
+        )
+    return np.fromfile(path, dtype=dtype).reshape(shape)
 
 
 _APU_V1_PROGRAM_BACKENDS = (None, "virtual", "functional")
@@ -476,11 +676,14 @@ class CompiledAPUv1Program:
             discover_apu_v1_native_vector_lowering,
         )
 
+        # A required-vector phase either proves one native recipe or raises
+        # NoNativeVectorRouteError naming each recipe's mismatch.
         self.native_vector_lowering = discover_apu_v1_native_vector_lowering(
             phase,
             self.artifact,
             self.arguments,
             self.schedule.top_func_name,
+            target,
         )
         # Native recipes carry their own complete structural proof and source
         # lowering.  Discover the ordinary scalar ABI manifest without asking
@@ -639,7 +842,7 @@ class CompiledAPUv1Program:
             return self._run_virtual(inputs)
         if self.backend == "functional":
             return self._run_functional(inputs)
-        reason = _apu_v1_unavailable_reason()
+        reason = _apu_v1_unavailable_reason() or _ledag_available_reason()
         if reason:
             raise SimulatorUnavailable("apu_v1", reason)
         normalized = self._checked_sources(inputs)
@@ -691,34 +894,25 @@ class CompiledAPUv1Program:
             argv = [str(binary)]
             argv.extend(str(input_paths[name]) for name in sorted(input_paths))
             argv.extend(str(output_paths[name]) for name in sorted(output_paths))
-            process = None
-            text = ""
-            for attempt in range(3):
-                process = subprocess.run(
-                    argv, cwd=project, capture_output=True, timeout=900, check=False
-                )
-                text = process.stdout.decode(errors="replace") + process.stderr.decode(
-                    errors="replace"
-                )
-                if process.returncode == 0 or "no valid context" not in text:
-                    break
-                time.sleep(attempt + 1)
-            if process.returncode:
-                raise RuntimeError(
-                    f"APU v1 scalar device run failed ({process.returncode}):\n{text[-4000:]}"
-                )
-            log = text + "\n" + _ledag_log()
+            text, profile, cycles = launch_on_board(
+                argv, project, expected_records=1, timeout=900
+            )
+            log = text + "\n" + profile
             outputs = {}
             for argument in self.outputs:
                 role = output_roles[argument.name]
-                value = np.fromfile(
-                    output_paths[role], dtype=argument.numpy_dtype
-                ).reshape(argument.shape)
-                outputs[argument.name] = value
+                outputs[argument.name] = read_output_image(
+                    output_paths[role], role, argument.numpy_dtype, argument.shape
+                )
+            for argument in self.outputs:
                 if argument.name in inputs:
-                    np.copyto(inputs[argument.name], value, casting="same_kind")
+                    np.copyto(
+                        inputs[argument.name],
+                        outputs[argument.name],
+                        casting="same_kind",
+                    )
             return RunResult(
-                _parse_scalar_profile(log),
+                cycles[0],
                 log,
                 "apu_v1",
                 kind="device",
@@ -732,6 +926,8 @@ class CompiledAPUv1Program:
                     ),
                     "build_mode": build_config.mode,
                     "device_source": self.device_source,
+                    "board_lock": str(apu_v1_lock_path()),
+                    "profile_records": 1,
                 },
             )
         finally:
@@ -787,6 +983,11 @@ def compile_apu_v1_program(program, target, *, cost=None, backend=None):
 
 
 __all__ = [
+    "apu_v1_board_lock",
+    "apu_v1_lock_path",
+    "launch_on_board",
+    "parse_fresh_profile",
+    "read_output_image",
     "APUv1PrecisionPolicy",
     "APUv1Phase",
     "APUv1Program",

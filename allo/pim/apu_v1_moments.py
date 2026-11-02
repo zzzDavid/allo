@@ -2,23 +2,68 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused GVML lowering for five first/second bivariate moments.
 
-The structural route recognizes a freshly initialized result with columns
-``sum(x), sum(y), sum(x*x), sum(y*y), sum(x*y)``.  Independent datasets are
-mapped to power-of-two lane groups whose combined size is one 32K APUv1
-frontier.  Both inputs are loaded once, the three products are formed in
-parallel VRs, and all five quantities use native grouped reduction.
+Supported semantics (proved structurally from the retained MLIR; see
+:mod:`apu_v1_native_vector`)::
+
+    stats: uint16[B, 5] = 0                    # whole-array zero initializer
+    for b in range(B):                         # batch loop (either order)
+        for p in range(P):                     # point loop
+            stats[b, 0] += x[b, p]
+            stats[b, 1] += y[b, p]
+            stats[b, 2] += x[b, p] * x[b, p]
+            stats[b, 3] += y[b, p] * y[b, p]
+            stats[b, 4] += x[b, p] * y[b, p]   # (or y * x)
+
+all modulo ``2**16`` with ``x, y: uint16[B, P]`` and ``stats`` the only
+returned array.  The five statements may appear in any order, each column is
+updated exactly once per iteration, and every update adds its term with
+coefficient one.  Operand roles are bound from the IR: ``x`` is the argument
+accumulated into column 0, ``y`` the other one, and columns 1-4 must then
+match the table above; a program whose columns 0 and 1 are swapped relative
+to its products is rejected.
+
+Rejected with :class:`APUv1NativeRecipeMismatch` naming the difference: a
+nonzero initializer, a different term or coefficient in any column, a
+repeated or missing column, guards, extra stores, loop-carried scalars,
+non-uint16 dtypes, offset indices.
+
+Shape domain: ``P`` is a power of two and ``B * P`` is at most the VR lane
+count.  Batch ``b`` occupies lanes ``[b*P, (b+1)*P)`` of one VR; a frontier
+with ``B * P`` below the lane count is zero padded (padding groups are reduced
+but never read back).  Both inputs are loaded once, the three products are
+formed in parallel VRs, and all five quantities use native grouped reduction.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
 
 import numpy as np
 
+from .apu_v1_native_vector import (
+    APUv1NativeRecipeMismatch,
+    APUv1NativeTargetFacts,
+    E,
+    bind_abi,
+    describe,
+    iv_of,
+    require_fill_zero,
+    require_loop,
+    require_no_carried_locals,
+    ring16,
+    ring_product,
+    summarize_native_function,
+)
 
-VR_LANES = 32768
+
+RECIPE = "bivariate_moments"
 MOMENT_COUNT = 5
+_VRS_USED = 6
+_VMRS_USED = 3
+
+
+def _mismatch(reason: str, stage: int = 2) -> APUv1NativeRecipeMismatch:
+    return APUv1NativeRecipeMismatch(RECIPE, reason, stage=stage)
 
 
 def _power2_enum(extent: int) -> str:
@@ -58,6 +103,7 @@ class APUv1BivariateMomentsAnalysis:
     stats_role: str
     batches: int
     points_per_batch: int
+    lanes: int = 32768
 
     def manifest(self) -> dict:
         return {
@@ -68,160 +114,151 @@ class APUv1BivariateMomentsAnalysis:
             "stats_role": self.stats_role,
             "batches": self.batches,
             "points_per_batch": self.points_per_batch,
+            "lanes": self.lanes,
             "stat_order": ["sum_x", "sum_y", "sum_xx", "sum_yy", "sum_xy"],
-            "input_layout": "batch_major_contiguous_lane_groups",
+            "initial_value": 0,
+            "input_layout": "batch_major_contiguous_lane_groups_zero_padded",
             "arithmetic": "uint16_ring",
         }
 
 
-def _opcode_count(source: str, opcode: str) -> int:
-    return len(re.findall(rf"\b{re.escape(opcode)}\b", source))
-
-
-def _load_counts(source: str, role: str) -> int:
-    return len(re.findall(rf"\bfrom\s*=\s*\"{re.escape(role)}\"", source))
-
-
-# The recognizer deliberately rejects every structural mismatch independently.
-# pylint: disable=too-many-return-statements,too-many-boolean-expressions
+# The recognizer deliberately rejects every semantic mismatch independently.
+# pylint: disable=too-many-locals,too-many-branches,too-many-statements
 def analyze_apu_v1_bivariate_moments(
     source_mlir: str,
     arguments,
     *,
     function: str,
-) -> APUv1BivariateMomentsAnalysis | None:
-    """Recognize the exact five-moment source skeleton, independent of names."""
+    target=None,
+) -> APUv1BivariateMomentsAnalysis:
+    """Prove the five-moment semantics or raise a named mismatch."""
 
-    source = [arg for arg in arguments if arg.source == "argument"]
+    facts = APUv1NativeTargetFacts.from_target(target)
+    sources = [arg for arg in arguments if arg.source == "argument"]
     results = [arg for arg in arguments if arg.source == "result"]
-    if len(source) != 2 or len(results) != 1:
-        return None
-    if any(arg.dtype != "ui16" for arg in source + results):
-        return None
-    x, y = source
+    if len(sources) != 2 or len(results) != 1:
+        raise _mismatch(
+            "expects two source arrays (x, y) and one returned array (stats); "
+            f"got {len(sources)} source and {len(results)} returned",
+            stage=0,
+        )
     stats = results[0]
-    if (
-        len(x.shape) != 2
-        or y.shape != x.shape
-        or stats.shape != (x.shape[0], MOMENT_COUNT)
-        or x.mode != "in"
-        or y.mode != "in"
-        or stats.mode != "out"
-    ):
-        return None
-    batches, points = x.shape
-    if batches * points != VR_LANES:
-        return None
-    try:
-        _power2_enum(points)
-    except ValueError:
-        return None
+    if any(len(arg.shape) != 2 for arg in sources + results):
+        raise _mismatch("x, y, and stats must be rank-2 arrays", stage=0)
+    if sources[0].shape != sources[1].shape:
+        raise _mismatch("x and y must have the same shape", stage=0)
+    if stats.shape != (sources[0].shape[0], MOMENT_COUNT):
+        raise _mismatch(
+            f"stats has shape {stats.shape}; the template returns "
+            f"({sources[0].shape[0]}, {MOMENT_COUNT})",
+            stage=0,
+        )
 
-    inventory = {
-        "affine.for": 2,
-        "arith.muli": 3,
-        "arith.addi": 5,
-        "affine.load": 13,
-        "affine.store": 5,
-        "memref.alloc": 1,
-        "linalg.fill": 1,
-    }
-    if any(_opcode_count(source_mlir, op) != count for op, count in inventory.items()):
-        return None
-    if _load_counts(source_mlir, x.name) != 4:
-        return None
-    if _load_counts(source_mlir, y.name) != 4:
-        return None
-    if _load_counts(source_mlir, stats.name) != 5:
-        return None
-    if len(re.findall(rf"\bto\s*=\s*\"{re.escape(stats.name)}\"", source_mlir)) != 5:
-        return None
-    if (
-        len(
-            re.findall(
-                rf"\baffine\.for\s+%[-\w.$]+\s*=\s*0\s+to\s+{batches}\b", source_mlir
-            )
+    if any(arg.dtype != "ui16" for arg in sources + results):
+        raise _mismatch(
+            "the template implements uint16 inputs and statistics; got "
+            + ", ".join(f"{arg.name}:{arg.dtype}" for arg in sources + results)
         )
-        != 1
-    ):
-        return None
-    if (
-        len(
-            re.findall(
-                rf"\baffine\.for\s+%[-\w.$]+\s*=\s*0\s+to\s+{points}\b", source_mlir
-            )
+
+    summary = summarize_native_function(source_mlir, function, RECIPE)
+    abi = bind_abi(summary, arguments, RECIPE)
+    names = abi.names
+    ((stats_array, _),) = abi.results
+    formals = dict(abi.sources)
+    require_no_carried_locals(summary, RECIPE)
+
+    if len(summary.effects) != MOMENT_COUNT:
+        raise _mismatch(
+            f"expects exactly {MOMENT_COUNT} stores (one per statistic); found "
+            f"{len(summary.effects)}",
+            stage=1,
         )
-        != 1
-    ):
-        return None
-    for stat in range(MOMENT_COUNT):
+    first = summary.effects[0]
+    if len(first.loops) != 2 or not first.indices:
+        raise _mismatch(
+            "every statistic update must sit inside exactly two loops", stage=1
+        )
+    batch_loop = iv_of(first.indices[0])
+    if batch_loop not in first.loops:
+        raise _mismatch("stats must be indexed by the batch loop variable", stage=1)
+    (point_loop,) = [loop for loop in first.loops if loop is not batch_loop]
+
+    terms = {}
+    for effect in summary.effects:
+        if effect.base is not stats_array:
+            raise _mismatch(
+                f"a store writes {names.get(effect.base, effect.base.name)!r}, not "
+                f"the returned {stats.name!r}",
+                stage=1,
+            )
+        if effect.loops != first.loops:
+            raise _mismatch("all statistic updates must share one loop nest", stage=1)
+        if effect.guards:
+            raise _mismatch("statistic updates must be unconditional")
         if (
-            len(
-                re.findall(
-                    rf"affine\.store\s+%[-\w.$]+\s*,\s*%[-\w.$]+\["
-                    rf"%[-\w.$]+,\s*{stat}\][^\n]*to\s*=\s*\"{re.escape(stats.name)}\"",
-                    source_mlir,
-                )
-            )
-            != 1
+            len(effect.indices) != 2
+            or iv_of(effect.indices[0]) is not batch_loop
+            or effect.indices[1][0] != "const"
         ):
-            return None
-
-    # The canonical Allo emission orders the three multiplications as x*x,
-    # y*y, x*y.  Prove their operand origins across only the widening aliases
-    # that appear between loads and multiplication.
-    definitions: dict[str, tuple] = {}
-    for line in source_mlir.splitlines():
-        load = re.search(
-            r"(?P<dst>%[-\w.$]+)\s*=\s*affine\.load\s+%[-\w.$]+\[[^]]+]"
-            r"[^\n]*from\s*=\s*\"(?P<role>[^\"]+)\"",
-            line,
-        )
-        if load is not None:
-            definitions[load.group("dst")] = ("load", load.group("role"))
-            continue
-        alias = re.search(
-            r"(?P<dst>%[-\w.$]+)\s*=\s*arith\.(?:extui|extsi|trunci)\s+"
-            r"(?P<src>%[-\w.$]+)",
-            line,
-        )
-        if alias is not None:
-            definitions[alias.group("dst")] = ("alias", alias.group("src"))
-            continue
-        multiply = re.search(
-            r"(?P<dst>%[-\w.$]+)\s*=\s*arith\.muli\s+"
-            r"(?P<lhs>%[-\w.$]+)\s*,\s*(?P<rhs>%[-\w.$]+)",
-            line,
-        )
-        if multiply is not None:
-            definitions[multiply.group("dst")] = (
-                "multiply",
-                multiply.group("lhs"),
-                multiply.group("rhs"),
+            raise _mismatch(f"{stats.name} must be indexed [batch, <literal column>]")
+        column = effect.indices[1][1]
+        if column in terms or not 0 <= column < MOMENT_COUNT:
+            raise _mismatch(
+                f"column {column} is updated more than once or is out of range"
             )
+        update = ring16(effect.value)
+        current = E("load", (stats_array, effect.indices), 16)
+        if update.kind != "add" or current not in update.args:
+            raise _mismatch(
+                f"column {column} is set to {describe(update, names)}; the "
+                f"template accumulates {stats.name}[b, {column}] += term"
+            )
+        lhs, rhs = update.args
+        terms[column] = rhs if lhs == current else lhs
 
-    def load_origin(value: str) -> str | None:
-        seen = set()
-        while value not in seen:
-            seen.add(value)
-            definition = definitions.get(value)
-            if definition is None:
-                return None
-            if definition[0] == "load":
-                return definition[1]
-            if definition[0] != "alias":
-                return None
-            value = definition[1]
-        return None
+    def operand(formal):
+        return E("load", (formal, (("iv", batch_loop), ("iv", point_loop))), 16)
 
-    products = []
-    for definition in definitions.values():
-        if definition[0] != "multiply":
-            continue
-        products.append((load_origin(definition[1]), load_origin(definition[2])))
-    expected_products = [(x.name, x.name), (y.name, y.name), (x.name, y.name)]
-    if products != expected_products:
-        return None
+    x_term = terms[0]
+    if x_term.kind != "load" or x_term.args[0] not in formals:
+        raise _mismatch(
+            f"column 0 accumulates {describe(x_term, names)}; the template's "
+            "column 0 is x[b, p] for one source argument"
+        )
+    x_formal = x_term.args[0]
+    (y_formal,) = [formal for formal in formals if formal is not x_formal]
+    x_value, y_value = operand(x_formal), operand(y_formal)
+    expected = {
+        0: x_value,
+        1: y_value,
+        2: ring_product(x_value, x_value),
+        3: ring_product(y_value, y_value),
+        4: ring_product(x_value, y_value),
+    }
+    labels = {0: "x", 1: "y", 2: "x*x", 3: "y*y", 4: "x*y"}
+    x, y = formals[x_formal], formals[y_formal]
+    for column in range(MOMENT_COUNT):
+        if terms[column] != expected[column]:
+            raise _mismatch(
+                f"column {column} accumulates {describe(terms[column], names)}; "
+                f"with x = {x.name!r} (column 0) the template's column {column} is "
+                f"{labels[column]} = {describe(expected[column], names)}"
+            )
+    require_fill_zero(summary, stats_array, stats.name, RECIPE)
+
+    if x.mode != "in" or y.mode != "in":
+        raise _mismatch("x and y must be read-only")
+    batches, points = x.shape
+    require_loop(batch_loop, lower=0, upper=batches, what="batch", recipe=RECIPE)
+    require_loop(point_loop, lower=0, upper=points, what="point", recipe=RECIPE)
+    if points & (points - 1) or batches * points > facts.lanes:
+        raise _mismatch(
+            f"{batches}x{points}: the grouped reduction needs a power-of-two "
+            f"group size and at most {facts.lanes} lanes in total",
+            stage=3,
+        )
+    if facts.writable_vrs < _VRS_USED or facts.vmr_slots < _VMRS_USED:
+        raise _mismatch("the fused plan needs six VRs and three VMRs", stage=3)
 
     return APUv1BivariateMomentsAnalysis(
         function=function,
@@ -230,6 +267,7 @@ def analyze_apu_v1_bivariate_moments(
         stats_role=stats.name,
         batches=batches,
         points_per_batch=points,
+        lanes=facts.lanes,
     )
 
 
@@ -254,10 +292,16 @@ class APUv1BivariateMomentsLowering:
         y = inputs[analysis.y_role]
         if x.shape != expected or y.shape != expected:
             raise ValueError("bivariate-moment inputs do not match analyzed shape")
+
+        def frontier(values):
+            image = np.zeros(analysis.lanes, dtype=np.uint16)
+            image[: values.size] = np.asarray(values, dtype=np.uint16).reshape(-1)
+            return image
+
         return {
             **inputs,
-            analysis.x_role: np.ascontiguousarray(x),
-            analysis.y_role: np.ascontiguousarray(y),
+            analysis.x_role: frontier(x),
+            analysis.y_role: frontier(y),
         }
 
     def operation_inventory(self) -> dict[str, int]:
@@ -315,7 +359,10 @@ class APUv1BivariateMomentsLowering:
             "route": self.route,
             "analysis": self.analysis.manifest(),
             "operation_inventory": self.operation_inventory(),
-            "physical_input_transforms": {},
+            "physical_input_transforms": {
+                self.analysis.x_role: "row_major_then_zero_pad_to_lane_frontier",
+                self.analysis.y_role: "row_major_then_zero_pad_to_lane_frontier",
+            },
             "output_transform": "identity",
         }
 
@@ -343,8 +390,8 @@ enum {{
     MOMENT_STATS = 5,
 }};
 
-_Static_assert(MOMENT_BATCHES * MOMENT_POINTS == 32768,
-               "moment groups must fill one APUv1 frontier");
+_Static_assert(MOMENT_BATCHES * MOMENT_POINTS <= {analysis.lanes},
+               "moment groups must fit one APUv1 frontier");
 
 PROF_VAR(total);
 

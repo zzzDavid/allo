@@ -18,7 +18,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -26,7 +25,13 @@ import numpy as np
 from ..spmw_apu_v1_build import _apu_v1_build_config
 from ..spmw_codegen import RunResult
 from ..spmw_fingerprint import canonical_json
-from .apu_v1_program import _generate_project, _ledag_log
+from .apu_v1_program import (
+    _generate_project,
+    _ledag_available_reason,
+    apu_v1_lock_path,
+    launch_on_board,
+    read_output_image,
+)
 from .apu_v1_vector_codegen import PointerOffsetRef, PointerRef, VR_LANES
 
 
@@ -39,6 +44,20 @@ def _zero_arrays(realization):
         value.name: np.zeros(value.shape, dtype=value.dtype)
         for value in realization.values
     }
+
+
+def _carried_outputs(realization) -> tuple[str, ...]:
+    """Output roles whose packed initial image the host transfers to L4."""
+
+    if not realization.carries_output_ingress:
+        return ()
+    return tuple(
+        sorted(
+            value.name
+            for value in realization.values
+            if value.intent in {"out", "inout"}
+        )
+    )
 
 
 def _runtime_io(realization):
@@ -67,7 +86,7 @@ def _runtime_io(realization):
 
 def _abi_manifest(realization, input_images, output_specs, output_batches, role_bytes):
     return {
-        "schema": "apu-v1-vector-runtime-abi-v1",
+        "schema": "apu-v1-vector-runtime-abi-v2",
         "inputs": [
             [name, str(value.dtype), int(value.nbytes)]
             for name, value in sorted(input_images.items())
@@ -86,6 +105,7 @@ def _abi_manifest(realization, input_images, output_specs, output_batches, role_
         "argv": {
             "inputs": sorted(input_images),
             "outputs": sorted(output_specs),
+            "initial_outputs": list(_carried_outputs(realization)),
         },
         "single_apuc": True,
         "vector_lanes": VR_LANES,
@@ -103,6 +123,8 @@ def _build_manifest(lab_name: str):
         "execution_attempts": 3,
         "retry_marker": "no valid context",
         "retry_backoff_seconds": [1, 2],
+        "board_lock": "apu_v1_board_lock (TENON_APU_V1_LOCK or per PCI node)",
+        "profile": "ledag drained before launch; exactly one fresh total record",
     }
 
 
@@ -125,6 +147,7 @@ def _generate_runtime_project(realization, lab_name: str):
             input_images,
             output_specs,
             lab_name,
+            initial_outputs=_carried_outputs(realization),
         )
         files, modes = _snapshot_directory(project)
     finally:
@@ -188,13 +211,6 @@ def _pointer_values(realization):
             }
         )
     )
-
-
-def _parse_vector_profile(text: str) -> int | None:
-    """Return the newest device ``total`` CRUN counter."""
-
-    totals = re.findall(r"\btotal\b[^\n]*?\bcrun\s*[:=]\s*(\d+)", text)
-    return int(totals[-1]) if totals else None
 
 
 def _full_device_source(realization, role_bytes: dict[str, int]) -> str:
@@ -289,22 +305,14 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
             raise RuntimeError(
                 "APU v1 launch name differs from the frozen materialization"
             )
-    reason = _apu_v1_unavailable_reason()
+    realization.check_initial_outputs(arrays)
+    reason = _apu_v1_unavailable_reason() or _ledag_available_reason()
     if reason:
         raise SimulatorUnavailable("apu_v1", reason)
     if runtime_artifact is None:
         raise RuntimeError(
             "APU v1 device execution has no complete frozen runtime artifact"
         )
-
-    if realization.compute_tiles_per_output > 1:
-        for value in realization.values:
-            if value.intent in {"out", "inout"} and np.any(arrays[value.name] != 0):
-                raise ValueError(
-                    "spatial APU group-reduction scatter currently requires a "
-                    "zero-initialized output; nonzero inout accumulation has no "
-                    "layout-safe group-head ingress"
-                )
 
     output_names = tuple(
         value.name for value in realization.values if value.intent in {"out", "inout"}
@@ -319,9 +327,6 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
             input_images[value.name] = routed_inputs[value.name]
         elif value.intent in {"out", "inout"}:
             image = packed[value.name]
-            # The current contraction plans initialize the carried output to
-            # zero.  Keeping it as the output buffer avoids an unnecessary
-            # host round trip and matches the MICRO kernels.
             batches = int(image.data.shape[0])
             output_batches[value.name] = batches
             output_specs[value.name] = ((batches, VR_LANES), np.uint16)
@@ -359,6 +364,13 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
             value.tofile(path)
             input_paths[role] = path
         output_paths = {role: Path(root) / f"out_{role}.bin" for role in output_specs}
+        # Carried outputs: the plan loads each output tile from L4 before
+        # accumulating, so the host transfers the packed initial image.
+        initial_paths = {}
+        for role in _carried_outputs(realization):
+            path = Path(root) / f"init_{role}.bin"
+            np.ascontiguousarray(packed[role].data[:, 0, :]).tofile(path)
+            initial_paths[role] = path
         build = subprocess.run(
             build_config.make_command,
             cwd=project,
@@ -375,29 +387,16 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
         argv = [str(binary)]
         argv.extend(str(input_paths[name]) for name in sorted(input_paths))
         argv.extend(str(output_paths[name]) for name in sorted(output_paths))
-        process = None
-        text = ""
-        for attempt in range(3):
-            process = subprocess.run(
-                argv, cwd=project, capture_output=True, timeout=900, check=False
-            )
-            text = process.stdout.decode(errors="replace") + process.stderr.decode(
-                errors="replace"
-            )
-            if process.returncode == 0 or "no valid context" not in text:
-                break
-            time.sleep(attempt + 1)
-        if process is None or process.returncode:
-            code = None if process is None else process.returncode
-            raise RuntimeError(
-                f"APU v1 vector device run failed ({code}):\n{text[-6000:]}"
-            )
+        argv.extend(str(initial_paths[name]) for name in sorted(initial_paths))
+        text, profile, cycles = launch_on_board(
+            argv, project, expected_records=1, timeout=900
+        )
 
         raw_outputs = {}
         packed_outputs = dict(packed)
         for role, batches in output_batches.items():
-            raw = np.fromfile(output_paths[role], dtype=np.uint16).reshape(
-                batches, VR_LANES
+            raw = read_output_image(
+                output_paths[role], role, np.uint16, (batches, VR_LANES)
             )
             raw_outputs[role] = raw
             image = packed_outputs[role]
@@ -408,9 +407,9 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
         for name, value in outputs.items():
             if name in arrays:
                 np.copyto(arrays[name], value, casting="same_kind")
-        log = text + "\n" + _ledag_log()
+        log = text + "\n" + profile
         return RunResult(
-            _parse_vector_profile(log),
+            cycles[0],
             log,
             "apu_v1",
             kind="device",
@@ -418,11 +417,15 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
                 "outputs": outputs,
                 "raw_outputs": raw_outputs,
                 "selected_plan": realization.plan.name,
+                "plan_selection": getattr(compiled, "plan_selection", None),
                 "device_source": dict(runtime_artifact.project_files)[
                     "device.c"
                 ].decode("utf-8"),
                 "build_mode": build_config.mode,
                 "single_apuc": True,
+                "initial_outputs_transferred": sorted(initial_paths),
+                "board_lock": str(apu_v1_lock_path()),
+                "profile_records": 1,
             },
         )
     finally:

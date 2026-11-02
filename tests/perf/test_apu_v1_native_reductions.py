@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
+import pytest
 
 import allo
 from allo.ir.types import uint16
@@ -17,6 +18,7 @@ from allo.pim.apu_v1_record_frequency import (
     APUv1RecordFrequencyLowering,
     analyze_apu_v1_record_frequency,
 )
+from allo.pim.apu_v1_native_vector import APUv1NativeRecipeMismatch
 from allo.pim.costs import apu_v1_cost
 from allo.pim.targets import build_apu_v1_target
 
@@ -94,7 +96,8 @@ def test_dense_histogram_selects_paired_immediate_count_route():
 
     source = compiled.device_source
     assert source.count("direct_dma_l4_to_l1_32k(") == 1
-    assert "for (uint16_t bin = 0; bin < HIST_BINS; bin += 2)" in source
+    assert "for (uint32_t bin = 0; bin + 1 < HIST_BINS; bin += 2)" in source
+    assert "gvml_count_m_g32k(" not in source
     assert source.count("gvml_eq_imm_16(") == 2
     assert "gvml_2_fast_count_m_g32k(" in source
     assert "data->mem_hndl_counts" in source
@@ -184,37 +187,31 @@ def test_native_reduction_recognizers_fail_closed_on_semantic_mutations():
     mutated_histogram = histogram.artifact.source_mlir.replace(
         "arith.cmpi eq", "arith.cmpi ne", 1
     )
-    assert (
+    with pytest.raises(APUv1NativeRecipeMismatch, match="the guard uses !="):
         analyze_apu_v1_dense_histogram(
             mutated_histogram,
             histogram.arguments,
             function=histogram.schedule.top_func_name,
         )
-        is None
-    )
 
     frequency = _compile(record_frequency, "counts")
     mutated_frequency = frequency.artifact.source_mlir.replace(
         "arith.cmpi eq", "arith.cmpi ne", 1
     )
-    assert (
+    with pytest.raises(APUv1NativeRecipeMismatch, match="guard 0 uses !="):
         analyze_apu_v1_record_frequency(
             mutated_frequency,
             frequency.arguments,
             function=frequency.schedule.top_func_name,
         )
-        is None
-    )
 
     moments = _compile(bivariate_moments, "result")
     mutated_moments = moments.artifact.source_mlir.replace(
         "arith.muli", "arith.addi", 1
     )
-    assert (
+    with pytest.raises(APUv1NativeRecipeMismatch, match="column 2 accumulates"):
         analyze_apu_v1_bivariate_moments(
             mutated_moments,
             moments.arguments,
             function=moments.schedule.top_func_name,
         )
-        is None
-    )

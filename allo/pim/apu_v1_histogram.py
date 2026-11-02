@@ -2,33 +2,73 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exact paired-count GVML lowering for dense unsigned histograms.
 
-The recognizer accepts the retained-MLIR form of a freshly zero-initialized
-256-bin histogram over one complete 32K APUv1 lane frontier.  Bin identities
-must come from the outer induction variable itself; no input-value or kernel
-name is used to infer the histogram domain.
+Supported semantics (proved structurally from the retained MLIR; see
+:mod:`apu_v1_native_vector`)::
 
-The physical plan loads the complete 32K lane frontier once, compares two
-implicit bin values at a time, and uses the hardware's paired marker-count
-primitive.  Unlike the performance-only Phoenix source, the bin identities
-are proven from the retained program and all 256 logical counts are returned
-to L4 exactly once.
+    counts: uint16[B] = 0                 # whole-array zero initializer
+    for b in range(B):                    # bin loop (either nesting order)
+        for i in range(N):                # item loop
+            if values[i] == b:            # equality, value vs bin IV
+                counts[b] += 1            # increment exactly 1, mod 2**16
+
+with ``values: uint16[N]`` the only source argument and ``counts`` the only
+returned array.  The comparison may compare the 16-bit patterns directly or
+after zero extension (sign extension is accepted only when every bin is below
+``2**15``).  Function, argument, and loop names are irrelevant.
+
+Rejected with :class:`APUv1NativeRecipeMismatch` naming the difference: any
+other increment, a nonzero or missing initializer, any predicate other than
+``==``, a comparison that is not ``values[item]`` against the bin induction
+variable, extra stores/loads-with-effects, loop-carried scalars, non-uint16
+dtypes, non-unit steps or offset bounds.
+
+Shape domain: ``N`` equals the target's VR lane count (one complete 32K
+frontier on Gemini-I); ``1 <= B <= 2**16`` (bins are 16-bit immediates).
+Odd ``B`` counts the final bin with the single-marker count primitive.
+
+The physical plan loads the lane frontier once, compares two implicit bin
+values at a time, and uses the hardware's paired marker-count primitive; all
+``B`` logical counts are written to L4 exactly once.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
 
 import numpy as np
 
+from .apu_v1_native_vector import (
+    APUv1NativeRecipeMismatch,
+    APUv1NativeTargetFacts,
+    E,
+    bind_abi,
+    compare_view,
+    describe,
+    iv_of,
+    match_increment,
+    predicate_text,
+    require_fill_zero,
+    require_loop,
+    require_no_carried_locals,
+    ring16,
+    summarize_native_function,
+)
 
-VR_LANES = 32768
-HISTOGRAM_BINS = 256
+
+RECIPE = "dense_histogram"
+
+
+def _mismatch(reason: str, stage: int = 2) -> APUv1NativeRecipeMismatch:
+    return APUv1NativeRecipeMismatch(RECIPE, reason, stage=stage)
+
+
+def _signed16(value: int) -> int:
+    return value - (1 << 16) if value >= 1 << 15 else value
 
 
 @dataclass(frozen=True)
 class APUv1DenseHistogramAnalysis:
-    """A proven canonical dense-u8 histogram loop nest."""
+    """A proven dense-u16 histogram loop nest."""
 
     function: str
     values_role: str
@@ -44,114 +84,151 @@ class APUv1DenseHistogramAnalysis:
             "counts_role": self.counts_role,
             "items": self.items,
             "bins": self.bins,
-            "bin_source": "outer_induction_variable",
+            "bin_source": "bin_induction_variable",
+            "increment": 1,
+            "initial_value": 0,
             "input_layout": "one_u16_value_per_lane",
-            "physical_plan": "one_32k_load_then_128_paired_immediate_counts",
+            "physical_plan": "one_lane_frontier_load_then_paired_immediate_counts",
             "count_pairing": "consecutive_implicit_bins",
         }
 
 
-def _count(text: str, pattern: str) -> int:
-    return len(re.findall(pattern, text, flags=re.MULTILINE))
-
-
-# The recognizer deliberately rejects every structural mismatch independently.
-# pylint: disable=too-many-return-statements,too-many-boolean-expressions
+# The recognizer deliberately rejects every semantic mismatch independently.
+# pylint: disable=too-many-locals,too-many-branches,too-many-statements
 def analyze_apu_v1_dense_histogram(
     source_mlir: str,
     arguments,
     *,
     function: str,
-) -> APUv1DenseHistogramAnalysis | None:
-    """Recognize a complete structural histogram, failing closed on changes."""
+    target=None,
+) -> APUv1DenseHistogramAnalysis:
+    """Prove the dense-histogram semantics or raise a named mismatch."""
 
-    source = [arg for arg in arguments if arg.source == "argument"]
+    facts = APUv1NativeTargetFacts.from_target(target)
+    sources = [arg for arg in arguments if arg.source == "argument"]
     results = [arg for arg in arguments if arg.source == "result"]
-    if len(source) != 1 or len(results) != 1:
-        return None
-    values, counts = source[0], results[0]
-    if (
-        values.dtype != "ui16"
-        or counts.dtype != "ui16"
-        or values.shape != (VR_LANES,)
-        or counts.shape != (HISTOGRAM_BINS,)
-        or values.mode != "in"
-        or counts.mode != "out"
-    ):
-        return None
+    if len(sources) != 1 or len(results) != 1:
+        raise _mismatch(
+            "expects one source array (values) and one returned array (counts); "
+            f"got {len(sources)} source and {len(results)} returned arrays",
+            stage=0,
+        )
+    values, counts = sources[0], results[0]
+    if len(values.shape) != 1 or len(counts.shape) != 1:
+        raise _mismatch("values and counts must both be rank-1 arrays", stage=0)
 
-    inventory = {
-        r"\baffine\.for\b": 2,
-        r"\barith\.cmpi\s+eq\b": 1,
-        r"\bscf\.if\b": 1,
-        r"\barith\.addi\b": 1,
-        r"\baffine\.store\b": 1,
-        r"\bmemref\.alloc\b": 1,
-        r"\blinalg\.fill\b": 1,
-        r"\barith\.index_cast\b": 1,
-    }
-    if any(
-        _count(source_mlir, pattern) != wanted for pattern, wanted in inventory.items()
-    ):
-        return None
-    if _count(source_mlir, r"\baffine\.load\b") != 2:
-        return None
-    if _count(source_mlir, r"\baffine\.for\s+%[-\w.$]+\s*=\s*0\s+to\s+256\b") != 1:
-        return None
-    if _count(source_mlir, r"\baffine\.for\s+%[-\w.$]+\s*=\s*0\s+to\s+32768\b") != 1:
-        return None
+    if values.dtype != "ui16" or counts.dtype != "ui16":
+        raise _mismatch(
+            f"dtypes are {values.name}:{values.dtype}, {counts.name}:{counts.dtype}; "
+            "the template implements uint16 values and uint16 counts"
+        )
 
-    # Prove that equality is between the loaded value and the outer induction
-    # variable after only width/index casts.  This is what makes bins 0..255 a
-    # static semantic fact instead of a fixture-dependent assumption.
-    outer_match = re.search(
-        r"affine\.for\s+(%[-\w.$]+)\s*=\s*0\s+to\s+256\b",
-        source_mlir,
-    )
-    inner_match = re.search(
-        r"affine\.for\s+(%[-\w.$]+)\s*=\s*0\s+to\s+32768\b",
-        source_mlir,
-    )
-    if outer_match is None or inner_match is None:
-        return None
-    outer, inner = outer_match.group(1), inner_match.group(1)
-    value_load = re.search(
-        rf"(?P<load>%[-\w.$]+)\s*=\s*affine\.load\s+%arg0\[{re.escape(inner)}\]"
-        rf"[^\n]*from\s*=\s*\"{re.escape(values.name)}\"",
-        source_mlir,
-    )
-    if value_load is None:
-        return None
-    widened = re.search(
-        rf"(?P<wide>%[-\w.$]+)\s*=\s*arith\.extui\s+{re.escape(value_load.group('load'))}\b",
-        source_mlir,
-    )
-    index = re.search(
-        rf"(?P<index>%[-\w.$]+)\s*=\s*arith\.index_cast\s+{re.escape(outer)}\b",
-        source_mlir,
-    )
-    if widened is None or index is None:
-        return None
-    comparison = re.search(
-        rf"arith\.cmpi\s+eq,\s*{re.escape(widened.group('wide'))},\s*"
-        rf"{re.escape(index.group('index'))}\b",
-        source_mlir,
-    )
-    if comparison is None:
-        return None
-    if not re.search(
-        rf"affine\.store\s+%[-\w.$]+\s*,\s*%[-\w.$]+\[{re.escape(outer)}\]"
-        rf"[^\n]*to\s*=\s*\"{re.escape(counts.name)}\"",
-        source_mlir,
-    ):
-        return None
+    summary = summarize_native_function(source_mlir, function, RECIPE)
+    abi = bind_abi(summary, arguments, RECIPE)
+    names = abi.names
+    ((values_formal, _),) = abi.sources
+    ((counts_array, _),) = abi.results
+    require_no_carried_locals(summary, RECIPE)
+
+    if len(summary.effects) != 1:
+        raise _mismatch(
+            f"expects exactly one store (the counter update); found "
+            f"{len(summary.effects)}",
+            stage=1,
+        )
+    (effect,) = summary.effects
+    if effect.base is not counts_array:
+        raise _mismatch(
+            f"the only store writes {names.get(effect.base, effect.base.name)!r}, "
+            f"not the returned counts {counts.name!r}",
+            stage=1,
+        )
+    if len(effect.loops) != 2:
+        raise _mismatch(
+            "the counter update must sit inside exactly two loops (bins x items); "
+            f"found {len(effect.loops)}",
+            stage=1,
+        )
+    if len(effect.indices) != 1 or iv_of(effect.indices[0]) not in effect.loops:
+        raise _mismatch("counts must be indexed by an enclosing loop variable")
+    bin_loop = iv_of(effect.indices[0])
+    (item_loop,) = [loop for loop in effect.loops if loop is not bin_loop]
+    if len(effect.guards) != 1 or effect.guards[0].kind != "cmp":
+        raise _mismatch(
+            "the counter update must be guarded by exactly one comparison "
+            "(no else branch)",
+            stage=1,
+        )
+
+    predicate, lhs, rhs = effect.guards[0].args
+    value_load = E("load", (values_formal, (("iv", item_loop),)), 16)
+    bin_value = E("iv", (bin_loop,), 16)
+    views = (compare_view(lhs), compare_view(rhs))
+    value_side = [view for view in views if view[0] == value_load]
+    bin_side = [view for view in views if view[0] == bin_value]
+    if len(value_side) != 1 or len(bin_side) != 1:
+        raise _mismatch(
+            "the guard compares "
+            f"{describe(views[0][0], names)} with {describe(views[1][0], names)}; "
+            f"the template compares {values.name}[item] with the bin index"
+        )
+    value_extension = value_side[0][1]
+    bin_extension = bin_side[0][1]
+    if value_extension not in {None, "u", "s"} or bin_extension not in {
+        None,
+        "index",
+        "u",
+    }:
+        raise _mismatch("the comparison operands are not exact 16-bit values")
+    if predicate != "eq":
+        raise _mismatch(
+            f"the guard uses {predicate_text(predicate)}; the template counts "
+            "equality (==) only"
+        )
+
+    counter = E("load", (counts_array, effect.indices), 16)
+    update = ring16(effect.value)
+    increment = match_increment(update, counter)
+    if increment is None:
+        raise _mismatch(
+            f"the update is {counts.name}[bin] = {describe(update, names)}; the "
+            f"template implements {counts.name}[bin] += 1"
+        )
+    if increment != 1:
+        raise _mismatch(
+            f"{counts.name}[bin] is incremented by {_signed16(increment)}; the "
+            "template implements += 1"
+        )
+    require_fill_zero(summary, counts_array, counts.name, RECIPE)
+
+    if values.mode != "in":
+        raise _mismatch(f"{values.name!r} is written; the template reads it only")
+    items, bins = values.shape[0], counts.shape[0]
+    require_loop(bin_loop, lower=0, upper=bins, what="bin", recipe=RECIPE)
+    require_loop(item_loop, lower=0, upper=items, what="item", recipe=RECIPE)
+    if value_extension == "s" and bins > 1 << (facts.lane_bits - 1):
+        raise _mismatch(
+            "sign-extended values never equal bins >= 2**15, but the template "
+            "compares raw 16-bit patterns"
+        )
+    if items != facts.lanes:
+        raise _mismatch(
+            f"{values.name} has {items} items; the template needs exactly one "
+            f"complete frontier of {facts.lanes} lanes",
+            stage=3,
+        )
+    if not 1 <= bins <= 1 << facts.lane_bits:
+        raise _mismatch(
+            f"{bins} bins exceed the {facts.lane_bits}-bit immediate range",
+            stage=3,
+        )
 
     return APUv1DenseHistogramAnalysis(
         function=function,
         values_role=values.name,
         counts_role=counts.name,
-        items=VR_LANES,
-        bins=HISTOGRAM_BINS,
+        items=items,
+        bins=bins,
     )
 
 
@@ -176,12 +253,14 @@ class APUv1DenseHistogramLowering:
         return {**inputs, self.analysis.values_role: np.ascontiguousarray(values)}
 
     def operation_inventory(self) -> dict[str, int]:
+        pairs, odd = divmod(self.analysis.bins, 2)
         return {
             "dma_l4_to_l1_32k": 1,
             "gvml_load_16": 1,
-            "gvml_eq_imm_16": HISTOGRAM_BINS,
-            "gvml_2_fast_count_m_g32k": HISTOGRAM_BINS // 2,
-            "scalar_l4_store_u16": HISTOGRAM_BINS,
+            "gvml_eq_imm_16": self.analysis.bins,
+            "gvml_2_fast_count_m_g32k": pairs,
+            "gvml_count_m_g32k": odd,
+            "scalar_l4_store_u16": self.analysis.bins,
         }
 
     def build_execution_graph(self, target, cost):
@@ -211,6 +290,11 @@ class APUv1DenseHistogramLowering:
             "gvml_2_fast_count_m_g32k",
             count=inventory["gvml_2_fast_count_m_g32k"],
         )
+        graph.op(
+            "COUNT_M_G32K",
+            "gvml_count_m_g32k",
+            count=inventory["gvml_count_m_g32k"],
+        )
         graph.move(
             "ARC_STORE_L4_U16",
             "scalar_l4_store_u16",
@@ -226,13 +310,23 @@ class APUv1DenseHistogramLowering:
             "physical_input_transforms": {},
             "output_transform": "identity",
             "correctness_repairs": [
-                "derive every immediate bin from the proven outer induction variable",
-                "return all 256 bins without overwrite",
+                "derive every immediate bin from the proven bin induction variable",
+                "return all bins without overwrite",
             ],
         }
 
     def emit_device_source(self) -> str:
         analysis = self.analysis
+        odd_tail = ""
+        if analysis.bins % 2:
+            odd_tail = """
+    {
+        unsigned int count = 0;
+        gvml_eq_imm_16(GVML_MRK0, values_vr, (uint16_t)(HIST_BINS - 1));
+        gvml_count_m_g32k(&count, GVML_MRK0);
+        counts_l4[HIST_BINS - 1] = (uint16_t)count;
+    }
+"""
         return f"""#include <stdint.h>
 
 #include <gsi/libsys/assert.h>
@@ -253,8 +347,7 @@ enum {{
     HIST_BINS = {analysis.bins},
 }};
 
-_Static_assert(HIST_ITEMS == 32768, "one complete APUv1 lane frontier required");
-_Static_assert(HIST_BINS == 256, "paired plan requires 256 dense bins");
+_Static_assert(HIST_BINS <= 65536, "bins are 16-bit immediates");
 
 PROF_VAR(total);
 
@@ -274,17 +367,17 @@ static int dense_histogram(struct program_data *data)
     direct_dma_l4_to_l1_32k(GVML_VM_0, values_l4);
     gvml_load_16(values_vr, GVML_VM_0);
 
-    for (uint16_t bin = 0; bin < HIST_BINS; bin += 2) {{
+    for (uint32_t bin = 0; bin + 1 < HIST_BINS; bin += 2) {{
         unsigned int count0 = 0;
         unsigned int count1 = 0;
-        gvml_eq_imm_16(GVML_MRK0, values_vr, bin);
+        gvml_eq_imm_16(GVML_MRK0, values_vr, (uint16_t)bin);
         gvml_eq_imm_16(GVML_MRK1, values_vr, (uint16_t)(bin + 1));
         gvml_2_fast_count_m_g32k(
             &count0, &count1, GVML_MRK0, GVML_MRK1, GVML_VR16_1);
         counts_l4[bin] = (uint16_t)count0;
         counts_l4[bin + 1] = (uint16_t)count1;
     }}
-
+{odd_tail}
     PROF_END(total);
     PROF_PRINT(total);
     return 0;
