@@ -124,9 +124,10 @@ match; autoschedule (decision domains, legality and pruning, layout
 construction, materialization, ranking of materialized candidates with
 deterministic tie-breaking); lower the selected program and link the runtime;
 virtual execution follows the same flow and returns only the cost. The
-implementation follows this order with two documented departures: ranking
-happens before the winner is materialized (only a codegen probe runs on the
-ranked list) and ranking is per kernel group (C-03, C-05; Section 2.6).
+implementation follows this order; candidates are generated in cost order
+and only a generated program can win, and complete assignments are
+evaluated jointly within a documented budget (Section 2.6 and
+`docs/release/design/selection.md`).
 
 ### 2.0 Route dispatch (`allo/compiler.py::compile`)
 
@@ -342,15 +343,22 @@ chosen_position, rejections, movement, cost_ties, tie_break,
 movement_rejections, policy_pruned)` and `PlacementRanking(kernels,
 incomplete)` on `MatcherScheduledPlacements.placement_ranking`.
 
-What is still per kernel group (open C-03, C-05): ranking scores one
-kernel's placements over that kernel's sub-trace before anything is
-materialized; only `InfeasibleSchedule` from a cost rule or the codegen
-probe counts as a rejection; the reconciled whole program is not re-costed;
-`allo/pim/schedule_search.py::grid_search` (materialize-then-score over a
-finite decision grid, used by the APU v1 vector route's
-`search_apu_v1_vector_plans`) is not used by the matcher route. The paper's
-"each surviving complete assignment is evaluated as one program" (III-F)
-therefore holds within one kernel group, not across groups.
+Selection contract (`docs/release/design/selection.md`, C-03 and C-05
+closed): candidates are code-generated in cost order and the first that
+generates wins; `InfeasibleSchedule`, `NotImplementedError` and `ValueError`
+from an emitter are recorded as rejections (`PlacementRanking.materialization`
+reports how many candidates were probed; `SelectionPolicy(materialize=
+"eager")` generates every candidate first). After per-group choices the
+reconciled whole program is re-priced (`program_cycles` equals
+`estimate().cycles`) and any group a revert touched is re-ranked under the
+whole-program cost. When the product of the groups' surviving candidate
+counts is within `SelectionPolicy.joint_budget` (default 256), every
+complete assignment is evaluated as one program through
+`allo/pim/schedule_search.py::grid_search` over the whole-trace graph and
+the record says `joint_evaluation="complete"`; above the budget the
+per-group route runs and the record says `"per-group heuristic"`. The
+paper's "each surviving complete assignment is evaluated as one program"
+therefore holds within the budget, and the label states when it does not.
 
 ### 2.7 Materialization and code generation (`allo/spmw_codegen.py`)
 
@@ -525,8 +533,25 @@ Numerics of the token-partition merge are checked separately by
 lowered record (`aim_contraction_profile`; M-06); host transfers are priced
 by slice (M-05). `_check_simulator_geometry` rejects targets whose geometry
 differs from the 32-channel preset (M-10). Design:
-`docs/release/design/aim-token-partition.md`. Open: M-04 (AttAcc path
-external), skill-doc bank geometry.
+`docs/release/design/aim-token-partition.md`. Open: skill-doc bank geometry.
+
+### 3.6 AttAcc (`attacc`, analytical only)
+
+`build_attacc_target()` describes the paper's AttAcc device (5 HBM3 PIM
+devices x 16 pseudo-channels x 64 banks, FP16; `MAC`, `SFM_EXP`, `SFM_SUM`,
+`SFM_DIV`; no timing). `allo/pim/attacc_tiling.py` enumerates the legal
+tilings from the geometry and the matched contraction, the `attacc_tiling`
+knob makes each a candidate, and `allo/pim/costs/attacc.py` prices the
+retained command inventory with the paper's closed-form rules
+(re-implemented from the paper's source, no DCC code; validity domain in
+the docstring). `allo/spmw_attacc.py::AttAccCtx` emits the command
+inventory; there is no runner, so `backend=None` raises and only
+`backend="virtual"` (`kind="virtual"`) is supported. All 500 paper
+instances select the paper tiling through `allo.compile`
+(`benchmarks/attacc/`, `tests/pim/test_attacc_virtual.py`). The
+Ramulator2-AttAcc timing and the DCC decode composition are external
+scripts with named dependencies (`benchmarks/attacc/scripts/`). Design:
+`docs/release/design/attacc-backend.md`.
 
 ### 3.3 UPMEM (`allo/spmw_upmem.py`, `allo/pim/upmem_physical*.py`, `allo/pim/upmem_irregular.py`, `allo/pim/costs/upmem.py`)
 
@@ -600,9 +625,12 @@ profile freshness by diffing the device log before and after the launch
   packed initial output for temporal plans; V1-02); `"functional"` and
   `"virtual"` both run a NumPy model of the selected plan's numerics and
   return `kind="functional"` with the analytical cycles (a known labelling
-  residue, `docs/release/REVIEW.md`). Open: V1-05 (fitted count rule
-  absent), V1-06 (tile heuristic), V1-08 (template location and licenses),
-  V1-11, V1-12.
+  residue, `docs/release/REVIEW.md`). GEMV reduction tiles are cost-ranked
+  candidates (`spatial_gemv_group_reduction_k<tile>`; `tile_decision` in the
+  estimate and run record). The cost program carries the paper's fitted
+  affine event model with provenance and labels estimates `calibrated` or
+  `extrapolated` (`docs/release/design/apu-v1-cost.md`). Open: V1-08
+  (template location and licenses).
 * **`APUv1Program` scalar route** (`apu_v1_program.py`): one
   `APUv1Phase(kernel, vectorize=False)`; the whole function lowers to
   portable C11 (`emit_c_from_mlir`) and runs on APUC 0. Backends `None`
@@ -853,14 +881,13 @@ Allo alone.
 ## 8. Open items and compatibility boundary
 
 Open findings that shape the architecture (details and status in
-`docs/release/ISSUES.md`): C-03 and C-05 (ranking precedes materialization
-and is per kernel group; no re-cost after reconciliation), C-10, F-02,
-S-11/S-13, M-04, U-06 (minus and constant pointwise forms), P-06/P-17 (UPMEM
-public build), V1-03 (default FP16 GEMV plan under `"reassociate"` is a tree
-plan; strict selects a temporal plan), V1-05/V1-06/V1-08/V1-11/V1-12,
-G2-09..G2-12, P-04/P-05/S-04 (Samsung simulator overlay in the containing
-repository), P-13/P-14/P-18/P-19/P-20. CLAIMS row 16 (movement ties) is
-partial for the realizability reason in Section 2.5.
+`docs/release/ISSUES.md`): C-10, S-11/S-13, U-06 (minus and constant
+pointwise forms), P-17 (UPMEM SDK is proprietary), V1-03 (default FP16 GEMV
+plan under `"reassociate"` is a tree plan; strict selects a temporal plan),
+V1-08 (GSI template location and licenses), G2-09..G2-12, P-04 (Samsung
+simulator patches need Samsung's permission to publish; the overlay lives
+in the containing repository). CLAIMS row 16 (movement ties) is partial for
+the realizability reason in Section 2.5.
 
 Tenon does not change upstream Allo's `allo.memory.Layout` or the FPGA/AIE
 build paths; the PIM surface is additive (`allo/__init__.py` eager exports

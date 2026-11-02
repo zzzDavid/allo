@@ -143,6 +143,38 @@ what was accepted and why.
   host-slice metrics, Samsung carried-accumulator gate) were applied by the
   reviewer after reading the proposed patches.
 
+## Accepted repairs (round 4) and review notes
+
+- Selection contract (C-03, C-05). Accepted: lazy materialization in cost
+  order with recorded rejections selects the same program as eager
+  materialization and keeps compile time flat; the joint evaluation is
+  bounded by a documented budget and labelled. Reviewer note: the
+  cross-kernel residency coupling that reconciliation handles is never
+  produced by liveness on dataflow regions today, so the conflict test
+  fakes it; this is recorded in ISSUES C-05.
+- AttAcc analytical backend (M-04). Accepted: the paper's closed-form rules
+  are re-implemented from the paper's own source without DCC code, the
+  tiling space comes from the target geometry, and the 500-instance
+  selection reproduces the paper's selector exactly. The inherited
+  power-of-two rounding quirk of the reference space is kept and
+  documented. What stays external is named with its dependency and
+  license status; the e2e script's batch-4 discrepancy is reported, not
+  hidden. Open question for the user: DCC has no license.
+- APU v1 cost provenance and tiles (V1-05, V1-06). Accepted: the fitted
+  coefficients are copied at full precision from the archived freeze with
+  a provenance test; the released cost program reproduces the paper's
+  error figures exactly; the tile is a ranked decision whose predicted
+  order matches the archived measurements. The 1024x64x1024 default winner
+  is a catalog variant never measured on the device, which the record
+  states.
+- Frontend literal typing (F-02). Accepted as a shared-file change after a
+  module-level diff of 866 built modules showed two intended differences;
+  one upstream test that depended on silent truncation was corrected.
+- Simulator recipes (P-05, P-06, P-21). Accepted: each simulator rebuilt
+  from committed overlay/patch plus a fresh upstream clone reproduces the
+  pinned cycles; the Samsung patches still need Samsung's permission to
+  publish (P-04).
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -156,7 +188,11 @@ what was accepted and why.
   default selection: rejected in round 2; the rule now matches the
   simulator and the paper placement is selected explicitly in the tests.
 - Treating the Gemini-II typed-record runs as evidence for a source route:
-  they validate the typed routes only; G2-02 stays open.
+  they validate the typed routes only (G2-02 was closed later by the source
+  route and its own card run).
+- Presenting the 26-minute 500-instance AttAcc sweep as the paper's 24 s
+  selector time, or ranking AttAcc tilings with the archived replay model
+  that contradicts the paper.
 
 ## Constants and specialization inventory
 
@@ -170,13 +206,13 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 | Gate | Judgment | Basis |
 |---|---|---|
-| G1 correspondence | **PARTIAL** | rows 3, 13, 17-22, E2, E5, E8 now implemented; row 16 partial (ties reach ranking, not realizable by backends); row 15 open (per-group ranking); E11, E12, E14-E16 and the AttAcc path (M-04) external |
-| G2 semantic preservation / explicit failure | **PARTIAL** | all round 1-3 repairs; open: F-02 literal truncation (shared frontend), V1-11/V1-12 minor |
-| G3 general mechanisms | **PARTIAL** | structural recognizers on APU v1, Samsung, Gemini-II source route; UPMEM template-derived legality; open: `a*A - b*B`/`+ c` patterns (U-06), G2 device index |
-| G4 search/layout/selected-program integrity | **PARTIAL** | legality pass, movement stage, documented tie-break, Samsung executes selected program; open: C-03 (ranking before materialization), C-05 (per kernel, no re-cost after reconciliation) |
-| G5 cost models | **PARTIAL** | Samsung MAC and TEMPORAL rules calibrated; AiM single route and slice-aware host cost; UPMEM validity labels; Gemini-II card-fitted rules; open: V1-05/V1-06 |
-| G6 evidence beyond examples | **PARTIAL** | variant/rename/neighbor-shape regressions on every backend; Gemini-II fresh fixtures on the card; UPMEM 391x65 sweep; no systematic independent-oracle campaign document yet |
-| G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install verified; docs added; open: P-04/P-06/S-04 simulator reproducibility, P-08 architecture doc rewrite, P-13/P-14/P-17/P-18/P-19/P-20 |
-| G8 backend execution | **PARTIAL** | simulators at the candidate; APU v1 device 4 tests; Gemini-II card-gated test 10 passed with 11 exact programs; open: UPMEM public build path |
+| G1 correspondence | **PARTIAL** | rows 3, 13-15, 17-22, E2, E5, E8, E12, E16 implemented; row 16 partial (ties reach ranking, not realizable by backends); E11, E14 (DRAM half), E15 external reproduction scripts |
+| G2 semantic preservation / explicit failure | **PASS (candidate)** | all identified silent-wrong-code and missing-output paths repaired with tests; remaining minor items (V1-03 default plan documentation, G2-09..G2-12) do not produce silent wrong results |
+| G3 general mechanisms | **PARTIAL** | structural recognizers everywhere; open: `a*A - b*B`/`+ c` pointwise patterns (U-06), Gemini-II device index, movement-tie realizability |
+| G4 search/layout/selected-program integrity | **PARTIAL** | legality, movement stage, bounded joint evaluation, lazy materialization with rejections, Samsung executes the selected program; open: realizing alternative owner maps (row 16) |
+| G5 cost models | **PARTIAL** | every backend's model carries provenance and a validity label; open: per-level movement weights from cost programs, Samsung CRF-fill preload cost outside the model |
+| G6 evidence beyond examples | **PARTIAL** | rename/variant/neighbor regressions per backend; artifact-free execution probe; UPMEM 391x65 sweep; Gemini-II fresh fixtures; no consolidated independent-oracle campaign document yet |
+| G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install, architecture doc rewritten, simulator recipes verified; open: P-04 Samsung patch permission, P-17 proprietary UPMEM SDK (documented), RELEASE_CHECKLIST index removals to run, containing-repo overlay commits (user) |
+| G8 backend execution | **PARTIAL** | simulators at the candidate; APU v1 device 4 tests after the repairs (the retiled GEMM default is unmeasured); Gemini-II card-gated test 10 passed; AttAcc analytical only by design |
 
 Verdict: **NOT READY.**

@@ -176,8 +176,8 @@ outside this change (Section 7).
 
 | policy | selected plan | pruned | bit-equal to source order |
 |---|---|---|---|
-| strict | `temporal_dma_coalescing` | `baseline_spatial_reduction`, `spatial_gemv_group_reduction` | 4096/4096 |
-| reassociate | `spatial_gemv_group_reduction` | none | 425/4096 (plan-order model) |
+| strict | `temporal_dma_coalescing` | `baseline_spatial_reduction`, `spatial_gemv_group_reduction_k<tile>` | 4096/4096 |
+| reassociate | `spatial_gemv_group_reduction_k<tile>` | none | 425/4096 (plan-order model) |
 
 ## 6. Tests
 

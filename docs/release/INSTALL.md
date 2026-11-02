@@ -17,9 +17,9 @@ What you need depends on what you want to run:
 | Goal | Needs |
 |---|---|
 | Compile, inspect, and get analytical estimates (`backend="virtual"`) for every PIM target | Allo + MLIR bindings only |
-| Samsung HBM-PIM simulation | + PIMSimulator with Tenon's `pim_driver` (see `simulators.md`) |
-| SK hynix AiM timing simulation | + aim_simulator checkout + Docker image `aim-simulator-build` |
-| UPMEM simulation | + uPIMulator (Tenon-patched) + UPMEM DPU SDK Docker image |
+| Samsung HBM-PIM simulation | + PIMSimulator at `3703d1f` with Tenon's overlay (`pim_driver`; section 3a) |
+| SK hynix AiM timing simulation | + aim_simulator at `0f28a07` + a Docker image built from Tenon's Dockerfile (section 3a) |
+| UPMEM simulation | + uPIMulator at `870d916` with `tenon-upimulator.patch` + a UPMEM DPU SDK 2023.1.0 Docker image you build from your own copy of the SDK (section 3a) |
 | GSI APU v1 (Gemini-I) hardware | + GSI APU SDK, ARC toolchain, GVML headers, `example-gvml` project, a Gemini-I board |
 | GSI APU v2 (Gemini-II) hardware | + GSI Gemini-II SDK under `/opt/gsi`, `gsi_tool`, a Gemini-II card |
 
@@ -31,9 +31,15 @@ verified.
 ## 1. Prerequisites
 
 - Linux x86-64, CPython 3.12 (`python_requires=">=3.12"`).
-- CMake >= 3.20 and Ninja. `setup.py` calls the `cmake` on `PATH` and now
-  refuses older versions with a message; `python3 -m pip install cmake ninja`
-  is the easiest way to get both.
+- CMake >= 3.20 and Ninja. `setup.py` calls the `cmake` on `PATH`. Many
+  distributions ship an older one (Ubuntu 20.04: 3.16.3); then run
+  `python3 -m pip install cmake ninja` in the build interpreter's
+  environment and put its `bin` directory first on `PATH`. With an older
+  `cmake` first on `PATH`, `build_ext` stops before configuring with
+  `RuntimeError: CMake >= 3.20 is required to build the Allo MLIR bindings,
+  but cmake on PATH is 3.16. Run python3 -m pip install cmake and put its bin
+  directory first on PATH.` (checked against the system cmake 3.16.3 on
+  2026-11-02; P-20).
 - `nanobind>=2.9,<3.0` in the build interpreter.
 - An LLVM/MLIR build with Python bindings
   (`-DLLVM_ENABLE_PROJECTS="clang;mlir;openmp" -DMLIR_ENABLE_BINDINGS_PYTHON=ON`).
@@ -47,11 +53,23 @@ verified.
   conda environment that ships it. Otherwise the final link of
   `libAlloMLIRAggregateCAPI.so` fails with undefined
   `std::__glibcxx_assert_fail`.
-- Python dependencies: `requirements.txt`. It still carries upstream
-  developer tools (`black`, `pylint`, `clang-format`, `pytest`), `gurobipy`
-  and a direct-URL `past` wheel (audit P-13, not changed here). Tenon itself
-  needs only numpy, sympy, ml_dtypes, PyYAML, packaging, psutil, rich,
-  tabulate and pytest for the tests.
+- Python dependencies (P-13):
+  - `requirements.txt` is the runtime list and the only file `setup.py`
+    reads for `install_requires`: numpy, PyYAML (MLIR `linalg` opdsl), sympy,
+    ml_dtypes, rich, tabulate, xmltodict, pandas, pyparsing, graphviz (the
+    last four for upstream Allo's report and AIE modules). `setup.py` rejects
+    pip options and direct URLs in that file.
+  - `requirements-dev.txt` (`-r requirements.txt` plus build, test and lint
+    tools: cmake, ninja, nanobind, pybind11, pytest, clang-format, black,
+    pylint) is for developers and CI. It also lists upstream Allo's optional
+    features, which are imported only when used and are not installed by
+    `pip install`: `gurobipy` (commercial solver client; `allo.autoscheduler`)
+    and the direct-URL `past` wheel (PAST verifier, cp312 Linux only;
+    `allo/verify.py`).
+  - `python3 -m pip install -r requirements-dev.txt` before running the test
+    suite. A venv holding only `requirements.txt` imports `allo` and compiles
+    the Samsung, UPMEM and AiM GEMVs with `backend="virtual"` (checked
+    2026-11-02).
 
 ## 2. Source install
 
@@ -171,18 +189,66 @@ The UPMEM backend has two routes.
 - **User build.** Set both `UPIMULATOR_ROOT` (your Tenon-patched uPIMulator
   project root, containing the `benchmark/GENERIC` slot) and `UPIMULATOR_BIN`
   (its binary). Nothing is staged and the manifest is not compared. This is
-  the route for ordinary use. The Tenon uPIMulator patch (GENERIC assembler,
-  fixture loader, SDK build fixes) is described in `simulators.md`; it is not
-  yet published as a patch series, which is the remaining gap for a fully
-  public UPMEM path.
+  the route for ordinary use. The Tenon uPIMulator patch (GENERIC slot,
+  fixture loader, linker and SDK build fixes) is
+  `<repo>/experiments/simulators/setup/uPIMulator/tenon-upimulator.patch`;
+  section 3a has the build. A build made that way with the SDK 2023.1.0
+  mirror produced the pinned object manifest and all 16 paper UPMEM cycle
+  counts on 2026-11-02.
 
 `allo.spmw_simenv.upmem_sdk_build_identity(manifest)` returns
 `"pinned-campaign"` or `"user-build:<first 12 hex digits of the manifest>"`
 (and raises on a drifted manifest on the pinned route). Each DPU record in
-`RunResult.extra["upmem"]` is meant to carry it as `sdk_build`; that field is
-written by `allo/spmw_upmem.py` once its run loop calls the helper (pending,
-tracked as P-03 in `ISSUES.md`). Until then, `sdk_build_sha256` in each
-record holds the raw manifest.
+`RunResult.extra["upmem"]` carries it as `sdk_build`, next to the raw
+manifest in `sdk_build_sha256` (for example `"user-build:d45e285c34b5"` on
+the verified user build).
+
+### 3a. Building the simulators (verified 2026-11-02)
+
+Each recipe was run from a fresh upstream clone in a scratch directory with a
+new Docker tag, then exercised through `allo.compile`; full commands,
+hashes, times and licensing are in `simulators.md`, the per-simulator
+READMEs in `<repo>/experiments/simulators/setup/`. `<repo>` is the containing
+Tenon repository; `setup/` there holds every Tenon-side change.
+
+```bash
+# Samsung HBM-PIM (PIMSimulator is Samsung-licensed: clone it yourself)
+git clone https://github.com/SAITPublic/PIMSimulator.git
+git -C PIMSimulator checkout 3703d1f19c8f027360cc33a3243eb271e3bb6898
+bash <repo>/experiments/simulators/setup/PIMSimulator/apply.sh PIMSimulator   # ~12 s
+export PIMSIMULATOR_ROOT=$PWD/PIMSimulator
+#   paper GEMV 4096x256: vendor layout 4,435 cycles, cost-selected default 4,389
+
+# SK hynix AiM
+git clone https://github.com/arkhadem/aim_simulator.git
+git -C aim_simulator checkout 0f28a07bdb83e42b9305ad3d45410ebd3aa2c091
+cp <repo>/experiments/simulators/setup/aim_simulator/Dockerfile aim_simulator/
+docker build -t tenon-aim-simulator-build:0f28a07 aim_simulator          # ~30 s
+docker run --rm -u $(id -u):$(id -g) -v $PWD/aim_simulator:/work tenon-aim-simulator-build:0f28a07 \
+    bash -c "mkdir -p build && cd build && cmake .. && make -j8"        # ~2 min, downloads deps
+export AIM_SIMULATOR_ROOT=$PWD/aim_simulator TENON_AIM_SIM_IMAGE=tenon-aim-simulator-build:0f28a07
+
+# UPMEM (the DPU SDK 2023.1.0 is UPMEM proprietary: obtain it yourself;
+# <upmem-sdk> holds upmem-2023.1.0-Linux-x86_64/)
+git clone https://github.com/VIA-Research/uPIMulator.git
+git -C uPIMulator checkout 870d916334e9ff0b190f555f951a9ec3c4257781
+bash <repo>/experiments/simulators/setup/uPIMulator/apply.sh uPIMulator  # patch + go build, ~7 s
+export UPIMULATOR_ROOT=$PWD/uPIMulator/golang/uPIMulator UPIMULATOR_BIN=$PWD/uPIMulator/golang/uPIMulator/build/uPIMulator
+tar czf $UPIMULATOR_ROOT/docker/upmem-sdk.tar.gz -C <upmem-sdk> upmem-2023.1.0-Linux-x86_64
+docker build -t tenon-upimulator-sdk:2023.1.0 $UPIMULATOR_ROOT/docker/   # ~36 s
+export TENON_UPMEM_SDK_IMAGE=tenon-upimulator-sdk:2023.1.0
+docker run --rm -v $UPIMULATOR_ROOT:/root/uPIMulator $TENON_UPMEM_SDK_IMAGE \
+    python3 /root/uPIMulator/sdk/build.py --num_tasklets 12
+#   paper GEMV (96x128): 359,026 cycles, sdk_build "user-build:d45e285c34b5"
+```
+
+What you must obtain yourself, in every case: the PIMSimulator source under
+Samsung's notice (no redistribution, non-commercial research only), the
+UPMEM DPU SDK (proprietary; the official host returned HTTP 403, the
+CMU-SAFARI mirror carries no license file), and, for the GSI backends, the
+GSI SDKs and boards. Never publish an image or tarball containing the UPMEM
+SDK, and do not reuse the tag `bongjoonhyun/upimulator` (the upstream
+author's Docker Hub name; P-17).
 
 ## 4. Running the tests
 
@@ -190,6 +256,7 @@ From a git checkout, with the bindings built:
 
 ```bash
 cd <checkout>
+python -m pip install -r requirements-dev.txt   # pytest and the dev tools
 export PYTHONPATH=$PWD:$PYTHONPATH
 python -m pytest tests/pim tests/perf -q -p no:cacheprovider
 ```
