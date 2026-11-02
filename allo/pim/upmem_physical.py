@@ -430,8 +430,8 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
     """Streaming int32 pointwise plan with calibrated fused chunk packing.
 
     ``operation`` is one of :data:`ELEMENTWISE_OPERATIONS`:
-    ``x + y``, ``alpha x + beta y``, ``x - y``, ``x * y`` or ``alpha x``.
-    With the default 128-byte operand chunk, fused storage is a sequence of
+    ``x + y``, ``alpha x + beta y`` (plus the int32 literal ``gamma`` when
+    nonzero), ``x - y``, ``x * y`` or ``alpha x``.  With the default 128-byte operand chunk, fused storage is a sequence of
     ``[A_chunk32, B_chunk32]`` 256-byte records.  Each record is fetched with
     one DMA and produces one 128-byte output chunk.  ``scale`` reads one
     operand and has no fused form.
@@ -444,6 +444,7 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
     alpha: int = 2
     beta: int = -1
     runtime_coefficients: bool = False
+    gamma: int = 0
 
     def __post_init__(self):
         _positive("elements", self.elements)
@@ -456,10 +457,15 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
             )
         if self.interleaved and self.operands != 2:
             raise ValueError(f"{self.operation!r} reads one operand; no fused packet")
-        for name in ("alpha", "beta"):
+        for name in ("alpha", "beta", "gamma"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{name} must be an integer")
+        if self.gamma and (self.operation != "axpby" or self.runtime_coefficients):
+            raise ValueError(
+                "a constant term gamma is implemented by the compile-time "
+                "axpby template only"
+            )
         if self.interleaved:
             _validate_dma("fused operand DMA", 2 * self.dma_bytes)
         _validate_capacity(self.wram_bytes, self.mram_image_bytes)
@@ -507,7 +513,7 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
 
         value = {
             "add": lambda: x + y,
-            "axpby": lambda: self.alpha * x + self.beta * y,
+            "axpby": lambda: self.alpha * x + self.beta * y + self.gamma,
             "sub": lambda: x - y,
             "mul": lambda: x * y,
             "scale": lambda: self.alpha * x,
@@ -609,7 +615,7 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
         calibrated_shift_sub = (
             self.operation == "axpby"
             and not self.runtime_coefficients
-            and (self.alpha, self.beta) == (2, -1)
+            and (self.alpha, self.beta, self.gamma) == (2, -1, 0)
         )
         general_axpby = self.operation == "axpby" and not calibrated_shift_sub
         reads_per_chunk = 1 if self.interleaved else self.operands
@@ -628,7 +634,8 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
             "mram_bytes": read_bytes + write_bytes,
             "barriers": coefficient_calls,
             "wram_bytes": self.wram_bytes,
-            "int32_adds": self.elements * int(self.operation == "add" or general_axpby),
+            "int32_adds": self.elements
+            * (int(self.operation == "add" or general_axpby) + int(self.gamma != 0)),
             "int32_subtracts": self.elements
             * int(calibrated_shift_sub or self.operation == "sub"),
             "int32_shifts": self.elements * int(calibrated_shift_sub),
@@ -643,7 +650,12 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
             "coefficients": (
                 {"alpha": self.alpha, "binding": "compile_time"}
                 if self.operation == "scale"
-                else {"alpha": self.alpha, "beta": self.beta, "binding": "compile_time"}
+                else {
+                    "alpha": self.alpha,
+                    "beta": self.beta,
+                    **({"gamma": self.gamma} if self.gamma else {}),
+                    "binding": "compile_time",
+                }
                 if self.operation == "axpby" and not self.runtime_coefficients
                 else (
                     {"alpha": self.alpha, "beta": self.beta, "binding": "runtime_mram"}
@@ -686,13 +698,14 @@ __dma_aligned int32_t tenon_coefficients[2];
   barrier_wait(&tenon_barrier);
 """
         elif self.operation == "axpby":
-            if (self.alpha, self.beta) == (2, -1):
+            if (self.alpha, self.beta, self.gamma) == (2, -1, 0):
                 expression = "(packet[i] << 1) - " "packet[i + TENON_CHUNK_ELEMENTS]"
             else:
                 expression = _wrap32(
                     f"(uint32_t){self.alpha} * (uint32_t)packet[i] + "
                     f"(uint32_t){self.beta} * "
                     "(uint32_t)packet[i + TENON_CHUNK_ELEMENTS]"
+                    + (f" + (uint32_t){self.gamma}" if self.gamma else "")
                 )
         elif self.operation == "sub":
             expression = _wrap32(

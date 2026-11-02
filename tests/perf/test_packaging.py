@@ -97,8 +97,9 @@ def sdist_members(tmp_path_factory):
 def test_sdist_ships_every_runtime_asset(sdist_members):
     members, _top = sdist_members
     assets = _runtime_assets()
-    # 39 Gemini-II template files at the time of writing; guard the glob.
-    assert sum(a.startswith("allo/pim/templates/apu_g2/") for a in assets) >= 30
+    # 11 Gemini-II template files since the uint16 programs left (G2-11);
+    # guard the glob.
+    assert sum(a.startswith("allo/pim/templates/apu_g2/") for a in assets) >= 11
     missing = [asset for asset in assets if asset not in members]
     assert not missing, missing
 

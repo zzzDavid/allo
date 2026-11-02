@@ -345,19 +345,15 @@ def _generate_project(
     initial_outputs=(),
 ):
     from ..spmw_apu_v1_build import (
-        _COPY_FILES,
         _emit_host_c,
         _emit_makefile,
         _emit_struct_h,
-        _template_dir,
+        stage_apu_v1_template,
     )
 
     dst = Path(dst)
     dst.mkdir(parents=True, exist_ok=True)
-    template = _template_dir()
-    shutil.copytree(template / "Common", dst / "Common")
-    for name in _COPY_FILES:
-        shutil.copy2(template / name, dst / name)
+    stage_apu_v1_template(dst)
     in_roles = sorted(inputs)
     out_roles = sorted(output_specs)
     input_sizes = {name: value.nbytes for name, value in inputs.items()}

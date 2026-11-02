@@ -25,6 +25,10 @@ from .apu_g2_runtime import (
     _run_command,
     _source_snapshot,
 )
+from .apu_g2_composed_layout import (
+    canonicalize_apu_g2_values,
+    require_apu_g2_value_range,
+)
 from .apu_g2_typed_program import (
     APUG2TypedOperation,
     APUG2TypedProgram,
@@ -44,13 +48,33 @@ _OPERATION_ABI = {
 }
 
 
-def _pack_operand(array: np.ndarray, dtype: np.dtype) -> np.ndarray:
-    physical = np.zeros(APUG2_TYPED_CAPACITY, dtype=dtype)
+def _pack_operand(array: np.ndarray, dtype: np.dtype, fill: int = 0) -> np.ndarray:
+    physical = np.full(APUG2_TYPED_CAPACITY, fill, dtype=dtype)
     flattened = np.asarray(array).reshape(-1)
     physical[: flattened.size] = flattened
     return physical.reshape(
         APUG2_TYPED_PHYSICAL_VECTORS,
         APUG2_TYPED_LANES_PER_VECTOR,
+    )
+
+
+def pack_apu_g2_typed_operands(program: APUG2TypedProgram, operands) -> tuple:
+    """Physical carriers of validated logical operands.
+
+    Lanes past the logical shape are zero, except the divisor of ``DIV``,
+    whose padded lanes hold 1 so the VL64 ``div`` never divides by zero on
+    lanes whose results are discarded.
+    """
+
+    return tuple(
+        _pack_operand(
+            operand,
+            scalar_type.numpy_dtype,
+            fill=1 if program.operation is APUG2TypedOperation.DIV and index == 1 else 0,
+        )
+        for index, (operand, scalar_type) in enumerate(
+            zip(operands, program.input_types)
+        )
     )
 
 
@@ -64,20 +88,17 @@ def _logical_output(program: APUG2TypedProgram, physical: np.ndarray) -> np.ndar
         values = flattened[
             : count * program.reduction_extent : program.reduction_extent
         ].copy()
-        return values.reshape(program.output_shape)
-    return flattened[: math.prod(program.shape)].copy().reshape(program.shape)
+        values = values.reshape(program.output_shape)
+    else:
+        values = flattened[: math.prod(program.shape)].copy().reshape(program.shape)
+    require_apu_g2_value_range(values, program.output_type, "device output")
+    return values
 
 
-def _canonicalize(values: np.ndarray, scalar_type) -> np.ndarray:
-    """Apply the declared logical integer width inside its NumPy container."""
+def _canonicalize(values: np.ndarray, scalar_type, *, wrap: bool = False) -> np.ndarray:
+    """The oracle in the declared type's container (out of range raises)."""
 
-    wide = np.asarray(values, dtype=np.int64)
-    modulus = 1 << scalar_type.bits
-    payload = np.mod(wide, modulus)
-    if scalar_type.signed:
-        sign = 1 << (scalar_type.bits - 1)
-        payload = np.where(payload >= sign, payload - modulus, payload)
-    return payload.astype(scalar_type.numpy_dtype)
+    return canonicalize_apu_g2_values(values, scalar_type, wrap=wrap)
 
 
 def _expected_output(program: APUG2TypedProgram, operands) -> np.ndarray:
@@ -103,7 +124,14 @@ def _expected_output(program: APUG2TypedProgram, operands) -> np.ndarray:
         )
     else:
         raise AssertionError(f"unhandled APUg2 typed operation {program.operation}")
-    return _canonicalize(values, program.output_type)
+    # Typed ADD is addition modulo 2**bits (its input and output types are
+    # identical by construction); every other typed operation has an exact
+    # output width, so its oracle is in range and nothing wraps.
+    return _canonicalize(
+        values,
+        program.output_type,
+        wrap=program.operation is APUG2TypedOperation.ADD,
+    )
 
 
 def _artifact_sha256(path: Path) -> str:
@@ -219,10 +247,7 @@ def run_apu_g2_typed(program: APUG2TypedProgram, *operands) -> RunResult:
     card_info = _require_hardware_stack()
     sources, source_hashes = _source_snapshot()
     recipe = build_apu_g2_typed_recipe(program)
-    physical_inputs = tuple(
-        _pack_operand(operand, scalar_type.numpy_dtype)
-        for operand, scalar_type in zip(operands, program.input_types)
-    )
+    physical_inputs = pack_apu_g2_typed_operands(program, operands)
 
     keep = os.environ.get(_KEEP_ENV) == "1"
     root = Path(tempfile.mkdtemp(prefix="tenon-apu-g2-typed-"))
@@ -281,7 +306,15 @@ def run_apu_g2_typed(program: APUG2TypedProgram, *operands) -> RunResult:
             "-DCMAKE_BUILD_TYPE=Release",
             *apu_g2_cmake_arguments(),
         ]
-        host_compile = ["cmake", "--build", host_build, "-j", str(jobs)]
+        host_compile = [
+            "cmake",
+            "--build",
+            host_build,
+            "--target",
+            "tenon_apu_g2_typed",
+            "-j",
+            str(jobs),
+        ]
         commands.extend((host_configure, host_compile))
         _run_command(
             host_configure,
@@ -403,4 +436,4 @@ def run_apu_g2_typed(program: APUG2TypedProgram, *operands) -> RunResult:
             shutil.rmtree(root, ignore_errors=True)
 
 
-__all__ = ["run_apu_g2_typed"]
+__all__ = ["pack_apu_g2_typed_operands", "run_apu_g2_typed"]

@@ -285,7 +285,7 @@ def classify_upmem_kernel(target, matches) -> UpmemKernel:
 
 
 _FAMILY_FORMS = (
-    "pointwise (one ADD/SUB/MUL/SCALE/AXPBY over one loop), "
+    "pointwise (one ADD/SUB/MUL/SCALE/AXPBY/AXMBY/AXPBYC over one loop), "
     "reduction (out[c] += in[i]), "
     "matrix_vector (one MAC over 2-3 loops, optionally y = alpha * acc via SCALE), "
     "gemm (C[i,j] += A[i,k] * B[k,j]), "
@@ -417,7 +417,7 @@ def _require_int32_constant(family: str, name: str, value) -> None:
     ):
         raise NotImplementedError(
             f"UPMEM {family}: coefficient {name}={value!r} is not an int32 "
-            "literal; the DPU template multiplies in int32"
+            "literal; the DPU template computes in int32"
         )
 
 
@@ -444,20 +444,25 @@ def _accumulator_init(family: str, match) -> str:
 # Matched op -> (plan operation, physical-model instructions per element).
 # The matcher reports the source's pointwise expression as one of these
 # target ops (``pim/targets.py::build_upmem_target``) with its int32 literal
-# coefficients: ``x + y``, ``x - y``, ``x * y``, ``alpha x`` and
-# ``alpha x + beta y``.  Instruction counts are analytical: one native
-# add/sub, a constant multiply as one instruction, and a variable 32-bit
-# multiply as the 32-step ``mul_step`` sequence plus one.  Expressions the
-# matcher has no op for (``alpha x - beta y`` written with a minus, a
-# constant term ``+ c``) are rejected by the matcher's coverage check before
-# a family is chosen; ``alpha x + (-beta) y`` is the supported spelling.
+# coefficients: ``x + y``, ``x - y``, ``x * y``, ``alpha x``,
+# ``alpha x + beta y``, ``alpha x - beta y`` and ``alpha x + beta y + gamma``.
+# The last three lower to the one int32 AXPBY template: a subtraction is
+# ``alpha x + (-beta) y`` and the constant is one more int32 add.
+# Instruction counts are analytical: one native add/sub, a constant multiply
+# as one instruction, and a variable 32-bit multiply as the 32-step
+# ``mul_step`` sequence plus one.  Other expressions are rejected by the
+# matcher's coverage check before a family is chosen.
 _POINTWISE_OPERATIONS = {
     "ADD": ("add", 1),
     "SUB": ("sub", 1),
     "MUL": ("mul", 33),
     "SCALE": ("scale", 1),
     "AXPBY": ("axpby", 2),
+    "AXMBY": ("axpby", 2),
+    "AXPBYC": ("axpby", 3),
 }
+# Sign the AXPBY template applies to the matched ``beta``.
+_POINTWISE_BETA_SIGN = {"AXMBY": -1}
 _POINTWISE_OPERAND_ROLES = {"scale": ("x",)}
 
 
@@ -477,7 +482,7 @@ def _loop_extents(match) -> list | None:
 
 def _recognize_pointwise(target, stream):
     """``out[i] = f(lhs[i], rhs[i])`` (or ``f(lhs[i])``) as one ADD, SUB, MUL,
-    SCALE or AXPBY over a single loop."""
+    SCALE, AXPBY, AXMBY or AXPBYC over a single loop."""
     del target
     if len(stream) != 1 or stream[0].target_op_name not in _POINTWISE_OPERATIONS:
         return None
@@ -505,6 +510,9 @@ def _recognize_pointwise(target, stream):
     constants = tuple(sorted(match.extra.get("constants", {}).items()))
     for name, value in constants:
         _require_int32_constant("pointwise", name, value)
+    sign = _POINTWISE_BETA_SIGN.get(match.target_op_name, 1)
+    if sign != 1:
+        _require_int32_constant("pointwise", "-beta", sign * dict(constants)["beta"])
     return {
         "geometry": (("elements", extents[0]),),
         "anchor_op": match.target_op_name,
@@ -535,7 +543,12 @@ def _pointwise_plan(kernel: UpmemKernel, decision: UPMEMPhysicalDecision):
     coefficients = {}
     constants = dict(kernel.constants)
     if operation == "axpby":
-        coefficients = {"alpha": int(constants["alpha"]), "beta": int(constants["beta"])}
+        sign = _POINTWISE_BETA_SIGN.get(kernel.anchor_op, 1)
+        coefficients = {
+            "alpha": int(constants["alpha"]),
+            "beta": sign * int(constants["beta"]),
+            "gamma": int(constants.get("gamma", 0)),
+        }
     elif operation == "scale":
         coefficients = {"alpha": int(constants["alpha"])}
     return UPMEMElementwisePlan(

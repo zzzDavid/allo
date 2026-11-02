@@ -344,17 +344,6 @@ _STANDALONE_4X64K_DOMAIN = ShapeValidityDomain(
     extent_bounds=((4, 4), (65_536, 65_536)),
 )
 
-_DIRECT_REDUCTION_DOMAIN = ShapeValidityDomain(
-    extent_bounds=((1, 65_536), (1, 256)),
-    power_of_two_padding=(True, True),
-    padded_extent_limits=(65_536, 256),
-    max_padded_volume=65_536,
-)
-
-_RESIDENT_TWO_STAGE_DOMAIN = ShapeValidityDomain(
-    extent_bounds=((1, 128), (1, 128)),
-)
-
 
 STANDALONE_4X64K_ADD_CALIBRATION = PipelineCalibration(
     signature=PipelineSignature(
@@ -380,89 +369,6 @@ STANDALONE_4X64K_ADD_CALIBRATION = PipelineCalibration(
         OpAttribution(Opcode.BARRIER, 1),
     ),
 )
-
-
-NORMALIZED_SINGLE_STREAM_REDUCTION_CALIBRATION = PipelineCalibration(
-    signature=PipelineSignature(
-        topology=PipelineTopology.NORMALIZED,
-        coalesced_matrix_streams=1,
-        call_inventory=(
-            CallInventoryEntry(Opcode.MUL, 3),
-            CallInventoryEntry(Opcode.REDUCE, 3),
-            CallInventoryEntry(Opcode.SHIFT, 2),
-            CallInventoryEntry(Opcode.ADD, 3),
-            CallInventoryEntry(Opcode.BARRIER, 1),
-        ),
-        resident_intermediate=False,
-        vl64_scope=VL64Scope.CORE_WIDE,
-        vl64_group_count=_CORE_GROUP_COUNT,
-        shape_domain=_DIRECT_REDUCTION_DOMAIN,
-    ),
-    attributions=(
-        OpAttribution(Opcode.MUL, 580),
-        OpAttribution(Opcode.REDUCE, 1_474),
-        OpAttribution(Opcode.SHIFT, 179),
-        OpAttribution(Opcode.ADD, 124),
-        OpAttribution(Opcode.BARRIER, 1),
-    ),
-)
-
-
-NORMALIZED_DUAL_STREAM_REDUCTION_CALIBRATION = PipelineCalibration(
-    signature=PipelineSignature(
-        topology=PipelineTopology.NORMALIZED,
-        coalesced_matrix_streams=2,
-        call_inventory=(
-            CallInventoryEntry(Opcode.MUL, 6),
-            CallInventoryEntry(Opcode.REDUCE, 3),
-            CallInventoryEntry(Opcode.SHIFT, 4),
-            CallInventoryEntry(Opcode.ADD, 5),
-            CallInventoryEntry(Opcode.BARRIER, 1),
-        ),
-        resident_intermediate=False,
-        vl64_scope=VL64Scope.CORE_WIDE,
-        vl64_group_count=_CORE_GROUP_COUNT,
-        shape_domain=_DIRECT_REDUCTION_DOMAIN,
-    ),
-    attributions=(
-        OpAttribution(Opcode.MUL, 426),
-        OpAttribution(Opcode.REDUCE, 1_152),
-        OpAttribution(Opcode.SHIFT, 142),
-        OpAttribution(Opcode.ADD, 284),
-        OpAttribution(Opcode.BARRIER, 1),
-    ),
-)
-
-
-NORMALIZED_RESIDENT_TWO_STAGE_REDUCTION_CALIBRATION = PipelineCalibration(
-    signature=PipelineSignature(
-        topology=PipelineTopology.NORMALIZED,
-        coalesced_matrix_streams=1,
-        call_inventory=(
-            CallInventoryEntry(Opcode.MUL, 15),
-            CallInventoryEntry(Opcode.REDUCE, 15),
-            CallInventoryEntry(Opcode.SHIFT, 10),
-            CallInventoryEntry(Opcode.ADD, 16),
-            CallInventoryEntry(Opcode.SQUEEZE, 20),
-            CallInventoryEntry(Opcode.SPREAD, 4),
-            CallInventoryEntry(Opcode.BARRIER, 1),
-        ),
-        resident_intermediate=True,
-        vl64_scope=VL64Scope.CORE_WIDE,
-        vl64_group_count=_CORE_GROUP_COUNT,
-        shape_domain=_RESIDENT_TWO_STAGE_DOMAIN,
-    ),
-    attributions=(
-        OpAttribution(Opcode.MUL, 580),
-        OpAttribution(Opcode.REDUCE, 1_474),
-        OpAttribution(Opcode.SHIFT, 179),
-        OpAttribution(Opcode.ADD, 124),
-        OpAttribution(Opcode.SQUEEZE, 1_200),
-        OpAttribution(Opcode.SPREAD, 4_382),
-        OpAttribution(Opcode.BARRIER, 6),
-    ),
-)
-
 
 
 # --------------------------------------------------------------------------- #
@@ -723,9 +629,9 @@ class APUG2TypedTickModel(_CanonicalModel):
 # leave-one-out error <= 2.6% on the five composed programs (see
 # docs/release/design/apu-g2-source-route.md).  The calibrated reduction
 # depths are only 7 and 8; the per-level 2**l shift scaling below them is an
-# extrapolation whose shape agrees with the 2026-07-08 uint16 dot-tile points
-# (APUG2_DOT_TILE_MEASURED_POINTS: increments 2,246 ticks from depth 6 to 7
-# and 4,793 from 7 to 8).
+# extrapolation whose shape agrees with the 2026-07-08 uint16 dot-tile
+# measurements (increments 2,246 ticks from depth 6 to 7 and 4,793 from 7 to
+# 8; that kernel and its measured points left the release with G2-11).
 APUG2_TYPED_TICK_MODEL = APUG2TypedTickModel(
     coefficients=(
         ("pipeline_bodies", 195.704),
@@ -756,9 +662,6 @@ __all__ = [
     "APUG2TypedTickModel",
     "apu_g2_typed_call_features",
     "CallInventoryEntry",
-    "NORMALIZED_DUAL_STREAM_REDUCTION_CALIBRATION",
-    "NORMALIZED_RESIDENT_TWO_STAGE_REDUCTION_CALIBRATION",
-    "NORMALIZED_SINGLE_STREAM_REDUCTION_CALIBRATION",
     "Opcode",
     "OpAttribution",
     "PipelineCalibration",

@@ -25,11 +25,44 @@ APUG2_COMPOSED_EPILOGUE_ABI = {
 }
 
 
-def canonicalize_apu_g2_values(values, scalar_type: APUG2ScalarType) -> np.ndarray:
-    """Apply one declared logical width inside its native NumPy container."""
+def require_apu_g2_value_range(
+    values, scalar_type: APUG2ScalarType, what: str = "value"
+) -> np.ndarray:
+    """Return ``values`` as int64 after checking the declared logical range.
+
+    Exact-width programs never produce a logical value outside the declared
+    type, so an out-of-range value is a corrupt carrier or an overflowing
+    oracle, never something to wrap.
+    """
 
     if not isinstance(scalar_type, APUG2ScalarType):
         raise TypeError("scalar_type must be APUG2ScalarType")
+    wide = np.asarray(values, dtype=np.int64)
+    outside = (wide < scalar_type.minimum) | (wide > scalar_type.maximum)
+    if np.any(outside):
+        index = tuple(int(item) for item in np.argwhere(outside)[0])
+        raise ValueError(
+            f"APUg2 {what} {int(wide[index])} at {index} is outside "
+            f"{scalar_type.name} [{scalar_type.minimum}, {scalar_type.maximum}]"
+        )
+    return wide
+
+
+def canonicalize_apu_g2_values(
+    values, scalar_type: APUG2ScalarType, *, wrap: bool = False
+) -> np.ndarray:
+    """Store values of one declared logical width in its native NumPy container.
+
+    Values outside the declared range raise; ``wrap=True`` reduces them
+    modulo ``2**bits`` instead (two's complement for signed types).
+    """
+
+    if not isinstance(scalar_type, APUG2ScalarType):
+        raise TypeError("scalar_type must be APUG2ScalarType")
+    if not wrap:
+        return require_apu_g2_value_range(values, scalar_type).astype(
+            scalar_type.numpy_dtype
+        )
     wide = np.asarray(values, dtype=np.int64)
     modulus = 1 << scalar_type.bits
     payload = np.mod(wide, modulus)
@@ -43,12 +76,27 @@ def decode_apu_g2_u16_bitpatterns(
     values,
     scalar_type: APUG2ScalarType,
 ) -> np.ndarray:
-    """Decode portable little-endian uint16 fixture payloads at logical width."""
+    """Decode portable little-endian uint16 fixture payloads at logical width.
+
+    A payload with a bit set above ``scalar_type.bits`` is not an encoding of
+    any value of that type and raises instead of being masked.
+    """
 
     values = np.asarray(values)
     if values.dtype != np.dtype("<u2") and values.dtype != np.dtype(np.uint16):
         raise TypeError("canonical APUg2 fixtures must use uint16 containers")
-    return canonicalize_apu_g2_values(values, scalar_type)
+    if scalar_type.bits > 16:
+        raise ValueError(f"{scalar_type.name} does not fit a uint16 fixture payload")
+    payload = values.astype(np.int64)
+    excess = (payload >> scalar_type.bits) != 0
+    if np.any(excess):
+        index = tuple(int(item) for item in np.argwhere(excess)[0])
+        raise ValueError(
+            f"APUg2 fixture payload 0x{int(payload[index]):04x} at {index} has "
+            f"bits above the {scalar_type.bits}-bit {scalar_type.name} payload"
+        )
+    # Sign extension of an in-width payload is the decoding, not a wrap.
+    return canonicalize_apu_g2_values(payload, scalar_type, wrap=True)
 
 
 def encode_apu_g2_u16_bitpatterns(
@@ -173,6 +221,7 @@ def gather_apu_g2_composed_output(
         row = output_index * row_step
         column, mmb_set = program.layout_plan.physical_coordinate(row, 0)
         result[output_index] = physical[mmb_set, column]
+    require_apu_g2_value_range(result, program.output_type, "device output")
     return result.reshape(program.output_shape)
 
 
@@ -466,6 +515,7 @@ __all__ = [
     "build_apu_g2_composed_host_command",
     "canonicalize_apu_g2_values",
     "decode_apu_g2_u16_bitpatterns",
+    "require_apu_g2_value_range",
     "deinterleave_apu_g2_streams",
     "encode_apu_g2_u16_bitpatterns",
     "expected_apu_g2_composed_output",

@@ -103,7 +103,6 @@ from .apu_g2_recipe import (
     APUG2RecipeOpKind,
     APUG2VectorizationCertificate,
     build_apu_g2_recipe_graph,
-    build_apu_g2_u16_dot_tile_recipe,
 )
 from .upmem_physical import (
     MaskedTaskletLayout,
@@ -280,7 +279,6 @@ __all__ = [
     "APUG2RecipeOpKind",
     "APUG2VectorizationCertificate",
     "build_apu_g2_recipe_graph",
-    "build_apu_g2_u16_dot_tile_recipe",
     "MaskedTaskletLayout",
     "UPMEMElementwisePlan",
     "UPMEMGEMMPlan",

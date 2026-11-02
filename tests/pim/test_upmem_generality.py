@@ -108,6 +108,33 @@ def pointwise_region(n, expression):
                 for i in range(_n):
                     lC[i] = 3 * lA[i] - 7 * lB[i]
 
+    elif expression == "affine":
+
+        @df_region()
+        def k(A: int32[_n], B: int32[_n], C: int32[_n]):
+            @allo.work(mapping=[1], args=[A, B, C])
+            def f(lA: int32[_n], lB: int32[_n], lC: int32[_n]):
+                for i in range(_n):
+                    lC[i] = 2 * lA[i] + 5 * lB[i] + 11
+
+    elif expression == "affine_wide_constant":
+
+        @df_region()
+        def k(A: int32[_n], B: int32[_n], C: int32[_n]):
+            @allo.work(mapping=[1], args=[A, B, C])
+            def f(lA: int32[_n], lB: int32[_n], lC: int32[_n]):
+                for i in range(_n):
+                    lC[i] = 2 * lA[i] + 5 * lB[i] + 2147483648
+
+    elif expression == "minus_int32_min":
+
+        @df_region()
+        def k(A: int32[_n], B: int32[_n], C: int32[_n]):
+            @allo.work(mapping=[1], args=[A, B, C])
+            def f(lA: int32[_n], lB: int32[_n], lC: int32[_n]):
+                for i in range(_n):
+                    lC[i] = 3 * lA[i] - (-2147483648) * lB[i]
+
     else:
 
         @df_region()
@@ -493,9 +520,50 @@ def test_pointwise_plan_evaluates_with_int32_wraparound():
     assert sub.evaluate(-(1 << 31), 1) == (1 << 31) - 1
 
 
-def test_minus_form_is_rejected_by_the_matcher_with_its_reason():
-    with pytest.raises(Exception, match="matches no target op"):
-        _virtual(pointwise_region(1536, "minus_axpby"))
+@pytest.mark.parametrize(
+    "expression, anchor, coefficients",
+    [("minus_axpby", "AXMBY", (3, -7, 0)), ("affine", "AXPBYC", (2, 5, 11))],
+)
+def test_minus_and_constant_forms_lower_to_the_axpby_template(
+    expression, anchor, coefficients
+):
+    compiled = _virtual(pointwise_region(1536, expression))
+    segment = _segment(compiled)
+    plan = segment.plan
+    assert plan.operation == "axpby"
+    assert (plan.alpha, plan.beta, plan.gamma) == coefficients
+    source = plan.device_source()
+    alpha, beta, gamma = coefficients
+    assert f"(uint32_t){alpha} * (uint32_t)packet[i]" in source
+    assert f"(uint32_t){beta} * (uint32_t)packet[i + TENON_CHUNK_ELEMENTS]" in source
+    assert (f" + (uint32_t){gamma})" in source) == bool(gamma)
+    assert plan.evaluate(-(1 << 31), (1 << 31) - 1) == UPMEMElementwisePlan(
+        16, operation="axpby", interleaved=False, alpha=alpha, beta=beta, gamma=gamma
+    ).evaluate(-(1 << 31), (1 << 31) - 1)
+    assert segment.kernel.anchor_op == anchor
+
+
+@pytest.mark.parametrize(
+    "expression, message",
+    [
+        ("affine_wide_constant", r"gamma=2147483648 is not an int32 literal"),
+        ("minus_int32_min", r"-beta=2147483648 is not an int32 literal"),
+    ],
+)
+def test_minus_and_constant_forms_reject_non_int32_coefficients(expression, message):
+    with pytest.raises(NotImplementedError, match=message):
+        _virtual(pointwise_region(64, expression))
+
+
+def test_constant_term_is_compile_time_axpby_only():
+    with pytest.raises(ValueError, match="gamma"):
+        UPMEMElementwisePlan(16, operation="add", interleaved=False, gamma=1)
+    plan = UPMEMElementwisePlan(16, operation="axpby", alpha=2, beta=-1, gamma=3)
+    assert "<< 1" not in plan.device_source()
+    assert plan.manifest()["coefficients"]["gamma"] == 3
+    assert "gamma" not in UPMEMElementwisePlan(16, operation="axpby").manifest()[
+        "coefficients"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -920,16 +988,26 @@ def test_sim_carried_reduction():
     assert int(P[0]) == 123456789 + int(A.astype(np.int64).sum())
 
 
-@pytest.mark.parametrize("expression", ["sub", "mul", "scale"])
+@pytest.mark.parametrize("expression", ["sub", "mul", "scale", "minus_axpby", "affine"])
 def test_sim_pointwise_forms_off_grid(expression):
     _sim_gate()
     rng = _rng(7)
     A = rng.integers(-(1 << 30), 1 << 30, size=1000, dtype=np.int32)
     B = rng.integers(-(1 << 30), 1 << 30, size=1000, dtype=np.int32)
+    # int32 edge values, so the wraparound of every product and sum is hit.
+    A[:4] = [-(1 << 31), (1 << 31) - 1, -1, 0]
+    B[:4] = [(1 << 31) - 1, -(1 << 31), -(1 << 31), (1 << 31) - 1]
     C = np.zeros(1000, dtype=np.int32)
     a, b = A.astype(np.int64), B.astype(np.int64)
-    want = {"sub": a - b, "mul": a * b, "scale": -5 * a}[expression]
-    _compile(pointwise_region(1000, expression))(A, B, C)
+    want = {
+        "sub": a - b,
+        "mul": a * b,
+        "scale": -5 * a,
+        "minus_axpby": 3 * a - 7 * b,
+        "affine": 2 * a + 5 * b + 11,
+    }[expression]
+    result = _compile(pointwise_region(1000, expression))(A, B, C)
+    assert result.kind == "simulator"
     np.testing.assert_array_equal(C, want.astype(np.int64).astype(np.uint32).astype(np.int32))
 
 

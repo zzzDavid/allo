@@ -540,6 +540,36 @@ def upmem_cost(target):
             "axpby",
         )
 
+    @rule(target.op("AXMBY"))
+    def axmby(event, ctx):
+        if family_event(event, ctx):
+            return
+        compute(
+            event,
+            ctx,
+            _instructions(
+                event,
+                2 * MUL_STEP_INSTRUCTIONS + ADD_INSTRUCTIONS,
+                2 * FLOAT_MUL_INSTRUCTIONS + FLOAT_ADD_INSTRUCTIONS,
+            ),
+            "axmby",
+        )
+
+    @rule(target.op("AXPBYC"))
+    def axpbyc(event, ctx):
+        if family_event(event, ctx):
+            return
+        compute(
+            event,
+            ctx,
+            _instructions(
+                event,
+                2 * MUL_STEP_INSTRUCTIONS + 2 * ADD_INSTRUCTIONS,
+                2 * FLOAT_MUL_INSTRUCTIONS + 2 * FLOAT_ADD_INSTRUCTIONS,
+            ),
+            "axpbyc",
+        )
+
     @rule(target.op("SCALE"))
     def scale(event, ctx):
         if family_event(event, ctx):

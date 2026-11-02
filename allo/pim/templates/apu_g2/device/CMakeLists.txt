@@ -41,22 +41,8 @@ include_directories(
 add_executable(tenon_apu_g2_tasks
   ${g2_transport_TASK_SOURCES}
   apu_g2_u16_add.cc
-  apu_g2_u16_atax.cc
-  apu_g2_u16_block_sum.cc
-  apu_g2_u16_div.cc
-  apu_g2_u16_dot_tile.cc
-  apu_g2_u16_fill.cc
-  apu_g2_u16_gemv.cc
-  apu_g2_u16_gesummv.cc
-  apu_g2_u16_minmax.cc
-  apu_g2_u16_mul.cc
-  apu_g2_u16_select.cc
-  apu_g2_u16_shift_right.cc
-  apu_g2_u16_sqrt.cc
-  apu_g2_u16_sub.cc
   apu_g2_typed.cc
   apu_g2_composed_dot.cc
-  apu_g2_u16_gemm.cc
   ${CMAKE_CURRENT_BINARY_DIR}/gsi_library_entry_points_wrapper.cpp)
 
 include(gsi_generate_gsi_library_entry_point_cxx_function_wrappers)

@@ -777,6 +777,47 @@ def build_upmem_target():
                             ),
                         )
 
+                        # The int32 AXPBY template with the subtraction
+                        # folded into its coefficient (alpha x + (-beta) y)
+                        # and with one more int32 add of a literal constant.
+                        allo.op(
+                            "AXMBY",
+                            src=(
+                                allo.or_(any_wram, any_gpr),
+                                allo.or_(any_wram, any_gpr),
+                            ),
+                            dst=any_gpr,
+                            fn=lambda x, y, alpha, beta: alpha * x - beta * y,
+                            const_params=("alpha", "beta"),
+                            emit=lambda x, y, dst, ctx: ctx.emit_c_line(
+                                "{d} = alpha * {a} - beta * {b};".format(
+                                    d=ctx.handle_c_name(dst),
+                                    a=ctx.handle_c_name(x),
+                                    b=ctx.handle_c_name(y),
+                                )
+                            ),
+                        )
+
+                        allo.op(
+                            "AXPBYC",
+                            src=(
+                                allo.or_(any_wram, any_gpr),
+                                allo.or_(any_wram, any_gpr),
+                            ),
+                            dst=any_gpr,
+                            fn=lambda x, y, alpha, beta, gamma: alpha * x
+                            + beta * y
+                            + gamma,
+                            const_params=("alpha", "beta", "gamma"),
+                            emit=lambda x, y, dst, ctx: ctx.emit_c_line(
+                                "{d} = alpha * {a} + beta * {b} + gamma;".format(
+                                    d=ctx.handle_c_name(dst),
+                                    a=ctx.handle_c_name(x),
+                                    b=ctx.handle_c_name(y),
+                                )
+                            ),
+                        )
+
                         # Spec 004: irregular-kernel ops. Guarded ops may
                         # match stores under an `if` (M5), "any" ops write a
                         # computed destination (M6), iv_params bind loop
