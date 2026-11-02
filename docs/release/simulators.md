@@ -9,29 +9,48 @@ evaluation used, where the Tenon-side changes live, how to build it, its
 license, and what a user has to obtain on their own. Discovery variables are
 in `INSTALL.md` section 3.
 
-Paths below of the form `<repo>/...` are in the containing Tenon repository
-(the repository that holds this Allo fork under `experiments/allo`), not in
-this package. Revisions were read on the authors' host on 2026-11-02 with
+The Tenon-side recipes are in this repository under `simulators/`
+(`simulators/README.md`); `$ALLO` below is the root of a checkout of
+`zzzDavid/allo`, branch `tenon`. The AiM and UPMEM routes build from that
+checkout alone (UPMEM also needs the UPMEM DPU SDK, which you obtain
+yourself). **Samsung is the exception: the five patches to Samsung-licensed
+PIMSimulator files are not in this repository, so until Samsung authorizes
+their publication the Samsung HBM-PIM simulator route cannot be built from the
+release repository alone** (P-04; Samsung section below).
+
+Revisions were read on the authors' host on 2026-11-02 with
 `git -C <checkout> rev-parse HEAD` (PIMSimulator through the parent
 repository's `.git/modules/simulators/PIMSimulator`, because the checkout's
 own `.git` pointer is broken); on that date each pinned commit was also the
 upstream `HEAD`.
 
-The three simulator recipes below were verified on 2026-11-02 by building
-from fresh upstream clones in scratch directories (`/tmp/tenon-release/simbuild/`)
-and new Docker tags, without touching the installed simulators, then running
-the Tenon tests through `allo.compile` against the scratch builds. Host: Linux
+The three simulator recipes were verified twice on 2026-11-02, each time by
+building from fresh upstream clones in scratch directories and new Docker tags,
+without touching the installed simulators, then running the Tenon tests
+through `allo.compile` against the scratch builds: first from the recipes'
+original home (below), then from the copies in `simulators/` of this
+repository (section "Verification from the release copies"). Host: Linux
 x86-64 (Ubuntu 20.04 userland), Docker 24.0.2, system g++ 9.4.0 and SCons
 3.1.2, Go 1.23.12.
 
+Historical note: until 2026-11-02 the recipes lived only in the containing
+Tenon research repository (the repository that holds this Allo fork under
+`experiments/allo`, written `<repo>` below) under
+`<repo>/experiments/simulators/setup/`, which a checkout of this repository
+does not have. `simulators/` holds byte-for-byte copies of every
+redistributable file from there, except the `README.md` files and
+`PIMSimulator/apply.sh`, which were adapted to the release paths and to the
+missing Samsung patches. The Samsung-derived `PIMSimulator/patches/` stay only
+in `<repo>`.
+
 ## Summary
 
-| Dependency | Upstream | Pinned revision | Tenon changes (in `<repo>/experiments/simulators/setup/`) | License | Rebuildable from public sources? |
+| Dependency | Upstream | Pinned revision | Tenon changes (in `simulators/` of this repository) | License | Rebuildable from this repository and public sources? |
 |---|---|---|---|---|---|
-| Samsung PIMSimulator | <https://github.com/SAITPublic/PIMSimulator> | `3703d1f19c8f027360cc33a3243eb271e3bb6898` (2024-07-01) | `PIMSimulator/`: `pim_driver` conductor sources, `Sconstruct`, 5 patches, `apply.sh` | Samsung proprietary notice (no redistribution without written permission; non-commercial research only); DRAMSim2 part BSD | **Yes, with the user's own clone** (verified; publishing the patches is a licensing question, below) |
-| SK hynix AiM simulator (Ramulator 2.0 based) | <https://github.com/arkhadem/aim_simulator> | `0f28a07bdb83e42b9305ad3d45410ebd3aa2c091` (2025-07-22) | `aim_simulator/Dockerfile` | MIT (University of Michigan, 2025) | **Yes** (verified) |
+| Samsung PIMSimulator | <https://github.com/SAITPublic/PIMSimulator> | `3703d1f19c8f027360cc33a3243eb271e3bb6898` (2024-07-01) | `PIMSimulator/`: `pim_driver` conductor sources, `Sconstruct`, `apply.sh`; the 5 patches to Samsung files are **not included** | Samsung proprietary notice (no redistribution without written permission; non-commercial research only); DRAMSim2 part BSD | **No**: needs the 5 Samsung-derived patches, which await Samsung's permission (P-04); verified with the authors' copy of the patches |
+| SK hynix AiM simulator (Ramulator 2.0 based) | <https://github.com/arkhadem/aim_simulator> | `0f28a07bdb83e42b9305ad3d45410ebd3aa2c091` (2025-07-22) | `aim_simulator/Dockerfile`, `README.md` | MIT (University of Michigan, 2025) | **Yes** (verified from the release copy) |
 | Ramulator2-AttAcc (evaluation script only; not used by the package) | DCC artifact <https://github.com/SPIN-Research-Group/DCC> `src/Ramulator2/` (AttAcc model from <https://github.com/scale-snu/attacc_simulator>) | DCC `212f86ea7f08da059836e3a1311d3a11afae8dbe` | none (no Tenon recipe yet) | Ramulator2 and AttAcc simulator MIT; DCC (trace generator, `inference/`) **no license** | user builds it from the DCC checkout (`build.sh`); no Tenon recipe |
-| uPIMulator (Go) | <https://github.com/VIA-Research/uPIMulator> | `870d916334e9ff0b190f555f951a9ec3c4257781` (2025-02-01) | `uPIMulator/tenon-upimulator.patch` (47 files), `apply.sh`, README | MIT-style (VIA Research Group, KAIST, 2024) | **Yes** (verified), given the user-obtained SDK |
+| uPIMulator (Go) | <https://github.com/VIA-Research/uPIMulator> | `870d916334e9ff0b190f555f951a9ec3c4257781` (2025-02-01) | `uPIMulator/tenon-upimulator.patch` (47 files), `apply.sh`, `Dockerfile`, README | MIT (VIA Research Group, KAIST, 2024) | **Yes** (verified from the release copy), given the user-obtained SDK |
 | UPMEM DPU SDK 2023.1.0 | UPMEM (`sdk-releases.upmem.com`, returned HTTP 403 when fetched); mirror <https://github.com/CMU-SAFARI/UPMEM> | mirror `84a0dcd3f57ded98ea049f2be5d45c71eda96ace` | none | UPMEM proprietary; the mirror ships no license file | user must obtain it |
 | GSI APU v1 (Gemini-I) SDK: ARC toolchain, GDL/GAL/GVML, `example-gvml` | GSI Technology | `/usr/local/gsi-apu/13.7.1` on the authors' host | none | GSI proprietary | user must obtain it |
 | GSI APU v2 (Gemini-II) SDK under `/opt/gsi`, `gsi_tool`, card firmware | GSI Technology | firmware `GSI_G2_Infrastructure_V1.24.1` on `zhang-x4` | none | GSI proprietary | user must obtain it |
@@ -44,27 +63,39 @@ x86-64 (Ubuntu 20.04 userland), Docker 24.0.2, system g++ 9.4.0 and SCons
   (`allo/spmw_samsung.py` always passes `--op GENERIC`), the `ini/`
   configurations of the upstream tree, and, for the layout-swizzle probe
   only, `libdramsim/libdramsim2.a`.
-- **Where the Tenon changes are:** `<repo>/experiments/simulators/setup/PIMSimulator/`
-  (README with the file list). Allo-authored files copied in:
-  `Sconstruct`, `src/pim_driver.cc`, `src/tests/TenonConductor.{h,inc}`,
-  `src/tests/TemporalReduce.inc`. Samsung files changed only through
-  `patches/{PIMKernel.h,PIMKernel.cpp,PIMCmdGen.h,PIMCmdGen.cpp,Burst.h}.patch`.
-  The earlier `--slice-plan` route (`SamsungSlicePlan.*`) and the stale
+- **Where the Tenon changes are:** `simulators/PIMSimulator/` in this
+  repository (README with the file list): `Sconstruct`, `src/pim_driver.cc`,
+  `src/tests/TenonConductor.{h,inc}`, `src/tests/TemporalReduce.inc`,
+  `apply.sh`. Samsung files are changed only through
+  `patches/{PIMKernel.h,PIMKernel.cpp,PIMCmdGen.h,PIMCmdGen.cpp,Burst.h}.patch`
+  (against `src/tests/PIMKernel.h`, `src/tests/PIMKernel.cpp`,
+  `src/tests/PIMCmdGen.h`, `src/tests/PIMCmdGen.cpp`, `src/Burst.h`), which
+  are **not in this repository**; for the authors they live in
+  `<repo>/experiments/simulators/setup/PIMSimulator/patches/`.
+- **Samsung limitation:** until Samsung authorizes publication of those five
+  patches, the Samsung HBM-PIM simulator route cannot be built from the
+  release repository alone. `simulators/PIMSimulator/apply.sh` exits with
+  status 2 and prints that message when the patches are missing; it accepts
+  them as its second argument, through `TENON_PIMSIM_PATCHES`, or as a
+  `patches/` directory next to it (ignored by git and pruned from the sdist).
+- The earlier `--slice-plan` route (`SamsungSlicePlan.*`) and the stale
   323-line overlay are gone; every overlay file now equals the installed
   tree's, and the installed tree has no other modified tracked file.
-- **Build recipe (verified):**
+- **Build recipe (verified; needs the patches):**
 
   ```bash
   git clone https://github.com/SAITPublic/PIMSimulator.git
   git -C PIMSimulator checkout 3703d1f19c8f027360cc33a3243eb271e3bb6898
-  bash <repo>/experiments/simulators/setup/PIMSimulator/apply.sh PIMSimulator
+  bash $ALLO/simulators/PIMSimulator/apply.sh PIMSimulator <patches-dir>
+  #   without <patches-dir> it stops: "...cannot be built from the release
+  #   repository alone..." (exit 2)
   #   applies the patches, installs the conductor sources, runs
   #   `scons pim_driver libdramsim/libdramsim2.a -j$(nproc)`, prints PIM_GEOMETRY
   export PIMSIMULATOR_ROOT=$PWD/PIMSimulator
   ```
 
   Needs g++ with C++14 and SCons; no gtest for `pim_driver`. No Docker image.
-- **Verification (2026-11-02):** clone + `apply.sh` took about 12 s (48
+- **Verification (2026-11-02, first round, `<repo>` overlay):** clone + `apply.sh` took about 12 s (48
   cores). Scratch `pim_driver` sha256
   `75dd297c3c102b33f6a77080f82819ff067d6102c2387a186b7f061f62441734`;
   installed `0ae6a3d9bc0aa1ed06e52eb74d81d7c2b98c0fe344e1a5591add5b05b50c2df2`.
@@ -89,16 +120,18 @@ x86-64 (Ubuntu 20.04 userland), Docker 24.0.2, system g++ 9.4.0 and SCons
   question in `audit/packaging.md` section 9). The containing repository also
   tracks modified Samsung files under `dev/` (P-04; untracking commands in
   `RELEASE_CHECKLIST.md`); they must not be part of any public tree.
-- **What a user must do:** clone PIMSimulator themselves (accepting Samsung's
-  notice) and run `apply.sh`. The Samsung compile and `backend="virtual"`
-  routes need no simulator.
+- **What a user must do:** today a user outside the authors' group cannot
+  build the Samsung simulator route from this repository: besides cloning
+  PIMSimulator (accepting Samsung's notice), `apply.sh` needs the five
+  patches, which are published only once Samsung authorizes it. The Samsung
+  compile and `backend="virtual"` routes need no simulator.
 
 ## SK hynix AiM: aim_simulator (Ramulator 2.0)
 
 - **Upstream:** <https://github.com/arkhadem/aim_simulator>, revision
   `0f28a07bdb83e42b9305ad3d45410ebd3aa2c091`; no tracked modifications on
   the authors' host.
-- **Tenon changes:** `<repo>/experiments/simulators/setup/aim_simulator/Dockerfile`
+- **Tenon changes:** `simulators/aim_simulator/Dockerfile` (+ `README.md`)
   (Ubuntu 24.04 + g++-12; the upstream ships no build environment, and the
   binary needs glibc 2.38).
 - **Build recipe (verified):**
@@ -106,7 +139,7 @@ x86-64 (Ubuntu 20.04 userland), Docker 24.0.2, system g++ 9.4.0 and SCons
   ```bash
   git clone https://github.com/arkhadem/aim_simulator.git
   cd aim_simulator && git checkout 0f28a07bdb83e42b9305ad3d45410ebd3aa2c091
-  cp <repo>/experiments/simulators/setup/aim_simulator/Dockerfile .
+  cp $ALLO/simulators/aim_simulator/Dockerfile .
   docker build -t tenon-aim-simulator-build:0f28a07 .
   docker run --rm -u $(id -u):$(id -g) -v $PWD:/work tenon-aim-simulator-build:0f28a07 \
       bash -c "mkdir -p build && cd build && cmake .. && make -j8"
@@ -119,7 +152,7 @@ x86-64 (Ubuntu 20.04 userland), Docker 24.0.2, system g++ 9.4.0 and SCons
   `-u $(id -u):$(id -g)` keeps the build tree owned by you (without it Docker
   writes root-owned files). CMake downloads its third-party dependencies
   (`build/_deps`) during configure, so the build needs network access.
-- **Verification (2026-11-02):** `docker build --no-cache` 27 s (image
+- **Verification (2026-11-02, first round, `<repo>` Dockerfile):** `docker build --no-cache` 27 s (image
   `tenon-aim-simulator-build:0f28a07`, id `sha256:fc69e92cf358...`, base
   image already cached); `cmake` + `make -j8` 120 s. With
   `AIM_SIMULATOR_ROOT` at the scratch clone and
@@ -134,7 +167,7 @@ x86-64 (Ubuntu 20.04 userland), Docker 24.0.2, system g++ 9.4.0 and SCons
 - **License:** MIT. Redistribution is allowed with the notice; Tenon vendors
   no simulator code, only the Dockerfile.
 - **What a user must do:** nothing beyond the recipe; this route is fully
-  reproducible from public sources.
+  reproducible from this repository and the public upstream.
 
 ## AttAcc: Ramulator2-AttAcc (external evaluation only)
 
@@ -205,10 +238,10 @@ no data path).
   comparison, `--skip_compilation`, the linker and DPU-semantics fixes the
   campaign was measured with, and a `sdk/build` tree of DPU runtime objects
   compiled by the UPMEM SDK.
-- **Where the Tenon changes are:**
-  `<repo>/experiments/simulators/setup/uPIMulator/tenon-upimulator.patch`
-  (47 files, +1,930/-170, sha256 `bf4887b825ab...`), `apply.sh` and a README
-  with the per-area change list. The patch was derived on 2026-11-02 from the
+- **Where the Tenon changes are:** `simulators/uPIMulator/` in this
+  repository: `tenon-upimulator.patch` (47 files, +1,930/-170, sha256
+  `bf4887b825ab...`), `apply.sh`, the SDK image `Dockerfile`, and a README
+  with the per-area change list and the upstream MIT license verbatim. The patch was derived on 2026-11-02 from the
   evaluation's provenance snapshot (`$TENON_ARTIFACTS/upmem/provenance/upimulator/`,
   `source-snapshot.tar` sha256 `13ed0d80...` and `tracked-changes.patch`
   sha256 `eba19cc5...`) by diffing it against a pristine clone of the pinned
@@ -225,13 +258,14 @@ no data path).
   ```bash
   git clone https://github.com/VIA-Research/uPIMulator.git
   git -C uPIMulator checkout 870d916334e9ff0b190f555f951a9ec3c4257781
-  bash <repo>/experiments/simulators/setup/uPIMulator/apply.sh uPIMulator   # patch + go build, ~7 s
+  bash $ALLO/simulators/uPIMulator/apply.sh uPIMulator   # patch + go build, ~7 s
   export UPIMULATOR_ROOT=$PWD/uPIMulator/golang/uPIMulator
   export UPIMULATOR_BIN=$UPIMULATOR_ROOT/build/uPIMulator
 
   # DPU SDK image under a new tag; <upmem-sdk> is your copy of the SDK (below)
   tar czf $UPIMULATOR_ROOT/docker/upmem-sdk.tar.gz -C <upmem-sdk> upmem-2023.1.0-Linux-x86_64   # ~32 s
-  docker build -t tenon-upimulator-sdk:2023.1.0 $UPIMULATOR_ROOT/docker/                       # ~36 s
+  docker build -f $ALLO/simulators/uPIMulator/Dockerfile \
+      -t tenon-upimulator-sdk:2023.1.0 $UPIMULATOR_ROOT/docker/                                # ~36 s
   export TENON_UPMEM_SDK_IMAGE=tenon-upimulator-sdk:2023.1.0
 
   # DPU runtime objects under $UPIMULATOR_ROOT/sdk/build                                       ~2 s
@@ -247,7 +281,7 @@ no data path).
   pinned-campaign route (default) instead uses the archived binary and
   snapshot and the SDK object-manifest pin `d45e285c34b5...`; it exists for
   paper reproduction on the authors' archive.
-- **Verification (2026-11-02):** fresh clone + `apply.sh` 7 s, `go test
+- **Verification (2026-11-02, first round, `<repo>` patch):** fresh clone + `apply.sh` 7 s, `go test
   -vet=off ./...` 5 packages ok. The Go sources equal the snapshot's:
   `go build -trimpath -buildvcs=false` of the patched tree and of the snapshot
   give the same binary (sha256 `90022c862724...`); the default build
@@ -275,8 +309,10 @@ no data path).
   give you the tested image. Build your own under a new tag as above and set
   `TENON_UPMEM_SDK_IMAGE` (the default name is kept only so the authors'
   host keeps working; P-17).
-- **Licenses:** uPIMulator is MIT-style (KAIST VIA Research Group); the Tenon
-  patch is redistributable with that notice. The patched `sdk/` runtime
+- **Licenses:** uPIMulator is MIT (`LICENSE`, "Copyright (c) 2024, VIA
+  Research Group at KAIST", sha256 `73de95273ba8...` at `870d916`); the Tenon
+  patch is redistributable with that notice, which
+  `simulators/uPIMulator/README.md` reproduces verbatim. The patched `sdk/` runtime
   sources are UPMEM's BSD-style DPU runtime files that upstream uPIMulator
   already bundles. The UPMEM DPU SDK itself (compiler and libraries) is UPMEM
   proprietary; the CMU-SAFARI mirror carries no license file. Neither the
@@ -284,9 +320,128 @@ no data path).
   this project.
 - **What a user must do:** obtain the UPMEM SDK 2023.1.0 themselves (from
   UPMEM, or the mirror at their own discretion), then follow the recipe:
-  clone uPIMulator, run `apply.sh`, build the SDK image under their own tag
-  and the `sdk/build` objects. The UPMEM compile and `backend="virtual"`
+  clone uPIMulator, run `$ALLO/simulators/uPIMulator/apply.sh`, build the SDK
+  image under their own tag and the `sdk/build` objects. The UPMEM compile and `backend="virtual"`
   routes need neither.
+
+## Verification from the release copies (2026-11-02)
+
+Every command below used only the files in `simulators/` of this repository
+(plus, for Samsung, the authors' patches passed explicitly), fresh upstream
+clones and new Docker tags. Python package: release `HEAD` `e41ebbd`
+exported with `git archive` (MLIR bindings from the live build), so the run
+does not depend on uncommitted work. Scratch: `/tmp/tenon-release/distbuild/`
+(a symlink to local disk, because `/tmp` was full); `TMPDIR` and
+`TENON_UPMEM_SCRATCH` pointed into it. `/docker` had about 1 GB free, so both
+images were built with the layer cache: every layer resolved to the layers of
+the first round's `docker build --no-cache` of byte-identical Dockerfiles, and
+the image ids equal the first round's. Times are wall clock.
+
+**SK hynix AiM** (all from the release copy):
+
+```bash
+git clone https://github.com/arkhadem/aim_simulator.git aim          # 14:18
+git -C aim checkout 0f28a07bdb83e42b9305ad3d45410ebd3aa2c091
+cp $ALLO/simulators/aim_simulator/Dockerfile aim/
+docker build -t tenon-aim-simulator-build:dist aim                     # 0.6 s (cache)
+docker run --rm -u $(id -u):$(id -g) -v $PWD/aim:/work tenon-aim-simulator-build:dist \
+    bash -c "mkdir -p build && cd build && cmake .. && make -j8"       # 114.6 s
+docker run --rm -u $(id -u):$(id -g) -v $PWD/aim:/work tenon-aim-simulator-build:dist \
+    bash -c "cd /work && ./build/ramulator2 -f test/example.yaml -t test/all_isr.trace"
+#   memory_system_cycles: 689
+AIM_SIMULATOR_ROOT=$PWD/aim TENON_AIM_SIM_IMAGE=tenon-aim-simulator-build:dist \
+    python -m pytest tests/pim/test_gemv_all_targets.py -k aim         # 2 passed in 27.6 s
+```
+
+Image `tenon-aim-simulator-build:dist` id
+`sha256:fc69e92cf3583e8bd22498c5ad69508f073aa14618d31ae5b59a3e6675ecab38`
+(666 MB). `build/ramulator2` sha256
+`3a7d88a86a26b2af3a6251e47c16812efd8b2995c5f2c8f225be9f020c2777e7`,
+`libramulator.so` `f7477027cd2a7e88cb77d648a33c83606d864271741d3dc068088fe0ba0c1f58`.
+AiM GEMV of `test_gemv_all_targets.py` (256x256 BF16): **222 cycles**,
+`kind="simulator-timing-only"`, same as the first round.
+
+**UPMEM** (release copy of the patch, `apply.sh` and `Dockerfile`; user-obtained SDK):
+
+```bash
+git clone https://github.com/VIA-Research/uPIMulator.git upim        # 14:18
+git -C upim checkout 870d916334e9ff0b190f555f951a9ec3c4257781
+bash $ALLO/simulators/uPIMulator/apply.sh upim                        # 6.9 s, go1.23.12
+export UPIMULATOR_ROOT=$PWD/upim/golang/uPIMulator UPIMULATOR_BIN=$PWD/upim/golang/uPIMulator/build/uPIMulator
+cp <SDK tarball> $UPIMULATOR_ROOT/docker/upmem-sdk.tar.gz
+docker build -f $ALLO/simulators/uPIMulator/Dockerfile \
+    -t tenon-upimulator-sdk:dist $UPIMULATOR_ROOT/docker/              # 1.9 s (cache)
+docker run --rm -v $UPIMULATOR_ROOT:/root/uPIMulator tenon-upimulator-sdk:dist \
+    python3 /root/uPIMulator/sdk/build.py --num_tasklets 12            # 1.5 s, 148 steps
+TENON_UPMEM_SDK_IMAGE=tenon-upimulator-sdk:dist \
+    python -m pytest tests/pim/test_gemv_all_targets.py -k upmem       # 1 passed in 63.7 s
+```
+
+* SDK tarball: the authors' user-obtained copy, reused from the installed
+  checkout's Docker context
+  (`<repo>/experiments/simulators/uPIMulator/golang/uPIMulator/docker/upmem-sdk.tar.gz`,
+  dated 2026-04-18, 204,556,701 bytes, sha256
+  `9da2972ab7b8f39e87ae76c1fa789d1b6aff1f78741f2e6dbdacf3a558710240`). Its
+  extracted `upmem-2023.1.0-Linux-x86_64/` equals (`diff -r`, no differences)
+  the clean CMU-SAFARI mirror checkout at `84a0dcd` in
+  `<repo>/experiments/simulators/upmem-sdk`. It is not, and must not be, in
+  this repository.
+* Go binary (`script/build.py`) sha256
+  `1787f31228cd27e1e467c6840cb3258524255382c76292a3207872017d67b00b` (build
+  info go1.23.12, `vcs.revision=870d916`, `CGO_ENABLED=0`); `go build
+  -trimpath -buildvcs=false` gives
+  `90022c862724528b6e5d790ca10b32493afd7840bb1e52ca9de0b4f466ccd2c6`, the
+  provenance snapshot's binary; `go test -vet=off ./...` 5 packages ok.
+* Image `tenon-upimulator-sdk:dist` id
+  `sha256:db2d99e95fba4fcf12ba0873f7f5f42d7f026bb6bf2909384aad7299414fd287`.
+  `sdk/build` object manifest
+  `d45e285c34b5ab53e02f9d8a7289725112a3a25c0c3ed8a8a15d47c41173963a` = the
+  pinned `UPMEM_SDK_BUILD_MANIFEST_SHA256`.
+* `test_gemv_all_targets.py` GEMV (768x128 int32, 8 DPUs): NumPy-exact,
+  **461,165 cycles**, DPU record `sdk_build = "user-build:d45e285c34b5"`,
+  `simulator_sha256` `1787f312...`; the pinned-campaign route (archived binary
+  `0ab6af912dc6...`) gives the same 461,165 cycles. Paper GEMV (96x128,
+  `benchmarks.upmem.workloads` case `gemv`, canonical inputs) on the same
+  build: **359,026 cycles** (the pinned paper value), NumPy-exact,
+  `sdk_build = "user-build:d45e285c34b5"`, 9.2 s.
+
+**Samsung HBM-PIM** (release copy; patches supplied from `<repo>`):
+
+```bash
+git clone https://github.com/SAITPublic/PIMSimulator.git pimsim       # 14:18
+git -C pimsim checkout 3703d1f19c8f027360cc33a3243eb271e3bb6898
+bash $ALLO/simulators/PIMSimulator/apply.sh pimsim
+#   exit 2: "error: the Samsung-derived PIMSimulator patches are not available ...
+#   The Samsung HBM-PIM simulator route cannot be built from the release
+#   repository alone ..."; the checkout is left untouched
+bash $ALLO/simulators/PIMSimulator/apply.sh pimsim <repo>/experiments/simulators/setup/PIMSimulator/patches
+#   patched: 5 patches; scons pim_driver libdramsim/libdramsim2.a; 11.7 s
+#   PIM_GEOMETRY channels=64 ranks=1 pim_blocks=8 banks=16 ... lanes=16 crf_words=32
+PIMSIMULATOR_ROOT=$PWD/pimsim python -m pytest tests/pim/test_paper_golden.py -k samsung -s
+#   3 passed in 130 s
+```
+
+* `pim_driver` sha256
+  `210b7f542f5844d0320cae712a12355667dc3a733b8be5ea7568f1983bada948`,
+  `libdramsim/libdramsim2.a`
+  `08807bf9c0ad07a5811a69de58cf39fe1c80c9461d2f8320f64fb5a0ff7f2fc0`. After
+  `objcopy --strip-all --remove-section=.note.gnu.build-id`:
+  `9780b17c73965f7abc7060be7f434d119422d04198362c50caec3342e52b53e7`, equal to
+  the installed lab binary stripped the same way. (The first round's
+  `181fb3bb...` predates the `TenonConductor.inc` update of 2026-11-02 07:43;
+  the lab binary was rebuilt at 07:54.) The five installed overlay files equal
+  `<repo>`'s byte for byte.
+* Vendor layout (`samsung_vendor_gemv_layout`) **4,435** / 8,041 / 8,247
+  cycles and cost-selected default **4,389** / 7,947 / 8,153 for 4096x256 /
+  4096x512 / 8192x256.
+* Not verifiable from the release repository alone: without the patches the
+  build stops by design.
+
+**Recipe tests:** `tests/perf/test_simulator_recipes.py` (files present and
+non-empty, pins and the uPIMulator license recorded, Samsung limitation in the
+README, `apply.sh` refusal without or with an incomplete patch directory,
+the three ways of supplying patches with synthetic non-Samsung patches, sdist
+ships `simulators/**` but never `simulators/PIMSimulator/patches/`).
 
 ## GSI APU v1 (Gemini-I)
 

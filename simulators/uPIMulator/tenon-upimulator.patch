@@ -1,0 +1,2903 @@
+diff --git a/golang/uPIMulator/benchmark/BS/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/BS/dpu/CMakeLists.txt
+index 089b1a60ec623dfedc79632e7ed66b3e2aeb91f8..fc16fade8cc614a4a302645bf4593db92d29da3a 100644
+--- a/golang/uPIMulator/benchmark/BS/dpu/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/BS/dpu/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-w -I/root/uPIMulator/benchmark/BS/support -O2 -S -DNR_TASKLETS=${NR_TASKLETS}")
+ 
+ file(GLOB_RECURSE SRCS *.c)
+diff --git a/golang/uPIMulator/benchmark/CMakeLists.txt b/golang/uPIMulator/benchmark/CMakeLists.txt
+index 30998a14af0c90ed73b9c1bf17e3459f04165d79..503c4992f746285d6dc1132539580ab52a5c28cc 100644
+--- a/golang/uPIMulator/benchmark/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/CMakeLists.txt
+@@ -15,3 +15,4 @@ add_subdirectory(TRNS)
+ add_subdirectory(TS)
+ add_subdirectory(UNI)
+ add_subdirectory(VA)
++add_subdirectory(GENERIC)
+diff --git a/golang/uPIMulator/benchmark/GEMV/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/GEMV/dpu/CMakeLists.txt
+index c4d4e4190346ced5b7149797fb449c808a925484..338f3034c254a787cbd16b1cd27038aed8895a64 100644
+--- a/golang/uPIMulator/benchmark/GEMV/dpu/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/GEMV/dpu/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ SET(BL 10)
+ 
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-w -I/root/uPIMulator/benchmark/GEMV/support -O2 -S -DNR_TASKLETS=${NR_TASKLETS} -DBL=${BL}")
+ 
+ file(GLOB_RECURSE SRCS *.c)
+diff --git a/golang/uPIMulator/benchmark/GENERIC/CMakeLists.txt b/golang/uPIMulator/benchmark/GENERIC/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..790b74bf2a100039db9fe0262fab84a4f9164afa
+--- /dev/null
++++ b/golang/uPIMulator/benchmark/GENERIC/CMakeLists.txt
+@@ -0,0 +1 @@
++add_subdirectory(dpu)
+diff --git a/golang/uPIMulator/benchmark/GENERIC/README.md b/golang/uPIMulator/benchmark/GENERIC/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..d936b0f8ee5091d3b2b1ad6adcc54c0edddb56f4
+--- /dev/null
++++ b/golang/uPIMulator/benchmark/GENERIC/README.md
+@@ -0,0 +1,41 @@
++# GENERIC benchmark adapter
++
++`GENERIC` runs an externally generated DPU program with raw binary fixtures.
++Stage the program as `dpu/task.c`; optional support `.c` files may be placed in
++the same directory and remain separate translation units. Headers may be
++placed in `dpu/` or `GENERIC/`.
++
++Pass `--benchmark GENERIC --fixture_dir /path/to/fixture`. The fixture directory
++must contain a version-1 `manifest.json`:
++
++```json
++{
++  "schema_version": 1,
++  "num_dpus": 1,
++  "num_tasklets": 12,
++  "executions": [
++    {
++      "dpus": [
++        {
++          "host_inputs": {"DPU_INPUT_ARGUMENTS": "arguments.bin"},
++          "host_outputs": {"result": "expected-result.bin"},
++          "mram_heap_input": {"offset": 0, "file": "heap-input.bin"},
++          "mram_heap_output": {"offset": 4096, "file": "expected-output.bin"}
++        }
++      ]
++    }
++  ]
++}
++```
++
++Each host map key is the exact `__host` symbol name and each value is a raw
++binary file path relative to the fixture directory. MRAM heap entries are
++optional; omitted entries become zero-length fixtures at offset zero. Multiple
++executions and DPUs are represented by adding array entries. Manifest DPU and
++tasklet counts must exactly match the simulator command line.
++
++Paths are deliberately relative and may not escape `fixture_dir`, keeping a
++fixture bundle relocatable. Host names must be C identifiers and may not begin
++with `dpu_mram_heap_pointer_name`, which is reserved by uPIMulator's fixture
++filename parser. `GENERIC` verifies only regions listed under `host_outputs`
++and `mram_heap_output`; omitted output regions are not correctness-checked.
+diff --git a/golang/uPIMulator/benchmark/GENERIC/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/GENERIC/dpu/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..549beb6af164a8d51bfdeac3aecb26e40fc89431
+--- /dev/null
++++ b/golang/uPIMulator/benchmark/GENERIC/dpu/CMakeLists.txt
+@@ -0,0 +1,16 @@
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
++set(CMAKE_C_FLAGS "-w -O2 -S")
++
++# A staged benchmark always supplies task.c. Any additional .c files staged in
++# this directory are preserved as separate translation units so uPIMulator's
++# unresolved-symbol linker can select them without source concatenation.
++file(GLOB GENERIC_DEVICE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.c")
++
++add_executable(GENERIC_device ${GENERIC_DEVICE_SOURCES})
++target_include_directories(
++    GENERIC_device
++    PRIVATE
++        ${CMAKE_CURRENT_SOURCE_DIR}
++        ${CMAKE_CURRENT_SOURCE_DIR}/..
++)
++target_compile_definitions(GENERIC_device PRIVATE NR_TASKLETS=${NR_TASKLETS})
+diff --git a/golang/uPIMulator/benchmark/GENERIC/dpu/task.c b/golang/uPIMulator/benchmark/GENERIC/dpu/task.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..e74e37780dee4a52285e7407f7b3903c76984c08
+--- /dev/null
++++ b/golang/uPIMulator/benchmark/GENERIC/dpu/task.c
+@@ -0,0 +1,3 @@
++/* Placeholder: Tenon (allo/spmw_upmem.py) replaces this file with the
++ * generated DPU program before every build of the GENERIC slot. */
++int main(void) { return 0; }
+diff --git a/golang/uPIMulator/benchmark/HST-L/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/HST-L/dpu/CMakeLists.txt
+index ff6e2a6a041b91829b5a18368b3df8f55041c0f6..0ccd5f3787f73b96ac1471315438b3ac6b25a7ea 100644
+--- a/golang/uPIMulator/benchmark/HST-L/dpu/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/HST-L/dpu/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ SET(BL 10)
+ SET(NR_HISTO 1)
+ 
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-w -I/root/uPIMulator/benchmark/HST-L/support -O2 -S -DNR_TASKLETS=${NR_TASKLETS} -DBL=${BL} -DNR_HISTO=${NR_HISTO}")
+ 
+ file(GLOB_RECURSE SRCS *.c)
+diff --git a/golang/uPIMulator/benchmark/HST-S/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/HST-S/dpu/CMakeLists.txt
+index 2dabb4f8c4985e5c7bafdb8005e4eff41e4abcc0..38c916d5925779c2ac6bf1903e41672e73fdb3a4 100644
+--- a/golang/uPIMulator/benchmark/HST-S/dpu/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/HST-S/dpu/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ SET(BL 10)
+ 
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-w -I/root/uPIMulator/benchmark/HST-S/support -O2 -S -DNR_TASKLETS=${NR_TASKLETS} -DBL=${BL}")
+ 
+ file(GLOB_RECURSE SRCS *.c)
+diff --git a/golang/uPIMulator/benchmark/MLP/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/MLP/dpu/CMakeLists.txt
+index c0a1c4b50dc0ba556c88a1ab1e77ae1fc83da561..51f1ce84f0cc30615555cc60f1f5af681eacff48 100644
+--- a/golang/uPIMulator/benchmark/MLP/dpu/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/MLP/dpu/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ SET(BL 10)
+ 
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-w -I/root/uPIMulator/benchmark/MLP/support -O2 -S -DNR_TASKLETS=${NR_TASKLETS} -DBL=${BL}")
+ 
+ file(GLOB_RECURSE SRCS *.c)
+diff --git a/golang/uPIMulator/benchmark/RED/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/RED/dpu/CMakeLists.txt
+index 42708ce286e3620b2e160fa7a53c9b75269d3d45..88dd4246bfba2ba50439d7f42e2fd802b4d59feb 100644
+--- a/golang/uPIMulator/benchmark/RED/dpu/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/RED/dpu/CMakeLists.txt
+@@ -4,7 +4,7 @@ SET(VERSION SINGLE)
+ SET(SYNC HAND)
+ SET(PERF 0)
+ 
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-w -I/root/uPIMulator/benchmark/RED/support -O2 -S -DNR_TASKLETS=${NR_TASKLETS} -DBL=${BL} -D${VERSION} -D${SYNC} -D${TYPE} -DPERF=${PERF}")
+ 
+ file(GLOB_RECURSE SRCS *.c)
+diff --git a/golang/uPIMulator/benchmark/SCAN-RSS/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/SCAN-RSS/dpu/CMakeLists.txt
+index e21a4bb3e944ff5f3d98311a912ca1e6881102f9..730d5c2d6f6ff2495a76a6766cc855c64756fa2a 100644
+--- a/golang/uPIMulator/benchmark/SCAN-RSS/dpu/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/SCAN-RSS/dpu/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ SET(BL 10)
+ SET(TYPE INT64)
+ 
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-w -I/root/uPIMulator/benchmark/SCAN-RSS/support -O2 -S -DNR_TASKLETS=${NR_TASKLETS} -DBL=${BL} -D${TYPE}")
+ 
+ file(GLOB_RECURSE SRCS *.c)
+diff --git a/golang/uPIMulator/benchmark/SCAN-SSA/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/SCAN-SSA/dpu/CMakeLists.txt
+index 93264ea88521f884ccdb8ed735a862a478b07fa1..ddc125a34877d7e2821b97cdfda212c04cab924b 100644
+--- a/golang/uPIMulator/benchmark/SCAN-SSA/dpu/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/SCAN-SSA/dpu/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ SET(BL 10)
+ SET(TYPE INT64)
+ 
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-w -I/root/uPIMulator/benchmark/SCAN-SSA/support -O2 -S -DNR_TASKLETS=${NR_TASKLETS} -DBL=${BL} -D${TYPE}")
+ 
+ file(GLOB_RECURSE SRCS *.c)
+diff --git a/golang/uPIMulator/benchmark/SEL/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/SEL/dpu/CMakeLists.txt
+index 51e14077c15d015244f63a6a7acffe7ebb166222..c9cef97b79301da27b6b5de68c75868d37d7ba16 100644
+--- a/golang/uPIMulator/benchmark/SEL/dpu/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/SEL/dpu/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ SET(BL 10)
+ 
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-w -I/root/uPIMulator/benchmark/SEL/support -O2 -S -DNR_TASKLETS=${NR_TASKLETS} -DBL=${BL}")
+ 
+ file(GLOB_RECURSE SRCS *.c)
+diff --git a/golang/uPIMulator/benchmark/TRNS/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/TRNS/dpu/CMakeLists.txt
+index b0554881038a4e0715377b535ff5cc86241de69e..5b424325b67b460efb0a92f0dc747e2b271c0774 100644
+--- a/golang/uPIMulator/benchmark/TRNS/dpu/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/TRNS/dpu/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-w -I/root/uPIMulator/benchmark/TRNS/support -O2 -S -DNR_TASKLETS=${NR_TASKLETS} -DBL=${BL}")
+ 
+ file(GLOB_RECURSE SRCS *.c)
+diff --git a/golang/uPIMulator/benchmark/TS/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/TS/dpu/CMakeLists.txt
+index ef2a0d558b602e5f0ec430a6235a82a3ab0d03ed..7ddcac9597f761e2359934f9c73664c829e804bd 100644
+--- a/golang/uPIMulator/benchmark/TS/dpu/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/TS/dpu/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ SET(BL 10)
+ 
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-w -I/root/uPIMulator/benchmark/TS/support -O2 -S -DNR_TASKLETS=${NR_TASKLETS} -DBL${BL}")
+ 
+ file(GLOB_RECURSE SRCS *.c)
+diff --git a/golang/uPIMulator/benchmark/UNI/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/UNI/dpu/CMakeLists.txt
+index 2c51744fd47db57bde54ddb655c48aa2abb8f394..264eda84f3e26696ce5cfdff0aed976973cadffb 100644
+--- a/golang/uPIMulator/benchmark/UNI/dpu/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/UNI/dpu/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ SET(BL 10)
+ 
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-w -I/root/uPIMulator/benchmark/UNI/support -O2 -S -DNR_TASKLETS=${NR_TASKLETS} -DBL=${BL}")
+ 
+ file(GLOB_RECURSE SRCS *.c)
+diff --git a/golang/uPIMulator/benchmark/VA/dpu/CMakeLists.txt b/golang/uPIMulator/benchmark/VA/dpu/CMakeLists.txt
+index 9f928789f17d22c4b94088b32e3adfbf083ee831..6bca2e0589bf0bce96395caa7e6877e8f56043bb 100644
+--- a/golang/uPIMulator/benchmark/VA/dpu/CMakeLists.txt
++++ b/golang/uPIMulator/benchmark/VA/dpu/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ SET(BL 10)
+ SET(TYPE INT32)
+ 
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-w -I/root/uPIMulator/benchmark/VA/support -O2 -S -DNR_TASKLETS=${NR_TASKLETS} -DBL=${BL} -D${TYPE}")
+ 
+ file(GLOB_RECURSE SRCS *.c)
+diff --git a/golang/uPIMulator/benchmark/build.py b/golang/uPIMulator/benchmark/build.py
+index 1a78d6830ff241fb2c0c46c7d3310a4ad5610714..1569311a753aa0e05a4a81684a37df19636d64b3 100644
+--- a/golang/uPIMulator/benchmark/build.py
++++ b/golang/uPIMulator/benchmark/build.py
+@@ -8,6 +8,10 @@ if __name__ == "__main__":
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--num_dpus", type=int, default=1)
+     parser.add_argument("--num_tasklets", type=int, default=1)
++    parser.add_argument(
++        "--benchmark",
++        help="build only this benchmark target (for example, GENERIC)",
++    )
+     args = parser.parse_args()
+ 
+     benchmark_dir_path = os.path.dirname(__file__)
+@@ -18,7 +22,7 @@ if __name__ == "__main__":
+         shutil.rmtree(build_dir_path)
+     os.makedirs(build_dir_path)
+ 
+-    subprocess.run(
++    configured = subprocess.run(
+         [
+             "cmake",
+             "-D",
+@@ -31,6 +35,14 @@ if __name__ == "__main__":
+             build_dir_path,
+             "-G",
+             "Ninja",
+-        ]
++        ],
++        check=False,
+     )
+-    subprocess.run(["ninja", "-C", build_dir_path])
++    if configured.returncode != 0:
++        raise SystemExit(configured.returncode)
++
++    build_command = ["ninja", "-C", build_dir_path]
++    if args.benchmark:
++        build_command.append(f"{args.benchmark}_device")
++    built = subprocess.run(build_command, check=False)
++    raise SystemExit(built.returncode)
+diff --git a/golang/uPIMulator/docker/Dockerfile b/golang/uPIMulator/docker/Dockerfile
+index 2a1789b44ff8b41733f554c5fe8deffe30cd5766..716999c7041845c2d56e06068b90228d35bd6a7e 100644
+--- a/golang/uPIMulator/docker/Dockerfile
++++ b/golang/uPIMulator/docker/Dockerfile
+@@ -1,20 +1,21 @@
+-FROM ubuntu:22.04
+-
+-ENV DEBIAN_FRONTEND=noninteractive
+-
+-RUN apt update
+-RUN apt install -y git
+-RUN apt install -y wget
+-RUN apt install -y cmake
+-RUN apt install -y ninja-build
+-RUN apt install -y pkg-config
+-RUN apt install -y python3
+-RUN apt install -y python3-pip
+-
+-# UPMEM SDK
+-WORKDIR /root
+-RUN wget sdk-releases.upmem.com/2023.2.0/ubuntu_22.04/upmem-2023.2.0-Linux-x86_64.tar.gz
+-RUN tar -zxvf upmem-2023.2.0-Linux-x86_64.tar.gz
+-RUN echo "source /root/upmem-2023.2.0-Linux-x86_64/upmem_env.sh" > /root/.bashrc
+-
+-WORKDIR /root/uPIMulator
++FROM ubuntu:22.04
++
++ENV DEBIAN_FRONTEND=noninteractive
++
++RUN apt-get update && apt-get install -y \
++    git wget cmake ninja-build pkg-config \
++    python3 python3-pip libc6 \
++    && rm -rf /var/lib/apt/lists/*
++
++# UPMEM SDK 2023.1.0 from the CMU-SAFARI mirror.  The upstream Dockerfile
++# downloads SDK 2023.2.0 from an endpoint that is no longer reachable here.
++WORKDIR /root
++COPY upmem-sdk.tar.gz /root/upmem-sdk.tar.gz
++RUN tar -zxf upmem-sdk.tar.gz && rm upmem-sdk.tar.gz
++
++ENV UPMEM_HOME=/root/upmem-2023.1.0-Linux-x86_64
++ENV PATH=${UPMEM_HOME}/bin:${PATH}
++ENV LD_LIBRARY_PATH=${UPMEM_HOME}/lib
++ENV PYTHONPATH=${UPMEM_HOME}/lib/python3/dist-packages
++
++WORKDIR /root/uPIMulator
+diff --git a/golang/uPIMulator/sdk/misc/CMakeLists.txt b/golang/uPIMulator/sdk/misc/CMakeLists.txt
+index 7a41b99c8de6fcd04db6491131585c273f999c44..c95de3a7c9e542103c6c884a5e32f509baa51514 100644
+--- a/golang/uPIMulator/sdk/misc/CMakeLists.txt
++++ b/golang/uPIMulator/sdk/misc/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-O3 -S -DNR_TASKLETS=${NR_TASKLETS}")
+ 
+ include_directories("/root/uPIMulator/sdk/misc")
+diff --git a/golang/uPIMulator/sdk/misc/stdoutBufferState.c b/golang/uPIMulator/sdk/misc/stdoutBufferState.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..75140766aea55233927d9ffc274684f89530cad7
+--- /dev/null
++++ b/golang/uPIMulator/sdk/misc/stdoutBufferState.c
+@@ -0,0 +1,19 @@
++/* Copyright 2020 UPMEM. All rights reserved.
++ * Use of this source code is governed by a BSD-style license that can be
++ * found in the LICENSE file.
++ */
++
++#include <attributes.h>
++#include <dpuruntime.h>
++
++/*
++ * The bootstrap clears this state whether or not the application uses stdio.
++ * Keep it in its own object so uPIMulator's object-granularity SDK resolver
++ * does not pull in stdio.c and its unused 1 MiB default MRAM buffer merely to
++ * satisfy the bootstrap reference.
++ *
++ * __lower_data keeps the address within the bootstrap sd instruction's signed
++ * 12-bit offset; __dma_aligned supplies the required eight-byte alignment.
++ */
++stdout_buffer_state_t __lower_data(__STR(__STDOUT_BUFFER_STATE)) __dma_aligned
++    __STDOUT_BUFFER_STATE;
+diff --git a/golang/uPIMulator/sdk/stdlib/CMakeLists.txt b/golang/uPIMulator/sdk/stdlib/CMakeLists.txt
+index 6135cf1b9a65d086d183c6397b660fffc637ba62..eaa22de1c157a5940b135d8b826bd863aa0f3636 100644
+--- a/golang/uPIMulator/sdk/stdlib/CMakeLists.txt
++++ b/golang/uPIMulator/sdk/stdlib/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-O3 -S -DNR_TASKLETS=${NR_TASKLETS}")
+ 
+ include_directories("/root/uPIMulator/sdk/misc")
+diff --git a/golang/uPIMulator/sdk/stdlib/stdio.c b/golang/uPIMulator/sdk/stdlib/stdio.c
+index dceb7b7fbd41e450084e28fbde7211650d670f8d..57718488016315a5f167976dbb6624326a6606b8 100644
+--- a/golang/uPIMulator/sdk/stdlib/stdio.c
++++ b/golang/uPIMulator/sdk/stdlib/stdio.c
+@@ -18,18 +18,6 @@
+ unsigned char __weak __mram_noinit __stdout_buffer[DEFAULT_STDOUT_BUFFER_SIZE];
+ unsigned int __weak __stdout_buffer_size = DEFAULT_STDOUT_BUFFER_SIZE;
+ 
+-/* __lower_data: needed to make sure that the structure address will be less that a signed12
+- *               (sd endian:e ra off:s12 imm:s16 used in bootstrap).
+- *
+- * __dma_aligned: needed to make sure that the structure address will be aligned on 8 bytes (for sd in bootstrap as well).
+- *
+- * This structure is initialize at zero in the bootsrap
+- */
+-__lower_data(__STR(__STDOUT_BUFFER_STATE)) __dma_aligned struct {
+-    uint32_t wp;
+-    uint32_t has_wrapped;
+-} __STDOUT_BUFFER_STATE;
+-
+ static uint32_t __stdout_buffer_write_pointer_initial;
+ static uint32_t __stdout_nr_of_wrapping;
+ 
+diff --git a/golang/uPIMulator/sdk/syslib/CMakeLists.txt b/golang/uPIMulator/sdk/syslib/CMakeLists.txt
+index c6d3ef569d549c1b0d13a35ea342d49381868cd4..ea825b27e49e1e7501717444a868ca1e8f014aba 100644
+--- a/golang/uPIMulator/sdk/syslib/CMakeLists.txt
++++ b/golang/uPIMulator/sdk/syslib/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-set(CMAKE_C_COMPILER "/root/upmem-2023.2.0-Linux-x86_64/bin/dpu-upmem-dpurte-clang")
++set(CMAKE_C_COMPILER "dpu-upmem-dpurte-clang")
+ set(CMAKE_C_FLAGS "-O3 -S -DNR_TASKLETS=${NR_TASKLETS}")
+ 
+ include_directories("/root/uPIMulator/sdk/misc")
+diff --git a/golang/uPIMulator/sdk/syslib/dpuruntime.h b/golang/uPIMulator/sdk/syslib/dpuruntime.h
+index 3acc2856f3db8e3cc004de662de5836e05ba1c8d..1372e930543117a3c0afd4b1b763ab1202d9e447 100644
+--- a/golang/uPIMulator/sdk/syslib/dpuruntime.h
++++ b/golang/uPIMulator/sdk/syslib/dpuruntime.h
+@@ -26,10 +26,16 @@ typedef struct {
+     uint32_t stack_ptr;
+ } thread_stack_t;
+ 
++typedef struct {
++    uint32_t wp;
++    uint32_t has_wrapped;
++} stdout_buffer_state_t;
++
+ extern unsigned int __INITIAL_HEAP_POINTER;
+ extern volatile unsigned int __HEAP_POINTER;
+ extern unsigned char __WAIT_QUEUE_TABLE[];
+ extern thread_stack_t __SP_TABLE__[];
++extern stdout_buffer_state_t __STDOUT_BUFFER_STATE;
+ 
+ #define __acquire(base, off) __builtin_acquire_rici(base, off, "nz", __AT_THIS_INSTRUCTION)
+ #define __release(base, off, at) __builtin_release_rici(base, off, "nz", at)
+diff --git a/golang/uPIMulator/src/assembler/assembler.go b/golang/uPIMulator/src/assembler/assembler.go
+index 0b26695a31844e71810137ef875b1461d9093c5e..e2a5971d83018eb07f6646240dcd0ce3cb7c4fde 100644
+--- a/golang/uPIMulator/src/assembler/assembler.go
++++ b/golang/uPIMulator/src/assembler/assembler.go
+@@ -50,6 +50,9 @@ func (this *Assembler) Init(command_line_parser *misc.CommandLineParser) {
+ 	this.assemblables["TS"] = new(prim.Ts)
+ 	this.assemblables["UNI"] = new(prim.Uni)
+ 	this.assemblables["VA"] = new(prim.Va)
++	this.assemblables["SIMPLEPIM-VA"] = new(prim.SimplePimVa)
++	this.assemblables["ATIM-VA"] = new(prim.AtimVa)
++	this.assemblables["GENERIC"] = new(prim.Generic)
+ 
+ 	if assemblable, found := this.assemblables[this.benchmark]; found {
+ 		assemblable.Init(command_line_parser)
+diff --git a/golang/uPIMulator/src/assembler/prim/atim_va.go b/golang/uPIMulator/src/assembler/prim/atim_va.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..5fcd8633737d19e048fbfd3d72e5ffb24a5b7726
+--- /dev/null
++++ b/golang/uPIMulator/src/assembler/prim/atim_va.go
+@@ -0,0 +1,164 @@
++package prim
++
++import (
++	"fmt"
++	"uPIMulator/src/abi/encoding"
++	"uPIMulator/src/abi/word"
++	"uPIMulator/src/misc"
++)
++
++const atimVaNumElements = 256
++
++// atimVaSmokeInput is the exact first 256-int32 input used by the archived
++// ATiM SDK-2021.3 smoke. ATiM's cached host_array call supplied this same
++// array for both A and B.
++var atimVaSmokeInput = [...]int64{
++	24, 40, 27, 46, 43, 48, 42, 20,
++	29, 25, 40, 46, 16, 42, 16, 47,
++	37, 15, 6, 21, 7, 28, 22, 34,
++	24, 19, 27, 0, 28, 9, 42, 19,
++	38, 2, 25, 28, 6, 0, 6, 23,
++	36, 12, 9, 16, 31, 49, 35, 26,
++	21, 24, 11, 48, 40, 0, 14, 46,
++	20, 0, 34, 41, 9, 30, 15, 7,
++	27, 10, 36, 10, 11, 30, 7, 42,
++	10, 3, 34, 37, 15, 45, 1, 13,
++	32, 22, 47, 45, 0, 29, 30, 47,
++	45, 14, 49, 26, 45, 13, 20, 40,
++	1, 23, 38, 45, 5, 15, 46, 48,
++	46, 43, 41, 47, 22, 45, 44, 42,
++	30, 1, 0, 13, 37, 47, 9, 30,
++	45, 23, 18, 8, 25, 41, 26, 4,
++	48, 41, 44, 33, 16, 21, 27, 37,
++	43, 38, 2, 29, 43, 16, 9, 22,
++	41, 25, 5, 37, 48, 9, 9, 4,
++	43, 44, 0, 23, 39, 43, 27, 39,
++	46, 22, 32, 24, 16, 3, 28, 29,
++	22, 2, 32, 35, 29, 23, 15, 22,
++	24, 22, 21, 18, 32, 2, 13, 14,
++	29, 18, 34, 46, 43, 30, 12, 29,
++	19, 12, 10, 7, 0, 0, 31, 23,
++	3, 14, 34, 31, 25, 24, 15, 33,
++	47, 8, 12, 29, 24, 5, 37, 41,
++	17, 42, 7, 47, 15, 10, 25, 9,
++	17, 27, 8, 31, 13, 13, 17, 19,
++	25, 24, 35, 13, 8, 16, 39, 40,
++	34, 49, 27, 8, 33, 33, 38, 12,
++	10, 20, 38, 29, 30, 46, 11, 8,
++}
++
++// AtimVa supplies uPIMulator's host fixtures for the exact archived ATiM VA
++// kernel. The kernel has fixed 256-element A/B/C symbols and was generated for
++// one block/DPU and one tasklet.
++type AtimVa struct {
++	numDpus       int
++	numTasklets   int
++	numExecutions int
++
++	bufferA []int64
++	bufferB []int64
++	bufferC []int64
++}
++
++func (this *AtimVa) Init(commandLineParser *misc.CommandLineParser) {
++	numChannels := int(commandLineParser.IntParameter("num_channels"))
++	numRanksPerChannel := int(commandLineParser.IntParameter("num_ranks_per_channel"))
++	numDpusPerRank := int(commandLineParser.IntParameter("num_dpus_per_rank"))
++
++	this.numDpus = numChannels * numRanksPerChannel * numDpusPerRank
++	this.numTasklets = int(commandLineParser.IntParameter("num_tasklets"))
++	this.numExecutions = 1
++
++	if this.numDpus != 1 {
++		panic(fmt.Errorf("ATIM-VA requires exactly one DPU, got %d", this.numDpus))
++	}
++	if this.numTasklets != 1 {
++		panic(fmt.Errorf("ATIM-VA was generated for exactly one tasklet, got %d", this.numTasklets))
++	}
++
++	dataPrepParams := commandLineParser.DataPrepParams()
++	if len(dataPrepParams) != 1 || dataPrepParams[0] != atimVaNumElements {
++		panic(fmt.Errorf("ATIM-VA requires exactly %d int32 elements", atimVaNumElements))
++	}
++
++	this.initSmokeBuffers()
++}
++
++func (this *AtimVa) initSmokeBuffers() {
++	this.bufferA = make([]int64, atimVaNumElements)
++	this.bufferB = make([]int64, atimVaNumElements)
++	this.bufferC = make([]int64, atimVaNumElements)
++	for i, value := range atimVaSmokeInput {
++		this.bufferA[i] = value
++		this.bufferB[i] = value
++		this.bufferC[i] = value + value
++	}
++}
++
++func appendAtimUint32(byteStream *encoding.ByteStream, value int64) {
++	valueWord := new(word.Word)
++	valueWord.Init(32)
++	valueWord.SetValue(value)
++	byteStream.Merge(valueWord.ToByteStream())
++}
++
++func atimInt32ByteStream(values []int64) *encoding.ByteStream {
++	byteStream := new(encoding.ByteStream)
++	byteStream.Init()
++	for _, value := range values {
++		appendAtimUint32(byteStream, value)
++	}
++	return byteStream
++}
++
++func emptyAtimByteStream() *encoding.ByteStream {
++	byteStream := new(encoding.ByteStream)
++	byteStream.Init()
++	return byteStream
++}
++
++func (this *AtimVa) InputDpuHost(execution int, dpuId int) map[string]*encoding.ByteStream {
++	this.validateIndices(execution, dpuId)
++
++	blockIdx := new(encoding.ByteStream)
++	blockIdx.Init()
++	appendAtimUint32(blockIdx, 0)
++	appendAtimUint32(blockIdx, 0)
++	appendAtimUint32(blockIdx, 0)
++
++	return map[string]*encoding.ByteStream{
++		"A":        atimInt32ByteStream(this.bufferA),
++		"B":        atimInt32ByteStream(this.bufferB),
++		"blockIdx": blockIdx,
++	}
++}
++
++func (this *AtimVa) OutputDpuHost(execution int, dpuId int) map[string]*encoding.ByteStream {
++	this.validateIndices(execution, dpuId)
++	return map[string]*encoding.ByteStream{
++		"C": atimInt32ByteStream(this.bufferC),
++	}
++}
++
++func (this *AtimVa) InputDpuMramHeapPointerName(execution int, dpuId int) (int64, *encoding.ByteStream) {
++	this.validateIndices(execution, dpuId)
++	return 0, emptyAtimByteStream()
++}
++
++func (this *AtimVa) OutputDpuMramHeapPointerName(execution int, dpuId int) (int64, *encoding.ByteStream) {
++	this.validateIndices(execution, dpuId)
++	return 0, emptyAtimByteStream()
++}
++
++func (this *AtimVa) NumExecutions() int {
++	return this.numExecutions
++}
++
++func (this *AtimVa) validateIndices(execution int, dpuId int) {
++	if execution < 0 || execution >= this.numExecutions {
++		panic(fmt.Errorf("execution %d is outside [0, %d)", execution, this.numExecutions))
++	}
++	if dpuId < 0 || dpuId >= this.numDpus {
++		panic(fmt.Errorf("DPU ID %d is outside [0, %d)", dpuId, this.numDpus))
++	}
++}
+diff --git a/golang/uPIMulator/src/assembler/prim/atim_va_test.go b/golang/uPIMulator/src/assembler/prim/atim_va_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8fe485c84146faaee364125e41ec2dba47cae62
+--- /dev/null
++++ b/golang/uPIMulator/src/assembler/prim/atim_va_test.go
+@@ -0,0 +1,57 @@
++package prim
++
++import (
++	"crypto/sha256"
++	"encoding/binary"
++	"fmt"
++	"testing"
++)
++
++func TestAtimVaArchivedSmokeFixtures(t *testing.T) {
++	fixture := &AtimVa{
++		numDpus:       1,
++		numTasklets:   1,
++		numExecutions: 1,
++	}
++	fixture.initSmokeBuffers()
++
++	input := fixture.InputDpuHost(0, 0)
++	if got := input["A"].Size(); got != 4*atimVaNumElements {
++		t.Fatalf("A fixture size = %d, want %d", got, 4*atimVaNumElements)
++	}
++	if got := input["B"].Size(); got != 4*atimVaNumElements {
++		t.Fatalf("B fixture size = %d, want %d", got, 4*atimVaNumElements)
++	}
++	if got := input["blockIdx"].Size(); got != 12 {
++		t.Fatalf("blockIdx fixture size = %d, want 12", got)
++	}
++
++	aBytes := make([]byte, input["A"].Size())
++	for i := range aBytes {
++		aBytes[i] = input["A"].Get(i)
++		if input["B"].Get(i) != aBytes[i] {
++			t.Fatalf("B differs from archived cached A at byte %d", i)
++		}
++	}
++	if got := fmt.Sprintf("%x", sha256.Sum256(aBytes)); got != "7469686dc29010ff5bad4017c005492b75e4dc4e794675cc42ae2b30ebf226ef" {
++		t.Fatalf("archived input SHA-256 = %s", got)
++	}
++
++	output := fixture.OutputDpuHost(0, 0)["C"]
++	if got := output.Size(); got != 4*atimVaNumElements {
++		t.Fatalf("C oracle size = %d, want %d", got, 4*atimVaNumElements)
++	}
++	for i, inputValue := range atimVaSmokeInput {
++		offset := 4 * i
++		actual := int32(binary.LittleEndian.Uint32([]byte{
++			output.Get(offset),
++			output.Get(offset + 1),
++			output.Get(offset + 2),
++			output.Get(offset + 3),
++		}))
++		expected := int32(inputValue + inputValue)
++		if actual != expected {
++			t.Fatalf("C[%d] = %d, want %d", i, actual, expected)
++		}
++	}
++}
+diff --git a/golang/uPIMulator/src/assembler/prim/generic.go b/golang/uPIMulator/src/assembler/prim/generic.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..904455f14dac159c592bd079f91c207974d3c84d
+--- /dev/null
++++ b/golang/uPIMulator/src/assembler/prim/generic.go
+@@ -0,0 +1,404 @@
++package prim
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++	"uPIMulator/src/abi/encoding"
++	"uPIMulator/src/misc"
++)
++
++const genericManifestVersion = 1
++
++var genericHostSymbolPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
++
++// genericManifest is the on-disk description for a GENERIC benchmark. Raw
++// binary paths are relative to the fixture directory containing manifest.json.
++type genericManifest struct {
++	SchemaVersion int                `json:"schema_version"`
++	NumDpus       int                `json:"num_dpus"`
++	NumTasklets   int                `json:"num_tasklets"`
++	Executions    []genericExecution `json:"executions"`
++}
++
++type genericExecution struct {
++	Dpus []genericDpuManifest `json:"dpus"`
++}
++
++type genericDpuManifest struct {
++	HostInputs     map[string]string    `json:"host_inputs"`
++	HostOutputs    map[string]string    `json:"host_outputs"`
++	MramHeapInput  *genericMramManifest `json:"mram_heap_input"`
++	MramHeapOutput *genericMramManifest `json:"mram_heap_output"`
++}
++
++type genericMramManifest struct {
++	Offset int64  `json:"offset"`
++	File   string `json:"file"`
++}
++
++type genericDpuFixture struct {
++	hostInputs     map[string]*encoding.ByteStream
++	hostOutputs    map[string]*encoding.ByteStream
++	mramHeapInput  genericMramFixture
++	mramHeapOutput genericMramFixture
++}
++
++type genericMramFixture struct {
++	offset int64
++	bytes  *encoding.ByteStream
++}
++
++// Generic supplies uPIMulator host fixtures from a versioned JSON manifest.
++// It lets externally generated DPU programs retain their native __host symbol
++// names and DPU_MRAM_HEAP_POINTER_NAME layouts without adding a Go adapter for
++// each benchmark.
++type Generic struct {
++	numDpus     int
++	numTasklets int
++	executions  [][]genericDpuFixture
++}
++
++func (this *Generic) Init(commandLineParser *misc.CommandLineParser) {
++	numChannels := int(commandLineParser.IntParameter("num_channels"))
++	numRanksPerChannel := int(commandLineParser.IntParameter("num_ranks_per_channel"))
++	numDpusPerRank := int(commandLineParser.IntParameter("num_dpus_per_rank"))
++	expectedNumDpus := numChannels * numRanksPerChannel * numDpusPerRank
++	expectedNumTasklets := int(commandLineParser.IntParameter("num_tasklets"))
++
++	loaded, err := loadGenericFixture(
++		commandLineParser.StringParameter("fixture_dir"),
++		expectedNumDpus,
++		expectedNumTasklets,
++	)
++	if err != nil {
++		panic(err)
++	}
++	*this = *loaded
++}
++
++func loadGenericFixture(
++	fixtureDir string,
++	expectedNumDpus int,
++	expectedNumTasklets int,
++) (*Generic, error) {
++	if strings.TrimSpace(fixtureDir) == "" {
++		return nil, errors.New("GENERIC requires a non-empty --fixture_dir")
++	}
++
++	manifestPath := filepath.Join(fixtureDir, "manifest.json")
++	manifestFile, err := os.Open(manifestPath)
++	if err != nil {
++		return nil, fmt.Errorf("open GENERIC manifest %q: %w", manifestPath, err)
++	}
++	defer manifestFile.Close()
++
++	decoder := json.NewDecoder(manifestFile)
++	decoder.DisallowUnknownFields()
++	manifest := new(genericManifest)
++	if err := decoder.Decode(manifest); err != nil {
++		return nil, fmt.Errorf("decode GENERIC manifest %q: %w", manifestPath, err)
++	}
++	if err := requireJSONEOF(decoder); err != nil {
++		return nil, fmt.Errorf("decode GENERIC manifest %q: %w", manifestPath, err)
++	}
++	if err := validateGenericManifest(manifest, expectedNumDpus, expectedNumTasklets); err != nil {
++		return nil, fmt.Errorf("validate GENERIC manifest %q: %w", manifestPath, err)
++	}
++
++	fixture := &Generic{
++		numDpus:     manifest.NumDpus,
++		numTasklets: manifest.NumTasklets,
++		executions:  make([][]genericDpuFixture, len(manifest.Executions)),
++	}
++	for executionIndex, execution := range manifest.Executions {
++		fixture.executions[executionIndex] = make([]genericDpuFixture, len(execution.Dpus))
++		for dpuIndex, dpu := range execution.Dpus {
++			materialized, err := materializeGenericDpu(fixtureDir, dpu)
++			if err != nil {
++				return nil, fmt.Errorf(
++					"materialize GENERIC execution %d DPU %d: %w",
++					executionIndex,
++					dpuIndex,
++					err,
++				)
++			}
++			fixture.executions[executionIndex][dpuIndex] = materialized
++		}
++	}
++
++	return fixture, nil
++}
++
++func requireJSONEOF(decoder *json.Decoder) error {
++	var trailing any
++	if err := decoder.Decode(&trailing); err == io.EOF {
++		return nil
++	} else if err != nil {
++		return err
++	}
++	return errors.New("manifest contains more than one JSON value")
++}
++
++func validateGenericManifest(
++	manifest *genericManifest,
++	expectedNumDpus int,
++	expectedNumTasklets int,
++) error {
++	if manifest.SchemaVersion != genericManifestVersion {
++		return fmt.Errorf(
++			"schema_version is %d, want %d",
++			manifest.SchemaVersion,
++			genericManifestVersion,
++		)
++	}
++	if manifest.NumDpus <= 0 {
++		return fmt.Errorf("num_dpus must be positive, got %d", manifest.NumDpus)
++	}
++	if manifest.NumDpus != expectedNumDpus {
++		return fmt.Errorf(
++			"num_dpus is %d, but command line config creates %d",
++			manifest.NumDpus,
++			expectedNumDpus,
++		)
++	}
++	if manifest.NumTasklets <= 0 {
++		return fmt.Errorf("num_tasklets must be positive, got %d", manifest.NumTasklets)
++	}
++	if manifest.NumTasklets != expectedNumTasklets {
++		return fmt.Errorf(
++			"num_tasklets is %d, but command line config requests %d",
++			manifest.NumTasklets,
++			expectedNumTasklets,
++		)
++	}
++	if len(manifest.Executions) == 0 {
++		return errors.New("executions must contain at least one execution")
++	}
++
++	for executionIndex, execution := range manifest.Executions {
++		if len(execution.Dpus) != manifest.NumDpus {
++			return fmt.Errorf(
++				"execution %d contains %d DPUs, want %d",
++				executionIndex,
++				len(execution.Dpus),
++				manifest.NumDpus,
++			)
++		}
++		for dpuIndex, dpu := range execution.Dpus {
++			if err := validateGenericDpu(dpu); err != nil {
++				return fmt.Errorf("execution %d DPU %d: %w", executionIndex, dpuIndex, err)
++			}
++		}
++	}
++
++	return nil
++}
++
++func validateGenericDpu(dpu genericDpuManifest) error {
++	for kind, symbols := range map[string]map[string]string{
++		"host_inputs":  dpu.HostInputs,
++		"host_outputs": dpu.HostOutputs,
++	} {
++		for symbol, path := range symbols {
++			if !genericHostSymbolPattern.MatchString(symbol) {
++				return fmt.Errorf("%s symbol %q is not a C identifier", kind, symbol)
++			}
++			if symbol == "dpu_mram_heap_pointer_name" ||
++				strings.HasPrefix(symbol, "dpu_mram_heap_pointer_name_") {
++				return fmt.Errorf(
++					"%s symbol %q conflicts with uPIMulator's MRAM fixture filename format",
++					kind,
++					symbol,
++				)
++			}
++			if err := validateGenericRelativePath(path); err != nil {
++				return fmt.Errorf("%s symbol %q: %w", kind, symbol, err)
++			}
++		}
++	}
++
++	for kind, mram := range map[string]*genericMramManifest{
++		"mram_heap_input":  dpu.MramHeapInput,
++		"mram_heap_output": dpu.MramHeapOutput,
++	} {
++		if mram == nil {
++			continue
++		}
++		if mram.Offset < 0 {
++			return fmt.Errorf("%s offset must be non-negative, got %d", kind, mram.Offset)
++		}
++		if err := validateGenericRelativePath(mram.File); err != nil {
++			return fmt.Errorf("%s: %w", kind, err)
++		}
++	}
++
++	return nil
++}
++
++func validateGenericRelativePath(path string) error {
++	if strings.TrimSpace(path) == "" {
++		return errors.New("file must be non-empty")
++	}
++	if filepath.IsAbs(path) {
++		return fmt.Errorf("file %q must be relative to fixture_dir", path)
++	}
++	cleaned := filepath.Clean(path)
++	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
++		return fmt.Errorf("file %q escapes fixture_dir", path)
++	}
++	return nil
++}
++
++func materializeGenericDpu(
++	fixtureDir string,
++	manifest genericDpuManifest,
++) (genericDpuFixture, error) {
++	hostInputs, err := materializeGenericHostSymbols(fixtureDir, manifest.HostInputs)
++	if err != nil {
++		return genericDpuFixture{}, fmt.Errorf("host_inputs: %w", err)
++	}
++	hostOutputs, err := materializeGenericHostSymbols(fixtureDir, manifest.HostOutputs)
++	if err != nil {
++		return genericDpuFixture{}, fmt.Errorf("host_outputs: %w", err)
++	}
++	mramHeapInput, err := materializeGenericMram(fixtureDir, manifest.MramHeapInput)
++	if err != nil {
++		return genericDpuFixture{}, fmt.Errorf("mram_heap_input: %w", err)
++	}
++	mramHeapOutput, err := materializeGenericMram(fixtureDir, manifest.MramHeapOutput)
++	if err != nil {
++		return genericDpuFixture{}, fmt.Errorf("mram_heap_output: %w", err)
++	}
++
++	return genericDpuFixture{
++		hostInputs:     hostInputs,
++		hostOutputs:    hostOutputs,
++		mramHeapInput:  mramHeapInput,
++		mramHeapOutput: mramHeapOutput,
++	}, nil
++}
++
++func materializeGenericHostSymbols(
++	fixtureDir string,
++	manifest map[string]string,
++) (map[string]*encoding.ByteStream, error) {
++	fixtures := make(map[string]*encoding.ByteStream, len(manifest))
++	for symbol, relativePath := range manifest {
++		bytes, err := readGenericRawBinary(fixtureDir, relativePath)
++		if err != nil {
++			return nil, fmt.Errorf("symbol %q: %w", symbol, err)
++		}
++		fixtures[symbol] = bytes
++	}
++	return fixtures, nil
++}
++
++func materializeGenericMram(
++	fixtureDir string,
++	manifest *genericMramManifest,
++) (genericMramFixture, error) {
++	if manifest == nil {
++		return genericMramFixture{offset: 0, bytes: newGenericByteStream(nil)}, nil
++	}
++	bytes, err := readGenericRawBinary(fixtureDir, manifest.File)
++	if err != nil {
++		return genericMramFixture{}, err
++	}
++	return genericMramFixture{offset: manifest.Offset, bytes: bytes}, nil
++}
++
++func readGenericRawBinary(fixtureDir string, relativePath string) (*encoding.ByteStream, error) {
++	fixtureRoot, err := filepath.Abs(fixtureDir)
++	if err != nil {
++		return nil, fmt.Errorf("resolve fixture_dir %q: %w", fixtureDir, err)
++	}
++	fixtureRoot, err = filepath.EvalSymlinks(fixtureRoot)
++	if err != nil {
++		return nil, fmt.Errorf("resolve fixture_dir %q: %w", fixtureDir, err)
++	}
++
++	path := filepath.Join(fixtureRoot, filepath.Clean(relativePath))
++	path, err = filepath.EvalSymlinks(path)
++	if err != nil {
++		return nil, fmt.Errorf("resolve raw binary %q: %w", path, err)
++	}
++	pathFromFixture, err := filepath.Rel(fixtureRoot, path)
++	if err != nil {
++		return nil, fmt.Errorf("locate raw binary %q under fixture_dir: %w", path, err)
++	}
++	if pathFromFixture == ".." || strings.HasPrefix(pathFromFixture, ".."+string(filepath.Separator)) {
++		return nil, fmt.Errorf("raw binary %q resolves outside fixture_dir", relativePath)
++	}
++	info, err := os.Stat(path)
++	if err != nil {
++		return nil, fmt.Errorf("stat raw binary %q: %w", path, err)
++	}
++	if !info.Mode().IsRegular() {
++		return nil, fmt.Errorf("raw binary %q is not a regular file", path)
++	}
++
++	bytes, err := os.ReadFile(path)
++	if err != nil {
++		return nil, fmt.Errorf("read raw binary %q: %w", path, err)
++	}
++	return newGenericByteStream(bytes), nil
++}
++
++func newGenericByteStream(bytes []byte) *encoding.ByteStream {
++	byteStream := new(encoding.ByteStream)
++	byteStream.Init()
++	for _, value := range bytes {
++		byteStream.Append(value)
++	}
++	return byteStream
++}
++
++func (this *Generic) InputDpuHost(
++	execution int,
++	dpuId int,
++) map[string]*encoding.ByteStream {
++	return this.dpuFixture(execution, dpuId).hostInputs
++}
++
++func (this *Generic) OutputDpuHost(
++	execution int,
++	dpuId int,
++) map[string]*encoding.ByteStream {
++	return this.dpuFixture(execution, dpuId).hostOutputs
++}
++
++func (this *Generic) InputDpuMramHeapPointerName(
++	execution int,
++	dpuId int,
++) (int64, *encoding.ByteStream) {
++	mram := this.dpuFixture(execution, dpuId).mramHeapInput
++	return mram.offset, mram.bytes
++}
++
++func (this *Generic) OutputDpuMramHeapPointerName(
++	execution int,
++	dpuId int,
++) (int64, *encoding.ByteStream) {
++	mram := this.dpuFixture(execution, dpuId).mramHeapOutput
++	return mram.offset, mram.bytes
++}
++
++func (this *Generic) NumExecutions() int {
++	return len(this.executions)
++}
++
++func (this *Generic) dpuFixture(execution int, dpuId int) *genericDpuFixture {
++	if execution < 0 || execution >= len(this.executions) {
++		panic(fmt.Errorf("execution %d is outside [0, %d)", execution, len(this.executions)))
++	}
++	if dpuId < 0 || dpuId >= this.numDpus {
++		panic(fmt.Errorf("DPU ID %d is outside [0, %d)", dpuId, this.numDpus))
++	}
++	return &this.executions[execution][dpuId]
++}
+diff --git a/golang/uPIMulator/src/assembler/prim/generic_test.go b/golang/uPIMulator/src/assembler/prim/generic_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ec4ebc698557f75b1c62b6089ad749cf18fb27e8
+--- /dev/null
++++ b/golang/uPIMulator/src/assembler/prim/generic_test.go
+@@ -0,0 +1,214 @@
++package prim
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"uPIMulator/src/abi/encoding"
++)
++
++func TestLoadGenericFixtureMaterializesRawBinaries(t *testing.T) {
++	fixtureDir := t.TempDir()
++	writeGenericTestFile(t, fixtureDir, "raw/host-input.bin", []byte{0, 1, 127, 255})
++	writeGenericTestFile(t, fixtureDir, "raw/host-output.bin", []byte{4, 3, 2, 1})
++	writeGenericTestFile(t, fixtureDir, "raw/heap-input.bin", []byte{10, 20, 30})
++	writeGenericTestFile(t, fixtureDir, "raw/heap-output.bin", []byte{40, 50})
++	writeGenericTestFile(t, fixtureDir, "raw/second-execution.bin", []byte{99})
++
++	manifest := `{
++	  "schema_version": 1,
++  "num_dpus": 2,
++  "num_tasklets": 12,
++  "executions": [
++    {"dpus": [
++      {
++        "host_inputs": {"DPU_INPUT_ARGUMENTS": "raw/host-input.bin"},
++        "host_outputs": {"result_0": "raw/host-output.bin"},
++        "mram_heap_input": {"offset": 8, "file": "raw/heap-input.bin"},
++        "mram_heap_output": {"offset": 24, "file": "raw/heap-output.bin"}
++      },
++      {}
++    ]},
++    {"dpus": [
++      {},
++      {"host_inputs": {"again": "raw/second-execution.bin"}}
++    ]}
++  ]
++}`
++	writeGenericTestFile(t, fixtureDir, "manifest.json", []byte(manifest))
++
++	fixture, err := loadGenericFixture(fixtureDir, 2, 12)
++	if err != nil {
++		t.Fatalf("loadGenericFixture() error = %v", err)
++	}
++	if got := fixture.NumExecutions(); got != 2 {
++		t.Fatalf("NumExecutions() = %d, want 2", got)
++	}
++	if fixture.numDpus != 2 || fixture.numTasklets != 12 {
++		t.Fatalf(
++			"fixture dimensions = (%d DPUs, %d tasklets), want (2, 12)",
++			fixture.numDpus,
++			fixture.numTasklets,
++		)
++	}
++
++	assertGenericBytes(
++		t,
++		fixture.InputDpuHost(0, 0)["DPU_INPUT_ARGUMENTS"],
++		[]byte{0, 1, 127, 255},
++	)
++	assertGenericBytes(t, fixture.OutputDpuHost(0, 0)["result_0"], []byte{4, 3, 2, 1})
++	inputOffset, inputBytes := fixture.InputDpuMramHeapPointerName(0, 0)
++	if inputOffset != 8 {
++		t.Errorf("input MRAM offset = %d, want 8", inputOffset)
++	}
++	assertGenericBytes(t, inputBytes, []byte{10, 20, 30})
++	outputOffset, outputBytes := fixture.OutputDpuMramHeapPointerName(0, 0)
++	if outputOffset != 24 {
++		t.Errorf("output MRAM offset = %d, want 24", outputOffset)
++	}
++	assertGenericBytes(t, outputBytes, []byte{40, 50})
++
++	if got := len(fixture.InputDpuHost(0, 1)); got != 0 {
++		t.Errorf("omitted host_inputs contains %d entries, want 0", got)
++	}
++	emptyOffset, emptyBytes := fixture.InputDpuMramHeapPointerName(0, 1)
++	if emptyOffset != 0 || emptyBytes.Size() != 0 {
++		t.Errorf(
++			"omitted MRAM input = (offset %d, size %d), want (0, 0)",
++			emptyOffset,
++			emptyBytes.Size(),
++		)
++	}
++	assertGenericBytes(t, fixture.InputDpuHost(1, 1)["again"], []byte{99})
++}
++
++func TestLoadGenericFixtureRejectsInvalidManifests(t *testing.T) {
++	tests := []struct {
++		name      string
++		manifest  string
++		wantError string
++	}{
++		{
++			name: "unknown field",
++			manifest: `{
++			  "schema_version": 1, "num_dpus": 1, "num_tasklets": 12,
++  "executions": [{"dpus": [{}]}], "surprise": true
++}`,
++			wantError: "unknown field",
++		},
++		{
++			name: "unsupported version",
++			manifest: `{
++			  "schema_version": 2, "num_dpus": 1, "num_tasklets": 12,
++  "executions": [{"dpus": [{}]}]
++}`,
++			wantError: "schema_version is 2, want 1",
++		},
++		{
++			name: "DPU count mismatch",
++			manifest: `{
++			  "schema_version": 1, "num_dpus": 1, "num_tasklets": 12,
++  "executions": [{"dpus": []}]
++}`,
++			wantError: "contains 0 DPUs, want 1",
++		},
++		{
++			name: "tasklet count mismatch",
++			manifest: `{
++			  "schema_version": 1, "num_dpus": 1, "num_tasklets": 11,
++  "executions": [{"dpus": [{}]}]
++}`,
++			wantError: "num_tasklets is 11",
++		},
++		{
++			name: "invalid host symbol",
++			manifest: `{
++			  "schema_version": 1, "num_dpus": 1, "num_tasklets": 12,
++  "executions": [{"dpus": [{"host_inputs": {"not-a-symbol": "x.bin"}}]}]
++}`,
++			wantError: "is not a C identifier",
++		},
++		{
++			name: "escaping path",
++			manifest: `{
++			  "schema_version": 1, "num_dpus": 1, "num_tasklets": 12,
++  "executions": [{"dpus": [{"mram_heap_input": {"offset": 0, "file": "../x.bin"}}]}]
++}`,
++			wantError: "escapes fixture_dir",
++		},
++		{
++			name: "negative MRAM offset",
++			manifest: `{
++			  "schema_version": 1, "num_dpus": 1, "num_tasklets": 12,
++  "executions": [{"dpus": [{"mram_heap_output": {"offset": -1, "file": "x.bin"}}]}]
++}`,
++			wantError: "offset must be non-negative",
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			fixtureDir := t.TempDir()
++			writeGenericTestFile(t, fixtureDir, "manifest.json", []byte(test.manifest))
++			_, err := loadGenericFixture(fixtureDir, 1, 12)
++			if err == nil {
++				t.Fatal("loadGenericFixture() succeeded, want error")
++			}
++			if !strings.Contains(err.Error(), test.wantError) {
++				t.Fatalf("loadGenericFixture() error = %q, want substring %q", err, test.wantError)
++			}
++		})
++	}
++}
++
++func TestLoadGenericFixtureRejectsSymlinkOutsideFixtureDir(t *testing.T) {
++	fixtureDir := t.TempDir()
++	outsideDir := t.TempDir()
++	writeGenericTestFile(t, outsideDir, "outside.bin", []byte{1, 2, 3})
++	if err := os.Symlink(
++		filepath.Join(outsideDir, "outside.bin"),
++		filepath.Join(fixtureDir, "outside.bin"),
++	); err != nil {
++		t.Fatalf("Symlink() error = %v", err)
++	}
++	writeGenericTestFile(t, fixtureDir, "manifest.json", []byte(`{
++	  "schema_version": 1, "num_dpus": 1, "num_tasklets": 12,
++  "executions": [{"dpus": [{"host_inputs": {"A": "outside.bin"}}]}]
++}`))
++
++	_, err := loadGenericFixture(fixtureDir, 1, 12)
++	if err == nil {
++		t.Fatal("loadGenericFixture() followed outside symlink, want error")
++	}
++	if !strings.Contains(err.Error(), "resolves outside fixture_dir") {
++		t.Fatalf("loadGenericFixture() error = %q, want outside-fixture error", err)
++	}
++}
++
++func writeGenericTestFile(t *testing.T, root string, relativePath string, bytes []byte) {
++	t.Helper()
++	path := filepath.Join(root, relativePath)
++	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
++		t.Fatalf("MkdirAll(%q) error = %v", filepath.Dir(path), err)
++	}
++	if err := os.WriteFile(path, bytes, 0o644); err != nil {
++		t.Fatalf("WriteFile(%q) error = %v", path, err)
++	}
++}
++
++func assertGenericBytes(t *testing.T, stream *encoding.ByteStream, want []byte) {
++	t.Helper()
++	if stream == nil {
++		t.Fatal("byte stream is nil")
++	}
++	if got := stream.Size(); got != int64(len(want)) {
++		t.Fatalf("byte stream size = %d, want %d", got, len(want))
++	}
++	for index, expected := range want {
++		if actual := stream.Get(index); actual != expected {
++			t.Fatalf("byte stream[%d] = %d, want %d", index, actual, expected)
++		}
++	}
++}
+diff --git a/golang/uPIMulator/src/assembler/prim/simplepim_va.go b/golang/uPIMulator/src/assembler/prim/simplepim_va.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..825a42ae24bdb714b2b249075d62516d42ec3b7c
+--- /dev/null
++++ b/golang/uPIMulator/src/assembler/prim/simplepim_va.go
+@@ -0,0 +1,141 @@
++package prim
++
++import (
++	"fmt"
++	"uPIMulator/src/abi/encoding"
++	"uPIMulator/src/abi/word"
++	"uPIMulator/src/misc"
++)
++
++// SimplePimVa describes the exact per-DPU layout produced by the checked-in
++// SimplePIM vector-add host.  The zip is virtual: the sole timed DPU launch is
++// the native map kernel, which reads A and B independently and writes A+B.
++type SimplePimVa struct {
++	numDpus       int
++	numTasklets   int
++	numExecutions int
++	numElements   int64
++
++	inputBytes       int64
++	virtualTableBase int64
++	outputBase       int64
++
++	bufferA []int64
++	bufferB []int64
++	bufferC []int64
++}
++
++func (this *SimplePimVa) Init(commandLineParser *misc.CommandLineParser) {
++	numChannels := int(commandLineParser.IntParameter("num_channels"))
++	numRanksPerChannel := int(commandLineParser.IntParameter("num_ranks_per_channel"))
++	numDpusPerRank := int(commandLineParser.IntParameter("num_dpus_per_rank"))
++
++	this.numDpus = numChannels * numRanksPerChannel * numDpusPerRank
++	this.numTasklets = int(commandLineParser.IntParameter("num_tasklets"))
++	this.numExecutions = 1
++
++	if this.numDpus != 1 {
++		panic(fmt.Errorf("SIMPLEPIM-VA requires exactly one DPU, got %d", this.numDpus))
++	}
++	if this.numTasklets != 12 {
++		panic(fmt.Errorf("SIMPLEPIM-VA preserves SimplePIM's fixed 12 tasklets, got %d", this.numTasklets))
++	}
++
++	dataPrepParams := commandLineParser.DataPrepParams()
++	if len(dataPrepParams) != 1 || dataPrepParams[0] <= 0 {
++		panic(fmt.Errorf("SIMPLEPIM-VA expects one positive element count"))
++	}
++	this.numElements = int64(dataPrepParams[0])
++	if this.numElements%2 != 0 {
++		panic(fmt.Errorf("SIMPLEPIM-VA requires an even element count for 8-byte DMA alignment"))
++	}
++
++	// Two materialized uint32 input tables precede a virtual uint32-pair
++	// table.  SimplePIM advances free_space_start_pos by an extra eight bytes
++	// when the virtual table end is already aligned.
++	this.inputBytes = 4 * this.numElements
++	this.virtualTableBase = 2 * this.inputBytes
++	virtualTableEnd := this.virtualTableBase + 8*this.numElements
++	this.outputBase = virtualTableEnd + (8 - virtualTableEnd%8)
++
++	this.bufferA = make([]int64, this.numElements)
++	this.bufferB = make([]int64, this.numElements)
++	this.bufferC = make([]int64, this.numElements)
++	for i := int64(0); i < this.numElements; i++ {
++		this.bufferA[i] = i % 128
++		this.bufferB[i] = (i + 1) % 128
++		this.bufferC[i] = this.bufferA[i] + this.bufferB[i]
++	}
++}
++
++func appendUint32(byteStream *encoding.ByteStream, value int64) {
++	valueWord := new(word.Word)
++	valueWord.Init(32)
++	valueWord.SetValue(value)
++	byteStream.Merge(valueWord.ToByteStream())
++}
++
++func (this *SimplePimVa) InputDpuHost(execution int, dpuId int) map[string]*encoding.ByteStream {
++	this.validateIndices(execution, dpuId)
++
++	arguments := new(encoding.ByteStream)
++	arguments.Init()
++
++	// map_arguments_t: eleven consecutive little-endian uint32 fields.
++	appendUint32(arguments, this.virtualTableBase) // input_start_offset
++	appendUint32(arguments, 8)                     // input_type_size
++	appendUint32(arguments, this.outputBase)       // output_start_offset
++	appendUint32(arguments, 4)                     // output_type_size
++	appendUint32(arguments, this.numElements)      // len
++	appendUint32(arguments, 0)                     // info
++	appendUint32(arguments, 1)                     // is_virtually_zipped
++	appendUint32(arguments, 0)                     // start1
++	appendUint32(arguments, this.inputBytes)       // start2
++	appendUint32(arguments, 4)                     // type1
++	appendUint32(arguments, 4)                     // type2
++
++	return map[string]*encoding.ByteStream{"MAP_INPUT_ARGUMENTS": arguments}
++}
++
++func (this *SimplePimVa) OutputDpuHost(execution int, dpuId int) map[string]*encoding.ByteStream {
++	this.validateIndices(execution, dpuId)
++	return make(map[string]*encoding.ByteStream)
++}
++
++func (this *SimplePimVa) InputDpuMramHeapPointerName(execution int, dpuId int) (int64, *encoding.ByteStream) {
++	this.validateIndices(execution, dpuId)
++
++	inputs := new(encoding.ByteStream)
++	inputs.Init()
++	for _, value := range this.bufferA {
++		appendUint32(inputs, value)
++	}
++	for _, value := range this.bufferB {
++		appendUint32(inputs, value)
++	}
++	return 0, inputs
++}
++
++func (this *SimplePimVa) OutputDpuMramHeapPointerName(execution int, dpuId int) (int64, *encoding.ByteStream) {
++	this.validateIndices(execution, dpuId)
++
++	output := new(encoding.ByteStream)
++	output.Init()
++	for _, value := range this.bufferC {
++		appendUint32(output, value)
++	}
++	return this.outputBase, output
++}
++
++func (this *SimplePimVa) NumExecutions() int {
++	return this.numExecutions
++}
++
++func (this *SimplePimVa) validateIndices(execution int, dpuId int) {
++	if execution < 0 || execution >= this.numExecutions {
++		panic(fmt.Errorf("execution %d is outside [0, %d)", execution, this.numExecutions))
++	}
++	if dpuId < 0 || dpuId >= this.numDpus {
++		panic(fmt.Errorf("DPU ID %d is outside [0, %d)", dpuId, this.numDpus))
++	}
++}
+diff --git a/golang/uPIMulator/src/compiler/compiler.go b/golang/uPIMulator/src/compiler/compiler.go
+index f14b65ae55033dd94a97be577925813bfea6940c..80ae22b053edf713f21438b971703d02b67b1a04 100644
+--- a/golang/uPIMulator/src/compiler/compiler.go
++++ b/golang/uPIMulator/src/compiler/compiler.go
+@@ -13,8 +13,9 @@ type Compiler struct {
+ 	root_dirpath string
+ 	benchmark    string
+ 
+-	num_dpus     int
+-	num_tasklets int
++	num_dpus         int
++	num_tasklets     int
++	skip_compilation bool
+ }
+ 
+ func (this *Compiler) Init(command_line_parser *misc.CommandLineParser) {
+@@ -29,8 +30,11 @@ func (this *Compiler) Init(command_line_parser *misc.CommandLineParser) {
+ 	this.num_dpus = num_channels * num_ranks_per_channel * num_dpus_per_rank
+ 
+ 	this.num_tasklets = int(command_line_parser.IntParameter("num_tasklets"))
++	this.skip_compilation = command_line_parser.BoolParameter("skip_compilation")
+ 
+-	this.Build()
++	if !this.skip_compilation {
++		this.Build()
++	}
+ }
+ 
+ func (this *Compiler) Build() {
+@@ -46,6 +50,9 @@ func (this *Compiler) Build() {
+ }
+ 
+ func (this *Compiler) Compile() {
++	if this.skip_compilation {
++		return
++	}
+ 	this.CompileBenchmark()
+ 	this.CompileSdk()
+ }
+@@ -54,7 +61,6 @@ func (this *Compiler) CompileBenchmark() {
+ 	command := exec.Command(
+ 		"docker",
+ 		"run",
+-		"--privileged",
+ 		"--rm",
+ 		"-v",
+ 		this.root_dirpath+":/root/uPIMulator",
+@@ -78,7 +84,6 @@ func (this *Compiler) CompileSdk() {
+ 	command := exec.Command(
+ 		"docker",
+ 		"run",
+-		"--privileged",
+ 		"--rm",
+ 		"-v",
+ 		this.root_dirpath+":/root/uPIMulator",
+diff --git a/golang/uPIMulator/src/linker/kernel/executable.go b/golang/uPIMulator/src/linker/kernel/executable.go
+index 8e6aa30b473ec4ff4da79bf79093b442f968d3c0..2b80798c5ff32717f4d309c82aff10c4088fb4c9 100644
+--- a/golang/uPIMulator/src/linker/kernel/executable.go
++++ b/golang/uPIMulator/src/linker/kernel/executable.go
+@@ -288,8 +288,17 @@ func (this *Executable) WramByteStream() *encoding.ByteStream {
+ 	byte_stream := new(encoding.ByteStream)
+ 	byte_stream.Init()
+ 
++	cursor := config_loader.WramOffset()
+ 	for _, wram_section := range wram_sections {
++		if wram_section.Address() < cursor {
++			panic(errors.New("WRAM sections overlap"))
++		}
++		for cursor < wram_section.Address() {
++			byte_stream.Append(0)
++			cursor++
++		}
+ 		byte_stream.Merge(wram_section.ToByteStream())
++		cursor += wram_section.Size()
+ 	}
+ 
+ 	return byte_stream
+@@ -307,8 +316,17 @@ func (this *Executable) MramByteStream() *encoding.ByteStream {
+ 	byte_stream := new(encoding.ByteStream)
+ 	byte_stream.Init()
+ 
++	cursor := config_loader.MramOffset()
+ 	for _, mram_section := range mram_sections {
++		if mram_section.Address() < cursor {
++			panic(errors.New("MRAM sections overlap"))
++		}
++		for cursor < mram_section.Address() {
++			byte_stream.Append(0)
++			cursor++
++		}
+ 		byte_stream.Merge(mram_section.ToByteStream())
++		cursor += mram_section.Size()
+ 	}
+ 
+ 	return byte_stream
+diff --git a/golang/uPIMulator/src/linker/linker.go b/golang/uPIMulator/src/linker/linker.go
+index 180d395093edeb9d439e0b417454863ababe3188..67d475c3889b1ee0a42259338b62735033b0b83e 100644
+--- a/golang/uPIMulator/src/linker/linker.go
++++ b/golang/uPIMulator/src/linker/linker.go
+@@ -4,6 +4,7 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 	"uPIMulator/src/core"
+ 	"uPIMulator/src/linker/kernel"
+ 	"uPIMulator/src/linker/lexer"
+@@ -38,6 +39,7 @@ func (this *Linker) Init(command_line_parser *misc.CommandLineParser) {
+ 
+ 	this.InitBenchmarkRelocatable()
+ 	this.InitSdkRelocatables()
++	this.InitBenchmarkLibraryRelocatables()
+ 
+ 	this.executable = new(kernel.Executable)
+ 	this.executable.Init(this.benchmark)
+@@ -46,6 +48,40 @@ func (this *Linker) Init(command_line_parser *misc.CommandLineParser) {
+ 	this.linker_script.Init(command_line_parser)
+ }
+ 
++// InitBenchmarkLibraryRelocatables makes additional translation units in a
++// benchmark target available to the normal unresolved-symbol resolver.  The
++// original PrIM slots contain only task.c.o; compiler/framework adapters may
++// preserve their upstream multi-file compilation instead of concatenating C
++// sources and changing optimization opportunities.
++func (this *Linker) InitBenchmarkLibraryRelocatables() {
++	benchmarkLibDirpath := filepath.Join(
++		this.root_dirpath,
++		"benchmark",
++		"build",
++		this.benchmark,
++		"dpu",
++		"CMakeFiles",
++		fmt.Sprintf("%s_device.dir", this.benchmark),
++	)
++
++	entries, err := os.ReadDir(benchmarkLibDirpath)
++	if err != nil {
++		panic(err)
++	}
++
++	for _, entry := range entries {
++		if entry.IsDir() || entry.Name() == "task.c.o" || !strings.HasSuffix(entry.Name(), ".o") {
++			continue
++		}
++
++		name := "benchmark." + strings.TrimSuffix(entry.Name(), ".o")
++		relocatable := new(kernel.Relocatable)
++		relocatable.Init(name)
++		relocatable.SetPath(filepath.Join(benchmarkLibDirpath, entry.Name()))
++		this.sdk_relocatables[name] = relocatable
++	}
++}
++
+ func (this *Linker) InitBenchmarkRelocatable() {
+ 	benchmark_build_dirpath := filepath.Join(this.root_dirpath, "benchmark", "build")
+ 
+diff --git a/golang/uPIMulator/src/linker/logic/linker_script.go b/golang/uPIMulator/src/linker/logic/linker_script.go
+index 49c3d80c7f5cf244626231b6ef19fe6c4aec6f71..b728ee7aea2cbe0730434bd634a5bdbdc3065250 100644
+--- a/golang/uPIMulator/src/linker/logic/linker_script.go
++++ b/golang/uPIMulator/src/linker/logic/linker_script.go
+@@ -4,6 +4,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"math"
++	"sort"
+ 	"strconv"
+ 	"strings"
+ 	"uPIMulator/src/linker/kernel"
+@@ -162,35 +163,31 @@ func (this *LinkerScript) AssignWram(executable *kernel.Executable) {
+ 
+ 	sys_zero := executable.Section(kernel.DATA, "__sys_zero")
+ 	if sys_zero != nil {
+-		sys_zero.SetAddress(cur_address)
+-		cur_address += sys_zero.Size()
++		cur_address = this.AssignWramSection(sys_zero, cur_address)
+ 	}
+ 
+ 	immediate_memory := executable.Section(kernel.DATA, "immediate_memory")
+ 	if immediate_memory != nil {
+-		immediate_memory.SetAddress(cur_address)
+-		cur_address += immediate_memory.Size()
++		cur_address = this.AssignWramSection(immediate_memory, cur_address)
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.DATA) {
++	for _, section := range this.SortedSections(executable.Sections(kernel.DATA)) {
+ 		if strings.Contains(section.Name(), "immediate_memory.") {
+-			section.SetAddress(cur_address)
+-			cur_address += section.Size()
++			cur_address = this.AssignWramSection(section, cur_address)
+ 		}
+ 	}
+ 
++	cur_address = this.AlignWramAddress(cur_address)
+ 	this.linker_constants["__rodata_start_addr"].SetValue(cur_address)
+ 
+ 	rodata_default := executable.Section(kernel.RODATA, "")
+ 	if rodata_default != nil {
+-		rodata_default.SetAddress(cur_address)
+-		cur_address += rodata_default.Size()
++		cur_address = this.AssignWramSection(rodata_default, cur_address)
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.RODATA) {
++	for _, section := range this.SortedSections(executable.Sections(kernel.RODATA)) {
+ 		if section.Name() != "" {
+-			section.SetAddress(cur_address)
+-			cur_address += section.Size()
++			cur_address = this.AssignWramSection(section, cur_address)
+ 		}
+ 	}
+ 
+@@ -198,36 +195,31 @@ func (this *LinkerScript) AssignWram(executable *kernel.Executable) {
+ 
+ 	bss_default := executable.Section(kernel.BSS, "")
+ 	if bss_default != nil {
+-		bss_default.SetAddress(cur_address)
+-		cur_address += bss_default.Size()
++		cur_address = this.AssignWramSection(bss_default, cur_address)
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.BSS) {
++	for _, section := range this.SortedSections(executable.Sections(kernel.BSS)) {
+ 		if section.Name() != "" {
+-			section.SetAddress(cur_address)
+-			cur_address += section.Size()
++			cur_address = this.AssignWramSection(section, cur_address)
+ 		}
+ 	}
+ 
+ 	sys_keep := executable.Section(kernel.DATA, "__sys_keep")
+ 	if sys_keep != nil {
+-		sys_keep.SetAddress(cur_address)
+-		cur_address += sys_keep.Size()
++		cur_address = this.AssignWramSection(sys_keep, cur_address)
+ 	}
+ 
+ 	data_default := executable.Section(kernel.DATA, "")
+ 	if data_default != nil {
+-		data_default.SetAddress(cur_address)
+-		cur_address += data_default.Size()
++		cur_address = this.AssignWramSection(data_default, cur_address)
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.DATA) {
++	for _, section := range this.SortedSections(executable.Sections(kernel.DATA)) {
+ 		if section.Name() != "__sys_zero" &&
+ 			section.Name() != "__sys_keep" &&
+ 			!strings.Contains(section.Name(), "immediate_memory") &&
+ 			section.Name() != "" {
+-			section.SetAddress(cur_address)
+-			cur_address += section.Size()
++			cur_address = this.AssignWramSection(section, cur_address)
+ 		}
+ 	}
+ 
+@@ -235,14 +227,18 @@ func (this *LinkerScript) AssignWram(executable *kernel.Executable) {
+ 
+ 	dpu_host := executable.Section(kernel.DPU_HOST, "")
+ 	if dpu_host != nil {
+-		dpu_host.SetAddress(cur_address)
+-		cur_address += dpu_host.Size()
++		cur_address = this.AssignWramSection(dpu_host, cur_address)
+ 	}
+ 
+ 	// TODO(bongjoon.hyun@gmail.com): figure out ".data.__sys_profilng" section
+ 
+ 	// TODO(bongjoon.hyun@gmail.com): figure out ".data.stacks" section
+ 
++	// Match the SDK linker script's `. = ALIGN(8)` at the start of
++	// `.data.stacks`.  In particular, crt0 treats these values as WRAM
++	// addresses rather than ordinary section symbols, so aligning only the
++	// materialized WRAM sections above is not sufficient.
++	cur_address = this.AlignWramAddress(cur_address)
+ 	for i := 0; i < config_loader.MaxNumTasklets(); i++ {
+ 		sys_stack_thread := "__sys_stack_thread_" + strconv.Itoa(i)
+ 		this.linker_constants[sys_stack_thread].SetValue(cur_address)
+@@ -253,6 +249,10 @@ func (this *LinkerScript) AssignWram(executable *kernel.Executable) {
+ 
+ 	// TODO(bongjoon.hyun@gmail.com): figure out ".data.sw_cache" section
+ 
++	// The SDK gives the software-cache buffer its own aligned output section.
++	// Stores compiled through the software cache mask the low address bits, so
++	// an unaligned synthetic value silently redirects those writes.
++	cur_address = this.AlignWramAddress(cur_address)
+ 	this.linker_constants["__sw_cache_buffer"].SetValue(cur_address)
+ 	cur_address += int64(8 * config_loader.MaxNumTasklets())
+ 
+@@ -271,61 +271,79 @@ func (this *LinkerScript) AssignWram(executable *kernel.Executable) {
+ 	}
+ }
+ 
++func (this *LinkerScript) AssignWramSection(section *kernel.Section, address int64) int64 {
++	address = this.AlignWramAddress(address)
++	section.SetAddress(address)
++	return address + section.Size()
++}
++
++func (this *LinkerScript) AlignWramAddress(address int64) int64 {
++	return int64(math.Ceil(float64(address)/float64(this.min_access_granularity))) *
++		this.min_access_granularity
++}
++
+ func (this *LinkerScript) AssignMram(executable *kernel.Executable) {
+ 	config_loader := new(misc.ConfigLoader)
+ 	config_loader.Init()
+ 
+ 	cur_address := config_loader.MramOffset()
++	debug_address := config_loader.MramOffset() + config_loader.MramSize()
+ 
+-	for section, _ := range executable.Sections(kernel.DEBUG_ABBREV) {
+-		section.SetAddress(cur_address)
+-		cur_address += section.Size()
++	// Debug and stack-size sections are not allocated in a hardware DPU's
++	// MRAM image.  Give their labels unique non-runtime addresses so they can
++	// still be resolved, but do not let their source-dependent byte counts
++	// shift or misalign actual MRAM objects.
++	for _, section := range this.SortedSections(executable.Sections(kernel.DEBUG_ABBREV)) {
++		section.SetAddress(debug_address)
++		debug_address += section.Size()
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.DEBUG_FRAME) {
+-		section.SetAddress(cur_address)
+-		cur_address += section.Size()
++	for _, section := range this.SortedSections(executable.Sections(kernel.DEBUG_FRAME)) {
++		section.SetAddress(debug_address)
++		debug_address += section.Size()
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.DEBUG_INFO) {
+-		section.SetAddress(cur_address)
+-		cur_address += section.Size()
++	for _, section := range this.SortedSections(executable.Sections(kernel.DEBUG_INFO)) {
++		section.SetAddress(debug_address)
++		debug_address += section.Size()
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.DEBUG_LINE) {
+-		section.SetAddress(cur_address)
+-		cur_address += section.Size()
++	for _, section := range this.SortedSections(executable.Sections(kernel.DEBUG_LINE)) {
++		section.SetAddress(debug_address)
++		debug_address += section.Size()
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.DEBUG_LOC) {
+-		section.SetAddress(cur_address)
+-		cur_address += section.Size()
++	for _, section := range this.SortedSections(executable.Sections(kernel.DEBUG_LOC)) {
++		section.SetAddress(debug_address)
++		debug_address += section.Size()
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.DEBUG_RANGES) {
+-		section.SetAddress(cur_address)
+-		cur_address += section.Size()
++	for _, section := range this.SortedSections(executable.Sections(kernel.DEBUG_RANGES)) {
++		section.SetAddress(debug_address)
++		debug_address += section.Size()
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.DEBUG_STR) {
+-		section.SetAddress(cur_address)
+-		cur_address += section.Size()
++	for _, section := range this.SortedSections(executable.Sections(kernel.DEBUG_STR)) {
++		section.SetAddress(debug_address)
++		debug_address += section.Size()
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.STACK_SIZES) {
+-		section.SetAddress(cur_address)
+-		cur_address += section.Size()
++	for _, section := range this.SortedSections(executable.Sections(kernel.STACK_SIZES)) {
++		section.SetAddress(debug_address)
++		debug_address += section.Size()
+ 	}
+ 
+ 	noinit := executable.Section(kernel.MRAM, "noinit")
+ 	if noinit != nil {
++		cur_address = this.AlignMramAddress(cur_address)
+ 		noinit.SetAddress(cur_address)
+ 		cur_address += noinit.Size()
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.MRAM) {
++	for _, section := range this.SortedSections(executable.Sections(kernel.MRAM)) {
+ 		if strings.Contains(section.Name(), "noinit.") &&
+ 			!strings.Contains(section.Name(), "noinit.keep") {
++			cur_address = this.AlignMramAddress(cur_address)
+ 			section.SetAddress(cur_address)
+ 			cur_address += section.Size()
+ 		}
+@@ -333,20 +351,24 @@ func (this *LinkerScript) AssignMram(executable *kernel.Executable) {
+ 
+ 	noinit_keep := executable.Section(kernel.MRAM, "noinit.keep")
+ 	if noinit_keep != nil {
++		cur_address = this.AlignMramAddress(cur_address)
+ 		noinit_keep.SetAddress(cur_address)
+ 		cur_address += noinit_keep.Size()
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.MRAM) {
+-		if strings.Contains(section.Name(), "noinit.keep") &&
++	for _, section := range this.SortedSections(executable.Sections(kernel.MRAM)) {
++		if section.Name() != "noinit.keep" &&
++			strings.Contains(section.Name(), "noinit.keep") &&
+ 			!strings.Contains(section.Name(), "noinit.keep.") {
++			cur_address = this.AlignMramAddress(cur_address)
+ 			section.SetAddress(cur_address)
+ 			cur_address += section.Size()
+ 		}
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.MRAM) {
++	for _, section := range this.SortedSections(executable.Sections(kernel.MRAM)) {
+ 		if strings.Contains(section.Name(), "noinit.keep.") {
++			cur_address = this.AlignMramAddress(cur_address)
+ 			section.SetAddress(cur_address)
+ 			cur_address += section.Size()
+ 		}
+@@ -354,29 +376,33 @@ func (this *LinkerScript) AssignMram(executable *kernel.Executable) {
+ 
+ 	mram_default := executable.Section(kernel.MRAM, "")
+ 	if mram_default != nil {
++		cur_address = this.AlignMramAddress(cur_address)
+ 		mram_default.SetAddress(cur_address)
+ 		cur_address += mram_default.Size()
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.MRAM) {
++	for _, section := range this.SortedSections(executable.Sections(kernel.MRAM)) {
+ 		if section.Name() != "" &&
+ 			!strings.Contains(section.Name(), "noinit") &&
+ 			!strings.Contains(section.Name(), "keep") {
++			cur_address = this.AlignMramAddress(cur_address)
+ 			section.SetAddress(cur_address)
+ 			cur_address += section.Size()
+ 		}
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.MRAM) {
++	for _, section := range this.SortedSections(executable.Sections(kernel.MRAM)) {
+ 		if strings.Contains(section.Name(), "keep") &&
+ 			!strings.Contains(section.Name(), "keep.") {
++			cur_address = this.AlignMramAddress(cur_address)
+ 			section.SetAddress(cur_address)
+ 			cur_address += section.Size()
+ 		}
+ 	}
+ 
+-	for section, _ := range executable.Sections(kernel.MRAM) {
++	for _, section := range this.SortedSections(executable.Sections(kernel.MRAM)) {
+ 		if strings.Contains(section.Name(), "keep.") {
++			cur_address = this.AlignMramAddress(cur_address)
+ 			section.SetAddress(cur_address)
+ 			cur_address += section.Size()
+ 		}
+@@ -394,6 +420,22 @@ func (this *LinkerScript) AssignMram(executable *kernel.Executable) {
+ 	}
+ }
+ 
++func (this *LinkerScript) AlignMramAddress(address int64) int64 {
++	return int64(math.Ceil(float64(address)/float64(this.min_access_granularity))) *
++		this.min_access_granularity
++}
++
++func (this *LinkerScript) SortedSections(sections map[*kernel.Section]bool) []*kernel.Section {
++	ordered := make([]*kernel.Section, 0, len(sections))
++	for section := range sections {
++		ordered = append(ordered, section)
++	}
++	sort.Slice(ordered, func(i int, j int) bool {
++		return ordered[i].Name() < ordered[j].Name()
++	})
++	return ordered
++}
++
+ func (this *LinkerScript) DumpValues(path string) {
+ 	lines := make([]string, 0)
+ 
+diff --git a/golang/uPIMulator/src/linker/logic/linker_script_wram_test.go b/golang/uPIMulator/src/linker/logic/linker_script_wram_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a6c15242f2f243063387a272f32ab605f46751b
+--- /dev/null
++++ b/golang/uPIMulator/src/linker/logic/linker_script_wram_test.go
+@@ -0,0 +1,128 @@
++package logic
++
++import (
++	"fmt"
++	"reflect"
++	"testing"
++	"uPIMulator/src/linker/kernel"
++	"uPIMulator/src/linker/kernel/directive"
++	"uPIMulator/src/misc"
++)
++
++type wramSectionSpec struct {
++	sectionName kernel.SectionName
++	name        string
++	size        int64
++}
++
++func TestAssignWramAlignsSectionsAndIsReproducible(t *testing.T) {
++	specs := []wramSectionSpec{
++		{kernel.DATA, "__sys_zero", 4},
++		{kernel.DATA, "immediate_memory", 4},
++		{kernel.DATA, "immediate_memory.z", 4},
++		{kernel.DATA, "immediate_memory.a", 4},
++		{kernel.RODATA, "", 4},
++		{kernel.RODATA, "z", 4},
++		{kernel.RODATA, "a", 4},
++		{kernel.BSS, "", 4},
++		{kernel.BSS, "aa_prefix", 4},
++		{kernel.BSS, "e2e_mm_header_word", 8},
++		{kernel.BSS, "z", 4},
++		{kernel.DATA, "__sys_keep", 4},
++		{kernel.DATA, "", 4},
++		{kernel.DATA, "z", 4},
++		{kernel.DATA, "a", 4},
++		{kernel.DPU_HOST, "", 4},
++	}
++
++	forwardExecutable, forwardScript, forward := assignTestWramSections(t, specs)
++	reversedSpecs := append([]wramSectionSpec(nil), specs...)
++	for i, j := 0, len(reversedSpecs)-1; i < j; i, j = i+1, j-1 {
++		reversedSpecs[i], reversedSpecs[j] = reversedSpecs[j], reversedSpecs[i]
++	}
++	_, _, reversed := assignTestWramSections(t, reversedSpecs)
++
++	if !reflect.DeepEqual(forward, reversed) {
++		t.Fatalf("WRAM layout depends on section insertion order:\nforward: %v\nreverse: %v", forward, reversed)
++	}
++
++	for key, address := range forward {
++		if address%8 != 0 {
++			t.Errorf("section %s address = %d, want 8-byte alignment", key, address)
++		}
++	}
++
++	headerKey := wramSectionKey(kernel.BSS, "e2e_mm_header_word")
++	if got, want := forward[headerKey], int64(584); got != want {
++		t.Errorf("e2e_mm_header_word address = %d, want %d", got, want)
++	}
++
++	if got, want := forward[wramSectionKey(kernel.DATA, "immediate_memory.a")], int64(528); got != want {
++		t.Errorf("sorted immediate-memory address = %d, want %d", got, want)
++	}
++	if got, want := forward[wramSectionKey(kernel.RODATA, "a")], int64(552); got != want {
++		t.Errorf("sorted RODATA address = %d, want %d", got, want)
++	}
++	if got, want := forward[wramSectionKey(kernel.BSS, "aa_prefix")], int64(576); got != want {
++		t.Errorf("sorted BSS address = %d, want %d", got, want)
++	}
++	if got, want := forward[wramSectionKey(kernel.DATA, "a")], int64(616); got != want {
++		t.Errorf("sorted DATA address = %d, want %d", got, want)
++	}
++
++	for _, name := range []string{
++		"__sys_stack_thread_0",
++		"__sw_cache_buffer",
++		"__sys_heap_pointer_reset",
++	} {
++		if address := forwardScript.LinkerConstant(name).Value(); address%8 != 0 {
++			t.Errorf("linker constant %s = %d, want 8-byte alignment", name, address)
++		}
++	}
++
++	configLoader := new(misc.ConfigLoader)
++	configLoader.Init()
++	lastSection := forwardExecutable.Section(kernel.DPU_HOST, "")
++	wantStreamSize := lastSection.Address() + lastSection.Size() - configLoader.WramOffset()
++	if got := forwardExecutable.WramByteStream().Size(); got != wantStreamSize {
++		t.Errorf("WRAM image size = %d, want address-preserving size %d", got, wantStreamSize)
++	}
++}
++
++func assignTestWramSections(
++	t *testing.T,
++	specs []wramSectionSpec,
++) (*kernel.Executable, *LinkerScript, map[string]int64) {
++	t.Helper()
++	executable := new(kernel.Executable)
++	executable.Init("wram-layout-test")
++
++	for _, spec := range specs {
++		executable.AddSection(spec.sectionName, spec.name, map[kernel.SectionFlag]bool{}, kernel.PROGBITS)
++		executable.CheckoutSection(spec.sectionName, spec.name)
++		label := executable.CurSection().CurLabel()
++		label.SetSize(spec.size)
++		zeros := new(directive.ZeroDirective)
++		zeros.Init(spec.size, 0)
++		label.Append(zeros)
++	}
++
++	commandLineParser := new(misc.CommandLineParser)
++	commandLineParser.Init()
++	commandLineParser.AddOption(misc.INT, "num_tasklets", "1", "")
++	commandLineParser.AddOption(misc.INT, "min_access_granularity", "8", "")
++	linkerScript := new(LinkerScript)
++	linkerScript.Init(commandLineParser)
++	linkerScript.AssignWram(executable)
++
++	addresses := make(map[string]int64, len(specs))
++	for _, spec := range specs {
++		section := executable.Section(spec.sectionName, spec.name)
++		addresses[wramSectionKey(spec.sectionName, spec.name)] = section.Address()
++	}
++	return executable, linkerScript, addresses
++}
++
++func wramSectionKey(sectionName kernel.SectionName, name string) string {
++	return fmt.Sprintf("%d:%s", sectionName, name)
++}
+diff --git a/golang/uPIMulator/src/linker/parser/parser.go b/golang/uPIMulator/src/linker/parser/parser.go
+index 0a877082bd5d83ec4289e0f54f3e7418e3ea59de..3e1d4242e077d48873d3724ffc8e8e2d9907c342 100644
+--- a/golang/uPIMulator/src/linker/parser/parser.go
++++ b/golang/uPIMulator/src/linker/parser/parser.go
+@@ -2,6 +2,7 @@ package parser
+ 
+ import (
+ 	"errors"
++	"fmt"
+ 	"uPIMulator/src/linker/lexer"
+ 	"uPIMulator/src/linker/parser/expr"
+ 	"uPIMulator/src/linker/parser/stmt"
+@@ -154,6 +155,7 @@ func (this *Parser) Init() {
+ }
+ 
+ func (this *Parser) Parse(token_stream *lexer.TokenStream) *Ast {
++	line := 1
+ 	for pos := 0; pos < token_stream.Size(); pos++ {
+ 		token := token_stream.Get(pos)
+ 
+@@ -168,9 +170,10 @@ func (this *Parser) Parse(token_stream *lexer.TokenStream) *Ast {
+ 			this.ReduceStmt(token)
+ 
+ 			if !this.stack.AreStmts() {
+-				err := errors.New("stack are not stmts")
++				err := fmt.Errorf("stack are not stmts at assembly line %d", line)
+ 				panic(err)
+ 			}
++			line++
+ 		}
+ 	}
+ 
+diff --git a/golang/uPIMulator/src/linker/stdio_reachability_test.go b/golang/uPIMulator/src/linker/stdio_reachability_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..9957c1812f522a741ffbd14ff04d82040ff95463
+--- /dev/null
++++ b/golang/uPIMulator/src/linker/stdio_reachability_test.go
+@@ -0,0 +1,216 @@
++package linker
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"uPIMulator/src/linker/kernel"
++	"uPIMulator/src/linker/lexer"
++	"uPIMulator/src/linker/logic"
++	"uPIMulator/src/linker/parser"
++	"uPIMulator/src/misc"
++)
++
++const syntheticStdoutBufferSize = 1 << 20
++
++func TestUnusedStdioObjectDoesNotShiftMramLayout(t *testing.T) {
++	dir := t.TempDir()
++	benchmarkPath := writeSyntheticAssembly(t, dir, "benchmark.S", `
++	.section .mram.noinit,"aw",@progbits
++	.globl app_input
++app_input:
++	.zero 16
++	.section .mram,"aw",@progbits
++	.globl app_output
++app_output:
++	.zero 16
++`)
++	crt0Path := writeSyntheticAssembly(t, dir, "crt0.S", `
++	.text
++	.globl __bootstrap
++__bootstrap:
++	.long __stdout_buffer_state
++`)
++	stdoutStatePath := writeSyntheticAssembly(t, dir, "stdout-state.S", `
++	.section .data.immediate_memory.__stdout_buffer_state,"aw",@progbits
++	.globl __stdout_buffer_state
++__stdout_buffer_state:
++	.zero 8
++`)
++	stdioPath := writeSyntheticAssembly(t, dir, "stdio.S", `
++	.text
++	.globl printf
++printf:
++	.long __stdout_buffer_state
++	.section .mram.noinit,"aw",@progbits
++	.weak __stdout_buffer
++__stdout_buffer:
++	.zero 1048576
++`)
++
++	benchmark := syntheticRelocatable(
++		"GENERIC",
++		benchmarkPath,
++		[]string{"app_input", "app_output"},
++		nil,
++		[]string{"app_input", "app_output"},
++	)
++	crt0 := syntheticRelocatable(
++		"misc.crt0",
++		crt0Path,
++		[]string{"__bootstrap"},
++		[]string{"__stdout_buffer_state"},
++		[]string{"__bootstrap"},
++	)
++	stdoutState := syntheticRelocatable(
++		"misc.stdoutBufferState",
++		stdoutStatePath,
++		[]string{"__stdout_buffer_state"},
++		nil,
++		[]string{"__stdout_buffer_state"},
++	)
++	stdio := syntheticRelocatable(
++		"stdlib.stdio",
++		stdioPath,
++		[]string{"printf", "__stdout_buffer"},
++		[]string{"__stdout_buffer_state"},
++		[]string{"printf"},
++	)
++
++	commandLineParser := syntheticLinkerCommandLineParser()
++	linkerScript := new(logic.LinkerScript)
++	linkerScript.Init(commandLineParser)
++	executable := new(kernel.Executable)
++	executable.Init("GENERIC")
++	executable.SetBenchmarkRelocatable(benchmark)
++
++	linker := &Linker{
++		sdk_relocatables: map[string]*kernel.Relocatable{
++			"misc.crt0":              crt0,
++			"misc.stdoutBufferState": stdoutState,
++			"stdlib.stdio":           stdio,
++		},
++		executable:    executable,
++		linker_script: linkerScript,
++	}
++	linker.ResolveSymbols()
++
++	resolvedPath := filepath.Join(dir, "resolved.S")
++	executable.SetPath(resolvedPath)
++	executable.DumpAssembly()
++	resolvedAssembly, err := os.ReadFile(resolvedPath)
++	if err != nil {
++		t.Fatalf("ReadFile(%q) error = %v", resolvedPath, err)
++	}
++	if !strings.Contains(string(resolvedAssembly), "__stdout_buffer_state:") {
++		t.Fatal("always-live stdout state object was not selected")
++	}
++	if strings.Contains(string(resolvedAssembly), "__stdout_buffer:") {
++		t.Fatal("unused stdio implementation and its MRAM buffer were selected")
++	}
++
++	resolvedAddresses := assignSyntheticMramAddresses(t, resolvedPath, commandLineParser)
++	withoutStdioOutput := resolvedAddresses["app_output"]
++
++	// This is the old object-granularity failure mode: satisfying the
++	// bootstrap's state reference with stdio.c also admits its unrelated 1 MiB
++	// .mram.noinit section. Compare against it to make the symbol shift visible.
++	forcedStdioPath := filepath.Join(dir, "forced-stdio.S")
++	forcedAssembly := append([]byte{}, resolvedAssembly...)
++	stdioAssembly, err := os.ReadFile(stdioPath)
++	if err != nil {
++		t.Fatalf("ReadFile(%q) error = %v", stdioPath, err)
++	}
++	forcedAssembly = append(forcedAssembly, stdioAssembly...)
++	if err := os.WriteFile(forcedStdioPath, forcedAssembly, 0o644); err != nil {
++		t.Fatalf("WriteFile(%q) error = %v", forcedStdioPath, err)
++	}
++	forcedAddresses := assignSyntheticMramAddresses(t, forcedStdioPath, commandLineParser)
++	withStdioOutput := forcedAddresses["app_output"]
++
++	if got, want := withStdioOutput-withoutStdioOutput, int64(syntheticStdoutBufferSize); got != want {
++		t.Fatalf(
++			"unused stdio shifted app_output by %d bytes, want demonstration shift %d",
++			got,
++			want,
++		)
++	}
++	if got, want := withoutStdioOutput, int64(512*1024+16); got != want {
++		t.Fatalf("reachable-only app_output address = %d, want %d", got, want)
++	}
++}
++
++func syntheticRelocatable(
++	name string,
++	path string,
++	defs []string,
++	uses []string,
++	globals []string,
++) *kernel.Relocatable {
++	relocatable := new(kernel.Relocatable)
++	relocatable.Init(name)
++	relocatable.SetPath(path)
++	liveness := new(kernel.Liveness)
++	liveness.Init()
++	for _, def := range defs {
++		liveness.AddDef(def)
++	}
++	for _, use := range uses {
++		liveness.AddUse(use)
++	}
++	for _, global := range globals {
++		liveness.AddGlobalSymbol(global)
++	}
++	relocatable.SetLiveness(liveness)
++	return relocatable
++}
++
++func syntheticLinkerCommandLineParser() *misc.CommandLineParser {
++	commandLineParser := new(misc.CommandLineParser)
++	commandLineParser.Init()
++	commandLineParser.AddOption(misc.INT, "num_tasklets", "1", "")
++	commandLineParser.AddOption(misc.INT, "min_access_granularity", "8", "")
++	return commandLineParser
++}
++
++func assignSyntheticMramAddresses(
++	t *testing.T,
++	path string,
++	commandLineParser *misc.CommandLineParser,
++) map[string]int64 {
++	t.Helper()
++	lexer_ := new(lexer.Lexer)
++	lexer_.Init()
++	tokenStream := lexer_.Lex(path)
++	parser_ := new(parser.Parser)
++	parser_.Init()
++	ast := parser_.Parse(tokenStream)
++
++	executable := new(kernel.Executable)
++	executable.Init("synthetic")
++	executable.SetTokenStream(tokenStream)
++	executable.SetAst(ast)
++	labelAssigner := new(logic.LabelAssigner)
++	labelAssigner.Init()
++	labelAssigner.Assign(executable)
++	linkerScript := new(logic.LinkerScript)
++	linkerScript.Init(commandLineParser)
++	linkerScript.AssignMram(executable)
++	addresses := make(map[string]int64)
++	for section := range executable.Sections(kernel.MRAM) {
++		for _, label := range section.Labels() {
++			addresses[label.Name()] = label.Address()
++		}
++	}
++	return addresses
++}
++
++func writeSyntheticAssembly(t *testing.T, dir string, name string, contents string) string {
++	t.Helper()
++	path := filepath.Join(dir, name)
++	if err := os.WriteFile(path, []byte(strings.TrimSpace(contents)+"\n"), 0o644); err != nil {
++		t.Fatalf("WriteFile(%q) error = %v", path, err)
++	}
++	return path
++}
+diff --git a/golang/uPIMulator/src/main.go b/golang/uPIMulator/src/main.go
+index fd99600c5163afba811d63e1a4ffd5cb8889dbff..cc228aa104118623965d5c341b60fcbff93eb138 100644
+--- a/golang/uPIMulator/src/main.go
++++ b/golang/uPIMulator/src/main.go
+@@ -79,6 +79,18 @@ func InitCommandLineParser() *misc.CommandLineParser {
+ 		"number of simulation threads to launch")
+ 
+ 	command_line_parser.AddOption(misc.STRING, "benchmark", "BS", "benchmark name")
++	command_line_parser.AddOption(
++		misc.STRING,
++		"fixture_dir",
++		"",
++		"path to a GENERIC benchmark fixture directory containing manifest.json",
++	)
++	command_line_parser.AddOption(
++		misc.BOOL,
++		"skip_compilation",
++		"false",
++		"reuse precompiled benchmark and SDK assembly",
++	)
+ 
+ 	command_line_parser.AddOption(misc.INT, "num_channels", "1", "number of PIM memory channels")
+ 	command_line_parser.AddOption(
+diff --git a/golang/uPIMulator/src/simulator/dpu/logic/alu.go b/golang/uPIMulator/src/simulator/dpu/logic/alu.go
+index a14682f63789de99e0f2a562a89f70a42e5a009d..13c6f677c24cbad61d1ccb98a295e18b928ce40d 100644
+--- a/golang/uPIMulator/src/simulator/dpu/logic/alu.go
++++ b/golang/uPIMulator/src/simulator/dpu/logic/alu.go
+@@ -130,24 +130,21 @@ func (this *Alu) Subc(operand1 int64, operand2 int64, carry_flag bool) (int64, b
+ 	word2.Init(mram_data_width)
+ 	word2.SetValue(operand2)
+ 
++	borrow_in := int64(0)
++	if carry_flag {
++		borrow_in = 1
++	}
++	minuend := word1.Value(word.UNSIGNED)
++	subtrahend := word2.Value(word.UNSIGNED) + borrow_in
++
+ 	var result int64
+ 	var carry bool
+-	if carry_flag {
+-		if word1.Value(word.UNSIGNED)+1 >= word2.Value(word.UNSIGNED) {
+-			result = word1.Value(word.UNSIGNED) - word2.Value(word.UNSIGNED) - 1
+-			carry = false
+-		} else {
+-			result = this.Pow2(mram_data_width) + word1.Value(word.UNSIGNED) - word2.Value(word.UNSIGNED) - 1
+-			carry = true
+-		}
++	if minuend >= subtrahend {
++		result = minuend - subtrahend
++		carry = false
+ 	} else {
+-		if word1.Value(word.UNSIGNED) >= word2.Value(word.UNSIGNED) {
+-			result = word1.Value(word.UNSIGNED) - word2.Value(word.UNSIGNED)
+-			carry = false
+-		} else {
+-			result = this.Pow2(mram_data_width) + word1.Value(word.UNSIGNED) - word2.Value(word.UNSIGNED)
+-			carry = true
+-		}
++		result = this.Pow2(mram_data_width) + minuend - subtrahend
++		carry = true
+ 	}
+ 
+ 	result_word := new(word.Word)
+diff --git a/golang/uPIMulator/src/simulator/dpu/logic/alu_subc_test.go b/golang/uPIMulator/src/simulator/dpu/logic/alu_subc_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..90fc99ca7c562deba735ffbfef54c95ad74efe70
+--- /dev/null
++++ b/golang/uPIMulator/src/simulator/dpu/logic/alu_subc_test.go
+@@ -0,0 +1,40 @@
++package logic
++
++import "testing"
++
++func TestSubcPropagatesBorrow(t *testing.T) {
++	alu := new(Alu)
++	alu.Init()
++
++	tests := []struct {
++		name       string
++		minuend    int64
++		subtrahend int64
++		borrowIn   bool
++		wantResult int64
++		wantBorrow bool
++	}{
++		{"equal with borrow", 0, 0, true, 0xffffffff, true},
++		{"larger by one with borrow", 1, 0, true, 0, false},
++		{"ordinary underflow", 0, 1, false, 0xffffffff, true},
++		{"maximum subtrahend with borrow", 0xffffffff, 0xffffffff, true, 0xffffffff, true},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			result, borrow, _ := alu.Subc(test.minuend, test.subtrahend, test.borrowIn)
++			if result != test.wantResult || borrow != test.wantBorrow {
++				t.Fatalf(
++					"Subc(%#x, %#x, %t) = (%#x, %t), want (%#x, %t)",
++					test.minuend,
++					test.subtrahend,
++					test.borrowIn,
++					result,
++					borrow,
++					test.wantResult,
++					test.wantBorrow,
++				)
++			}
++		})
++	}
++}
+diff --git a/golang/uPIMulator/src/simulator/dpu/logic/dma_address_test.go b/golang/uPIMulator/src/simulator/dpu/logic/dma_address_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..36a39316ab60bb11336a4383afb2619e36b186f4
+--- /dev/null
++++ b/golang/uPIMulator/src/simulator/dpu/logic/dma_address_test.go
+@@ -0,0 +1,52 @@
++package logic
++
++import "testing"
++
++func TestDmaAddressesAlignSoftCacheReadModifyWrite(t *testing.T) {
++	tests := []struct {
++		name     string
++		ra       int64
++		rb       int64
++		wantWram int64
++		wantMram int64
++	}{
++		{
++			name:     "upper word addresses align to the containing eight-byte block",
++			ra:       0x0000c36c,
++			rb:       0x00088c04,
++			wantWram: 0x0000c368,
++			wantMram: 0x00088c00,
++		},
++		{
++			name:     "WRAM length bits do not become address bits",
++			ra:       0x7f00c36c,
++			rb:       0x00088c04,
++			wantWram: 0x0000c368,
++			wantMram: 0x00088c00,
++		},
++		{
++			name:     "aligned addresses remain unchanged",
++			ra:       0x0000c368,
++			rb:       0x00088c00,
++			wantWram: 0x0000c368,
++			wantMram: 0x00088c00,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			gotWram, gotMram := dmaAddresses(test.ra, test.rb)
++			if gotWram != test.wantWram || gotMram != test.wantMram {
++				t.Fatalf(
++					"dmaAddresses(%#x, %#x) = (%#x, %#x), want (%#x, %#x)",
++					test.ra,
++					test.rb,
++					gotWram,
++					gotMram,
++					test.wantWram,
++					test.wantMram,
++				)
++			}
++		})
++	}
++}
+diff --git a/golang/uPIMulator/src/simulator/dpu/logic/logic.go b/golang/uPIMulator/src/simulator/dpu/logic/logic.go
+index 32de3e3092f27e27ca523416f60781cb4ca224ca..ea6d0b06c7b837ce99412d494fc07961ff8fc8c7 100644
+--- a/golang/uPIMulator/src/simulator/dpu/logic/logic.go
++++ b/golang/uPIMulator/src/simulator/dpu/logic/logic.go
+@@ -3,7 +3,6 @@ package logic
+ import (
+ 	"errors"
+ 	"fmt"
+-	"math"
+ 	"uPIMulator/src/abi/word"
+ 	"uPIMulator/src/linker/kernel/instruction"
+ 	"uPIMulator/src/linker/kernel/instruction/cc"
+@@ -4837,8 +4836,54 @@ func (this *Logic) ExecuteErri(instruction_ *instruction.Instruction) {
+ }
+ 
+ func (this *Logic) ExecuteSErri(instruction_ *instruction.Instruction) {
+-	err := errors.New("ExecuteSErri is not yet implemented")
+-	panic(err)
++	if _, found := instruction_.ErriOpCodes()[instruction_.OpCode()]; !found {
++		err := errors.New("op code is not a valid ERRI op code")
++		panic(err)
++	} else if instruction_.Suffix() != instruction.S_ERRI && instruction_.Suffix() != instruction.U_ERRI {
++		err := errors.New("suffix is not S_ERRI nor U_ERRI")
++		panic(err)
++	}
++
++	thread := this.scoreboard[instruction_]
++
++	ra := thread.RegFile().ReadSrcReg(instruction_.Ra(), word.SIGNED)
++	off := instruction_.Off().Value()
++
++	address, _, _ := this.alu.Add(ra, off)
++
++	var result int64
++
++	op_code := instruction_.OpCode()
++	if op_code == instruction.LBS {
++		result = this.operand_collector.Lbs(address)
++	} else if op_code == instruction.LBU {
++		result = this.operand_collector.Lbu(address)
++	} else if op_code == instruction.LHS {
++		result = this.operand_collector.Lhs(address)
++	} else if op_code == instruction.LHU {
++		result = this.operand_collector.Lhu(address)
++	} else if op_code == instruction.LW {
++		result = this.operand_collector.Lw(address)
++	} else {
++		err := errors.New("op code is not valid")
++		panic(err)
++	}
++
++	thread.RegFile().ClearConditions()
++
++	var even int64
++	var odd int64
++	if instruction_.Suffix() == instruction.S_ERRI {
++		even, odd = this.alu.SignedExtension(result)
++	} else if instruction_.Suffix() == instruction.U_ERRI {
++		even, odd = this.alu.UnsignedExtension(result)
++	} else {
++		err := errors.New("suffix is not S_ERRI nor U_ERRI")
++		panic(err)
++	}
++
++	thread.RegFile().WritePairReg(instruction_.Dc(), even, odd)
++	thread.RegFile().IncrementPcReg()
+ }
+ 
+ func (this *Logic) ExecuteEdri(instruction_ *instruction.Instruction) {
+@@ -5009,6 +5054,15 @@ func (this *Logic) ExecuteDmaRri(instruction_ *instruction.Instruction) {
+ 	}
+ }
+ 
++const (
++	dmaWramAddressMask int64 = 0x00fffff8
++	dmaMramAddressMask int64 = 0xfffffff8
++)
++
++func dmaAddresses(ra int64, rb int64) (int64, int64) {
++	return ra & dmaWramAddressMask, rb & dmaMramAddressMask
++}
++
+ func (this *Logic) ExecuteLdmaDmaRri(instruction_ *instruction.Instruction) {
+ 	if _, found := instruction_.LdmaDmaRriOpCodes()[instruction_.OpCode()]; !found {
+ 		err := errors.New("op code is not a valid ldma DMA_RRI op code")
+@@ -5024,18 +5078,7 @@ func (this *Logic) ExecuteLdmaDmaRri(instruction_ *instruction.Instruction) {
+ 	rb := thread.RegFile().ReadSrcReg(instruction_.Rb(), word.SIGNED)
+ 	imm := instruction_.Imm().Value()
+ 
+-	config_loader := new(misc.ConfigLoader)
+-	config_loader.Init()
+-
+-	wram_end_address := config_loader.WramOffset() + config_loader.WramSize()
+-	wram_end_address_width := int(math.Floor(math.Log2(float64(wram_end_address))) + 1)
+-	wram_mask := this.Pow2(wram_end_address_width) - 1
+-	wram_address := this.alu.And(ra, wram_mask)
+-
+-	mram_end_address := config_loader.MramOffset() + config_loader.MramSize()
+-	mram_end_address_width := int(math.Floor(math.Log2(float64(mram_end_address))) + 1)
+-	mram_mask := this.Pow2(mram_end_address_width) - 1
+-	mram_address := this.alu.And(rb, mram_mask)
++	wram_address, mram_address := dmaAddresses(ra, rb)
+ 
+ 	size := (1 + this.alu.And(imm+this.alu.And(this.alu.Lsr(ra, 24), 255), 255)) * this.min_access_granularity
+ 
+@@ -5064,18 +5107,7 @@ func (this *Logic) ExecuteSdmaDmaRri(instruction_ *instruction.Instruction) {
+ 	rb := thread.RegFile().ReadSrcReg(instruction_.Rb(), word.SIGNED)
+ 	imm := instruction_.Imm().Value()
+ 
+-	config_loader := new(misc.ConfigLoader)
+-	config_loader.Init()
+-
+-	wram_end_address := config_loader.WramOffset() + config_loader.WramSize()
+-	wram_end_address_width := int(math.Floor(math.Log2(float64(wram_end_address))) + 1)
+-	wram_mask := this.Pow2(wram_end_address_width) - 1
+-	wram_address := this.alu.And(ra, wram_mask)
+-
+-	mram_end_address := config_loader.MramOffset() + config_loader.MramSize()
+-	mram_end_address_width := int(math.Floor(math.Log2(float64(mram_end_address))) + 1)
+-	mram_mask := this.Pow2(mram_end_address_width) - 1
+-	mram_address := this.alu.And(rb, mram_mask)
++	wram_address, mram_address := dmaAddresses(ra, rb)
+ 
+ 	size := (1 + this.alu.And(imm+this.alu.And(this.alu.Lsr(ra, 24), 255), 255)) * this.min_access_granularity
+ 
+@@ -5365,19 +5397,22 @@ func (this *Logic) SetExtSubSetCc(
+ 	word2.Init(mram_data_width)
+ 	word2.SetValue(operand2)
+ 
+-	if word1.Value(word.UNSIGNED) < word2.Value(word.UNSIGNED) {
++	// For subtraction, C is the borrow-out bit.  Derive unsigned relation
++	// conditions from the effective result/borrow so SUBC includes its
++	// incoming low-word borrow in chained comparisons.
++	if carry {
+ 		thread.RegFile().SetCondition(cc.LTU)
+ 	}
+ 
+-	if word1.Value(word.UNSIGNED) <= word2.Value(word.UNSIGNED) {
++	if carry || result == 0 {
+ 		thread.RegFile().SetCondition(cc.LEU)
+ 	}
+ 
+-	if word1.Value(word.UNSIGNED) > word2.Value(word.UNSIGNED) {
++	if !carry && result != 0 {
+ 		thread.RegFile().SetCondition(cc.GTU)
+ 	}
+ 
+-	if word1.Value(word.UNSIGNED) >= word2.Value(word.UNSIGNED) {
++	if !carry {
+ 		thread.RegFile().SetCondition(cc.GEU)
+ 	}
+ 
+@@ -5613,19 +5648,22 @@ func (this *Logic) SetSubNzCc(
+ 	word2.Init(mram_data_width)
+ 	word2.SetValue(operand2)
+ 
+-	if word1.Value(word.UNSIGNED) < word2.Value(word.UNSIGNED) {
++	// For subtraction, C is the borrow-out bit.  Derive unsigned relation
++	// conditions from the effective result/borrow so SUBC includes its
++	// incoming low-word borrow in chained comparisons.
++	if carry {
+ 		thread.RegFile().SetCondition(cc.LTU)
+ 	}
+ 
+-	if word1.Value(word.UNSIGNED) <= word2.Value(word.UNSIGNED) {
++	if carry || result == 0 {
+ 		thread.RegFile().SetCondition(cc.LEU)
+ 	}
+ 
+-	if word1.Value(word.UNSIGNED) > word2.Value(word.UNSIGNED) {
++	if !carry && result != 0 {
+ 		thread.RegFile().SetCondition(cc.GTU)
+ 	}
+ 
+-	if word1.Value(word.UNSIGNED) >= word2.Value(word.UNSIGNED) {
++	if !carry {
+ 		thread.RegFile().SetCondition(cc.GEU)
+ 	}
+ 
+diff --git a/golang/uPIMulator/src/simulator/host/channel_transfer_read_job.go b/golang/uPIMulator/src/simulator/host/channel_transfer_read_job.go
+index 9b9c214792fa74247ecc217ccd3738d1e431db96..8fafb3434dd7b5ccb34f00ee89e828b1ccf4abdc 100644
+--- a/golang/uPIMulator/src/simulator/host/channel_transfer_read_job.go
++++ b/golang/uPIMulator/src/simulator/host/channel_transfer_read_job.go
+@@ -2,6 +2,8 @@ package host
+ 
+ import (
+ 	"errors"
++	"fmt"
++	"os"
+ 	"uPIMulator/src/abi/encoding"
+ 	"uPIMulator/src/simulator/channel"
+ )
+@@ -9,7 +11,8 @@ import (
+ type ChannelTransferReadJob struct {
+ 	channel_message *channel.ChannelMessage
+ 
+-	byte_streams []*encoding.ByteStream
++	byte_streams   []*encoding.ByteStream
++	observed_paths []string
+ 
+ 	channel *channel.Channel
+ }
+@@ -17,6 +20,7 @@ type ChannelTransferReadJob struct {
+ func (this *ChannelTransferReadJob) Init(
+ 	channel_message *channel.ChannelMessage,
+ 	byte_streams []*encoding.ByteStream,
++	observed_paths []string,
+ 	channel_ *channel.Channel,
+ ) {
+ 	if channel_message.ChannelOperation() != channel.READ {
+@@ -26,6 +30,10 @@ func (this *ChannelTransferReadJob) Init(
+ 
+ 	this.channel_message = channel_message
+ 	this.byte_streams = byte_streams
++	if len(observed_paths) != len(byte_streams) {
++		panic(errors.New("observed paths' length != byte streams' length"))
++	}
++	this.observed_paths = observed_paths
+ 	this.channel = channel_
+ }
+ 
+@@ -40,11 +48,30 @@ func (this *ChannelTransferReadJob) Execute() {
+ 
+ 	this.channel.PopChannelMessage(this.channel_message)
+ 
+-	this.CompareByteStreams(this.byte_streams, this.channel_message.ByteStreams())
++	observed := this.channel_message.ByteStreams()
++	this.DumpObservedByteStreams(observed)
++	this.CompareByteStreams(this.byte_streams, observed)
+ 
+ 	this.channel.Unlock()
+ }
+ 
++func (this *ChannelTransferReadJob) DumpObservedByteStreams(
++	byte_streams []*encoding.ByteStream,
++) {
++	if len(byte_streams) != len(this.observed_paths) {
++		panic(errors.New("observed byte streams' length != observed paths' length"))
++	}
++	for i, byte_stream := range byte_streams {
++		contents := make([]byte, byte_stream.Size())
++		for j := int64(0); j < byte_stream.Size(); j++ {
++			contents[j] = byte_stream.Get(int(j))
++		}
++		if err := os.WriteFile(this.observed_paths[i], contents, 0o644); err != nil {
++			panic(fmt.Errorf("write observed output %q: %w", this.observed_paths[i], err))
++		}
++	}
++}
++
+ func (this *ChannelTransferReadJob) CompareByteStreams(
+ 	byte_streams_1 []*encoding.ByteStream,
+ 	byte_streams_2 []*encoding.ByteStream,
+@@ -63,11 +90,29 @@ func (this *ChannelTransferReadJob) CompareByteStreams(
+ 			panic(err)
+ 		}
+ 
++		mismatchCount := 0
++		firstMismatch := ""
+ 		for j := int64(0); j < byte_stream_1.Size(); j++ {
+ 			if byte_stream_1.Get(int(j)) != byte_stream_2.Get(int(j)) {
+-				err := errors.New("bytes are different")
+-				panic(err)
++				mismatchCount++
++				if firstMismatch == "" {
++					firstMismatch = fmt.Sprintf(
++						"byte %d: expected %d, observed %d",
++						j,
++						byte_stream_1.Get(int(j)),
++						byte_stream_2.Get(int(j)),
++					)
++				}
+ 			}
+ 		}
++		if mismatchCount != 0 {
++			panic(fmt.Errorf(
++				"output mismatch in stream %d (%d of %d bytes differ); first %s",
++				i,
++				mismatchCount,
++				byte_stream_1.Size(),
++				firstMismatch,
++			))
++		}
+ 	}
+ }
+diff --git a/golang/uPIMulator/src/simulator/host/channel_transfer_read_job_test.go b/golang/uPIMulator/src/simulator/host/channel_transfer_read_job_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..799e1dcf06f6cc3af00f8e6bc4d2c815bcf293e5
+--- /dev/null
++++ b/golang/uPIMulator/src/simulator/host/channel_transfer_read_job_test.go
+@@ -0,0 +1,46 @@
++package host
++
++import (
++	"bytes"
++	"os"
++	"path/filepath"
++	"testing"
++	"uPIMulator/src/abi/encoding"
++)
++
++func TestDumpObservedByteStreamsWritesRawEvidence(t *testing.T) {
++	dir := t.TempDir()
++	paths := []string{
++		filepath.Join(dir, "first.raw.bin"),
++		filepath.Join(dir, "second.raw.bin"),
++	}
++	streams := []*encoding.ByteStream{
++		testByteStream([]byte{0, 1, 127, 255}),
++		testByteStream([]byte{9, 8, 7}),
++	}
++	job := &ChannelTransferReadJob{observed_paths: paths}
++	job.DumpObservedByteStreams(streams)
++
++	for i, path := range paths {
++		observed, err := os.ReadFile(path)
++		if err != nil {
++			t.Fatalf("ReadFile(%q) error = %v", path, err)
++		}
++		expected := make([]byte, streams[i].Size())
++		for position := range expected {
++			expected[position] = streams[i].Get(position)
++		}
++		if !bytes.Equal(observed, expected) {
++			t.Fatalf("raw evidence %q = %v, want %v", path, observed, expected)
++		}
++	}
++}
++
++func testByteStream(contents []byte) *encoding.ByteStream {
++	stream := new(encoding.ByteStream)
++	stream.Init()
++	for _, value := range contents {
++		stream.Append(value)
++	}
++	return stream
++}
+diff --git a/golang/uPIMulator/src/simulator/host/host.go b/golang/uPIMulator/src/simulator/host/host.go
+index f8043e24fb861c1454b5f0a91973ad0d6fe3d61b..b3399b62cb3059cdde5c7a9eaf86fb03b3e9fae2 100644
+--- a/golang/uPIMulator/src/simulator/host/host.go
++++ b/golang/uPIMulator/src/simulator/host/host.go
+@@ -2,6 +2,7 @@ package host
+ 
+ import (
+ 	"errors"
++	"fmt"
+ 	"os"
+ 	"path/filepath"
+ 	"strconv"
+@@ -443,6 +444,7 @@ func (this *Host) ChannelTransferOutputDpuHost(execution int) {
+ 				for i := 0; i < 8; i++ {
+ 					dpu_ids := make([]int, 0)
+ 					byte_streams := make([]*encoding.ByteStream, 0)
++					observed_paths := make([]string, 0)
+ 
+ 					for _, dpu_ := range dpus {
+ 						dpu_id := dpu_.DpuId()
+@@ -453,6 +455,10 @@ func (this *Host) ChannelTransferOutputDpuHost(execution int) {
+ 
+ 							dpu_ids = append(dpu_ids, dpu_id)
+ 							byte_streams = append(byte_streams, chunk.ByteStream())
++							observed_paths = append(observed_paths, filepath.Join(
++								this.bin_dirpath,
++								fmt.Sprintf("observed_host_%s_execution_%d_dpu_%d.raw.bin", pointer, execution, unique_dpu_id),
++							))
+ 						}
+ 					}
+ 
+@@ -467,7 +473,7 @@ func (this *Host) ChannelTransferOutputDpuHost(execution int) {
+ 						)
+ 
+ 						channel_transfer_read_job := new(ChannelTransferReadJob)
+-						channel_transfer_read_job.Init(channel_message, byte_streams, channel_)
++						channel_transfer_read_job.Init(channel_message, byte_streams, observed_paths, channel_)
+ 
+ 						thread_pool.Enque(channel_transfer_read_job)
+ 					}
+@@ -574,6 +580,7 @@ func (this *Host) ChannelTransferOutputDpuMramHeapPointerName(execution int) {
+ 				for i := 0; i < 8; i++ {
+ 					dpu_ids := make([]int, 0)
+ 					byte_streams := make([]*encoding.ByteStream, 0)
++					observed_paths := make([]string, 0)
+ 
+ 					for _, dpu_ := range dpus {
+ 						dpu_id := dpu_.DpuId()
+@@ -588,6 +595,10 @@ func (this *Host) ChannelTransferOutputDpuMramHeapPointerName(execution int) {
+ 
+ 							dpu_ids = append(dpu_ids, dpu_id)
+ 							byte_streams = append(byte_streams, chunk.ByteStream())
++							observed_paths = append(observed_paths, filepath.Join(
++								this.bin_dirpath,
++								fmt.Sprintf("observed_mram_heap_offset_%d_execution_%d_dpu_%d.raw.bin", offset, execution, unique_dpu_id),
++							))
+ 						}
+ 					}
+ 
+@@ -602,7 +613,7 @@ func (this *Host) ChannelTransferOutputDpuMramHeapPointerName(execution int) {
+ 						)
+ 
+ 						channel_transfer_read_job := new(ChannelTransferReadJob)
+-						channel_transfer_read_job.Init(channel_message, byte_streams, channel_)
++						channel_transfer_read_job.Init(channel_message, byte_streams, observed_paths, channel_)
+ 
+ 						thread_pool.Enque(channel_transfer_read_job)
+ 					}

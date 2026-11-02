@@ -101,3 +101,7 @@ tests/xlscc_tests/**/test
 # outputs
 *.lock
 dist/
+
+# Tenon: Samsung-derived PIMSimulator patches must never enter this repository
+# (simulators/PIMSimulator/README.md, release issue P-04)
+simulators/PIMSimulator/patches/
