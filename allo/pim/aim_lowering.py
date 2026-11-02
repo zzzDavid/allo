@@ -449,6 +449,11 @@ def _target_geometry(target) -> _AimGeometry:
     vector_bits = int(getattr(gb, "width", gb.geometry.get("width", 0)))
     if channels <= 0 or bank_count <= 0 or rows <= 0 or row_elements <= 0:
         raise ValueError("aim target geometry must be positive")
+    if reuse_window < 1:
+        raise ValueError(
+            f"aim target mac_reg declares {reuse_window} accumulator slots; "
+            "the MAC reuse window needs slots >= 1"
+        )
     if vector_bits <= 0 or element_bits <= 0 or vector_bits % element_bits:
         raise ValueError("aim target vector width must divide into element lanes")
     lanes = vector_bits // element_bits
@@ -1743,72 +1748,119 @@ def mac_operands(match):
     return x_operand, y_operand
 
 
-def contraction_shape(
-    match, *, replicated: bool, replicas: int, channels: int
-) -> dict:
+class AimCoverageError(ValueError):
+    """A lowered contraction does not perform the matched program's work."""
+
+
+def _work_items(match) -> int:
+    scope = match.extra.get("spmw_work_scope")
+    shape = tuple(getattr(scope, "group_shape", ()) or ())
+    return math.prod(shape) if shape else 1
+
+
+def program_scalar_macs(match) -> int:
+    """Scalar MACs the matched source performs over its whole work grid.
+
+    One MAC executes per innermost iteration, so a work item performs the
+    product of its enclosing-loop trip counts; the group runs that body once
+    per work item.  Independent of axis-role derivation by construction.
+    """
+    roles = match.extra.get("axis_roles") or {}
+    trips = roles.get("trips") or {}
+    per_item = 1
+    for var, _lb, ub, _step in match.enclosing_loops:
+        extent = trips.get(var, _loop_extent(ub))
+        if extent is None:
+            raise ValueError(f"AiM loop extent is not static: {ub}")
+        per_item *= int(extent)
+    return per_item * _work_items(match)
+
+
+def contraction_shape(match, *, replicated: bool, replicas: int) -> dict:
     """Shape of one AiM contraction from one bucket's MAC match.
 
-    A replicated group takes its shape from the bucket's loop extents: the
-    innermost loop is the reduction, loops indexing the GB vector are the
-    batch, and the remaining loops are the outputs.  A partitioned group's
-    buckets cover one aggregate problem, so its shape comes from the matrix's
-    memref extents.  ``storage_extent`` is the matrix extent along the
-    reduction axis when it exceeds the reduction.
+    Axis roles come from the matcher-stamped ``extra['axis_roles']`` (see
+    ``spmw_match_engine._axis_roles``): exactly one innermost reduction loop,
+    output loops (result loops that do not index the GB vector) and batch
+    loops (result loops that do).  Per work item, ``outputs`` and ``batches``
+    are the products of their loops' trip counts.
+
+    A replicated group (every work item runs the same body) keeps that
+    per-item shape and carries ``replicas`` copies.  A partitioned group's
+    work items cover one aggregate problem; the matcher's ``work_axis``
+    names the axis the work id partitions, which is multiplied by the
+    declared work-grid size.  Anything else is rejected, never guessed.
+    ``storage_extent`` is the matrix extent along the reduction axis when it
+    exceeds the reduction.
     """
+    roles = match.extra.get("axis_roles")
+    if roles is None:
+        raise ValueError(
+            f"AiM MAC match in {match.func_name} carries no axis roles; "
+            "match_workload stamps them"
+        )
+    if roles["unresolved"] is not None:
+        raise ValueError(
+            f"AiM cannot derive the axis roles of {match.func_name}: "
+            f"{roles['unresolved']}"
+        )
     if not match.enclosing_loops:
         raise ValueError("AiM MAC match has no reduction loop")
     matrix, vector = mac_operands(match)
-    reduction_var, _lb, reduction_ub, _step = match.enclosing_loops[-1]
-    reduction = _loop_extent(reduction_ub)
-    if reduction is None or reduction <= 0:
-        raise ValueError(f"AiM reduction extent is not static: {reduction_ub}")
-
-    # A bank-pair MAC (x and y bind one buffer) has no GB vector, so no batch.
     same_buffer = matrix.memref_name == vector.memref_name
+    if not same_buffer and matrix.role != roles["matrix"]:
+        raise ValueError(
+            f"AiM {match.func_name}: matrix operand {matrix.role!r} differs from "
+            f"the matcher's {roles['matrix']!r}"
+        )
+    reduction_var = match.enclosing_loops[-1][0]
+    if tuple(roles["reduction"]) != (reduction_var,):
+        raise ValueError(
+            f"AiM {match.func_name}: a contraction reduces over exactly the "
+            f"innermost loop {reduction_var}; the accumulator is reduced over "
+            f"{list(roles['reduction'])}"
+        )
+    trips = roles["trips"]
+    reduction = trips[reduction_var]
+    if reduction <= 0:
+        raise ValueError(f"AiM {match.func_name}: empty reduction loop")
+    outputs = math.prod(trips[var] for var in roles["output"])
+    batches = math.prod(trips[var] for var in roles["batch"])
+
+    work_items = _work_items(match)
     if replicated:
-        batches = 1
-        outputs = 1
-        for var, _lb, ub, _step in match.enclosing_loops[:-1]:
-            extent = _loop_extent(ub)
-            if extent is None or extent <= 0:
-                raise ValueError(f"AiM loop extent is not static: {ub}")
-            if not same_buffer and var in vector.indices:
-                batches *= extent
-            else:
-                outputs *= extent
+        replicas = int(replicas)
     else:
         replicas = 1
-        batch_var = match.extra.get("batch_loop_var")
-        batches = 1 if same_buffer else int(match.extra.get("batch_dim", 1) or 1)
-        outputs = None
-        for operand in match.operands:
-            if operand.is_loop_carried:
-                continue
-            shape = _memref_shape(getattr(operand, "memref_type", None))
-            if len(shape) != len(operand.indices):
-                continue
-            if reduction_var not in operand.indices:
-                continue
-            for extent, index in zip(shape, operand.indices):
-                if index in (reduction_var, batch_var):
-                    continue
-                outputs = extent
-                break
-            if outputs is not None:
-                break
-        if outputs is None:
-            outer = _loop_extent(match.enclosing_loops[0][2])
-            if outer is None:
-                raise ValueError("AiM cannot recover output extent from match")
-            outputs = outer * channels
+        axis = roles.get("work_axis")
+        if work_items > 1 and axis == "output":
+            outputs *= work_items
+        elif work_items > 1 and axis == "batch":
+            batches *= work_items
+        elif work_items > 1:
+            raise ValueError(
+                f"AiM {match.func_name}: cannot tell which contraction axis the "
+                f"{work_items}-item work grid partitions "
+                f"({roles.get('work_axis_reason')})"
+            )
 
+    matrix_shape = _memref_shape(getattr(matrix, "memref_type", None))
     storage_extent = None
-    shape = _memref_shape(getattr(matrix, "memref_type", None))
-    if len(shape) == len(matrix.indices):
-        for extent, index in zip(shape, matrix.indices):
+    if len(matrix_shape) == len(matrix.indices):
+        loop_vars = set(trips)
+        declared_outputs = 1
+        for extent, index in zip(matrix_shape, matrix.indices):
             if index == reduction_var and extent > reduction:
                 storage_extent = extent
-    return {
+            if index in roles["output"] or index not in loop_vars:
+                declared_outputs *= extent
+        if not same_buffer and outputs > declared_outputs:
+            raise ValueError(
+                f"AiM {match.func_name}: the program computes {outputs} output "
+                f"rows but {matrix.memref_name} declares {declared_outputs}"
+            )
+
+    shape = {
         "outputs": int(outputs),
         "reduction": int(reduction),
         "batches": int(batches),
@@ -1817,6 +1869,58 @@ def contraction_shape(
         "input_source": "banks" if same_buffer else "gb",
         "matrix": matrix.memref_name,
         "vector": vector.memref_name,
+        "program_scalar_macs": program_scalar_macs(match),
+    }
+    declared = outputs * batches * reduction * replicas
+    if declared != shape["program_scalar_macs"]:
+        raise AimCoverageError(
+            f"AiM {match.func_name}: contraction shape covers {declared} scalar "
+            f"MACs, the matched program performs {shape['program_scalar_macs']}"
+        )
+    return shape
+
+
+def issued_scalar_macs(lines, geometry) -> int:
+    """Scalar MAC slots the MAC_ABK/MAC_SBK commands in ``lines`` issue."""
+    issued = 0
+    for line in lines:
+        fields = line.split(" ")
+        if fields[:2] == ["AiM", "MAC_ABK"]:
+            op_size, mask = int(fields[2]), int(fields[3])
+            issued += op_size * geometry.lanes * geometry.banks * mask.bit_count()
+        elif fields[:2] == ["AiM", "MAC_SBK"]:
+            op_size, mask = int(fields[2]), int(fields[3])
+            issued += op_size * geometry.lanes * mask.bit_count()
+    return issued
+
+
+def check_contraction_coverage(entry: dict, issued: int, program: int) -> dict:
+    """Reconcile one lowered contraction with the matched program's work.
+
+    ``entry`` is the lowerer's manifest record (``logical_scalar_macs`` and
+    the padded ``physical_mac_slots`` it declares), ``issued`` the scalar MAC
+    slots of its emitted commands and ``program`` the matched source's scalar
+    MACs over its work grid.  The record must declare exactly the program's
+    work, and the commands must cover it without exceeding the declared
+    padded capacity.  Returns the fields recorded in the manifest.
+    """
+    name = entry.get("name")
+    declared = int(entry["logical_scalar_macs"])
+    capacity = int(entry["physical_mac_slots"])
+    if declared != program:
+        raise AimCoverageError(
+            f"AiM {name}: lowered contraction declares {declared} logical scalar "
+            f"MACs, the matched program performs {program}"
+        )
+    if issued < program or issued > capacity:
+        raise AimCoverageError(
+            f"AiM {name}: emitted commands issue {issued} scalar MACs for "
+            f"{program} program MACs (declared padded capacity {capacity})"
+        )
+    return {
+        "program_scalar_macs": program,
+        "issued_scalar_macs": issued,
+        "padding_ratio": issued / program,
     }
 
 

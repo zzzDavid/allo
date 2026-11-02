@@ -91,13 +91,6 @@ def aim_sim_gate():
     yield
 
 
-@pytest.fixture
-def apu_v2_sim_gate():
-    """Skip when the `gsi-g2-l1sim` Docker image is absent."""
-    _simulator_gate("apu_v2")
-    yield
-
-
 @contextlib.contextmanager
 def board_lock():
     """Serialize APU v1 board access across pytest workers (shared resource).

@@ -19,6 +19,7 @@ import fcntl
 import hashlib
 import json
 import math
+import operator
 import os
 import re
 import shutil
@@ -261,6 +262,64 @@ def _memref_rank(operand) -> int | None:
     return match.group(1).count("x")
 
 
+# ---------------------------- element types ---------------------------- #
+
+# The element type of every role as the family's DPU template computes it
+# (``pim/upmem_physical.py``, ``pim/upmem_irregular.py``): operands are packed
+# into int32 MRAM words and the template's arithmetic and output words have
+# exactly these widths. The device's int32 wraparound equals the source's
+# int32 semantics only for these types, so every other type is rejected.
+# Signedness is not part of MLIR's signless integer types; the final compile
+# checks it on the work function's ABI (``_check_role_dtypes``).
+UPMEM_ROLE_ELEMENT_TYPES = {
+    "pointwise": {"lhs": "i32", "rhs": "i32", "out": "i32"},
+    "reduction": {"input": "i32", "out": "i64"},
+    "matrix_vector": {"matrix": "i32", "vector": "i32", "acc": "i32", "out": "i32"},
+    "gemm": {"lhs": "i32", "rhs": "i32", "out": "i32"},
+    "histogram": {"input": "i32", "out": "i32"},
+    "selection": {"input": "i32", "out": "i32", "count": "i32"},
+    "kmeans_distances": {"points": "i32", "centroids": "i32", "out": "i64"},
+    "feature_gradient": {"samples": "i32", "out": "i64"},
+}
+_ABI_DTYPE_NAMES = {"i32": "int32", "i64": "int64"}
+
+
+def _element_type(memref_type) -> str | None:
+    match = re.match(r"memref<(?:\d+x)*([a-z]+\d*)", memref_type or "")
+    return match.group(1) if match else None
+
+
+def _supported_types(family: str) -> str:
+    return ", ".join(
+        f"{role}: {_ABI_DTYPE_NAMES[dtype]}"
+        for role, dtype in UPMEM_ROLE_ELEMENT_TYPES[family].items()
+    )
+
+
+def _require_element_type(family: str, role: str, operand) -> None:
+    """Fail recognition when ``operand`` (an ``OperandBinding`` or ``WLoad``)
+    does not have the element type the family template computes."""
+    want = UPMEM_ROLE_ELEMENT_TYPES[family][role]
+    memref_type = getattr(operand, "memref_type", None)
+    if _element_type(memref_type) != want:
+        raise NotImplementedError(
+            f"UPMEM {family}: operand {operand.memref_name!r} (role {role!r}) has "
+            f"MLIR type {memref_type or 'unknown'}; the {family} DPU template "
+            f"computes {_ABI_DTYPE_NAMES[want]} for this role (supported: "
+            f"{_supported_types(family)}). Declare the buffer with that type."
+        )
+
+
+def _require_int32_constant(family: str, name: str, value) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or not (
+        -(2**31) <= value < 2**31
+    ):
+        raise NotImplementedError(
+            f"UPMEM {family}: coefficient {name}={value!r} is not an int32 "
+            "literal; the DPU template multiplies in int32"
+        )
+
+
 # ------------------------------ pointwise ------------------------------ #
 
 # Matched op -> (plan operation, physical-model instructions per element).
@@ -301,7 +360,11 @@ def _recognize_pointwise(target, stream):
         return None
     if match.extra.get("store_indices") != [iv]:
         return None
+    _require_element_type("pointwise", "lhs", lhs)
+    _require_element_type("pointwise", "rhs", rhs)
     constants = tuple(sorted(match.extra.get("constants", {}).items()))
+    for name, value in constants:
+        _require_int32_constant("pointwise", name, value)
     return {
         "geometry": (("elements", extents[0]),),
         "anchor_op": match.target_op_name,
@@ -383,10 +446,8 @@ def _recognize_reduction(target, stream):
         return None
     if _memref_rank(value) != 1 or list(value.indices) != [iv]:
         return None
-    if not (cell.memref_type or "").endswith("xi64>"):
-        return None
-    if not (value.memref_type or "").endswith("xi32>"):
-        return None
+    _require_element_type("reduction", "input", value)
+    _require_element_type("reduction", "out", cell)
     return {
         "geometry": (("elements", extents[0]),),
         "anchor_op": "ADD",
@@ -470,10 +531,16 @@ def _recognize_matrix_vector(target, stream):
             return None
         out = scale.result_memref_name
         constants = tuple(sorted(scale.extra.get("constants", {}).items()))
+        for name, value in constants:
+            _require_int32_constant("matrix_vector", name, value)
+        _require_element_type("matrix_vector", "acc", acc)
     else:
         if list(acc.indices) != outer or acc.memref_name != match.result_memref_name:
             return None
         out = acc.memref_name
+        _require_element_type("matrix_vector", "out", acc)
+    _require_element_type("matrix_vector", "matrix", matrix)
+    _require_element_type("matrix_vector", "vector", vector)
     return {
         "geometry": (("batches", batches), ("rows", rows), ("columns", extents[-1])),
         "anchor_op": "MAC",
@@ -576,6 +643,9 @@ def _recognize_gemm(target, stream):
     rhs = next((op for op in inputs if list(op.indices) == [k, j]), None)
     if lhs is None or rhs is None or lhs is rhs:
         return None
+    _require_element_type("gemm", "lhs", lhs)
+    _require_element_type("gemm", "rhs", rhs)
+    _require_element_type("gemm", "out", acc)
     rows, columns, reduction = extents
     return {
         "geometry": (("rows", rows), ("columns", columns), ("reduction", reduction)),
@@ -753,6 +823,8 @@ def _recognize_histogram(target, stream):
     if list(x.indices) != [iv]:
         return None
     (acc,) = [op for op in match.operands if op.is_loop_carried]
+    _require_element_type("histogram", "input", x)
+    _require_element_type("histogram", "out", acc)
     if _memref_shape(acc) != (bins,):
         raise NotImplementedError(
             f"histogram multiplier {bins} differs from the bin count "
@@ -823,6 +895,7 @@ def _recognize_selection(target, stream):
         x = _data_operands(match).get("x")
         if x is None or list(x.indices) != [iv]:
             return None
+        _require_element_type("selection", "input", x)
         return {
             "geometry": (("elements", extents[0]), ("compact", 0)),
             "anchor_op": "SELECT_ODD",
@@ -840,6 +913,7 @@ def _recognize_selection(target, stream):
     value = _data_operands(compact).get("x")
     if value is None or list(value.indices) != [iv]:
         return None
+    _require_element_type("selection", "input", value)
     guards = _guards(compact)
     if len(guards) != 1 or len(_guards(counter)) != 1:
         return None
@@ -943,6 +1017,9 @@ def _recognize_kmeans_distances(target, stream):
         return None
     if list(x.indices) != [p, d] or list(y.indices) != [c, d] or list(acc.indices) != [p, c]:
         return None
+    _require_element_type("kmeans_distances", "points", x)
+    _require_element_type("kmeans_distances", "centroids", y)
+    _require_element_type("kmeans_distances", "out", acc)
     points, clusters, dimension = extents
     return {
         "geometry": (("points", points), ("dimension", dimension), ("clusters", clusters)),
@@ -1033,6 +1110,8 @@ def _recognize_feature_gradient(target, stream):
     s_iv, f_iv = x.indices
     if acc.indices[0] != f_iv or list(y.indices) != [s_iv] or set(loops) != {s_iv, f_iv}:
         return None
+    _require_element_type("feature_gradient", "samples", x)
+    _require_element_type("feature_gradient", "out", acc)
     features, samples = loops[f_iv], loops[s_iv]
     label = _constant_last_column(y)
     if label != features or _memref_shape(x) != (samples, features + 1):
@@ -1743,6 +1822,29 @@ def _check_zero_init(function, state, kernel) -> None:
             )
 
 
+def _check_role_dtypes(kernel, function, name, windows) -> None:
+    """Every role's ABI element type, with signedness, must be the family's.
+
+    Recognition sees signless MLIR types only; ``uint32`` is ``i32`` there.
+    """
+    from .utils import get_func_inputs_outputs
+
+    inputs, _outputs = get_func_inputs_outputs(function)
+    roles = dict(kernel.roles)
+    for role, window in windows.items():
+        want = UPMEM_ROLE_ELEMENT_TYPES[kernel.family][role]
+        got = inputs[window.argument][0]
+        if got != want:
+            raise NotImplementedError(
+                f"UPMEM {kernel.family}: operand {roles[role]!r} (role {role!r}, "
+                f"argument {window.argument} of {name}) has element type {got}; "
+                f"the {kernel.family} DPU template computes "
+                f"{_ABI_DTYPE_NAMES[want]} for this role (supported: "
+                f"{_supported_types(kernel.family)}). Declare the buffer with "
+                "that type."
+            )
+
+
 def _union_windows(windows, role, name) -> "_Window":
     """The bounding window of several accesses to one argument."""
     windows = list(windows)
@@ -1791,8 +1893,32 @@ def _check_preconditions(plan, kernel, slices) -> None:
 # --------------------------------------------------------------------- #
 
 
-def _i32(values) -> bytes:
-    return np.asarray(values, dtype=np.int64).astype("<i4").tobytes()
+def _packed_int(values, bits: int, what: str) -> bytes:
+    """Little-endian ``bits``-wide words; a value that does not fit raises
+    instead of being truncated (the template computes in exactly this width)."""
+    array = np.asarray(values)
+    if array.dtype.kind not in "biuO":
+        raise TypeError(
+            f"UPMEM {what}: {array.dtype} values cannot be packed as int{bits} "
+            "MRAM words exactly"
+        )
+    flat = array.reshape(-1)
+    if array.dtype.kind == "O":
+        flat = np.asarray([operator.index(value) for value in flat.tolist()], dtype=object)
+    low, high = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    if flat.size and not (low <= int(flat.min()) and int(flat.max()) <= high):
+        index, value = next(
+            (i, v) for i, v in enumerate(flat.tolist()) if not low <= int(v) <= high
+        )
+        raise ValueError(
+            f"UPMEM {what}: value {value} at flat index {index} does not fit "
+            f"the template's int{bits} word"
+        )
+    return np.asarray(flat, dtype=np.int64).astype(f"<i{bits // 8}").tobytes()
+
+
+def _i32(values, what: str = "operand") -> bytes:
+    return _packed_int(values, 32, what)
 
 
 def _region_dict(region) -> dict:
@@ -1833,8 +1959,8 @@ def _flat(values) -> list:
     return np.asarray(values).reshape(-1).tolist()
 
 
-def _i64(values) -> bytes:
-    return np.asarray(values, dtype=np.int64).astype("<i8").tobytes()
+def _i64(values, what: str = "operand") -> bytes:
+    return _packed_int(values, 64, what)
 
 
 def _pack_fused_elementwise(plan, lhs, rhs) -> list:
@@ -1880,13 +2006,13 @@ def pack_inputs(plan, kernel: UpmemKernel, slices: Mapping) -> bytes:
     if isinstance(plan, UPMEMMatrixVectorPlan):
         matrix, vector = _flat(slices["matrix"]), _flat(slices["vector"])
         if plan.vector_mode == "tasklet_private_wram":
-            _write_region(image, _region(plan, "matrix"), _i32(matrix), "matrix")
-            _write_region(image, _region(plan, "vector"), _i32(vector), "vector")
+            _write_region(image, _region(plan, "matrix"), _i32(matrix, "matrix"), "matrix")
+            _write_region(image, _region(plan, "vector"), _i32(vector, "vector"), "vector")
         else:
             _write_region(
                 image,
                 _region(plan, "packed_matrix_vector"),
-                _i32(plan.pack_fused_inputs(matrix, vector)),
+                _i32(plan.pack_fused_inputs(matrix, vector), "packed_matrix_vector"),
                 "packed_matrix_vector",
             )
     elif isinstance(plan, UPMEMElementwisePlan):
@@ -1895,37 +2021,40 @@ def pack_inputs(plan, kernel: UpmemKernel, slices: Mapping) -> bytes:
             _write_region(
                 image,
                 _region(plan, "packed_operands"),
-                _i32(_pack_fused_elementwise(plan, lhs, rhs)),
+                _i32(_pack_fused_elementwise(plan, lhs, rhs), "packed_operands"),
                 "packed_operands",
             )
         else:
-            _write_region(image, _region(plan, "x"), _i32(lhs), "x")
-            _write_region(image, _region(plan, "y"), _i32(rhs), "y")
+            _write_region(image, _region(plan, "x"), _i32(lhs, "x"), "x")
+            _write_region(image, _region(plan, "y"), _i32(rhs, "y"), "y")
         if "coefficients" in plan.mram_regions:
             _write_region(
                 image,
                 _region(plan, "coefficients"),
-                _i32((plan.alpha, plan.beta)),
+                _i32((plan.alpha, plan.beta), "coefficients"),
                 "coefficients",
             )
     elif isinstance(plan, UPMEMSumReductionPlan):
         values = _flat(slices["input"])
         padded = values + [0] * (plan.padded_elements - len(values))
-        _write_region(image, _region(plan, "input"), _i32(padded), "input")
+        _write_region(image, _region(plan, "input"), _i32(padded, "input"), "input")
     elif isinstance(plan, UPMEMGEMMPlan):
         _write_region(
             image,
             _region(plan, "packed_lhs_rhs"),
-            _i32(_pack_fused_gemm(plan, _flat(slices["lhs"]), _flat(slices["rhs"]))),
+            _i32(
+                _pack_fused_gemm(plan, _flat(slices["lhs"]), _flat(slices["rhs"])),
+                "packed_lhs_rhs",
+            ),
             "packed_lhs_rhs",
         )
     elif isinstance(plan, (UPMEMHistogramPlan, UPMEMSelectionFlagsPlan)):
-        _write_region(image, _region(plan, "input"), _i32(_flat(slices["input"])), "input")
+        _write_region(image, _region(plan, "input"), _i32(_flat(slices["input"]), "input"), "input")
     elif isinstance(plan, UPMEMKMeansDistancesPlan):
         fused = plan.pack_fused_pairs(_flat(slices["points"]), _flat(slices["centroids"]))
-        _write_region(image, _region(plan, "fused_pairs"), _i32(fused), "fused_pairs")
+        _write_region(image, _region(plan, "fused_pairs"), _i32(fused, "fused_pairs"), "fused_pairs")
     elif isinstance(plan, UPMEMFeatureGradientPlan):
-        _write_region(image, _region(plan, "samples"), _i32(_flat(slices["samples"])), "samples")
+        _write_region(image, _region(plan, "samples"), _i32(_flat(slices["samples"]), "samples"), "samples")
     else:
         raise NotImplementedError(f"no UPMEM input packer for {type(plan).__name__}")
     return bytes(image)
@@ -1939,28 +2068,28 @@ def pack_expected(plan, kernel: UpmemKernel, slices: Mapping) -> tuple[int, byte
         # reference. The end-to-end check against the oracle runs after the
         # host compaction (``_selection_epilogue``).
         flags = plan.reference_flags(_flat(slices["input"]))
-        _write_region(image, _region(plan, "flags"), _i32(flags), "flags")
+        _write_region(image, _region(plan, "flags"), _i32(flags, "flags"), "flags")
         begin, end = _output_window(plan)
         return begin, bytes(image[begin:end])
     out = _flat(slices["out"])
     if isinstance(plan, UPMEMHistogramPlan):
-        _write_region(image, _region(plan, "histogram"), _i32(out), "histogram")
+        _write_region(image, _region(plan, "histogram"), _i32(out, "histogram"), "histogram")
         begin, end = _output_window(plan)
         return begin, bytes(image[begin:end])
     if isinstance(plan, UPMEMKMeansDistancesPlan):
-        _write_region(image, _region(plan, "distances"), _i64(out), "distances")
+        _write_region(image, _region(plan, "distances"), _i64(out, "distances"), "distances")
         begin, end = _output_window(plan)
         return begin, bytes(image[begin:end])
     if isinstance(plan, UPMEMFeatureGradientPlan):
-        _write_region(image, _region(plan, "gradient"), _i64(out), "gradient")
+        _write_region(image, _region(plan, "gradient"), _i64(out, "gradient"), "gradient")
         begin, end = _output_window(plan)
         return begin, bytes(image[begin:end])
     if isinstance(plan, UPMEMMatrixVectorPlan):
-        data = _i32(plan.pack_output(out))
+        data = _i32(plan.pack_output(out), "expected output")
     elif isinstance(plan, UPMEMElementwisePlan):
-        data = _i32(out + [0] * (plan.padded_elements - len(out)))
+        data = _i32(out + [0] * (plan.padded_elements - len(out)), "expected output")
     elif isinstance(plan, UPMEMSumReductionPlan):
-        data = _i64(out)
+        data = _i64(out, "expected output")
     elif isinstance(plan, UPMEMGEMMPlan):
         physical = [0] * (plan.padded_rows * plan.padded_columns)
         for row in range(plan.rows):
@@ -1968,7 +2097,7 @@ def pack_expected(plan, kernel: UpmemKernel, slices: Mapping) -> tuple[int, byte
             physical[begin : begin + plan.columns] = out[
                 row * plan.columns : (row + 1) * plan.columns
             ]
-        data = _i32(physical)
+        data = _i32(physical, "expected output")
     else:
         raise NotImplementedError(f"no UPMEM output packer for {type(plan).__name__}")
     _write_region(image, _region(plan, "output"), data, "output")
@@ -2250,6 +2379,7 @@ class UpmemCtx(CodegenContext):
                             f"UPMEM role {role!r} ({memref_name}) in {name} has no access"
                         )
                     windows[role] = _union_windows(found, role, memref_name)
+                _check_role_dtypes(program.kernel, function, name, windows)
                 if any(value >= _LOCAL_ABI_ID for value in abi):
                     raise NotImplementedError(
                         f"{name} reads a region-local buffer; the UPMEM oracle binds "
@@ -2451,6 +2581,26 @@ def _first_mismatch(segment, expected, bin_dir: Path) -> str | None:
     return None
 
 
+def _store_exact(view: np.ndarray, values, what: str) -> None:
+    """Write device results into a caller view; raise rather than let the
+    caller's dtype narrow or round them."""
+    data = np.asarray(values, dtype=np.int64).reshape(view.shape)
+    if view.dtype.kind not in "iu":
+        raise TypeError(
+            f"UPMEM {what}: the caller's {view.dtype} array cannot hold the "
+            "device's integer results exactly"
+        )
+    if data.size:
+        info = np.iinfo(view.dtype)
+        low, high = int(data.min()), int(data.max())
+        if low < info.min or high > info.max:
+            raise ValueError(
+                f"UPMEM {what}: device value {low if low < info.min else high} "
+                f"does not fit the caller's {view.dtype} array"
+            )
+    view[...] = data.astype(view.dtype)
+
+
 def _selection_epilogue(segment, windows, flags, arrays, oracle_state) -> None:
     """Host stable compaction of the observed DPU flags (spec 004 D1).
 
@@ -2464,13 +2614,13 @@ def _selection_epilogue(segment, windows, flags, arrays, oracle_state) -> None:
     out_window = windows["out"]
     out = out_window.slice(arrays[out_window.argument]).reshape(-1)
     if not segment.kernel.geometry_value("compact"):
-        out[...] = flags.astype(out.dtype)
+        _store_exact(out, flags, "selection flags")
         return
     kept = flags[(flags & 1) != 0]
-    out[: kept.size] = kept.astype(out.dtype)
+    _store_exact(out[: kept.size], kept, "selection output")
     count_window = windows["count"]
     count = count_window.slice(arrays[count_window.argument]).reshape(-1)
-    count[0] = kept.size
+    _store_exact(count[:1], [kept.size], "selection count")
     want_out = out_window.slice(oracle_state[out_window.argument]).reshape(-1)
     want_count = count_window.slice(oracle_state[count_window.argument]).reshape(-1)
     if int(want_count[0]) != kept.size or not np.array_equal(out[: kept.size], want_out[: kept.size]):
@@ -2622,8 +2772,10 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                 for role, data in values.items():
                     window = program.windows[name][role]
                     destination = caller_arrays[window.argument]
-                    view = window.slice(destination)
-                    view[...] = np.asarray(data).reshape(view.shape).astype(view.dtype)
+                    _store_exact(
+                        window.slice(destination), data,
+                        f"{segment.kernel.family} role {role!r}",
+                    )
 
         records.append(
             {
@@ -2646,11 +2798,22 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                 "timing_scope": _TIMING_SCOPE,
             }
         )
+    # The run writes decoded outputs into the caller's arrays in place;
+    # extra["outputs"] exposes each argument's post-run array by name.
     return RunResult(
+        kind="simulator",
         cycles=total,
         stdout="".join(stdout_parts),
         backend="upmem",
-        extra={"upmem": records, "timing_scope": _TIMING_SCOPE},
+        extra={
+            "upmem": records,
+            "timing_scope": _TIMING_SCOPE,
+            "outputs": {
+                name: value
+                for name, value in zip(inputs, caller_arrays)
+                if isinstance(value, np.ndarray)
+            },
+        },
     )
 
 

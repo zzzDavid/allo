@@ -36,8 +36,10 @@ from .pim.aim_lowering import (
     _memref_shape,
     _target_geometry,
     build_contraction,
+    check_contraction_coverage,
     contraction_shape,
     group_replicated,
+    issued_scalar_macs,
     mac_operands,
     matrix_axes,
     resolve_batch_mapping,
@@ -89,6 +91,54 @@ class AimCtx(CodegenContext):
         # emitted line; populated by `cmd()` so tests can introspect.
         self._human_lines: list[str] = []
 
+    def _unit_env(self) -> dict:
+        """Concrete ``(level, unit) -> coordinate`` of the active work item.
+
+        Work-grid axis ``i`` is unit level ``i`` of the target's unit chain
+        (outer first); each coordinate must lie inside that unit's extent.
+        Levels below the work grid are bound only when they jointly span the
+        layout's bank dimension and the active placement's LinearLayout sends
+        the whole work item to one physical bank, which is then decomposed
+        mixed-radix over those levels' extents.  Any other level stays
+        unbound, so `_eval_sym` raises instead of guessing unit 0.
+        """
+        chain = [
+            unit
+            for unit in self.target._walk()
+            if unit.parent is not None and getattr(unit, "mode", None) not in ("device", "host")
+        ]
+        work_id = tuple(int(value) for value in getattr(self, "_active_work_id", ()))
+        if len(work_id) > len(chain):
+            raise ValueError(
+                f"AiM work id {work_id} has more axes than the unit chain "
+                f"{[unit.name for unit in chain]}"
+            )
+        extents = [math.prod(int(v) for v in unit.axes.values()) for unit in chain]
+        env = {}
+        for level, coordinate in enumerate(work_id):
+            if not 0 <= coordinate < extents[level]:
+                raise ValueError(
+                    f"AiM work coordinate {coordinate} is outside "
+                    f"{chain[level].name!r} extent {extents[level]}"
+                )
+            env[(level, chain[level].name)] = coordinate
+        layout = getattr(getattr(self, "_active_placement", None), "layout", None)
+        deeper = range(len(work_id), len(chain))
+        if (
+            layout is not None
+            and deeper
+            and "bank" in layout.out_dims
+            and math.prod(extents[level] for level in deeper)
+            == layout.out_sizes[layout.out_dims.index("bank")]
+            and layout.image_size(varying_inputs=tuple(layout.bases), output_dims=("bank",)) == 1
+        ):
+            bank = layout.apply(**{name: 0 for name in layout.bases})[
+                layout.out_dims.index("bank")
+            ]
+            for level in reversed(deeper):
+                bank, env[(level, chain[level].name)] = divmod(bank, extents[level])
+        return env
+
     def _operand_text(self, handle, role: str) -> str:
         """Render a Tenon handle as the AiM trace field set it implies.
 
@@ -110,14 +160,9 @@ class AimCtx(CodegenContext):
         if isinstance(handle, MemoryRef):
             mem = handle.memory
             if mem.name == "banks":
-                # `handle.idx` may be a symbolic SymExpr (e.g. autoscheduler
-                # produces `8*bg + bank` with placeholder UnitIds); collapse
-                # to a concrete int via `_eval_sym` so ramulator2 accepts it.
-                env = {
-                    level: value
-                    for level, value in enumerate(getattr(self, "_active_work_id", ()))
-                }
-                bank_int = _eval_sym(handle.idx, env)
+                # `handle.idx` may be a symbolic SymExpr over unit ids (the
+                # target's `4*bg + bank`); every level must be bound.
+                bank_int = _eval_sym(handle.idx, self._unit_env())
                 if bank_int is None:
                     raise NotImplementedError(
                         f"AimCtx: bank index {handle.idx!r} cannot be reduced "
@@ -171,11 +216,7 @@ class AimCtx(CodegenContext):
         if isinstance(handle, MemoryRef):
             mem = handle.memory
             if mem.name == "banks":
-                env = {
-                    level: value
-                    for level, value in enumerate(getattr(self, "_active_work_id", ()))
-                }
-                bank_int = _eval_sym(handle.idx, env)
+                bank_int = _eval_sym(handle.idx, self._unit_env())
                 if bank_int is None:
                     raise NotImplementedError(
                         f"AimCtx: bank index {handle.idx!r} cannot be reduced "
@@ -361,6 +402,15 @@ class AimCtx(CodegenContext):
                 entry["bank_scope"] = "abk" if sbk_banks is None else "sbk"
                 if sbk_banks is not None:
                     entry["sbk_banks"] = list(sbk_banks)
+                program_macs = program.program_macs.get(id(operation))
+                if program_macs is not None:
+                    entry.update(
+                        check_contraction_coverage(
+                            entry,
+                            issued_scalar_macs(lines[begin:], lowerer.geometry),
+                            program_macs,
+                        )
+                    )
         self.lowered_operations = tuple(operations)
         self.lowering_manifest = lowerer.operations
         self.row_regions = program.regions
@@ -451,6 +501,8 @@ class _AimProgramDerivation:
             for (scope, _matches), layout in zip(_bucket_for_autoschedule(trace), layouts)
         }
         self._index_buffers()
+        # id(AimContraction record) -> scalar MACs of its matched program.
+        self.program_macs: dict[int, int] = {}
         self.groups = self._derive_groups()
         self.by_id = {group.group_id: group for group in self.groups}
         self.regions = self._allocate_rows()
@@ -541,7 +593,6 @@ class _AimProgramDerivation:
                         match,
                         replicated=replicated,
                         replicas=group.replicas,
-                        channels=self.geometry.channels,
                     )
                     matrix, vector = mac_operands(match)
                     acc = next(op for op in match.operands if op.role == "acc")
@@ -768,6 +819,7 @@ class _AimProgramDerivation:
                     name=contraction["match"].func_name,
                 )
                 operation = replace(operation, row=self.row_of_key[contraction["matrix"]])
+                self.program_macs[id(operation)] = shape["program_scalar_macs"]
                 records.append((operation, group.sbk_banks))
         elif group.kind == "mul":
             records.append(
@@ -1107,6 +1159,44 @@ def _aim_runtime_segments(commands) -> tuple[tuple[str, int, tuple[str, ...]], .
     return (("program", 1, lines),)
 
 
+# ``GDDR6_AiM_org`` in aim_simulator ``src/dram/impl/GDDR6.cpp`` (commit
+# 0f28a07): {Ch 32, Bg 4, Ba 4, Ro 16K, Co 1K}.  The ramulator2 build fixes
+# this organization; trace channel masks and bank/row fields assume it.
+_SIMULATOR_ORGS = {
+    "GDDR6_AiM_org": {
+        "channels": 32,
+        "bank_groups": 4,
+        "banks": 16,
+        "rows": 1 << 14,
+        "row_elements": 1 << 10,
+    },
+}
+
+
+def _check_simulator_geometry(target, yaml_cfg: Path) -> None:
+    """Refuse a trace whose target geometry differs from the simulator's."""
+    match = re.search(r"org:\s*\n\s*preset:\s*(\S+)", yaml_cfg.read_text())
+    preset = match.group(1) if match else None
+    org = _SIMULATOR_ORGS.get(preset)
+    if org is None:
+        raise ValueError(
+            f"AiM simulator config {yaml_cfg} uses DRAM org preset {preset!r}; "
+            f"only {sorted(_SIMULATOR_ORGS)} is described"
+        )
+    geometry = _target_geometry(target)
+    mismatched = {
+        field: (getattr(geometry, field), expected)
+        for field, expected in org.items()
+        if getattr(geometry, field) != expected
+    }
+    if mismatched:
+        raise ValueError(
+            f"AiM target geometry differs from simulator preset {preset} "
+            f"(target, simulator): {mismatched}; its channel masks and bank "
+            "addresses are not executable there (use backend='virtual')"
+        )
+
+
 def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
     """Run a compiled AiM artifact through ramulator2 in Docker.
 
@@ -1115,12 +1205,17 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
     binary inside the `aim-simulator-build` Docker image. The simulator's
     YAML stdout carries per-channel `memory_system_cycles`; we parse
     out the max across channels as the headline cycle count.
+
+    ramulator2 is a timing simulator: it replays the command trace and
+    computes no data. The result is ``kind="simulator-timing-only"`` with no
+    outputs, and the caller's output arrays are never written.
     """
     reason = _aim_unavailable_reason()
     if reason is not None:
         raise SimulatorUnavailable("aim", reason)
     root = _aim_root()
     yaml_cfg = root / "test" / "example.yaml"
+    _check_simulator_geometry(compiled.target, yaml_cfg)
 
     cfg_rel = yaml_cfg.relative_to(root)
 
@@ -1191,8 +1286,12 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
     cycles = total_cycles
     combined = "\n".join(logs)
     return RunResult(
+        kind="simulator-timing-only",
         cycles=cycles,
-        stdout=combined,
+        stdout=(
+            "AiM ramulator2 is timing-only: cycles are simulated, no numerical "
+            "outputs exist and output arrays are not written\n" + combined
+        ),
         backend="aim",
         extra={
             "returncode": max(returncodes, default=0),

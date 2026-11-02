@@ -34,7 +34,6 @@ from .spmw_match import MatchTrace, MatchedOp
 from .spmw_simenv import (
     aim_unavailable_reason as _aim_unavailable_reason,
     apu_v1_unavailable_reason as _apu_v1_unavailable_reason,
-    docker_image_unavailable_reason as _docker_image_unavailable_reason,
     samsung_unavailable_reason as _samsung_unavailable_reason,
     upmem_unavailable_reason as _upmem_unavailable_reason,
 )
@@ -316,14 +315,16 @@ class CodegenContext:
 # --------------------------------------------------------------------- #
 
 
-def _eval_sym(expr, env: dict | None = None) -> int | None:
+def _eval_sym(
+    expr, env: dict | None = None, *, representative: bool = False
+) -> int | None:
     """Evaluate a SymExpr to a Python int, substituting UnitIds via ``env``.
 
-    ``env`` maps ``(level, unit_name_or_None)`` to a concrete int. UnitIds
-    not found in ``env`` default to 0 — this lets backends that emit one
-    representative trace per work-item render symbolic bank indices like
-    ``8*bg + bank`` as a concrete integer (here, 0). Returns ``None`` if
-    the expression contains a non-numeric atom the evaluator can't reduce.
+    ``env`` maps ``(level, unit_name_or_None)`` (or a bare level) to a
+    concrete int. An unbound UnitId raises ``ValueError`` naming its level and
+    unit, unless the caller explicitly asks for a ``representative`` value, in
+    which case it evaluates as unit 0. Returns ``None`` if the expression
+    contains a non-numeric atom the evaluator can't reduce.
     """
     env = env or {}
     if isinstance(expr, int):
@@ -335,11 +336,14 @@ def _eval_sym(expr, env: dict | None = None) -> int | None:
             return env[(expr.level, unit_name)]
         if expr.level in env:
             return env[expr.level]
-        # Default: representative lane 0 (autoscheduler emits one trace
-        # per work-id; symbolic bg/bank placeholders collapse to bank 0).
-        return 0
+        if representative:
+            return 0
+        raise ValueError(
+            f"unbound UnitId at level {expr.level} (unit {unit_name!r}); bind "
+            "it from the placement or request representative=True"
+        )
     if isinstance(expr, SymExpr):
-        vals = [_eval_sym(a, env) for a in expr.args]
+        vals = [_eval_sym(a, env, representative=representative) for a in expr.args]
         if any(v is None for v in vals):
             return None
         if expr.op == "add":
@@ -791,22 +795,100 @@ def _walk_buckets(
 # --------------------------------------------------------------------- #
 
 
+# What a `RunResult` evidences. See the `RunResult` docstring.
+RUN_KIND_DEVICE = "device"
+RUN_KIND_SIMULATOR = "simulator"
+RUN_KIND_SIMULATOR_TIMING_ONLY = "simulator-timing-only"
+RUN_KIND_FUNCTIONAL = "functional"
+RUN_KIND_VIRTUAL = "virtual"
+RUN_KIND_UNSPECIFIED = "unspecified"
+RUN_KINDS = frozenset(
+    {
+        RUN_KIND_DEVICE,
+        RUN_KIND_SIMULATOR,
+        RUN_KIND_SIMULATOR_TIMING_ONLY,
+        RUN_KIND_FUNCTIONAL,
+        RUN_KIND_VIRTUAL,
+    }
+)
+# Kinds whose run executed the program and read its numerical outputs back.
+RUN_KINDS_WITH_OUTPUTS = frozenset(
+    {RUN_KIND_DEVICE, RUN_KIND_SIMULATOR, RUN_KIND_FUNCTIONAL}
+)
+
+
 @dataclass
 class RunResult:
-    """Outcome of running a `Compiled` artifact on a simulator/hardware.
+    """Outcome of running a compiled artifact.
 
-    `cycles` is `None` only for a run that executed on a functional-only
-    backend (the UPMEM functional oracle, APU v2 l1_sim). A simulator or
-    device that cannot run raises `SimulatorUnavailable` instead.
-    `stdout` is the captured stdout from the sub-process / API call.
-    `backend` is the target name -- a convenience for callers that
-    don't want to dig through `compiled.target.name`.
+    `kind` states what the result evidences; every backend runner must set
+    it to one of:
+
+    * ``"device"``: physical hardware executed the program and its outputs
+      were read back.
+    * ``"simulator"``: a functional simulator executed the program and its
+      outputs were read back.
+    * ``"simulator-timing-only"``: a timing simulator ran the command stream;
+      no numerical outputs exist.
+    * ``"functional"``: a host-side functional execution of the lowered
+      program; outputs exist, `cycles` is not a measurement.
+    * ``"virtual"``: analytical cost evaluation only; nothing executed and
+      caller arrays are not written.
+
+    Numerical outputs live only in ``extra["outputs"]`` (a mapping from
+    output role or argument name to array). For ``device``, ``simulator``
+    and ``functional`` results it holds every output the run produced (an
+    all-zero array is a valid output); a runner that cannot read an output
+    back raises instead of returning. ``virtual`` and
+    ``simulator-timing-only`` results carry no outputs.
+
+    `cycles` is the backend's cycle figure, or `None` when it has none. A
+    simulator or device that cannot run raises `SimulatorUnavailable`.
+    `stdout` is the captured output of the sub-process / API call.
+    `backend` is the target (or route) name.
+
+    `kind` defaults to ``"unspecified"`` so the dataclass stays
+    constructible; `validate()` rejects such a result, and
+    `CompiledCallable.run_backend` validates every backend result.
     """
 
     cycles: int | None
     stdout: str
     backend: str
     extra: dict = field(default_factory=dict)
+    kind: str = RUN_KIND_UNSPECIFIED
+
+    def __post_init__(self):
+        if self.kind != RUN_KIND_UNSPECIFIED and self.kind not in RUN_KINDS:
+            raise ValueError(
+                f"RunResult.kind must be one of {sorted(RUN_KINDS)}, got {self.kind!r}"
+            )
+
+    @property
+    def outputs(self) -> dict:
+        """``extra["outputs"]``, or an empty dict when there is none."""
+        return dict((self.extra or {}).get("outputs") or {})
+
+    @property
+    def executed(self) -> bool:
+        """True when the run executed the program and read outputs back."""
+        return self.kind in RUN_KINDS_WITH_OUTPUTS
+
+    def validate(self) -> "RunResult":
+        """Check the kind contract; return ``self``. Raise RuntimeError on a
+        result with no kind or a non-executing result carrying outputs."""
+        if self.kind not in RUN_KINDS:
+            raise RuntimeError(
+                f"backend {self.backend!r} returned a RunResult without a kind; "
+                f"runners must set kind to one of {sorted(RUN_KINDS)}"
+            )
+        if not self.executed and self.outputs:
+            raise RuntimeError(
+                f"backend {self.backend!r} returned a {self.kind!r} RunResult "
+                f"carrying outputs {sorted(self.outputs)}; only "
+                f"{sorted(RUN_KINDS_WITH_OUTPUTS)} results may carry outputs"
+            )
+        return self
 
 
 class SimulatorUnavailable(RuntimeError):
@@ -826,8 +908,6 @@ def simulator_unavailable_reason(target_name: str) -> str | None:
         return _aim_unavailable_reason()
     if target_name == "apu_v1":
         return _apu_v1_unavailable_reason()
-    if target_name == "apu_v2":
-        return _docker_image_unavailable_reason("gsi-g2-l1sim")
     if target_name == "upmem":
         return _upmem_unavailable_reason()
     return f"no simulator runner for target {target_name!r}"
@@ -841,13 +921,21 @@ def simulator_unavailable_reason(target_name: str) -> str | None:
 
 
 def _run_virtual(compiled: "Compiled", **inputs) -> RunResult:
-    """Execute the already-lowered cost program without a simulator."""
+    """Evaluate the already-lowered cost program; nothing executes.
+
+    The result has ``kind="virtual"`` and no outputs: caller arrays are left
+    untouched.
+    """
     if compiled.cost is None or compiled.execution_graph is None:
         raise RuntimeError("virtual execution requires an executable CostSpec")
     estimate = compiled.cost.evaluate(compiled.execution_graph)
     return RunResult(
+        kind=RUN_KIND_VIRTUAL,
         cycles=estimate.cycles,
-        stdout=f"virtual backend: executable cost spec {compiled.cost.spec.name!r}",
+        stdout=(
+            f"virtual backend: executable cost spec {compiled.cost.spec.name!r}; "
+            "analytical estimate only, nothing executed, outputs not written"
+        ),
         backend="virtual",
         extra={
             "critical_path": list(estimate.critical_path),
@@ -1042,7 +1130,6 @@ _BACKENDS: dict[str, tuple[str, str, str | None]] = {
     "samsung_hbm_pim": ("allo.spmw_samsung", "SamsungCtx", "_run_samsung"),
     "aim": ("allo.spmw_aim", "AimCtx", "_run_aim"),
     "apu_v1": ("allo.spmw_apu_v1", "APUv1Ctx", "_run_apu_v1"),
-    "apu_v2": ("allo.spmw_apu_v2", "APUv2Ctx", "_run_apu_v2"),
     "upmem": ("allo.spmw_upmem", "UpmemCtx", "_run_upmem"),
 }
 
@@ -1122,8 +1209,6 @@ _MOVED: dict[str, str] = {
     "_apu_v1_output_specs": "allo.spmw_apu_v1",
     "_apu_v1_prepare_io": "allo.spmw_apu_v1",
     "_run_apu_v1": "allo.spmw_apu_v1",
-    "APUv2Ctx": "allo.spmw_apu_v2",
-    "_run_apu_v2": "allo.spmw_apu_v2",
 }
 
 
@@ -1400,6 +1485,31 @@ def compile_for_target(
         raise ValueError(
             f"trace.target_name {trace.target_name!r} != target.name {target_name!r}"
         )
+
+    # Release gate G2: no dropped store and no silently changed accumulator
+    # initial value, whichever route produced the trace.
+    from .spmw_match_engine import require_match_coverage
+
+    checked_trace = require_match_coverage(trace, target=target, module=module)
+    if target_name in ("samsung_hbm_pim", "aim", "apu_v1"):
+        carried = [
+            match
+            for match in checked_trace.matches
+            if match.extra.get("accumulator_init") == "carried"
+        ]
+        if carried:
+            first = carried[0]
+            raise NotImplementedError(
+                f"{target_name}: {first.target_op_name} in {first.func_name!r} "
+                f"accumulates into {first.result_memref_name!r}, a caller-provided "
+                "buffer the kernel never initializes (the `y[i] += ...` form, "
+                "accumulator_init='carried'). This device zeroes its accumulator "
+                "before each reduction, so the caller's initial value would be "
+                "lost. Initialize a local accumulator with literal 0 before the "
+                "reduction loop and store it to the output "
+                "(`acc = 0; for k: acc += ...; y[i] = acc`); lowering the carried "
+                "form with a host epilogue add is not implemented."
+            )
 
     # Gap-1 derive/lint: compare the trace's work-id partition against the grid
     # implied by the @allo.unit tree. Warns + auto-fills; never raises.

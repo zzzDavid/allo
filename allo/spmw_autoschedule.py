@@ -809,18 +809,14 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
 
 def _aim_contraction_shape(target, matches: list[MatchedOp]) -> dict:
     """Shape of the bucket's first MAC match, as the knobs and cost see it."""
-    import math
-
     from .pim.aim_lowering import contraction_shape, group_replication
 
     mac = next(match for match in matches if match.target_op_name == "MAC")
-    channels = math.prod(int(v) for v in target.unit("channel").axes.values())
     replicated, buckets = group_replication(mac)
     shape = contraction_shape(
         mac,
         replicated=replicated,
         replicas=buckets if replicated else 1,
-        channels=channels,
     )
     acc = next(op for op in mac.operands if op.role == "acc")
     shape["activation"] = any(
@@ -1094,42 +1090,6 @@ def _apu_v1_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
                 "n_stage_boundaries": n_boundaries,
             },
             layout=layout,
-        )
-    ]
-
-
-@register_enumerator("apu_v2")
-def _apu_v2_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
-    """Enumerate placements for APU v2.
-
-    Per spec 013 §D.4, the canonical L1-row layout is a one-liner
-    `LinearLayout.identity` over the element + group axes. The L1 grid
-    is the operand store; l1_sim treats all L1 addresses uniformly so
-    there is no swizzle algebra to exercise yet.
-    """
-    role_to_memref = _trace_memrefs_by_role(matches)
-    x_mref = role_to_memref.get("x")
-    y_mref = role_to_memref.get("y")
-    acc_mref = role_to_memref.get("acc")
-    if x_mref is None or y_mref is None or acc_mref is None:
-        raise NotImplementedError(
-            "apu_v2 enumerator: trace is missing one of x/y/acc roles; "
-            f"got {sorted(role_to_memref)}"
-        )
-
-    # APU v2 topology note: 64K-lane element axis with a 16-row L1 group.
-    # Until retained semantics and codegen prove interchangeable operand rows,
-    # expose only the canonical physical binding rather than a cost-identical
-    # synthetic challenger.
-    l1 = target.l1
-    return [
-        Placement(
-            placements={
-                x_mref: l1[0],
-                y_mref: l1[1],
-                acc_mref: l1[2],
-            },
-            mode="l1_row_canonical",
         )
     ]
 

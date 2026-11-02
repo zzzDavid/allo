@@ -413,6 +413,7 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
             _parse_vector_profile(log),
             log,
             "apu_v1",
+            kind="device",
             extra={
                 "outputs": outputs,
                 "raw_outputs": raw_outputs,

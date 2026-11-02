@@ -584,6 +584,7 @@ def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
             outputs[packing["output"]] = logical
 
         return RunResult(
+            kind="device",
             cycles=cycles,
             stdout=combined,
             backend="apu_v1",

@@ -5,9 +5,9 @@
 Each row times the compile against a budget, then runs behind its environment
 gate. Paper cycle numbers live only in ``test_paper_golden.py``.
 
-APU v2 has no row: neither its hardware nor its simulator is present here, and
-its GEMV vector path was deleted. The composed and typed APU v2 compile-only
-tests keep that backend's code compiling.
+APU v2 (Gemini-II) has no row: it has no source route, so ``allo.compile`` of
+this GEMV on it raises NotImplementedError (``test_gemv_apu_v2_source_rejected``).
+Its typed and composed program routes are tested separately.
 """
 
 from __future__ import annotations
@@ -64,12 +64,22 @@ def test_gemv_samsung_hbm_pim(samsung_sim_gate):
     result = compiled(W, x, y)
 
     assert result.cycles > 0
+    assert result.kind == "simulator"
     np.testing.assert_allclose(
         y.astype(np.float32),
         W.astype(np.float32) @ x.astype(np.float32),
         rtol=1e-2,
         atol=1e-2,
     )
+
+
+def test_gemv_apu_v2_source_rejected():
+    from allo.pim.costs import apu_g2_cost
+    from allo.pim.targets import build_apu_g2_target
+
+    workload, _M, _K = _samsung_case()
+    with pytest.raises(NotImplementedError, match="APUG2TypedProgram"):
+        allo.compile(workload, build_apu_g2_target(), apu_g2_cost)
 
 
 # --------------------------------------------------------------------- #
@@ -106,6 +116,9 @@ def test_gemv_aim(aim_sim_gate):
     # The AiM run replays a ramulator2 trace and reports cycles only.
     assert result.cycles > 0
     assert result.backend == "aim"
+    assert result.kind == "simulator-timing-only"
+    assert result.outputs == {}
+    np.testing.assert_array_equal(y, np.zeros(AIM_M, dtype=np.float32))
     assert "[AiMTrace]" in result.stdout
 
     (kernel,) = compiled.placement_ranking.kernels
@@ -250,7 +263,11 @@ def test_gemv_upmem():
 
     assert address_only(upmem_gemv_row0, "row0")
     assert not address_only(upmem_gemv_data_temp, "t")
-    with pytest.raises(NotImplementedError, match="store to t .* not covered"):
+    # The matcher's coverage analysis now rejects it first: the accumulator's
+    # initializer is the non-constant data temporary ``t``.
+    from allo.spmw_match import UnsupportedWorkloadError
+
+    with pytest.raises(UnsupportedWorkloadError, match="initializer .* non-constant"):
         allo.compile(upmem_gemv_data_temp, build_upmem_target(), upmem_cost)
 
     import conftest
@@ -264,6 +281,7 @@ def test_gemv_upmem():
 
     np.testing.assert_array_equal(y, W @ x)
     assert result.backend == "upmem"
+    assert result.kind == "simulator"
     assert result.cycles > 0
     (record,) = result.extra["upmem"]
     assert record["num_dpus"] == _UPMEM_MAPPING[0]

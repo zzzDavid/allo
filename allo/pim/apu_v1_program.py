@@ -400,11 +400,40 @@ def _parse_scalar_profile(text):
     return int(totals[-1]) if totals else None
 
 
+_APU_V1_PROGRAM_BACKENDS = (None, "virtual", "functional")
+
+
 class CompiledAPUv1Program:
+    """One single-phase APUv1Program lowered to scalar ARC C or a native recipe.
+
+    ``backend`` selects what :meth:`run` does:
+
+    * ``None``: build and launch on the APU v1 board (``kind="device"``).
+    * ``"virtual"``: evaluate the retained cost graph; the device is neither
+      probed nor launched and no array is written (``kind="virtual"``).
+    * ``"functional"``: compile the retained MLIR-derived portable C for the
+      host and execute it (``kind="functional"``, ``cycles=None``). The scalar
+      ARC device program is that same C, so this executes the lowered
+      program. Native-vector programs run a GVML recipe that has no host
+      execution path, so they reject ``"functional"`` at compile time.
+    """
+
     def __init__(self, program, target, cost=None, backend=None):
+        if backend not in _APU_V1_PROGRAM_BACKENDS:
+            raise ValueError(
+                "APUv1Program supports backend=None (device), 'virtual', or "
+                f"'functional'; got {backend!r}"
+            )
         self.program = program
         self.target = target
         self.cost = cost
+        self.backend = backend
+        self._host_module = None
+        if backend == "virtual" and cost is None:
+            raise ValueError(
+                "APUv1Program backend='virtual' evaluates the retained cost graph "
+                "and needs a cost spec (e.g. allo.pim.costs.apu_v1_cost)"
+            )
         if len(program.phases) != 1:
             raise RuntimeError(
                 "multi-phase APUv1Program requires the hybrid orchestration backend"
@@ -518,14 +547,15 @@ class CompiledAPUv1Program:
                     attributes={"source": "retained_mlir"},
                 )
                 cost.emit(self.execution_graph, event)
+        if backend == "functional" and self.native_vector_lowering is not None:
+            raise NotImplementedError(
+                f"APUv1Program backend='functional' executes the scalar ARC C on "
+                f"the host; {program.name!r} lowers to the native vector route "
+                f"{self.native_vector_lowering.route!r}, whose GVML program has no "
+                "host execution path. Use backend=None (device) or 'virtual'"
+            )
 
-    def run(self, **inputs):
-        from ..spmw_codegen import SimulatorUnavailable
-        from ..spmw_simenv import apu_v1_unavailable_reason as _apu_v1_unavailable_reason
-
-        reason = _apu_v1_unavailable_reason()
-        if reason:
-            raise SimulatorUnavailable("apu_v1", reason)
+    def _checked_sources(self, inputs):
         normalized = {}
         for argument in self.source_arguments:
             value = inputs[argument.name]
@@ -537,6 +567,82 @@ class CompiledAPUv1Program:
                     f"got {value.dtype}{value.shape}"
                 )
             normalized[argument.name] = np.ascontiguousarray(value)
+        return normalized
+
+    def _run_virtual(self, inputs):
+        self._checked_sources(inputs)
+        estimate = self.cost.evaluate(self.execution_graph)
+        spec = getattr(self.cost, "spec", self.cost)
+        return RunResult(
+            estimate.cycles,
+            "virtual APUv1Program cost evaluation; device not launched, "
+            "nothing executed, outputs not written",
+            "virtual",
+            kind="virtual",
+            extra={
+                "critical_path": list(estimate.critical_path),
+                "utilization": dict(estimate.utilization),
+                "bottlenecks": list(estimate.bottlenecks),
+                "model_fingerprint": estimate.model_fingerprint,
+                "cost_model": getattr(spec, "name", None),
+                "priced_target": self.target.name,
+            },
+        )
+
+    def _run_functional(self, inputs):
+        # Private copies keep the caller's arrays untouched until the outputs
+        # are copied back, as on the device path.
+        sources = {
+            name: np.array(value, order="C", copy=True)
+            for name, value in self._checked_sources(inputs).items()
+        }
+        if self._host_module is None:
+            self._host_module = self.artifact.compile()
+        returned = self._host_module(
+            *(sources[argument.name] for argument in self.source_arguments)
+        )
+        results = [argument for argument in self.arguments if argument.source == "result"]
+        if len(results) == 1:
+            returned = (returned,)
+        returned = dict(zip((argument.name for argument in results), returned or ()))
+        outputs = {}
+        for argument in self.outputs:
+            value = (
+                returned[argument.name]
+                if argument.source == "result"
+                else sources[argument.name]
+            )
+            value = np.asarray(value, dtype=argument.numpy_dtype).reshape(
+                argument.shape
+            )
+            outputs[argument.name] = value
+            if argument.name in inputs:
+                np.copyto(inputs[argument.name], value, casting="same_kind")
+        return RunResult(
+            None,
+            "functional APUv1Program: retained MLIR-derived portable C executed "
+            "on the host; cycles are not measured",
+            "apu_v1-functional",
+            kind="functional",
+            extra={
+                "outputs": outputs,
+                "scalar_arc": True,
+                "host_library": self._host_module.library_path,
+            },
+        )
+
+    def run(self, **inputs):
+        from ..spmw_codegen import SimulatorUnavailable
+        from ..spmw_simenv import apu_v1_unavailable_reason as _apu_v1_unavailable_reason
+
+        if self.backend == "virtual":
+            return self._run_virtual(inputs)
+        if self.backend == "functional":
+            return self._run_functional(inputs)
+        reason = _apu_v1_unavailable_reason()
+        if reason:
+            raise SimulatorUnavailable("apu_v1", reason)
+        normalized = self._checked_sources(inputs)
         normalized[self.scratch_role] = np.zeros(self.scratch_bytes, dtype=np.uint8)
         if self.native_vector_lowering is not None:
             normalized = self.native_vector_lowering.pack_inputs(normalized)
@@ -615,6 +721,7 @@ class CompiledAPUv1Program:
                 _parse_scalar_profile(log),
                 log,
                 "apu_v1",
+                kind="device",
                 extra={
                     "outputs": outputs,
                     "scalar_arc": self.native_vector_lowering is None,

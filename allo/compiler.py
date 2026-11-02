@@ -32,7 +32,7 @@ from .pim.apu_g2_typed_program import (
 from .spmw_autoschedule import MatcherWorkScope, _retain_matcher_work_scope
 from .spmw_codegen import RunResult, compile_for_target, source_backend_binding
 from .spmw_liveness import MatcherValueId, trace_liveness
-from .spmw_match_engine import match_workload
+from .spmw_match_engine import match_workload, require_match_coverage
 from .spmw_plan import BufferMetricManifest, launch_schedule
 from .spmw_target import HostProgram
 
@@ -448,9 +448,13 @@ class CompiledCallable:
     """An Allo-style callable backed by a compiled PIM artifact.
 
     Calls accept positional or keyword NumPy operands according to the original
-    workload signature and return a :class:`RunResult`. When a backend returns
-    output arrays, explicitly gathered output arguments are updated in place,
-    matching the mutation behavior of Allo's LLVM callable modules.
+    workload signature and return a :class:`RunResult`. For an executed run
+    (``RunResult.kind`` in ``"device"``, ``"simulator"``, ``"functional"``) the
+    output arguments are updated in place from ``RunResult.extra["outputs"]``,
+    matching the mutation behavior of Allo's LLVM callable modules; a run that
+    reports success without an output for a gathered or bound output argument
+    raises RuntimeError. ``"virtual"`` and ``"simulator-timing-only"`` runs
+    leave every argument untouched.
     """
 
     def __init__(
@@ -498,9 +502,15 @@ class CompiledCallable:
 
         This compiler-testing escape hatch supports backend ABIs whose lowered
         operand roles differ from the source workload signature. Applications
-        should normally call the object directly.
+        should normally call the object directly. The backend result must carry
+        a valid ``RunResult.kind`` (see :class:`RunResult`).
         """
         result = self.compiled.run(**inputs)
+        if not isinstance(result, RunResult):
+            raise RuntimeError(
+                f"backend returned {type(result).__name__}, expected RunResult"
+            )
+        result.validate()
         self._copy_outputs(result, inputs)
         self.last_result = result
         return result
@@ -538,9 +548,15 @@ class CompiledCallable:
         return {}
 
     def _copy_outputs(self, result, arguments):
-        outputs = result.extra.get("outputs", {}) if result.extra else {}
-        if not outputs:
+        """Write ``extra["outputs"]`` of an executed run into the arguments.
+
+        Virtual and timing-only results write nothing. An executed result
+        must cover every gathered output role (or, with none, the bound
+        output parameter); a missing one raises RuntimeError.
+        """
+        if not result.executed:
             return
+        outputs = result.outputs
         gather_roles = []
         for resolved in getattr(self.compiled, "host_moves", ()):
             verb = getattr(getattr(resolved, "verb", None), "name", None)
@@ -548,6 +564,18 @@ class CompiledCallable:
                 gather_roles.append(resolved.buffer_role)
 
         binding = getattr(self, "_source_binding", None)
+        required = list(gather_roles)
+        if not required and binding is not None and binding.output in arguments:
+            required.append(binding.output)
+        if not outputs:
+            if required:
+                raise RuntimeError(
+                    f"backend {result.backend!r} reported success "
+                    f"(kind={result.kind!r}) but produced no output for role(s) "
+                    f"{required}"
+                )
+            return
+
         if (
             binding is not None
             and (binding.inputs or binding.output is not None)
@@ -566,6 +594,14 @@ class CompiledCallable:
                     assignments[lower_names[output_name.lower()]] = value
             if len(outputs) == 1 and len(gather_roles) == 1:
                 assignments.setdefault(gather_roles[0], next(iter(outputs.values())))
+
+        missing = [name for name in required if name not in assignments]
+        if missing:
+            raise RuntimeError(
+                f"backend {result.backend!r} reported success "
+                f"(kind={result.kind!r}) but produced no output for role(s) "
+                f"{missing}; it returned outputs {sorted(outputs)}"
+            )
 
         for name, value in assignments.items():
             destination = arguments[name]
@@ -648,9 +684,14 @@ def compile(
     1. Typed program frontends. ``APUv1Program``, ``APUG2TypedProgram`` and
        ``APUG2ComposedContractionProgram`` each compile through their own
        route. ``APUv1Program`` accepts
-       ``backend in (None, "virtual", "functional")``; the APU v2 routes
-       validate ``backend`` themselves. No typed route accepts
-       ``host_moves`` or ``layout``.
+       ``backend in (None, "virtual", "functional")``: ``None`` builds and
+       launches on the board, ``"virtual"`` evaluates the retained cost graph
+       without touching the device, and ``"functional"`` executes the
+       retained MLIR-derived portable C on the host (scalar ARC programs
+       only; native-vector programs reject it at compile time). The APU v2
+       routes validate ``backend`` themselves. No typed route accepts
+       ``host_moves`` or ``layout``. Gemini-II (``apu_v2``) has no source
+       route: an ordinary source workload on it raises NotImplementedError.
     2. Source frontend. A plain ``@allo`` workload is customized to MLIR.
     3. Contraction frontend (APU v1, non-dataflow only). Contractions go
        through the APU v1 layout-plan vector path; anything else falls through.
@@ -674,6 +715,15 @@ def compile(
     backend : str or None
         ``None`` selects the target's normal simulator/device runner;
         ``"virtual"`` evaluates only the analytical performance graph.
+
+    Returns
+    -------
+    A callable whose calls return a :class:`RunResult`. Check
+    ``RunResult.kind`` before reading output arrays: only ``"device"``,
+    ``"simulator"`` and ``"functional"`` runs write outputs. With
+    ``backend="virtual"`` (kind ``"virtual"``) and on timing-only targets such
+    as AiM (kind ``"simulator-timing-only"``) the output arrays are not
+    written and keep whatever the caller put in them.
     host_moves : sequence or None
         Explicit host-transfer records. They are never discovered implicitly.
     layout : object
@@ -688,6 +738,12 @@ def compile(
             return _compile_program(
                 route, workload, target, bound_cost, backend, host_moves, layout
             )
+    if target.name == "apu_v2":
+        raise NotImplementedError(
+            "Gemini-II (apu_v2) compiles APUG2TypedProgram or "
+            "APUG2ComposedContractionProgram records; ordinary source workloads "
+            "have no Gemini-II lowering in this release"
+        )
 
     schedule = customize(workload, enable_tensor=False)
     # Dataflow regions retain their matcher/group implementation through typed
@@ -708,6 +764,7 @@ def compile(
             pass
 
     trace = match_workload(target, schedule.module)
+    require_match_coverage(trace, target=target, defer_unknown=True)
     _stamp_matcher_work_scopes(target, schedule.module, trace)
     launch_order = None
     if isinstance(host_moves, HostProgram):

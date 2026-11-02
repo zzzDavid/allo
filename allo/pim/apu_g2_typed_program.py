@@ -795,6 +795,7 @@ class APUG2TypedCallable:
 
         if self.backend == "virtual":
             result = RunResult(
+                kind="virtual",
                 cycles=int(self.estimate_result.cycles),
                 stdout="virtual APUg2 typed cost evaluation; hardware not executed",
                 backend="virtual",

@@ -469,7 +469,6 @@ def register_default_knobs():
     for tname in (
         "samsung_hbm_pim",
         "apu_v1",
-        "apu_v2",
     ):
         register_knob(tname, Knob("residency", _residency_candidates, _residency_emit))
 
@@ -481,7 +480,6 @@ def register_default_knobs():
     for tname in (
         "samsung_hbm_pim",
         "apu_v1",
-        "apu_v2",
     ):
         register_knob(tname, Knob("tile", _tile_candidates, _tile_emit))
 
@@ -494,7 +492,6 @@ def register_default_knobs():
     for tname in (
         "samsung_hbm_pim",
         "apu_v1",
-        "apu_v2",
     ):
         register_knob(
             tname, Knob("double_buffer", _double_buffer_candidates, _double_buffer_emit)

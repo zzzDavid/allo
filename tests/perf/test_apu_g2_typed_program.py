@@ -118,6 +118,7 @@ def test_device_dispatch_preserves_native_int15_output(monkeypatch):
             73,
             "software-only fake typed device",
             "apu_v2",
+            kind="device",
             extra={
                 "outputs": {
                     "out": observed,

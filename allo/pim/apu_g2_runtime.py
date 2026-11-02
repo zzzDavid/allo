@@ -442,6 +442,7 @@ def run_apu_g2_u16_add(
             cycles,
             text,
             "apu_v2",
+            kind="device",
             extra={
                 "outputs": {"out": output},
                 "raw_ticks": ticks,

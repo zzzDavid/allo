@@ -164,6 +164,54 @@ class MatchedOp:
     vector_width: int = 1
 
 
+class UnsupportedWorkloadError(ValueError):
+    """The workload has an effect no target op implements.
+
+    Raised instead of compiling a program that would silently drop a store
+    (an unmatched computation, an unrecognised copy into an output) or
+    silently change an accumulator's initial value.
+    """
+
+
+# Store categories recorded by the matcher's coverage analysis.  Every store
+# in every matched function falls in exactly one of them.
+STORE_MATCHED = "matched"
+STORE_COPY = "copy"
+STORE_ACCUMULATOR_INIT = "accumulator_init"
+STORE_LOCAL = "local"
+STORE_UNMATCHED = "unmatched"
+
+
+@dataclass(frozen=True)
+class StoreCoverage:
+    """How one store site of the workload is implemented."""
+
+    func_name: str
+    # ``"<store op>@<stored ssa>"``, the same handle as ``MatchedOp.op_range[1]``.
+    store: str
+    memref_name: str | None
+    enclosing_loops: tuple
+    category: str
+    detail: str = ""
+
+
+@dataclass
+class MatchCoverage:
+    """Whole-module store coverage computed by ``match_workload``.
+
+    ``errors`` holds one actionable message per distinct unsupported store
+    (unmatched effect or unsupported accumulator initialization);
+    ``spmw_match_engine.require_match_coverage`` raises them, except those of
+    functions the backend executes verbatim on the host.
+    """
+
+    stores: list[StoreCoverage] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    # ``(function names, message)`` behind ``errors``, so a backend that runs
+    # a function verbatim on the host can exempt exactly that function.
+    problems: list[tuple[tuple[str, ...], str]] = field(default_factory=list)
+
+
 @dataclass
 class MatchTrace:
     """Top-level container — what `match_workload(target, module)` returns."""
@@ -176,6 +224,9 @@ class MatchTrace:
     # workloads use their ABI argument ordinal); values are the canonical IR
     # references already carried by matcher operands/results.
     source_value_refs: dict[int, IRValueRef] = field(default_factory=dict)
+    # Store coverage of the module this trace was matched from.  None for a
+    # trace assembled by hand or sliced from another trace.
+    coverage: MatchCoverage | None = None
 
     def by_target_op(self, name: str) -> list[MatchedOp]:
         return [m for m in self.matches if m.target_op_name == name]

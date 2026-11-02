@@ -41,7 +41,20 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ._mlir.ir import AsmState
-from .spmw_match import IRValueRef, MatchedOp, MatchTrace, OperandBinding
+from .spmw_match import (
+    STORE_ACCUMULATOR_INIT,
+    STORE_COPY,
+    STORE_LOCAL,
+    STORE_MATCHED,
+    STORE_UNMATCHED,
+    IRValueRef,
+    MatchCoverage,
+    MatchedOp,
+    MatchTrace,
+    OperandBinding,
+    StoreCoverage,
+    UnsupportedWorkloadError,
+)
 
 
 # --------------------------------------------------------------------- #
@@ -1601,56 +1614,157 @@ def _parse_loop_upper(text: str) -> int | None:
     return None
 
 
+def _accumulator_scope_depth(acc: OperandBinding) -> int | None:
+    """Number of enclosing region ops around the accumulator's definition.
+
+    Reads the canonical ``IRValueRef`` path built by `_build_ir_value_refs`:
+    ``(function, 0, argument)`` for a function argument (depth 0) and
+    ``(function, 1, op, (region, block, op)*, result)`` for an op result,
+    where each ``(region, block, op)`` triple is one nesting level.
+    """
+    ref = acc.value_ref
+    if ref is None or ref.namespace != "mlir":
+        return None
+    path = ref.path
+    if len(path) == 3 and path[1] == 0:
+        return 0
+    if len(path) < 4 or path[1] != 1 or (len(path) - 4) % 3:
+        return None
+    return (len(path) - 4) // 3
+
+
+def _axis_roles(match: MatchedOp) -> dict:
+    """Structural role of every enclosing loop of one accumulating match.
+
+    The result coordinate of an accumulation is the accumulator element it
+    stores to.  For an indexed accumulator (``y[i] += ...``) the result loops
+    are the loop variables in the store index (``extra['store_indices']``).
+    For an accumulator element whose index carries no loop variable
+    (``acc: T = 0`` declared in a loop body, or ``y[0] += ...``) a fresh
+    element exists per iteration of exactly the loops that enclose its
+    definition, so those loops are the result loops.  Every other enclosing
+    loop is a reduction loop.
+
+    The two inputs split into the matrix and the vector: the matrix is the
+    input whose index set strictly contains the other's (``K[h, s, d]`` over
+    ``q[h, d]``), otherwise the first input in pattern order.  A result loop
+    is then a BATCH axis iff its variable indexes the vector (``X[b, k]``,
+    and also the per-head ``h`` of ``q[h, d]``/``K[h, s, d]``: each value
+    selects its own vector), and an OUTPUT axis otherwise (``W[i, k]`` /
+    ``W[row0 + i, k]`` with ``x[k]``: the vector is shared).  When both
+    inputs bind one buffer there is no shared vector and every result loop
+    is an output axis.
+
+    Returns ``{"reduction", "output", "batch"}`` (loop-variable tuples in
+    loop order), ``trips`` (variable -> static trip count), ``matrix`` /
+    ``vector`` (input roles) and ``unresolved``: ``None`` or the reason the
+    roles cannot be proven from the retained match.  Matches without a
+    loop-carried accumulator carry no roles (``unresolved`` says so).
+    """
+    roles = {
+        "reduction": (),
+        "output": (),
+        "batch": (),
+        "trips": {},
+        "matrix": None,
+        "vector": None,
+        "same_buffer": False,
+        "unresolved": None,
+    }
+
+    def unresolved(reason):
+        roles["unresolved"] = reason
+        return roles
+
+    loops = list(match.enclosing_loops)
+    loop_vars = [loop[0] for loop in loops]
+    accumulators = [opb for opb in match.operands if opb.is_loop_carried]
+    inputs = [
+        opb
+        for opb in match.operands
+        if not opb.is_loop_carried and opb.memref_name is not None
+    ]
+    if len(accumulators) != 1:
+        return unresolved("match has no single loop-carried accumulator")
+    if not loops:
+        return unresolved("accumulation has no enclosing loop")
+    if len(inputs) != 2:
+        return unresolved(f"expected two memref inputs, got {len(inputs)}")
+
+    trips = {}
+    for var, lower, upper, step in loops:
+        lo, hi = _parse_loop_upper(str(lower)), _parse_loop_upper(str(upper))
+        if lo is None or hi is None or int(step) <= 0:
+            return unresolved(f"loop {var} has no static trip count ({upper})")
+        trips[var] = max(0, -(-(hi - lo) // int(step)))
+    roles["trips"] = trips
+
+    first, second = inputs
+    same_buffer = first.memref_name == second.memref_name
+    if same_buffer:
+        matrix = vector = first
+    elif set(second.indices) > set(first.indices):
+        matrix, vector = second, first
+    else:
+        matrix, vector = first, second
+    roles["matrix"], roles["vector"] = matrix.role, vector.role
+    roles["same_buffer"] = same_buffer
+
+    (acc,) = accumulators
+    store = list(match.extra.get("store_indices", ()))
+    if store:
+        opaque = [index for index in store if index not in loop_vars]
+        if opaque:
+            return unresolved(
+                f"result index {opaque} is not an enclosing loop variable"
+            )
+        result_vars = [var for var in loop_vars if var in store]
+    else:
+        if match.extra.get("guards"):
+            return unresolved("guarded accumulator scope")
+        depth = _accumulator_scope_depth(acc)
+        if depth is None:
+            return unresolved("accumulator definition scope is not retained")
+        if depth > len(loops):
+            return unresolved("accumulator is defined below the matched loops")
+        result_vars = loop_vars[:depth]
+    roles["reduction"] = tuple(var for var in loop_vars if var not in result_vars)
+
+    vector_opaque = [index for index in vector.indices if index not in loop_vars]
+    outputs, batches = [], []
+    for var in result_vars:
+        if same_buffer:
+            outputs.append(var)
+        elif var in vector.indices:
+            batches.append(var)
+        elif vector_opaque:
+            return unresolved(
+                f"vector index {vector_opaque} may depend on result loop {var}"
+            )
+        else:
+            outputs.append(var)
+    roles["output"], roles["batch"] = tuple(outputs), tuple(batches)
+    return roles
+
+
 def batch_dim(match: MatchedOp) -> tuple[str | None, int | None]:
     """Return ``(batch_loop_var, B)`` for a batched reduction match.
 
-    SPEC-026 §1.2. A loop ``L`` in ``match.enclosing_loops`` is the BATCH
-    loop iff its iter var:
-      (a) indexes some non-accumulator input operand load (the per-batch input
-          vector may be stored either X[b,k] or X[k,b]), AND
-      (b) is ABSENT from some OTHER non-accumulator input operand's index
-          list (the resident weight W[row, k], which the batch axis never
-          indexes).
+    The batch axes are the result loops whose variable indexes the vector
+    input (see `_axis_roles`); ``B`` is the product of their trip counts and
+    ``batch_loop_var`` the outermost one.  The output loop of ``W[f(i), k] *
+    x[k]`` is never a batch: it does not index the vector.
 
-    This is the structural separation between the batch axis (leading
-    index of one input, absent from the other) and the reduction axis
-    (present in *every* input's index list). It is computed over loop
-    vars + operand indices only -- never a positional ``enclosing_loops[0]``
-    assumption, never a shape literal. ``B`` is `_parse_loop_upper(L.upper)`.
-
-    Returns ``(None, None)`` when no loop satisfies (a)+(b): the canonical
-    single-vector GEMV and the eltwise paths, which downstream treats as
-    ``B = 1`` (SPEC-026 I4 parity).
+    Returns ``(None, None)`` when the match has no batch axis or its roles
+    are unresolved; downstream treats that as ``B = 1``.
     """
-    loops = match.enclosing_loops
-    if not loops:
+    roles = _axis_roles(match)
+    if roles["unresolved"] is not None or not roles["batch"]:
         return (None, None)
-    loop_vars = {L[0] for L in loops}
-
-    # Non-accumulator input operands with at least one index.
-    inputs = [opb for opb in match.operands if not opb.is_loop_carried and opb.indices]
-    if len(inputs) < 2:
-        # Need >=2 inputs to separate "leading index of one, absent from
-        # another"; a single-input reduction has no batch axis.
-        return (None, None)
-
-    for L in loops:
-        var = L[0]
-        # (a) indexes some input operand.  Requiring a leading index loses the
-        # canonical PolyBench A@B spelling, whose column batch is B[k,j].
-        is_input_axis = any(var in opb.indices for opb in inputs)
-        if not is_input_axis:
-            continue
-        # (b) absent from some OTHER input operand entirely.
-        absent_elsewhere = any(var not in opb.indices for opb in inputs)
-        if not absent_elsewhere:
-            continue
-        # Guard: a batch axis is an enclosing loop var (so B is bounded by
-        # the trace, never a literal we invented).
-        if var not in loop_vars:
-            continue
-        return (var, _parse_loop_upper(L[2]))
-    return (None, None)
+    extent = 1
+    for var in roles["batch"]:
+        extent *= roles["trips"][var]
+    return (roles["batch"][0], extent)
 
 
 def _stamp_batch_dims(trace: MatchTrace) -> None:
@@ -1660,11 +1774,88 @@ def _stamp_batch_dims(trace: MatchTrace) -> None:
     Single source of truth: cost (205) and codegen (206) read
     `extra['batch_dim']` and never re-derive it. A match with no batch
     axis gets ``batch_dim = 1`` (I4 parity).
+
+    Also stamps ``extra['axis_roles']`` (see `_axis_roles`) and, per matched
+    position of a work-item group (functions ``<root>_<id>...``), the whole
+    group fact ``axis_roles['work_axis']``: which contraction axis the work id
+    partitions.  It is ``"output"`` when only the matrix access differs
+    between work items (or hides an index that is not a loop variable) while
+    the vector access is identical and fully visible, ``"batch"`` in the
+    mirrored case, and ``None`` otherwise, with the reason in
+    ``axis_roles['work_axis_reason']``.
     """
+
+    def access_status(column, role):
+        accesses = set()
+        opaque = False
+        for match in column:
+            operand = next(op for op in match.operands if op.role == role)
+            loop_vars = {loop[0] for loop in match.enclosing_loops}
+            accesses.add(
+                (operand.memref_name, tuple(operand.indices), operand.index_map)
+            )
+            opaque = opaque or any(index not in loop_vars for index in operand.indices)
+        if len(accesses) > 1:
+            return "varies"
+        return "opaque" if opaque else "invariant"
+
+    def work_axis(column):
+        roles = [match.extra["axis_roles"] for match in column]
+        if any(r["unresolved"] is not None for r in roles):
+            return None, "axis roles are unresolved"
+        first = roles[0]
+        if any(
+            (r["matrix"], r["vector"], r["trips"]) != (first["matrix"], first["vector"], first["trips"])
+            for r in roles
+        ):
+            return None, "work items differ in operand roles or loop extents"
+        if first["same_buffer"]:
+            if access_status(column, first["matrix"]) == "invariant":
+                return None, "no input access depends on the work id"
+            return None, "the single shared input depends on the work id"
+        matrix = access_status(column, first["matrix"])
+        vector = access_status(column, first["vector"])
+        if vector == "invariant" and matrix != "invariant":
+            return "output", "only the matrix access depends on the work id"
+        if matrix == "invariant" and vector != "invariant":
+            return "batch", "only the vector access depends on the work id"
+        if matrix == vector == "invariant":
+            return None, "no input access depends on the work id"
+        return None, (
+            f"matrix access {matrix} and vector access {vector} across work "
+            "items: the work id may split the reduction or a shared axis"
+        )
+
+    groups: dict[str, dict[str, list]] = {}
     for m in trace.matches:
-        var, B = batch_dim(m)
-        m.extra["batch_loop_var"] = var
-        m.extra["batch_dim"] = B if B is not None else 1
+        roles = _axis_roles(m)
+        batch = roles["batch"] if roles["unresolved"] is None else ()
+        extent = 1
+        for var in batch:
+            extent *= roles["trips"][var]
+        roles["work_axis"] = None
+        roles["work_axis_reason"] = "one work item"
+        m.extra["axis_roles"] = roles
+        m.extra["batch_loop_var"] = batch[0] if batch else None
+        m.extra["batch_dim"] = extent
+        root, work_id = _parse_work_id(m.func_name)
+        if work_id:
+            groups.setdefault(root, {}).setdefault(m.func_name, []).append(m)
+
+    for bodies in groups.values():
+        bodies = list(bodies.values())
+        if len(bodies) < 2:
+            continue
+        uniform = all(len(body) == len(bodies[0]) for body in bodies)
+        for position in range(max(len(body) for body in bodies)):
+            column = [body[position] for body in bodies if position < len(body)]
+            if uniform:
+                axis, reason = work_axis(column)
+            else:
+                axis, reason = None, "work items differ in matched structure"
+            for m in column:
+                m.extra["axis_roles"]["work_axis"] = axis
+                m.extra["axis_roles"]["work_axis_reason"] = reason
 
 
 def match_workload(target, mlir_module) -> MatchTrace:
@@ -1678,7 +1869,9 @@ def match_workload(target, mlir_module) -> MatchTrace:
         target_name=getattr(target, "name", "<unknown>"),
         module_name=str(getattr(mlir_module, "name", "<unnamed>")),
         source_value_refs=source_value_refs,
+        coverage=MatchCoverage(),
     )
+    coverage_problems: dict = {}
 
     # Iterate every func.func at the module top level.
     for func in mlir_module.body.operations:
@@ -1703,7 +1896,8 @@ def match_workload(target, mlir_module) -> MatchTrace:
         sites: list = []
         _walk_loops(body, [], sites, state=state)
 
-        for op, loops, guards in sites:
+        site_matches: dict[int, list[MatchedOp]] = {}
+        for site_index, (op, loops, guards) in enumerate(sites):
             if op.operation.name not in _STORE_OPS:
                 continue
             ms = _try_match_at_store(
@@ -1718,12 +1912,775 @@ def match_workload(target, mlir_module) -> MatchTrace:
                 scope=scope,
                 guards=guards,
             )
+            if ms:
+                site_matches[site_index] = ms
             trace.matches.extend(ms)
+
+        _FunctionCoverage(
+            target,
+            func,
+            func_name,
+            sites,
+            site_matches,
+            defining_map,
+            value_refs,
+            state=state,
+            scope=scope,
+        ).run(trace.coverage, coverage_problems)
+
+    trace.coverage.problems = [
+        (tuple(functions), message) for message, functions in coverage_problems.values()
+    ]
+    trace.coverage.errors = _format_coverage_problems(trace.coverage.problems)
 
     # SPEC-026 §1.2: stamp the batch dim on each match (one source of
     # truth for cost/codegen). Additive; default batch_dim=1.
     _stamp_batch_dims(trace)
     return trace
+
+
+# --------------------------------------------------------------------- #
+# Store coverage and accumulator initialization (release gate G2)
+# --------------------------------------------------------------------- #
+#
+# After matching, every store of every function is put in exactly one
+# category (``spmw_match.STORE_*``):
+#
+#   matched           the store produced a MatchedOp.
+#   accumulator_init  a non-matched store into the result memref of an
+#                     accumulating match in the same function.  Its legality
+#                     is the accumulator-initialization fact below; anything
+#                     but a supported zero initializer is an error.
+#   copy              the stored value is a load (through value-preserving
+#                     casts) of the result memref of a match that precedes the
+#                     store, written into a different memref.  The sink is
+#                     recorded on those matches as ``extra["output_sinks"]``.
+#   local             a store into a function-local ``memref.alloc``/``alloca``
+#                     whose every read is consumed only by index expressions,
+#                     loop/branch control, other accepted local stores, or the
+#                     traced term of a matched store.  A read that reaches a
+#                     matched op as a load operand (not forwarded into its
+#                     term) additionally requires every store into that local
+#                     to be a constant or a plain copy, because the matched op
+#                     only reads the local; it does not compute it.
+#   unmatched         everything else: an error naming the function, the
+#                     store, its loop nest, the term, and the ops considered.
+#
+# Accumulator initialization (``extra["accumulator_init"]`` on every match
+# with a loop-carried operand):
+#
+#   "zero"     every other store into the accumulator is the constant 0, comes
+#              before the match in program order, is under no guard the match
+#              is not also under, and either (a) sits in a strict prefix of the
+#              match's loop nest and writes the same element, or (b) is a
+#              whole-buffer fill: below the loops it shares with the match,
+#              each memref dimension is indexed by its own loop over [0, dim).
+#   "carried"  no other store, and the accumulator is a function argument: the
+#              initial value comes from the caller.
+#   otherwise  "unsupported", with an error stating what was found.
+
+# Value ops ``_trace_value`` traces through.  A value reaching a matched store
+# only along these is part of that store's traced term.
+_COVERAGE_TRACED_OPS = (
+    set(_FP_BINOPS)
+    | set(_MATH_UNARY)
+    | _CAST_OPS
+    | {"arith.cmpf", "arith.cmpi", "arith.select", "arith.negf"}
+)
+_COVERAGE_INDEX_OPS = {"affine.apply"}
+_COVERAGE_CONTROL_OPS = {"scf.if", "affine.if", "scf.for", "affine.for"}
+_LOCAL_ALLOC_OPS = {"memref.alloc", "memref.alloca"}
+_AFFINE_CONST_RE = re.compile(r"^affine_map<\(\)(?:\[[^\]]*\])?\s*->\s*\((-?\d+)\)>$")
+_COVERAGE_ACC_HINT = (
+    "Supported: initialize the accumulator with literal 0 before the reduction "
+    "loop, or accumulate directly into the output buffer."
+)
+
+
+def _render_term(term, depth: int = 0) -> str:
+    """Compact source-like text of a traced term, for diagnostics."""
+    if depth > 8:
+        return "..."
+    value = None if isinstance(term, WLoad) else _const_value(term)
+    if value is not None:
+        return repr(value)
+    if isinstance(term, WLoad):
+        if term.index_terms is not None:
+            indices = [_render_term(t, depth + 1) for t in term.index_terms]
+        else:
+            indices = list(term.indices)
+        return (
+            f"{term.memref_name or '?'}"
+            f"[{', '.join(_access_text(term.index_map, indices))}]"
+        )
+    if isinstance(term, WBinOp):
+        return (
+            f"{term.op}({_render_term(term.lhs, depth + 1)}, "
+            f"{_render_term(term.rhs, depth + 1)})"
+        )
+    if isinstance(term, WUnary):
+        return f"{term.fn}({_render_term(term.arg, depth + 1)})"
+    if isinstance(term, WCmp):
+        return (
+            f"{term.pred}({_render_term(term.lhs, depth + 1)}, "
+            f"{_render_term(term.rhs, depth + 1)})"
+        )
+    if isinstance(term, WSelect):
+        return (
+            f"select({_render_term(term.cond, depth + 1)}, "
+            f"{_render_term(term.a, depth + 1)}, {_render_term(term.b, depth + 1)})"
+        )
+    if isinstance(term, WConst):
+        return repr(term.value)
+    if isinstance(term, WBlockArg):
+        return term.ssa_name
+    return "?"
+
+
+def _access_text(index_map, rendered) -> list[str]:
+    """Per-dimension access text: ``rendered`` operands substituted into the
+    affine map results (``index_map`` None means the operands are the
+    coordinates)."""
+    if index_map is None:
+        return list(rendered)
+    results = _affine_map_results(index_map)
+    if results is None:
+        return [f"{index_map}({', '.join(rendered)})"]
+
+    def substitute(match):
+        position = int(match.group(1))
+        if position >= len(rendered):
+            return match.group(0)
+        text = rendered[position]
+        return text if re.fullmatch(r"[\w%#.-]+", text) else f"({text})"
+
+    return [re.sub(r"\bd(\d+)\b", substitute, result) for result in results]
+
+
+def _term_blockargs(term, out: set) -> set:
+    if isinstance(term, WBlockArg):
+        out.add(term.ssa_name)
+    elif isinstance(term, WLoad):
+        for t in term.index_terms or ():
+            _term_blockargs(t, out)
+    elif isinstance(term, (WBinOp, WCmp)):
+        _term_blockargs(term.lhs, out)
+        _term_blockargs(term.rhs, out)
+    elif isinstance(term, WUnary):
+        _term_blockargs(term.arg, out)
+    elif isinstance(term, WSelect):
+        for t in (term.cond, term.a, term.b):
+            _term_blockargs(t, out)
+    return out
+
+
+def _term_loads(term, out: list) -> list:
+    if isinstance(term, WLoad):
+        out.append(term)
+    elif isinstance(term, (WBinOp, WCmp)):
+        _term_loads(term.lhs, out)
+        _term_loads(term.rhs, out)
+    elif isinstance(term, WUnary):
+        _term_loads(term.arg, out)
+    elif isinstance(term, WSelect):
+        for t in (term.cond, term.a, term.b):
+            _term_loads(t, out)
+    return out
+
+
+def _render_loops(loops) -> str:
+    parts = []
+    for iv, lower, upper, step in loops:
+        lo = _AFFINE_CONST_RE.match(str(lower).strip())
+        hi = _AFFINE_CONST_RE.match(str(upper).strip())
+        if lo and hi:
+            text = f"{iv} in [{lo.group(1)}, {hi.group(1)})"
+            parts.append(text if step == 1 else f"{text} step {step}")
+        else:
+            parts.append(f"{iv} in [{lower}, {upper})")
+    return "[" + ", ".join(parts) + "]" if parts else "[] (no enclosing loop)"
+
+
+def _affine_map_results(text: str) -> list[str] | None:
+    m = _AFFINE_MAP_RE.match(text.strip())
+    if m is None or "[" in text.split("->")[0]:
+        return None
+    results, depth, start = [], 0, 0
+    body = m.group("results")
+    for i, ch in enumerate(body):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            results.append(body[start:i].strip())
+            start = i + 1
+    results.append(body[start:].strip())
+    return [r for r in results if r]
+
+
+class _FunctionCoverage:
+    """Classify every store of one function; see the comment block above."""
+
+    def __init__(
+        self,
+        target,
+        func,
+        func_name,
+        sites,
+        site_matches,
+        defining_map,
+        value_refs,
+        *,
+        state,
+        scope,
+    ):
+        self.target = target
+        self.func_name = func_name
+        self.work_root = _parse_work_id(func_name)[0]
+        self.sites = sites
+        self.site_matches = site_matches
+        self.defining_map = defining_map
+        self.value_refs = value_refs
+        self.state = state
+        self.scope = scope
+        self.arg_refs = {
+            self._ref(argument)
+            for argument in func.arguments
+            if _is_memref_value(argument)
+        }
+        self.stores = [
+            index
+            for index, (op, _loops, _guards) in enumerate(sites)
+            if op.operation.name in _STORE_OPS and len(op.operands) > 1
+        ]
+        self.loads_by_ref: dict = {}
+        self.uses: dict[str, list[tuple[int, int]]] = {}
+        for index, (op, _loops, _guards) in enumerate(sites):
+            if op.operation.name in _LOAD_OPS and op.operands and op.results:
+                self.loads_by_ref.setdefault(self._ref(op.operands[0]), []).append(
+                    index
+                )
+            for position, operand in enumerate(op.operands):
+                self.uses.setdefault(_value_name(operand, state), []).append(
+                    (index, position)
+                )
+        self._terms: dict[int, Any] = {}
+        self._index_terms: dict[int, tuple] = {}
+
+    # -- small accessors ------------------------------------------------ #
+
+    def _ref(self, value):
+        return self.value_refs.get(value, value)
+
+    def _op(self, index):
+        return self.sites[index][0]
+
+    def _dest(self, index):
+        return self._ref(self._op(index).operands[1])
+
+    def _dest_name(self, index):
+        op = self._op(index)
+        return _attr_str(op.attributes["to"]) if "to" in op.attributes else None
+
+    def _handle(self, index):
+        op = self._op(index)
+        return f"{op.operation.name}@{_value_name(op.operands[0], self.state)}"
+
+    def _term(self, index):
+        if index not in self._terms:
+            self._terms[index] = _trace_value(
+                _value_name(self._op(index).operands[0], self.state),
+                self.defining_map,
+                self.value_refs,
+                state=self.state,
+                scope=self.scope,
+            )
+        return self._terms[index]
+
+    def _store_index_terms(self, index):
+        if index not in self._index_terms:
+            self._index_terms[index] = tuple(
+                _trace_value(
+                    _value_name(operand, self.state),
+                    self.defining_map,
+                    self.value_refs,
+                    state=self.state,
+                    scope=self.scope,
+                )
+                for operand in list(self._op(index).operands)[2:]
+            )
+        return self._index_terms[index]
+
+    def _store_map(self, index):
+        op = self._op(index)
+        return str(op.attributes["map"]) if "map" in op.attributes else None
+
+    def _access_key(self, index) -> tuple:
+        rendered = [_render_term(t) for t in self._store_index_terms(index)]
+        return tuple(_access_text(self._store_map(index), rendered))
+
+    def _index_text(self, index) -> str:
+        return ", ".join(self._access_key(index))
+
+    def _reads_own_element(self, index) -> bool:
+        """The stored term reads the element being stored (``y[i] += ...``),
+        and some enclosing loop does not move that element: the value is
+        carried across that loop even when the matched op does not declare
+        an accumulator."""
+        loops = self.sites[index][1]
+        index_terms = self._store_index_terms(index)
+        used = set()
+        for t in index_terms:
+            _term_blockargs(t, used)
+        if all(loop[0] in used for loop in loops):
+            return False
+        dest = self._dest(index)
+        return any(
+            load.value_ref == dest
+            and self._same_access(
+                load.index_map, load.index_terms, self._store_map(index), index_terms
+            )
+            for load in _term_loads(self._term(index), [])
+            if load.index_terms is not None
+        )
+
+    @staticmethod
+    def _same_access(lhs_map, lhs_terms, rhs_map, rhs_terms) -> bool:
+        if lhs_map == rhs_map and _terms_eq(lhs_terms, rhs_terms):
+            return True
+        # Equal text is trusted only for load-free (pure index) coordinates.
+        if any(_term_loads(t, []) for t in (*lhs_terms, *rhs_terms)):
+            return False
+        lhs = _access_text(lhs_map, [_render_term(t) for t in lhs_terms])
+        rhs = _access_text(rhs_map, [_render_term(t) for t in rhs_terms])
+        return lhs == rhs
+
+    def _copy_source(self, index):
+        """The load whose value the store writes, through casts; else None."""
+        name = _value_name(self._op(index).operands[0], self.state)
+        src = self.defining_map.get(name)
+        while (
+            src is not None
+            and src.operation.name in _CAST_OPS
+            and len(src.operands) == 1
+        ):
+            src = self.defining_map.get(_value_name(src.operands[0], self.state))
+        if src is not None and src.operation.name in _LOAD_OPS and src.operands:
+            return src
+        return None
+
+    def _is_local(self, index) -> bool:
+        owner = getattr(self._op(index).operands[1], "owner", None)
+        name = getattr(getattr(owner, "operation", owner), "name", None)
+        return name in _LOCAL_ALLOC_OPS
+
+    def _target_ops(self) -> str:
+        names = sorted(
+            {
+                op.name
+                for unit in self.target._walk()
+                for op in unit.ops.values()
+                if op.matchable
+            }
+        )
+        return ", ".join(names) if names else "(none)"
+
+    # -- classification ------------------------------------------------- #
+
+    def run(self, coverage: MatchCoverage, problems: dict) -> None:
+        result_sites: dict = {}
+        acc_sites: dict = {}
+        for index, matches in self.site_matches.items():
+            dest = self._dest(index)
+            result_sites.setdefault(dest, []).append(index)
+            self_carried = None
+            for match in matches:
+                carried = any(operand.is_loop_carried for operand in match.operands)
+                if not carried:
+                    if self_carried is None:
+                        self_carried = self._reads_own_element(index)
+                    carried = self_carried
+                if carried:
+                    acc_sites.setdefault(dest, []).append((index, match))
+
+        category: dict[int, str] = {}
+        detail: dict[int, str] = {}
+        for index in self.stores:
+            dest = self._dest(index)
+            if index in self.site_matches:
+                category[index] = STORE_MATCHED
+                detail[index] = ", ".join(
+                    m.target_op_name for m in self.site_matches[index]
+                )
+                continue
+            if dest in acc_sites:
+                category[index] = STORE_ACCUMULATOR_INIT
+                continue
+            source = self._copy_source(index)
+            if source is not None:
+                source_ref = self._ref(source.operands[0])
+                producers = [j for j in result_sites.get(source_ref, ()) if j < index]
+                if source_ref != dest and producers:
+                    category[index] = STORE_COPY
+                    sink = (self._dest_name(index), self._index_text(index))
+                    for j in producers:
+                        for match in self.site_matches[j]:
+                            sinks = match.extra.setdefault("output_sinks", [])
+                            if sink not in sinks:
+                                sinks.append(sink)
+                    detail[index] = f"copy of {_render_term(self._term(index))}"
+                    continue
+            if self._is_local(index):
+                category[index] = STORE_LOCAL
+                continue
+            category[index] = STORE_UNMATCHED
+
+        self._settle_locals(category, detail)
+
+        for dest, entries in acc_sites.items():
+            for index, match in entries:
+                init, found = self._accumulator_init(dest, index, category)
+                match.extra["accumulator_init"] = init
+                if found:
+                    loops = self.sites[index][1]
+                    problems.setdefault(
+                        (self.work_root, index, "accumulator"),
+                        [
+                            f"function '{self.func_name}': the accumulator "
+                            f"'{match.result_memref_name}' of "
+                            f"{match.target_op_name} (store {self._handle(index)}, "
+                            f"loop nest {_render_loops(loops)}) is not supported: "
+                            f"{'; '.join(found)}. {_COVERAGE_ACC_HINT}",
+                            [],
+                        ],
+                    )[1].append(self.func_name)
+
+        for index in self.stores:
+            cat = category[index]
+            coverage.stores.append(
+                StoreCoverage(
+                    func_name=self.func_name,
+                    store=self._handle(index),
+                    memref_name=self._dest_name(index),
+                    enclosing_loops=tuple(self.sites[index][1]),
+                    category=cat,
+                    detail=detail.get(index, ""),
+                )
+            )
+            if cat == STORE_UNMATCHED:
+                problems.setdefault(
+                    (self.work_root, index, "unmatched"),
+                    [self._unmatched_message(index, detail.get(index)), []],
+                )[1].append(self.func_name)
+
+    def _unmatched_message(self, index, reason) -> str:
+        op = self._op(index)
+        term = self._term(index)
+        stored = self.defining_map.get(_value_name(op.operands[0], self.state))
+        root = stored.operation.name if stored is not None else "block argument"
+        loops = _render_loops(self.sites[index][1])
+        guards = self.sites[index][2]
+        where = (
+            f"function '{self.func_name}', store {self._handle(index)} to "
+            f"'{self._dest_name(index)}[{self._index_text(index)}]', loop nest {loops}"
+            + (" under a guard" if guards else "")
+        )
+        if reason:
+            what = f"stores {_render_term(term)} ({root}) into a local buffer whose value {reason}"
+        elif isinstance(term, WLoad):
+            what = (
+                f"copies {_render_term(term)} ({root}), but "
+                f"'{term.memref_name}' is not the result of a preceding matched op"
+            )
+        elif _const_value(term) is not None:
+            what = (
+                f"stores the constant {_render_term(term)}, which is not the "
+                "initializer of any matched accumulator"
+            )
+        else:
+            what = f"computes {_render_term(term)} (root op {root}), which matches no target op"
+        return (
+            f"{where}: {what}. Target ops considered: {self._target_ops()}. "
+            "Compiling would silently drop this effect; express it with the "
+            "target's ops or extend the target description."
+        )
+
+    def _settle_locals(self, category, detail) -> None:
+        """Greatest fixpoint over local stores; failures become unmatched."""
+        accepted = {i for i in self.stores if category[i] == STORE_LOCAL}
+        reasons: dict[int, str] = {}
+        changed = True
+        while changed:
+            changed = False
+            for index in sorted(accepted):
+                reason = self._local_problem(index, category, accepted)
+                if reason is not None:
+                    accepted.discard(index)
+                    reasons[index] = reason
+                    changed = True
+        for index, reason in reasons.items():
+            category[index] = STORE_UNMATCHED
+            detail[index] = reason
+        for index in accepted:
+            detail[index] = "local value consumed by matched ops / index expressions"
+
+    def _local_problem(self, index, category, accepted) -> str | None:
+        dest = self._dest(index)
+        memref_name = _value_name(self._op(index).operands[1], self.state)
+        for user, position in self.uses.get(memref_name, ()):
+            user_name = self._op(user).operation.name
+            if user_name in _LOAD_OPS and position == 0:
+                continue
+            if user_name in _STORE_OPS and position == 1:
+                continue
+            if user_name == "memref.dealloc":
+                continue
+            return f"escapes to '{user_name}'"
+        writers = [i for i in self.stores if self._dest(i) == dest]
+        computed_writers = [
+            i
+            for i in writers
+            if i not in self.site_matches
+            and _const_value(self._term(i)) is None
+            and self._copy_source(i) is None
+        ]
+        for load in self.loads_by_ref.get(dest, ()):
+            load_op = self._op(load)
+            result = _value_name(load_op.results[0], self.state)
+            forwarded = result in self.scope.forward
+            stack = [(result, False)]
+            seen = set()
+            while stack:
+                value, index_only = stack.pop()
+                if (value, index_only) in seen:
+                    continue
+                seen.add((value, index_only))
+                for user, position in self.uses.get(value, ()):
+                    user_op = self._op(user)
+                    user_name = user_op.operation.name
+                    if user_name in _LOAD_OPS and position >= 1:
+                        continue
+                    if user_name in _STORE_OPS and position >= 2:
+                        continue
+                    if user_name in _COVERAGE_CONTROL_OPS:
+                        continue
+                    if user_name in _STORE_OPS and position == 0:
+                        if index_only:
+                            return "reaches a stored value through index arithmetic"
+                        if category[user] == STORE_MATCHED:
+                            if not forwarded and computed_writers:
+                                return (
+                                    "is read as an operand by matched op(s) "
+                                    + ", ".join(
+                                        m.target_op_name
+                                        for m in self.site_matches[user]
+                                    )
+                                    + ", but is computed by an expression no target "
+                                    "op implements"
+                                )
+                            continue
+                        if user in accepted:
+                            continue
+                        return (
+                            f"flows into the {category[user]} store to "
+                            f"'{self._dest_name(user)}'"
+                        )
+                    if user_name in _COVERAGE_TRACED_OPS:
+                        for r in user_op.results:
+                            stack.append((_value_name(r, self.state), index_only))
+                        continue
+                    if user_name in _COVERAGE_INDEX_OPS:
+                        for r in user_op.results:
+                            stack.append((_value_name(r, self.state), True))
+                        continue
+                    return f"is read by '{user_name}', which no target op implements"
+        return None
+
+    # -- accumulator initialization ------------------------------------ #
+
+    def _accumulator_init(self, dest, index, category):
+        others = [i for i in self.stores if i != index and self._dest(i) == dest]
+        if not others:
+            if dest in self.arg_refs:
+                return "carried", []
+            return "unsupported", [
+                "it is a local buffer that is never initialized"
+            ]
+        _op, match_loops, match_guards = self.sites[index]
+        match_ivs = [loop[0] for loop in match_loops]
+        found = []
+        for other in others:
+            other_loops, other_guards = self.sites[other][1], self.sites[other][2]
+            other_ivs = [loop[0] for loop in other_loops]
+            at = f"store {self._handle(other)} at loop nest {_render_loops(other_loops)}"
+            if other in self.site_matches:
+                found.append(
+                    f"it is also written by matched op(s) "
+                    f"{', '.join(m.target_op_name for m in self.site_matches[other])} "
+                    f"({at}): multiple writers"
+                )
+                continue
+            term = self._term(other)
+            value = _const_value(term)
+            if value is None:
+                found.append(
+                    f"its initializer {at} is the non-constant value {_render_term(term)}"
+                )
+                continue
+            if value != 0:
+                found.append(f"its initializer {at} is the nonzero constant {value!r}")
+                continue
+            if other > index:
+                found.append(f"the zero store {at} comes after the reduction")
+                continue
+            if tuple(other_guards) != tuple(match_guards[: len(other_guards)]):
+                found.append(
+                    f"the zero store {at} is under a guard the reduction is not under"
+                )
+                continue
+            prefix = 0
+            while (
+                prefix < min(len(other_ivs), len(match_ivs))
+                and other_ivs[prefix] == match_ivs[prefix]
+            ):
+                prefix += 1
+            if prefix == len(other_ivs) and prefix < len(match_ivs):
+                if self._same_element(other, index):
+                    continue
+                found.append(
+                    f"the zero store {at} writes "
+                    f"'{self._dest_name(other)}[{self._index_text(other)}]', not "
+                    f"the reduced element '[{self._index_text(index)}]'"
+                )
+                continue
+            if prefix < len(other_ivs) and self._whole_buffer_fill(other, prefix):
+                continue
+            found.append(
+                f"the zero store {at} is inside the reduction loop nest "
+                f"{_render_loops(match_loops)} (not before it) and does not fill the "
+                "whole buffer"
+            )
+        return ("zero", []) if not found else ("unsupported", found)
+
+    def _same_element(self, lhs, rhs) -> bool:
+        return self._same_access(
+            self._store_map(lhs),
+            self._store_index_terms(lhs),
+            self._store_map(rhs),
+            self._store_index_terms(rhs),
+        )
+
+    def _whole_buffer_fill(self, index, prefix) -> bool:
+        op = self._op(index)
+        try:
+            shape = [int(d) for d in op.operands[1].type.shape]
+        except (AttributeError, TypeError, ValueError):
+            return False
+        fill = self.sites[index][1][prefix:]
+        if len(fill) != len(shape) or not shape:
+            return False
+        operands = [_value_name(o, self.state) for o in list(op.operands)[2:]]
+        store_map = self._store_map(index)
+        if store_map is None:
+            dims = operands
+        else:
+            results = _affine_map_results(store_map)
+            if results is None or len(results) != len(shape):
+                return False
+            dims = []
+            for result in results:
+                m = re.fullmatch(r"d(\d+)", result)
+                if m is None or int(m.group(1)) >= len(operands):
+                    return False
+                dims.append(operands[int(m.group(1))])
+        loops = {loop[0]: loop for loop in fill}
+        if len(set(dims)) != len(dims):
+            return False
+        for iv, extent in zip(dims, shape):
+            loop = loops.get(iv)
+            if loop is None or loop[3] != 1:
+                return False
+            lo = _AFFINE_CONST_RE.match(str(loop[1]).strip())
+            hi = _AFFINE_CONST_RE.match(str(loop[2]).strip())
+            if not lo or not hi or int(lo.group(1)) != 0 or int(hi.group(1)) != extent:
+                return False
+        return True
+
+
+def _format_coverage_problems(problems, exempt=frozenset()) -> list[str]:
+    errors = []
+    for functions, message in problems:
+        count = sum(1 for name in functions if name not in exempt)
+        if count == 0:
+            continue
+        if count > 1:
+            message += f" (the same store occurs in {count - 1} more work-item function(s))"
+        errors.append(message)
+    return errors
+
+
+def _host_executed_functions(target, trace: MatchTrace):
+    """Functions the backend runs verbatim from their own MLIR on the host.
+
+    Every store of such a function is implemented, matched or not.  Today
+    only UPMEM has them: a kernel group whose family is placed on the host
+    (``kmeans_update``, spec 004 D2) is compiled whole by the C backend.
+    Group membership needs the retained work scopes stamped by
+    ``compiler._stamp_matcher_work_scopes``; None means not yet known.
+    """
+    if getattr(target, "name", None) != "upmem":
+        return frozenset()
+    if any("spmw_work_scope" not in match.extra for match in trace.matches):
+        return None
+    from .spmw_autoschedule import _matcher_work_scope
+    from .spmw_upmem import classify_upmem_kernel
+
+    groups: dict = {}
+    for match in trace.matches:
+        groups.setdefault(_matcher_work_scope(match).group_id, []).append(match)
+    host = set()
+    for matches in groups.values():
+        try:
+            kernel = classify_upmem_kernel(target, matches)
+        except (NotImplementedError, ValueError):
+            continue
+        if kernel.placement == "host":
+            host.update(match.func_name for match in matches)
+    return frozenset(host)
+
+
+def require_match_coverage(
+    trace: MatchTrace, *, target=None, module=None, defer_unknown=False
+) -> MatchTrace:
+    """Raise :class:`UnsupportedWorkloadError` if ``trace`` drops an effect.
+
+    A trace from :func:`match_workload` carries its coverage.  A trace without
+    one (assembled by hand or sliced) is re-matched from ``module`` when given;
+    the returned trace is the one whose coverage was checked.  Problems in
+    functions the backend executes verbatim on the host are exempt; when that
+    set cannot be known yet (unstamped UPMEM trace), ``defer_unknown=True``
+    skips the check, which ``compile_for_target`` then repeats, failing closed.
+    """
+    checked = trace
+    coverage = getattr(trace, "coverage", None)
+    if coverage is None and target is not None and module is not None:
+        checked = match_workload(target, module)
+        coverage = checked.coverage
+    if coverage is None or not coverage.problems:
+        return checked
+    exempt = _host_executed_functions(target, checked)
+    if exempt is None:
+        if defer_unknown:
+            return checked
+        exempt = frozenset()
+    errors = _format_coverage_problems(coverage.problems, exempt)
+    if errors:
+        raise UnsupportedWorkloadError(
+            f"workload is not supported by target {trace.target_name!r}:\n  - "
+            + "\n  - ".join(errors)
+        )
+    return checked
 
 
 __all__ = [
@@ -1744,5 +2701,7 @@ __all__ = [
     "compile_op_pattern",
     "compile_target_patterns",
     "match_workload",
+    "require_match_coverage",
+    "UnsupportedWorkloadError",
     "batch_dim",
 ]

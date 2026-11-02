@@ -282,6 +282,7 @@ def run_apu_g2_composed(
             int(round(per_call["pipeline"])),
             text,
             "apu_v2",
+            kind="device",
             extra={
                 "outputs": {
                     "out": logical_output,

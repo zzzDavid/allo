@@ -409,6 +409,7 @@ class APUG2ComposedContractionCallable:
 
         if self.backend == "virtual":
             result = RunResult(
+                kind="virtual",
                 cycles=int(self.estimate_result.cycles),
                 stdout=(
                     "virtual APUg2 composed cost evaluation; hardware not executed"

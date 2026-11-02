@@ -31,9 +31,10 @@ class _FakeCompiled:
     def run(self, **inputs):
         self.calls.append(inputs)
         return RunResult(
+            kind="functional",
             cycles=17,
             stdout="fake",
-            backend="virtual",
+            backend="fake",
             extra={"outputs": {"out": np.asarray(inputs["A"]) + inputs["B"]}},
         )
 

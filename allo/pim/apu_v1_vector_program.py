@@ -610,7 +610,8 @@ class APUv1VectorCallable:
             cycles,
             "functional NumPy execution of retained Allo contraction",
             f"apu_v1-{self.backend}",
-            {
+            kind="functional",
+            extra={
                 "outputs": outputs,
                 "plan": self.selected_plan.name,
                 "analytical": self.selected_estimate is not None,

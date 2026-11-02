@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from allo import spmw_apu_v2, spmw_samsung, spmw_simenv
+from allo import spmw_aim, spmw_samsung, spmw_simenv
 from allo.spmw_codegen import (
     Compiled,
     SimulatorUnavailable,
@@ -38,7 +38,7 @@ def test_docker_timeout_is_reported_separately_from_missing_image(monkeypatch):
         raise subprocess.TimeoutExpired(cmd="docker", timeout=10)
 
     monkeypatch.setattr(spmw_simenv.subprocess, "run", timeout)
-    assert simulator_unavailable_reason("apu_v2") == (
+    assert simulator_unavailable_reason("aim") == (
         "docker daemon did not answer within 10 s"
     )
 
@@ -48,11 +48,26 @@ def test_docker_timeout_is_reported_separately_from_missing_image(monkeypatch):
         )
 
     monkeypatch.setattr(spmw_simenv.subprocess, "run", missing)
-    assert simulator_unavailable_reason("apu_v2") == (
-        "docker image 'gsi-g2-l1sim' is missing"
+    assert simulator_unavailable_reason("aim") == (
+        "docker image 'aim-simulator-build' is missing"
     )
     with pytest.raises(SimulatorUnavailable):
-        spmw_apu_v2._run_apu_v2(SimpleNamespace(cmds=[]))
+        spmw_aim._run_aim(SimpleNamespace(cmds=[]))
+
+
+def test_gemini_ii_has_no_source_runner():
+    # The typed APUg2 programs own Gemini-II execution; there is no matcher
+    # runner, context or Docker gate for a source workload.
+    import importlib
+
+    from allo.spmw_codegen import _BACKENDS
+
+    assert "apu_v2" not in _BACKENDS
+    assert simulator_unavailable_reason("apu_v2") == (
+        "no simulator runner for target 'apu_v2'"
+    )
+    with pytest.raises(ImportError):
+        importlib.import_module("allo.spmw_apu_v2")
 
 
 def test_run_without_a_hook_raises_not_implemented():

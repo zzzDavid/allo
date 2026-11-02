@@ -341,6 +341,7 @@ def run_apu_g2_typed(program: APUG2TypedProgram, *operands) -> RunResult:
             cycles,
             text,
             "apu_v2",
+            kind="device",
             extra={
                 "outputs": {
                     "out": logical_output,

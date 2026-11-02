@@ -20,6 +20,8 @@ from .spmw_codegen import (
     _bucket_by_work_id,
     _matcher_command_manifest,
     RunResult,
+    RUN_KIND_SIMULATOR,
+    RUN_KIND_SIMULATOR_TIMING_ONLY,
     SimulatorUnavailable,
     Compiled,
 )
@@ -427,23 +429,33 @@ def _samsung_num_pim_blocks(compiled) -> int:
     return 8
 
 
-def _samsung_read_generic_outbin(out_path, n):
+def _samsung_outbin_error(out_path, what, need, have, driver_log):
+    tail = (driver_log or "")[-800:]
+    return RuntimeError(
+        f"Samsung pim_driver {what} readback: {out_path} "
+        + ("is absent" if have is None else "is too short")
+        + f"; expected {need} bytes, got {0 if have is None else have} bytes. "
+        f"Driver output tail:\n{tail}"
+    )
+
+
+def _samsung_read_generic_outbin(out_path, n, driver_log=""):
     """Flat fp16 readback for the GENERIC (ELTWISE) interpreter path: read `n`
     fp16 elements from out.bin, NO reduce-sum (unlike the REDUCE readback's
-    per-element 16-lane tree reduction). Returns {"out": <fp32 array>} or {} when
-    the blob is absent/empty/all-zero (CYCLES-ONLY graceful fallback)."""
-    p = Path(out_path)
-    if not p.exists():
-        return {}
+    per-element 16-lane tree reduction). Returns {"out": <fp32 array>}; an
+    all-zero array is a valid result. Raises RuntimeError when out.bin is
+    absent or holds fewer than `n` elements."""
     import numpy as np
 
+    p = Path(out_path)
+    need = int(n) * np.dtype(np.float16).itemsize
+    if not p.exists():
+        raise _samsung_outbin_error(p, "GENERIC", need, None, driver_log)
+    have = p.stat().st_size
+    if have < need:
+        raise _samsung_outbin_error(p, "GENERIC", need, have, driver_log)
     raw = np.fromfile(str(p), dtype=np.float16)
-    if raw.size == 0:
-        return {}
-    out = raw[:n].astype(np.float32)
-    if not np.any(out):
-        return {}
-    return {"out": out}
+    return {"out": raw[: int(n)].astype(np.float32)}
 
 
 # SPEC-04: the PIMSimulator physical fabric row-tile = num_total_pim_blocks_ *
@@ -570,26 +582,27 @@ def _samsung_reduce_partition(compiled, inputs):
     return (int(ROWS), int(n_workids), int(K), int(N), int(M_real))
 
 
-def _samsung_read_reduce_outbin(out_path, M, N, m_pad):
+def _samsung_read_reduce_outbin(out_path, M, N, m_pad, driver_log=""):
     """SPEC-04 §4.3: REDUCE readback. The driver writes M_pad*N partial-sum bursts
     (16 lanes each), drained N-pass-major: pass n's M_pad outputs, then pass n+1's.
     So the blob reshapes (N, M_pad, 16) -> sum the 16 lanes -> (N, M_pad) -> .T ->
-    (M_pad, N) -> slice [:M, :N]. For GEMV (N==1) this collapses to (M,). Graceful:
-    empty/all-zero -> {} (CYCLES-ONLY), mirroring the GEMV readback contract.
+    (M_pad, N) -> slice [:M, :N]. For GEMV (N==1) this collapses to (M,). An
+    all-zero result is a valid result. Raises RuntimeError when out.bin is absent
+    or shorter than the M_pad*N*16 fp16 partials the drain must write.
     Surfaces "out" (GEMM, (M, N)) or "y" (GEMV, (M,)) so the harness finds it."""
-    p = Path(out_path)
-    if not p.exists():
-        return {}
     import numpy as np
 
-    raw = np.fromfile(str(p), dtype=np.float16)
+    p = Path(out_path)
     need = m_pad * N * 16
-    if raw.size < need:
-        return {}
+    need_bytes = need * np.dtype(np.float16).itemsize
+    if not p.exists():
+        raise _samsung_outbin_error(p, "REDUCE", need_bytes, None, driver_log)
+    have = p.stat().st_size
+    if have < need_bytes:
+        raise _samsung_outbin_error(p, "REDUCE", need_bytes, have, driver_log)
+    raw = np.fromfile(str(p), dtype=np.float16)
     partials = raw[:need].reshape(-1, 16).astype(np.float32).sum(axis=1)  # (N*m_pad,)
     grid = partials.reshape(N, m_pad).T[:M, :N]  # (M, N)
-    if not np.any(grid):
-        return {}
     if N == 1:
         return {"y": grid.reshape(-1)}
     return {"out": grid}
@@ -603,16 +616,18 @@ def _samsung_run_reduce_driver(weight, vec, M, K, N):
     for an A^T stage); `vec` is the (K,) GEMV input or (K, N) GEMM second operand.
     Pads K to a multiple of 256 and M to the fabric row-tile (zeros, leaving the
     contraction unchanged), runs the driver, tree-reduces the 16-lane partial sums,
-    and slices [:M, :N]. Returns `(C, cycles)` where C is (M,) for N==1 else (M, N);
-    `(None, cycles)` if the readback is empty/all-zero; `(None, None)` if the driver
-    is unavailable. This is the reusable engine behind both the single-stage
-    GENERIC_REDUCE run path and `samsung_reduce_chain` (multi-stage threading)."""
+    and slices [:M, :N]. Returns `(C, cycles)` where C is (M,) for N==1 else (M, N).
+    Raises `SimulatorUnavailable` when the driver cannot run and RuntimeError
+    when the driver reports no cycles or out.bin is absent or truncated. This is
+    the reusable engine behind both the single-stage GENERIC_REDUCE run path and
+    `samsung_reduce_chain` (multi-stage threading)."""
     import numpy as np
 
+    reason = _samsung_unavailable_reason()
+    if reason is not None:
+        raise SimulatorUnavailable("samsung_hbm_pim", reason)
     root = _pimsim_root()
     driver = root / "pim_driver"
-    if not driver.exists():
-        return None, None
 
     M, K, N = int(M), int(K), int(N)
     weight = np.asarray(weight, dtype=np.float16).reshape(M, K)
@@ -695,9 +710,7 @@ def _samsung_run_reduce_driver(weight, vec, M, K, N):
                 "Samsung REDUCE driver missing PIM_CYCLES; tail: " + combined[-400:]
             )
         cycles = int(m.group(1))
-        outputs = _samsung_read_reduce_outbin(out_path, M, N, m_pad)
-    if not outputs:
-        return None, cycles
+        outputs = _samsung_read_reduce_outbin(out_path, M, N, m_pad, combined)
     arr = outputs.get("out")
     if arr is None:
         arr = outputs.get("y")
@@ -724,9 +737,9 @@ def execute_host_schedule_samsung(schedule, dev_inputs):
     so a later group can consume a device-resident intermediate.
 
     Returns `(dev, total_cycles)` where `dev` maps every buffer name to its
-    device value, or `(None, None)` if the driver is unavailable / surfaced
-    nothing. Backend execution only: NO reference composition (that is the
-    caller's concern), mirroring `run_samsung_reduce`.
+    device value. Driver unavailability and missing readbacks raise (see
+    `run_samsung_reduce`). Backend execution only: NO reference composition
+    (that is the caller's concern), mirroring `run_samsung_reduce`.
     """
     import numpy as np
 
@@ -738,22 +751,14 @@ def execute_host_schedule_samsung(schedule, dev_inputs):
         if not g.is_batched:
             lx = g.launches[0]
             out_dev, cyc = run_samsung_reduce(W, dev[lx.vec], M=M, K=K, N=lx.N)
-            if cyc is None:
-                return None, None
             total += cyc
-            if out_dev is None:
-                return None, total
             dev[lx.out] = np.asarray(out_dev, dtype=np.float16)
         else:
             # Batched GEMV: stack the B input vectors as the N columns of ONE
             # contraction -> a single preload of the resident weight.
             second = np.stack([dev[lx.vec] for lx in g.launches], axis=1)  # (K, B)
             out_dev, cyc = run_samsung_reduce(W, second, M=M, K=K, N=len(g.launches))
-            if cyc is None:
-                return None, None
             total += cyc
-            if out_dev is None:
-                return None, total
             out_arr = np.asarray(out_dev)
             for b, lx in enumerate(g.launches):
                 dev[lx.out] = out_arr[:, b].astype(np.float16)
@@ -847,6 +852,11 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
     (placement does). The GENERIC REDUCE path supplies its own minimal --crf
     (rebuilt canonical GEMV body) and does not pass --cmds.
 
+    The result is ``kind="simulator"`` with the decoded out.bin in
+    ``extra["outputs"]`` (an all-zero result is returned as such). Missing
+    operand roles raise ValueError; an absent or truncated out.bin raises
+    RuntimeError.
+
     Line-delimited cmd format:
         MAC dst=GRF_B src0=GRF_A src1=EVEN_BANK is_auto=1
         JUMP loop_counter=7 loop_offset=2
@@ -903,10 +913,10 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             # ceil(M_logical/4096) tiles the logical grid across fabric tiles.
             part = _samsung_reduce_partition(compiled, inputs)
             if part is None:
-                return RunResult(
-                    cycles=None,
-                    stdout="Samsung GENERIC_REDUCE: no MAC partition in trace",
-                    backend="samsung_hbm_pim",
+                raise ValueError(
+                    "Samsung GENERIC_REDUCE: the compiled trace has no MAC "
+                    "partition (no work-id bucket with a MAC slice loop), so the "
+                    "REDUCE conductor cannot be configured"
                 )
             ROWS, n_workids, K, N, M_real = part
             M_logical = ROWS * n_workids
@@ -921,29 +931,29 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
             if xv is None:
                 xv = inputs.get("in")
             if A is None:
-                return RunResult(
-                    cycles=None,
-                    stdout="Samsung GENERIC_REDUCE needs A (and B for GEMM / x "
-                    "for GEMV) kwargs",
-                    backend="samsung_hbm_pim",
+                raise ValueError(
+                    "Samsung GENERIC_REDUCE is missing the bank-resident weight "
+                    "operand (role 'A'; also accepted as 'a'); got operands "
+                    f"{sorted(k for k, v in inputs.items() if v is not None)}"
                 )
             A = np.asarray(A, dtype=np.float16).reshape(int(M_real), int(K))
             # The second operand: B[K,N] (GEMM) or x[K] (GEMV).
             if N > 1:
                 if B is None:
-                    return RunResult(
-                        cycles=None,
-                        stdout="Samsung GENERIC_REDUCE GEMM needs B kwarg",
-                        backend="samsung_hbm_pim",
+                    raise ValueError(
+                        f"Samsung GENERIC_REDUCE GEMM (N={N}) is missing the "
+                        "second operand (role 'B'; also accepted as 'b'); got "
+                        f"operands {sorted(k for k, v in inputs.items() if v is not None)}"
                     )
                 second = np.asarray(B, dtype=np.float16).reshape(int(K), int(N))
             else:
                 src = B if B is not None else xv
                 if src is None:
-                    return RunResult(
-                        cycles=None,
-                        stdout="Samsung GENERIC_REDUCE GEMV needs x (or B) kwarg",
-                        backend="samsung_hbm_pim",
+                    raise ValueError(
+                        "Samsung GENERIC_REDUCE GEMV is missing the broadcast "
+                        "vector operand (role 'B'; also accepted as 'b', 'x' or "
+                        "'in'); got operands "
+                        f"{sorted(k for k, v in inputs.items() if v is not None)}"
                     )
                 second = np.asarray(src, dtype=np.float16).reshape(int(K), 1)
             # Partition-provenance assertion (SPEC-05 §2.3): M_logical is the grid
@@ -1028,11 +1038,9 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
                 if v is not None and k not in ("layers",)
             }
             if not generic_inputs:
-                # Back-compat: compiled.run() with no kwargs returns cycles=None.
-                return RunResult(
-                    cycles=None,
-                    stdout="Samsung GENERIC needs operand kwargs",
-                    backend="samsung_hbm_pim",
+                raise ValueError(
+                    "Samsung GENERIC (elementwise) run received no operand "
+                    "arrays; pass every input role of the compiled kernel"
                 )
             in_paths = []
             generic_n = None
@@ -1092,22 +1100,20 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
                 "'PIM_CYCLES total=...' line; tail: " + combined[-400:]
             )
         cycles = int(match.group(1))
-        # SPEC-004b (additive readback): surface the GEMV result the driver
-        # already wrote to `out_path` into extra["outputs"], mirroring
-        # _run_apu_v1. Pure post-run file I/O -- cycles (parsed above) and the
-        # command stream are untouched; graceful when absent. Output role "y".
+        # SPEC-004b readback: surface the result the driver wrote to `out_path`
+        # into extra["outputs"]. An absent or truncated out.bin raises.
         extra = {"kernel": kernel, "returncode": proc.returncode}
         if kernel == "GENERIC_REDUCE":
             # SPEC-04 §4.3: faithful matmul readback. The REDUCE column cadence
             # drives the real PIMBlock::mac accumulator and the real drain, so
             # out.bin holds genuine numerics (no dual-run / plain rerun needed).
             M, K, N, m_pad = reduce_shape
-            outputs = _samsung_read_reduce_outbin(out_path, M, N, m_pad)
-            if outputs:
-                extra["outputs"] = outputs
-                extra["cycles_source"] = "PIMSimulator GENERIC REDUCE interpreter"
-                extra["correctness_source"] = "PIMSimulator GENERIC REDUCE interpreter"
+            outputs = _samsung_read_reduce_outbin(out_path, M, N, m_pad, combined)
+            extra["outputs"] = outputs
+            extra["cycles_source"] = "PIMSimulator GENERIC REDUCE interpreter"
+            extra["correctness_source"] = "PIMSimulator GENERIC REDUCE interpreter"
             return RunResult(
+                kind=RUN_KIND_SIMULATOR,
                 cycles=cycles,
                 stdout=combined,
                 backend="samsung_hbm_pim",
@@ -1117,12 +1123,12 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
         # interpreter writes real numerics into out.bin. Role name "out". (The
         # only two routes are GENERIC_REDUCE above and GENERIC here -- the legacy
         # GEMV/ADD/MUL/RELU readbacks were deleted with the legacy routing.)
-        outputs = _samsung_read_generic_outbin(out_path, generic_n)
-        if outputs:
-            extra["outputs"] = outputs
-            extra["cycles_source"] = "PIMSimulator GENERIC interpreter"
-            extra["correctness_source"] = "PIMSimulator GENERIC interpreter"
+        outputs = _samsung_read_generic_outbin(out_path, generic_n, combined)
+        extra["outputs"] = outputs
+        extra["cycles_source"] = "PIMSimulator GENERIC interpreter"
+        extra["correctness_source"] = "PIMSimulator GENERIC interpreter"
         return RunResult(
+            kind=RUN_KIND_SIMULATOR,
             cycles=cycles,
             stdout=combined,
             backend="samsung_hbm_pim",
@@ -1269,7 +1275,9 @@ def _run_samsung_batched(
 
     `RunResult.cycles` is the Tenon total; `extra` carries the native
     total + both per-phase splits so the gate-A comparison and the
-    cost-model assertion can be made by the caller.
+    cost-model assertion can be made by the caller. This path reads no
+    output back, so the result is ``kind="simulator-timing-only"`` and
+    carries no outputs.
     """
     import numpy as np
 
@@ -1346,6 +1354,7 @@ def _run_samsung_batched(
         combined = tenon_out + "\n--- native rebaseline ---\n" + native_out
 
     return RunResult(
+        kind=RUN_KIND_SIMULATOR_TIMING_ONLY,
         cycles=tenon_total,
         stdout=combined,
         backend="samsung_hbm_pim",
