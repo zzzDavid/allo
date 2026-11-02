@@ -7,10 +7,6 @@ Spec: design_doc/compiler/upmem-matcher-track.md, U5 and U6.
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -35,22 +31,11 @@ from allo.pim.upmem_physical_search import (
 from allo.spmw_upmem import (
     UPMEM_DECISION_DOMAINS,
     UPMEM_KNOBS,
+    _realize,
     decision_fields,
+    kernel_from_extra,
     upmem_knob_candidates,
 )
-
-_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "prepare_upmem_tenon_campaign.py"
-
-
-def _campaign():
-    name = "prepare_upmem_tenon_campaign_for_matcher_test"
-    if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(name, _SCRIPT)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    return sys.modules[name]
-
 
 _KIND_FAMILY = {
     "pointwise": "pointwise",
@@ -60,20 +45,22 @@ _KIND_FAMILY = {
 }
 
 
-def _candidate(problem, decision):
-    """Placement ``extra`` the UPMEM enumerator produces for this decision."""
-    family = _KIND_FAMILY[problem.kind.value]
-    if family == "matrix_vector":
-        geometry = (
+def _geometry(problem):
+    if _KIND_FAMILY[problem.kind.value] == "matrix_vector":
+        return (
             ("batches", problem.batches),
             ("rows", problem.rows // problem.batches),
             ("columns", problem.reduction),
         )
-    else:
-        geometry = (("elements", problem.logical_work),)
+    return (("elements", problem.logical_work),)
+
+
+def _candidate(problem, decision):
+    """Placement ``extra`` the UPMEM enumerator produces for this decision."""
+    family = _KIND_FAMILY[problem.kind.value]
     return {
         "upmem_family": family,
-        "upmem_geometry": geometry,
+        "upmem_geometry": _geometry(problem),
         "upmem_anchor_op": "MAC" if family in ("matrix_vector", "gemm") else "ADD",
         "upmem_constants": (),
         **decision_fields(decision),
@@ -105,62 +92,63 @@ def _knob_fanout(base):
     return current
 
 
-def test_upmem_decision_domains_match_campaign():
-    campaign = _campaign()
-    expected = {
-        "pointwise": campaign._pointwise_search_decisions(),
-        "matrix_vector": campaign._matrix_vector_search_decisions(),
-        "gemm": campaign._gemm_search_decisions(),
-        "selection": campaign._selection_search_decisions(),
-    }
-    assert {"pointwise", "matrix_vector"} <= set(UPMEM_DECISION_DOMAINS)
-    for family, domain in UPMEM_DECISION_DOMAINS.items():
-        if family in expected:
-            assert domain == expected[family], family
-
-    # The knob fan-out over each data layout reproduces exactly the legal
-    # decisions, in deterministic_order_key order.
+def test_upmem_knob_fanout_is_the_realizable_catalog():
+    """The knob fan-out over each data layout reproduces exactly the catalog
+    decisions the family template realizes (physical legality plus the plan
+    builder), in deterministic_order_key order; every excluded decision has
+    a stated reason."""
     for family, reference, anchor in (
         ("pointwise", _POINTWISE_REFERENCE, "ADD"),
         ("matrix_vector", _MV_REFERENCE, "MAC"),
         ("matrix_vector", _MMTV_REFERENCE, "MAC"),
     ):
+        geometry = _geometry(reference)
+        base = {
+            "upmem_family": family,
+            "upmem_geometry": geometry,
+            "upmem_anchor_op": anchor,
+            "upmem_constants": (),
+            "upmem_accumulator_init": "zero" if family == "matrix_vector" else "none",
+        }
+        kernel = kernel_from_extra(base)
         legal = []
         for decision in UPMEM_DECISION_DOMAINS[family]:
-            try:
-                physical_features(reference, decision)
-            except UPMEMPhysicalLegalityError:
-                continue
-            legal.append(decision)
+            reason = _realize(kernel, decision)[1]
+            if reason is None:
+                legal.append(decision)
+            else:
+                assert reason.strip(), decision
         legal.sort(key=lambda decision: decision.deterministic_order_key)
-        geometry = _candidate(reference, legal[0])["upmem_geometry"]
         fanned = []
         for layout in sorted({decision.layout.value for decision in legal}):
-            base = {
-                "upmem_family": family,
-                "upmem_geometry": geometry,
-                "upmem_anchor_op": anchor,
-                "upmem_constants": (),
-                "data_layout": layout,
-            }
-            fanned.extend(_knob_fanout(base))
+            fanned.extend(_knob_fanout({**base, "data_layout": layout}))
         assert [
             {name: extra[name] for name in ("data_layout",) + UPMEM_KNOBS}
             for extra in fanned
         ] == [decision_fields(decision) for decision in legal], family
+    # The MV catalog's shared-WRAM entry has no template: priced never.
+    mv = kernel_from_extra(
+        {
+            "upmem_family": "matrix_vector",
+            "upmem_geometry": (("batches", 1), ("rows", 96), ("columns", 128)),
+            "upmem_anchor_op": "MAC",
+            "upmem_accumulator_init": "zero",
+        }
+    )
+    shared = UPMEM_DECISION_DOMAINS["matrix_vector"][0]
+    assert "does not materialize" in _realize(mv, shared)[1]
 
 
 def test_upmem_cost_equals_physical_model():
-    campaign = _campaign()
     target = build_upmem_target()
     bound = upmem_cost.bind(target)
     cases = [(row.problem, row.decision) for row in DEFAULT_UPMEM_CALIBRATION_EVIDENCE]
     for reference, decisions in (
-        (_POINTWISE_REFERENCE, campaign._pointwise_search_decisions()),
-        (_MV_REFERENCE, campaign._matrix_vector_search_decisions()),
-        (_MMTV_REFERENCE, campaign._matrix_vector_search_decisions()),
-        (_GEMM_REFERENCE, campaign._gemm_search_decisions()),
-        (_SELECTION_REFERENCE, campaign._selection_search_decisions()),
+        (_POINTWISE_REFERENCE, UPMEM_DECISION_DOMAINS["pointwise"]),
+        (_MV_REFERENCE, UPMEM_DECISION_DOMAINS["matrix_vector"]),
+        (_MMTV_REFERENCE, UPMEM_DECISION_DOMAINS["matrix_vector"]),
+        (_GEMM_REFERENCE, UPMEM_DECISION_DOMAINS["gemm"]),
+        (_SELECTION_REFERENCE, UPMEM_DECISION_DOMAINS["selection"]),
     ):
         cases.extend((reference, decision) for decision in decisions)
     checked = 0

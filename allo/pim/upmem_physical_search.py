@@ -85,6 +85,33 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
+def _next_power_of_two(value: int) -> int:
+    return 1 << max(0, int(value) - 1).bit_length()
+
+
+def _tasklet_block(units: int, tasklets: int) -> int:
+    """Units one tasklet owns under the templates' contiguous ownership: a
+    power-of-two block of ``ceil(units / tasklets)`` (``pim/upmem_physical``)."""
+
+    return _next_power_of_two(_ceil_div(units, tasklets))
+
+
+def _issue_bound(total: int, busiest: int, tasklets: int) -> int:
+    """Dynamic instructions charged for an instruction stream of ``total``
+    instructions whose busiest tasklet issues ``busiest`` of them.
+
+    ``_analytical_breakdown`` divides the stream over ``min(tasklets, 11)``
+    revolver lanes, which assumes balanced tasklets.  A tasklet issues at
+    most once per revolver period, so the busiest one alone needs
+    ``11 * busiest`` cycles; expressing that as ``busiest * lanes``
+    instructions makes the breakdown charge exactly that lower bound when it
+    dominates.  Balanced plans (every reference shape) are unchanged.
+    """
+
+    lanes = min(tasklets, UPMEM_REVOLVER_CYCLES)
+    return max(total, busiest * lanes)
+
+
 def _enum_value(value: Enum | None) -> str | None:
     return None if value is None else str(value.value)
 
@@ -612,6 +639,10 @@ def _pointwise_features(
     chunk_bytes = decision.chunk_elements * problem.element_bytes
     expected_read_dma = chunk_bytes
     if decision.layout is UPMEMDataLayout.FUSED_REPLICATED:
+        if problem.input_operands < 2:
+            raise UPMEMPhysicalLegalityError(
+                "fused [x, y] packets need two input operands"
+            )
         expected_read_dma *= problem.input_operands
     if decision.dma_bytes != expected_read_dma:
         raise UPMEMPhysicalLegalityError(
@@ -619,11 +650,11 @@ def _pointwise_features(
         )
     if chunk_bytes > UPMEM_MAX_DMA_BYTES:
         raise UPMEMPhysicalLegalityError("pointwise output DMA exceeds 2048 bytes")
-    if problem.logical_elements % decision.chunk_elements:
-        raise UPMEMPhysicalLegalityError(
-            "pointwise logical extent must be divisible by chunk_elements"
-        )
-    chunks = problem.logical_elements // decision.chunk_elements
+    # The template streams whole chunks and masks the tail
+    # (``element < TENON_ELEMENTS``): features are those of the padded extent.
+    chunks = _ceil_div(problem.logical_elements, decision.chunk_elements)
+    padded_elements = chunks * decision.chunk_elements
+    busiest_chunks = min(chunks, _tasklet_block(chunks, decision.tasklets))
     if decision.layout is UPMEMDataLayout.SEPARATE:
         read_calls = chunks * problem.input_operands
         read_buffer_bytes = decision.dma_bytes * problem.input_operands
@@ -631,10 +662,8 @@ def _pointwise_features(
         read_calls = chunks
         read_buffer_bytes = decision.dma_bytes
     write_calls = chunks
-    read_bytes = (
-        problem.logical_elements * problem.element_bytes * problem.input_operands
-    )
-    write_bytes = problem.logical_elements * problem.output_element_bytes
+    read_bytes = padded_elements * problem.element_bytes * problem.input_operands
+    write_bytes = padded_elements * problem.output_element_bytes
     wram = decision.tasklets * (
         read_buffer_bytes + decision.chunk_elements * problem.output_element_bytes
     )
@@ -643,7 +672,11 @@ def _pointwise_features(
     backpressure = oversized + max(0, read_calls + write_calls - 768) * 8
     return UPMEMPhysicalFeatures(
         logical_work=problem.logical_work,
-        dynamic_instructions=problem.logical_work * problem.operation_instructions,
+        dynamic_instructions=_issue_bound(
+            padded_elements * problem.operation_instructions,
+            busiest_chunks * decision.chunk_elements * problem.operation_instructions,
+            decision.tasklets,
+        ),
         mram_read_bytes=read_bytes,
         mram_write_bytes=write_bytes,
         mram_read_calls=read_calls,
@@ -654,6 +687,14 @@ def _pointwise_features(
         backpressure_proxy_units=backpressure,
         wram_bytes=wram,
     )
+
+
+def selection_padded_elements(elements: int, tasklets: int, dma_elements: int) -> int:
+    """Smallest extent >= ``elements`` that the selection-flags template
+    splits into ``tasklets`` equal runs of whole ``dma_elements`` chunks."""
+
+    quantum = tasklets * dma_elements
+    return _ceil_div(elements, quantum) * quantum
 
 
 def _selection_features(
@@ -680,13 +721,15 @@ def _selection_features(
         raise UPMEMPhysicalLegalityError(
             "selection DMA bytes must equal dma_elements * element_bytes"
         )
-    if problem.logical_elements % decision.chunk_elements:
-        raise UPMEMPhysicalLegalityError(
-            "selection logical extent must be divisible by dma_elements"
-        )
-    chunks = problem.logical_elements // decision.chunk_elements
-    read_bytes = problem.logical_elements * problem.element_bytes
-    write_bytes = problem.logical_elements * problem.output_element_bytes
+    # The flags template gives every tasklet the same whole number of
+    # dma_elements chunks; the extent is zero-padded to that and the padded
+    # flags are discarded (``selection_padded_elements``).
+    padded = selection_padded_elements(
+        problem.logical_elements, decision.tasklets, decision.chunk_elements
+    )
+    chunks = padded // decision.chunk_elements
+    read_bytes = padded * problem.element_bytes
+    write_bytes = padded * problem.output_element_bytes
     wram = decision.tasklets * (
         decision.dma_bytes + decision.chunk_elements * problem.output_element_bytes
     )
@@ -704,9 +747,7 @@ def _selection_features(
     return UPMEMPhysicalFeatures(
         logical_work=problem.logical_work,
         dynamic_instructions=(
-            problem.logical_work
-            * problem.operation_instructions
-            * lowering_instruction_factor
+            padded * problem.operation_instructions * lowering_instruction_factor
         ),
         mram_read_bytes=read_bytes,
         mram_write_bytes=write_bytes,
@@ -717,6 +758,50 @@ def _selection_features(
         replicated_mram_bytes=0,
         backpressure_proxy_units=oversized + branch_proxy,
         wram_bytes=wram,
+    )
+
+
+def matrix_vector_rows_per_tasklet(rows: int, tasklets: int) -> int:
+    """Rows one tasklet owns in the row-blocked MV template: a power-of-two
+    block, at least two rows so the per-tasklet int32 output DMA reaches the
+    8-byte UPMEM minimum."""
+
+    return max(2, _tasklet_block(rows, tasklets))
+
+
+def private_batch_output_bytes(rows_per_batch: int, output_element_bytes: int = 4) -> int:
+    """Bytes of one batch's output DMA in the tasklet-private MV template:
+    the batch rows, rounded up to the 8-byte DMA granule."""
+
+    return _ceil_div(rows_per_batch * output_element_bytes, UPMEM_DMA_ALIGNMENT) * (
+        UPMEM_DMA_ALIGNMENT
+    )
+
+
+# The 2023.1 SDK linker reserves a 1 KiB stack per enabled tasklet, and the
+# runtime keeps a small WRAM reserve (``upmem_irregular``).
+UPMEM_STACK_BYTES_PER_TASKLET = 1024
+UPMEM_WRAM_RUNTIME_RESERVE = 1024
+
+
+def private_matrix_vector_wram_bytes(
+    padded_reduction: int,
+    rows_per_batch: int,
+    dma_bytes: int,
+    tasklets: int,
+    element_bytes: int = 4,
+    output_element_bytes: int = 4,
+) -> int:
+    """WRAM the tasklet-private MV template occupies: per tasklet one resident
+    vector, one matrix chunk and one batch output group, plus stacks."""
+
+    per_tasklet = (
+        padded_reduction * element_bytes
+        + dma_bytes
+        + private_batch_output_bytes(rows_per_batch, output_element_bytes)
+    )
+    return tasklets * (per_tasklet + UPMEM_STACK_BYTES_PER_TASKLET) + (
+        UPMEM_WRAM_RUNTIME_RESERVE
     )
 
 
@@ -733,19 +818,20 @@ def _matrix_vector_features(
         )
     if decision.nc is not None or decision.kc is not None:
         raise UPMEMPhysicalLegalityError("matrix-vector plans cannot assign GEMM tiles")
-    if problem.reduction % decision.chunk_elements:
-        raise UPMEMPhysicalLegalityError(
-            "matrix-vector reduction must be divisible by chunk_elements"
-        )
-    if problem.rows % decision.tasklets:
-        raise UPMEMPhysicalLegalityError(
-            "matrix-vector rows must divide evenly across contiguous tasklets"
-        )
+    # Templates zero-pad each row to whole chunks and the row count to whole
+    # tasklet blocks (``UPMEMMatrixVectorPlan``); features are those of the
+    # padded program.  Padded rows fetch nothing.
     matrix_chunk_bytes = decision.chunk_elements * problem.element_bytes
-    row_chunks = problem.reduction // decision.chunk_elements
-    matrix_bytes = problem.rows * problem.reduction * problem.element_bytes
-    vector_bytes_per_batch = problem.reduction * problem.element_bytes
+    row_chunks = _ceil_div(problem.reduction, decision.chunk_elements)
+    padded_reduction = row_chunks * decision.chunk_elements
+    rows_per_tasklet = matrix_vector_rows_per_tasklet(problem.rows, decision.tasklets)
+    padded_rows = decision.tasklets * rows_per_tasklet
+    busiest_rows = min(problem.rows, rows_per_tasklet)
+    matrix_bytes = problem.rows * padded_reduction * problem.element_bytes
+    vector_bytes_per_batch = padded_reduction * problem.element_bytes
     vector_bytes = problem.batches * vector_bytes_per_batch
+    output_bytes = padded_rows * problem.output_element_bytes
+    output_calls = decision.tasklets
     if decision.layout is UPMEMDataLayout.FUSED_REPLICATED:
         if decision.vector_residency is not UPMEMOperandResidency.FUSED_DMA_PACKET:
             raise UPMEMPhysicalLegalityError(
@@ -776,33 +862,39 @@ def _matrix_vector_features(
             read_calls = problem.rows * row_chunks + _ceil_div(
                 vector_bytes, decision.dma_bytes
             )
-            shared_accesses = problem.logical_work
+            shared_accesses = problem.rows * padded_reduction
             wram = vector_bytes + decision.tasklets * (
                 decision.dma_bytes + problem.accumulator_bytes
             )
         elif decision.vector_residency is UPMEMOperandResidency.TASKLET_PRIVATE_WRAM:
+            # One batch vector resident per owning tasklet; tasklet t owns
+            # batches t, t + tasklets, ... (``UPMEMMatrixVectorPlan``).
             rows_per_batch = problem.rows // problem.batches
-            if (
-                problem.batches,
-                rows_per_batch,
-                problem.reduction,
-                decision.tasklets,
-                decision.dma_bytes,
-                decision.chunk_elements,
-            ) != (12, 16, 32, 12, 64, 16):
+            batch_output_bytes = private_batch_output_bytes(
+                rows_per_batch, problem.output_element_bytes
+            )
+            if batch_output_bytes > UPMEM_MAX_DMA_BYTES:
                 raise UPMEMPhysicalLegalityError(
-                    "tasklet-private matrix-vector residency is proven only for "
-                    "12 batches x 16 rows x 32 columns, one tasklet per batch, "
-                    "and 64-byte chunks"
+                    f"tasklet-private matrix-vector writes one batch of "
+                    f"{rows_per_batch} outputs ({batch_output_bytes} bytes) per "
+                    f"DMA; the UPMEM limit is {UPMEM_MAX_DMA_BYTES} bytes"
                 )
-            output_group_bytes = rows_per_batch * problem.output_element_bytes
+            busiest_batches = _ceil_div(problem.batches, decision.tasklets)
+            busiest_rows = busiest_batches * rows_per_batch
             read_bytes = matrix_bytes + vector_bytes
             read_calls = problem.rows * row_chunks + problem.batches * _ceil_div(
                 vector_bytes_per_batch, decision.dma_bytes
             )
+            output_bytes = problem.batches * batch_output_bytes
+            output_calls = problem.batches
             shared_accesses = 0
-            wram = decision.tasklets * (
-                vector_bytes_per_batch + decision.dma_bytes + output_group_bytes
+            wram = private_matrix_vector_wram_bytes(
+                padded_reduction,
+                rows_per_batch,
+                decision.dma_bytes,
+                decision.tasklets,
+                problem.element_bytes,
+                problem.output_element_bytes,
             )
         elif decision.vector_residency is UPMEMOperandResidency.STREAMED_MRAM:
             read_bytes = matrix_bytes * 2
@@ -819,13 +911,15 @@ def _matrix_vector_features(
         replicated = 0
     else:  # pragma: no cover - exhaustive enum guard
         raise UPMEMPhysicalLegalityError("unsupported matrix-vector layout")
-    output_bytes = problem.rows * problem.output_element_bytes
-    output_calls = decision.tasklets
     oversized = read_calls * max(0, decision.dma_bytes - 128)
     backpressure = oversized + shared_accesses
     return UPMEMPhysicalFeatures(
         logical_work=problem.logical_work,
-        dynamic_instructions=problem.logical_work * problem.operation_instructions,
+        dynamic_instructions=_issue_bound(
+            problem.rows * padded_reduction * problem.operation_instructions,
+            busiest_rows * padded_reduction * problem.operation_instructions,
+            decision.tasklets,
+        ),
         mram_read_bytes=read_bytes,
         mram_write_bytes=output_bytes,
         mram_read_calls=read_calls,
@@ -849,17 +943,18 @@ def _gemm_features(
         raise UPMEMPhysicalLegalityError("GEMM plans require both Nc and Kc tiles")
     if decision.chunk_elements != decision.kc:
         raise UPMEMPhysicalLegalityError("GEMM chunk_elements must equal Kc")
-    if problem.columns % decision.nc or problem.reduction % decision.kc:
-        raise UPMEMPhysicalLegalityError(
-            "GEMM dimensions must be divisible by Nc and Kc"
-        )
-    if problem.rows % decision.tasklets:
-        raise UPMEMPhysicalLegalityError(
-            "GEMM rows must divide evenly across contiguous tasklets"
-        )
+    # The template zero-pads columns to Nc tiles, the reduction to Kc tiles and
+    # rows to whole tasklet blocks (``UPMEMGEMMPlan``); padded rows fetch
+    # nothing but still write their (zero) output tiles.
     element_bytes = problem.element_bytes
-    output_tiles = problem.rows * (problem.columns // decision.nc)
-    reduction_tiles = problem.reduction // decision.kc
+    column_tiles = _ceil_div(problem.columns, decision.nc)
+    reduction_tiles = _ceil_div(problem.reduction, decision.kc)
+    padded_columns = column_tiles * decision.nc
+    padded_reduction = reduction_tiles * decision.kc
+    rows_per_tasklet = _tasklet_block(problem.rows, decision.tasklets)
+    padded_rows = decision.tasklets * rows_per_tasklet
+    busiest_rows = min(problem.rows, rows_per_tasklet)
+    output_tiles = problem.rows * column_tiles
     if decision.layout is UPMEMDataLayout.FUSED_REPLICATED:
         if decision.rhs_residency is not UPMEMOperandResidency.FUSED_DMA_PACKET:
             raise UPMEMPhysicalLegalityError(
@@ -873,7 +968,7 @@ def _gemm_features(
         packets = output_tiles * reduction_tiles
         read_bytes = packets * packet_bytes
         read_calls = packets
-        logical_rhs = problem.columns * problem.reduction * element_bytes
+        logical_rhs = padded_columns * padded_reduction * element_bytes
         replicated = max(0, read_bytes - logical_rhs)
         shared_accesses = 0
         wram = decision.tasklets * (
@@ -881,8 +976,8 @@ def _gemm_features(
         )
     elif decision.layout is UPMEMDataLayout.SEPARATE:
         if decision.rhs_residency is UPMEMOperandResidency.SHARED_WRAM:
-            rhs_bytes = problem.columns * problem.reduction * element_bytes
-            lhs_bytes = problem.rows * problem.reduction * element_bytes
+            rhs_bytes = padded_columns * padded_reduction * element_bytes
+            lhs_bytes = problem.rows * padded_reduction * element_bytes
             read_bytes = lhs_bytes + rhs_bytes
             read_calls = _ceil_div(read_bytes, decision.dma_bytes)
             shared_accesses = problem.logical_work
@@ -891,21 +986,14 @@ def _gemm_features(
                 decision.kc * element_bytes + decision.nc * problem.accumulator_bytes
             )
         elif decision.rhs_residency is UPMEMOperandResidency.STREAMED_MRAM:
-            lhs_bytes = (
-                problem.rows
-                * problem.reduction
-                * element_bytes
-                * (problem.columns // decision.nc)
-            )
-            rhs_bytes = (
-                problem.rows * problem.columns * problem.reduction * element_bytes
-            )
+            lhs_bytes = problem.rows * padded_reduction * element_bytes * column_tiles
+            rhs_bytes = problem.rows * padded_columns * padded_reduction * element_bytes
             read_bytes = lhs_bytes + rhs_bytes
             read_calls = _ceil_div(read_bytes, decision.dma_bytes)
             shared_accesses = 0
             replicated = max(
                 0,
-                rhs_bytes - problem.columns * problem.reduction * element_bytes,
+                rhs_bytes - padded_columns * padded_reduction * element_bytes,
             )
             wram = decision.tasklets * (
                 2 * decision.dma_bytes + decision.nc * problem.accumulator_bytes
@@ -916,8 +1004,8 @@ def _gemm_features(
             )
     else:  # pragma: no cover - exhaustive enum guard
         raise UPMEMPhysicalLegalityError("unsupported GEMM layout")
-    write_bytes = problem.rows * problem.columns * problem.output_element_bytes
-    write_calls = output_tiles
+    write_calls = padded_rows * column_tiles
+    write_bytes = write_calls * decision.nc * problem.output_element_bytes
     oversized = read_calls * max(0, decision.dma_bytes - 128)
     # Small Nc has loop/control pressure; large Nc increases live accumulator
     # pressure.  Both terms are dimensionless proxies, not cycle constants.
@@ -929,9 +1017,12 @@ def _gemm_features(
         + output_tiles * underfill * underfill * 64
         + accumulator_pressure * problem.accumulator_bytes
     )
+    tile_work = padded_columns * padded_reduction * problem.operation_instructions
     return UPMEMPhysicalFeatures(
         logical_work=problem.logical_work,
-        dynamic_instructions=problem.logical_work * problem.operation_instructions,
+        dynamic_instructions=_issue_bound(
+            problem.rows * tile_work, busiest_rows * tile_work, decision.tasklets
+        ),
         mram_read_bytes=read_bytes,
         mram_write_bytes=write_bytes,
         mram_read_calls=read_calls,
@@ -1419,6 +1510,74 @@ class UPMEMPhysicalCostModel:
             calibration_status=status,
             model_fingerprint=self.fingerprint,
         )
+
+
+def _problem_summary(problem: UPMEMPhysicalProblem) -> dict[str, object]:
+    fields = {
+        UPMEMKernelKind.POINTWISE: ("logical_elements", "operation_instructions"),
+        UPMEMKernelKind.SELECTION: ("logical_elements",),
+        UPMEMKernelKind.MATRIX_VECTOR: ("batches", "rows", "reduction"),
+        UPMEMKernelKind.GEMM: ("rows", "columns", "reduction"),
+    }[problem.kind]
+    return {"kind": problem.kind.value, **{name: getattr(problem, name) for name in fields}}
+
+
+def calibration_validity(
+    problem: UPMEMPhysicalProblem,
+    decision: UPMEMPhysicalDecision,
+    model: "UPMEMPhysicalCostModel | None" = None,
+) -> dict[str, object]:
+    """Validity of the model's cycle estimate for one decision.
+
+    ``cost_validity`` is ``"calibrated"`` only when an anchor of the
+    decision's calibration stratum has exactly this problem (shape and
+    operation); every other estimate is ``"extrapolated"``: a represented
+    stratum at another shape (the stratum's mean ratio is applied), or an
+    unrepresented stratum (factor 1.0, raw analytical model).  The nearest
+    calibrated point is the anchor of the same kernel kind that shares the
+    most of the stratum, then the closest logical work (log ratio).
+    """
+    model = DEFAULT_UPMEM_PHYSICAL_COST_MODEL if model is None else model
+    estimate = model.estimate(problem, decision)
+    key = _calibration_key(problem, decision)
+    nearest = None
+    best = None
+    for row in model.evidence:
+        if row.problem.kind is not problem.kind:
+            continue
+        row_key = _calibration_key(row.problem, row.decision)
+        shared = sum(a == b for a, b in zip(row_key, key))
+        distance = abs(
+            math.log(max(1, row.problem.logical_work) / max(1, problem.logical_work))
+        )
+        rank = (-shared, distance, row.evidence_id)
+        if best is None or rank < best:
+            best, nearest = rank, row
+    exact = estimate.calibration_status == "calibrated_exact_problem_and_decision_stratum"
+    return {
+        "cost_validity": "calibrated" if exact else "extrapolated",
+        "calibration_status": estimate.calibration_status,
+        "calibration_factor": estimate.calibration_factor,
+        "basis": (
+            "uPIMulator anchors of the same problem and decision stratum"
+            if exact
+            else "analytical model scaled by the stratum's mean anchor ratio"
+            if estimate.calibration_evidence_ids
+            else "raw analytical model (no anchor in this stratum, factor 1.0)"
+        ),
+        "nearest_calibrated_point": None
+        if nearest is None
+        else {
+            "evidence_id": nearest.evidence_id,
+            "problem": _problem_summary(nearest.problem),
+            "decision": {
+                "layout": nearest.decision.layout.value,
+                "dma_bytes": nearest.decision.dma_bytes,
+                "chunk_elements": nearest.decision.chunk_elements,
+            },
+            "logic_cycles": nearest.logic_cycles,
+        },
+    }
 
 
 def _pointwise_decision(

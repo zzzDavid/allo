@@ -289,6 +289,9 @@ class UPMEMHistogramPlan(_UPMEMIrregularPlan):
     depth: int
     num_tasklets: int = UPMEM_IRREGULAR_TASKLETS
     dma_elements: int = 128
+    # ``H[bin] += 1`` into the caller's counts (accumulator_init='carried'):
+    # the merge starts from the initial histogram instead of zero.
+    carried_output: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "elements", _positive_int(self.elements, "elements"))
@@ -370,7 +373,9 @@ class UPMEMHistogramPlan(_UPMEMIrregularPlan):
                 "ST_MRAM": _align_up(4 * self.bins),
             },
             "dma_calls": {
-                "LD_MRAM": _ceil_div(self.elements, self.dma_elements),
+                "LD_MRAM": _ceil_div(self.elements, self.dma_elements)
+                + int(self.carried_output)
+                * _ceil_div(_align_up(4 * self.bins), UPMEM_MAX_DMA_BYTES),
                 "ST_MRAM": _ceil_div(_align_up(4 * self.bins), UPMEM_MAX_DMA_BYTES),
             },
         }
@@ -382,6 +387,7 @@ class UPMEMHistogramPlan(_UPMEMIrregularPlan):
             "bins": self.bins,
             "depth": self.depth,
             "dma_elements": self.dma_elements,
+            "carried_output": self.carried_output,
             "algorithm": ["private_histogram", "barrier", "merge", "aligned_write"],
         }
 
@@ -404,6 +410,21 @@ class UPMEMHistogramPlan(_UPMEMIrregularPlan):
         output_words = output.bytes // 4
         n, bins, depth = self.elements, self.bins, self.depth
         nt, dma, local = self.num_tasklets, self.dma_elements, self.local_elements
+        initial_load = ""
+        merge_initial = "0u"
+        if self.carried_output:
+            initial_load = f"""  if (tid == 0) {{
+    uint32_t cursor = 0u;
+    while (cursor < {output.bytes}u) {{
+      uint32_t bytes = {output.bytes}u - cursor;
+      if (bytes > {UPMEM_MAX_DMA_BYTES}u) bytes = {UPMEM_MAX_DMA_BYTES}u;
+      mram_read((const __mram_ptr void *)(uintptr_t)(heap + {output.offset}u + cursor),
+                (void *)((uint8_t *)tenon_merged_hist + cursor), bytes);
+      cursor += bytes;
+    }}
+  }}
+"""
+            merge_initial = "tenon_merged_hist[bin]"
         return f"""// Tenon private-WRAM histogram physical plan for UPMEM.
 // Runtime ABI: int32 input[{n}] -> uint32 histogram[{bins}].
 #include <alloc.h>
@@ -452,7 +473,7 @@ int main(void) {{
   if (tid == 0) mem_reset();
   for (uint32_t bin = 0; bin < TENON_BINS; ++bin)
     tenon_private_hist[tid][bin] = 0u;
-  barrier_wait(&tenon_barrier);
+{initial_load}  barrier_wait(&tenon_barrier);
 
   uint32_t begin = tid * TENON_LOCAL_ELEMENTS;
   uint32_t end = begin + TENON_LOCAL_ELEMENTS;
@@ -466,7 +487,7 @@ int main(void) {{
   barrier_wait(&tenon_barrier);
 
   for (uint32_t bin = tid; bin < TENON_BINS; bin += TENON_NUM_TASKLETS) {{
-    uint32_t total = 0u;
+    uint32_t total = {merge_initial};
     for (uint32_t owner = 0; owner < TENON_NUM_TASKLETS; ++owner)
       total += tenon_private_hist[owner][bin];
     tenon_merged_hist[bin] = total;
@@ -813,6 +834,66 @@ int main(void) {{
 """
 
 
+_C_COMPARE = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
+
+
+@dataclass(frozen=True)
+class SelectionPredicate:
+    """``((x & mask) cmp value)`` on an int32 ``x``; ``mask=None`` compares
+    ``x`` itself.  ``unsigned`` compares as uint32 (MLIR ``ult``/... forms).
+    All literals are int32, so the C expression and :meth:`holds` agree."""
+
+    compare: str
+    value: int
+    mask: int | None = None
+    unsigned: bool = False
+
+    def __post_init__(self) -> None:
+        if self.compare not in _C_COMPARE:
+            raise ValueError(f"unsupported selection comparison {self.compare!r}")
+        for name in ("value", "mask"):
+            literal = getattr(self, name)
+            if literal is None and name == "mask":
+                continue
+            if isinstance(literal, bool) or not isinstance(literal, int) or not (
+                -(1 << 31) <= literal < (1 << 32)
+            ):
+                raise ValueError(f"selection {name} {literal!r} is not a 32-bit literal")
+
+    @staticmethod
+    def _as(value: int, unsigned: bool) -> int:
+        value &= 0xFFFFFFFF
+        if not unsigned and value >= 1 << 31:
+            value -= 1 << 32
+        return value
+
+    def _term(self, x: int) -> int:
+        return x & self.mask if self.mask is not None else x
+
+    def holds(self, x: int) -> bool:
+        lhs = self._as(self._term(int(x)), self.unsigned)
+        rhs = self._as(self.value, self.unsigned)
+        return {
+            "eq": lhs == rhs,
+            "ne": lhs != rhs,
+            "lt": lhs < rhs,
+            "le": lhs <= rhs,
+            "gt": lhs > rhs,
+            "ge": lhs >= rhs,
+        }[self.compare]
+
+    def c_condition(self, x: str) -> str:
+        kind = "uint32_t" if self.unsigned else "int32_t"
+        term = f"({kind}){x}"
+        if self.mask is not None:
+            term = f"({kind})((uint32_t){x} & {self.mask & 0xFFFFFFFF}u)"
+        literal = self._as(self.value, self.unsigned)
+        rhs = f"{literal}u" if self.unsigned else f"(int32_t){literal}"
+        if not self.unsigned and literal == -(1 << 31):
+            rhs = "(int32_t)0x80000000u"
+        return f"{term} {_C_COMPARE[self.compare]} {rhs}"
+
+
 @dataclass(frozen=True)
 class UPMEMSelectionFlagsPlan(_UPMEMIrregularPlan):
     """Device-comparable odd-selection flag/materialization phase.
@@ -827,14 +908,17 @@ class UPMEMSelectionFlagsPlan(_UPMEMIrregularPlan):
     elements: int
     num_tasklets: int = UPMEM_IRREGULAR_TASKLETS
     dma_elements: int = 16
-    predicate: str = "odd"
+    predicate: "str | SelectionPredicate" = "odd"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "elements", _positive_int(self.elements, "elements"))
         object.__setattr__(self, "num_tasklets", _validate_tasklets(self.num_tasklets))
         object.__setattr__(self, "dma_elements", _validate_dma_words(self.dma_elements))
-        if self.predicate != "odd":
-            raise ValueError("the selection-flags plan supports predicate='odd'")
+        if self.predicate != "odd" and not isinstance(self.predicate, SelectionPredicate):
+            raise ValueError(
+                "the selection-flags plan supports predicate='odd' or a "
+                "SelectionPredicate ((x & mask) cmp value)"
+            )
         if self.elements % self.num_tasklets:
             raise ValueError("selection-flags elements must divide evenly by tasklets")
         if self.local_elements % self.dma_elements:
@@ -845,6 +929,14 @@ class UPMEMSelectionFlagsPlan(_UPMEMIrregularPlan):
     @property
     def local_elements(self) -> int:
         return self.elements // self.num_tasklets
+
+    @property
+    def encoding(self) -> str:
+        """``value_or_zero`` for the calibrated odd kernel (a kept value is
+        never 0); ``mask`` (1 = selected) for a general predicate, which may
+        select 0."""
+
+        return "value_or_zero" if self.predicate == "odd" else "mask"
 
     @property
     def linear_layout(self) -> LinearLayout:
@@ -882,7 +974,11 @@ class UPMEMSelectionFlagsPlan(_UPMEMIrregularPlan):
             "kind": "exact-selection-device-flags",
             "combined_offset": flags.offset,
             "combined_bytes": flags.bytes,
-            "equation": "flags[i] = input[i] if (input[i] & 1) else 0",
+            "equation": (
+                "flags[i] = input[i] if (input[i] & 1) else 0"
+                if self.encoding == "value_or_zero"
+                else f"flags[i] = 1 if {self.predicate.c_condition('input[i]')} else 0"
+            ),
             "host_compaction": "excluded-to-match-archived-device-kernel-scope",
             "result": flags.manifest(),
         }
@@ -922,7 +1018,12 @@ class UPMEMSelectionFlagsPlan(_UPMEMIrregularPlan):
         return {
             **self._base_manifest("upmem-selection-device-flags"),
             "elements": self.elements,
-            "predicate": self.predicate,
+            "predicate": (
+                self.predicate
+                if self.predicate == "odd"
+                else self.predicate.c_condition("x")
+            ),
+            "encoding": self.encoding,
             "dma_elements": self.dma_elements,
             "local_elements": self.local_elements,
             "algorithm": [
@@ -936,14 +1037,25 @@ class UPMEMSelectionFlagsPlan(_UPMEMIrregularPlan):
         values = tuple(int(value) for value in values)
         if len(values) != self.elements:
             raise ValueError(f"expected {self.elements} selection inputs")
-        return tuple(value if value & 1 else 0 for value in values)
+        if self.encoding == "value_or_zero":
+            return tuple(value if value & 1 else 0 for value in values)
+        return tuple(int(self.predicate.holds(value)) for value in values)
 
     def device_source(self) -> str:
         input_region = self.mram_regions["input"]
         flags_region = self.mram_regions["flags"]
         n, nt = self.elements, self.num_tasklets
         dma, local = self.dma_elements, self.local_elements
-        return f"""// Tenon device-comparable odd-selection flags for UPMEM.
+        if self.encoding == "mask":
+            body = (
+                f"      buffer[i] = ({self.predicate.c_condition('buffer[i]')}) ? 1 : 0;"
+            )
+            title = "selection-predicate mask"
+        else:
+            body = """      if ((buffer[i] & 1) == 0)
+        buffer[i] = 0;"""
+            title = "odd-selection flags"
+        return f"""// Tenon device-comparable {title} for UPMEM.
 // Runtime ABI: int32 input[{n}] -> int32 flags[{n}].
 #include <alloc.h>
 #include <barrier.h>
@@ -975,8 +1087,7 @@ int main(void) {{
                   heap + {input_region.offset}u + element * sizeof(int32_t)),
               buffer, TENON_DMA_WORDS * sizeof(int32_t));
     for (uint32_t i = 0; i < TENON_DMA_WORDS; ++i) {{
-      if ((buffer[i] & 1) == 0)
-        buffer[i] = 0;
+{body}
     }}
     mram_write(buffer,
                (__mram_ptr void *)(uintptr_t)(
@@ -2063,6 +2174,7 @@ __all__ = [
     "UPMEMSelectionFlagsPlan",
     "UPMEMStableSelectionPhysicalPlan",
     "UPMEMStableSelectionPlan",
+    "SelectionPredicate",
     "UPMEM_IRREGULAR_TASKLETS",
     "UPMEM_LAYOUT_TASKLETS",
 ]

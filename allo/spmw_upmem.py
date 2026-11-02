@@ -15,7 +15,9 @@ uPIMulator DPU logic cycles. Spec: design_doc/compiler/upmem-matcher-track.md
 
 from __future__ import annotations
 
+import dataclasses
 import fcntl
+import functools
 import hashlib
 import json
 import math
@@ -32,6 +34,7 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 from . import spmw_simenv
+from .pim.costs import upmem as upmem_costs
 from .pim.upmem_physical import (
     UPMEM_ACTIVE_TASKLETS,
     UPMEMElementwisePlan,
@@ -42,6 +45,7 @@ from .pim.upmem_physical import (
 )
 from .pim.upmem_irregular import (
     GradientFormula,
+    SelectionPredicate,
     UPMEMFeatureGradientPlan,
     UPMEMHistogramPlan,
     UPMEMKMeansDistancesPlan,
@@ -55,7 +59,9 @@ from .pim.upmem_physical_search import (
     UPMEMPhysicalLegalityError,
     UPMEMPhysicalProblem,
     UPMEMPlanBuilderRejected,
+    calibration_validity,
     physical_features,
+    selection_padded_elements,
 )
 from .spmw_autoschedule import (
     Placement,
@@ -66,6 +72,8 @@ from .spmw_codegen import CodegenContext, RunResult, SimulatorUnavailable
 from .spmw_match import MatchedOp
 
 _TIMING_SCOPE = "uPIMulator DPU logic_cycle only"
+# Scope of a ``backend="virtual"`` result (``UpmemCtx.virtual_run_extra``).
+VIRTUAL_TIMING_SCOPE = "analytical: device logic cycles incl. modeled host transfers"
 _BUILD_TIMEOUT_S = 600
 _SIMULATE_TIMEOUT_S = 1800
 _LOGIC_CYCLE = re.compile(r"^Logic\[(\d+)_(\d+)_(\d+)\]_logic_cycle:\s*(\d+)\s*$", re.M)
@@ -93,9 +101,21 @@ class UpmemKernel:
     dpus: int
     # Spec 004: "host" groups run their own MLIR on the host (paper partition).
     placement: str = "dpu"
+    # The matcher's proof of the accumulator's initial value
+    # (``MatchedOp.extra["accumulator_init"]``): "zero", "carried" (the
+    # caller's buffer is accumulated into), or "none" (no accumulator).
+    accumulator_init: str = "none"
+    # Per work-id geometry, in work-id order, when the work items have
+    # different extents (uneven partition).  ``geometry`` is then the largest
+    # one, which the shared DPU binary is built for; the others are
+    # zero-padded to it (``_padded_slices``).  Empty when all are equal.
+    streams: tuple = ()
 
     def geometry_value(self, name: str) -> int:
         return int(dict(self.geometry)[name])
+
+    def stream_geometry(self, index: int) -> tuple:
+        return self.streams[index] if self.streams else self.geometry
 
     def role(self, name: str) -> str:
         return dict(self.roles)[name]
@@ -166,15 +186,28 @@ class UpmemFamily:
     plan_for: Callable
     features: Callable
     domain: tuple
+    # The one geometry key whose extent may differ between work items, padded
+    # with zeros the template's result for which is discarded (a
+    # padding-neutral axis); () when every work item must match exactly.
+    uneven: tuple = ()
+    # Whether the template implements accumulator_init='carried'.
+    carried: bool = False
 
 
 _UPMEM_FAMILIES: dict[str, UpmemFamily] = {}
-# Family name -> ordered physical decision domain (spec U5).
+# Family name -> ordered physical decision domain (spec U5).  Each domain is
+# a finite, curated candidate catalog (the calibration campaign's search
+# lists), not an exhaustive space: selection among its realizable members is
+# by cost, with no optimality claim beyond the catalog.
 UPMEM_DECISION_DOMAINS: dict[str, tuple] = {}
 
 
-def register_upmem_family(name, recognize, plan_for, features, domain) -> UpmemFamily:
-    family = UpmemFamily(name, recognize, plan_for, features, tuple(domain))
+def register_upmem_family(
+    name, recognize, plan_for, features, domain, *, uneven=(), carried=False
+) -> UpmemFamily:
+    family = UpmemFamily(
+        name, recognize, plan_for, features, tuple(domain), tuple(uneven), carried
+    )
     _UPMEM_FAMILIES[name] = family
     UPMEM_DECISION_DOMAINS[name] = family.domain
     return family
@@ -209,19 +242,14 @@ def classify_upmem_kernel(target, matches) -> UpmemKernel:
         shapes = [family.recognize(target, stream) for stream in streams]
         if any(shape is None for shape in shapes):
             continue
-        first = shapes[0]
-        if any(shape != first for shape in shapes[1:]):
-            raise NotImplementedError(
-                f"UPMEM family {family.name!r}: work-id streams of one kernel "
-                "group classify differently"
-            )
-        found = (family, first)
+        found = (family, _merge_stream_shapes(family, shapes))
         break
     if found is None:
         ops = sorted({match.target_op_name for match in matches})
         functions = sorted({match.func_name for match in matches})
         raise NotImplementedError(
-            f"no UPMEM kernel family matches ops {ops} in {functions}"
+            f"no UPMEM kernel family matches ops {ops} in {functions}. "
+            f"Families: {_FAMILY_FORMS}"
         )
     family, shape = found
     for stream in streams:
@@ -232,6 +260,16 @@ def classify_upmem_kernel(target, matches) -> UpmemKernel:
                 f"{shape['anchor_op']} per work-id stream; "
                 f"{stream[0].func_name} has {len(anchors)}"
             )
+    init = shape.get("accumulator_init", "none")
+    if init == "carried" and not family.carried:
+        raise NotImplementedError(
+            f"UPMEM {family.name}: the source accumulates into the caller's "
+            f"{dict(shape['roles']).get('out', 'output')!r} without initializing "
+            "it (accumulator_init='carried'); the "
+            f"{family.name} DPU template computes the result from zero and "
+            "would drop the initial value. Zero the output in the kernel "
+            "before accumulating."
+        )
     return UpmemKernel(
         family=family.name,
         group_id=group_ids.pop(),
@@ -241,7 +279,70 @@ def classify_upmem_kernel(target, matches) -> UpmemKernel:
         roles=tuple(shape["roles"]),
         dpus=len(streams),
         placement=shape.get("placement", "dpu"),
+        accumulator_init=init,
+        streams=tuple(shape.get("streams", ())),
     )
+
+
+_FAMILY_FORMS = (
+    "pointwise (one ADD/SUB/MUL/SCALE/AXPBY over one loop), "
+    "reduction (out[c] += in[i]), "
+    "matrix_vector (one MAC over 2-3 loops, optionally y = alpha * acc via SCALE), "
+    "gemm (C[i,j] += A[i,k] * B[k,j]), "
+    "histogram (H[(x*m)>>k] += 1), "
+    "selection (COMPACT + INC under one guard, or SELECT_ODD), "
+    "kmeans_distances (SQDIST_ACC), kmeans_update (host argmin/scatter update), "
+    "feature_gradient (GRAD_LINEAR/GRAD_LOGISTIC)"
+)
+
+
+def _merge_stream_shapes(family: UpmemFamily, shapes: list) -> dict:
+    """One kernel shape for all work-id streams of a group.
+
+    Identical streams share it.  Otherwise the streams may differ only in the
+    family's padding-neutral key (``family.uneven``): the merged geometry
+    takes its largest extent, and ``streams`` keeps every work item's own.
+    """
+    first = shapes[0]
+    if all(shape == first for shape in shapes[1:]):
+        return first
+    for field in ("anchor_op", "constants", "roles", "accumulator_init"):
+        values = {repr(shape.get(field)) for shape in shapes}
+        if len(values) != 1:
+            raise NotImplementedError(
+                f"UPMEM family {family.name!r}: work-id streams of one kernel "
+                f"group differ in {field}; one DPU binary serves every work item"
+            )
+    geometries = [dict(shape["geometry"]) for shape in shapes]
+    varying = sorted(
+        {key for g in geometries for key in g if g[key] != geometries[0][key]}
+    )
+    if not family.uneven:
+        raise NotImplementedError(
+            f"UPMEM family {family.name!r}: work items have different extents "
+            f"({', '.join(varying)}); this template has no padding-neutral axis, "
+            "so uneven partitions need equal work items"
+        )
+    if len(varying) != 1 or varying[0] not in family.uneven:
+        raise NotImplementedError(
+            f"UPMEM family {family.name!r}: work items differ in "
+            f"{', '.join(varying)}; an uneven partition may vary only "
+            f"{' or '.join(family.uneven)} (one axis), which the template "
+            "zero-pads"
+        )
+    key = varying[0]
+    if key == "rows" and geometries[0].get("batches", 1) != 1:
+        raise NotImplementedError(
+            f"UPMEM family {family.name!r}: batched work items differ in rows "
+            "per batch; only the batch count may vary between batched work items"
+        )
+    largest = max(g[key] for g in geometries)
+    merged = dict(first)
+    merged["geometry"] = tuple(
+        (name, largest if name == key else value) for name, value in first["geometry"]
+    )
+    merged["streams"] = tuple(tuple(shape["geometry"]) for shape in shapes)
+    return merged
 
 
 def _static_extent(loop) -> int | None:
@@ -320,10 +421,44 @@ def _require_int32_constant(family: str, name: str, value) -> None:
         )
 
 
+def _accumulator_init(family: str, match) -> str:
+    """The matcher's initialization proof for ``match``'s accumulator.
+
+    ``spmw_match_engine`` sets ``extra["accumulator_init"]`` on every match
+    with a loop-carried operand: "zero" (a dominating zero store covers the
+    accumulated element) or "carried" (no initializer; the caller's value is
+    accumulated into).  Anything else never reaches a backend, so a missing
+    fact fails closed here.
+    """
+    init = match.extra.get("accumulator_init")
+    if init not in ("zero", "carried"):
+        raise NotImplementedError(
+            f"UPMEM {family}: {match.target_op_name} in {match.func_name!r} has no "
+            f"proven accumulator initialization (accumulator_init={init!r})"
+        )
+    return init
+
+
 # ------------------------------ pointwise ------------------------------ #
 
 # Matched op -> (plan operation, physical-model instructions per element).
-_POINTWISE_OPERATIONS = {"ADD": ("add", 1), "AXPBY": ("axpby", 2)}
+# The matcher reports the source's pointwise expression as one of these
+# target ops (``pim/targets.py::build_upmem_target``) with its int32 literal
+# coefficients: ``x + y``, ``x - y``, ``x * y``, ``alpha x`` and
+# ``alpha x + beta y``.  Instruction counts are analytical: one native
+# add/sub, a constant multiply as one instruction, and a variable 32-bit
+# multiply as the 32-step ``mul_step`` sequence plus one.  Expressions the
+# matcher has no op for (``alpha x - beta y`` written with a minus, a
+# constant term ``+ c``) are rejected by the matcher's coverage check before
+# a family is chosen; ``alpha x + (-beta) y`` is the supported spelling.
+_POINTWISE_OPERATIONS = {
+    "ADD": ("add", 1),
+    "SUB": ("sub", 1),
+    "MUL": ("mul", 33),
+    "SCALE": ("scale", 1),
+    "AXPBY": ("axpby", 2),
+}
+_POINTWISE_OPERAND_ROLES = {"scale": ("x",)}
 
 
 def _data_operands(match) -> dict:
@@ -341,7 +476,8 @@ def _loop_extents(match) -> list | None:
 
 
 def _recognize_pointwise(target, stream):
-    """``out[i] = lhs[i] (op) rhs[i]`` as one ADD or AXPBY over a single loop."""
+    """``out[i] = f(lhs[i], rhs[i])`` (or ``f(lhs[i])``) as one ADD, SUB, MUL,
+    SCALE or AXPBY over a single loop."""
     del target
     if len(stream) != 1 or stream[0].target_op_name not in _POINTWISE_OPERATIONS:
         return None
@@ -350,18 +486,22 @@ def _recognize_pointwise(target, stream):
     if extents is None or len(extents) != 1:
         return None
     (iv,) = (loop[0] for loop in match.enclosing_loops)
+    operation = _POINTWISE_OPERATIONS[match.target_op_name][0]
     operands = _data_operands(match)
-    lhs, rhs = operands.get("x"), operands.get("y")
-    if lhs is None or rhs is None or any(op.is_loop_carried for op in (lhs, rhs)):
+    names = _POINTWISE_OPERAND_ROLES.get(operation, ("x", "y"))
+    if set(operands) != set(names):
         return None
-    if any(_memref_rank(op) != 1 or list(op.indices) != [iv] for op in (lhs, rhs)):
+    inputs = [operands[name] for name in names]
+    if any(op.is_loop_carried for op in inputs):
         return None
-    if match.result_memref_name in (None, lhs.memref_name, rhs.memref_name):
+    if any(_memref_rank(op) != 1 or list(op.indices) != [iv] for op in inputs):
+        return None
+    if match.result_memref_name in (None, *(op.memref_name for op in inputs)):
         return None
     if match.extra.get("store_indices") != [iv]:
         return None
-    _require_element_type("pointwise", "lhs", lhs)
-    _require_element_type("pointwise", "rhs", rhs)
+    for role, operand in zip(("lhs", "rhs"), inputs):
+        _require_element_type("pointwise", role, operand)
     constants = tuple(sorted(match.extra.get("constants", {}).items()))
     for name, value in constants:
         _require_int32_constant("pointwise", name, value)
@@ -369,11 +509,10 @@ def _recognize_pointwise(target, stream):
         "geometry": (("elements", extents[0]),),
         "anchor_op": match.target_op_name,
         "constants": constants,
-        "roles": (
-            ("lhs", lhs.memref_name),
-            ("rhs", rhs.memref_name),
-            ("out", match.result_memref_name),
-        ),
+        "roles": tuple(
+            (role, operand.memref_name) for role, operand in zip(("lhs", "rhs"), inputs)
+        )
+        + (("out", match.result_memref_name),),
     }
 
 
@@ -382,9 +521,11 @@ def _pointwise_operation(kernel: UpmemKernel) -> tuple[str, int]:
 
 
 def _pointwise_problem(kernel: UpmemKernel) -> UPMEMPhysicalProblem:
+    operation, instructions = _pointwise_operation(kernel)
     return UPMEMPhysicalProblem.pointwise(
         kernel.geometry_value("elements"),
-        operation_instructions=_pointwise_operation(kernel)[1],
+        input_operands=len(_POINTWISE_OPERAND_ROLES.get(operation, ("x", "y"))),
+        operation_instructions=instructions,
     )
 
 
@@ -392,9 +533,11 @@ def _pointwise_plan(kernel: UpmemKernel, decision: UPMEMPhysicalDecision):
     interleaved = decision.layout is UPMEMDataLayout.FUSED_REPLICATED
     operation = _pointwise_operation(kernel)[0]
     coefficients = {}
+    constants = dict(kernel.constants)
     if operation == "axpby":
-        constants = dict(kernel.constants)
         coefficients = {"alpha": int(constants["alpha"]), "beta": int(constants["beta"])}
+    elif operation == "scale":
+        coefficients = {"alpha": int(constants["alpha"])}
     return UPMEMElementwisePlan(
         kernel.geometry_value("elements"),
         operation=operation,
@@ -419,6 +562,7 @@ register_upmem_family(
     _pointwise_plan,
     _pointwise_problem,
     _POINTWISE_DOMAIN,
+    uneven=("elements",),
 )
 
 
@@ -453,12 +597,15 @@ def _recognize_reduction(target, stream):
         "anchor_op": "ADD",
         "constants": (),
         "roles": (("input", value.memref_name), ("out", cell.memref_name)),
+        "accumulator_init": _accumulator_init("reduction", match),
     }
 
 
 def _reduction_plan(kernel: UpmemKernel, decision: UPMEMPhysicalDecision):
     return UPMEMSumReductionPlan(
-        kernel.geometry_value("elements"), dma_bytes=decision.dma_bytes
+        kernel.geometry_value("elements"),
+        dma_bytes=decision.dma_bytes,
+        carried_output=kernel.accumulator_init == "carried",
     )
 
 
@@ -473,6 +620,8 @@ register_upmem_family(
     _reduction_plan,
     None,
     _REDUCTION_DOMAIN,
+    uneven=("elements",),
+    carried=True,
 )
 
 
@@ -550,6 +699,8 @@ def _recognize_matrix_vector(target, stream):
             ("vector", vector.memref_name),
             ("out", out),
         ),
+        # A scaled accumulator is a local scalar the matcher proves zeroed.
+        "accumulator_init": _accumulator_init("matrix_vector", match),
     }
 
 
@@ -584,6 +735,7 @@ def _matrix_vector_plan(kernel: UpmemKernel, decision: UPMEMPhysicalDecision):
         scale_factor=int(dict(kernel.constants).get("alpha", 1)),
         dma_bytes=decision.chunk_elements * 4,
         vector_mode=vector_mode,
+        carried_output=kernel.accumulator_init == "carried",
     )
 
 
@@ -616,6 +768,8 @@ register_upmem_family(
     _matrix_vector_plan,
     _matrix_vector_problem,
     _MATRIX_VECTOR_DOMAIN,
+    uneven=("rows", "batches"),
+    carried=True,
 )
 
 
@@ -656,6 +810,7 @@ def _recognize_gemm(target, stream):
             ("rhs", rhs.memref_name),
             ("out", acc.memref_name),
         ),
+        "accumulator_init": _accumulator_init("gemm", match),
     }
 
 
@@ -681,6 +836,7 @@ def _gemm_plan(kernel: UpmemKernel, decision: UPMEMPhysicalDecision):
         reduction=kernel.geometry_value("reduction"),
         column_tile=int(decision.nc),
         reduction_tile=int(decision.kc),
+        carried_output=kernel.accumulator_init == "carried",
     )
 
 
@@ -709,6 +865,8 @@ register_upmem_family(
     _gemm_plan,
     _gemm_problem,
     _GEMM_DOMAIN,
+    uneven=("rows",),
+    carried=True,
 )
 
 
@@ -840,44 +998,74 @@ def _recognize_histogram(target, stream):
         "anchor_op": "INC",
         "constants": (),
         "roles": (("input", x.memref_name), ("out", acc.memref_name)),
+        "accumulator_init": _accumulator_init("histogram", match),
     }
 
 
 def _histogram_plan(kernel, decision):
+    # The plan has one DMA policy (128-element reads); the decision's
+    # dma/chunk fields are the single catalog entry and are not consulted.
     del decision
     return UPMEMHistogramPlan(
         kernel.geometry_value("elements"),
         kernel.geometry_value("bins"),
         kernel.geometry_value("depth"),
+        carried_output=kernel.accumulator_init == "carried",
     )
 
 
 # hist was not in the physical search: one decision, the plan defaults.
 _HISTOGRAM_DOMAIN = (UPMEMPhysicalDecision(UPMEMDataLayout.SEPARATE, 512, 128),)
 
+# Uneven work items are not padding-neutral here: a zero-padded element
+# would be counted in bin (0 * m) >> k.
 register_upmem_family(
-    "histogram", _recognize_histogram, _histogram_plan, None, _HISTOGRAM_DOMAIN
+    "histogram",
+    _recognize_histogram,
+    _histogram_plan,
+    None,
+    _HISTOGRAM_DOMAIN,
+    carried=True,
 )
 
 
 # ------------------------------ selection ------------------------------ #
 
 
-def _odd_guard_value(guards):
-    """The tested term ``x`` when the single guard is ``x & 1 != 0`` or
-    ``x & 1 == 1`` (mirrors accepted), else None."""
+def _selection_predicate(guards):
+    """``(tested_term, predicate)`` for a single ``if`` guard comparing
+    ``x`` or ``x & mask`` against an int32 literal, else None.
+
+    ``predicate`` is ``"odd"`` for ``x & 1 != 0`` / ``x & 1 == 1`` (the
+    calibrated kernel), otherwise a :class:`SelectionPredicate`.
+    """
     E = _engine()
     if len(guards) != 1 or guards[0][0] != "if":
         return None
-    for pred, lhs, rhs in _cmp_parts(guards[0][1]):
-        if not (isinstance(lhs, E.WBinOp) and lhs.op == "and"):
-            continue
+    cond = guards[0][1]
+    if not isinstance(cond, E.WCmp):
+        return None
+    unsigned = str(getattr(cond, "raw", "")).startswith("u")
+    for pred, lhs, rhs in _cmp_parts(cond):
         value = E._const_value(rhs)
-        if not ((pred == "ne" and value == 0) or (pred == "eq" and value == 1)):
+        if not isinstance(value, int) or isinstance(value, bool):
             continue
-        for x, mask in ((lhs.lhs, lhs.rhs), (lhs.rhs, lhs.lhs)):
-            if E._const_value(mask) == 1:
-                return x
+        tested, mask = lhs, None
+        if isinstance(lhs, E.WBinOp) and lhs.op == "and":
+            for x, literal in ((lhs.lhs, lhs.rhs), (lhs.rhs, lhs.lhs)):
+                if isinstance(E._const_value(literal), int):
+                    tested, mask = x, E._const_value(literal)
+                    break
+            else:
+                continue
+        if not isinstance(tested, E.WLoad):
+            continue
+        if mask == 1 and (pred, value) in (("ne", 0), ("eq", 1)):
+            return tested, "odd"
+        try:
+            return tested, SelectionPredicate(pred, value, mask, unsigned)
+        except ValueError:
+            return None
     return None
 
 
@@ -921,12 +1109,15 @@ def _recognize_selection(target, stream):
         guards[0][1], _guards(counter)[0][1]
     ):
         return None
-    tested = _odd_guard_value(guards)
-    if tested is None:
+    found = _selection_predicate(guards)
+    if found is None:
         raise NotImplementedError(
-            "selection predicate is not 'odd'; the selection plan supports "
-            "x & 1 != 0 only"
+            "UPMEM selection: the guard is not a comparison of the copied value "
+            "(or the value & an int32 mask) against an int32 literal; the "
+            "selection plan supports '(x & mask) cmp k' and 'x cmp k' with cmp "
+            "in ==, !=, <, <=, >, >="
         )
+    tested, predicate = found
     if not _load_is(tested, value):
         raise NotImplementedError("selection guard tests a value other than the copied one")
     terms = compact.extra.get("index_terms") or ()
@@ -940,13 +1131,27 @@ def _recognize_selection(target, stream):
     return {
         "geometry": (("elements", extents[0]), ("compact", 1)),
         "anchor_op": "COMPACT",
-        "constants": (),
+        "constants": (("predicate", _predicate_constant(predicate)),),
         "roles": (
             ("input", value.memref_name),
             ("out", compact.result_memref_name),
             ("count", cell),
         ),
+        # A carried count appends after the caller's first ``count`` outputs;
+        # the host compaction step implements it.
+        "accumulator_init": _accumulator_init("selection", counter),
     }
+
+
+def _predicate_constant(predicate) -> tuple:
+    if predicate == "odd":
+        return ("odd",)
+    return (predicate.compare, predicate.value, predicate.mask, predicate.unsigned)
+
+
+def _kernel_predicate(kernel):
+    spec = dict(kernel.constants).get("predicate", ("odd",))
+    return "odd" if tuple(spec) == ("odd",) else SelectionPredicate(*spec)
 
 
 def _selection_problem(kernel):
@@ -956,12 +1161,16 @@ def _selection_problem(kernel):
 def _selection_plan(kernel, decision):
     if decision.predicate_lowering is not UPMEMPredicateLowering.CONDITIONAL_ZERO:
         raise UPMEMPlanBuilderRejected(
-            "selection-flags source materializes conditional-zero only"
+            "the selection-flags template materializes the conditional-zero "
+            "lowering only"
         )
     return UPMEMSelectionFlagsPlan(
-        kernel.geometry_value("elements"),
+        selection_padded_elements(
+            kernel.geometry_value("elements"), decision.tasklets, decision.chunk_elements
+        ),
         num_tasklets=decision.tasklets,
         dma_elements=decision.chunk_elements,
+        predicate=_kernel_predicate(kernel),
     )
 
 
@@ -988,7 +1197,13 @@ _SELECTION_DOMAIN = tuple(
 )
 
 register_upmem_family(
-    "selection", _recognize_selection, _selection_plan, _selection_problem, _SELECTION_DOMAIN
+    "selection",
+    _recognize_selection,
+    _selection_plan,
+    _selection_problem,
+    _SELECTION_DOMAIN,
+    uneven=("elements",),
+    carried=True,
 )
 
 
@@ -1026,10 +1241,12 @@ def _recognize_kmeans_distances(target, stream):
         "anchor_op": "SQDIST_ACC",
         "constants": (),
         "roles": (("points", x.memref_name), ("centroids", y.memref_name), ("out", acc.memref_name)),
+        "accumulator_init": _accumulator_init("kmeans_distances", match),
     }
 
 
 def _kmeans_distances_plan(kernel, decision):
+    # One fused-packet policy; the single catalog decision is not consulted.
     del decision
     dimension = kernel.geometry_value("dimension")
     return UPMEMKMeansDistancesPlan(
@@ -1055,21 +1272,108 @@ register_upmem_family(
 
 
 def _recognize_kmeans_update(target, stream):
-    """Argmin (``ARGMIN_IDX``, ``MIN_SEL``) plus centroid sums and counts
-    (``SCATTER_ADD``, ``INC``): placed on the host, the paper partition.
+    """One k-means centroid update, placed on the host (the paper partition).
 
-    The rounded centroid division has no pattern (spec 004 D2): a host group
-    runs its own MLIR, so no template consumes it.
+    The matched part must be exactly: per point ``p`` an argmin over the
+    clusters of ``D[p, c]`` (``MIN_SEL`` + ``ARGMIN_IDX``, the running
+    minimum seeded by a ``COMPACT`` copy of ``D[p, 0]``), then
+    ``counts[idx] += 1`` (``INC``) and ``sums[idx, d] += P[p, d]``
+    (``SCATTER_ADD``); the only other matches are ``COMPACT`` copies of
+    ``sums``/``counts`` elements (the division's operands).  The per-cluster
+    division has no target op: ``_check_kmeans_update_epilogue`` proves on
+    the IR that the remaining output is computed only from ``sums`` and
+    ``counts`` with a division.  The host runs the group's own lowered MLIR
+    and the cost program prices it (``costs/upmem.py::HOST_OP_CYCLES``).
     """
     del target
-    names = {m.target_op_name for m in stream}
-    if not {"MIN_SEL", "ARGMIN_IDX", "SCATTER_ADD", "INC"} <= names:
+    names = sorted(m.target_op_name for m in stream)
+    if not {"MIN_SEL", "ARGMIN_IDX", "SCATTER_ADD", "INC"} <= set(names):
         return None
+
+    def reject(reason):
+        raise NotImplementedError(
+            f"UPMEM kmeans_update (host-placed centroid update): {reason}; the "
+            "host partition implements exactly an argmin over D[p, c], "
+            "counts[idx] += 1, sums[idx, d] += P[p, d], then per-cluster "
+            "division of sums by counts"
+        )
+
+    def single(name):
+        found = [m for m in stream if m.target_op_name == name]
+        if len(found) != 1:
+            reject(f"expected one {name}, found {len(found)}")
+        return found[0]
+
+    extra_ops = sorted(
+        set(names) - {"MIN_SEL", "ARGMIN_IDX", "SCATTER_ADD", "INC", "COMPACT"}
+    )
+    if extra_ops:
+        reject(f"the kernel also computes {extra_ops}")
+    argmin, minimum = single("ARGMIN_IDX"), single("MIN_SEL")
+    counter, scatter = single("INC"), single("SCATTER_ADD")
+    distances = _data_operands(argmin).get("x")
+    if distances is None or _data_operands(minimum).get("x") is None:
+        reject("the argmin does not read a distance matrix")
+    if _data_operands(minimum)["x"].memref_name != distances.memref_name:
+        reject("MIN_SEL and ARGMIN_IDX read different distance matrices")
+    loops = [loop[0] for loop in argmin.enclosing_loops]
+    extents = _loop_extents(argmin)
+    if (
+        extents is None
+        or len(loops) != 2
+        or list(distances.indices) != loops
+        or _memref_shape(distances) != tuple(extents)
+    ):
+        reject("the argmin is not over D[p, c] for every point and cluster")
+    points, clusters = extents
+    index_name = argmin.result_memref_name
+    count_terms = counter.extra.get("index_terms") or ()
+    counts = next((op for op in counter.operands if op.is_loop_carried), None)
+    if (
+        counts is None
+        or _memref_shape(counts) != (clusters,)
+        or len(count_terms) != 1
+        or getattr(count_terms[0], "memref_name", None) != index_name
+    ):
+        reject("the counter is not counts[idx] += 1 over the argmin index")
+    point_values = _data_operands(scatter).get("x")
+    sums = _data_operands(scatter).get("acc")
+    scatter_terms = scatter.extra.get("index_terms") or ()
+    if (
+        point_values is None
+        or sums is None
+        or len(_memref_shape(point_values)) != 2
+        or _memref_shape(point_values)[0] != points
+        or _memref_shape(sums) != (clusters, _memref_shape(point_values)[1])
+        or not scatter_terms
+        or getattr(scatter_terms[0], "memref_name", None) != index_name
+    ):
+        reject("the scatter is not sums[idx, d] += P[p, d]")
+    dimension = _memref_shape(point_values)[1]
+    copy_sources = {distances.memref_name, sums.memref_name, counts.memref_name}
+    for match in stream:
+        if match.target_op_name != "COMPACT":
+            continue
+        source = _data_operands(match).get("x")
+        if source is None or source.memref_name not in copy_sources:
+            reject(f"COMPACT into {match.result_memref_name!r} copies another value")
+    for match in (counter,):
+        if match.extra.get("accumulator_init") != "zero":
+            reject("counts is not zero-initialized before the update")
     return {
-        "geometry": (),
+        "geometry": (
+            ("points", points),
+            ("clusters", clusters),
+            ("dimension", dimension),
+        ),
         "anchor_op": "ARGMIN_IDX",
         "constants": (),
-        "roles": (),
+        "roles": (
+            ("distances", distances.memref_name),
+            ("points", point_values.memref_name),
+            ("sums", sums.memref_name),
+            ("counts", counts.memref_name),
+        ),
         "placement": "host",
     }
 
@@ -1146,10 +1450,12 @@ def _recognize_feature_gradient(target, stream):
         "anchor_op": match.target_op_name,
         "constants": tuple(sorted(constants.items())),
         "roles": (("samples", x.memref_name), ("out", acc.memref_name)),
+        "accumulator_init": _accumulator_init("feature_gradient", match),
     }
 
 
 def _feature_gradient_plan(kernel, decision):
+    # One record-streaming policy; the single catalog decision is not consulted.
     del decision
     formula = (
         GradientFormula.LINEAR_FIXED_POINT
@@ -1173,13 +1479,6 @@ register_upmem_family(
     _SINGLE_DOMAIN,
 )
 
-# Families whose plan overwrites its output: the source must zero it.
-_ZERO_INIT_ROLES = {
-    "histogram": ("out",),
-    "selection": ("count",),
-    "kmeans_distances": ("out",),
-    "feature_gradient": ("out",),
-}
 
 
 # --------------------------------------------------------------------- #
@@ -1208,15 +1507,19 @@ def decision_fields(decision: UPMEMPhysicalDecision) -> dict:
     }
 
 
-def placement_extra(kernel: UpmemKernel, decision: UPMEMPhysicalDecision) -> dict:
+def _kernel_extra(kernel: UpmemKernel) -> dict:
     return {
         "upmem_family": kernel.family,
         "upmem_geometry": kernel.geometry,
         "upmem_anchor_op": kernel.anchor_op,
         "upmem_constants": kernel.constants,
         "upmem_placement": kernel.placement,
-        **decision_fields(decision),
+        "upmem_accumulator_init": kernel.accumulator_init,
     }
+
+
+def placement_extra(kernel: UpmemKernel, decision: UPMEMPhysicalDecision) -> dict:
+    return {**_kernel_extra(kernel), **decision_fields(decision)}
 
 
 def decision_from_extra(family: UpmemFamily, extra: Mapping) -> UPMEMPhysicalDecision:
@@ -1236,36 +1539,61 @@ def decision_from_extra(family: UpmemFamily, extra: Mapping) -> UPMEMPhysicalDec
     )
 
 
+# The F2 object a UPMEM placement carries: the masked 12-of-16 map from a
+# tasklet coordinate to the index of the contiguous block it owns.  It is
+# independent of the extent, so the work items of an uneven partition share
+# decision keys and are ranked as one group; the block size is the realized
+# plan's (``_check_tasklet_ownership`` proves the plan factors through it).
+UPMEM_TASKLET_CARRIER = masked_12_tasklet_linear_layout(1)
 
 
-def _next_power_of_two(value: int) -> int:
-    return 1 << max(0, int(value) - 1).bit_length()
+def _plan_block(plan) -> int | None:
+    """Units one tasklet owns in a row/element-blocked plan, else None."""
+    layout = getattr(plan, "tasklet_layout", None)
+    return None if layout is None else int(layout.block_elements)
 
 
-def _tasklet_block(kernel: UpmemKernel, decision: UPMEMPhysicalDecision) -> int:
-    """Consecutive elements one tasklet owns in the family plan."""
-    if kernel.family == "matrix_vector":
-        rows = kernel.geometry_value("batches") * kernel.geometry_value("rows")
-        return _next_power_of_two(-(-rows // UPMEM_ACTIVE_TASKLETS))
-    if kernel.family == "gemm":
-        rows = kernel.geometry_value("rows")
-        return _next_power_of_two(-(-rows // UPMEM_ACTIVE_TASKLETS))
-    if kernel.family in ("pointwise", "reduction"):
-        fused = decision.layout is UPMEMDataLayout.FUSED_REPLICATED
-        chunk = (decision.dma_bytes // 2 if fused else decision.dma_bytes) // 4
-        chunks = -(-kernel.geometry_value("elements") // chunk)
-        return _next_power_of_two(-(-chunks // UPMEM_ACTIVE_TASKLETS)) * chunk
-    work = {
-        "histogram": "elements",
-        "selection": "elements",
-        "kmeans_distances": "points",
-        "feature_gradient": "samples",
-    }.get(kernel.family)
-    if work is not None:
-        return _next_power_of_two(-(-kernel.geometry_value(work) // UPMEM_ACTIVE_TASKLETS))
-    if kernel.placement == "host":
-        return 1
-    raise NotImplementedError(f"no tasklet layout for UPMEM family {kernel.family!r}")
+def _carrier_projection(layout) -> dict | None:
+    """The tasklet carrier inside a placement layout: the ``tasklet``/``lane``
+    bases restricted to the ``element`` output (the movement search may
+    compose program dimensions onto the carrier), or None when those inputs
+    also drive another output."""
+    if "element" not in layout.out_dims or "tasklet" not in layout.bases:
+        return None
+    index = layout.out_dims.index("element")
+    projected = {}
+    for name in ("tasklet", "lane"):
+        vectors = layout.bases.get(name, [])
+        if any(value for vector in vectors for i, value in enumerate(vector) if i != index):
+            return None
+        projected[name] = [(vector[index],) for vector in vectors]
+    return projected
+
+
+def _check_tasklet_ownership(plan, layout) -> None:
+    """The emitted kernel's ``tid * BLOCK + local`` ownership must be the
+    carried tasklet->block map scaled by the plan's block: the carrier's
+    tasklet bases are the identity on 16 coordinates (12 active, the
+    template's ``NR_TASKLETS``) and the plan starts tasklet ``t``'s block at
+    ``t * BLOCK``."""
+    carrier = UPMEM_TASKLET_CARRIER
+    projected = _carrier_projection(layout)
+    if projected != {name: carrier.bases.get(name, []) for name in ("tasklet", "lane")}:
+        raise ValueError(
+            "UPMEM placement layout does not contain the 12-of-16 tasklet carrier "
+            "on its 'element' output"
+        )
+    block = _plan_block(plan)
+    if block is None:
+        return
+    owned = plan.tasklet_layout
+    for tasklet in range(UPMEM_ACTIVE_TASKLETS):
+        start = carrier.apply(tasklet=tasklet, lane=0)[0] * block
+        if owned.coordinate(tasklet, 0) != start:
+            raise ValueError(
+                f"UPMEM plan ownership of tasklet {tasklet} starts at "
+                f"{owned.coordinate(tasklet, 0)}, not {start}"
+            )
 
 
 def kernel_from_extra(extra: Mapping) -> UpmemKernel:
@@ -1279,18 +1607,33 @@ def kernel_from_extra(extra: Mapping) -> UpmemKernel:
         roles=(),
         dpus=1,
         placement=extra.get("upmem_placement", "dpu"),
+        accumulator_init=extra.get("upmem_accumulator_init", "none"),
     )
 
 
-def _legal(kernel: UpmemKernel, decision: UPMEMPhysicalDecision) -> bool:
+@functools.lru_cache(maxsize=4096)
+def _realize(kernel: UpmemKernel, decision: UPMEMPhysicalDecision):
+    """``(plan, None)`` when the family template realizes ``decision`` for
+    ``kernel``, else ``(None, reason)``.
+
+    Legality is the template's: the physical model's structural checks
+    (decision fields that belong to the family, DMA sizes, WRAM) and the plan
+    constructor's own preconditions (DMA bounds and alignment, tasklet split,
+    capacities).  Divisibility of an extent is never a legality condition:
+    the templates zero-pad and mask, and the features price the padded
+    program.
+    """
     family = upmem_family(kernel.family)
-    if family.features is None:
-        return True
     try:
-        physical_features(family.features(kernel), decision)
-    except UPMEMPhysicalLegalityError:
-        return False
-    return True
+        if family.features is not None:
+            physical_features(family.features(kernel), decision)
+        return family.plan_for(kernel, decision), None
+    except ValueError as error:  # UPMEMPhysicalLegalityError, UPMEMPlanBuilderRejected
+        return None, str(error)
+
+
+def _legal(kernel: UpmemKernel, decision: UPMEMPhysicalDecision) -> bool:
+    return _realize(kernel, decision)[1] is None
 
 
 def _legal_decisions(kernel: UpmemKernel) -> list:
@@ -1301,28 +1644,48 @@ def _legal_decisions(kernel: UpmemKernel) -> list:
     )
 
 
+def _no_legal_decision(kernel: UpmemKernel) -> NotImplementedError:
+    family = upmem_family(kernel.family)
+    reasons: dict[str, list] = {}
+    for decision in family.domain:
+        reason = _realize(kernel, decision)[1]
+        fields = decision_fields(decision)
+        label = f"{fields['data_layout']}/dma{fields['dma_bytes']}"
+        reasons.setdefault(reason, []).append(label)
+    detail = "; ".join(
+        f"{', '.join(labels)}: {reason}" for reason, labels in reasons.items()
+    )
+    geometry = ", ".join(f"{name}={value}" for name, value in kernel.geometry)
+    return NotImplementedError(
+        f"UPMEM {kernel.family} ({geometry}): no decision of the family's "
+        f"catalog is realizable by its template: {detail}"
+    )
+
+
 def upmem_base_placements(target, matches) -> list[Placement]:
     """One base placement per data layout with a legal decision (spec U5)."""
     kernel = classify_upmem_kernel(target, matches)
-    layouts = sorted({d.layout.value for d in _legal_decisions(kernel)})
+    legal = _legal_decisions(kernel)
+    if not legal:
+        raise _no_legal_decision(kernel)
+    layouts = sorted({d.layout.value for d in legal})
     return [
         Placement(
             placements={},
             mode=f"upmem:{kernel.family}:{layout}",
-            extra={
-                "upmem_family": kernel.family,
-                "upmem_geometry": kernel.geometry,
-                "upmem_anchor_op": kernel.anchor_op,
-                "upmem_constants": kernel.constants,
-                "upmem_placement": kernel.placement,
-                "data_layout": layout,
-            },
+            extra={**_kernel_extra(kernel), "data_layout": layout},
         )
         for layout in layouts
     ]
 
 
-# Knob names in registration (cross) order, spec 001 D5.
+# Knob names in registration (cross) order, spec 001 D5.  ``tasklets`` only
+# ever takes 12 (every catalog decision and template is a 12-tasklet plan: a
+# schedule policy, not a hardware limit; the target declares 24); it stays a
+# knob so a calibrated catalog with other tasklet counts needs no enumerator
+# change.  Families with a one-decision catalog (reduction, histogram,
+# kmeans_distances, feature_gradient, kmeans_update) carry their single
+# decision's fields; their templates have one DMA policy each.
 UPMEM_KNOBS = (
     "tasklets",
     "dma_bytes",
@@ -1350,17 +1713,23 @@ def upmem_knob_candidates(name: str, extra: Mapping) -> list:
 
 
 def upmem_knob_emit(name: str, value, base: Placement) -> Placement:
-    """A copy of ``base`` with ``extra[name] = value``; the last knob also
-    attaches the plan family's masked 12-of-16 tasklet layout."""
+    """A copy of ``base`` with ``extra[name] = value``.  The last knob checks
+    the decision is realizable and attaches the F2 tasklet carrier (which
+    codegen checks against the emitted plan's ownership) and the decision's
+    cost validity."""
     extra = dict(base.extra or {})
     extra[name] = value
     layout = base.layout
     if name == UPMEM_KNOBS[-1]:
         family = upmem_family(extra["upmem_family"])
         decision = decision_from_extra(family, extra)
-        layout = masked_12_tasklet_linear_layout(
-            _tasklet_block(kernel_from_extra(extra), decision)
-        )
+        kernel = kernel_from_extra(extra)
+        plan, reason = _realize(kernel, decision)
+        if reason is not None:
+            raise ValueError(f"UPMEM knob emitted an unrealizable decision: {reason}")
+        del plan
+        layout = UPMEM_TASKLET_CARRIER
+        extra["upmem_cost_validity"] = upmem_cost_validity(kernel, decision)
     return Placement(
         placements=dict(base.placements or {}),
         mode=f"{base.mode}+{name}={value}",
@@ -1369,17 +1738,64 @@ def upmem_knob_emit(name: str, value, base: Placement) -> Placement:
     )
 
 
+_FEATURE_COST_KEYS = {
+    "mram_read_calls": "mram_read_calls",
+    "mram_read_bytes": "mram_read_bytes",
+}
+
+
 def upmem_kernel_features(properties: Mapping) -> tuple | None:
     """``(name, int)`` pairs of ``UPMEMPhysicalFeatures`` for a placement, or
-    None for a family the physical model does not cover (reduction)."""
+    None for a family the physical model does not cover (reduction).
+
+    A carried accumulator adds the template's initial-output loads, taken
+    from the plan's own accounting (carried minus zero-initialized).
+    """
     family = upmem_family(properties["upmem_family"])
     if family.features is None:
         return None
     kernel = kernel_from_extra(properties)
-    features = physical_features(
-        family.features(kernel), decision_from_extra(family, properties)
-    )
-    return tuple(features.manifest().items())
+    decision = decision_from_extra(family, properties)
+    features = dict(physical_features(family.features(kernel), decision).manifest())
+    plan = _realize(kernel, decision)[0]
+    if kernel.accumulator_init == "carried" and getattr(plan, "carried_output", False):
+        carried = plan.cost_features()
+        zeroed = family.plan_for(
+            dataclasses.replace(kernel, accumulator_init="zero"), decision
+        ).cost_features()
+        for feature, plan_key in _FEATURE_COST_KEYS.items():
+            features[feature] += int(carried[plan_key]) - int(zeroed[plan_key])
+    return tuple(features.items())
+
+
+def upmem_cost_validity(kernel: UpmemKernel, decision: UPMEMPhysicalDecision) -> dict:
+    """Validity label of the cost the cost program assigns this decision.
+
+    ``calibrated``: the physical model has anchors in the decision's
+    calibration stratum and one of them has exactly this problem.
+    ``extrapolated``: anything else (other shape or operation in a calibrated
+    stratum, an uncalibrated stratum at factor 1.0, or a family priced by the
+    per-op analytical rules), with the nearest calibrated point.
+    """
+    family = upmem_family(kernel.family)
+    if kernel.placement == "host":
+        return {
+            "cost_validity": "extrapolated",
+            "basis": "coarse host-operation count (costs/upmem.py HOST_OP_CYCLES)",
+            "nearest_calibrated_point": None,
+        }
+    if family.features is None:
+        return {
+            "cost_validity": "extrapolated",
+            "basis": "per-op analytical rules (costs/upmem.py); no calibration "
+            f"anchors exist for the {kernel.family} family",
+            "nearest_calibrated_point": None,
+        }
+    validity = dict(calibration_validity(family.features(kernel), decision))
+    if kernel.accumulator_init == "carried" and validity["cost_validity"] == "calibrated":
+        validity["cost_validity"] = "extrapolated"
+        validity["basis"] += "; carried-output loads are outside every anchor"
+    return validity
 
 
 # --------------------------------------------------------------------- #
@@ -1804,22 +2220,84 @@ def _check_coverage(function, state, matches) -> None:
         )
 
 
-def _check_zero_init(function, state, kernel) -> None:
-    """The plan overwrites these outputs, so the source must zero them."""
-    for role in _ZERO_INIT_ROLES.get(kernel.family, ()):
-        name = kernel.role(role)
-        zeroed = any(
-            op.name in ("affine.store", "memref.store")
-            and "to" in op.attributes
-            and _attr_text(op.attributes["to"]) == name
-            and _is_zero_constant(op.operands[0])
-            for op in _walk(function.regions[0].blocks[0], [])
+_DIVISIONS = {"arith.divsi", "arith.divui", "arith.floordivsi", "arith.ceildivsi"}
+
+
+def _check_kmeans_update_epilogue(function, kernel) -> None:
+    """The unmatched part of a host ``kmeans_update`` group is the
+    per-cluster division: every store into a caller argument other than
+    ``counts`` writes one ``(clusters, dimension)`` output, and each stored
+    value is computed (through local scalars, arithmetic and selects) only
+    from ``sums``/``counts`` elements and constants, with a division."""
+    ir = _ir()
+    roles = dict(kernel.roles)
+    sums, counts = roles["sums"], roles["counts"]
+    shape = (kernel.geometry_value("clusters"), kernel.geometry_value("dimension"))
+    body = _walk(function.regions[0].blocks[0], [])
+    stores = [op for op in body if op.name in ("affine.store", "memref.store")]
+
+    def name_of(op, key):
+        return _attr_text(op.attributes[key]) if key in op.attributes else None
+
+    outputs = {}
+    for op in stores:
+        if _func_argument_number(function, op.operands[1]) is None:
+            continue
+        target = name_of(op, "to")
+        if target == counts:
+            continue
+        outputs.setdefault(target, []).append(op)
+    if len(outputs) != 1:
+        raise NotImplementedError(
+            "UPMEM kmeans_update: the host update must write exactly one "
+            f"centroid output besides {counts!r}; it writes {sorted(outputs)}"
         )
-        if not zeroed:
+    ((output, output_stores),) = outputs.items()
+    if tuple(map(int, output_stores[0].operands[1].type.shape)) != shape:
+        raise NotImplementedError(
+            f"UPMEM kmeans_update: centroid output {output!r} is not "
+            f"{shape[0]}x{shape[1]}"
+        )
+    local_stores = {}
+    for op in stores:
+        if _owner_name(op.operands[1]) in ("memref.alloc", "memref.alloca"):
+            local_stores.setdefault(name_of(op, "to"), []).append(op)
+    seen_locals: set = set()
+    divisions = []
+
+    def derived(value) -> bool:
+        if ir.BlockArgument.isinstance(value):
+            return False
+        owner = ir.OpResult(value).owner
+        op_name = owner.name
+        if op_name == "arith.constant":
+            return True
+        if op_name in ("affine.load", "memref.load"):
+            source = name_of(owner, "from")
+            if source in (sums, counts):
+                return True
+            if source in local_stores:
+                if source in seen_locals:
+                    return True
+                seen_locals.add(source)
+                return all(derived(st.operands[0]) for st in local_stores[source])
+            return False
+        if op_name.startswith("arith."):
+            if op_name in _DIVISIONS:
+                divisions.append(op_name)
+            return all(derived(operand) for operand in owner.operands)
+        return False
+
+    for op in output_stores:
+        if not derived(op.operands[0]):
             raise NotImplementedError(
-                f"accumulator {name} is not zero-initialized in the kernel; the "
-                "UPMEM template overwrites it"
+                f"UPMEM kmeans_update: a value stored to {output!r} is not "
+                f"computed from {sums!r} and {counts!r} alone"
             )
+    if not divisions:
+        raise NotImplementedError(
+            f"UPMEM kmeans_update: {output!r} is not divided by the counts"
+        )
 
 
 def _check_role_dtypes(kernel, function, name, windows) -> None:
@@ -2000,14 +2478,50 @@ def _pack_fused_gemm(plan, lhs, rhs) -> list:
     return values
 
 
+def _pad_to(values: list, size: int) -> list:
+    return values + [0] * (size - len(values))
+
+
+def _encode_output(plan, out) -> tuple[str, bytes]:
+    """``(region, bytes)`` of logical output values in the plan's physical
+    output layout (also the initial-output image of a carried accumulator)."""
+    if isinstance(plan, UPMEMMatrixVectorPlan):
+        return "output", _i32(plan.pack_output(out), "output")
+    if isinstance(plan, UPMEMElementwisePlan):
+        return "output", _i32(_pad_to(out, plan.padded_elements), "output")
+    if isinstance(plan, UPMEMSumReductionPlan):
+        return "output", _i64(out, "output")
+    if isinstance(plan, UPMEMGEMMPlan):
+        physical = [0] * (plan.padded_rows * plan.padded_columns)
+        for row in range(plan.rows):
+            begin = row * plan.padded_columns
+            physical[begin : begin + plan.columns] = out[
+                row * plan.columns : (row + 1) * plan.columns
+            ]
+        return "output", _i32(physical, "output")
+    if isinstance(plan, UPMEMHistogramPlan):
+        return "histogram", _i32(out, "histogram")
+    if isinstance(plan, UPMEMKMeansDistancesPlan):
+        return "distances", _i64(out, "distances")
+    if isinstance(plan, UPMEMFeatureGradientPlan):
+        return "gradient", _i64(out, "gradient")
+    raise NotImplementedError(f"no UPMEM output packer for {type(plan).__name__}")
+
+
 def pack_inputs(plan, kernel: UpmemKernel, slices: Mapping) -> bytes:
-    """Full MRAM heap image for one DPU and launch."""
+    """Full MRAM heap image for one DPU and launch.
+
+    ``slices`` are already padded to the plan's geometry (``_padded_slices``);
+    a carried accumulator's initial output arrives as ``initial_out`` and is
+    placed in the output region, where the template loads it.
+    """
     image = bytearray(int(plan.mram_image_bytes))
     if isinstance(plan, UPMEMMatrixVectorPlan):
         matrix, vector = _flat(slices["matrix"]), _flat(slices["vector"])
         if plan.vector_mode == "tasklet_private_wram":
-            _write_region(image, _region(plan, "matrix"), _i32(matrix, "matrix"), "matrix")
-            _write_region(image, _region(plan, "vector"), _i32(vector, "vector"), "vector")
+            matrix_words, vector_words = plan.pack_private_inputs(matrix, vector)
+            _write_region(image, _region(plan, "matrix"), _i32(matrix_words, "matrix"), "matrix")
+            _write_region(image, _region(plan, "vector"), _i32(vector_words, "vector"), "vector")
         else:
             _write_region(
                 image,
@@ -2016,7 +2530,8 @@ def pack_inputs(plan, kernel: UpmemKernel, slices: Mapping) -> bytes:
                 "packed_matrix_vector",
             )
     elif isinstance(plan, UPMEMElementwisePlan):
-        lhs, rhs = _flat(slices["lhs"]), _flat(slices["rhs"])
+        lhs = _flat(slices["lhs"])
+        rhs = _flat(slices["rhs"]) if plan.operands == 2 else []
         if plan.interleaved:
             _write_region(
                 image,
@@ -2026,7 +2541,8 @@ def pack_inputs(plan, kernel: UpmemKernel, slices: Mapping) -> bytes:
             )
         else:
             _write_region(image, _region(plan, "x"), _i32(lhs, "x"), "x")
-            _write_region(image, _region(plan, "y"), _i32(rhs, "y"), "y")
+            if plan.operands == 2:
+                _write_region(image, _region(plan, "y"), _i32(rhs, "y"), "y")
         if "coefficients" in plan.mram_regions:
             _write_region(
                 image,
@@ -2057,6 +2573,9 @@ def pack_inputs(plan, kernel: UpmemKernel, slices: Mapping) -> bytes:
         _write_region(image, _region(plan, "samples"), _i32(_flat(slices["samples"]), "samples"), "samples")
     else:
         raise NotImplementedError(f"no UPMEM input packer for {type(plan).__name__}")
+    if "initial_out" in slices:
+        region, data = _encode_output(plan, _flat(slices["initial_out"]))
+        _write_region(image, _region(plan, region), data, f"initial {region}")
     return bytes(image)
 
 
@@ -2067,46 +2586,19 @@ def pack_expected(plan, kernel: UpmemKernel, slices: Mapping) -> tuple[int, byte
         # The source never materializes flags; they come from the plan's own
         # reference. The end-to-end check against the oracle runs after the
         # host compaction (``_selection_epilogue``).
-        flags = plan.reference_flags(_flat(slices["input"]))
+        flags = plan.reference_flags(_pad_to(_flat(slices["input"]), plan.elements))
         _write_region(image, _region(plan, "flags"), _i32(flags, "flags"), "flags")
         begin, end = _output_window(plan)
         return begin, bytes(image[begin:end])
-    out = _flat(slices["out"])
-    if isinstance(plan, UPMEMHistogramPlan):
-        _write_region(image, _region(plan, "histogram"), _i32(out, "histogram"), "histogram")
-        begin, end = _output_window(plan)
-        return begin, bytes(image[begin:end])
-    if isinstance(plan, UPMEMKMeansDistancesPlan):
-        _write_region(image, _region(plan, "distances"), _i64(out, "distances"), "distances")
-        begin, end = _output_window(plan)
-        return begin, bytes(image[begin:end])
-    if isinstance(plan, UPMEMFeatureGradientPlan):
-        _write_region(image, _region(plan, "gradient"), _i64(out, "gradient"), "gradient")
-        begin, end = _output_window(plan)
-        return begin, bytes(image[begin:end])
-    if isinstance(plan, UPMEMMatrixVectorPlan):
-        data = _i32(plan.pack_output(out), "expected output")
-    elif isinstance(plan, UPMEMElementwisePlan):
-        data = _i32(out + [0] * (plan.padded_elements - len(out)), "expected output")
-    elif isinstance(plan, UPMEMSumReductionPlan):
-        data = _i64(out, "expected output")
-    elif isinstance(plan, UPMEMGEMMPlan):
-        physical = [0] * (plan.padded_rows * plan.padded_columns)
-        for row in range(plan.rows):
-            begin = row * plan.padded_columns
-            physical[begin : begin + plan.columns] = out[
-                row * plan.columns : (row + 1) * plan.columns
-            ]
-        data = _i32(physical, "expected output")
-    else:
-        raise NotImplementedError(f"no UPMEM output packer for {type(plan).__name__}")
-    _write_region(image, _region(plan, "output"), data, "output")
+    region, data = _encode_output(plan, _flat(slices["out"]))
+    _write_region(image, _region(plan, region), data, region)
     begin, end = _output_window(plan)
     return begin, bytes(image[begin:end])
 
 
 def gather_outputs(plan, kernel: UpmemKernel, window: bytes) -> dict:
-    """Decode one DPU's output window into ``{role: logical values}``."""
+    """Decode one DPU's output window into ``{role: logical values}`` at the
+    plan's geometry (a padded work item keeps its leading elements)."""
     if isinstance(plan, UPMEMMatrixVectorPlan):
         values = np.frombuffer(window, dtype="<i4")
         return {"out": np.asarray(plan.gather_output(values.tolist()), dtype=np.int64)}
@@ -2127,6 +2619,50 @@ def gather_outputs(plan, kernel: UpmemKernel, window: bytes) -> dict:
     if isinstance(plan, (UPMEMKMeansDistancesPlan, UPMEMFeatureGradientPlan)):
         return {"out": np.frombuffer(window, dtype="<i8").astype(np.int64)}
     raise NotImplementedError(f"no UPMEM output gather for {type(plan).__name__}")
+
+
+# Roles whose flattened extent follows the family's uneven axis (the axis is
+# outermost, so padding a work item is appending zeros to these roles).
+_PADDED_ROLES = {
+    "pointwise": ("lhs", "rhs", "out", "initial_out"),
+    "reduction": ("input",),
+    "matrix_vector": ("matrix", "out", "initial_out"),
+    "gemm": ("lhs", "out", "initial_out"),
+    "selection": ("input",),
+}
+
+
+def _padded_slices(kernel: UpmemKernel, stream: int, slices: Mapping) -> dict:
+    """Zero-pad one work item's role slices to the plan's (largest) geometry.
+
+    Every padded family is padding-neutral: zero inputs produce zero (or a
+    discarded) result, and the padded outputs are dropped on gather.
+    """
+    own, full = dict(kernel.stream_geometry(stream)), dict(kernel.geometry)
+    if own == full:
+        return dict(slices)
+    (axis,) = [key for key in full if own[key] != full[key]]
+    roles = _PADDED_ROLES[kernel.family]
+    if kernel.family == "matrix_vector" and axis == "batches":
+        roles += ("vector",)
+    padded = dict(slices)
+    for role in roles:
+        if role not in padded:
+            continue
+        values = _flat(padded[role])
+        size = len(values) // own[axis] * full[axis]
+        padded[role] = _pad_to(values, size)
+    return padded
+
+
+def padding_fraction(kernel: UpmemKernel) -> float:
+    """Fraction of the DPUs' work-item extents that is zero padding."""
+    if not kernel.streams:
+        return 0.0
+    full = dict(kernel.geometry)
+    (axis,) = {key for stream in kernel.streams for key, value in stream if value != full[key]}
+    logical = sum(dict(stream)[axis] for stream in kernel.streams)
+    return 1.0 - logical / (full[axis] * len(kernel.streams))
 
 
 _INPUT_ROLES = {
@@ -2157,6 +2693,7 @@ class _GroupProgram:
     device_source: str
     windows: dict  # function -> {role: _Window}
     oracles: dict  # function -> (compiled C module, abi positions)
+    cost_validity: dict | None = None
 
 
 class UpmemCtx(CodegenContext):
@@ -2194,27 +2731,46 @@ class UpmemCtx(CodegenContext):
         for group_id, matches in by_group.items():
             kernel = classify_upmem_kernel(self.target, matches)
             family = upmem_family(kernel.family)
-            decisions = {
-                decision_from_extra(family, layout_by_scope[scope].extra)
-                for scope in {_matcher_search_scope(match) for match in matches}
-                if scope in layout_by_scope
+            scope_by_work = {
+                _matcher_work_scope(match).work_id: _matcher_search_scope(match)
+                for match in matches
             }
-            if len(decisions) != 1:
+            work_ids = sorted(scope_by_work)
+            chosen = {
+                scope_by_work[work]: decision_from_extra(
+                    family, layout_by_scope[scope_by_work[work]].extra
+                )
+                for work in work_ids
+                if scope_by_work[work] in layout_by_scope
+            }
+            if not chosen:
+                raise ValueError(f"UPMEM kernel group {group_id} carries no decision")
+            if len(set(chosen.values())) == 1:
+                (decision,) = set(chosen.values())
+            elif kernel.streams:
+                # Uneven work items are ranked at their own extents; the one
+                # shared binary is built for the largest, so its decision is
+                # the executed one (it is also the slowest DPU's).
+                largest = next(
+                    index
+                    for index in range(len(work_ids))
+                    if kernel.streams[index] == kernel.geometry
+                )
+                decision = chosen[scope_by_work[work_ids[largest]]]
+            else:
                 raise ValueError(
-                    f"UPMEM kernel group {group_id} carries {len(decisions)} "
+                    f"UPMEM kernel group {group_id} carries {len(set(chosen.values()))} "
                     "physical decisions; one is required"
                 )
-            (decision,) = decisions
-            try:
-                if family.features is not None:
-                    physical_features(family.features(kernel), decision)
-                plan = family.plan_for(kernel, decision)
-                device_source = "" if plan is None else plan.device_source()
-            except (UPMEMPlanBuilderRejected, UPMEMPhysicalLegalityError, ValueError) as error:
+            plan, reason = _realize(kernel, decision)
+            if reason is not None:
                 raise InfeasibleSchedule(
                     f"UPMEM {kernel.family} decision {decision.manifest()} is not "
-                    f"realizable: {error}"
-                ) from error
+                    f"realizable: {reason}"
+                )
+            device_source = "" if plan is None else plan.device_source()
+            if plan is not None:
+                self._check_carried_layout(kernel, plan, decision, chosen, layout_by_scope)
             functions = sorted(
                 {m.func_name: _matcher_work_scope(m).work_id for m in matches}.items(),
                 key=lambda item: item[1],
@@ -2227,6 +2783,7 @@ class UpmemCtx(CodegenContext):
                 device_source,
                 {},
                 {},
+                upmem_cost_validity(kernel, decision),
             )
 
         if module is not None:
@@ -2275,6 +2832,16 @@ class UpmemCtx(CodegenContext):
             for index, segment in enumerate(self.segments)
         ]
 
+    @staticmethod
+    def _check_carried_layout(kernel, plan, decision, chosen, layout_by_scope) -> None:
+        """Every work item's placement carries the tasklet carrier the
+        emitted plan's ownership factors through."""
+        del kernel, decision
+        for scope in chosen:
+            layout = layout_by_scope[scope].layout
+            if layout is not None:
+                _check_tasklet_ownership(plan, layout)
+
     def _bind_module(self, module, by_group, groups) -> None:
         from ._mlir.ir import AsmState
         from .backend.c import emit_c_from_mlir
@@ -2292,12 +2859,12 @@ class UpmemCtx(CodegenContext):
                 abi = [int(v.value) for v in function.attributes["spmw.abi_value_ids"]]
                 if program.kernel.placement == "host":
                     # A host group runs its own MLIR: no template, no windows.
+                    _check_kmeans_update_epilogue(function, program.kernel)
                     artifact = emit_c_from_mlir(module, name, wrap_wide_integers=True)
                     program.oracles[name] = (artifact.compile(), abi)
                     arity = max(arity, max(abi, default=-1) + 1)
                     continue
                 _check_coverage(function, state, own)
-                _check_zero_init(function, state, program.kernel)
                 windows = {}
                 body = _walk(function.regions[0].blocks[0], [])
                 for role, memref_name in roles.items():
@@ -2394,6 +2961,34 @@ class UpmemCtx(CodegenContext):
                 program.oracles[name] = (artifact.compile(), abi)
         self.arity = arity
 
+    def virtual_run_extra(self) -> dict:
+        """``RunResult.extra`` fields of a ``backend="virtual"`` run.
+
+        The virtual estimate is the cost graph: DPU logic cycles from the
+        physical model plus any modeled host steps (explicit host moves, host
+        groups, selection compaction).  It is therefore never comparable
+        one-to-one with the simulator's device-only ``cycles``.
+        """
+        labels = [
+            {
+                "group": group_id,
+                "family": program.kernel.family,
+                "placement": program.kernel.placement,
+                **(program.cost_validity or {}),
+            }
+            for group_id, program in sorted(self.groups.items())
+        ]
+        overall = (
+            "calibrated"
+            if labels and all(label.get("cost_validity") == "calibrated" for label in labels)
+            else "extrapolated"
+        )
+        return {
+            "timing_scope": VIRTUAL_TIMING_SCOPE,
+            "cost_validity": overall,
+            "upmem_cost_validity": labels,
+        }
+
     def runtime_route(self, commands):
         del commands
         return (
@@ -2464,20 +3059,31 @@ class UpmemCtx(CodegenContext):
                     slices_in = {
                         r: windows[r].slice(before[windows[r].argument])
                         for r in _INPUT_ROLES[family]
+                        if r in windows
                     }
                     _check_preconditions(segment.plan, segment.kernel, slices_in)
-                    heap = pack_inputs(segment.plan, segment.kernel, slices_in)
+                    device_in = dict(slices_in)
+                    if segment.plan is not None and _carries_output_on_device(segment):
+                        device_in["initial_out"] = windows["out"].slice(
+                            before[windows["out"].argument]
+                        )
+                    device_in = _padded_slices(segment.kernel, dpu, device_in)
+                    heap = pack_inputs(segment.plan, segment.kernel, device_in)
                     offset, oracle = pack_expected(
                         segment.plan,
                         segment.kernel,
-                        {
-                            **slices_in,
-                            **{
-                                r: windows[r].slice(arrays[windows[r].argument])
-                                for r in _OUTPUT_ROLES[family]
-                                if r in windows
+                        _padded_slices(
+                            segment.kernel,
+                            dpu,
+                            {
+                                **slices_in,
+                                **{
+                                    r: windows[r].slice(arrays[windows[r].argument])
+                                    for r in _OUTPUT_ROLES[family]
+                                    if r in windows
+                                },
                             },
-                        },
+                        ),
                     )
                     outputs[(execution, dpu)] = (offset, oracle)
                     dpus.append(
@@ -2513,6 +3119,43 @@ class UpmemCtx(CodegenContext):
             expected.append(outputs)
             states.append([array.copy() for array in arrays])
         return UpmemBundle(tuple(fixtures), tuple(expected), tuple(states))
+
+
+def _host_steps(segment) -> list:
+    """Host-runtime steps of a DPU segment, as part of the retained program:
+    the per-DPU output gather into the caller's arrays (priced by explicit
+    ``host_moves`` GATHER steps when the program declares them) and, for
+    compaction-form selection, the stable compaction of the device flags
+    (priced by the cost program's ``selection`` host rule)."""
+    kernel = segment.kernel
+    steps = [
+        {
+            "kind": "gather_outputs",
+            "dpus": kernel.dpus,
+            "bytes_per_dpu": _output_window(segment.plan)[1] - _output_window(segment.plan)[0],
+            "priced_by": "host_moves GATHER_MRAM (when declared)",
+        }
+    ]
+    if kernel.family == "selection" and kernel.geometry_value("compact"):
+        steps.append(
+            {
+                "kind": "selection_compaction",
+                "elements": kernel.geometry_value("elements") * kernel.dpus,
+                "modeled_host_cycles": kernel.dpus
+                * upmem_costs.selection_compaction_cycles(kernel.geometry_value("elements")),
+                "priced_by": "costs/upmem.py selection_compaction_cycles",
+            }
+        )
+    return steps
+
+
+def _carries_output_on_device(segment) -> bool:
+    """A carried accumulator whose template loads the initial output (the
+    selection count is carried by the host compaction step instead)."""
+    return (
+        segment.kernel.accumulator_init == "carried"
+        and segment.kernel.family != "selection"
+    )
 
 
 def _indexed_name(stem: str, index: int) -> str:
@@ -2604,11 +3247,15 @@ def _store_exact(view: np.ndarray, values, what: str) -> None:
 def _selection_epilogue(segment, windows, flags, arrays, oracle_state) -> None:
     """Host stable compaction of the observed DPU flags (spec 004 D1).
 
-    Generated from the ``COMPACT`` and ``INC`` matches: keep every flag value
-    whose low bit is set, in index order, into ``out[0:k]`` and set the counter
-    cell to ``k``; ``out[k:]`` is untouched, as in the source. The flags form
-    (``SELECT_ODD``) writes the flags to its output instead. The result must
-    equal the functional oracle's, or the run raises.
+    Generated from the ``COMPACT`` and ``INC`` matches: keep, in index order,
+    every input the device marked (``value_or_zero`` flags: the nonzero odd
+    values; ``mask`` flags: the inputs whose flag is 1), write them to
+    ``out[c0:c0 + k]`` and set the counter to ``c0 + k``, where ``c0`` is
+    the counter's initial value (0 when the source zeroes it, the caller's
+    value when it is carried).  ``out`` outside that range is untouched, as
+    in the source.  The flags form (``SELECT_ODD``) writes the flags to its
+    output instead.  The result must equal the functional oracle's, or the
+    run raises.
     """
     flags = np.asarray(flags, dtype=np.int64)
     out_window = windows["out"]
@@ -2616,17 +3263,30 @@ def _selection_epilogue(segment, windows, flags, arrays, oracle_state) -> None:
     if not segment.kernel.geometry_value("compact"):
         _store_exact(out, flags, "selection flags")
         return
-    kept = flags[(flags & 1) != 0]
-    _store_exact(out[: kept.size], kept, "selection output")
+    if segment.plan.encoding == "value_or_zero":
+        kept = flags[(flags & 1) != 0]
+    else:
+        input_window = windows["input"]
+        values = input_window.slice(arrays[input_window.argument]).reshape(-1)
+        kept = np.asarray(values, dtype=np.int64)[flags != 0]
     count_window = windows["count"]
     count = count_window.slice(arrays[count_window.argument]).reshape(-1)
-    _store_exact(count[:1], [kept.size], "selection count")
+    start = int(count[0]) if segment.kernel.accumulator_init == "carried" else 0
+    if start < 0 or start + kept.size > out.size:
+        raise RuntimeError(
+            f"UPMEM selection: compacting {kept.size} values after the initial "
+            f"count {start} overruns the {out.size}-element output"
+        )
+    _store_exact(out[start : start + kept.size], kept, "selection output")
+    _store_exact(count[:1], [start + kept.size], "selection count")
     want_out = out_window.slice(oracle_state[out_window.argument]).reshape(-1)
     want_count = count_window.slice(oracle_state[count_window.argument]).reshape(-1)
-    if int(want_count[0]) != kept.size or not np.array_equal(out[: kept.size], want_out[: kept.size]):
+    if int(want_count[0]) != start + kept.size or not np.array_equal(
+        out[start : start + kept.size], want_out[start : start + kept.size]
+    ):
         raise RuntimeError(
             "UPMEM selection: host compaction of the simulated flags differs from "
-            f"the functional oracle (count {kept.size} vs {int(want_count[0])})"
+            f"the functional oracle (count {start + kept.size} vs {int(want_count[0])})"
         )
 
 
@@ -2676,8 +3336,13 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                     "family": segment.kernel.family,
                     "executions": segment.executions,
                     "host_wall_s": time.perf_counter() - started,
+                    # Device cycles only (the paper metric); the host work is
+                    # reported separately, in the cost program's host unit.
                     "logic_cycles": 0,
+                    "modeled_host_cycles": segment.executions
+                    * upmem_costs.host_group_cycles(dict(segment.kernel.geometry)),
                     "timing_scope": _TIMING_SCOPE,
+                    "host_timing_scope": upmem_costs.HOST_TIMING_SCOPE,
                 }
             )
             continue
@@ -2736,11 +3401,16 @@ def _run_upmem(compiled, **inputs) -> RunResult:
         log_path = bin_dir / "log.txt"
         if simulated.returncode != 0:
             mismatch = _first_mismatch(segment, expected, bin_dir)
+            # A located mismatch is the whole story; the SDK's analysis
+            # output stays in the run directory's log.
             raise RuntimeError(
                 f"uPIMulator failed on segment {index} (exit {simulated.returncode})"
-                + (f"; first mismatch: {mismatch}" if mismatch else "")
-                + "\n"
-                + "\n".join((simulated.stdout + simulated.stderr).splitlines()[-40:])
+                + (
+                    f"; first mismatch: {mismatch} (log: {run_dir / 'simulate.log'})"
+                    if mismatch
+                    else "\n"
+                    + "\n".join((simulated.stdout + simulated.stderr).splitlines()[-40:])
+                )
             )
         log_text = log_path.read_text(errors="replace")
         per_dpu = {}
@@ -2765,16 +3435,18 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                 )
                 values = gather_outputs(segment.plan, segment.kernel, observed.read_bytes())
                 if "flags" in values:
+                    own = dict(segment.kernel.stream_geometry(dpu))["elements"]
                     _selection_epilogue(
-                        segment, program.windows[name], values["flags"], caller_arrays,
-                        bundle.states[index],
+                        segment, program.windows[name], values["flags"][:own],
+                        caller_arrays, bundle.states[index],
                     )
                     continue
                 for role, data in values.items():
                     window = program.windows[name][role]
-                    destination = caller_arrays[window.argument]
+                    destination = window.slice(caller_arrays[window.argument])
+                    # A zero-padded work item keeps its leading elements.
                     _store_exact(
-                        window.slice(destination), data,
+                        destination, np.asarray(data).reshape(-1)[: destination.size],
                         f"{segment.kernel.family} role {role!r}",
                     )
 
@@ -2798,6 +3470,15 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                 },
                 "logic_cycles": segment_cycles,
                 "timing_scope": _TIMING_SCOPE,
+                "geometry": dict(segment.kernel.geometry),
+                "work_item_geometry": [
+                    dict(segment.kernel.stream_geometry(d)) for d in range(dpus)
+                ],
+                "padding_fraction": padding_fraction(segment.kernel),
+                "plan_manifest_sha256": _sha256(
+                    json.dumps(segment.plan.manifest(), sort_keys=True, default=str).encode()
+                ),
+                "host_steps": _host_steps(segment),
             }
         )
     # The run writes decoded outputs into the caller's arrays in place;

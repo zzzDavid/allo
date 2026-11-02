@@ -303,9 +303,12 @@ def linear_reg_region(S: int32[_GRAD_S, _GRAD_W], G: int64[_GRAD_F]):
             lG[f] = 0
         for s in range(_GRAD_S):
             for f in range(_GRAD_F):
-                # An int64 temporary keeps the shift signed in the portable-C
-                # oracle (backend/c.py stores >64-bit temporaries unsigned);
-                # M3 forwarding folds it into the GRAD_LINEAR match.
+                # The int64 temporary keeps the product within 64 bits: Allo
+                # widens int32 * int32 * literal to a >64-bit intermediate,
+                # whose arithmetic shift the portable-C oracle rejects
+                # (backend/c.py WideIntegerError: only add/sub/mul/and/or/xor
+                # are exact on the low 64 bits).  M3 forwarding folds the
+                # temporary into the GRAD_LINEAR match.
                 t: int64 = (lS[s, f] * lS[s, _GRAD_F]) * -32
                 lG[f] += t >> 8
 

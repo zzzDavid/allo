@@ -51,6 +51,12 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
+# The 2023.1 SDK linker reserves a 1 KiB stack per enabled tasklet; the
+# runtime keeps a further reserve (same facts as ``upmem_irregular``).
+_STACK_BYTES_PER_TASKLET = 1024
+_WRAM_RUNTIME_RESERVE = 1024
+
+
 def _next_power_of_two(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
@@ -407,13 +413,28 @@ def _source_prelude(title: str) -> str:
 """
 
 
+# Pointwise operations the streaming template computes, with the number of
+# MRAM input operands each reads.  ``add`` and the (2, -1) ``axpby`` keep the
+# calibrated expressions; every other expression is emitted with explicit
+# uint32 wraparound so int32 overflow is defined (two's complement), exactly
+# as the source's int32 arithmetic.
+ELEMENTWISE_OPERATIONS = {"add": 2, "axpby": 2, "sub": 2, "mul": 2, "scale": 1}
+
+
+def _wrap32(expression: str) -> str:
+    return f"(int32_t)({expression})"
+
+
 @dataclass(frozen=True)
 class UPMEMElementwisePlan(UPMEMPhysicalPlan):
-    """Streaming int32 add/AXPBY with calibrated fused chunk packing.
+    """Streaming int32 pointwise plan with calibrated fused chunk packing.
 
+    ``operation`` is one of :data:`ELEMENTWISE_OPERATIONS`:
+    ``x + y``, ``alpha x + beta y``, ``x - y``, ``x * y`` or ``alpha x``.
     With the default 128-byte operand chunk, fused storage is a sequence of
     ``[A_chunk32, B_chunk32]`` 256-byte records.  Each record is fetched with
-    one DMA and produces one 128-byte output chunk.
+    one DMA and produces one 128-byte output chunk.  ``scale`` reads one
+    operand and has no fused form.
     """
 
     elements: int
@@ -429,8 +450,12 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
         _validate_dma("dma_bytes", self.dma_bytes)
         if self.dma_bytes % 4:
             raise ValueError("int32 DMA chunks must contain whole elements")
-        if self.operation not in {"add", "axpby"}:
-            raise ValueError("operation must be 'add' or 'axpby'")
+        if self.operation not in ELEMENTWISE_OPERATIONS:
+            raise ValueError(
+                f"operation must be one of {sorted(ELEMENTWISE_OPERATIONS)}"
+            )
+        if self.interleaved and self.operands != 2:
+            raise ValueError(f"{self.operation!r} reads one operand; no fused packet")
         for name in ("alpha", "beta"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
@@ -438,6 +463,10 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
         if self.interleaved:
             _validate_dma("fused operand DMA", 2 * self.dma_bytes)
         _validate_capacity(self.wram_bytes, self.mram_image_bytes)
+
+    @property
+    def operands(self) -> int:
+        return ELEMENTWISE_OPERATIONS[self.operation]
 
     @property
     def chunk_elements(self) -> int:
@@ -472,6 +501,19 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
         return UPMEM_ACTIVE_TASKLETS * 2 * self.dma_bytes + (
             8 if self.operation == "axpby" and self.runtime_coefficients else 0
         )
+
+    def evaluate(self, x: int, y: int = 0) -> int:
+        """The template's int32 result for one element (two's complement)."""
+
+        value = {
+            "add": lambda: x + y,
+            "axpby": lambda: self.alpha * x + self.beta * y,
+            "sub": lambda: x - y,
+            "mul": lambda: x * y,
+            "scale": lambda: self.alpha * x,
+        }[self.operation]()
+        value &= 0xFFFFFFFF
+        return value - (1 << 32) if value >= 1 << 31 else value
 
     @property
     def mram_regions(self) -> dict[str, dict[str, object]]:
@@ -521,16 +563,17 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
                     logical_shape=(self.elements,),
                     physical_shape=(self.padded_elements,),
                 ),
-                "y": _contiguous_region(
+            }
+            if self.operands == 2:
+                regions["y"] = _contiguous_region(
                     offset=operand_bytes,
                     size=operand_bytes,
                     dtype="int32",
                     direction="input",
                     logical_shape=(self.elements,),
                     physical_shape=(self.padded_elements,),
-                ),
-            }
-            cursor = 2 * operand_bytes
+                )
+            cursor = self.operands * operand_bytes
         if self.operation == "axpby" and self.runtime_coefficients:
             regions["coefficients"] = _contiguous_region(
                 offset=cursor,
@@ -569,8 +612,10 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
             and (self.alpha, self.beta) == (2, -1)
         )
         general_axpby = self.operation == "axpby" and not calibrated_shift_sub
-        reads_per_chunk = 1 if self.interleaved else 2
-        read_bytes = 2 * self.chunks * self.dma_bytes + 8 * coefficient_calls
+        reads_per_chunk = 1 if self.interleaved else self.operands
+        read_bytes = (
+            self.operands * self.chunks * self.dma_bytes + 8 * coefficient_calls
+        )
         write_bytes = self.chunks * self.dma_bytes
         read_calls = reads_per_chunk * self.chunks + coefficient_calls
         write_calls = self.chunks
@@ -584,9 +629,11 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
             "barriers": coefficient_calls,
             "wram_bytes": self.wram_bytes,
             "int32_adds": self.elements * int(self.operation == "add" or general_axpby),
-            "int32_subtracts": self.elements * int(calibrated_shift_sub),
+            "int32_subtracts": self.elements
+            * int(calibrated_shift_sub or self.operation == "sub"),
             "int32_shifts": self.elements * int(calibrated_shift_sub),
-            "int32_multiplies": 2 * self.elements * int(general_axpby),
+            "int32_multiplies": self.elements
+            * (2 * int(general_axpby) + int(self.operation in ("mul", "scale"))),
         }
 
     def manifest(self) -> dict[str, object]:
@@ -594,7 +641,9 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
             "kind": "upmem-streaming-int32-elementwise",
             "operation": self.operation,
             "coefficients": (
-                {"alpha": self.alpha, "beta": self.beta, "binding": "compile_time"}
+                {"alpha": self.alpha, "binding": "compile_time"}
+                if self.operation == "scale"
+                else {"alpha": self.alpha, "beta": self.beta, "binding": "compile_time"}
                 if self.operation == "axpby" and not self.runtime_coefficients
                 else (
                     {"alpha": self.alpha, "beta": self.beta, "binding": "runtime_mram"}
@@ -640,14 +689,30 @@ __dma_aligned int32_t tenon_coefficients[2];
             if (self.alpha, self.beta) == (2, -1):
                 expression = "(packet[i] << 1) - " "packet[i + TENON_CHUNK_ELEMENTS]"
             else:
-                expression = (
-                    f"({self.alpha} * packet[i]) + "
-                    f"({self.beta} * packet[i + TENON_CHUNK_ELEMENTS])"
+                expression = _wrap32(
+                    f"(uint32_t){self.alpha} * (uint32_t)packet[i] + "
+                    f"(uint32_t){self.beta} * "
+                    "(uint32_t)packet[i + TENON_CHUNK_ELEMENTS]"
                 )
+        elif self.operation == "sub":
+            expression = _wrap32(
+                "(uint32_t)packet[i] - (uint32_t)packet[i + TENON_CHUNK_ELEMENTS]"
+            )
+        elif self.operation == "mul":
+            expression = _wrap32(
+                "(uint32_t)packet[i] * (uint32_t)packet[i + TENON_CHUNK_ELEMENTS]"
+            )
+        elif self.operation == "scale":
+            expression = _wrap32(f"(uint32_t){self.alpha} * (uint32_t)packet[i]")
         if self.interleaved:
             read_code = f"""
     mram_read((const __mram_ptr void *)(uintptr_t)(heap + block * {2 * self.dma_bytes}),
               packet, {2 * self.dma_bytes});
+"""
+        elif self.operands == 1:
+            read_code = f"""
+    mram_read((const __mram_ptr void *)(uintptr_t)(heap + block * {self.dma_bytes}),
+              packet, {self.dma_bytes});
 """
         else:
             y_offset = int(regions["y"]["offset"])
@@ -699,6 +764,9 @@ class UPMEMSumReductionPlan(UPMEMPhysicalPlan):
 
     elements: int
     dma_bytes: int = 64
+    # The output cell's initial value is an input (``out += sum``, the
+    # accumulator_init='carried' source form) instead of zero.
+    carried_output: bool = False
 
     def __post_init__(self):
         _positive("elements", self.elements)
@@ -766,13 +834,14 @@ class UPMEMSumReductionPlan(UPMEMPhysicalPlan):
         return self.padded_elements * 4 + 8
 
     def cost_features(self) -> dict[str, int]:
+        carried = int(self.carried_output)
         return {
-            "mram_read_calls": self.chunks,
+            "mram_read_calls": self.chunks + carried,
             "mram_write_calls": 1,
-            "mram_calls": self.chunks + 1,
-            "mram_read_bytes": self.chunks * self.dma_bytes,
+            "mram_calls": self.chunks + carried + 1,
+            "mram_read_bytes": self.chunks * self.dma_bytes + 8 * carried,
             "mram_write_bytes": 8,
-            "mram_bytes": self.chunks * self.dma_bytes + 8,
+            "mram_bytes": self.chunks * self.dma_bytes + 8 * carried + 8,
             "barriers": 1,
             "wram_bytes": self.wram_bytes,
             "int64_adds": self.elements + UPMEM_ACTIVE_TASKLETS,
@@ -789,12 +858,18 @@ class UPMEMSumReductionPlan(UPMEMPhysicalPlan):
             "chunks": self.chunks,
             "chunks_per_tasklet": self.chunks_per_tasklet,
             "reduction": "register-accumulate/wram-partial/barrier/serial-merge",
+            "carried_output": self.carried_output,
             "tasklet_layout": self.tasklet_layout.manifest(),
             **self._common_manifest(),
         }
 
     def device_source(self) -> str:
         output_offset = int(self.mram_regions["output"]["offset"])
+        initial = "int64_t total = 0;"
+        if self.carried_output:
+            initial = f"""mram_read((const __mram_ptr void *)(uintptr_t)(heap + {output_offset}),
+              tenon_result, 8);
+    int64_t total = tenon_result[0];"""
         return (
             _source_prelude("Tenon calibrated int32-to-int64 reduction plan.")
             + f"""
@@ -828,7 +903,7 @@ int main(void) {{
   tenon_partials[tid] = accumulator;
   barrier_wait(&tenon_barrier);
   if (tid == 0) {{
-    int64_t total = 0;
+    {initial}
     for (uint32_t tasklet = 0; tasklet < TENON_ACTIVE_TASKLETS; ++tasklet)
       total += tenon_partials[tasklet];
     tenon_result[0] = total;
@@ -845,9 +920,17 @@ int main(void) {{
 class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
     """Batched row-owned int32 MV with a fail-closed physical vector mode.
 
-    The generic path uses replicated ``[A16, x16]`` packets.  The calibrated
-    MMTV fast path keeps one batch vector in each owning tasklet's private
-    WRAM and uses a separate contiguous ``A, B, output`` heap ABI.
+    The generic path uses replicated ``[A16, x16]`` packets over row blocks
+    owned by contiguous tasklets.  ``tasklet_private_wram`` keeps one batch
+    vector resident in its owning tasklet's private WRAM (tasklet ``t`` owns
+    batches ``t, t + 12, ...``) and uses a separate ``A, B, output`` heap ABI
+    whose rows are zero-padded to whole DMA chunks.  When every tasklet owns
+    exactly one unpadded batch the emitted source is the calibrated
+    one-batch-per-tasklet MMTV kernel.
+
+    ``carried_output``: the source accumulates into the caller's output
+    (accumulator_init='carried'); the kernel loads the initial output before
+    accumulating instead of starting from zero.
     """
 
     rows: int
@@ -858,6 +941,7 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
     dma_bytes: int = 64
     vector_mode: str = "fused_replicated"
     physical_to_logical_rows: tuple[int, ...] | None = None
+    carried_output: bool = False
 
     def __post_init__(self):
         _positive("rows", self.rows)
@@ -872,15 +956,10 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
                 "MVP supports vector_mode='fused_replicated' or "
                 "'tasklet_private_wram'"
             )
-        if self.vector_mode == "tasklet_private_wram" and (
-            (self.batches, self.rows, self.columns, self.dma_bytes)
-            != (UPMEM_ACTIVE_TASKLETS, 16, 32, 64)
-            or self.effective_scale_factor != 1
-        ):
+        if self.carried_output and self.effective_scale_factor != 1:
             raise ValueError(
-                "tasklet_private_wram MV is calibrated only for 12 batches, "
-                "16 rows per batch, 32 columns, 64-byte matrix chunks, and "
-                "unit scale"
+                "a carried MV output cannot be scaled: alpha * (y0 + A x) is "
+                "not the source's y0 + alpha * A x"
             )
         if self.scale_factor is not None and (
             isinstance(self.scale_factor, bool)
@@ -930,7 +1009,16 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
             )
         if self.vector_mode == "fused_replicated":
             _validate_dma("fused matrix/vector DMA", 2 * self.dma_bytes)
-        _validate_dma("grouped MV output DMA", self.output_dma_bytes)
+            _validate_dma("grouped MV output DMA", self.output_dma_bytes)
+        else:
+            _validate_dma("per-batch MV output DMA", self.batch_output_bytes)
+            stacks = UPMEM_ACTIVE_TASKLETS * _STACK_BYTES_PER_TASKLET
+            if self.wram_bytes + stacks + _WRAM_RUNTIME_RESERVE > UPMEM_WRAM_BYTES:
+                raise ValueError(
+                    f"tasklet_private_wram MV needs {self.wram_bytes} WRAM bytes "
+                    f"of buffers plus {stacks + _WRAM_RUNTIME_RESERVE} bytes of "
+                    f"stacks and runtime; UPMEM limit is {UPMEM_WRAM_BYTES}"
+                )
         _validate_capacity(self.wram_bytes, self.mram_image_bytes)
 
     @property
@@ -951,7 +1039,36 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
 
     @property
     def rows_per_tasklet(self) -> int:
-        return _next_power_of_two(_ceil_div(self.total_rows, UPMEM_ACTIVE_TASKLETS))
+        # At least two int32 rows, so one tasklet's output DMA reaches the
+        # 8-byte UPMEM minimum.
+        return max(
+            2, _next_power_of_two(_ceil_div(self.total_rows, UPMEM_ACTIVE_TASKLETS))
+        )
+
+    @property
+    def batch_output_stride(self) -> int:
+        """Output words per batch in the tasklet-private ABI (8-byte DMA)."""
+
+        return _ceil_div(self.rows, 2) * 2
+
+    @property
+    def batch_output_bytes(self) -> int:
+        return self.batch_output_stride * 4
+
+    @property
+    def one_batch_per_tasklet(self) -> bool:
+        """The calibrated private kernel: tasklet ``t`` owns exactly batch
+        ``t`` and no row, column or output padding exists."""
+
+        return (
+            self.batches == UPMEM_ACTIVE_TASKLETS
+            and self.padded_columns == self.columns
+            and self.batch_output_stride == self.rows
+            and self.effective_scale_factor == 1
+            and not self.carried_output
+            and self.batch_output_bytes
+            == _next_power_of_two(_ceil_div(self.total_rows, UPMEM_ACTIVE_TASKLETS)) * 4
+        )
 
     @property
     def padded_rows(self) -> int:
@@ -969,6 +1086,10 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
 
     @property
     def tasklet_layout(self) -> MaskedTaskletLayout:
+        if self.vector_mode == "tasklet_private_wram":
+            # Batch b runs on tasklet b mod 12; within one round of up to 12
+            # batches that is a contiguous block of the batch's rows.
+            return MaskedTaskletLayout(_next_power_of_two(self.rows))
         return MaskedTaskletLayout(self.rows_per_tasklet)
 
     @property
@@ -1017,17 +1138,21 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
     @property
     def wram_bytes(self) -> int:
         if self.vector_mode == "tasklet_private_wram":
+            if self.one_batch_per_tasklet:
+                return UPMEM_ACTIVE_TASKLETS * (
+                    self.columns * 4 + self.dma_bytes + self.output_dma_bytes
+                )
             return UPMEM_ACTIVE_TASKLETS * (
-                self.columns * 4 + self.dma_bytes + self.output_dma_bytes
+                self.padded_columns * 4 + self.dma_bytes + self.batch_output_bytes
             )
         return UPMEM_ACTIVE_TASKLETS * (self.packet_bytes + self.output_dma_bytes)
 
     @property
     def mram_regions(self) -> dict[str, dict[str, object]]:
         if self.vector_mode == "tasklet_private_wram":
-            matrix_bytes = self.total_rows * self.columns * 4
-            vector_bytes = self.batches * self.columns * 4
-            output_bytes = self.total_rows * 4
+            matrix_bytes = self.total_rows * self.padded_columns * 4
+            vector_bytes = self.batches * self.padded_columns * 4
+            output_bytes = self.batches * self.batch_output_bytes
             return {
                 "matrix": _contiguous_region(
                     offset=0,
@@ -1035,7 +1160,7 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
                     dtype="int32",
                     direction="input",
                     logical_shape=(self.batches, self.rows, self.columns),
-                    physical_shape=(self.batches, self.rows, self.columns),
+                    physical_shape=(self.batches, self.rows, self.padded_columns),
                     flattened_order="batch-major-row-major-column-major",
                 ),
                 "vector": _contiguous_region(
@@ -1044,7 +1169,7 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
                     dtype="int32",
                     direction="input",
                     logical_shape=(self.batches, self.columns),
-                    physical_shape=(self.batches, self.columns),
+                    physical_shape=(self.batches, self.padded_columns),
                     flattened_order="batch-major-column-major",
                     residency="tasklet-private-wram-one-vector-per-owning-batch",
                 ),
@@ -1054,10 +1179,14 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
                     dtype="int32",
                     direction="output",
                     logical_shape=(self.batches, self.rows),
-                    physical_shape=(self.batches, self.rows),
+                    physical_shape=(self.batches, self.batch_output_stride),
                     flattened_order="batch-major-row-major",
                     row_layout="manifest.row_layout",
-                    tasklet_group_bytes=self.output_dma_bytes,
+                    tasklet_group_bytes=(
+                        self.output_dma_bytes
+                        if self.one_batch_per_tasklet
+                        else self.batch_output_bytes
+                    ),
                 ),
             }
         packets_bytes = self.packet_count * self.packet_bytes
@@ -1191,13 +1320,44 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
             for logical_row in range(self.total_rows)
         )
 
+    def pack_private_inputs(self, matrix, vectors) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Matrix and vector words of the tasklet-private ABI, each row
+        zero-padded to whole DMA chunks."""
+
+        if self.vector_mode != "tasklet_private_wram":
+            raise ValueError("pack_private_inputs requires tasklet_private_wram mode")
+        matrix_values, vector_values = _matrix_vector_inputs(
+            self.rows, self.columns, self.batches, matrix, vectors
+        )
+        tail = (0,) * (self.padded_columns - self.columns)
+
+        def padded(values, count):
+            words: list[int] = []
+            for index in range(count):
+                words.extend(values[index * self.columns : (index + 1) * self.columns])
+                words.extend(tail)
+            return tuple(words)
+
+        return padded(matrix_values, self.total_rows), padded(vector_values, self.batches)
+
+    def _physical_output_words(self) -> int:
+        if self.vector_mode == "tasklet_private_wram":
+            return self.batches * self.batch_output_stride
+        return self.padded_rows
+
+    def _physical_row(self, logical_row: int) -> int:
+        if self.vector_mode == "tasklet_private_wram":
+            batch, row = divmod(logical_row, self.rows)
+            return batch * self.batch_output_stride + row
+        return self.logical_to_physical_rows[logical_row]
+
     def pack_output(self, logical_values) -> tuple[int, ...]:
         """Scatter logical batch-major outputs into physical tasklet slots."""
 
         values, _ = _matrix_vector_inputs(self.total_rows, 1, 1, logical_values, (0,))
-        physical = [0] * self.padded_rows
-        for physical_row, logical_row in enumerate(self.physical_to_logical_rows):
-            physical[physical_row] = values[logical_row]
+        physical = [0] * self._physical_output_words()
+        for logical_row, value in enumerate(values):
+            physical[self._physical_row(logical_row)] = value
         return tuple(physical)
 
     def gather_output(self, physical_values) -> tuple[int, ...]:
@@ -1209,10 +1369,10 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
             raise TypeError(
                 "physical output must be an iterable of integers"
             ) from error
-        if len(raw_values) != self.padded_rows:
+        if len(raw_values) != self._physical_output_words():
             raise ValueError(
                 f"physical output has {len(raw_values)} values; "
-                f"expected {self.padded_rows}"
+                f"expected {self._physical_output_words()}"
             )
         values: list[int] = []
         for value in raw_values:
@@ -1222,18 +1382,23 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
                 values.append(operator.index(value))
             except TypeError as error:
                 raise TypeError("physical output values must be integers") from error
-        return tuple(values[row] for row in self.logical_to_physical_rows)
+        return tuple(values[self._physical_row(row)] for row in range(self.total_rows))
 
     def cost_features(self) -> dict[str, int]:
+        carried = int(self.carried_output)
         if self.vector_mode == "tasklet_private_wram":
-            matrix_bytes = self.total_rows * self.columns * 4
-            vector_bytes = self.batches * self.columns * 4
+            matrix_bytes = self.total_rows * self.padded_columns * 4
+            vector_bytes = self.batches * self.padded_columns * 4
             read_calls = (
-                self.total_rows * self.column_chunks + self.batches * self.column_chunks
+                self.total_rows * self.column_chunks
+                + self.batches * self.column_chunks
+                + carried * self.batches
             )
             write_calls = self.batches
-            read_bytes = matrix_bytes + vector_bytes
-            write_bytes = self.total_rows * 4
+            read_bytes = (
+                matrix_bytes + vector_bytes + carried * self.batches * self.batch_output_bytes
+            )
+            write_bytes = self.batches * self.batch_output_bytes
             return {
                 "mram_read_calls": read_calls,
                 "mram_write_calls": write_calls,
@@ -1253,9 +1418,9 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
         # Invalid padded rows are written as deterministic zero records but do
         # not fetch input packets.
         compute_packets = self.total_rows * self.column_chunks
-        read_calls = compute_packets
+        read_calls = compute_packets + carried * UPMEM_ACTIVE_TASKLETS
         write_calls = UPMEM_ACTIVE_TASKLETS
-        read_bytes = compute_packets * self.packet_bytes
+        read_bytes = compute_packets * self.packet_bytes + carried * self.padded_rows * 4
         write_bytes = self.padded_rows * 4
         return {
             "mram_read_calls": read_calls,
@@ -1289,13 +1454,18 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
                 "output_dma_bytes": self.output_dma_bytes,
                 "tasklet_layout": self.tasklet_layout.manifest(),
                 "row_layout": self.row_layout_manifest,
-                "row_ownership": "tasklet-id-is-batch-id",
+                "row_ownership": (
+                    "tasklet-id-is-batch-id"
+                    if self.one_batch_per_tasklet
+                    else "batch-b-on-tasklet-b-mod-12"
+                ),
+                "carried_output": self.carried_output,
                 "mram_addressing": "heap-relative-typed-bases",
                 "heap_abi_order": ["matrix", "vector", "output"],
                 "wram_allocation": {
                     "kind": "per-tasklet-mem-alloc",
                     "calls_per_tasklet": 3,
-                    "vector_bytes_per_tasklet": self.columns * 4,
+                    "vector_bytes_per_tasklet": self.padded_columns * 4,
                     "matrix_chunk_bytes_per_tasklet": self.dma_bytes,
                     "output_bytes_per_tasklet": self.output_dma_bytes,
                     "total_payload_bytes": self.wram_bytes,
@@ -1318,12 +1488,15 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
             "tasklet_layout": self.tasklet_layout.manifest(),
             "row_layout": self.row_layout_manifest,
             "packet_layout": self.packet_layout.manifest(),
+            "carried_output": self.carried_output,
             **self._common_manifest(),
         }
 
     def device_source(self) -> str:
         if self.vector_mode == "tasklet_private_wram":
-            return self._tasklet_private_wram_device_source()
+            if self.one_batch_per_tasklet:
+                return self._tasklet_private_wram_device_source()
+            return self._strided_private_wram_device_source()
         regions = self.mram_regions
         output_offset = int(regions["output"]["offset"])
         scale_expression = (
@@ -1331,6 +1504,14 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
             if self.effective_scale_factor == 1
             else f"{self.effective_scale_factor} * accumulator"
         )
+        initial_load = ""
+        initial_value = "0"
+        if self.carried_output:
+            initial_load = f"""  mram_read((const __mram_ptr void *)(uintptr_t)(heap + {output_offset} +
+                                                  tid * {self.output_dma_bytes}),
+            result, {self.output_dma_bytes});
+"""
+            initial_value = "result[local_row]"
         return (
             _source_prelude("Tenon calibrated fused-replicated int32 MV plan.")
             + f"""
@@ -1349,10 +1530,10 @@ int main(void) {{
   const uint32_t heap = (uint32_t)DPU_MRAM_HEAP_POINTER;
   int32_t *packet = tenon_packets[tid];
   int32_t *result = tenon_outputs[tid];
-  for (uint32_t local_row = 0; local_row < TENON_ROWS_PER_TASKLET;
+{initial_load}  for (uint32_t local_row = 0; local_row < TENON_ROWS_PER_TASKLET;
        ++local_row) {{
     const uint32_t row = tid * TENON_ROWS_PER_TASKLET + local_row;
-    int32_t accumulator = 0;
+    int32_t accumulator = {initial_value};
 #if TENON_PADDED_ROWS != TENON_TOTAL_ROWS
     if (row >= TENON_TOTAL_ROWS) {{
       result[local_row] = 0;
@@ -1443,6 +1624,90 @@ int main(void) {{
         )
 
 
+    def _strided_private_wram_device_source(self) -> str:
+        """Batch-resident MV for any batch count: tasklet ``t`` owns batches
+        ``t, t + 12, ...``; rows are zero-padded to whole chunks."""
+
+        regions = self.mram_regions
+        vector_offset = int(regions["vector"]["offset"])
+        output_offset = int(regions["output"]["offset"])
+        initial_load = ""
+        initial_value = "0"
+        if self.carried_output:
+            initial_load = """    mram_read((const __mram_ptr void *)&outputs[batch * TENON_OUTPUT_STRIDE],
+              output, TENON_OUTPUT_BYTES);
+"""
+            initial_value = "output[row]"
+        result = (
+            "accumulator"
+            if self.effective_scale_factor == 1
+            else f"{self.effective_scale_factor} * accumulator"
+        )
+        pad_rows = ""
+        if self.batch_output_stride != self.rows:
+            pad_rows = """    for (uint32_t row = TENON_ROWS_PER_BATCH; row < TENON_OUTPUT_STRIDE; ++row)
+      output[row] = 0;
+"""
+        return (
+            _source_prelude("Tenon batch-resident int32 MV plan (strided batches).")
+            + f"""
+#define TENON_BATCHES {self.batches}u
+#define TENON_ROWS_PER_BATCH {self.rows}u
+#define TENON_PADDED_COLUMNS {self.padded_columns}u
+#define TENON_CHUNK_ELEMENTS {self.chunk_elements}u
+#define TENON_CHUNK_BYTES {self.dma_bytes}u
+#define TENON_COLUMN_CHUNKS {self.column_chunks}u
+#define TENON_OUTPUT_STRIDE {self.batch_output_stride}u
+#define TENON_OUTPUT_BYTES {self.batch_output_bytes}u
+
+BARRIER_INIT(tenon_barrier, NR_TASKLETS);
+
+int main(void) {{
+  const uint32_t tid = me();
+  const uint32_t heap = (uint32_t)DPU_MRAM_HEAP_POINTER;
+  if (tid == 0)
+    mem_reset();
+  barrier_wait(&tenon_barrier);
+
+  const __mram_ptr int32_t *matrix =
+      (const __mram_ptr int32_t *)(uintptr_t)heap;
+  const __mram_ptr int32_t *vectors =
+      (const __mram_ptr int32_t *)(uintptr_t)(heap + {vector_offset}u);
+  __mram_ptr int32_t *outputs =
+      (__mram_ptr int32_t *)(uintptr_t)(heap + {output_offset}u);
+  int32_t *vector = (int32_t *)mem_alloc(TENON_PADDED_COLUMNS * sizeof(int32_t));
+  int32_t *matrix_chunk = (int32_t *)mem_alloc(TENON_CHUNK_BYTES);
+  int32_t *output = (int32_t *)mem_alloc(TENON_OUTPUT_BYTES);
+
+  for (uint32_t batch = tid; batch < TENON_BATCHES; batch += NR_TASKLETS) {{
+    for (uint32_t block = 0; block < TENON_COLUMN_CHUNKS; ++block)
+      mram_read((const __mram_ptr void *)
+                    &vectors[batch * TENON_PADDED_COLUMNS +
+                             block * TENON_CHUNK_ELEMENTS],
+                vector + block * TENON_CHUNK_ELEMENTS, TENON_CHUNK_BYTES);
+{initial_load}    for (uint32_t row = 0; row < TENON_ROWS_PER_BATCH; ++row) {{
+      int32_t accumulator = {initial_value};
+      for (uint32_t block = 0; block < TENON_COLUMN_CHUNKS; ++block) {{
+        mram_read((const __mram_ptr void *)
+                      &matrix[(batch * TENON_ROWS_PER_BATCH + row) *
+                                  TENON_PADDED_COLUMNS +
+                              block * TENON_CHUNK_ELEMENTS],
+                  matrix_chunk, TENON_CHUNK_BYTES);
+        for (uint32_t column = 0; column < TENON_CHUNK_ELEMENTS; ++column)
+          accumulator += matrix_chunk[column] *
+                         vector[block * TENON_CHUNK_ELEMENTS + column];
+      }}
+      output[row] = {result};
+    }}
+{pad_rows}    mram_write(output, (__mram_ptr void *)&outputs[batch * TENON_OUTPUT_STRIDE],
+               TENON_OUTPUT_BYTES);
+  }}
+  return 0;
+}}
+"""
+        )
+
+
 @dataclass(frozen=True)
 class UPMEMGEMMPlan(UPMEMPhysicalPlan):
     """Row-owned int32 GEMM with calibrated private fused A/RHS packets.
@@ -1458,6 +1723,9 @@ class UPMEMGEMMPlan(UPMEMPhysicalPlan):
     column_tile: int = 16
     reduction_tile: int = 16
     rhs_mode: str = "fused_replicated"
+    # ``C += A B`` into the caller's C (accumulator_init='carried'): each
+    # output tile is loaded before its reduction instead of zeroed.
+    carried_output: bool = False
 
     def __post_init__(self):
         _positive("rows", self.rows)
@@ -1629,6 +1897,9 @@ class UPMEMGEMMPlan(UPMEMPhysicalPlan):
         read_bytes = read_calls * self.packet_bytes
         write_bytes = write_calls * self.output_tile_bytes
         fast_path = int(self.exact_row_fast_path)
+        if self.carried_output:
+            read_calls += write_calls
+            read_bytes += write_bytes
         return {
             "mram_read_calls": read_calls,
             "mram_write_calls": write_calls,
@@ -1681,6 +1952,7 @@ class UPMEMGEMMPlan(UPMEMPhysicalPlan):
             "packet_bytes": self.packet_bytes,
             "packet_order": ["lhs_chunk", "rhs_column_chunks"],
             "output_tile_bytes": self.output_tile_bytes,
+            "carried_output": self.carried_output,
             "tasklet_layout": self.tasklet_layout.manifest(),
             "packet_layout": self.packet_layout.manifest(),
             **self._common_manifest(),
@@ -1696,6 +1968,14 @@ class UPMEMGEMMPlan(UPMEMPhysicalPlan):
         if self.padded_rows != self.rows:
             row_guard_open = "      if (row < TENON_ROWS) {\n"
             row_guard_close = "      }\n"
+        initial = """      for (uint32_t column = 0; column < TENON_COLUMN_TILE; ++column)
+        accumulator[column] = 0;
+"""
+        if self.carried_output:
+            initial = f"""      mram_read((const __mram_ptr void *)(uintptr_t)(heap + {output_offset} +
+                    (row * {self.padded_columns}u + column_block * TENON_COLUMN_TILE) * 4),
+                accumulator, {self.output_tile_bytes});
+"""
         return (
             _source_prelude("Tenon calibrated fused-replicated int32 GEMM plan.")
             + f"""
@@ -1722,9 +2002,7 @@ int main(void) {{
     const uint32_t row = tid * TENON_ROWS_PER_TASKLET + local_row;
     for (uint32_t column_block = 0; column_block < TENON_COLUMN_TILES;
          ++column_block) {{
-      for (uint32_t column = 0; column < TENON_COLUMN_TILE; ++column)
-        accumulator[column] = 0;
-{row_guard_open}        for (uint32_t reduction_block = 0;
+{initial}{row_guard_open}        for (uint32_t reduction_block = 0;
              reduction_block < TENON_REDUCTION_TILES; ++reduction_block) {{
           const uint32_t packet_id =
               (row * TENON_COLUMN_TILES + column_block) *
@@ -1755,6 +2033,15 @@ int main(void) {{
         """Emit the calibrated one-real-row-per-tasklet GEMM fast path."""
 
         output_offset = int(self.mram_regions["output"]["offset"])
+        initial = """    for (uint32_t column = 0; column < TENON_COLUMN_TILE; ++column)
+      accumulator[column] = 0;
+"""
+        if self.carried_output:
+            initial = """    mram_read((const __mram_ptr void *)
+                  &output[tid * TENON_PADDED_COLUMNS +
+                          column_block * TENON_COLUMN_TILE],
+              accumulator, TENON_OUTPUT_TILE_BYTES);
+"""
         return (
             _source_prelude(
                 "Tenon tasklet-private mem_alloc fused int32 GEMM fast path."
@@ -1787,9 +2074,7 @@ int main(void) {{
 
   for (uint32_t column_block = 0; column_block < TENON_COLUMN_TILES;
        ++column_block) {{
-    for (uint32_t column = 0; column < TENON_COLUMN_TILE; ++column)
-      accumulator[column] = 0;
-    for (uint32_t reduction_block = 0;
+{initial}    for (uint32_t reduction_block = 0;
          reduction_block < TENON_REDUCTION_TILES; ++reduction_block) {{
       const uint32_t packet_id =
           (tid * TENON_COLUMN_TILES + column_block) *
