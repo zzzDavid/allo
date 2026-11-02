@@ -302,11 +302,31 @@ def aim_cost(target):
 
     @rule(target.op("ADD"))
     def elementwise_add(event, ctx):
-        # EWADD is a GPR-vector ALU instruction and does not open a bank row.
-        vectors = max(1, _ceil_div(_metric(event, "iterations"), geometry.lanes))
+        # Lowering emits one ``AiM EWADD op_size`` over the device-level GPR
+        # for the whole kernel (spmw_aim._spread_elementwise_grid): op_size
+        # covers elements_per_item, times work_items for a partitioned grid.
+        # Work item 0 prices that command; the other items' events are
+        # zero-cycle. One cycle per 256-bit GPR column is analytical:
+        # ramulator2 does not time ISR_EWADD (aim_DRAM_system.cpp, "Do
+        # nothing"), and EWADD opens no bank row.
+        candidate = event.metrics.get("candidate", {}) or {}
+        grid = candidate.get("aim_elementwise")
+        if grid is None:
+            raise ValueError(
+                "AiM EWADD cost needs the placement's aim_elementwise record "
+                "(the work grid codegen lowers); use the AiM enumerator"
+            )
+        if any(int(value) != 0 for value in event.work_id):
+            ctx.step(cycles=0, occupy=[ctx.use(event.primitive)], name="ewadd_in_kernel")
+            return
+        per_item = grid.get("elements_per_item")
+        elements = _metric(event, "iterations") if per_item is None else int(per_item)
+        if not grid["replicated"]:
+            elements *= int(grid["work_items"])
+        op_size = max(1, _ceil_div(elements, geometry.lanes))
         ctx.step(
-            cycles=vectors,
-            occupy=[ctx.use(event.primitive), ctx.use(channel)],
+            cycles=op_size,
+            occupy=[ctx.use(event.primitive), ctx.use(target.gpr)],
             name="ewadd",
         )
 

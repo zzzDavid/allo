@@ -100,7 +100,35 @@ class _Calendar:
 
 
 class Evaluator:
-    """ASAP scheduler over dependencies and concrete target-handle calendars."""
+    """ASAP scheduler over dependencies and concrete target-handle calendars.
+
+    Policy: activities are visited once, in ``ExecutionGraph.topological_order``
+    (ready activities by insertion position, so one work item's chain is
+    usually placed before the next item's), and each is placed at the earliest
+    cycle after its dependencies at which every handle it occupies has room
+    for the whole occupancy. Placement is first-fit with backfill: a later
+    visited activity may take a calendar gap left before earlier reservations.
+    Nothing placed is ever moved. The estimate is the makespan of this one
+    schedule, not the optimum over schedules.
+
+    Monotonicity (release ledger C-18): the estimate is non-decreasing in every
+    latency and occupancy when no two activities compete for a handle instance
+    (it is then the longest dependency path). With shared handles it is not
+    monotone, a list-scheduling anomaly (Graham 1969) of first-fit placement:
+    a longer activity moves its successor's reservation later, which can open
+    a gap wide enough for an activity visited afterwards, so that activity
+    starts earlier and the makespan drops. On the Samsung 4096x256 GEMV
+    (bank_row, host GRF_A fill) a channel's 8 PIM units each issue 4-cycle
+    channel slots for LD_A, LD_B, MAC; with 2 + 8*b fill cycles the gap
+    between unit 5's fill slot (ends at 24) and unit 0's LD_B slot is
+    8*b - 22 cycles: 2 at b=3 host-bus cycles per burst (units 6 and 7 wait
+    until cycle 76, estimate 275) and 10 at b=4 (they fill at 24 and 28,
+    estimate 257). Making the estimate monotone needs a duration-independent
+    order per handle (no backfill past an earlier start) or an optimal
+    schedule; both change existing estimates (the fixed-order variant moves
+    the stock Samsung GEMV from 253 to 235), so the policy stays as is and
+    perturbation probes must compare decisions, not assume monotone totals.
+    """
 
     def evaluate(self, graph: ExecutionGraph) -> Estimate:
         calendars: dict[HandleInstance, _Calendar] = {}

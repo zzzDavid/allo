@@ -440,34 +440,42 @@ def test_samsung_fiber_term_removal_keeps_bank_row_by_construction():
     assert estimates["samsung_cost_no_fiber_term"] > moved.estimate().cycles
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "G6 finding: the Samsung estimate is not monotone in the host burst "
-        "cost. The ASAP calendar evaluator (allo/perf/evaluator.py) packs the "
-        "GRF_A fills of a channel's 8 PIM units around their 4-cycle channel "
-        "slots; at HOST_BURST_CYCLES=3 a host fill (26 cycles) aligns with the "
-        "26-cycle LD_B fill and the 4096x256 bank_row/host estimate is 275, at "
-        "4 (34 cycles) it is 257 (a list-scheduling anomaly, not a priced effect)"
-    ),
-)
-def test_samsung_estimate_is_monotone_in_the_host_burst_cost():
+def test_samsung_host_burst_cost_shows_the_documented_list_scheduling_anomaly():
+    """C-18: the Samsung estimate is not monotone in HOST_BURST_CYCLES (b),
+    and that is the evaluator's documented first-fit policy (Evaluator
+    docstring), not a priced effect. A channel's 8 PIM units each take a
+    4-cycle channel slot for LD_A, LD_B and MAC; the host GRF_A fill lasts
+    2 + 8*b cycles, so unit 0's LD_B slot opens at that cycle and units 0-5's
+    fill slots end at 24. At b=3 the remaining gap [24, 26) cannot hold unit
+    6's fill slot, which waits behind the six LD_B and MAC slots until 76
+    (estimate 275); at b=4 the gap [24, 34) holds units 6 and 7 (estimate
+    257). From b=4 on each extra burst cycle adds 8 (one per GRF_A entry
+    of the last unit's fill)."""
     workload, _M, _K = _samsung_paper_gemv()
     target = build_samsung_target()
     stock = allo.compile(workload, target, samsung_cost, backend="virtual", **REASSOCIATE)
     layout = list(stock.compiled.layout)
-    estimates = [
-        allo.compile(
+    estimates = {
+        b: allo.compile(
             workload,
             target,
             _rebound_cost(samsung_cost, samsung_costs, f"samsung_burst_{b}", HOST_BURST_CYCLES=b),
             layout=layout,
             backend="virtual",
             **REASSOCIATE,
-        ).estimate().cycles
-        for b in (3, 4)
-    ]
-    assert estimates[0] <= estimates[1], estimates
+        ).estimate()
+        for b in (3, 4, 5)
+    }
+
+    def fill_start(estimate, unit):
+        (span,) = [
+            span for name, span in estimate.spans.items() if f":0.{unit}:pre:0:LD_A:" in name
+        ]
+        return span.start_cycle
+
+    assert {b: e.cycles for b, e in estimates.items()} == {3: 275, 4: 257, 5: 265}
+    assert [fill_start(estimates[3], u) for u in (5, 6, 7)] == [20, 76, 80]
+    assert [fill_start(estimates[4], u) for u in (5, 6, 7)] == [20, 24, 28]
 
 
 VA_N = 12288
@@ -1102,6 +1110,74 @@ def test_aim_operation_change_at_fixed_shape():
     assert _aim_opcodes(mac)["MAC_ABK"] >= 1
     with pytest.raises(UnsupportedWorkloadError, match="'aim'"):
         allo.compile(aim_gemv_sub, target, aim_cost, backend="virtual", **REASSOCIATE)
+
+
+# One EWMUL column is 16 BF16 lanes in each of a channel's 4 bank groups;
+# one EWADD column is 16 lanes of the GPR (GDDR6_AiM_org, 256-bit columns).
+AIM_LANES, AIM_BANK_GROUPS = 16, 4
+
+
+def _aim_issued_elements(compiled):
+    issued = Counter()
+    for line in map(str, compiled.compiled.cmds):
+        fields = line.split()
+        if fields[:2] == ["AiM", "EWMUL"]:
+            columns, mask = int(fields[2]), int(fields[3])
+            issued["mul"] += columns * AIM_LANES * AIM_BANK_GROUPS * bin(mask).count("1")
+        elif fields[:2] == ["AiM", "EWADD"]:
+            issued["add"] += int(fields[2]) * AIM_LANES
+    return issued
+
+
+def test_aim_elementwise_grid_issues_every_work_item():
+    """M-14: the 32-item elementwise grids issue the program's 32 x 128
+    elements. MUL places one work item per channel (one EWMUL, every
+    channel's mask bit, 2 columns per channel), as the cost program prices
+    it; ADD covers the aggregate in one GPR EWADD. A grid whose items do not
+    tile the operands is refused, not lowered with work dropped."""
+    target = build_aim_target()
+    program = 32 * 128
+    assert program == AIM_N
+    mul = allo.compile(aim_ew_mul, target, aim_cost, backend="virtual")
+    add = allo.compile(aim_ew_add, target, aim_cost, backend="virtual")
+    assert list(map(str, mul.compiled.cmds)) == [f"AiM EWMUL 2 {2**32 - 1} 0", "AiM EOC"]
+    assert _aim_issued_elements(mul) == {"mul": program}
+    assert _aim_issued_elements(add) == {"add": program}
+    # The ADD estimate prices the issued EWADD inventory: one command of
+    # 4096 / 16 = 256 GPR columns at one cycle each (it was 8 when the cost
+    # program priced 32 parallel 8-column EWADDs).
+    assert list(map(str, add.compiled.cmds)) == [f"AiM EWADD {program // AIM_LANES} 0 256", "AiM EOC"]
+    assert add.estimate().cycles == program // AIM_LANES == 256
+
+    with pytest.raises(NotImplementedError, match="do not tile the operands"):
+        allo.compile(_aim_ew_mul_half_grid, target, aim_cost, backend="virtual")
+
+
+@_df_region()
+def _aim_ew_mul_half_grid(a: bfloat16[AIM_N], b: bfloat16[AIM_N], c: bfloat16[AIM_N]):
+    @allo.work(mapping=[16], args=[a, b, c])
+    def k(la: bfloat16[AIM_N], lb: bfloat16[AIM_N], lc: bfloat16[AIM_N]):
+        (ch,) = allo.get_wid()
+        for i in range(128):
+            lc[ch * 128 + i] = la[ch * 128 + i] * lb[ch * 128 + i]
+
+
+def test_aim_elementwise_grid_simulates_every_work_item(aim_sim_gate):
+    """M-14 in ramulator2: every channel issues its 2 EWMUL16 device commands
+    (64 lanes each over the 4 bank groups), 32 x 2 x 64 = the program's 4096
+    elements, and the run takes one channel's 2-column time (the channels
+    run in parallel), within a few cycles of the estimate."""
+    compiled = allo.compile(aim_ew_mul, build_aim_target(), aim_cost)
+    a = np.ones(AIM_N, dtype=np.float32)
+    result = compiled(a, a, np.zeros_like(a))
+    per_channel = {
+        int(ch): int(count)
+        for ch, count in re.findall(r"CH(\d+)_num_EWMUL16_commands:\s*(\d+)", result.stdout)
+    }
+    assert per_channel == {ch: 2 for ch in range(32)}
+    assert sum(per_channel.values()) * AIM_LANES * AIM_BANK_GROUPS == AIM_N
+    estimate = compiled.estimate().cycles
+    assert estimate <= result.cycles <= estimate + 4, (estimate, result.cycles)
 
 
 # ===================================================================== #

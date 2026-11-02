@@ -35,6 +35,7 @@ from .pim.aim_lowering import (
     _AimLowerer,
     _memref_shape,
     _target_geometry,
+    _work_items,
     build_contraction,
     check_contraction_coverage,
     contraction_shape,
@@ -395,7 +396,7 @@ class _Group:
     __slots__ = (
         "group_id", "name", "functions", "matches", "properties", "kind",
         "replicas", "partitions", "elements", "usages", "contractions",
-        "sbk_banks", "row", "reduction_partitions", "row_map",
+        "sbk_banks", "row", "reduction_partitions", "row_map", "split_replicas",
     )
 
     def __init__(self, group_id, name):
@@ -407,6 +408,9 @@ class _Group:
         self.elements = 0
         self.row = 0
         self.reduction_partitions = 1
+        # True when the replicas are a partitioned grid's work items, each
+        # owning 1/replicas of every operand (EWMUL), not full copies.
+        self.split_replicas = False
         # (row -> frontier slot table or None, record) of a carried owner map
         # other than the work grid's; None for the work grid's own map.
         self.row_map = None
@@ -587,6 +591,7 @@ class _AimProgramDerivation:
                 group.elements = math.prod(
                     _parse_loop_bound(ub) for _var, _lb, ub, _step in match.enclosing_loops
                 )
+                self._spread_elementwise_grid(group, match, replicated)
                 if kind == "MUL":
                     roles = {op.role: op for op in match.operands}
                     for role in ("x", "y"):
@@ -609,6 +614,57 @@ class _AimProgramDerivation:
             groups.append(group)
         return groups
 
+    def _spread_elementwise_grid(self, group, match, replicated):
+        """Cover every work item of a partitioned elementwise grid (M-14).
+
+        ``group.elements`` is one work item's trip count. A replicated grid
+        repeats one body, so one copy of it is the program (MUL keeps one
+        replica per work item, as before). A partitioned grid's work items
+        each own a disjoint slice of the operands:
+
+        * MUL lowers one replica per work item, each on its own group of
+          ``replica_partitions`` channels holding that item's slice, so one
+          EWMUL whose mask spans every replica's channels covers all
+          ``work_items * elements``. This is the layout the knob enumerator
+          (replicas = work items) and the cost program (one EWMUL per work
+          item on its own channel) already assume.
+        * ADD runs on the single device GPR, so one EWADD covers the
+          aggregate ``work_items * elements``.
+
+        The slices must tile the operands exactly; anything else is refused
+        rather than lowered with dropped or duplicated work.
+        """
+        items = _work_items(match)
+        if replicated or items == 1:
+            return
+        per_item = group.elements
+        total = per_item * items
+        roles = {op.role: op for op in match.operands}
+        operands = [roles.get(role) for role in ("x", "y")]
+        extents = {
+            self._elements(self._key(op.value_ref, op.memref_name), None)
+            for op in operands
+            if op is not None
+        }
+        extents.add(
+            self._elements(
+                self._key(match.result_value_ref, match.result_memref_name), None
+            )
+        )
+        extents.discard(None)
+        if extents != {total}:
+            raise NotImplementedError(
+                f"AiM {group.name}: {items} work items x {per_item} elements "
+                f"do not tile the operands (extents {sorted(extents)})"
+            )
+        if group.kind == "add":
+            group.elements = total
+            return
+        group.replicas = items
+        group.split_replicas = True
+        if group.properties.get("replica_partitions") in (None, "none"):
+            group.partitions = max(1, self.geometry.channels // items)
+
     # --------------------------- row allocator ------------------------- #
 
     def _relocated(self, group, key):
@@ -628,6 +684,8 @@ class _AimProgramDerivation:
         cols = geometry.row_elements
         if usage.kind == "slot":
             elements = self._elements(key, group.elements)
+            if group.split_replicas:
+                elements = _ceil(elements, group.replicas)
             partitions = group.partitions * (geometry.banks // usage.stride)
             return _ceil(_ceil(elements, partitions), cols)
         contraction = usage.contraction
@@ -1079,9 +1137,17 @@ class _AimProgramDerivation:
                 continue
             if verb == "broadcast":
                 raise NotImplementedError(f"AiM broadcast of {text} into a slot layout")
+            elements = self._token_extent(key, index)
+            if group.split_replicas:
+                if index is not None:
+                    raise NotImplementedError(
+                        f"AiM host {verb} of {text}: a sliced transfer into a "
+                        "work-item-split elementwise layout"
+                    )
+                elements = _ceil(elements, group.replicas)
             transfer = dict(
                 direction="read" if verb == "gather" else "write",
-                elements=self._token_extent(key, index),
+                elements=elements,
                 replicas=group.replicas,
                 channels_per_replica=group.partitions,
                 row=group.row if group.kind != "contraction" else self.row_of_key[key],

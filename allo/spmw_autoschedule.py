@@ -903,7 +903,20 @@ def _aim_contraction_shape(target, matches: list[MatchedOp]) -> dict:
 
 
 def _aim_elementwise_base(target, matches: list[MatchedOp], name: str) -> Placement:
-    """The single base placement of an AiM MUL (banks) or ADD (gpr) kernel."""
+    """The single base placement of an AiM MUL (banks) or ADD (gpr) kernel.
+
+    ``extra["aim_elementwise"]`` records the work grid the lowering covers
+    (``spmw_aim._AimProgramDerivation._spread_elementwise_grid``) so the cost
+    program prices the issued command: ``replicated`` from the group stamp of
+    ``rank_matcher_placements`` (else, as codegen, the body fingerprints of
+    the group's buckets in ``matches``), ``work_items`` from the work scope's
+    ``group_shape`` and ``elements_per_item`` from one bucket's trip counts.
+    It is not a decision feature (not in ``_MATCHER_PHYSICAL_EXTRA_FIELDS``).
+    """
+    import math
+
+    from .pim.aim_lowering import _loop_extent, group_replicated, group_replication
+
     home = target.banks if name == "MUL" else target.gpr
     placements = {}
     for match in matches:
@@ -912,10 +925,31 @@ def _aim_elementwise_base(target, matches: list[MatchedOp], name: str) -> Placem
                 placements.setdefault(operand.memref_name, home)
         if match.result_memref_name is not None:
             placements.setdefault(match.result_memref_name, home)
+    op_match = next(match for match in matches if match.target_op_name == name)
+    try:
+        replicated, work_items = group_replication(op_match)
+    except ValueError:
+        group_id = _matcher_work_scope(op_match).group_id
+        replicated = group_replicated(
+            [m for m in matches if _matcher_work_scope(m).group_id == group_id]
+        )
+        shape_of = tuple(
+            getattr(op_match.extra.get("spmw_work_scope"), "group_shape", ()) or ()
+        )
+        work_items = math.prod(shape_of) if shape_of else 1
+    extents = [_loop_extent(ub) for _var, _lb, ub, _step in op_match.enclosing_loops]
+    elements = None if None in extents else math.prod(extents)
     return Placement(
         placements=placements,
         mode="elementwise",
-        extra={"operation_name": name},
+        extra={
+            "operation_name": name,
+            "aim_elementwise": {
+                "replicated": bool(replicated),
+                "work_items": int(work_items),
+                "elements_per_item": elements,
+            },
+        },
     )
 
 

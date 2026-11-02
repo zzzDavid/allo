@@ -95,6 +95,42 @@ def test_dependency_prevents_overlap_on_independent_handles():
     assert estimate.spans["b"].start_cycle == 7
 
 
+def _fill_then_load(fill_cycles, shared_bus=True):
+    """Three work items, each a fill then a 26-cycle load; every step holds a
+    4-cycle slot on its bus (one bus for all items, or one bus per item)."""
+    graph = ExecutionGraph("fill_then_load")
+    for item in range(3):
+        bus = HandleInstance("chip/bus", (0,) if shared_bus else (item,))
+        graph.add(_activity(f"fill{item}", bus, latency=fill_cycles, occupancy=4))
+        graph.add(
+            _activity(f"load{item}", bus, latency=26, occupancy=4, deps=(f"fill{item}",))
+        )
+    return Evaluator().evaluate(graph)
+
+
+def test_estimate_is_monotone_without_shared_handles():
+    """With no handle instance shared between work items the estimate is the
+    longest dependency path, non-decreasing in every step cost (C-18)."""
+    cycles = [_fill_then_load(fill, shared_bus=False).cycles for fill in range(4, 40)]
+    assert cycles == sorted(cycles)
+    assert cycles[0] == 4 + 26
+
+
+def test_first_fit_list_scheduling_anomaly_is_the_documented_policy():
+    """C-18: first-fit placement with backfill is not monotone on a shared
+    handle (Evaluator docstring). Items are visited in insertion order, so
+    item 0's load takes the bus slot at fill_cycles. At 10 fill cycles the
+    gap [8, 10) is too short for item 2's fill slot, which waits for both
+    loads (start 18, makespan 54); at 12 the gap [8, 12) holds it (start 8,
+    makespan 46). A schedule of 46 cycles exists at 10 too (all fills first),
+    so the drop is the policy's choice, not a priced effect."""
+    short, long_ = _fill_then_load(10), _fill_then_load(12)
+
+    assert short.spans["fill2"].start_cycle == 18
+    assert long_.spans["fill2"].start_cycle == 8
+    assert (short.cycles, long_.cycles) == (54, 46)
+
+
 def _build_test_target():
     @target("cost_test")
     def device():

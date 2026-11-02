@@ -260,7 +260,14 @@ class AimHostReduction(AimOp):
 
 @dataclass(frozen=True)
 class AimElementwise(AimOp):
-    """Elementwise MUL in bank groups or ADD in the host-visible GPR."""
+    """Elementwise MUL in bank groups or ADD in the host-visible GPR.
+
+    MUL covers ``elements`` per replica (``elements * replicas`` issued); ADD
+    has no channel mask and covers ``elements``. The program derivation
+    (``spmw_aim._AimProgramDerivation._spread_elementwise_grid``) lowers a
+    partitioned work grid's MUL as one replica per work item and its ADD as
+    the aggregate, so either way the issued count is the whole grid's.
+    """
 
     operation: Literal["mul", "add"]
     elements: int
