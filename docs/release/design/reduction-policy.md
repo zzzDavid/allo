@@ -166,9 +166,14 @@ enumerator prunes the REDUCE candidates for it (they zero GRF_B).
 `_run_samsung_temporal` loads the incoming output from runtime role `C`,
 which `compiler._bind_carried_accumulator` binds to the source parameter.
 The conductor carries the value correctly (test above). The public route
-still rejects carried accumulators, because `spmw_codegen.compile_for_target`
-refuses `carried` for `samsung_hbm_pim` before scheduling. That gate is
-outside this change (Section 7).
+accepts carried accumulators on Samsung: `compile_for_target` no longer
+refuses `carried` for `samsung_hbm_pim`, and the MAC pattern matches
+`y[row] += W[row, k] * x[k]` through distinct SSA index values, so
+`allo.compile` selects the ordered program and the simulator result equals
+source-order FP16 accumulation from the caller's `y`
+(`tests/pim/samsung_hbm_pim/test_samsung_reduction_order.py::test_carried_accumulator_through_the_public_api`).
+AiM and APU v1 matcher routes still refuse `carried` (their devices zero the
+accumulator).
 
 ## 5. APU v1 (V1-03)
 

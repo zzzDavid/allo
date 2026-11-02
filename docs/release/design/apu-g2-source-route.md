@@ -210,8 +210,9 @@ estimate is still produced (selection needs a total order) and labelled
 `estimate_validity="extrapolated"` on the graph, plan and virtual
 `RunResult`. The 2^l shift scaling used below depth 7 is an extrapolation;
 its shape agrees with the 2026-07-08 uint16 dot-tile points
-(`APUG2_DOT_TILE_MEASURED_POINTS`: +2,246 ticks from depth 6 to 7, +4,793
-from 7 to 8). The leave-one-out errors show elementwise-only programs are
+(+2,246 ticks from depth 6 to 7, +4,793 from 7 to 8; the uint16 dot-tile
+kernel and its measured-point table left the release with G2-11 and are in
+git history before that change). The leave-one-out errors show elementwise-only programs are
 weakly identified (add/mul +-18%).
 
 Stated before the confirmation run: for calibrated single-launch programs

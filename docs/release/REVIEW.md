@@ -175,6 +175,18 @@ what was accepted and why.
   pinned cycles; the Samsung patches still need Samsung's permission to
   publish (P-04).
 
+## Accepted repairs (round 5) and review notes
+
+- Samsung owner maps. Accepted: the realizable family is stated (owner
+  bits from output-row bits; no reduction split), the identity map yields
+  the byte-identical vendor plan, the conductor verifies a row-map digest,
+  and the finding that tied layouts have identical cycles on Samsung (the
+  lockstep program issues every slot) is recorded rather than hidden.
+- Minor closures (U-06, G2-09, G2-10, G2-11, V1-08). Accepted; the reduced
+  Gemini-II templates were rebuilt and run on the card (10 passed).
+- EVIDENCE.md. Accepted as the G6 record; its gap list is the remaining
+  G6 work.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead

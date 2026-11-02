@@ -595,8 +595,9 @@ calibration anchor, else `extrapolated` with the nearest point; U-09).
 Routes: pinned-campaign (archived binary + snapshot + pinned SDK manifest)
 or user-build (`UPIMULATOR_ROOT` + `UPIMULATOR_BIN`; U-07/P-03). The Tenon
 uPIMulator patch is not yet published (P-06). Design:
-`docs/release/design/upmem-domain.md`. Open: `a*x - b*y` and `+ c` need
-target patterns (U-06), 12-tasklet policy, P-06, P-17.
+`docs/release/design/upmem-domain.md`. Pointwise `a*x - b*y` and
+`a*x + b*y + c` (target ops `AXMBY`, `AXPBYC`) lower to the int32 AXPBY
+template (U-06). Open: 12-tasklet policy, P-06, P-17.
 
 ### 3.4 GSI APU v1 / Gemini-I (`allo/pim/apu_v1_*.py`, `allo/spmw_apu_v1.py`, `allo/spmw_apu_v1_build.py`, `allo/pim/costs/apu_v1.py`)
 
@@ -629,8 +630,21 @@ profile freshness by diffing the device log before and after the launch
   candidates (`spatial_gemv_group_reduction_k<tile>`; `tile_decision` in the
   estimate and run record). The cost program carries the paper's fitted
   affine event model with provenance and labels estimates `calibrated` or
-  `extrapolated` (`docs/release/design/apu-v1-cost.md`). Open: V1-08
-  (template location and licenses).
+  `extrapolated` (`docs/release/design/apu-v1-cost.md`).
+  Reduction order (V1-03): under `reduction_order="reassociate"` the default
+  FP16 GEMV plan is `spatial_gemv_group_reduction_k<tile>`, a tree reduction
+  (`gvml_add_subgrps`) whose rounding differs from source order; on the
+  4096x256 GEMV 425 of 4096 outputs are bit-equal to the source-order FP16
+  sum in the plan-order model (halving FP16 tree per group, groups added in
+  ascending order). Under `"strict"` (the default) the tree plans are pruned
+  and the temporal plan `temporal_dma_coalescing` is selected, bit-equal to
+  source order (4096/4096) in the same model. The halving-tree numerics are
+  a model of `gvml_add_subgrps` and are not board-checked; the board GEMV
+  test checks a 5e-2 tolerance, not bit equality.
+  The ARC project copies only the eight GSI files its `make` reads from the
+  user's GSI SDK `example-gvml` project (`TENON_APU_V1_TEMPLATE_DIR`;
+  `spmw_apu_v1_build._TEMPLATE_FILES`) and records their origin and SHA-256
+  in the project's `THIRD_PARTY.txt`; Tenon does not redistribute them (V1-08).
 * **`APUv1Program` scalar route** (`apu_v1_program.py`): one
   `APUv1Phase(kernel, vectorize=False)`; the whole function lowers to
   portable C11 (`emit_c_from_mlir`) and runs on APUC 0. Backends `None`
@@ -700,8 +714,12 @@ validity domain the estimate is labelled `estimate_validity="extrapolated"`
 (G2-03). `backend="virtual"` returns `kind="virtual"` with `cost_model`,
 `latency_unit`, `estimate_validity`. Card-gated test:
 `tests/pim/test_apu_g2_hardware.py` (G2-04). Design:
-`docs/release/design/apu-g2-source-route.md`. Open: G2-09..G2-12, device
-index semantics, `t + u` epilogue without coefficients.
+`docs/release/design/apu-g2-source-route.md`. Readback range-checks the
+declared output type instead of wrapping (G2-09); padded `div` divisor lanes
+are 1 (G2-10); the template holds the uint16 add, typed and composed programs
+only, and the typed and composed runtimes build their one host target
+(G2-11). Open: G2-12, device index semantics, `t + u` epilogue without
+coefficients.
 
 ## 4. Extending Tenon
 
@@ -881,10 +899,10 @@ Allo alone.
 ## 8. Open items and compatibility boundary
 
 Open findings that shape the architecture (details and status in
-`docs/release/ISSUES.md`): C-10, S-11/S-13, U-06 (minus and constant
-pointwise forms), P-17 (UPMEM SDK is proprietary), V1-03 (default FP16 GEMV
-plan under `"reassociate"` is a tree plan; strict selects a temporal plan),
-V1-08 (GSI template location and licenses), G2-09..G2-12, P-04 (Samsung
+`docs/release/ISSUES.md`): C-10, S-11/S-13, P-17 (UPMEM SDK is
+proprietary), V1-03 (default FP16 GEMV plan under `"reassociate"` is a tree
+plan; strict selects a temporal plan; documented in section 3.4), G2-12,
+P-04 (Samsung
 simulator patches need Samsung's permission to publish; the overlay lives
 in the containing repository). CLAIMS row 16 (movement ties) is partial for
 the realizability reason in Section 2.5.

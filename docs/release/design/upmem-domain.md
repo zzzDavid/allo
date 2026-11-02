@@ -30,7 +30,7 @@ decision's reason; it no longer returns "no candidate layouts produced".
 
 | Family | Recognized source form | Padded (zeros, result masked or discarded) | Rejected (template constraint named in the error) | Uneven work items | `carried` accumulator |
 |---|---|---|---|---|---|
-| `pointwise` | `out[i] = x[i] + y[i]`, `x - y`, `x * y`, `a * x`, `a * x + b * y` (matched ADD/SUB/MUL/SCALE/AXPBY, int32 literals) | N to whole DMA chunks; the template masks `element >= N` | DMA chunk outside 8..2048 B or not 8-B aligned (decision); fused packet needs two operands (`a * x` streams one) | yes, `elements` | no accumulator |
+| `pointwise` | `out[i] = x[i] + y[i]`, `x - y`, `x * y`, `a * x`, `a * x + b * y`, `a * x - b * y`, `a * x + b * y + c` (matched ADD/SUB/MUL/SCALE/AXPBY/AXMBY/AXPBYC, int32 literals) | N to whole DMA chunks; the template masks `element >= N` | DMA chunk outside 8..2048 B or not 8-B aligned (decision); fused packet needs two operands (`a * x` streams one) | yes, `elements` | no accumulator |
 | `reduction` | `out[c] += in[i]` (int32 into int64) | N to `12 * pow2(ceil(chunks/12))` chunks; masked `element >= N` | none beyond MRAM capacity | yes, `elements` | yes: tasklet 0 loads the cell before the merge |
 | `matrix_vector`, fused packets | `y[o] += M[o, k] * v[k]` (rows flattened over outer loops), MMTV `C[b, r] += A[b, r, k] * B[b, k]`, scaled `y = alpha * acc` | K to whole chunks; rows to `12 * max(2, pow2(ceil(rows/12)))` (padded rows fetch nothing and write 0) | `2 * chunk` packet > 2048 B; per-tasklet output group (`rows_per_tasklet * 4`) > 2048 B, i.e. more than 6144 rows | yes, `rows` (batches = 1) or `batches` | yes (unscaled form): each tasklet loads its output group first |
 | `matrix_vector`, tasklet-private WRAM | same; any batch count (tasklet `t` owns batches `t, t+12, ...`) | K to whole chunks; rows per batch to an even count (8-B output DMA) | per-batch output DMA > 2048 B (rows per batch > 512); WRAM `12 * (Kpad*4 + dma + out) + 12 KiB stacks + 1 KiB > 64 KiB` (K above about 1056 at small rows) | as above | yes |
@@ -42,11 +42,17 @@ decision's reason; it no longer returns "no candidate layouts produced".
 | `feature_gradient` | linear `G[f] += ((S[s,f] * S[s,F]) * -(2^s)) >> beta`, logistic `G[f] += S[s,f] * (1 - 2 * S[s,F])` | none | other coefficients; label column not `F`; record > 2048 B; products >= 2^63 (run time) | no | **rejected** on every route |
 | `kmeans_update` (host) | argmin over `D[p, c]`, `counts[idx] += 1`, `sums[idx, d] += P[p, d]`, then per-cluster division (section 4) | | any other op, operand relation or epilogue | | `counts` must be zeroed |
 
-The pointwise minus spelling `a * x - b * y` and a constant term `+ c` have
-no target op in `pim/targets.py` (`AXPBY` is `alpha * x + beta * y`), so the
-matcher's coverage check rejects them before any family runs ("... matches no
-target op"). `a * x + (-b) * y` is the supported spelling. Adding the minus
-form needs a target-description pattern, which this repair did not touch.
+The minus spelling `a * x - b * y` and the constant term
+`a * x + b * y + c` are the target ops `AXMBY` and `AXPBYC` in
+`pim/targets.py`. Both lower to the int32 AXPBY template: the subtraction is
+`a * x + (-b) * y` (the negated coefficient must itself be an int32, so
+`- (-2147483648) * y` is rejected) and `c` is one more int32 add
+(`UPMEMElementwisePlan.gamma`, compile-time only). A coefficient or constant
+outside int32 raises "coefficient ... is not an int32 literal". uPIMulator
+runs of `3*A - 7*B` and `2*A + 5*B + 11` on int32 inputs including the int32
+extremes are exact (`tests/pim/test_upmem_generality.py::test_sim_pointwise_forms_off_grid`).
+Forms with other association (`c + a * x + b * y`, `a * x - b * y + c`,
+`a * x - y`) still match no target op.
 
 All new pointwise expressions (`sub`, `mul`, `scale`, general `axpby`) are
 emitted with explicit `uint32_t` wraparound, so int32 overflow is defined two's

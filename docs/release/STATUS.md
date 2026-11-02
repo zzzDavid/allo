@@ -1,6 +1,6 @@
 # Release status
 
-Updated: 2026-11-02 (round 4). Read `TASK.md` in the containing repository,
+Updated: 2026-11-02 (round 5). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -29,62 +29,50 @@ then this file, then `ISSUES.md` for the next action.
 ## Verdict
 
 **NOT READY** (close). Gate judgments are in `REVIEW.md`. What still keeps
-the verdict from READY, in order of weight:
+the verdict from READY:
 
-1. Movement ties are not realizable: no backend can execute an
-   iteration-to-owner map other than the kernel's own work-grid map, so
-   CLAIMS row 16 ("ties in movement survive to final cost ranking") holds
-   only in the sense that ties reach the ranking and are rejected with a
-   stated reason. Closing it means teaching at least one backend (Samsung
-   row interleaving across channels, or UPMEM row-to-DPU maps) to realize an
-   alternative owner map and verifying it on the simulator.
-2. User decisions that are not the compiler's to make: redistribution of
+1. User decisions that are not the compiler's to make: redistribution of
    the Samsung-derived simulator patches (P-04); whether to seek a license
    from the DCC authors for the AttAcc evaluation scripts; committing the
-   simulator overlays in the containing repository; running the index
-   removals in `RELEASE_CHECKLIST.md`.
-3. Device evidence still owed: the retiled APU v1 GEMM default
-   (`..._broadcast_friendly_acc2`) and the ranked GEMV tiles have not been
-   measured on the board (only compile-built); the 12.71x row's plans are
-   reachable by `layout=`.
-4. Minor open items: V1-03 (default tree plan under `"reassociate"` is a
-   documented choice), V1-08 (GSI example template location and license
-   headers), G2-09..G2-12, U-06 (`a*A - b*B` and `+ c` pointwise patterns),
-   skill-doc AiM bank geometry, a consolidated G6 evidence document.
+   simulator overlays and skill-doc corrections in the containing
+   repository; running the index removals in `RELEASE_CHECKLIST.md`.
+2. Movement ties are realized on Samsung only (CLAIMS row 16 partial):
+   AiM, UPMEM and APU v1 reject alternative owner maps with a stated reason,
+   and ties that split a row's reduction belong to the reduction policy and
+   are not executed anywhere.
+3. G6 gaps listed in `EVIDENCE.md` section 3 (alias cases on every backend,
+   extreme-integer execution outside UPMEM and the C backend, executed
+   two-schedule pairs on AiM/UPMEM/Gemini-II, cost perturbations traced to
+   an executed program, target-parameter variation beyond the AiM virtual
+   study).
+4. Device evidence owed: see VALIDATION.md round 5 for the APU v1 tile
+   ranking and retiled GEMM board check.
 
-## Round 4 (2026-11-02): what was done
+## Round 5 (2026-11-02): what was done
 
-- Selection: lazy materialization with recorded rejections; whole-program
-  re-pricing; bounded joint evaluation (`joint_evaluation` label);
-  `design/selection.md` (C-03, C-05).
-- AttAcc as an analytical backend: target, tiling space, closed-form cost
-  with provenance, `attacc_tiling` knob; 500/500 paper tilings through
-  `allo.compile`; external scripts documented (M-04).
-- APU v1: fitted affine event model with provenance and validity labels
-  (paper error figures reproduced); cost-ranked GEMV tiles; dead API
-  removed; correct sqrt (V1-05, V1-06, V1-11, V1-12).
-- Frontend: exact integer literal typing with range and shift checks
-  (F-02).
-- Simulators: Samsung overlay, AiM Dockerfile and the new uPIMulator patch
-  each rebuilt from a fresh upstream clone and shown to reproduce the
-  pinned cycles; runtime versus dev requirements split; calibration-table
-  regeneration script; `RELEASE_CHECKLIST.md`.
-- Evidence: artifact-free execution probe (Samsung and AiM run with the
-  archive hidden); APU v1 device tests pass on the wave 4 tree (4 passed).
+- Samsung realizes movement-tie layouts whose owner bits come from the
+  output-row bits (row-to-slot placement executed by the conductor, digest
+  checked at readback; vendor program unchanged; 4 realizable ties on the
+  paper GEMV, identical cycles). Conductor overlay updated in the containing
+  repository; installed `pim_driver` rebuilt (backup kept).
+- Minor items closed: UPMEM `a*A - b*B` and `a*A + b*B + c` patterns
+  (exact on the simulator); Gemini-II out-of-range readback raises instead
+  of wrapping, padded divisor lanes hold 1, dead uint16 templates and
+  pricing removed (card test re-run: 10 passed); APU v1 template staging
+  copies only the needed GSI files with a `THIRD_PARTY.txt` record; V1-03
+  documented; AiM skill-doc geometry corrected.
+- `docs/release/EVIDENCE.md`: per-mechanism G6 evidence tables, execution
+  paths, gaps with proposed tests.
 
 ## Next concrete actions (in order)
 
-1. Commit and push round 4 (done when this file is committed).
-2. Realize alternative owner maps on one backend (row 16): start with
-   Samsung, whose conductor already packs rows by slot; let the lowering
-   accept a tie layout that permutes rows across channels, verify outputs
-   and cycles on the simulator.
-3. Board run for the APU v1 tile ranking and the retiled GEMM default;
-   update `design/apu-v1-cost.md` with the measured order.
-4. Consolidated G6 evidence document listing, per mechanism, the
-   independent oracle, the perturbations and the regression tests.
-5. User decisions listed above; then re-run the full suites and both
-   hardware hosts at the final revision and re-judge the gates.
+1. Commit and push round 5 (done when this file is committed).
+2. Close the G6 gaps in `EVIDENCE.md` section 3, starting with alias cases
+   and executed two-schedule pairs on AiM and UPMEM.
+3. Realize alternative owner maps on UPMEM (row-to-DPU maps) and AiM
+   (row-to-channel maps) as Samsung now does.
+4. User decisions listed above; then re-run every suite and both hardware
+   hosts at the final revision and re-judge the gates.
 
 ## Round 1 (2026-11-01): what was done
 

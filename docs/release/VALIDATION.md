@@ -173,3 +173,42 @@ passed (781 s). Gemini-II hardware test re-run on the final tree
 | simulator rebuilds from committed recipes (scratch, installed copies untouched) | Samsung: fresh SAITPublic 3703d1f clone + overlay reproduces 4,435 / 8,041 / 8,247 (vendor layout) and 4,389 / 7,947 / 8,153 (default), binaries identical after stripping build paths; AiM: fresh 0f28a07 clone + Dockerfile (`tenon-aim-simulator-build:0f28a07`) gives 222 cycles; UPMEM: fresh 870d916 clone + `setup/uPIMulator/tenon-upimulator.patch` + new SDK image (`tenon-upimulator-sdk:2023.1.0`) reproduces all 16 paper rows exactly on the user-build route (`sdk_build=user-build:d45e285c34b5`) |
 
 Ramulator2-AttAcc (external, MIT, in another user's DCC checkout, GLIBC 2.34) was run once read-only inside the `aim-simulator-build` image: 11,454 cycles for the qkv batch-1 selected tiling and 953 for the worst-loss attention shape, equal to the archived and paper values. The DCC decode composition script reproduces the archived batch-1 speedups but not batch-4 and is marked unvalidated.
+
+## Round 5 (2026-11-02): Samsung owner maps, minor closures, device checks
+
+### APU v1 board check of the ranked GEMV tiles and the retiled GEMM default (`apuv1/tile_ranking_board.{py,log,json}`)
+
+Paper GEMV 4096x256 FP16, `reduction_order="reassociate"`, fresh random inputs (seed 7), outputs checked against FP32 NumPy (max abs error 4.6e-4 to 6.6e-4):
+
+| Plan | cost estimate | device cycles (CRUN) |
+|---|---|---|
+| `spatial_gemv_group_reduction_k32` | 1,536,466 | 1,369,443 |
+| `spatial_gemv_group_reduction_k64` | 1,458,814 | 1,292,886 |
+| `spatial_gemv_group_reduction_k128` | 1,426,276 | 1,258,531 |
+| `spatial_gemv_group_reduction_k256` (cost-selected default) | 1,414,983 | 1,243,617 |
+
+The cost program's order equals the device order; tile 64 is 3.96 percent slower than tile 256 on the board (paper: 3.845 percent). Estimates run about 12 to 14 percent high, as the design note predicted.
+
+GEMM 1024x64x1024 FP16 (the 12.71x row's workload), fresh random inputs, outputs within FP16 tolerance (relative error 3.2e-3) on every plan:
+
+| Plan | cost estimate | device cycles |
+|---|---|---|
+| default, cost-selected (`temporal_dma_coalescing_broadcast_friendly_acc2`) | 6,553,468 | 5,044,711 |
+| `temporal_dma_coalescing` (row baseline) | 93,711,488 | 91,622,057 (paper 93,449,834) |
+| `temporal_dma_coalescing_broadcast_friendly` (row adapted) | 8,552,316 | 7,147,558 (paper 7,349,987; golden 7,145,109) |
+
+The cost-ranked default, a catalog variant that had never been measured before, runs 1.42x faster than the paper's adapted plan with correct outputs. These are device cycles (CRUN) with no host time; a single launch each.
+
+### Gemini-II card test after the template reduction (`g2/round5-hardware.log`)
+
+`tests/pim/test_apu_g2_hardware.py` on zhang-x4 `apu-00`: 10 passed in 70 s with the reduced project templates (device library and host targets rebuilt on the card; padded divisor lanes hold 1).
+
+### Round 5 suites (final tree)
+
+| Suite | Result |
+|---|---|
+| PIM non-device (`tests/pim`, paper golden and APU board rows deselected) | 325 passed, 25 skipped, 59 deselected in 2056.99s (0:34:16) |
+| perf (`tests/perf`, scope, C backend, literal typing) | 553 passed, 597 s |
+| golden (default and `paper_full`, APU board row deselected) | 55 passed, 847 s; pinned Samsung, AiM and UPMEM cycles unchanged |
+| Gemini-II card test (zhang-x4) | 10 passed (`g2/round5-hardware.log`) |
+| APU v1 board | tile ranking and retiled GEMM default, see above |
