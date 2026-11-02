@@ -1,6 +1,6 @@
 # Release status
 
-Updated: 2026-11-02 (round 7). Read `TASK.md` in the containing repository,
+Updated: 2026-11-02 (round 7, final evidence at `1ea8756`). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -43,9 +43,9 @@ closed. Gate judgments are in `REVIEW.md`. What remains:
    (proprietary UPMEM SDK, documented). C-18 is a documented evaluator
    policy and M-14 (an AiM elementwise lowering that dropped work on
    partitioned grids) is fixed.
-3. Final hardware evidence at the release revision: the round 6 board and
-   card runs are recorded in `VALIDATION.md`; any later commit requires a
-   re-run before a READY verdict.
+3. Final evidence at `1ea8756` is recorded in `VALIDATION.md` (PIM suite,
+   APU v1 board, Gemini-II card). Any later code commit requires a re-run
+   before a READY verdict.
 
 ## Round 6 (2026-11-02): what was done
 
