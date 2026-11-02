@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import dataclasses
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -288,6 +289,13 @@ class WLoad:
     version: tuple | None = None
     # Traced index operands (spec 004 M6), filled inside a function scope.
     index_terms: tuple | None = None
+    # How the program reads the loaded integer: True after the frontend
+    # widened it with ``arith.extsi``, False after ``arith.extui``, None when
+    # the load is used at its own width (MLIR integers are signless; Allo's
+    # ``uint`` types lower to the same ``iN`` as ``int``).  Only the range
+    # analysis (`_interval`, `_float_leaf_fits`) reads it; None is treated
+    # as "either", the union of both ranges.
+    signed: bool | None = None
 
 
 @dataclass
@@ -309,6 +317,10 @@ class WBinOp:
     lhs: Any
     rhs: Any
     ssa_name: str
+    # MLIR result type text (``i16``, ``f32``) when traced from the IR; None
+    # for synthesized terms.  Lets the range analysis check that the wide
+    # intermediate the frontend chose cannot wrap.
+    result_type: str | None = None
 
 
 @dataclass
@@ -405,6 +417,416 @@ _CAST_OPS = {
 _LOAD_OPS = {"memref.load", "affine.load"}
 _STORE_OPS = {"memref.store", "affine.store"}
 
+# Significand bits (including the implicit one) of the MLIR float types: an
+# integer of at most this many bits converts to the float exactly.
+_FLOAT_SIGNIFICAND_BITS = {"f16": 11, "bf16": 8, "f32": 24, "f64": 53}
+_INDEX_BITS = 64
+
+
+def _scalar_type_text(mlir_type) -> str:
+    text = str(mlir_type).strip()
+    return text
+
+
+def _int_bits(type_text: str) -> int | None:
+    if type_text == "index":
+        return _INDEX_BITS
+    m = re.fullmatch(r"[su]?i(\d+)", type_text)
+    return int(m.group(1)) if m else None
+
+
+def cast_is_exact(op_name: str, source_type, result_type) -> bool:
+    """True when the conversion preserves every source value exactly, so the
+    matcher may look through it as if it were not there.
+
+    Exact: widening of the same kind (``extf``: f16/bf16 -> f32 -> f64;
+    ``extsi``/``extui``: a narrower integer to a wider one; ``index_cast``
+    to ``index``), and an integer to float conversion whose integer width is
+    at most the float's significand width (``sitofp``/``uitofp``: i8 -> f16,
+    up to i24 -> f32, up to i53 -> f64).  Everything else (``trunci``,
+    ``truncf``, ``fptosi``, ``fptoui``, ``index_cast`` to a narrower type, an
+    int to float conversion that can round) changes values and is a
+    computation of its own: the matcher keeps it as an opaque unary term, so
+    it can only be lowered by a target op that declares it, and otherwise
+    fails coverage.
+    """
+    src = _scalar_type_text(source_type)
+    dst = _scalar_type_text(result_type)
+    if op_name == "arith.extf":
+        return (
+            src in _FLOAT_SIGNIFICAND_BITS
+            and dst in _FLOAT_SIGNIFICAND_BITS
+            and _FLOAT_SIGNIFICAND_BITS[dst] >= _FLOAT_SIGNIFICAND_BITS[src]
+            and dst != src
+        ) or src == dst
+    if op_name in ("arith.extsi", "arith.extui"):
+        a, b = _int_bits(src), _int_bits(dst)
+        return a is not None and b is not None and b >= a
+    if op_name == "arith.index_cast":
+        if dst == "index":
+            # Address formation: the frontend computes an address in a wide
+            # integer and casts it to `index`; an in-bounds address (the only
+            # kind a well-defined program forms) is unchanged by the cast.
+            return True
+        a, b = _int_bits(src), _int_bits(dst)
+        return a is not None and b is not None and b >= a
+    if op_name in ("arith.sitofp", "arith.uitofp"):
+        a = _int_bits(src)
+        bits = _FLOAT_SIGNIFICAND_BITS.get(dst)
+        if a is None or bits is None:
+            return False
+        # A signed source spends one bit on the sign; its magnitude is a-1 bits.
+        magnitude = a - 1 if op_name == "arith.sitofp" else a
+        return magnitude <= bits
+    return False
+
+
+def _cast_constant(value, op_name: str):
+    """The destination-type value of a constant under ``op_name``."""
+    if op_name in ("arith.sitofp", "arith.uitofp", "arith.extf", "arith.truncf"):
+        return float(value)
+    if op_name in ("arith.fptosi", "arith.fptoui"):
+        return int(value)
+    return int(value)
+
+
+def _constant_survives_cast(value, op_name: str, result_type) -> bool:
+    """True when casting the constant ``value`` with ``op_name`` into
+    ``result_type`` is exact for that value (a proof for the constant, not
+    for the operation)."""
+    import math
+
+    dst = _scalar_type_text(result_type)
+    if isinstance(value, bool):
+        return False
+    if op_name in ("arith.sitofp", "arith.uitofp", "arith.extf", "arith.truncf"):
+        bits = _FLOAT_SIGNIFICAND_BITS.get(dst)
+        if bits is None:
+            return False
+        if op_name in ("arith.sitofp", "arith.uitofp"):
+            if not isinstance(value, int):
+                return False
+            return abs(value) < (1 << bits)
+        # float narrowing/widening of a constant: exact when the float
+        # round-trips through the destination type
+        import numpy as np
+
+        if dst == "bf16":
+            # bf16 is the upper half of an f32: the value is representable
+            # when its f32 form is exact and has no low-half bits.
+            as_f32 = np.float32(value)
+            if not math.isfinite(float(as_f32)) or float(as_f32) != float(value):
+                return False
+            return int(as_f32.view(np.uint32)) & 0xFFFF == 0
+        try:
+            dtype = {"f16": np.float16, "f32": np.float32, "f64": np.float64}[dst]
+        except KeyError:
+            return False
+        converted = dtype(value)
+        return math.isfinite(float(converted)) and float(converted) == float(value)
+    if op_name in ("arith.fptosi", "arith.fptoui"):
+        if isinstance(value, float) and not value.is_integer():
+            return False
+        bits = _int_bits(dst)
+        if bits is None:
+            return False
+        as_int = int(value)
+        if op_name == "arith.fptoui":
+            return 0 <= as_int < (1 << bits)
+        return -(1 << (bits - 1)) <= as_int < (1 << (bits - 1))
+    if op_name in ("arith.trunci", "arith.extsi", "arith.extui", "arith.index_cast"):
+        bits = _int_bits(dst)
+        if bits is None or not isinstance(value, int):
+            return False
+        return -(1 << (bits - 1)) <= value < (1 << bits)
+    return False
+
+
+def _cast_exact_op(src_op) -> bool:
+    """`cast_is_exact` for an MLIR cast op with one operand and one result."""
+    try:
+        return cast_is_exact(
+            src_op.operation.name, src_op.operands[0].type, src_op.results[0].type
+        )
+    except (AttributeError, IndexError):
+        return False
+
+
+_MEMREF_ELEM_RE = re.compile(r"memref<(?:[^x<>]*x)*([^x<>]+)>")
+
+
+def _memref_element_type(memref_type: str | None) -> str | None:
+    """Element type text of a memref type string (``memref<8x4xi15>`` -> ``i15``)."""
+    if not memref_type:
+        return None
+    m = _MEMREF_ELEM_RE.match(memref_type.strip())
+    return m.group(1).strip() if m else None
+
+
+def _int_fits(value: int, bits: int) -> bool:
+    return -(1 << (bits - 1)) <= value < (1 << (bits - 1))
+
+
+# Binary ops that commute with truncation to N bits (ring homomorphism of
+# Z -> Z/2^N, and bitwise ops act lane-wise): trunc(a op b) == trunc(a) op
+# trunc(b) in N-bit two's complement.  Everything else (division, right
+# shifts, min/max, comparisons) does not distribute, so the truncation is
+# exact only when the whole value provably fits (`_fits_integer`).
+_TRUNC_DISTRIBUTES = {"add", "sub", "mul", "and", "or", "xor"}
+
+
+def _signed_range(bits: int) -> tuple[int, int]:
+    return (-(1 << (bits - 1)), (1 << bits - 1) - 1)
+
+
+def _load_range(bits: int, signed: bool | None) -> tuple[int, int]:
+    """Every value a ``bits``-bit signless load may denote: the signed range
+    when the program sign-extends it, the unsigned range when it zero-extends
+    it, and the union of both when the width is used as is."""
+    if signed is True:
+        return _signed_range(bits)
+    if signed is False:
+        return (0, (1 << bits) - 1)
+    return (-(1 << (bits - 1)), (1 << bits) - 1)
+
+
+def _interval(term, loop_bounds) -> tuple[int, int] | None:
+    """Sound bounds on the integer value of ``term`` as the source computes
+    it, or None when no bound is known.
+
+    Leaves: a constant, a load of an ``iK`` element (any ``K``-bit value), a
+    loop index with constant bounds.  Interior ops use interval arithmetic;
+    a result that would not fit the op's own IR type is discarded (the wide
+    op could wrap, so the arithmetic bound would be unsound).
+    """
+    if isinstance(term, WConst):
+        value = term.value
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return (value, value)
+    if isinstance(term, WLoad):
+        width = _int_bits(_memref_element_type(term.memref_type) or "")
+        return None if width is None else _load_range(width, term.signed)
+    if isinstance(term, WBlockArg):
+        bounds = loop_bounds.get(term.ssa_name)
+        return None if bounds is None or bounds[1] <= bounds[0] else (bounds[0], bounds[1] - 1)
+    if isinstance(term, WSelect):
+        a = _interval(term.a, loop_bounds)
+        b = _interval(term.b, loop_bounds)
+        if a is None or b is None:
+            return None
+        return (min(a[0], b[0]), max(a[1], b[1]))
+    if isinstance(term, WUnary):
+        if term.fn != "neg":
+            return None
+        inner = _interval(term.arg, loop_bounds)
+        return None if inner is None else (-inner[1], -inner[0])
+    if not isinstance(term, WBinOp):
+        return None
+    lhs = _interval(term.lhs, loop_bounds)
+    rhs = _interval(term.rhs, loop_bounds)
+    if lhs is None or rhs is None:
+        return None
+    op = term.op
+    if op == "add":
+        result = (lhs[0] + rhs[0], lhs[1] + rhs[1])
+    elif op == "sub":
+        result = (lhs[0] - rhs[1], lhs[1] - rhs[0])
+    elif op == "mul":
+        products = [a * b for a in lhs for b in rhs]
+        result = (min(products), max(products))
+    elif op in ("min", "max"):
+        pick = min if op == "min" else max
+        result = (pick(lhs[0], rhs[0]), pick(lhs[1], rhs[1]))
+    elif op in ("and", "or", "xor"):
+        if lhs[0] >= 0 and rhs[0] >= 0:
+            result = (0, (1 << max(lhs[1], rhs[1]).bit_length()) - 1)
+        else:
+            width = max(_bits_for(lhs), _bits_for(rhs))
+            result = _signed_range(width)
+    elif op in ("shr", "shl", "shru"):
+        if rhs[0] != rhs[1] or rhs[0] < 0:
+            return None
+        shift = rhs[0]
+        if op == "shl":
+            result = (lhs[0] << shift, lhs[1] << shift)
+        elif op == "shr":
+            result = (lhs[0] >> shift, lhs[1] >> shift)
+        elif lhs[0] >= 0:
+            result = (lhs[0] >> shift, lhs[1] >> shift)
+        else:
+            return None
+    elif op == "div":
+        if rhs[0] != rhs[1] or rhs[0] == 0:
+            return None
+        divisor = rhs[0]
+        quotients = [int(a / divisor) for a in lhs]
+        result = (min(quotients), max(quotients))
+    else:
+        return None
+    width = _int_bits(term.result_type or "")
+    if width is not None and not (
+        _int_fits(result[0], width) and _int_fits(result[1], width)
+    ):
+        # The IR evaluates the op in `width` bits; a value outside that range
+        # would wrap there, so the arithmetic bound is not what the IR holds.
+        return None
+    return result
+
+
+def _bits_for(interval: tuple[int, int]) -> int:
+    """Smallest signed width holding both ends of ``interval``."""
+    bits = 1
+    while not (_int_fits(interval[0], bits) and _int_fits(interval[1], bits)):
+        bits += 1
+    return bits
+
+
+def _fits_integer(term, bits: int, loop_bounds) -> bool:
+    """True when ``term``'s value provably lies in the signed ``bits``-bit
+    range, so a truncation to ``bits`` bits leaves it unchanged."""
+    interval = _interval(term, loop_bounds)
+    return (
+        interval is not None
+        and _int_fits(interval[0], bits)
+        and _int_fits(interval[1], bits)
+    )
+
+
+def _narrow_integer(term, bits: int, loop_bounds):
+    """The term ``term`` read in ``bits``-bit two's-complement arithmetic, or
+    None when that is not provably the value ``trunci`` produces.
+
+    The frontend widens integer arithmetic (``i4 * i4`` in ``i8``, the sum
+    in ``i16``) and truncates back to the variable's width at the store.
+    Truncation distributes over the ring ops (`_TRUNC_DISTRIBUTES`), so
+    the stored value equals the same expression evaluated in ``bits``-bit
+    wraparound arithmetic, provided every leaf is a ``bits``-bit value
+    (a load of at most ``bits`` bits whatever its signedness, a constant or
+    loop index with a ``bits``-bit two's-complement pattern).
+    That evaluation is exactly what a target op declared on the
+    destination's element type computes, so the returned tree is the one
+    the patterns match against.  Any other shape (a wider leaf, a value
+    that may not fit, a cast we cannot prove) returns None and the caller
+    keeps the cast visible so matching fails closed.
+    """
+    if _fits_integer(term, bits, loop_bounds):
+        return term
+    # Leaves are judged by bit width, not by the signed range: truncating a
+    # ``bits``-bit (or narrower) load to ``bits`` bits is the identity on its
+    # bit pattern whatever its signedness, and a constant or loop index with
+    # some ``bits``-bit two's-complement pattern denotes that pattern.  The
+    # target op's declared element type decides how the device reads the
+    # pattern; backends check that against the source (UPMEM's ABI check).
+    if isinstance(term, WLoad):
+        width = _int_bits(_memref_element_type(term.memref_type) or "")
+        return term if width is not None and width <= bits else None
+    if isinstance(term, WConst):
+        value = term.value
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return term if -(1 << (bits - 1)) <= value < (1 << bits) else None
+    if isinstance(term, WBlockArg):
+        bounds = loop_bounds.get(term.ssa_name)
+        if bounds is None or bounds[1] <= bounds[0]:
+            return None
+        lo, hi = bounds[0], bounds[1] - 1
+        return term if -(1 << (bits - 1)) <= lo and hi < (1 << bits) else None
+    if isinstance(term, WBinOp) and term.op in _TRUNC_DISTRIBUTES:
+        lhs = _narrow_integer(term.lhs, bits, loop_bounds)
+        rhs = _narrow_integer(term.rhs, bits, loop_bounds)
+        if lhs is None or rhs is None:
+            return None
+        return WBinOp(term.op, lhs, rhs, term.ssa_name)
+    if isinstance(term, WBinOp) and term.op == "shl":
+        # Low bits of a left shift depend only on the low bits of the value.
+        lhs = _narrow_integer(term.lhs, bits, loop_bounds)
+        if lhs is None or not _fits_integer(term.rhs, bits, loop_bounds):
+            return None
+        return WBinOp(term.op, lhs, term.rhs, term.ssa_name)
+    if isinstance(term, WSelect):
+        a = _narrow_integer(term.a, bits, loop_bounds)
+        b = _narrow_integer(term.b, bits, loop_bounds)
+        if a is None or b is None:
+            return None
+        return WSelect(term.cond, a, b, term.ssa_name)
+    if isinstance(term, WUnary) and term.fn == "neg":
+        arg = _narrow_integer(term.arg, bits, loop_bounds)
+        return None if arg is None else WUnary("neg", arg, term.ssa_name)
+    return None
+
+
+def _float_leaf_fits(term, dst: str, loop_bounds) -> bool:
+    """True when every leaf of the float expression ``term`` is a value of
+    the destination float type ``dst`` (or exactly representable in it)."""
+    bits = _FLOAT_SIGNIFICAND_BITS[dst]
+    if isinstance(term, WConst):
+        value = term.value
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        return _constant_survives_cast(float(value), "arith.truncf", dst)
+    if isinstance(term, WLoad):
+        elem = _memref_element_type(term.memref_type) or ""
+        if elem in _FLOAT_SIGNIFICAND_BITS:
+            return _FLOAT_SIGNIFICAND_BITS[elem] <= bits
+        width = _int_bits(elem)
+        if width is None:
+            return False
+        magnitude = width - 1 if term.signed is True else width
+        return magnitude <= bits
+    if isinstance(term, WBlockArg):
+        bounds = loop_bounds.get(term.ssa_name)
+        return bounds is not None and max(abs(bounds[0]), abs(bounds[1] - 1)) < (1 << bits)
+    if isinstance(term, WBinOp):
+        return _float_leaf_fits(term.lhs, dst, loop_bounds) and _float_leaf_fits(
+            term.rhs, dst, loop_bounds
+        )
+    if isinstance(term, WUnary):
+        # math.* functions and negation of a fitting argument; a cast term
+        # (``arith.*<..>``) is a conversion we could not prove and stays out.
+        return not term.fn.startswith("arith.") and _float_leaf_fits(term.arg, dst, loop_bounds)
+    if isinstance(term, WSelect):
+        return (
+            _float_leaf_fits(term.cond, dst, loop_bounds)
+            and _float_leaf_fits(term.a, dst, loop_bounds)
+            and _float_leaf_fits(term.b, dst, loop_bounds)
+        )
+    if isinstance(term, WCmp):
+        return _float_leaf_fits(term.lhs, dst, loop_bounds) and _float_leaf_fits(
+            term.rhs, dst, loop_bounds
+        )
+    return False
+
+
+def _narrow_float(term, dst: str, state):
+    """Accept ``truncf`` to ``dst`` as the destination-precision rounding of
+    an expression over ``dst``-typed leaves, or return None.
+
+    The frontend evaluates ``bf16`` arithmetic in ``f32`` and rounds once at
+    the store.  When every leaf is a ``dst`` value, the stored expression is
+    the source expression over ``dst`` operands and a target op declared on
+    ``dst`` computes it; the only difference is where intermediate rounding
+    happens (once at the store in the source, per operation in a device that
+    computes natively in ``dst``).  That is a precision contract, recorded in
+    the trace's ``precision_notes`` so backends and reports state it, not a
+    change of the computed function.  A leaf that is not a ``dst`` value
+    (an ``f32`` input, a constant that ``dst`` cannot represent) means the
+    source really computes in the wider type and the cast stays visible.
+    """
+    if dst not in _FLOAT_SIGNIFICAND_BITS:
+        return None
+    loop_bounds = getattr(state, "loop_bounds", {})
+    if not _float_leaf_fits(term, dst, loop_bounds):
+        return None
+    notes = getattr(state, "rounding_notes", None)
+    if notes is not None:
+        notes.append(
+            f"{_render_term(term)} is rounded to {dst} at the store; the source "
+            f"evaluates the intermediates in a wider float type, a device that "
+            f"computes natively in {dst} rounds per operation"
+        )
+    return term
+
 
 def _attr_str(a) -> str | None:
     """Best-effort: strip surrounding quotes from a StringAttr-ish value."""
@@ -429,6 +851,14 @@ class ValueNames:
     def __init__(self, func, state):
         self.state = state
         self._names: dict = {}
+        # affine.for induction variable name -> (lower, upper) when both
+        # bounds are constants (the iv ranges over [lower, upper)); used to
+        # prove that a narrowing cast of a loop index is exact.
+        self.loop_bounds: dict[str, tuple[int, int]] = {}
+        # Float narrowings accepted as destination-precision rounding of the
+        # stored expression (see `_narrow_float`), for the trace's
+        # `precision_notes`.
+        self.rounding_notes: list[str] = []
         taken: set = set()
 
         def assign(value):
@@ -449,11 +879,24 @@ class ValueNames:
                 for region in op.regions:
                     for nested in region.blocks:
                         visit(nested)
+                if op.operation.name == "affine.for":
+                    self._record_loop_bounds(op)
 
         for argument in func.arguments:
             if argument not in self._names:
                 assign(argument)
         visit(func.regions[0].blocks[0])
+
+    def _record_loop_bounds(self, op) -> None:
+        attrs = op.attributes
+        try:
+            iv = self._names[op.regions[0].blocks[0].arguments[0]]
+            lo = _AFFINE_CONST_RE.match(str(attrs["lowerBoundMap"]).strip())
+            hi = _AFFINE_CONST_RE.match(str(attrs["upperBoundMap"]).strip())
+        except (KeyError, IndexError):
+            return
+        if lo and hi:
+            self.loop_bounds[iv] = (int(lo.group(1)), int(hi.group(1)))
 
     def __call__(self, value) -> str:
         name = self._names.get(value)
@@ -631,7 +1074,13 @@ def _trace_value(
         ops = _operand_names(src, state=state)
         lhs = _trace_value(ops[0], defining_map, value_refs, state=state, scope=scope)
         rhs = _trace_value(ops[1], defining_map, value_refs, state=state, scope=scope)
-        return WBinOp(kind, lhs, rhs, _result_names(src, state=state)[0])
+        return WBinOp(
+            kind,
+            lhs,
+            rhs,
+            _result_names(src, state=state)[0],
+            result_type=_scalar_type_text(src.results[0].type) if src.results else None,
+        )
     if op_name in _MATH_UNARY:
         arg = _trace_value(
             _operand_names(src, state=state)[0], defining_map, value_refs, state=state, scope=scope
@@ -685,16 +1134,51 @@ def _trace_value(
         if value is not None:
             return WConst(-value, result)
         return WUnary("neg", inner, result)
-    # Only value-preserving casts are traced through, so that constants on
-    # the other side still appear as constants when the pattern needs them.
-    # Every other single-operand op is opaque.
+    # Only value-preserving casts are traced through (`cast_is_exact`), so
+    # that constants on the other side still appear as constants when the
+    # pattern needs them.  A conversion that can change a value (narrowing,
+    # float to int, int to float beyond the significand) is a computation:
+    # it stays visible as a unary term named after the op and the types, so
+    # no pattern silently absorbs it and coverage reports it.
     if op_name in _CAST_OPS and len(src.operands) == 1 and src.results:
         inner = _trace_value(
             _operand_names(src, state=state)[0], defining_map, value_refs, state=state, scope=scope
         )
-        # Wrap-through: keep the original ssa name so codegen can audit.
-        if isinstance(inner, (WLoad, WBlockArg, WConst, WBinOp, WSelect)):
+        dst = _scalar_type_text(src.results[0].type)
+        if _cast_exact_op(src):
+            # Value-preserving: the term is unchanged (its ssa name stays the
+            # source's so codegen can audit).  A sign or zero extension of a
+            # load tells the range analysis how the program reads it.
+            if op_name in ("arith.extsi", "arith.extui") and isinstance(inner, WLoad):
+                return dataclasses.replace(inner, signed=op_name == "arith.extsi")
             return inner
+        if _const_value(inner) is not None and _constant_survives_cast(
+            _const_value(inner), op_name, src.results[0].type
+        ):
+            # A constant proven representable in the destination type (the
+            # frontend's `acc: f16 = 0` arrives as sitofp(0)).
+            return WConst(_cast_constant(_const_value(inner), op_name), _result_names(src, state=state)[0])
+        narrowed = None
+        if op_name in ("arith.trunci", "arith.index_cast") and _int_bits(dst) is not None:
+            narrowed = _narrow_integer(inner, _int_bits(dst), getattr(state, "loop_bounds", {}))
+        elif op_name == "arith.truncf":
+            narrowed = _narrow_float(inner, dst, state)
+        elif op_name in ("arith.sitofp", "arith.uitofp") and isinstance(inner, WBlockArg):
+            bounds = getattr(state, "loop_bounds", {}).get(inner.ssa_name)
+            bits = _FLOAT_SIGNIFICAND_BITS.get(dst)
+            if (
+                bounds is not None
+                and bits is not None
+                and max(abs(bounds[0]), abs(bounds[1] - 1)) < (1 << bits)
+            ):
+                narrowed = inner
+        if narrowed is not None:
+            return narrowed
+        return WUnary(
+            f"{op_name}<{src.operands[0].type}->{dst}>",
+            inner,
+            _result_names(src, state=state)[0],
+        )
     return WBlockArg(
         ssa_name=_result_names(src, state=state)[0] if src.results else ssa_name
     )
@@ -1895,6 +2379,7 @@ def match_workload(target, mlir_module, *, reduction_order=None) -> MatchTrace:
         coverage=MatchCoverage(),
     )
     coverage_problems: dict = {}
+    function_states: list = []
 
     # Iterate every func.func at the module top level.
     for func in mlir_module.body.operations:
@@ -1913,6 +2398,7 @@ def match_workload(target, mlir_module, *, reduction_order=None) -> MatchTrace:
         # state per function yields the same names in linear time.
         state = ValueNames(func, AsmState(func))
         defining_map = _build_defining_map(func, state=state)
+        function_states.append((func_name, state))
 
         body = func.regions[0].blocks[0]
         scope = _build_function_scope(func, value_refs, state=state)
@@ -1955,6 +2441,14 @@ def match_workload(target, mlir_module, *, reduction_order=None) -> MatchTrace:
         (tuple(functions), message) for message, functions in coverage_problems.values()
     ]
     trace.coverage.errors = _format_coverage_problems(trace.coverage.problems)
+    # (a store's value is traced more than once; keep each note once)
+    trace.precision_notes = list(
+        dict.fromkeys(
+            f"function '{name}': {note}"
+            for name, state in function_states
+            for note in getattr(state, "rounding_notes", ())
+        )
+    )
 
     # SPEC-026 §1.2: stamp the batch dim on each match (one source of
     # truth for cost/codegen). Additive; default batch_dim=1.
@@ -2114,6 +2608,14 @@ def _term_loads(term, out: list) -> list:
     return out
 
 
+def _render_guards(guards) -> str:
+    if not guards:
+        return "none"
+    return ", ".join(
+        f"{frame[0]}({frame[1]})" if len(frame) > 1 else str(frame[0]) for frame in guards
+    )
+
+
 def _render_loops(loops) -> str:
     parts = []
     for iv, lower, upper, step in loops:
@@ -2193,6 +2695,9 @@ class _FunctionCoverage:
                 )
         self._terms: dict[int, Any] = {}
         self._index_terms: dict[int, tuple] = {}
+        # store index -> (source type, destination type) of the one integer
+        # narrowing `_copy_source` looked through for that store
+        self._copy_narrowing: dict[int, tuple[str, str]] = {}
 
     # -- small accessors ------------------------------------------------ #
 
@@ -2283,17 +2788,212 @@ class _FunctionCoverage:
         return lhs == rhs
 
     def _copy_source(self, index):
-        """The load whose value the store writes, through casts; else None."""
+        """The load whose value the store writes, through casts; else None.
+
+        Exact casts are transparent.  One integer narrowing (``trunci`` or a
+        narrowing ``index_cast``) of the loaded value is peeled as well and
+        remembered in ``_copy_narrowing``; `_copy_contract_problem` then has
+        to prove from the producer's accumulated range that the truncation
+        cannot change the value, otherwise the store is not a copy.
+        """
         name = _value_name(self._op(index).operands[0], self.state)
         src = self.defining_map.get(name)
+        narrowing = None
         while (
             src is not None
             and src.operation.name in _CAST_OPS
             and len(src.operands) == 1
+            and src.results
         ):
+            if _cast_exact_op(src):
+                pass
+            elif (
+                narrowing is None
+                and src.operation.name in ("arith.trunci", "arith.index_cast")
+                and _int_bits(_scalar_type_text(src.results[0].type)) is not None
+                and _int_bits(_scalar_type_text(src.operands[0].type)) is not None
+            ):
+                narrowing = (
+                    _scalar_type_text(src.operands[0].type),
+                    _scalar_type_text(src.results[0].type),
+                )
+            else:
+                return None
             src = self.defining_map.get(_value_name(src.operands[0], self.state))
         if src is not None and src.operation.name in _LOAD_OPS and src.operands:
+            if narrowing is not None:
+                self._copy_narrowing[index] = narrowing
             return src
+        return None
+
+    def _accumulator_load(self, term, dest, dest_name):
+        """The operand of ``term`` that reloads the accumulator ``dest``,
+        and the remaining operand(s); None when ``term`` is not an
+        accumulation of a recognized shape."""
+
+        def is_acc(t):
+            return isinstance(t, WLoad) and (
+                (t.value_ref is not None and t.value_ref == dest)
+                or (t.value_ref is None and t.memref_name == dest_name)
+            )
+
+        if isinstance(term, WBinOp) and term.op in ("add", "sub", "min", "max"):
+            if is_acc(term.lhs):
+                return term.op, term.rhs
+            if is_acc(term.rhs) and term.op != "sub":
+                return term.op, term.lhs
+        if isinstance(term, WSelect):
+            if is_acc(term.a):
+                return "select", term.b
+            if is_acc(term.b):
+                return "select", term.a
+        return None
+
+    def _carried_interval(self, producer):
+        """Sound bounds on the value held by the accumulator that the matched
+        store ``producer`` updates, over the whole reduction; None when no
+        bound can be established.
+
+        ``init + trips * [increment range]`` for ``acc += x``/``acc -= x``;
+        the hull of the initializer and the other operand for ``min``,
+        ``max`` and ``select`` accumulators.  The bound must also fit the
+        accumulator's own element type, otherwise the source wraps there
+        and the bound says nothing about the stored value.
+        """
+        dest = self._dest(producer)
+        dest_name = self._dest_name(producer)
+        loop_bounds = getattr(self.state, "loop_bounds", {})
+        shape = self._accumulator_load(self._term(producer), dest, dest_name)
+        if shape is None:
+            return None
+        kind, other = shape
+        other_interval = _interval(other, loop_bounds)
+        if other_interval is None:
+            return None
+        init = None
+        for index in self.stores:
+            if index == producer or self._dest(index) != dest or index in self.site_matches:
+                continue
+            interval = _interval(self._term(index), loop_bounds)
+            if interval is None:
+                return None
+            init = interval if init is None else (
+                min(init[0], interval[0]), max(init[1], interval[1])
+            )
+        if init is None:
+            return None
+        if kind in ("add", "sub"):
+            depth = None
+            for match in self.site_matches[producer]:
+                for operand in match.operands:
+                    if operand.is_loop_carried:
+                        depth = _accumulator_scope_depth(operand)
+            loops = self.sites[producer][1]
+            if depth is None:
+                return None
+            trips = 1
+            for loop in loops[min(depth, len(loops)):]:
+                lo = _AFFINE_CONST_RE.match(str(loop[1]).strip())
+                hi = _AFFINE_CONST_RE.match(str(loop[2]).strip())
+                if not lo or not hi or not loop[3]:
+                    return None
+                trips *= max(0, -(-(int(hi.group(1)) - int(lo.group(1))) // loop[3]))
+            lo, hi = other_interval
+            if kind == "sub":
+                lo, hi = -hi, -lo
+            total = (init[0] + min(0, trips * lo), init[1] + max(0, trips * hi))
+        else:
+            total = (min(init[0], other_interval[0]), max(init[1], other_interval[1]))
+        try:
+            width = _int_bits(str(self._op(producer).operands[1].type.element_type))
+        except AttributeError:
+            return None
+        if width is None or not (_int_fits(total[0], width) and _int_fits(total[1], width)):
+            return None
+        return total
+
+    def _copy_contract_problem(self, index, source, producers) -> str | None:
+        """Why the store at ``index`` is not an output copy a backend may
+        realize unconditionally, or None when it is.
+
+        A backend writes the produced value to the sink once per produced
+        element, unconditionally, in the result's element type.  The copy
+        therefore has to (a) run under exactly the guards its producers run
+        under, (b) sit in exactly the producers' result loops (the loops
+        enclosing the accumulator's definition; for a non-accumulating
+        producer, all of its loops), so it executes once per produced
+        element, and (c) write a buffer of the same element type (a copy
+        through an exact widening cast still changes the stored type).  A
+        copy through an integer truncation is accepted only when the
+        producer's accumulated range provably fits the destination type.
+        """
+
+        def source_name(load_op):
+            return _attr_str(load_op.attributes["from"]) if "from" in load_op.attributes else "?"
+
+        copy_guards = tuple(self.sites[index][2])
+        copy_loops = [loop[0] for loop in self.sites[index][1]]
+        for j in producers:
+            producer_guards = tuple(self.sites[j][2])
+            if copy_guards != producer_guards:
+                return (
+                    "is a copy of a matched result under a different guard than "
+                    f"its producer (copy guards {_render_guards(copy_guards)}, producer "
+                    f"guards {_render_guards(producer_guards)}); a conditional output "
+                    "copy would be executed unconditionally by the device"
+                )
+            producer_loops = [loop[0] for loop in self.sites[j][1]]
+            result_loops = producer_loops
+            for match in self.site_matches[j]:
+                accumulators = [o for o in match.operands if o.is_loop_carried]
+                if accumulators:
+                    depth = _accumulator_scope_depth(accumulators[0])
+                    if depth is None:
+                        return (
+                            "copies an accumulator whose definition scope is not "
+                            "retained, so the copy cannot be proven to run once per "
+                            "reduced element"
+                        )
+                    result_loops = producer_loops[: min(depth, len(producer_loops))]
+            if copy_loops != result_loops:
+                return (
+                    f"is a copy of a matched result in loop nest "
+                    f"{_render_loops(self.sites[index][1])}, but the result is "
+                    f"produced once per iteration of {result_loops or '[]'}; the "
+                    "copy must execute exactly once per produced element"
+                )
+        try:
+            source_type = str(source.operands[0].type.element_type)
+            dest_type = str(self._op(index).operands[1].type.element_type)
+        except AttributeError:
+            return "copies a value whose buffer element types cannot be read"
+        narrowing = self._copy_narrowing.get(index)
+        if narrowing is not None:
+            bits = _int_bits(narrowing[1])
+            for j in producers:
+                interval = self._carried_interval(j)
+                if interval is None:
+                    return (
+                        f"copies the {source_type} result '{source_name(source)}' into a "
+                        f"{narrowing[1]} buffer through a truncation, and the accumulated "
+                        "value has no provable range, so the truncation may change it"
+                    )
+                if not (_int_fits(interval[0], bits) and _int_fits(interval[1], bits)):
+                    return (
+                        f"copies the {source_type} result '{source_name(source)}' into a "
+                        f"{narrowing[1]} buffer through a truncation; the accumulated value "
+                        f"ranges over [{interval[0]}, {interval[1]}], which {narrowing[1]} "
+                        "cannot hold, so the truncation changes it"
+                    )
+            # The value provably fits the destination: the device writing the
+            # result into the destination buffer stores exactly that value.
+            source_type = dest_type
+        if source_type != dest_type:
+            return (
+                f"copies a {source_type} result into a {dest_type} buffer; the "
+                "device writes the result in its own element type, so the "
+                "conversion is not performed"
+            )
         return None
 
     def _is_local(self, index) -> bool:
@@ -2349,6 +3049,11 @@ class _FunctionCoverage:
                 source_ref = self._ref(source.operands[0])
                 producers = [j for j in result_sites.get(source_ref, ()) if j < index]
                 if source_ref != dest and producers:
+                    problem = self._copy_contract_problem(index, source, producers)
+                    if problem is not None:
+                        category[index] = STORE_UNMATCHED
+                        detail[index] = problem
+                        continue
                     category[index] = STORE_COPY
                     copy_producers[index] = producers
                     sink = (self._dest_name(index), self._index_text(index))
@@ -2467,7 +3172,9 @@ class _FunctionCoverage:
             f"'{self._dest_name(index)}[{self._index_text(index)}]', loop nest {loops}"
             + (" under a guard" if guards else "")
         )
-        if reason:
+        if reason and reason.startswith(("is a copy", "copies")):
+            what = f"{reason} (stored value {_render_term(term)}, {root})"
+        elif reason:
             what = f"stores {_render_term(term)} ({root}) into a local buffer whose value {reason}"
         elif isinstance(term, WLoad):
             what = (

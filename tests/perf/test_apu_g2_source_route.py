@@ -516,7 +516,9 @@ def extra_effect(A: int4[64, 128], x: int4[128], y: int15[64], z: int8[64]):
         (k96, "power of two"),
         (mixed_signedness, "mix signed and unsigned"),
         (three_products, "at most two products"),
-        (narrow_accumulator, "narrower than the exact int15"),
+        # the matcher refuses the widening copy of an int12 accumulator
+        # (its range exceeds int12 but the device computes an exact int15)
+        (narrow_accumulator, "copies a i12 result into a i15 buffer"),
         (float_gemv, "not an integer buffer"),
         (mixed_combined_types, "mixed operand types"),
         (k1024, "at most 256"),

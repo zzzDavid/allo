@@ -227,6 +227,12 @@ class MatchTrace:
     # Store coverage of the module this trace was matched from.  None for a
     # trace assembled by hand or sliced from another trace.
     coverage: MatchCoverage | None = None
+    # Float narrowings the matcher accepted as destination-precision rounding
+    # (the frontend evaluates bf16 arithmetic in f32 and rounds at the store;
+    # a device computing natively in bf16 rounds per operation).  Each entry
+    # names the function and the rounded expression.  Empty when the module
+    # has no such store.
+    precision_notes: list[str] = field(default_factory=list)
 
     def by_target_op(self, name: str) -> list[MatchedOp]:
         return [m for m in self.matches if m.target_op_name == name]

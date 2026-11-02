@@ -254,3 +254,282 @@ def test_compile_for_target_rechecks_an_unchecked_trace():
         compile_for_target(
             target, trace, backend="virtual", module=module
         )
+
+
+# --------------------------------------------------------------------------- #
+# Conversions and conditional copies (release review, round 8)
+# --------------------------------------------------------------------------- #
+
+from allo.spmw_match_engine import cast_is_exact
+
+
+def test_cast_exactness_rules():
+    assert cast_is_exact("arith.extf", "f16", "f32")
+    assert cast_is_exact("arith.extsi", "i8", "i32")
+    assert cast_is_exact("arith.sitofp", "i8", "f16")  # 7 magnitude bits <= 11
+    assert cast_is_exact("arith.uitofp", "i24", "f32")
+    assert cast_is_exact("arith.index_cast", "i65", "index")  # address formation
+    assert not cast_is_exact("arith.truncf", "f32", "f16")
+    assert not cast_is_exact("arith.trunci", "i32", "i8")
+    assert not cast_is_exact("arith.fptosi", "f16", "i32")
+    assert not cast_is_exact("arith.sitofp", "i32", "f16")  # 31 magnitude bits > 11
+    assert not cast_is_exact("arith.sitofp", "i32", "f32")  # 31 > 24
+    assert cast_is_exact("arith.sitofp", "i25", "f32")  # 24 magnitude bits
+
+
+@_df_region()
+def gemv_rounded_output(W: fp16[M, K], x: fp16[K], y: fp16[M]):
+    @allo.work(mapping=[16, 8], args=[W, x, y])
+    def calc(w: fp16[M, K], v: fp16[K], out: fp16[M]):
+        p, u = allo.get_wid()
+        row = p * 8 + u
+        acc: fp16 = 0
+        for k in range(K):
+            acc += w[row, k] * v[k]
+        out[row] = int(acc)
+
+
+@_df_region()
+def gemv_guarded_output(W: fp16[M, K], x: fp16[K], y: fp16[M]):
+    @allo.work(mapping=[16, 8], args=[W, x, y])
+    def calc(w: fp16[M, K], v: fp16[K], out: fp16[M]):
+        p, u = allo.get_wid()
+        row = p * 8 + u
+        acc: fp16 = 0
+        for k in range(K):
+            acc += w[row, k] * v[k]
+        if v[0] > 0:
+            out[row] = acc
+
+
+@_df_region()
+def gemv_copy_inside_reduction(W: fp16[M, K], x: fp16[K], y: fp16[M]):
+    @allo.work(mapping=[16, 8], args=[W, x, y])
+    def calc(w: fp16[M, K], v: fp16[K], out: fp16[M]):
+        p, u = allo.get_wid()
+        row = p * 8 + u
+        acc: fp16 = 0
+        for k in range(K):
+            acc += w[row, k] * v[k]
+            out[row] = acc
+
+
+def test_value_changing_conversion_on_the_output_is_rejected():
+    """``out[row] = int(acc)`` (fptosi then sitofp) must not compile to a plain
+    copy of ``acc``: the reviewer's probe returned 0.25 where the source
+    produces 0. The conversion is a computation no target op declares."""
+    with pytest.raises(UnsupportedWorkloadError) as info:
+        _compile(gemv_rounded_output)
+    message = str(info.value)
+    assert "arith.fptosi<f16->i32>" in message
+    assert "arith.sitofp<i32->f16>" in message
+    assert "matches no target op" in message
+
+
+def test_conditional_output_copy_is_rejected():
+    """``if v[0] > 0: out[row] = acc`` must not become an unconditional store:
+    the reviewer's probe overwrote a sentinel when the guard was false."""
+    with pytest.raises(UnsupportedWorkloadError) as info:
+        _compile(gemv_guarded_output)
+    message = str(info.value)
+    assert "different guard than its producer" in message
+    assert "conditional output copy" in message
+
+
+def test_copy_inside_the_reduction_loop_is_rejected():
+    """A copy that runs once per reduction step is not a once-per-element
+    output copy; the lowering writes the final accumulator only."""
+    with pytest.raises(UnsupportedWorkloadError) as info:
+        _compile(gemv_copy_inside_reduction)
+    assert "exactly once per produced element" in str(info.value)
+
+
+def test_exact_constant_initializer_still_matches():
+    """The frontend spells ``acc: fp16 = 0`` as sitofp(0); the constant is
+    representable, so the initializer is still recognized as zero."""
+    trace = match_workload(
+        build_samsung_target(), allo.customize(_paper_gemv(), enable_tensor=False).module
+    )
+    assert trace.coverage.errors == []
+    assert {m.extra["accumulator_init"] for m in trace.matches} == {"zero"}
+
+
+# --------------------------------------------------------------------------- #
+# Integer and float narrowing at stores (release review, round 8)
+# --------------------------------------------------------------------------- #
+
+from allo.ir.types import bfloat16 as bf16, int4, int15, int16, int32, int64
+from allo.spmw_match import select, tanh  # pattern lambdas are parsed by name
+from allo.spmw_match_engine import require_match_coverage
+
+
+def _int_target(*names):
+    ops = {
+        "MAC": dict(fn=lambda a, b, acc: acc + a * b, accumulates=True),
+        "ADD": dict(fn=lambda a, b: a + b),
+        "ARGMIN_IDX": dict(
+            fn=lambda x, best, i, acc: select(x < best, i, acc),
+            accumulates=True,
+            iv_params=("i",),
+        ),
+        "AF": dict(fn=lambda x: 0.5 * tanh(0.5 * x) + 0.5),
+    }
+
+    @allo.target("narrowing_" + "_".join(n.lower() for n in names))
+    def t():
+        @allo.device
+        def dev():
+            @allo.unit(mapping={"lane": 1})
+            def lane():
+                r = allo.reg(16, 32, name="r")
+                for name in names:
+                    allo.op(name, src=r, dst=r, **ops[name])
+
+    return t
+
+
+def _trace(kernel, *names):
+    return match_workload(
+        _int_target(*names), allo.customize(kernel, enable_tensor=False).module
+    )
+
+
+def gemm_int15(A: int4[8, 16], B: int4[16, 8], C: int15[8, 8]):
+    for i in range(8):
+        for j in range(8):
+            acc: int15 = 0
+            for k in range(16):
+                acc += A[i, k] * B[k, j]
+            C[i, j] = acc
+
+
+def test_widened_integer_accumulation_matches_in_the_stored_width():
+    """The frontend computes ``i4 * i4`` in i8 and the sum in i16, then
+    truncates to the i15 accumulator.  Truncation distributes over the ring
+    ops and every leaf is at most 15 bits wide, so the stored value is the
+    i15 evaluation of ``acc + A * B``: the pattern matches without any cast."""
+    trace = _trace(gemm_int15, "MAC")
+    assert trace.coverage.errors == []
+    (mac,) = trace.matches
+    assert mac.extra["accumulator_init"] == "zero"
+
+
+def gemm_wide_acc_fits(A: int4[8, 16], B: int4[16, 8], C: int15[8, 8]):
+    for i in range(8):
+        for j in range(8):
+            acc: int16 = 0
+            for k in range(16):
+                acc += A[i, k] * B[k, j]
+            C[i, j] = acc
+
+
+def gemm_wide_acc_overflows(A: int16[8, 16], B: int16[16, 8], C: int16[8, 8]):
+    for i in range(8):
+        for j in range(8):
+            acc: int64 = 0
+            for k in range(16):
+                acc += A[i, k] * B[k, j]
+            C[i, j] = acc
+
+
+def test_truncating_copy_needs_a_range_proof():
+    """``C = acc`` with a wider accumulator truncates at the store.  Sixteen
+    products of two int4 values lie in [-896, 1024], which int15 holds, so
+    the copy is exact and accepted; sixteen int16 products can reach 2^34,
+    so the same copy into an int16 output is refused with the range."""
+    exact = _trace(gemm_wide_acc_fits, "MAC")
+    assert exact.coverage.errors == []
+    assert [s.category for s in exact.coverage.stores].count("copy") == 1
+
+    with pytest.raises(UnsupportedWorkloadError) as info:
+        require_match_coverage(_trace(gemm_wide_acc_overflows, "MAC"))
+    message = str(info.value)
+    assert "through a truncation" in message
+    assert "[-17179344896, 17179869184]" in message  # 16 products of two int16
+    assert "i16 cannot hold" in message
+
+
+def argmin_rows(D: int64[12, 4], a: int32[12]):
+    for p in range(12):
+        best: int64 = D[p, 0]
+        idx: int32 = 0
+        for c in range(4):
+            idx = c if D[p, c] < best else idx
+            best = D[p, c] if D[p, c] < best else best
+        a[p] = idx
+
+
+def test_loop_index_narrowing_is_proven_from_the_loop_bounds():
+    """``idx = c`` casts the index loop variable to int32; the loop runs
+    over [0, 4), so the cast cannot change the value and the pattern binds
+    the loop variable."""
+    trace = _trace(argmin_rows, "ARGMIN_IDX")
+    assert [m.target_op_name for m in trace.matches] == ["ARGMIN_IDX"]
+    assert trace.matches[0].extra["iv_params"] == {"i": 1}
+
+
+def activation_bf16(acc: bf16[64], sg: bf16[64]):
+    for i in range(64):
+        sg[i] = 0.5 * allo.tanh(0.5 * acc[i]) + 0.5
+
+
+def activation_bf16_f32_constant(acc: bf16[64], sg: bf16[64]):
+    for i in range(64):
+        sg[i] = 0.1 * allo.tanh(0.5 * acc[i]) + 0.5
+
+
+def test_bf16_store_rounding_is_a_recorded_precision_contract():
+    """bf16 arithmetic is evaluated in f32 and rounded once at the store.
+    With every leaf a bf16 value the stored expression is the bf16
+    expression the AF op declares; the matcher records that the device
+    rounds per operation instead.  A constant bf16 cannot represent (0.1)
+    makes the source genuinely f32 and the store is refused."""
+    trace = _trace(activation_bf16, "AF")
+    assert trace.coverage.errors == []
+    assert [m.target_op_name for m in trace.matches] == ["AF"]
+    (note,) = trace.precision_notes
+    assert "rounded to bf16 at the store" in note
+
+    with pytest.raises(UnsupportedWorkloadError) as info:
+        require_match_coverage(_trace(activation_bf16_f32_constant, "AF"))
+    assert "arith.truncf<f32->bf16>" in str(info.value)
+
+
+def vadd_i32(A: int32[16], B: int32[16], C: int32[16]):
+    for i in range(16):
+        C[i] = A[i] + B[i]
+
+
+def test_pointwise_sum_is_matched_in_the_stored_width():
+    """``i32 + i32`` is evaluated in i33 and truncated at the i32 store:
+    this is i32 addition and matches ADD with plain operands."""
+    trace = _trace(vadd_i32, "ADD")
+    assert trace.coverage.errors == []
+    (add,) = trace.matches
+    assert {b.memref_name for b in add.operands} == {"A", "B"}
+
+
+from allo.ir.types import Int, uint8
+
+int17 = Int(17)
+
+
+def gemm_u8_narrow_copy(A: uint8[8, 2], B: uint8[2, 8], C: int17[8, 8]):
+    for i in range(8):
+        for j in range(8):
+            acc: int32 = 0
+            for k in range(2):
+                acc += A[i, k] * B[k, j]
+            C[i, j] = acc
+
+
+def test_unsigned_loads_use_the_unsigned_range():
+    """``uint8`` lowers to the signless ``i8``; the frontend zero-extends it.
+    Two products of two uint8 values reach 130,050, which int17 cannot hold,
+    so the truncating copy is refused.  Reading the loads as signed would
+    bound the sum by 32,768 and wrongly accept the copy."""
+    with pytest.raises(UnsupportedWorkloadError) as info:
+        require_match_coverage(_trace(gemm_u8_narrow_copy, "MAC"))
+    message = str(info.value)
+    assert "[0, 130050]" in message
+    assert "i17 cannot hold" in message

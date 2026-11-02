@@ -358,7 +358,15 @@ def _apu_v1(workload, **kwargs):
     return allo.compile(workload, build_apu_v1_target(), apu_v1_cost, **kwargs)
 
 
-def g2_gemv_in_place(A: int4[64, 64], y: int16[64]):
+def g2_gemv_in_place(A: int4[64, 64], y: int15[64]):
+    for i in range(64):
+        acc: int15 = 0
+        for k in range(64):
+            acc += A[i, k] * y[k]
+        y[i] = acc
+
+
+def g2_gemv_in_place_wide_operand(A: int4[64, 64], y: int16[64]):
     for i in range(64):
         acc: int15 = 0
         for k in range(64):
@@ -454,6 +462,15 @@ def test_apu_g2_source_aliases_are_rejected():
     for workload in (g2_gemv_in_place, g2_gemv_carried_in_place):
         with pytest.raises(APUG2SourceRouteError, match="aliases its result"):
             _g2(workload)
+
+
+def test_apu_g2_operand_wider_than_the_accumulator_is_refused_visibly():
+    """``acc: int15 += A * y`` with ``y: int16`` truncates a value whose
+    operand is wider than the accumulator; the device would have to narrow
+    the operand, which no target op declares, so the matcher keeps the
+    truncation visible and coverage fails instead of matching a MAC."""
+    with pytest.raises(APUG2SourceRouteError, match=r"arith\.trunci<i21->i15>"):
+        _g2(g2_gemv_in_place_wide_operand)
 
 
 def test_samsung_in_place_elementwise_executes(samsung_sim_gate):

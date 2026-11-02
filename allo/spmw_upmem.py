@@ -986,7 +986,17 @@ def _recognize_histogram(target, stream):
     extents = _loop_extents(match)
     if len(terms) != 1 or extents is None or len(extents) != 1:
         return None
-    parts = _histogram_index(terms[0])
+    E = _engine()
+    term = terms[0]
+    unproven_truncation = None
+    if isinstance(term, E.WUnary) and term.fn.startswith(("arith.trunci<", "arith.index_cast<")):
+        # The matcher kept a bin-index truncation it could not prove exact.
+        # Recognize the shape so the element-type check names the real
+        # problem for a non-int32 input; an int32 input whose index may
+        # still truncate is refused below.
+        unproven_truncation = term.fn
+        term = term.arg
+    parts = _histogram_index(term)
     if parts is None:
         return None
     x, bins, depth = parts
@@ -996,6 +1006,12 @@ def _recognize_histogram(target, stream):
     (acc,) = [op for op in match.operands if op.is_loop_carried]
     _require_element_type("histogram", "input", x)
     _require_element_type("histogram", "out", acc)
+    if unproven_truncation is not None:
+        raise NotImplementedError(
+            f"UPMEM histogram: the bin index ({x.memref_name} * {bins}) >> {depth} is "
+            f"narrowed by {unproven_truncation}, which is not provably exact; the "
+            "device computes the index in int32"
+        )
     if _memref_shape(acc) != (bins,):
         raise NotImplementedError(
             f"histogram multiplier {bins} differs from the bin count "
