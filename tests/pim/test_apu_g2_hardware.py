@@ -284,3 +284,179 @@ def test_selected_fingerprint_mismatch_is_refused_before_launch(monkeypatch, tmp
             launch.program, operand, operand, expected_layout_fingerprint="0" * 64
         )
     assert probed == []
+
+
+# --------------------------------------------------------------------------- #
+# G6 semantic probes on the card.  tests/pim/test_g6_semantics.py runs the
+# same host path against the emulated card; these confirm the device.
+# --------------------------------------------------------------------------- #
+
+
+def g6_gemm_square(A: int4[32, 32], B: int4[32, 32], C: int15[32, 32]):
+    for i in range(32):
+        for j in range(32):
+            acc: int15 = 0
+            for k in range(32):
+                acc += A[i, k] * B[k, j]
+            C[i, j] = acc
+
+
+def test_call_aliases_read_pre_call_values_on_card(apu_g2_card):
+    """One array passed for two parameters: every input is staged before any
+    output is written, so the result is computed from the pre-call values."""
+
+    rng = np.random.default_rng(SEED + 61)
+    target = build_apu_g2_target()
+    gemm = allo.compile(g6_gemm_square, target, apu_g2_cost)
+    gemm.compiled.repetitions = REPETITIONS
+    A0 = rng.integers(-8, 8, size=(32, 32)).astype(np.int16)
+    B0 = rng.integers(-8, 8, size=(32, 32)).astype(np.int16)
+
+    shared = A0.copy()
+    out = np.full((32, 32), 7, np.int16)
+    result = gemm(shared, shared, out)
+    assert result.kind == "device"
+    np.testing.assert_array_equal(out, A0.astype(np.int64) @ A0)
+    _record("g6_alias", "gemm_lhs_is_rhs", result)
+
+    output_is_lhs = A0.copy()
+    result = gemm(output_is_lhs, B0, output_is_lhs)
+    np.testing.assert_array_equal(output_is_lhs, A0.astype(np.int64) @ B0)
+    _record("g6_alias", "gemm_output_is_lhs", result)
+
+    mvt = allo.compile(PAPER_KERNELS["mvt"], target, apu_g2_cost)
+    mvt.compiled.repetitions = REPETITIONS
+    M = rng.integers(-4, 4, size=(256, 256)).astype(np.int16)
+    y1 = rng.integers(-4, 4, size=256).astype(np.int16)
+    y2 = rng.integers(-4, 4, size=256).astype(np.int16)
+    x2 = rng.integers(-1000, 1000, size=256).astype(np.int16)
+    x1_is_y1, x2_out = y1.copy(), x2.copy()
+    result = mvt(M, x1_is_y1, y2, x1_is_y1, x2_out)
+    np.testing.assert_array_equal(x1_is_y1, y1 + M.astype(np.int64) @ y1)
+    np.testing.assert_array_equal(x2_out, x2 + M.T.astype(np.int64) @ y2)
+    _record("g6_alias", "mvt_x1_is_y1", result)
+
+
+def test_extreme_operands_on_card(apu_g2_card):
+    """i8 products at -128/127 into i16, and an int4 GEMM reaching both ends
+    of its exact int15 dot range (8192 = (-8)(-8)128, -7168 = (-8)(7)128)."""
+
+    target = build_apu_g2_target()
+    full = (4, 65_536)
+    lhs = np.resize(np.array([-128, 127, 0, -128, 127], np.int8), full)
+    rhs = np.resize(np.array([-128, -128, 127, 127, 127, -1, 0], np.int8), full)
+    mul = allo.compile(
+        APUG2TypedProgram("mul", (S(8), S(8)), S(16), full, repetitions=REPETITIONS),
+        target,
+        apu_g2_cost,
+    )
+    out = np.full(full, 7, np.int16)
+    result = mul(lhs, rhs, out)
+    np.testing.assert_array_equal(out.astype(np.int64), lhs.astype(np.int64) * rhs)
+    assert (out.max(), out.min()) == (16384, -16256)
+    _record("g6_extreme", "mul_i8_i16", result)
+
+    gemm = allo.compile(PAPER_KERNELS["gemm"], target, apu_g2_cost)
+    gemm.compiled.repetitions = REPETITIONS
+    A = np.full((64, 128), -8, np.int16)
+    B = np.full((128, 31), -8, np.int16)
+    B[:, 1::2] = 7
+    C = np.full((64, 31), 7, np.int16)
+    result = gemm(A, B, C)
+    np.testing.assert_array_equal(C, A.astype(np.int64) @ B)
+    assert (C.max(), C.min()) == (8192, -7168)
+    _record("g6_extreme", "gemm_int4_edges", result)
+
+
+def test_zero_results_overwrite_a_sentinel_on_card(apu_g2_card):
+    rng = np.random.default_rng(SEED + 62)
+    target = build_apu_g2_target()
+    full = (4, 65_536)
+    a = rng.integers(-(1 << 15), 1 << 15, size=full).astype(np.int16)
+    b = (-a.astype(np.int32)).astype(np.int16)  # -(-32768) wraps to -32768
+    add = allo.compile(
+        APUG2TypedProgram("add", (S(16), S(16)), S(16), full, repetitions=REPETITIONS),
+        target,
+        apu_g2_cost,
+    )
+    out = np.full(full, 7, np.int16)
+    result = add(a, b, out)
+    np.testing.assert_array_equal(out, np.zeros(full, np.int16))
+    np.testing.assert_array_equal(result.extra["outputs"]["out"], np.zeros(full, np.int16))
+    _record("g6_zero", "add_i16_a_minus_a", result)
+
+    gemm = allo.compile(PAPER_KERNELS["gemm"], target, apu_g2_cost)
+    gemm.compiled.repetitions = REPETITIONS
+    B = rng.integers(-8, 8, size=(128, 31)).astype(np.int16)
+    C = np.full((64, 31), 7, np.int16)
+    result = gemm(np.zeros((64, 128), np.int16), B, C)
+    np.testing.assert_array_equal(C, np.zeros((64, 31), np.int16))
+    _record("g6_zero", "gemm_zero_lhs", result)
+
+
+def test_fused_and_separate_bicg_plans_agree_on_card(apu_g2_card):
+    rng = np.random.default_rng(SEED + 63)
+    A = rng.integers(-4, 4, size=(256, 256)).astype(np.int16)
+    p = rng.integers(-4, 4, size=256).astype(np.int16)
+    r = rng.integers(-4, 4, size=256).astype(np.int16)
+    runs = {}
+    for layout in (None, "separate/k1"):
+        compiled = allo.compile(
+            PAPER_KERNELS["bicg"], build_apu_g2_target(), apu_g2_cost, layout=layout
+        )
+        compiled.compiled.repetitions = REPETITIONS
+        q = np.full(256, 7, np.int16)
+        s = np.full(256, 7, np.int16)
+        result = compiled(A, p, r, q, s)
+        runs[compiled.compiled.plan.name] = (q, s, result)
+        _record(
+            "g6_two_plans",
+            compiled.compiled.plan.name,
+            result,
+            estimate=compiled.compiled.plan.estimate_cycles,
+            launches=len(result.extra["launches"]),
+        )
+    (fq, fs, fused), (sq, ss, separate) = runs["fused/k1"], runs["separate/k1"]
+    np.testing.assert_array_equal(fq, A.astype(np.int64) @ p)
+    np.testing.assert_array_equal(fs, r.astype(np.int64) @ A)
+    np.testing.assert_array_equal(fq, sq)
+    np.testing.assert_array_equal(fs, ss)
+    assert (len(fused.extra["launches"]), len(separate.extra["launches"])) == (1, 2)
+
+
+def test_typed_div_ignores_garbage_in_padded_lanes_on_card(apu_g2_card, monkeypatch):
+    """A partial shape leaves 262144 - 3000 lanes padded; they are filled
+    with random garbage after packing (nonzero divisors), and the logical
+    quotients must still be exact."""
+
+    import allo.pim.apu_g2_typed_runtime as runtime
+
+    rng = np.random.default_rng(SEED + 64)
+    shape = (3, 1000)
+    original = runtime.pack_apu_g2_typed_operands
+
+    def with_garbage(program, operands):
+        carriers = []
+        for index, carrier in enumerate(original(program, operands)):
+            flat = np.array(carrier, copy=True).reshape(-1)
+            low = 1 if index == 1 else 0
+            garbage = rng.integers(low, 1 << 16, size=flat.size - 3000)
+            flat[3000:] = garbage.astype(flat.dtype)
+            carriers.append(flat.reshape(carrier.shape))
+        return tuple(carriers)
+
+    monkeypatch.setattr(runtime, "pack_apu_g2_typed_operands", with_garbage)
+    div = allo.compile(
+        APUG2TypedProgram(
+            "div", (S(16, False),) * 2, S(16, False), shape, repetitions=REPETITIONS
+        ),
+        build_apu_g2_target(),
+        apu_g2_cost,
+    )
+    lhs = rng.integers(0, 1 << 16, size=shape).astype(np.uint16)
+    rhs = rng.integers(1, 1 << 16, size=shape).astype(np.uint16)
+    rhs[0, :8] = 1
+    out = np.full(shape, 7, np.uint16)
+    result = div(lhs, rhs, out)
+    np.testing.assert_array_equal(out, lhs // rhs)
+    _record("g6_padding", "div_u16_3x1000_garbage", result)

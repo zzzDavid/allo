@@ -1056,6 +1056,12 @@ def source_backend_binding(target, trace, parameter_names) -> SourceBackendBindi
         if 0 <= int(ordinal) < len(parameter_names) and ref not in operand_refs
     ]
     output = unreferenced[0] if len(unreferenced) == 1 else None
+    if output is None:
+        # In place (``a[i] = a[i] + b[i]``): the stored parameter is also an
+        # operand, so only the matches' store destination names the output.
+        stored = {m.result_value_ref for m in trace.matches}
+        if len(stored) == 1 and next(iter(stored)) in ordinal_by_ref:
+            output = parameter_names[ordinal_by_ref[next(iter(stored))]]
     return SourceBackendBinding(inputs=inputs, output=output)
 
 

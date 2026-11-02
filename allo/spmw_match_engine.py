@@ -2332,6 +2332,7 @@ class _FunctionCoverage:
 
         category: dict[int, str] = {}
         detail: dict[int, str] = {}
+        copy_producers: dict[int, list[int]] = {}
         for index in self.stores:
             dest = self._dest(index)
             if index in self.site_matches:
@@ -2349,6 +2350,7 @@ class _FunctionCoverage:
                 producers = [j for j in result_sites.get(source_ref, ()) if j < index]
                 if source_ref != dest and producers:
                     category[index] = STORE_COPY
+                    copy_producers[index] = producers
                     sink = (self._dest_name(index), self._index_text(index))
                     for j in producers:
                         for match in self.site_matches[j]:
@@ -2363,6 +2365,7 @@ class _FunctionCoverage:
             category[index] = STORE_UNMATCHED
 
         self._settle_locals(category, detail)
+        self._check_result_aliases(copy_producers, problems)
 
         for dest, entries in acc_sites.items():
             for index, match in entries:
@@ -2406,6 +2409,51 @@ class _FunctionCoverage:
                     (self.work_root, index, "unmatched"),
                     [self._unmatched_message(index, detail.get(index)), []],
                 )[1].append(self.func_name)
+
+    def _check_result_aliases(self, copy_producers, problems) -> None:
+        """Reject a match whose operand reads the buffer its own result is
+        written to, at another element (``y[i] = sum_k W[i, k] * y[k]``).
+
+        In source order a later iteration reads elements an earlier one
+        already overwrote; every PIM program reads its operands before it
+        writes its result, so lowering it would silently compute
+        ``W @ y_initial`` instead.  Reading the element being written
+        (``y[i] += ...``, ``a[i] = a[i] + b[i]``) is not an alias.
+        """
+        result_stores: dict[int, list[int]] = {
+            index: [index] for index in self.site_matches
+        }
+        for copy, producers in copy_producers.items():
+            for producer in producers:
+                result_stores[producer].append(copy)
+        for index, stores in result_stores.items():
+            for load in _term_loads(self._term(index), []):
+                if load.index_terms is None or load.value_ref is None:
+                    continue
+                for store in stores:
+                    if load.value_ref != self._dest(store) or self._same_access(
+                        load.index_map,
+                        load.index_terms,
+                        self._store_map(store),
+                        self._store_index_terms(store),
+                    ):
+                        continue
+                    names = ", ".join(m.target_op_name for m in self.site_matches[index])
+                    read = _render_term(load)
+                    written = f"{self._dest_name(store)}[{self._index_text(store)}]"
+                    problems.setdefault(
+                        (self.work_root, index, "alias", store),
+                        [
+                            f"function '{self.func_name}': operand {read} of {names} "
+                            f"(store {self._handle(index)}, loop nest "
+                            f"{_render_loops(self.sites[index][1])}) aliases its "
+                            f"result {written}: the source reads elements of "
+                            f"'{load.memref_name}' that earlier iterations overwrite, "
+                            "but the target program reads every operand before it "
+                            "writes the result. Write the result to a separate buffer.",
+                            [],
+                        ],
+                    )[1].append(self.func_name)
 
     def _unmatched_message(self, index, reason) -> str:
         op = self._op(index)

@@ -132,9 +132,10 @@ probe A: only two distinct scores, 226 and 275).
 * `residency` crosses work items (single kernel) or kernels (multi-kernel).
   On one kernel, the vector is HAB-broadcast once per K tile per pass to all
   blocks simultaneously, so restage and resident denote the same physical
-  program; the knob has no cost rule either (tie). Multi-kernel Samsung
-  traces are compile-only: the conductor executes one REDUCE kernel and
-  the runtime raises for more.
+  program; the knob has no cost rule either (tie). Across kernels the
+  conductor keeps nothing between invocations, so a multi-kernel program
+  runs only the residency its host program spells out with transfers
+  (section 9); a value left device-resident across launches is rejected.
 * `tile` and `double_buffer` are 1x fans on the Samsung GEMV (no legal
   non-identity tiling, no buffer pair). The Samsung lowering does not
   realize either, so a placement carrying a non-identity value is rejected
@@ -407,7 +408,8 @@ paragraph); the paper rows now pin P0 explicitly.
   the conductor computes `W[row]` for the store row. The matcher would need
   to retain the row expression (as it does for `affine.load`).
 * Multi-kernel Samsung traces compile but do not run (one REDUCE or
-  ELTWISE program per artifact).
+  ELTWISE program per artifact). Closed in section 9: they run their host
+  program's launch schedule, one invocation per launch.
 * Elementwise kernels require `mapping=[1]`, which triggers the generic
   `_check_work_grid` warning (owned elsewhere).
 * `experiments/simulators/setup/apply.sh` now calls
@@ -630,4 +632,89 @@ AiM/UPMEM keep the one-program-per-work-item reason).
   need a partial-sum combine across PIM units: reduction-policy work.
 * GEMM (two output coordinates), masked row counts and elementwise kernels
   run only the program map.
+
+## 9. Multi-kernel programs (launch schedule, 2026-11-02)
+
+A dataflow region with several `@allo.work` kernels lowers to one
+`SamsungProgram` per kernel group (`SamsungCtx.programs`). It runs when it
+was compiled with an `@allo.host_program` (`host_moves=`), whose launch
+schedule (`spmw_plan.launch_schedule`: `HostStep`s and `LaunchStep`s in
+program order) drives one `pim_driver` invocation per launch
+(`spmw_samsung._run_samsung_launches`). The conductor is unchanged: every
+invocation starts with empty banks, GRF and CRF, and ends with a readback.
+Without a launch schedule, `run()` raises `NotImplementedError` naming the
+missing host program.
+
+### 9.1 Contract (`samsung_launch_plan`, pure, checked before any simulator call)
+
+* Binding. Each kernel's matrix, vector and output are bound to workload
+  parameters through `trace.source_value_refs` (operands by `value_ref`;
+  the output of a contraction is the parameter on an argument of the
+  kernel's own functions that no operand reads). Inputs and outputs of a
+  multi-kernel run are named by workload parameter.
+* Staging. `scatter(b)` / `broadcast(b)` snapshot the host copy of `b` and
+  stage it for the next launch that reads `b`. The selected program decides
+  the verb: matrix, carried initial accumulator and elementwise inputs are
+  bank-resident (scatter, realized in that launch's preload phase); the
+  vector is broadcast under host GRF_A fill (realized in its execution
+  phase) and scattered under CRF fill. A staging declared before an earlier
+  launch (V before mv1 in `_chained`) is placed by the invocation of the
+  launch that reads it, once.
+* Threading. A launch's result is the device value of its output buffer.
+  `gather(b)` takes it into the host copy (FP16, the declared buffer type);
+  a later `broadcast(b)` / `scatter(b)` stages that copy. The second launch
+  of `_chained` therefore reads the FP16 `y` gathered from the first.
+* Rejected, with a `ValueError` naming the residency: a launch operand that
+  a previous launch left on the device without a gather and re-staging
+  (`_legacy_order`: "keeps 'y' device-resident across the two launches");
+  a staging read by one launch and needed again by a later one without a
+  new staging; a buffer declared `resident=` before the program; a staging
+  of a host copy older than a device result (stale broadcast); a verb that
+  does not match the selected program's fill; a gather of a buffer no
+  launch produced; sliced buffer transfers.
+* Accounting. `RunResult.cycles` = sum of the launches' invocation cycles
+  + the cost-graph latency of host steps no invocation performs (a staging
+  no launch reads, a repeated gather; `extra["host_steps"][i]["realized_by"]
+  == "modelled"`). `extra["launches"]` has one record per launch (kernel,
+  program kind, operands, staging host steps, output, gathering host steps,
+  cycles, `cycle_phases`, its own `timing_scope`, conductor receipt, CRF,
+  plan, levers); `extra["timing_scope"]` states the sum; `extra["outputs"]`
+  holds every gathered buffer, which `CompiledCallable` writes back.
+  Launches do not overlap; host arithmetic between launches (lane sum of a
+  REDUCE result, FP16 rounding of a gathered buffer) is not timed.
+
+### 9.2 Executed (`_two_kernels`, 64 x 64 GEMVs, `z = V @ (W @ x)`)
+
+Installed `pim_driver` (section 8.2 build), inputs `W, V ~ U(-0.5, 0.5)`,
+`x ~ U(-1, 1)` in FP16 (probe seed 7; the tests draw fresh seeds):
+
+| Host program, policy | Program | Launch cycles (preload / exec / readback) | Total | Max abs err y / z vs FP32 chain (max abs z) | Cost graph |
+|---|---|---|---|---|---|
+| `_chained`, `reassociate` | REDUCE (bank_row, host fill) | 2,813 (1,518 / 1,114 / 181) each | 5,626 | 1.9e-3 / 4.7e-3 (6.31) | 706 |
+| `_chained`, strict (default) | TEMPORAL_REDUCE | 7,485 (3,251 / 4,167 / 67) each | 14,970 | 4.8e-3 / 9.7e-3 (6.31) | 8,530 |
+| `_legacy_order`, either | | rejected before the simulator | | | 8,524 / 700 |
+
+Every host step of `_chained` is performed inside an invocation (modelled
+host-step cycles 0). The cost graph prices the REDUCE program without
+preload and readback (section 6.3), hence 706 versus 5,626.
+
+Tests: `tests/pim/test_host_program_analysis.py` (`test_samsung_launch_plan_threads_gathered_results`,
+`test_samsung_legacy_order_rejects_device_resident_intermediate`,
+`test_samsung_reused_staging_is_rejected`, and the simulator-gated
+`test_samsung_runs_chained_launches[reassociate-REDUCE|strict-TEMPORAL_REDUCE]`,
+which compare `y` and `z` with the FP32 chain within 1e-2 of the largest
+reference magnitude and `z` with `V @ y_gathered`).
+
+### 9.3 Open
+
+* The virtual estimate of `_legacy_order` prices no hand-off of `y`
+  between the kernels (8,524 / 700, below `_chained`) although no Samsung
+  program can execute that order; the cost graph does not check that a
+  consumer's GRF_A fill has a matching host step.
+* Co-residency of buffers staged for later launches (V while mv1 runs) is
+  not checked against bank capacity; each invocation places its operands at
+  the conductor's fixed rows.
+* Repeated launches of one kernel over slices of a buffer (`X[b]`) are
+  rejected (whole-buffer transfers only); `run_batched` covers the
+  resident-matrix batch.
 

@@ -755,8 +755,14 @@ def test_temporal_plan_accumulates_nonzero_initial_output(backend):
     assert realization.carries_output_ingress
     left, right, initial, expected = _gemm_inputs()
     result = initial.copy()
-    compiled(left, right, result)
-    np.testing.assert_array_equal(result, expected)
+    run = compiled(left, right, result)
+    if backend == "virtual":
+        # The virtual route prices the plan; it executes and writes nothing.
+        assert run.kind == "virtual" and run.outputs == {}
+        np.testing.assert_array_equal(result, initial)
+    else:
+        assert run.kind == "functional"
+        np.testing.assert_array_equal(result, expected)
 
     # The device ABI transfers the carried output image instead of zeroing it.
     artifact = realization.runtime_artifact

@@ -1742,8 +1742,9 @@ def _program_of(compiled) -> SamsungProgram:
         )
     if len(programs) != 1:
         raise NotImplementedError(
-            f"Samsung execution runs one kernel per artifact; this one has "
-            f"{len(programs)} kernels (multi-kernel Samsung programs are compile-only)"
+            f"this Samsung entry point runs one kernel; the artifact has "
+            f"{len(programs)} kernels (run a multi-kernel artifact with run(), "
+            "which follows its host program's launch schedule)"
         )
     return programs[0]
 
@@ -1797,9 +1798,14 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
     shapes, the padding fraction of issued work, the plan, the CRF and the
     conductor receipt.  Missing operands raise ValueError; a conductor
     rejection or an absent/short readback raises RuntimeError.
-    """
-    import numpy as np
 
+    An artifact with several kernels runs its host program's launch schedule,
+    one conductor invocation per launch (``_run_samsung_launches``); its
+    operands arrive under the workload's parameter names.
+    """
+    ctx_programs = list(getattr(getattr(compiled, "layout_ctx", None), "programs", ()) or ())
+    if len(ctx_programs) > 1:
+        return _run_samsung_launches(compiled, inputs)
     reason = _samsung_unavailable_reason()
     if reason is not None:
         raise SimulatorUnavailable("samsung_hbm_pim", reason)
@@ -1808,6 +1814,14 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
     geometry = samsung_simulator_geometry(root)
     _check_geometry(program.facts, geometry)
     _check_host_moves(compiled, program, inputs)
+    return _run_samsung_program(compiled, program, root, geometry, inputs)
+
+
+def _run_samsung_program(compiled, program, root, geometry, inputs) -> RunResult:
+    """Execute one lowered program (one ``pim_driver`` invocation) on the
+    runtime-role operands ``inputs`` (``A``/``B``/``C`` or ``IN0..IN2``)."""
+    import numpy as np
+
     crf_words = list(compiled.cmds[program.start:program.end])
     supplied = sorted(k for k, v in inputs.items() if v is not None)
 
@@ -2036,6 +2050,439 @@ def _run_samsung_temporal(program, crf_words, root, geometry, inputs) -> RunResu
         stdout=res["log"],
         backend="samsung_hbm_pim",
         extra=extra,
+    )
+
+
+# --------------------------------------------------------------------- #
+# Multi-kernel artifacts: one conductor invocation per launch
+# --------------------------------------------------------------------- #
+
+_LAUNCHES_TIMING_SCOPE = (
+    "Sum over the host program's launches, run back to back without overlap, "
+    "of each launch's pim_driver invocation (PIMSimulator memory-clock cycles; "
+    "each launch states its own scope in extra['launches'][i]['timing_scope']: "
+    "staging of the operands the host program scattered for it, CRF upload, "
+    "execution with its host GRF_A broadcasts, readback of its result), plus "
+    "the cost-graph latency of host steps no invocation performs "
+    "(extra['host_steps'] entries realized_by 'modelled'). Not timed: host "
+    "arithmetic between launches (the 16-lane sum of a REDUCE result, the "
+    "rounding of a gathered buffer to its FP16 host copy) and host padding."
+)
+
+_CONTRACTION_KINDS = ("REDUCE", "TEMPORAL_REDUCE")
+
+
+def _launch_buffers(compiled, program, names) -> dict:
+    """Workload parameters one lowered kernel reads and writes, by runtime role.
+
+    Binds through the trace's retained source identities: an operand whose
+    ``value_ref`` is a parameter's ``source_value_refs`` entry is that
+    parameter.  A contraction stores through a local accumulator, so its
+    output is the parameter bound to an argument of the kernel's own
+    functions that none of its operands read (``_build_ir_value_refs`` names
+    argument ``i`` of function ``f`` ``(f, 0, i)`` and values inside ``f``
+    ``(f, 1|2, ...)``).  Returns ``{"A", "B"[, "C"], "out"}`` for a
+    contraction, ``{"IN0".., "out"}`` for an elementwise kernel.
+    """
+    from .spmw_autoschedule import _matcher_work_scope
+
+    trace = compiled.trace
+    refs = getattr(trace, "source_value_refs", None) or {}
+    name_of = {ref: names[int(o)] for o, ref in refs.items() if 0 <= int(o) < len(names)}
+    matches = [
+        m for m in trace.matches if _matcher_work_scope(m).group_id == program.group_id
+    ]
+    kernel = matches[0].func_name.rsplit("_", 1)[0] if matches else str(program.group_id)
+
+    def bind(what, value_refs):
+        found = {name_of.get(ref) for ref in value_refs}
+        if len(found) != 1 or None in found:
+            raise ValueError(
+                f"Samsung multi-kernel execution: the {what} of kernel {kernel!r} "
+                f"binds to {sorted(str(n) for n in found)}, not to one workload "
+                "parameter"
+            )
+        return found.pop()
+
+    def operand_refs(role):
+        return [op.value_ref for m in matches for op in m.operands if op.role == role]
+
+    if program.kind in _CONTRACTION_KINDS:
+        c = program.contraction
+        roles = {
+            "A": bind("matrix", operand_refs(c.matrix_role)),
+            "B": bind("vector", operand_refs(c.vector_role)),
+        }
+    else:
+        roles = {
+            f"IN{index}": bind(f"input {role!r}", operand_refs(role))
+            for index, role in enumerate(program.elementwise.input_roles)
+        }
+    results = {name_of.get(m.result_value_ref) for m in matches} - {None}
+    if len(results) == 1:
+        roles["out"] = results.pop()
+    else:
+        read = {op.value_ref for m in matches for op in m.operands}
+        functions = {
+            ref.path[0]
+            for m in matches
+            for ref in (m.result_value_ref, *(op.value_ref for op in m.operands))
+            if ref is not None and len(ref.path) > 1 and ref.path[1] != 0
+        }
+        roles["out"] = bind(
+            "output",
+            [
+                ref
+                for ref in name_of
+                if len(ref.path) == 3
+                and ref.path[1] == 0
+                and ref.path[0] in functions
+                and ref not in read
+            ]
+            or [None],
+        )
+    if program.kind in _CONTRACTION_KINDS and program.contraction.accumulator_init == "carried":
+        roles["C"] = roles["out"]
+    return roles
+
+
+def _host_step_activity_cycles(compiled, schedule) -> dict:
+    """Cost-graph latency of each host step (``host_index -> cycles``), or
+    an empty map when the artifact retains no execution graph."""
+    from .spmw_plan import HostStep
+
+    graph = getattr(compiled, "execution_graph", None)
+    if graph is None:
+        return {}
+    counts = {"ingress": 0, "egress": 0}
+    cycles = {}
+    for step in schedule.steps:
+        if not isinstance(step, HostStep):
+            continue
+        resolved = compiled.host_moves[step.host_index]
+        direction = "egress" if resolved.verb.name == "gather" else "ingress"
+        prefix = f"host:{direction}:{counts[direction]}:"
+        counts[direction] += 1
+        cycles[step.host_index] = sum(
+            int(a.latency_cycles) for a in graph.activities if a.id.startswith(prefix)
+        )
+    return cycles
+
+
+def samsung_launch_plan(compiled) -> dict:
+    """Bind a multi-kernel artifact's launch schedule to conductor invocations.
+
+    Pure (no simulator).  Walks the host program in order:
+
+    * ``scatter(b)`` / ``broadcast(b)`` snapshots the host copy of ``b`` and
+      stages it for the next launch that reads ``b``.  The selected program
+      decides the verb: the matrix (and the initial accumulator of a carried
+      ordered program, and every elementwise input) is bank-resident, so it
+      needs a scatter; the vector needs a broadcast under host GRF_A fill and
+      a scatter under CRF fill.  The staged copy is placed by that launch's
+      invocation (preload phase for a scatter, execution phase for a
+      broadcast).
+    * A launch consumes one staging of each operand and runs its kernel's
+      program in its own ``pim_driver`` invocation; its result becomes the
+      device value of its output buffer.
+    * ``gather(b)`` takes the device value of ``b`` (the readback of the
+      launch that produced it) into the host copy.
+
+    The conductor keeps nothing between invocations: banks, GRF and CRF
+    start empty in every run.  A launch operand that is not staged for it is
+    therefore rejected, naming the residency the program assumed (a result
+    left on the device for the next kernel, a staging reused by a second
+    launch, a buffer declared resident before the program), as is a staging
+    that would read a host copy older than a device result.  Host steps no
+    invocation performs (a staging no launch reads, a repeated gather) are
+    priced from the retained execution graph.
+
+    Returns ``events`` (the execution order), ``launches`` (one record per
+    launch), ``host_steps`` (one per host transfer, with ``realized_by``),
+    and ``external_inputs`` (buffers staged from the caller's arrays).
+    """
+    from .spmw_plan import HostStep, LaunchStep
+
+    programs = list(getattr(getattr(compiled, "layout_ctx", None), "programs", ()) or ())
+    schedule = getattr(compiled, "launch_schedule", None)
+    if schedule is None or not any(isinstance(s, LaunchStep) for s in schedule.steps):
+        raise NotImplementedError(
+            f"this Samsung artifact has {len(programs)} kernels and no launch "
+            "schedule; multi-kernel execution follows the host program's "
+            "launches: compile with host_moves=<an @allo.host_program that "
+            "launches every kernel and declares its transfers>"
+        )
+    names = tuple(name for name, _shape in schedule.parameters)
+    by_group = {program.group_id: program for program in programs}
+    activity_cycles = _host_step_activity_cycles(compiled, schedule)
+
+    events, launches, host_steps = [], [], {}
+    staged = {}  # buffer -> host_index staged and not yet read by a launch
+    consumed = {}  # buffer -> (host_index, launch) of its last staging read
+    produced = {}  # buffer -> launch whose device value is current
+    gathered = {}  # buffer -> launch whose value the host copy holds
+    external = []
+
+    def model(host_index, reason):
+        record = host_steps[host_index]
+        record["realized_by"] = "modelled"
+        record["reason"] = reason
+        record["modelled_cycles"] = activity_cycles.get(host_index)
+
+    def residency_error(index, kernel, role_text, buffer, verb):
+        where = f"launch {index} ({kernel!r}) reads {buffer!r} as its {role_text}"
+        keep = (
+            "The Samsung conductor runs one program per pim_driver invocation "
+            "and keeps no bank, GRF or CRF contents between invocations"
+        )
+        if buffer in produced and gathered.get(buffer) != produced[buffer]:
+            source = launches[produced[buffer]]
+            return ValueError(
+                f"{where}, which launch {source['launch']} ({source['kernel']!r}) "
+                f"left on the device: the host program keeps {buffer!r} "
+                "device-resident across the two launches (no gather and "
+                f"{verb} between them). {keep}, and the result drains to the "
+                f"host; declare gather({buffer}) and {verb}({buffer}) between "
+                "the launches"
+            )
+        if buffer in consumed:
+            host_index, reader = consumed[buffer]
+            return ValueError(
+                f"{where}, but host step {host_index} staged it for launch "
+                f"{reader} and no host step stages it again: the program keeps "
+                f"{buffer!r} device-resident across launches. {keep}; "
+                f"{verb} {buffer!r} again before launch {index}"
+            )
+        if buffer in (getattr(schedule, "resident", ()) or ()):
+            return ValueError(
+                f"{where}; the host program declares {buffer!r} resident before "
+                f"it runs. {keep}, so it cannot honour that residency; {verb} "
+                f"{buffer!r} before launch {index}"
+            )
+        return ValueError(
+            f"{where}, but no host step stages it before the launch; {verb} "
+            f"{buffer!r} before launch {index}"
+        )
+
+    for step in schedule.steps:
+        if isinstance(step, HostStep):
+            index = step.host_index
+            resolved = compiled.host_moves[index]
+            verb = resolved.verb.name
+            buffer = resolved.buffer_role
+            host_steps[index] = {
+                "host_index": index,
+                "verb": verb,
+                "buffer": buffer,
+                "realized_by": None,
+            }
+            if not isinstance(buffer, str) or buffer not in names:
+                raise ValueError(
+                    f"Samsung multi-kernel execution moves whole workload buffers "
+                    f"{list(names)}; host step {index} ({verb}) moves {buffer!r}"
+                )
+            if verb == "gather":
+                if buffer not in produced:
+                    raise ValueError(
+                        f"host step {index} gathers {buffer!r}, which no earlier "
+                        "launch produced on the device"
+                    )
+                if gathered.get(buffer) == produced[buffer]:
+                    model(index, f"the host already holds this value of {buffer!r}")
+                else:
+                    gathered[buffer] = produced[buffer]
+                    host_steps[index]["realized_by"] = {
+                        "launch": produced[buffer],
+                        "phase": "readback",
+                    }
+                    launches[produced[buffer]]["gathered_by"].append(index)
+                events.append(("gather", index, buffer))
+            elif verb in ("scatter", "broadcast"):
+                if buffer in produced and gathered.get(buffer) != produced[buffer]:
+                    raise ValueError(
+                        f"host step {index} ({verb}) stages the host copy of "
+                        f"{buffer!r}, but launch {produced[buffer]} produced "
+                        f"{buffer!r} on the device and the host program has not "
+                        "gathered it before this step"
+                    )
+                if buffer in staged:
+                    model(
+                        staged[buffer],
+                        f"host step {index} stages {buffer!r} again before any "
+                        "launch reads this staging",
+                    )
+                if buffer not in gathered and buffer not in external:
+                    external.append(buffer)
+                staged[buffer] = index
+                events.append(("stage", index, buffer))
+            else:
+                raise ValueError(
+                    f"Samsung multi-kernel execution: host step {index} has verb "
+                    f"{verb!r}; the conductor stages by scatter/broadcast and "
+                    "reads back by gather"
+                )
+        elif isinstance(step, LaunchStep):
+            program = by_group.get(step.group_id)
+            if program is None:
+                raise ValueError(
+                    f"launch of {step.kernel!r} names kernel group {step.group_id}, "
+                    "which has no lowered Samsung program"
+                )
+            index = len(launches)
+            roles = _launch_buffers(compiled, program, names)
+            contraction = program.kind in _CONTRACTION_KINDS
+            operands = {}
+            for role, buffer in roles.items():
+                if role == "out":
+                    continue
+                if contraction and role == "B" and not program.vector_from_bank:
+                    need, phase, text = "broadcast", "exec", "vector (host GRF_A fill)"
+                elif contraction and role == "B":
+                    need, phase, text = "scatter", "preload", "vector (CRF GRF_A fill)"
+                elif contraction and role == "A":
+                    need, phase, text = "scatter", "preload", "bank-resident matrix"
+                elif role == "C":
+                    need, phase, text = "scatter", "preload", "initial accumulator"
+                else:
+                    need, phase, text = "scatter", "preload", f"bank operand {role}"
+                host_index = staged.pop(buffer, None)
+                if host_index is None:
+                    raise residency_error(index, step.kernel, text, buffer, need)
+                verb = host_steps[host_index]["verb"]
+                if verb != need:
+                    raise ValueError(
+                        f"launch {index} ({step.kernel!r}) reads {buffer!r} as its "
+                        f"{text}, which its selected program takes by {need}; "
+                        f"host step {host_index} declares {verb}"
+                    )
+                host_steps[host_index]["realized_by"] = {"launch": index, "phase": phase}
+                consumed[buffer] = (host_index, index)
+                operands[role] = (buffer, host_index)
+            produced[roles["out"]] = index
+            launches.append(
+                {
+                    "launch": index,
+                    "kernel": step.kernel,
+                    "group_id": step.group_id,
+                    "ordinal": step.ordinal,
+                    "program": program.kind,
+                    "operands": operands,
+                    "output": roles["out"],
+                    "gathered_by": [],
+                }
+            )
+            events.append(("launch", index))
+        else:
+            raise TypeError(f"unknown launch schedule step {step!r}")
+    for buffer, host_index in staged.items():
+        model(host_index, f"no launch reads this staging of {buffer!r}")
+    return {
+        "events": events,
+        "launches": launches,
+        "host_steps": [host_steps[i] for i in sorted(host_steps)],
+        "external_inputs": external,
+        "parameters": dict(schedule.parameters),
+    }
+
+
+def _run_samsung_launches(compiled, inputs) -> RunResult:
+    """Execute a multi-kernel artifact: ``samsung_launch_plan``'s launches, one
+    ``pim_driver`` invocation each, threading gathered results into later
+    stagings.  ``inputs`` are named by workload parameter."""
+    import numpy as np
+
+    plan = samsung_launch_plan(compiled)
+    missing = [b for b in plan["external_inputs"] if inputs.get(b) is None]
+    if missing:
+        raise ValueError(
+            f"Samsung multi-kernel execution stages {missing} from the caller; "
+            f"supplied {sorted(k for k, v in inputs.items() if v is not None)}"
+        )
+    modelled = [s for s in plan["host_steps"] if s["realized_by"] == "modelled"]
+    unpriced = [s["host_index"] for s in modelled if s["modelled_cycles"] is None]
+    if unpriced:
+        raise RuntimeError(
+            f"host steps {unpriced} are performed by no invocation and the "
+            "artifact retains no execution graph to price them"
+        )
+    reason = _samsung_unavailable_reason()
+    if reason is not None:
+        raise SimulatorUnavailable("samsung_hbm_pim", reason)
+    root = _pimsim_root()
+    geometry = samsung_simulator_geometry(root)
+    by_group = {p.group_id: p for p in compiled.layout_ctx.programs}
+    for program in by_group.values():
+        _check_geometry(program.facts, geometry)
+
+    host, snapshots, device, outputs = {}, {}, {}, {}
+    records, logs = [], []
+    for event in plan["events"]:
+        if event[0] == "stage":
+            _kind, host_index, buffer = event
+            value = host[buffer] if buffer in host else inputs[buffer]
+            snapshots[host_index] = np.array(value, dtype=np.float16, copy=True)
+        elif event[0] == "launch":
+            launch = plan["launches"][event[1]]
+            program = by_group[launch["group_id"]]
+            role_inputs = {
+                role: snapshots[host_index]
+                for role, (_buffer, host_index) in launch["operands"].items()
+            }
+            res = _run_samsung_program(compiled, program, root, geometry, role_inputs)
+            (value,) = res.extra["outputs"].values()
+            device[launch["output"]] = np.asarray(value)
+            extra = res.extra
+            record = {
+                key: launch[key]
+                for key in ("launch", "kernel", "group_id", "ordinal", "program", "output", "gathered_by")
+            }
+            record.update(
+                operands={role: buffer for role, (buffer, _h) in launch["operands"].items()},
+                staged_by={role: h for role, (_buffer, h) in launch["operands"].items()},
+                cycles=res.cycles,
+                **{
+                    key: extra[key]
+                    for key in (
+                        "timing_scope", "cycle_phases", "conductor",
+                        "crf", "plan", "levers", "logical_shape", "padded_shape",
+                        "padding_fraction", "row_map", "accumulation",
+                    )
+                    if key in extra
+                },
+            )
+            record["kernel_route"] = extra.get("kernel")
+            records.append(record)
+            logs.append(f"--- launch {launch['launch']}: {launch['kernel']} ---\n{res.stdout}")
+        else:
+            _kind, _host_index, buffer = event
+            destination = inputs.get(buffer)
+            dtype = destination.dtype if isinstance(destination, np.ndarray) else np.float16
+            value = device[buffer]
+            shape = plan["parameters"].get(buffer)
+            if shape is not None and value.size == math.prod(shape):
+                value = value.reshape(shape)
+            host[buffer] = value.astype(dtype)
+            outputs[buffer] = host[buffer]
+    launch_cycles = sum(r["cycles"] for r in records)
+    modelled_cycles = sum(s["modelled_cycles"] for s in modelled)
+    return RunResult(
+        kind=RUN_KIND_SIMULATOR,
+        cycles=launch_cycles + modelled_cycles,
+        stdout="\n".join(logs),
+        backend="samsung_hbm_pim",
+        extra={
+            "kernel": "SAMSUNG_LAUNCH_SCHEDULE",
+            "returncode": 0,
+            "outputs": outputs,
+            "launches": records,
+            "host_steps": plan["host_steps"],
+            "timing_scope": _LAUNCHES_TIMING_SCOPE,
+            "cycle_phases": {"launches": launch_cycles, "modelled_host_steps": modelled_cycles},
+            "simulator_geometry": geometry,
+            "cycles_source": "PIMSimulator, one Tenon conductor invocation per launch, "
+            "plus the cost graph for host steps no invocation performs",
+            "correctness_source": "PIMSimulator, one Tenon conductor invocation per launch",
+        },
     )
 
 

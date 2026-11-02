@@ -4,9 +4,12 @@
 
 This module is the narrow bridge between the public ``allo.compile`` facade
 and the three independent APU abstractions: MLIR-based contraction analysis,
-declarative layout plans, and executable target-bound costs.  Functional
-execution deliberately uses the original Allo function as a NumPy reference;
-the selected plan's concrete GVML realization remains attached for the device
+declarative layout plans, and executable target-bound costs.
+``backend="virtual"`` evaluates the selected plan's retained cost graph only
+(``kind="virtual"``, nothing executed, caller arrays untouched).
+``backend="functional"`` is a host-side NumPy model of the selected plan's
+arithmetic order (``kind="functional"``), not compiled device code.  The
+selected plan's concrete GVML realization remains attached for the device
 runtime and for inspection.
 """
 
@@ -51,7 +54,7 @@ from .schedule_search import (
 )
 
 
-_FUNCTIONAL_BACKENDS = frozenset({"functional", "virtual"})
+_HOST_BACKENDS = frozenset({"functional", "virtual"})
 _APU_V1_PHYSICAL_PLAN_FIELDS = (
     "iteration_layout",
     "value_layouts",
@@ -657,7 +660,7 @@ class APUv1VectorCallable:
             )
         self.plan_selection = "cost_ranked" if layout is None else "explicit_layout"
         self.backend = "device" if backend is None else str(backend)
-        if self.backend not in _FUNCTIONAL_BACKENDS | {"device"}:
+        if self.backend not in _HOST_BACKENDS | {"device"}:
             raise ValueError(
                 "APU v1 vector contractions support backend=None/'device', "
                 "'functional', or 'virtual'"
@@ -757,10 +760,12 @@ class APUv1VectorCallable:
     run = __call__
 
     def run_backend(self, **inputs):
-        if self.backend in _FUNCTIONAL_BACKENDS:
-            result = self._run_functional(inputs)
+        if self.backend == "virtual":
+            result = self._run_virtual(inputs)
+        elif self.backend == "functional":
+            result = self._run_functional(self._stage_output(inputs))
         else:
-            result = self._run_device(inputs)
+            result = self._run_device(self._stage_output(inputs))
         result.extra["reduction_order"] = self.reduction_order
         result.extra["plan_regroups_reduction"] = apu_v1_plan_regroups(
             self.selected_plan
@@ -768,7 +773,87 @@ class APUv1VectorCallable:
         self.last_result = result
         return result
 
+    def _stage_output(self, inputs: Mapping[str, object]) -> dict:
+        """Inputs as the executed program sees them.
+
+        The device stages every input before it writes the output, so an
+        input passed as (a view of) the output array keeps its pre-call
+        value.  A source that fills the output with literal 0 before
+        accumulating (``analysis.output_initializer == "zero"``) starts from
+        zero, not from the caller's values the device would otherwise load.
+        """
+        arguments = dict(inputs)
+        output_name = self.analysis.output.value
+        output = arguments.get(output_name)
+        if not isinstance(output, np.ndarray):
+            return arguments
+        for name, value in arguments.items():
+            if (
+                name != output_name
+                and isinstance(value, np.ndarray)
+                and np.shares_memory(value, output)
+            ):
+                arguments[name] = value.copy()
+        if self.analysis.output_initializer == "zero":
+            output[...] = 0
+        return arguments
+
+    def _run_virtual(self, inputs: Mapping[str, object]):
+        """Evaluate the selected plan's retained cost graph; nothing executes.
+
+        ``kind="virtual"``: no outputs, caller arrays are not written.
+        """
+        for name, value in inputs.items():
+            if not isinstance(value, np.ndarray):
+                raise TypeError(
+                    f"APU v1 vector operand {name!r} must be a NumPy array, "
+                    f"got {type(value).__name__}"
+                )
+        if self.cost is None or self.execution_graph is None:
+            raise RuntimeError(
+                "APU v1 vector backend='virtual' needs an executable cost spec"
+            )
+        if (
+            self.realization is not None
+            and getattr(self.analysis, "output_initializer", "carried") != "zero"
+        ):
+            # Price only inputs the plan can take: the executing routes reject
+            # a nonzero initial output the plan resets; checked, not written.
+            self.realization.check_initial_outputs(inputs)
+        estimate = self.cost.evaluate(self.execution_graph)
+        spec = getattr(self.cost, "spec", self.cost)
+        return RunResult(
+            estimate.cycles,
+            "virtual APU v1 vector contraction cost evaluation; device not "
+            "launched, nothing executed, outputs not written",
+            "virtual",
+            kind="virtual",
+            extra={
+                "critical_path": list(estimate.critical_path),
+                "utilization": dict(estimate.utilization),
+                "bottlenecks": list(estimate.bottlenecks),
+                "model_fingerprint": estimate.model_fingerprint,
+                "cost_model": getattr(spec, "name", None),
+                "priced_target": self.target.name,
+                "cost_validity": self.cost_validity,
+                "plan": self.selected_plan.name,
+                "plan_selection": self.plan_selection,
+                "tile_decision": self.tile_decision,
+            },
+        )
+
     def _run_functional(self, inputs: Mapping[str, object]):
+        """Host-side NumPy model of the selected plan's arithmetic order.
+
+        Not compiled device code: neither the GVML realization nor any
+        lowered program runs.  A plan that regroups an FP16 reduction is
+        modelled by ``_grouped_fp16_contraction`` (FP16 products, the
+        plan's FP16 group tree, groups added in ascending order); any other
+        plan keeps the source order, so the original Allo function is
+        executed on the host as that model.  ``kind="functional"``; the
+        outputs are written to the caller's arrays and ``cycles`` is the
+        selected plan's analytical estimate, not a measurement.
+        """
         arguments = dict(inputs)
         for name, value in arguments.items():
             if not isinstance(value, np.ndarray):
@@ -835,8 +920,9 @@ class APUv1VectorCallable:
         )
         return RunResult(
             cycles,
-            "functional NumPy execution of retained Allo contraction",
-            f"apu_v1-{self.backend}",
+            "host-side NumPy model of the selected APU v1 plan's arithmetic "
+            "order; not compiled device code",
+            "apu_v1-functional",
             kind="functional",
             extra={
                 "outputs": outputs,
@@ -846,6 +932,8 @@ class APUv1VectorCallable:
                 "cost_validity": self.cost_validity,
                 "analytical": self.selected_estimate is not None,
                 "functional": True,
+                "execution": "host NumPy model of the selected plan's arithmetic "
+                "order; not compiled device code",
                 "numerics": numerics,
             },
         )

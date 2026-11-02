@@ -9,7 +9,7 @@ import pytest
 
 import allo
 from allo.compiler import CompiledCallable
-from allo.ir.types import int32, uint16
+from allo.ir.types import float16, int32, uint16
 from allo.pim.costs import apu_v1_cost
 from allo.pim.targets import build_apu_v1_target
 from allo.spmw_codegen import RUN_KINDS, RunResult, SourceBackendBinding
@@ -184,3 +184,56 @@ def test_apu_v1_program_virtual_requires_cost():
         allo.pim.apu_v1_program.compile_apu_v1_program(
             _program(_scan), build_apu_v1_target(), backend="virtual"
         )
+
+
+def _vector_contraction(
+    left: float16[4, 8], right: float16[8, 6], result: float16[4, 6]
+):
+    for row, column in allo.grid(4, 6):
+        for depth in allo.reduction(8):
+            result[row, column] += left[row, depth] * right[depth, column]
+
+
+def _vector_operands():
+    rng = np.random.default_rng(3)
+    left = rng.normal(size=(4, 8)).astype(np.float16)
+    right = rng.normal(size=(8, 6)).astype(np.float16)
+    return left, right
+
+
+def test_apu_v1_vector_virtual_evaluates_cost_graph_only(no_apu_v1_device):
+    """The vector route's virtual backend prices the retained graph of the
+    selected plan; it executes nothing and writes no caller array."""
+    virtual = allo.compile(
+        _vector_contraction, build_apu_v1_target(), apu_v1_cost, backend="virtual"
+    )
+    left, right = _vector_operands()
+    result = np.full((4, 6), 7, np.float16)
+    run = virtual(left, right, result)
+    assert run.validate().kind == "virtual" and run.backend == "virtual"
+    assert not run.executed and run.outputs == {}
+    assert run.cycles == virtual.estimate().cycles > 0
+    assert run.extra["cost_validity"] == virtual.cost_validity
+    assert run.extra["cost_validity"]["cost_validity"] in {"calibrated", "extrapolated"}
+    np.testing.assert_array_equal(result, np.full((4, 6), 7, np.float16))
+
+
+def test_apu_v1_vector_functional_is_host_model_of_plan(no_apu_v1_device):
+    """The vector route's functional backend is a host NumPy model of the
+    selected plan's arithmetic order (not device code); it writes outputs."""
+    functional = allo.compile(
+        _vector_contraction, build_apu_v1_target(), apu_v1_cost, backend="functional"
+    )
+    left, right = _vector_operands()
+    result = np.zeros((4, 6), np.float16)
+    run = functional(left, right, result)
+    assert run.validate().kind == "functional" and run.executed
+    assert run.backend == "apu_v1-functional"
+    assert run.extra["execution"].startswith("host NumPy model")
+    np.testing.assert_array_equal(run.outputs["result"], result)
+    np.testing.assert_allclose(
+        result.astype(np.float32),
+        left.astype(np.float32) @ right.astype(np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )

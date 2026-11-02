@@ -85,6 +85,10 @@ class ContractionAnalysis:
     packed_word_bits: int | None = None
     product_coefficient: int = 1
     accumulator_coefficient: int = 1
+    # How the source initializes the output before accumulating: "carried"
+    # (no other store: the caller's values), "zero" (a preceding literal-0
+    # fill of every element), or "other" (any other store into the output).
+    output_initializer: str = "carried"
 
     @property
     def axis_extents(self) -> dict[str, int]:
@@ -149,6 +153,11 @@ class _UnaryExpr:
 
 
 @dataclass(frozen=True)
+class _FloatConstantExpr:
+    value: float
+
+
+@dataclass(frozen=True)
 class _ProductMatch:
     operation: str
     lhs: ValueAccess
@@ -162,6 +171,7 @@ class _Store:
     value_ssa: str
     access: ValueAccess
     loop_ssa_names: tuple[str, ...]
+    loops: tuple = ()
 
 
 _FUNC_START = re.compile(r"\bfunc\.func\s+@(?P<name>[-\w.$]+)")
@@ -189,6 +199,13 @@ _BINARY = re.compile(
 )
 _CONSTANT = re.compile(
     rf"{_RESULT}\s*=\s*arith\.constant\s+(?P<value>-?\d+)\s*:\s*(?P<dtype>i\d+|ui\d+)"
+)
+_FLOAT_CONSTANT = re.compile(
+    rf"{_RESULT}\s*=\s*arith\.constant\s+(?P<value>[-+]?(?:0x[0-9A-Fa-f]+|[\d.]+(?:[eE][-+]?\d+)?))"
+    r"\s*:\s*(?:bf16|f16|f32|f64)\b"
+)
+_INT_TO_FLOAT = re.compile(
+    rf"{_RESULT}\s*=\s*arith\.(?:sitofp|uitofp)\s+(?P<source>%[-\w.$]+)"
 )
 _POPCOUNT = re.compile(
     rf"{_RESULT}\s*=\s*(?P<op>math\.ctpop|allo\.popcount|llvm(?:\.intr)?\.ctpop)"
@@ -319,6 +336,26 @@ def _parse_function(name: str, lines: tuple[str, ...]):
             )
             continue
 
+        float_constant = _FLOAT_CONSTANT.search(line)
+        if float_constant is not None:
+            text = float_constant.group("value")
+            value = (
+                (0.0 if int(text.lstrip("+-"), 16) == 0 else float("nan"))
+                if "0x" in text
+                else float(text)
+            )
+            definitions[define(float_constant.group("result"))] = _FloatConstantExpr(
+                value
+            )
+            continue
+
+        int_to_float = _INT_TO_FLOAT.search(line)
+        if int_to_float is not None:
+            definitions[define(int_to_float.group("result"))] = _UnaryExpr(
+                "int_to_float", use(int_to_float.group("source"))
+            )
+            continue
+
         popcount = _POPCOUNT.search(line) or _GENERIC_LLVM_POPCOUNT.search(line)
         if popcount is not None:
             definitions[define(popcount.group("result"))] = _UnaryExpr(
@@ -347,6 +384,7 @@ def _parse_function(name: str, lines: tuple[str, ...]):
                         shape,
                     ),
                     tuple(loop.ssa_name for loop in loops),
+                    tuple(loops),
                 )
             )
             continue
@@ -596,6 +634,21 @@ def _analyze_store(function, loops, definitions, store) -> ContractionAnalysis |
             f"{function}: product reads the accumulator location, creating a "
             "non-reduction loop-carried recurrence"
         )
+    for access in (lhs, rhs):
+        if access.value == output.value:
+            # A vector plan reads every operand before it writes the output;
+            # the source order reads elements earlier iterations overwrote.
+            raise IllegalContractionError(
+                f"{function}: operand {access.value}{access.indices} aliases the "
+                f"output {output.value}{output.indices}; write the result to a "
+                "separate buffer"
+            )
+    if lhs.value == rhs.value:
+        # Each multiplicand gets its own value layout in the vector plan.
+        raise IllegalContractionError(
+            f"{function}: both multiplicands {lhs.value}{lhs.indices} and "
+            f"{rhs.value}{rhs.indices} read one buffer; pass it as two parameters"
+        )
     legal_indices = set(output_axes) | {reduction.name}
     for access in (lhs, rhs):
         unknown = set(access.indices) - legal_indices
@@ -658,6 +711,49 @@ def _analyze_store(function, loops, definitions, store) -> ContractionAnalysis |
     )
 
 
+def _is_zero_constant(ssa: str, definitions: dict[str, object]) -> bool:
+    expression = definitions.get(_resolve_alias(ssa, definitions))
+    if isinstance(expression, _UnaryExpr) and expression.operation == "int_to_float":
+        return _is_zero_constant(expression.source, definitions)
+    return (
+        isinstance(expression, (_ConstantExpr, _FloatConstantExpr))
+        and expression.value == 0
+    )
+
+
+def _output_initializer(definitions, stores, position, analysis) -> str:
+    """Classify the other stores into the contraction's output buffer.
+
+    "zero" requires every one of them to precede the contraction and store
+    literal 0 to every element: each output dimension indexed by its own
+    enclosing unit-step loop over ``[0, dim)``.
+    """
+    others = [
+        (index, store)
+        for index, store in enumerate(stores)
+        if index != position and store.access.value == analysis.output.value
+    ]
+    if not others:
+        return "carried"
+    shape = analysis.output.shape
+    for index, store in others:
+        if index > position or not _is_zero_constant(store.value_ssa, definitions):
+            return "other"
+        if len(store.access.indices) != len(shape):
+            return "other"
+        seen = set()
+        for dimension, ssa in zip(shape, store.access.indices):
+            loop = next((l for l in reversed(store.loops) if l.ssa_name == ssa), None)
+            if (
+                loop is None
+                or id(loop) in seen
+                or (loop.lower_bound, loop.upper_bound, loop.step) != (0, dimension, 1)
+            ):
+                return "other"
+            seen.add(id(loop))
+    return "zero"
+
+
 def analyze_apu_v1_contractions(module_or_text) -> tuple[ContractionAnalysis, ...]:
     """Return every legal dense contraction in retained Allo MLIR."""
     text = module_or_text if isinstance(module_or_text, str) else str(module_or_text)
@@ -665,14 +761,21 @@ def analyze_apu_v1_contractions(module_or_text) -> tuple[ContractionAnalysis, ..
     illegal: list[IllegalContractionError] = []
     for function, lines in _function_regions(text):
         loops, definitions, stores = _parse_function(function, lines)
-        for store in stores:
+        for position, store in enumerate(stores):
             try:
                 analysis = _analyze_store(function, loops, definitions, store)
             except IllegalContractionError as error:
                 illegal.append(error)
                 continue
             if analysis is not None:
-                analyses.append(analysis)
+                analyses.append(
+                    replace(
+                        analysis,
+                        output_initializer=_output_initializer(
+                            definitions, stores, position, analysis
+                        ),
+                    )
+                )
     if analyses:
         return tuple(analyses)
     if illegal:
@@ -945,6 +1048,15 @@ def generate_apu_v1_vectorization_candidates(
         if isinstance(module_or_analysis, ContractionAnalysis)
         else analyze_apu_v1_contraction(module_or_analysis)
     )
+    if analysis.output_initializer == "other":
+        # Vector plans either accumulate onto the caller's output or start
+        # from zero; any other store into the output would be dropped.
+        raise IllegalContractionError(
+            f"{analysis.function}: output {analysis.output.value} is also written "
+            "by a store that is not a preceding literal-0 fill of every element; "
+            "APU v1 vector plans support only 'C[...] += ...' onto the caller's "
+            "output or after such a fill"
+        )
     analysis = _lift_unit_output_axis(analysis)
     if len(analysis.output_axes) != 2:
         next_subset = (

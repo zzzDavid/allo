@@ -61,6 +61,9 @@ def test_public_compile_generates_ranks_and_executes_four_apu_plans():
     np.testing.assert_array_equal(run.extra["outputs"]["result"], result)
     assert run.cycles == compiled.estimate().cycles
     assert run.extra["plan"] == compiled.selected_plan.name
+    # backend="functional" is a host NumPy model of the plan's order.
+    assert run.kind == "functional" and run.validate().executed
+    assert run.extra["execution"].endswith("not compiled device code")
 
 
 def test_public_compile_accepts_candidate_name_and_plan_object():
@@ -75,6 +78,18 @@ def test_public_compile_accepts_candidate_name_and_plan_object():
     )
     assert named.selected_plan.name == "baseline_spatial_reduction"
     assert named.estimate("temporal_svp").cycles > 0
+
+    # backend="virtual" evaluates the cost graph only: no outputs, no writes.
+    result = np.full((4, 6), 3, dtype=np.float16)
+    run = named(
+        np.ones((4, 8), dtype=np.float16), np.ones((8, 6), dtype=np.float16), result
+    )
+    assert run.kind == "virtual" and not run.validate().executed
+    assert run.outputs == {}
+    assert run.cycles == named.estimate().cycles
+    assert run.extra["plan"] == "baseline_spatial_reduction"
+    assert run.extra["cost_validity"] == named.cost_validity
+    np.testing.assert_array_equal(result, np.full((4, 6), 3, dtype=np.float16))
 
     explicit = allo.compile(
         ordinary_contraction,
