@@ -14,6 +14,8 @@ its own enumerator under the target name.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -142,6 +144,7 @@ _MATCHER_PHYSICAL_EXTRA_FIELDS = (
     "nc",
     "kc",
     "predicate_lowering",
+    "attacc_tiling",
 )
 
 
@@ -1149,6 +1152,20 @@ def _apu_v1_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     ]
 
 
+@register_enumerator("attacc")
+def _attacc_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
+    """One base placement per AttAcc kernel crossed with ``attacc_tiling``.
+
+    The base (``spmw_attacc.attacc_base_placement``) carries the kernel
+    record; the knob fans out every legal tiling of it
+    (``allo/pim/attacc_tiling.py``).
+    """
+    from .spmw_attacc import attacc_base_placement
+    from .spmw_knobs import cross_with_knobs
+
+    return cross_with_knobs(target, [attacc_base_placement(target, matches)], matches, {})
+
+
 # --------------------------------------------------------------------- #
 # Public entry point
 # --------------------------------------------------------------------- #
@@ -1162,6 +1179,8 @@ def autoschedule(
     host_moves=(),
     buffer_metrics=None,
     movement_policy=None,
+    selection_policy=None,
+    launch_schedule=None,
 ) -> list[Placement]:
     """Pick one `Placement` per `@allo.work` kernel in `trace`.
 
@@ -1171,7 +1190,11 @@ def autoschedule(
 
     Every candidate is lowered through the same executable cost program used
     by the virtual backend. Target declarations never supply timing data.
-    Selection ranks one decision per kernel (`rank_matcher_placements`).
+    Selection (`rank_matcher_placements`) ranks each kernel's candidates,
+    reconciles them and, within ``SelectionPolicy.joint_budget``, evaluates
+    every complete assignment as one program; ``selection_policy`` (a
+    ``SelectionPolicy``) overrides the active policy and ``launch_schedule``
+    orders the whole-program graph as ``compile_for_target`` does.
     ``movement_policy`` (a ``spmw_layout_problem.MovementSelectionPolicy``)
     configures the layout-construction stage; ``None`` uses the policy of
     ``spmw_layout_problem.movement_selection_policy`` or the default.
@@ -1250,6 +1273,8 @@ def autoschedule(
             buffer_metrics=buffer_metrics,
             liveness=liveness,
             movement_policy=movement_policy,
+            selection_policy=selection_policy,
+            launch_schedule=launch_schedule,
         )
     finally:
         reset_active_liveness(_liveness_token)
@@ -1283,18 +1308,135 @@ TIE_BREAK_RULE = (
 
 
 @dataclass(frozen=True)
+class SelectionPolicy:
+    """Policy of the selection stages (``docs/release/design/selection.md``).
+
+    ``joint_budget`` bounds the joint evaluation: when the product of the
+    groups' surviving candidate counts is at most this number, every complete
+    assignment is scored as one program; otherwise the per-group picks plus
+    reconciliation are selected and labelled ``"per-group heuristic"``.
+    ``max_reconcile_iterations`` bounds the re-ranking rounds after a
+    reconciliation revert.  ``materialize`` is ``"lazy"`` (code generation
+    runs in cost order until a candidate succeeds; the selected program is
+    the same as under ``"eager"``) or ``"eager"`` (every candidate of every
+    group, and every joint assignment, is generated before ranking).
+    """
+
+    joint_budget: int = 256
+    max_reconcile_iterations: int = 4
+    materialize: str = "lazy"
+
+    def __post_init__(self):
+        if isinstance(self.joint_budget, bool) or not isinstance(self.joint_budget, int):
+            raise TypeError("joint_budget must be an integer")
+        if self.joint_budget < 0:
+            raise ValueError("joint_budget must be non-negative")
+        if (
+            isinstance(self.max_reconcile_iterations, bool)
+            or not isinstance(self.max_reconcile_iterations, int)
+            or self.max_reconcile_iterations < 0
+        ):
+            raise ValueError("max_reconcile_iterations must be a non-negative integer")
+        if self.materialize not in ("lazy", "eager"):
+            raise ValueError("materialize must be 'lazy' or 'eager'")
+
+
+DEFAULT_SELECTION_POLICY = SelectionPolicy()
+
+_ACTIVE_SELECTION_POLICY: contextvars.ContextVar = contextvars.ContextVar(
+    "spmw_selection_policy", default=None
+)
+
+
+@contextlib.contextmanager
+def selection_policy(policy: SelectionPolicy):
+    """Use ``policy`` for every selection inside the ``with`` block."""
+
+    if not isinstance(policy, SelectionPolicy):
+        raise TypeError("policy must be a SelectionPolicy")
+    token = _ACTIVE_SELECTION_POLICY.set(policy)
+    try:
+        yield policy
+    finally:
+        _ACTIVE_SELECTION_POLICY.reset(token)
+
+
+def active_selection_policy(policy=None) -> SelectionPolicy:
+    if policy is not None:
+        if not isinstance(policy, SelectionPolicy):
+            raise TypeError("selection_policy must be a SelectionPolicy")
+        return policy
+    return _ACTIVE_SELECTION_POLICY.get() or DEFAULT_SELECTION_POLICY
+
+
+def candidate_rejection_types() -> tuple[type[Exception], ...]:
+    """Exceptions a backend raises for one candidate it cannot realize.
+
+    ``InfeasibleSchedule`` (schedule_search), ``NotImplementedError`` (an op
+    or form the emitter does not lower, e.g. ``SamsungUnsupported``) and
+    ``ValueError`` (a geometry or layout the emitter or
+    ``derive_layout_properties`` refuses).  Any other exception type is a
+    programming error and propagates.
+    """
+    from .pim.schedule_search import InfeasibleSchedule
+
+    return (InfeasibleSchedule, NotImplementedError, ValueError)
+
+
+def candidate_rejection_reason(error: Exception) -> str:
+    from .pim.schedule_search import InfeasibleSchedule
+
+    if isinstance(error, InfeasibleSchedule):
+        return str(error)
+    return f"{type(error).__name__}: {error}"
+
+
+class _Rejected(str):
+    """A rejection reason that keeps the backend exception behind it."""
+
+    def __new__(cls, error: Exception):
+        reason = super().__new__(cls, candidate_rejection_reason(error))
+        reason.error = error
+        return reason
+
+
+def _raise_unmaterialized(message: str, reasons) -> None:
+    """No candidate materialized: re-raise the backend's own diagnostic.
+
+    ``reasons`` are in cost order.  The first ``NotImplementedError`` or
+    ``ValueError`` a backend raised for a candidate (its domain diagnostic,
+    e.g. Samsung row coverage) is re-raised with ``message`` (every
+    rejection) added as a note; when every rejection is an
+    ``InfeasibleSchedule`` the error is a ``RuntimeError``.
+    """
+    from .pim.schedule_search import InfeasibleSchedule
+
+    for reason in reasons:
+        error = getattr(reason, "error", None)
+        if error is not None and not isinstance(error, InfeasibleSchedule):
+            error.add_note(message)
+            raise error
+    raise RuntimeError(message)
+
+
+@dataclass(frozen=True)
 class KernelRanking:
     """Per-kernel record of the ranked placement selection.
 
-    ``movement`` is the layout-construction record
-    (``spmw_layout_problem.KernelMovement``): derived problem, search
-    termination, tie classes, the movement of the chosen layout and its label.
-    ``cost_ties`` lists every scored candidate at the winner's cycles, in
-    tie-break order (``TIE_BREAK_RULE``); its first entry is the winner unless
-    the winner's codegen probe rejected the earlier ones.
+    ``scores`` are the group-scope cycles: the group's sub-trace, or the
+    whole program when it has a single group.  ``movement`` is the
+    layout-construction record (``spmw_layout_problem.KernelMovement``):
+    derived problem, search termination, tie classes, the movement of the
+    chosen layout and its label.  ``cost_ties`` lists every scored candidate
+    at the group pick's cycles, in tie-break order (``TIE_BREAK_RULE``).
     ``movement_rejections`` holds ``(position, reason)`` for every movement
     tie crossed with a key that the backend cannot realize; ``rejections``
-    keeps the cost-rule and codegen-probe rejections.
+    keeps the cost-rule and code generation rejections.
+    ``per_group_position`` is the group's own pick (stage 1) and
+    ``chosen_position`` the selected program's choice for this group, which
+    differs when reconciliation or the joint evaluation changed it.
+    ``probe_count`` counts code generation probes of this group's candidates
+    and ``materialized`` the positions whose probe succeeded.
     """
 
     group_id: int
@@ -1312,6 +1454,56 @@ class KernelRanking:
     # ``(mode, reason)`` of base placements an enumerator pruned before
     # ranking (``extra["reduction_policy_pruned"]`` of the first bucket).
     policy_pruned: tuple[tuple[str, str], ...] = ()
+    per_group_position: int | None = None
+    probe_count: int = 0
+    materialized: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReconciliationRecord:
+    """Stage 2: what ``_reconcile_resident_pairs`` changed and the re-ranking.
+
+    ``reverted`` lists ``(group_id, memref)`` of the per-group picks'
+    resident choices reverted to restage; ``remaining`` those still reverted
+    in the stage 2 result.  ``fixed_point`` is False when the re-ranking was
+    still changing a choice after ``max_reconcile_iterations`` rounds.
+    """
+
+    reverted: tuple[tuple[int, str], ...] = ()
+    iterations: int = 0
+    fixed_point: bool = True
+    changed_groups: tuple[int, ...] = ()
+    remaining: tuple[tuple[int, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class JointEvaluation:
+    """Stage 3 record: the complete-assignment search over whole programs.
+
+    An assignment is one tuple of kernel-choice positions, one per group in
+    ``PlacementRanking.kernels`` order.  ``incumbent`` is the stage 2
+    assignment, evaluated first and preferred on equal cycles;
+    ``incumbent_rank`` its rank.  ``ties`` counts feasible assignments at the
+    selected cycles.  ``probed`` counts the ranked assignments whose code
+    generation was attempted (the selected one included); their failures are
+    in ``probe_rejections``.
+    """
+
+    assignments_total: int
+    assignments_evaluated: int
+    feasible: int
+    rejections_by_stage: tuple[tuple[str, int], ...]
+    rejections: tuple[tuple[tuple, str, str], ...]
+    incumbent: tuple | None
+    incumbent_rank: int | None
+    ties: int
+    chosen: tuple[tuple[int, int], ...]
+    chosen_rank: int
+    probed: int
+    probe_rejections: tuple[tuple[tuple, str], ...]
+    whole_program_evaluations: int
+    termination: str
+    elapsed_seconds: float = field(compare=False, default=0.0)
 
 
 @dataclass(frozen=True)
@@ -1320,14 +1512,79 @@ class PlacementRanking:
 
     ``incomplete`` is True when some kernel's movement search ended at its
     node budget: its ties are the best layouts found, not proven minima.
+    ``joint_evaluation`` names how the program was selected: ``"complete"``
+    (every complete assignment within ``joint_budget`` scored as one
+    program, ``joint`` holds the record) or ``"per-group heuristic"``
+    (``joint_assignments`` exceeded the budget; the per-group picks after
+    reconciliation and re-ranking were selected).  ``per_group_cycles`` is
+    the whole-program cycles of the stage 2 result, ``selection_cycles``
+    those of the selected program as scored by selection, and
+    ``program_cycles`` the cycles of the final execution graph
+    (``compile_for_target`` sets it from ``Compiled.execution_graph``).
     """
 
     kernels: tuple[KernelRanking, ...]
     incomplete: bool = False
+    joint_evaluation: str = "per-group heuristic"
+    joint_budget: int | None = None
+    joint_assignments: int | None = None
+    joint: JointEvaluation | None = None
+    per_group_cycles: int | None = None
+    selection_cycles: int | None = None
+    program_cycles: int | None = None
+    reconciliation: ReconciliationRecord | None = None
+    materialize: str = "lazy"
 
     @property
     def movement(self) -> tuple:
         return tuple(kernel.movement for kernel in self.kernels)
+
+    @property
+    def materialization(self) -> dict[str, int]:
+        """Counts behind "ranked N, probed P, materialized M, rejected R"."""
+
+        return {
+            "ranked": sum(len(kernel.scores) for kernel in self.kernels),
+            "probed": sum(kernel.probe_count for kernel in self.kernels),
+            "materialized": sum(len(kernel.materialized) for kernel in self.kernels),
+            "rejected": sum(len(kernel.rejections) for kernel in self.kernels),
+            "assignments_probed": 0 if self.joint is None else self.joint.probed,
+        }
+
+
+@dataclass
+class _GroupSelection:
+    """Mutable stage-1 state of one kernel group inside the ranking."""
+
+    group_id: int
+    bucket_indices: list
+    kernel_trace: Any
+    order: list
+    cycles: dict
+    realized: dict
+    probes: dict
+    rejections: list
+    winner: Any
+    probe_count: int
+    record: Any
+
+    def probe(self, run, position):
+        if position not in self.probes:
+            self.probe_count += 1
+            reason = run(self.kernel_trace, self.realized[position])
+            self.probes[position] = reason
+            if reason is not None:
+                self.rejections.append((position, reason))
+        return self.probes[position]
+
+    def probe_failures(self) -> list:
+        """Probe rejection reasons in rank order, then the others."""
+        ranked = [self.probes[p] for p in self.order if self.probes.get(p) is not None]
+        return ranked + [reason for _position, reason in self.rejections]
+
+    def domain(self) -> list:
+        """Ranked positions not rejected by a code generation probe."""
+        return [p for p in self.order if self.probes.get(p) is None]
 
 
 def _bucket_decision_map(target, trace, enumerator, matches):
@@ -1449,27 +1706,57 @@ def rank_matcher_placements(
     buffer_metrics=None,
     liveness=None,
     movement_policy=None,
+    selection_policy=None,
+    launch_schedule=None,
 ) -> MatcherScheduledPlacements:
-    """Choose one placement decision per `@allo.work` kernel by cost rank.
+    """Select one placement decision per `@allo.work` kernel group.
 
-    The kernel choice set is the decision keys every bucket of the kernel
-    enumerates.  Layout construction (``spmw_layout_problem``) then derives
-    the kernel's minimum-movement problem, runs the search once and crosses
-    every tie class with every key, so movement ties reach the cost ranking;
-    the program's own layout is kept, marked ``not-minimal``, when no tie
-    class contains it.  A tie the backend cannot realize is rejected before
-    emission with the reason.  When the problem cannot be derived the keys
-    keep their hand-built layouts, labelled ``not-analyzed: <reason>``.
+    Stage 1 (per group).  The kernel choice set is the decision keys every
+    bucket of the kernel enumerates.  Layout construction
+    (``spmw_layout_problem``) derives the kernel's minimum-movement problem,
+    runs the search once and crosses every tie class with every key, so
+    movement ties reach the cost ranking; the program's own layout is kept,
+    marked ``not-minimal``, when no tie class contains it.  A tie the backend
+    cannot realize is rejected before emission with the reason.  When the
+    problem cannot be derived the keys keep their hand-built layouts,
+    labelled ``not-analyzed: <reason>``.  Every candidate is scored over the
+    group's sub-trace (the whole trace when the program has one group) and
+    ranked by cycles, then by the structural key of ``TIE_BREAK_RULE``.  The
+    group's pick is the first candidate in that order whose code generation
+    probe (``spmw_codegen._materialize_matcher_codegen``) succeeds; a probe
+    failure of any type in ``CANDIDATE_REJECTION_TYPES`` is a recorded
+    rejection.  Kernels whose buckets share no decision key fall back to
+    each bucket's cheapest materializable candidate.
 
-    Candidates are scored over the kernel's stamped placements and ranked by
-    cycles, then by the structural key of ``TIE_BREAK_RULE``; the first
-    whose codegen is feasible wins.  Kernels with an empty choice set fall
-    back to each bucket's own stable argmin.  Cross-kernel residency is
-    reconciled once afterwards.
+    Stage 2 (reconciliation).  The group picks are assembled,
+    ``_reconcile_resident_pairs`` runs, and the reconciled whole program is
+    priced (``per_group_cycles``).  When reconciliation reverted a choice,
+    every affected group is re-ranked under the whole-program graph with
+    the other groups fixed, up to ``SelectionPolicy.max_reconcile_iterations``
+    rounds or a fixed point.
+
+    Stage 3 (joint evaluation).  When the product of the groups' surviving
+    candidate counts is at most ``SelectionPolicy.joint_budget``, every
+    complete assignment is built, reconciled and scored as one program
+    through ``pim.schedule_search.grid_search`` (the stage 2 result is the
+    incumbent) and the cheapest whose code generation succeeds is selected
+    (``joint_evaluation="complete"``).  Otherwise the stage 2 result is
+    selected (``joint_evaluation="per-group heuristic"``).  See
+    ``docs/release/design/selection.md``.
     """
 
+    import math
+    import time
+    from dataclasses import replace
+
     from . import spmw_plan
-    from .pim.schedule_search import InfeasibleSchedule
+    from .pim.schedule_search import (
+        DecisionDomain,
+        InfeasibleIncumbent,
+        InfeasibleSchedule,
+        NoFeasibleSchedule,
+        grid_search,
+    )
     from .spmw_codegen import _materialize_matcher_codegen, _stamp_host_moves
     from .spmw_layout_problem import (
         active_movement_policy,
@@ -1478,14 +1765,14 @@ def rank_matcher_placements(
     )
 
     policy = active_movement_policy(movement_policy)
+    selection = active_selection_policy(selection_policy)
+    rejection_types = candidate_rejection_types()
     buckets = _bucket_for_autoschedule(trace)
     kernels: dict[int, list[int]] = {}
     for index, (_scope, matches) in enumerate(buckets):
         group_id = _matcher_work_scope(matches[0]).group_id
         kernels.setdefault(group_id, []).append(index)
-
-    chosen: dict[int, Placement] = {}
-    records = []
+    single_group = len(kernels) == 1
 
     def realize(kernel_trace, templates):
         placements = [_clone_placement(template) for template in templates]
@@ -1496,6 +1783,30 @@ def rank_matcher_placements(
             _stamp_host_moves(placements, host_moves)
         return placements
 
+    def probe(probe_trace, placements):
+        """Materialize one candidate: None, or the rejection reason."""
+        try:
+            _materialize_matcher_codegen(
+                target, probe_trace, placements, host_moves=host_moves
+            )
+        except rejection_types as error:
+            return _Rejected(error)
+        return None
+
+    def graph_cycles(score_trace, placements, schedule):
+        graph = spmw_plan.build_execution_graph(
+            target,
+            score_trace,
+            placements[0] if len(placements) == 1 else placements,
+            bound_cost,
+            host_moves=host_moves,
+            buffer_metrics=buffer_metrics,
+            launch_schedule=schedule,
+        )
+        return int(bound_cost.evaluate(graph).cycles)
+
+    groups: list[_GroupSelection] = []
+
     for group_id, bucket_indices in kernels.items():
         kernel_trace = MatchTrace(
             target_name=trace.target_name,
@@ -1504,6 +1815,10 @@ def rank_matcher_placements(
                 match for index in bucket_indices for match in buckets[index][1]
             ],
         )
+        # With one group the group scope is the whole program, so its scores
+        # are whole-program scores (same trace and launch schedule).
+        score_trace = trace if single_group else kernel_trace
+        score_schedule = launch_schedule if single_group else None
         _stamp_group_replication(kernel_trace.matches)
         infos = [
             _bucket_decision_map(target, trace, enumerator, buckets[index][1])
@@ -1517,50 +1832,123 @@ def rank_matcher_placements(
         movement = analyze_kernel_movement(
             target, kernel_trace.matches, bound_cost, policy
         )
+        policy_pruned = tuple(infos[0][1][0].extra.get("reduction_policy_pruned", ()))
 
         if not choice_set:
-            templates = []
-            for bucket_trace, candidates, _key_map in infos:
-                best = _per_bucket_argmin_index(
-                    target,
-                    bucket_trace,
-                    candidates,
-                    bound_cost,
-                    host_moves=host_moves,
-                    buffer_metrics=buffer_metrics,
+            # Each bucket ranks its own candidates; the kernel assembled from
+            # the per-bucket argmins is probed with the same code generation
+            # probe as the ranked path (a single bucket is not a program the
+            # backends accept, e.g. Samsung row coverage).  On failure every
+            # bucket advances to its next-ranked candidate together (rank
+            # level k = 1, 2, ...), up to FALLBACK_REPAIR_PROBES further kernel
+            # probes; a lockstep backend (Samsung) refuses mixed levels.
+            fallback_rejections = []
+            fallback_reasons = []
+            ranked = []
+            for bucket_index, (bucket_trace, candidates, _key_map) in enumerate(infos):
+                bucket_rejections = []
+                ranked.append(
+                    _per_bucket_ranking(
+                        target,
+                        bucket_trace,
+                        candidates,
+                        bound_cost,
+                        host_moves=host_moves,
+                        buffer_metrics=buffer_metrics,
+                        rejections=bucket_rejections,
+                    )
                 )
-                templates.append(candidates[best])
+                fallback_rejections.extend(
+                    (
+                        None,
+                        f"bucket {bucket_index} candidate {index} "
+                        f"({candidates[index].mode}): {reason}",
+                    )
+                    for index, reason in bucket_rejections
+                )
+                if not ranked[-1]:
+                    raise RuntimeError(
+                        f"no feasible placement for bucket {bucket_index} of kernel "
+                        f"group {group_id} on target "
+                        f"{getattr(target, 'name', None)!r}; rejections: "
+                        f"{fallback_rejections}"
+                    )
             if movement.status == "analyzed":
                 label = movement.program_label
                 cost = movement.program_cost
             else:
                 label = None if movement.status == "disabled" else movement.label
                 cost = None
-            placements = realize(
-                kernel_trace,
-                [_with_movement(t, None, label, cost) for t in templates],
-            )
-            for index, placement in zip(bucket_indices, placements):
-                chosen[index] = placement
-            records.append(
-                KernelRanking(
+            fallback_probes = [0]
+
+            def kernel_probe(choice):
+                fallback_probes[0] += 1
+                try:
+                    placements = realize(
+                        kernel_trace,
+                        [
+                            _with_movement(infos[b][1][i], None, label, cost)
+                            for b, i in enumerate(choice)
+                        ],
+                    )
+                except rejection_types as error:
+                    return None, _Rejected(error)
+                return placements, probe(kernel_trace, placements)
+
+            choice = [order[0] for order in ranked]
+            placements, reason = kernel_probe(choice)
+            if reason is not None:
+                fallback_reasons.append(reason)
+                fallback_rejections.append((None, f"per-bucket argmins: {reason}"))
+                placements = None
+                for level in range(1, max(len(order) for order in ranked)):
+                    if fallback_probes[0] > FALLBACK_REPAIR_PROBES:
+                        break
+                    trial = [order[min(level, len(order) - 1)] for order in ranked]
+                    trial_placements, reason = kernel_probe(trial)
+                    if reason is None:
+                        choice, placements = trial, trial_placements
+                        break
+                    fallback_reasons.append(reason)
+                    fallback_rejections.append(
+                        (None, f"per-bucket rank {level}: {reason}")
+                    )
+                if placements is None:
+                    _raise_unmaterialized(
+                        f"no feasible placement for kernel group {group_id} on "
+                        f"target {getattr(target, 'name', None)!r} (per-bucket "
+                        f"fallback, {fallback_probes[0]} kernel probe(s)); "
+                        f"rejections: {fallback_rejections}",
+                        fallback_reasons,
+                    )
+            groups.append(
+                _GroupSelection(
                     group_id=group_id,
-                    bucket_count=len(bucket_indices),
-                    fallback="per_bucket",
-                    scores=(),
-                    chosen_position=None,
-                    rejections=(),
-                    policy_pruned=tuple(
-                        infos[0][1][0].extra.get("reduction_policy_pruned", ())
-                    ),
-                    movement=with_chosen(
-                        movement,
-                        cost,
-                        label,
-                        notes=movement.notes
-                        + (
-                            "per-bucket fallback: the buckets share no decision "
-                            "key, so movement layouts were not crossed",
+                    bucket_indices=bucket_indices,
+                    kernel_trace=kernel_trace,
+                    order=[0],
+                    cycles={0: None},
+                    realized={0: placements},
+                    probes={0: None},
+                    rejections=fallback_rejections,
+                    winner=0,
+                    probe_count=fallback_probes[0],
+                    record=dict(
+                        group_id=group_id,
+                        bucket_count=len(bucket_indices),
+                        fallback="per_bucket",
+                        scores=(),
+                        policy_pruned=policy_pruned,
+                        movement=with_chosen(
+                            movement,
+                            cost,
+                            label,
+                            notes=movement.notes
+                            + (
+                                "per-bucket fallback: the buckets share no "
+                                "decision key, so movement layouts were not "
+                                "crossed",
+                            ),
                         ),
                     ),
                 )
@@ -1605,25 +1993,21 @@ def rank_matcher_placements(
                         )
                     )
                     continue
-                placements = realize(
-                    kernel_trace,
-                    [
-                        _with_movement(key_map[key], layout, label, cost)
-                        for _t, _c, key_map in infos
-                    ],
-                )
+                try:
+                    placements = realize(
+                        kernel_trace,
+                        [
+                            _with_movement(key_map[key], layout, label, cost)
+                            for _t, _c, key_map in infos
+                        ],
+                    )
+                except rejection_types as error:
+                    rejections.append((position, _Rejected(error)))
+                    continue
                 # A cost rule may find a knob combination unrealizable; it is
                 # dropped like a codegen-probe rejection (spec 001 D1 rule 2).
                 try:
-                    graph = spmw_plan.build_execution_graph(
-                        target,
-                        kernel_trace,
-                        placements[0] if len(placements) == 1 else placements,
-                        bound_cost,
-                        host_moves=host_moves,
-                        buffer_metrics=buffer_metrics,
-                    )
-                    cycles = int(bound_cost.evaluate(graph).cycles)
+                    cycles = graph_cycles(score_trace, placements, score_schedule)
                 except InfeasibleSchedule as error:
                     rejections.append((position, str(error)))
                     continue
@@ -1637,62 +2021,303 @@ def rank_matcher_placements(
                 realized[position] = placements
         scored.sort()
 
-        winner = None
-        winner_cycles = None
-        for cycles, _key, position in scored:
-            try:
-                _materialize_matcher_codegen(
-                    target,
-                    kernel_trace,
-                    realized[position],
-                    host_moves=host_moves,
-                )
-            except InfeasibleSchedule as error:
-                rejections.append((position, str(error)))
-                continue
-            winner = position
-            winner_cycles = cycles
-            break
-        if winner is None:
-            raise RuntimeError(
+        group = _GroupSelection(
+            group_id=group_id,
+            bucket_indices=bucket_indices,
+            kernel_trace=kernel_trace,
+            order=[position for _cycles, _key, position in scored],
+            cycles={position: cycles for cycles, _key, position in scored},
+            realized=realized,
+            probes={},
+            rejections=rejections,
+            winner=None,
+            probe_count=0,
+            record=None,
+        )
+        if selection.materialize == "eager":
+            for position in group.order:
+                group.probe(probe, position)
+        group.winner = next(
+            (p for p in group.order if group.probe(probe, p) is None), None
+        )
+        if group.winner is None:
+            _raise_unmaterialized(
                 f"no feasible placement for kernel group {group_id} on target "
-                f"{getattr(target, 'name', None)!r}; rejections: {rejections}"
+                f"{getattr(target, 'name', None)!r}: {len(scored)} candidate(s) "
+                f"scored, none materialized; rejections: "
+                f"{[(p, str(r)) for p, r in rejections]}",
+                group.probe_failures(),
             )
-        for index, placement in zip(bucket_indices, realized[winner]):
-            chosen[index] = placement
-        _layout, label, cost, _r, _reason, _tie = candidate_entry[winner]
-        records.append(
-            KernelRanking(
-                group_id=group_id,
-                bucket_count=len(bucket_indices),
-                fallback=None,
-                scores=tuple(
-                    (position, cycles, candidate_mode[position])
-                    for cycles, _key, position in scored
-                ),
-                chosen_position=winner,
-                rejections=tuple(rejections),
-                movement=with_chosen(
-                    movement,
-                    cost,
-                    label,
-                    ties_crossed=ties_crossed,
-                    notes=tuple(notes),
-                ),
-                cost_ties=tuple(
-                    (position, cycles, candidate_mode[position])
-                    for cycles, _key, position in scored
-                    if cycles == winner_cycles
-                ),
-                movement_rejections=tuple(movement_rejections),
-                policy_pruned=tuple(
-                    infos[0][1][0].extra.get("reduction_policy_pruned", ())
-                ),
-            )
+        winner_cycles = group.cycles[group.winner]
+        _layout, label, cost, _r, _reason, _tie = candidate_entry[group.winner]
+        group.record = dict(
+            group_id=group_id,
+            bucket_count=len(bucket_indices),
+            fallback=None,
+            scores=tuple(
+                (position, cycles, candidate_mode[position])
+                for cycles, _key, position in scored
+            ),
+            movement=with_chosen(
+                movement,
+                cost,
+                label,
+                ties_crossed=ties_crossed,
+                notes=tuple(notes),
+            ),
+            cost_ties=tuple(
+                (position, cycles, candidate_mode[position])
+                for cycles, _key, position in scored
+                if cycles == winner_cycles
+            ),
+            movement_rejections=tuple(movement_rejections),
+            policy_pruned=policy_pruned,
+        )
+        groups.append(group)
+
+    # ---- whole-program evaluation of complete assignments ---------------- #
+    group_of_bucket = {
+        index: group_index
+        for group_index, group in enumerate(groups)
+        for index in group.bucket_indices
+    }
+    whole_scores: dict[tuple, Any] = {}
+    whole_probes: dict[tuple, str | None] = {}
+    evaluations = [0]
+
+    def assemble(assignment):
+        placements = [None] * len(buckets)
+        for group, position in zip(groups, assignment):
+            for index, placement in zip(group.bucket_indices, group.realized[position]):
+                placements[index] = _clone_placement(placement)
+        reverted = _reconcile_resident_pairs(trace, placements, liveness)
+        return placements, tuple(reverted)
+
+    def whole_cycles(assignment):
+        """Whole-program cycles of one reconciled complete assignment."""
+        if assignment not in whole_scores:
+            placements, reverted = assemble(assignment)
+            reused = groups[0].cycles.get(assignment[0]) if single_group else None
+            if reused is not None and not reverted:
+                whole_scores[assignment] = reused
+            else:
+                evaluations[0] += 1
+                try:
+                    whole_scores[assignment] = graph_cycles(
+                        trace, placements, launch_schedule
+                    )
+                except InfeasibleSchedule as error:
+                    whole_scores[assignment] = error
+        value = whole_scores[assignment]
+        if isinstance(value, InfeasibleSchedule):
+            raise InfeasibleSchedule(str(value))
+        return value
+
+    def assignment_probe(assignment):
+        """Code generation of one complete assignment: None, or the reason."""
+        if single_group:
+            return groups[0].probe(probe, assignment[0])
+        if assignment not in whole_probes:
+            placements, _reverted = assemble(assignment)
+            whole_probes[assignment] = probe(trace, placements)
+        return whole_probes[assignment]
+
+    def bucket_reverts(reverted):
+        return tuple(
+            (groups[group_of_bucket[index]].group_id, memref)
+            for index, memref in reverted
         )
 
-    placements = [chosen[index] for index in range(len(buckets))]
-    _reconcile_resident_pairs(trace, placements, liveness)
+    # Stage 2: reconcile the per-group picks; re-rank reverted groups.
+    assignment = tuple(group.winner for group in groups)
+    _placements, reverted = assemble(assignment)
+    first_reverts = bucket_reverts(reverted)
+    iterations = 0
+    fixed_point = True
+    changed_groups = []
+    while reverted:
+        if iterations >= selection.max_reconcile_iterations:
+            fixed_point = False
+            break
+        iterations += 1
+        changed = False
+        affected = sorted({group_of_bucket[index] for index, _memref in reverted})
+        for group_index in affected:
+            group = groups[group_index]
+            trials = []
+            for rank, position in enumerate(group.domain()):
+                trial = (
+                    assignment[:group_index] + (position,) + assignment[group_index + 1 :]
+                )
+                try:
+                    trials.append((whole_cycles(trial), rank, position))
+                except InfeasibleSchedule:
+                    continue
+            trials.sort()
+            choice = next(
+                (p for _c, _r, p in trials if group.probe(probe, p) is None),
+                assignment[group_index],
+            )
+            if choice != assignment[group_index]:
+                assignment = (
+                    assignment[:group_index] + (choice,) + assignment[group_index + 1 :]
+                )
+                changed = True
+                if group.group_id not in changed_groups:
+                    changed_groups.append(group.group_id)
+        _placements, reverted = assemble(assignment)
+        if not changed:
+            break
+    reconciliation = ReconciliationRecord(
+        reverted=first_reverts,
+        iterations=iterations,
+        fixed_point=fixed_point,
+        changed_groups=tuple(changed_groups),
+        remaining=bucket_reverts(reverted),
+    )
+    try:
+        per_group_cycles = whole_cycles(assignment)
+    except InfeasibleSchedule:
+        per_group_cycles = None
+
+    # Stage 3: joint evaluation of every complete assignment within budget.
+    domains = [tuple(group.domain()) for group in groups]
+    joint_assignments = math.prod(len(domain) for domain in domains)
+    joint = None
+    selected = assignment
+    selection_cycles = per_group_cycles
+    if joint_assignments <= selection.joint_budget:
+        started = time.perf_counter()
+        names = tuple(f"group{index}" for index in range(len(groups)))
+        evaluations_before = evaluations[0]
+
+        def materialize(candidate):
+            if selection.materialize == "eager":
+                reason = assignment_probe(candidate)
+                if reason is not None:
+                    raise InfeasibleSchedule(reason)
+            return candidate
+
+        search = dict(
+            build=lambda decisions: tuple(decisions[name] for name in names),
+            materialize=materialize,
+            score=whole_cycles,
+            objective=lambda cycles: cycles,
+            objective_domain=(
+                "whole-program cycles",
+                getattr(target, "name", None),
+                bound_cost.fingerprint,
+            ),
+        )
+        incumbent = dict(zip(names, assignment)) if per_group_cycles is not None else None
+        try:
+            try:
+                result = grid_search(
+                    tuple(
+                        DecisionDomain(name, domain)
+                        for name, domain in zip(names, domains)
+                    ),
+                    incumbent=incumbent,
+                    **search,
+                )
+            except InfeasibleIncumbent:
+                result = grid_search(
+                    tuple(
+                        DecisionDomain(name, domain)
+                        for name, domain in zip(names, domains)
+                    ),
+                    **search,
+                )
+        except NoFeasibleSchedule as error:
+            raise RuntimeError(
+                f"no feasible whole program on target "
+                f"{getattr(target, 'name', None)!r} among {joint_assignments} "
+                f"complete assignment(s); rejections: "
+                f"{[(dict(r.decisions), r.stage, r.reason) for r in error.rejections]}"
+            ) from error
+        probe_rejections = []
+        chosen_rank = None
+        for rank, candidate in enumerate(result.ranked):
+            reason = assignment_probe(candidate.payload)
+            if reason is None:
+                chosen_rank = rank
+                break
+            probe_rejections.append((candidate.payload, reason))
+        if chosen_rank is None:
+            _raise_unmaterialized(
+                f"no complete assignment materialized on target "
+                f"{getattr(target, 'name', None)!r}; rejections: "
+                f"{[(a, str(r)) for a, r in probe_rejections]}",
+                [reason for _assignment, reason in probe_rejections],
+            )
+        winner = result.ranked[chosen_rank]
+        selected = winner.payload
+        selection_cycles = winner.objective
+        stages = {}
+        for item in result.rejections:
+            stages[item.stage] = stages.get(item.stage, 0) + 1
+        incumbent_candidate = result.best_incumbent
+        joint = JointEvaluation(
+            assignments_total=result.stats.complete_assignments_total,
+            assignments_evaluated=result.stats.complete_assignments_considered
+            + int(result.stats.incumbent_evaluated),
+            feasible=result.stats.feasible_candidates,
+            rejections_by_stage=tuple(sorted(stages.items())),
+            rejections=tuple(
+                (
+                    tuple(dict(item.decisions).get(name) for name in names),
+                    item.stage,
+                    item.reason,
+                )
+                for item in result.rejections
+            ),
+            incumbent=assignment if incumbent is not None else None,
+            incumbent_rank=(
+                None
+                if incumbent_candidate is None
+                else result.ranked.index(incumbent_candidate)
+            ),
+            ties=sum(
+                1 for candidate in result.ranked if candidate.objective == winner.objective
+            ),
+            chosen=tuple(
+                (group.group_id, position) for group, position in zip(groups, selected)
+            ),
+            chosen_rank=chosen_rank,
+            probed=chosen_rank + 1,
+            probe_rejections=tuple(
+                (assignment_, str(reason)) for assignment_, reason in probe_rejections
+            ),
+            whole_program_evaluations=evaluations[0] - evaluations_before,
+            termination=result.stats.termination,
+            elapsed_seconds=time.perf_counter() - started,
+        )
+        label = "complete"
+    else:
+        if per_group_cycles is None:
+            raise RuntimeError(
+                f"the per-group selection on target {getattr(target, 'name', None)!r} "
+                "is infeasible as a whole program and the joint evaluation is over "
+                f"budget ({joint_assignments} > {selection.joint_budget})"
+            )
+        label = "per-group heuristic"
+
+    placements, _reverted = assemble(selected)
+    records = []
+    for group, position in zip(groups, selected):
+        fallback = group.record["fallback"] is not None
+        records.append(
+            KernelRanking(
+                **group.record,
+                rejections=tuple((p, str(reason)) for p, reason in group.rejections),
+                chosen_position=None if fallback else position,
+                per_group_position=None if fallback else group.winner,
+                probe_count=group.probe_count,
+                materialized=()
+                if fallback
+                else tuple(p for p, reason in group.probes.items() if reason is None),
+            )
+        )
     return MatcherScheduledPlacements(
         placements,
         placement_ranking=PlacementRanking(
@@ -1701,6 +2326,15 @@ def rank_matcher_placements(
                 record.movement is not None and record.movement.incomplete
                 for record in records
             ),
+            joint_evaluation=label,
+            joint_budget=selection.joint_budget,
+            joint_assignments=joint_assignments,
+            joint=joint,
+            per_group_cycles=per_group_cycles,
+            selection_cycles=selection_cycles,
+            program_cycles=selection_cycles,
+            reconciliation=reconciliation,
+            materialize=selection.materialize,
         ),
     )
 
@@ -1729,6 +2363,51 @@ def _stamp_xkernel(trace, placements, liveness) -> None:
             pl.extra = new_extra
 
 
+#: Kernel probes the per-bucket fallback may spend repairing a kernel whose
+#: per-bucket argmins do not materialize (docs/release/design/selection.md).
+FALLBACK_REPAIR_PROBES = 64
+
+
+def _per_bucket_ranking(
+    target,
+    trace,
+    candidates,
+    bound_cost,
+    *,
+    host_moves=(),
+    buffer_metrics=None,
+    rejections=None,
+) -> list[int]:
+    """Indices of one bucket's candidates ranked by ``(cycles, index)``.
+
+    A cost rule raising ``InfeasibleSchedule`` rejects a candidate;
+    ``(index, reason)`` is appended to ``rejections``.
+    """
+
+    from .pim.schedule_search import InfeasibleSchedule
+    from .spmw_plan import build_execution_graph
+
+    scored = []
+    for index, candidate in enumerate(candidates):
+        try:
+            graph = build_execution_graph(
+                target,
+                trace,
+                candidate,
+                bound_cost,
+                host_moves=host_moves,
+                buffer_metrics=buffer_metrics,
+            )
+            cycles = bound_cost.evaluate(graph).cycles
+        except InfeasibleSchedule as error:
+            if rejections is not None:
+                rejections.append((index, str(error)))
+            continue
+        scored.append((cycles, index))
+    scored.sort()
+    return [int(index) for _cycles, index in scored]
+
+
 def _per_bucket_argmin_index(
     target,
     trace,
@@ -1737,27 +2416,39 @@ def _per_bucket_argmin_index(
     *,
     host_moves=(),
     buffer_metrics=None,
+    probe=None,
+    rejections=None,
 ) -> int:
-    """Run the pre-search stable argmin used by public matcher defaults."""
+    """Index of the bucket's cheapest candidate, or with ``probe`` the
+    cheapest one ``probe(trace, candidate)`` accepts (it returns None or a
+    rejection reason; ``(index, reason)`` goes to ``rejections``)."""
 
-    from .spmw_plan import build_execution_graph
+    if rejections is None:
+        rejections = []
+    order = _per_bucket_ranking(
+        target,
+        trace,
+        candidates,
+        bound_cost,
+        host_moves=host_moves,
+        buffer_metrics=buffer_metrics,
+        rejections=rejections,
+    )
+    for index in order:
+        reason = None if probe is None else probe(trace, candidates[index])
+        if reason is None:
+            return index
+        rejections.append((index, reason))
+    func_name = trace.matches[0].func_name if trace.matches else "<empty>"
+    _raise_unmaterialized(
+        f"no feasible placement for bucket of {func_name!r} on target "
+        f"{getattr(target, 'name', None)!r}; rejections: "
+        f"{[(i, str(r)) for i, r in rejections]}",
+        [reason for _index, reason in rejections],
+    )
 
-    scored = []
-    for index, candidate in enumerate(candidates):
-        graph = build_execution_graph(
-            target,
-            trace,
-            candidate,
-            bound_cost,
-            host_moves=host_moves,
-            buffer_metrics=buffer_metrics,
-        )
-        scored.append((bound_cost.evaluate(graph).cycles, index))
-    scored.sort()
-    return int(scored[0][1])
 
-
-def _reconcile_resident_pairs(trace, placements, liveness) -> None:
+def _reconcile_resident_pairs(trace, placements, liveness) -> list[tuple[int, str]]:
     """Post-argmin resident-pair reconciliation (SPEC-023 D1).
 
     A `residency == "resident"` choice is only HONOURED when both endpoints of
@@ -1775,12 +2466,15 @@ def _reconcile_resident_pairs(trace, placements, liveness) -> None:
       otherwise both are reverted to restage.
 
     Mutates `placements` in place (each is a `Placement` whose `extra` carries
-    the chosen `residency` / `residency_pairs`). Byte-identical no-op when no
-    placement chose resident (the regression-default, since `residency`'s
-    `knob_cost` is unregistered so the argmin keeps restage).
+    the chosen `residency` / `residency_pairs`) and returns the reverted
+    ``(placement index, memref)`` pairs; the selection re-prices the
+    reconciled program and re-ranks the groups a revert touched
+    (`rank_matcher_placements` stage 2). Byte-identical no-op when no
+    placement chose resident.
     """
+    reverted: list[tuple[int, str]] = []
     if not liveness:
-        return
+        return reverted
 
     # `placements` align with `_bucket_for_autoschedule(trace)` order, so zip to
     # recover each placement's func_name WITHOUT stamping it onto `extra` (that
@@ -1804,7 +2498,7 @@ def _reconcile_resident_pairs(trace, placements, liveness) -> None:
             new_extra.pop("residency_pairs", None)
         pl.extra = new_extra
 
-    for pl in placements:
+    for position, pl in enumerate(placements):
         extra = getattr(pl, "extra", {}) or {}
         if extra.get("residency") != "resident":
             continue
@@ -1826,3 +2520,5 @@ def _reconcile_resident_pairs(trace, placements, liveness) -> None:
             )
             if not other_ok:
                 _revert_to_restage(pl, mref)
+                reverted.append((position, mref))
+    return reverted

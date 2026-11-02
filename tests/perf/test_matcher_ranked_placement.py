@@ -205,9 +205,19 @@ def test_ranked_evaluation_count_is_bounded(case, request, monkeypatch):
 
     monkeypatch.setattr(spmw_plan, "build_execution_graph", counting)
     placements = autoschedule(target, trace, samsung_cost)
+    ranking = placements.placement_ranking
 
-    assert len(calls) == sum(expected)
-    assert [len(k.scores) for k in placements.placement_ranking.kernels] == expected
+    # One graph per candidate, plus the whole-program graphs of the
+    # reconciled per-group picks and of the joint evaluation's other complete
+    # assignments; a single group's scores already are whole-program scores.
+    if len(expected) == 1:
+        whole_program = 0
+    else:
+        whole_program = 1 + (
+            0 if ranking.joint is None else ranking.joint.whole_program_evaluations
+        )
+    assert len(calls) == sum(expected) + whole_program
+    assert [len(k.scores) for k in ranking.kernels] == expected
 
 
 def test_ranked_is_no_worse_than_uniform_per_bucket_argmin(gemv_case):

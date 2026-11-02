@@ -655,6 +655,17 @@ class SearchResult(Generic[PayloadT, MaterializedT, ScoreT, ObjectiveT]):
         return self.ranked[0]
 
     @property
+    def ties(self) -> int:
+        """Number of ranked candidates whose objective equals the best's."""
+
+        best = self.best.validated_objective_order_key()
+        return sum(
+            1
+            for candidate in self.ranked
+            if candidate.validated_objective_order_key() == best
+        )
+
+    @property
     def best_incumbent(
         self,
     ) -> ScheduleCandidate[PayloadT, MaterializedT, ScoreT, ObjectiveT] | None:
@@ -697,6 +708,7 @@ class SearchResult(Generic[PayloadT, MaterializedT, ScoreT, ObjectiveT]):
             ),
             "recommended_decisions": dict(self.best.decisions),
             "recommended_objective": self.best.objective,
+            "ties_at_best": self.ties,
             "incumbent_rank": (
                 None if incumbent is None else self.ranked.index(incumbent)
             ),

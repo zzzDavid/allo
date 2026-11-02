@@ -1167,6 +1167,8 @@ _BACKENDS: dict[str, tuple[str, str, str | None]] = {
     "aim": ("allo.spmw_aim", "AimCtx", "_run_aim"),
     "apu_v1": ("allo.spmw_apu_v1", "APUv1Ctx", "_run_apu_v1"),
     "upmem": ("allo.spmw_upmem", "UpmemCtx", "_run_upmem"),
+    # Analytical-only: the runner raises (no device, no in-package simulator).
+    "attacc": ("allo.spmw_attacc", "AttAccCtx", "_run_attacc"),
 }
 
 
@@ -1248,9 +1250,11 @@ def __getattr__(name):
 #     (spmw_upmem knobs), not the workload grid.
 #   aim: the AiM lowering maps a single item's rows onto channels
 #     (tests/pim/test_aim_axis_roles.py `gemv_single`).
+#   attacc: the `attacc_tiling` knob maps a single item over one device's
+#     channels and units (allo/pim/attacc_tiling.py).
 # apu_v1 is not listed: its scalar mapping is a coalesced VR partition axis,
 # accepted by its own branch below.
-_SINGLE_ITEM_LAUNCH_BACKENDS = frozenset({"samsung_hbm_pim", "upmem", "aim"})
+_SINGLE_ITEM_LAUNCH_BACKENDS = frozenset({"samsung_hbm_pim", "upmem", "aim", "attacc"})
 # Backends that map a 1-D grid of n items (n <= the OUTERMOST extent) onto
 # disjoint groups of outermost units:
 #   upmem: n DPUs are allocated and loaded (`num_dpus == mapping[0]`,
@@ -1656,6 +1660,7 @@ def compile_for_target(
             cost=cost,
             host_moves=resolved_host_moves,
             buffer_metrics=buffer_metrics,
+            launch_schedule=launch_schedule,
         )
     elif isinstance(layout, Placement):
         # Single layout: replicate across every kernel. Equivalent to
@@ -1715,6 +1720,20 @@ def compile_for_target(
             buffer_metrics=buffer_metrics,
             launch_schedule=launch_schedule,
         )
+    placement_ranking = getattr(layouts, "placement_ranking", None)
+    if placement_ranking is not None and execution_graph is not None:
+        # The selected program's whole-program cycles are those of the graph
+        # retained for `estimate()` (docs/release/design/selection.md).
+        from dataclasses import replace
+
+        from .spmw_plan import _bind_cost
+
+        placement_ranking = replace(
+            placement_ranking,
+            program_cycles=int(
+                _bind_cost(cost, target).evaluate(execution_graph).cycles
+            ),
+        )
     return Compiled(
         target,
         trace,
@@ -1725,6 +1744,6 @@ def compile_for_target(
         host_moves=resolved_host_moves,
         execution_graph=execution_graph,
         cost=cost,
-        placement_ranking=getattr(layouts, "placement_ranking", None),
+        placement_ranking=placement_ranking,
         launch_schedule=launch_schedule,
     )

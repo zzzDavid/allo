@@ -93,3 +93,25 @@ def test_exact_complete_assignment_bound_is_exhausted_but_larger_space_truncates
     assert truncated.stats.complete_assignments_considered == 2
     assert truncated.stats.termination == "truncated"
     assert truncated.stats.truncated
+
+
+def test_ties_count_equal_objectives_and_incumbent_wins_them():
+    """The joint selection reads ``ties`` and prefers its incumbent on equal
+    objectives (docs/release/design/selection.md)."""
+    cycles = {"a": 3, "b": 1, "c": 1, "d": 1}
+    result = grid_search(
+        (DecisionDomain("choice", ("a", "b", "c", "d")),),
+        build=lambda decisions: decisions["choice"],
+        materialize=lambda payload: payload,
+        score=lambda payload: cycles[payload],
+        objective=lambda value: value,
+        objective_domain="cycles@test-model",
+        incumbent={"choice": "c"},
+    )
+
+    assert result.ties == 3
+    assert result.best.decisions["choice"] == "c" and result.best.is_incumbent
+    assert [c.decisions["choice"] for c in result.ranked] == ["c", "b", "d", "a"]
+    report = result.report()
+    assert report["ties_at_best"] == 3
+    assert report["incumbent_rank"] == 0
