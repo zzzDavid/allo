@@ -46,7 +46,11 @@ def test_readback_rejects_absent_and_truncated_blob(tmp_path):
 
 def test_paper_gemv_zero_input_writes_zero_output(samsung_sim_gate):
     workload, M, K = _paper_gemv()
-    compiled = allo.compile(workload, build_samsung_target(), samsung_cost)
+    # The REDUCE readback path; the ordered program has its own test
+    # (test_samsung_reduction_order.py).
+    compiled = allo.compile(
+        workload, build_samsung_target(), samsung_cost, reduction_order="reassociate"
+    )
 
     W = (np.random.default_rng(0).standard_normal((M, K)) * 0.1).astype(np.float16)
     x = np.zeros(K, dtype=np.float16)

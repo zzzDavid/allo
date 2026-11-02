@@ -122,8 +122,13 @@ def build_samsung_target():
                     # Legal operand sources: GRF_A/GRF_B, SRF_M/SRF_A,
                     # EVEN/ODD_BANK (PIMCmd.h:45-55). dst forbids a bank when
                     # the src is a GRF (ISA-1.0); enforced at emit/codegen.
+                    # SRF_M/SRF_A are real ISA sources, but `srf` is left out of
+                    # the operand set: SamsungCtx._opd encodes only GRF_A/GRF_B
+                    # and the conductor (TenonConductor.inc, pim_driver GENERIC)
+                    # has no SRF upload, so an SRF operand could be placed but
+                    # neither emitted nor executed (release audit C-01, Q6).
                     any_bank = allo.any_(banks)
-                    any_reg = allo.any_([grf_a, grf_b, srf])
+                    any_reg = allo.any_([grf_a, grf_b])
                     operand = allo.or_(any_bank, any_reg)
                     allo.op(
                         "MUL",
@@ -294,92 +299,95 @@ def build_aim_target():
                     width=16,
                     name="af_lut",
                 )
+                # Bank-slot conventions of CENT's AiM mapper, which the
+                # installed simulator traces follow.  The EWMUL and bank-pair
+                # MAC ISRs carry no bank operand: EWMUL reads slots
+                # ewmul_slots[0] and [1] of every bank group and writes slot
+                # [2]; a bank-pair MAC reads its shared buffer from
+                # bank_pair_slots of every bank_pair_stride-bank pair.
                 banks = allo.mem(
                     banks=16,
                     bank_groups=4,
                     rows=16384,
                     cols=1024,
                     width=16,
+                    ewmul_slots=(0, 1, 2),
+                    bank_pair_stride=2,
+                    bank_pair_slots=(0, 1),
                     name="banks",
                 )
 
                 # Channel-wide data paths and instructions.  These are not
                 # declared inside a bank: a single ISR channel mask launches
-                # them over the channel's shared GB or all 16 banks.
+                # them over the channel's shared GB or all 16 banks.  AiM ops
+                # and moves declare no `emit`: the only ISR encoder is
+                # allo.pim.aim_lowering, reached through AimCtx.emit_program.
                 allo.move(
                     "WR_ABK",
                     src=gpr,
                     dst=banks,
-                    emit=lambda ctx: ctx.cmd("WR_ABK", dst=banks, src0=gpr),
                 )
                 allo.move(
                     "WR_GB",
                     src=gpr,
                     dst=gb,
-                    emit=lambda ctx: ctx.cmd("WR_GB", dst=gb, src0=gpr),
                 )
                 allo.move(
                     "WR_BIAS",
                     src=gpr,
                     dst=mac_reg,
-                    emit=lambda ctx: ctx.cmd("WR_BIAS", dst=mac_reg, src0=gpr),
                 )
                 allo.move(
                     "RD_MAC",
                     src=mac_reg,
                     dst=gpr,
-                    emit=lambda ctx: ctx.cmd("RD_MAC", dst=gpr, src0=mac_reg),
                 )
                 allo.move(
                     "RD_AF",
                     src=af_reg,
                     dst=gpr,
-                    emit=lambda ctx: ctx.cmd("RD_AF", dst=gpr, src0=af_reg),
                 )
                 allo.move(
                     "COPY_BKGB",
                     src=banks,
                     dst=gb,
-                    emit=lambda ctx: ctx.cmd("COPY_BKGB", dst=gb, src0=banks),
                 )
                 allo.move(
                     "COPY_GBBK",
                     src=gb,
                     dst=banks,
-                    emit=lambda ctx: ctx.cmd("COPY_GBBK", dst=banks, src0=gb),
                 )
 
                 any_bank = allo.any_(banks)
+                # The y source also admits the banks: CENT's bank-pair MAC
+                # (RMSNorm partial sums, x and y the same buffer) reads both
+                # operands from bank_pair_slots of every bank_pair_stride pair
+                # instead of the GB.
                 allo.op(
                     "MAC_ABK",
-                    src=(banks, gb),
+                    src=(banks, allo.or_(gb, banks)),
                     dst=mac_reg,
                     accumulates=True,
                     matchable=False,
                     fn=lambda x, y, acc: acc + x * y,
-                    emit=lambda x, y, acc, ctx: ctx.cmd(
-                        "MAC_ABK", dst=acc, src0=x, src1=y
-                    ),
                 )
                 allo.op(
                     "ADD",
                     src=(gpr, gpr),
                     dst=gpr,
                     fn=lambda x, y: x + y,
-                    emit=lambda x, y, dst, ctx: ctx.cmd(
-                        "EWADD", dst=dst, src0=x, src1=y
-                    ),
                     vector_width=16,
                 )
                 # The installed AF LUT is CENT's logistic sigmoid, written in
                 # its exact tanh identity. The matcher keys on the callee name
                 # ``tanh``.
+                # AF reads the MAC accumulator latch (CENT/JSSC'23 issue order
+                # MAC -> AF -> RD_AF; the AF ISR has no GPR operand).
                 allo.op(
                     "AF",
-                    src=(gpr,),
+                    src=(mac_reg,),
                     dst=af_reg,
                     fn=lambda x: 0.5 * math.tanh(0.5 * x) + 0.5,
-                    emit=lambda x, dst, ctx: ctx.cmd("AF", dst=dst, src0=x),
                     vector_width=16,
                 )
 
@@ -392,9 +400,6 @@ def build_aim_target():
                         src=(any_bank, any_bank),
                         dst=any_bank,
                         fn=lambda x, y: x * y,
-                        emit=lambda x, y, dst, ctx: ctx.cmd(
-                            "EWMUL", dst=dst, src0=x, src1=y
-                        ),
                         vector_width=16,
                     )
 
@@ -407,29 +412,25 @@ def build_aim_target():
                             "WR_SBK",
                             src=gpr,
                             dst=bank_ref,
-                            emit=lambda ctx: ctx.cmd("WR_SBK", dst=bank_ref, src0=gpr),
                         )
                         allo.move(
                             "RD_SBK",
                             src=bank_ref,
                             dst=gpr,
-                            emit=lambda ctx: ctx.cmd("RD_SBK", dst=gpr, src0=bank_ref),
                         )
                         allo.move(
                             "ST_SBK",
                             src=gpr,
                             dst=bank_ref,
-                            emit=lambda ctx: ctx.cmd("WR_SBK", dst=bank_ref, src0=gpr),
                         )
+                        # y admits the bank too: the bank-pair form (see
+                        # MAC_ABK above).
                         allo.op(
                             "MAC",
-                            src=(bank_ref, gb),
+                            src=(bank_ref, allo.or_(gb, bank_ref)),
                             dst=mac_reg,
                             accumulates=True,
                             fn=lambda x, y, acc: acc + x * y,
-                            emit=lambda x, y, acc, ctx: ctx.cmd(
-                                "MAC_SBK", dst=acc, src0=x, src1=y
-                            ),
                         )
 
         # Host DRAM traffic. Scatter and gather are raw W/R MEM bursts into
@@ -1404,6 +1405,60 @@ def build_apu_v2_target():
 
     return device
 
+
+def build_apu_g2_contraction_patterns():
+    """Matcher view of the Gemini-II source contraction idioms.
+
+    The hardware target (:func:`build_apu_v2_target`) declares only the issued
+    typed VL64 primitives, none of which is matchable on its own: a source
+    reduction is realized by a whole recipe (L1->MMB copies, ``MUL_TYPED``,
+    ``GROUP_REDUCE_ADD_TYPED`` and an epilogue), not by one primitive.  This
+    view declares the two source-level idioms the composed-dot route
+    (:mod:`allo.pim.apu_g2_source_route`) recognizes and lowers to such
+    recipes:
+
+    * ``MAC``: ``acc += x * y``, one integer dot-product reduction;
+    * ``AXPBY``: ``alpha * x + beta * y`` with literal coefficients, the
+      two-term epilogue realized by ``MUL_TYPED``,
+      ``COPY_ODD_TO_EVEN_VECTORS`` and ``ADD_TYPED`` over interleaved dots.
+
+    It carries no cost rules and is never executed; costs and execution use
+    the hardware target.
+    """
+
+    @allo.target("apu_v2")
+    def patterns():
+        @allo.device
+        def core():
+            mmb = allo.mem(
+                sets=4,
+                rows_per_set=48,
+                segment_rows=24,
+                cols=65536,
+                width=1,
+                name="mmb",
+            )
+
+            @allo.unit(capacity=1)
+            def vector_engine():
+                seg0 = mmb["seg0"]
+                seg1 = mmb["seg1"]
+                allo.op(
+                    "MAC",
+                    src=(seg0, seg0),
+                    dst=seg1,
+                    accumulates=True,
+                    fn=lambda x, y, acc: acc + x * y,
+                )
+                allo.op(
+                    "AXPBY",
+                    src=(seg0, seg0),
+                    dst=seg1,
+                    fn=lambda x, y, alpha, beta: alpha * x + beta * y,
+                    const_params=("alpha", "beta"),
+                )
+
+    return patterns
 
 def build_apu_g2_target():
     """Preferred hardware name for :func:`build_apu_v2_target`.

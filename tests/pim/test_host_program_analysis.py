@@ -128,7 +128,8 @@ from allo.pim.targets import build_samsung_target
 from allo.spmw_plan import launch_schedule
 from allo.spmw_target import LaunchRecord
 
-_LM, _LK, _LR = 64, 64, 32
+# 16 work items (the outer prefix of Samsung's 16 x 8 grid), 4 rows each.
+_LM, _LK, _LR = 64, 64, 4
 _hx = allo.host_xfer
 
 
@@ -140,7 +141,7 @@ def _two_kernels(
     y: float16[_LM],
     z: float16[_LM],
 ):
-    @allo.work(mapping=[2], args=[W, x, y])
+    @allo.work(mapping=[16], args=[W, x, y])
     def mv1(lW: float16[_LM, _LK], lx: float16[_LK], ly: float16[_LM]):
         (c,) = allo.get_wid()
         for i in range(_LR):
@@ -149,7 +150,7 @@ def _two_kernels(
                 acc += lW[c * _LR + i, k] * lx[k]
             ly[c * _LR + i] = acc
 
-    @allo.work(mapping=[2], args=[V, y, z])
+    @allo.work(mapping=[16], args=[V, y, z])
     def mv2(lV: float16[_LM, _LK], ly: float16[_LK], lz: float16[_LM]):
         (c,) = allo.get_wid()
         for i in range(_LR):
@@ -214,7 +215,7 @@ def test_launch_schedule_orders_host_transfers_between_kernels():
     g1_terminals = {
         a.id for a in acts if group_of(a) == g1 and a.metadata["phase"] == "post"
     }
-    assert set(gather_y.depends_on) == g1_terminals and len(g1_terminals) == 2
+    assert set(gather_y.depends_on) == g1_terminals and len(g1_terminals) == 16
     assert bcast_y.depends_on == (gather_y.id,)
 
     g2_first = [

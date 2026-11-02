@@ -104,8 +104,15 @@ def aim_gemv(W: bfloat16[AIM_M, AIM_K], x: bfloat16[AIM_K], y: bfloat16[AIM_M]):
             local_y[row0 + i] = acc
 
 
+# Every AiM MAC reduces 16 BF16 products through the bank adder tree, so an
+# AiM contraction compiles only with permission to regroup partial sums.
+REASSOCIATE = {"reduction_order": "reassociate"}
+
+
 def test_gemv_aim(aim_sim_gate):
-    compiled = _compile_within(120.0, aim_gemv, build_aim_target(), aim_cost)
+    compiled = _compile_within(
+        120.0, aim_gemv, build_aim_target(), aim_cost, **REASSOCIATE
+    )
 
     rng = np.random.default_rng(0)
     W = (rng.standard_normal((AIM_M, AIM_K)) * 0.1).astype(np.float32)
@@ -137,14 +144,14 @@ def test_gemv_aim_forced_sbk_expands_layout_banks():
     from allo.spmw_codegen import simulator_unavailable_reason
 
     target = build_aim_target()
-    ranked = allo.compile(aim_gemv, target, aim_cost, backend="virtual")
+    ranked = allo.compile(aim_gemv, target, aim_cost, backend="virtual", **REASSOCIATE)
     sbk_layout, abk_layout = _aim_layout_candidates(
         target, ranked.compiled.trace.matches
     )
     assert sbk_layout.extra["bank_fanout"] == 1
     # Both layouts carry no knob values, so they lower the same contraction.
-    abk = allo.compile(aim_gemv, target, aim_cost, layout=abk_layout)
-    sbk = allo.compile(aim_gemv, target, aim_cost, layout=sbk_layout)
+    abk = allo.compile(aim_gemv, target, aim_cost, layout=abk_layout, **REASSOCIATE)
+    sbk = allo.compile(aim_gemv, target, aim_cost, layout=sbk_layout, **REASSOCIATE)
 
     expected_banks = sorted(
         {

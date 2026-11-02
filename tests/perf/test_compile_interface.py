@@ -219,7 +219,9 @@ def _patch_pipeline(monkeypatch):
     monkeypatch.setattr(
         compiler_api,
         "match_workload",
-        lambda target, module: SimpleNamespace(target_name=target.name),
+        lambda target, module, **kwargs: SimpleNamespace(
+            target_name=target.name, coverage=None, matches=[]
+        ),
     )
 
     def compile_fake(target, trace, **kwargs):
@@ -346,7 +348,13 @@ def test_compile_binds_repeated_shape_metrics_by_retained_value(monkeypatch):
     from allo.pim.costs import aim_cost
     from allo.pim.targets import build_aim_target
 
-    allo.compile(_repeated_shape_metric_pipeline, build_aim_target(), aim_cost)
+    # AiM sums 16 bf16 products per burst in its adder tree: regrouping needed.
+    allo.compile(
+        _repeated_shape_metric_pipeline,
+        build_aim_target(),
+        aim_cost,
+        reduction_order="reassociate",
+    )
 
     trace = captured["trace"]
     manifest = captured["buffer_metrics"]
@@ -745,7 +753,7 @@ def test_public_compile_selects_matcher_adapter_from_retained_ir(monkeypatch):
     trace = MatchTrace("apu_v1", "retained_adapter", matches)
     fake = _FakeCompiled()
     monkeypatch.setattr(compiler_api, "customize", lambda *args, **kwargs: schedule)
-    monkeypatch.setattr(compiler_api, "match_workload", lambda *args: trace)
+    monkeypatch.setattr(compiler_api, "match_workload", lambda *args, **kwargs: trace)
     monkeypatch.setattr(
         compiler_api, "compile_for_target", lambda *args, **kwargs: fake
     )

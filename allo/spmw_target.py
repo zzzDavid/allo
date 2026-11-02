@@ -353,6 +353,31 @@ class Unit:
             p = p.parent
         return n  # root has level 0
 
+    @property
+    def path(self) -> tuple:
+        """Names from the root to this unit. Two `Target` instances built
+        from the same description have units with equal paths, so structural
+        comparisons (legality, pattern admission) use paths, not identity."""
+        names = []
+        unit = self
+        while unit is not None:
+            names.append(unit.name)
+            unit = unit.parent
+        return tuple(reversed(names))
+
+    def is_ancestor_of(self, other) -> bool:
+        """True if `other` is a strict descendant of this unit (by path)."""
+        mine, theirs = self.path, getattr(other, "path", None)
+        if theirs is None:
+            return False
+        return len(theirs) > len(mine) and theirs[: len(mine)] == mine
+
+    def encloses(self, other) -> bool:
+        """True if `other` is this unit or one of its descendants: storage
+        declared on this unit is accessible from `other` (paper III-A)."""
+        mine, theirs = self.path, getattr(other, "path", None)
+        return theirs is not None and theirs[: len(mine)] == mine
+
     def __repr__(self):
         return f"Unit({self.name}, mapping={self.mapping}, level={self.level})"
 
@@ -766,6 +791,78 @@ def or_(*alternatives):
     `or_` here.
     """
     return OrOf(alternatives)
+
+
+def handle_owner(handle):
+    """The `Unit` that declares a concrete storage handle (`Register`,
+    `Memory`, or a `MemoryRef` into a memory), or None for anything else.
+    Wrapped handles exposing `home_handle` resolve to their home storage."""
+    return _handle_unit(getattr(handle, "home_handle", handle))
+
+
+def pattern_handles(pattern) -> list:
+    """The concrete storage handles a `src`/`dst` pattern names."""
+    if isinstance(pattern, OrOf):
+        return [h for alt in pattern.alternatives for h in pattern_handles(alt)]
+    if isinstance(pattern, AnyOf):
+        cands = pattern.candidates
+        if isinstance(cands, (Memory, MemoryRef, Register)):
+            return [cands]
+        return [h for c in cands for h in pattern_handles(c)]
+    if isinstance(pattern, (Memory, MemoryRef, Register)):
+        return [pattern]
+    return []
+
+
+def storage_key(handle):
+    """Structural identity of a `Register` or `Memory`: (owner unit path,
+    kind, name). Equal for the same declaration in two `Target` instances
+    built from one description; None for anything else."""
+    handle = getattr(handle, "home_handle", handle)
+    if isinstance(handle, MemoryRef):
+        handle = handle.memory
+    if not isinstance(handle, (Register, Memory)):
+        return None
+    owner = _handle_unit(handle)
+    path = owner.path if owner is not None else ()
+    return (path, type(handle).__name__, handle.name)
+
+
+def same_storage(a, b) -> bool:
+    """True when `a` and `b` name the same declared register or memory
+    (by structural identity, see `storage_key`)."""
+    key = storage_key(a)
+    return key is not None and key == storage_key(b)
+
+
+def pattern_admits(pattern, handle) -> bool:
+    """True if a `src`/`dst` pattern admits the placed storage `handle`.
+
+    Registers match by structural identity (`same_storage`). A `Memory`
+    (bare, or as `AnyOf(memory)`) admits the memory and every `MemoryRef`
+    into it; a `MemoryRef` pattern admits refs into the same memory (which
+    bank of it a placement selects is a layout decision the backend lowering
+    checks). `AnyOf`/`OrOf` admit the union of their members.
+    """
+    handle = getattr(handle, "home_handle", handle)
+    if isinstance(pattern, OrOf):
+        return any(pattern_admits(alt, handle) for alt in pattern.alternatives)
+    if isinstance(pattern, AnyOf):
+        cands = pattern.candidates
+        if isinstance(cands, (Memory, MemoryRef, Register)):
+            return pattern_admits(cands, handle)
+        return any(pattern_admits(c, handle) for c in cands)
+    if isinstance(pattern, Register):
+        return isinstance(handle, Register) and same_storage(pattern, handle)
+    if isinstance(pattern, Memory):
+        return isinstance(handle, (Memory, MemoryRef)) and same_storage(
+            pattern, handle
+        )
+    if isinstance(pattern, MemoryRef):
+        return isinstance(handle, (Memory, MemoryRef)) and same_storage(
+            pattern.memory, handle
+        )
+    return False
 
 
 # ---------------- host-transfer dispatch surface (spec 001) ---------------- #

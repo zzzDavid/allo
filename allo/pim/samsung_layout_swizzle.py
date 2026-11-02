@@ -214,6 +214,7 @@ def select_autoscheduled_xor_layout(
     from .targets import build_samsung_target
     from ..spmw_autoschedule import autoschedule
     from ..spmw_match import MatchTrace, MatchedOp, OperandBinding
+    from ..spmw_reduction_policy import stamp_reduction_policy
 
     target = build_samsung_target()
     # A structurally complete one-row GEMV, y[i] = sum_k W[i, k] * x[k]: the
@@ -241,6 +242,8 @@ def select_autoscheduled_xor_layout(
             "output_sinks": [("y", "i")],
         },
     )
+    # The probe studies the REDUCE bank layouts, which regroup the reduction.
+    stamp_reduction_policy([match], "reassociate")
     trace = MatchTrace(target.name, "linear_layout_swizzle_probe", [match])
     placement = autoschedule(target, trace, samsung_cost)[0]
     source = placement.layout

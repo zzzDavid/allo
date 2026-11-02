@@ -102,9 +102,14 @@ def _f32(a):
     return a.astype(np.float32)
 
 
+# The REDUCE programs regroup the FP16 reduction (16 lane partial sums summed
+# in FP32); these tests run them under explicit permission.
+REASSOCIATE = {"reduction_order": "reassociate"}
+
+
 def _forced(workload, mode, residency, resident=False):
     target = build_samsung_target()
-    default = allo.compile(workload, target, samsung_cost)
+    default = allo.compile(workload, target, samsung_cost, **REASSOCIATE)
     for candidate in _samsung_enumerate(target, default.trace.matches[:1]):
         modes = set((candidate.extra.get("grf_residency") or {}).values()) or {"crf"}
         if (
@@ -114,7 +119,9 @@ def _forced(workload, mode, residency, resident=False):
             and bool(candidate.extra.get("stage_resident")) == resident
         ):
             n = default.placement_ranking.kernels[0].bucket_count
-            return allo.compile(workload, target, samsung_cost, layout=[candidate] * n)
+            return allo.compile(
+                workload, target, samsung_cost, layout=[candidate] * n, **REASSOCIATE
+            )
     raise KeyError((mode, residency, resident))
 
 
@@ -129,10 +136,11 @@ def gemv_inputs():
 def test_canonical_run_reports_program_plan_and_padding(samsung_sim_gate, gemv_inputs):
     workload, _M, _K = _workloads()["gemv_m4096_k256"]
     target = build_samsung_target()
-    default = allo.compile(workload, target, samsung_cost)
+    default = allo.compile(workload, target, samsung_cost, **REASSOCIATE)
     compiled = allo.compile(
         workload, target, samsung_cost,
         layout=spmw_samsung.samsung_vendor_gemv_layout(target, default.trace),
+        **REASSOCIATE,
     )
     W, x, ref = gemv_inputs
     y = np.zeros(M, dtype=np.float16)
@@ -172,7 +180,9 @@ def test_noncanonical_placements_execute_their_own_programs(samsung_sim_gate, ge
 
 def test_tampered_crf_is_rejected_not_canonicalized(samsung_sim_gate, gemv_inputs):
     workload, _M, _K = _workloads()["gemv_m4096_k256"]
-    compiled = allo.compile(workload, build_samsung_target(), samsung_cost)
+    compiled = allo.compile(
+        workload, build_samsung_target(), samsung_cost, **REASSOCIATE
+    )
     (program,) = compiled.compiled.layout_ctx.programs
     words = list(compiled.compiled.cmds)
     words[1] = PIMCmd(type_="JUMP", loopCounter_=3, loopOffset_=2)
@@ -190,7 +200,9 @@ def test_ragged_shape_reports_padding(samsung_sim_gate):
     W = (rng.standard_normal((2048, 100)) * 0.1).astype(np.float16)
     x = (rng.standard_normal(100) * 0.1).astype(np.float16)
     y = np.zeros(2048, dtype=np.float16)
-    compiled = allo.compile(ragged_gemv, build_samsung_target(), samsung_cost)
+    compiled = allo.compile(
+        ragged_gemv, build_samsung_target(), samsung_cost, **REASSOCIATE
+    )
     result = compiled(W, x, y)
     np.testing.assert_allclose(_f32(y), _f32(W) @ _f32(x), rtol=1e-2, atol=1e-2)
     assert result.extra["logical_shape"] == {"rows": 2048, "reduction": 100, "columns": 1}
@@ -213,7 +225,7 @@ def test_gemm_matrix_residency_lever_changes_staging(samsung_sim_gate):
     assert runs[True].extra["conductor"]["matrix_preloads"] == 1
     assert runs[False].extra["conductor"]["matrix_preloads"] == N
     assert runs[True].cycles < runs[False].cycles
-    default = allo.compile(gemm, build_samsung_target(), samsung_cost)
+    default = allo.compile(gemm, build_samsung_target(), samsung_cost, **REASSOCIATE)
     assert default.compiled.layout_ctx.programs[0].weight_resident is True
 
 

@@ -2,8 +2,8 @@
 
 Status: implemented as a standalone package library (`allo/pim/gf2.py`,
 `allo/pim/layout_problem.py`, `allo/pim/layout_movement.py`,
-`allo/pim/layout_search.py`). Not yet wired into the autoscheduler (see
-Section 8). Implements steps 1 to 4 and 7 of the salvage plan in
+`allo/pim/layout_search.py`). Wired into placement selection through
+`allo/spmw_layout_problem.py` (see Section 8). Implements steps 1 to 4 and 7 of the salvage plan in
 `docs/release/audit/core.md` Section 3.3 and addresses claim rows 17 to 22 of
 `docs/release/CLAIMS.md`.
 
@@ -183,21 +183,118 @@ Snapshot telemetry witnesses (12 and 47 prefix nodes, 6 and 13 evaluated
 bounds, 31 and 590 search nodes, the atomic budget table) are re-asserted to
 show the traversal and budget accounting were preserved.
 
-## 8. What remains
+## 8. Wiring into placement selection, and what remains
 
-* Wiring into `spmw_autoschedule.rank_matcher_placements` as the
-  layout-construction stage: every tied layout (or flag representative)
-  becomes a `Placement.layout` candidate crossed with the knobs, and a
-  `NODE_BUDGET` termination must mark the ranking incomplete (salvage step 6).
-* Deriving `LayoutAccess` rows from `MatchedOp` (operand index maps,
-  `enclosing_loops`, power-of-two trip counts via
-  `spmw_tripcount.resolve_trip_count`, work-grid bits from
-  `MatcherWorkScope.group_shape`) and `reassociation_allowed` from a user
-  numeric policy plus the accumulator role (salvage step 5). Non-affine or
-  non-power-of-two accesses must be rejected or masked explicitly.
-* Deriving `cost_per_level` from the cost program (per-byte movement cost
-  across each owner level) instead of passing it by hand.
-* Generating `active_points` from non-power-of-two loop bounds.
+### 8.1 What is wired (layout-construction stage)
+
+`allo/spmw_layout_problem.py` derives the problem of one `@allo.work` kernel
+group, and `spmw_autoschedule.rank_matcher_placements` runs the search once
+per group and crosses its ties with the backend's decision keys.
+
+* **Derivation** (module docstring has the full rules). The variables are the
+  work-grid axes (`MatcherWorkScope.group_shape`) followed by the enclosing
+  loops (`0 <= v < n`, step 1, static bound). They are named positionally
+  (`work0`, `loop1`), so renaming changes nothing. A non-power-of-two extent
+  pads to `ceil(log2 n)` bits and makes the problem masked (a box of active
+  points). Each coordinate must be `c + sum a_v v` with `c` affine in the work
+  id (fitted across the buckets and checked on every bucket). It must also be
+  injective in its variables (mixed radix), so `K_j` is the coordinate
+  subspace of the variables an access ignores. Inputs are `READ` and the
+  loop-carried accumulator (through its output sink when it is a scalar) is
+  `WRITE_ACCUMULATE`. `reassociation_allowed` comes from
+  `extra["reduction_policy"]` (`may_regroup`); when no policy is present it
+  defaults to `True` and records an assumption. Element bytes come from the
+  memref element type. The owner levels come from `COMPUTE_LEVELS`: Samsung
+  `pseudo_channel`/`pim`, AiM `channel`/`bank_group`/`bank`, UPMEM
+  `dpu`/`tasklet` (an `active_extents` subgroup when the grid uses fewer
+  units, for example 16 of 24 tasklets), and APU v1 `vr0.lane`. They are
+  truncated to the levels the work grid covers; deeper levels are listed as
+  `unmodelled_levels`. Rejected with the reason: non-affine or opaque
+  coordinates, non-injective coordinates, non-unit loop steps, work
+  dependence that is not affine, non-power-of-two work grids, and more than
+  one matched op per work item. One recorded rule: an opaque contraction
+  matrix row (`memref.load` of `row0 + i`) is taken equal to the single store
+  row, the rule `spmw_samsung.samsung_contraction` already applies.
+* **Weights.** `cost_per_level` is read from a cost-program hook
+  `movement_cost_per_byte(level_name)`. No package cost program defines one,
+  so every level weighs 1 per byte and the record says
+  `movement_weights="uniform"`.
+* **Search.** Problems inside the bounded domain (4 bits, 3 levels; masked
+  or not) run the ported Algorithm 1 (`search_min_movement_layout`). Real
+  kernels do not fit: the Samsung paper GEMV is 20 iteration bits over 4 + 3
+  owner bits. `search_min_movement_layout` sends it to `SCALABLE`, which hits
+  the 20,672-node budget after 25 s with only a fallback incumbent, because
+  about 2^35 flags tie at the minimum. Larger problems therefore run
+  `search_coordinate_min_movement` (addition to `layout_search.py`). It
+  relies on a coordinate-dominance lemma (stated and proved in the module):
+  with coordinate kernels, the pivot (initial) flag of any flag has no larger
+  rank at any level. So a minimum is a coordinate flag, and every minimum
+  movement profile is the profile of a coordinate flag. The search enumerates
+  per-variable owner-bit classes. It is exact over all one-to-one layouts on
+  a full carrier (`optimality_proven=True`) and exact over coordinate layouts
+  only on a mask (`optimality_scope="coordinate layouts"`,
+  `optimality_proven=False`). Ties are reported as movement *profiles*
+  (owners per element, per access and level) with a coordinate-assignment
+  multiplicity. The Samsung paper GEMV runs in 0.02 s (95 assignments visited
+  under strict order, 581 under reassociation). Checked against Algorithm 1
+  on random small problems: same
+  minimum and same set of minimum profiles (`tests/perf/test_layout_selection_search.py`).
+* **Selection.** Every tie class (cap `max_tie_candidates=64`) becomes a
+  candidate for every decision key. The movement layout joins the backend's
+  `LinearLayout` as a block-diagonal `product` over `mm.`-prefixed dims, so
+  it enters the decision key and the backend's own dims are unchanged. When
+  no tie class contains the program's layout, that layout is crossed as well,
+  labelled `extra["movement"]="not-minimal"`. Unanalyzable groups keep the
+  hand-built layouts, labelled `not-analyzed: <reason>`. Realizability: every
+  backend emits one program per work item on the unit its work id names, so
+  a tie is realizable exactly when its owner flag equals the program's.
+  Other ties are rejected before emission and recorded in
+  `KernelRanking.movement_rejections`. Ties are broken by cycles, then by a
+  structural key: layout text, knob and feature values, handle paths
+  (`TIE_BREAK_RULE`, C-06). `KernelRanking.cost_ties` exposes the full
+  equal-cycle set. `KernelRanking.movement` (`KernelMovement`) records
+  status, implementation, termination, `optimality_proven`, scope,
+  `incomplete`, min, program and chosen movement cost and label, tie count
+  and multiplicity, visited/pruned, weights, assumptions and notes.
+  `PlacementRanking.incomplete` is set on any node-budget exit.
+  `MovementSelectionPolicy` (default: the ported budget of 20,672 nodes)
+  is set per call or with `movement_selection_policy(...)`.
+
+### 8.2 Findings
+
+* **No backend can realize a layout other than the program's work-grid owner
+  map.** On the measured GEMVs every alternative tie is rejected. Samsung
+  under strict FP16: the program layout is the unique minimum profile
+  (72,704 B, proven), so nothing changes. Samsung under reassociation: the
+  minimum is 48,128 against the program's 72,704 (one or two `k` bits split
+  across PIM units); 2 tie classes are rejected. AiM (`reassociate`): 5,120
+  against 15,872; 2 classes are rejected. UPMEM 64 x 12 rows (masked): 14,848
+  against 32,256; 2 classes are rejected. Selected programs, cycles and
+  emitted commands are identical to HEAD on all five GEMVs (Samsung 253, 381,
+  253; AiM 255; UPMEM 359,488 virtual cycles).
+* **Backend layouts are not in the iteration-to-owner coordinate space.**
+  Samsung's `swizzled` maps `grf`/`bank`/`tile` and its emitter reads fibers
+  from `extra["fibers"]`, not from `Placement.layout`. AiM's layout maps
+  `k`/`work_bank`/`lane_bank` to `bank` and is read for SBK bank expansion.
+  UPMEM checks only that a `LinearLayout` is present. A tie can therefore
+  never "equal the swizzled layout"; the product keeps both.
+* A user `compile(layout=...)` whose carried movement part is not the
+  program's owner map is not checked, and backends ignore it (needs the C-01
+  legality pass).
+
+### 8.3 What remains
+
+* Backends that re-map iterations to owners (for example splitting `k`
+  across PIM units with a partial-sum combine) would turn the rejected ties
+  into real candidates; until then the claim holds only in the narrow sense
+  that ties reach the ranking and are rejected for a stated reason.
+* Movement weights from the cost programs (`movement_cost_per_byte`).
+* Levels below the work grid (AiM banks, UPMEM tasklets, Samsung bank
+  fibers) are chosen inside the backends and are not part of the problem.
+* Masked problems: the lemma is not proved for masks, so the coordinate
+  search claims only coordinate optimality there.
+* Kernels with several matched ops per work item (MAC + AF) and opaque
+  coordinates other than the contraction matrix row are not analyzed.
 * Target legality beyond the owner structure (capacity, alignment,
   contiguity: `L_legal` in Eq. pim-minmove-objective) is not modelled; the
   snapshot's SLS6 target-constraint callback protocol was not ported.

@@ -161,6 +161,10 @@ class SamsungContraction:
     vector_k_axis: int  # GEMV 0; GEMM: position of k in the vector's indices
     row_offset: int  # first output row of this work item
     output_memref: str
+    # "zero" (literal 0 before the reduction) or "carried" (the output's
+    # incoming value is the initial accumulator; only the ordered program
+    # loads it).
+    accumulator_init: str = "zero"
 
     def structure(self):
         """Everything but the row offset: identical across work items."""
@@ -178,6 +182,7 @@ class SamsungContraction:
             self.matrix_k_axis,
             self.vector_k_axis,
             self.output_memref,
+            self.accumulator_init,
         )
 
 
@@ -283,10 +288,12 @@ def samsung_contraction(match: MatchedOp) -> SamsungContraction:
 
     if match.target_op_name != "MAC":
         reject(f"expected a MAC match, got {match.target_op_name}")
-    if match.extra.get("accumulator_init") != "zero":
+    accumulator_init = match.extra.get("accumulator_init")
+    if accumulator_init not in ("zero", "carried"):
         reject(
             "the accumulator must be initialized to literal 0 before the reduction "
-            f"(accumulator_init={match.extra.get('accumulator_init')!r})"
+            "or carry the output's incoming value "
+            f"(accumulator_init={accumulator_init!r})"
         )
     loops = list(match.enclosing_loops)
     if len(loops) not in (1, 2, 3):
@@ -421,6 +428,7 @@ def samsung_contraction(match: MatchedOp) -> SamsungContraction:
         vector_k_axis=vector_k_axis,
         row_offset=row_offset,
         output_memref=output_memref,
+        accumulator_init=accumulator_init,
     )
 
 
@@ -755,7 +763,11 @@ class SamsungCtx(CodegenContext):
                     "its CRF per work item"
                 )
             ops = {m.target_op_name for _w, matches in buckets for m in matches}
-            if ops == {"MAC"}:
+            if ops == {"MAC"} and _is_temporal(group_layouts[0]):
+                program = self._emit_temporal(
+                    group_id, buckets, group_layouts[0], issue
+                )
+            elif ops == {"MAC"}:
                 program = self._emit_reduce(group_id, buckets, group_layouts[0], issue)
             elif len(ops) == 1 and ops <= SAMSUNG_ELEMENTWISE_OPS:
                 program = self._emit_eltwise(group_id, buckets, group_layouts[0], issue)
@@ -798,9 +810,10 @@ class SamsungCtx(CodegenContext):
             raise _infeasible("a placement names the same bank fiber twice")
         return indexed
 
-    def _emit_reduce(self, group_id, buckets, layout, issue):
-        target = self.target
-        facts = samsung_target_facts(target)
+    @staticmethod
+    def _covered_contraction(buckets):
+        """The group's contraction and its row count, after checking that the
+        work items' store ranges partition the matrix rows (S-10)."""
         contractions = [samsung_contraction_roles(matches) for _w, matches in buckets]
         rep = contractions[0]
         if any(c.structure() != rep.structure() for c in contractions):
@@ -827,6 +840,30 @@ class SamsungCtx(CodegenContext):
                 f"matrix {rep.matrix_memref!r} has {rows_total}; the device would "
                 "overwrite rows the program leaves untouched. Make the work grid "
                 "(mapping x rows per item) cover every row"
+            )
+        return rep, rows_total
+
+    def _emit_reduce(self, group_id, buckets, layout, issue):
+        from .spmw_reduction_policy import may_regroup, no_strict_program_error
+
+        target = self.target
+        facts = samsung_target_facts(target)
+        rep, rows_total = self._covered_contraction(buckets)
+        matches = [m for _w, ms in buckets for m in ms]
+        if not may_regroup(matches):
+            # Reached only with a forced layout: the enumerator prunes REDUCE
+            # candidates under a strict policy.
+            raise no_strict_program_error(
+                target.name,
+                matches,
+                f"the selected REDUCE placement {layout.mode!r} sums per-lane FP16 "
+                "partial sums in FP32; the ordered (temporal) placement keeps the "
+                "source order",
+            )
+        if rep.accumulator_init != "zero":
+            raise _infeasible(
+                "the REDUCE program zeroes GRF_B; only the ordered (temporal) "
+                "program carries the accumulator's initial value"
             )
 
         self._check_unrealized_levers(layout)
@@ -910,6 +947,88 @@ class SamsungCtx(CodegenContext):
                 "crf_issue": issue,
                 "stage_resident": bool(extra.get("stage_resident", False)),
                 "residency": extra.get("residency"),
+            },
+        )
+
+    def _emit_temporal(self, group_id, buckets, layout, issue):
+        """Lower the ordered program (conductor ``TEMPORAL_REDUCE``).
+
+        FP16 lane l of PIM unit b owns one output row; the per-pass CRF is
+        ``MOV GRF_B <- EVEN_BANK`` (initial accumulator, bank row 0),
+        ``MAC GRF_B <- GRF_A * EVEN_BANK`` (not auto: one column command, one
+        reduction element), ``JUMP K-1``, ``NOP 0`` (drain the one GRF_B
+        entry) and ``EXIT``.  The conductor broadcasts element k of the vector
+        into GRF_A before MAC k, in ascending k, so every multiply and add
+        rounds to FP16 in source order and the host does no arithmetic.
+        """
+        target = self.target
+        facts = samsung_target_facts(target)
+        rep, rows_total = self._covered_contraction(buckets)
+        self._check_unrealized_levers(layout)
+        extra = layout.extra or {}
+        handles = layout.placements
+        matrix_h = handles.get(rep.matrix_memref)
+        vector_h = handles.get(rep.vector_memref)
+        acc_h = handles.get(rep.acc_memref)
+        if acc_h is not target.grf_b:
+            raise _infeasible("the ordered program accumulates in GRF_B")
+        if vector_h is not target.grf_a:
+            raise _infeasible("the ordered program broadcasts the vector into GRF_A")
+        if (
+            not isinstance(matrix_h, MemoryRef)
+            or _bank_fiber_class(matrix_h.idx) != "EVEN_BANK"
+        ):
+            raise _infeasible("the ordered program reads the matrix from the even bank")
+        residency = extra.get("grf_residency", {}) or {}
+        if residency.get(rep.vector_memref) != "host":
+            raise _infeasible(
+                "the ordered program receives each reduction element by host "
+                "broadcast (grf_residency=host)"
+            )
+        if extra.get("stage_resident"):
+            raise _infeasible("the ordered program stages the matrix for every column")
+        if not 1 <= rep.K <= _TEMPORAL_MAX_DEPTH:
+            raise _infeasible(
+                f"the ordered program supports 1 <= K <= {_TEMPORAL_MAX_DEPTH} "
+                f"(conductor contract, TemporalReduce.inc); K = {rep.K}"
+            )
+
+        start = len(self.cmds)
+        binds = [(0, "initial", 0, -1, 0)]
+        self.cmd("MOV", dst=acc_h, src0=matrix_h)
+        binds.append((len(self.cmds) - start, "matrix", 0, -1, 0))
+        target.op("MAC").emit(vector_h, matrix_h, acc_h, self)
+        # One column command per reduction element: no auto-mode GRF walk.
+        self.cmds[-1].isAuto_ = 0
+        self._emit_move("JUMP")
+        self.cmds[-1].loopCounter_ = rep.K - 1
+        self.cmds[-1].loopOffset_ = 2
+        binds.append((len(self.cmds) - start, "drain", 1, -1, 0))
+        self.cmds.append(PIMCmd(type_="NOP", loopCounter_=0))
+        self.cmds.append(PIMCmd(type_="EXIT"))
+        return SamsungProgram(
+            kind="TEMPORAL_REDUCE",
+            group_id=group_id,
+            start=start,
+            end=len(self.cmds),
+            binds=tuple(binds),
+            facts=facts,
+            crf_issue=issue,
+            work_items=len(buckets),
+            contraction=rep,
+            rows=rows_total,
+            k_tiles=rep.K,
+            rows_per_block=facts.lanes,
+            vector_from_bank=False,
+            weight_resident=False,
+            lever_record={
+                "mode": layout.mode,
+                "reduction_program": "temporal",
+                "grf_residency": dict(residency),
+                "crf_issue": issue,
+                "stage_resident": False,
+                "residency": extra.get("residency"),
+                "accumulator_init": rep.accumulator_init,
             },
         )
 
@@ -1014,7 +1133,20 @@ class SamsungCtx(CodegenContext):
         )
 
     def runtime_route(self, commands) -> tuple[str, tuple]:
-        return (_samsung_runtime_route(commands), (_matcher_command_manifest(commands),))
+        if any(program.kind == "TEMPORAL_REDUCE" for program in self.programs):
+            route = "GENERIC_TEMPORAL_REDUCE"
+        else:
+            route = _samsung_runtime_route(commands)
+        return (route, (_matcher_command_manifest(commands),))
+
+
+# Conductor contract of the ordered program (TemporalReduce.inc): at most
+# 4096 reduction elements per pass.
+_TEMPORAL_MAX_DEPTH = 4096
+
+
+def _is_temporal(layout) -> bool:
+    return (getattr(layout, "extra", None) or {}).get("reduction_program") == "temporal"
 
 
 def samsung_vendor_gemv_layout(target, trace) -> list:
@@ -1049,8 +1181,14 @@ def samsung_vendor_gemv_layout(target, trace) -> list:
             and not extra.get("stage_resident")
         ):
             return [candidate] * len(buckets)
+    pruned = {
+        reason
+        for candidate in candidates
+        for _mode, reason in candidate.extra.get("reduction_policy_pruned", ())
+    }
     raise SamsungUnsupported(
         "the trace has no dual_fiber + host-fill + shared-CRF candidate"
+        + (f" (pruned: {'; '.join(sorted(pruned))})" if pruned else "")
     )
 
 
@@ -1358,6 +1496,72 @@ def _samsung_run_reduce(compiled, program, crf_words, root, geometry, matrix, ve
     }
 
 
+_TEMPORAL_TIMING_SCOPE = (
+    "PIMSimulator memory-clock cycles of the executed ordered program on the "
+    "simulated system: for every row tile and result column, the weight and "
+    "initial-accumulator preload (K + 1 bursts per PIM unit), CRF upload, K "
+    "host broadcasts of one vector element each followed by one MAC, the "
+    "drain, and readback. The outputs are the drained FP16 accumulators; the "
+    "host performs no arithmetic. Excludes host padding."
+)
+
+
+def _samsung_run_temporal(program, crf_words, root, geometry, matrix, vectors, initial):
+    """Execute the ordered program: ``matrix`` (M, K), ``vectors`` (N, K),
+    ``initial`` (M, N); return the FP16 results (M, N) and the run record."""
+    import numpy as np
+
+    facts = program.facts
+    M, K = matrix.shape
+    N = int(vectors.shape[0])
+    tile_rows = geometry["channels"] * facts.pim_blocks * facts.lanes
+    padded_rows = math.ceil(M / tile_rows) * tile_rows
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        a_path, b_path, i_path = td / "A.npy", td / "B.npy", td / "init.npy"
+        out_path, crf_path = td / "out.bin", td / "crf.txt"
+        np.save(a_path, np.ascontiguousarray(matrix, dtype=np.float16))
+        np.save(b_path, np.ascontiguousarray(vectors.T, dtype=np.float16))
+        np.save(i_path, np.ascontiguousarray(initial, dtype=np.float16))
+        crf_text = _samsung_cmds_text(crf_words)
+        crf_path.write_text(crf_text)
+        argv = [
+            str(Path(root) / "pim_driver"),
+            "--op", "GENERIC",
+            "--op-kind", "TEMPORAL_REDUCE",
+            "--cmds", str(crf_path),
+            "--inputs", f"{a_path},{b_path},{i_path}",
+            "--out-rows", str(M),
+            "--reduce-k", str(K),
+            "--out-cols", str(N),
+            "--temporal-audit", str(td / "audit"),
+            "--out", str(out_path),
+        ]
+        cycles, phases, _conductor, log = _invoke_conductor(root, argv, "TEMPORAL_REDUCE")
+        bursts = _samsung_read_bursts(out_path, (M * N + 15) // 16, "TEMPORAL_REDUCE", log)
+    receipt = re.search(r"PIM_TEMPORAL_REDUCE (.*)", log)
+    if not receipt or "ordered_k=1" not in receipt.group(1):
+        raise RuntimeError(
+            "Samsung pim_driver TEMPORAL_REDUCE did not confirm ordered execution: "
+            + log[-600:]
+        )
+    conductor = {
+        k: (int(v) if v.isdigit() else v)
+        for k, v in re.findall(r"(\w+)=(\S+)", receipt.group(1))
+    }
+    return {
+        "rows": bursts.reshape(-1)[: M * N].reshape(M, N),
+        "cycles": cycles,
+        "phases": phases,
+        "crf": crf_text,
+        "conductor": conductor,
+        "log": log,
+        "logical_shape": {"rows": M, "reduction": K, "columns": N},
+        "padded_shape": {"rows": padded_rows, "reduction": K, "columns": N},
+        "padding_fraction": 1.0 - M / padded_rows,
+    }
+
+
 def _program_of(compiled) -> SamsungProgram:
     ctx = getattr(compiled, "layout_ctx", None)
     programs = list(getattr(ctx, "programs", ()) or ())
@@ -1390,7 +1594,7 @@ def _check_host_moves(compiled, program, inputs) -> None:
                 f"Samsung host move ({verb}) binds buffer {role!r}, but no input "
                 f"named {role!r} was supplied (supplied: {sorted(supplied)})"
             )
-        if program.kind != "REDUCE":
+        if program.kind not in ("REDUCE", "TEMPORAL_REDUCE"):
             continue
         value = inputs[role]
         is_matrix = value is inputs.get("A")
@@ -1436,6 +1640,9 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
     _check_host_moves(compiled, program, inputs)
     crf_words = list(compiled.cmds[program.start:program.end])
     supplied = sorted(k for k, v in inputs.items() if v is not None)
+
+    if program.kind == "TEMPORAL_REDUCE":
+        return _run_samsung_temporal(program, crf_words, root, geometry, inputs)
 
     if program.kind == "REDUCE":
         c = program.contraction
@@ -1550,6 +1757,83 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
         kind=RUN_KIND_SIMULATOR,
         cycles=cycles,
         stdout=log,
+        backend="samsung_hbm_pim",
+        extra=extra,
+    )
+
+
+def _contraction_operands(program, inputs):
+    """The (M, K) matrix and (N, K) vectors of a contraction from roles A, B."""
+    import numpy as np
+
+    c = program.contraction
+    A, B = inputs.get("A"), inputs.get("B")
+    if A is None or B is None:
+        supplied = sorted(k for k, v in inputs.items() if v is not None)
+        raise ValueError(
+            "Samsung contractions need the bank-resident matrix (role 'A') and the "
+            f"vector (role 'B'); got operands {supplied}"
+        )
+    A = np.asarray(A, dtype=np.float16)
+    B = np.asarray(B, dtype=np.float16)
+    if A.shape != c.matrix_shape or B.shape != c.vector_shape:
+        raise ValueError(
+            f"Samsung contraction operands have shapes A{A.shape}, B{B.shape}; the "
+            f"compiled program reads A{c.matrix_shape}, B{c.vector_shape}"
+        )
+    matrix = (A if c.matrix_k_axis == 1 else A.T)[: program.rows, : c.K]
+    if c.column_var is None:
+        vectors = B[: c.K].reshape(1, c.K)
+    elif c.vector_k_axis == 0:
+        vectors = B[: c.K, : c.N].T
+    else:
+        vectors = B[: c.N, : c.K]
+    return matrix, vectors
+
+
+def _run_samsung_temporal(program, crf_words, root, geometry, inputs) -> RunResult:
+    import numpy as np
+
+    c = program.contraction
+    matrix, vectors = _contraction_operands(program, inputs)
+    M, N = program.rows, int(vectors.shape[0])
+    if c.accumulator_init == "carried":
+        init = inputs.get("C")
+        if init is None:
+            raise ValueError(
+                "the ordered Samsung program carries the output's incoming value "
+                "as its initial accumulator; the runtime role 'C' (the output "
+                "array) was not supplied"
+            )
+        init = np.asarray(init, dtype=np.float16)
+        initial = (init.reshape(M, 1) if c.column_var is None else init.reshape(M, N))
+    else:
+        initial = np.zeros((M, N), dtype=np.float16)
+    res = _samsung_run_temporal(program, crf_words, root, geometry, matrix, vectors, initial)
+    rows = res["rows"]
+    outputs = {"y": rows[:, 0]} if c.column_var is None else {"out": rows}
+    extra = {
+        "kernel": "GENERIC_TEMPORAL_REDUCE",
+        "returncode": 0,
+        "outputs": outputs,
+        "logical_shape": res["logical_shape"],
+        "padded_shape": res["padded_shape"],
+        "padding_fraction": res["padding_fraction"],
+        "timing_scope": _TEMPORAL_TIMING_SCOPE,
+        "cycle_phases": res["phases"],
+        "crf": res["crf"],
+        "conductor": res["conductor"],
+        "simulator_geometry": geometry,
+        "levers": dict(program.lever_record),
+        "accumulation": "source-order FP16 (one GRF_B entry per output row, "
+        "K issued in ascending order, no host arithmetic)",
+        "cycles_source": "PIMSimulator, TEMPORAL_REDUCE conductor executing the uploaded CRF",
+        "correctness_source": "PIMSimulator, TEMPORAL_REDUCE conductor executing the uploaded CRF",
+    }
+    return RunResult(
+        kind=RUN_KIND_SIMULATOR,
+        cycles=res["cycles"],
+        stdout=res["log"],
         backend="samsung_hbm_pim",
         extra=extra,
     )

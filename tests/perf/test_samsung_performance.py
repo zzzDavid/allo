@@ -45,12 +45,16 @@ def _bound_mac(work_id=(0, 0)):
         "axis_roles": {"reduction": ("k",), "output": ("i",)},
         "output_sinks": [("y", "i")],
     }
+    # The REDUCE placements regroup the FP16 reduction: permit it explicitly.
+    from allo.spmw_reduction_policy import stamp_reduction_policy
+
+    stamp_reduction_policy([match], "reassociate")
     return match
 
 
 def test_virtual_graph_includes_shape_aware_host_transfers():
     target = build_samsung_target()
-    trace = MatchTrace(target.name, "host_boundary", [_mac((0, 0))])
+    trace = MatchTrace(target.name, "host_boundary", [_bound_mac((0, 0))])
     bound = samsung_cost.bind(target)
     scatter = SimpleNamespace(
         verb=SimpleNamespace(name="scatter"),
@@ -66,7 +70,8 @@ def test_virtual_graph_includes_shape_aware_host_transfers():
     graph = build_execution_graph(
         target,
         trace,
-        Placement(placements={}, extra={"n_fibers": 1}),
+        # The MAC accumulates in GRF_B; the plan reads its lane count there.
+        Placement(placements={"acc": target.grf_b}, extra={"n_fibers": 1}),
         bound,
         host_moves=[scatter, gather],
         buffer_metrics={
@@ -76,12 +81,26 @@ def test_virtual_graph_includes_shape_aware_host_transfers():
     )
     estimate = bound.evaluate(graph)
 
+    # The accumulator lives in GRF_B, so the plan materializes its load and
+    # drain around the MAC; the host moves bracket the device program.
     assert [activity.primitive for activity in graph.activities] == [
         "samsung_hbm_pim/host/SCATTER_BANKS",
+        "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/LD_B",
         "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/MAC",
+        "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/ST_B",
         "samsung_hbm_pim/host/GATHER_BANKS",
     ]
-    assert estimate.cycles == 4 + 65 + 3
+    # Host moves are priced from their buffer bytes (64 B scatter -> 4 cycles,
+    # 32 B gather -> 3 cycles) and serialize with the device program.
+    device_only = bound.evaluate(
+        build_execution_graph(
+            target,
+            trace,
+            Placement(placements={"acc": target.grf_b}, extra={"n_fibers": 1}),
+            bound,
+        )
+    )
+    assert estimate.cycles == 4 + device_only.cycles + 3
 
 
 def test_autoscheduler_and_virtual_backend_share_cost_program(monkeypatch):

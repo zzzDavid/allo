@@ -100,7 +100,11 @@ def colliding_gemv(B: fp16[M, K], x: fp16[K], y: fp16[M]):
 
 def _match(region, target):
     schedule = customize(region, enable_tensor=False)
-    trace = spmw_match_engine.match_workload(target, schedule.module)
+    # These tests exercise ranking over the REDUCE placements, which regroup
+    # the FP16 reduction and need explicit permission.
+    trace = spmw_match_engine.match_workload(
+        target, schedule.module, reduction_order="reassociate"
+    )
     _stamp_matcher_work_scopes(target, schedule.module, trace)
     return schedule, trace
 
@@ -145,7 +149,9 @@ def test_asmstate_names_equal_plain_get_name(monkeypatch):
     # `get_name(False)` resolves to the no-AsmState overload, i.e. the plain
     # `get_name()` the matcher used before the per-function AsmState.
     monkeypatch.setattr(spmw_match_engine, "AsmState", lambda _func: False)
-    reference = spmw_match_engine.match_workload(target, schedule.module)
+    reference = spmw_match_engine.match_workload(
+        target, schedule.module, reduction_order="reassociate"
+    )
     _stamp_matcher_work_scopes(target, schedule.module, reference)
 
     assert len(trace.matches) == len(reference.matches) == 4
@@ -254,10 +260,16 @@ def test_ranked_falls_through_infeasible_codegen(gemv_case, monkeypatch):
     )
     kernel = autoschedule(target, trace, samsung_cost).placement_ranking.kernels[0]
 
+    # The top-ranked candidate is rejected by the forced probe; other
+    # candidates may be rejected for their own (real) reasons, e.g. a
+    # per-work-item CRF on a multi-item kernel. The winner is the first
+    # candidate in cost order that materialized.
     first_position = kernel.scores[0][0]
-    second_position = kernel.scores[1][0]
-    assert kernel.rejections == ((first_position, "forced top-rank rejection"),)
-    assert kernel.chosen_position == second_position
+    assert (first_position, "forced top-rank rejection") in kernel.rejections
+    rejected = {entry[0] for entry in kernel.rejections}
+    assert kernel.chosen_position == next(
+        entry[0] for entry in kernel.scores if entry[0] not in rejected
+    )
 
 
 def test_grid_search_coverage_is_closed_form_without_constraints():

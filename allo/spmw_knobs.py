@@ -157,7 +157,15 @@ def _grf_residency_candidates(ctx: KnobCtx) -> list:
     host = _samsung_host_eligible_memrefs(
         ctx.target, ctx.base, ctx.role_to_memref, ctx.matches
     )
+    if _samsung_temporal(ctx.base):
+        # The ordered program broadcasts each reduction element from the host
+        # (TemporalReduce.inc); it has no CRF-filled GRF_A variant.
+        return ["host"] if host else []
     return ["crf", "host"] if host else ["crf"]
+
+
+def _samsung_temporal(base) -> bool:
+    return (getattr(base, "extra", None) or {}).get("reduction_program") == "temporal"
 
 
 def _grf_residency_emit(value, base, ctx: KnobCtx):
@@ -192,6 +200,9 @@ def _stage_resident_candidates(ctx: KnobCtx) -> list:
     # columns or re-staged per column; an elementwise kernel has no resident
     # operand, so the lever does not apply.
     if not any(m.target_op_name == "MAC" for m in ctx.matches):
+        return [False]
+    if _samsung_temporal(ctx.base):
+        # The ordered program stages the matrix again for every column.
         return [False]
     return [False, True]
 
@@ -395,7 +406,8 @@ def _aim_replica_partitions_candidates(ctx: KnobCtx) -> list:
         return [1]
     from .pim.aim_lowering import _target_geometry
 
-    channels = _target_geometry(ctx.target).channels
+    geometry = _target_geometry(ctx.target)
+    channels = geometry.channels
     shape = _aim_shape(ctx)
     if shape is not None:
         replicas = int(shape["replicas"])
@@ -405,7 +417,76 @@ def _aim_replica_partitions_candidates(ctx: KnobCtx) -> list:
         )
         group_shape = tuple(getattr(scope, "group_shape", ()) or ())
         replicas = math.prod(group_shape) if group_shape else 1
-    return replica_partition_domain(replicas, channels)
+    domain = replica_partition_domain(replicas, channels)
+    if shape is None or shape["input_source"] != "gb":
+        return domain
+    # Channels a replica can occupy with work.  A wider group either repeats
+    # the same command stream with an identical mask (row_packed, channels)
+    # or only adds zero-padded channels (flattened); both tie with the
+    # narrowest covering group at every cost, so only that one is kept.
+    # Each of the P reduction partitions of a batch needs its own channel.
+    extra = getattr(ctx.base, "extra", {}) or {}
+    reduction_parts = int(extra.get("reduction_partitions", 1))
+    mapping = extra.get("batch_mapping")
+    if mapping == "flattened":
+        needed = math.ceil(shape["outputs"] * shape["batches"] / geometry.banks)
+    elif mapping == "row_packed":
+        needed = math.ceil(shape["outputs"] / geometry.banks)
+    elif mapping == "channels":
+        needed = shape["batches"] * reduction_parts
+    else:
+        return domain
+    widest = 1 << (max(1, needed) - 1).bit_length()
+    return [p for p in domain if reduction_parts <= p <= widest]
+
+
+def _aim_reduction_partitions_candidates(ctx: KnobCtx) -> list:
+    """Token (reduction-axis) partition counts P of a contraction.
+
+    P > 1 splits the reduction over P channel groups, each accumulating a
+    partial output that a host ADD merges (PIMphony token partitioning when
+    the reduction is the attention token axis).  Domain: powers of two
+    P <= channels / replicas that divide the reduction, on the ``channels``
+    batch mapping with a GB-fed vector.  Splitting reassociates the reduction:
+    when any accumulating match's reduction-order policy forbids regrouping
+    (``spmw_reduction_policy.reduction_policy``; an unstamped floating-point
+    match reads as the strict default) only P = 1 remains.
+    """
+    from .pim.aim_lowering import _target_geometry
+    from .spmw_reduction_policy import reduction_policy
+
+    shape = _aim_shape(ctx)
+    extra = getattr(ctx.base, "extra", {}) or {}
+    if (
+        shape is None
+        or shape["input_source"] != "gb"
+        or extra.get("batch_mapping") != "channels"
+    ):
+        return [1]
+    for match in ctx.matches:
+        policy = reduction_policy(match)
+        if policy is not None and not policy.may_regroup:
+            return [1]
+    limit = _target_geometry(ctx.target).channels // max(1, int(shape["replicas"]))
+    values = [1]
+    parts = 2
+    while parts <= limit and shape["reduction"] % parts == 0:
+        values.append(parts)
+        parts *= 2
+    return values
+
+
+def _aim_reduction_partitions_emit(value, base, ctx: KnobCtx):
+    del ctx
+    if int(value) == 1:
+        # The unsplit reduction is the base candidate itself (no extra key,
+        # no layout change), so existing decisions stay byte-identical.
+        return base
+    from .pim.aim_lowering import reduction_partitioned_layout
+
+    candidate = _with_knob(base, "reduction_partitions", int(value))
+    candidate.layout = reduction_partitioned_layout(base.layout, int(value))
+    return candidate
 
 
 def _aim_knob_emit(name):
@@ -421,6 +502,7 @@ _AIM_KNOB_EMITS = {
     name: _aim_knob_emit(name)
     for name in ("bank_scope", "batch_mapping", "reuse_group", "replica_partitions")
 }
+_AIM_KNOB_EMITS["reduction_partitions"] = _aim_reduction_partitions_emit
 
 
 def _upmem_knob(name):
@@ -510,10 +592,13 @@ def register_default_knobs():
 
     # AiM placement-realization levers (spec 002 A7, spec 001 D5 order). Not
     # schedule-search knobs: SPMW_DISABLE_SCHEDULE_SEARCH leaves them on.
+    # reduction_partitions precedes replica_partitions: the channel group
+    # width must hold every partition of a batch.
     for name, candidates in (
         ("bank_scope", _aim_bank_scope_candidates),
         ("batch_mapping", _aim_batch_mapping_candidates),
         ("reuse_group", _aim_reuse_group_candidates),
+        ("reduction_partitions", _aim_reduction_partitions_candidates),
         ("replica_partitions", _aim_replica_partitions_candidates),
     ):
         register_knob("aim", Knob(name, candidates, _AIM_KNOB_EMITS[name]))

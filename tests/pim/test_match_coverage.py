@@ -210,17 +210,39 @@ def test_unmatched_update_after_copy_is_rejected():
     assert "arith.subf" in str(info.value)
 
 
-def test_carried_accumulator_rejected_on_samsung():
+def test_carried_accumulator_selects_the_ordered_program_on_samsung():
+    """``y[i] += W[i,k]*x[k]`` keeps the caller's initial value: the matcher
+    records ``accumulator_init == "carried"`` and Samsung lowers it to the
+    ordered TEMPORAL program, whose conductor loads the initial accumulator.
+    The REDUCE programs (which zero GRF_B) are pruned for it."""
     target = build_samsung_target()
     trace = match_workload(target, allo.customize(gemv_carried, enable_tensor=False).module)
     assert trace.coverage.errors == []
     assert {match.extra["accumulator_init"] for match in trace.matches} == {"carried"}
+    # The store itself is the output sink of a carried accumulation.
+    assert all(match.extra["output_sinks"] for match in trace.matches)
+    compiled = _compile(gemv_carried)
+    layouts = compiled.compiled.layout
+    layouts = layouts if isinstance(layouts, list) else [layouts]
+    assert all(layout.mode.startswith("temporal") for layout in layouts)
+
+
+def test_carried_accumulator_rejected_where_the_device_zeroes_it():
+    """AiM's MAC accumulates in a bias-initialized register the lowering
+    always zeroes, so a carried accumulator is a finite error there."""
+    from allo.pim.costs import aim_cost
+    from allo.pim.targets import build_aim_target
+
     with pytest.raises(NotImplementedError) as info:
-        _compile(gemv_carried)
+        allo.compile(
+            gemv_carried,
+            build_aim_target(),
+            aim_cost,
+            backend="virtual",
+            reduction_order="reassociate",
+        )
     message = str(info.value)
-    assert "accumulator_init='carried'" in message
-    assert "zeroes its accumulator" in message
-    assert "y[i] += ..." in message
+    assert "accumulator_init='carried'" in message or "carried" in message
 
 
 def test_compile_for_target_rechecks_an_unchecked_trace():

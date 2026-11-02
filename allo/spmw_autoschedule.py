@@ -552,13 +552,20 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     matrix lives: ``bank_row`` (all reduction tiles in the even bank fiber),
     ``dual_fiber`` (tiles alternate between the even and odd fiber of each
     PIM unit) and ``grf_staged`` (matrix staged into GRF_A; enumerated so the
-    ranking records why it is rejected at materialization).  The vector is
-    in GRF_A and the accumulator in GRF_B in every candidate.  Elementwise
+    ranking records why it is rejected at materialization) and ``temporal``
+    (the ordered TEMPORAL_REDUCE program: one output row per FP16 lane, the
+    reduction issued in source order).  The vector is in GRF_A and the
+    accumulator in GRF_B in every candidate.  The first three regroup the
+    reduction; they are pruned before ranking when a strict reduction-order
+    policy covers a floating-point accumulator (``spmw_reduction_policy``) or
+    when the accumulator carries an initial value, with ``(mode, reason)``
+    recorded in each survivor's ``extra["reduction_policy_pruned"]``.  Elementwise
     ops (ADD/MUL/MAD/RELU, ``spmw_samsung.samsung_elementwise``) have one
     base placement streaming both fibers.  The levers in ``spmw_knobs`` are
     crossed on top; execution semantics of every lever are documented in
     ``docs/release/design/samsung-execution.md``.
     """
+    from .spmw_reduction_policy import may_regroup, strict_policies
     from .spmw_samsung import (
         SAMSUNG_ELEMENTWISE_OPS,
         SamsungUnsupported,
@@ -578,6 +585,7 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     base = LinearLayout.identity(
         {"grf": facts.grf_a_entries, "bank": facts.banks, "tile": banks_per_pim},
         out_dims=("grf", "bank"),
+        allow_zero=True,
     )
     swizzled = LinearLayout.optimal_swizzle(
         base,
@@ -620,7 +628,55 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             extra={"fibers": list(fibers), "fiber_axis": "tile", "n_fibers": n_fibers},
             layout=swizzled,
         )
-        base_candidates = [bank_row, grf_staged, dual_fiber]
+        # Ordered program (TEMPORAL_REDUCE): FP16 lane l of a PIM unit owns
+        # output row l of the unit's row block, the reduction walks time in
+        # source order in one GRF_B entry, no partial sums exist.  Its layout
+        # maps lanes to rows (not to reduction elements), which is also what
+        # distinguishes it from bank_row in the decision key.
+        temporal = Placement(
+            placements={vector: target.grf_a, matrix: y_even, acc: target.grf_b},
+            mode="temporal",
+            extra={"reduction_program": "temporal"},
+            layout=LinearLayout.identity(
+                {"lane": facts.lanes, "bank": facts.banks}, out_dims=("lane", "bank")
+            ),
+        )
+        # The REDUCE program accumulates reduction element k in lane k mod
+        # `lanes` and the runtime sums the lane partials in FP32 (plus the
+        # fiber split for dual_fiber): it regroups the reduction.
+        lane_split = (
+            f"accumulates reduction element k in FP16 lane k mod {facts.lanes} "
+            f"of GRF_B and sums the {facts.lanes} lane partial sums in FP32 on "
+            "the host"
+        )
+        regrouping = {
+            "bank_row": lane_split,
+            "grf_staged": lane_split,
+            "dual_fiber": lane_split
+            + f" after splitting the reduction tiles over {n_fibers} bank fibers",
+        }
+        base_candidates = [bank_row, grf_staged, dual_fiber, temporal]
+        pruned = []
+        if roles.accumulator_init == "carried":
+            # Only the ordered program loads an initial accumulator (its first
+            # CRF word moves it from the bank into GRF_B).
+            pruned += [
+                (c.mode, "the REDUCE program zeroes GRF_B and cannot carry the "
+                 "accumulator's initial value")
+                for c in base_candidates
+                if c.mode in regrouping
+            ]
+        elif not may_regroup(matches):
+            policy = strict_policies(matches)[0]
+            pruned += [
+                (c.mode, f"{policy.describe()}; the REDUCE program {regrouping[c.mode]}")
+                for c in base_candidates
+                if c.mode in regrouping
+            ]
+        dropped = {mode for mode, _reason in pruned}
+        base_candidates = [c for c in base_candidates if c.mode not in dropped]
+        for candidate in base_candidates:
+            candidate.extra["reduction_policy_pruned"] = tuple(pruned)
     elif len(ops) == 1 and ops <= SAMSUNG_ELEMENTWISE_OPS:
         el = samsung_elementwise(matches)
         placements = {el.input_memrefs[0]: target.grf_a}
@@ -750,6 +806,20 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
             return {x_mref: matrix_handle, acc_mref: mac_reg}
         return {x_mref: matrix_handle, y_mref: gb, acc_mref: mac_reg}
 
+    # The contraction shape rides on every base layout, so a placement passed
+    # as ``layout=`` is priced by the same lowered-record cost program as an
+    # enumerated (knob-crossed) one.
+    shape = _aim_contraction_shape(target, matches)
+    # Banks one SBK launch visits (AimCtx._sbk_banks order), for the cost.
+    sbk_banks = []
+    for work_bank in range(single_bank_layout.size_of("work_bank")):
+        for lane_bank in range(single_bank_layout.size_of("lane_bank")):
+            bank = single_bank_layout.apply(
+                k=0, work_bank=work_bank, lane_bank=lane_bank
+            )[0]
+            if bank not in sbk_banks:
+                sbk_banks.append(bank)
+
     layouts: list[Placement] = []
     # Candidate 1: per-bank MAC (no_bank_layout -- y stays in its bank).
     layouts.append(
@@ -761,6 +831,8 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
                 "bank_fanout": single_fanout,
                 "bank_conflicts": single_conflicts,
                 "input_source": input_source,
+                "aim_shape": dict(shape),
+                "sbk_banks": tuple(sbk_banks),
             },
             layout=single_bank_layout,
         )
@@ -775,6 +847,7 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
                 "bank_fanout": all_fanout,
                 "bank_conflicts": all_conflicts,
                 "input_source": input_source,
+                "aim_shape": dict(shape),
             },
             layout=all_bank_layout,
         )
@@ -783,11 +856,31 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
 
 
 def _aim_contraction_shape(target, matches: list[MatchedOp]) -> dict:
-    """Shape of the bucket's first MAC match, as the knobs and cost see it."""
-    from .pim.aim_lowering import contraction_shape, group_replication
+    """Shape of the bucket's first MAC match, as the knobs and cost see it.
+
+    Replication comes from the group stamp of ``rank_matcher_placements``;
+    without it, ``matches`` must hold every bucket of the group, whose body
+    fingerprints decide it (as codegen does).
+    """
+    import math
+
+    from .pim.aim_lowering import (
+        contraction_shape,
+        group_replicated,
+        group_replication,
+    )
 
     mac = next(match for match in matches if match.target_op_name == "MAC")
-    replicated, buckets = group_replication(mac)
+    try:
+        replicated, buckets = group_replication(mac)
+    except ValueError:
+        group_id = _matcher_work_scope(mac).group_id
+        group = [m for m in matches if _matcher_work_scope(m).group_id == group_id]
+        shape_of = tuple(getattr(mac.extra.get("spmw_work_scope"), "group_shape", ()))
+        buckets = math.prod(shape_of) if shape_of else 1
+        if len({m.func_name for m in group}) != buckets:
+            raise
+        replicated = group_replicated(group)
     shape = contraction_shape(
         mac,
         replicated=replicated,
@@ -944,20 +1037,35 @@ def _bank_stride_per_pim(target, layout: LinearLayout) -> int:
 
 @register_enumerator("upmem")
 def _upmem_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
-    """UPMEM physical decisions as base layouts crossed with the six knobs.
+    """UPMEM physical decisions as base layouts crossed with the seven knobs.
 
     Each base placement is one data layout of the matched kernel family; the
-    knobs fan out only legal decisions of the family domain, and the last one
-    attaches the plan's masked 12-of-16 tasklet layout (spec 003 U5).
+    knobs fan out only the catalog decisions the family template realizes,
+    and the last one attaches the masked 12-of-16 tasklet carrier (spec 003
+    U5).  A kernel no catalog decision realizes raises with every decision's
+    reason (``spmw_upmem.upmem_base_placements``) instead of yielding no
+    candidates.
     """
     from .spmw_knobs import cross_with_knobs
+    from .spmw_reduction_policy import may_regroup, no_strict_program_error
     from .spmw_upmem import upmem_base_placements
 
+    bases = upmem_base_placements(target, matches)
+    # Every family splits its reduction into tasklet partials (and nc/kc
+    # tiles); its accumulators are int32/int64 (UPMEM_ROLE_ELEMENT_TYPES),
+    # which a strict policy lets regroup. Classification rejects other types,
+    # so this guards the policy should a non-integer family appear.
+    if not may_regroup(matches):
+        raise no_strict_program_error(
+            "upmem",
+            matches,
+            "UPMEM programs combine tasklet and nc/kc partial sums",
+        )
     # UPMEM knobs never read roles; a scaled GEMV binds role "x" to both the
     # matrix (MAC) and the accumulator (SCALE), which the role map rejects.
     return cross_with_knobs(
         target,
-        upmem_base_placements(target, matches),
+        bases,
         matches,
         {},
     )
@@ -1053,6 +1161,7 @@ def autoschedule(
     *,
     host_moves=(),
     buffer_metrics=None,
+    movement_policy=None,
 ) -> list[Placement]:
     """Pick one `Placement` per `@allo.work` kernel in `trace`.
 
@@ -1063,6 +1172,9 @@ def autoschedule(
     Every candidate is lowered through the same executable cost program used
     by the virtual backend. Target declarations never supply timing data.
     Selection ranks one decision per kernel (`rank_matcher_placements`).
+    ``movement_policy`` (a ``spmw_layout_problem.MovementSelectionPolicy``)
+    configures the layout-construction stage; ``None`` uses the policy of
+    ``spmw_layout_problem.movement_selection_policy`` or the default.
     """
     target_name = getattr(target, "name", None)
     enumerator = _ENUMERATORS.get(target_name)
@@ -1091,25 +1203,99 @@ def autoschedule(
     from .spmw_liveness import trace_liveness
     from .spmw_knobs import set_active_liveness, reset_active_liveness
 
+    # Placement legality (release audit C-01, `spmw_legality`): candidates the
+    # target description does not permit never reach ranking. Each is
+    # recorded as a rejection of its kernel with position None (it never
+    # entered the choice set).
+    from .spmw_legality import IllegalPlacement, check_placement
+
+    from dataclasses import replace
+
+    from .spmw_legality import LegalityVerdict
+
+    # group id -> reason (without work-item names) -> rejected bucket count
+    illegal: dict[int, dict[str, int]] = {}
+
+    def legal_enumerator(target_, matches):
+        candidates = enumerator(target_, matches)
+        kept, verdicts = [], []
+        for candidate in candidates:
+            verdict = check_placement(target_, matches, candidate)
+            if verdict.legal:
+                kept.append(candidate)
+                continue
+            verdicts.append(verdict)
+            anonymous = LegalityVerdict(
+                tuple(replace(v, func_name=None) for v in verdict.violations)
+            )
+            reasons = illegal.setdefault(_matcher_work_scope(matches[0]).group_id, {})
+            reason = f"illegal placement {candidate.mode!r}: {anonymous.describe()}"
+            reasons[reason] = reasons.get(reason, 0) + 1
+        if candidates and not kept:
+            raise IllegalPlacement(
+                LegalityVerdict(tuple(v for vd in verdicts for v in vd.violations)),
+                f"placement: every enumerated candidate for {matches[0].func_name!r}",
+            )
+        return kept
+
     liveness = trace_liveness(trace)
     _liveness_token = set_active_liveness(liveness)
     try:
-        return rank_matcher_placements(
+        result = rank_matcher_placements(
             target,
             trace,
-            enumerator,
+            legal_enumerator,
             bound_cost,
             host_moves=host_moves,
             buffer_metrics=buffer_metrics,
             liveness=liveness,
+            movement_policy=movement_policy,
         )
     finally:
         reset_active_liveness(_liveness_token)
+    ranking = getattr(result, "placement_ranking", None)
+    if illegal and ranking is not None:
+        result.placement_ranking = replace(
+            ranking,
+            kernels=tuple(
+                replace(
+                    kernel,
+                    rejections=tuple(kernel.rejections)
+                    + tuple(
+                        (None, f"{reason} ({count} work item(s))")
+                        for reason, count in illegal.get(kernel.group_id, {}).items()
+                    ),
+                )
+                for kernel in ranking.kernels
+            ),
+        )
+    return result
+
+
+#: Deterministic tie-break among equal-cycle candidates (release audit C-06).
+TIE_BREAK_RULE = (
+    "cycles, then the structural decision key: the carried layout's exact F2 "
+    "map (backend layout x movement layout), then the allowlisted knob and "
+    "physical feature values, then the operand handle paths (all rendered as "
+    "text, names replaced by operand roles); the candidate position only "
+    "separates candidates whose keys are identical"
+)
 
 
 @dataclass(frozen=True)
 class KernelRanking:
-    """Per-kernel record of the ranked placement selection."""
+    """Per-kernel record of the ranked placement selection.
+
+    ``movement`` is the layout-construction record
+    (``spmw_layout_problem.KernelMovement``): derived problem, search
+    termination, tie classes, the movement of the chosen layout and its label.
+    ``cost_ties`` lists every scored candidate at the winner's cycles, in
+    tie-break order (``TIE_BREAK_RULE``); its first entry is the winner unless
+    the winner's codegen probe rejected the earlier ones.
+    ``movement_rejections`` holds ``(position, reason)`` for every movement
+    tie crossed with a key that the backend cannot realize; ``rejections``
+    keeps the cost-rule and codegen-probe rejections.
+    """
 
     group_id: int
     bucket_count: int
@@ -1119,11 +1305,29 @@ class KernelRanking:
     scores: tuple[tuple[int, int, str], ...]
     chosen_position: int | None
     rejections: tuple[tuple[int, str], ...]
+    movement: Any = None
+    cost_ties: tuple[tuple[int, int, str], ...] = ()
+    tie_break: str = TIE_BREAK_RULE
+    movement_rejections: tuple[tuple[int, str], ...] = ()
+    # ``(mode, reason)`` of base placements an enumerator pruned before
+    # ranking (``extra["reduction_policy_pruned"]`` of the first bucket).
+    policy_pruned: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
 class PlacementRanking:
+    """Ranking record of a whole trace.
+
+    ``incomplete`` is True when some kernel's movement search ended at its
+    node budget: its ties are the best layouts found, not proven minima.
+    """
+
     kernels: tuple[KernelRanking, ...]
+    incomplete: bool = False
+
+    @property
+    def movement(self) -> tuple:
+        return tuple(kernel.movement for kernel in self.kernels)
 
 
 def _bucket_decision_map(target, trace, enumerator, matches):
@@ -1165,6 +1369,76 @@ def _stamp_group_replication(matches: list[MatchedOp]) -> None:
         match.extra["spmw_group_replicated"] = replicated
 
 
+def _movement_entries(movement, policy):
+    """Layout-construction candidates of one kernel from its movement record.
+
+    Each entry is ``(movement layout or None, label, cost, realizable,
+    reason, tie index)``.  Analyzed kernels contribute every tie class (up to
+    ``policy.max_tie_candidates``) and, when no tie class contains it, the
+    program's own layout marked ``not-minimal``.  Unanalyzed kernels keep
+    the backend's hand-built layouts with the ``not-analyzed`` reason.
+    """
+    from .spmw_layout_problem import label_for_cost
+
+    if movement.status == "disabled":
+        return [(None, None, None, True, None, None)], 0
+    if movement.status != "analyzed":
+        return [(None, movement.label, None, True, None, None)], 0
+    crossed = movement.ties[: policy.max_tie_candidates]
+    entries = [
+        (
+            tie.layout,
+            label_for_cost(movement, tie.cost),
+            tie.cost,
+            tie.realizable,
+            tie.reason,
+            tie.index,
+        )
+        for tie in crossed
+    ]
+    if not any(tie.realizable for tie in movement.ties):
+        entries.append(
+            (
+                movement.program_layout,
+                movement.program_label,
+                movement.program_cost,
+                True,
+                None,
+                None,
+            )
+        )
+    # Realizable entries first: they keep the positions of the backend keys.
+    entries.sort(key=lambda entry: not entry[3])
+    return entries, len(crossed)
+
+
+def _with_movement(template, layout, label, cost):
+    """Copy ``template`` carrying a movement layout and its label.
+
+    The movement layout joins the backend's own ``LinearLayout`` as a
+    block-diagonal ``product`` (disjoint ``mm.`` dims), so backend readers of
+    their dims see the same map and the decision key includes the movement
+    layout.  A template without a ``LinearLayout`` keeps ``layout`` as is.
+    """
+    placement = _clone_placement(template)
+    if label is None:
+        return placement
+    extra = dict(placement.extra)
+    extra["movement"] = label
+    if cost is not None:
+        extra["movement_cost"] = str(cost)
+    if layout is not None and isinstance(placement.layout, LinearLayout):
+        placement.layout = placement.layout.product(layout)
+    placement.extra = extra
+    return placement
+
+
+def _structural_decision_key(bucket_trace, placement) -> tuple[str, str, str]:
+    """Tie-break key of one realized candidate (``TIE_BREAK_RULE``)."""
+    decision = _matcher_placement_decision(bucket_trace, placement)
+    return (repr(decision.layout), repr(decision.features), repr(decision.handle_paths))
+
+
 def rank_matcher_placements(
     target,
     trace,
@@ -1174,20 +1448,36 @@ def rank_matcher_placements(
     host_moves=(),
     buffer_metrics=None,
     liveness=None,
+    movement_policy=None,
 ) -> MatcherScheduledPlacements:
     """Choose one placement decision per `@allo.work` kernel by cost rank.
 
     The kernel choice set is the decision keys every bucket of the kernel
-    enumerates. Keys are scored over the kernel's stamped placements and
-    ranked by ``(cycles, position)``; the first key whose codegen is feasible
-    wins. Kernels with an empty choice set fall back to each bucket's own
-    stable argmin. Cross-kernel residency is reconciled once afterwards.
+    enumerates.  Layout construction (``spmw_layout_problem``) then derives
+    the kernel's minimum-movement problem, runs the search once and crosses
+    every tie class with every key, so movement ties reach the cost ranking;
+    the program's own layout is kept, marked ``not-minimal``, when no tie
+    class contains it.  A tie the backend cannot realize is rejected before
+    emission with the reason.  When the problem cannot be derived the keys
+    keep their hand-built layouts, labelled ``not-analyzed: <reason>``.
+
+    Candidates are scored over the kernel's stamped placements and ranked by
+    cycles, then by the structural key of ``TIE_BREAK_RULE``; the first
+    whose codegen is feasible wins.  Kernels with an empty choice set fall
+    back to each bucket's own stable argmin.  Cross-kernel residency is
+    reconciled once afterwards.
     """
 
     from . import spmw_plan
     from .pim.schedule_search import InfeasibleSchedule
     from .spmw_codegen import _materialize_matcher_codegen, _stamp_host_moves
+    from .spmw_layout_problem import (
+        active_movement_policy,
+        analyze_kernel_movement,
+        with_chosen,
+    )
 
+    policy = active_movement_policy(movement_policy)
     buckets = _bucket_for_autoschedule(trace)
     kernels: dict[int, list[int]] = {}
     for index, (_scope, matches) in enumerate(buckets):
@@ -1224,6 +1514,9 @@ def rank_matcher_placements(
             for key in infos[0][2]
             if all(key in key_map for _t, _c, key_map in infos[1:])
         ]
+        movement = analyze_kernel_movement(
+            target, kernel_trace.matches, bound_cost, policy
+        )
 
         if not choice_set:
             templates = []
@@ -1237,7 +1530,16 @@ def rank_matcher_placements(
                     buffer_metrics=buffer_metrics,
                 )
                 templates.append(candidates[best])
-            placements = realize(kernel_trace, templates)
+            if movement.status == "analyzed":
+                label = movement.program_label
+                cost = movement.program_cost
+            else:
+                label = None if movement.status == "disabled" else movement.label
+                cost = None
+            placements = realize(
+                kernel_trace,
+                [_with_movement(t, None, label, cost) for t in templates],
+            )
             for index, placement in zip(bucket_indices, placements):
                 chosen[index] = placement
             records.append(
@@ -1248,38 +1550,96 @@ def rank_matcher_placements(
                     scores=(),
                     chosen_position=None,
                     rejections=(),
+                    policy_pruned=tuple(
+                        infos[0][1][0].extra.get("reduction_policy_pruned", ())
+                    ),
+                    movement=with_chosen(
+                        movement,
+                        cost,
+                        label,
+                        notes=movement.notes
+                        + (
+                            "per-bucket fallback: the buckets share no decision "
+                            "key, so movement layouts were not crossed",
+                        ),
+                    ),
                 )
             )
             continue
 
+        entries, ties_crossed = _movement_entries(movement, policy)
+        notes = list(movement.notes)
+        if movement.tie_count > ties_crossed and movement.status == "analyzed":
+            notes.append(
+                f"{movement.tie_count - ties_crossed} of {movement.tie_count} tie "
+                f"classes exceed max_tie_candidates={policy.max_tie_candidates} "
+                "and were not crossed"
+            )
+        if movement.status == "analyzed" and not any(
+            isinstance(infos[0][2][key].layout, LinearLayout) for key in choice_set
+        ):
+            notes.append(
+                "the backend's placements carry no LinearLayout; the movement "
+                "layout is recorded on the ranking only"
+            )
+
         scored = []
         realized = {}
         rejections = []
-        for position, key in enumerate(choice_set):
-            placements = realize(
-                kernel_trace, [key_map[key] for _t, _c, key_map in infos]
-            )
-            # A cost rule may find a knob combination unrealizable; it is
-            # dropped like a codegen-probe rejection (spec 001 D1 rule 2).
-            try:
-                graph = spmw_plan.build_execution_graph(
-                    target,
+        movement_rejections = []
+        candidate_entry = {}
+        candidate_mode = {}
+        position = -1
+        for entry in entries:
+            layout, label, cost, realizable, reason, tie_index = entry
+            for key in choice_set:
+                position += 1
+                candidate_mode[position] = infos[0][2][key].mode
+                candidate_entry[position] = entry
+                if not realizable:
+                    movement_rejections.append(
+                        (
+                            position,
+                            f"movement tie {tie_index} rejected before emission: "
+                            f"{reason}",
+                        )
+                    )
+                    continue
+                placements = realize(
                     kernel_trace,
-                    placements[0] if len(placements) == 1 else placements,
-                    bound_cost,
-                    host_moves=host_moves,
-                    buffer_metrics=buffer_metrics,
+                    [
+                        _with_movement(key_map[key], layout, label, cost)
+                        for _t, _c, key_map in infos
+                    ],
                 )
-                cycles = int(bound_cost.evaluate(graph).cycles)
-            except InfeasibleSchedule as error:
-                rejections.append((position, str(error)))
-                continue
-            scored.append((cycles, position))
-            realized[position] = placements
+                # A cost rule may find a knob combination unrealizable; it is
+                # dropped like a codegen-probe rejection (spec 001 D1 rule 2).
+                try:
+                    graph = spmw_plan.build_execution_graph(
+                        target,
+                        kernel_trace,
+                        placements[0] if len(placements) == 1 else placements,
+                        bound_cost,
+                        host_moves=host_moves,
+                        buffer_metrics=buffer_metrics,
+                    )
+                    cycles = int(bound_cost.evaluate(graph).cycles)
+                except InfeasibleSchedule as error:
+                    rejections.append((position, str(error)))
+                    continue
+                scored.append(
+                    (
+                        cycles,
+                        _structural_decision_key(infos[0][0], placements[0]),
+                        position,
+                    )
+                )
+                realized[position] = placements
         scored.sort()
 
         winner = None
-        for cycles, position in scored:
+        winner_cycles = None
+        for cycles, _key, position in scored:
             try:
                 _materialize_matcher_codegen(
                     target,
@@ -1291,6 +1651,7 @@ def rank_matcher_placements(
                 rejections.append((position, str(error)))
                 continue
             winner = position
+            winner_cycles = cycles
             break
         if winner is None:
             raise RuntimeError(
@@ -1299,17 +1660,34 @@ def rank_matcher_placements(
             )
         for index, placement in zip(bucket_indices, realized[winner]):
             chosen[index] = placement
+        _layout, label, cost, _r, _reason, _tie = candidate_entry[winner]
         records.append(
             KernelRanking(
                 group_id=group_id,
                 bucket_count=len(bucket_indices),
                 fallback=None,
                 scores=tuple(
-                    (position, cycles, infos[0][2][choice_set[position]].mode)
-                    for cycles, position in scored
+                    (position, cycles, candidate_mode[position])
+                    for cycles, _key, position in scored
                 ),
                 chosen_position=winner,
                 rejections=tuple(rejections),
+                movement=with_chosen(
+                    movement,
+                    cost,
+                    label,
+                    ties_crossed=ties_crossed,
+                    notes=tuple(notes),
+                ),
+                cost_ties=tuple(
+                    (position, cycles, candidate_mode[position])
+                    for cycles, _key, position in scored
+                    if cycles == winner_cycles
+                ),
+                movement_rejections=tuple(movement_rejections),
+                policy_pruned=tuple(
+                    infos[0][1][0].extra.get("reduction_policy_pruned", ())
+                ),
             )
         )
 
@@ -1317,7 +1695,13 @@ def rank_matcher_placements(
     _reconcile_resident_pairs(trace, placements, liveness)
     return MatcherScheduledPlacements(
         placements,
-        placement_ranking=PlacementRanking(tuple(records)),
+        placement_ranking=PlacementRanking(
+            tuple(records),
+            incomplete=any(
+                record.movement is not None and record.movement.incomplete
+                for record in records
+            ),
+        ),
     )
 
 

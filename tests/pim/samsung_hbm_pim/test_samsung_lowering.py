@@ -126,7 +126,11 @@ VENDOR_K256 = [
 @pytest.fixture(scope="module")
 def paper():
     workload, _M, _K = _workloads()["gemv_m4096_k256"]
-    return workload, allo.compile(workload, build_samsung_target(), samsung_cost)
+    # The REDUCE placements regroup the FP16 reduction (lane partial sums):
+    # their lowering is exercised under explicit permission.
+    return workload, allo.compile(
+        workload, build_samsung_target(), samsung_cost, reduction_order="reassociate"
+    )
 
 
 def _forced(workload, compiled, mode, residency, issue="shared"):
@@ -140,7 +144,9 @@ def _forced(workload, compiled, mode, residency, issue="shared"):
             and not candidate.extra.get("stage_resident")
         ):
             n = compiled.placement_ranking.kernels[0].bucket_count
-            return allo.compile(workload, target, samsung_cost, layout=[candidate] * n)
+            return allo.compile(
+                workload, target, samsung_cost, layout=[candidate] * n, reduction_order="reassociate"
+            )
     raise KeyError((mode, residency, issue))
 
 
@@ -153,6 +159,7 @@ def vendor(paper):
         target,
         samsung_cost,
         layout=samsung_vendor_gemv_layout(target, compiled.trace),
+        reduction_order="reassociate",
     )
 
 
@@ -185,10 +192,11 @@ def test_default_selection_follows_the_serialized_fiber_cost(paper):
 def test_k512_program_derives_trip_counts_from_tiles():
     workload, _M, _K = _workloads()["gemv_m4096_k512"]
     target = build_samsung_target()
-    default = allo.compile(workload, target, samsung_cost)
+    default = allo.compile(workload, target, samsung_cost, reduction_order="reassociate")
     compiled = allo.compile(
         workload, target, samsung_cost,
         layout=samsung_vendor_gemv_layout(target, default.trace),
+        reduction_order="reassociate",
     )
     words = _words(compiled)
     assert [w[5] for w in words if w[0] == "JUMP"] == [15, 15]
@@ -198,7 +206,9 @@ def test_k512_program_derives_trip_counts_from_tiles():
 
 def test_operand_order_does_not_change_decisions(paper):
     _workload, compiled = paper
-    swapped = allo.compile(swapped_gemv, build_samsung_target(), samsung_cost)
+    swapped = allo.compile(
+        swapped_gemv, build_samsung_target(), samsung_cost, reduction_order="reassociate"
+    )
     assert _words(swapped) == _words(compiled)
     assert dict(swapped._source_binding.inputs) == {"A": "W", "B": "x"}
     (a,) = compiled.compiled.layout_ctx.programs

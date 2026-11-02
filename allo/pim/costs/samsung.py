@@ -41,6 +41,27 @@ odd-fiber tile per pass. Ranking agreement with the simulator is judged per
 candidate pair: a pair agrees when both order it the same way; simulated
 differences below 0.5% are ties (docs/release/design/samsung-execution.md
 sections 6 and 7). Absolute values are not comparable (scope above).
+
+Ordered (temporal) program provenance (2026-11-02). Same simulator build,
+conductor ``pim_driver --op GENERIC --op-kind TEMPORAL_REDUCE`` executing
+the five-word ordered CRF (``spmw_samsung.SamsungCtx._emit_temporal``), one
+result column, seed-0 FP16 data. One row tile is 64 channels x 8 PIM units x
+16 lanes = 8192 rows; cycles per (row tile, column):
+
+    K      preload   exec     readback   total
+    100     5,051     5,859      67      10,977
+    128     6,451     7,174      67      13,692
+    256    12,851    13,889      67      26,807   (M = 2048, 4096, 8192)
+    512    25,651    26,967      67      52,685   (M = 4096, 8192)
+
+(M = 16384, K = 256: two tiles, 53,615.) The execution phase is linear in K:
+51.4 cycles per reduction element (one host broadcast of the element to
+every channel, a barrier, one MAC column command) plus 681 cycles per pass
+(least squares, within 1.2% at every point). The rule prices that phase for
+each pass a work item needs (one pass per 16 output rows of a PIM unit);
+like the REDUCE rule it leaves the preload and readback out of scope. The
+4096x256 GEMV with initial value 0.5 measures 26,807 cycles and matches
+source-order FP16 for 4096/4096 rows.
 """
 
 from __future__ import annotations
@@ -64,6 +85,9 @@ CRF_PROGRAM_CYCLES = 2
 # Row-open cost of a reduction tile on a second bank fiber (measured, see the
 # module docstring): 46-47 PIMSimulator cycles per odd-fiber tile per pass.
 FIBER_TILE_CYCLES = 47
+# Ordered program (module docstring): per reduction element and per pass.
+TEMPORAL_STEP_CYCLES = 51
+TEMPORAL_PASS_CYCLES = 681
 
 
 def _ceil_div(value, divisor):
@@ -90,10 +114,31 @@ def samsung_cost(target):
             name=event.primitive.name.lower(),
         )
 
+    def temporal_mac(event, ctx):
+        # One output row per FP16 lane; the reduction is issued element by
+        # element, so each pass costs K steps whatever the fiber layout.
+        reduction = max(1, int(event.metrics.get("reduction_extent", 1)))
+        extents = tuple(event.metrics.get("loop_extents", ()) or ())
+        rows = int(extents[0]) if len(extents) > 1 else 1
+        columns = int(extents[1]) if len(extents) == 3 else 1
+        lanes16 = int(target.grf_b.width) // 16
+        passes = _ceil_div(rows, lanes16) * columns
+        latency = passes * (reduction * TEMPORAL_STEP_CYCLES + TEMPORAL_PASS_CYCLES)
+        occupy_compute(event, ctx, latency, MAC_CYCLES)
+
     @rule(target.op("MAC"))
     def mac(event, ctx):
+        candidate = event.metrics.get("candidate", {}) or {}
+        if candidate.get("reduction_program") == "temporal":
+            temporal_mac(event, ctx)
+            return
         fibers = max(1, int(event.metrics.get("n_fibers", 1)))
-        lanes = max(1, int(event.metrics.get("lanes", 8)))
+        if "lanes" not in event.metrics:
+            raise ValueError(
+                "Samsung MAC event has no 'lanes' metric: the placement must put "
+                "the MAC in a GRF, whose Register.lanes the plan reads"
+            )
+        lanes = max(1, int(event.metrics["lanes"]))
         reduction = max(0, int(event.metrics.get("reduction_extent", 1)))
         # Both fibers' MAC column commands share the channel bus: no
         # division by the fiber count.

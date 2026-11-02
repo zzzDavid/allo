@@ -53,21 +53,26 @@ def test_gemv_samsung_hbm_pim(case, samsung_sim_gate, record_property):
     target = build_samsung_target()
 
     started = time.perf_counter()
-    compiled = allo.compile(workload, target, samsung_cost)
+    # The paper rows permit regrouping partial sums (5-evaluation.tex); the
+    # strict default selects the ordered program (test_samsung_reduction_order).
+    compiled = allo.compile(
+        workload, target, samsung_cost, reduction_order="reassociate"
+    )
     assert time.perf_counter() - started < COMPILE_BUDGET_SECONDS
 
     kernels = compiled.placement_ranking.kernels
     assert len(kernels) == 1
     assert kernels[0].bucket_count == 128
     assert kernels[0].fallback is None
-    # 24 enumerated placements x the restage/resident residency knob that the
-    # whole-trace liveness enables inside autoschedule.
-    assert len(kernels[0].scores) == 48
+    # 24 REDUCE placements plus 2 ordered ones, x the restage/resident
+    # residency knob that the whole-trace liveness enables inside autoschedule.
+    assert len(kernels[0].scores) == 52
     vendor = allo.compile(
         workload,
         target,
         samsung_cost,
         layout=samsung_vendor_gemv_layout(target, compiled.trace),
+        reduction_order="reassociate",
     )
 
     rng = np.random.default_rng(0)

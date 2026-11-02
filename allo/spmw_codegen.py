@@ -929,6 +929,19 @@ def _run_virtual(compiled: "Compiled", **inputs) -> RunResult:
     if compiled.cost is None or compiled.execution_graph is None:
         raise RuntimeError("virtual execution requires an executable CostSpec")
     estimate = compiled.cost.evaluate(compiled.execution_graph)
+    extra = {
+        "critical_path": list(estimate.critical_path),
+        "utilization": dict(estimate.utilization),
+        "bottlenecks": list(estimate.bottlenecks),
+        "model_fingerprint": estimate.model_fingerprint,
+        "cost_model": compiled.cost.spec.name,
+        "priced_target": compiled.target.name,
+    }
+    # A backend context may label the estimate (validity domain of its cost
+    # model, timing scope); it never changes the estimate itself.
+    hook = getattr(getattr(compiled, "layout_ctx", None), "virtual_run_extra", None)
+    if callable(hook):
+        extra.update(hook())
     return RunResult(
         kind=RUN_KIND_VIRTUAL,
         cycles=estimate.cycles,
@@ -937,14 +950,7 @@ def _run_virtual(compiled: "Compiled", **inputs) -> RunResult:
             "analytical estimate only, nothing executed, outputs not written"
         ),
         backend="virtual",
-        extra={
-            "critical_path": list(estimate.critical_path),
-            "utilization": dict(estimate.utilization),
-            "bottlenecks": list(estimate.bottlenecks),
-            "model_fingerprint": estimate.model_fingerprint,
-            "cost_model": compiled.cost.spec.name,
-            "priced_target": compiled.target.name,
-        },
+        extra=extra,
     )
 
 
@@ -1232,65 +1238,127 @@ def __getattr__(name):
     return getattr(importlib.import_module(module_name), name)
 
 
-def _check_work_grid(target, trace, *, auto_fill=True):
-    """Gap-1 derive/lint: compare the trace's work-id partition against the
-    grid derived from the @allo.unit tree. Warns on mismatch; optionally
-    auto-fills. Returns the (possibly auto-filled) expected work-id count.
+# Backends whose lowering decomposes ONE work item over the whole device
+# itself, so `@allo.work(mapping=[1])` is an executable launch:
+#   samsung_hbm_pim: elementwise ops are one item walking a 1-D extent
+#     (spmw_samsung.samsung_elementwise); the REDUCE program accepts any item
+#     set whose stores partition the rows (`_covered_contraction`), one item
+#     covering every row included.
+#   upmem: the DPU x tasklet split is the backend's decision domain
+#     (spmw_upmem knobs), not the workload grid.
+#   aim: the AiM lowering maps a single item's rows onto channels
+#     (tests/pim/test_aim_axis_roles.py `gemv_single`).
+# apu_v1 is not listed: its scalar mapping is a coalesced VR partition axis,
+# accepted by its own branch below.
+_SINGLE_ITEM_LAUNCH_BACKENDS = frozenset({"samsung_hbm_pim", "upmem", "aim"})
+# Backends that map a 1-D grid of n items (n <= the OUTERMOST extent) onto
+# disjoint groups of outermost units:
+#   upmem: n DPUs are allocated and loaded (`num_dpus == mapping[0]`,
+#     tests/pim/test_gemv_all_targets.py `upmem_gemv`).
+#   aim: each item is a replica on its own channel group
+#     (aim_lowering._replica_channel_layout, which raises when the channels
+#     do not divide among the replicas).
+# Samsung is not listed: the 8 PIM blocks of a pseudo-channel run its CRF in
+# lockstep and the conductor drives every channel.
+_OUTER_SUBSET_LAUNCH_BACKENDS = frozenset({"upmem", "aim"})
 
-    - derived = target.work_grid()[1]  (e.g. 128 for Samsung)
-    - observed = number of distinct work-id buckets for the trace's SOLE
-      kernel (multi-kernel traces are exempt: each @allo.work layer
-      legitimately walks its own partition, e.g. MLP mapping=[1]).
+
+def _check_work_grid(target, trace, *, auto_fill=False):
+    """Check that every kernel's declared work grid maps onto the target's
+    unit tree in a form the backend executes; raise ValueError otherwise.
+    Returns the work-item count of a single-kernel trace (the derived
+    fanout product for a multi-kernel trace).
+
+    Accepted forms, per `@allo.work` kernel (grid = its `mapping`):
+
+    ======================  ===================================================
+    full fanout             grid == unit-tree fanout (Samsung [16, 8])
+    outer prefix            grid == a prefix of the fanout ([32] of AiM
+                            [32, 4, 4]); each item addresses an outer unit
+                            and the selected op spans its descendants
+    single item             grid == [1] on a backend in
+                            `_SINGLE_ITEM_LAUNCH_BACKENDS` (or a virtual-only
+                            target, which executes nothing)
+    outer-level subset      grid == [n], n <= the outermost extent, on a
+                            backend in `_OUTER_SUBSET_LAUNCH_BACKENDS` (UPMEM
+                            [8] launches 8 of 64 DPUs; AiM [4] places 4
+                            replicas on 8-channel groups)
+    APU v1 coalesced axis   the scalar mapping partitions the VR lanes; the
+                            backend supplies the four APUC tasks
+    ======================  ===================================================
+
+    Anything else (e.g. [4, 4] on Samsung's 16 x 8 tree, whose 16 items
+    match no unit level) raises: no unit mapping exists for it, and the
+    cost program's one-stream-per-unit graph would misprice it.  Nothing
+    is auto-filled; `auto_fill` is accepted for compatibility and ignored.
+    Backend partition checks that need the workload (Samsung row coverage,
+    `SamsungCtx._covered_contraction`) still apply on top of this one.
     """
+    import math
+
     from .spmw_autoschedule import _bucket_for_autoschedule
 
-    derived = target.work_grid()[1]
+    del auto_fill
+    factors, derived = target.work_grid()
+    factors = tuple(int(f) for f in factors)
     buckets = _bucket_for_autoschedule(trace)
     if target.name == "apu_v1" and any(
         _matcher_work_scope(match).coalesced_axes for match in trace.matches
     ):
-        # The authored scalar mapping is a VR partition axis. Four physical
-        # APUC tasks are supplied by the backend and are not source replicas.
-        return target.work_grid()[1]
-    # Distinct retained matcher groups. Multi-kernel traces are exempt because
-    # each ``@allo.work`` layer may legitimately walk its own partition.
-    group_ids = set()
-    for _fn, matches in buckets:
-        group_ids.add(_matcher_work_scope(matches[0]).group_id)
-    if len(group_ids) != 1:
-        return derived  # multi-kernel: exempt
-    observed = len(buckets)
-    if observed == derived:
         return derived
-    # A workload may intentionally stop at an outer spatial scope.  AiM's
-    # MAC_ABK is the canonical case: one work item addresses a channel while
-    # the instruction itself fans out over all 16 descendant banks.  Accept
-    # products of outer prefixes (32 for [32,4,4]) as structurally valid; the
-    # selected operation and cost rule account for the internal parallelism.
-    prefix = 1
-    for factor in target.work_grid()[0]:
-        prefix *= factor
-        if observed == prefix:
-            return observed
-    if observed == 1 and auto_fill:
-        # Under-specified partition (e.g. mapping=[1] on a single kernel).
-        warnings.warn(
-            f"work grid: workload declares 1 work-item but target "
-            f"{target.name!r} has {derived} PEs (unit-tree fanout "
-            f"{target.work_grid()[0]}); auto-filling the full grid. Declare "
-            f"@allo.work(mapping={target.work_grid()[0]}) to silence.",
-            stacklevel=2,
-        )
-        return derived
-    # Genuine mismatch: advisory, do not raise. Trigger schedule uses observed.
-    warnings.warn(
-        f"work grid: workload partition has {observed} work-items but target "
-        f"{target.name!r} unit-tree implies {derived} "
-        f"(fanout {target.work_grid()[0]}); proceeding with the authored "
-        f"{observed}. Mispricing possible if this was unintended.",
-        stacklevel=2,
+    groups: dict[int, list] = {}
+    for _scope, matches in buckets:
+        groups.setdefault(_matcher_work_scope(matches[0]).group_id, []).append(matches)
+    prefixes = [factors[:n] for n in range(1, len(factors) + 1)]
+    single_ok = (
+        target.name in _SINGLE_ITEM_LAUNCH_BACKENDS or target.name not in _BACKENDS
     )
-    return observed
+    problems = []
+    for group_id, group in groups.items():
+        observed = len(group)
+        shape = tuple(
+            int(f) for f in (_matcher_work_scope(group[0][0]).group_shape or ())
+        )
+        if shape and math.prod(shape) != observed:
+            shape = ()  # partially retained scope: judge by count alone
+        grid = tuple(f for f in shape if f != 1) if shape else None
+        if grid is not None:
+            if grid in prefixes:
+                continue
+        elif observed in {math.prod(p) for p in prefixes}:
+            continue
+        if (
+            target.name in _OUTER_SUBSET_LAUNCH_BACKENDS
+            and factors
+            and (grid is None or len(grid) <= 1)
+            and observed <= factors[0]
+        ):
+            continue
+        if observed == 1:
+            if single_ok:
+                continue
+            problems.append(
+                f"kernel group {group_id} declares one work item, but backend "
+                f"{target.name!r} does not decompose a single-item launch over "
+                f"the device; declare @allo.work(mapping={list(factors)})"
+            )
+            continue
+        problems.append(
+            f"kernel group {group_id} declares the work grid "
+            f"{list(shape) if shape else observed} ({observed} items), which is "
+            f"neither the unit-tree fanout {list(factors)} nor an outer prefix "
+            f"of it ({[list(p) for p in prefixes[:-1]]})"
+            + (" nor a single item" if single_ok else "")
+            + "; no unit mapping exists for it"
+        )
+    if problems:
+        raise ValueError(
+            f"work grid does not partition target {target.name!r}: "
+            + "; ".join(problems)
+        )
+    if len(groups) == 1:
+        return len(buckets)
+    return derived
 
 
 def _resolve_host_moves(target, records):
@@ -1502,7 +1570,9 @@ def compile_for_target(
     from .spmw_match_engine import require_match_coverage
 
     checked_trace = require_match_coverage(trace, target=target, module=module)
-    if target_name in ("samsung_hbm_pim", "aim", "apu_v1"):
+    # Samsung is not listed: its REDUCE candidates are pruned for a carried
+    # accumulator and the ordered TEMPORAL program loads the initial value.
+    if target_name in ("aim", "apu_v1"):
         carried = [
             match
             for match in checked_trace.matches
@@ -1522,14 +1592,18 @@ def compile_for_target(
                 "form with a host epilogue add is not implemented."
             )
 
-    # Gap-1 derive/lint: compare the trace's work-id partition against the grid
-    # implied by the @allo.unit tree. Warns + auto-fills; never raises.
-    if hasattr(target, "work_grid"):
-        _check_work_grid(target, trace)
+    # Placement legality (release audit C-01): a caller-supplied layout must
+    # respect the target's access scopes, operand patterns and moves.
+    if layout is not None:
+        from .spmw_legality import check_layouts
+
+        check_layouts(target, trace, layout).raise_if_illegal("user-supplied layout")
 
     # A virtual-only target needs no code generator. Its executable cost spec
     # lowers the trace directly to the retained handle-based graph.
     if backend == "virtual" and target_name not in _BACKENDS:
+        if hasattr(target, "work_grid"):
+            _check_work_grid(target, trace)
         if layout is None:
             stored_layout = Placement(placements={})
         elif isinstance(layout, Placement):
@@ -1595,6 +1669,18 @@ def compile_for_target(
             f"layout list has {len(layouts)} entries but trace has "
             f"{len(buckets)} @allo.work kernels"
         )
+    if layout is None:
+        # The autoscheduler filtered its candidates; re-check what survived
+        # the cross-kernel reconciliation.
+        from .spmw_legality import check_layouts
+
+        check_layouts(target, trace, layouts).raise_if_illegal("autoscheduled layout")
+
+    # The declared work grid must map onto the unit tree (release audit C-04).
+    # Checked after selection so backend partition diagnostics raised while
+    # materializing candidates (Samsung row coverage) report first.
+    if hasattr(target, "work_grid"):
+        _check_work_grid(target, trace)
 
     ctx = ctx_cls(target)
     _walk_and_emit(

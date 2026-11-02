@@ -666,7 +666,7 @@ def _trace_value(
                 except ValueError:
                     v = sval
             return WConst(v, _result_names(src, state=state)[0])
-        except Exception:  # noqa: BLE001
+        except KeyError:  # MLIR attribute map: no "value" attribute
             return WConst(None, _result_names(src, state=state)[0])
     # Any other math.* op computes a value; tracing through it as a cast
     # would let e.g. ``a + exp(b)`` match ``x + y`` with ``y = b``.
@@ -809,11 +809,8 @@ def _unify(pattern, term, bindings: dict[str, Any], kinds=None) -> bool:
 
     if isinstance(pattern, PConst):
         if isinstance(term, WConst):
-            # Numeric equality where possible; otherwise structural.
-            try:
-                return term.value == pattern.value
-            except Exception:  # noqa: BLE001
-                return False
+            # Literal values are int/float/str/None; == never raises on them.
+            return term.value == pattern.value
         return False
 
     if isinstance(pattern, PBinOp):
@@ -1533,13 +1530,28 @@ def _try_match_at_store(
                             or not _terms_eq(acc_term.index_terms, index_terms)
                         ):
                             continue
-                    elif (
-                        list(acc_term.indices) != list(store_indices)
-                        or acc_term.index_map != store_map
-                        or _data_dependent(acc_term.source_op_name, acc_term.index_terms)
+                    elif acc_term.index_map != store_map or _data_dependent(
+                        acc_term.source_op_name, acc_term.index_terms
+                    ):
+                        continue
+                    elif list(acc_term.indices) != list(store_indices) and not (
+                        # The same element may be addressed through distinct
+                        # SSA values (``y[row0 + r]`` recomputed for the load
+                        # and the store): compare the traced index terms.
+                        index_terms is not None
+                        and acc_term.index_terms is not None
+                        and _terms_eq(acc_term.index_terms, index_terms)
                     ):
                         continue
                 extra = {"store_indices": list(store_indices)}
+                if index_terms is not None and not any(
+                    _term_loads(t, []) for t in index_terms
+                ):
+                    # Loop variables each store coordinate depends on (the
+                    # coordinate may be an SSA value such as ``row0 + r``).
+                    extra["store_index_vars"] = tuple(
+                        tuple(sorted(_term_blockargs(t, set()))) for t in index_terms
+                    )
                 if constants is not None and getattr(op_obj, "const_params", ()):
                     extra["constants"] = constants
                 if kinds is not None and any(k == "iv" for k in kinds.values()):
@@ -1715,10 +1727,19 @@ def _axis_roles(match: MatchedOp) -> dict:
     if store:
         opaque = [index for index in store if index not in loop_vars]
         if opaque:
-            return unresolved(
-                f"result index {opaque} is not an enclosing loop variable"
-            )
-        result_vars = [var for var in loop_vars if var in store]
+            # ``y[row0 + r]``: the coordinate is an SSA value; the matcher
+            # recorded the loop variables it depends on (loads excluded).
+            depends = match.extra.get("store_index_vars")
+            if depends is None:
+                return unresolved(
+                    f"result index {opaque} is not an enclosing loop variable "
+                    "and its dependence on the loops is not retained"
+                )
+            result_vars = [
+                var for var in loop_vars if any(var in vars_ for vars_ in depends)
+            ]
+        else:
+            result_vars = [var for var in loop_vars if var in store]
     else:
         if match.extra.get("guards"):
             return unresolved("guarded accumulator scope")
@@ -1858,10 +1879,12 @@ def _stamp_batch_dims(trace: MatchTrace) -> None:
                 m.extra["axis_roles"]["work_axis_reason"] = reason
 
 
-def match_workload(target, mlir_module) -> MatchTrace:
+def match_workload(target, mlir_module, *, reduction_order=None) -> MatchTrace:
     """Walk ``mlir_module`` and emit a :class:`MatchTrace` for ``target``.
 
     Eagerly compiles target Op patterns the first time it sees them.
+    Every accumulating match carries ``extra["reduction_policy"]`` for
+    ``reduction_order`` (``"strict"`` when None; ``allo.spmw_reduction_policy``).
     """
     compile_target_patterns(target)
     value_refs, source_value_refs = _build_ir_value_refs(mlir_module)
@@ -1936,6 +1959,9 @@ def match_workload(target, mlir_module) -> MatchTrace:
     # SPEC-026 §1.2: stamp the batch dim on each match (one source of
     # truth for cost/codegen). Additive; default batch_dim=1.
     _stamp_batch_dims(trace)
+    from .spmw_reduction_policy import stamp_reduction_policy
+
+    stamp_reduction_policy(trace, reduction_order)
     return trace
 
 
@@ -2342,6 +2368,13 @@ class _FunctionCoverage:
             for index, match in entries:
                 init, found = self._accumulator_init(dest, index, category)
                 match.extra["accumulator_init"] = init
+                if init == "carried":
+                    # ``y[i] += ...``: the matched store itself writes the
+                    # output buffer, so it is the result's sink.
+                    sink = (self._dest_name(index), self._index_text(index))
+                    sinks = match.extra.setdefault("output_sinks", [])
+                    if sink not in sinks:
+                        sinks.append(sink)
                 if found:
                     loops = self.sites[index][1]
                     problems.setdefault(

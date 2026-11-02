@@ -80,6 +80,28 @@ def _same_handle(pattern, handle):
     return isinstance(pattern, Register) and pattern is handle
 
 
+def _placement_register_lanes(operation, match, placement):
+    """``Register.lanes`` of the register the placement computes ``match``
+    in: the destination's register, else the source registers' common lane
+    count. None when the placement names no register (or registers that
+    disagree), so the metric is absent rather than guessed (audit C-08)."""
+    from .spmw_legality import placed_operands
+    from .spmw_target import Register
+
+    placed = placed_operands(operation, match, placement)
+    for kinds in (("dst",), ("src",)):
+        lanes = {
+            int(_unwrap_handle(item.handle).lanes)
+            for item in placed
+            if item.kind in kinds and isinstance(_unwrap_handle(item.handle), Register)
+        }
+        if len(lanes) == 1:
+            return lanes.pop()
+        if lanes:
+            return None
+    return None
+
+
 def _moves_for_handles(target, handles, *, phase):
     """Resolve structural register materialization moves for a placement."""
     from .spmw_target import Register
@@ -553,7 +575,11 @@ def build_execution_graph(
                 resolved.move,
                 f"host:{direction}:{phase_index}:{resolved.move.name}",
                 (),
-                buffer_manifest.metrics_for_host_transfer(host_index),
+                _host_transfer_metrics(
+                    buffer_manifest.metrics_for_host_transfer(host_index),
+                    resolved,
+                    launch_schedule,
+                ),
                 {
                     "buffer_value": buffer_manifest.value_id_for_host_transfer(
                         host_index
@@ -661,10 +687,12 @@ def build_execution_graph(
                 result_geometry = buffer_manifest.metrics_for(
                     trace_values.value_id_for_result(match)
                 )
+                lanes = _placement_register_lanes(operation, match, placement)
+                if lanes is not None:
+                    metrics["lanes"] = lanes
                 metrics.update(
                     n_fibers=max(1, int(extra.get("n_fibers", 1))),
                     batch=max(1, int(match.extra.get("batch_dim", 1))),
-                    lanes=8,
                     operand_shapes=operand_shapes,
                     result_shape=(
                         result_geometry["shape"]
@@ -774,6 +802,41 @@ def build_execution_graph(
             host_index, resolved, phase_index, previous_function_terminals
         )
     return graph
+
+
+def _host_transfer_metrics(metrics, resolved, launch_schedule):
+    """Buffer metrics of one host transfer plus, only when they differ from
+    the whole-buffer default, the moved slice and the residency of its buffer.
+
+    ``host_slice`` is the normalized index of a sliced buffer token (an int,
+    None for ``:``, or a ``(start, stop)`` pair per dimension);
+    ``host_resident`` marks a buffer the schedule declares resident.
+    """
+    metrics = dict(metrics)
+    role = getattr(resolved, "buffer_role", None)
+    text = str(role) if role is not None else ""
+    base = text.split("[", 1)[0]
+    if "[" in text and text.endswith("]"):
+        index = []
+        for item in text[len(base) + 1 : -1].split(","):
+            item = item.strip()
+            if item == ":":
+                index.append(None)
+            elif ":" in item:
+                start, stop = item.split(":")
+                index.append((int(start or 0), int(stop)))
+            else:
+                try:
+                    index.append(int(item))
+                except ValueError:
+                    index = None
+                    break
+        if index is not None:
+            metrics["host_slice"] = tuple(index)
+    resident = getattr(launch_schedule, "resident", ()) or ()
+    if base and base in resident:
+        metrics["host_resident"] = True
+    return metrics
 
 
 def _is_gather(resolved) -> bool:

@@ -196,13 +196,17 @@ def test_samsung_gemv_paper_cycles(row, samsung_sim_gate, record_property):
     target = build_samsung_target()
 
     started = time.perf_counter()
-    default = allo.compile(workload, target, samsung_cost)
+    # The paper Samsung rows permit regrouping partial sums (5-evaluation.tex).
+    default = allo.compile(
+        workload, target, samsung_cost, reduction_order="reassociate"
+    )
     assert time.perf_counter() - started < _SAMSUNG_COMPILE_BUDGET_S
     vendor = allo.compile(
         workload,
         target,
         samsung_cost,
         layout=samsung_vendor_gemv_layout(target, default.trace),
+        reduction_order="reassociate",
     )
 
     rng = np.random.default_rng(0)
@@ -244,8 +248,13 @@ def test_aim_cent_paper_cycles(row, aim_sim_gate):
 
     case = build_case(row.case_id)
     started = time.perf_counter()
+    # Every AiM MAC reduces 16 BF16 products through an adder tree.
     compiled = allo.compile(
-        case.region, build_aim_target(), aim_cost, host_moves=case.host_program
+        case.region,
+        build_aim_target(),
+        aim_cost,
+        host_moves=case.host_program,
+        reduction_order="reassociate",
     )
     assert time.perf_counter() - started < _AIM_COMPILE_BUDGET_S
 

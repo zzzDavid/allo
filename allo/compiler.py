@@ -29,11 +29,17 @@ from .pim.apu_g2_typed_program import (
     APUG2TypedProgram,
     compile_apu_g2_typed_program,
 )
+from .pim.apu_g2_source_route import compile_apu_g2_source_workload
 from .spmw_autoschedule import MatcherWorkScope, _retain_matcher_work_scope
 from .spmw_codegen import RunResult, compile_for_target, source_backend_binding
 from .spmw_liveness import MatcherValueId, trace_liveness
 from .spmw_match_engine import match_workload, require_match_coverage
 from .spmw_plan import BufferMetricManifest, launch_schedule
+from .spmw_reduction_policy import (
+    POLICY_KEY,
+    normalize_reduction_order,
+    require_matcher_route_policy,
+)
 from .spmw_target import HostProgram
 
 
@@ -465,6 +471,7 @@ class CompiledCallable:
         trace,
         compiled,
         cost=None,
+        reduction_order=None,
     ):
         self.workload = workload
         self.target = target
@@ -472,13 +479,19 @@ class CompiledCallable:
         self.trace = trace
         self.compiled = compiled
         self.cost = cost
+        self.reduction_order = normalize_reduction_order(reduction_order)
+        # Candidates the enumerators pruned under the reduction-order policy:
+        # ``(mode, reason)`` pairs recorded on the selected placements.
+        self.reduction_policy_pruned = _reduction_policy_pruned(compiled)
         self.signature = inspect.signature(workload)
         self.__signature__ = self.signature
         self.__name__ = getattr(workload, "__name__", "compiled_workload")
         self.__doc__ = getattr(workload, "__doc__", None)
         self.placement_ranking = getattr(compiled, "placement_ranking", None)
-        self._source_binding = source_backend_binding(
-            target, trace, tuple(self.signature.parameters)
+        self._source_binding = _bind_carried_accumulator(
+            source_backend_binding(target, trace, tuple(self.signature.parameters)),
+            trace,
+            tuple(self.signature.parameters),
         )
         self.last_result: RunResult | None = None
 
@@ -511,6 +524,7 @@ class CompiledCallable:
                 f"backend returned {type(result).__name__}, expected RunResult"
             )
         result.validate()
+        _stamp_reduction_order(result, self.reduction_order, self.trace)
         self._copy_outputs(result, inputs)
         self.last_result = result
         return result
@@ -618,6 +632,71 @@ class CompiledCallable:
             np.copyto(destination, source, casting="same_kind")
 
 
+def _bind_carried_accumulator(binding, trace, parameter_names):
+    """Bind runtime role ``C`` to the parameter a carried accumulator reads.
+
+    A ``y[i] += ...`` accumulator (``accumulator_init == "carried"``) starts
+    from the caller's ``y``; a backend program that loads an initial
+    accumulator (Samsung's ordered program) receives it as ``C`` and its
+    result is written back to the same parameter.
+    """
+    if not binding.inputs:
+        return binding
+    refs = {
+        operand.value_ref
+        for match in getattr(trace, "matches", ())
+        if match.extra.get("accumulator_init") == "carried"
+        for operand in match.operands
+        if operand.is_loop_carried and operand.value_ref is not None
+    }
+    if len(refs) != 1:
+        return binding
+    (ref,) = refs
+    ordinals = [
+        int(ordinal)
+        for ordinal, source_ref in (getattr(trace, "source_value_refs", None) or {}).items()
+        if source_ref == ref and 0 <= int(ordinal) < len(parameter_names)
+    ]
+    if len(ordinals) != 1:
+        return binding
+    name = parameter_names[ordinals[0]]
+    return type(binding)(
+        inputs={**binding.inputs, "C": name}, output=binding.output or name
+    )
+
+
+def _reduction_policy_pruned(compiled):
+    layouts = getattr(compiled, "layout", None)
+    if not isinstance(layouts, (list, tuple)):
+        layouts = [layouts]
+    pruned = []
+    for layout in layouts:
+        for record in (getattr(layout, "extra", None) or {}).get(
+            "reduction_policy_pruned", ()
+        ):
+            if record not in pruned:
+                pruned.append(record)
+    return tuple(pruned)
+
+
+def _stamp_reduction_order(result, reduction_order, trace=None):
+    """Record the reduction-order policy the executed artifact was compiled
+    under, and the per-accumulator permission it implied."""
+    result.extra["reduction_order"] = reduction_order
+    policies = []
+    for match in getattr(trace, "matches", ()) or ():
+        policy = match.extra.get(POLICY_KEY)
+        if policy is not None:
+            entry = {
+                "accumulator_type": policy.accumulator_type,
+                "may_regroup": policy.may_regroup,
+            }
+            if entry not in policies:
+                policies.append(entry)
+    if policies:
+        result.extra["reduction_policy"] = policies
+
+
 class CompiledWorkload(typing.Protocol):
     """What every allo.compile result supports."""
 
@@ -660,11 +739,20 @@ _PROGRAM_ROUTES: tuple[_ProgramRoute, ...] = (
 )
 
 
-def _compile_program(route, workload, target, bound_cost, backend, host_moves, layout):
+def _compile_program(
+    route, workload, target, bound_cost, backend, host_moves, layout, reduction_order
+):
     if route.backends is not None and backend not in route.backends:
         raise ValueError(route.backend_error)
     if host_moves is not None or layout is not None:
         raise ValueError(route.owner)
+    if reduction_order is not None:
+        # A typed program record spells out its own reduction grouping; the
+        # policy selects among schedules of ordinary source workloads only.
+        raise ValueError(
+            f"{route.program_type.__name__} fixes its reduction grouping in the "
+            "program record; reduction_order applies to source workloads"
+        )
     return route.compile_fn(workload, target, cost=bound_cost, backend=backend)
 
 
@@ -676,6 +764,7 @@ def compile(
     backend=None,
     host_moves=None,
     layout=None,
+    reduction_order=None,
 ) -> CompiledWorkload:
     """Compile ``workload`` for ``target`` and return a NumPy-callable object.
 
@@ -690,8 +779,12 @@ def compile(
        retained MLIR-derived portable C on the host (scalar ARC programs
        only; native-vector programs reject it at compile time). The APU v2
        routes validate ``backend`` themselves. No typed route accepts
-       ``host_moves`` or ``layout``. Gemini-II (``apu_v2``) has no source
-       route: an ordinary source workload on it raises NotImplementedError.
+       ``host_moves`` or ``layout``. An ordinary source workload on
+       Gemini-II (``apu_v2``) goes through the composed-dot source route
+       (``allo.pim.apu_g2_source_route``): integer contractions are matched,
+       lowered to cost-ranked composed-dot launch plans (``layout=`` names a
+       plan), and anything outside that family raises
+       ``APUG2SourceRouteError`` (a NotImplementedError).
     2. Source frontend. A plain ``@allo`` workload is customized to MLIR.
     3. Contraction frontend (APU v1, non-dataflow only). Contractions go
        through the APU v1 layout-plan vector path; anything else falls through.
@@ -728,6 +821,19 @@ def compile(
         Explicit host-transfer records. They are never discovered implicitly.
     layout : object
         Optional preselected placement or placement list.
+    reduction_order : {"strict", "reassociate"} or None
+        Whether partial sums of a reduction may be regrouped. ``"strict"``
+        (the default, also selected by None) keeps the source accumulation
+        order and rounding of every floating-point accumulator: schedules
+        that split such a reduction (bank fibers, SIMD lane partials, tree
+        reductions) are pruned before ranking, and a backend with no
+        order-preserving program raises ``ReductionOrderError``. Integer
+        accumulators wrap modulo 2^width, so ``"strict"`` still permits
+        splitting them. ``"reassociate"`` permits any grouping. The choice is
+        stamped on every accumulating match (``extra["reduction_policy"]``)
+        and on every result (``RunResult.extra["reduction_order"]``).
+        Typed program records fix their own grouping and reject this
+        argument. See ``docs/release/design/reduction-policy.md``.
     """
     workload = _materialize_workload(workload)
     target = _materialize_target(target)
@@ -736,13 +842,41 @@ def compile(
     for route in _PROGRAM_ROUTES:
         if isinstance(workload, route.program_type):
             return _compile_program(
-                route, workload, target, bound_cost, backend, host_moves, layout
+                route,
+                workload,
+                target,
+                bound_cost,
+                backend,
+                host_moves,
+                layout,
+                reduction_order,
             )
+    reduction_order = normalize_reduction_order(reduction_order)
     if target.name == "apu_v2":
-        raise NotImplementedError(
-            "Gemini-II (apu_v2) compiles APUG2TypedProgram or "
-            "APUG2ComposedContractionProgram records; ordinary source workloads "
-            "have no Gemini-II lowering in this release"
+        # Ordinary source: matched integer contractions lowered to ranked
+        # composed-dot launch plans; anything else raises
+        # APUG2SourceRouteError (a NotImplementedError naming the family).
+        if bound_cost is None:
+            raise ValueError(
+                "Gemini-II source workloads need an executable cost program "
+                "(apu_g2_cost) to rank their launch plans"
+            )
+        schedule, trace, compiled = compile_apu_g2_source_workload(
+            workload,
+            target,
+            cost=bound_cost,
+            backend=backend,
+            host_moves=host_moves,
+            layout=layout,
+        )
+        return CompiledCallable(
+            workload,
+            target,
+            schedule,
+            trace,
+            compiled,
+            cost=bound_cost,
+            reduction_order=reduction_order,
         )
 
     schedule = customize(workload, enable_tensor=False)
@@ -759,12 +893,14 @@ def compile(
                 cost=bound_cost,
                 layout=layout,
                 backend=backend,
+                reduction_order=reduction_order,
             )
         except NoContractionError:
             pass
 
-    trace = match_workload(target, schedule.module)
+    trace = match_workload(target, schedule.module, reduction_order=reduction_order)
     require_match_coverage(trace, target=target, defer_unknown=True)
+    require_matcher_route_policy(target, trace)
     _stamp_matcher_work_scopes(target, schedule.module, trace)
     launch_order = None
     if isinstance(host_moves, HostProgram):
@@ -791,4 +927,5 @@ def compile(
         trace,
         compiled,
         cost=bound_cost,
+        reduction_order=reduction_order,
     )

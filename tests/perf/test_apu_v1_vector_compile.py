@@ -20,11 +20,14 @@ def ordinary_contraction(
 
 
 def test_public_compile_generates_ranks_and_executes_four_apu_plans():
+    # The baseline plan reduces with a subgroup tree: it competes only when
+    # regrouping the FP16 reduction is permitted.
     target = build_apu_v1_target()
     compiled = allo.compile(
         ordinary_contraction,
         target,
         apu_v1_cost,
+        reduction_order="reassociate",
         backend="functional",
     )
 
@@ -49,10 +52,12 @@ def test_public_compile_generates_ranks_and_executes_four_apu_plans():
     left = rng.normal(size=(4, 8)).astype(np.float16)
     right = rng.normal(size=(8, 6)).astype(np.float16)
     result = np.zeros((4, 6), dtype=np.float16)
-    reference = left @ right
+    reference = left.astype(np.float32) @ right.astype(np.float32)
     run = compiled(left, right, result)
 
-    np.testing.assert_allclose(result, reference, rtol=2e-3, atol=2e-3)
+    # The functional run reproduces the selected plan's FP16 grouping (a
+    # subgroup tree for the baseline plan), not NumPy's.
+    np.testing.assert_allclose(result.astype(np.float32), reference, rtol=1e-2, atol=1e-2)
     np.testing.assert_array_equal(run.extra["outputs"]["result"], result)
     assert run.cycles == compiled.estimate().cycles
     assert run.extra["plan"] == compiled.selected_plan.name
@@ -64,6 +69,7 @@ def test_public_compile_accepts_candidate_name_and_plan_object():
         ordinary_contraction,
         target,
         apu_v1_cost,
+        reduction_order="reassociate",
         backend="virtual",
         layout="baseline_spatial_reduction",
     )
@@ -74,6 +80,7 @@ def test_public_compile_accepts_candidate_name_and_plan_object():
         ordinary_contraction,
         target,
         apu_v1_cost,
+        reduction_order="reassociate",
         backend="functional",
         layout=named.plans[1],
     )

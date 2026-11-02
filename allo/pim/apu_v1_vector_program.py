@@ -23,6 +23,11 @@ from typing import Mapping
 import numpy as np
 
 from ..spmw_codegen import RunResult
+from ..spmw_reduction_policy import (
+    ReductionOrderError,
+    is_integer_type,
+    normalize_reduction_order,
+)
 from .apu_v1_layout import APUV1Plan
 from .apu_v1_vector_codegen import (
     UnsupportedVectorOperation,
@@ -207,6 +212,117 @@ def _apu_v1_cycle_objective_domain(estimate):
         unit="cycles",
         direction="minimize",
     )
+
+
+# Reduction strategies that add each product into the accumulator once, in
+# source order: ``temporal_accumulate`` walks the reduction axis in time and
+# adds one product per step into the output (its ``partial`` flag means the
+# output is accumulated across steps, not that partial sums are regrouped).
+_ORDER_PRESERVING_REDUCTIONS = frozenset({"none", "serial", "temporal_accumulate"})
+
+
+def apu_v1_plan_regroups(plan) -> bool:
+    """True when the plan forms partial sums of the reduction and combines
+    them (a group tree, pairwise or host combination)."""
+    reduction = plan.reduction_strategy
+    if reduction is None:
+        return False
+    return reduction.kind not in _ORDER_PRESERVING_REDUCTIONS
+
+
+def _apply_reduction_policy(candidates, analysis, reduction_order, layout):
+    """Prune plans that regroup a strict floating-point reduction.
+
+    Returns the surviving candidates and the ``(plan name, reason)`` record of
+    the pruned ones.  Integer contractions wrap modulo 2^16 and keep every
+    plan.  A ``layout`` naming a pruned plan, or a policy that leaves no plan,
+    raises ReductionOrderError.
+    """
+    if reduction_order != "strict" or is_integer_type(analysis.numeric_type):
+        return tuple(candidates), ()
+    keep, pruned = [], []
+    for candidate in candidates:
+        if apu_v1_plan_regroups(candidate.plan):
+            pruned.append(
+                (
+                    candidate.name,
+                    f"reduction_order='strict' on a {analysis.numeric_type} "
+                    f"accumulator; the {candidate.plan.reduction_strategy.kind} "
+                    "reduction adds the products in subgroup-tree order",
+                )
+            )
+        else:
+            keep.append(candidate)
+    requested = layout.name if isinstance(layout, APUV1Plan) else layout
+    if isinstance(layout, APUV1Plan) and apu_v1_plan_regroups(layout):
+        pruned_names = {requested}
+    else:
+        pruned_names = {name for name, _reason in pruned}
+    if isinstance(requested, str) and requested in pruned_names:
+        raise ReductionOrderError(
+            f"APU v1 plan {requested!r} regroups the {analysis.numeric_type} "
+            "reduction, which reduction_order='strict' forbids; pass "
+            "reduction_order='reassociate' or choose one of: "
+            + ", ".join(candidate.name for candidate in keep)
+        )
+    if not keep:
+        raise ReductionOrderError(
+            "reduction_order='strict': no APU v1 plan keeps the source order of "
+            f"the {analysis.numeric_type} reduction (pruned: "
+            + ", ".join(name for name, _reason in pruned)
+            + "); pass reduction_order='reassociate' to allow regrouping"
+        )
+    return tuple(keep), tuple(pruned)
+
+
+def _grouped_fp16_contraction(analysis, plan, arrays):
+    """FP16 result of a group-tree plan in that plan's accumulation order.
+
+    Products round to FP16; each reduction group (``group_size`` consecutive
+    reduction elements, zero padded) is summed by a halving tree whose every
+    add rounds to FP16; the group sums are added to the incoming output in
+    ascending group order (``fp16_contraction_ops``: MUL_F16,
+    GROUP_REDUCE_F16, ADD_F16).
+    """
+    letters = {}
+
+    def subscripts(indices):
+        return "".join(
+            letters.setdefault(axis, chr(ord("a") + len(letters))) for axis in indices
+        )
+
+    def operand(access):
+        return np.reshape(
+            np.asarray(arrays[access.value], dtype=np.float16), access.shape
+        ).astype(np.float32)
+
+    output = np.reshape(
+        np.asarray(arrays[analysis.output.value], dtype=np.float16),
+        analysis.output.shape,
+    ).copy()
+    spec = (
+        f"{subscripts(analysis.lhs.indices)},{subscripts(analysis.rhs.indices)}"
+        f"->{subscripts(analysis.output.indices)}"
+        f"{subscripts((analysis.reduction_axis,))}"
+    )
+    # An FP16 x FP16 product is exact in FP32, so one rounding gives MUL_F16.
+    products = np.einsum(spec, operand(analysis.lhs), operand(analysis.rhs)).astype(
+        np.float16
+    )
+    depth = products.shape[-1]
+    group = int(plan.reduction_strategy.group_size or 1 << (depth - 1).bit_length())
+    for start in range(0, depth, group):
+        chunk = np.zeros(products.shape[:-1] + (group,), dtype=np.float16)
+        piece = products[..., start : start + group]
+        chunk[..., : piece.shape[-1]] = piece
+        width = group
+        while width > 1:
+            width //= 2
+            chunk = (chunk[..., :width] + chunk[..., width : 2 * width]).astype(
+                np.float16
+            )
+        output = (output + chunk[..., 0]).astype(np.float16)
+    return output
 
 
 def _candidate_by_name(candidates, name: str):
@@ -443,12 +559,17 @@ class APUv1VectorCallable:
         cost=None,
         layout=None,
         backend=None,
+        reduction_order=None,
     ):
         self.workload = workload
         self.target = target
         self.schedule = schedule
         self.module = schedule.module
         self.analysis = candidates[0].analysis
+        self.reduction_order = normalize_reduction_order(reduction_order)
+        candidates, self.reduction_policy_pruned = _apply_reduction_policy(
+            candidates, self.analysis, self.reduction_order, layout
+        )
         self.candidates = tuple(candidates)
         self.plans = tuple(candidate.plan for candidate in candidates)
         self.cost = cost
@@ -555,6 +676,10 @@ class APUv1VectorCallable:
             result = self._run_functional(inputs)
         else:
             result = self._run_device(inputs)
+        result.extra["reduction_order"] = self.reduction_order
+        result.extra["plan_regroups_reduction"] = apu_v1_plan_regroups(
+            self.selected_plan
+        )
         self.last_result = result
         return result
 
@@ -570,20 +695,49 @@ class APUv1VectorCallable:
             # Same contract as the device route: a plan without output ingress
             # rejects a nonzero initial output instead of diverging from it.
             self.realization.check_initial_outputs(arguments)
-        # ``allo.reduction(1-D)`` is represented by ``np.ndindex`` when an
-        # Allo DSL function is executed directly, so its induction variable is
-        # a one-element tuple.  NumPy currently accepts that scalar-shaped
-        # access but emits a deprecation warning.  This functional reference
-        # is intentionally temporary; the retained MLIR, not this warning, is
-        # the compilation source of truth.
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Conversion of an array with ndim > 0 to a scalar",
-                category=DeprecationWarning,
-            )
-            returned = self.workload(**arguments)
         output_name = self.analysis.output.value
+        returned = None
+        if (
+            apu_v1_plan_regroups(self.selected_plan)
+            and self.analysis.multiply_operation == "arith.mulf"
+            and output_name in arguments
+        ):
+            # The selected plan regroups an FP16 reduction: reproduce its
+            # order, not the source order.
+            destination = arguments[output_name]
+            np.copyto(
+                destination,
+                _grouped_fp16_contraction(
+                    self.analysis, self.selected_plan, arguments
+                ).reshape(destination.shape),
+                casting="same_kind",
+            )
+            numerics = (
+                "selected plan order: FP16 products, halving FP16 tree over each "
+                f"reduction group of {self.selected_plan.reduction_strategy.group_size} "
+                "(model of gvml_add_subgrps; not checked against the device), "
+                "groups added to the output in ascending order"
+            )
+        else:
+            # ``allo.reduction(1-D)`` is represented by ``np.ndindex`` when an
+            # Allo DSL function is executed directly, so its induction variable
+            # is a one-element tuple.  NumPy currently accepts that
+            # scalar-shaped access but emits a deprecation warning.  This
+            # functional reference is intentionally temporary; the retained
+            # MLIR, not this warning, is the compilation source of truth.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Conversion of an array with ndim > 0 to a scalar",
+                    category=DeprecationWarning,
+                )
+                returned = self.workload(**arguments)
+            numerics = (
+                "source order"
+                if not apu_v1_plan_regroups(self.selected_plan)
+                else "source order (integer or bitwise reduction: every grouping "
+                "of the selected plan gives the same wrapped result)"
+            )
         outputs = {}
         if output_name in arguments:
             outputs[output_name] = np.asarray(arguments[output_name]).copy()
@@ -605,6 +759,7 @@ class APUv1VectorCallable:
                 "plan_selection": self.plan_selection,
                 "analytical": self.selected_estimate is not None,
                 "functional": True,
+                "numerics": numerics,
             },
         )
 
@@ -654,8 +809,13 @@ def compile_apu_v1_vector_workload(
     cost=None,
     layout=None,
     backend=None,
+    reduction_order=None,
 ):
-    """Analyze one ordinary Allo contraction and return its public callable."""
+    """Analyze one ordinary Allo contraction and return its public callable.
+
+    Under ``reduction_order="strict"`` (the default) a floating-point
+    contraction ranks only plans that keep the source accumulation order.
+    """
 
     if getattr(target, "name", None) != "apu_v1":
         raise ValueError("APU v1 vector workloads require the apu_v1 target")
@@ -668,11 +828,13 @@ def compile_apu_v1_vector_workload(
         cost=cost,
         layout=layout,
         backend=backend,
+        reduction_order=reduction_order,
     )
 
 
 __all__ = [
     "APUv1VectorCallable",
+    "apu_v1_plan_regroups",
     "compile_apu_v1_vector_workload",
     "search_apu_v1_vector_plans",
 ]

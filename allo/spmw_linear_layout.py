@@ -225,15 +225,27 @@ class LinearLayout:
         cls,
         dims: dict[str, int],
         out_dims: tuple[str, ...] | None = None,
+        *,
+        allow_zero: bool = False,
     ) -> "LinearLayout":
         """Identity layout — input dim `d` of size 2^k maps to output dim
-        `d` via the k basis vectors (1, 2, 4, ..., 2^(k-1)). Input dims
-        whose name is not in `out_dims` get all-zero basis vectors (they
-        do not contribute to any output). `out_dims` defaults to
-        `tuple(dims)`.
+        `d` via the k basis vectors (1, 2, 4, ..., 2^(k-1)). `out_dims`
+        defaults to `tuple(dims)`.
+
+        An input dim of size > 1 whose name is not in `out_dims` raises
+        ValueError unless `allow_zero=True`, in which case it gets all-zero
+        basis vectors (it contributes to no output, e.g. a segment dim a
+        later swizzle assigns).
         """
         if out_dims is None:
             out_dims = tuple(dims)
+        unmatched = [n for n, size in dims.items() if n not in out_dims and size > 1]
+        if unmatched and not allow_zero:
+            raise ValueError(
+                f"LinearLayout.identity: input dims {unmatched} have no output "
+                f"dim of the same name in {tuple(out_dims)}; pass allow_zero=True "
+                "to map them to zero"
+            )
         n_out = len(out_dims)
         out_idx = {name: i for i, name in enumerate(out_dims)}
         out_sizes = [1] * n_out
@@ -664,9 +676,15 @@ class LinearLayout:
         )
 
     def is_surjective(self) -> bool:
-        """True iff the F2 rank equals the total number of output bits."""
+        """True iff the F2 rank equals the total number of output bits.
+
+        A layout with no output bits (every output dim of size 1) is
+        reported non-surjective: it sends every input to one point, and the
+        rank test would otherwise hold vacuously (release audit C-12)."""
         M = self.matrix().astype(np.uint8)
         rows, cols = M.shape
+        if rows == 0:
+            return False
         # Gaussian elimination over F2.
         rank = 0
         r = 0

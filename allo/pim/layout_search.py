@@ -1559,3 +1559,591 @@ __all__ = [
     "layouts_per_flag",
     "search_min_movement_layout",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# Coordinate-variable search (exact for matcher-derived accesses)
+# --------------------------------------------------------------------------- #
+#
+# Matcher-derived problems (``allo.spmw_layout_problem``) have a special
+# shape: the iteration space is a product of named variables (work-grid axes
+# and loops), each padded to ``bits`` carrier bits, and every access depends
+# injectively on a subset of the variables, so its kernel ``K_j`` is the
+# coordinate subspace spanned by the bits of the variables it ignores.
+#
+# Lemma (coordinate dominance).  Let every ``K_j`` and every forced-local
+# space be coordinate subspaces.  For any flag ``T_1 >= ... >= T_h`` take the
+# initial spaces ``in(T_s)`` (the pivot coordinates of the RREF basis under
+# one fixed coordinate order).  They form a flag with the same dimensions,
+# and for every coordinate subspace ``K`` spanned by a coordinate set ``S``,
+# ``dim(K intersect T) <= dim(K intersect in(T))``: the RREF rows of ``T``
+# with pivots outside ``S`` project to independent vectors on the coordinates
+# outside ``S``, so ``rank(proj_{not S} T) >= #pivots outside S`` and
+# ``dim(K intersect T) = dim T - rank(proj_{not S} T) <= #pivots in S``.
+# Every rank ``r_{j,s}`` therefore weakly drops, the cost (non-negative
+# weights) weakly drops, and strict reductions stay legal.  A minimum is
+# reached by a coordinate flag (owner bits are iteration bits), and every
+# minimum *movement profile* over the positive-weight terms is the profile
+# of some coordinate flag.
+#
+# For a coordinate flag only the number of each variable's bits at each
+# level matters on a full carrier.  The search below enumerates those
+# counts per variable and is exact over all one-to-one layouts.  On a masked
+# (box) domain, where a variable's active range is not a power of two, the
+# count of distinct owner images depends on which bits are chosen; the search
+# then enumerates bit subsets, evaluates the exact active-owner count of
+# paper Section VI, and is exact over coordinate layouts only (the lemma is
+# not proved for masks), which ``optimality_scope`` reports.
+
+from .layout_movement import (
+    AccessMode,
+)  # noqa: E402  pylint: disable=wrong-import-position
+
+#: Domain names reported by :class:`CoordinateSearchResult`.
+SCOPE_ALL_LAYOUTS = "all one-to-one layouts"
+SCOPE_COORDINATE_LAYOUTS = "coordinate layouts"
+
+#: Default cap on the per-variable owner-bit choices of a masked variable.
+DEFAULT_MAX_VARIABLE_CHOICES = 1 << 16
+
+
+@dataclass(frozen=True)
+class CoordinateVariable:
+    """One iteration variable with an active range ``[0, extent)``."""
+
+    name: str
+    extent: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("variable name must be a non-empty string")
+        if isinstance(self.extent, bool) or not isinstance(self.extent, int):
+            raise TypeError("variable extent must be an integer")
+        if self.extent < 1:
+            raise ValueError(f"variable {self.name!r} has extent {self.extent}")
+
+    @property
+    def bits(self) -> int:
+        return (self.extent - 1).bit_length()
+
+    @property
+    def masked(self) -> bool:
+        return self.extent != 1 << self.bits
+
+
+@dataclass(frozen=True)
+class CoordinateAccess:
+    """An access that depends injectively on ``variables`` (indices)."""
+
+    name: str
+    variables: tuple[int, ...]
+    mode: AccessMode
+    element_bytes: Fraction
+    cost_per_level: tuple[Fraction, ...]
+    reassociation_allowed: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("access name must be a non-empty string")
+        variables = tuple(sorted(set(int(v) for v in self.variables)))
+        if any(v < 0 for v in variables):
+            raise ValueError("variable indices must be non-negative")
+        if not isinstance(self.mode, AccessMode):
+            raise TypeError("mode must be an AccessMode")
+        # Reuse LayoutAccess validation of the numeric fields.
+        probe = LayoutAccess(
+            self.name,
+            GF2Matrix(0, 0, ()),
+            self.mode,
+            self.element_bytes,
+            self.cost_per_level,
+            self.reassociation_allowed,
+        )
+        object.__setattr__(self, "variables", variables)
+        object.__setattr__(self, "element_bytes", probe.element_bytes)
+        object.__setattr__(self, "cost_per_level", probe.cost_per_level)
+
+    @property
+    def is_strict_reduction(self) -> bool:
+        return (
+            self.mode is AccessMode.WRITE_ACCUMULATE and not self.reassociation_allowed
+        )
+
+
+@dataclass(frozen=True)
+class CoordinateLayoutProblem:
+    """Owner levels of ``level_bits`` bits over a product of variables.
+
+    Carrier bit order: variable 0's bits (low to high), then variable 1's,
+    and so on.  Work coordinates: the owner bits of level 0, then level 1,
+    ..., then the local bits.  ``sum(level_bits)`` must not exceed the
+    carrier.
+    """
+
+    variables: tuple[CoordinateVariable, ...]
+    level_bits: tuple[int, ...]
+    accesses: tuple[CoordinateAccess, ...]
+
+    def __post_init__(self) -> None:
+        variables = tuple(self.variables)
+        accesses = tuple(self.accesses)
+        level_bits = tuple(int(b) for b in self.level_bits)
+        if not variables or not accesses or not level_bits:
+            raise ValueError("variables, accesses and level_bits must be non-empty")
+        if any(b < 1 for b in level_bits):
+            raise ValueError("every owner level needs at least one bit")
+        names = [access.name for access in accesses]
+        if len(set(names)) != len(names):
+            raise ValueError(f"access names must be unique, got {names}")
+        for access in accesses:
+            if any(v >= len(variables) for v in access.variables):
+                raise ValueError(f"access {access.name!r} names an unknown variable")
+            if len(access.cost_per_level) != len(level_bits):
+                raise ValueError(
+                    f"access {access.name!r} has {len(access.cost_per_level)} "
+                    f"per-level costs for {len(level_bits)} owner levels"
+                )
+        carrier = sum(v.bits for v in variables)
+        if sum(level_bits) > carrier:
+            raise ValueError(
+                f"{sum(level_bits)} owner bits exceed the {carrier}-bit carrier"
+            )
+        object.__setattr__(self, "variables", variables)
+        object.__setattr__(self, "accesses", accesses)
+        object.__setattr__(self, "level_bits", level_bits)
+
+    @property
+    def carrier_bits(self) -> int:
+        return sum(v.bits for v in self.variables)
+
+    @property
+    def is_masked(self) -> bool:
+        return any(v.masked for v in self.variables)
+
+    def bit_offset(self, variable: int) -> int:
+        return sum(v.bits for v in self.variables[:variable])
+
+    def kernel_variables(self, access: CoordinateAccess) -> tuple[int, ...]:
+        return tuple(v for v in range(len(self.variables)) if v not in access.variables)
+
+    def active_points(self) -> tuple[int, ...]:
+        """The box domain as packed carrier points (for cross-checks only)."""
+
+        points = [0]
+        for index, variable in enumerate(self.variables):
+            offset = self.bit_offset(index)
+            points = [
+                p | (value << offset)
+                for p in points
+                for value in range(variable.extent)
+            ]
+        return tuple(sorted(points))
+
+    def layout_accesses(self) -> tuple[LayoutAccess, ...]:
+        """The same accesses as GF(2) selection matrices on the carrier."""
+
+        carrier = self.carrier_bits
+        result = []
+        for access in self.accesses:
+            rows = []
+            for v in access.variables:
+                offset = self.bit_offset(v)
+                rows.extend(1 << (offset + b) for b in range(self.variables[v].bits))
+            result.append(
+                LayoutAccess(
+                    access.name,
+                    GF2Matrix(len(rows), carrier, tuple(rows)),
+                    access.mode,
+                    access.element_bytes,
+                    access.cost_per_level,
+                    access.reassociation_allowed,
+                )
+            )
+        return tuple(result)
+
+
+@dataclass(frozen=True)
+class CoordinateAssignment:
+    """Owner bits of a coordinate layout.
+
+    ``levels[s][v]`` lists the bit positions (within variable ``v``) that are
+    owner bits of level ``s``; every other bit is local.
+    """
+
+    levels: tuple[tuple[tuple[int, ...], ...], ...]
+
+    def owner_bits(
+        self, problem: CoordinateLayoutProblem, level: int
+    ) -> tuple[int, ...]:
+        """Carrier bit indices of level ``level`` (variable order, ascending)."""
+
+        bits = []
+        for v, positions in enumerate(self.levels[level]):
+            offset = problem.bit_offset(v)
+            bits.extend(offset + b for b in sorted(positions))
+        return tuple(bits)
+
+    def matrix(self, problem: CoordinateLayoutProblem) -> GF2Matrix:
+        """Work-to-iteration matrix: owner columns level by level, then local
+        columns in ascending carrier order."""
+
+        carrier = problem.carrier_bits
+        columns = []
+        for level in range(len(self.levels)):
+            columns.extend(self.owner_bits(problem, level))
+        used = set(columns)
+        columns.extend(bit for bit in range(carrier) if bit not in used)
+        return _matrix_from_columns(tuple(1 << bit for bit in columns), carrier)
+
+
+@dataclass(frozen=True)
+class CoordinateTie:
+    """One minimum movement profile.
+
+    ``profile`` is ``((access, level, owners per element), ...)`` over the
+    positive-weight terms; ``owners per element`` is ``2**r_{j,s}`` on a full
+    carrier.  ``multiplicity`` counts the coordinate owner-bit assignments
+    (bits per level, ignoring order inside a level) with this profile.
+    """
+
+    profile: tuple[tuple[str, int, int], ...]
+    cost: Fraction
+    assignment: CoordinateAssignment
+    multiplicity: int
+
+
+@dataclass(frozen=True)
+class CoordinateSearchResult:
+    # pylint: disable=too-many-instance-attributes
+    """Outcome of :func:`search_coordinate_min_movement`.
+
+    ``optimality_proven`` holds when the enumeration completed on a full
+    carrier (``optimality_scope == SCOPE_ALL_LAYOUTS``).  A masked problem is
+    exact over coordinate layouts only.  On ``NODE_BUDGET`` the ties are the
+    best assignments seen (or a fallback incumbent).
+    """
+
+    cost: Fraction | None
+    ties: tuple[CoordinateTie, ...]
+    termination: LayoutSearchTermination
+    visited: int
+    illegal: int
+    nodes_used: int
+    optimality_proven: bool
+    optimality_scope: str
+    fallback_incumbent: bool
+    problem: CoordinateLayoutProblem = field(repr=False)
+
+
+def _multinomial(total: int, parts: tuple[int, ...]) -> int:
+    result = 1
+    remaining = total
+    for part in parts:
+        result *= _binomial(remaining, part)
+        remaining -= part
+    return result
+
+
+def _binomial(n: int, k: int) -> int:
+    if k < 0 or k > n:
+        return 0
+    value = 1
+    for i in range(k):
+        value = value * (n - i) // (i + 1)
+    return value
+
+
+def _distinct_values(extent: int, positions: tuple[int, ...]) -> int:
+    if not positions:
+        return 1
+    if extent & (extent - 1) == 0 and max(positions) < (extent - 1).bit_length():
+        return 1 << len(positions)
+    mask = 0
+    for bit in positions:
+        mask |= 1 << bit
+    return len({value & mask for value in range(extent)})
+
+
+@dataclass(frozen=True)
+class _VariableClass:
+    counts: tuple[int, ...]
+    distinct: tuple[int, ...]  # owners per value through each level
+    representative: tuple[tuple[int, ...], ...]
+    multiplicity: int
+
+
+def _count_vectors(bits: int, level_bits: tuple[int, ...]):
+    def rec(level, remaining):
+        if level == len(level_bits):
+            yield ()
+            return
+        for count in range(min(remaining, level_bits[level]) + 1):
+            for rest in rec(level + 1, remaining - count):
+                yield (count,) + rest
+
+    yield from rec(0, bits)
+
+
+def _variable_classes(
+    variable: CoordinateVariable, level_bits: tuple[int, ...], max_choices: int
+) -> tuple[_VariableClass, ...]:
+    bits = variable.bits
+    classes = []
+    if not variable.masked:
+        for counts in _count_vectors(bits, level_bits):
+            positions, top = [], bits
+            for count in counts:
+                positions.append(tuple(range(top - 1, top - 1 - count, -1)))
+                top -= count
+            cumulative, distinct = 0, []
+            for count in counts:
+                cumulative += count
+                distinct.append(1 << cumulative)
+            classes.append(
+                _VariableClass(
+                    counts,
+                    tuple(distinct),
+                    tuple(positions),
+                    _multinomial(bits, counts),
+                )
+            )
+        return tuple(classes)
+
+    choices = sum(
+        _multinomial(bits, counts) for counts in _count_vectors(bits, level_bits)
+    )
+    if choices > max_choices:
+        raise LayoutSearchDomainError(
+            f"masked variable {variable.name!r} ({bits} bits, active extent "
+            f"{variable.extent}) has {choices} owner-bit choices; the cap is "
+            f"{max_choices}"
+        )
+    grouped: dict[tuple, list] = {}
+
+    def rec(level, available, chosen):
+        if level == len(level_bits):
+            yield tuple(chosen)
+            return
+        for count in range(min(len(available), level_bits[level]) + 1):
+            for subset in combinations(available, count):
+                rest = tuple(bit for bit in available if bit not in subset)
+                yield from rec(
+                    level + 1, rest, chosen + [tuple(sorted(subset, reverse=True))]
+                )
+
+    for option in rec(0, tuple(range(bits - 1, -1, -1)), []):
+        counts = tuple(len(s) for s in option)
+        cumulative, distinct = (), []
+        for subset in option:
+            cumulative = cumulative + subset
+            distinct.append(_distinct_values(variable.extent, cumulative))
+        key = (counts, tuple(distinct))
+        grouped.setdefault(key, []).append(option)
+    for (counts, distinct), options in grouped.items():
+        classes.append(_VariableClass(counts, distinct, max(options), len(options)))
+    return tuple(classes)
+
+
+def _fallback_coordinate_assignment(problem, strict_kernel_vars):
+    """Greedy legal assignment: fill owner levels from the highest bits of the
+    variables no strict reduction keeps local (None if impossible)."""
+
+    order = [v for v in range(len(problem.variables)) if v not in strict_kernel_vars]
+    free = {v: list(range(problem.variables[v].bits - 1, -1, -1)) for v in order}
+    levels = []
+    for need in problem.level_bits:
+        level = [[] for _ in problem.variables]
+        for v in order:
+            while need and free[v]:
+                level[v].append(free[v].pop(0))
+                need -= 1
+        if need:
+            return None
+        levels.append(tuple(tuple(bits) for bits in level))
+    return CoordinateAssignment(tuple(levels))
+
+
+def coordinate_assignment_cost(
+    problem: CoordinateLayoutProblem, assignment: CoordinateAssignment
+) -> tuple[Fraction | None, tuple[tuple[str, int, int], ...]]:
+    """Exact movement cost and profile of one coordinate layout.
+
+    Returns ``(None, profile)`` when a strict reduction is split.  The profile
+    lists ``(access, level, owners per element)`` for positive-weight terms.
+    """
+
+    h = len(problem.level_bits)
+    if len(assignment.levels) != h:
+        raise ValueError("assignment has the wrong number of owner levels")
+    distinct = []
+    for v, variable in enumerate(problem.variables):
+        cumulative, per_level = (), []
+        for level in range(h):
+            cumulative = cumulative + tuple(assignment.levels[level][v])
+            per_level.append(_distinct_values(variable.extent, cumulative))
+        distinct.append(per_level)
+    return _profile_cost(problem, distinct)
+
+
+def _profile_cost(problem, distinct):
+    h = len(problem.level_bits)
+    total = Fraction(0)
+    profile = []
+    legal = True
+    for access in problem.accesses:
+        kernel = problem.kernel_variables(access)
+        elements = 1
+        for v in access.variables:
+            elements *= problem.variables[v].extent
+        for level in range(h):
+            owners = 1
+            for v in kernel:
+                owners *= distinct[v][level]
+            if access.is_strict_reduction:
+                legal = legal and owners == 1
+                continue
+            weight = access.cost_per_level[level] * access.element_bytes * elements
+            if weight:
+                total += weight * (owners - 1)
+                profile.append((access.name, level, owners))
+    return (total if legal else None), tuple(profile)
+
+
+def search_coordinate_min_movement(
+    problem: CoordinateLayoutProblem,
+    *,
+    max_search_nodes: int | None = DEFAULT_MAX_SEARCH_NODES,
+    max_variable_choices: int = DEFAULT_MAX_VARIABLE_CHOICES,
+) -> CoordinateSearchResult:
+    """Exact minimum movement over coordinate layouts (see the lemma above).
+
+    Depth-first over variables; each node picks one equivalence class of a
+    variable's owner bits (same counts per level and, under a mask, the same
+    distinct-owner counts).  A node is charged per class choice and per
+    completed assignment; ``max_search_nodes=None`` runs to exhaustion.
+    """
+
+    if not isinstance(problem, CoordinateLayoutProblem):
+        raise TypeError("problem must be a CoordinateLayoutProblem")
+    level_bits = problem.level_bits
+    classes = [
+        _variable_classes(variable, level_bits, max_variable_choices)
+        for variable in problem.variables
+    ]
+    strict_kernel_vars = set()
+    for access in problem.accesses:
+        if access.is_strict_reduction:
+            strict_kernel_vars.update(problem.kernel_variables(access))
+
+    best: Fraction | None = None
+    by_profile: dict[tuple, list] = {}
+    visited = illegal = nodes = 0
+    exhausted_budget = False
+
+    chosen: list[_VariableClass] = []
+
+    def leaf():
+        nonlocal best, visited, illegal
+        visited += 1
+        distinct = [list(c.distinct) for c in chosen]
+        cost, profile = _profile_cost(problem, distinct)
+        if cost is None:
+            illegal += 1
+            return
+        if best is not None and cost > best:
+            return
+        if best is None or cost < best:
+            best = cost
+            by_profile.clear()
+        multiplicity = 1
+        for c in chosen:
+            multiplicity *= c.multiplicity
+        entry = by_profile.setdefault(profile, [None, 0])
+        assignment = CoordinateAssignment(
+            tuple(
+                tuple(c.representative[level] for c in chosen)
+                for level in range(len(level_bits))
+            )
+        )
+        if entry[0] is None:
+            entry[0] = assignment
+        entry[1] += multiplicity
+
+    def rec(index, remaining):
+        nonlocal nodes, exhausted_budget
+        if exhausted_budget:
+            return
+        if index == len(classes):
+            if any(remaining):
+                return
+            leaf()
+            return
+        # Bits still available in later variables must cover what remains.
+        later = sum(problem.variables[v].bits for v in range(index + 1, len(classes)))
+        for cls in classes[index]:
+            if any(c > r for c, r in zip(cls.counts, remaining)):
+                continue
+            rest = tuple(r - c for r, c in zip(remaining, cls.counts))
+            if sum(rest) > later:
+                continue
+            if index in strict_kernel_vars and any(cls.counts):
+                continue
+            if max_search_nodes is not None and nodes >= max_search_nodes:
+                exhausted_budget = True
+                return
+            nodes += 1
+            chosen.append(cls)
+            rec(index + 1, rest)
+            chosen.pop()
+
+    rec(0, level_bits)
+
+    fallback = False
+    if exhausted_budget and best is None:
+        assignment = _fallback_coordinate_assignment(problem, strict_kernel_vars)
+        if assignment is not None:
+            cost, profile = coordinate_assignment_cost(problem, assignment)
+            if cost is not None:
+                best = cost
+                by_profile = {profile: [assignment, 1]}
+                fallback = True
+    ties = tuple(
+        CoordinateTie(profile, best, entry[0], entry[1])
+        for profile, entry in sorted(by_profile.items(), key=lambda item: item[0])
+    )
+    if exhausted_budget:
+        termination = LayoutSearchTermination.NODE_BUDGET
+    else:
+        termination = LayoutSearchTermination.EXHAUSTED
+    if best is None and not exhausted_budget:
+        raise NoLegalLayoutError(
+            "no coordinate layout keeps every strict reduction inside one owner"
+        )
+    scope = SCOPE_COORDINATE_LAYOUTS if problem.is_masked else SCOPE_ALL_LAYOUTS
+    return CoordinateSearchResult(
+        cost=best,
+        ties=ties,
+        termination=termination,
+        visited=visited,
+        illegal=illegal,
+        nodes_used=nodes,
+        optimality_proven=(not exhausted_budget and scope == SCOPE_ALL_LAYOUTS),
+        optimality_scope=scope,
+        fallback_incumbent=fallback,
+        problem=problem,
+    )
+
+
+__all__ += [
+    "CoordinateAccess",
+    "CoordinateAssignment",
+    "CoordinateLayoutProblem",
+    "CoordinateSearchResult",
+    "CoordinateTie",
+    "CoordinateVariable",
+    "DEFAULT_MAX_VARIABLE_CHOICES",
+    "SCOPE_ALL_LAYOUTS",
+    "SCOPE_COORDINATE_LAYOUTS",
+    "coordinate_assignment_cost",
+    "search_coordinate_min_movement",
+]
