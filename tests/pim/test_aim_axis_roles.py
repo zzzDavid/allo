@@ -11,7 +11,6 @@ are never guessed (audit C-07).
 from __future__ import annotations
 
 import collections
-from types import SimpleNamespace
 
 import pytest
 
@@ -27,7 +26,6 @@ from allo.pim.aim_lowering import (
 from allo.pim.costs import aim_cost
 from allo.pim.targets import build_aim_target
 from allo.spmw_codegen import _eval_sym
-from allo.spmw_linear_layout import LinearLayout
 from allo.spmw_target import UnitId
 
 pytestmark = pytest.mark.filterwarnings("ignore::UserWarning")
@@ -132,6 +130,8 @@ def heads_qk(q: bfloat16[H, DH], kc: bfloat16[H, L, DH], sc: bfloat16[H, L]):
 
 
 def _compile(workload, **kwargs):
+    # Every AiM MAC reduces 16 BF16 products through the bank adder tree.
+    kwargs.setdefault("reduction_order", "reassociate")
     return allo.compile(workload, build_aim_target(), aim_cost, **kwargs)
 
 
@@ -310,40 +310,9 @@ def test_eval_sym_refuses_unbound_unit_ids():
     assert _eval_sym(index, {1: 2, 2: 3}) == 11
 
 
-def _ctx(work_id, layout):
-    from allo.spmw_aim import AimCtx
-
-    target = build_aim_target()
-    ctx = AimCtx(target)
-    ctx._active_work_id = work_id
-    ctx._active_placement = SimpleNamespace(layout=layout)
-    return ctx, target
-
-
-def test_aim_bank_handle_binds_levels_from_work_id_and_layout():
-    all_banks = LinearLayout(
-        bases={"work_bank": [(1,), (2,), (4,), (8,)]},
-        out_dims=("bank",),
-        out_sizes=(16,),
-    )
-    ctx, target = _ctx((5,), all_banks)
-    with pytest.raises(ValueError, match="unbound UnitId at level 1"):
-        ctx.cmd("WR_SBK", dst=_bank_handle(target), src0=target.gpr)
-
-    ctx, target = _ctx((5, 2, 3), all_banks)
-    ctx.cmd("WR_SBK", dst=_bank_handle(target), src0=target.gpr)
-    assert ctx.cmds[-1].split()[4] == "11"
-
-    one_bank = LinearLayout(
-        bases={"work_bank": [(0,), (0,)]}, out_dims=("bank",), out_sizes=(16,)
-    )
-    ctx, target = _ctx((5,), one_bank)
-    ctx.cmd("WR_SBK", dst=_bank_handle(target), src0=target.gpr)
-    assert ctx.cmds[-1].split()[4] == "0"
-
-    ctx, target = _ctx((40,), one_bank)
-    with pytest.raises(ValueError, match="outside 'channel' extent 32"):
-        ctx.cmd("WR_SBK", dst=_bank_handle(target), src0=target.gpr)
+# The handle-based `AimCtx.cmd` encoder that bound bank handles from work ids
+# was unreachable from the matcher route and was removed (audit M-11); bank
+# addresses come from the LinearLayout in `AimCtx.emit_program`/`_sbk_banks`.
 
 
 def test_target_geometry_requires_a_reuse_slot():

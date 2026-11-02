@@ -17,7 +17,16 @@ from allo.spmw_autoschedule import (
 from allo.spmw_codegen import compile_for_target
 from allo.spmw_knobs import registered_knobs
 
-AIM_KNOBS = ("bank_scope", "batch_mapping", "reuse_group", "replica_partitions")
+AIM_KNOBS = (
+    "bank_scope",
+    "batch_mapping",
+    "reuse_group",
+    "reduction_partitions",
+    "replica_partitions",
+)
+# reduction_partitions > 1 rides on the LinearLayout (token_partition output
+# dim), which is part of the decision key; P = 1 leaves the base unchanged.
+LAYOUT_CARRIED_KNOBS = ("reduction_partitions",)
 
 H, DH, L = 32, 128, 512
 
@@ -56,13 +65,26 @@ def _wr_gb(compiled):
 def test_aim_knobs_registered_logged_and_realizable(monkeypatch):
     target = build_aim_target()
     assert tuple(knob.name for knob in registered_knobs("aim")) == AIM_KNOBS
-    assert set(AIM_KNOBS) <= set(_MATCHER_PHYSICAL_EXTRA_FIELDS)
+    assert set(AIM_KNOBS) - set(LAYOUT_CARRIED_KNOBS) <= set(
+        _MATCHER_PHYSICAL_EXTRA_FIELDS
+    )
 
-    compiled = allo.compile(attention_qk, target, aim_cost, backend="virtual")
+    compiled = allo.compile(
+        attention_qk, target, aim_cost, backend="virtual", reduction_order="reassociate"
+    )
     (kernel,) = compiled.placement_ranking.kernels
     modes = [mode for _p, _c, mode in kernel.scores]
     for mode in modes:
-        assert all(f"+{name}=" in mode for name in AIM_KNOBS), mode
+        assert all(
+            f"+{name}=" in mode for name in AIM_KNOBS if name not in LAYOUT_CARRIED_KNOBS
+        ), mode
+        if "+reduction_partitions=" in mode:
+            assert _knob(mode, "batch_mapping") == "channels", mode
+    assert {
+        _knob(mode, "reduction_partitions")
+        for mode in modes
+        if "+reduction_partitions=" in mode
+    } == {"2", "4", "8"}
     assert {_knob(mode, "bank_scope") for mode in modes} == {"sbk", "abk"}
     assert {_knob(mode, "batch_mapping") for mode in modes} == {
         "row_packed",
@@ -99,13 +121,17 @@ def test_aim_knobs_registered_logged_and_realizable(monkeypatch):
         return profile(candidate, geometry)
 
     monkeypatch.setattr(aim_costs, "_contraction_profile_cycles", reject_row_packed)
-    skipped = allo.compile(attention_qk, target, aim_cost, backend="virtual")
+    skipped = allo.compile(
+        attention_qk, target, aim_cost, backend="virtual", reduction_order="reassociate"
+    )
     assert _knob(_chosen(skipped), "batch_mapping") == "channels"
 
 
 def test_aim_row_activation_cost_flips_batch_mapping(monkeypatch):
     target = build_aim_target()
-    compiled = allo.compile(attention_qk, target, aim_cost, backend="virtual")
+    compiled = allo.compile(
+        attention_qk, target, aim_cost, backend="virtual", reduction_order="reassociate"
+    )
     assert _knob(_chosen(compiled), "batch_mapping") == "row_packed"
     assert _wr_gb(compiled) == 16
     fingerprint = aim_cost.bind(target).fingerprint
@@ -114,7 +140,9 @@ def test_aim_row_activation_cost_flips_batch_mapping(monkeypatch):
         "allo.pim.costs.aim.BATCH_MAPPING_ROW_ACTIVATE_CYCLES", 0, raising=True
     )
     assert aim_cost.bind(target).fingerprint != fingerprint
-    flipped = allo.compile(attention_qk, target, aim_cost, backend="virtual")
+    flipped = allo.compile(
+        attention_qk, target, aim_cost, backend="virtual", reduction_order="reassociate"
+    )
     assert _knob(_chosen(flipped), "batch_mapping") == "channels"
     assert _wr_gb(flipped) == 4
     macs = lambda c: sum(1 for x in c.compiled.cmds if x.startswith("AiM MAC_"))

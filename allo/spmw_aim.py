@@ -14,10 +14,8 @@ from pathlib import Path
 from .spmw_autoschedule import _matcher_work_scope
 from .spmw_plan import LaunchStep
 from .spmw_match import MatchedOp
-from .spmw_target import MemoryRef, Register
 from .spmw_codegen import (
     CodegenContext,
-    _eval_sym,
     _parse_loop_bound,
     RunResult,
     SimulatorUnavailable,
@@ -31,6 +29,7 @@ from .pim.aim_lowering import (
     AimBankCopy,
     AimDistributedHostTransfer,
     AimElementwise,
+    AimHostReduction,
     AimHostTransfer,
     AimSync,
     _AimLowerer,
@@ -41,6 +40,7 @@ from .pim.aim_lowering import (
     contraction_shape,
     group_replicated,
     issued_scalar_macs,
+    layout_reduction_partitions,
     mac_operands,
     matrix_axes,
     resolve_batch_mapping,
@@ -48,257 +48,24 @@ from .pim.aim_lowering import (
 
 
 class AimCtx(CodegenContext):
-    """Codegen ctx for AiM. Emits one text-format ISR line per `cmd(...)`.
+    """Codegen ctx for AiM: emits the ramulator2 text trace.
 
-    Output is a list of strings on `self.cmds` (NOT `PIMCmd` records —
-    AiM's ramulator2 consumes a plain text trace). Each line is a
-    space-separated, positional sequence of integer fields in the order
-    ramulator2 expects per opcode (see `_ISR_FIELDS`). A side-channel
-    `_human_lines` mirror keeps the older `key=value` annotation that
-    `_operand_text` produces — useful for unit tests that inspect the
-    rendered trace by substring.
+    ``self.cmds`` is a list of trace lines (not ``PIMCmd`` records).  Every
+    line comes from :meth:`emit_program`: matched kernels become typed
+    ``AimOp`` records that ``_AimLowerer`` expands into simulator commands, so
+    there is exactly one ISR encoder (``allo.pim.aim_lowering``).  The target's
+    op/move declarations carry no ``emit`` callbacks for AiM; only the host
+    moves keep one, which reports the transfer direction (``host_scatter``
+    and friends below).
     """
-
-    # Per-opcode field ordering (positional, matches
-    # ``Ramulator::AiMISRInfo::opcode_str_to_aim_ISR`` in request.h).
-    # Each tuple is the legal field sequence; values are pulled from
-    # the field map built by `_field_map(...)`.
-    _ISR_FIELDS = {
-        "WR_SBK": ("gpr_addr_0", "channel_mask", "bank_index", "row_addr"),
-        "WR_ABK": ("gpr_addr_0", "channel_mask", "row_addr"),
-        "WR_GB": ("opsize", "gpr_addr_0", "channel_mask"),
-        "WR_BIAS": ("gpr_addr_0", "channel_mask"),
-        "WR_AFLUT": ("opsize",),
-        "RD_MAC": ("gpr_addr_0", "channel_mask"),
-        "RD_AF": ("gpr_addr_0", "channel_mask"),
-        "RD_SBK": ("gpr_addr_0", "channel_mask", "bank_index", "row_addr"),
-        "COPY_BKGB": ("opsize", "channel_mask", "bank_index", "row_addr"),
-        "COPY_GBBK": ("opsize", "channel_mask", "bank_index", "row_addr"),
-        "MAC_SBK": ("opsize", "channel_mask", "bank_index", "row_addr"),
-        "MAC_ABK": ("opsize", "channel_mask", "row_addr"),
-        "AF": ("channel_mask",),
-        "EWMUL": ("opsize", "channel_mask", "row_addr"),
-        "EWADD": ("opsize", "gpr_addr_0", "gpr_addr_1"),
-        "SYNC": (),
-        "EOC": (),
-    }
 
     def __init__(self, target):
         super().__init__(target)
-        # Override the parent's PIMCmd list with a plain text-line list —
         # AiM's ramulator2 frontend consumes a text trace.
         self.cmds: list[str] = []
-        # Parallel list of the human-readable key=value annotation per
-        # emitted line; populated by `cmd()` so tests can introspect.
-        self._human_lines: list[str] = []
-
-    def _unit_env(self) -> dict:
-        """Concrete ``(level, unit) -> coordinate`` of the active work item.
-
-        Work-grid axis ``i`` is unit level ``i`` of the target's unit chain
-        (outer first); each coordinate must lie inside that unit's extent.
-        Levels below the work grid are bound only when they jointly span the
-        layout's bank dimension and the active placement's LinearLayout sends
-        the whole work item to one physical bank, which is then decomposed
-        mixed-radix over those levels' extents.  Any other level stays
-        unbound, so `_eval_sym` raises instead of guessing unit 0.
-        """
-        chain = [
-            unit
-            for unit in self.target._walk()
-            if unit.parent is not None and getattr(unit, "mode", None) not in ("device", "host")
-        ]
-        work_id = tuple(int(value) for value in getattr(self, "_active_work_id", ()))
-        if len(work_id) > len(chain):
-            raise ValueError(
-                f"AiM work id {work_id} has more axes than the unit chain "
-                f"{[unit.name for unit in chain]}"
-            )
-        extents = [math.prod(int(v) for v in unit.axes.values()) for unit in chain]
-        env = {}
-        for level, coordinate in enumerate(work_id):
-            if not 0 <= coordinate < extents[level]:
-                raise ValueError(
-                    f"AiM work coordinate {coordinate} is outside "
-                    f"{chain[level].name!r} extent {extents[level]}"
-                )
-            env[(level, chain[level].name)] = coordinate
-        layout = getattr(getattr(self, "_active_placement", None), "layout", None)
-        deeper = range(len(work_id), len(chain))
-        if (
-            layout is not None
-            and deeper
-            and "bank" in layout.out_dims
-            and math.prod(extents[level] for level in deeper)
-            == layout.out_sizes[layout.out_dims.index("bank")]
-            and layout.image_size(varying_inputs=tuple(layout.bases), output_dims=("bank",)) == 1
-        ):
-            bank = layout.apply(**{name: 0 for name in layout.bases})[
-                layout.out_dims.index("bank")
-            ]
-            for level in reversed(deeper):
-                bank, env[(level, chain[level].name)] = divmod(bank, extents[level])
-        return env
-
-    def _operand_text(self, handle, role: str) -> str:
-        """Render a Tenon handle as the AiM trace field set it implies.
-
-        This is the human-readable `key=value` annotation; positional
-        emission flows through `_handle_to_fields`. Tests that previously
-        asserted on this format inspect `self._human_lines`.
-        """
-        if handle is None:
-            return ""
-        if isinstance(handle, Register):
-            if handle.name == "gpr":
-                prefix = "gpr_in" if role.startswith("src") else "gpr_out"
-                return f"{prefix}=0"
-            if handle.name in ("mac_reg", "af_reg"):
-                return f"{handle.name}=0"
-            raise NotImplementedError(
-                f"AimCtx: register {handle.name!r} has no operand mapping."
-            )
-        if isinstance(handle, MemoryRef):
-            mem = handle.memory
-            if mem.name == "banks":
-                # `handle.idx` may be a symbolic SymExpr over unit ids (the
-                # target's `4*bg + bank`); every level must be bound.
-                bank_int = _eval_sym(handle.idx, self._unit_env())
-                if bank_int is None:
-                    raise NotImplementedError(
-                        f"AimCtx: bank index {handle.idx!r} cannot be reduced "
-                        "to an integer; supply concrete UnitId values."
-                    )
-                return f"bank={bank_int} row=0"
-            if mem.name == "gb":
-                return "gb=1"
-            raise NotImplementedError(
-                f"AimCtx: memory {mem.name!r} has no operand mapping."
-            )
-        # Memory (whole-memory broadcast operand, e.g. WR_ABK src0=banks).
-        from .spmw_target import Memory
-
-        if isinstance(handle, Memory):
-            if handle.name == "banks":
-                return "bank=ALL row=0"
-            if handle.name == "gb":
-                return "gb=1"
-            if handle.name == "gpr":
-                prefix = "gpr_in" if role.startswith("src") else "gpr_out"
-                return f"{prefix}=0"
-            raise NotImplementedError(
-                f"AimCtx: whole-memory {handle.name!r} has no operand mapping."
-            )
-        raise NotImplementedError(
-            f"AimCtx: unknown handle type {type(handle).__name__}."
-        )
-
-    def _handle_to_fields(self, handle, role: str, fields: dict) -> None:
-        """Update `fields` with the integer values implied by `handle`.
-
-        Keys written: `gpr_addr_0`, `gpr_addr_1`, `bank_index`, `row_addr`,
-        and `channel_mask` for whole-memory broadcasts. Unknown handles
-        are tolerated — the caller's ISR-field selector picks only the
-        fields the opcode declares as legal.
-        """
-        if handle is None:
-            return
-        from .spmw_target import Memory
-
-        if isinstance(handle, Register):
-            if handle.name in ("gpr", "mac_reg", "af_reg"):
-                # gpr_addr_1 hosts the second GPR for ISRs that need two
-                # (EWADD); the first src GPR routes to gpr_addr_0.
-                if role == "src1" and "gpr_addr_0" in fields:
-                    fields["gpr_addr_1"] = 0
-                else:
-                    fields.setdefault("gpr_addr_0", 0)
-            return
-        if isinstance(handle, MemoryRef):
-            mem = handle.memory
-            if mem.name == "banks":
-                bank_int = _eval_sym(handle.idx, self._unit_env())
-                if bank_int is None:
-                    raise NotImplementedError(
-                        f"AimCtx: bank index {handle.idx!r} cannot be reduced "
-                        "to an integer; supply concrete UnitId values."
-                    )
-                fields["bank_index"] = bank_int
-                fields.setdefault("row_addr", 0)
-            elif mem.name == "gb":
-                fields.setdefault("channel_mask", 1)
-            return
-        if isinstance(handle, Memory):
-            if handle.name == "banks":
-                # WR_ABK / MAC_ABK target every bank in a channel; the
-                # parser still wants a row_addr field.
-                fields.setdefault("row_addr", 0)
-            elif handle.name == "gb":
-                fields.setdefault("channel_mask", 1)
-            elif handle.name == "gpr":
-                if role == "src1" and "gpr_addr_0" in fields:
-                    fields["gpr_addr_1"] = 0
-                else:
-                    fields.setdefault("gpr_addr_0", 0)
-            return
-
-    def cmd(self, name: str, dst=None, src0=None, src1=None, **fields):
-        """Emit one ISR line in ramulator2's positional format.
-
-        `fields` may carry overrides (e.g. `row_addr=8`, `opsize=2`);
-        unspecified fields default to 0 (or 1 for `channel_mask`).
-        Unknown opcodes fall back to the legacy key=value form so
-        callers using non-canonical opcode names still produce a
-        parseable diagnostic line.
-        """
-        # Build the integer field map from operand handles + overrides.
-        work_id = getattr(self, "_active_work_id", ())
-        channel_id = int(work_id[0]) if work_id else 0
-        field_map: dict = {"channel_mask": 1 << channel_id}
-        self._handle_to_fields(src0, "src0", field_map)
-        self._handle_to_fields(src1, "src1", field_map)
-        self._handle_to_fields(dst, "dst", field_map)
-        # Caller overrides (e.g. `row_addr=...`, `opsize=...`).
-        for k, v in fields.items():
-            field_map[k] = v
-
-        # Human-readable mirror — keeps the older key=value annotation so
-        # tests can introspect handle-derived field labels.
-        parts = [f"AiM {name}", f"ch={channel_id}"]
-        if src0 is not None:
-            parts.append(self._operand_text(src0, "src0"))
-        if src1 is not None:
-            parts.append(self._operand_text(src1, "src1"))
-        if dst is not None:
-            parts.append(self._operand_text(dst, "dst"))
-        for k, v in fields.items():
-            parts.append(f"{k}={v}")
-        human = "  ".join(p for p in parts if p)
-        self._human_lines.append(human)
-
-        # Positional output — ramulator2 expects space-separated ints in
-        # the order declared by `_ISR_FIELDS[opcode]`. Defaults:
-        # gpr/opsize/bank/row -> 0; channel_mask -> 1 (channel 0 enabled).
-        order = self._ISR_FIELDS.get(name)
-        if order is None:
-            # Unknown opcode -- preserve diagnostic mode by emitting the
-            # key=value annotation. ramulator2 will reject it, which is
-            # the correct behaviour (caller asked for an opcode the spec
-            # doesn't know about).
-            self.cmds.append(human)
-            return
-        defaults = {
-            "gpr_addr_0": 0,
-            "gpr_addr_1": 0,
-            "opsize": 1,
-            "bank_index": 0,
-            "row_addr": 0,
-            "channel_mask": 1,
-        }
-        tokens = [f"AiM {name}"]
-        for fld in order:
-            tokens.append(str(field_map.get(fld, defaults[fld])))
-        self.cmds.append(" ".join(tokens))
+        # Host steps of the retained program that lower to no ISR line
+        # (``AimHostReduction``), in program order.
+        self.host_steps: list = []
 
     def append(self, line: str):
         """Low-level escape hatch — append a raw trace line."""
@@ -307,37 +74,6 @@ class AimCtx(CodegenContext):
     def emit_eoc(self):
         """End-of-command marker — every AiM trace ends with EOC."""
         self.cmds.append("AiM EOC")
-        self._human_lines.append("AiM EOC")
-
-    def resolve_moves(self, role, src_handle=None, dst_handle=None):
-        from .spmw_target import Memory
-
-        if dst_handle is None:
-            return (None, None)
-        if isinstance(dst_handle, MemoryRef):
-            mem = dst_handle.memory
-            if mem.name == "banks":
-                # per-bank: WR_SBK in, RD_SBK out
-                return ("WR_SBK", "RD_SBK")
-            if mem.name == "gb":
-                return ("WR_GB", None)
-            return (None, None)
-        if isinstance(dst_handle, Memory):
-            if dst_handle.name == "banks":
-                # all-bank broadcast write; no readback path
-                return ("WR_ABK", None)
-            if dst_handle.name == "gb":
-                return ("WR_GB", None)
-            return (None, None)
-        if isinstance(dst_handle, Register):
-            if dst_handle.name == "mac_reg":
-                return (None, "RD_MAC")
-            if dst_handle.name == "af_reg":
-                return (None, "RD_AF")
-            if dst_handle.name == "gpr":
-                return (None, None)
-            return (None, None)
-        return (None, None)
 
     def _sbk_banks(self, placement) -> tuple[int, ...]:
         """Physical banks one single-bank launch touches, from the layout."""
@@ -399,6 +135,10 @@ class AimCtx(CodegenContext):
             entry = lowerer.operations[-1]
             entry["command_span"] = [begin, len(lines)]
             entry["command_count"] = len(lines) - begin
+            if isinstance(operation, AimHostReduction):
+                # Runs on the host after the device commands before it.
+                entry["after_command"] = len(lines)
+                self.host_steps.append(operation)
             if entry["kind"] == "contraction":
                 entry["bank_scope"] = "abk" if sbk_banks is None else "sbk"
                 if sbk_banks is not None:
@@ -443,16 +183,38 @@ class AimCtx(CodegenContext):
 # Spec 002 A3-A5: AimOp derivation, row allocation, host-step lowering.
 # --------------------------------------------------------------------- #
 
-# CENT's mapper conventions for the bank slots inside one bank group: an EWMUL
-# reads x and y from slots 0 and 1 and writes slot 2; a bank-pair MAC reads its
-# shared buffer from slots 0 and 1 of each neighbour pair.
-_EWMUL_SLOTS = {"x": 0, "y": 1, "dst": 2}
-_BANK_PAIR_STRIDE = 2
-_BANK_PAIR_SLOTS = (0, 1)
+def _bank_slot_conventions(target):
+    """EWMUL and bank-pair MAC bank slots declared by the target's ``banks``
+    memory (CENT mapper conventions; see ``build_aim_target``)."""
+    geometry = target.banks.geometry
+    try:
+        x, y, dst = (int(slot) for slot in geometry["ewmul_slots"])
+        stride = int(geometry["bank_pair_stride"])
+        pair = tuple(int(slot) for slot in geometry["bank_pair_slots"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "aim target banks must declare ewmul_slots, bank_pair_stride and "
+            "bank_pair_slots"
+        ) from error
+    return {"x": x, "y": y, "dst": dst}, stride, pair
 
 
 def _ceil(value, divisor):
     return -(-int(value) // int(divisor))
+
+
+def _reduction_partitions(group, placement) -> int:
+    """P of a group: the placement's LinearLayout carries it (reduction bits
+    mapped onto ``token_partition``); the knob value must agree."""
+    carried = layout_reduction_partitions(getattr(placement, "layout", None))
+    declared = group.properties.get("reduction_partitions")
+    declared = 1 if declared in (None, "none") else int(declared)
+    if declared != carried:
+        raise ValueError(
+            f"AiM {group.name}: placement declares reduction_partitions="
+            f"{declared} but its LinearLayout splits the reduction {carried} ways"
+        )
+    return carried
 
 
 class _Usage:
@@ -473,7 +235,7 @@ class _Group:
     __slots__ = (
         "group_id", "name", "functions", "matches", "properties", "kind",
         "replicas", "partitions", "elements", "usages", "contractions",
-        "sbk_banks", "row",
+        "sbk_banks", "row", "reduction_partitions",
     )
 
     def __init__(self, group_id, name):
@@ -484,6 +246,7 @@ class _Group:
         self.sbk_banks = None
         self.elements = 0
         self.row = 0
+        self.reduction_partitions = 1
 
 
 class _AimProgramDerivation:
@@ -497,6 +260,11 @@ class _AimProgramDerivation:
         self.schedule = schedule
         self.geometry = _target_geometry(target)
         self.group_width = self.geometry.banks // self.geometry.bank_groups
+        (
+            self.ewmul_slots,
+            self.bank_pair_stride,
+            self.bank_pair_slots,
+        ) = _bank_slot_conventions(target)
         self.layout_by_scope = {
             scope: layout
             for (scope, _matches), layout in zip(_bucket_for_autoschedule(trace), layouts)
@@ -583,6 +351,7 @@ class _AimProgramDerivation:
                 else self.geometry.channels // group.replicas
             )
             names = {match.target_op_name for match in reps}
+            group.reduction_partitions = _reduction_partitions(group, placement)
             if "MAC" in names:
                 group.kind = "contraction"
                 if group.properties.get("bank_fanout") == 1:
@@ -621,9 +390,9 @@ class _AimProgramDerivation:
                     if shape["input_source"] == "banks":
                         group.usages[key] = _Usage(
                             "slot",
-                            stride=_BANK_PAIR_STRIDE,
-                            slot=_BANK_PAIR_SLOTS[0],
-                            copies=len(_BANK_PAIR_SLOTS),
+                            stride=self.bank_pair_stride,
+                            slot=self.bank_pair_slots[0],
+                            copies=len(self.bank_pair_slots),
                         )
                     else:
                         group.usages[key] = _Usage("matrix", contraction=contraction)
@@ -646,13 +415,13 @@ class _AimProgramDerivation:
                         operand = roles[role]
                         key = self._key(operand.value_ref, operand.memref_name)
                         group.usages[key] = _Usage(
-                            "slot", stride=self.group_width, slot=_EWMUL_SLOTS[role]
+                            "slot", stride=self.group_width, slot=self.ewmul_slots[role]
                         )
                     key = self._key(match.result_value_ref, match.result_memref_name)
                     group.usages[key] = _Usage(
                         "slot",
                         stride=self.group_width,
-                        slot=_EWMUL_SLOTS["dst"],
+                        slot=self.ewmul_slots["dst"],
                         store=True,
                     )
             else:
@@ -706,7 +475,14 @@ class _AimProgramDerivation:
             pack = max(1, min(batch, cols // aligned))
             return _ceil(batch, pack) * _ceil(outputs, cpr * geometry.banks)
         if mapping == "channels":
-            return _ceil(batch, cpr) * _ceil(outputs, geometry.banks) * _ceil(reduction, cols)
+            # Reduction partitions are extra channel-batched accumulators,
+            # each storing ceil(reduction / P) local elements.
+            parts = group.reduction_partitions
+            return (
+                _ceil(batch * parts, cpr)
+                * _ceil(outputs, geometry.banks)
+                * _ceil(_ceil(reduction, parts), cols)
+            )
         return _ceil(outputs * batch * group.replicas, channels * geometry.banks) * _ceil(
             reduction, cols
         )
@@ -799,6 +575,7 @@ class _AimProgramDerivation:
                 for name in ("batch_mapping", "reuse_group", "replica_partitions")
                 if group.properties.get(name) not in (None, "none")
             }
+            knobs["reduction_partitions"] = group.reduction_partitions
             for contraction in group.contractions:
                 shape = contraction["shape"]
                 if shape["replicas"] * group.partitions > self.geometry.channels and (
@@ -822,6 +599,20 @@ class _AimProgramDerivation:
                 operation = replace(operation, row=self.row_of_key[contraction["matrix"]])
                 self.program_macs[id(operation)] = shape["program_scalar_macs"]
                 records.append((operation, group.sbk_banks))
+                if operation.reduction_partitions > 1:
+                    records.append(
+                        (
+                            AimHostReduction(
+                                partitions=operation.reduction_partitions,
+                                outputs=operation.outputs,
+                                batches=operation.batches,
+                                replicas=operation.replicas,
+                                source=operation.name,
+                                name=f"{operation.name}.host_reduce",
+                            ),
+                            None,
+                        )
+                    )
         elif group.kind == "mul":
             records.append(
                 (
@@ -861,7 +652,7 @@ class _AimProgramDerivation:
 
         key = contraction["matrix"]
         elements = self._elements(key, 0)
-        pairs = group.partitions * (self.geometry.banks // _BANK_PAIR_STRIDE)
+        pairs = group.partitions * (self.geometry.banks // self.bank_pair_stride)
         span = _ceil(elements, pairs) if elements else None
         reduction = contraction["shape"]["reduction"]
         if span != reduction:
@@ -1011,18 +802,39 @@ class _AimProgramDerivation:
                     )
             return records
         if direction == "broadcast" and mapping == "channels" and fixed == ["reduction"]:
+            # Element `position` of a reduction split P ways lives in partition
+            # position % P at local index position // P; only the channels of
+            # that partition's accumulators (local channel c with c % P == p)
+            # receive it.  P == 1 is the unpartitioned layout.
+            parts = group.reduction_partitions
             storage = shape["storage_extent"] or shape["reduction"]
-            storage_rows = _ceil(storage, geometry.row_elements)
+            storage_rows = _ceil(_ceil(storage, parts), geometry.row_elements)
             output_tiles = _ceil(shape["outputs"], geometry.banks)
+            partition, local = divmod(position, parts)[::-1]
+            if parts == 1:
+                channels = tuple(range(group.replicas * cpr))
+            else:
+                if cpr % parts:
+                    raise NotImplementedError(
+                        f"AiM {direction} {name}: {parts} reduction partitions "
+                        f"do not divide {cpr} channels per replica"
+                    )
+                channels = tuple(
+                    replica * cpr + channel
+                    for replica in range(group.replicas)
+                    for channel in range(
+                        partition, min(cpr, shape["batches"] * parts), parts
+                    )
+                )
             return [
                 (
                     AimAllBankWrite(
-                        row=base + position // geometry.row_elements,
+                        row=base + local // geometry.row_elements,
                         rows=output_tiles,
                         row_stride=storage_rows,
-                        copies=_ceil(shape["batches"], cpr),
+                        copies=_ceil(shape["batches"] * parts, cpr),
                         copy_row_stride=output_tiles * storage_rows,
-                        channels=tuple(range(group.replicas * cpr)),
+                        channels=channels,
                         name=name,
                     ),
                     None,
@@ -1253,6 +1065,13 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
         stdout = proc.stdout.decode("utf-8", errors="replace")
         stderr = proc.stderr.decode("utf-8", errors="replace")
         combined = stdout + ("\n" + stderr if stderr else "")
+        if proc.returncode != 0:
+            # A failed run may still print partial statistics; never report
+            # cycles from it.
+            raise RuntimeError(
+                f"AiM ramulator2 exited with status {proc.returncode}; no cycles "
+                "are reported from a failed run; tail: " + combined[-400:]
+            )
         values = [
             int(m) for m in re.findall(r"memory_system_cycles:\s*(\d+)", combined)
         ]
@@ -1299,5 +1118,11 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
             "returncode": max(returncodes, default=0),
             "segments": len(segments),
             "unique_segments": len(cache),
+            # Host steps of the program (e.g. a reduction-partition merge) are
+            # not simulated: they are listed, never added to `cycles`.
+            "host_steps": [
+                step.manifest()
+                for step in getattr(getattr(compiled, "layout_ctx", None), "host_steps", ())
+            ],
         },
     )

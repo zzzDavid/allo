@@ -4,13 +4,46 @@
 
 This module is intentionally ordinary Python: calibration means changing these
 constants or formulas after inspecting a trace or running a microprofile.  The
-structural target in :mod:`allo.pim.targets` contains no cycle information.
+structural target in :mod:`allo.pim.targets` contains no cycle information and
+every geometry fact (lanes, banks, channels) is read from it.
 
-The initial values come from ``aim_simulator`` commit
-``0f28a07bdb83e42b9305ad3d45410ebd3aa2c091``:
-``src/dram/impl/GDDR6.cpp`` (``GDDR6_AiM_timing`` and command latencies) and
-``src/dram/impl/GDDR6.cpp``/``request.h`` (AiM command scopes).  Cycle counts
-are reported directly; no frequency or wall-time conversion is involved.
+Units and scope
+---------------
+Cycles are ramulator2 ``memory_system_cycles`` of ``aim_simulator`` commit
+``0f28a07bdb83e42b9305ad3d45410ebd3aa2c091``.  ``GDDR6.cpp`` recomputes
+``tCK_ps = 1e6 / (rate / 2)`` for every preset (line 602), so with
+``GDDR6_AiM_timing``'s rate 2000 one cycle is 1 ns; no other wall-time
+conversion is involved.  Device terms come from ``GDDR6_AiM_timing`` and
+``m_command_meta`` in ``src/dram/impl/GDDR6.cpp`` and ``request.h``.
+
+* Contractions (MAC/MAC_ABK) are priced from the lowered command stream of the
+  exact ``AimContraction`` record codegen emits (``build_contraction`` with the
+  placement's knob values; absent knobs resolve as in codegen), serially per
+  channel group: one cost route for enumerated and ``layout=`` placements.
+  Calibration (``tests/pim/test_aim_program.py``, GEMV 256x256 mapping [32],
+  simulator run): ABK 223 estimated vs 222 simulated; SBK 1528 vs 1527.
+  Validity domain: single-issue command streams of the installed simulator;
+  every command is serialized (no overlap of a row activation with the
+  previous group's register traffic), refresh and inter-channel bus
+  contention are not modelled.  Observed error band beyond the calibration
+  probe: on the attention token-partition workloads
+  (``tests/pim/test_aim_token_partition.py``, QK + SV, 1-32 heads, 128-4096
+  tokens) estimates exceed simulated cycles by 1.25x to 1.59x; the estimate is
+  a ranking model there, not a cycle prediction.
+* Host link transfers (scatter/gather/broadcast) are priced per 256-bit burst
+  of the *moved slice* (``host_slice`` metric when the execution graph carries
+  it, the whole buffer otherwise); a transfer to a buffer declared resident
+  costs nothing.  The first burst opens a row, later bursts issue every nCCD.
+  This mirrors the ``R/W MEM`` lines lowering emits; it is not a model of a
+  host-side PCIe/CXL link.
+* Host reduction steps (token/reduction partitioning) are priced with a
+  declared host-link scenario: 32 GB/s and zero fixed latency (paper
+  5-evaluation.tex "Token Partitioning"; harness
+  ``reviews/experiments/aim_attention_campaign.py`` ``host_link_bytes_per_ns=32``,
+  ``host_link_fixed_latency_ns=0``), one 256-bit GPR entry per RD_MAC
+  readout, plus an analytical one-cycle host SIMD add per 256-bit vector.
+  These are scenario terms, not simulator measurements; the simulator never
+  executes host steps.
 """
 
 from __future__ import annotations
@@ -22,12 +55,6 @@ from .. import aim_lowering
 from ..aim_lowering import _target_geometry
 from ..schedule_search import InfeasibleSchedule
 
-
-# One 256-bit DRAM column contains 16 BF16 operands.  MAC_ABK launches the
-# same column operation in every one of the channel's 16 banks: those banks
-# hold independent output rows, not disjoint pieces of one reduction.
-LANES_PER_PU = 16
-BANKS_PER_CHANNEL = 16
 
 # GDDR6_AiM_timing (rate=2000).  Names intentionally mirror the simulator so
 # an agent can compare a microprofile and edit the relevant source constant.
@@ -54,10 +81,13 @@ CMD_COPY = 1
 CMD_WR_GB = 3
 CMD_RD_REG = 2
 
-# Knob-aware contraction pricing (spec 002 A7).  The simulator keeps rows open,
-# so a MAC that targets a new (channel mask, row) pays a precharge plus the
-# MAC-row activation; this term is what separates batch mappings that issue
-# the same MAC count.
+# Contraction pricing (spec 002 A7).  The simulator keeps rows open: a MAC
+# line whose banks have no open row pays the MAC-row activation only; one that
+# replaces an open row also pays the precharge.  The switch term is what
+# separates batch mappings that issue the same MAC count.  Calibrated against
+# the simulator on the GEMV probe (see module docstring): every MAC_SBK of an
+# SBK expansion targets a fresh bank and pays N_RCD_RD_MAC.
+FIRST_ROW_ACTIVATE_CYCLES = N_RCD_RD_MAC
 BATCH_MAPPING_ROW_ACTIVATE_CYCLES = N_RP + N_RCD_RD_MAC
 # Each WR_BIAS run opens a new accumulator reuse group (a mode change).
 REUSE_GROUP_SWITCH_CYCLES = N_MODCH
@@ -66,7 +96,13 @@ REUSE_GROUP_SWITCH_CYCLES = N_MODCH
 # row; each further 256-bit burst issues after nCCD.
 HOST_WRITE_BURST_CYCLES = N_RCD_WR + N_CWL + N_BL
 HOST_READ_BURST_CYCLES = N_RCD_RD + N_CL
-HOST_BURST_BYTES = 32
+
+# Host reduction scenario (paper "Token Partitioning"): 32 GB/s host link with
+# zero fixed latency.  At 1 ns per cycle that is 32 bytes per cycle.
+HOST_LINK_BYTES_PER_CYCLE = 32
+HOST_LINK_FIXED_CYCLES = 0
+# One 256-bit host SIMD add per merged GPR vector (analytical, uncalibrated).
+HOST_VECTOR_ADD_CYCLES = 1
 
 
 def _ceil_div(value, divisor):
@@ -79,76 +115,57 @@ def _metric(event, name, default=1):
     return max(0, int(event.metrics.get(name, default)))
 
 
-def _bank_fanout(event, default):
-    candidate = event.metrics.get("candidate", {}) or {}
-    fanout = max(1, int(candidate.get("bank_fanout", default)))
-    if fanout > BANKS_PER_CHANNEL or fanout & (fanout - 1):
-        raise ValueError(
-            f"AiM layout bank_fanout must be a power of two up to "
-            f"{BANKS_PER_CHANNEL}, got {fanout}"
-        )
-    return fanout
-
-
-def _columns(event):
-    elements = _metric(event, "reduction_extent")
-    return max(1, _ceil_div(elements, LANES_PER_PU))
-
-
-def _mac_launches(event, *, default_bank_fanout=1):
-    """Number of physical MAC commands represented by one loop-nest event.
-
-    ``iterations`` contains every enclosing loop, while ``reduction_extent``
-    and the matcher-stamped ``batch`` identify the reduction and independent
-    vector axes.  The quotient is therefore the number of output rows owned
-    by this work item.  An all-bank command computes one such row per bank in
-    parallel; it does not make the reduction itself wider.
-    """
-    reduction = max(1, _metric(event, "reduction_extent"))
-    batch = max(1, _metric(event, "batch"))
-    iterations = max(1, _metric(event, "iterations", reduction * batch))
-    outputs = max(1, _ceil_div(iterations, reduction * batch))
-    fanout = _bank_fanout(event, default_bank_fanout)
-    return batch * _ceil_div(outputs, fanout)
-
-
-def _knob_candidate(event):
-    """The candidate's AiM knob/shape record, or None for knob-free events."""
+def _shaped_candidate(event):
+    """The placement record of a contraction event (knobs plus the stamped
+    ``aim_shape``), or None for elementwise events."""
     candidate = event.metrics.get("candidate", {}) or {}
     if candidate.get("aim_shape") is None:
-        return None
-    if candidate.get("batch_mapping") in (None, "none"):
         return None
     return candidate
 
 
+def _contraction_record(candidate):
+    """The AimContraction codegen lowers for this placement (one replica)."""
+    shape = candidate["aim_shape"]
+    return aim_lowering.build_contraction(
+        shape,
+        {
+            "batch_mapping": candidate.get("batch_mapping"),
+            "reuse_group": candidate.get("reuse_group"),
+            "replica_partitions": candidate.get("replica_partitions"),
+            "reduction_partitions": candidate.get("reduction_partitions"),
+            "replicas": 1,
+        },
+        activation=shape.get("activation", False),
+    )
+
+
+def _sbk_banks(candidate, geometry):
+    """Banks of a single-bank (SBK) layout, or None for an all-bank one."""
+    if int(candidate.get("bank_fanout", geometry.banks)) != 1:
+        return None
+    banks = candidate.get("sbk_banks")
+    return tuple(banks) if banks else tuple(range(geometry.banks))
+
+
 def _contraction_profile_cycles(candidate, geometry):
     """Serial channel cycles of one replica's lowered contraction."""
-    shape = candidate["aim_shape"]
     try:
-        operation = aim_lowering.build_contraction(
-            shape,
-            {
-                "batch_mapping": candidate["batch_mapping"],
-                "reuse_group": candidate.get("reuse_group"),
-                "replica_partitions": candidate.get("replica_partitions"),
-                "replicas": 1,
-            },
-            activation=shape.get("activation", False),
+        operation = _contraction_record(candidate)
+        profile = aim_lowering.aim_contraction_profile(
+            operation, geometry, _sbk_banks(candidate, geometry)
         )
-        profile = aim_lowering.aim_contraction_profile(operation, geometry)
     except ValueError as error:
         raise InfeasibleSchedule(f"AiM contraction is not realizable: {error}") from error
     counts = profile["counts"]
     mac_lines = profile["mac_lines"]
     mac_cycles = (profile["mac_columns"] - mac_lines) * N_CCD + mac_lines * CMD_MAC
-    if candidate.get("bank_scope") == "sbk":
-        mac_cycles *= geometry.banks
     register_io = N_MODCH + CMD_WR_GB
     register_read = N_MODCH + CMD_RD_REG
     return (
         mac_cycles
-        + profile["row_activations"] * BATCH_MAPPING_ROW_ACTIVATE_CYCLES
+        + profile["first_activations"] * FIRST_ROW_ACTIVATE_CYCLES
+        + profile["row_switches"] * BATCH_MAPPING_ROW_ACTIVATE_CYCLES
         + profile["reuse_groups"] * REUSE_GROUP_SWITCH_CYCLES
         + counts.get("WR_GB", 0) * register_io
         + counts.get("WR_BIAS", 0) * register_io
@@ -156,6 +173,41 @@ def _contraction_profile_cycles(candidate, geometry):
         + counts.get("AF", 0) * (N_RCD_RD_AF + CMD_AF)
         + counts.get("RD_AF", 0) * register_read
     )
+
+
+def host_reduction_cycles(record, geometry):
+    """Cycles of one ``AimHostReduction`` under the declared link scenario.
+
+    The host reads ``partitions`` partial GPR entries per merged vector, adds
+    them and writes the merged entry back: (P + 1) entries cross the link per
+    merged vector, plus one host add per partial beyond the first.
+    """
+    vectors = _ceil_div(record.outputs, geometry.lanes) * record.batches * record.replicas
+    entry_bytes = geometry.vector_bits // 8
+    link_bytes = vectors * (record.partitions + 1) * entry_bytes
+    return (
+        HOST_LINK_FIXED_CYCLES
+        + _ceil_div(link_bytes, HOST_LINK_BYTES_PER_CYCLE)
+        + vectors * (record.partitions - 1) * HOST_VECTOR_ADD_CYCLES
+    )
+
+
+def _slice_elements(shape, index):
+    """Elements of a normalized host slice (ints, None for ``:``, (a, b))."""
+    index = tuple(index)
+    shape = tuple(int(extent) for extent in shape)
+    if len(index) == 1 and len(shape) > 1 and isinstance(index[0], (tuple, list)):
+        start, stop = index[0]
+        return int(stop) - int(start)
+    if len(index) != len(shape):
+        raise ValueError(f"AiM host slice {index} does not fit shape {shape}")
+    elements = 1
+    for item, extent in zip(index, shape):
+        if item is None:
+            elements *= extent
+        elif isinstance(item, (tuple, list)):
+            elements *= int(item[1]) - int(item[0])
+    return elements
 
 
 def _ewmul_profile_cycles(elements, partitions, geometry):
@@ -176,11 +228,20 @@ def aim_cost(target):
     bank_group = target.unit("bank_group")
     bank = target.unit("bank")
     gb = target.gb
+    host = target.unit("host")
     geometry = _target_geometry(target)
 
-    def profiled_mac(event, ctx, candidate, name):
-        # The profile already prices the WR_GB/WR_BIAS/RD_MAC/AF commands the
-        # contraction issues; the per-bucket move events become zero-cost.
+    def contraction(event, ctx, name):
+        # One route: the lowered record's command stream prices the
+        # WR_GB/WR_BIAS/RD_MAC/AF commands too, so the per-bucket move events
+        # of a contraction are zero-cost (see channel_move).
+        candidate = _shaped_candidate(event)
+        if candidate is None:
+            raise ValueError(
+                "AiM cost prices the lowered contraction record and needs the "
+                "contraction shape on the placement: build placements with the "
+                "AiM enumerator or spmw_autoschedule._aim_layout_candidates"
+            )
         latency = _contraction_profile_cycles(candidate, geometry)
         ctx.step(
             latency=latency,
@@ -191,79 +252,50 @@ def aim_cost(target):
             ],
             name=name,
         )
-
-    def single_bank_mac(event, ctx):
-        candidate = _knob_candidate(event)
-        if candidate is not None:
-            profiled_mac(event, ctx, candidate, "mac_sbk")
-            return
-        columns = _columns(event)
-        launches = _mac_launches(event)
-        issue = max(CMD_MAC, columns * N_CCD)
-        latency = N_RCD_RD_MAC + (columns - 1) * N_CCD + CMD_MAC
-        with ctx.repeat(launches):
+        operation = _contraction_record(candidate)
+        if operation.reduction_partitions > 1:
+            # The explicit host ADD of the partials (AimHostReduction).
+            record = aim_lowering.AimHostReduction(
+                partitions=operation.reduction_partitions,
+                outputs=operation.outputs,
+                batches=operation.batches,
+                replicas=operation.replicas,
+            )
+            host_latency = host_reduction_cycles(record, geometry)
             ctx.step(
-                latency=latency,
-                occupy=[
-                    ctx.use(event.primitive, cycles=latency),
-                    ctx.use(bank, cycles=latency),
-                    ctx.use(channel, cycles=issue),
-                    ctx.use(gb, cycles=issue),
-                ],
-                name="mac_sbk",
+                latency=host_latency,
+                occupy=[ctx.use(host, cycles=host_latency)],
+                name="host_reduction",
             )
 
-    rule(target.op("MAC"))(single_bank_mac)
+    @rule(target.op("MAC"))
+    def single_bank_mac(event, ctx):
+        contraction(event, ctx, "mac_sbk")
 
     @rule(target.op("MAC_ABK"))
     def all_bank_mac(event, ctx):
-        candidate = _knob_candidate(event)
-        if candidate is not None:
-            profiled_mac(event, ctx, candidate, "mac_abk")
-            return
-        columns = _columns(event)
-        launches = _mac_launches(event, default_bank_fanout=BANKS_PER_CHANNEL)
-        latency = N_RCD_RD_MAC + (columns - 1) * N_CCD + CMD_MAC
-        with ctx.repeat(launches):
-            ctx.step(
-                latency=latency,
-                occupy=[
-                    ctx.use(event.primitive, cycles=latency),
-                    ctx.use(channel, cycles=latency),
-                    ctx.use(gb, cycles=latency),
-                ],
-                name="mac_abk",
-            )
+        contraction(event, ctx, "mac_abk")
 
     @rule(target.op("MUL"))
     def elementwise_mul(event, ctx):
         candidate = event.metrics.get("candidate", {}) or {}
         partitions = candidate.get("replica_partitions")
-        if partitions not in (None, "none"):
-            # Each partition owns ceil(elements / (p * bank_groups)) elements;
-            # one EWMUL per bank row of that span (spec 002 A7).
-            latency = _ewmul_profile_cycles(
-                _metric(event, "iterations"), int(partitions), geometry
+        if partitions in (None, "none"):
+            raise ValueError(
+                "AiM EWMUL cost needs the placement's replica_partitions (the "
+                "channel group codegen lowers to); use the AiM enumerator"
             )
-            ctx.step(
-                latency=latency,
-                occupy=[
-                    ctx.use(event.primitive, cycles=latency),
-                    ctx.use(bank_group, cycles=latency),
-                    ctx.use(channel, cycles=latency),
-                ],
-                name="ewmul",
-            )
-            return
-        columns = max(1, _ceil_div(_metric(event, "iterations"), LANES_PER_PU))
-        latency = N_RCD_EWMUL + (columns - 1) * N_CCD + CMD_EWMUL
+        # Each partition owns ceil(elements / (p * bank_groups)) elements;
+        # one EWMUL per bank row of that span (spec 002 A7).
+        latency = _ewmul_profile_cycles(
+            _metric(event, "iterations"), int(partitions), geometry
+        )
         ctx.step(
             latency=latency,
             occupy=[
-                ctx.use(event.primitive),
-                ctx.use(bank_group),
-                ctx.use(channel, cycles=max(1, columns * N_CCD)),
-                ctx.use(gb),
+                ctx.use(event.primitive, cycles=latency),
+                ctx.use(bank_group, cycles=latency),
+                ctx.use(channel, cycles=latency),
             ],
             name="ewmul",
         )
@@ -271,7 +303,7 @@ def aim_cost(target):
     @rule(target.op("ADD"))
     def elementwise_add(event, ctx):
         # EWADD is a GPR-vector ALU instruction and does not open a bank row.
-        vectors = max(1, _ceil_div(_metric(event, "iterations"), LANES_PER_PU))
+        vectors = max(1, _ceil_div(_metric(event, "iterations"), geometry.lanes))
         ctx.step(
             cycles=vectors,
             occupy=[ctx.use(event.primitive), ctx.use(channel)],
@@ -280,10 +312,10 @@ def aim_cost(target):
 
     @rule(target.op("AF"))
     def activation(event, ctx):
-        if _knob_candidate(event) is not None:
+        if _shaped_candidate(event) is not None:
             ctx.step(cycles=0, occupy=[ctx.use(event.primitive)], name="af_in_profile")
             return
-        vectors = max(1, _ceil_div(_metric(event, "iterations"), LANES_PER_PU))
+        vectors = max(1, _ceil_div(_metric(event, "iterations"), geometry.lanes))
         latency = N_RCD_RD_AF + (vectors - 1) * N_CCD + CMD_AF
         ctx.step(
             latency=latency,
@@ -316,7 +348,7 @@ def aim_cost(target):
         bank_move(event, ctx, N_RAS + N_RP, "rd_sbk")
 
     def channel_move(event, ctx, latency, name, *resources):
-        if _knob_candidate(event) is not None and name in (
+        if _shaped_candidate(event) is not None and name in (
             "wr_gb",
             "wr_bias",
             "rd_mac",
@@ -353,11 +385,19 @@ def aim_cost(target):
     def read_af_register(event, ctx):
         channel_move(event, ctx, N_MODCH + CMD_RD_REG, "rd_af", target.af_reg)
 
-    host = target.unit("host")
-
     def host_transfer(event, ctx, first_burst, name):
-        nbytes = max(0, int(event.metrics.get("bytes", 0)))
-        bursts = max(1, _ceil_div(nbytes, HOST_BURST_BYTES))
+        if event.metrics.get("host_resident"):
+            # Resident buffers are on the device before the program starts.
+            ctx.step(latency=0, occupy=[ctx.use(event.primitive, cycles=0)], name=name)
+            return
+        bits = int(event.metrics.get("dtype_bits", 0) or 0)
+        shape = event.metrics.get("shape")
+        index = event.metrics.get("host_slice")
+        if index is not None and shape is not None and bits > 0:
+            nbytes = _ceil_div(_slice_elements(shape, index) * bits, 8)
+        else:
+            nbytes = max(0, int(event.metrics.get("bytes", 0)))
+        bursts = max(1, _ceil_div(nbytes, geometry.vector_bits // 8))
         latency = first_burst + (bursts - 1) * N_CCD
         ctx.step(
             latency=latency,

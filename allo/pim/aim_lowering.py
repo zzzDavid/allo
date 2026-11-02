@@ -95,6 +95,15 @@ class AimContraction(AimOp):
     as even as possible under that limit to avoid a needlessly tiny tail.
     CENT's fused MAC/AF schedule budgets half of the configured reuse window
     (equivalently, two window entries per live output).
+
+    ``reduction_partitions`` (P) splits the reduction axis over P channel
+    groups (PIMphony's token partitioning when the reduction is the attention
+    token axis).  Reduction element ``t`` belongs to partition ``t % P`` at
+    local index ``t // P``; the pair ``(batch, partition)`` is lowered as the
+    channel-batched virtual batch ``batch * P + partition``, so each partition
+    accumulates its own partial output vector.  The lowering does not add the
+    partials: a following :class:`AimHostReduction` record does, on the host.
+    P > 1 reassociates the reduction and requires the ``channels`` mapping.
     """
 
     outputs: int
@@ -114,6 +123,7 @@ class AimContraction(AimOp):
     reuse_group_candidates: tuple[int, ...] = ()
     activation: bool = False
     name: str | None = None
+    reduction_partitions: int = 1
 
     def __post_init__(self):
         object.__setattr__(self, "outputs", _positive("outputs", self.outputs))
@@ -173,6 +183,79 @@ class AimContraction(AimOp):
         object.__setattr__(self, "reuse_group_candidates", candidates)
         if self.name is not None and not self.name:
             raise ValueError("contraction name must be non-empty")
+        partitions = _positive("reduction_partitions", self.reduction_partitions)
+        object.__setattr__(self, "reduction_partitions", partitions)
+        if partitions > 1:
+            if self.reduction % partitions:
+                raise ValueError(
+                    f"reduction {self.reduction} is not divisible by "
+                    f"reduction_partitions {partitions}"
+                )
+            if self.batch_mapping not in {"auto", "channels"}:
+                raise ValueError(
+                    "reduction_partitions > 1 requires the 'channels' batch "
+                    "mapping (one (batch, partition) accumulator per channel)"
+                )
+            if self.input_source != "gb":
+                raise ValueError("reduction_partitions > 1 requires input_source='gb'")
+
+    def manifest(self) -> dict:
+        data = super().manifest()
+        if self.reduction_partitions == 1:
+            # The unpartitioned record keeps its pre-existing manifest.
+            del data["reduction_partitions"]
+        return data
+
+
+@dataclass(frozen=True)
+class AimHostReduction(AimOp):
+    """Host ``ADD`` of the partial outputs of one reduction-partitioned contraction.
+
+    The device leaves ``partitions`` partial vectors of ``outputs`` elements
+    each (per replica) in the host-visible GPR (one ``RD_MAC`` entry of
+    ``lanes`` elements per output tile and partition).  The host reads them,
+    adds them elementwise and writes the merged vector back to the GPR, where
+    the contraction's consumer expects it.  This record lowers to no simulator
+    command: the AiM ISR set has no host-CPU instruction.  It is priced by
+    :func:`allo.pim.costs.aim.host_reduction_cycles` and executed numerically
+    by :meth:`merge`.
+    """
+
+    partitions: int
+    outputs: int
+    batches: int = 1
+    replicas: int = 1
+    source: str | None = None
+    name: str | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "partitions", _positive("partitions", self.partitions))
+        if self.partitions < 2:
+            raise ValueError("a host reduction needs at least two partials")
+        object.__setattr__(self, "outputs", _positive("outputs", self.outputs))
+        object.__setattr__(self, "batches", _positive("batches", self.batches))
+        object.__setattr__(self, "replicas", _positive("replicas", self.replicas))
+        if self.name is not None and not self.name:
+            raise ValueError("host-reduction name must be non-empty")
+
+    def merge(self, partials):
+        """The host step's computation: sum over the partition axis.
+
+        ``partials`` has shape ``(replicas, batches, partitions, outputs)``
+        (leading unit axes may be omitted).  Floating-point partials are
+        added in FP32, integer partials exactly in int64.
+        """
+        import numpy as np
+
+        values = np.asarray(partials)
+        expected = (self.replicas, self.batches, self.partitions, self.outputs)
+        if values.ndim < 2 or values.shape != expected[4 - values.ndim :]:
+            raise ValueError(
+                f"host reduction expects partials of shape {expected}, got "
+                f"{values.shape}"
+            )
+        dtype = np.int64 if np.issubdtype(values.dtype, np.integer) else np.float32
+        return np.sum(values.astype(dtype), axis=-2, dtype=dtype)
 
 
 @dataclass(frozen=True)
@@ -639,6 +722,8 @@ class _AimLowerer:
         elif isinstance(operation, AimSync):
             self.emit("AiM SYNC")
             details = {"barrier": "device"}
+        elif isinstance(operation, AimHostReduction):
+            details = self._host_reduction(operation)
         else:
             raise TypeError(f"unsupported AiM operation {type(operation).__name__}")
         end = len(self.commands)
@@ -654,6 +739,8 @@ class _AimLowerer:
         )
 
     def _contraction(self, operation: AimContraction) -> dict:
+        if operation.reduction_partitions > 1:
+            return self._contraction_reduction_partitioned(operation)
         selected_mapping = operation.batch_mapping
         selection_reason = "explicit batch mapping"
         if selected_mapping == "auto":
@@ -708,6 +795,89 @@ class _AimLowerer:
                 "uses_operation_name": False,
             }
         return details
+
+    def _contraction_reduction_partitioned(self, operation: AimContraction) -> dict:
+        """Lower a reduction split over P channel groups (token partitioning).
+
+        Element ``t`` of the reduction goes to partition ``t % P`` at local
+        index ``t // P``.  Each ``(batch, partition)`` pair is the virtual
+        batch ``batch * P + partition`` of an ordinary channel-batched
+        contraction over ``reduction / P`` elements, whose reserved storage is
+        ``ceil(storage / P)`` local elements.  The P partial outputs per batch
+        stay separate; the host adds them (:class:`AimHostReduction`).
+        """
+        from dataclasses import replace
+
+        partitions = operation.reduction_partitions
+        storage = operation.reduction_storage_extent
+        virtual = replace(
+            operation,
+            batches=operation.batches * partitions,
+            reduction=operation.reduction // partitions,
+            reduction_storage_extent=(
+                None if storage is None else math.ceil(storage / partitions)
+            ),
+            batch_mapping="channels",
+            reduction_partitions=1,
+        )
+        details = self._contraction_channels_batched(virtual)
+        # The virtual record covers the same scalar MACs and GB payload.
+        details.update(
+            outputs_per_instance=operation.outputs,
+            batches=operation.batches,
+            reduction=operation.reduction,
+            reduction_storage_extent=(
+                operation.reduction if storage is None else storage
+            ),
+            total_outputs=operation.outputs * operation.batches * operation.replicas,
+        )
+        if operation.batch_mapping == "auto":
+            details["requested_batch_mapping"] = "auto"
+            details["batch_mapping_selection"] = {
+                "policy": "shape_and_residency_v1",
+                "selected": "channels",
+                "reason": "a reduction split over channel groups needs one "
+                "accumulator per (batch, partition) channel",
+                "uses_operation_name": False,
+            }
+        details["reduction_partition"] = {
+            "partitions": partitions,
+            "element_to_partition": "reduction_index % partitions",
+            "local_index": "reduction_index // partitions",
+            "local_reduction": virtual.reduction,
+            "local_storage_extent": virtual.reduction_storage_extent,
+            "virtual_batch": "batch * partitions + partition",
+            "virtual_batches": virtual.batches,
+            "partial_outputs": (
+                partitions * operation.outputs * operation.batches * operation.replicas
+            ),
+            "merge": "host ADD over the partition axis (AimHostReduction)",
+        }
+        return details
+
+    def _host_reduction(self, operation: AimHostReduction) -> dict:
+        geometry = self.geometry
+        vectors = math.ceil(operation.outputs / geometry.lanes)
+        merged = vectors * operation.batches * operation.replicas
+        return {
+            "executes_on": "host",
+            "source": operation.source,
+            "partitions": operation.partitions,
+            "outputs": operation.outputs,
+            "batches": operation.batches,
+            "replicas": operation.replicas,
+            # GPR entries (one per RD_MAC readout) read, added and written back.
+            "partial_gpr_entries": merged * operation.partitions,
+            "merged_gpr_entries": merged,
+            "gpr_entry_bytes": geometry.vector_bits // 8,
+            "host_vector_adds": merged * (operation.partitions - 1),
+            "host_scalar_adds": (
+                operation.outputs
+                * operation.batches
+                * operation.replicas
+                * (operation.partitions - 1)
+            ),
+        }
 
     def _emit_contraction_reuse_scope(
         self,
@@ -1927,14 +2097,23 @@ def check_contraction_coverage(entry: dict, issued: int, program: int) -> dict:
 def build_contraction(shape: dict, knobs: dict, *, activation=False, name=None):
     """The AimContraction one kernel lowers to under the given knob values.
 
-    ``knobs`` maps ``batch_mapping``, ``reuse_group`` and
-    ``replica_partitions``; a missing knob keeps the typed default.
-    ``replicas`` overrides the shape's replica count (the profile prices one).
+    ``knobs`` maps ``batch_mapping``, ``reuse_group``,
+    ``replica_partitions`` and ``reduction_partitions``; a missing knob keeps
+    the typed default.  ``replicas`` overrides the shape's replica count (the
+    profile prices one).  Codegen and the cost program both call this with the
+    placement's knob values, so they lower the same record.
     """
     partitions = knobs.get("replica_partitions")
+    if partitions in (None, "none"):
+        partitions = None
     replicas = int(knobs.get("replicas", shape["replicas"]))
-    batch_mapping = knobs.get("batch_mapping") or "auto"
+    batch_mapping = knobs.get("batch_mapping")
+    if batch_mapping in (None, "none"):
+        batch_mapping = "auto"
     reuse = knobs.get("reuse_group")
+    reduction_partitions = knobs.get("reduction_partitions")
+    if reduction_partitions in (None, "none"):
+        reduction_partitions = 1
     return AimContraction(
         outputs=shape["outputs"],
         reduction=shape["reduction"],
@@ -1951,6 +2130,7 @@ def build_contraction(shape: dict, knobs: dict, *, activation=False, name=None):
         reuse_group_size=None if not reuse else int(reuse),
         activation=bool(activation),
         name=name,
+        reduction_partitions=int(reduction_partitions),
     )
 
 
@@ -1983,42 +2163,62 @@ def lower_contraction(operation, geometry) -> list[str]:
     return lowerer.commands
 
 
-def aim_contraction_profile(operation, geometry) -> dict:
+def aim_contraction_profile(operation, geometry, sbk_banks=None) -> dict:
     """Opcode counts, MAC column total, reuse groups and row activations.
 
-    ``row_activations`` counts MAC lines whose ``(mask, row)`` differs from the
-    previous MAC line; ``reuse_groups`` counts maximal WR_BIAS runs.
+    ``sbk_banks`` is the bank list of a single-bank (SBK) layout: each lowered
+    ``MAC_ABK`` then stands for one ``MAC_SBK`` per listed bank, exactly as
+    ``AimCtx.emit_program`` expands it.  Each MAC line opens its target
+    ``(mask, bank set, row)``: ``first_activations`` counts lines that open a
+    row in banks with no open row, ``row_switches`` lines that replace another
+    open row of the same banks in some masked channel (precharge first).
+    ``row_activations`` is their sum.  ``reuse_groups`` counts maximal WR_BIAS
+    runs.  Open rows are tracked per (mask bit, bank).
     """
-    key = (operation, geometry)
+    banks = None if sbk_banks is None else tuple(int(bank) for bank in sbk_banks)
+    key = (operation, geometry, banks)
     cached = _PROFILE_CACHE.entries.get(key)
     if cached is not None:
         return cached
     counts: dict[str, int] = {}
     mac_columns = 0
     mac_lines = 0
-    row_activations = 0
+    first_activations = 0
+    row_switches = 0
     reuse_groups = 0
-    previous_open = None
+    open_rows: dict = {}
     previous_opcode = None
     for line in lower_contraction(operation, geometry):
         fields = line.split(" ")
         opcode = fields[1]
-        counts[opcode] = counts.get(opcode, 0) + 1
         if opcode == "WR_BIAS" and previous_opcode != "WR_BIAS":
             reuse_groups += 1
-        if opcode == "MAC_ABK":
-            op_size, mask, row = (int(value) for value in fields[2:5])
+        previous_opcode = opcode
+        if opcode != "MAC_ABK":
+            counts[opcode] = counts.get(opcode, 0) + 1
+            continue
+        op_size, mask, row = (int(value) for value in fields[2:5])
+        targets = ("all",) if banks is None else banks
+        opcode = "MAC_ABK" if banks is None else "MAC_SBK"
+        channel_bits = [bit for bit in range(mask.bit_length()) if mask >> bit & 1]
+        for bank in targets:
+            counts[opcode] = counts.get(opcode, 0) + 1
             mac_lines += 1
             mac_columns += op_size
-            if (mask, row) != previous_open:
-                row_activations += 1
-                previous_open = (mask, row)
-        previous_opcode = opcode
+            opened = {open_rows.get((bit, bank)) for bit in channel_bits}
+            if opened - {None, row}:
+                row_switches += 1
+            elif None in opened:
+                first_activations += 1
+            for bit in channel_bits:
+                open_rows[(bit, bank)] = row
     profile = {
         "counts": counts,
         "mac_lines": mac_lines,
         "mac_columns": mac_columns,
-        "row_activations": row_activations,
+        "first_activations": first_activations,
+        "row_switches": row_switches,
+        "row_activations": first_activations + row_switches,
         "reuse_groups": reuse_groups,
     }
     _PROFILE_CACHE.entries[key] = profile
@@ -2115,3 +2315,140 @@ def matrix_axes(match) -> list[str]:
         else:
             roles.append("output")
     return roles
+
+
+def bf16_round(values):
+    """Round finite FP32 values to BF16 (ties to even), returned as FP32."""
+    import numpy as np
+
+    array = np.ascontiguousarray(values, dtype=np.float32)
+    if not np.all(np.isfinite(array)):
+        raise ValueError("BF16 rounding requires finite values")
+    bits = array.view(np.uint32)
+    rounded = ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) << 16
+    return rounded.astype(np.uint32).view(np.float32)
+
+
+def reference_partial_sums(details: dict, matrix, vector, *, arithmetic="bf16"):
+    """Execute a lowered reduction-partitioned contraction's ownership contract.
+
+    This is a functional oracle for the compiler transformation, separate from
+    the timing-only simulator.  ``details`` is the lowering-manifest entry of
+    one contraction with ``reduction_partitions > 1``; ``matrix`` has shape
+    ``(replicas, batches, outputs, reduction)`` and ``vector``
+    ``(replicas, batches, reduction)`` (the replica axis may be omitted).  It
+    walks the manifest's channel groups and row chunks: virtual batch ``vb``
+    of a group is ``(batch, partition) = divmod(vb, P)`` and local element
+    ``j`` of a chunk is reduction element ``j * P + partition``.  Products are
+    BF16 x BF16 summed in FP32 per row chunk; each chunk's ``RD_MAC`` readout
+    rounds the running partial to BF16 (the next chunk's ``WR_BIAS`` reloads
+    it).  Raises unless every (replica, batch, element) is owned exactly once
+    and each group binds distinct channels.  Returns partials of shape
+    ``(replicas, batches, partitions, outputs)``.
+
+    ``arithmetic="exact"`` (integer operands) sums in int64 without rounding,
+    which checks the ownership and the merge exactly.
+    """
+    import numpy as np
+
+    if arithmetic not in ("bf16", "exact"):
+        raise ValueError("arithmetic must be 'bf16' or 'exact'")
+    exact = arithmetic == "exact"
+
+    split = details.get("reduction_partition")
+    if not split:
+        raise ValueError("lowering entry is not a reduction-partitioned contraction")
+    partitions = int(split["partitions"])
+    dtype = np.int64 if exact else np.float32
+    weights = np.asarray(matrix)
+    inputs = np.asarray(vector)
+    if exact and not (
+        np.issubdtype(weights.dtype, np.integer) and np.issubdtype(inputs.dtype, np.integer)
+    ):
+        raise ValueError("exact arithmetic needs integer operands")
+    weights, inputs = weights.astype(dtype), inputs.astype(dtype)
+    if weights.ndim == 3:
+        weights, inputs = weights[None], inputs[None]
+    replicas, batches, outputs, reduction = weights.shape
+    if inputs.shape != (replicas, batches, reduction):
+        raise ValueError("vector shape does not match the matrix")
+    if (
+        replicas != details["replicas"]
+        or batches != details["batches"]
+        or outputs != details["outputs_per_instance"]
+        or reduction != details["reduction"]
+    ):
+        raise ValueError("operands do not match the lowered contraction shape")
+    rounding = (lambda values: values) if exact else bf16_round
+    weights, inputs = rounding(weights), rounding(inputs)
+    partials = np.zeros((replicas, batches, partitions, outputs), dtype=dtype)
+    owned = np.zeros((replicas, batches, reduction), dtype=np.int64)
+    for group in details["groups"]:
+        width = int(group["batches"])
+        channels = list(group["active_channels"])
+        if len(channels) != width * replicas or len(set(channels)) != len(channels):
+            raise ValueError("a channel group must bind one channel per accumulator")
+        for local_batch in range(width):
+            batch, partition = divmod(int(group["batch_begin"]) + local_batch, partitions)
+            for replica in range(replicas):
+                running = np.zeros(outputs, dtype=dtype)
+                for chunk in group["row_chunks"]:
+                    local = np.arange(
+                        int(chunk["element_begin"]),
+                        int(chunk["element_begin"]) + int(chunk["elements"]),
+                    )
+                    elements = local * partitions + partition
+                    owned[replica, batch, elements] += 1
+                    products = (
+                        weights[replica, batch][:, elements]
+                        * inputs[replica, batch, elements][None, :]
+                    )
+                    running = rounding(running + np.sum(products, axis=1, dtype=dtype))
+                partials[replica, batch, partition] = running
+    if not np.all(owned == 1):
+        raise ValueError(
+            "lowered partition ownership does not cover every reduction element "
+            "exactly once"
+        )
+    return partials
+
+
+TOKEN_PARTITION_DIM = "token_partition"
+
+
+def layout_reduction_partitions(layout) -> int:
+    """P carried by an AiM LinearLayout: the image of the reduction input ``k``
+    on the ``token_partition`` output dim (1 when the layout has none)."""
+    if layout is None or TOKEN_PARTITION_DIM not in getattr(layout, "out_dims", ()):
+        return 1
+    return layout.image_size(varying_inputs=("k",), output_dims=(TOKEN_PARTITION_DIM,))
+
+
+def reduction_partitioned_layout(layout, partitions: int):
+    """Extend an AiM bank layout so reduction bit ``i < log2(P)`` selects
+    partition bit ``i``: element ``t`` goes to channel group ``t % P``."""
+    from ..spmw_linear_layout import LinearLayout
+
+    partitions = int(partitions)
+    if partitions < 2 or partitions & (partitions - 1):
+        raise ValueError("reduction partitions must be a power of two >= 2")
+    if TOKEN_PARTITION_DIM in layout.out_dims:
+        raise ValueError("layout already carries a reduction partition")
+    bits = partitions.bit_length() - 1
+    if len(layout.bases.get("k", ())) < bits:
+        raise ValueError(
+            f"reduction axis has {layout.size_of('k')} elements, fewer than "
+            f"{partitions} partitions"
+        )
+    bases = {}
+    for name, vectors in layout.bases.items():
+        extended = []
+        for bit, vector in enumerate(vectors):
+            part = 1 << bit if name == "k" and bit < bits else 0
+            extended.append((*vector, part))
+        bases[name] = extended
+    return LinearLayout(
+        bases=bases,
+        out_dims=(*layout.out_dims, TOKEN_PARTITION_DIM),
+        out_sizes=(*layout.out_sizes, partitions),
+    )

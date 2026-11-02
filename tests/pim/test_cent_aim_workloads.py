@@ -51,6 +51,8 @@ def _compile(case, backend=None):
         aim_cost,
         host_moves=case.host_program,
         backend=backend,
+        # Every AiM MAC reduces 16 BF16 products through the bank adder tree.
+        reduction_order="reassociate",
     )
 
 
