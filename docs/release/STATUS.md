@@ -1,6 +1,6 @@
 # Release status
 
-Updated: 2026-11-02 (round 2). Read `TASK.md` in the containing repository,
+Updated: 2026-11-02 (round 3). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -28,76 +28,65 @@ then this file, then `ISSUES.md` for the next action.
 
 ## Verdict
 
-**NOT READY.** Gate judgments are in `REVIEW.md`. Blockers still open after
-round 2 (see `ISSUES.md` for all):
+**NOT READY.** Gate judgments are in `REVIEW.md` (all PARTIAL after round
+3). Open items that still block a READY verdict (see `ISSUES.md`):
 
-1. C-01 no access-scope legality; C-09 no reassociation permission in the
-   public API (the layout algebra now carries `reassociation_allowed`, but
-   nothing sets it from the workload); C-03/C-05 ranking before
-   materialization and per kernel; C-11 the ported Section IV search is not
-   yet wired into placement selection and `LayoutAccess` rows are not yet
-   derived from `MatchedOp`.
-2. S-03 Samsung ordered (source-order FP16) fallback is in the simulator
-   overlay but not selectable from `allo.compile`.
-3. G2-02 no source route to Gemini-II (typed records built by hand); G2-03
-   the Gemini-II cost program does not price the typed opcodes; G2-04 no
-   hardware test in the suite (hardware evidence exists, VALIDATION.md).
-4. M-03 token partitioning and M-04 AttAcc path external to the release;
-   U-04 UPMEM uneven partitions; U-05/U-06 UPMEM shape-exact paths.
-5. F-02 i32 literal truncation in the shared frontend.
-6. P-04/P-06/S-04 simulator reproducibility: Samsung overlay uncommitted in
-   the containing repository (and Samsung-licensed patches need the user's
-   redistribution decision); the Tenon uPIMulator patch (GENERIC slot,
-   fixture loader) exists only in the artifact archive.
-7. V1-05 the paper's fitted APU v1 count rule is not in the cost program;
-   V1-06 tile choice is a fixed heuristic.
+1. C-03/C-05: ranking precedes materialization and is per kernel group
+   with reconciliation afterwards; the paper's "each complete assignment
+   evaluated as one program" is not what runs. Row 16: movement ties reach
+   the ranking but no backend can realize an alternative owner map.
+2. M-04 AttAcc compiler/virtual-model path is outside the release (needs a
+   port or a documented evaluation-only boundary); E11/E12/E14/E15 are
+   external reproduction scripts.
+3. V1-05/V1-06 APU v1 cost provenance (fitted count rule; fixed tile
+   heuristic); F-02 i32 literal truncation in the shared frontend.
+4. Simulator reproducibility: Samsung overlay uncommitted in the containing
+   repository with Samsung-licensed patches (user decision), the Tenon
+   uPIMulator patch unpublished (P-06), UPMEM SDK proprietary.
+5. P-08 `SPMW_ARCHITECTURE.md` still describes removed modules; needs a
+   rewrite against the current implementation (routes, policies, extension
+   points, inspection).
 
-## Round 2 (2026-11-02): what was done
+## Round 3 (2026-11-02): what was done
 
-- Frontend: annotation names resolve from the defining scope only (F-01).
-- Section IV port: `allo/pim/{gf2,layout_problem,layout_movement,layout_search}.py`
-  with the paper's 20,160 / 315 / 576 and 121,968 figures reproduced from
-  the package (`design/layout-search.md`).
-- Samsung executes the selected program: per-placement CRF lowering, the
-  conductor uploads it verbatim, unrealizable levers rejected, structural
-  operand roles, padding reported, elementwise ops reachable, MAC cost rule
-  corrected (default now beats the vendor program by about 1%; paper rows
-  pinned through `samsung_vendor_gemv_layout`); `design/samsung-execution.md`.
-- APU v1: structural native recognizers (symbolic executor), carried
-  outputs uploaded on temporal plans, board lock and profile freshness,
-  ABI-derived output shapes. Device run on this server after the repairs:
-  `test_gemv_apu_v1`, two `vector_gemm` plans and the histogram golden
-  median row pass (4 passed, `VALIDATION.md`).
-- Gemini-II: eleven programs executed on `zhang-x4` `apu-00`, all exact,
-  composed paper programs within 1.3% of the paper medians.
-- Packaging: package data, wheel with bindings, fresh-venv install verified,
-  every external location through `spmw_simenv` with documented variables,
-  UPMEM user-build route, `INSTALL.md`, `CAPABILITIES.md`, `simulators.md`,
-  README section.
+- Target legality pass (`spmw_legality.py`), work-grid forms as errors,
+  `lanes` from the placement, `LinearLayout.identity` strictness.
+- Reduction-order policy (`reduction_order`, strict by default); Samsung
+  ordered program selectable and cost-modeled; APU v1 tree plans pruned
+  under strict; AiM/APU v1 matcher routes refuse float under strict.
+- Movement stage in `rank_matcher_placements` (`spmw_layout_problem.py`,
+  exact coordinate search, ties/termination/optimality recorded,
+  structural tie-break).
+- Gemini-II source route (five paper kernels as plain source reproduce the
+  artifact's fingerprints), card-fitted cost rules, carrier tiling,
+  in-process device lock, fingerprint bound to packed carriers, card-gated
+  hardware test (10 passed on zhang-x4, 11 exact programs).
+- UPMEM: uneven partitions (391x65 sweep), template-derived legality with
+  masked padding, carried accumulators loaded, virtual validity labels,
+  exact k-means update recognizer, host steps recorded and priced.
+- AiM: token-partition knob with explicit priced host reduction (6 of 9
+  minima, max gap 1.34%), slice-aware host cost (4.2M -> 10,108 vs 11,010
+  simulated), one cost route (SBK 1528 vs 1527), ties resolved, exit codes.
+- Device evidence: APU v1 4 tests on the board after the repairs; Gemini-II
+  round 3 table in `VALIDATION.md`.
 
 ## Next concrete actions (in order)
 
-1. Commit and push round 2 after the final suite runs recorded in
-   `VALIDATION.md`.
-2. Wire `search_min_movement_layout` into `rank_matcher_placements`: derive
-   `LayoutAccess` rows (access matrices, element bytes, reassociation
-   policy) and the owner hierarchy from `MatchedOp` and the target; feed the
-   tie set as `Placement.layout` candidates; mark `PlacementRanking`
-   incomplete on a budget exit (C-11, row 16 of CLAIMS.md).
-3. C-09: a reduction-order policy on the workload or `compile(...)`
-   consulted by `dual_fiber`, UPMEM `nc/kc` and the APU v1 plan ranking;
-   expose Samsung TEMPORAL_REDUCE as the strict-order placement (S-03).
-4. C-01 target-neutral legality pass (operand owner reachability and
-   `Op.src/dst` patterns) applied to user `layout=` and to enumerators.
-5. C-03/C-05: materialize before ranking (convert backend rejections into
-   `Rejection`s) and re-cost the reconciled whole program; document the
-   tie-break key (C-06).
-6. Gemini-II: add a hardware test gated on the card (G2-04), run the
-   negative controls, decide G2-02 (source route or documented typed-only
-   boundary) and price typed opcodes (G2-03).
-7. UPMEM: U-04 uneven partitions, U-05/U-06 template-derived legality,
-   publish the uPIMulator patch (P-06).
-8. F-02 literal typing in the shared frontend; V1-05/V1-06 cost provenance.
+1. (done in round 3) Commit and push round 3.
+2. C-03/C-05: materialize before ranking (convert backend rejections into
+   recorded rejections), re-cost the reconciled whole program, and either
+   route the matcher through `pim/schedule_search.grid_search` for a
+   bounded joint evaluation or document the per-kernel heuristic in
+   CLAIMS row 15 and the architecture doc.
+3. M-04: decide the AttAcc release boundary; if ported, add the AttAcc
+   target and closed-form cost as a virtual backend with the tiling knob.
+4. P-08: rewrite `SPMW_ARCHITECTURE.md` from the current tree (routes,
+   policies, legality, movement stage, result kinds, extension points,
+   inspection) and retire stale `design/` statements.
+5. V1-05/V1-06, F-02, remaining minor items; UPMEM public build path
+   (publish the uPIMulator patch from the archive diff).
+6. Independent-oracle evidence document for G6 summarizing the probes and
+   regressions per mechanism.
 
 ## External blockers
 

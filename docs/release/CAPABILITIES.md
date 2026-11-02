@@ -3,16 +3,19 @@
 
 # Tenon backend capability matrix
 
-Scope: `experiments/allo`, branch `tenon`, at `ffb4a78` plus uncommitted
-round-2 repairs (2026-11-02). Sources: `docs/release/audit/*.md`,
-`docs/release/ISSUES.md`, `docs/release/VALIDATION.md`, and the runs noted in
-the "Evidence" rows. Finding IDs (S-xx, M-xx, U-xx, V1-xx, G2-xx, C-xx, P-xx)
-refer to `ISSUES.md`; check it for the current status of each.
+Scope: `experiments/allo`, branch `tenon`, working tree on top of `6efaca5`
+(round 3, 2026-11-02). Sources: `docs/release/audit/*.md`,
+`docs/release/ISSUES.md`, `docs/release/VALIDATION.md`,
+`docs/release/design/*.md`, and the runs noted in the "Evidence" rows.
+Finding IDs (S-xx, M-xx, U-xx, V1-xx, G2-xx, C-xx, P-xx, F-xx) refer to
+`ISSUES.md`; check it for the current status of each. The implementation map
+(modules, stages, inspection fields) is `SPMW_ARCHITECTURE.md`.
 
 Terms used below:
 
 - **Input kind.** *Source*: an ordinary `@allo` workload (usually an
-  `allo.dataflow.region` with `@allo.work(mapping=...)`) passed to
+  `allo.dataflow.region` with `@allo.work(mapping=...)`; a plain function on
+  the APU v1 vector route and the Gemini-II source route) passed to
   `allo.compile(workload, target, cost)`. *Typed*: a typed program object
   (`APUv1Program`, `APUG2TypedProgram`, `APUG2ComposedContractionProgram`)
   passed to `allo.compile`; these bypass the matcher.
@@ -24,118 +27,138 @@ Terms used below:
   (`kind="simulator-timing-only"`; no outputs exist), *hardware*
   (`kind="device"`), *host functional* (`kind="functional"`; host execution
   of the lowered program, cycles are not a measurement).
-- **Evidence status.** *Verified* means run at or after `ffb4a78` on the
-  authors' host through the public API and recorded; *verified (earlier
-  revision)* names that revision; **UNVERIFIED** means no run at the
-  candidate revision, whatever older artifacts say. No simulator result is a
-  hardware measurement.
+- **Reduction order.** `allo.compile(..., reduction_order=)` is `"strict"`
+  by default (source accumulation order and rounding for floating-point
+  accumulators; integer accumulators may always be split) or
+  `"reassociate"`. Rows below say which programs each policy admits.
+- **Evidence status.** *Verified* means run at the round 3 tree on the
+  authors' hosts through the public API and recorded in `VALIDATION.md`;
+  **UNVERIFIED** means no run at the candidate revision, whatever older
+  artifacts say. No simulator result is a hardware measurement.
 
 ## Summary
 
 | Backend | Target builder / cost | Input | Compile-only | Analytical | Simulator functional | Simulator timing-only | Hardware |
 |---|---|---|---|---|---|---|---|
-| Samsung HBM-PIM | `build_samsung_target()` / `samsung_cost` | source | yes | yes | yes (PIMSimulator `pim_driver`) | (batched path only, untested) | no |
+| Samsung HBM-PIM | `build_samsung_target()` / `samsung_cost` | source | yes | yes | yes (PIMSimulator `pim_driver`, Tenon conductor) | no | no |
 | SK hynix AiM | `build_aim_target()` / `aim_cost` | source | yes | yes | no | yes (Ramulator2 `aim_simulator`) | no |
-| UPMEM | `build_upmem_target()` / `upmem_cost` | source | yes | yes | yes (uPIMulator + DPU SDK) | no | no |
+| UPMEM | `build_upmem_target()` / `upmem_cost` | source | yes | yes (validity labelled) | yes (uPIMulator + DPU SDK) | no | no |
 | GSI APU v1, source contraction route | `build_apu_v1_target()` / `apu_v1_cost` | source (rank-2 contractions, 1-D GEMV) | yes | yes (see note) | no simulator exists | no | yes (Gemini-I board) |
 | GSI APU v1, `APUv1Program` scalar route | same | typed (`APUv1Phase(vectorize=False)`) | yes | yes | no | no | yes; plus host functional |
 | GSI APU v1, native recipes | same | typed (`APUv1Phase(vectorize="required")`) | yes | yes | no | no | yes |
-| GSI APU v2 (Gemini-II), `APUG2TypedProgram` | `build_apu_g2_target()` (= `build_apu_v2_target()`) / `apu_g2_cost` | typed | yes | yes (op count) | no | no | yes (Gemini-II card) |
-| GSI APU v2, `APUG2ComposedContractionProgram` | same | typed | yes | yes (op count) | no | no | yes |
-| GSI APU v2, source | same | source | **rejected**: `NotImplementedError` | - | - | - | - |
+| GSI APU v2 (Gemini-II), `APUG2TypedProgram` | `build_apu_g2_target()` (= `build_apu_v2_target()`) / `apu_g2_cost` | typed | yes | yes (card-fitted tick model) | no | no | yes (Gemini-II card) |
+| GSI APU v2, `APUG2ComposedContractionProgram` | same | typed | yes | yes | no | no | yes |
+| GSI APU v2, source | same | source (integer contractions) | yes | yes | no | no | yes |
 
 Every PIM target compiles and runs analytically with only Allo installed.
-Everything else needs the external pieces in `simulators.md`.
+Everything else needs the external pieces in `simulators.md` and the
+discovery variables in `INSTALL.md` section 3.
 
 ## Samsung HBM-PIM
 
 | Aspect | Status |
 |---|---|
-| Input | Source GEMV/GEMM: one `MAC` per work-id stream with roles `x`, `y`, `acc` (`acc += W[i,k] * x[k]`), mapping `[P, U]` with `P <= 16`, `U <= 8`. ADD/MUL/RELU and `y += W*x` forms are declared on the target but rejected at compile time (`NotImplementedError ... missing one of x/y/acc roles`, S-07). |
-| Compile-only | `compiled.compiled.cmds` is the emitted PIM command list (e.g. 6 commands for shared CRF), `compiled.placement_ranking` the ranked placements (24 per bucket, 3 bases). |
-| Analytical | `samsung_cost` over the retained graph; 226 cycles for the 4096x256 GEMV at the selected `dual_fiber` placement. |
-| Simulator | PIMSimulator `pim_driver --op GENERIC --op-kind REDUCE`; outputs read back from `out.bin` (absent/short output raises, S-02 fixed). |
-| Numerical scope | FP16 only (inputs cast to `float16`); per-lane FP16 with 16-way regrouping, **not** source order (the paper's ordered fallback is outside the release, S-03; no reassociation permission exists, C-09). `x[k]*W[i,k]` operand order fails at run time (S-05). |
-| What cycles mean | Simulated DRAM cycles of the **vendor canonical GEMV program on the zero-padded shape** (K padded to 256, M to 4096): K=100/128/256 and M=128/2048/4096 all report 4435 (S-06). The selected placement/layout does **not** determine the executed program; the conductor regenerates the vendor microcode (S-01). |
+| Input | Source FP16 contractions classified structurally (`spmw_samsung.samsung_contraction`): nests `[k]`, `[row, k]` (GEMV), `[row, column, k]` (GEMM), either operand order (`W[i,k]*x[k]` or `x[k]*W[i,k]`, S-05 fixed), literal-zero accumulator; work items must partition the output rows exactly (full `[16, 8]` grid or `mapping=[1]`, S-10). Elementwise `ADD`/`MUL`/`MAD`/`RELU` for one work item (`mapping=[1]`) walking a 1-D FP16 extent (S-07 fixed); partitioned elementwise grids are rejected with the reason. A carried accumulator (`y[i] += ...` with no initializer) is rejected before scheduling. |
+| Compile-only | `compiled.compiled.cmds` is the emitted per-pass CRF (`PIMCmd` list); `compiled.compiled.layout_ctx.programs` the `SamsungProgram` records; `compiled.placement_ranking` the ranked placements, pruned modes (`policy_pruned`) and movement record. |
+| Analytical | `samsung_cost` over the retained graph. Unit: memory-clock cycles of the modeled activities (GRF fills, MAC/elementwise, drains, explicit host moves) of one work item on the declared 16-channel device, unpadded shape; preload, CRF upload and readback are outside the graph. Not comparable in absolute value with simulated cycles; compared by candidate ranking (4 of 6 placement pairs agree per GEMV shape, `design/samsung-execution.md` section 7). |
+| Simulator | PIMSimulator `pim_driver --op GENERIC --op-kind REDUCE | TEMPORAL_REDUCE | ELTWISE`: the conductor uploads the compiled CRF verbatim and never calls the vendor command generator (S-01 fixed); `kind="simulator"`, outputs read back (`out.bin` absent or short raises; all-zero is a value, S-02 fixed). |
+| Numerical scope | FP16 inputs. `reduction_order="strict"` (default) selects the ordered TEMPORAL program: one GRF_B lane per output row, K issued in source order, bit-equal to source-order FP16 (4096/4096 rows at 4096x256, including a 0.5 initial value through the runtime). `"reassociate"` admits the REDUCE programs (`bank_row`, `dual_fiber`): lane `k mod 16` partials summed on the host in FP32, within 1e-2 of FP32 (343/4096 rows bit-equal to source order). Elementwise results are bit-exact against NumPy FP16. |
+| What cycles mean | PIMSimulator memory-clock cycles of the **padded** program (preload + execution + readback on the simulated 64-channel system). REDUCE pads K to 128-element tiles and rows to 4,096-slot passes; TEMPORAL pads rows to 8,192-row tiles; elementwise pads to 131,072-element tiles. `RunResult.extra` reports `logical_shape`, `padded_shape`, `padding_fraction`, `timing_scope`, `cycle_phases`, `plan`, `crf`, `conductor`, `levers` (S-06 fixed). |
+| Selection | Default under strict: TEMPORAL (26,807 cycles at 4096x256). Under `"reassociate"`: bank_row + host GRF_A fill, 4,389 / 7,947 / 8,153 cycles at 4096x256 / 4096x512 / 8192x256, 1.0-1.2% fewer than the vendor program; the paper's vendor-equivalent placement (dual_fiber, host fill, shared CRF) is selected explicitly with `allo.spmw_samsung.samsung_vendor_gemv_layout(target, trace)` and reproduces 4,435 / 8,041 / 8,247. Unrealizable levers (`grf_staged`, `crf_issue=per_workid` with more than one item, more than 32 CRF words, non-identity `tile`, `double_buffer`) are rejected at materialization and recorded in `KernelRanking.rejections`. |
 | Hardware | none (no HBM-PIM device). |
-| Evidence | Verified 2026-11-02 at the candidate: `tests/pim/test_gemv_all_targets.py::test_gemv_samsung_hbm_pim` passed (functional, 4096x256), and the installed wheel ran the same GEMV on PIMSimulator from outside the checkout: 4435 cycles, max abs error 4.5e-4 vs float32 (`INSTALL.md` section 6). Paper rows E1 reproduce (`CLAIMS.md`). The `pim_driver` cannot be rebuilt from public sources (S-04, `simulators.md`). |
+| Evidence | Verified at round 3: `tests/pim/test_paper_golden.py` Samsung rows (vendor layout 4,435 / 8,041 / 8,247), `tests/pim/samsung_hbm_pim/test_samsung_lowering.py`, `test_samsung_conductor_runs.py`, `test_samsung_reduction_order.py`, `gemv/` tests; executed table in `design/samsung-execution.md` sections 6-7. The running `pim_driver` is built from the overlay in the containing repository's `experiments/simulators/setup/PIMSimulator/`, which is not yet committed there (S-04, P-04, P-05). Open: S-11 (docs page), S-12 (CRF-fill preload outside the model), S-13 (XOR swizzle 148 -> 116 only as a harness, `tests/pim/samsung_hbm_pim/layout_swizzle/`). Multi-kernel traces compile but do not run. |
 
 ## SK hynix AiM
 
 | Aspect | Status |
 |---|---|
-| Input | Source GEMV/attention-style MAC (`acc += W*x`), elementwise MUL/ADD and AF through target ops; mapping a prefix of `[32, 4, 4]`. Output/reduction axes are derived structurally (`axis_roles`, M-01 fixed); issued MACs are checked against the program (`AimCoverageError`). |
-| Compile-only | `compiled.compiled.cmds` is the exact Ramulator2 trace text (`AiM WR_GB ...`, `MAC_ABK ...`, `EOC`). |
-| Analytical | `aim_cost`; host-transfer cost is slice-blind (virtual estimate up to 380x the simulated cycles on small GEMVs, M-05). |
-| Simulator | Ramulator2 timing simulator in Docker (`aim-simulator-build`); `kind="simulator-timing-only"`, `extra["outputs"]` absent, caller arrays untouched. Nonzero simulator exit codes are recorded in `extra["returncode"]` but not rejected (M-08, open). |
-| Numerical scope | **None.** The simulator has no data path. dtype is not enforced (float32/int32 GEMVs emit the same trace as bf16); nonzero initial accumulators produce the zero-init trace (timing-equivalent only). |
-| What cycles mean | Max over channels of Ramulator2 `memory_system_cycles`, per distinct trace segment, multiplied by the segment's compile-time repeat count and summed. Simulator geometry is fixed at 32 channels; other targets are rejected. |
+| Input | Source GEMV and attention-style batched MAC (`acc += W*x`), elementwise `MUL`/`ADD` and `AF` through target ops; mapping a prefix of `[32, 4, 4]` or an outer subset. Output, reduction, batch and work axes are derived structurally (`axis_roles`, M-01 fixed); undecidable forms (split-K grids, uneven per-item extents, `y[row0+i] += ...`) raise; issued MACs are checked against the program (`AimCoverageError`). Carried accumulators are rejected (M-09/C-14). |
+| Compile-only | `compiled.compiled.cmds` is the exact Ramulator2 trace text (`AiM WR_GB ...`, `MAC_ABK ...`, `EOC`); `compiled.compiled.layout_ctx.host_steps` lists host reductions. |
+| Analytical | `aim_cost`: one route prices the exact lowered record (M-06 fixed; GEMV 256x256 ABK 223 vs 222 simulated, SBK 1,528 vs 1,527); host transfers priced by the moved slice and residency (M-05 fixed; `attention_l128` 10,108 estimated vs 11,010 simulated). Long streams remain 1.25x to 1.59x high (token-partition study). |
+| Simulator | Ramulator2 timing simulator in Docker (`TENON_AIM_SIM_IMAGE`, default `aim-simulator-build`); `kind="simulator-timing-only"`, no `extra["outputs"]`, caller arrays untouched; a nonzero simulator exit raises (M-08 fixed). Trace files go to a private temp directory (P-21 fixed). |
+| Numerical scope | **None in the simulator** (no data path). Under `"strict"` every BF16 reduction is refused before scheduling with `ReductionOrderError` (each MAC regroups 16 products through the bank adder tree); use `reduction_order="reassociate"` or integer accumulators. The token-partition merge (`reduction_partitions` knob, `AimHostReduction`) is checked numerically by `aim_lowering.reference_partial_sums` (exact on integers, within 3.7e-3 on BF16). |
+| What cycles mean | Max over channels of Ramulator2 `memory_system_cycles` per distinct trace segment, times the compile-time repeat count, summed. Host steps are listed in `extra["host_steps"]` and never added. Simulator geometry is fixed at the 32-channel preset; other targets are rejected (M-10). |
 | Hardware | none. |
-| Evidence | Verified 2026-11-02: `test_gemv_aim` passed through the public API (trace now written to a private temp directory, not the simulator checkout). CENT reproduction: 14 traces byte-identical to pinned SHA-256, golden cycles 11,750 / 129,605 / 11,010 / 6,307 (`VALIDATION.md`, after repair increment 1). Token partitioning and the AttAcc path are **not** in the release (M-03, M-04). |
+| Evidence | Verified at round 3: 14 CENT traces byte-identical to pins with golden cycles (`test_paper_golden.py`), `tests/pim/test_aim_axis_roles.py`, `test_aim_cost_routes.py`, `test_aim_token_partition.py` (6 of 9 simulated minima reached, max gap 1.34%; paper 7 of 9), `test_aim_virtual_study.py`. The AttAcc compiler path is outside the release (M-04). |
 
 ## UPMEM
 
 | Aspect | Status |
 |---|---|
-| Input | Source kernels recognized as families: `pointwise` (ADD, `a*A + b*B` with literal coefficients), `reduction`, `matrix_vector`, `gemm`, `histogram`, `selection` (odd values), `kmeans_distances`, `kmeans_update` (host-placed), `feature_gradient`; mapping `[N]` over DPUs with even partitions. |
-| Compile-only | `compiled.compiled.cmds` names the segments; `compiled.compiled.layout_ctx.segments` holds the DPU `task.c` source per segment. |
-| Analytical | `upmem_cost`; calibrated factors are valid inside the calibration stratum only, outside it virtual cycles were 1.39x-1.53x off without a validity flag (U-09). |
-| Simulator | DPU program built with the DPU SDK in Docker, run on uPIMulator with a fixture; uPIMulator byte-compares the observed MRAM window with the host oracle (`emit_c_from_mlir`) and the decoded outputs overwrite the caller's arrays (`kind="simulator"`). |
-| Numerical scope | Element types enforced per role (`UPMEM_ROLE_ELEMENT_TYPES`): int32 operands, int64 accumulators for reduction/k-means distances/gradients (U-01 fixed); wide-integer host code rejected instead of truncated (U-02 fixed). Shape constraints come from cost-model features: MV `rows % 12 == 0`, `K % 16 == 0`, `rows > 12`; GEMM `rows % 12 == 0`, `N`, `K` divisibility; uneven DPU partitions rejected (U-04, U-05). |
-| What cycles mean | Sum over DPU segments of the max per-DPU uPIMulator `logic_cycle` (350 MHz logic clock); host packing, host transfers and host-placed groups are excluded (`extra["timing_scope"]`). |
+| Input | Source kernels proven as one of nine families (`spmw_upmem.classify_upmem_kernel`): `pointwise` (ADD, SUB, MUL, SCALE, `a*x + b*y` with int32 literals; `a*x - b*y` and `+ c` need target patterns, U-06), `reduction`, `matrix_vector` (incl. MMTV and scaled), `gemm`, `histogram`, `selection` (`(x & mask) cmp k`, `x cmp k`, odd flags), `kmeans_distances`, `kmeans_update` (host-placed), `feature_gradient`; `mapping=[N]`, `N <= 64`, uneven partitions through `meta_if`/`meta_else` (last DPU takes the remainder; U-04 fixed). Legality is the template's (DMA size and alignment, WRAM footprint); non-dividing extents are zero-padded and masked (U-05, U-06 fixed). Carried accumulators are loaded by the MV, GEMM, reduction, histogram and selection templates and rejected for k-means distances and gradients (U-03 fixed). |
+| Compile-only | `compiled.compiled.cmds` names the segments; `compiled.compiled.layout_ctx.segments[i].device_source` is the DPU `task.c`. |
+| Analytical | `upmem_cost` over the retained graph; every virtual result carries `cost_validity` (`calibrated` only at a calibration anchor, else `extrapolated` with the nearest point) and `upmem_cost_validity` per group (U-09 fixed). Outside the calibrated stratum the model was 0.54x to 1.41x off in the recorded sample (`design/upmem-domain.md` section 5). The host-placed group and selection compaction are priced with a coarse host unit (`HOST_TIMING_SCOPE`). |
+| Simulator | DPU program built with the DPU SDK in Docker, run on uPIMulator with the `GENERIC` fixture; uPIMulator byte-compares the observed MRAM window with the portable-C host oracle; decoded outputs overwrite the caller's arrays (`kind="simulator"`). Two routes: pinned-campaign (archived binary, snapshot, pinned SDK manifest) and user-build (`UPIMULATOR_ROOT` + `UPIMULATOR_BIN`); each record carries `sdk_build` (`pinned-campaign` or `user-build:<manifest12>`). |
+| Numerical scope | Element types enforced per role (`UPMEM_ROLE_ELEMENT_TYPES`: int32 operands, int64 accumulators for reduction, k-means distances and gradients; U-01 fixed); wide-integer host code is rejected instead of truncated (U-02 fixed). Results exact against the oracle on every executed case, including the 391x65 GEMV sweep over 1-32 DPUs and carried-accumulator runs. |
+| What cycles mean | Sum over DPU segments of the max per-DPU uPIMulator `logic_cycle` (350 MHz logic clock); host packing, host transfers and host-placed groups are excluded (`extra["timing_scope"]`); modeled host work appears as `modeled_host_cycles` in the records. |
 | Hardware | none (no UPMEM DIMMs). |
-| Evidence | Verified 2026-11-02: `test_gemv_upmem` passed on the pinned-campaign route and again with `UPIMULATOR_ROOT`/`UPIMULATOR_BIN` set (user-build route, identity `user-build:d45e285c34b5`). 13 `paper_full` golden rows pass (`VALIDATION.md`). A user build from public sources is **not yet possible**: the Tenon uPIMulator patch is unpublished (P-06), and the run record does not yet carry `sdk_build` (P-03, pending call site in `spmw_upmem.py`). |
+| Evidence | Verified at round 3: 13 `paper_full` golden rows with pinned cycles (`test_paper_golden.py`), `tests/pim/test_upmem_generality.py` (391x65: 1 DPU 1,146,612 cycles vs paper 1,149,430; 32 DPUs 49,421 remainder split / 40,058 balanced vs paper 38,484), `test_upmem_dtypes.py`, `test_upmem_matcher.py`, user-build route (`user-build:d45e285c34b5`). A build from public sources is **not yet possible**: the Tenon uPIMulator patch is unpublished (P-06) and the SDK image reuses an upstream name (P-17). |
 
 ## GSI APU v1 (Gemini-I)
 
-Three routes share `build_apu_v1_target()`.
+Four routes share `build_apu_v1_target()`. Every board launch takes the
+board lock (`apu_v1_program.apu_v1_board_lock`, `TENON_APU_V1_LOCK`,
+default `/tmp/tenon-apu-v1-<pci node>.lock`) and proves profile freshness
+by diffing the device log before and after the launch (V1-07 fixed).
 
 | Aspect | Source contraction route | `APUv1Program` scalar route | Native recipes |
 |---|---|---|---|
-| Input | Source `@allo` function (not a dataflow region) whose stores are rank-2 contractions `C[i,j] += A[i,k]*B[k,j]` (mul, and/or/xor/xnor-popcount), 1-D GEMV lifted with a unit axis | `APUv1Program([APUv1Phase(fn, vectorize=False)])`: whole function lowered to C11 with `emit_c_from_mlir`, runs on APUC 0 | `APUv1Program([APUv1Phase(fn, vectorize="required")])` matched by one of four recognizers: dense 256-bin histogram (32,768 values), squared-L2 argmin (P=32,768, D<=48), bivariate moments, record frequency |
-| Plan selection | Finite recipe catalog (`temporal_svp`, `temporal_dma_coalescing*`, `..._acc{2,4,8}`, `spatial_gemv_group_reduction`, ...); every candidate realized to GVML, infeasible ones dropped, ranked by `apu_v1_cost` on the materialized instructions; `layout=` forces a plan | none | the recognizer's single template |
-| Analytical | yes; note: `backend="virtual"` on this route executes the same NumPy reference as `"functional"` and reports `kind="functional"` with the analytical cycles | yes (`kind="virtual"`, V1-04 fixed) | yes |
-| Host functional | yes (NumPy reference of the source; `kind="functional"`) | yes (retained portable C on the host) | rejected at compile time |
-| Hardware | yes: GVML project built with the ARC toolchain, launched on the board, outputs read back | yes | yes |
-| Numerical scope | FP16, uint16, bitwise; the default FP16 GEMV plan **reassociates** the reduction (V1-03, no permission flag, C-09); nonzero initial `C` on plans without output ingress: see V1-02 | C11 semantics of the C backend; `sqrt` replaced by a Newton helper that is wrong above about 1e8 (V1-12) | fixed shapes/dtypes listed above; recognizers **fail open** on several semantic mutations (`+= 2`, nonzero init, swapped columns emit the paper kernel, V1-01) |
-| What cycles mean | ARC core cycles (`crun`) of the profiled `total` section printed by the device build (`PROF_PRINT`), read from the board log | same | same |
-| Evidence | Baseline `test_gemv_apu_v1` ran on the board at `8160d6d` (verified, earlier revision). **UNVERIFIED** at the candidate revision: no post-repair device run. Paper numbers (E9-E12) came from an external locked runner (`CLAIMS.md`). | **UNVERIFIED** on hardware at the candidate; virtual/functional covered by `tests/perf/test_run_result_contract.py` | **UNVERIFIED** on hardware at the candidate; four kernels compile-only in `test_paper_golden.py`, `histogram` has a board test |
+| Input | Plain `@allo` function (not a dataflow region) whose stores are rank-2 contractions `C[i,j] += A[i,k]*B[k,j]` (FP16/uint16 multiply, and/or/xor, XNOR-popcount); 1-D GEMV lifted with a unit axis | `APUv1Program([APUv1Phase(fn, vectorize=False)])`: the whole function lowered to C11 with `emit_c_from_mlir`, runs on APUC 0; one phase only | `APUv1Program([APUv1Phase(fn, vectorize="required")])` proven by exactly one of four recipes (dense 256-bin histogram, squared-L2 argmin, bivariate moments, record frequency) with a strict MLIR parser and symbolic executor; mismatches raise `APUv1NativeRecipeMismatch` (V1-01 fixed) |
+| Plan selection | Finite recipe catalog (`temporal_svp`, `temporal_dma_coalescing*`, `..._acc{2,4,8}`, `spatial_gemv_group_reduction`, ...); regrouping plans pruned under `"strict"` (`reduction_policy_pruned`); every surviving plan realized to GVML, infeasible ones dropped, ranked by `apu_v1_cost` on the materialized instructions (`schedule_search.grid_search`); `layout=<plan>` forces a plan; `cost=None` without `layout=` is an error (V1-10) | none | the recognizer's single template |
+| Analytical | yes; note: `backend="virtual"` on this route runs the same NumPy model of the selected plan as `"functional"` and reports `kind="functional"` with the analytical cycles (labelling residue, `REVIEW.md`) | yes (`kind="virtual"`, V1-04 fixed) | yes |
+| Host functional | yes (NumPy model of the selected plan's numerics; `kind="functional"`) | yes (retained portable C on the host) | rejected at compile time |
+| Hardware | yes: GVML project built with the ARC toolchain, launched on the board, outputs read back; temporal plans upload the packed initial output and accumulate onto it, spatial group-reduction plans reject a nonzero initial output (V1-02 fixed) | yes | yes |
+| Numerical scope | FP16, uint16, bitwise. Default (`"strict"`) selects `temporal_dma_coalescing` for the 4096x256 FP16 GEMV, bit-equal to source order (4096/4096); `"reassociate"` selects `spatial_gemv_group_reduction` (tree reduction, 425/4096 bit-equal in the plan-order model; the halving-tree model is not board-checked) | C11 semantics of the C backend; `sqrt` replaced by a Newton helper that is wrong above about 1e8 (V1-12) | fixed shapes and dtypes per recipe (histogram 32,768 values x 256 bins, argmin P=32,768, D<=48) |
+| What cycles mean | ARC core cycles (`crun`) of the profiled `total` section printed by the device build (`PROF_PRINT`), exactly one fresh record per launch | same | same |
+| Evidence | Verified at round 3 on this server: `test_gemv_apu_v1` and two `tests/pim/apu_v1/vector_gemm` plans passed on the board (4 device tests, 197 s). Paper numbers (E9-E12) came from an external locked runner (`CLAIMS.md`); open: V1-05 (fitted count rule absent, native estimates 19-56% off without a validity flag), V1-06 (fixed tile heuristic; 12.71x row plans reachable by `layout=`, golden drift 2.9%), V1-08 (template location, license headers) | virtual/functional covered by `tests/perf/test_run_result_contract.py`; hardware **UNVERIFIED** at round 3 | histogram golden median row passed on the board at round 3; other recipes compile-only at round 3 (`test_paper_golden.py`) |
 
-A legacy matcher route (`spmw_apu_v1.py`, grouped FP16 MAC over four APUCs)
-is still reachable for dataflow regions; it is mostly dead and guesses output
-shapes (V1-09). Board launches take an exclusive `flock`
-(`TENON_APU_V1_LOCK`, default `/tmp/tenon-apu-v1-<pci node>.lock`); the tests
-use the same lock (V1-07 repair, in progress).
+A legacy matcher route (`spmw_apu_v1.APUv1Ctx`, grouped FP16 MAC over four
+APUCs with `gvml_add_subgrps`) is reachable for dataflow regions only; it
+refuses float accumulators under `"strict"`, reads output shapes from the
+compiled ABI and raises on missing output files (V1-09 fixed).
 
 ## GSI APU v2 (Gemini-II)
 
-| Aspect | `APUG2TypedProgram` | `APUG2ComposedContractionProgram` |
-|---|---|---|
-| Input | Typed op record: `add`, `mul`, `div`, `block_sum`, `dot` over `input_types`/`output_type`, `shape`, `reduction_extent`, `repetitions` | Typed record of independent dot products `(dot_count, K)` with an epilogue (identity, two-coefficient pair-affine, accumulate); GEMM/GEMV/batched forms must be pre-packed by the caller with the host helpers |
-| Legality | exact output width (`out_bits == lhs + rhs (+ log2 K)`), shared signedness, unsigned-only div/block_sum, <= 24-bit segments, K power of two in [2, 4096], up to 262,144 elements | one `(4, 65536)` carrier: `padded(dot_count) <= 4*65536/K_pad`, `K_pad <= 256`, K power of two; larger problems are rejected, not tiled (G2-05) |
-| Plan selection | none: fixed layout, nothing ranked; `layout=`/`host_moves=` rejected | none: one deterministic `APUG2DotTilePlan` (`LinearLayout` over F2); nothing searched (G2-02) |
-| Analytical | `kind="virtual"`; the "cycles" are an **operation count**, not calibrated cycles (G2-03) | same |
-| Hardware | fixed project template (`allo/pim/templates/apu_g2`) built per call with CMake (ARC device library + host), run on card `apu-00` after `gsi_tool info` reports it Available and core 0 idle; outputs read back and compared with an int64 NumPy oracle, mismatch raises; device values are returned | same, plus layout fingerprint and epilogue attested |
-| Numerical scope | exact integer arithmetic modulo the declared widths (1-24 bit, signed/unsigned) | same |
-| What cycles mean | `round(device pipeline ticks / repetitions)`: ARC running-state ticks over `repetitions` bodies plus one barrier, host transfers excluded (`extra` keeps host microseconds separately); default `repetitions=256` | same |
-| Evidence | Executed on the `apu-00` card of `zhang-x4` (FW V1.24.1) on 2026-11-02 at `ffb4a78` + the wave 2 tree: typed add/mul/div/block_sum/dot and the u16 add runner, all exact against the runtime oracle (`VALIDATION.md`, Round 2). No hardware test in `tests/` yet (G2-04); virtual route and a fake runtime are tested (`tests/perf/test_apu_g2_typed_program.py`). | Executed on the same card and date: the five paper programs (GEMM, batched GEMM, GESUMMV, BiCG, MVT) with fresh random inputs, exact, cycles within 1.3% of the paper medians (`VALIDATION.md`). No hardware test in `tests/` yet (G2-04). |
+Three routes share `build_apu_g2_target()` (`target.name == "apu_v2"`).
+Every runtime takes an in-process `flock` (`TENON_APU_G2_LOCK`, default
+`/tmp/tenon-apu-g2-<device>.lock`) around status check, build and launch;
+`extra["device_lock"]` records the path (G2-06, partially fixed: only
+`apu-00` and SDK root `/opt/gsi`-compatible installs are accepted).
 
-Source workloads on `apu_v2` raise `NotImplementedError` (the old matcher
-route reported success without compiling or executing and was removed,
-G2-01). The SDK root and device are routed through `spmw_simenv` but only the
-defaults `/opt/gsi` and `apu-00` are accepted until the templates are
-parameterized (`INSTALL.md` section 3).
+| Aspect | `APUG2TypedProgram` | `APUG2ComposedContractionProgram` | Source route |
+|---|---|---|---|
+| Input | Typed op record: `add`, `mul`, `div`, `block_sum`, `dot` over `input_types`/`output_type`, `shape`, `reduction_extent`, `repetitions` | Typed record of independent dot products `(dot_count, K)` with an epilogue (identity, two-coefficient pair-affine, accumulate); GEMM/GEMV/batched forms pre-packed by the caller with the host helpers | Plain `@allo` function with one or two integer dot-product reductions (`acc += x*y`) and optionally an `alpha*t + beta*u` epilogue (`allo/pim/apu_g2_source_route.py`, G2-02 fixed); `benchmarks/apu_g2/workloads.py` holds the five paper kernels |
+| Legality | exact output width (`out_bits == lhs + rhs (+ log2 K)`), shared signedness, unsigned-only div/block_sum, <= 24-bit segments, K power of two in [2, 4096], up to 262,144 elements | one `(4, 65536)` carrier: `padded(dot_count) <= 4*65536/K_pad`, `K_pad <= 256`; larger problems are rejected naming the capacity | exact widths derived from the source (`D = a + b + log2 K <= 24`, carried output `>= D + 1`), one signedness, K power of two `<= 512`; dots beyond one carrier are tiled, K up to 512 split into two launches (G2-05 fixed); anything else raises `APUG2SourceRouteError` |
+| Plan selection | none: fixed layout; `layout=`/`host_moves=` rejected | none: one deterministic `APUG2DotTilePlan` (`LinearLayout` over F2) | `enumerate_apu_g2_launch_plans` (`single`/`fused`/`separate` x `k1`/`k2` x output tiles) ranked by `rank_apu_g2_launch_plans` (estimate, launches, catalog order); `layout="<plan>"` forces one; `compiled.compiled.placement_ranking`, `.rejected`, `.manifest()` |
+| Analytical | `kind="virtual"`; `apu_g2_cost` prices every issued recipe call from seven structural features fitted on ten card programs (in-sample within 1.9%, leave-one-out within 2.6%; G2-03 fixed); `estimate_validity="extrapolated"` outside reduction depths 7-8 | same | same, summed over launches |
+| Hardware | project template (`allo/pim/templates/apu_g2`) built per call with CMake, run on the card after `gsi_tool info` reports it Available and core 0 idle; outputs compared with an int64 NumPy oracle inside the runtime, mismatch raises; device values returned | same, plus the layout fingerprint bound to the packed carriers before launch (G2-08 fixed) | same, each launch through `run_apu_g2_composed`, results checked against an `einsum` oracle of the matched contractions |
+| Numerical scope | exact integer arithmetic modulo the declared widths (1-24 bit) | same | same |
+| What cycles mean | `round(device pipeline ticks / repetitions)`: ARC running-state ticks over `repetitions` bodies plus one barrier, host transfers excluded (`extra` keeps host microseconds separately); default `repetitions=256` | same | sum of launch cycles; host readback between launches outside the unit |
+| Evidence | Verified at round 3 on zhang-x4 `apu-00` (FW V1.24.1): `tests/pim/test_apu_g2_hardware.py` 10 passed (G2-04); typed add/mul/div/block_sum/dot exact, cycles 315 / 311 / 1,014 / 2,585 / 1,725 vs estimates 340 / 307 / 1,020 / 2,588 / 1,714 | five paper programs exact in round 2 (1,711 / 1,720 / 1,876 / 2,569 / 2,754 vs paper medians within 1.3%) | round 3: GEMM, batched GEMM, GESUMMV, BiCG, MVT from source exact with cycles 1,736 / 1,719 / 1,869 / 2,554 / 2,766 (estimates within 8%), GEMM 64x128x33 two-launch `single/k2` 2,685 (extrapolated estimate 2,550); layout fingerprints equal the artifact's |
 
-## Cross-cutting limits
+Open: G2-09..G2-12 (fingerprint echo, mod-2^bits wrap in decode, padded-lane
+division, dead uint16 templates), `DeviceConfig` semantics for cards other
+than index 0, `t + u` epilogue without coefficients.
 
-- No access-scope/operand legality pass: a hand-supplied `layout=` that
-  violates operand placement can be accepted and priced (C-01).
-- No floating-point reduction-order permission: reduction-splitting
-  placements are chosen by cost alone (C-09).
-- Ranking is per kernel group and precedes materialization (C-03, C-05); ties
-  are broken by enumeration position (C-06).
-- The minimum-movement layout search of the paper's Section IV is not in the
-  package (C-11).
-- Shared frontend: annotation shape names are resolved from the caller's
-  frames (F-01) and wide integer literals are truncated to i32 (F-02); both
-  affect every backend.
+## Cross-cutting status
+
+- Placement legality (`allo/spmw_legality.py`) filters enumerated
+  candidates and rejects illegal `layout=` (C-01 fixed); the work grid must
+  map onto the unit tree in a documented form (C-04 fixed).
+- Reduction order is explicit (`reduction_order`, default `"strict"`,
+  C-09 fixed); every reassociating paper row passes `"reassociate"`.
+- Ties are broken by a documented structural key and exposed as
+  `KernelRanking.cost_ties` (C-06 fixed).
+- The minimum-movement layout stage runs per kernel group and records
+  ties, termination and optimality (`KernelRanking.movement`, C-11 fixed),
+  but no backend can realize an owner map other than the program's
+  work-grid map, so alternative ties are rejected with a stated reason
+  (CLAIMS row 16 partial).
+- Ranking is per kernel group and precedes materialization (only a
+  codegen probe runs on the ranked list); the reconciled whole program is
+  not re-costed (C-03, C-05 open).
+- Shared frontend: annotation names resolve from the defining scope only
+  (F-01 fixed); wide integer literals are still truncated to i32 (F-02
+  open).
+- `RunResult.kind` is set on every route and validated; non-executed kinds
+  never write caller arrays (G2-07, S-02, V1-09, M-08 fixed).

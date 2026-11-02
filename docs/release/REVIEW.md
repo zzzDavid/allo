@@ -113,6 +113,36 @@ what was accepted and why.
 - Packaging. Accepted; the wheel is host-specific (libstdc++) and the
   supported installation remains the source build, which INSTALL.md states.
 
+## Accepted repairs (round 3) and review notes
+
+- Reduction-order policy with `strict` as the default. Accepted: the paper
+  says regrouping needs explicit permission. Consequence accepted knowingly:
+  the default Samsung compile now selects the ordered TEMPORAL program
+  (26,807 cycles at 4096x256) and AiM/APU v1 matcher routes refuse float
+  reductions under strict with a finite error; every reassociating golden
+  row passes `reduction_order="reassociate"` explicitly. Integer reductions
+  may always split (wraparound makes grouping irrelevant).
+- Target legality pass. Accepted. `srf` removed from the Samsung MAC
+  operand set because neither the emitter nor the conductor can carry SRF
+  data; the honest choice was to stop declaring it. Reviewer note: the
+  work-grid check briefly rejected multi-DPU UPMEM programs until the
+  outer-subset form was added; the accepted forms are now a documented
+  table in `_check_work_grid`.
+- Layout selection stage. Accepted with the finding it surfaced: the ported
+  search runs per kernel group (an exact coordinate search handles problems
+  beyond the 4-bit bounded domain, with a stated lemma), ties reach the
+  ranking, but no backend can realize an iteration-to-owner map other than
+  the kernel's own work-grid map; alternative ties are rejected with a
+  stated reason. CLAIMS row 16 is therefore "partial", not "implemented".
+- Gemini-II source route. Accepted: the five paper kernels as plain source
+  reproduce the artifact's fingerprints and packed carriers byte for byte,
+  and the plan candidates are ranked by a cost program fitted on card
+  measurements with a stated validity domain. Reviewer repair after the
+  card run: the typed runtime lacked the artifact hash record.
+- UPMEM and AiM generality. Accepted; cross-file hooks (virtual-run extra,
+  host-slice metrics, Samsung carried-accumulator gate) were applied by the
+  reviewer after reading the proposed patches.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -140,13 +170,13 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 | Gate | Judgment | Basis |
 |---|---|---|
-| G1 correspondence | **FAIL** (improved) | Section IV mechanisms now in the package (rows 17-22) but not driving selection (row 16); rows 3, 13, 15 missing; E2, E5, E8, E11, E12, E14-E16 external |
-| G2 semantic preservation / explicit failure | **FAIL** (improved) | fixed: unmatched effects, accumulator init, zero outputs, result kinds, UPMEM dtypes, wide ints, AiM over-issue, Samsung selected program, APU v1 recognizers and carried outputs, scope resolution; open: C-01, C-09, F-02 |
-| G3 general mechanisms | **FAIL** (improved) | APU v1 recognizers structural; Samsung roles structural; open: U-05/U-06 shape-exact paths, G2-02 per-case adapter |
-| G4 search/layout/selected-program integrity | **FAIL** (improved) | S-01 closed; C-03/C-05/C-06 open; C-11 search present but not wired |
-| G5 cost models | **FAIL** (improved) | Samsung MAC rule calibrated with provenance; open: M-05/M-06, U-09, V1-05, G2-03 |
-| G6 evidence beyond examples | **FAIL** (partial) | variant/rename regressions for matcher, AiM, Samsung, UPMEM, APU v1 recipes; Gemini-II fresh random fixtures; no systematic independent-oracle campaign yet |
-| G7 install/interfaces/maintainability | **FAIL** (improved) | fresh-venv install verified; docs added; open: P-04/P-06/S-04 simulator reproducibility, P-13/P-14/P-17/P-18/P-19/P-20, architecture doc rewrite (P-08) |
-| G8 backend execution | **PARTIAL** | simulators ran at the candidate; APU v1 device: 4 device tests pass after repairs; Gemini-II: 11 programs exact on the card; still no Gemini-II test in the suite and no negative controls |
+| G1 correspondence | **PARTIAL** | rows 3, 13, 17-22, E2, E5, E8 now implemented; row 16 partial (ties reach ranking, not realizable by backends); row 15 open (per-group ranking); E11, E12, E14-E16 and the AttAcc path (M-04) external |
+| G2 semantic preservation / explicit failure | **PARTIAL** | all round 1-3 repairs; open: F-02 literal truncation (shared frontend), V1-11/V1-12 minor |
+| G3 general mechanisms | **PARTIAL** | structural recognizers on APU v1, Samsung, Gemini-II source route; UPMEM template-derived legality; open: `a*A - b*B`/`+ c` patterns (U-06), G2 device index |
+| G4 search/layout/selected-program integrity | **PARTIAL** | legality pass, movement stage, documented tie-break, Samsung executes selected program; open: C-03 (ranking before materialization), C-05 (per kernel, no re-cost after reconciliation) |
+| G5 cost models | **PARTIAL** | Samsung MAC and TEMPORAL rules calibrated; AiM single route and slice-aware host cost; UPMEM validity labels; Gemini-II card-fitted rules; open: V1-05/V1-06 |
+| G6 evidence beyond examples | **PARTIAL** | variant/rename/neighbor-shape regressions on every backend; Gemini-II fresh fixtures on the card; UPMEM 391x65 sweep; no systematic independent-oracle campaign document yet |
+| G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install verified; docs added; open: P-04/P-06/S-04 simulator reproducibility, P-08 architecture doc rewrite, P-13/P-14/P-17/P-18/P-19/P-20 |
+| G8 backend execution | **PARTIAL** | simulators at the candidate; APU v1 device 4 tests; Gemini-II card-gated test 10 passed with 11 exact programs; open: UPMEM public build path |
 
 Verdict: **NOT READY.**

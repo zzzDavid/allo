@@ -115,3 +115,46 @@ new profile-freshness check reporting ~2,058 `total` records: each
 diffing the log read before the launch against the log read after it
 (`allo.pim.apu_v1_program.fresh_profile_records`). Second run:
 `w2-device-tests-2.log` (result recorded in STATUS.md when complete).
+
+## Round 3 (2026-11-02): merged tree after the legality, reduction-policy, layout-selection, Gemini-II source-route, UPMEM and AiM repairs
+
+| Suite | Result |
+|---|---|
+| golden (`tests/pim/test_paper_golden.py`, default and `paper_full` rows, APU board row deselected) | 55 passed in 838 s: Samsung vendor-layout rows 4,435 / 8,041 / 8,247, 14 AiM CENT rows (traces byte-identical to pins), 13 UPMEM rows with pinned cycles unchanged |
+| perf (`tests/perf`, `tests/test_global_vars_scope.py`, `tests/test_c_backend.py`) | 462 passed, 5 failed in the first run; the 5 were test fixtures (a stub lacking the new `reduction_order` argument, a synthetic placement without a register for the `lanes` metric, an assertion on the old enumeration-order tie-break, an AiM bf16 compile needing explicit `reduction_order="reassociate"`); fixtures updated, all pass |
+| PIM non-device (`tests/pim`, paper golden and APU board rows deselected, `-m "not apu_v1_device"`) | 266 passed, 24 skipped (`paper_full` rows), 30 min, after the review fixes below |
+| APU v1 device (this server) | `test_gemv_apu_v1`, two `vector_gemm` plans, histogram golden median row: 4 passed, 197 s (`apuv1/w3-device-tests.log`) |
+| Gemini-II hardware test (`tests/pim/test_apu_g2_hardware.py` on zhang-x4 `apu-00`) | 10 passed, 90 s (`g2/round3b-hardware.log`); an earlier run exposed a missing `artifact_sha256` record in the typed runtime, which was added |
+
+Gemini-II round 3 records (device ARC ticks per call, batch of 20, fresh random inputs, exactness enforced by the runtime oracle; estimate = the new cost program; `plan` = the source route's cost-selected plan):
+
+| Kind | Program | cycles | estimate | plan |
+|---|---|---|---|---|
+| typed | add i16 | 315 | 340 | |
+| typed | mul i8 -> i16 | 311 | 307 | |
+| typed | div u16 | 1,014 | 1,020 | |
+| typed | block_sum u8 -> u16 | 2,585 | 2,588 | |
+| typed | dot i4 -> i15 | 1,725 | 1,714 | |
+| source | GEMM INT4 64x128x31 | 1,736 | 1,714 | single/k1 |
+| source | batched GEMM INT4 4x32x128x16 | 1,719 | 1,714 | single/k1 |
+| source | GESUMMV INT2 M1024 K128 | 1,869 | 1,882 | fused/k1 |
+| source | BiCG INT3 N256 | 2,554 | 2,610 | fused/k1 |
+| source | MVT INT3 N256 | 2,766 | 2,740 | fused/k1 |
+| source | GEMM INT4 64x128x33 (beyond one carrier) | 2,685 | 2,550 (extrapolated) | single/k2 |
+
+The agreement tolerance stated before the run was 10% for calibrated single-launch programs; every calibrated row is within 8%, the extrapolated row within 5.3%. Negative controls passed: a wrong oracle is reported as a mismatch and an echoed fingerprint mismatch is refused by the host binary. The source-route programs carry the same layout fingerprints as the artifact's per-case programs (20a85096, 07f71036, b4afa6b9, a06509fd). Device library sha256 `8ea3600c0a60...` for all rows.
+
+Review fixes applied while merging round 3 (all re-run above): legality and
+pattern admission now compare units and handles structurally
+(`Unit.path`, `storage_key`), so placements from a second target instance
+are judged correctly; the MAC pattern accepts an accumulator addressed
+through distinct SSA values (`y[row0 + r]`), which makes the carried
+`y[i] += W[i,k]*x[k]` form a MAC with `accumulator_init="carried"` and lets
+Samsung run it as the ordered program (`test_carried_accumulator_through_the_public_api`,
+simulator, bit-equal to source-order FP16 from the caller's initial `y`);
+axis roles resolve result loops through the recorded store-index
+dependences; the Gemini-II source route ignores a carried accumulator's own
+store when checking for copies. Upstream smoke (same file list as round 2
+minus the three pre-existing `test_nn` failures): 313 passed. Golden: 55
+passed (781 s). Gemini-II hardware test re-run on the final tree
+(`g2/round3c-hardware.log`): 10 passed.

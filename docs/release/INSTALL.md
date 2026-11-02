@@ -218,15 +218,25 @@ import allo
 from allo.pim import build_samsung_target, samsung_cost
 
 compiled = allo.compile(workload, build_samsung_target(), samsung_cost)  # or backend="virtual"
-compiled.placement_ranking        # per kernel group: bucket_count, scores, chosen_position, rejections, fallback
+ranking = compiled.placement_ranking            # PlacementRanking: .kernels, .incomplete
+k = ranking.kernels[0]                          # KernelRanking of the first @allo.work kernel
+k.scores, k.chosen_position, k.cost_ties        # (position, cycles, mode) in rank order; tie set at the winner's cycles
+k.rejections, k.movement_rejections, k.tie_break # cost-rule/codegen/legality rejections; unrealizable movement ties; TIE_BREAK_RULE
+k.policy_pruned                                 # (mode, reason) pruned by the reduction-order policy
+k.movement                                      # KernelMovement: status, termination, optimality_proven, min_cost, program_cost, chosen_label, ties
+compiled.reduction_order, compiled.reduction_policy_pruned
 compiled.compiled.cmds            # the emitted target command stream
-compiled.compiled.layout          # the chosen Placement (layout, knobs)
+compiled.compiled.layout          # the chosen Placement (placements, extra knob values, layout)
+compiled.compiled.layout_ctx      # backend state (Samsung .programs, UPMEM .segments, AiM .host_steps)
 compiled.execution_graph          # retained cost graph of the chosen candidate
 compiled.estimate()               # Estimate(cycles=..., spans=...) from that graph, no backend
 result = compiled(*arrays)        # RunResult
 result.kind                       # "device" | "simulator" | "simulator-timing-only" | "functional" | "virtual"
-result.cycles, result.backend, result.extra
+result.cycles, result.backend, result.extra   # extra always carries reduction_order and reduction_policy
 ```
+
+The per-backend `RunResult.extra` keys and the fields of the APU v1 and
+Gemini-II compiled objects are listed in `SPMW_ARCHITECTURE.md` section 5.
 
 `RunResult.kind` says what the number is evidence of: `device` is a hardware
 run with outputs read back; `simulator` a functional simulator run with

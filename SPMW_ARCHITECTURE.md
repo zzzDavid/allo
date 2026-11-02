@@ -1,229 +1,870 @@
 # Tenon architecture in Allo
 
-This is the living map of the aggressively refactored implementation. Historical
-design proposals under `design/` are useful rationale, but this file describes
-the supported interfaces and paths in the current tree.
+This document maps the Tenon (SPMW) implementation as it is in the working
+tree of branch `tenon` (on top of `6efaca5`, 2026-11-02). It names the module
+and symbol that implements each stage of the paper's compilation flow
+(`paper/latex/sections/3-language-and-compiler.tex`, Sections III-E and
+III-F) and states the invariant that holds at each stage boundary. Release
+status, claim-by-claim correspondence and open findings are kept in
+`docs/release/STATUS.md`, `docs/release/CLAIMS.md`, `docs/release/ISSUES.md`
+and `docs/release/REVIEW.md`; finding identifiers below (C-xx, S-xx, U-xx,
+M-xx, V1-xx, G2-xx, P-xx, F-xx) refer to `ISSUES.md`. The historical design
+notes under `design/` are rationale, not a description of the current tree;
+`design/README.md` lists which of their statements no longer hold.
 
-## Three programming abstractions
+Paper notation uses `@tn.*`; the Python surface is `allo.*`.
 
-Tenon deliberately separates three concerns:
+Contents
 
-1. A **target specification** describes units, memories, registers, legal
-   moves, operations, capacities, mappings, and spatial axes. It contains no
-   latency formula.
-2. A **cost specification** is ordinary executable Python. It maps retained
-   operation/move events and their shape/layout metrics to cycle estimates and
-   resource occupancy. An agent calibrates a backend by editing this code after
-   microprofiling a device.
-3. A **workload specification** is an Allo/MLIR program plus the partition and
-   launch information required by its target.
+1. The three languages and their public symbols
+2. The compile pipeline, stage by stage
+3. Backend routes
+4. Extending Tenon (primitives, knobs, backends)
+5. Inspecting a chosen program
+6. External dependencies and discovery
+7. Module map
+8. Open items and compatibility boundary
 
-The public composition point is:
+## 1. The three languages and their public symbols
+
+### 1.1 Target language (`allo/spmw_target.py`)
+
+A target is a tree of units with attached storage, moves and operations. It
+carries structure and legality only; no cycle figure is stored on a target.
+
+| Paper | Python | Implementation |
+|---|---|---|
+| `@tn.target` | `allo.target(name)` | `spmw_target.target`; returns a `Target` (root `Unit`, flat handle index, `Target.op(name)`, `Target.move(name)`, `Target.unit(name)`, `Target.work_grid()`) |
+| `@tn.unit(mapping)` | `allo.unit(mapping=None, *, mode=None, capacity=1)` | `spmw_target.unit`; `Unit.mapping`, `Unit.axes`; `mode="host"` marks the host scope |
+| `@tn.device` | `allo.device` | `spmw_target.device` returning a `DeviceScope` whose attributes name device storage from a sibling host scope (`hbm_pim.banks`) |
+| `tn.mem`, `tn.reg` | `allo.mem(**geometry)` (= `spmw_target.memory`), `allo.reg(lanes, width, name=None, slots=None, ports=1, axes=None)` | `Memory`, `MemoryRef` (a `Memory` indexed by a `SymExpr`/`UnitId`), `Register` |
+| `tn.get_uid` | `allo.get_uid()` | symbolic unit coordinates of the enclosing scope |
+| `tn.op(fn, emit, src, dst)` | `allo.op(name, src, dst, fn, accumulates=False, emit=None, capacity=1, matchable=True, vector_width=1, const_params=(), guarded=False, dst_index="affine", iv_params=())` | `Op`; `fn` is a Python lambda compiled to a pattern by `spmw_match_engine.compile_op_pattern` |
+| `tn.move` | `allo.move(name, src, dst, emit=None, verb=move_only, capacity=1)` | `Move`; verbs `allo.broadcast`, `allo.scatter`, `allo.gather`, `allo.move_only` tag host collectives |
+| `tn.any`, `tn.or` | `allo.any_(candidates)`, `allo.or_(*alternatives)` | `AnyOf`, `OrOf`; admission is `spmw_target.pattern_admits` |
+
+Host programs: `allo.host_xfer` (a `RecordingBackend` whose verb calls
+record `HostMoveRecord`s), `allo.record_host_moves`, `allo.host_program`,
+`allo.launch`, `allo.HostProgram`, `allo.BufferToken`, `allo.LaunchRecord`.
+`allo.compile(..., host_moves=...)` accepts a list of records or a
+`HostProgram`; nothing is inferred implicitly. `allo/spmw_host_program.py`
+(`analyze`, `HostSchedule`, `schedule_residency`, `schedule_cost`) is a
+residency analysis of such programs that has no production caller (C-10).
+
+Reference targets, `allo/pim/targets.py`: `build_samsung_target`,
+`build_aim_target`, `build_upmem_target`, `build_apu_v1_target`,
+`build_apu_v2_target` (alias `build_apu_g2_target`; `target.name` stays
+`"apu_v2"`), and `build_apu_g2_contraction_patterns` (a matcher-only view of
+the two Gemini-II source idioms, never executed).
+
+### 1.2 Workload language
+
+| Paper | Python | Implementation |
+|---|---|---|
+| `@tn.work(mapping)` | `allo.work` | alias of `allo.dataflow.kernel` (`allo/__init__.py`: `from .dataflow import kernel as work`) inside an `allo.dataflow.region` |
+| `tn.get_wid()` | `allo.get_wid` | alias of `allo.dataflow.get_pid` |
+| typed ops, loops, accesses | ordinary Allo frontend | `allo.customize` lowers to retained MLIR (`func`, `affine`/`scf`, `memref`, `arith`, `math`) |
+
+The frontend stamps structural scope attributes on each work-item function
+(`allo/ir/builder.py`: `spmw.group_id`, `spmw.work_id`, `spmw.group_shape`,
+`spmw.coalesced_axes`, `spmw.abi_value_ids`, `spmw.group_fingerprint`,
+`spmw.body_fingerprint`); `allo/compiler.py::_stamp_matcher_work_scopes`
+reads them back into `spmw_autoschedule.MatcherWorkScope` records on every
+`MatchedOp`.
+
+Two other workload kinds reach `allo.compile`:
+
+* a plain `@allo` function (no dataflow region): the APU v1 vector
+  contraction route (`allo/pim/apu_v1_vector_program.py`) and the Gemini-II
+  source route (`allo/pim/apu_g2_source_route.py`) accept it; on the
+  matcher backends it is matched as a single work item;
+* typed program records that bypass the matcher: `allo.APUv1Program` /
+  `allo.APUv1Phase` (`allo/pim/apu_v1_program.py`), `allo.APUG2TypedProgram`
+  (`allo/pim/apu_g2_typed_program.py`), `allo.APUG2ComposedContractionProgram`
+  (`allo/pim/apu_g2_composed_contraction.py`).
+
+### 1.3 Cost language (`allo/perf/`)
+
+| Paper | Python | Implementation |
+|---|---|---|
+| `@tn.cost` | `allo.cost(function=None, *, target=None, name=None, fingerprint_data=None, materialization_scorer=None)` | `allo/perf/cost.py::cost` returns a `CostSpec`; `CostSpec.bind(target)` runs the builder once and yields a `BoundCostSpec` (rules keyed by handle path, `fingerprint`) |
+| `@tn.rule(handle)` | `allo.rule(handle)` | `allo/perf/cost.py::rule`, legal only while a builder is binding; one rule per op or move handle, `function(event, ctx)` |
+| `ctx.step(latency, occupy=[ctx.use(...)])` | `CostContext.step(cycles=/latency=, occupy=(), name=)`, `CostContext.use(handle, cycles=None, amount=1)`, `CostContext.repeat(count)`, `CostContext.parallel()` | `allo/perf/cost.py::CostContext`; a `CostEvent` exposes `metrics` (shapes, extents, `candidate` knob values, `lanes`, `host_slice`, ...) and `attributes` |
+| evaluator | `BoundCostSpec.evaluate(graph) -> Estimate` | `allo/perf/evaluator.py::Evaluator`: ASAP over `depends_on` plus per-handle-instance calendars with capacity; `Estimate(cycles, spans, critical_path, utilization, bottlenecks, model_fingerprint)` |
+| execution graph | `allo/perf/graph.py::ExecutionGraph`, `Activity`, `Occupancy`, `HandleInstance` | |
+
+Reference cost programs (`allo/pim/costs/`): `samsung_cost`, `aim_cost`,
+`upmem_cost`, `apu_v1_cost` (each `@cost(target=...)`), and
+`apu_g2_cost = build_apu_g2_cost()` (`allo/pim/costs/apu_g2.py`, rules built from an
+`APUG2TypedTickModel`). Constants are module-level Python with provenance in
+the module docstrings; calibrating a backend means editing that file.
+
+### 1.4 Composition
 
 ```python
-compiled = allo.compile(workload, target, cost)
-result = compiled(*numpy_inputs)
-estimate = compiled.estimate()
+compiled = allo.compile(workload, target, cost, *, backend=None, host_moves=None,
+                        layout=None, reduction_order=None)
+result = compiled(*arrays)        # RunResult
+estimate = compiled.estimate()    # perf.Estimate from the retained graph
 ```
 
-The target and cost specifications together form the virtual target used by
-the autoscheduler and by simulator-free performance evaluation.
+`allo/compiler.py::compile` returns a `CompiledWorkload`
+(`CompiledCallable` for matcher and Gemini-II source routes,
+`APUv1VectorCallable`, `APUv1ProgramCallable`, `APUG2TypedCallable`,
+`APUG2ComposedContractionCallable` otherwise). `reduction_order` is
+`"strict"` (default) or `"reassociate"` (`allo/spmw_reduction_policy.py`);
+typed program records reject it. `backend="virtual"` evaluates the cost
+program only.
 
-## Module map
+## 2. The compile pipeline, stage by stage
+
+The paper's flow (III-E) is: lower the workload to target-agnostic IR; derive
+device model, operation definitions and rewrite patterns from the target;
+match; autoschedule (decision domains, legality and pruning, layout
+construction, materialization, ranking of materialized candidates with
+deterministic tie-breaking); lower the selected program and link the runtime;
+virtual execution follows the same flow and returns only the cost. The
+implementation follows this order with two documented departures: ranking
+happens before the winner is materialized (only a codegen probe runs on the
+ranked list) and ranking is per kernel group (C-03, C-05; Section 2.6).
+
+### 2.0 Route dispatch (`allo/compiler.py::compile`)
+
+1. `_materialize_workload` (calls `build()` when present),
+   `_materialize_target` (calls a zero-argument builder), `_resolve_cost`
+   (binds a `CostSpec` to the target).
+2. Typed records route through `_PROGRAM_ROUTES`: `APUv1Program ->
+   compile_apu_v1_program`, `APUG2TypedProgram ->
+   compile_apu_g2_typed_program`, `APUG2ComposedContractionProgram ->
+   compile_apu_g2_composed_program`. They refuse `host_moves`, `layout` and
+   `reduction_order`.
+3. `target.name == "apu_v2"` with a source workload goes to
+   `apu_g2_source_route.compile_apu_g2_source_workload` (Section 3.5).
+4. Otherwise `customize(workload, enable_tensor=False)` produces the MLIR
+   module. On `apu_v1` without retained dataflow scopes the APU v1 vector
+   route is tried first (`compile_apu_v1_vector_workload`;
+   `NoContractionError` falls through).
+5. Matcher route: `match_workload`, `require_match_coverage(...,
+   defer_unknown=True)`, `require_matcher_route_policy`,
+   `_stamp_matcher_work_scopes`, then `spmw_codegen.compile_for_target`.
+
+### 2.1 Frontend (`allo/customize.py`, `allo/ir/`)
+
+`customize` lowers the Python function to retained MLIR. Two shared-frontend
+facts matter to Tenon:
+
+* Name resolution for annotations (`allo/ir/utils.py::_get_global_vars`):
+  the function's module globals, then locals of call-stack frames whose code
+  lexically encloses the definition (nearest first, `functools.wraps`
+  unwrapped), then closure cells. Frames that do not enclose the definition
+  contribute nothing, so an unrelated `M = 256` in a calling script cannot
+  change a shape (F-01, fixed; `tests/test_global_vars_scope.py`).
+* Integer literals are typed `i32` and silently truncated (`-(1 << 40)`
+  becomes `arith.constant 0 : i32`) (F-02, open).
+
+Invariant at the boundary: the module contains one `func.func` per work item,
+each carrying the `spmw.*` scope attributes, with loop bounds retained as
+affine text (`spmw_tripcount._parse_loop_bound` reads them).
+
+### 2.2 Matcher (`allo/spmw_match_engine.py`, `allo/spmw_match.py`)
+
+`match_workload(target, module, *, reduction_order=None) -> MatchTrace`.
+`compile_target_patterns(target)` compiles every matchable `Op.fn` lambda
+into an `OpPattern` (`PVar`, `PConst`, `PBinOp`, `PUnary`, `PCmp`,
+`PSelect`); `_try_match_at_store` unifies the term stored at each
+`memref.store`/`affine.store` site against the patterns (commutative
+operands, constant folding, `const_params`, `guarded`, `dst_index`,
+`iv_params`). Each hit is a `MatchedOp(target_op_name, func_name, work_id,
+enclosing_loops, operands: list[OperandBinding], result_memref_name,
+op_range, extra, result_value_ref, vector_width)`; operands carry
+`memref_name`, `indices`, `index_map`, `memref_type`, `is_loop_carried` and
+an exact `IRValueRef`.
+
+Facts stamped on `MatchedOp.extra`:
+
+| Key | Meaning | Producer |
+|---|---|---|
+| `accumulator_init` | `"zero"` (a dominating zero store or whole-buffer fill) or `"carried"` (caller buffer, no initializer); any other initializer raises | `_FunctionCoverage` (C-14) |
+| `axis_roles` | `{"reduction", "output", "batch", "trips", "matrix", "vector", "unresolved", "work_axis", ...}` derived from index sets including the store index; consumers must not re-derive roles from extents | `_axis_roles`, `_stamp_batch_dims` (M-01) |
+| `batch_dim` | batch extent | `_stamp_batch_dims` |
+| `reduction_policy` | `ReductionPolicy(order, accumulator_type)` on every accumulating match | `spmw_reduction_policy.stamp_reduction_policy` via `match_workload` |
+| `constants` | literal `const_params` values | `_try_match_at_store` |
+| `output_sinks`, `store_indices` | where a scalar accumulator is stored, and the store's loop variables | coverage analysis |
+
+Store coverage: every store of every function is classified
+(`spmw_match.StoreCoverage.category` in `matched`, `copy`,
+`accumulator_init`, `local`, `unmatched`; `MatchCoverage.problems`).
+`require_match_coverage(trace, *, target=None, module=None,
+defer_unknown=False)` raises `UnsupportedWorkloadError` for any store the
+target does not implement, except in functions a backend executes verbatim
+on the host (`_host_executed_functions`, today the UPMEM `kmeans_update`
+group); a trace without coverage is re-matched from `module` when given
+(C-02).
+
+Invariant: a trace that reaches codegen implements every store of the
+source; a device may zero an accumulator only when the source does.
+
+### 2.3 Reduction-order policy (`allo/spmw_reduction_policy.py`)
+
+`reduction_order="strict"` (default) forbids forming and regrouping partial
+sums of a floating-point accumulator; integer accumulators (`i*`, `ui*`,
+`si*`, `index`) may always be split (wrapping addition). `reduction_policy
+(match)`, `may_regroup(matches)`, `ReductionOrderError`.
+`require_matcher_route_policy(target, trace)` fails before scheduling on
+`aim` and the `apu_v1` matcher route under strict with a float accumulator
+(`_REGROUPING_MATCHER_ROUTES`); Samsung and UPMEM are policy-aware
+enumerators (`_POLICY_AWARE_MATCHER_ROUTES`). Design:
+`docs/release/design/reduction-policy.md`. Candidates pruned by the policy are
+recorded on survivors as `extra["reduction_policy_pruned"]` and surface as
+`KernelRanking.policy_pruned` and `CompiledCallable.reduction_policy_pruned`.
+
+### 2.4 Legality (`allo/spmw_legality.py`)
+
+`check_target(target)`, `check_placement(target, matches, placement)` and
+`check_layouts(target, trace, layouts)` return a `LegalityVerdict`
+(`violations`, `raise_if_illegal(context)` raising `IllegalPlacement`).
+Rules, applied per matched op and its selected target operation
+(`selected_operation`, honouring `placement.extra["operation_name"]`):
+`declaration` (op/move handles declared on the owner or an ancestor; `src`
+arity fits `fn`), `access-scope` (every placed operand handle is declared on
+`op.owner` or an ancestor), `operand-pattern` (each operand admitted by its
+`src`/`dst` pattern up to the symmetries of `fn`), `move` (a register-placed
+source needs a declared fill, a register-placed result a declared drain, and
+`spmw_plan._moves_for_handles` must be unambiguous), `register-aliasing`
+(an accumulator may not share a register with a distinct source),
+`register-capacity` (distinct values per register bounded by
+`Register.slots`). The pass filters enumerated candidates in
+`autoschedule()` (rejections recorded) and rejects a user `layout=` in
+`compile_for_target` (C-01). Placements that name no handles (UPMEM)
+satisfy the rules vacuously; their legality is the template's (Section 3.3).
+Replacing the cost program cannot legalize a placement (paper III-C).
+
+### 2.5 Movement stage (`allo/spmw_layout_problem.py`, `allo/pim/layout_*.py`, `allo/pim/gf2.py`)
+
+The paper's Section IV machinery lives in the package:
+`layout_problem.py` (`OwnerHierarchy`, `owner_hierarchy_from_target`),
+`layout_movement.py` (`LayoutAccess`, `full_carrier_rank_incidence`,
+`exact_active_owner_incidence`, `layout_movement_cost`,
+`strict_reduction_kernel`), `layout_search.py`
+(`search_min_movement_layout` dispatching to the bounded Algorithm 1, its
+masked variant and the scalable flag search; `LayoutSearchPolicy`,
+`LayoutSearchResult`; plus `search_coordinate_min_movement`, an exact
+coordinate-variable search with a stated dominance lemma for problems beyond
+the 4-bit domain). `spmw_layout_problem.derive_layout_problem` builds the
+problem of one kernel group from the matched ops (work-grid axes and loops
+as variables, affine injective coordinates, `READ`/`WRITE_ACCUMULATE`
+accesses, `reassociation_allowed` from the policy stamp, owner levels from
+`COMPUTE_LEVELS`), and `analyze_kernel_movement` runs the search and
+classifies ties.
+
+What is proven: inside the bounded domain, the complete tie set of minimum
+movement (`optimality_proven=True`, `ties_complete`); for larger full-carrier
+problems the coordinate search is exact over all one-to-one layouts; on a
+mask it is exact over coordinate layouts only (`optimality_scope`). A
+node-budget exit sets `incomplete`. Movement weights are uniform (1 per
+byte) because no package cost program defines `movement_cost_per_byte`
+(`movement_weights="uniform"`).
+
+What is recorded: `KernelRanking.movement` is a `KernelMovement` (`status`,
+`implementation`, `termination`, `optimality_proven`, `optimality_scope`,
+`incomplete`, `min_cost`, `program_cost`, `program_label`, `chosen_cost`,
+`chosen_label`, `tie_count`, `ties_crossed`, `visited`, `pruned`,
+`movement_weights`, `assumptions`, `notes`, `ties: tuple[MovementTie]`).
+`PlacementRanking.incomplete` aggregates node-budget exits.
+
+Realizability limitation: every backend emits one program per work item on
+the unit its work id names and none re-maps iterations to owners, so a tie is
+realizable only when its owner flag equals the program's work-grid map.
+Other ties are crossed with the candidates and rejected before emission with
+the reason (`KernelRanking.movement_rejections`). CLAIMS row 16 is therefore
+"partial". Policy: `MovementSelectionPolicy`, `movement_selection_policy()`
+context manager (default node budget 20,672, `max_tie_candidates=64`).
+Design: `docs/release/design/layout-search.md`; tests
+`tests/perf/test_layout_*.py`, `tests/pim/test_layout_selection.py`.
+
+### 2.6 Placement enumeration, knobs, ranking (`allo/spmw_autoschedule.py`, `allo/spmw_knobs.py`)
+
+Enumeration. `autoschedule(target, trace, cost, *, host_moves=(),
+buffer_metrics=None, movement_policy=None) -> list[Placement]` looks up the
+backend enumerator registered with `@register_enumerator(name)`
+(`_ENUMERATORS`: `_samsung_enumerate`, `_aim_enumerate`, `_upmem_enumerate`,
+`_apu_v1_enumerate`). A `Placement(placements: memref -> handle, mode, extra,
+layout: LinearLayout | None)` is the unit of decision; `mode` is a label only
+and `extra` carries allowlisted structural fields
+(`_MATCHER_PHYSICAL_EXTRA_FIELDS`). Each enumerator produces base candidates
+and calls `cross_with_knobs(target, bases, matches, role_to_memref)`.
+
+Knobs. `spmw_knobs.Knob(name, candidates_fn, emit_fn)`,
+`register_knob(target_name, knob)`, `registered_knobs(target_name)`,
+`register_default_knobs()` (run at import; registration order is the cross
+order). Registered today: Samsung `grf_residency`, `crf_issue`,
+`stage_resident`, `residency`, `tile`, `double_buffer`; APU v1 (matcher
+route) `residency`, `tile`, `double_buffer`; AiM `bank_scope`,
+`batch_mapping`, `reuse_group`, `reduction_partitions`,
+`replica_partitions`; UPMEM the family decision fields
+(`_UPMEM_KNOB_NAMES`, from `UPMEM_DECISION_DOMAINS` catalogs). A knob's
+`emit` writes `extra[name]`; cost rules read it through
+`event.metrics["candidate"]`. `SPMW_DISABLE_SCHEDULE_SEARCH=1` skips
+`residency`/`tile`/`double_buffer` (baseline-versus-search comparisons).
+`derive_layout_properties(target, placement)` adds facts derived from a
+carried `LinearLayout` (AiM bank fanout, UPMEM tasklet features) so that
+removing the F2 map changes both cost and emitted code.
+
+Ranking. `rank_matcher_placements(target, trace, enumerator, bound_cost,
+*, host_moves, buffer_metrics, liveness, movement_policy)`:
+
+1. buckets the trace by work item (`_bucket_for_autoschedule`) and groups
+   buckets by `MatcherWorkScope.group_id` (one `@allo.work` kernel);
+2. the kernel choice set is the decision keys
+   (`_structural_decision_key`) every bucket enumerates; the legality pass
+   has already removed illegal candidates inside `autoschedule()`;
+3. `analyze_kernel_movement` runs the movement stage and
+   `_movement_entries` crosses every realizable tie class with every key
+   (the program's own layout is kept, labelled `not-minimal`, when no tie
+   contains it); the movement layout joins the backend layout as a product
+   over `mm.`-prefixed dims;
+4. every candidate is priced through the same executable cost program as
+   virtual execution (`spmw_plan.build_execution_graph` +
+   `bound_cost.evaluate`); a cost rule raising
+   `pim.schedule_search.InfeasibleSchedule` is a recorded rejection;
+5. candidates sort by `(cycles, structural key, position)`
+   (`TIE_BREAK_RULE`: cycles, then the carried layout's F2 map, then knob
+   and feature values, then operand handle paths; C-06) and the first whose
+   codegen probe (`spmw_codegen._materialize_matcher_codegen` on the
+   kernel's sub-trace) does not raise `InfeasibleSchedule` wins;
+6. kernels whose buckets share no decision key fall back to a per-bucket
+   stable argmin (`fallback="per_bucket"`);
+7. `_reconcile_resident_pairs` honours a cross-kernel `resident` residency
+   only when both endpoints chose it, without re-costing.
+
+Records: `KernelRanking(group_id, bucket_count, fallback, scores,
+chosen_position, rejections, movement, cost_ties, tie_break,
+movement_rejections, policy_pruned)` and `PlacementRanking(kernels,
+incomplete)` on `MatcherScheduledPlacements.placement_ranking`.
+
+What is still per kernel group (open C-03, C-05): ranking scores one
+kernel's placements over that kernel's sub-trace before anything is
+materialized; only `InfeasibleSchedule` from a cost rule or the codegen
+probe counts as a rejection; the reconciled whole program is not re-costed;
+`allo/pim/schedule_search.py::grid_search` (materialize-then-score over a
+finite decision grid, used by the APU v1 vector route's
+`search_apu_v1_vector_plans`) is not used by the matcher route. The paper's
+"each surviving complete assignment is evaluated as one program" (III-F)
+therefore holds within one kernel group, not across groups.
+
+### 2.7 Materialization and code generation (`allo/spmw_codegen.py`)
+
+`compile_for_target(target, trace, layout=None, backend=None, host_moves=None,
+buffer_metrics=None, cost=None, module=None, launch_schedule=None) ->
+Compiled`:
+
+1. `_resolve_host_moves` matches recorded `host_xfer.*` calls to declared
+   host moves by verb and device-handle identity; a `LaunchSchedule`
+   (`spmw_plan.launch_schedule(host_program, trace)`) must have one host
+   step per move;
+2. `require_match_coverage` again (fail closed for traces that deferred it);
+   AiM and the APU v1 matcher route refuse `accumulator_init == "carried"`
+   with `NotImplementedError` (they zero the accumulator); Samsung prunes
+   REDUCE candidates for it and the ordered program loads the value, but
+   `compile_for_target` still refuses `carried` on Samsung before
+   scheduling (open, `design/reduction-policy.md` section 7);
+3. a user `layout=` is checked by `check_layouts`; otherwise
+   `autoschedule()` picks one placement per kernel and the survivors are
+   re-checked after reconciliation;
+4. `_check_work_grid(target, trace)` (C-04) raises unless the kernel grid is
+   one of the documented forms: full fanout, outer prefix, single item on
+   `_SINGLE_ITEM_LAUNCH_BACKENDS` (`samsung_hbm_pim`, `upmem`, `aim`),
+   outer-level subset on `_OUTER_SUBSET_LAUNCH_BACKENDS` (`upmem`, `aim`),
+   or the APU v1 coalesced lane axis;
+5. the backend `CodegenContext` subclass (`_BACKENDS`: `samsung_hbm_pim ->
+   spmw_samsung.SamsungCtx/_run_samsung`, `aim -> spmw_aim.AimCtx/_run_aim`,
+   `apu_v1 -> spmw_apu_v1.APUv1Ctx/_run_apu_v1`, `upmem ->
+   spmw_upmem.UpmemCtx/_run_upmem`) lowers the program through
+   `emit_program(trace, layouts, *, schedule, host_moves, module)`; the
+   default walks buckets and calls each matched op's `emit` with placed
+   handles (`_walk_buckets`, `_schedule_moves`, `_emit_move`); Samsung, AiM
+   and UPMEM override it. `emit_program` must raise `InfeasibleSchedule` for
+   a layout the backend cannot realize and `NotImplementedError` for an op it
+   cannot lower;
+6. `spmw_plan.build_execution_graph` lowers the selected placements to the
+   retained `ExecutionGraph` when a cost is supplied;
+7. the result is `Compiled(target, trace, cmds, layout, ctx=layout_ctx,
+   backend, host_moves, execution_graph, cost, placement_ranking,
+   launch_schedule)` with `Compiled.run(**inputs)` dispatching to the
+   backend runner or `_run_virtual`.
+
+The matcher materialization manifest (`MatcherCodegenArtifact`: commands,
+host schedule, host preloads, resolved host moves, `runtime_abi`,
+`runtime_segments`) is what the codegen probe freezes; the backend runners
+consume `Compiled.cmds` and the context state (CLAIMS row 23).
+
+### 2.8 Execution graph and estimate (`allo/spmw_plan.py`)
+
+`build_execution_graph(target, trace, layout, cost_spec, *, host_moves=(),
+buffer_metrics=None, launch_schedule=None)` emits one `CostEvent` per
+matched op and per structural move (`_moves_for_handles` resolves the fill
+and drain of each register-placed operand) per work item, plus host
+transfer events; `_host_transfer_metrics` adds `host_slice` and
+`host_resident` so a sliced or resident buffer is priced for what moves
+(M-05). Metrics such as `lanes` come from the placement register (C-08).
+`CompiledCallable.estimate()` evaluates the retained graph with the bound
+cost and returns an `Estimate`. `estimate_candidate(target, trace, layout,
+cost_spec)` prices one placement standalone.
+
+### 2.9 Runners, result kinds and cost validity
+
+`RunResult(cycles, stdout, backend, extra, kind)` (`spmw_codegen.py`).
+`kind` is one of `device`, `simulator`, `simulator-timing-only`,
+`functional`, `virtual` (`RUN_KINDS`); `validate()` rejects an unset kind and
+a non-executing result carrying outputs; `CompiledCallable.run_backend`
+validates every result, stamps `extra["reduction_order"]` and
+`extra["reduction_policy"]`, and copies `extra["outputs"]` into the caller's
+arrays only for `device`, `simulator` and `functional` kinds, raising when a
+gathered output is missing (S-02, G2-07, V1-09).
+
+`backend="virtual"` (`_run_virtual`) evaluates the retained graph and
+returns `kind="virtual"` with `extra` keys `critical_path`, `utilization`,
+`bottlenecks`, `model_fingerprint`, `cost_model`, `priced_target`, merged
+with the backend context's `virtual_run_extra()` when it defines one
+(UPMEM: `timing_scope`, `cost_validity` in `calibrated`/`extrapolated`,
+`upmem_cost_validity` per group; Gemini-II: `estimate_validity`,
+`latency_unit`). `simulator_unavailable_reason(target_name)` and
+`SimulatorUnavailable(target, reason)` report missing external pieces
+without running anything.
+
+## 3. Backend routes
+
+Each subsection gives the input kind, the supported domain, what executes
+versus what is analytical, and open findings. Evidence status per route is
+in `docs/release/CAPABILITIES.md` and `docs/release/VALIDATION.md`.
+
+### 3.1 Samsung HBM-PIM (`allo/spmw_samsung.py`, `allo/spmw_autoschedule.py::_samsung_enumerate`, `allo/pim/costs/samsung.py`)
+
+Input: source dataflow workloads matched to the target's `MAC`, `ADD`,
+`MUL`, `MAD`, `RELU` ops (`build_samsung_target`). Runner: PIMSimulator
+`pim_driver --op GENERIC` with the Tenon conductor
+(`experiments/simulators/setup/PIMSimulator`, S-04/P-04 for its licensing
+state); `kind="simulator"`, outputs read back (all-zero is a value, a short
+`out.bin` raises).
+
+* **Contractions, REDUCE program.** `samsung_contraction(match)` classifies
+  operands structurally (matrix indexed by row and reduction, vector by
+  reduction only; nests `[k]`, `[row, k]`, `[row, column, k]`; FP16; S-05).
+  Work items must partition the output rows exactly (S-10). Base candidates
+  `bank_row`, `dual_fiber`, `grf_staged` cross the knobs; the legality pass
+  and `SamsungCtx._emit_reduce` reject what the conductor cannot run
+  (`grf_staged`, `crf_issue=per_workid` with more than one item, more than
+  32 CRF words, non-identity `tile`, `double_buffer`) with
+  `InfeasibleSchedule`. The emitted per-pass CRF is uploaded verbatim; the
+  conductor never calls the vendor command generator (S-01). Reduction
+  element `k` accumulates in lane `k mod 16` of a GRF_B entry and the host
+  sums the 16 lane partials in FP32, so REDUCE regroups and is pruned under
+  `reduction_order="strict"`. `samsung_vendor_gemv_layout(target, trace)`
+  selects the vendor-equivalent placement (dual_fiber, host-broadcast
+  GRF_A, shared CRF) that reproduces the paper's 4,435 / 8,041 / 8,247
+  cycles; the cost-selected default under `"reassociate"` is bank_row with
+  host fill (4,389 / 7,947 / 8,153 cycles). The MAC rule serializes both
+  fibers on the channel bus (`FIBER_TILE_CYCLES`); the fill-residency
+  disagreements that remain are preload cost outside the graph (S-12).
+* **Contractions, TEMPORAL (ordered) program.** The `temporal` base
+  candidate (`extra["reduction_program"]="temporal"`, layout
+  `identity({"lane": 16, "bank": 16})`, `grf_residency=host`,
+  `stage_resident=False`) is the only survivor under strict for FP16.
+  `SamsungCtx._emit_temporal` emits the five-word CRF (`MOV`, `MAC`,
+  `JUMP K-1`, `NOP`, `EXIT`); `_run_samsung_temporal` calls `--op-kind
+  TEMPORAL_REDUCE`; one GRF_B lane per output row; bit-equal to source-order
+  FP16 (26,807 cycles at 4096x256); cost rule `temporal_mac`
+  (`TEMPORAL_STEP_CYCLES=51`, `TEMPORAL_PASS_CYCLES=681`). `K <= 4096`.
+* **Elementwise.** `samsung_elementwise(matches)`: one work item
+  (`mapping=[1]`) walking a 1-D FP16 extent; `ADD`/`MUL`/`MAD`/`RELU`
+  through `SamsungCtx._emit_eltwise`, one CRF pass per 131,072-element
+  tile, bit-exact against NumPy FP16 (S-07). Partitioned grids are rejected
+  with the reason.
+
+Executed versus analytical: `RunResult.cycles` is PIMSimulator memory-clock
+cycles of the padded program (preload + execution + readback, 64-channel
+configuration); `extra` carries `logical_shape`, `padded_shape`,
+`padding_fraction`, `timing_scope`, `cycle_phases`, `plan`, `crf`,
+`conductor`, `simulator_geometry`, `levers`, `kernel` (S-06). The cost graph
+prices only the modeled activities of the declared 16-channel device on the
+unpadded shape; the two are compared by ranking only
+(`docs/release/design/samsung-execution.md`). Open: S-11, S-13 (XOR swizzle
+148 -> 116 reachable only through
+`tests/pim/samsung_hbm_pim/layout_swizzle/` and
+`allo/pim/samsung_layout_swizzle.py`), multi-kernel traces compile but do
+not run, carried accumulators rejected before scheduling.
+
+### 3.2 SK hynix AiM (`allo/spmw_aim.py`, `allo/pim/aim_lowering.py`, `allo/pim/costs/aim.py`)
+
+Input: source dataflow workloads (GEMV, attention-style batched MAC,
+elementwise `MUL`/`ADD`, `AF`) with `mapping` a prefix of `[32, 4, 4]`.
+`AimCtx.emit_program` turns matched kernels into typed `AimOp` records
+(`AimContraction`, `AimElementwise`, `AimActivation`, `AimHostTransfer`,
+`AimBankCopy`, `AimAllBankWrite`, `AimDistributedHostTransfer`,
+`AimHostReduction`, `AimSync`) that `_AimLowerer` expands into the
+ramulator2 text trace; `aim_lowering` is the only ISR encoder (M-11). Axis
+roles come from the matcher (`contraction_shape`), and
+`check_contraction_coverage` raises `AimCoverageError` when issued MACs
+differ from the program's (M-01). Knobs: `bank_scope` (SBK/ABK from the
+`LinearLayout` bank image), `batch_mapping`, `reuse_group`,
+`reduction_partitions` (token partition: the reduction split cyclically over
+P channel groups plus an explicit `AimHostReduction` host step, offered only
+when the policy permits regrouping; M-03), `replica_partitions`. Under
+`reduction_order="strict"` every BF16 program is refused before scheduling
+(`ReductionOrderError`), since each MAC reduces 16 products through the bank
+adder tree.
+
+Executed versus analytical: the simulator (ramulator2 in Docker,
+`TENON_AIM_SIM_IMAGE`) is timing-only; `kind="simulator-timing-only"`, no
+outputs, caller arrays untouched; a nonzero exit raises (M-08). `cycles` is
+the per-segment `memory_system_cycles` maximum over channels times the
+compile-time repeat, summed; `extra` carries `returncode`, `segments`,
+`unique_segments`, `host_steps` (host reductions are listed, never added).
+Numerics of the token-partition merge are checked separately by
+`aim_lowering.reference_partial_sums`. One cost route prices the exact
+lowered record (`aim_contraction_profile`; M-06); host transfers are priced
+by slice (M-05). `_check_simulator_geometry` rejects targets whose geometry
+differs from the 32-channel preset (M-10). Design:
+`docs/release/design/aim-token-partition.md`. Open: M-04 (AttAcc path
+external), skill-doc bank geometry.
+
+### 3.3 UPMEM (`allo/spmw_upmem.py`, `allo/pim/upmem_physical*.py`, `allo/pim/upmem_irregular.py`, `allo/pim/costs/upmem.py`)
+
+Input: source dataflow workloads with `mapping=[N]` (one DPU per work item;
+uneven partitions through `meta_if`/`meta_else`, U-04).
+`classify_upmem_kernel(target, matches)` proves one of the registered
+families (`register_upmem_family`: `pointwise`, `reduction`,
+`matrix_vector`, `gemm`, `histogram`, `selection`, `kmeans_distances`,
+`kmeans_update` (host-placed), `feature_gradient`), including operand roles,
+element types (`UPMEM_ROLE_ELEMENT_TYPES`: int32 operands, int64
+accumulators where the template says so; U-01), literal coefficients and
+`accumulator_init` (carried outputs are loaded by MV, GEMM, reduction,
+histogram and selection templates; rejected for k-means distances and
+gradients; U-03). `_upmem_enumerate` fans out the family's finite decision
+catalog (`UPMEM_DECISION_DOMAINS`) and keeps only decisions the template
+realizes (`upmem_physical_search.physical_features`: DMA sizes and
+alignment, WRAM footprint); non-dividing extents are padded and masked, not
+rejected (U-05, U-06). `UpmemCtx.emit_program` instantiates the plan
+(`UPMEMElementwisePlan`, `UPMEMSumReductionPlan`, `UPMEMMatrixVectorPlan`,
+`UPMEMGEMMPlan`, `UPMEMHistogramPlan`, `UPMEMStableSelectionPlan`,
+`UPMEMSelectionFlagsPlan`, `UPMEMKMeansDistancesPlan`,
+`UPMEMFeatureGradientPlan`) whose `device_source()` is the DPU `task.c`;
+`_check_tasklet_ownership` proves the emitted ownership factors through the
+carried 12-of-16 tasklet `LinearLayout` (`UPMEM_TASKLET_CARRIER`). The
+host-placed `kmeans_update` group runs its own portable C
+(`allo/backend/c.py::emit_c_from_mlir`; wide integers rejected by
+`WideIntegerError`, U-02) and is priced by `allo/pim/costs/upmem.py::host_group_cycles`
+(coarse, `HOST_TIMING_SCOPE`).
+
+Executed versus analytical: `_run_upmem` builds the DPU program with the
+SDK Docker image, runs uPIMulator on a `GENERIC` fixture whose expected
+bytes come from an independent portable-C oracle, and overwrites caller
+arrays (`kind="simulator"`). `cycles` is the sum over segments of the max
+per-DPU `logic_cycle` (`timing_scope="uPIMulator DPU logic_cycle only"`);
+each record in `extra["upmem"]` carries `family`, `sdk_build`
+(`pinned-campaign` or `user-build:<manifest12>`), `num_dpus`,
+`num_tasklets`, `logic_cycles`, `geometry`, `work_item_geometry`,
+`padding_fraction`, `host_steps`, source and simulator hashes. Virtual
+runs label validity (`calibration_validity`: `calibrated` only at a
+calibration anchor, else `extrapolated` with the nearest point; U-09).
+Routes: pinned-campaign (archived binary + snapshot + pinned SDK manifest)
+or user-build (`UPIMULATOR_ROOT` + `UPIMULATOR_BIN`; U-07/P-03). The Tenon
+uPIMulator patch is not yet published (P-06). Design:
+`docs/release/design/upmem-domain.md`. Open: `a*x - b*y` and `+ c` need
+target patterns (U-06), 12-tasklet policy, P-06, P-17.
+
+### 3.4 GSI APU v1 / Gemini-I (`allo/pim/apu_v1_*.py`, `allo/spmw_apu_v1.py`, `allo/spmw_apu_v1_build.py`, `allo/pim/costs/apu_v1.py`)
+
+Four routes share `build_apu_v1_target()` and the device. Every board
+launch holds `apu_v1_program.apu_v1_board_lock()` (`flock` on
+`TENON_APU_V1_LOCK`, default `/tmp/tenon-apu-v1-<pci>.lock`) and proves
+profile freshness by diffing the device log before and after the launch
+(`fresh_profile_records`, `parse_fresh_profile`; V1-07).
+
+* **Vector contraction route** (`apu_v1_vector_program.py`,
+  `apu_v1_vectorize.py`, `apu_v1_layout.py`, `apu_v1_vector_codegen.py`,
+  `apu_v1_vector_cost.py`, `apu_v1_vector_runtime.py`). Input: a plain
+  `@allo` function whose stores are rank-2 contractions (FP16/uint16 multiply,
+  bitwise and XNOR-popcount forms); 1-D GEMV is lifted with a unit axis.
+  `generate_apu_v1_vectorization_candidates` builds a finite recipe catalog
+  of `APUV1Plan`s (temporal SVP, DMA coalescing with accumulator depths,
+  spatial group reduction, ...); `_apply_reduction_policy` removes
+  regrouping plans under strict (`apu_v1_plan_regroups`);
+  `search_apu_v1_vector_plans` (over `schedule_search.grid_search`)
+  realizes every plan to GVML (`realize_apu_v1_plan`) and ranks the
+  materialized instructions with `apu_v1_cost`; `layout=<plan name>` forces
+  one. `APUv1VectorCallable` exposes `plans`, `candidate_estimates`,
+  `selected_plan`, `realization`, `plan_selection`, `reduction_policy_pruned`.
+  Backends: `None` builds the GVML project with the ARC toolchain and runs on
+  the board (`run_apu_v1_vector`, `kind="device"`, manifest v2 uploads the
+  packed initial output for temporal plans; V1-02); `"functional"` and
+  `"virtual"` both run a NumPy model of the selected plan's numerics and
+  return `kind="functional"` with the analytical cycles (a known labelling
+  residue, `docs/release/REVIEW.md`). Open: V1-05 (fitted count rule
+  absent), V1-06 (tile heuristic), V1-08 (template location and licenses),
+  V1-11, V1-12.
+* **`APUv1Program` scalar route** (`apu_v1_program.py`): one
+  `APUv1Phase(kernel, vectorize=False)`; the whole function lowers to
+  portable C11 (`emit_c_from_mlir`) and runs on APUC 0. Backends `None`
+  (device), `"virtual"` (retained cost graph), `"functional"` (host
+  execution of the same C; V1-04). Multi-phase programs raise.
+* **Native recipes** (`apu_v1_native_vector.py`, `apu_v1_histogram.py`,
+  `apu_v1_distance_argmin.py`, `apu_v1_moments.py`,
+  `apu_v1_record_frequency.py`, `apu_v1_native_cost.py`):
+  `APUv1Phase(kernel, vectorize="required")` is proven by exactly one of
+  `APU_V1_NATIVE_VECTOR_DISCOVERERS` with a strict MLIR parser plus symbolic
+  executor; mismatches raise `APUv1NativeRecipeMismatch` and no match raises
+  `NoNativeVectorRouteError` (V1-01). `"functional"` is rejected at compile
+  time.
+* **Legacy matcher route** (`spmw_apu_v1.APUv1Ctx`, `_run_apu_v1`,
+  `_apu_v1_enumerate`): reached only by dataflow regions on `apu_v1`;
+  grouped FP16 MAC over four APUCs with `gvml_add_subgrps`, refused under
+  strict for float accumulators; output shapes come from the compiled ABI
+  (V1-09).
+
+`allo/pim/apu_v1_hybrid.py` (`discover_apu_v1_hybrid_manifest`) supplies the
+ABI manifest of a single phase; the four-APUC hybrid runtime described in
+`design/10-apu-v1-reference-backend.md` is not in the tree.
+
+### 3.5 GSI Gemini-II / APU v2 (`allo/pim/apu_g2_*.py`, `allo/pim/costs/apu_g2.py`, `allo/pim/templates/apu_g2/`)
+
+Three routes share `build_apu_g2_target()` (`target.name == "apu_v2"`).
+Every runtime takes `apu_g2_runtime.apu_g2_device_lock()` (`flock` on
+`TENON_APU_G2_LOCK`, default `/tmp/tenon-apu-g2-<device>.lock`) around
+status check, build and launch, and `_require_hardware_stack` requires the
+SDK files, `gsi_tool`, an `Available` card with core 0 idle, and device
+index 0 (other indices rejected until `DeviceConfig` semantics are verified;
+G2-06).
+
+* **Typed route** (`APUG2TypedProgram`, `apu_g2_typed_program.py`,
+  `apu_g2_typed_runtime.run_apu_g2_typed`): exact-width `add`, `mul`,
+  `div`, `block_sum`, `dot` records; fixed layout, nothing ranked;
+  `layout=`/`host_moves=` rejected.
+* **Composed route** (`APUG2ComposedContractionProgram`,
+  `apu_g2_composed_program.py`, `apu_g2_composed_layout.py`,
+  `apu_g2_composed_runtime.run_apu_g2_composed`): independent dot products
+  `(dot_count, K)` with identity, pair-affine or accumulate epilogue on one
+  `(4, 65536)` carrier (`APUG2DotTilePlan`, a `LinearLayout` over F2);
+  larger problems are rejected naming the capacity; packing is attested
+  against the plan before launch (`attest_apu_g2_composed_packing`,
+  G2-08).
+* **Source route** (`apu_g2_source_route.py`,
+  `compile_apu_g2_source_workload`): a plain integer contraction function is
+  matched against `build_apu_g2_contraction_patterns()` (`MAC`, `AXPBY`),
+  `analyze_apu_g2_source` derives the `APUG2SourceContract` (K, result
+  coordinates, transposition, broadcast, epilogue, exact widths; rejects
+  wrapping, non-power-of-two K, mixed signedness, K > 512),
+  `enumerate_apu_g2_launch_plans` builds `single`/`fused`/`separate` x
+  `k1`/`k2` x output-tile plans (G2-05), `rank_apu_g2_launch_plans` orders
+  them by estimate, launches, catalog order; `APUG2SourceProgram` exposes
+  `plan`, `ranking`, `rejected`, `selection`, `placement_ranking`,
+  `manifest()`; `layout="<plan name>"` forces a plan. Results are checked
+  against an `einsum` oracle before `kind="device"` is returned (G2-02).
+  The five paper kernels as source (`benchmarks/apu_g2/workloads.py`)
+  reproduce the artifact's layout and program fingerprints.
+
+Executed versus analytical: `cycles` is `round(device pipeline ticks /
+repetitions)` (ARC running-state ticks of the timed batch plus one barrier;
+host transfers reported separately in microseconds). The cost program
+(`build_apu_g2_cost(APUG2TypedTickModel)`) prices every issued recipe call
+from seven structural features fitted on ten card programs; outside its
+validity domain the estimate is labelled `estimate_validity="extrapolated"`
+(G2-03). `backend="virtual"` returns `kind="virtual"` with `cost_model`,
+`latency_unit`, `estimate_validity`. Card-gated test:
+`tests/pim/test_apu_g2_hardware.py` (G2-04). Design:
+`docs/release/design/apu-g2-source-route.md`. Open: G2-09..G2-12, device
+index semantics, `t + u` epilogue without coefficients.
+
+## 4. Extending Tenon
+
+### 4.1 Adding a target primitive (op or move)
+
+Worked example in the tree: Samsung `RELU` (`allo/pim/targets.py`,
+`build_samsung_target`), priced by `elementwise` in
+`allo/pim/costs/samsung.py`, lowered by `SamsungCtx._emit_eltwise`, and
+recognized by `spmw_samsung.samsung_elementwise`.
+
+1. Declare the primitive inside the unit that executes it:
+   `allo.op(name, src=(pattern, ...), dst=pattern, fn=lambda ...,
+   accumulates=..., emit=lambda ..., ctx: ctx.cmd(...))` or
+   `allo.move(name, src, dst, emit=..., verb=...)`. `fn` is what the matcher
+   unifies against (commutative operands, `const_params` for literal
+   coefficients, `guarded`, `dst_index`, `iv_params`); `src`/`dst` patterns
+   (`allo.any_`, `allo.or_`) are what the legality pass admits; `emit`
+   receives placed handles and the backend `CodegenContext`. A declaration
+   whose handles are out of scope fails `spmw_legality.check_target`
+   (rule `declaration`); do not declare an operand source the backend
+   cannot emit (the Samsung `srf` precedent, C-01).
+2. Add a cost rule: inside the backend's `@cost` builder,
+   `@rule(target.op(name))` (or `target.move(name)`) with
+   `def r(event, ctx): ctx.step(latency=..., occupy=[ctx.use(...)])`.
+   `BoundCostSpec.emit` raises `KeyError` for an event with no rule, so every
+   reachable primitive needs one. Read shape facts from `event.metrics`, not
+   from the target.
+3. Legality implications: a new register destination needs declared fill
+   and drain moves (rule `move`); an accumulating op's `dst` must not alias
+   its sources (rule `register-aliasing`); `Register.slots` bounds distinct
+   values (rule `register-capacity`). Run `tests/perf/test_legality.py`.
+4. Backend lowering and runtime: if the backend overrides `emit_program`,
+   teach it the new op (Samsung: `samsung_elementwise` plus `_emit_eltwise`
+   and the conductor plan `samsung_eltwise_plan`; AiM: a new `AimOp` and
+   `_AimLowerer` case; UPMEM: a family recognizer plus template). Make the
+   runner's `RunResult.extra` describe what executed.
+5. Tests: a matcher test (`tests/pim/test_match_patterns.py`,
+   `tests/pim/test_match_coverage.py`), a compile-only test through
+   `allo.compile(..., backend="virtual")`, and the backend's simulator or
+   device test gated by `simulator_unavailable_reason`.
+
+### 4.2 Adding a schedule knob
+
+Worked example: AiM `reduction_partitions` (`spmw_knobs.
+_aim_reduction_partitions_candidates`, `_aim_reduction_partitions_emit`;
+layout carrier `aim_lowering.reduction_partitioned_layout`; codegen reader
+`spmw_aim._reduction_partitions`; cost `allo/pim/costs/aim.py::host_reduction_cycles`).
+`register_knob(target_name, Knob(name, candidates_fn, emit_fn))` in
+`register_default_knobs`; the candidates function reads `KnobCtx(target,
+matches, role_to_memref, base, liveness)` and may consult
+`spmw_reduction_policy.reduction_policy(match)`; `emit` writes
+`extra[name]` (and the `LinearLayout` when the knob changes the layout, so it
+enters the decision key). Cost rules read `event.metrics["candidate"][name]`;
+codegen reads `placement.extra[name]` or the layout and must raise
+`InfeasibleSchedule` for values it cannot realize.
+
+### 4.3 Adding a backend
+
+Follow the AiM backend as the smallest complete example
+(`allo/spmw_aim.py`, `allo/pim/aim_lowering.py`, `allo/pim/costs/aim.py`,
+`spmw_autoschedule._aim_enumerate`, `spmw_simenv.aim_unavailable_reason`).
+
+1. Target: `build_<name>_target()` in `allo/pim/targets.py` (structure only;
+   `check_target` must pass). Export it from `allo/pim/__init__.py`.
+2. Cost: `allo/pim/costs/<name>.py` with `@cost(target="<name>")` and one
+   rule per reachable primitive; export from `allo/pim/costs/__init__.py`.
+3. Enumerator: `@register_enumerator("<name>")` in `spmw_autoschedule.py`
+   returning base `Placement`s crossed with `cross_with_knobs`; add the
+   backend's compute levels to `spmw_layout_problem.COMPUTE_LEVELS` so the
+   movement stage can derive the problem.
+4. Codegen context: a `CodegenContext` subclass with `cmd` or an
+   `emit_program` override, `runtime_route(commands)`, and optionally
+   `virtual_run_extra()`; register it in `spmw_codegen._BACKENDS` as
+   `(module, class name, runner name)`. If the backend accepts
+   `mapping=[1]` or outer-subset grids, add it to
+   `_SINGLE_ITEM_LAUNCH_BACKENDS` / `_OUTER_SUBSET_LAUNCH_BACKENDS`.
+5. Runner: `_run_<name>(compiled, **inputs) -> RunResult` that raises
+   `SimulatorUnavailable` when the external piece is missing, raises on
+   missing outputs or a failed sub-process, and sets `kind` honestly
+   (`simulator-timing-only` when no data path exists).
+6. Discovery: every external path or image name goes through
+   `allo/spmw_simenv.py` with an environment override; add
+   `<name>_unavailable_reason()` and wire it into
+   `spmw_codegen.simulator_unavailable_reason`; document the variables in
+   `docs/release/INSTALL.md` and the external software in
+   `docs/release/simulators.md`.
+7. Policy: decide whether the backend has an order-preserving program and
+   either consult `reduction_policy(match)` in the enumerator
+   (`_POLICY_AWARE_MATCHER_ROUTES`) or add the reason to
+   `_REGROUPING_MATCHER_ROUTES`.
+8. Tests: `tests/pim/test_gemv_all_targets.py` (one GEMV per backend),
+   `tests/perf/test_simulator_unavailable.py`, `tests/perf/test_run_result_contract.py`,
+   `tests/pim/test_import_surface.py`, and `docs/release/CAPABILITIES.md`.
+
+A typed route (no matcher) instead adds a `_ProgramRoute` entry in
+`allo/compiler.py::_PROGRAM_ROUTES` with its own `compile_fn(program,
+target, *, cost, backend)`.
+
+## 5. Inspecting a chosen program
+
+For a matcher-route `CompiledCallable`:
+
+| What | Where |
+|---|---|
+| ranked placements per kernel | `compiled.placement_ranking.kernels[i]` (`KernelRanking`): `scores` `(position, cycles, mode)` in rank order, `chosen_position`, `cost_ties`, `tie_break`, `rejections` `(position, reason)`, `movement_rejections`, `policy_pruned` `(mode, reason)`, `fallback`, `bucket_count` |
+| movement record | `compiled.placement_ranking.kernels[i].movement` (`KernelMovement`): `status`, `implementation`, `termination`, `optimality_proven`, `optimality_scope`, `incomplete`, `min_cost`, `program_cost`, `chosen_cost`, `chosen_label`, `tie_count`, `ties_crossed`, `ties`, `assumptions`, `notes`; `compiled.placement_ranking.incomplete` |
+| reduction policy | `compiled.reduction_order`, `compiled.reduction_policy_pruned`; per match `compiled.trace.matches[j].extra["reduction_policy"]` |
+| matcher facts | `compiled.trace.matches[j].extra` (`accumulator_init`, `axis_roles`, `batch_dim`, `constants`, `output_sinks`), `compiled.trace.coverage.stores` |
+| chosen placement(s) | `compiled.compiled.layout` (a `Placement` or a list): `placements`, `extra` (knob values, `movement`, `reduction_program`, `reduction_policy_pruned`), `layout` (`LinearLayout`) |
+| emitted program | `compiled.compiled.cmds` (Samsung `PIMCmd` list, AiM trace lines, UPMEM segment names); `compiled.compiled.layout_ctx` for backend state (Samsung `programs`, UPMEM `segments` with `device_source()`, AiM `host_steps`) |
+| legality rejections | raised as `IllegalPlacement` for `layout=`; enumerated candidates the pass removed are appended to `KernelRanking.rejections` as `(None, "illegal placement <mode>: <rule> ...")` entries by `autoschedule()` |
+| cost graph and estimate | `compiled.execution_graph` (`ExecutionGraph.activities`), `compiled.estimate()` (`Estimate.cycles`, `critical_path`, `utilization`, `bottlenecks`) |
+| run outcome | `result.kind`, `result.cycles`, `result.extra` (Samsung: `timing_scope`, `logical_shape`, `padded_shape`, `padding_fraction`, `cycle_phases`, `plan`, `crf`, `conductor`, `levers`, `outputs`; AiM: `returncode`, `segments`, `unique_segments`, `host_steps`; UPMEM: `upmem` records with `sdk_build`, `logic_cycles`, `geometry`, `padding_fraction`, `host_steps`, plus `timing_scope`, `outputs`; virtual: `cost_model`, `priced_target`, `critical_path`, and `cost_validity`/`upmem_cost_validity` on UPMEM); every result also carries `reduction_order` and `reduction_policy` |
+
+For the APU v1 vector route: `compiled.plans`, `compiled.ranked_plans`,
+`compiled.candidate_estimates`, `compiled.selected_plan`,
+`compiled.selected_estimate`, `compiled.realization`,
+`compiled.plan_selection`, `compiled.reduction_policy_pruned`,
+`compiled.execution_graph`, `compiled.estimate(plan=None)`;
+`result.extra["plan"]`, `["plan_selection"]`, `["plan_regroups_reduction"]`,
+`["numerics"]`, `["board_lock"]`. For `APUv1Program`: `compiled.hybrid_manifest`,
+`compiled.native_vector_lowering`, `compiled.device_source`. For Gemini-II
+source: `compiled.compiled.plan`, `.ranking`, `.rejected`, `.selection`,
+`.placement_ranking`, `.manifest()`, `.repetitions`; `result.extra`
+carries `layout_fingerprint`, `program_fingerprint`, `packing_attestation`,
+`estimate_validity`, `device_lock`. The same table is kept short in
+`docs/release/INSTALL.md` section 5.
+
+## 6. External dependencies and discovery
+
+All locations outside the package are owned by `allo/spmw_simenv.py`; each
+has an environment override (`TENON_SIMULATORS_DIR`, `PIMSIMULATOR_ROOT`,
+`AIM_SIMULATOR_ROOT`, `TENON_AIM_SIM_IMAGE`, `UPIMULATOR_ROOT`,
+`UPIMULATOR_BIN`, `TENON_UPMEM_SDK_IMAGE`, `TENON_UPMEM_BENCHMARK_SLOT`,
+`TENON_UPMEM_SCRATCH`, `TENON_UPMEM_PROVENANCE_DIR`, `TENON_ARTIFACTS`,
+`TENON_APU_V1_TOOLCHAIN_BASE`, `TENON_APU_V1_GVML_INCLUDE_ROOT`,
+`TENON_APU_V1_TEMPLATE_DIR`, `TENON_APU_V1_PCI_NODE`, `TENON_APU_V1_LOCK`,
+`TENON_APU_G2_SDK_ROOT`, `TENON_APU_G2_GSI_TOOL`, `TENON_APU_G2_DEVICE`,
+`TENON_APU_G2_LOCK`, `TENON_APU_G2_KEEP_TMP`, `TENON_APU_G2_BUILD_JOBS`).
+The variable table, defaults, timeouts, temporary directories and locks are
+in `docs/release/INSTALL.md` section 3; the simulators and vendor SDKs,
+their revisions and licenses are in `docs/release/simulators.md`. Nothing
+external is bundled; every target compiles and runs `backend="virtual"` with
+Allo alone.
+
+## 7. Module map
 
 | Module | Responsibility |
 |---|---|
-| `allo/compiler.py` | Public `allo.compile` facade and NumPy-callable wrapper. |
-| `allo/spmw_target.py` | Structure-only target data model and decorators. |
-| `allo/spmw_match.py`, `allo/spmw_match_engine.py` | MLIR matching for operation-pattern backends. |
-| `allo/spmw_autoschedule.py` | Matcher-path placement enumeration for Samsung, AiM, and APU. |
-| `allo/spmw_codegen.py` | Matcher-path code generation and Samsung/AiM/APU physical runners. |
-| `allo/spmw_plan.py` | Target-neutral execution graph, cost events, dependencies, and resources. |
-| `allo/spmw_linear_layout.py` | F2 `LinearLayout` algebra used by AiM and UPMEM placement. |
-| `allo/perf/` | `CostSpec`, binding, event rules, and execution-graph evaluation. |
-| `allo/pim/targets.py` | Reference Samsung, AiM, UPMEM, and APU v1 target specifications. |
-| `allo/pim/costs/` | Executable reference-backend cost specifications. |
-| `allo/pim/upmem_program.py` | Multi-phase MLIR compilation, launch orchestration, retained graph, and callable host-C runtime. |
-| `allo/pim/upmem_abi.py` | LinearLayout-derived 64-DPU MRAM pack/gather ABI. |
-| `allo/pim/upmem_analysis.py` | MLIR instruction/control-flow summary used to emit UPMEM cost events. |
-| `allo/backend/c.py` | MLIR-to-portable-C backend shared by UPMEM and the APU v1 scalar path. |
-| `allo/pim/apu_v1_program.py` | Complete MLIR-to-ARC-C APU v1 programs and NumPy/L4 ABI. |
-| `allo/pim/apu_v1_layout.py` | Immutable APU iteration/value/transfer/reduction plans over `LinearLayout`. |
-| `allo/pim/apu_v1_vectorize.py` | Retained-MLIR contraction analysis and four MICRO-inspired plans. |
-| `allo/pim/apu_v1_vector_codegen.py` | Plan-driven GVML lowering, VR allocation, and NumPy packing ABI. |
-| `allo/pim/apu_v1_vector_cost.py` | Executable plan-to-cost-graph bridge and candidate ranking. |
-| `allo/pim/apu_v1_vector_program.py` | Public `allo.compile` callable for ordinary APU contractions. |
-| `allo/pim/apu_v1_vector_runtime.py` | Real-board GDL harness for a realized APU vector plan. |
-| `allo/pim/apu_v1_hybrid.py` | Structural region discovery, persistent-L4 physical manifests, hybrid execution graph, and functional orchestration. |
-| `allo/pim/apu_v1_hybrid_runtime.py` | Four-APUC shard packing, persistent-L4 GDL project emission, packed-result gather, and hybrid device execution. |
+| `allo/compiler.py` | `allo.compile`, route dispatch, `CompiledCallable`, work-scope stamping, carried-accumulator binding |
+| `allo/spmw_target.py` | target language: units, memories, registers, ops, moves, patterns, host-move recording, host programs |
+| `allo/spmw_match.py`, `allo/spmw_match_engine.py` | matcher data model, pattern compilation, store coverage, axis roles |
+| `allo/spmw_reduction_policy.py` | reduction-order policy, stamps, route gates |
+| `allo/spmw_legality.py` | target-neutral placement legality |
+| `allo/spmw_autoschedule.py` | enumerators, `Placement`, ranking, `KernelRanking`/`PlacementRanking`, residency reconciliation |
+| `allo/spmw_knobs.py` | typed knob registry and generic cross product |
+| `allo/spmw_layout_problem.py` | movement-stage problem derivation, search dispatch, tie classification, `KernelMovement` |
+| `allo/pim/gf2.py`, `allo/pim/layout_problem.py`, `allo/pim/layout_movement.py`, `allo/pim/layout_search.py` | Section IV algebra, movement formula, bounded/masked/scalable/coordinate searches |
+| `allo/spmw_codegen.py` | `compile_for_target`, `CodegenContext`, `_BACKENDS`, work-grid check, materialization manifest, `Compiled`, `RunResult`, virtual runner |
+| `allo/spmw_plan.py` | execution-graph construction, host transfer metrics, launch schedules |
+| `allo/spmw_linear_layout.py` | `LinearLayout` F2 algebra (`compose`, `product`, `identity`, `to_gf2`/`from_gf2`, `materialise_handle`) |
+| `allo/spmw_liveness.py`, `allo/spmw_tiling.py`, `allo/spmw_tripcount.py`, `allo/spmw_fingerprint.py` | whole-trace liveness for the residency knob, capacity tiling candidates, affine trip counts, canonical digests |
+| `allo/spmw_host_program.py` | host-program residency analysis (no production caller, C-10) |
+| `allo/spmw_simenv.py` | external paths, images, devices, availability probes |
+| `allo/perf/` | cost language and evaluator |
+| `allo/pim/targets.py`, `allo/pim/costs/` | reference targets and cost programs |
+| `allo/spmw_samsung.py`, `allo/pim/samsung_layout_swizzle.py` | Samsung classification, CRF lowering, conductor plans, runner; XOR swizzle harness |
+| `allo/spmw_aim.py`, `allo/pim/aim_lowering.py` | AiM program derivation, ISR lowering, coverage invariant, runner |
+| `allo/spmw_upmem.py`, `allo/pim/upmem_physical.py`, `allo/pim/upmem_physical_search.py`, `allo/pim/upmem_irregular.py`, `allo/pim/upmem_analysis.py`, `allo/pim/upmem_calibration.py` | UPMEM families, templates, physical decision catalog and calibration, MLIR instruction summary, calibration tooling |
+| `allo/backend/c.py` | MLIR to portable C (UPMEM oracle and host groups, APU v1 scalar programs) |
+| `allo/spmw_apu_v1.py`, `allo/spmw_apu_v1_build.py` | APU v1 legacy matcher context and GVML project emission |
+| `allo/pim/apu_v1_*.py` | APU v1 vector plans, codegen, cost bridge, runtime, typed scalar programs, native recipes, hybrid manifest |
+| `allo/pim/apu_g2_*.py`, `allo/pim/templates/apu_g2/` | Gemini-II typed, composed and source routes, tick model, runtimes, project templates |
+| `allo/pim/schedule_search.py` | generic materialize-then-score grid search (APU v1 vector route) |
+| `benchmarks/cent_aim/`, `benchmarks/upmem/`, `benchmarks/apu_g2/` | paper workloads as source |
 
-## Backend paths
+## 8. Open items and compatibility boundary
 
-### Samsung HBM-PIM and SK hynix AiM
+Open findings that shape the architecture (details and status in
+`docs/release/ISSUES.md`): C-03 and C-05 (ranking precedes materialization
+and is per kernel group; no re-cost after reconciliation), C-10, F-02,
+S-11/S-13, M-04, U-06 (minus and constant pointwise forms), P-06/P-17 (UPMEM
+public build), V1-03 (default FP16 GEMV plan under `"reassociate"` is a tree
+plan; strict selects a temporal plan), V1-05/V1-06/V1-08/V1-11/V1-12,
+G2-09..G2-12, P-04/P-05/S-04 (Samsung simulator overlay in the containing
+repository), P-13/P-14/P-18/P-19/P-20. CLAIMS row 16 (movement ties) is
+partial for the realizability reason in Section 2.5.
 
-A plain Allo workload is customized into MLIR, matched against target
-operations, autoscheduled, lowered to backend commands, and compiled into a
-callable. AiM MAC bank fanout is derived from a `LinearLayout`, which selects
-single-bank versus all-bank execution and drives both code generation and cost.
-
-### UPMEM
-
-UPMEM supports arbitrary multi-phase MLIR workloads through `UPMEMProgram`.
-Every launch declares tensor directions, BLOCK/BROADCAST placement, partition
-axes, halos, scalars, and orchestration barriers or collectives. Each tensor has
-a logical-index map to physical `(dpu, tasklet, local)` coordinates. The same
-map drives:
-
-- MRAM shard ownership and pack/gather behavior;
-- DPU and tasklet parallelism in the cost graph;
-- the retained physical launch manifest.
-
-The old contraction-only `UPMEMCtx`/uPIMulator matcher path has been removed.
-Both `allo.compile` and `compile_for_target` fail closed if a plain callable or
-matcher trace attempts to target UPMEM. This leaves one supported UPMEM path:
-
-```python
-allo.compile(allo.UPMEMProgram(...), build_upmem_target(), upmem_cost)
-```
-
-The host functional runtime executes MLIR-derived portable C and validates the
-64-DPU ABI. Generated physical DPU C remains a fail-closed translation-unit
-fragment until the SDK wrapper supplies DPU `main`, MRAM descriptor binding,
-tasklet-strided entry, and build/run integration. Analytical cycles are never
-reported as simulator or device measurements.
-
-### GSI APU v1
-
-The fixed spatial hierarchy is four APUCs, each with a named 32K-lane VR
-axis. A GVML group is a workload-selected power-of-two partition of that lane
-axis, not a fixed target unit. Scalar `mapping=N` means exactly `N` groups per
-VR, so `group_size=32768/N`. The compiler coalesces the source work replicas
-and builds a `LinearLayout` from logical `(group, lane_in_group)` to physical
-`vr_lane`; all groups execute in one GVML operation.
-
-Grouped FP16 contractions lower to `gvml_mul_f16` followed by
-`gvml_add_subgrps_f16_grp`. The callable ABI packs one dot product per group,
-partitions output rows over all four APUCs, streams multiple VR batches when
-needed, and gathers the result at each group head. The host launches four GDL
-tasks as one batch with per-APUC L4 slices.
-
-Ordinary non-dataflow contractions use retained-MLIR access analysis to create
-four immutable APU plans. `TransferLayout` and `TransferRouteStep` relate
-compact L4/L3 representations, resident VR banks, and expanded compute
-layouts; `OutputBatching` relates compute work tiles to dense physical output
-VRs. The same relations drive NumPy packing, GVML lookup/subgroup lowering,
-VR liveness, and executable costs. The full 1024x1024x64 reference test runs
-all four candidates on silicon and preserves the measured ranking.
-
-Fixed-width bitwise complement, `allo.xnor`, and `allo.popcount` are
-target-neutral frontend operations. Popcount remains `math.ctpop` in retained
-MLIR and lowers through both LLVM and portable C. The APU analyzer recognizes
-the structural XNOR/popcount dataflow and emits faithful GVML
-XOR/NOT/POPCOUNT/ADD operations; it does not implicitly apply the distinct
-bipolar `2*popcount-word_bits` transform. The 32x1024xK8 reference leaf is
-bit-exact on hardware. Contraction discovery now accepts one or more output
-axes, while plan construction remains fail-closed outside the proven rank-2
-layout; rank-1 ATAX/BiCG/MVT reductions are the next native-vector subset.
-
-Complete non-vectorized programs use an explicit `APUv1Program` containing one
-`APUv1Phase`. Allo MLIR lowers to portable C, the GSI ARC toolchain builds it,
-and NumPy arguments and results use L4-backed buffers. This correctness path
-currently runs on APUC 0 because arbitrary programs do not yet declare the
-partition and barrier semantics needed for a faithful four-APUC launch.
-
-An `APUv1Phase` with `vectorize=True` uses the same retained MLIR to discover a
-hybrid region graph. Dense contractions become vector regions only after
-illegal plans have been filtered by dtype, reduction, VR-pressure, zero-input,
-and realization constraints; unmatched functions remain explicit ARC scalar
-regions. Produced/consumed values derive dependencies and barriers, and an
-explicit precision policy inserts conversion phases. No benchmark name is used
-for region selection or code generation.
-
-The physical lowering assigns persistent-L4 allocations and emits ordered
-conversion, four-APUC vector, barrier, and APUC-0 scalar phases. The same
-logical graph builds the analytical cost graph: independent regions may
-overlap subject to concrete APUC/ARC/SEU/DMA/L4 occupancy, while data edges and
-barriers serialize required transitions. The functional backend executes that
-physical phase sequence without host intermediate round trips.
-
-Canonical GEMM, 2mm, and 3mm leaf tests now call `allo.compile` directly and
-assert the discovered region manifests. Their staged-FP16 functional references
-match exactly and are recorded separately from the existing scalar real-device
-CRUN evidence. A vector region has an explicit balanced four-APUC partition;
-each shard is replanned with a local zero-based output axis, physical
-power-of-two padding, exact validity masks, sliced LHS/output ownership, and a
-replicated RHS.
-
-Canonical GEMM now has a physical unified runner. Initial ABI packing creates
-four shard-local ingress images, one stitched 67 MB L4 arena remains live across
-a four-task GVML batch and a retained-MLIR scalar `ele_add` task on APUC 0, and
-the host gathers only the final output. The measured critical path is 7,470,927
-cycles: 4,456,146 for the slowest vector shard plus 3,014,781 for packed-result
-gather and the scalar epilogue. The result passes both staged-FP16 and canonical
-PolyBench tolerance. The public `backend=None` path installs this runner rather
-than substituting the scalar baseline.
-
-The same persistent-arena runner covers the milestone's multi-vector graphs.
-For 2mm, an ARC repack batch maps packed `mm1` output coordinates directly to
-`mm2` ingress before the second vector batch and scalar epilogue. It measures
-18,566,489 cycles and passes both staged and canonical tolerance. For 3mm, the
-join batch repacks row-sharded `out_AB` and all-gathers differently sharded
-`out_CD` into every `mm3` ingress image. The complete graph measures 31,828,554
-cycles, but compounded FP16 produces 104 staged and 129 canonical values outside
-the repository tolerance. A sequential GVML-style reference that rounds every
-multiply and add still has 75 values outside tolerance. It is recorded as
-executed hardware evidence, not a correctness pass. In both cases,
-intermediate data stays in L4.
-
-`allo/pim/costs/apu_v1.py` contains the independently measured GVML/DMA
-constants, explicit grouped-kernel startup/batch-control calibration, and a
-coarse scalar ARC rule. The target contains only resources and legal
-operations. See
-`design/10-apu-v1-reference-backend.md`.
-
-## Cost and parallel execution
-
-A cost program emits events into an execution graph. Dependencies serialize
-events; resource coordinates determine contention; disjoint spatial
-coordinates may overlap. Operand shapes, layout image sizes, byte counts,
-iteration counts, and candidate properties are event metrics rather than target
-timing fields.
-
-Reference costs are in:
-
-- `allo/pim/costs/samsung.py`
-- `allo/pim/costs/aim.py`
-- `allo/pim/costs/upmem.py`
-- `allo/pim/costs/apu_v1.py`
-
-The UPMEM cost uses the DPU/tasklet fanout derived from tensor layouts. It does
-not divide all phases by an unconditional rank size. Its constants are initial
-assumptions sourced from the reference paper and simulator implementation and
-are intended to be edited directly after real-device microprofiling.
-
-## PolyBench coverage
-
-The Samsung and AiM suites use their operation-pattern workloads. The UPMEM and
-APU v1 suites contain all 30 repository PolyBench programs as complete MLIR
-workloads. Each leaf calls `allo.compile` and validates every observable result
-against the repository NumPy reference. UPMEM records analytical cost beside a
-portable-C functional run; APU v1 records measured CRUN from the real scalar
-ARC execution. APU v1 GEMM also tests the optimized four-APUC grouped-GVML path.
-GEMM, 2mm, and 3mm additionally retain distinct hybrid functional and physical
-evidence. GEMM and 2mm pass their physical precision contracts; 3mm is explicitly
-marked out-of-tolerance rather than promoted to a false PASS.
-
-See:
-
-- `design/06-upmem-reference-backend.md`
-- `design/08-upmem-polybench-execution-matrix.md`
-- `design/09-aim-upmem-linear-layout.md`
-- `design/10-apu-v1-reference-backend.md`
-
-## Compatibility boundary
-
-Tenon does not change upstream Allo's legacy `allo.memory.Layout` or FPGA/AIE
-build paths. The PIM interfaces are additive at the public package boundary.
-Backend-specific code must continue to keep cost formulas out of target
-specifications and must not silently fall back from an unsupported physical
-runner to an analytical estimate.
+Tenon does not change upstream Allo's `allo.memory.Layout` or the FPGA/AIE
+build paths; the PIM surface is additive (`allo/__init__.py` eager exports
+plus `_LAZY_EXPORTS`, checked by `tests/pim/test_import_surface.py`). Cost
+formulas stay out of target descriptions, and no runner falls back from an
+unavailable simulator or device to an analytical estimate: it raises
+`SimulatorUnavailable`, and only `backend="virtual"` returns an estimate.
