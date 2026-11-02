@@ -71,10 +71,14 @@ then this file, then `ISSUES.md` for the next action.
 ## Next concrete actions (in order)
 
 1. Independent review of the round 8 matcher contracts.
-2. Installed-artifact evidence at this revision: build the wheel, install
-   outside the checkout, run virtual + Samsung + AiM + UPMEM through it;
-   then APU v1 board (local lock) and Gemini-II card on zhang-x4 (remote
-   lock). Record in `VALIDATION.md`.
+2. Installed-artifact evidence at this revision: done for virtual, Samsung,
+   AiM, UPMEM and the APU v1 board from a clean venv at `9cd8fb3`
+   (VALIDATION.md round 8). Still to do: Gemini-II card on zhang-x4
+   (remote lock; the shared checkout is visible there, the `spmw` env is
+   not, and the wheel's RUNPATH points at this server's conda lib
+   directory, so build or install the artifact with the `allo-dev`
+   interpreter there). New: U-16 (hoisted row base on UPMEM), P-22
+   (install pitfalls).
 3. G9: refine `design/shared-compilation-path.md` from source (stage
    inventory, reusable pieces, missing contracts), then the first vertical
    slice through one matcher backend, then the APU routes; remove the

@@ -404,3 +404,17 @@ ModuleNotFoundError: No module named 'allo._mlir'   (from allo/ir/types.py:9)
 Caveat: the wheel's RUNPATH also carries the absolute library directory given
 in `LDFLAGS` (here the conda environment that supplies libstdc++), so it is
 a per-host artifact, not a portable `manylinux` wheel.
+
+Round 8 (2026-11-02, commit `9cd8fb3`, wheel sha256 `788e5e13...2e69`): the
+same build was installed into a **clean** venv (`python -m venv venv2`,
+`pip install -r requirements.txt psutil`, then the wheel with
+`--no-deps --force-reinstall`) and exercised from `/tmp` with `PYTHONPATH`
+unset; `allo` imported from the venv only ("modules loaded from the
+checkout: []"). Results are in `VALIDATION.md` round 8 (virtual, Samsung
+simulator, AiM timing-only, UPMEM simulator, both reviewer probes rejected).
+Two pitfalls (ISSUES P-22): a venv made with `--system-site-packages` over
+an environment that has an editable `allo` install silently keeps the
+editable copy (pip reports the wheel's requirement satisfied and the
+editable finder shadows site-packages), and the wheel's metadata lists the
+development requirements (`past@<github url>`, `pylint`, `pytest`), so
+install the wheel with `--no-deps` after `requirements.txt`.

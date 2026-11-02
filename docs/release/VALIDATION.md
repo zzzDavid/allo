@@ -263,9 +263,9 @@ the documentation commit that records them changes no code.
 
 Environment as above (`spmw` env, `PYTHONPATH=$PWD`,
 `LLVM_BUILD_DIR=/work/shared/common/llvm-project-main/build-rhel8`). Raw
-logs: `/tmp/tenon-release/r9/*.log` on this server (copied to
-`/work/shared/users/phd/nz264/tenon-release-evidence/r8/` when the round
-closes).
+logs: `/tmp/tenon-release/r9/*.log` on this server, copied with the scripts
+and the reviewer's probe files to
+`/work/shared/users/phd/nz264/tenon-release-evidence/r8/`.
 
 Independent reviewer's probes (their scripts, unchanged:
 `/tmp/tenon_reviewer_samsung_cast.py`, `/tmp/tenon_reviewer_samsung_guard.py`):
@@ -298,5 +298,46 @@ only by the ledger text written after these runs):
 | re-run after those fixes | `pytest tests/pim/test_upmem_dtypes.py tests/pim/test_upmem_generality.py tests/pim/test_g6_semantics.py -m "not apu_v1_device"` | 119 passed, 1 skipped (`refix-a.log`) |
 | re-run after those fixes | `pytest tests/pim/test_match_coverage.py tests/perf/test_apu_g2_source_route.py tests/pim/test_cent_aim_workloads.py tests/perf/test_legality.py` | 96 passed, 11 skipped (`refix-b.log`) |
 
-A full `tests/pim` and `tests/perf` run on the committed tree and the
-installed-artifact runs are recorded below when they complete.
+Suites on the committed tree `9cd8fb3` (checkout, `spmw` env, logs
+`commit-pim.log`, `commit-perf.log`):
+
+| Suite | Command | Result |
+|---|---|---|
+| PIM non-device | `pytest tests/pim -q -rfxs -m "not apu_v1_device"` | 442 passed, 54 skipped (`paper_full` rows, card-gated Gemini-II tests), 12 deselected, 0 failed in 3877.56 s (1:04:37) |
+| perf | `pytest tests/perf -q -rfxs` | 534 passed in 686.37 s |
+
+### Installed-artifact runs at `9cd8fb3` (2026-11-02)
+
+Build: `setup.py sdist` from the clean committed tree, then `pip wheel` with
+the LLVM 22 clang and the `LDFLAGS` of INSTALL.md section 6
+(`/tmp/tenon-release/r9/wheel-build.log`); the sdist contains `simulators/`
+(no `patches/`, no `scripts/verifier_check_*`). Wheel
+`allo-0.5-cp312-cp312-linux_x86_64.whl`, sha256
+`788e5e13f38bef03f12f9d907c2db7da3a5ec7a02d8e956a74695654732a2e69`. Installed
+into a clean venv (`/tmp/tenon-release/r9/pkg/venv2`) with `--no-deps
+--force-reinstall`; every run below used `cd /tmp`, `env -u PYTHONPATH`,
+`TENON_SIMULATORS_DIR=<repo>/experiments/simulators` and the installed
+simulators of this server (`/tmp/tenon-release/r9/run_installed.sh`, log
+`installed2.log`; scripts in `/tmp/tenon-release/r9/scripts/`).
+
+| Check | Result |
+|---|---|
+| provenance | `allo` from `venv2/.../site-packages/allo/__init__.py`; modules loaded from the checkout: none; Gemini-II and IR templates shipped |
+| Samsung GEMV 4096x256 FP16, `backend="virtual"` | kind `virtual`, estimate 27,598 (strict TEMPORAL program) |
+| Samsung GEMV 4096x256 FP16 on PIMSimulator, random inputs | kind `simulator`, 26,807 cycles, max abs error 2.2e-3 against FP32 |
+| AiM GEMV 256x256 BF16 over 32 channels, `reassociate`, y pre-filled with 7.0 | kind `simulator-timing-only`, 222 cycles, `outputs == {}`, caller array untouched; chosen `all_bank+bank_scope=abk+...` |
+| UPMEM GEMV 768x128 int32 over 8 DPUs, random inputs in [-1000, 1000), y pre-filled | kind `simulator`, 563,207 DPU cycles, outputs exact against the int64 oracle |
+| reviewer cast probe through the installed module | `UnsupportedWorkloadError` naming `arith.sitofp<i32->f16>(arith.fptosi<f16->i32>(acc[]))` |
+| reviewer guard probe through the installed module | `UnsupportedWorkloadError` naming the guard mismatch (`copy guards if(%9), producer guards none`) |
+
+| APU v1 board (this server, PCI `0000:41:00.0`, shared `flock`), tests run from the installed wheel with `cd /tmp`, `PYTHONSAFEPATH=1`, `env -u PYTHONPATH` (`run_board.sh`, log `board-installed.log`) | `allo` from `venv2`; `test_vector_gemm_apu_v1[temporal_dma_coalescing]`, `[temporal_dma_coalescing_broadcast_friendly]` and `test_apu_v1_board_median_cycles[apu_v1-histogram]`: 3 passed in 180.83 s (device builds, launches and readback through the installed package). `tests/pim/test_g6_semantics.py` and `apu_v1/test_g6_board_semantics.py` cannot be collected outside the checkout because they import evaluation workloads from the repository's `benchmarks/` tree, which is not part of the package; they ran from the checkout in the full PIM suite |
+
+Found on the way: the hoisted-row-base GEMV form is refused by the UPMEM
+family classifier (U-16, open); installing into a `--system-site-packages`
+venv over the editable development environment does not install the wheel,
+and running `python -m pytest` with the checkout as the working directory
+puts the checkout's `allo` first on `sys.path` even inside a clean venv
+(P-22; use a working directory outside the checkout and `PYTHONSAFEPATH=1`).
+Not done at this revision: the Gemini-II card run from the installed
+artifact on zhang-x4 (G8 stays UNVERIFIED there at `9cd8fb3`; APU v1 and
+the three simulators have installed-artifact evidence above).
