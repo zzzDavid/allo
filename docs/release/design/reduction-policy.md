@@ -241,3 +241,18 @@ because they exercise regrouping programs:
 4. The policy is per compile. A per-reduction policy (one strict reduction
    and one regrouped reduction in the same workload) has no syntax yet. The
    stamp is per match, so the enumerators already read it per reduction.
+
+
+## Board finding on APU v1 (round 6, V1-16)
+
+`tests/pim/apu_v1/test_g6_board_semantics.py` ran both plans of a 512x256
+and a 384x200 FP16 GEMV on the Gemini-I board. Both plans agree with FP32
+within FP16 tolerance, but neither is bit-equal to its host model: about
+half of the outputs differ from the source-order loop (strict plan) and
+from the halving tree (reassociating plan) by a few ulps. The strict policy
+on APU v1 therefore guarantees that the selected plan does not regroup the
+reduction, and the functional route models the plan's order; it does not
+guarantee bit-equality with an IEEE FP16 round-to-nearest model, because
+the GVML FP16 multiply and add have not been characterized at that level.
+The bit-equality test is kept as a strict xfail with the mismatch counts
+printed.

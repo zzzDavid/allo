@@ -61,7 +61,10 @@ what was accepted and why.
   sites compiling; `validate()` rejects it on every public route. Twenty-two
   construction sites updated. Known residue: `apu_v1_vector_program` labels a
   Python-source execution as `functional` (it is neither the lowered program
-  nor virtual); UPMEM `extra["outputs"]` exposes every argument array;
+  nor virtual; closed 2026-11-02: `backend="virtual"` there now evaluates the
+  cost graph only and returns `kind="virtual"`, and `"functional"` is
+  documented and labelled as a host NumPy model of the selected plan's
+  arithmetic order, not compiled device code); UPMEM `extra["outputs"]` exposes every argument array;
   Samsung/AiM still tolerate a nonzero simulator exit code when a cycles
   line exists.
 - Removal of the Gemini-II source route. Accepted: there was no emission and
@@ -187,6 +190,33 @@ what was accepted and why.
 - EVIDENCE.md. Accepted as the G6 record; its gap list is the remaining
   G6 work.
 
+## Accepted repairs (round 6) and review notes
+
+- G6 probe campaign. Accepted; the probes used fresh random inputs and
+  independent oracles and found four defects that returned wrong results
+  without error (source alias, in-place Samsung elementwise, APU v1 aliased
+  output, APU v1 zero-fill); each is fixed with the probe kept as the
+  regression. One cost-evaluator anomaly (C-18) is recorded as an xfail
+  rather than hidden.
+- Owner maps on UPMEM and AiM. Accepted with the stated families; the
+  expected cycle relations were written down before the simulator runs
+  and held. Reviewer note: on skinny AiM GEMVs the routed reduction split
+  can become the only realizable tie and displaces the unsplit program
+  from the candidates; the simulator favored the split in the one case
+  measured, but the enumerator should keep the program's own map as a
+  candidate (recorded as a follow-up in the design note).
+- Multi-kernel Samsung execution. Accepted: residency the conductor cannot
+  keep across invocations is rejected before any simulator call instead of
+  being silently re-staged.
+- Board finding V1-16. The bit-equality board test written by the G6 agent
+  failed: the Gemini-I device is not bit-equal to the functional route's
+  FP16 models for either plan (a few ulps on about half of the outputs,
+  all within FP16 tolerance of FP32). Treated as a documented limitation of
+  the host model, not weakened: the test is a strict xfail with the
+  mismatch counts printed, the strict policy's APU v1 guarantee is restated
+  as accumulation order rather than bit-exactness, and the issue stays open
+  until the GVML arithmetic is characterized.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -218,13 +248,13 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 | Gate | Judgment | Basis |
 |---|---|---|
-| G1 correspondence | **PARTIAL** | rows 3, 13-15, 17-22, E2, E5, E8, E12, E16 implemented; row 16 partial (ties reach ranking, not realizable by backends); E11, E14 (DRAM half), E15 external reproduction scripts |
-| G2 semantic preservation / explicit failure | **PASS (candidate)** | all identified silent-wrong-code and missing-output paths repaired with tests; remaining minor items (V1-03 default plan documentation, G2-09..G2-12) do not produce silent wrong results |
-| G3 general mechanisms | **PARTIAL** | structural recognizers everywhere; open: `a*A - b*B`/`+ c` pointwise patterns (U-06), Gemini-II device index, movement-tie realizability |
-| G4 search/layout/selected-program integrity | **PARTIAL** | legality, movement stage, bounded joint evaluation, lazy materialization with rejections, Samsung executes the selected program; open: realizing alternative owner maps (row 16) |
-| G5 cost models | **PARTIAL** | every backend's model carries provenance and a validity label; open: per-level movement weights from cost programs, Samsung CRF-fill preload cost outside the model |
-| G6 evidence beyond examples | **PARTIAL** | rename/variant/neighbor regressions per backend; artifact-free execution probe; UPMEM 391x65 sweep; Gemini-II fresh fixtures; no consolidated independent-oracle campaign document yet |
-| G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install, architecture doc rewritten, simulator recipes verified; open: P-04 Samsung patch permission, P-17 proprietary UPMEM SDK (documented), RELEASE_CHECKLIST index removals to run, containing-repo overlay commits (user) |
-| G8 backend execution | **PARTIAL** | simulators at the candidate; APU v1 device 4 tests after the repairs (the retiled GEMM default is unmeasured); Gemini-II card-gated test 10 passed; AttAcc analytical only by design |
+| G1 correspondence | **PASS (candidate)** | every substantive mechanism of Sections III and IV has a maintained implementation reachable through `allo.compile` (CLAIMS.md); row 16 realized on Samsung, UPMEM and AiM; the remaining external items are evaluation scripts documented as such (E11, E14 DRAM half, E15, the AttAcc reference-best study and e2e composition) |
+| G2 semantic preservation / explicit failure | **PASS (candidate)** | all identified silent-wrong-code paths repaired with regressions, including the round 6 alias and zero-fill findings; nonzero initial outputs, zero results and boundary cases executed on every numeric backend |
+| G3 general mechanisms | **PASS (candidate)** | structural recognizers and template-derived legality on every backend; renamed and neighbouring programs compile to the same normalized decisions; open minor: M-14 |
+| G4 search/layout/selected-program integrity | **PASS (candidate)** | legality pass, movement stage with realized ties on three backends, lazy materialization with recorded rejections, bounded joint evaluation, selected program executed on Samsung and verified on the devices |
+| G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1; open: C-18 evaluator anomaly, uniform movement weights |
+| G6 evidence beyond examples | **PASS (candidate)** | EVIDENCE.md tables plus the round 6 probe files; remaining gaps are hardware-only confirmations listed in VALIDATION.md |
+| G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install, verified simulator recipes, architecture doc; open: user decisions P-04 and DCC license, RELEASE_CHECKLIST index removals, P-17 documented proprietary SDK |
+| G8 backend execution | **PASS (candidate)** | simulators at the candidate; APU v1 board and Gemini-II card runs at round 6 (VALIDATION.md); AttAcc analytical by design |
 
-Verdict: **NOT READY.**
+Verdict: **NOT READY** until the user decisions in STATUS.md are taken and the final hardware re-runs are recorded at the release revision; no compiler-side blocker remains open.

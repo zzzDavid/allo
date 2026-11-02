@@ -499,8 +499,12 @@ unpadded shape; the two are compared by ranking only
 (`docs/release/design/samsung-execution.md`). Open: S-11, S-13 (XOR swizzle
 148 -> 116 reachable only through
 `tests/pim/samsung_hbm_pim/layout_swizzle/` and
-`allo/pim/samsung_layout_swizzle.py`), multi-kernel traces compile but do
-not run, carried accumulators rejected before scheduling.
+`allo/pim/samsung_layout_swizzle.py`), carried accumulators rejected before
+scheduling. Multi-kernel programs run their host program's launch schedule,
+one `pim_driver` invocation per launch (`_run_samsung_launches`; gathered
+results are re-staged by the declared broadcast/scatter, a value left
+device-resident across launches is rejected; per-launch cycles in
+`extra["launches"]`; `samsung-execution.md` section 9).
 
 ### 3.2 SK hynix AiM (`allo/spmw_aim.py`, `allo/pim/aim_lowering.py`, `allo/pim/costs/aim.py`)
 
@@ -623,10 +627,15 @@ profile freshness by diffing the device log before and after the launch
   `selected_plan`, `realization`, `plan_selection`, `reduction_policy_pruned`.
   Backends: `None` builds the GVML project with the ARC toolchain and runs on
   the board (`run_apu_v1_vector`, `kind="device"`, manifest v2 uploads the
-  packed initial output for temporal plans; V1-02); `"functional"` and
-  `"virtual"` both run a NumPy model of the selected plan's numerics and
-  return `kind="functional"` with the analytical cycles (a known labelling
-  residue, `docs/release/REVIEW.md`). GEMV reduction tiles are cost-ranked
+  packed initial output for temporal plans; V1-02); `"virtual"` evaluates
+  the selected plan's retained cost graph only (`kind="virtual"`, no
+  outputs, caller arrays untouched, `extra["cost_validity"]` as on the
+  other routes; a nonzero initial output the plan resets is still
+  rejected); `"functional"` is a host-side NumPy model of the selected
+  plan's arithmetic order, not compiled device code (`kind="functional"`,
+  outputs written, `cycles` the analytical estimate; a regrouping FP16
+  plan runs `_grouped_fp16_contraction`, any other plan the source
+  function, whose order it keeps). GEMV reduction tiles are cost-ranked
   candidates (`spatial_gemv_group_reduction_k<tile>`; `tile_decision` in the
   estimate and run record). The cost program carries the paper's fitted
   affine event model with provenance and labels estimates `calibrated` or

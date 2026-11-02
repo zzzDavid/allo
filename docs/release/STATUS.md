@@ -1,6 +1,6 @@
 # Release status
 
-Updated: 2026-11-02 (round 5). Read `TASK.md` in the containing repository,
+Updated: 2026-11-02 (round 6). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -28,51 +28,44 @@ then this file, then `ISSUES.md` for the next action.
 
 ## Verdict
 
-**NOT READY** (close). Gate judgments are in `REVIEW.md`. What still keeps
-the verdict from READY:
+**NOT READY** pending user decisions and the final hardware re-runs
+recorded below; the compiler-side blockers identified by the audits are
+closed. Gate judgments are in `REVIEW.md`. What remains:
 
-1. User decisions that are not the compiler's to make: redistribution of
-   the Samsung-derived simulator patches (P-04); whether to seek a license
-   from the DCC authors for the AttAcc evaluation scripts; committing the
-   simulator overlays and skill-doc corrections in the containing
-   repository; running the index removals in `RELEASE_CHECKLIST.md`.
-2. Movement ties are realized on Samsung only (CLAIMS row 16 partial):
-   AiM, UPMEM and APU v1 reject alternative owner maps with a stated reason,
-   and ties that split a row's reduction belong to the reduction policy and
-   are not executed anywhere.
-3. G6 gaps listed in `EVIDENCE.md` section 3 (alias cases on every backend,
-   extreme-integer execution outside UPMEM and the C backend, executed
-   two-schedule pairs on AiM/UPMEM/Gemini-II, cost perturbations traced to
-   an executed program, target-parameter variation beyond the AiM virtual
-   study).
-4. Device evidence owed: see VALIDATION.md round 5 for the APU v1 tile
-   ranking and retiled GEMM board check.
+1. User decisions: redistribution of the Samsung-derived simulator patches
+   (P-04); whether to seek a license from the DCC authors for the AttAcc
+   evaluation scripts; committing the simulator overlays and skill-doc
+   corrections in the containing repository; running the index removals in
+   `RELEASE_CHECKLIST.md`.
+2. Open minor items: C-18 (cost evaluator anomaly, xfail), M-14 (AiM
+   elementwise single-channel placement to confirm), APU v1 realizes only
+   the work-grid owner map, P-17 (proprietary UPMEM SDK, documented).
+3. Final hardware evidence at the release revision: the round 6 board and
+   card runs are recorded in `VALIDATION.md`; any later commit requires a
+   re-run before a READY verdict.
 
-## Round 5 (2026-11-02): what was done
+## Round 6 (2026-11-02): what was done
 
-- Samsung realizes movement-tie layouts whose owner bits come from the
-  output-row bits (row-to-slot placement executed by the conductor, digest
-  checked at readback; vendor program unchanged; 4 realizable ties on the
-  paper GEMV, identical cycles). Conductor overlay updated in the containing
-  repository; installed `pim_driver` rebuilt (backup kept).
-- Minor items closed: UPMEM `a*A - b*B` and `a*A + b*B + c` patterns
-  (exact on the simulator); Gemini-II out-of-range readback raises instead
-  of wrapping, padded divisor lanes hold 1, dead uint16 templates and
-  pricing removed (card test re-run: 10 passed); APU v1 template staging
-  copies only the needed GSI files with a `THIRD_PARTY.txt` record; V1-03
-  documented; AiM skill-doc geometry corrected.
-- `docs/release/EVIDENCE.md`: per-mechanism G6 evidence tables, execution
-  paths, gaps with proposed tests.
+- G6 probes (`tests/pim/test_g6_semantics.py`, `test_g6_decisions.py`,
+  board and card additions) covering aliases, extreme integers, nonzero
+  accumulators, executed schedule pairs, all-zero results, masks, strict
+  versus reassociative pairs, cost perturbations traced to execution,
+  target-parameter variation, renames with normalized decisions, op and
+  constant changes at fixed shape, composed stages, archive removal and an
+  sdist smoke test. Four silent-wrong-result defects found and fixed
+  (C-17, S-14, V1-15 and the APU v1 zero-fill disagreement).
+- Owner maps realized on UPMEM and AiM (CLAIMS row 16 now holds on three
+  of four matcher backends).
+- Multi-kernel Samsung programs execute on the simulator through the host
+  schedule (S-15); APU v1 `backend="virtual"` is analytical only.
 
 ## Next concrete actions (in order)
 
-1. Commit and push round 5 (done when this file is committed).
-2. Close the G6 gaps in `EVIDENCE.md` section 3, starting with alias cases
-   and executed two-schedule pairs on AiM and UPMEM.
-3. Realize alternative owner maps on UPMEM (row-to-DPU maps) and AiM
-   (row-to-channel maps) as Samsung now does.
-4. User decisions listed above; then re-run every suite and both hardware
-   hosts at the final revision and re-judge the gates.
+1. Commit and push round 6 (done when this file is committed).
+2. User decisions listed above.
+3. C-18 evaluator diagnosis; M-14 confirmation; APU v1 owner maps.
+4. Re-run every suite and both hardware hosts at the final revision and
+   re-judge the gates for a READY verdict.
 
 ## Round 1 (2026-11-01): what was done
 

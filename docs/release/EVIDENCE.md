@@ -354,7 +354,7 @@ Only the scalar ARC route (`APUv1Program`) compiles and runs host C.
 | c | `::test_histogram_nearby_bin_counts_compile_and_out_of_domain_rejects` (B=255 odd tail, B=64; N=16384 rejected), `::test_argmin_nearby_shapes_compile_and_out_of_domain_rejects` ((23, 11), (48, 2); D=49 rejected at 48 VMRs), `::test_moments_nearby_shapes_compile_and_out_of_domain_rejects` (16x2048, 4x4096 partial frontier; P=4095 rejected), `::test_record_frequency_nearby_shapes_compile_and_out_of_domain_rejects` (Q=127; C=14 at the writable-VR limit, C=15 rejected); `perf/test_apu_v1_tile_selection.py::test_tile_domain_is_derived_from_lanes_and_residency`; `perf/test_apu_v1_vector_compile.py::test_public_compile_generates_ranks_and_executes_four_apu_plans` (4x8x6, NumPy route). None of these shapes executes on the device | struct, exc; NP versus np FP32 | synthetic; rng(0) | V, CO; NP |
 | d | none (board lock path and PCI node env overrides are discovery, not target parameters) | | | |
 | e | `perf/test_apu_v1_scalar_surface.py::test_sqrt_is_exact_at_the_audit_failure_points` (1e10, 1e12, 1e30), `::test_sqrt_double_domain_ends_within_one_ulp[...]`, `::test_sqrt_special_values`, `::test_sqrt_random_sample_across_both_ranges` (20,000 doubles and floats, seed 20261102), `::test_scalar_program_uses_the_helper_and_matches_the_functional_route[root32|root64]` (MLIR-derived C compiled and run on the host against `np.sqrt`); `perf/test_apu_v1_recognizers.py::test_temporal_plan_accumulates_nonzero_initial_output[...]` (uint16 full-range wrap, NumPy route), `::test_nearby_semantic_changes_are_rejected[...]` (`uint32` counts rejected). No shift-width probe | HC versus `math.sqrt`/`np.sqrt`; NP versus np uint64 mod 2^16 | fixed, rng(20261102); rng(7) | HC (skips without a C compiler); NP |
-| f | `perf/test_apu_v1_recognizers.py::test_temporal_plan_accumulates_nonzero_initial_output[functional|virtual]` (`C0 + A@B` on the NumPy route; the ABI half asserts `initial_outputs == ["result"]` in the frozen host.c and skips without the GSI template), `::test_plan_without_output_ingress_rejects_nonzero_output_on_every_route` (spatial group reduction refuses a nonzero output on functional, virtual and device before launch), `::test_host_harness_reads_carried_output_image_with_exact_size`. No device execution of a nonzero carried output; the only APU v1 device GEMM test uses a zero `result` | NP versus np; struct; exc | rng(7) | NP, V, device pre-launch |
+| f | `perf/test_apu_v1_recognizers.py::test_temporal_plan_accumulates_nonzero_initial_output[functional|virtual]` (`C0 + A@B` on the functional NumPy route; the virtual route returns `kind="virtual"` and leaves the output untouched; the ABI half asserts `initial_outputs == ["result"]` in the frozen host.c and skips without the GSI template), `::test_plan_without_output_ingress_rejects_nonzero_output_on_every_route` (spatial group reduction refuses a nonzero output on functional, virtual and device before launch), `::test_host_harness_reads_carried_output_image_with_exact_size`. No device execution of a nonzero carried output; the only APU v1 device GEMM test uses a zero `result` | NP versus np; struct; exc | rng(7) | NP, V, device pre-launch |
 | g | none | | | |
 | h | Structural only: `perf/test_apu_v1_native_reductions.py::test_record_frequency_keeps_chunks_resident_and_counts_query_pairs` (queries 384 padded to 512, tail asserted zero), `perf/test_apu_v1_recognizers.py::test_moments_nearby_shapes_compile_and_out_of_domain_rejects` (padding zero); executed guard on the scalar route: `perf/test_run_result_contract.py::test_apu_v1_program_functional_executes_scalar_c_on_host` (`cumsum(where(v > 3))`) | struct; HC versus np | `arange`; fixed | V; HC |
 | i | none | | | |
@@ -580,9 +580,35 @@ documentary. Scripts live under `/tmp/tenon-release/probes/`,
 
 ## 3. Gaps
 
-Each entry names the mechanism, the G6 category, what is missing, and a
-concrete test to add. Ordered roughly by how much of the declared domain the
-gap leaves unvalidated.
+### Status after round 6
+
+The numbered list below is the gap analysis written at `d13cf08`. Round 6
+added `tests/pim/test_g6_semantics.py` (semantic probes), `tests/pim/test_g6_decisions.py`
+(decision probes), `tests/pim/apu_v1/test_g6_board_semantics.py` (board,
+`apu_v1_device`) and five card-gated tests in `tests/pim/test_apu_g2_hardware.py`,
+plus `tests/pim/test_upmem_owner_maps.py` and `tests/pim/test_aim_owner_maps.py`.
+Their effect on each gap:
+
+| Gap | Status after round 6 |
+|---|---|
+| 1 aliases | closed: source aliases rejected on every backend ("aliases its result"); same array for two parameters executes with pre-call semantics on Samsung, UPMEM, APU v1 functional and Gemini-II (card); in-place Samsung elementwise executes (defects C-17, S-14, V1-15 fixed) |
+| 2 extreme integers | closed where numerics exist: UPMEM int32 products and int64 reductions wrap as documented and k-means refuses beyond its exact bound; APU v1 uint16 wraps (functional and board); Gemini-II int4 GEMM at both range ends on the card, int8 dot needing 17 bits rejected; AiM has no numerics (documented) |
+| 3 nonzero accumulators on device paths | closed: APU v1 carried FP16 output bit-equal to the source-order model (functional and board); UPMEM and Gemini-II cases referenced |
+| 4 two schedules executed | closed: AiM SBK versus ABK simulated (cost order equals simulated order); UPMEM two pointwise decisions executed with identical outputs; Gemini-II fused versus separate BiCG on the card with identical outputs |
+| 5 cost perturbation to execution | closed for Samsung, UPMEM and APU v1 (perturbed models select different programs; both executed; the stock model's pick is faster in each case); the shared evaluator anomaly found on the way is C-18 (xfail) |
+| 6 target parameter variation | closed: Samsung 8-channel variant (grid, streams, rows per item derived; the simulator runs it, see the note in `test_g6_decisions.py`), UPMEM 32-DPU variant, AiM geometry study referenced |
+| 7 renames with decision comparison | closed for Samsung and UPMEM (renamed functions, arguments, loops and module file; identical normalized decisions and cycles) |
+| 8 op/constant change at fixed shape | closed: Samsung ADD/MUL/MAD microcode and bindings, literal coefficients rejected; UPMEM AXPBY coefficients reach the device source and execute; AiM MUL/ADD/MAC traces (compile-only) |
+| 9 composed stages executed | closed: Samsung two-kernel host program executes on the simulator (S-15); UPMEM k-means distances plus host update on the simulator with fresh inputs |
+| 10 archive removal | closed: Samsung and AiM execute with the archive variables unset; UPMEM raises naming the variables (or runs the user-build route); sdist smoke test compiles the Samsung GEMV from an unpacked sdist |
+| 11 all-zero results | closed: UPMEM, APU v1 functional and Gemini-II (card) zero results overwrite a sentinel |
+| 12 masks and guards executed | closed: APU v1 padded reduction and odd GEMM on the functional route (board-gated too); Gemini-II refuses garbage outside the layout and the typed div with garbage in padded lanes runs on the card |
+| 13 strict versus reassociative beyond Samsung | closed on APU v1 functional (strict bit-equal to source order; reassociating plan bit-equal to its tree model, within 1e-2 of FP32); board test asserts bit equality with the models |
+| 14 movement stage never changes a program | closed on Samsung, UPMEM and AiM (owner-map ties executed, see CLAIMS row 16); APU v1 still realizes only the work-grid map |
+| 15 working-tree drift | closed by the round 5 and 6 commits |
+
+The list below is kept as the record of what was missing and why each test
+was written.
 
 1. **Alias cases (i), every mechanism.** No test anywhere passes the same
    NumPy buffer as two operands, or an input aliased with the output, through
