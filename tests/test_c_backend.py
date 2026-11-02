@@ -8,8 +8,14 @@ import tempfile
 
 import allo
 import numpy as np
-from allo.backend.c import PortableCError, _portable_c11, emit_c_from_mlir
-from allo.ir.types import Int, float32, int8, int32, uint16
+import pytest
+from allo.backend.c import (
+    PortableCError,
+    WideIntegerError,
+    _portable_c11,
+    emit_c_from_mlir,
+)
+from allo.ir.types import Int, float32, int8, int32, int64, uint16
 
 
 def _syntax_check(source):
@@ -163,3 +169,114 @@ def test_portable_c_popcount_preserves_fixed_width_semantics():
         unsigned.compile()(unsigned_values),
         np.array([0, 1, 16, 8, 1, 5], dtype=np.uint16),
     )
+
+
+# --------------------------------------------------------------------------- #
+# wrap_wide_integers (audit U-02): >64-bit temporaries are kept as their low
+# 64 bits, which is exact only for ops whose low result bits depend only on
+# the operands' low bits.
+# --------------------------------------------------------------------------- #
+
+_WIDE_A = np.array([-3, -5, 7, -(1 << 40), 1 << 40, -1, 2, -(1 << 62)], dtype=np.int64)
+_WIDE_B = np.array([5, -7, 11, 1 << 30, -(1 << 30), 1 << 62, 3, 2], dtype=np.int64)
+
+
+def _wrap(value, bits):
+    value &= (1 << bits) - 1
+    return value - (1 << bits) if value >> (bits - 1) else value
+
+
+def _wide(kernel):
+    schedule = allo.customize(kernel, enable_tensor=False)
+    return emit_c_from_mlir(
+        schedule.module, schedule.top_func_name, wrap_wide_integers=True
+    )
+
+
+def test_wide_add_mul_shl_truncated_to_int32_keeps_exact_low_bits():
+    def kernel(A: int64[8], B: int64[8], C: int32[8]):
+        for i in range(8):
+            C[i] = ((A[i] * B[i] + A[i]) << 3) - B[i]
+
+    artifact = _wide(kernel)
+    assert "arith.muli" in artifact.lowered_mlir and "i128" in artifact.lowered_mlir
+    assert "uint64_t" in artifact.source
+    out = np.zeros(8, np.int32)
+    artifact.compile()(_WIDE_A.copy(), _WIDE_B.copy(), out)
+    expected = [
+        _wrap(((int(a) * int(b) + int(a)) << 3) - int(b), 32)
+        for a, b in zip(_WIDE_A, _WIDE_B)
+    ]
+    assert out.tolist() == expected
+
+
+def _wide_shift(A: int64[8], B: int64[8], C: int64[8]):
+    for i in range(8):
+        C[i] = (A[i] * B[i]) >> 8
+
+
+def _wide_compare(A: int64[8], B: int64[8], C: int64[8]):
+    for i in range(8):
+        C[i] = 1 if A[i] * B[i] < 0 else 0
+
+
+def _wide_divide(A: int64[8], B: int64[8], C: int64[8]):
+    for i in range(8):
+        C[i] = (A[i] * B[i]) // 16
+
+
+def _wide_high_bits(A: int64[8], B: int64[8], C: int64[8]):
+    for i in range(8):
+        C[i] = (A[i] * B[i]) >> 64
+
+
+@pytest.mark.parametrize(
+    "kernel, op",
+    [
+        (_wide_shift, "arith.shrsi"),
+        (_wide_compare, "arith.cmpi"),
+        (_wide_divide, "arith.floordivsi"),
+        (_wide_high_bits, "arith.shrsi"),
+    ],
+    ids=["ashr", "signed-compare", "floordiv", "high-bits"],
+)
+def test_wide_ops_that_read_high_bits_are_rejected(kernel, op):
+    with pytest.raises(WideIntegerError) as error:
+        _wide(kernel)
+    message = str(error.value)
+    assert op in message
+    assert "128-bit" in message
+    assert f"function {kernel.__name__}" in message
+    # Callers catching either the portable-C error or NotImplementedError see it.
+    assert isinstance(error.value, NotImplementedError)
+    assert isinstance(error.value, PortableCError)
+
+
+def test_kmeans_update_wide_epilogue_raises_instead_of_returning_wrong_values():
+    # Audit U-02 (p6_hostgroup): a host-placed UPMEM group's signed wide
+    # epilogue (t * scale) >> 40 went through uint64_t (logical shift of the
+    # low bits). Host-placed groups run exactly this emission
+    # (spmw_upmem.UpmemCtx._bind_module). The scale is a runtime value: an
+    # integer literal such as -(1 << 40) is currently typed i32 by the
+    # frontend and folds to 0 before the backend sees it.
+    def update(sums: int64[4, 8], scale: int64[1], C: int64[4, 8]):
+        for c in range(4):
+            for d in range(8):
+                t: int64 = sums[c, d]
+                C[c, d] = (t * scale[0]) >> 40
+
+    with pytest.raises(
+        WideIntegerError, match="arith.shrsi on a 128-bit integer in function update"
+    ):
+        _wide(update)
+
+
+def test_wide_integer_abi_is_rejected():
+    int96 = Int(96)
+
+    def kernel(a: int96[4], b: int32[4]):
+        for i in range(4):
+            b[i] = a[i]
+
+    with pytest.raises(WideIntegerError, match="96-bit integer through the ABI"):
+        _wide(kernel)

@@ -28,7 +28,16 @@ import tempfile
 import numpy as np
 
 from .._mlir.dialects import allo as allo_d
-from .._mlir.ir import Context, Location, Module, UnitAttr
+from .._mlir.ir import (
+    Context,
+    FunctionType,
+    IntegerType,
+    Location,
+    MemRefType,
+    Module,
+    TypeAttr,
+    UnitAttr,
+)
 from .._mlir.passmanager import PassManager
 from ..ir.transform import find_func_in_module
 from ..passes import (
@@ -41,6 +50,156 @@ from ..utils import get_func_inputs_outputs
 
 class PortableCError(RuntimeError):
     """Raised when lowered MLIR requires a C++/HLS-only source construct."""
+
+
+class WideIntegerError(PortableCError, NotImplementedError):
+    """An operation's result would depend on bits that ``wrap_wide_integers``
+    discards (bits 64 and above of an integer wider than 64 bits)."""
+
+
+# ``wrap_wide_integers`` stores an integer wider than 64 bits as its low 64
+# bits in ``uint64_t``. That is exact only for operations whose result's low
+# 64 bits are a function of the operands' low 64 bits. Every other operation
+# that reads or produces a wide value is rejected (``_check_wide_integers``).
+_WIDE_LOW_BITS_OPS = frozenset(
+    ("arith.addi", "arith.subi", "arith.muli", "arith.andi", "arith.ori", "arith.xori")
+)
+# Ops that only move a wide value (storage, control flow, calls, selection).
+_WIDE_TRANSPARENT_OPS = frozenset(
+    (
+        "arith.select",
+        "memref.alloc",
+        "memref.alloca",
+        "memref.dealloc",
+        "memref.load",
+        "memref.store",
+        "affine.load",
+        "affine.store",
+        "affine.for",
+        "affine.if",
+        "affine.yield",
+        "scf.for",
+        "scf.if",
+        "scf.while",
+        "scf.condition",
+        "scf.yield",
+        "func.call",
+        "func.return",
+    )
+)
+_WIDE_REASONS = {
+    "arith.shrsi": "a right shift reads bits above bit 63",
+    "arith.shrui": "a right shift reads bits above bit 63",
+    "arith.cmpi": "a comparison needs the full value",
+    "arith.divsi": "division needs the full value",
+    "arith.divui": "division needs the full value",
+    "arith.remsi": "remainder needs the full value",
+    "arith.remui": "remainder needs the full value",
+    "arith.floordivsi": "division needs the full value",
+    "arith.ceildivsi": "division needs the full value",
+    "arith.ceildivui": "division needs the full value",
+    "arith.maxsi": "a comparison needs the full value",
+    "arith.minsi": "a comparison needs the full value",
+    "arith.maxui": "a comparison needs the full value",
+    "arith.minui": "a comparison needs the full value",
+    "arith.sitofp": "conversion to floating point needs the full value",
+    "arith.uitofp": "conversion to floating point needs the full value",
+    "arith.fptosi": "a float-to-integer conversion can set bits above bit 63",
+    "arith.fptoui": "a float-to-integer conversion can set bits above bit 63",
+    "arith.shli": "the shift amount is not a constant below 64",
+    "arith.constant": "the constant does not fit 64 bits",
+}
+
+
+def _integer_width(mlir_type) -> int | None:
+    if IntegerType.isinstance(mlir_type):
+        return IntegerType(mlir_type).width
+    if MemRefType.isinstance(mlir_type):
+        return _integer_width(MemRefType(mlir_type).element_type)
+    return None
+
+
+def _wide_width(types) -> int | None:
+    widths = [width for width in map(_integer_width, types) if width and width > 64]
+    return max(widths) if widths else None
+
+
+def _constant_int(value) -> int | None:
+    owner = getattr(value.owner, "operation", value.owner)
+    if getattr(owner, "name", None) != "arith.constant":
+        return None
+    text = str(owner.attributes["value"]).split(":")[0].strip()
+    if text in ("true", "false"):
+        return int(text == "true")
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _wide_op_is_exact(operation) -> bool:
+    name = operation.name
+    if name in _WIDE_LOW_BITS_OPS or name in _WIDE_TRANSPARENT_OPS:
+        return True
+    if name in ("arith.trunci", "arith.extsi", "arith.extui"):
+        # Truncation keeps low bits. Extension from <= 64 bits is the C
+        # conversion itself; extension from a wider type changes only bits at
+        # or above the source width (> 64), so the low 64 bits are unchanged.
+        return True
+    if name == "arith.shli":
+        amount = _constant_int(operation.operands[1])
+        return amount is not None and 0 <= amount < 64
+    if name == "arith.constant":
+        value = _constant_int(operation.results[0])
+        return value is not None and -(2**63) < value < 2**63
+    return False
+
+
+def _walk_operations(block):
+    for operation in block.operations:
+        operation = operation.operation
+        yield operation
+        for region in operation.regions:
+            for inner in region.blocks:
+                yield from _walk_operations(inner)
+
+
+def _check_wide_integers(module, top_func_name: str) -> None:
+    """Reject every lowered operation that ``wrap_wide_integers`` cannot
+    emit exactly, naming the op, the width, and the enclosing function."""
+    for function in module.body.operations:
+        function = function.operation
+        if function.name != "func.func":
+            continue
+        name = str(function.attributes["sym_name"]).strip('"')
+        if name == top_func_name:
+            signature = FunctionType(TypeAttr(function.attributes["function_type"]).value)
+            width = _wide_width(list(signature.inputs) + list(signature.results))
+            if width is not None:
+                raise WideIntegerError(
+                    f"portable C cannot pass a {width}-bit integer through the ABI "
+                    f"of {name}: arguments and results must be at most 64 bits wide"
+                )
+        for region in function.regions:
+            for block in region.blocks:
+                for operation in _walk_operations(block):
+                    width = _wide_width(
+                        [value.type for value in operation.operands]
+                        + [value.type for value in operation.results]
+                    )
+                    if width is None or _wide_op_is_exact(operation):
+                        continue
+                    reason = _WIDE_REASONS.get(
+                        operation.name, "the operation is not proven to depend only "
+                        "on the low 64 bits"
+                    )
+                    raise WideIntegerError(
+                        f"portable C cannot lower {operation.name} on a {width}-bit "
+                        f"integer in function {name}: wide integers are kept as "
+                        f"their low 64 bits and {reason}. Narrow the value to a "
+                        "<= 64-bit type (for example an int64 temporary) before "
+                        "this operation."
+                    )
 
 
 _NUMPY_DTYPES = {
@@ -223,6 +382,8 @@ class MLIRToCModule:
                 ")"
             ).run(self.module.operation)
             self.lowered_mlir = str(self.module)
+            if wrap_wide_integers:
+                _check_wide_integers(self.module, top_func_name)
 
             output = io.StringIO()
             if not allo_d.emit_vhls(self.module, output):
@@ -398,5 +559,6 @@ __all__ = [
     "CompiledCModule",
     "MLIRToCModule",
     "PortableCError",
+    "WideIntegerError",
     "emit_c_from_mlir",
 ]
