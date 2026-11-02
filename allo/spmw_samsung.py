@@ -1,13 +1,24 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Samsung HBM-PIM codegen context and PIMSimulator runtime (moved from spmw_codegen)."""
+"""Samsung HBM-PIM lowering and PIMSimulator runtime.
+
+The codegen context lowers the selected placement to a per-pass CRF program
+(the words PIM blocks execute) plus a program record of the facts the
+conductor needs (reduction tiles, the bank fiber of each tile, GRF_A fill,
+rows per block, operand bindings of every CRF word).  The runtime derives the
+data placement from that record and the simulator geometry, uploads the
+emitted CRF verbatim, and reads back the drained results.  The conductor
+(``pim_driver --op GENERIC``, ``tests/TenonConductor.inc``) never regenerates
+microcode.  Contract: ``docs/release/design/samsung-execution.md``.
+"""
 
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 import tempfile
-import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .spmw_match import MatchedOp
@@ -15,13 +26,13 @@ from .spmw_target import MemoryRef, Register
 from .spmw_codegen import (
     PIMCmd,
     CodegenContext,
+    HostTrigger,
     _bank_fiber_class,
-    _parse_loop_bound,
     _bucket_by_work_id,
     _matcher_command_manifest,
+    _parse_loop_bound,
     RunResult,
     RUN_KIND_SIMULATOR,
-    RUN_KIND_SIMULATOR_TIMING_ONLY,
     SimulatorUnavailable,
     Compiled,
 )
@@ -29,95 +40,566 @@ from .spmw_simenv import pimsim_root as _pimsim_root
 from .spmw_simenv import samsung_unavailable_reason as _samsung_unavailable_reason
 
 
+# FP16 is the only element type of the Samsung PIM datapath (PIMBlock).
+_FP16_BITS = 16
+_FIBER_OF_CLASS = {"EVEN_BANK": 0, "ODD_BANK": 1}
+SAMSUNG_ELEMENTWISE_OPS = frozenset({"ADD", "MUL", "MAD", "RELU"})
+
+
+class SamsungUnsupported(NotImplementedError):
+    """A workload outside the documented Samsung lowering domain."""
+
+
+# --------------------------------------------------------------------- #
+# Target facts
+# --------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class SamsungFacts:
+    """Per-channel facts of the Samsung target that the lowering relies on."""
+
+    channels: int  # declared pseudo-channels
+    pim_blocks: int  # PIM units per pseudo-channel
+    banks: int  # banks per pseudo-channel
+    banks_per_pim: int  # bank fibers owned by one PIM unit
+    grf_a_entries: int
+    grf_b_entries: int
+    lanes: int  # FP16 lanes per GRF entry
+    crf_words: int
+
+
+def _unit_extent(target, name):
+    for unit in target._walk():
+        if unit.name == name:
+            return math.prod(unit.mapping) if unit.mapping else None
+    return None
+
+
+def samsung_target_facts(target) -> SamsungFacts:
+    """Read the lowering's geometry facts off the target tree.
+
+    Raises ValueError naming the missing declaration instead of assuming a
+    value (release audit S-09).
+    """
+    grf_a = getattr(target, "grf_a", None)
+    grf_b = getattr(target, "grf_b", None)
+    banks = getattr(target, "banks", None)
+    crf = getattr(target, "crf", None)
+    channels = _unit_extent(target, "pseudo_channel")
+    pim_blocks = _unit_extent(target, "pim")
+    missing = [
+        name
+        for name, value in (
+            ("register grf_a", grf_a),
+            ("register grf_b", grf_b),
+            ("memory banks", banks),
+            ("memory crf", crf),
+            ("unit pseudo_channel", channels),
+            ("unit pim", pim_blocks),
+        )
+        if value is None
+    ]
+    if missing:
+        raise ValueError(
+            f"target {getattr(target, 'name', None)!r} lacks the Samsung "
+            f"declarations {missing}; the lowering derives its geometry from them"
+        )
+    n_banks = getattr(banks, "banks", None)
+    crf_words = (getattr(crf, "geometry", {}) or {}).get("entries")
+    if not n_banks or n_banks % pim_blocks:
+        raise ValueError(
+            f"Samsung banks ({n_banks}) must divide evenly over {pim_blocks} PIM units"
+        )
+    if not crf_words:
+        raise ValueError("Samsung memory 'crf' must declare its word count (entries)")
+    if grf_a.width % _FP16_BITS or grf_a.width != grf_b.width:
+        raise ValueError(
+            "Samsung GRF_A/GRF_B must share a width that holds whole FP16 lanes"
+        )
+    return SamsungFacts(
+        channels=int(channels),
+        pim_blocks=int(pim_blocks),
+        banks=int(n_banks),
+        banks_per_pim=int(n_banks // pim_blocks),
+        grf_a_entries=int(grf_a.slots),
+        grf_b_entries=int(grf_b.slots),
+        lanes=int(grf_a.width // _FP16_BITS),
+        crf_words=int(crf_words),
+    )
+
+
+# --------------------------------------------------------------------- #
+# Structural operand classification (release audit S-05)
+# --------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class SamsungContraction:
+    """One work item's contraction, classified by indexing structure.
+
+    The matrix is the input indexed by the output row and the reduction axis;
+    the vector is indexed only by the reduction axis (and, for GEMM, by the
+    inner result loop that selects a column).  Source operand order does not
+    enter.
+    """
+
+    matrix_memref: str
+    vector_memref: str
+    acc_memref: str
+    matrix_role: str
+    vector_role: str
+    reduction_var: str
+    row_var: str | None  # None: one output row per work item, no row loop
+    column_var: str | None
+    K: int  # reduction trip count
+    rows_per_item: int
+    N: int  # result columns (1 for GEMV)
+    matrix_shape: tuple
+    vector_shape: tuple
+    matrix_k_axis: int  # 1: A[i, k]; 0: A[k, i]
+    vector_k_axis: int  # GEMV 0; GEMM: position of k in the vector's indices
+    row_offset: int  # first output row of this work item
+    output_memref: str
+
+    def structure(self):
+        """Everything but the row offset: identical across work items."""
+        return (
+            self.matrix_memref,
+            self.vector_memref,
+            self.acc_memref,
+            self.matrix_role,
+            self.vector_role,
+            self.K,
+            self.rows_per_item,
+            self.N,
+            self.matrix_shape,
+            self.vector_shape,
+            self.matrix_k_axis,
+            self.vector_k_axis,
+            self.output_memref,
+        )
+
+
+_MEMREF_TYPE = re.compile(r"memref<([^>]*)>")
+
+
+def _memref_dims(type_text):
+    """``memref<4096x256xf16>`` -> ((4096, 256), "f16")."""
+    m = _MEMREF_TYPE.search(type_text or "")
+    if not m:
+        return None, None
+    parts = m.group(1).split("x")
+    try:
+        return tuple(int(p) for p in parts[:-1]), parts[-1].split(",")[0].strip()
+    except ValueError:
+        return None, None
+
+
+def _split_top_level(text):
+    parts, depth, cur = [], 0, ""
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur.strip())
+    return parts
+
+
+def _affine_offset(text, var):
+    """Offset ``c`` when ``text`` is ``var`` plus a constant ``c``.
+
+    The matcher spells store indices either functionally (``add(c, var)``)
+    or infix (``var + c``); both orders are accepted."""
+    text = re.sub(r"\s+", "", text)
+    if text == var:
+        return 0
+    v, c = re.escape(var), r"(-?\d+)"
+    for pattern in (
+        rf"add\({c},{v}\)",
+        rf"add\({v},{c}\)",
+        rf"{v}\+{c}",
+        rf"{c}\+{v}",
+    ):
+        m = re.fullmatch(pattern, text)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _loop_trip(loop):
+    _var, lower, upper, step = loop
+    lo, hi = _parse_loop_bound(str(lower)), _parse_loop_bound(str(upper))
+    if lo is None or hi is None or lo != 0 or int(step) != 1:
+        return None
+    return hi
+
+
+_AFFINE_MAP = re.compile(r"affine_map<\(([^)]*)\)(?:\[[^\]]*\])?\s*->\s*\((.*)\)>")
+
+
+def _coordinates(operand):
+    """Accessed coordinates of an operand, as expressions over loop variables.
+
+    ``memref.load`` operands carry the coordinates directly (``indices``);
+    ``affine.load`` operands carry map operands plus the map, whose results
+    are the coordinates (``(d0, d1) -> (d0 + 32, d1)`` over ``[%i, %k]`` reads
+    ``[%i + 32, %k]``).  Returns None when the map cannot be read."""
+    if operand.index_map is None:
+        return [str(i) for i in operand.indices]
+    m = _AFFINE_MAP.fullmatch(operand.index_map.strip())
+    if not m or "[" in operand.index_map:
+        return None
+    dims = [d.strip() for d in m.group(1).split(",") if d.strip()]
+    if len(dims) != len(operand.indices):
+        return None
+    names = dict(zip(dims, operand.indices))
+    results = _split_top_level(m.group(2)) if m.group(2).strip() else []
+    return [
+        re.sub(r"\bd\d+\b", lambda t: names.get(t.group(0), t.group(0)), r)
+        for r in results
+    ]
+
+
+def _is_opaque(coord, loop_vars):
+    """An SSA value the matcher retains only by name (not a loop variable)."""
+    return re.fullmatch(r"%\w+", coord.strip()) is not None and coord.strip() not in loop_vars
+
+
+def samsung_contraction(match: MatchedOp) -> SamsungContraction:
+    """Classify one MAC match; raise SamsungUnsupported with the reason."""
+
+    def reject(reason):
+        raise SamsungUnsupported(
+            f"Samsung REDUCE lowering ({match.func_name}): {reason}"
+        )
+
+    if match.target_op_name != "MAC":
+        reject(f"expected a MAC match, got {match.target_op_name}")
+    if match.extra.get("accumulator_init") != "zero":
+        reject(
+            "the accumulator must be initialized to literal 0 before the reduction "
+            f"(accumulator_init={match.extra.get('accumulator_init')!r})"
+        )
+    loops = list(match.enclosing_loops)
+    if len(loops) not in (1, 2, 3):
+        reject(
+            "supported nests are [k] (one row per work item), [row, k] (GEMV) and "
+            f"[row, column, k] (GEMM); got {len(loops)} enclosing loops"
+        )
+    trips = [_loop_trip(loop) for loop in loops]
+    if any(t is None or t <= 0 for t in trips):
+        reject("every enclosing loop needs a static [0, n) range with step 1")
+    loop_vars = [loop[0] for loop in loops]
+    k = loop_vars[-1]
+    roles = match.extra.get("axis_roles") or {}
+    if tuple(roles.get("reduction") or ()) != (k,):
+        reject(
+            "the reduction must be exactly the innermost loop "
+            f"(matcher reduction axes {roles.get('reduction')!r})"
+        )
+    accs = [op for op in match.operands if op.is_loop_carried]
+    inputs = [op for op in match.operands if not op.is_loop_carried]
+    if len(accs) != 1 or len(inputs) != 2:
+        reject("expected one loop-carried accumulator and two inputs")
+    if inputs[0].memref_name == inputs[1].memref_name:
+        reject(
+            f"both inputs read {inputs[0].memref_name!r}; there is no separate "
+            "bank-resident matrix and broadcast vector"
+        )
+    coords = {}
+    for op in inputs:
+        c = _coordinates(op)
+        if c is None:
+            reject(f"cannot read the access map {op.index_map!r} of {op.memref_name!r}")
+        if [_affine_offset(x, k) for x in c].count(0) != 1:
+            reject(
+                f"input {op.memref_name!r} must read the reduction loop {k} unshifted "
+                f"in exactly one coordinate (coordinates {c})"
+            )
+        coords[op.role] = c
+    free = {
+        op.role: [x for x in coords[op.role] if _affine_offset(x, k) != 0]
+        for op in inputs
+    }
+    row_var = loop_vars[0] if len(loops) > 1 else None
+    column_var = loop_vars[1] if len(loops) == 3 else None
+    if column_var is None:
+        vectors = [op for op in inputs if not free[op.role]]
+        matrices = [op for op in inputs if len(free[op.role]) == 1]
+    else:
+        vectors = [op for op in inputs if free[op.role] == [column_var]]
+        matrices = [
+            op
+            for op in inputs
+            if len(free[op.role]) == 1 and free[op.role] != [column_var]
+        ]
+    if len(vectors) != 1 or len(matrices) != 1 or vectors[0] is matrices[0]:
+        reject(
+            "cannot tell the matrix from the vector: the matrix must be indexed by "
+            "the output row and the reduction loop, the vector only by the reduction "
+            "loop"
+            + (" and the column loop" if column_var else "")
+            + f" (coordinates: {[(op.memref_name, coords[op.role]) for op in inputs]})"
+        )
+    matrix, vector = matrices[0], vectors[0]
+    (matrix_row,) = free[matrix.role]
+    # The matrix row coordinate: the row loop plus a constant (checked against
+    # the store below), a constant, or an SSA value the matcher retains only
+    # by name (then the store row is trusted; see the design note).
+    if _is_opaque(matrix_row, loop_vars):
+        matrix_row_offset = None
+    elif row_var is not None and _affine_offset(matrix_row, row_var) is not None:
+        matrix_row_offset = _affine_offset(matrix_row, row_var)
+    elif row_var is None and re.fullmatch(r"\d+", matrix_row.strip()):
+        matrix_row_offset = int(matrix_row)
+    else:
+        reject(
+            f"the matrix row coordinate {matrix_row!r} is not the output row "
+            f"({row_var or 'a constant'}) plus a constant"
+        )
+    m_dims, m_elt = _memref_dims(matrix.memref_type)
+    v_dims, v_elt = _memref_dims(vector.memref_type)
+    _a_dims, a_elt = _memref_dims(accs[0].memref_type)
+    if not m_dims or len(m_dims) != 2 or not v_dims:
+        reject("operand memref types with static extents are required")
+    if {m_elt, v_elt, a_elt} != {"f16"}:
+        reject(
+            f"the PIM datapath is FP16 only; got matrix {m_elt}, vector {v_elt}, "
+            f"accumulator {a_elt}"
+        )
+    matrix_k_axis = [_affine_offset(x, k) for x in coords[matrix.role]].index(0)
+    vector_k_axis = [_affine_offset(x, k) for x in coords[vector.role]].index(0)
+    K = trips[-1]
+    if K > m_dims[matrix_k_axis] or K > v_dims[vector_k_axis]:
+        reject(f"reduction loop {K} exceeds the operand extents")
+    sinks = match.extra.get("output_sinks") or []
+    if len(sinks) != 1:
+        reject(f"expected one store of the accumulator, got {sinks!r}")
+    output_memref, sink_text = sinks[0]
+    dims = _split_top_level(sink_text)
+    if len(dims) != (1 if column_var is None else 2):
+        reject(f"store index {sink_text!r} does not match the loop nest")
+    if row_var is None:
+        row_offset = int(dims[0]) if re.fullmatch(r"\d+", dims[0].strip()) else None
+    else:
+        row_offset = _affine_offset(dims[0], row_var)
+    if row_offset is None or row_offset < 0:
+        reject(
+            f"store row index {dims[0]!r} is not the row loop "
+            f"({row_var or 'none'}) plus a constant"
+        )
+    if matrix_row_offset is not None and matrix_row_offset != row_offset:
+        reject(
+            f"the matrix row coordinate {matrix_row!r} and the store row "
+            f"{dims[0]!r} differ"
+        )
+    if column_var is not None and dims[1].strip() != column_var:
+        reject(f"store column index {dims[1]!r} is not the column loop {column_var}")
+    return SamsungContraction(
+        matrix_memref=matrix.memref_name,
+        vector_memref=vector.memref_name,
+        acc_memref=accs[0].memref_name,
+        matrix_role=matrix.role,
+        vector_role=vector.role,
+        reduction_var=k,
+        row_var=row_var,
+        column_var=column_var,
+        K=K,
+        rows_per_item=trips[0] if row_var is not None else 1,
+        N=trips[1] if column_var is not None else 1,
+        matrix_shape=tuple(m_dims),
+        vector_shape=tuple(v_dims),
+        matrix_k_axis=matrix_k_axis,
+        vector_k_axis=vector_k_axis,
+        row_offset=row_offset,
+        output_memref=output_memref,
+    )
+
+
+def samsung_contraction_roles(matches) -> SamsungContraction:
+    """Classify every MAC of one work item group; all must agree structurally."""
+    macs = [m for m in matches if m.target_op_name == "MAC"]
+    if not macs:
+        raise SamsungUnsupported("Samsung REDUCE lowering: no MAC in the work item")
+    by_item = {}
+    for m in macs:
+        by_item.setdefault(tuple(m.work_id), []).append(m)
+    if any(len(v) != 1 for v in by_item.values()):
+        raise SamsungUnsupported(
+            "Samsung REDUCE lowering supports one contraction per work item"
+        )
+    classified = [samsung_contraction(m) for m in macs]
+    first = classified[0]
+    if any(c.structure() != first.structure() for c in classified[1:]):
+        raise SamsungUnsupported(
+            "Samsung REDUCE lowering: work items differ in contraction structure"
+        )
+    return first
+
+
+@dataclass(frozen=True)
+class SamsungElementwise:
+    """One elementwise op over a 1-D FP16 extent, proven elementwise."""
+
+    op: str
+    input_memrefs: tuple  # in fn-signature role order (x, y[, z])
+    input_roles: tuple
+    output_memref: str
+    n: int
+
+
+def samsung_elementwise(matches) -> SamsungElementwise:
+    """Classify an elementwise trace; raise SamsungUnsupported with the reason.
+
+    Domain: one work item whose single loop walks every element of 1-D FP16
+    operands of one extent, every input and the store indexed by that loop
+    variable.  Partitioned forms index through opaque expressions the matcher
+    does not retain, so elementwise-ness could not be proven; they are
+    rejected rather than assumed.
+    """
+    if len(matches) != 1:
+        raise SamsungUnsupported(
+            f"Samsung elementwise lowering needs one work item whose loop walks the "
+            f"whole extent (got {len(matches)} matches); a partitioned work grid "
+            "indexes elements through expressions the lowering cannot prove "
+            "elementwise"
+        )
+    (m,) = matches
+    op = m.target_op_name
+    if op not in SAMSUNG_ELEMENTWISE_OPS:
+        raise SamsungUnsupported(f"Samsung elementwise lowering: unsupported op {op}")
+
+    def reject(reason):
+        raise SamsungUnsupported(f"Samsung elementwise {op} ({m.func_name}): {reason}")
+
+    if len(m.enclosing_loops) != 1:
+        reject("expected exactly one enclosing loop over the elements")
+    n = _loop_trip(m.enclosing_loops[0])
+    var = m.enclosing_loops[0][0]
+    if n is None:
+        reject("the element loop needs a static [0, n) range with step 1")
+    identity = (None, "affine_map<(d0) -> (d0)>")
+    inputs = [o for o in m.operands if not o.is_loop_carried]
+    if any(o.is_loop_carried for o in m.operands):
+        reject("an elementwise op cannot carry an accumulator")
+    for o in inputs:
+        dims, elt = _memref_dims(o.memref_type)
+        if o.indices != [var] or o.index_map not in identity:
+            reject(
+                f"input {o.memref_name!r} is not indexed by the element loop {var} "
+                f"(index {o.indices}); a partitioned work grid indexes elements "
+                "through expressions the lowering cannot prove elementwise, so write "
+                "one work item whose loop walks the whole extent"
+            )
+        if dims != (n,) or elt != "f16":
+            reject(f"input {o.memref_name!r} must be a 1-D FP16 buffer of {n} elements")
+    if list(m.extra.get("store_indices") or []) != [var] or m.result_memref_name is None:
+        reject(f"the result must be stored at the element loop index {var}")
+    if len({o.memref_name for o in inputs}) != len(inputs):
+        reject("one buffer bound to several inputs is not supported")
+    return SamsungElementwise(
+        op=op,
+        input_memrefs=tuple(o.memref_name for o in inputs),
+        input_roles=tuple(o.role for o in inputs),
+        output_memref=m.result_memref_name,
+        n=n,
+    )
+
+
+# --------------------------------------------------------------------- #
+# Codegen context
+# --------------------------------------------------------------------- #
+
+
+@dataclass
+class SamsungProgram:
+    """One lowered kernel: CRF word range plus what the conductor needs."""
+
+    kind: str  # "REDUCE" | "ELTWISE"
+    group_id: int
+    start: int
+    end: int
+    # (pc relative to start, binding kind, bank fiber, operand, column offset)
+    binds: tuple
+    facts: SamsungFacts
+    crf_issue: str
+    work_items: int
+    contraction: SamsungContraction | None = None
+    rows: int = 0  # logical output rows covered by the work items
+    k_tiles: int = 0
+    tile_fiber: tuple = ()
+    rows_per_block: int = 0
+    vector_from_bank: bool = False
+    weight_resident: bool = True
+    elementwise: SamsungElementwise | None = None
+    swap_parity: tuple = ()
+    lever_record: dict = field(default_factory=dict)
+
+
+def _infeasible(message):
+    from .pim.schedule_search import InfeasibleSchedule
+
+    return InfeasibleSchedule(f"Samsung: {message}")
+
+
 class SamsungCtx(CodegenContext):
-    """Codegen ctx for Samsung HBM-PIM.
+    """Codegen context for Samsung HBM-PIM.
 
-    Translates Tenon `Register` / `MemoryRef` handles into Samsung's
-    `PIMOpdType` enum names (as strings), infers the is_auto column-
-    strobe flag from operand shapes, and accumulates the result as a
-    `list[PIMCmd]`.
-
-    Recognized opcodes: "MAC", "MUL", "ADD", "MAD", "MOV", "FILL",
-    "NOP", "JUMP", "EXIT" — i.e. the `PIMCmdType` enum from PIMCmd.h.
+    Translates Tenon `Register` / `MemoryRef` handles into PIMSimulator
+    `PIMOpdType` names and lowers each kernel to a per-pass CRF program
+    (`emit_program`).  Every instruction is produced by the target's own
+    op/move `emit` callbacks; this class decides which ones, in which order,
+    and the loop counts, from the placement and the target facts.
     """
 
     _REG_TO_OPD = {"grf_a": "GRF_A", "grf_b": "GRF_B"}
 
     def __init__(self, target):
         super().__init__(target)
-        # Host-move bookkeeping (spec 001 D5): the host-scope moves' `emit`
-        # closures (`host_broadcast`/`host_scatter`/`host_gather`/`program_crf`)
-        # append `(hook, device_handle)` records here -- parallel to `cmds`,
-        # consumed by the cost model for `host_staging`, NOT by the driver argv
-        # (Q2 option a: the driver keeps doing the transfer; these moves carry
-        # cost + operand-role only). Empty for every cell that does not yet
-        # express `host_xfer.*`.
+        # Host-move bookkeeping: the host-scope moves' `emit` closures append
+        # `(hook, device_handle)` records here. The conductor performs the
+        # transfers; these records carry cost and operand-role information.
         self.host_moves_emitted: list[tuple[str, object]] = []
+        self.programs: list[SamsungProgram] = []
 
     # ------------------------------------------------------------------ #
-    # Host-transfer ctx hooks (spec 001 D5). These are bookkeeping hooks the
-    # host-scope moves' `emit` closures call; none emit a compute `PIMCmd`.
-    # The driver still performs the real preload/readback over PIM_REG_RA, so
-    # the cmd stream that reaches `programCrf` is unchanged.
+    # Host-transfer hooks (no compute PIMCmd)
     # ------------------------------------------------------------------ #
 
     def drain(self, dst=None, src0=None):
-        """GRF->bank writeback as a NOP+WRITE column-command drain.
-
-        ISA-1.0 forbids a bank dst with a GRF src (PIMCmd.cpp:73-97), so this
-        is NOT a `MOV ODD_BANK<-GRF_B`. The proven drain (PIMRank.cpp:474-487,
-        samsung-pim-isa.md) is a `NOP` in the CRF stream; the conductor issues
-        the WRITE column command host-side. Emitting the NOP form directly means
-        the run-side `_crf_valid` filter (which strips the rejected MOV) now
-        finds nothing to drop -- resolving the SPEC-005 §8 followup. We keep the
-        canonical eight-cycle pipe hold (`NOP` plus loopCounter 7).  The
-        faithful GEMV conductor passes this emitted stream directly to
-        ``programCrf``; omitting the hold produces an invalid drain schedule.
-        """
-        self.cmds.append(PIMCmd(type_="NOP", loopCounter_=7))
+        """GRF->bank writeback as a NOP hold; the conductor issues the WRITE
+        column commands (ISA 1.0 forbids MOV bank<-GRF, PIMCmd.cpp:73-97).
+        The hold covers every GRF entry, one write each."""
+        entries = getattr(src0, "slots", None) or self.target.grf_b.slots
+        self.cmds.append(PIMCmd(type_="NOP", loopCounter_=int(entries) - 1))
 
     def program_crf(self, crf_handle):
-        """Record that the <=32-word CRF microcode is uploaded for this group.
-
-        Host upload bookkeeping (the `STAGE_CRF` carrier); it does NOT emit a
-        compute `PIMCmd`. The CRF is already conveyed via `--cmds` (ELTWISE) or
-        the REDUCE minimal `--crf`, so this is a no-op on the cmd stream.
-        """
+        """Record the CRF upload (no compute PIMCmd)."""
         self.host_moves_emitted.append(("program_crf", crf_handle))
 
     def host_broadcast(self, handle):
-        """Record a host->device broadcast (GRF_A/GRF_B/SRF). Bookkeeping +
-        operand-role tag; the driver performs the HAB broadcast."""
+        """Record a host->device broadcast (GRF_A/GRF_B/SRF)."""
         self.host_moves_emitted.append(("broadcast", handle))
 
     def host_scatter(self, handle):
-        """Record a host->device per-bank scatter (the weight preload)."""
+        """Record a host->device per-bank scatter."""
         self.host_moves_emitted.append(("scatter", handle))
 
     def host_gather(self, handle):
-        """Record a device->host gather (the output readback)."""
+        """Record a device->host gather."""
         self.host_moves_emitted.append(("gather", handle))
 
-    def _fiber_stride(self):
-        """Bank fiber count (= banks-per-pim stride) for the active placement,
-        read from the carried `LinearLayout`'s segment axis (D3) or the
-        materialised fiber list, else `None` (the index's own coefficient is
-        used). The layout object is load-bearing: it is what determined how
-        many fibers the bank axis was swizzled into."""
-        pl = self._active_placement
-        if pl is None:
-            return None
-        layout = getattr(pl, "layout", None)
-        axis = (getattr(pl, "extra", {}) or {}).get("fiber_axis")
-        if layout is not None and axis is not None:
-            try:
-                return layout.size_of(axis)
-            except Exception:
-                pass
-        fibers = (getattr(pl, "extra", {}) or {}).get("fibers")
-        if fibers:
-            return len(fibers)
-        return None
+    # ------------------------------------------------------------------ #
+    # Operand encoding
+    # ------------------------------------------------------------------ #
 
     def _opd(self, handle):
         """Return (opd_name, idx) for a Tenon handle, or ("A_OUT", 0)."""
@@ -132,32 +614,29 @@ class SamsungCtx(CodegenContext):
                 )
             return (opd, 0)
         if isinstance(handle, MemoryRef):
-            # The bank-class name comes from the `range(stride)` fiber walk
-            # (SPEC-022 D3). `stride` is read off the carried LinearLayout's
-            # segment (fiber) axis when one is present; otherwise it is the
-            # index's own coefficient (self-describing). The F2 layout object,
-            # not a pattern matcher, is what determined the fiber geometry.
-            stride = self._fiber_stride()
-            cls = _bank_fiber_class(handle.idx, stride)
+            cls = _bank_fiber_class(handle.idx)
             if cls is None:
                 raise NotImplementedError(
-                    f"SamsungCtx: memref index {handle.idx!r} is not the "
-                    "canonical stride*pid + r fiber form. Real layout "
-                    "decisions are the autoscheduler's job (Blocker 4)."
+                    f"SamsungCtx: memref index {handle.idx!r} is not the canonical "
+                    "stride*pid + r fiber form."
                 )
             return (cls, 0)
         raise NotImplementedError(
             f"SamsungCtx: unknown handle type {type(handle).__name__}."
         )
 
-    def cmd(self, name, dst=None, src0=None, src1=None, is_relu=0):
+    def cmd(self, name, dst=None, src0=None, src1=None, src2=None, is_relu=0):
         dst_name, dst_idx = self._opd(dst)
         src0_name, src0_idx = self._opd(src0)
         src1_name, src1_idx = self._opd(src1)
-        # Samsung's "is_auto" column-strobe modifier: set when src1 is
-        # bank-shaped (the bank stream is read in burst mode while the
-        # GRF source stays put). Inferred per report 16 §"is_auto".
-        is_auto = 1 if isinstance(src1, MemoryRef) else 0
+        src2_name, _src2_idx = self._opd(src2)
+        # Auto mode: an arithmetic op that streams a bank operand walks the
+        # GRF entries by column address (PIMRank::readOpd).  FILL is always
+        # auto in hardware and carries no flag.
+        is_auto = int(
+            name in ("MAC", "ADD", "MUL", "MAD")
+            and any(isinstance(s, MemoryRef) for s in (src0, src1, src2))
+        )
         self.cmds.append(
             PIMCmd(
                 type_=name,
@@ -167,21 +646,16 @@ class SamsungCtx(CodegenContext):
                 src0Idx_=src0_idx,
                 src1_=src1_name,
                 src1Idx_=src1_idx,
+                src2_=src2_name,
                 isAuto_=is_auto,
                 isRelu_=is_relu,
             )
         )
 
     # Read-only roles emit LD only; read-write roles emit LD + ST.
-    # `acc` starts at 0 in the GEMV workload IR so its LD half is a
-    # zero-init, not a real memory move -- see spec 009 §E rule 3.
-    # TODO(task-015): revisit when accumulators carry across calls.
     _ROLE_IS_READ_ONLY = {"x": True, "y": True, "acc": False, "dst": False}
 
     def resolve_moves(self, role, src_handle=None, dst_handle=None):
-        # dst_handle is the placement-side handle. For Samsung that's
-        # either grf_a / grf_b (LD/ST target) or a bank-shaped MemoryRef
-        # (in-place; no LD/ST needed).
         if isinstance(dst_handle, MemoryRef):
             return (None, None)
         if isinstance(dst_handle, Register):
@@ -191,242 +665,490 @@ class SamsungCtx(CodegenContext):
                 ld, st = "LD_B", "ST_B"
             else:
                 return (None, None)
-            read_only = self._ROLE_IS_READ_ONLY.get(role, False)
-            if read_only:
+            if self._ROLE_IS_READ_ONLY.get(role, False):
                 return (ld, None)
-            # acc carries no prior value in the GEMV workload IR; emit
-            # only the storeback for now (see spec 009 §E rule 3).
             if role == "acc":
                 return (None, st)
             return (ld, st)
         return (None, None)
 
     def resolve_spill_moves(self, tier, home_handle, *, n_entries=1):
-        # Samsung spills to a bank row. The LD/ST pair keys off the home
-        # register side (grf_a -> LD_A/ST_A, grf_b -> LD_B/ST_B) -- the
-        # same `side` switch the spill cost factory prices.
         if tier != "bank_row":
             return super().resolve_spill_moves(tier, home_handle, n_entries=n_entries)
         if isinstance(home_handle, Register) and home_handle.name == "grf_b":
             return ("LD_B", "ST_B")
         return ("LD_A", "ST_A")
 
-    # Active placement + resolved bindings for the current match, set by
-    # `_walk_and_emit` before each compute emit. Default None keeps the
-    # single-fiber path (no dual-fiber state) unchanged.
-    _active_placement = None
-    _active_bindings = None
+    # ------------------------------------------------------------------ #
+    # Program lowering
+    # ------------------------------------------------------------------ #
 
-    def after_match(self, match, n_emitted):
-        # Inner-K JUMP -- the loop counter is computed off the
-        # just-emitted MAC body, so the call must stay inside the
-        # work-id window between compute and storeback.
-        placement = self._active_placement
-        fibers = tuple(getattr(placement, "extra", {}).get("fibers", ()))
-        if placement is not None and len(fibers) > 1 and match.target_op_name == "MAC":
-            self._emit_dual_fiber_jumps(match, n_emitted)
+    def _emit_move(self, name):
+        move = self.target.move(name)
+        if move.emit is None:
+            raise NotImplementedError(f"Samsung move {name!r} has no emit callback")
+        move.emit(self)
+
+    def _emit_jump(self, loop_counter, loop_offset):
+        """JUMP back `loop_offset - 1` words, taken `loop_counter` times."""
+        if loop_counter <= 0:
             return
-        _emit_inner_loop_jump(match, self, n_emitted)
+        self._emit_move("JUMP")
+        self.cmds[-1].loopCounter_ = int(loop_counter)
+        self.cmds[-1].loopOffset_ = int(loop_offset)
 
-    def _emit_dual_fiber_jumps(self, match, n_emitted):
-        """Materialise the alternating (JUMP even, MAC odd, JUMP odd, ...)
-        tail for a dual-fiber MAC.
+    def emit_program(self, trace, layouts, *, schedule=None, host_moves=(), module=None):
+        from .spmw_autoschedule import (
+            _bucket_for_autoschedule,
+            _matcher_placement_decision,
+            _matcher_search_scope,
+            _matcher_work_scope,
+            derive_layout_properties,
+        )
+        from .spmw_match import MatchTrace
 
-        The walker already emitted the canonical MAC against the EVEN
-        fiber (`placements[y]`). Here we close fiber 0's inner loop with
-        its split JUMP, then for each later fiber emit one MAC (same
-        dst/src0, src1 = that fiber's bank handle so `_bank_fiber_class`
-        stamps the per-fiber bank class) followed by its own split JUMP. Trip
-        counts come from `inner_ub // lanes` split across the fibers — no
-        shape literal. This walks `range(n_fibers)`, so it already generalizes
-        to a stride>2 fiber count with no structural change (SPEC-022 D3).
-        """
-        if not match.enclosing_loops:
-            return
-        ub = _parse_loop_bound(match.enclosing_loops[-1][2])
-        if ub is None:
-            return
-        folded = ub // _samsung_lane_burst(self)
-        fibers = self._active_placement.extra.get("fibers", [])
-        n_fibers = len(fibers)
-        if n_fibers <= 1:
-            _emit_inner_loop_jump(match, self, n_emitted)
-            return
-        split = _fiber_fold_split(folded, n_fibers)
+        layout_by_scope = {
+            scope: layout
+            for (scope, _matches), layout in zip(_bucket_for_autoschedule(trace), layouts)
+        }
+        groups: dict = {}
+        for work_id, matches in _bucket_by_work_id(trace):
+            group_id = _matcher_work_scope(matches[0]).group_id
+            groups.setdefault(group_id, []).append((work_id, matches))
 
-        bindings = self._active_bindings or {}
-        mac_dst = bindings.get("acc")
-        mac_src0 = bindings.get("x")
-
-        def emit_jump(trips):
-            # First MAC of the fiber is iteration 0; JUMP loops the rest.
-            loop_counter = trips - 1
-            if loop_counter <= 0:
-                return
-            self.cmds.append(
-                PIMCmd(
-                    type_="JUMP",
-                    loopCounter_=loop_counter,
-                    loopOffset_=n_emitted + 1,
+        for group_id, buckets in groups.items():
+            group_layouts = [
+                layout_by_scope[_matcher_search_scope(matches[0])]
+                for _work_id, matches in buckets
+            ]
+            for layout in group_layouts:
+                layout.extra = derive_layout_properties(self.target, layout)
+            issues = {
+                (layout.extra or {}).get("crf_issue", "per_workid")
+                for layout in group_layouts
+            }
+            if not issues <= {"shared", "per_workid"} or len(issues) != 1:
+                raise _infeasible(
+                    f"matcher group {group_id} has CRF issue decisions {sorted(issues)}"
                 )
+            (issue,) = issues
+            # The PIM blocks of a pseudo-channel execute one CRF in lockstep, so
+            # every work item of the kernel runs the same program.
+            keys = {
+                _matcher_placement_decision(
+                    MatchTrace(trace.target_name, trace.module_name, matches=matches),
+                    layout,
+                )
+                for (_w, matches), layout in zip(buckets, group_layouts)
+            }
+            if len(keys) != 1:
+                raise _infeasible(
+                    f"matcher group {group_id} assigns distinct placements to work "
+                    "items that share one lockstep CRF"
+                )
+            if issue == "per_workid" and len(buckets) > 1:
+                raise _infeasible(
+                    f"crf_issue=per_workid concatenates {len(buckets)} per-work-item "
+                    "bodies into one CRF, but the 8 PIM blocks of a pseudo-channel "
+                    "execute that CRF in lockstep (PIMRank::doPIM), so every block "
+                    "would run every body; only a one-work-item kernel can issue "
+                    "its CRF per work item"
+                )
+            ops = {m.target_op_name for _w, matches in buckets for m in matches}
+            if ops == {"MAC"}:
+                program = self._emit_reduce(group_id, buckets, group_layouts[0], issue)
+            elif len(ops) == 1 and ops <= SAMSUNG_ELEMENTWISE_OPS:
+                program = self._emit_eltwise(group_id, buckets, group_layouts[0], issue)
+            else:
+                raise SamsungUnsupported(
+                    f"Samsung lowering: kernel group {group_id} mixes ops {sorted(ops)}; "
+                    "a kernel is one contraction or one elementwise op"
+                )
+            self.programs.append(program)
+            if issue == "shared":
+                for work_id, matches in buckets:
+                    self.host_schedule.append(
+                        HostTrigger(
+                            work_id, sum(1 for m in matches if m.target_op_name == "MAC")
+                        )
+                    )
+
+    def _check_unrealized_levers(self, layout):
+        extra = layout.extra or {}
+        tile = extra.get("tile")
+        if tile is not None and not getattr(tile, "is_identity", True):
+            raise _infeasible("the Samsung lowering does not realize a non-identity tile")
+        if extra.get("double_buffer"):
+            raise _infeasible("the Samsung lowering has no double-buffer pair")
+
+    def _fiber_handles(self, layout, base_handle):
+        """Bank handles of the placement's fibers, ordered by fiber index."""
+        fibers = list((layout.extra or {}).get("fibers") or [base_handle])
+        indexed = []
+        for handle in fibers:
+            if not isinstance(handle, MemoryRef):
+                raise _infeasible(f"fiber handle {handle!r} is not a bank")
+            cls = _bank_fiber_class(handle.idx)
+            if cls not in _FIBER_OF_CLASS:
+                raise _infeasible(
+                    f"bank fiber class {cls!r} has no PIMSimulator operand encoding"
+                )
+            indexed.append((_FIBER_OF_CLASS[cls], handle))
+        if len({f for f, _h in indexed}) != len(indexed):
+            raise _infeasible("a placement names the same bank fiber twice")
+        return indexed
+
+    def _emit_reduce(self, group_id, buckets, layout, issue):
+        target = self.target
+        facts = samsung_target_facts(target)
+        contractions = [samsung_contraction_roles(matches) for _w, matches in buckets]
+        rep = contractions[0]
+        if any(c.structure() != rep.structure() for c in contractions):
+            raise SamsungUnsupported(
+                "Samsung REDUCE lowering: work items differ in contraction structure"
+            )
+        # Row coverage (S-10): the work items' store ranges must partition the
+        # matrix rows; the conductor computes and gathers every row.
+        rows_total = rep.matrix_shape[1 - rep.matrix_k_axis]
+        spans = sorted((c.row_offset, c.rows_per_item) for c in contractions)
+        cursor = 0
+        for offset, count in spans:
+            if offset != cursor:
+                raise ValueError(
+                    f"Samsung REDUCE: the {len(spans)} work items store output rows "
+                    f"{spans[0][0]}..{spans[-1][0] + spans[-1][1] - 1} with a gap or "
+                    f"overlap at row {cursor} (next item starts at {offset}); the "
+                    "work grid must partition the output rows exactly"
+                )
+            cursor += count
+        if cursor != rows_total:
+            raise ValueError(
+                f"Samsung REDUCE: the work items cover {cursor} output rows but the "
+                f"matrix {rep.matrix_memref!r} has {rows_total}; the device would "
+                "overwrite rows the program leaves untouched. Make the work grid "
+                "(mapping x rows per item) cover every row"
             )
 
-        # Fiber 0: the EVEN MAC the walker already emitted; just its JUMP.
-        emit_jump(split[0])
-        # Fibers 1..n-1: MAC against the fiber's bank handle, then JUMP.
-        for i in range(1, n_fibers):
-            self.cmd("MAC", dst=mac_dst, src0=mac_src0, src1=fibers[i])
-            emit_jump(split[i])
+        self._check_unrealized_levers(layout)
+        handles = layout.placements
+        matrix_h = handles.get(rep.matrix_memref)
+        vector_h = handles.get(rep.vector_memref)
+        acc_h = handles.get(rep.acc_memref)
+        if acc_h is not target.grf_b:
+            raise _infeasible("the MAC accumulator must live in GRF_B")
+        if isinstance(matrix_h, Register):
+            raise _infeasible(
+                "grf_staged places the matrix in a GRF; a non-auto MAC reads fixed GRF "
+                "entries (src0Idx/src1Idx), so its JUMP loop would repeat one product "
+                "instead of walking the reduction, and a per-entry program needs more "
+                f"than the {facts.crf_words}-word CRF"
+            )
+        if not isinstance(matrix_h, MemoryRef):
+            raise _infeasible("the matrix must be bank-resident")
+        if vector_h is not target.grf_a:
+            raise _infeasible("the broadcast vector must be placed in GRF_A")
+        if facts.grf_b_entries != facts.grf_a_entries:
+            raise _infeasible("auto-mode MAC needs equal GRF_A and GRF_B depths")
+
+        fibers = self._fiber_handles(layout, matrix_h)
+        E, L, G = facts.grf_a_entries, facts.lanes, facts.grf_b_entries
+        T = math.ceil(rep.K / (E * L))
+        tile_fiber = tuple(fibers[t % len(fibers)][0] for t in range(T))
+        residency = (layout.extra or {}).get("grf_residency", {}) or {}
+        vector_from_bank = residency.get(rep.vector_memref, "crf") != "host"
+        mac = target.op("MAC")
+
+        start = len(self.cmds)
+        binds = []
+        for fiber_index, (fiber, handle) in enumerate(fibers):
+            tiles = [t for t in range(T) if t % len(fibers) == fiber_index]
+            if not tiles:
+                continue
+            if vector_from_bank:
+                # One JUMP register: loops cannot nest, so each tile gets its
+                # own FILL + MAC row loop.
+                for _tile in tiles:
+                    binds.append((len(self.cmds) - start, "vector", 0, -1, 0))
+                    self._emit_move("LD_A")
+                    binds.append((len(self.cmds) - start, "matrix", fiber, -1, 0))
+                    mac.emit(vector_h, handle, acc_h, self)
+                    self._emit_jump(G - 1, 2)
+            else:
+                binds.append((len(self.cmds) - start, "matrix", fiber, -1, 0))
+                mac.emit(vector_h, handle, acc_h, self)
+                self._emit_jump(G * len(tiles) - 1, 2)
+        binds.append((len(self.cmds) - start, "drain", 1, -1, 0))
+        self._emit_move("ST_B")
+        self.cmds.append(PIMCmd(type_="EXIT"))
+        words = len(self.cmds) - start
+        if words > facts.crf_words:
+            raise _infeasible(
+                f"the per-pass program needs {words} CRF words; the CRF holds "
+                f"{facts.crf_words}"
+            )
+        extra = layout.extra or {}
+        return SamsungProgram(
+            kind="REDUCE",
+            group_id=group_id,
+            start=start,
+            end=len(self.cmds),
+            binds=tuple(binds),
+            facts=facts,
+            crf_issue=issue,
+            work_items=len(buckets),
+            contraction=rep,
+            rows=rows_total,
+            k_tiles=T,
+            tile_fiber=tile_fiber,
+            rows_per_block=G,
+            vector_from_bank=vector_from_bank,
+            weight_resident=bool(extra.get("stage_resident", False)),
+            lever_record={
+                "mode": layout.mode,
+                "fibers": len(fibers),
+                "grf_residency": dict(residency),
+                "crf_issue": issue,
+                "stage_resident": bool(extra.get("stage_resident", False)),
+                "residency": extra.get("residency"),
+            },
+        )
+
+    def _register_moves(self):
+        """Structural load/drain moves of a PIM unit: which register each
+        loads from which bank fiber, and which register drains to which."""
+        loads, drains = {}, {}
+        for unit in self.target._walk():
+            if unit.name != "pim":
+                continue
+            for move in unit.moves.values():
+                src, dst = move.src, move.dst
+                if isinstance(src, MemoryRef) and isinstance(dst, Register):
+                    cls = _bank_fiber_class(src.idx)
+                    if cls in _FIBER_OF_CLASS:
+                        loads[dst.name] = (move.name, _FIBER_OF_CLASS[cls])
+                elif isinstance(src, Register) and isinstance(dst, MemoryRef):
+                    cls = _bank_fiber_class(dst.idx)
+                    if cls in _FIBER_OF_CLASS:
+                        drains[_FIBER_OF_CLASS[cls]] = (move.name, src)
+        return loads, drains
+
+    def _emit_eltwise(self, group_id, buckets, layout, issue):
+        target = self.target
+        facts = samsung_target_facts(target)
+        all_matches = [m for _w, matches in buckets for m in matches]
+        el = samsung_elementwise(all_matches)
+        self._check_unrealized_levers(layout)
+        handles = layout.placements
+        anchor = handles.get(el.input_memrefs[1]) if len(el.input_memrefs) > 1 else None
+        anchor = anchor if isinstance(anchor, MemoryRef) else None
+        fibers = self._fiber_handles(layout, anchor)
+        if sorted(f for f, _h in fibers) != [0, 1]:
+            raise _infeasible(
+                "elementwise programs stream both bank fibers of every PIM unit "
+                "(the flat all-bank operand layout)"
+            )
+        loads, drains = self._register_moves()
+        op = target.op(el.op)
+        E = facts.grf_a_entries
+        start = len(self.cmds)
+        binds = []
+        swap = [False] * len(el.input_memrefs)
+        for fiber, bank in fibers:
+            if fiber not in drains:
+                raise _infeasible(f"no move drains a register to bank fiber {fiber}")
+            st_name, dest = drains[fiber]
+            ld_name, ld_fiber = loads.get(dest.name, (None, None))
+            if ld_name is None or ld_fiber != fiber:
+                raise _infeasible(
+                    f"register {dest.name} drains to fiber {fiber} but is not loaded from it"
+                )
+            pc = lambda: len(self.cmds) - start  # noqa: E731
+            if el.op == "RELU":
+                # The target's RELU is a non-auto MOV with the relu flag; one
+                # word per GRF entry covers a tile.
+                for entry in range(E):
+                    binds.append((pc(), "input", fiber, 0, entry))
+                    op.emit(bank, dest, self)
+                    self.cmds[-1].dstIdx_ = entry
+            else:
+                binds.append((pc(), "input", fiber, 0, 0))
+                self._emit_move(ld_name)
+                other = None
+                if el.op == "MAD":
+                    other = target.grf_b if dest is target.grf_a else target.grf_a
+                    o_name, o_fiber = loads.get(other.name, (None, None))
+                    if o_name is None:
+                        raise _infeasible(f"no move loads register {other.name}")
+                    # The addend reaches the other register through its own
+                    # load move, i.e. from the other fiber: store it with the
+                    # fibers exchanged so that read returns this half's elements.
+                    swap[2] = o_fiber != fiber
+                    binds.append((pc(), "input", o_fiber, 2, 0))
+                    self._emit_move(o_name)
+                binds.append((pc(), "input", fiber, 1, 0))
+                if el.op == "MAD":
+                    op.emit(dest, bank, other, dest, self)
+                else:
+                    op.emit(dest, bank, dest, self)
+            binds.append((pc(), "drain", fiber, -1, 0))
+            self._emit_move(st_name)
+        self.cmds.append(PIMCmd(type_="EXIT"))
+        words = len(self.cmds) - start
+        if words > facts.crf_words:
+            raise _infeasible(
+                f"the elementwise program needs {words} CRF words; the CRF holds "
+                f"{facts.crf_words}"
+            )
+        return SamsungProgram(
+            kind="ELTWISE",
+            group_id=group_id,
+            start=start,
+            end=len(self.cmds),
+            binds=tuple(binds),
+            facts=facts,
+            crf_issue=issue,
+            work_items=len(buckets),
+            elementwise=el,
+            swap_parity=tuple(swap),
+            lever_record={"mode": layout.mode, "crf_issue": issue},
+        )
 
     def runtime_route(self, commands) -> tuple[str, tuple]:
-        return (
-            _samsung_runtime_route(commands),
-            (_matcher_command_manifest(_samsung_main_runtime_commands(commands)),),
-        )
+        return (_samsung_runtime_route(commands), (_matcher_command_manifest(commands),))
 
 
-def _samsung_lane_burst(ctx) -> int:
-    """Samsung GRF lane count read from the target geometry.
+def samsung_vendor_gemv_layout(target, trace) -> list:
+    """Placements, one per work-item bucket, whose emitted program is the
+    vendor GEMV CRF of PIMSimulator/PIMLibrary.
 
-    Each MAC consumes this many fp16 elements per K-iteration, so the
-    inner-K loop folds `K` MACs into `K // lanes`. Sourced from
-    `target.grf_a.lanes` (the report-16 target spec, `lanes=8`); no
-    shape literal.
+    That is ``dual_fiber`` (reduction tiles alternate between the even and
+    odd bank of each PIM unit), host-broadcast GRF_A fill, one shared CRF,
+    matrix staged once.  Pass it as ``allo.compile(..., layout=...)`` to pin
+    the vendor-equivalent program (the paper's Samsung comparison rows); the
+    default compile instead selects by cost.  Raises SamsungUnsupported when
+    the trace is not a single-kernel contraction.
     """
-    return ctx.target.grf_a.lanes
+    from .spmw_autoschedule import _bucket_for_autoschedule, _samsung_enumerate
+    from .spmw_knobs import reset_active_liveness, set_active_liveness
 
-
-def _fiber_fold_split(folded: int, n_fibers: int) -> list[int]:
-    """Round-robin split of `folded` burst-tiles across `n_fibers` banks.
-
-    Fiber `i` gets `ceil` for the first `folded % n_fibers` fibers and
-    `floor` after, so the busier fiber stays bounded (matches the cost
-    model's ceil `per_fiber`). For folded=128, n=2 -> [64, 64]; for an
-    odd folded=127, n=2 -> [64, 63].
-    """
-    return [(folded + (n_fibers - 1 - i)) // n_fibers for i in range(n_fibers)]
-
-
-def _emit_inner_loop_jump(
-    match: MatchedOp, ctx: CodegenContext, n_emitted: int
-) -> None:
-    """Append a Samsung-style JUMP that folds the innermost reduction
-    loop.
-
-    Loop counter is `(inner_ub // lanes) - 1` (the first MAC counts as
-    iteration 0; JUMP loops back the rest). Loop offset is the number of
-    instructions that comprise one iteration body — i.e. `n_emitted` for
-    the compute ops the match emitted, plus 1 for the JUMP itself.
-    """
-    if not match.enclosing_loops:
-        return
-    inner = match.enclosing_loops[-1]
-    ub = _parse_loop_bound(inner[2])
-    if ub is None:
-        return
-    loop_counter = ub // _samsung_lane_burst(ctx) - 1
-    if loop_counter <= 0:
-        return
-    ctx.cmds.append(
-        PIMCmd(
-            type_="JUMP",
-            loopCounter_=loop_counter,
-            loopOffset_=n_emitted + 1,
-        )
+    buckets = _bucket_for_autoschedule(trace)
+    if not buckets or len({_scope[0] for _scope, _m in buckets}) != 1:
+        raise SamsungUnsupported("the vendor GEMV layout needs a single-kernel trace")
+    token = set_active_liveness(None)
+    try:
+        candidates = _samsung_enumerate(target, buckets[0][1])
+    finally:
+        reset_active_liveness(token)
+    for candidate in candidates:
+        extra = candidate.extra
+        fills = set((extra.get("grf_residency") or {}).values())
+        if (
+            candidate.mode.split("+")[0] == "dual_fiber"
+            and fills == {"host"}
+            and extra.get("crf_issue") == "shared"
+            and not extra.get("stage_resident")
+        ):
+            return [candidate] * len(buckets)
+    raise SamsungUnsupported(
+        "the trace has no dual_fiber + host-fill + shared-CRF candidate"
     )
 
 
-def _is_samsung_storeback_mov(c: PIMCmd) -> bool:
-    """A bank<-GRF store MOV that closes a work-id (the `ST_A`/`ST_B`
-    storeback). `acc -> grf_b` is never host-eligible (lever 2), so this
-    MOV is always present and is the residency-robust work-id delimiter."""
-    if c.type_ not in ("MOV", "FILL"):
-        return False
-    bank_dst = c.dst_ in ("EVEN_BANK", "ODD_BANK")
-    grf_src = any(s in ("GRF_A", "GRF_B") for s in (c.src0_, c.src1_))
-    return bank_dst and grf_src
+def _samsung_runtime_route(commands) -> str:
+    op_types = {c.type_ for c in commands if isinstance(c, PIMCmd)}
+    if "MAC" in op_types:
+        return "GENERIC_REDUCE"
+    return "GENERIC_ELTWISE"
 
 
-def _split_samsung_layers(cmds: list[PIMCmd]) -> list[list[PIMCmd]]:
-    """Group a flat Samsung GEMV cmd stream into per-layer (work-id)
-    chunks, closed by the storeback MOV that ends each work-id.
+def _write_samsung_cmds(path: Path, cmds) -> None:
+    """Serialise PIMCmds to the line format `pim_driver --crf` reads."""
+    Path(path).write_text(_samsung_cmds_text(cmds))
 
-    NOTE (SPEC-05, 2026-06-30): the legacy multi-layer GEMV RUN path that consumed
-    this was deleted. It is KEPT because the layer-split + FFN cost-model tests
-    (test_samsung_loop_012, test_samsung_multi_layer_split) assert its behaviour;
-    it is a pure cmd-stream analysis helper (no run-path coupling).
 
-    A layer body is `[LD MOV?, (MAC, JUMP)+, ST MOV]`; under lever 1 the
-    `(MAC, JUMP)` part repeats once per bank fiber (so we must NOT split
-    at JUMP), and under lever 2 the opening LD MOV is *absent* for
-    host-resident preloads -- so the preload MOV is no longer a reliable
-    boundary. The storeback MOV (`acc -> grf_b -> bank`, never
-    host-eligible) always closes a work-id, so we split *after* it.
-    Trailing setup/terminator (NOP/EXIT) with no MAC attaches to the
-    last group; groups with no MAC are dropped.
-    """
-    groups: list[list[PIMCmd]] = []
-    cur: list[PIMCmd] = []
+def _samsung_cmds_text(cmds) -> str:
+    lines = []
     for c in cmds:
-        cur.append(c)
-        if _is_samsung_storeback_mov(c) and any(g.type_ == "MAC" for g in cur):
-            # This storeback closes the current work-id's body.
-            groups.append(cur)
-            cur = []
-    if cur:
-        if groups and not any(g.type_ == "MAC" for g in cur):
-            groups[-1].extend(cur)
-        else:
-            groups.append(cur)
-    return [g for g in groups if any(c.type_ == "MAC" for c in g)]
+        parts = [c.type_]
+        for field_name, key in (
+            ("dst_", "dst"),
+            ("src0_", "src0"),
+            ("src1_", "src1"),
+            ("src2_", "src2"),
+        ):
+            value = getattr(c, field_name)
+            if value != "A_OUT":
+                parts.append(f"{key}={value}")
+        for field_name, key in (
+            ("loopCounter_", "loop_counter"),
+            ("loopOffset_", "loop_offset"),
+            ("isAuto_", "is_auto"),
+            ("dstIdx_", "dst_idx"),
+            ("src0Idx_", "src0_idx"),
+            ("src1Idx_", "src1_idx"),
+            ("isRelu_", "is_relu"),
+        ):
+            value = getattr(c, field_name)
+            if value:
+                parts.append(f"{key}={value}")
+        lines.append(" ".join(parts))
+    return "\n".join(lines) + "\n"
 
 
-def _write_samsung_cmds(path: Path, cmds: list[PIMCmd]) -> None:
-    """Serialise a list of PIMCmd to the line-delimited format pim_driver
-    accepts via `--cmds`. See `_run_samsung` docstring for the grammar.
-    """
-    with open(path, "w") as f:
-        for c in cmds:
-            parts = [c.type_]
-            # Only emit fields that differ from PIMCmd's default ctor so
-            # the trace stays human-greppable.
-            if c.dst_ != "A_OUT":
-                parts.append(f"dst={c.dst_}")
-            if c.src0_ != "A_OUT":
-                parts.append(f"src0={c.src0_}")
-            if c.src1_ != "A_OUT":
-                parts.append(f"src1={c.src1_}")
-            if c.src2_ != "A_OUT":
-                parts.append(f"src2={c.src2_}")
-            if c.loopCounter_:
-                parts.append(f"loop_counter={c.loopCounter_}")
-            if c.loopOffset_:
-                parts.append(f"loop_offset={c.loopOffset_}")
-            if c.isAuto_:
-                parts.append(f"is_auto={c.isAuto_}")
-            if c.dstIdx_:
-                parts.append(f"dst_idx={c.dstIdx_}")
-            if c.src0Idx_:
-                parts.append(f"src0_idx={c.src0Idx_}")
-            if c.src1Idx_:
-                parts.append(f"src1_idx={c.src1Idx_}")
-            if c.isRelu_:
-                parts.append(f"is_relu={c.isRelu_}")
-            f.write(" ".join(parts) + "\n")
+# --------------------------------------------------------------------- #
+# Runtime
+# --------------------------------------------------------------------- #
 
 
-def _samsung_num_pim_blocks(compiled) -> int:
-    """Inner `pim`-unit fanout (num PIM blocks per pseudo-channel) for the
-    Samsung tile-size derivation. Read off the unit tree's innermost mapping
-    factor (8 for the canonical fixture); falls back to 8 when unavailable so
-    elems_per_tile never collapses to a sub-tile size."""
-    try:
-        factors, _ = compiled.target.work_grid()
-        if factors:
-            return factors[-1]
-    except Exception:  # noqa: BLE001
-        pass
-    return 8
+_GEOMETRY_CACHE: dict = {}
+
+
+def samsung_simulator_geometry(root: Path) -> dict:
+    """Ask the conductor for the simulated geometry (`pim_driver --describe`)."""
+    driver = Path(root) / "pim_driver"
+    stat = driver.stat()
+    key = (str(driver), stat.st_mtime_ns, stat.st_size)
+    if key in _GEOMETRY_CACHE:
+        return dict(_GEOMETRY_CACHE[key])
+    proc = subprocess.run(
+        [str(driver), "--describe"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    m = re.search(r"PIM_GEOMETRY (.*)", proc.stdout)
+    if proc.returncode != 0 or not m:
+        raise RuntimeError(
+            f"{driver} does not report its geometry (`--describe`); rebuild it from "
+            "experiments/simulators/setup/PIMSimulator (see its README). Output: "
+            + (proc.stdout + proc.stderr)[-400:]
+        )
+    geometry = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", m.group(1))}
+    _GEOMETRY_CACHE[key] = geometry
+    return dict(geometry)
+
+
+def _check_geometry(facts: SamsungFacts, geometry: dict) -> None:
+    expected = {
+        "pim_blocks": facts.pim_blocks,
+        "grf_a": facts.grf_a_entries,
+        "grf_b": facts.grf_b_entries,
+        "lanes": facts.lanes,
+        "crf_words": facts.crf_words,
+        "banks": facts.banks,
+    }
+    mismatched = {
+        key: (value, geometry.get(key))
+        for key, value in expected.items()
+        if geometry.get(key) != value
+    }
+    if mismatched:
+        raise RuntimeError(
+            "PIMSimulator geometry disagrees with the Samsung target "
+            f"(target, simulator): {mismatched}"
+        )
 
 
 def _samsung_outbin_error(out_path, what, need, have, driver_log):
@@ -439,713 +1161,402 @@ def _samsung_outbin_error(out_path, what, need, have, driver_log):
     )
 
 
-def _samsung_read_generic_outbin(out_path, n, driver_log=""):
-    """Flat fp16 readback for the GENERIC (ELTWISE) interpreter path: read `n`
-    fp16 elements from out.bin, NO reduce-sum (unlike the REDUCE readback's
-    per-element 16-lane tree reduction). Returns {"out": <fp32 array>}; an
-    all-zero array is a valid result. Raises RuntimeError when out.bin is
-    absent or holds fewer than `n` elements."""
+def _samsung_read_bursts(out_path, nbursts, what, driver_log=""):
+    """Read `nbursts` 16-lane FP16 bursts; an all-zero blob is a valid result.
+    Raises RuntimeError when the file is absent or short."""
     import numpy as np
 
     p = Path(out_path)
-    need = int(n) * np.dtype(np.float16).itemsize
+    need = int(nbursts) * 16 * np.dtype(np.float16).itemsize
     if not p.exists():
-        raise _samsung_outbin_error(p, "GENERIC", need, None, driver_log)
+        raise _samsung_outbin_error(p, what, need, None, driver_log)
     have = p.stat().st_size
     if have < need:
-        raise _samsung_outbin_error(p, "GENERIC", need, have, driver_log)
-    raw = np.fromfile(str(p), dtype=np.float16)
-    return {"out": raw[: int(n)].astype(np.float32)}
+        raise _samsung_outbin_error(p, what, need, have, driver_log)
+    return np.fromfile(str(p), dtype=np.float16)[: int(nbursts) * 16].reshape(-1, 16)
 
 
-# SPEC-04: the PIMSimulator physical fabric row-tile = num_total_pim_blocks_ *
-# num_grfB_ = (64 channels * 8 PIM blocks) * 8 GRF_B = 4096. preloadGemv packs the
-# weight assuming M is a multiple of this (the y-loop strides output_tile_size =
-# num_grfB_*num_total_pim_blocks_); an M below it underfills the GRF_B slots and
-# reads OOB weight rows. The REDUCE run path pads A's rows up to this multiple
-# (zeros) and slices the real M back from the readback. It is a PIMSimulator
-# config constant (NUM_PIM_BLOCKS=8, 64 chans hardcoded in pim_driver make_kernel,
-# NUM_GRF=8), not a workload literal.
-_SAMSUNG_FABRIC_ROW_TILE = 4096
-
-
-def _samsung_reduce_row_tiling(rows: int) -> tuple[int, int, int]:
-    """Return ``(padded_rows, rows_per_tile, num_tiles)`` for REDUCE.
-
-    The GENERIC conductor interprets ``out_rows`` as a *per-tile* extent and
-    multiplies it by ``num_tiles`` for readback.  Keeping the logical/padded
-    total in ``out_rows`` therefore over-drains every multi-tile GEMV.
-    """
-    rows = int(rows)
-    if rows <= 0:
-        raise ValueError("Samsung REDUCE row count must be positive")
-    rows_per_tile = _SAMSUNG_FABRIC_ROW_TILE
-    num_tiles = (rows + rows_per_tile - 1) // rows_per_tile
-    return rows_per_tile * num_tiles, rows_per_tile, num_tiles
-
-# SPEC-04: pad the reduction extent K up to a multiple of this so computeGemv's
-# input-tile split (num_input_tiles = ceil(ceil(K/16)/8)) yields >= 2 tiles and
-# engages both even and odd banks. K below 256 (num_input_tiles==1) degenerates:
-# the odd bank's JUMP counter underflows and getResultColGemv's end_col collapses,
-# leaving the output undrained. 256 elems = 16 bursts = 2 input tiles. Zero-padding
-# K leaves A@B unchanged.
-_SAMSUNG_REDUCE_K_TILE = 256
-
-
-def _samsung_reduce_partition(compiled, inputs):
-    """SPEC-05 §2.1: derive the MAPPING-DRIVEN partition for a GENERIC_REDUCE run.
-
-    Returns `(ROWS, n_workids, K, N, M_real)`:
-      - ROWS      = per-PE output-row slice = bound(MAC enclosing_loops[-3]) for a
-                    3-deep slice nest [i(ROWS), j(N), k(K)], or [-2] for a 2-deep
-                    GEMV slice [i(ROWS), k(K)]. This is the partition primitive --
-                    it tracks `mapping` (a different mapping -> a different ROWS).
-      - n_workids = number of MAC work-id buckets = the realized PE count
-                    (= prod(mapping) once the dataflow expander materializes the
-                    grid). Cross-checked against target.work_grid()[1].
-      - K, N      = contraction / output-col loop bounds.
-      - M_real    = the true logical output rows = the operand A.shape[0] (the
-                    un-padded P); M_logical = ROWS * n_workids is the partition's
-                    total (>= M_real when the grid over-covers, e.g. P<128).
-
-    The PARTITION (ROWS, n_workids) is the trace's, NOT operand-shape tiling:
-    partition flows mapping -> trace -> codegen. Operand arrays still supply data
-    + the ground-truth K/N for the zero-pad. Returns None when no MAC match.
-    """
-    import numpy as np
-
-    trace = getattr(compiled, "trace", None)
-    if trace is None:
-        return None
-    macs = [m for m in trace.matches if m.target_op_name == "MAC"]
-    if not macs or not macs[0].enclosing_loops:
-        return None
-    mac = macs[0]
-    depth = len(mac.enclosing_loops)
-    K = _parse_loop_bound(mac.enclosing_loops[-1][2])
-    if K is None:
-        return None
-    if depth >= 3:
-        ROWS = _parse_loop_bound(mac.enclosing_loops[-3][2])
-        N = _parse_loop_bound(mac.enclosing_loops[-2][2])
-    elif depth == 2:
-        ROWS = _parse_loop_bound(mac.enclosing_loops[-2][2])
-        N = 1
-    else:
-        ROWS, N = 1, 1
-    if ROWS is None or N is None:
-        return None
-
-    # n_workids = MAC work-id bucket count (the realized PE grid). Cross-check
-    # against the declared grid; warn (gap-1 discipline), do not raise.
-    buckets = [
-        b
-        for b in _bucket_by_work_id(trace)
-        if any(m.target_op_name == "MAC" for m in b[1])
+def _plan_header(kind, facts, geometry):
+    return [
+        "tenon_samsung_plan v1",
+        f"kind {kind}",
+        f"channels {geometry['channels']}",
+        f"pim_blocks {facts.pim_blocks}",
+        f"grf_a {facts.grf_a_entries}",
+        f"grf_b {facts.grf_b_entries}",
+        f"lanes {facts.lanes}",
+        f"crf_words {facts.crf_words}",
     ]
-    n_workids = len(buckets)
+
+
+def _plan_binds(program):
+    return [
+        f"bind {pc} {kind} {bank} {operand} {offset}"
+        for pc, kind, bank, operand, offset in program.binds
+    ]
+
+
+def samsung_reduce_plan(program: SamsungProgram, geometry: dict, columns: int,
+                        weight_resident: bool | None = None) -> dict:
+    """Physical plan of a REDUCE program on the simulated geometry.
+
+    Rows are packed into slots ((pass * channels + channel) * blocks + block)
+    * rows_per_block + entry in row order; the work grid is a logical
+    partition and this packing is the backend's fixed placement policy.
+    """
+    facts = program.facts
+    C, P, G = geometry["channels"], facts.pim_blocks, program.rows_per_block
+    E, L = facts.grf_a_entries, facts.lanes
+    passes = math.ceil(program.rows / (C * P * G))
+    resident = program.weight_resident if weight_resident is None else weight_resident
+    lines = _plan_header("REDUCE", facts, geometry) + [
+        f"out_tiles {passes}",
+        f"k_tiles {program.k_tiles}",
+        "tile_fiber " + " ".join(str(f) for f in program.tile_fiber),
+        f"rows_per_block {G}",
+        f"vector_from_bank {int(program.vector_from_bank)}",
+        f"columns {columns}",
+        f"weight_resident {int(bool(resident))}",
+    ] + _plan_binds(program)
+    return {
+        "text": "\n".join(lines) + "\n",
+        "passes": passes,
+        "slots": passes * C * P * G,
+        "padded_k": program.k_tiles * E * L,
+        "weight_resident": bool(resident),
+    }
+
+
+def samsung_eltwise_plan(program: SamsungProgram, geometry: dict) -> dict:
+    facts = program.facts
+    C = geometry["channels"]
+    tile_elements = C * facts.banks * facts.grf_a_entries * facts.lanes
+    tiles = math.ceil(program.elementwise.n / tile_elements)
+    bursts = tiles * tile_elements // facts.lanes
+    row_bursts = C * facts.banks * geometry["cols_per_row"]
+    rows_per_operand = math.ceil(bursts / row_bursts)
+    n_inputs = len(program.elementwise.input_memrefs)
+    if (n_inputs + 1) * rows_per_operand > geometry["rows"]:
+        raise ValueError(
+            f"Samsung elementwise operands of {program.elementwise.n} elements need "
+            f"{(n_inputs + 1) * rows_per_operand} DRAM rows; a bank has {geometry['rows']}"
+        )
+    input_rows = [k * rows_per_operand for k in range(n_inputs)]
+    lines = _plan_header("ELTWISE", facts, geometry) + [
+        f"tiles {tiles}",
+        f"inputs {n_inputs}",
+        "input_rows " + " ".join(str(r) for r in input_rows),
+        "input_swap_parity " + " ".join(str(int(s)) for s in program.swap_parity),
+        f"output_row {n_inputs * rows_per_operand}",
+    ] + _plan_binds(program)
+    return {
+        "text": "\n".join(lines) + "\n",
+        "tiles": tiles,
+        "padded_n": tiles * tile_elements,
+    }
+
+
+def _invoke_conductor(root, argv, what):
     try:
-        declared = compiled.target.work_grid()[1]
-        if n_workids != declared:
-            warnings.warn(
-                f"Samsung REDUCE partition: trace has {n_workids} MAC work-id "
-                f"buckets but target.work_grid() declares {declared} PEs; using "
-                f"the trace count (mapping-driven).",
-                stacklevel=2,
-            )
-    except Exception:  # noqa: BLE001
-        pass
-    if n_workids <= 0:
-        n_workids = 1
-
-    # M_real (the un-padded logical rows) from the operand; cross-check vs the
-    # partition product (ROWS * n_workids) -- a mismatch beyond the grid pad is
-    # advisory (the operand may legitimately be padded to the grid by the harness).
-    a = inputs.get("A")
-    if a is None:
-        a = inputs.get("a")
-    M_real = None
-    if a is not None:
-        a = np.asarray(a)
-        if a.ndim == 2:
-            M_real = int(a.shape[0])
-    M_logical = int(ROWS) * int(n_workids)
-    if M_real is None:
-        M_real = M_logical
-    elif M_real > M_logical:
-        warnings.warn(
-            f"Samsung REDUCE partition: operand rows {M_real} exceed the grid "
-            f"partition ROWS*n_workids = {ROWS}*{n_workids} = {M_logical}; the "
-            f"grid under-covers the operand (check mapping/ROWS).",
-            stacklevel=2,
+        proc = subprocess.run(
+            argv, capture_output=True, cwd=str(root), timeout=1800, check=False
         )
-    return (int(ROWS), int(n_workids), int(K), int(N), int(M_real))
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise RuntimeError(f"Samsung pim_driver {what} invocation failed: {exc}") from exc
+    combined = proc.stdout.decode("utf-8", "replace") + proc.stderr.decode(
+        "utf-8", "replace"
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Samsung pim_driver {what} failed (rc={proc.returncode}): "
+            + combined[-1200:]
+        )
+    m = re.search(
+        r"PIM_CYCLES total=(\d+) preload=(\d+) exec=(\d+) readback=(\d+)", combined
+    )
+    if not m:
+        raise RuntimeError(f"Samsung pim_driver {what} reported no cycles: {combined[-600:]}")
+    receipt = re.search(r"TENON_CONDUCTOR (.*)", combined)
+    conductor = (
+        {k: (int(v) if v.isdigit() else v) for k, v in re.findall(r"(\w+)=(\S+)", receipt.group(1))}
+        if receipt
+        else {}
+    )
+    phases = {
+        "preload": int(m.group(2)),
+        "exec": int(m.group(3)),
+        "readback": int(m.group(4)),
+    }
+    return int(m.group(1)), phases, conductor, combined
 
 
-def _samsung_read_reduce_outbin(out_path, M, N, m_pad, driver_log=""):
-    """SPEC-04 §4.3: REDUCE readback. The driver writes M_pad*N partial-sum bursts
-    (16 lanes each), drained N-pass-major: pass n's M_pad outputs, then pass n+1's.
-    So the blob reshapes (N, M_pad, 16) -> sum the 16 lanes -> (N, M_pad) -> .T ->
-    (M_pad, N) -> slice [:M, :N]. For GEMV (N==1) this collapses to (M,). An
-    all-zero result is a valid result. Raises RuntimeError when out.bin is absent
-    or shorter than the M_pad*N*16 fp16 partials the drain must write.
-    Surfaces "out" (GEMM, (M, N)) or "y" (GEMV, (M,)) so the harness finds it."""
+_REDUCE_TIMING_SCOPE = (
+    "PIMSimulator memory-clock cycles of the executed padded program on the "
+    "simulated system: matrix (and, for CRF-filled GRF_A, vector) preload, "
+    "CRF upload, all passes with their GRF_A fills, and readback of the "
+    "drained partial sums. Excludes host padding, the host 16-lane tree "
+    "reduction and row un-permutation."
+)
+_ELTWISE_TIMING_SCOPE = (
+    "PIMSimulator memory-clock cycles of the executed padded program: operand "
+    "preload, CRF upload, one pass per tile, and output readback. Excludes "
+    "host padding."
+)
+
+
+def _samsung_run_reduce(compiled, program, crf_words, root, geometry, matrix, vectors,
+                        weight_resident=None):
+    """Execute one REDUCE program for `vectors` (N, K) and return the result
+    rows (N, M), cycles, phases, plan and conductor receipt."""
     import numpy as np
 
-    p = Path(out_path)
-    need = m_pad * N * 16
-    need_bytes = need * np.dtype(np.float16).itemsize
-    if not p.exists():
-        raise _samsung_outbin_error(p, "REDUCE", need_bytes, None, driver_log)
-    have = p.stat().st_size
-    if have < need_bytes:
-        raise _samsung_outbin_error(p, "REDUCE", need_bytes, have, driver_log)
-    raw = np.fromfile(str(p), dtype=np.float16)
-    partials = raw[:need].reshape(-1, 16).astype(np.float32).sum(axis=1)  # (N*m_pad,)
-    grid = partials.reshape(N, m_pad).T[:M, :N]  # (M, N)
-    if N == 1:
-        return {"y": grid.reshape(-1)}
-    return {"out": grid}
-
-
-def _samsung_run_reduce_driver(weight, vec, M, K, N):
-    """SPEC-04 cross-stage core: run ONE GENERIC REDUCE contraction `weight @ vec`
-    on real PIMSimulator and return `(readback_ndarray, cycles)`.
-
-    `weight` is the (M, K) bank-resident operand (already transposed by the caller
-    for an A^T stage); `vec` is the (K,) GEMV input or (K, N) GEMM second operand.
-    Pads K to a multiple of 256 and M to the fabric row-tile (zeros, leaving the
-    contraction unchanged), runs the driver, tree-reduces the 16-lane partial sums,
-    and slices [:M, :N]. Returns `(C, cycles)` where C is (M,) for N==1 else (M, N).
-    Raises `SimulatorUnavailable` when the driver cannot run and RuntimeError
-    when the driver reports no cycles or out.bin is absent or truncated. This is
-    the reusable engine behind both the single-stage GENERIC_REDUCE run path and
-    `samsung_reduce_chain` (multi-stage threading)."""
-    import numpy as np
-
-    reason = _samsung_unavailable_reason()
-    if reason is not None:
-        raise SimulatorUnavailable("samsung_hbm_pim", reason)
-    root = _pimsim_root()
-    driver = root / "pim_driver"
-
-    M, K, N = int(M), int(K), int(N)
-    weight = np.asarray(weight, dtype=np.float16).reshape(M, K)
-    if N > 1:
-        second = np.asarray(vec, dtype=np.float16).reshape(K, N)
-    else:
-        second = np.asarray(vec, dtype=np.float16).reshape(K, 1)
-
-    k_tile = _SAMSUNG_REDUCE_K_TILE
-    k_pad = ((K + k_tile - 1) // k_tile) * k_tile
-    if k_pad != K:
-        w_k = np.zeros((M, k_pad), dtype=np.float16)
-        w_k[:, :K] = weight
-        weight = w_k
-        s_k = np.zeros((k_pad, second.shape[1]), dtype=np.float16)
-        s_k[:K] = second
-        second = s_k
-    m_pad, rows_per_tile, num_tiles = _samsung_reduce_row_tiling(M)
-    w_pad = np.zeros((m_pad, k_pad), dtype=np.float16)
-    w_pad[:M] = weight
-    k_bursts = ((k_pad // 16) + 7) // 8
-
+    facts = program.facts
+    c = program.contraction
+    M, K = program.rows, c.K
+    N = int(vectors.shape[0])
+    plan = samsung_reduce_plan(program, geometry, N, weight_resident)
+    slots, Kp = plan["slots"], plan["padded_k"]
+    weight = np.zeros((slots, Kp), dtype=np.float16)
+    weight[:M, :K] = matrix
+    vec = np.zeros((N, Kp), dtype=np.float16)
+    vec[:, :K] = vectors
     with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
-        a_path = td_path / "A.npy"
-        b_path = td_path / "B.npy"
-        out_path = td_path / "out.bin"
-        crf_path = td_path / "reduce.crf"
-        np.save(a_path, w_pad)
-        np.save(b_path, second)
-        # The REDUCE path rebuilds the canonical GEMV CRF internally (matched JUMP
-        # counters), but the driver's GENERIC parser still requires a non-empty
-        # CRF. Supply a minimal MAC body; its JUMP counter is inert for REDUCE.
-        crf_path.write_text(
-            "MAC dst=GRF_B src0=GRF_A src1=EVEN_BANK is_auto=1\n"
-            "JUMP loop_counter=0 loop_offset=2\n"
-            "MAC dst=GRF_B src0=GRF_A src1=ODD_BANK is_auto=1\n"
-            "JUMP loop_counter=0 loop_offset=2\n"
-            "MOV dst=ODD_BANK src0=GRF_B\n"
-        )
+        td = Path(td)
+        a_path, b_path, out_path = td / "A.npy", td / "B.npy", td / "out.bin"
+        crf_path, plan_path = td / "crf.txt", td / "plan.txt"
+        np.save(a_path, weight)
+        np.save(b_path, vec)
+        crf_text = _samsung_cmds_text(crf_words)
+        crf_path.write_text(crf_text)
+        plan_path.write_text(plan["text"])
         argv = [
-            str(driver),
-            "--op",
-            "GENERIC",
-            "--op-kind",
-            "REDUCE",
-            "--crf",
-            str(crf_path),
-            "--out",
-            str(out_path),
-            "--inputs",
-            f"{a_path},{b_path}",
-            "--out-rows",
-            str(rows_per_tile),
-            "--out-cols",
-            str(N),
-            "--reduce-k",
-            str(k_pad),
-            "--num-tiles",
-            str(num_tiles),
-            "--bank-type",
-            "ALL",
-            "--roles",
-            f"A:0:0:2:0:0:0:{k_bursts},B:0:0:2:0:0:0:0,out:0:0:1:1:0:8:0",
+            str(Path(root) / "pim_driver"),
+            "--op", "GENERIC",
+            "--op-kind", "REDUCE",
+            "--plan", str(plan_path),
+            "--crf", str(crf_path),
+            "--inputs", f"{a_path},{b_path}",
+            "--out", str(out_path),
         ]
-        try:
-            proc = subprocess.run(
-                argv, capture_output=True, cwd=str(root), timeout=600, check=False
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(
-                f"Samsung pim_driver REDUCE invocation failed: {exc}"
-            ) from exc
-        combined = proc.stdout.decode("utf-8", "replace") + proc.stderr.decode(
-            "utf-8", "replace"
+        cycles, phases, conductor, log = _invoke_conductor(root, argv, "REDUCE")
+        bursts = _samsung_read_bursts(out_path, N * slots, "REDUCE", log)
+    # Host reduction of the 16 lane partial sums (the regrouping the paper
+    # permits), then slot -> row (rows occupy slots in order).
+    sums = bursts.astype(np.float32).sum(axis=1).reshape(N, slots)[:, :M]
+    issued = slots * Kp
+    return {
+        "rows": sums,
+        "cycles": cycles,
+        "phases": phases,
+        "plan": plan,
+        "crf": crf_text,
+        "conductor": conductor,
+        "log": log,
+        "logical_shape": {"rows": M, "reduction": K, "columns": N},
+        "padded_shape": {"rows": slots, "reduction": Kp, "columns": N},
+        "padding_fraction": 1.0 - (M * K) / issued,
+    }
+
+
+def _program_of(compiled) -> SamsungProgram:
+    ctx = getattr(compiled, "layout_ctx", None)
+    programs = list(getattr(ctx, "programs", ()) or ())
+    if not programs:
+        raise RuntimeError(
+            "compiled Samsung artifact carries no lowered program record; compile "
+            "it with allo.compile / compile_for_target"
         )
-        m = re.search(r"PIM_CYCLES total=(\d+)", combined)
-        if not m:
-            raise RuntimeError(
-                "Samsung REDUCE driver missing PIM_CYCLES; tail: " + combined[-400:]
-            )
-        cycles = int(m.group(1))
-        outputs = _samsung_read_reduce_outbin(out_path, M, N, m_pad, combined)
-    arr = outputs.get("out")
-    if arr is None:
-        arr = outputs.get("y")
-    return np.asarray(arr), cycles
+    if len(programs) != 1:
+        raise NotImplementedError(
+            f"Samsung execution runs one kernel per artifact; this one has "
+            f"{len(programs)} kernels (multi-kernel Samsung programs are compile-only)"
+        )
+    return programs[0]
 
 
-def run_samsung_reduce(weight, vec, M, K, N):
-    """Public entry for the harness cross-stage chain: run one Samsung GENERIC
-    REDUCE contraction `weight @ vec` and return `(readback_ndarray, cycles)`.
-    See `_samsung_run_reduce_driver`. The caller owns the numpy reference and any
-    host pre/post-pass (alpha/beta, transpose, centering)."""
-    return _samsung_run_reduce_driver(weight, vec, M, K, N)
-
-
-def execute_host_schedule_samsung(schedule, dev_inputs):
-    """Execute an analyzed host schedule on Samsung HBM-PIM (the run-path hook).
-
-    `schedule` is a `spmw_host_program.HostSchedule`; `dev_inputs` maps each
-    external-input buffer name to its float16 device array. Runs one
-    `run_samsung_reduce` per group -- a **batched (coalesced) group preloads its
-    resident weight ONCE** and stacks its B input vectors as the N=B columns of a
-    single contraction (the `P + B*(E+R)` schedule); a singleton group is a plain
-    contraction at its own N. Threads each group's real device readback forward
-    so a later group can consume a device-resident intermediate.
-
-    Returns `(dev, total_cycles)` where `dev` maps every buffer name to its
-    device value. Driver unavailability and missing readbacks raise (see
-    `run_samsung_reduce`). Backend execution only: NO reference composition
-    (that is the caller's concern), mirroring `run_samsung_reduce`.
-    """
-    import numpy as np
-
-    dev = {k: np.asarray(v, dtype=np.float16) for k, v in dev_inputs.items()}
-    total = 0
-    for g in schedule.groups:
-        M, K = g.weight_shape
-        W = dev[g.weight]
-        if not g.is_batched:
-            lx = g.launches[0]
-            out_dev, cyc = run_samsung_reduce(W, dev[lx.vec], M=M, K=K, N=lx.N)
-            total += cyc
-            dev[lx.out] = np.asarray(out_dev, dtype=np.float16)
-        else:
-            # Batched GEMV: stack the B input vectors as the N columns of ONE
-            # contraction -> a single preload of the resident weight.
-            second = np.stack([dev[lx.vec] for lx in g.launches], axis=1)  # (K, B)
-            out_dev, cyc = run_samsung_reduce(W, second, M=M, K=K, N=len(g.launches))
-            total += cyc
-            out_arr = np.asarray(out_dev)
-            for b, lx in enumerate(g.launches):
-                dev[lx.out] = out_arr[:, b].astype(np.float16)
-    return dev, total
-
-
-def _assert_host_move_roles(compiled, inputs) -> None:
-    """Assert the operand->role binding against the recorded host moves.
-
-    spec 001 D5 (Q2 option a): when `compiled.host_moves` is non-empty the
-    operand roles are *driven by the explicit moves* rather than purely inferred
-    -- the scatter buffer is the weight, the broadcast buffer is the input, the
-    gather buffer is the output. The driver still performs the transfer; this is
-    a consistency check that the recorded role names correspond to supplied
-    inputs. Advisory (warn, never raise): a buffer role may be unbound when the
-    workload passed a positional array rather than a named label, in which case
-    the run path's operand-shape inference is the fallback. When `host_moves` is
-    empty (today's path / non-Samsung) this is a no-op.
-    """
+def _check_host_moves(compiled, program, inputs) -> None:
+    """Recorded host moves must name the operands the conductor moves that way."""
     moves = getattr(compiled, "host_moves", None)
     if not moves:
         return
-    # Map verb name -> the buffer roles the moves bind it to.
-    by_verb: dict[str, list[str]] = {}
+    supplied = {name for name, value in inputs.items() if value is not None}
     for rhm in moves:
-        verb_name = getattr(rhm.verb, "name", str(rhm.verb))
-        if rhm.buffer_role is not None:
-            by_verb.setdefault(verb_name, []).append(rhm.buffer_role)
-    supplied = {k for k, v in inputs.items() if v is not None}
-    for verb_name, roles in by_verb.items():
-        # A gather binds the OUTPUT buffer, which is legitimately absent from
-        # `inputs` (it is the readback target, supplied separately or inferred);
-        # only the input-side verbs (scatter weight / broadcast input) name
-        # buffers that must appear among the supplied inputs.
-        if verb_name == "gather":
+        verb = getattr(rhm.verb, "name", str(rhm.verb))
+        role = rhm.buffer_role
+        if verb == "gather" or role is None:
             continue
-        for role in roles:
-            # A named role that names no supplied input is suspicious only when
-            # SOME inputs were supplied (a bare `compiled.run()` probe supplies
-            # none and is exempt).
-            if supplied and role not in supplied:
-                warnings.warn(
-                    f"Samsung host move ({verb_name}) binds buffer role "
-                    f"{role!r} but no input named {role!r} was supplied "
-                    f"(supplied: {sorted(supplied)}); falling back to "
-                    f"operand-shape inference for that operand.",
-                    stacklevel=2,
-                )
-
-
-def _samsung_runtime_route(commands) -> str:
-    op_types = {command.type_ for command in commands if isinstance(command, PIMCmd)}
-    compute_types = op_types & {"MAC", "MUL", "ADD", "RELU"}
-    return "GENERIC_REDUCE" if compute_types == {"MAC"} else "GENERIC"
-
-
-def _samsung_main_runtime_command_valid(command: PIMCmd) -> bool:
-    if command.type_ in ("MOV", "FILL"):
-        bank_dst = command.dst_ in ("EVEN_BANK", "ODD_BANK")
-        grf_src = any(
-            source in ("GRF_A", "GRF_B")
-            for source in (command.src0_, command.src1_, command.src2_)
-        )
-        if bank_dst and grf_src:
-            return False
-    return True
-
-
-def _samsung_main_runtime_commands(commands) -> tuple[PIMCmd, ...]:
-    return tuple(
-        command
-        for command in commands
-        if isinstance(command, PIMCmd) and _samsung_main_runtime_command_valid(command)
-    )
+        if role not in supplied:
+            raise ValueError(
+                f"Samsung host move ({verb}) binds buffer {role!r}, but no input "
+                f"named {role!r} was supplied (supplied: {sorted(supplied)})"
+            )
+        if program.kind != "REDUCE":
+            continue
+        value = inputs[role]
+        is_matrix = value is inputs.get("A")
+        is_vector = value is inputs.get("B")
+        if verb == "scatter" and not (is_matrix or (is_vector and program.vector_from_bank)):
+            raise ValueError(
+                f"Samsung host move scatter binds {role!r}, which the selected program "
+                "does not place in the banks"
+            )
+        if verb == "broadcast" and not (is_vector and not program.vector_from_bank):
+            raise ValueError(
+                f"Samsung host move broadcast binds {role!r}, but the selected program "
+                "broadcasts only the vector, and only with host GRF_A residency"
+            )
 
 
 def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
-    """Run a compiled Samsung HBM-PIM artifact via `pim_driver`.
+    """Run a compiled Samsung HBM-PIM artifact on PIMSimulator.
 
-    SPEC-05 routing (legacy GEMV/ADD/MUL/RELU paths DELETED, 2026-06-30): a MAC
-    kernel routes to the mapping-driven GENERIC REDUCE conductor; everything else
-    routes to the GENERIC ELTWISE conductor. There is no dedicated --op
-    GEMV/ADD/MUL/RELU branch and no multi-layer GEMV split.
+    The emitted CRF words of the kernel are uploaded verbatim; the plan
+    derived from the selected placement and the simulated geometry places the
+    operands and drives the passes (see ``samsung_reduce_plan``).  Operands
+    arrive under the structural runtime roles bound by
+    ``source_backend_binding``: ``A`` (bank-resident matrix) and ``B``
+    (broadcast vector, or the ``[K, N]`` second operand) for a contraction;
+    ``IN0..IN2`` for an elementwise op.
 
-    Wire protocol (SPEC-005): for the GENERIC ELTWISE path the emitted PIMCmd
-    stream is serialised to a line-delimited `cmds.txt` and passed via
-    ``pim_driver --cmds <path>``; the C++ side uses it as the CRF microcode
-    (uploaded by `programCrf`) instead of regenerating it via
-    `PIMCmdGen::getPIMCmds`. The static ``--op`` choice only selects which numpy
-    inputs to wire up; the kernel choice no longer determines the CRF program
-    (placement does). The GENERIC REDUCE path supplies its own minimal --crf
-    (rebuilt canonical GEMV body) and does not pass --cmds.
-
-    The result is ``kind="simulator"`` with the decoded out.bin in
-    ``extra["outputs"]`` (an all-zero result is returned as such). Missing
-    operand roles raise ValueError; an absent or truncated out.bin raises
-    RuntimeError.
-
-    Line-delimited cmd format:
-        MAC dst=GRF_B src0=GRF_A src1=EVEN_BANK is_auto=1
-        JUMP loop_counter=7 loop_offset=2
-        NOP loop_counter=7
-        EXIT
+    ``RunResult.cycles`` is the simulated cycle count of the *padded* program
+    (``extra["timing_scope"]``); ``extra`` also records the logical and padded
+    shapes, the padding fraction of issued work, the plan, the CRF and the
+    conductor receipt.  Missing operands raise ValueError; a conductor
+    rejection or an absent/short readback raises RuntimeError.
     """
+    import numpy as np
+
     reason = _samsung_unavailable_reason()
     if reason is not None:
         raise SimulatorUnavailable("samsung_hbm_pim", reason)
+    program = _program_of(compiled)
     root = _pimsim_root()
-    driver = root / "pim_driver"
+    geometry = samsung_simulator_geometry(root)
+    _check_geometry(program.facts, geometry)
+    _check_host_moves(compiled, program, inputs)
+    crf_words = list(compiled.cmds[program.start:program.end])
+    supplied = sorted(k for k, v in inputs.items() if v is not None)
 
-    # spec 001 D5: assert operand->role binding against the recorded host moves
-    # (no-op when none recorded; advisory when bound). The driver argv below is
-    # unchanged -- the moves carry cost + role, not driver args (Q2 option a).
-    _assert_host_move_roles(compiled, inputs)
-
-    # The `--op` flag still picks the data-path scaffolding (eltwise vs
-    # GEMV) and which numpy inputs to wire up, but no longer determines
-    # the CRF microcode -- that comes from `compiled.cmds` via `--cmds`.
-    # The choice of which scaffolding to use is inferred from MAC-vs-eltwise
-    # opcodes in the emitted stream.
-    kernel = _samsung_runtime_route(compiled.cmds)
-
-    # numpy is a hard Tenon dependency; "no numpy" is a setup bug, not
-    # an env skip -- let the ImportError propagate.
-    import numpy as np
-
-    # ISA-valid filter (drop the ST_A/ST_B storeback MOVs the C++ validationCheck
-    # rejects) -> the cmd stream that reaches programCrf via --cmds for the GENERIC
-    # ELTWISE path. (The GENERIC_REDUCE path supplies its own minimal CRF and
-    # ignores this; see its argv branch.)
-    pim_cmds_all = list(_samsung_main_runtime_commands(compiled.cmds))
-
-    with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
-        out_path = td_path / "out.bin"
-        # SPEC-04 §3.2: GENERIC_REDUCE is not a new --op; it reuses --op GENERIC
-        # with --op-kind REDUCE (added in the branch below). All other kernels map
-        # their name 1:1 to --op.
-        op_arg = "GENERIC" if kernel == "GENERIC_REDUCE" else kernel
-        argv = [str(driver), "--op", op_arg, "--out", str(out_path)]
-        # REDUCE state threaded to the readback (set in the GENERIC_REDUCE branch).
-        reduce_shape = None  # (M, K, N, m_pad)
-
-        if kernel == "GENERIC_REDUCE":
-            # SPEC-05 §2: MAPPING-DRIVEN genuine fp16 matmul via --op GENERIC
-            # --op-kind REDUCE. The PARTITION (per-PE slice ROWS, PE count
-            # n_workids) comes from the TRACE (the work-id buckets + the MAC slice
-            # loop bound), NOT from operand-shape tiling: partition flows
-            # mapping -> trace -> codegen. M_logical = ROWS * n_workids; operands
-            # supply data + ground-truth K/N. A is padded to the logical grid
-            # (n_workids*ROWS) then to the physical fabric tile; --num-tiles =
-            # ceil(M_logical/4096) tiles the logical grid across fabric tiles.
-            part = _samsung_reduce_partition(compiled, inputs)
-            if part is None:
-                raise ValueError(
-                    "Samsung GENERIC_REDUCE: the compiled trace has no MAC "
-                    "partition (no work-id bucket with a MAC slice loop), so the "
-                    "REDUCE conductor cannot be configured"
-                )
-            ROWS, n_workids, K, N, M_real = part
-            M_logical = ROWS * n_workids
-            # Operand arrays (real A/B/x). Accept A/B, a/b, x/in role names.
-            A = inputs.get("A")
-            if A is None:
-                A = inputs.get("a")
-            B = inputs.get("B")
-            if B is None:
-                B = inputs.get("b")
-            xv = inputs.get("x")
-            if xv is None:
-                xv = inputs.get("in")
-            if A is None:
-                raise ValueError(
-                    "Samsung GENERIC_REDUCE is missing the bank-resident weight "
-                    "operand (role 'A'; also accepted as 'a'); got operands "
-                    f"{sorted(k for k, v in inputs.items() if v is not None)}"
-                )
-            A = np.asarray(A, dtype=np.float16).reshape(int(M_real), int(K))
-            # The second operand: B[K,N] (GEMM) or x[K] (GEMV).
-            if N > 1:
-                if B is None:
-                    raise ValueError(
-                        f"Samsung GENERIC_REDUCE GEMM (N={N}) is missing the "
-                        "second operand (role 'B'; also accepted as 'b'); got "
-                        f"operands {sorted(k for k, v in inputs.items() if v is not None)}"
-                    )
-                second = np.asarray(B, dtype=np.float16).reshape(int(K), int(N))
-            else:
-                src = B if B is not None else xv
-                if src is None:
-                    raise ValueError(
-                        "Samsung GENERIC_REDUCE GEMV is missing the broadcast "
-                        "vector operand (role 'B'; also accepted as 'b', 'x' or "
-                        "'in'); got operands "
-                        f"{sorted(k for k, v in inputs.items() if v is not None)}"
-                    )
-                second = np.asarray(src, dtype=np.float16).reshape(int(K), 1)
-            # Partition-provenance assertion (SPEC-05 §2.3): M_logical is the grid
-            # product; the operand's real rows must fit within it (the harness pads
-            # the operand to the grid).
-            if M_real > M_logical:
-                warnings.warn(
-                    f"Samsung GENERIC_REDUCE: operand rows {M_real} exceed the "
-                    f"mapping partition ROWS*n_workids = {ROWS}*{n_workids} = "
-                    f"{M_logical}; the grid under-covers (check mapping).",
-                    stacklevel=2,
-                )
-            # Pad K up to a multiple of _SAMSUNG_REDUCE_K_TILE (256) so computeGemv's
-            # input-tile split engages both even and odd banks cleanly (K<256 /
-            # odd num_input_tiles degenerates -- zero-padding K leaves A@B unchanged).
-            k_tile = _SAMSUNG_REDUCE_K_TILE
-            k_pad = ((int(K) + k_tile - 1) // k_tile) * k_tile
-            # Pad A's rows: first to the LOGICAL grid (n_workids*ROWS = M_logical,
-            # so the partition divides evenly), then to the PHYSICAL fabric tile
-            # (preloadGemv requires it). The two pads compose (logical <= physical
-            # for SMALL/milestone). The readback slices [:M_real, :N].
-            m_pad, rows_per_tile, num_tiles = _samsung_reduce_row_tiling(M_logical)
-            A_pad = np.zeros((m_pad, k_pad), dtype=np.float16)
-            A_pad[: int(M_real), : int(K)] = A  # zero-fill grid pad + K pad
-            second_pad = np.zeros((k_pad, second.shape[1]), dtype=np.float16)
-            second_pad[: int(K)] = second
-            second = second_pad
-            a_path = td_path / "A.npy"
-            b_path = td_path / "B.npy"
-            np.save(a_path, A_pad)
-            np.save(b_path, second)
-            # k_bursts on the weight role = ceil(K_pad_bursts/8); the C++ derives
-            # the JUMP counters itself from the weight shape (advisory here).
-            k_bursts = ((k_pad // 16) + 7) // 8
-            # --num-tiles tiles the LOGICAL grid across physical fabric tiles
-            # (derived from the partition, not hardcoded 1). For M_logical <= 4096
-            # this is 1 (the whole grid fits one fabric tile).
-            # The REDUCE path rebuilds the canonical GEMV CRF internally from the
-            # weight shape (matched JUMP counters), so the EMITTED cmd stream is
-            # irrelevant -- and a slice-form workload's emitted stream is
-            # prod(mapping)*body cmds (e.g. 512 for the 128-PE grid), which would
-            # trip the conductor's 32-cmd cap. Pass a minimal MAC CRF (inert for
-            # REDUCE) and SKIP the emitted --cmds block below.
-            crf_path = td_path / "reduce.crf"
-            crf_path.write_text(
-                "MAC dst=GRF_B src0=GRF_A src1=EVEN_BANK is_auto=1\n"
-                "JUMP loop_counter=0 loop_offset=2\n"
-                "MAC dst=GRF_B src0=GRF_A src1=ODD_BANK is_auto=1\n"
-                "JUMP loop_counter=0 loop_offset=2\n"
-                "MOV dst=ODD_BANK src0=GRF_B\n"
+    if program.kind == "REDUCE":
+        c = program.contraction
+        A, B = inputs.get("A"), inputs.get("B")
+        if A is None or B is None:
+            raise ValueError(
+                "Samsung REDUCE needs the bank-resident matrix (role 'A') and the "
+                f"vector (role 'B'); got operands {supplied}"
             )
-            argv += [
-                "--inputs",
-                f"{a_path},{b_path}",
-                "--crf",
-                str(crf_path),
-                "--op-kind",
-                "REDUCE",
-                "--out-rows",
-                str(rows_per_tile),
-                "--out-cols",
-                str(int(N)),
-                "--reduce-k",
-                str(k_pad),
-                "--num-tiles",
-                str(num_tiles),
-                "--bank-type",
-                "ALL",
-                "--roles",
-                f"A:0:0:2:0:0:0:{k_bursts},B:0:0:2:0:0:0:0,out:0:0:1:1:0:8:0",
-            ]
-            # readback slices the REAL P (M_real), not the grid/fabric pad.
-            reduce_shape = (int(M_real), int(K), int(N), m_pad)
-        else:  # GENERIC -- faithful multi-opcode interpreter (spec 01 §4)
-            # Flat-CLI contract (§5.1): role .npy paths joined comma-separated
-            # in role order, one flat fp16 out.bin, --num-tiles derived from
-            # the operand size (never a shape literal). No --faithful: GENERIC
-            # is always faithful (spec 01 §5.1).
-            generic_inputs = {
-                k: v
-                for k, v in inputs.items()
-                if v is not None and k not in ("layers",)
-            }
-            if not generic_inputs:
-                raise ValueError(
-                    "Samsung GENERIC (elementwise) run received no operand "
-                    "arrays; pass every input role of the compiled kernel"
-                )
-            in_paths = []
-            generic_n = None
-            for ri, (rname, rval) in enumerate(generic_inputs.items()):
-                arr = np.asarray(rval, dtype=np.float16).reshape(-1)
-                if generic_n is None:
-                    generic_n = int(arr.size)
-                rp = td_path / f"in{ri}.npy"
-                np.save(rp, arr)
-                in_paths.append(str(rp))
-            # elems_per_tile = 16 lanes x 8 GRF x num_pim_blocks; derive
-            # num_tiles from the operand size (spec 01 §4.3 / §5.2). Fall back
-            # to 1 tile for sub-tile operands.
-            elems_per_tile = 16 * 8 * _samsung_num_pim_blocks(compiled)
-            num_tiles = max(1, (generic_n + elems_per_tile - 1) // elems_per_tile)
-            argv += [
-                "--inputs",
-                ",".join(in_paths),
-                "--num-tiles",
-                str(num_tiles),
-                "--bank-type",
-                "ALL",
-            ]
-
-        # SPEC-005: serialise compiled.cmds to a line-delimited file and
-        # pass --cmds so the driver uses our CRF microcode instead of
-        # PIMCmdGen's canonical one. Layout/placement changes show up in
-        # cycles only because this file flows into programCrf().
-        # The ISA-valid filter was applied up-front into `pim_cmds_all`.
-        # SPEC-05: GENERIC_REDUCE supplies its OWN minimal --crf (the emitted
-        # stream is canonicalized internally + a slice-form stream blows the
-        # 32-cmd cap), so it skips this emitted-cmds block. The GENERIC ELTWISE
-        # path uses the emitted CRF microcode via --cmds.
-        if pim_cmds_all and kernel != "GENERIC_REDUCE":
-            cmds_path = td_path / "cmds.txt"
-            _write_samsung_cmds(cmds_path, pim_cmds_all)
-            argv += ["--cmds", str(cmds_path)]
-
-        try:
-            proc = subprocess.run(
-                argv,
-                capture_output=True,
-                cwd=str(root),  # pim_driver resolves ini/ paths relative to cwd
-                timeout=600,
-                check=False,
+        A = np.asarray(A, dtype=np.float16)
+        B = np.asarray(B, dtype=np.float16)
+        if A.shape != c.matrix_shape or B.shape != c.vector_shape:
+            raise ValueError(
+                f"Samsung REDUCE operands have shapes A{A.shape}, B{B.shape}; the "
+                f"compiled program reads A{c.matrix_shape}, B{c.vector_shape}"
             )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(f"Samsung pim_driver invocation failed: {exc}") from exc
-
-        stdout = proc.stdout.decode("utf-8", errors="replace")
-        stderr = proc.stderr.decode("utf-8", errors="replace")
-        combined = stdout + ("\n" + stderr if stderr else "")
-        match = re.search(r"PIM_CYCLES total=(\d+)", combined)
-        if not match:
-            raise RuntimeError(
-                "Samsung pim_driver returned but stdout missing "
-                "'PIM_CYCLES total=...' line; tail: " + combined[-400:]
-            )
-        cycles = int(match.group(1))
-        # SPEC-004b readback: surface the result the driver wrote to `out_path`
-        # into extra["outputs"]. An absent or truncated out.bin raises.
-        extra = {"kernel": kernel, "returncode": proc.returncode}
-        if kernel == "GENERIC_REDUCE":
-            # SPEC-04 §4.3: faithful matmul readback. The REDUCE column cadence
-            # drives the real PIMBlock::mac accumulator and the real drain, so
-            # out.bin holds genuine numerics (no dual-run / plain rerun needed).
-            M, K, N, m_pad = reduce_shape
-            outputs = _samsung_read_reduce_outbin(out_path, M, N, m_pad, combined)
-            extra["outputs"] = outputs
-            extra["cycles_source"] = "PIMSimulator GENERIC REDUCE interpreter"
-            extra["correctness_source"] = "PIMSimulator GENERIC REDUCE interpreter"
-            return RunResult(
-                kind=RUN_KIND_SIMULATOR,
-                cycles=cycles,
-                stdout=combined,
-                backend="samsung_hbm_pim",
-                extra=extra,
-            )
-        # GENERIC (ELTWISE) flat fp16 readback (spec 01 §3.3): the faithful
-        # interpreter writes real numerics into out.bin. Role name "out". (The
-        # only two routes are GENERIC_REDUCE above and GENERIC here -- the legacy
-        # GEMV/ADD/MUL/RELU readbacks were deleted with the legacy routing.)
-        outputs = _samsung_read_generic_outbin(out_path, generic_n, combined)
-        extra["outputs"] = outputs
-        extra["cycles_source"] = "PIMSimulator GENERIC interpreter"
-        extra["correctness_source"] = "PIMSimulator GENERIC interpreter"
+        matrix = (A if c.matrix_k_axis == 1 else A.T)[: program.rows, : c.K]
+        if c.column_var is None:
+            vectors = B[: c.K].reshape(1, c.K)
+        elif c.vector_k_axis == 0:
+            vectors = B[: c.K, : c.N].T
+        else:
+            vectors = B[: c.N, : c.K]
+        res = _samsung_run_reduce(compiled, program, crf_words, root, geometry, matrix, vectors)
+        rows = res["rows"]
+        outputs = {"y": rows[0]} if c.column_var is None else {"out": rows.T}
+        extra = {
+            "kernel": "GENERIC_REDUCE",
+            "returncode": 0,
+            "outputs": outputs,
+            "logical_shape": res["logical_shape"],
+            "padded_shape": res["padded_shape"],
+            "padding_fraction": res["padding_fraction"],
+            "timing_scope": _REDUCE_TIMING_SCOPE,
+            "cycle_phases": res["phases"],
+            "plan": res["plan"]["text"],
+            "crf": res["crf"],
+            "conductor": res["conductor"],
+            "simulator_geometry": geometry,
+            "levers": dict(program.lever_record),
+            "cycles_source": "PIMSimulator, Tenon conductor executing the uploaded CRF",
+            "correctness_source": "PIMSimulator, Tenon conductor executing the uploaded CRF",
+        }
         return RunResult(
             kind=RUN_KIND_SIMULATOR,
-            cycles=cycles,
-            stdout=combined,
+            cycles=res["cycles"],
+            stdout=res["log"],
             backend="samsung_hbm_pim",
             extra=extra,
         )
 
+    el = program.elementwise
+    arrays = []
+    for index in range(len(el.input_memrefs)):
+        value = inputs.get(f"IN{index}")
+        if value is None:
+            raise ValueError(
+                f"Samsung elementwise {el.op} needs input role 'IN{index}'; got "
+                f"operands {supplied}"
+            )
+        value = np.asarray(value, dtype=np.float16).reshape(-1)
+        if value.size != el.n:
+            raise ValueError(
+                f"Samsung elementwise input IN{index} has {value.size} elements; the "
+                f"program reads {el.n}"
+            )
+        arrays.append(value)
+    plan = samsung_eltwise_plan(program, geometry)
+    padded = plan["padded_n"]
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        paths = []
+        for index, value in enumerate(arrays):
+            buf = np.zeros(padded, dtype=np.float16)
+            buf[: el.n] = value
+            path = td / f"in{index}.npy"
+            np.save(path, buf)
+            paths.append(str(path))
+        crf_text = _samsung_cmds_text(crf_words)
+        (td / "crf.txt").write_text(crf_text)
+        (td / "plan.txt").write_text(plan["text"])
+        out_path = td / "out.bin"
+        argv = [
+            str(Path(root) / "pim_driver"),
+            "--op", "GENERIC",
+            "--op-kind", "ELTWISE",
+            "--plan", str(td / "plan.txt"),
+            "--crf", str(td / "crf.txt"),
+            "--inputs", ",".join(paths),
+            "--out", str(out_path),
+        ]
+        cycles, phases, conductor, log = _invoke_conductor(root, argv, "ELTWISE")
+        flat = _samsung_read_bursts(out_path, padded // 16, "ELTWISE", log).reshape(-1)
+    extra = {
+        "kernel": "GENERIC_ELTWISE",
+        "returncode": 0,
+        "outputs": {"out": flat[: el.n].astype(np.float32)},
+        "logical_shape": {"elements": el.n},
+        "padded_shape": {"elements": padded},
+        "padding_fraction": 1.0 - el.n / padded,
+        "timing_scope": _ELTWISE_TIMING_SCOPE,
+        "cycle_phases": phases,
+        "plan": plan["text"],
+        "crf": crf_text,
+        "conductor": conductor,
+        "simulator_geometry": geometry,
+        "levers": dict(program.lever_record),
+        "cycles_source": "PIMSimulator, Tenon conductor executing the uploaded CRF",
+        "correctness_source": "PIMSimulator, Tenon conductor executing the uploaded CRF",
+    }
+    return RunResult(
+        kind=RUN_KIND_SIMULATOR,
+        cycles=cycles,
+        stdout=log,
+        backend="samsung_hbm_pim",
+        extra=extra,
+    )
+
 
 def _layout_stage_resident(layout) -> bool:
-    """Read the chosen placement's structural `stage_resident` flag.
-
-    Bridge option (b) (task-017): renamed off `weight_resident`; the
-    host_staging cost split and this run-path preload sequencing both read
-    the same flag. `Compiled.layout` is a single Placement (one kernel) or a
-    list. The batched run path is single-GEMV; default-absent key -> False
-    (the non-resident shape). Codegen materialises this decision; it does
-    not re-decide (I5).
-    """
+    """The chosen placement's `stage_resident` flag (False when absent)."""
     if isinstance(layout, list):
         layout = layout[0] if layout else None
     if layout is None:
@@ -1153,210 +1564,69 @@ def _layout_stage_resident(layout) -> bool:
     return bool(getattr(layout, "extra", {}).get("stage_resident", False))
 
 
-def _samsung_batched_invoke(
-    driver: Path,
-    root: Path,
-    cmd_subset: list,
-    W,
-    X,
-    batch: int,
-    native_rebaseline: bool,
-    np_mod,
-) -> tuple[int, dict, str]:
-    """One batched pim_driver --batch invocation (SPEC-026 §4.2).
+def _run_samsung_batched(compiled: "Compiled", W, X, compare_native: bool = True) -> RunResult:
+    """Run the compiled GEMV for B input vectors X[B, K] against one matrix W.
 
-    Returns `(total_cycles, phase_dict, combined_stdout)`. `phase_dict`
-    has preload/exec/readback so the caller can assert the per-phase
-    split against the cost model. `native_rebaseline=True` selects the
-    re-preload-per-vector comparator loop.
-    """
-    with tempfile.TemporaryDirectory() as td:
-        td_path = Path(td)
-        out_path = td_path / "out.bin"
-        w_path = td_path / "W.npy"
-        x_path = td_path / "X.npy"
-        cmds_path = td_path / "cmds.txt"
-        # The vendor GEMV conductor addresses a complete 4096-row Samsung
-        # fabric tile and alternates even/odd 128-wide reduction tiles.  Small
-        # or ragged PolyBench legs therefore need the same zero padding as the
-        # generic REDUCE path; passing an underfilled matrix makes the reference
-        # PIMSimulator preload walk beyond ``NumpyBurstType::bData`` and abort.
-        # Zero padding preserves W@X and is part of the physical lowering, not
-        # a workload-size change.
-        m_real, k_real = int(W.shape[0]), int(W.shape[1])
-        m_pad = (
-            (m_real + _SAMSUNG_FABRIC_ROW_TILE - 1) // _SAMSUNG_FABRIC_ROW_TILE
-        ) * _SAMSUNG_FABRIC_ROW_TILE
-        k_pad = (
-            (k_real + _SAMSUNG_REDUCE_K_TILE - 1) // _SAMSUNG_REDUCE_K_TILE
-        ) * _SAMSUNG_REDUCE_K_TILE
-        if m_pad != m_real or k_pad != k_real:
-            W_physical = np_mod.zeros((m_pad, k_pad), dtype=np_mod.float16)
-            W_physical[:m_real, :k_real] = W
-            X_physical = np_mod.zeros((batch, k_pad), dtype=np_mod.float16)
-            X_physical[:, :k_real] = X
-        else:
-            W_physical = W
-            X_physical = X
-        np_mod.save(w_path, W_physical)
-        np_mod.save(x_path, X_physical)
-        _write_samsung_cmds(cmds_path, cmd_subset)
-
-        argv = [
-            str(driver),
-            "--op",
-            "GEMV",
-            "--out",
-            str(out_path),
-            "--weight",
-            str(w_path),
-            "--in",
-            str(x_path),
-            "--output-dim",
-            str(m_pad),
-            "--input-dim",
-            str(k_pad),
-            "--cmds",
-            str(cmds_path),
-            "--faithful",
-            "--batch",
-            str(batch),
-        ]
-        if native_rebaseline:
-            argv.append("--native-rebaseline")
-
-        try:
-            proc = subprocess.run(
-                argv,
-                capture_output=True,
-                cwd=str(root),
-                timeout=600,
-                check=False,
-            )
-        except (subprocess.SubprocessError, OSError) as exc:
-            raise RuntimeError(
-                f"Samsung batched pim_driver invocation failed: {exc}"
-            ) from exc
-
-        stdout = proc.stdout.decode("utf-8", errors="replace")
-        stderr = proc.stderr.decode("utf-8", errors="replace")
-        combined = stdout + ("\n" + stderr if stderr else "")
-        m = re.search(
-            r"PIM_CYCLES total=(\d+)\s+preload=(\d+)\s+exec=(\d+)\s+readback=(\d+)",
-            combined,
-        )
-        if not m:
-            raise RuntimeError(
-                "Samsung batched pim_driver returned but stdout missing "
-                "'PIM_CYCLES total=...' line; tail: " + combined[-400:]
-            )
-        phases = {
-            "preload": int(m.group(2)),
-            "exec": int(m.group(3)),
-            "readback": int(m.group(4)),
-        }
-        return int(m.group(1)), phases, combined
-
-
-def _run_samsung_batched(
-    compiled: "Compiled",
-    W,
-    X,
-    compare_native: bool = True,
-) -> RunResult:
-    """Batched-GEMV run path (SPEC-026 §4.2/§4.3).
-
-    Emits the Tenon stream (preload once + B*(exec+readback), selected by
-    the chosen placement's `stage_resident` flag) AND, when
-    `compare_native` is set, the native rebaseline (B*(preload+exec+
-    readback)) under the SAME faithful instrument, cmd stream, W, and
-    X(B,K). Only the preload-loop placement differs (I2). B = X.shape[0]
-    is read off the operand shape, never a literal (I3).
-
-    `RunResult.cycles` is the Tenon total; `extra` carries the native
-    total + both per-phase splits so the gate-A comparison and the
-    cost-model assertion can be made by the caller. This path reads no
-    output back, so the result is ``kind="simulator-timing-only"`` and
-    carries no outputs.
+    The same emitted CRF runs B column passes; the selected placement's
+    `stage_resident` decides whether the matrix is staged once (resident) or
+    re-staged with a CRF upload for every vector (restage).  With
+    `compare_native`, the restage sequencing is also run as the comparator.
+    Outputs (`Y`, shape [B, M]) are read back and returned.
     """
     import numpy as np
 
     reason = _samsung_unavailable_reason()
     if reason is not None:
         raise SimulatorUnavailable("samsung_hbm_pim", reason)
+    program = _program_of(compiled)
+    if program.kind != "REDUCE" or program.contraction.column_var is not None:
+        raise NotImplementedError("run_batched runs a compiled Samsung GEMV")
+    c = program.contraction
     root = _pimsim_root()
-    driver = root / "pim_driver"
-
+    geometry = samsung_simulator_geometry(root)
+    _check_geometry(program.facts, geometry)
+    crf_words = list(compiled.cmds[program.start:program.end])
     W = np.asarray(W, dtype=np.float16)
     X = np.asarray(X, dtype=np.float16)
     if X.ndim == 1:
         X = X.reshape(1, -1)
-    B = int(X.shape[0])  # I3: B is operand geometry (X[B,K] leading dim).
-
-    pim_cmds = [c for c in compiled.cmds if isinstance(c, PIMCmd)]
-
-    # Same ISA-valid filter the single-vector run path applies.
-    def _crf_valid(c: PIMCmd) -> bool:
-        # GRF_A is populated by the faithful GEMV conductor before CRF
-        # execution.  ``SamsungCtx`` retains a FILL marker for the generic
-        # interpreter, but forwarding it to the vendor GEMV programCrf path
-        # makes PIMSimulator reject/abort the stream before reporting cycles.
-        # The canonical Samsung GEMV CRF begins with MAC for the same reason.
-        if c.type_ == "FILL":
-            return False
-        if c.type_ in ("MOV", "FILL"):
-            bank_dst = c.dst_ in ("EVEN_BANK", "ODD_BANK")
-            grf_src = any(s in ("GRF_A", "GRF_B") for s in (c.src0_, c.src1_, c.src2_))
-            if bank_dst and grf_src:
-                return False
-        return True
-
-    pim_cmds = [c for c in pim_cmds if _crf_valid(c)]
-
-    resident = _layout_stage_resident(compiled.layout)
-    # Tenon: resident mode preloads once when B>1; the driver reads the
-    # resident vs native loop from --native-rebaseline (absent => resident).
-    # If the chosen placement is NOT stage_resident, Tenon's own run is the
-    # native (re-preload-per-vector) sequencing -- codegen materialises the
-    # decision argmin made, it does not override it.
-    tenon_total, tenon_phases, tenon_out = _samsung_batched_invoke(
-        driver,
-        root,
-        pim_cmds,
-        W,
-        X,
-        B,
-        native_rebaseline=not resident,
-        np_mod=np,
-    )
-
-    extra = {
-        "kernel": "GEMV",
-        "batch": B,
-        "stage_resident": resident,
-        "tenon_total": tenon_total,
-        "tenon_phases": tenon_phases,
-    }
-    combined = tenon_out
-    if compare_native:
-        native_total, native_phases, native_out = _samsung_batched_invoke(
-            driver,
-            root,
-            pim_cmds,
-            W,
-            X,
-            B,
-            native_rebaseline=True,
-            np_mod=np,
+    if W.shape != c.matrix_shape or X.shape[1:] != c.vector_shape:
+        raise ValueError(
+            f"run_batched operands W{W.shape}, X{X.shape} do not match the compiled "
+            f"GEMV (W{c.matrix_shape}, X[B, {c.vector_shape[0]}])"
         )
-        extra["native_total"] = native_total
-        extra["native_phases"] = native_phases
-        combined = tenon_out + "\n--- native rebaseline ---\n" + native_out
-
+    matrix = (W if c.matrix_k_axis == 1 else W.T)[: program.rows, : c.K]
+    resident = program.weight_resident
+    tenon = _samsung_run_reduce(
+        compiled, program, crf_words, root, geometry, matrix, X[:, : c.K], resident
+    )
+    extra = {
+        "kernel": "GENERIC_REDUCE",
+        "batch": int(X.shape[0]),
+        "stage_resident": resident,
+        "tenon_total": tenon["cycles"],
+        "tenon_phases": tenon["phases"],
+        "outputs": {"Y": tenon["rows"]},
+        "logical_shape": tenon["logical_shape"],
+        "padded_shape": tenon["padded_shape"],
+        "padding_fraction": tenon["padding_fraction"],
+        "timing_scope": _REDUCE_TIMING_SCOPE,
+        "plan": tenon["plan"]["text"],
+        "crf": tenon["crf"],
+        "conductor": tenon["conductor"],
+    }
+    stdout = tenon["log"]
+    if compare_native:
+        native = _samsung_run_reduce(
+            compiled, program, crf_words, root, geometry, matrix, X[:, : c.K], False
+        )
+        extra["native_total"] = native["cycles"]
+        extra["native_phases"] = native["phases"]
+        stdout += "\n--- restage comparator ---\n" + native["log"]
     return RunResult(
-        kind=RUN_KIND_SIMULATOR_TIMING_ONLY,
-        cycles=tenon_total,
-        stdout=combined,
+        kind=RUN_KIND_SIMULATOR,
+        cycles=tenon["cycles"],
+        stdout=stdout,
         backend="samsung_hbm_pim",
         extra=extra,
     )

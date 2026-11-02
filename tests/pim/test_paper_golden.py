@@ -6,15 +6,14 @@
 paper number. A row changes only when the cited paper table changes; a live
 mismatch is a reproduction defect to report, never a reason to edit a row.
 
-Artifact-backed rows read ``$TENON_ARTIFACTS`` (default
-``/home/nz264/shared/tenon-artifacts``) and skip when it is absent.
+Artifact-backed rows read ``allo.spmw_simenv.tenon_artifacts_root()``
+(``$TENON_ARTIFACTS``) and skip when it is absent.
 """
 
 from __future__ import annotations
 
 import hashlib
 import importlib.util
-import os
 import statistics
 import sys
 import time
@@ -153,7 +152,9 @@ def test_leaf_checked_rows_name_their_checking_test():
 
 
 def _artifacts_root() -> Path:
-    return Path(os.environ.get("TENON_ARTIFACTS", "/home/nz264/shared/tenon-artifacts"))
+    from allo.spmw_simenv import tenon_artifacts_root
+
+    return tenon_artifacts_root()
 
 
 def _require_artifacts(*parts: str) -> Path:
@@ -180,30 +181,50 @@ def _ids(rows):
 
 
 @pytest.mark.parametrize("row", _rows("samsung_hbm_pim"), ids=_ids(_rows("samsung_hbm_pim")))
-def test_samsung_gemv_paper_cycles(row, samsung_sim_gate):
+def test_samsung_gemv_paper_cycles(row, samsung_sim_gate, record_property):
+    """The paper row pins the vendor-equivalent program (dual_fiber, host GRF_A
+    fill, shared CRF), selected explicitly with `samsung_vendor_gemv_layout`.
+    The cost-selected default program must be correct; its cycles are
+    recorded, not compared with the paper value."""
+    from allo.spmw_samsung import samsung_vendor_gemv_layout
+
     workloads = _load_module(
         Path(__file__).resolve().parent / "samsung_hbm_pim" / "gemv" / "workload.py",
         "paper_golden_samsung_gemv_workload",
     )
     workload, M, K = workloads.CASES[row.case_id]
+    target = build_samsung_target()
 
     started = time.perf_counter()
-    compiled = allo.compile(workload, build_samsung_target(), samsung_cost)
+    default = allo.compile(workload, target, samsung_cost)
     assert time.perf_counter() - started < _SAMSUNG_COMPILE_BUDGET_S
+    vendor = allo.compile(
+        workload,
+        target,
+        samsung_cost,
+        layout=samsung_vendor_gemv_layout(target, default.trace),
+    )
 
     rng = np.random.default_rng(0)
     W = (rng.standard_normal((M, K)) * 0.1).astype(np.float16)
     x = (rng.standard_normal(K) * 0.1).astype(np.float16)
-    y = np.zeros(M, dtype=np.float16)
-    result = compiled(W, x, y)
-
-    assert _within(result.cycles, row), (row, result.cycles)
-    np.testing.assert_allclose(
-        y.astype(np.float32),
-        W.astype(np.float32) @ x.astype(np.float32),
-        rtol=1e-2,
-        atol=1e-2,
+    reference = W.astype(np.float32) @ x.astype(np.float32)
+    cycles = {}
+    for name, compiled in (("vendor", vendor), ("default", default)):
+        y = np.zeros(M, dtype=np.float16)
+        result = compiled(W, x, y)
+        np.testing.assert_allclose(y.astype(np.float32), reference, rtol=1e-2, atol=1e-2)
+        cycles[name] = result.cycles
+    mode = default.compiled.layout_ctx.programs[0].lever_record
+    record_property("vendor_cycles", cycles["vendor"])
+    record_property("default_cycles", cycles["default"])
+    print(
+        f"SAMSUNG_GOLDEN {row.case_id} paper={row.expected} vendor={cycles['vendor']} "
+        f"default={cycles['default']} default_levers={mode}"
     )
+
+    assert _within(cycles["vendor"], row), (row, cycles)
+    assert cycles["default"] > 0
 
 
 @pytest.mark.parametrize(

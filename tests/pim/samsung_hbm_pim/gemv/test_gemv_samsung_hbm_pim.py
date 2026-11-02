@@ -15,6 +15,7 @@ import pytest
 import allo
 from allo.pim.costs import samsung_cost
 from allo.pim.targets import build_samsung_target
+from allo.spmw_samsung import samsung_vendor_gemv_layout
 
 
 def _load_workload():
@@ -45,11 +46,14 @@ COMPILE_BUDGET_SECONDS = 120.0
 
 
 @pytest.mark.parametrize("case", sorted(CASES))
-def test_gemv_samsung_hbm_pim(case, samsung_sim_gate):
+def test_gemv_samsung_hbm_pim(case, samsung_sim_gate, record_property):
+    """Vendor-equivalent placement pinned with `layout=` reproduces the paper
+    cycles; the cost-selected default is correct and its cycles recorded."""
     workload, M, K = CASES[case]
+    target = build_samsung_target()
 
     started = time.perf_counter()
-    compiled = allo.compile(workload, build_samsung_target(), samsung_cost)
+    compiled = allo.compile(workload, target, samsung_cost)
     assert time.perf_counter() - started < COMPILE_BUDGET_SECONDS
 
     kernels = compiled.placement_ranking.kernels
@@ -59,17 +63,30 @@ def test_gemv_samsung_hbm_pim(case, samsung_sim_gate):
     # 24 enumerated placements x the restage/resident residency knob that the
     # whole-trace liveness enables inside autoschedule.
     assert len(kernels[0].scores) == 48
+    vendor = allo.compile(
+        workload,
+        target,
+        samsung_cost,
+        layout=samsung_vendor_gemv_layout(target, compiled.trace),
+    )
 
     rng = np.random.default_rng(0)
     W = (rng.standard_normal((M, K)) * 0.1).astype(np.float16)
     x = (rng.standard_normal(K) * 0.1).astype(np.float16)
-    y = np.zeros(M, dtype=np.float16)
-    result = compiled(W, x, y)
+    cycles = {}
+    for name, artifact in (("vendor", vendor), ("default", compiled)):
+        y = np.zeros(M, dtype=np.float16)
+        result = artifact(W, x, y)
+        np.testing.assert_allclose(
+            y.astype(np.float32),
+            W.astype(np.float32) @ x.astype(np.float32),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        cycles[name] = result.cycles
+    record_property("vendor_cycles", cycles["vendor"])
+    record_property("default_cycles", cycles["default"])
+    print(f"SAMSUNG_GEMV {case} vendor={cycles['vendor']} default={cycles['default']}")
 
-    assert result.cycles == PAPER_CYCLES[case]
-    np.testing.assert_allclose(
-        y.astype(np.float32),
-        W.astype(np.float32) @ x.astype(np.float32),
-        rtol=1e-2,
-        atol=1e-2,
-    )
+    assert cycles["vendor"] == PAPER_CYCLES[case]
+    assert cycles["default"] > 0

@@ -13,10 +13,7 @@ import pytest
 import allo
 from allo.pim.costs import samsung_cost
 from allo.pim.targets import build_samsung_target
-from allo.spmw_samsung import (
-    _samsung_read_generic_outbin,
-    _samsung_read_reduce_outbin,
-)
+from allo.spmw_samsung import _samsung_read_bursts
 
 
 def _paper_gemv():
@@ -27,35 +24,24 @@ def _paper_gemv():
     return module.CASES["gemv_m4096_k256"]
 
 
-def test_reduce_readback_returns_all_zero_result(tmp_path):
-    M, N, m_pad = 8, 1, 16
+def test_readback_returns_all_zero_result(tmp_path):
     blob = tmp_path / "out.bin"
-    np.zeros(m_pad * N * 16, dtype=np.float16).tofile(blob)
-    outputs = _samsung_read_reduce_outbin(blob, M, N, m_pad)
-    assert set(outputs) == {"y"}
-    np.testing.assert_array_equal(outputs["y"], np.zeros(M, dtype=np.float32))
+    np.zeros(16 * 16, dtype=np.float16).tofile(blob)
+    bursts = _samsung_read_bursts(blob, 16, "REDUCE")
+    assert bursts.shape == (16, 16)
+    np.testing.assert_array_equal(bursts, np.zeros((16, 16), dtype=np.float16))
 
 
-def test_reduce_readback_rejects_absent_and_truncated_blob(tmp_path):
+def test_readback_rejects_absent_and_truncated_blob(tmp_path):
     blob = tmp_path / "out.bin"
     with pytest.raises(RuntimeError, match=r"is absent; expected 512 bytes, got 0"):
-        _samsung_read_reduce_outbin(blob, 8, 1, 16, "driver said hello")
+        _samsung_read_bursts(blob, 16, "REDUCE", "driver said hello")
     np.zeros(10, dtype=np.float16).tofile(blob)
     with pytest.raises(RuntimeError, match=r"too short; expected 512 bytes, got 20") as err:
-        _samsung_read_reduce_outbin(blob, 8, 1, 16, "driver said hello")
+        _samsung_read_bursts(blob, 16, "REDUCE", "driver said hello")
     assert "driver said hello" in str(err.value)
-
-
-def test_generic_readback_returns_all_zero_and_rejects_short_blob(tmp_path):
-    blob = tmp_path / "out.bin"
-    np.zeros(32, dtype=np.float16).tofile(blob)
-    np.testing.assert_array_equal(
-        _samsung_read_generic_outbin(blob, 32)["out"], np.zeros(32, np.float32)
-    )
-    with pytest.raises(RuntimeError, match=r"too short; expected 128 bytes, got 64"):
-        _samsung_read_generic_outbin(blob, 64)
-    with pytest.raises(RuntimeError, match="is absent"):
-        _samsung_read_generic_outbin(tmp_path / "missing.bin", 32)
+    with pytest.raises(RuntimeError, match="ELTWISE readback"):
+        _samsung_read_bursts(tmp_path / "missing.bin", 2, "ELTWISE")
 
 
 def test_paper_gemv_zero_input_writes_zero_output(samsung_sim_gate):

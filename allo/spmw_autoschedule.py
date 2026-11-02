@@ -435,28 +435,30 @@ def _bucket_for_autoschedule(trace: MatchTrace) -> list[tuple[tuple, list[Matche
 
 
 def _samsung_host_eligible_memrefs(
-    target, placement: "Placement", role_to_memref: dict[str, str]
+    target, placement: "Placement", role_to_memref: dict[str, str], matches=None
 ) -> list[str]:
-    """Return the memrefs whose GRF preload may be host-broadcast.
+    """Return the memrefs whose GRF_A fill may be a host broadcast.
 
-    A role is host-eligible (SPEC-024 §3) iff (a) its placement handle is
-    the broadcast GRF register `grf_a` -- the register the target declares
-    as the HAB-broadcast input -- AND (b) its home is the broadcast vector,
-    not a per-bank-staged operand. For GEMV that is the `x`/vector role:
-    `x` is broadcast to every bank, so one host write fills GRF_A for the
-    whole fan-out. The weight `y` may also be staged into `grf_a`
-    (grf_staged mode) but its home is a per-bank handle, so it is *not*
-    broadcast-uniform and stays crf-resident; `acc -> grf_b` is the
-    per-work-id accumulator, also excluded. Both tests are over handle
-    identity + role home, never a shape.
+    The broadcast operand is identified structurally (release audit S-05):
+    for a contraction it is the vector, the input indexed only by the
+    reduction axis (``spmw_samsung.samsung_contraction_roles``), never the
+    first factor in source order.  It is host-eligible iff the placement
+    puts it in ``grf_a``, the register the target's HAB broadcast fills.
+    Elementwise programs fill their registers from the banks only.
     """
-    grf_a = target.grf_a
-    x_mref = role_to_memref.get("x")
-    if x_mref is None:
+    del role_to_memref
+    from .spmw_samsung import SamsungUnsupported, samsung_contraction_roles
+
+    macs = [m for m in (matches or ()) if m.target_op_name == "MAC"]
+    if not macs:
         return []
-    handle = placement.placements.get(x_mref)
-    if isinstance(handle, Register) and handle is grf_a:
-        return [x_mref]
+    try:
+        vector = samsung_contraction_roles(macs).vector_memref
+    except SamsungUnsupported:
+        return []
+    handle = placement.placements.get(vector)
+    if isinstance(handle, Register) and handle is target.grf_a:
+        return [vector]
     return []
 
 
@@ -541,40 +543,40 @@ def _with_stage_resident(base: "Placement", resident: bool) -> "Placement":
 
 @register_enumerator("samsung_hbm_pim")
 def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
-    """Enumerate Samsung layouts: bank-row `y` vs GRF-staged `y`.
+    """Enumerate Samsung placements for one work item's matches.
 
-    Per SPEC-009 §1: bank-row `y` (is_auto=1, K-loop folds) is the
-    optimal layout via LinearLayout algebra (Zhou et al. ASPLOS '26
-    §5.4); GRF-staged `y` (is_auto=0, K MACs unrolled) is the
-    alternative the cost model can distinguish via
-    `isinstance(y_handle, MemoryRef)`. MAC's `dst=grf_b` constraint
-    pins `acc -> grf_b` in both candidates.
-
-    Argmin picks bank-row (~8x cheaper at K=1024).
+    Contractions (MAC) are classified structurally
+    (``spmw_samsung.samsung_contraction_roles``): the matrix is the input
+    indexed by the output row and the reduction axis, the vector the input
+    indexed only by the reduction axis.  Base candidates differ in where the
+    matrix lives: ``bank_row`` (all reduction tiles in the even bank fiber),
+    ``dual_fiber`` (tiles alternate between the even and odd fiber of each
+    PIM unit) and ``grf_staged`` (matrix staged into GRF_A; enumerated so the
+    ranking records why it is rejected at materialization).  The vector is
+    in GRF_A and the accumulator in GRF_B in every candidate.  Elementwise
+    ops (ADD/MUL/MAD/RELU, ``spmw_samsung.samsung_elementwise``) have one
+    base placement streaming both fibers.  The levers in ``spmw_knobs`` are
+    crossed on top; execution semantics of every lever are documented in
+    ``docs/release/design/samsung-execution.md``.
     """
-    role_to_memref = _trace_memrefs_by_role(matches)
-    x_mref = role_to_memref.get("x")
-    y_mref = role_to_memref.get("y")
-    acc_mref = role_to_memref.get("acc")
-    if x_mref is None or y_mref is None or acc_mref is None:
-        raise NotImplementedError(
-            "samsung enumerator: trace is missing one of x/y/acc roles; "
-            f"got {sorted(role_to_memref)}"
-        )
+    from .spmw_samsung import (
+        SAMSUNG_ELEMENTWISE_OPS,
+        SamsungUnsupported,
+        samsung_contraction_roles,
+        samsung_elementwise,
+        samsung_target_facts,
+    )
 
-    # Build the identity base on (grf, bank, tile) over outputs (grf, bank),
-    # then swizzle so the segment dim (tile) contributes to the bank bits.
-    # The tile (segment) axis size IS banks-per-pim = bank_out // pim_units,
-    # geometry-derived from the tree (SPEC-022 D3): for Samsung 16//8 == 2 (one
-    # tile bit -> the even/odd swizzle, byte-identical); a wide target with
-    # 16//4 == 4 gets a 2-bit tile -> a 4-fiber `range(stride)` walk. The
-    # `range(stride)` generalization is what makes the F2 algebra load-bearing
-    # beyond Samsung's factor-2 swizzle.
-    bank_out = _bank_out_size(target)
-    pim_units = _pim_unit_count(target)
-    banks_per_pim = (bank_out // pim_units) if (bank_out and pim_units) else 2
+    facts = samsung_target_facts(target)
+    role_to_memref = _trace_memrefs_by_role(matches)
+    ops = {m.target_op_name for m in matches}
+
+    # Fiber handles from the swizzled F2 layout (SPEC-022 D3): the segment
+    # (tile) axis has banks-per-pim values; materialising it at each value
+    # yields the bank `stride*pid + v` of that fiber.
+    banks_per_pim = facts.banks_per_pim
     base = LinearLayout.identity(
-        {"grf": 8, "bank": bank_out or 16, "tile": banks_per_pim},
+        {"grf": facts.grf_a_entries, "bank": facts.banks, "tile": banks_per_pim},
         out_dims=("grf", "bank"),
     )
     swizzled = LinearLayout.optimal_swizzle(
@@ -583,24 +585,8 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
         bank_dims=("bank",),
         segment_dims=("tile",),
     )
-
-    # Bind the bank input dim to `stride * pid` (level-1 pim UnitId): the
-    # pim axis maps its units onto the bank out-axis, so each pim owns a
-    # contiguous run of `stride` banks starting at `stride*pid` (banks-per-pim
-    # = the bank out-size over the pim unit count). For Samsung that is
-    # `16 // 8 == 2`, so each pim owns the even bank `2*pid` and its odd
-    # partner `2*pid + 1`. The stride is geometry-derived (SPEC-022): the
-    # `2` is the `bank_out // pim_units` instantiation, not a pasted constant.
-    # Materialising the swizzled layout at `fixed={"tile": v}` evaluates the
-    # same `tile->bank-bit-0` swizzle column at each fiber value: v=0 ->
-    # `stride*pid` (EVEN_BANK), v=1 -> `stride*pid + 1` (ODD_BANK). The
-    # `+0`/`+1` fall out of the swizzle column (SPEC-023 §2).
     pid = UnitId(level=1, unit=None)
     bank_stride = _bank_stride_per_pim(target, swizzled)
-
-    # Fiber values come from the layout's segment (tile) axis size, not a
-    # literal `2`. `size_of("tile") == 2` here because the swizzle gives
-    # the tile axis one basis bit.
     n_fibers = swizzled.size_of("tile")
     fibers = [
         materialise_handle(
@@ -614,60 +600,49 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     ]
     y_even = fibers[0]
 
-    # Candidate 1: bank-row `y` (is_auto=1 -> folded K-loop, EVEN fiber).
-    # Carries the swizzled F2 layout (SPEC-022 D3) + the fiber axis so codegen
-    # reads the bank-fiber stride from `layout.size_of("tile")`, not the index.
-    bank_row = Placement(
-        placements={
-            x_mref: target.grf_a,
-            y_mref: y_even,
-            acc_mref: target.grf_b,
-        },
-        mode="bank_row",
-        extra={"fiber_axis": "tile"},
-        layout=swizzled,
-    )
-    # Candidate 2: GRF-staged `y` (is_auto=0 -> K MACs unrolled).
-    # Both candidates share x->grf_a, acc->grf_b; only y differs.
-    grf_staged = Placement(
-        placements={
-            x_mref: target.grf_a,
-            y_mref: target.grf_a,
-            acc_mref: target.grf_b,
-        },
-        mode="grf_staged",
-        layout=swizzled,
-    )
-    # Candidate 3: dual-fiber bank-row `y` (is_auto=1, both bank halves
-    # busy). Strict superset of `bank_row`: `placements[y]` is the EVEN
-    # fiber so any consumer ignoring `extra` degrades to `bank_row`. The
-    # per-fiber handles ride `extra["fibers"]`; codegen materialises the
-    # alternating (MAC EVEN, JUMP, MAC ODD, JUMP) stream from them and the
-    # cost model prices it ~n_fibers x cheaper (concurrent bank halves).
-    dual_fiber = Placement(
-        placements={
-            x_mref: target.grf_a,
-            y_mref: y_even,
-            acc_mref: target.grf_b,
-        },
-        mode="dual_fiber",
-        extra={
-            "fibers": list(fibers),
-            "fiber_axis": "tile",
-            "n_fibers": n_fibers,
-        },
-        layout=swizzled,
-    )
-    base_candidates = [bank_row, grf_staged, dual_fiber]
+    if ops == {"MAC"}:
+        roles = samsung_contraction_roles(matches)
+        matrix, vector, acc = roles.matrix_memref, roles.vector_memref, roles.acc_memref
+        bank_row = Placement(
+            placements={vector: target.grf_a, matrix: y_even, acc: target.grf_b},
+            mode="bank_row",
+            extra={"fiber_axis": "tile"},
+            layout=swizzled,
+        )
+        grf_staged = Placement(
+            placements={vector: target.grf_a, matrix: target.grf_a, acc: target.grf_b},
+            mode="grf_staged",
+            layout=swizzled,
+        )
+        dual_fiber = Placement(
+            placements={vector: target.grf_a, matrix: y_even, acc: target.grf_b},
+            mode="dual_fiber",
+            extra={"fibers": list(fibers), "fiber_axis": "tile", "n_fibers": n_fibers},
+            layout=swizzled,
+        )
+        base_candidates = [bank_row, grf_staged, dual_fiber]
+    elif len(ops) == 1 and ops <= SAMSUNG_ELEMENTWISE_OPS:
+        el = samsung_elementwise(matches)
+        placements = {el.input_memrefs[0]: target.grf_a}
+        if len(el.input_memrefs) > 1:
+            placements[el.input_memrefs[1]] = y_even
+        if len(el.input_memrefs) > 2:
+            placements[el.input_memrefs[2]] = target.grf_b
+        placements[el.output_memref] = target.grf_a
+        base_candidates = [
+            Placement(
+                placements=placements,
+                mode="all_bank",
+                extra={"fibers": list(fibers), "fiber_axis": "tile", "n_fibers": n_fibers},
+                layout=swizzled,
+            )
+        ]
+    else:
+        raise SamsungUnsupported(
+            "samsung enumerator: a kernel must be one contraction (MAC) or one "
+            f"elementwise op ({sorted(SAMSUNG_ELEMENTWISE_OPS)}); got {sorted(ops)}"
+        )
 
-    # Lever 2 (SPEC-024): cross the layout candidates with {crf, host}
-    # Lever cross-product via the typed knob registry (SPEC-022 D4). The
-    # three Samsung levers -- grf_residency (SPEC-024), crf_issue (SPEC-025),
-    # stage_resident (SPEC-026) -- are registered knobs; `cross_with_knobs`
-    # applies them in registration order (residency -> crf_issue ->
-    # stage_resident), byte-identical to the prior hand-crossed loop. Each
-    # knob owns its candidate set + materialiser; adding a lever is one
-    # `register_knob` call, not a new loop here.
     from .spmw_knobs import cross_with_knobs
 
     return cross_with_knobs(target, base_candidates, matches, role_to_memref)
@@ -947,17 +922,10 @@ def _apu_v1_vr_tiling(target, trace: MatchTrace) -> tuple[int, int, int]:
 
 
 def _bank_stride_per_pim(target, layout: LinearLayout) -> int:
-    """Banks-per-pim stride, derived from layout + target geometry.
-
-    `stride = bank_out_size // pim_unit_count`: the bank out-axis size
-    (read off the layout's `bank` axis, == 16 for Samsung) divided by the
-    pim-unit fanout (the product of the `pim` unit's `mapping`, == 8). Each
-    pim owns `stride` contiguous banks based at `stride*pid`. For Samsung
-    this is `16 // 8 == 2` -- the `2` is this instantiation, never a pasted
-    constant (SPEC-022 anti-hardcoding gate). Falls back to a stride of 1
-    when the geometry is unresolvable (no `pim` unit / no bank axis), which
-    degrades to the identity `pid` binding rather than guessing a `2`.
-    """
+    """Banks-per-pim stride: the layout's `bank` axis size over the `pim`
+    unit fanout (16 // 8 == 2 for Samsung).  Each pim owns `stride`
+    contiguous banks based at `stride*pid`.  Raises when the geometry is
+    not declared instead of guessing a stride (release audit S-09)."""
     from math import prod
 
     bank_out = layout.size_of("bank") if "bank" in layout.bases else None
@@ -966,33 +934,12 @@ def _bank_stride_per_pim(target, layout: LinearLayout) -> int:
         if u.name == "pim":
             pim_units = prod(u.mapping) if u.mapping else None
             break
-    if not bank_out or not pim_units:
-        return 1
+    if not bank_out or not pim_units or bank_out % pim_units:
+        raise ValueError(
+            f"cannot derive the banks-per-pim stride: bank axis {bank_out}, "
+            f"pim units {pim_units}"
+        )
     return bank_out // pim_units
-
-
-def _pim_unit_count(target) -> int | None:
-    """Pim-unit fanout (`prod(pim.mapping)`) read from the unit tree, or None
-    when there is no `pim` unit. Sibling of `_bank_stride_per_pim`'s pim walk,
-    lifted out so the enumerator can size the swizzle tile axis BEFORE the
-    layout exists (the tile size == banks-per-pim == bank_out // pim_units)."""
-    from math import prod
-
-    for u in target._walk():
-        if u.name == "pim":
-            return prod(u.mapping) if u.mapping else None
-    return None
-
-
-def _bank_out_size(target) -> int | None:
-    """Bank out-axis size (the `banks` count) read from the target's `banks`
-    memory geometry, or None when absent. The bank dimension the swizzle maps
-    the tile fibers onto; geometry, never a pasted 16."""
-    banks = getattr(target, "banks", None)
-    if banks is None:
-        return None
-    n = getattr(banks, "banks", None)
-    return int(n) if n else None
 
 
 @register_enumerator("upmem")

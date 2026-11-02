@@ -150,18 +150,22 @@ def registered_knobs(target_name: str) -> "list[Knob]":
 
 
 def _grf_residency_candidates(ctx: KnobCtx) -> list:
-    # crf always; host ONLY when a role is host-eligible (SPEC-024 §3) -- the
-    # exact conditional the hand-crossed residency loop applied.
+    # crf always; host only when the structurally identified broadcast vector
+    # sits in GRF_A (SPEC-024 §3, release audit S-05).
     from .spmw_autoschedule import _samsung_host_eligible_memrefs
 
-    host = _samsung_host_eligible_memrefs(ctx.target, ctx.base, ctx.role_to_memref)
+    host = _samsung_host_eligible_memrefs(
+        ctx.target, ctx.base, ctx.role_to_memref, ctx.matches
+    )
     return ["crf", "host"] if host else ["crf"]
 
 
 def _grf_residency_emit(value, base, ctx: KnobCtx):
     from .spmw_autoschedule import _samsung_host_eligible_memrefs, _with_residency
 
-    host = _samsung_host_eligible_memrefs(ctx.target, base, ctx.role_to_memref)
+    host = _samsung_host_eligible_memrefs(
+        ctx.target, base, ctx.role_to_memref, ctx.matches
+    )
     out = base
     for mref in host:
         out = _with_residency(out, mref, value)
@@ -184,6 +188,11 @@ def _crf_issue_emit(value, base, ctx: KnobCtx):
 
 
 def _stage_resident_candidates(ctx: KnobCtx) -> list:
+    # Whether the bank-resident matrix is staged once for all reduction
+    # columns or re-staged per column; an elementwise kernel has no resident
+    # operand, so the lever does not apply.
+    if not any(m.target_op_name == "MAC" for m in ctx.matches):
+        return [False]
     return [False, True]
 
 
@@ -262,7 +271,9 @@ def _tile_candidates(ctx: KnobCtx) -> list:
     from .spmw_tiling import tile_candidates
 
     plans = tile_candidates(ctx.target, ctx.matches)
-    return plans if plans else None  # None -> knob is inert (no tileable nest)
+    # Empty -> the knob is inert (no tileable nest); `cross_with_knobs` then
+    # leaves the candidate unchanged.
+    return list(plans) if plans else []
 
 
 def _tile_emit(value, base, ctx: KnobCtx):

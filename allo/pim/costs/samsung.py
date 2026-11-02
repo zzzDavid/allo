@@ -5,6 +5,42 @@
 This file is the calibration surface. Agents update ordinary Python constants,
 formulas, and branches here after running microbenchmarks. The structural target
 in allo.pim.targets intentionally contains no cycle information.
+
+What the estimate reports. The graph (``spmw_plan.build_execution_graph``)
+has one stream per work item of the declared 16 x 8 grid: the GRF fills of
+its register-placed operands, its MAC (or elementwise op), the accumulator
+drain, and explicit host moves when the workload records ``host_xfer.*``.
+The unit is the memory-clock cycle of these modeled activities on the
+declared device, scheduled over the pim / pseudo_channel / host resources.
+It does not model the matrix preload, the CRF upload or the readback unless
+host moves are supplied, and it prices the logical (unpadded) shape. It is
+therefore *not* the quantity PIMSimulator reports for an executed program
+(``RunResult.cycles``: padded preload + execution + readback on the
+simulated 64-channel system, ``RunResult.extra["timing_scope"]``); the two
+are compared only by candidate ranking
+(``docs/release/design/samsung-execution.md`` section 6).
+
+MAC rule provenance (2026-11-02). Measured on PIMSimulator upstream
+SAITPublic/PIMSimulator 3703d1f19c8f027360cc33a3243eb271e3bb6898 plus the
+Tenon overlay (experiments/simulators/setup/PIMSimulator, pim_driver sha256
+0ae6a3d9...2df2), FP16 GEMV M x K = 4096x256, 4096x512, 8192x256, executing
+the compiled programs of each placement:
+
+    placement (CRF fill)   4096x256   4096x512   8192x256   (total cycles)
+    dual_fiber, host        4,435      8,041      8,247
+    bank_row,   host        4,389      7,947      8,153
+    dual_fiber, crf         4,560      8,410      8,359
+    bank_row,   crf         4,589      8,458      8,397
+
+The two bank fibers of a PIM unit share the pseudo-channel column-command
+bus, so their MAC column commands serialize: the MAC term does not shrink
+with the fiber count. Each reduction tile placed on a fiber other than the
+first pays FIBER_TILE_CYCLES: the execution phase of dual_fiber exceeds
+bank_row (host fill) by 46, 94 and 94 cycles, i.e. 46-47 cycles per
+odd-fiber tile per pass. Ranking agreement with the simulator is judged per
+candidate pair: a pair agrees when both order it the same way; simulated
+differences below 0.5% are ties (docs/release/design/samsung-execution.md
+sections 6 and 7). Absolute values are not comparable (scope above).
 """
 
 from __future__ import annotations
@@ -25,6 +61,9 @@ BANK_STORE_CYCLES = 14
 HOST_SETUP_CYCLES = 2
 HOST_BURST_CYCLES = 1
 CRF_PROGRAM_CYCLES = 2
+# Row-open cost of a reduction tile on a second bank fiber (measured, see the
+# module docstring): 46-47 PIMSimulator cycles per odd-fiber tile per pass.
+FIBER_TILE_CYCLES = 47
 
 
 def _ceil_div(value, divisor):
@@ -56,9 +95,40 @@ def samsung_cost(target):
         fibers = max(1, int(event.metrics.get("n_fibers", 1)))
         lanes = max(1, int(event.metrics.get("lanes", 8)))
         reduction = max(0, int(event.metrics.get("reduction_extent", 1)))
-        chunks = _ceil_div(reduction, lanes * fibers)
-        latency = chunks * MAC_CYCLES + fibers * JUMP_CYCLES
+        # Both fibers' MAC column commands share the channel bus: no
+        # division by the fiber count.
+        chunks = _ceil_div(reduction, lanes)
+        tile = int(target.grf_a.slots) * (int(target.grf_a.width) // 16)
+        tiles = _ceil_div(reduction, tile)
+        later_fiber_tiles = tiles - _ceil_div(tiles, fibers)
+        latency = (
+            chunks * MAC_CYCLES
+            + fibers * JUMP_CYCLES
+            + later_fiber_tiles * FIBER_TILE_CYCLES
+        )
         occupy_compute(event, ctx, latency, MAC_CYCLES)
+        # Several reduction columns (GEMM N, batched GEMV) with a restaged
+        # matrix: each extra column rewrites this work item's matrix rows
+        # (rows x K/16 bursts) over its pseudo-channel before its pass;
+        # resident staging writes once. The first staging is outside this
+        # graph's scope (module docstring), so only the extra ones appear.
+        # Columns come from the nest the Samsung lowering accepts, [row, k]
+        # or [row, column, k] (spmw_samsung.samsung_contraction), not from
+        # the matcher's batch_dim, which depends on source operand order.
+        extents = tuple(event.metrics.get("loop_extents", ()) or ())
+        columns = int(extents[1]) if len(extents) == 3 else 1
+        batch = max(columns, int(event.metrics.get("batch", 1)))
+        candidate = event.metrics.get("candidate", {}) or {}
+        if batch > 1 and not candidate.get("stage_resident", False):
+            rows = int(extents[0]) if len(extents) > 1 else 1
+            lanes16 = int(target.grf_a.width) // 16
+            bursts = rows * _ceil_div(reduction, lanes16)
+            restage = (batch - 1) * bursts * HOST_BURST_CYCLES
+            ctx.step(
+                latency=restage,
+                occupy=[ctx.use(channel, cycles=restage)],
+                name="mac_restage",
+            )
 
     def elementwise(event, ctx):
         iterations = max(1, int(event.metrics.get("iterations", 1)))
@@ -79,9 +149,22 @@ def samsung_cost(target):
             name=event.primitive.name.lower(),
         )
 
+    def grf_a_fill_is_host_broadcast(event):
+        # GRF_A residency (spmw_knobs grf_residency): "host" fills GRF_A with
+        # a HAB broadcast through PIM_REG_RA, "crf" with a CRF FILL from the
+        # bank (after the operand was scattered to every bank).
+        candidate = event.metrics.get("candidate", {}) or {}
+        residency = candidate.get("grf_residency", {}) or {}
+        return bool(residency) and all(mode == "host" for mode in residency.values())
+
     @rule(target.move("LD_A"))
     def load_a(event, ctx):
-        device_move(event, ctx, BANK_LOAD_CYCLES)
+        if grf_a_fill_is_host_broadcast(event):
+            # One host write per GRF_A entry on the channel bus.
+            entries = int(target.grf_a.slots)
+            device_move(event, ctx, HOST_SETUP_CYCLES + entries * HOST_BURST_CYCLES)
+        else:
+            device_move(event, ctx, BANK_LOAD_CYCLES)
 
     @rule(target.move("LD_B"))
     def load_b(event, ctx):

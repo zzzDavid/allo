@@ -963,18 +963,22 @@ class SourceBackendBinding:
     output: "str | None" = None
 
 
-# Samsung MAC operand role -> `_run_samsung` kwarg. `B` rather than `x` for the
-# broadcast vector because `_run_samsung` prefers `B` for both GEMV and GEMM.
-_SAMSUNG_MAC_ROLE_KWARGS = (("x", "A"), ("y", "B"))
+# Samsung runtime kwargs. A contraction binds by structure (release audit
+# S-05): the matrix (indexed by the output row and the reduction axis) is the
+# bank-resident `A`, the vector (indexed only by the reduction axis) is `B`,
+# whatever the source operand order. Elementwise inputs bind in signature
+# order of the matched op (x, y, z) to `IN0..IN2`.
+_SAMSUNG_MAC_ROLE_KWARGS = (("matrix", "A"), ("vector", "B"))
+_SAMSUNG_ELTWISE_ROLE_KWARGS = (("x", "IN0"), ("y", "IN1"), ("z", "IN2"))
 
 
 def source_backend_binding(target, trace, parameter_names) -> SourceBackendBinding:
     """Bind workload parameters to the Samsung runtime roles structurally.
 
     Uses the trace's retained source identities (`trace.source_value_refs`,
-    keyed by parameter ordinal) and the MAC operands' `value_ref`. Returns an
-    empty binding for other targets, multi-kernel traces, or when the MAC
-    matches disagree.
+    keyed by parameter ordinal) and the operands' `value_ref`. Returns an
+    empty binding for other targets, multi-kernel traces, traces outside the
+    Samsung lowering domain, or when the matches disagree.
     """
     empty = SourceBackendBinding()
     if getattr(target, "name", None) != "samsung_hbm_pim":
@@ -984,8 +988,39 @@ def source_backend_binding(target, trace, parameter_names) -> SourceBackendBindi
         return empty
     if len({_matcher_work_scope(m).group_id for m in trace.matches}) != 1:
         return empty
-    macs = [m for m in trace.matches if m.target_op_name == "MAC"]
-    if not macs:
+
+    from .spmw_samsung import (
+        SAMSUNG_ELEMENTWISE_OPS,
+        SamsungUnsupported,
+        samsung_contraction,
+    )
+
+    ops = {m.target_op_name for m in trace.matches}
+    role_kwargs = []  # (kwarg, set of operand roles per match)
+    if ops == {"MAC"}:
+        try:
+            classified = [(m, samsung_contraction(m)) for m in trace.matches]
+        except SamsungUnsupported:
+            return empty
+        for kind, kwarg in _SAMSUNG_MAC_ROLE_KWARGS:
+            refs = set()
+            for match, c in classified:
+                role = c.matrix_role if kind == "matrix" else c.vector_role
+                refs.update(
+                    op.value_ref for op in match.operands if op.role == role
+                )
+            role_kwargs.append((kwarg, refs))
+    elif len(ops) == 1 and ops <= SAMSUNG_ELEMENTWISE_OPS:
+        for role, kwarg in _SAMSUNG_ELTWISE_ROLE_KWARGS:
+            refs = {
+                op.value_ref
+                for match in trace.matches
+                for op in match.operands
+                if op.role == role
+            }
+            if refs:
+                role_kwargs.append((kwarg, refs))
+    else:
         return empty
 
     parameter_names = tuple(parameter_names)
@@ -995,12 +1030,7 @@ def source_backend_binding(target, trace, parameter_names) -> SourceBackendBindi
             ordinal_by_ref.setdefault(ref, int(ordinal))
 
     inputs = {}
-    for role, kwarg in _SAMSUNG_MAC_ROLE_KWARGS:
-        refs = set()
-        for match in macs:
-            refs.update(
-                operand.value_ref for operand in match.operands if operand.role == role
-            )
+    for kwarg, refs in role_kwargs:
         if len(refs) != 1:
             return empty
         ordinal = ordinal_by_ref.get(next(iter(refs)))
@@ -1176,29 +1206,10 @@ def _is_backend_ctx(ctx, target_name: str) -> bool:
 
 _MOVED: dict[str, str] = {
     "SamsungCtx": "allo.spmw_samsung",
-    "_samsung_lane_burst": "allo.spmw_samsung",
-    "_fiber_fold_split": "allo.spmw_samsung",
-    "_emit_inner_loop_jump": "allo.spmw_samsung",
-    "_is_samsung_storeback_mov": "allo.spmw_samsung",
-    "_split_samsung_layers": "allo.spmw_samsung",
     "_write_samsung_cmds": "allo.spmw_samsung",
-    "_samsung_num_pim_blocks": "allo.spmw_samsung",
-    "_samsung_read_generic_outbin": "allo.spmw_samsung",
-    "_SAMSUNG_FABRIC_ROW_TILE": "allo.spmw_samsung",
-    "_samsung_reduce_row_tiling": "allo.spmw_samsung",
-    "_SAMSUNG_REDUCE_K_TILE": "allo.spmw_samsung",
-    "_samsung_reduce_partition": "allo.spmw_samsung",
-    "_samsung_read_reduce_outbin": "allo.spmw_samsung",
-    "_samsung_run_reduce_driver": "allo.spmw_samsung",
-    "run_samsung_reduce": "allo.spmw_samsung",
-    "execute_host_schedule_samsung": "allo.spmw_samsung",
-    "_assert_host_move_roles": "allo.spmw_samsung",
     "_samsung_runtime_route": "allo.spmw_samsung",
-    "_samsung_main_runtime_command_valid": "allo.spmw_samsung",
-    "_samsung_main_runtime_commands": "allo.spmw_samsung",
     "_run_samsung": "allo.spmw_samsung",
     "_layout_stage_resident": "allo.spmw_samsung",
-    "_samsung_batched_invoke": "allo.spmw_samsung",
     "_run_samsung_batched": "allo.spmw_samsung",
     "AimCtx": "allo.spmw_aim",
     "_aim_runtime_segments": "allo.spmw_aim",

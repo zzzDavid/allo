@@ -216,18 +216,30 @@ def select_autoscheduled_xor_layout(
     from ..spmw_match import MatchTrace, MatchedOp, OperandBinding
 
     target = build_samsung_target()
+    # A structurally complete one-row GEMV, y[i] = sum_k W[i, k] * x[k]: the
+    # Samsung enumerator classifies the matrix and vector by their indices.
+    reduction = geometry.tile_count
     match = MatchedOp(
         target_op_name="MAC",
         func_name="linear_layout_swizzle_probe",
         work_id=(0, 0),
-        enclosing_loops=[("k", "0", str(geometry.tile_count), 1)],
+        enclosing_loops=[("i", "0", "1", 1), ("k", "0", str(reduction), 1)],
         operands=[
-            OperandBinding("x", "x"),
-            OperandBinding("y", "W"),
-            OperandBinding("acc", "acc", is_loop_carried=True),
+            OperandBinding("x", "x", ["k"], memref_type=f"memref<{reduction}xf16>"),
+            OperandBinding(
+                "y", "W", ["i", "k"], memref_type=f"memref<1x{reduction}xf16>"
+            ),
+            OperandBinding(
+                "acc", "acc", is_loop_carried=True, memref_type="memref<f16>"
+            ),
         ],
         result_memref_name="acc",
         op_range=("layout_probe_begin", "layout_probe_end"),
+        extra={
+            "accumulator_init": "zero",
+            "axis_roles": {"reduction": ("k",), "output": ("i",)},
+            "output_sinks": [("y", "i")],
+        },
     )
     trace = MatchTrace(target.name, "linear_layout_swizzle_probe", [match])
     placement = autoschedule(target, trace, samsung_cost)[0]
