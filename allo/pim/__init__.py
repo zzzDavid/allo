@@ -162,6 +162,37 @@ from .upmem_calibration import (
     load_upimulator_counters,
     parse_upimulator_log,
 )
+from .gf2 import GF2Matrix, GF2Subspace
+from .layout_problem import (
+    LocalAxis,
+    LocalSpaceFlag,
+    OwnerAxis,
+    OwnerAxisOrigin,
+    OwnerHierarchy,
+    OwnerLevel,
+    TargetHierarchyError,
+    owner_hierarchy_from_target,
+)
+from .layout_movement import (
+    AccessMode,
+    LayoutAccess,
+    exact_active_owner_incidence,
+    full_carrier_rank_incidence,
+    layout_movement_cost,
+    scale_extra_owner_incidence,
+)
+from .layout_search import (
+    LayoutSearchDomainError,
+    LayoutSearchPolicy,
+    LayoutSearchProblem,
+    LayoutSearchResult,
+    LayoutSearchTermination,
+    NoLegalLayoutError,
+    enumerate_layouts,
+    search_min_movement_layout,
+    complete_scalable_layout_representative,
+    search_scalable_layout_flags,
+)
 
 __all__ = [
     "build_samsung_target",
@@ -300,4 +331,30 @@ __all__ = [
     "load_upmem_candidate_row",
     "load_upimulator_counters",
     "parse_upimulator_log",
+    "GF2Matrix",
+    "GF2Subspace",
+    "LocalAxis",
+    "LocalSpaceFlag",
+    "OwnerAxis",
+    "OwnerAxisOrigin",
+    "OwnerHierarchy",
+    "OwnerLevel",
+    "TargetHierarchyError",
+    "owner_hierarchy_from_target",
+    "AccessMode",
+    "LayoutAccess",
+    "exact_active_owner_incidence",
+    "full_carrier_rank_incidence",
+    "layout_movement_cost",
+    "scale_extra_owner_incidence",
+    "LayoutSearchDomainError",
+    "LayoutSearchPolicy",
+    "LayoutSearchProblem",
+    "LayoutSearchResult",
+    "LayoutSearchTermination",
+    "NoLegalLayoutError",
+    "enumerate_layouts",
+    "search_min_movement_layout",
+    "complete_scalable_layout_representative",
+    "search_scalable_layout_flags",
 ]

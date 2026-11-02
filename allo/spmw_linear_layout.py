@@ -441,6 +441,76 @@ class LinearLayout:
             col_base += n
         return M
 
+    def to_gf2(self):
+        """Return this layout as an `allo.pim.gf2.GF2Matrix`.
+
+        Columns are input bits and rows are output bits, both in the order
+        of `matrix()`, so `to_gf2().apply(v)` evaluates the layout on the
+        input bits packed low-to-high in input-dim insertion order.
+        """
+        from .pim.gf2 import GF2Matrix  # deferred: allo.pim is not eager
+
+        M = self.matrix()
+        n_rows, n_cols = M.shape
+        rows = tuple(
+            sum(int(M[r, c]) << c for c in range(n_cols)) for r in range(n_rows)
+        )
+        return GF2Matrix(int(n_rows), int(n_cols), rows)
+
+    @classmethod
+    def from_gf2(cls, matrix, in_dims, out_dims) -> "LinearLayout":
+        """Build a layout from a `GF2Matrix` (inverse of `to_gf2`).
+
+        `in_dims` and `out_dims` are `(name, size)` sequences or dicts with
+        power-of-two sizes; they name the matrix columns and rows,
+        low bits first, in order.
+        """
+
+        def items(dims, what):
+            pairs = tuple(dims.items()) if isinstance(dims, dict) else tuple(dims)
+            out = []
+            for pair in pairs:
+                name, size = pair
+                out.append((str(name), int(size), _ilog2_exact(int(size))))
+            if len({name for name, _, _ in out}) != len(out):
+                raise ValueError(f"{what} names must be unique, got {pairs!r}")
+            return out
+
+        ins = items(in_dims, "in_dims")
+        outs = items(out_dims, "out_dims")
+        if sum(w for _, _, w in ins) != matrix.n_cols:
+            raise ValueError(
+                f"in_dims cover {sum(w for _, _, w in ins)} bits; the matrix "
+                f"has {matrix.n_cols} columns"
+            )
+        if sum(w for _, _, w in outs) != matrix.n_rows:
+            raise ValueError(
+                f"out_dims cover {sum(w for _, _, w in outs)} bits; the matrix "
+                f"has {matrix.n_rows} rows"
+            )
+        bases: dict[str, list[tuple[int, ...]]] = {}
+        column = 0
+        for name, _, width in ins:
+            vecs = []
+            for _bit in range(width):
+                vec = []
+                row = 0
+                for _, _, out_width in outs:
+                    word = 0
+                    for b in range(out_width):
+                        if (matrix.rows[row + b] >> column) & 1:
+                            word |= 1 << b
+                    vec.append(word)
+                    row += out_width
+                vecs.append(tuple(vec))
+                column += 1
+            bases[name] = vecs
+        return cls(
+            bases,
+            tuple(name for name, _, _ in outs),
+            tuple(size for _, size, _ in outs),
+        )
+
     def compose(self, other: "LinearLayout") -> "LinearLayout":
         """Return `other ∘ self`: outputs of `self` feed inputs of `other`.
 
