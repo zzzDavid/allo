@@ -245,19 +245,31 @@ per group and crosses its ties with the backend's decision keys.
   it enters the decision key and the backend's own dims are unchanged. When
   no tie class contains the program's layout, that layout is crossed as well,
   labelled `extra["movement"]="not-minimal"`. Unanalyzable groups keep the
-  hand-built layouts, labelled `not-analyzed: <reason>`. Realizability: AiM,
-  UPMEM and APU v1 emit one program per work item on the unit its work id
-  names, so there a tie is realizable exactly when its owner flag equals
-  the program's. Samsung (`ROW_MAP_TARGETS`) places contraction rows by the
-  owner map (row-to-slot table, `samsung-execution.md` section 8): a tie is
+  hand-built layouts, labelled `not-analyzed: <reason>`. Realizability: APU v1
+  emits one program per work item on the unit its work id names, so there a
+  tie is realizable exactly when its owner flag equals the program's.
+  Samsung, UPMEM and AiM (`ROW_MAP_TARGETS`) place contraction rows by the
+  owner map: Samsung as a row-to-slot table (`samsung-execution.md` section
+  8), UPMEM as the rows each DPU's MRAM image holds and gathers
+  (`upmem-domain.md` section 8), AiM as a row-to-output-frontier-slot table
+  with the host-side result mapping (`aim-token-partition.md` section 7);
+  `owner_rows` derives the rows of each owner unit from the tie. A tie is
   realizable when its owner coordinates depend on the output-row bits only
   (the accumulator's kernel lies in `T_h`, so no unit splits a row's
-  reduction), the accumulator has one row coordinate and the rows are not
-  masked (`row_map_unrealizable_reason`). On Samsung the realizable members
-  of a minimum class that group rows differently are crossed as separate
-  ties: the per-level BLOCK/CYCLIC row distributions (`row_distributions`,
-  multiplicity 1, still counted in `tie_layouts`). Other ties are rejected
-  before emission with the reason and recorded in
+  reduction) and the accumulator has one row coordinate
+  (`row_map_unrealizable_reason`). Samsung also needs unmasked rows; UPMEM
+  and AiM need a one-dimensional work grid that partitions the rows into
+  consecutive per-work-item blocks, no batch loop, and equal row counts per
+  unit on the active rows. A reduction split is rejected with the backend's
+  reason, except the AiM split whose owner bits are the low bits of the one
+  reduction loop: that is the `reduction_partitions` split
+  (`reduction_partition_split`) and is realizable on the candidates that
+  carry the same `P`. The realizable members of a minimum class that group
+  rows differently are crossed as separate ties: the per-level BLOCK/CYCLIC
+  row distributions (`row_distributions`, multiplicity 1, still counted in
+  `tie_layouts`), and on AiM the low-bit member of a minimum k-split class.
+  `KernelMovement.realizable_tie_count` counts the realizable ties. Other
+  ties are rejected before emission with the reason and recorded in
   `KernelRanking.movement_rejections`. Ties are broken by cycles, then by a
   structural key: layout text, knob and feature values, handle paths
   (`TIE_BREAK_RULE`, C-06). `KernelRanking.cost_ties` exposes the full
@@ -271,7 +283,7 @@ per group and crosses its ties with the backend's decision keys.
 
 ### 8.2 Findings
 
-* **Samsung realizes ties; AiM, UPMEM and APU v1 realize only the program's
+* **Samsung, UPMEM and AiM realize ties; APU v1 realizes only the program's
   work-grid owner map.** Samsung under strict FP16 (the default): the
   program's profile is the unique minimum (72,704 B, proven); its four row
   distributions (block/cyclic per level; the program is block x block) are
@@ -284,11 +296,33 @@ per group and crosses its ties with the backend's decision keys.
   Samsung under reassociation: the minimum is 48,128 against the program's
   72,704 (one or two `k` bits split across PIM units); both tie classes
   split a row's reduction and are rejected with that reason (reduction
-  policy). AiM (`reassociate`): 5,120
-  against 15,872; 2 classes are rejected. UPMEM 64 x 12 rows (masked): 14,848
-  against 32,256; 2 classes are rejected. Selected programs, cycles and
-  emitted commands are identical to HEAD on all five GEMVs (Samsung 253, 381,
-  253; AiM 255; UPMEM 359,488 virtual cycles).
+  policy). AiM 256 x 256 (`reassociate`): 5,120
+  against 15,872; both classes mix row and high `k` bits and are rejected
+  as reduction splits that are not the `reduction_partitions` split. UPMEM
+  64 x 12 rows (masked): 14,848 against 32,256; both classes split `k` and
+  are rejected (UPMEM accumulates in int32, but its templates do not combine
+  partials across DPUs). UPMEM 768 x 128 over 8 DPUs: 2,560 against 3,584,
+  the tie `dpu<-loop0[4,5,6]` leaves 2 DPUs without rows and is rejected for
+  unequal row counts. Selected programs, cycles and emitted commands of
+  these GEMVs are unchanged (Samsung 253, 381, 253; AiM 255; UPMEM 359,488
+  virtual cycles).
+* **UPMEM and AiM execute two ties each.** UPMEM GEMV 1024 x 128 int32 over
+  8 DPUs and AiM GEMV 2048 x 64 BF16 over 32 channels: the program is the
+  proven minimum, its cyclic row distribution ties it, both are realizable
+  (`realizable_tie_count == 2`, `chosen_label == "minimal"`). uPIMulator:
+  both correct; 595,371 (program) and 593,932 (cyclic) cycles on random
+  int32 values (the DPU multiply's cost depends on the values each DPU
+  holds), 604,829 for both when every row is equal. ramulator2: 507 and 507
+  (identical trace). In both default compiles the structural tie-break
+  selects the cyclic map.
+* **The AiM `reduction_partitions` split is routed.** A 64 x 2048 GEMV over
+  32 channels has the P = 32 split as its minimum (3,968 B against 126,976);
+  it is realizable and selected. The program's own map is crossed only when
+  no tie is realizable (`spmw_autoschedule._movement_entries`), so the
+  unsplit program (the movement-disabled selection) is no longer a
+  candidate. Estimates 8,883 (P = 32) against 670; ramulator2 507 device
+  cycles plus a modelled 256-cycle host merge (763) against 828: faster in
+  simulation, though the cost program ranks it slower.
 * **Backend layouts are not in the iteration-to-owner coordinate space.**
   Samsung's `swizzled` maps `grf`/`bank`/`tile` and its emitter reads fibers
   from `extra["fibers"]`, not from `Placement.layout`. AiM's layout maps
@@ -296,18 +330,25 @@ per group and crosses its ties with the backend's decision keys.
   UPMEM checks only that a `LinearLayout` is present. A tie can therefore
   never "equal the swizzled layout"; the product keeps both.
 * A user `compile(layout=...)` whose carried movement part is not the
-  program's owner map is executed by Samsung contractions (rejected at
-  emission with the reason when not realizable, and for elementwise
-  kernels); AiM, UPMEM and APU v1 ignore it (needs the C-01 legality pass).
+  program's owner map is executed by Samsung, UPMEM and AiM contractions
+  (rejected at emission with the reason when not realizable, and on Samsung
+  for elementwise kernels); APU v1 ignores it (needs the C-01 legality
+  pass).
 
 ### 8.3 What remains
 
-* Samsung realizes row-placement ties, but no tie is cycle-distinguishable
-  there (every slot is issued in lockstep). Ties that split `k` across PIM
-  units need a partial-sum combine (reduction policy) on every backend.
-  AiM, UPMEM and APU v1 would need a per-unit row re-map in their lowering;
-  until then their ties reach the ranking and are rejected for the stated
-  reason.
+* Samsung, UPMEM and AiM realize row-placement ties; none is
+  cycle-distinguishable by the cost programs (UPMEM's simulated cycles move
+  only with the values each DPU holds). Ties that split `k` across units
+  need a partial-sum combine (reduction policy) on every backend except the
+  AiM `reduction_partitions` split. APU v1 would need a per-unit row re-map
+  in its lowering; until then its ties are rejected for the stated reason.
+  UPMEM tasklets, AiM banks and multi-axis work grids are not placed by the
+  owner map.
+* Selecting among realizable minimum-movement ties drops the program's own
+  map when it is not minimal (the AiM P = 32 split of a skinny GEMV,
+  section 8.2); whether the program should stay a candidate, and movement
+  weights from the cost programs, are open.
 * Movement weights from the cost programs (`movement_cost_per_byte`).
 * Levels below the work grid (AiM banks, UPMEM tasklets, Samsung bank
   fibers) are chosen inside the backends and are not part of the problem.

@@ -8,10 +8,14 @@
 (c) A non-affine (opaque) access falls back with ``movement="not-analyzed"``.
 (d) A tiny budget ends at ``NODE_BUDGET``: incomplete, feasible incumbent.
 (e) AiM and UPMEM GEMVs report movement without changing cycles; their
-    strictly better-movement ties are not realizable and are rejected.
+    strictly better-movement ties split a row's reduction (or leave units
+    without rows) and are rejected with that reason.
 (f) Samsung places contraction rows by the owner map: the paper GEMV's
     row-distribution ties are realizable and ranked (simulator runs in
     ``samsung_hbm_pim/test_samsung_owner_maps.py``).
+(g) The ranking reports how many ties the backend realizes; APU v1 still
+    accepts only the work-grid owner map (UPMEM and AiM row placement:
+    ``test_upmem_owner_maps.py``, ``test_aim_owner_maps.py``).
 """
 
 from __future__ import annotations
@@ -324,17 +328,22 @@ def test_aim_and_upmem_report_movement_without_changing_cycles(
     record_property("min_cost", str(movement.min_cost))
     record_property("program_cost", str(movement.program_cost))
     # Both programs replicate x on every work unit; a strictly
-    # better-movement owner map exists but no backend realizes it.
+    # better-movement owner map exists, but it splits each row's reduction
+    # across units, which neither lowering combines.
     assert movement.program_cost > movement.min_cost
     assert movement.chosen_label == "not-minimal"
     assert movement.ties and not any(tie.realizable for tie in movement.ties)
+    assert movement.realizable_tie_count == 0
     assert kernel.movement_rejections
-    # Only row-map targets (Samsung) realize owner maps other than the work
-    # grid's; AiM and UPMEM keep the one-program-per-work-item reason.
-    assert all(
-        "does not re-map iterations to owners" in reason
-        for _position, reason in kernel.movement_rejections
-    )
+    # AiM and UPMEM place contraction rows by the owner map
+    # (test_upmem_owner_maps.py, test_aim_owner_maps.py); these ties are
+    # reduction splits and are rejected with the backend's reason.
+    reasons = [reason for _position, reason in kernel.movement_rejections]
+    assert all("places contraction rows by the owner map" in r for r in reasons)
+    if target.name == "upmem":
+        assert all("UPMEM accumulates in int32" in r for r in reasons)
+    else:
+        assert all("not that split" in r and "reduction_partitions" in r for r in reasons)
     if target.name == "upmem":
         assert movement.optimality_scope == "coordinate layouts"
         assert movement.derived.is_masked
@@ -375,3 +384,51 @@ def test_samsung_row_distribution_ties_are_distinct_owner_maps():
     # The program is the block x block distribution.
     (_name, block_block), *_ = row_distributions(derived)
     assert block_block.matrix(derived.coordinate_problem) == derived.program_layout()
+
+
+# --------------------------------------------------------------------- #
+# (g) Realizable tie counts; APU v1 keeps the work-grid owner map
+# --------------------------------------------------------------------- #
+
+
+def test_default_compile_reports_realizable_tie_counts_and_apu_v1_rejects():
+    """Samsung, UPMEM and AiM place contraction rows by the owner map
+    (``ROW_MAP_TARGETS``); the record counts the ties each one executes.
+    APU v1 emits one program per work item and rejects any other owner map
+    with that reason (UPMEM and AiM counts: ``test_upmem_owner_maps.py``,
+    ``test_aim_owner_maps.py``)."""
+    from dataclasses import replace
+
+    from allo.spmw_layout_problem import (
+        ROW_MAP_TARGETS,
+        _realization,
+        row_distributions,
+        row_map_unrealizable_reason,
+    )
+
+    assert {"samsung_hbm_pim", "upmem", "aim"} <= ROW_MAP_TARGETS
+    assert "apu_v1" not in ROW_MAP_TARGETS
+    compiled = _compile(_SAMSUNG.gemv_m4096_k256, build_samsung_target(), samsung_cost)
+    movement = _kernel(compiled).movement
+    assert movement.realizable_tie_count == movement.tie_count == 4
+    assert movement.chosen_label == "minimal"
+
+    # The same problem stated for APU v1: a row distribution other than the
+    # program's is rejected with the one-program-per-work-item reason.
+    derived = replace(movement.derived, target_name="apu_v1")
+    program = derived.program_assignment()
+    program_matrix = derived.program_layout()
+    (_name, cyclic), *_ = reversed(row_distributions(derived))
+    matrix = cyclic.matrix(derived.coordinate_problem)
+    realizable, reason = _realization(
+        derived, matrix, derived.owner_flag(program_matrix), program, "cyclic rows"
+    )
+    assert not realizable
+    assert "apu_v1 emits one program per work item" in reason
+    assert "does not re-map iterations to owners" in reason
+    assert row_map_unrealizable_reason(derived, matrix) == (
+        "apu_v1 does not place rows by the owner map"
+    )
+    assert _realization(
+        derived, program_matrix, derived.owner_flag(program_matrix), program, "program"
+    ) == (True, None)

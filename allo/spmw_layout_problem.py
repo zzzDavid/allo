@@ -74,27 +74,39 @@ included).  Larger problems run the exact coordinate-variable search
 full carrier is exact over all one-to-one layouts, and on a mask over
 coordinate layouts only.
 
-Realization.  AiM, UPMEM and APU v1 emit one program per work item, placed
-on the unit the work grid names; none rewrites the work decomposition.  On
-those targets a tie is realizable exactly when its owner flag (``T_s`` per
-level) equals the flag of the program layout (work axis ``d``'s bits on
-owner axis ``d``, loop bits local).
+Realization.  APU v1 emits one program per work item, placed on the unit
+the work grid names, and does not rewrite the work decomposition.  There a
+tie is realizable exactly when its owner flag (``T_s`` per level) equals the
+flag of the program layout (work axis ``d``'s bits on owner axis ``d``, loop
+bits local).
 
-Targets in :data:`ROW_MAP_TARGETS` (Samsung HBM-PIM) place the output rows
-of a contraction by the selected owner map: the lowering turns the tie into
-a row-to-slot table (rows that share an owner unit occupy that unit's slot
-range) that the conductor applies when it stages the matrix and drains the
-results.  There a tie is realizable when it keeps every row's reduction
-inside one owner unit (the accumulator's kernel lies in the innermost local
-space ``T_h``), the accumulator has one output-row coordinate and the row
-variables are not masked (:func:`row_map_unrealizable_reason`).  A tie
-that splits a row's reduction across units is a reduction split, which
-belongs to the reduction policy, and is rejected with that reason.  The
-program's tie class is also expanded into its per-level BLOCK/CYCLIC row
-distributions (:func:`row_distributions`), so distinct realizable owner maps
-reach the cost ranking as separate ties.  Unrealizable ties are still
-crossed with the backend candidates and are rejected before emission with
-the reason.
+Targets in :data:`ROW_MAP_TARGETS` place the output rows of a contraction
+by the selected owner map: the lowering turns the tie into a row-to-unit
+assignment (:func:`owner_rows`; the rows one owner unit holds, in ascending
+order).  Samsung HBM-PIM applies it as a row-to-slot table in the
+conductor; UPMEM packs DPU ``u``'s MRAM image from the rows unit ``u``
+owns and gathers its output back to those rows; AiM places row ``r`` at
+output-frontier position ``slot(r)`` (the channel and bank the mapping's
+storage contract gives that position), re-addresses per-row host transfers
+and records the host-side result mapping.  There a tie is realizable when
+it keeps every row's reduction inside one owner unit (the accumulator's
+kernel lies in the innermost local space ``T_h``) and the accumulator has
+one output-row coordinate (:func:`row_map_unrealizable_reason`).  Samsung
+also requires unmasked row variables; UPMEM and AiM require a
+one-dimensional work grid and every unit to own the same number of rows
+(checked on the active rows, so a masked row loop is accepted when it
+divides evenly).  A tie that splits a row's reduction across units is a
+reduction split, which belongs to the reduction policy, and is rejected
+with that reason; on AiM the one exception is the split the
+``reduction_partitions`` knob already lowers (every owner bit from the low
+bits of the one reduction loop: element ``t`` on channel group ``t % P``,
+:func:`reduction_partition_split`), which is realizable on the candidates
+that carry that ``P``.  The program's tie class is also expanded into its
+per-level BLOCK/CYCLIC row distributions (:func:`row_distributions`), and
+on AiM into the cyclic reduction split when it is minimal, so distinct
+realizable owner maps reach the cost ranking as separate ties.
+Unrealizable ties are still crossed with the backend candidates and are
+rejected before emission with the reason.
 """
 
 from __future__ import annotations
@@ -140,8 +152,17 @@ COMPUTE_LEVELS: dict[str, tuple[str, ...]] = {
 }
 
 #: Targets whose contraction lowering places output rows by the selected owner
-#: map (``spmw_samsung`` row-to-slot table); see the module docstring.
-ROW_MAP_TARGETS = frozenset({"samsung_hbm_pim"})
+#: map (``spmw_samsung`` row-to-slot table, ``spmw_upmem`` row-to-DPU images,
+#: ``spmw_aim`` row-to-frontier slots); see the module docstring.
+ROW_MAP_TARGETS = frozenset({"samsung_hbm_pim", "upmem", "aim"})
+
+#: Row-map targets that need unmasked row variables (Samsung's conductor
+#: packs a full slot range per unit); the others check equal row counts on
+#: the active rows.
+_UNMASKED_ROW_TARGETS = frozenset({"samsung_hbm_pim"})
+
+#: Enumeration cap of :func:`owner_rows` (output rows of one kernel group).
+_MAX_OWNER_ROWS = 1 << 22
 
 MOVEMENT_WEIGHTS_UNIFORM = "uniform"
 MOVEMENT_WEIGHTS_COST_PROGRAM = "cost-program"
@@ -175,6 +196,8 @@ class DerivedAccess:
     coordinates: tuple[str, ...]  # bucket-0 coordinate text, for diagnostics
     # Per coordinate: ((coefficient, variable), ...) sorted by coefficient.
     terms: tuple[tuple[tuple[int, int], ...], ...] = ()
+    # Per coordinate: the constant at the grid origin (``c0``).
+    offsets: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -741,6 +764,7 @@ def derive_layout_problem(target, matches, *, bound_cost=None) -> DerivedLayoutP
     for index, (memref, mode, mtype, coords0, texts0) in enumerate(base):
         variables_used: set[int] = set()
         coordinate_terms = []
+        coordinate_offsets = []
         for c, (loop_coefs, c0) in enumerate(coords0):
             work_coefs = []
             for d in range(n_work):
@@ -779,6 +803,7 @@ def derive_layout_problem(target, matches, *, bound_cost=None) -> DerivedLayoutP
                 reach += a * (variables[v].extent - 1)
             variables_used.update(v for _a, v in terms)
             coordinate_terms.append(tuple(sorted(terms)))
+            coordinate_offsets.append(int(c0))
         if mtype is None:
             raise LayoutDerivationError(f"{memref}: element type is not retained")
         name = memref
@@ -799,6 +824,7 @@ def derive_layout_problem(target, matches, *, bound_cost=None) -> DerivedLayoutP
                 ),
                 coordinates=tuple(texts0),
                 terms=tuple(coordinate_terms),
+                offsets=tuple(coordinate_offsets),
             )
         )
 
@@ -938,14 +964,135 @@ def split_movement_layout(layout):
     return part(keep, False), part(moved, True)
 
 
+def _split_reduction_bits(derived: DerivedLayoutProblem, matrix, acc) -> list[str]:
+    """Owner bits of ``matrix`` taken from variables ``acc`` does not read."""
+
+    problem = derived.coordinate_problem
+    innermost = derived.owner_flag(matrix)[-1]
+    split = []
+    for v, variable in enumerate(derived.variables):
+        if v in acc.variables:
+            continue
+        offset = problem.bit_offset(v)
+        bits = [b for b in range(variable.bits) if not innermost.contains(1 << (offset + b))]
+        if bits:
+            split.append(f"{variable.name}[{','.join(map(str, bits))}]")
+    return split
+
+
+def owner_rows(derived: DerivedLayoutProblem, matrix) -> dict[int, list[int]]:
+    """Output rows per flat owner unit of a row-only owner map.
+
+    Enumerates the active values of the accumulator's variables (the other
+    variables at 0: the map must keep them local, which
+    :func:`row_map_unrealizable_reason` checks) and evaluates the
+    accumulator's single coordinate ``c0 + sum a_v v`` at each.  Returns
+    ``{unit: ascending rows}``; the unit is :meth:`owner_unit`'s flat index
+    (outer level most significant).  Raises :class:`LayoutDerivationError`
+    when the accumulator has no single coordinate or too many rows.
+    """
+
+    acc = derived.accumulator()
+    if acc is None or len(acc.terms) != 1 or len(acc.offsets) != 1:
+        raise LayoutDerivationError("the accumulator has no single output-row coordinate")
+    variables = [v for v in acc.variables if derived.variables[v].extent > 1]
+    count = math.prod(derived.variables[v].extent for v in variables)
+    if count > _MAX_OWNER_ROWS:
+        raise LayoutDerivationError(
+            f"{count} output rows exceed the row-map enumeration cap {_MAX_OWNER_ROWS}"
+        )
+    coefficient = {v: a for a, v in acc.terms[0]}
+    inverse = matrix.inverse()
+    units: dict[int, list[int]] = {}
+    for point in itertools.product(*(range(derived.variables[v].extent) for v in variables)):
+        values = dict(zip(variables, point))
+        row = acc.offsets[0] + sum(coefficient.get(v, 0) * x for v, x in values.items())
+        units.setdefault(derived.owner_unit(inverse, values), []).append(row)
+    return {unit: sorted(rows) for unit, rows in sorted(units.items())}
+
+
+def reduction_partition_split(derived: DerivedLayoutProblem, matrix) -> int | None:
+    """``P`` when ``matrix`` is the AiM ``reduction_partitions`` split, else None.
+
+    The knob lowers reduction element ``t`` on channel group ``t % P`` and
+    keeps every output row in every group (a host merge adds the ``P``
+    partial vectors; ``aim_lowering.AimContraction``).  In owner-map terms:
+    one owner level, one reduction loop (a variable the accumulator does not
+    read), and the units are named by exactly that loop's ``log2 P`` low
+    bits.  The flag comparison accepts any relabeling of the groups.
+    """
+
+    if derived.target_name != "aim" or len(derived.level_names) != 1:
+        return None
+    acc = derived.accumulator()
+    if derived.op_name != "MAC" or acc is None or len(acc.coordinates) != 1:
+        return None
+    reductions = [
+        v
+        for v, variable in enumerate(derived.variables)
+        if v not in acc.variables and variable.bits
+    ]
+    if len(reductions) != 1:
+        return None
+    (k,) = reductions
+    (width,) = derived.coordinate_problem.level_bits
+    variable = derived.variables[k]
+    if width == 0 or width > variable.bits or variable.extent % (1 << width):
+        return None
+    if derived.owner_flag(matrix) != derived.owner_flag(
+        reduction_partition_assignment(derived, k, width).matrix(derived.coordinate_problem)
+    ):
+        return None
+    return 1 << width
+
+
+def reduction_partition_assignment(derived, k, width) -> CoordinateAssignment:
+    """The owner map naming the units by the low ``width`` bits of ``k``."""
+
+    level = tuple(
+        tuple(range(width)) if v == k else () for v in range(len(derived.variables))
+    )
+    return CoordinateAssignment((level,))
+
+
+def _reduction_split_reason(derived, acc, split) -> str:
+    owners = "+".join(split)
+    head = (
+        f"it splits the reduction of each {acc.memref} row across owner units "
+        f"(owner bits from {owners}); "
+    )
+    if derived.target_name == "upmem":
+        return head + (
+            "UPMEM accumulates in int32, so the reduction policy permits the "
+            "regrouping, but the UPMEM templates do not combine partial sums "
+            "across DPUs (each DPU writes whole output rows), so this "
+            "reduction split is not realized"
+        )
+    if derived.target_name == "aim":
+        return head + (
+            "the AiM lowering realizes a reduction split only as the "
+            "reduction_partitions split (every owner bit from the low bits of "
+            "the one reduction loop: element t on channel group t % P, every "
+            "row in every group, host merge), and this tie is not that split"
+        )
+    return head + (
+        "a reduction split needs a partial-sum combine, which belongs to the "
+        "reduction policy, not to the row placement"
+    )
+
+
 def row_map_unrealizable_reason(derived: DerivedLayoutProblem, matrix) -> str | None:
     """Why a row-map target cannot realize ``matrix``; None when it can.
 
     Realizable: the kernel is a contraction (``MAC``) with one accumulator
     of one output-row coordinate, every bit of a variable the accumulator
     does not depend on (the reduction) is local at the innermost owner
-    level, so each row's reduction stays in one unit, and the row variables
-    are not masked (every unit then owns the same number of rows).
+    level, so each row's reduction stays in one unit, and every unit owns
+    the same number of rows: on Samsung the row variables are not masked;
+    on UPMEM and AiM the work grid is one-dimensional (one work item per
+    DPU or output-frontier block) and the active rows divide evenly
+    (:func:`owner_rows`).  An AiM ``reduction_partitions`` split
+    (:func:`reduction_partition_split`) is realizable.
     """
 
     if derived.target_name not in ROW_MAP_TARGETS:
@@ -961,28 +1108,68 @@ def row_map_unrealizable_reason(derived: DerivedLayoutProblem, matrix) -> str | 
             f"the accumulator {acc.memref} has {len(acc.coordinates)} coordinates; "
             "the row map places one output-row index"
         )
-    problem = derived.coordinate_problem
-    innermost = derived.owner_flag(matrix)[-1]
-    split = []
-    for v, variable in enumerate(derived.variables):
-        if v in acc.variables:
-            continue
-        offset = problem.bit_offset(v)
-        bits = [b for b in range(variable.bits) if not innermost.contains(1 << (offset + b))]
-        if bits:
-            split.append(f"{variable.name}[{','.join(map(str, bits))}]")
+    if reduction_partition_split(derived, matrix) is not None:
+        return None
+    split = _split_reduction_bits(derived, matrix, acc)
     if split:
+        return _reduction_split_reason(derived, acc, split)
+    if derived.target_name in _UNMASKED_ROW_TARGETS:
+        masked = [
+            derived.variables[v].name for v in acc.variables if derived.variables[v].masked
+        ]
+        if masked:
+            return (
+                f"the row variables {masked} are masked, so units would own unequal "
+                "row counts"
+            )
+        return None
+    if len(derived.work_levels) != 1:
         return (
-            f"it splits the reduction of each {acc.memref} row across owner units "
-            f"(owner bits from {'+'.join(split)}); a reduction split needs a "
-            "partial-sum combine, which belongs to the reduction policy, not to "
-            "the row placement"
+            f"the work grid has {len(derived.work_levels)} axes; the "
+            f"{derived.target_name} row map places rows over a one-dimensional "
+            "work grid (one work item per unit)"
         )
-    masked = [derived.variables[v].name for v in acc.variables if derived.variables[v].masked]
-    if masked:
+    expected = 1 << sum(derived.coordinate_problem.level_bits)
+    n_work = len(derived.work_levels)
+    row_loops = {v for v in acc.variables if v >= n_work}
+    batched = [
+        a.name
+        for a in derived.accesses
+        if a.mode is AccessMode.READ
+        and set(a.variables) & row_loops
+        and not set(acc.variables) <= set(a.variables)
+    ]
+    if batched:
         return (
-            f"the row variables {masked} are masked, so units would own unequal "
-            "row counts"
+            f"the inputs {batched} read the row loops without the whole row index "
+            f"(a batched contraction); the {derived.target_name} row map places "
+            "the rows of one batch"
+        )
+    try:
+        own = owner_rows(derived, derived.program_layout())
+        units = owner_rows(derived, matrix)
+    except LayoutDerivationError as error:
+        return str(error)
+    per_item = len(own.get(0, ()))
+    base = own[0][0] if per_item else 0
+    if sorted(own) != list(range(expected)) or any(
+        rows != list(range(base + u * per_item, base + (u + 1) * per_item))
+        for u, rows in own.items()
+    ):
+        return (
+            "the work grid does not partition the output rows into consecutive "
+            "per-work-item blocks in work-id order (a replicated or interleaved "
+            f"work grid); the {derived.target_name} row map relocates the rows "
+            "of such a partition"
+        )
+    counts = sorted({len(rows) for rows in units.values()})
+    if len(units) != expected or len(counts) != 1:
+        held = "/".join(map(str, counts))
+        return (
+            f"its units own unequal row counts ({len(units)} of {expected} units "
+            f"own {held} rows, {expected - len(units)} own none); the "
+            f"{derived.target_name} lowering gives every work item's unit the "
+            "same row count"
         )
     return None
 
@@ -1026,10 +1213,51 @@ def row_distributions(derived: DerivedLayoutProblem):
     return out
 
 
+def _reduction_partition_class(derived, min_cost, seen):
+    """The AiM ``reduction_partitions`` member of a minimum class, or None."""
+
+    acc = derived.accumulator()
+    if derived.target_name != "aim" or acc is None or len(derived.level_names) != 1:
+        return None
+    reductions = [
+        v
+        for v, variable in enumerate(derived.variables)
+        if v not in acc.variables and variable.bits
+    ]
+    if len(reductions) != 1:
+        return None
+    problem = derived.coordinate_problem
+    (width,) = problem.level_bits
+    assignment = reduction_partition_assignment(derived, reductions[0], width)
+    if width > derived.variables[reductions[0]].bits:
+        return None
+    matrix = assignment.matrix(problem)
+    partitions = reduction_partition_split(derived, matrix)
+    flag = derived.owner_flag(matrix)
+    if partitions is None or flag in seen:
+        return None
+    cost, profile = coordinate_assignment_cost(problem, assignment)
+    if cost is None or cost != min_cost:
+        return None
+    seen.add(flag)
+    return (
+        cost,
+        profile,
+        matrix,
+        1,
+        f"reduction split t % {partitions} over {derived.level_names[0]} "
+        f"(reduction_partitions={partitions}): {derived.describe_assignment(assignment)}",
+        False,
+    )
+
+
 def _realization(derived, matrix, program_flag, program, description):
     """``(realizable, reason)`` of one tie (module docstring, Realization)."""
 
     if derived.owner_flag(matrix) == program_flag:
+        return True, None
+    partitions = reduction_partition_split(derived, matrix)
+    if partitions is not None:
         return True, None
     if derived.target_name in ROW_MAP_TARGETS:
         reason = row_map_unrealizable_reason(derived, matrix)
@@ -1154,6 +1382,11 @@ class KernelMovement:
         if self.status == "not-analyzed":
             return f"not-analyzed: {self.reason}"
         return self.status
+
+    @property
+    def realizable_tie_count(self) -> int:
+        """Tie classes the backend executes (the rest carry a reason)."""
+        return sum(1 for tie in self.ties if tie.realizable)
 
 
 def _label(cost, min_cost, proven, termination, scope):
@@ -1316,6 +1549,14 @@ def _search_and_classify(derived: DerivedLayoutProblem, policy) -> KernelMovemen
                 f"{added} row distribution(s) of a minimum tie class crossed as "
                 "separate ties: the backend places rows by the owner map"
             )
+        partition = _reduction_partition_class(derived, min_cost, seen)
+        if partition is not None:
+            classes.append(partition)
+            notes.append(
+                "the cyclic reduction split of a minimum tie class crossed as a "
+                "separate tie: AiM realizes it with the reduction_partitions "
+                "candidates of the same P"
+            )
 
     ties = []
     for index, (
@@ -1400,6 +1641,9 @@ __all__ = [
     "derive_layout_problem",
     "label_for_cost",
     "movement_selection_policy",
+    "owner_rows",
+    "reduction_partition_assignment",
+    "reduction_partition_split",
     "row_distributions",
     "row_map_unrealizable_reason",
     "split_movement_layout",

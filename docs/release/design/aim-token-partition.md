@@ -175,3 +175,85 @@ explicit-binding traces and measured host stages.
   checks ownership and merge, not GB payload routing.
 * Estimate accuracy on long streams (1.25x to 1.59x high) is the next
   calibration target; it was not tuned against these results.
+
+## 7. Owner-map row placement (movement ties, 2026-11-02)
+
+Claim row 16 on AiM. The movement stage (`allo/spmw_layout_problem.py`,
+`layout-search.md` section 8) states a contraction's layout as a GF(2) map
+from work bits (owner level `channel`; `bank_group` and `bank` are not
+modelled for a one-dimensional grid) to iteration bits (`work0`, the row
+loop, the reduction loop).
+
+### 7.1 Realizable family
+
+`row_map_unrealizable_reason` accepts a tie on AiM when the kernel is one
+`MAC` with one accumulator of one output-row coordinate, the owner bits come
+from the row bits only, the one-dimensional work grid partitions the output
+rows into consecutive per-work-item blocks in work-id order (the CENT
+replicated groups, `replicas = 4`, are outside), no input reads the row
+loops without the whole row index (batched contractions are outside), and
+every unit gets the same number of rows. A tie with an owner bit from `k`
+is a reduction split and is rejected, with one exception: when every owner
+bit comes from the low `log2 P` bits of the one reduction loop it is exactly
+the `reduction_partitions` split of section 1 (element `t` on channel group
+`t % P`, every row in every group, host merge;
+`reduction_partition_split`). That tie is realizable, the stage adds the
+low-bit member of a minimum k-split class as its own tie (description
+`reduction split t % P over channel (reduction_partitions=P)`), and codegen
+accepts it only on placements that lower the same `P`
+(`spmw_aim._contraction_row_map` raises InfeasibleSchedule otherwise; those
+candidates are scored and then rejected at materialization).
+
+### 7.2 Realization
+
+`_contraction_row_map` (in `_AimProgramDerivation._derive_groups`) evaluates
+`owner_rows` for the carried and the program map. The work grid partitions
+the output frontier in work-id order, so work item `w` owns positions
+`[w R, (w + 1) R)`; under a tie, owner unit `u`'s rows occupy those positions
+in ascending order: `slot[row] = u R + rank`. The map applies to one
+unreplicated single-batch contraction with an unsplit reduction (other
+carried maps are rejected with that reason).
+
+* Trace: MAC_ABK/MAC_SBK, WR_GB, WR_BIAS and RD_MAC address channels, banks
+  and positions, not rows, so the trace of a GB-fed contraction is
+  identical for every realizable tie. Per-row host transfers
+  (`_matrix_records`, `row_packed` scatter of `W[o, :]`) are addressed at
+  `slot[o]`.
+* Host-side result mapping: the lowering-manifest entry gains `row_map`
+  (`map`, `rows_moved`, `rows_per_unit`, FNV-1a 64 `digest`, the full
+  `row_slots` table and sample rows' `slot`, launch or tile, channel and
+  bank under the mapping's storage contract, `_frontier_position`);
+  `RunResult.extra["row_map"]` lists it. The identity adds nothing, so the
+  pinned CENT traces and manifests are unchanged.
+
+### 7.3 Ties and simulator runs
+
+GEMV 2048 x 64 BF16 over `mapping=[32]` (`reassociate`; 64 rows per work
+item; `M > 32 K / 2`, so splitting `k` never pays): minimum 3,968 B =
+program, proven; ties: the program (block) map and `rows cyclic over
+channel` (unit `u` holds rows `u, u + 32, ...`); `tie_count ==
+realizable_tie_count == 2`, `chosen_label == "minimal"`. Expected before
+running: equal cycles, because both ties emit the same 14-line trace.
+
+| Tie | Trace | ramulator2 cycles | Estimate |
+|---|---|---|---|
+| program `channel<-work0[0..4]` | 14 lines | 507 | 691 |
+| cyclic `channel<-loop0[0..4]` | identical | 507 | 691 |
+
+Row 63, for example, sits at slot 1985 (launch 3, channel 28, bank 1) under
+the cyclic map. Test: `tests/pim/test_aim_owner_maps.py`.
+
+The all-targets GEMV (256 x 256, `mapping=[32]`) is unchanged: its two
+minimum classes (5,120 B against the program's 15,872) mix row and high `k`
+bits and are rejected as reduction splits that are not the
+`reduction_partitions` split. A 64 x 2048 GEMV over 32 channels has the
+P = 32 split as its minimum (3,968 B against 126,976): it is realizable and
+selected (`chosen_label == "minimal"`). The ranking crosses the program's
+own map only when no tie is realizable (`spmw_autoschedule._movement_entries`),
+so the unsplit program is no longer a candidate. Without the movement stage
+the same kernel selects the unsplit `flattened` program. Estimates: 8,883
+(P = 32) against 670 (unsplit). ramulator2: 507 device cycles plus the
+modelled 256-cycle host merge = 763 for P = 32, against 828 for the unsplit
+program. The minimum-movement choice is faster in simulation although the
+cost program ranks it far slower (the serial-issue estimate overstates the
+32-group channel-batched program, section 3).

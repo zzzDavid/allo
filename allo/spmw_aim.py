@@ -140,6 +140,9 @@ class AimCtx(CodegenContext):
                 entry["after_command"] = len(lines)
                 self.host_steps.append(operation)
             if entry["kind"] == "contraction":
+                row_map = program.row_maps.get(id(operation))
+                if row_map is not None:
+                    entry["row_map"] = _row_map_entry(entry, *row_map)
                 entry["bank_scope"] = "abk" if sbk_banks is None else "sbk"
                 if sbk_banks is not None:
                     entry["sbk_banks"] = list(sbk_banks)
@@ -217,6 +220,163 @@ def _reduction_partitions(group, placement) -> int:
     return carried
 
 
+def _row_map_digest(values) -> str:
+    """FNV-1a 64 over the row -> slot table."""
+    digest = 0xCBF29CE484222325
+    for value in values:
+        digest ^= int(value)
+        digest = (digest * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{digest:016x}"
+
+
+def _contraction_row_map(target, group, matches, layouts):
+    """``(row slots or None, record)`` of the owner map a contraction group's
+    placements carry, or None for the work grid's own map.
+
+    The work grid partitions the output frontier in work-id order, so work
+    item ``w`` owns frontier positions ``[w R, (w + 1) R)``.  A realizable
+    map (``spmw_layout_problem.row_map_unrealizable_reason``) gives flat
+    owner unit ``u`` the same ``R`` rows; they occupy that unit's positions
+    in ascending order: ``slot[row] = u R + rank``.  The trace's MAC, GB and
+    readout commands address positions, not rows, so only per-row host
+    transfers and the host-side result mapping change.  The AiM
+    ``reduction_partitions`` split is realized by the placements that carry
+    the same ``P`` (rows stay in place).  Raises InfeasibleSchedule with the
+    reason otherwise.
+    """
+    from .pim.layout_problem import TargetHierarchyError
+    from .pim.schedule_search import InfeasibleSchedule
+    from .spmw_layout_problem import (
+        LayoutDerivationError,
+        derive_layout_problem,
+        owner_rows,
+        reduction_partition_split,
+        row_map_unrealizable_reason,
+        split_movement_layout,
+    )
+
+    movements = [split_movement_layout(getattr(p, "layout", None))[1] for p in layouts]
+    if all(m is None for m in movements):
+        return None
+    if any(m is None or m != movements[0] for m in movements):
+        raise InfeasibleSchedule(f"AiM {group.name}: work items carry different owner maps")
+    try:
+        derived = derive_layout_problem(target, matches)
+        matrix = derived.movement_matrix(movements[0])
+    except (LayoutDerivationError, TargetHierarchyError) as error:
+        raise InfeasibleSchedule(
+            f"AiM {group.name}: the carried movement layout cannot be placed: {error}"
+        ) from error
+    program = derived.program_layout()
+    if matrix == program:
+        return None
+    partitions = reduction_partition_split(derived, matrix)
+    if partitions is not None:
+        if group.reduction_partitions != partitions:
+            raise InfeasibleSchedule(
+                f"AiM {group.name}: the owner map is the reduction_partitions="
+                f"{partitions} split; this placement lowers reduction_partitions="
+                f"{group.reduction_partitions}"
+            )
+        return None, {"map": "reduction_partitions", "partitions": partitions}
+    if derived.owner_flag(matrix) != derived.owner_flag(program):
+        reason = row_map_unrealizable_reason(derived, matrix)
+        if reason is not None:
+            raise InfeasibleSchedule(f"AiM {group.name}: owner map not realizable: {reason}")
+    shapes = [contraction["shape"] for contraction in group.contractions]
+    if (
+        len(shapes) != 1
+        or shapes[0]["batches"] != 1
+        or shapes[0]["replicas"] != 1
+        or group.replicas != 1
+        or group.reduction_partitions != 1
+    ):
+        raise InfeasibleSchedule(
+            f"AiM {group.name}: owner map not realizable: rows are placed by the "
+            "owner map only for one unreplicated single-batch contraction with an "
+            "unsplit reduction"
+        )
+    outputs = shapes[0]["outputs"]
+    try:
+        units, own = owner_rows(derived, matrix), owner_rows(derived, program)
+    except LayoutDerivationError as error:
+        raise InfeasibleSchedule(f"AiM {group.name}: {error}") from error
+    count = len(own)
+    if count == 0 or outputs % count:
+        raise InfeasibleSchedule(
+            f"AiM {group.name}: {outputs} outputs over {count} work items"
+        )
+    per_unit = outputs // count
+    frontier = {u: list(range(u * per_unit, (u + 1) * per_unit)) for u in range(count)}
+    if own != frontier or sorted(units) != list(range(count)) or any(
+        len(rows) != per_unit for rows in units.values()
+    ):
+        raise InfeasibleSchedule(
+            f"AiM {group.name}: owner map not realizable: the work items do not "
+            f"partition the {outputs}-output frontier (rows 0..{outputs - 1}) in "
+            f"work-id order, or the map does not give each of the {count} units "
+            f"{per_unit} rows"
+        )
+    slots = [0] * outputs
+    for unit, rows in units.items():
+        for rank, row in enumerate(rows):
+            slots[row] = unit * per_unit + rank
+    if slots == list(range(outputs)):
+        return None
+    moved = sum(1 for row, slot in enumerate(slots) if row != slot)
+    return tuple(slots), {
+        "map": "permuted",
+        "rows_moved": moved,
+        "rows_per_unit": per_unit,
+        "digest": _row_map_digest(slots),
+    }
+
+
+def _frontier_position(entry, slot) -> dict:
+    """Launch or tile, physical channel and bank of output-frontier position
+    ``slot`` under the entry's matrix storage contract (one batch, one
+    replica)."""
+    banks = int(entry["active_banks_per_channel"])
+    mapping = entry.get("batch_mapping")
+    if mapping == "flattened":
+        capacity = int(entry["output_capacity_per_launch"])
+        channels = entry["active_channels"]
+        return {
+            "output_launch": slot // capacity,
+            "channel": channels[(slot % capacity) // banks],
+            "bank": slot % banks,
+        }
+    if mapping == "row_packed":
+        capacity = int(entry["output_capacity_per_tile_per_replica"])
+        channels = entry["replica_channel_groups"][0]
+        return {
+            "output_tile": slot // capacity,
+            "channel": channels[(slot % capacity) // banks],
+            "bank": slot % banks,
+        }
+    return {
+        "output_tile": slot // banks,
+        "channel": entry["replica_channel_groups"][0][0],
+        "bank": slot % banks,
+    }
+
+
+def _row_map_entry(entry, slots, record) -> dict:
+    """The lowering-manifest ``row_map`` block: the record, the row -> slot
+    table and the physical position of sample rows."""
+    out = dict(record)
+    if slots is None:
+        return out
+    rows = len(slots)
+    per_unit = record["rows_per_unit"]
+    samples = sorted({0, 1, per_unit - 1, per_unit, rows - 1} & set(range(rows)))
+    out["row_slots"] = list(slots)
+    out["placement"] = {
+        row: {"slot": slots[row], **_frontier_position(entry, slots[row])} for row in samples
+    }
+    return out
+
+
 class _Usage:
     """How one kernel group holds one buffer in banks."""
 
@@ -235,7 +395,7 @@ class _Group:
     __slots__ = (
         "group_id", "name", "functions", "matches", "properties", "kind",
         "replicas", "partitions", "elements", "usages", "contractions",
-        "sbk_banks", "row", "reduction_partitions",
+        "sbk_banks", "row", "reduction_partitions", "row_map",
     )
 
     def __init__(self, group_id, name):
@@ -247,6 +407,9 @@ class _Group:
         self.elements = 0
         self.row = 0
         self.reduction_partitions = 1
+        # (row -> frontier slot table or None, record) of a carried owner map
+        # other than the work grid's; None for the work grid's own map.
+        self.row_map = None
 
 
 class _AimProgramDerivation:
@@ -272,6 +435,8 @@ class _AimProgramDerivation:
         self._index_buffers()
         # id(AimContraction record) -> scalar MACs of its matched program.
         self.program_macs: dict[int, int] = {}
+        # id(AimContraction record) -> (row slots or None, row-map record).
+        self.row_maps: dict[int, tuple] = {}
         self.groups = self._derive_groups()
         self.by_id = {group.group_id: group for group in self.groups}
         self.regions = self._allocate_rows()
@@ -396,6 +561,19 @@ class _AimProgramDerivation:
                         )
                     else:
                         group.usages[key] = _Usage("matrix", contraction=contraction)
+                group.row_map = _contraction_row_map(
+                    self.target,
+                    group,
+                    matches,
+                    [
+                        self.layout_by_scope[_matcher_search_scope(match)]
+                        for match in matches
+                        if _matcher_search_scope(match) in self.layout_by_scope
+                    ],
+                )
+                if group.row_map is not None and group.row_map[0] is not None:
+                    for contraction in group.contractions:
+                        contraction["row_slots"] = group.row_map[0]
             elif "MUL" in names or "ADD" in names:
                 kind = "MUL" if "MUL" in names else "ADD"
                 matched = [match for match in reps if match.target_op_name == kind]
@@ -598,6 +776,8 @@ class _AimProgramDerivation:
                 )
                 operation = replace(operation, row=self.row_of_key[contraction["matrix"]])
                 self.program_macs[id(operation)] = shape["program_scalar_macs"]
+                if group.row_map is not None:
+                    self.row_maps[id(operation)] = group.row_map
                 records.append((operation, group.sbk_banks))
                 if operation.reduction_partitions > 1:
                     records.append(
@@ -780,7 +960,9 @@ class _AimProgramDerivation:
             pack = min(shape["batches"], geometry.row_elements // aligned)
             batch_groups = _ceil(shape["batches"], pack)
             tile = cpr * geometry.banks
-            output_tile, in_tile = divmod(position, tile)
+            # A carried owner map places output row `position` at its slot.
+            slot = contraction.get("row_slots", range(position + 1))[position]
+            output_tile, in_tile = divmod(slot, tile)
             local_channel, bank = divmod(in_tile, geometry.banks)
             records = []
             for batch_group in range(batch_groups):
@@ -1124,5 +1306,19 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
                 step.manifest()
                 for step in getattr(getattr(compiled, "layout_ctx", None), "host_steps", ())
             ],
+            **_row_map_extra(compiled),
         },
     )
+
+
+def _row_map_extra(compiled) -> dict:
+    """``{"row_map": [...]}`` when a contraction places rows by a carried
+    owner map: the host-side result mapping (row -> frontier slot ->
+    channel, bank) of every such contraction; empty otherwise."""
+    manifest = getattr(getattr(compiled, "layout_ctx", None), "lowering_manifest", ())
+    maps = [
+        {"name": entry.get("name"), **entry["row_map"]}
+        for entry in manifest or ()
+        if isinstance(entry, dict) and "row_map" in entry
+    ]
+    return {"row_map": maps} if maps else {}

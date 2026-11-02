@@ -2693,6 +2693,157 @@ _OUTPUT_ROLES["selection"] = ("out", "count")
 
 
 # --------------------------------------------------------------------- #
+# Owner-map row placement (movement ties)
+# --------------------------------------------------------------------- #
+
+# Roles indexed by the output row: the DPU holding a row holds its matrix row
+# and its output element.
+_ROW_MAPPED_ROLES = ("matrix", "out")
+
+
+def _row_map_digest(rows) -> str:
+    """FNV-1a 64 over the flattened per-DPU row table."""
+    digest = 0xCBF29CE484222325
+    for value in rows:
+        digest ^= int(value)
+        digest = (digest * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{digest:016x}"
+
+
+def _owner_row_map(target, kernel, matches, layouts):
+    """``(dpu_rows, program_rows, record)`` of the owner map the work items'
+    placements carry, or ``(None, None, None)`` for the work grid's own map.
+
+    ``dpu_rows[d]`` are the output rows DPU ``d`` (the ``d``-th work item in
+    work-id order) holds, ascending: the rows the map gives flat owner unit
+    ``d`` (``spmw_layout_problem.owner_rows``).  Realized for the
+    single-batch ``matrix_vector`` family on an even work grid: every DPU
+    keeps the plan's row count, so the task image is unchanged and only the
+    per-DPU MRAM images and the output gather follow the map.  Raises
+    InfeasibleSchedule with the reason otherwise.
+    """
+    from .pim.layout_problem import TargetHierarchyError
+    from .pim.schedule_search import InfeasibleSchedule
+    from .spmw_layout_problem import (
+        LayoutDerivationError,
+        derive_layout_problem,
+        owner_rows,
+        row_map_unrealizable_reason,
+        split_movement_layout,
+    )
+
+    movements = [split_movement_layout(getattr(p, "layout", None))[1] for p in layouts]
+    if all(m is None for m in movements):
+        return None, None, None
+    if any(m is None or m != movements[0] for m in movements):
+        raise InfeasibleSchedule("UPMEM work items carry different owner maps")
+    try:
+        derived = derive_layout_problem(target, matches)
+        matrix = derived.movement_matrix(movements[0])
+    except (LayoutDerivationError, TargetHierarchyError) as error:
+        raise InfeasibleSchedule(
+            f"UPMEM: the carried movement layout cannot be placed: {error}"
+        ) from error
+    program = derived.program_layout()
+    if matrix == program:
+        return None, None, None
+    if derived.owner_flag(matrix) != derived.owner_flag(program):
+        reason = row_map_unrealizable_reason(derived, matrix)
+        if reason is not None:
+            raise InfeasibleSchedule(f"UPMEM owner map not realizable: {reason}")
+    if (
+        kernel.family != "matrix_vector"
+        or kernel.geometry_value("batches") != 1
+        or kernel.streams
+        or kernel.placement != "dpu"
+    ):
+        raise InfeasibleSchedule(
+            "UPMEM owner map not realizable: rows are placed by the owner map only "
+            f"for the single-batch matrix_vector family on an even work grid (this "
+            f"group: {kernel.family}, geometry {dict(kernel.geometry)}, "
+            f"{'uneven' if kernel.streams else 'even'} work items)"
+        )
+    try:
+        units, own = owner_rows(derived, matrix), owner_rows(derived, program)
+    except LayoutDerivationError as error:
+        raise InfeasibleSchedule(f"UPMEM owner map not realizable: {error}") from error
+    rows = kernel.geometry_value("rows")
+    if sorted(units) != list(range(kernel.dpus)) or any(
+        len(units[d]) != rows for d in units
+    ):
+        raise InfeasibleSchedule(
+            f"UPMEM owner map not realizable: it does not give each of the "
+            f"{kernel.dpus} DPUs {rows} rows"
+        )
+    dpu_rows = tuple(tuple(units[d]) for d in range(kernel.dpus))
+    program_rows = tuple(tuple(own.get(d, ())) for d in range(kernel.dpus))
+    if dpu_rows == program_rows:
+        return None, None, None
+    owner_of = {row: d for d, held in enumerate(program_rows) for row in held}
+    moved = sum(1 for d, held in enumerate(dpu_rows) for row in held if owner_of[row] != d)
+    position = {row: (d, i) for d, held in enumerate(dpu_rows) for i, row in enumerate(held)}
+    total = rows * kernel.dpus
+    first = min(position)
+    samples = sorted(
+        {first, first + 1, first + rows - 1, first + rows, first + total - 1}
+        & set(position)
+    )
+    record = {
+        "map": "permuted",
+        "rows_moved": moved,
+        "rows_per_dpu": rows,
+        "digest": _row_map_digest(row for held in dpu_rows for row in held),
+        "placement": {row: {"dpu": position[row][0], "local_row": position[row][1]} for row in samples},
+    }
+    return dpu_rows, program_rows, record
+
+
+def _check_row_windows(program, dpu, windows, name) -> None:
+    """The IR windows of work item ``dpu`` hold exactly the rows the
+    program's own map gives it: its output and matrix windows start at
+    the same row, span the plan's rows, and the matrix spans whole rows."""
+    from .pim.schedule_search import InfeasibleSchedule
+
+    own = program.program_rows[dpu]
+    out, matrix = windows.get("out"), windows.get("matrix")
+    if (
+        out is None
+        or matrix is None
+        or len(out.offsets) != 1
+        or len(matrix.offsets) != 2
+        or tuple(range(out.offsets[0], out.offsets[0] + out.extents[0])) != own
+        or matrix.offsets[0] != out.offsets[0]
+        or matrix.extents[0] != out.extents[0]
+    ):
+        raise InfeasibleSchedule(
+            f"UPMEM owner map: the windows of {name} are not the rows {own[:1]}..."
+            f"{own[-1:]} its work item owns; the row map cannot be applied"
+        )
+
+
+def _mapped_rows(program, dpu, role):
+    if program.dpu_rows is None or role not in _ROW_MAPPED_ROLES:
+        return None
+    return program.dpu_rows[dpu]
+
+
+def _row_index(window, rows) -> tuple:
+    """Index of ``rows`` (dimension 0) inside ``window``'s other dimensions."""
+    tail = tuple(slice(o, o + e) for o, e in zip(window.offsets[1:], window.extents[1:]))
+    return (np.asarray(rows, dtype=np.intp),) + tail
+
+
+def _role_slice(program, dpu, role, window, arrays) -> np.ndarray:
+    """One DPU's slice of a role: its work item's window, or the owner
+    map's rows when the group places rows by a carried owner map."""
+    rows = _mapped_rows(program, dpu, role)
+    array = arrays[window.argument]
+    if rows is None:
+        return window.slice(array)
+    return array[_row_index(window, rows)]
+
+
+# --------------------------------------------------------------------- #
 # Codegen context
 # --------------------------------------------------------------------- #
 
@@ -2707,6 +2858,11 @@ class _GroupProgram:
     windows: dict  # function -> {role: _Window}
     oracles: dict  # function -> (compiled C module, abi positions)
     cost_validity: dict | None = None
+    # Output rows of each DPU (work-id order) under a carried owner map other
+    # than the work grid's; None keeps every work item's own window.
+    dpu_rows: tuple | None = None
+    program_rows: tuple | None = None
+    row_map: dict | None = None
 
 
 class UpmemCtx(CodegenContext):
@@ -2782,8 +2938,12 @@ class UpmemCtx(CodegenContext):
                     f"realizable: {reason}"
                 )
             device_source = "" if plan is None else plan.device_source()
+            dpu_rows = program_rows = row_map = None
             if plan is not None:
                 self._check_carried_layout(kernel, plan, decision, chosen, layout_by_scope)
+                dpu_rows, program_rows, row_map = _owner_row_map(
+                    self.target, kernel, matches, [layout_by_scope[s] for s in chosen]
+                )
             functions = sorted(
                 {m.func_name: _matcher_work_scope(m).work_id for m in matches}.items(),
                 key=lambda item: item[1],
@@ -2797,6 +2957,9 @@ class UpmemCtx(CodegenContext):
                 {},
                 {},
                 upmem_cost_validity(kernel, decision),
+                dpu_rows,
+                program_rows,
+                row_map,
             )
 
         if module is not None:
@@ -2833,6 +2996,11 @@ class UpmemCtx(CodegenContext):
             )
             for group_id, executions in segments
         )
+        row_maps = {
+            program.kernel: program.row_map
+            for program in groups.values()
+            if program.row_map is not None
+        }
         self.cmds = [
             (
                 f"segment {index} {segment.kernel.family} host "
@@ -2841,6 +3009,11 @@ class UpmemCtx(CodegenContext):
                 else f"segment {index} {segment.kernel.family} dpus={segment.kernel.dpus} "
                 f"executions={segment.executions} tasklets={segment.decision.tasklets} "
                 f"source_sha256={_sha256(segment.device_source.encode())}"
+                + (
+                    f" row_map={row_maps[segment.kernel]['digest']}"
+                    if segment.kernel in row_maps
+                    else ""
+                )
             )
             for index, segment in enumerate(self.segments)
         ]
@@ -2966,6 +3139,10 @@ class UpmemCtx(CodegenContext):
                         "only caller arguments"
                     )
                 arity = max(arity, max(abi, default=-1) + 1)
+                if program.dpu_rows is not None:
+                    _check_row_windows(
+                        program, program.functions.index(name), windows, name
+                    )
                 program.windows[name] = {
                     role: _Window(abi[w.argument], w.offsets, w.extents)
                     for role, w in windows.items()
@@ -3070,15 +3247,15 @@ class UpmemCtx(CodegenContext):
                 for dpu, name in enumerate(program.functions):
                     windows = program.windows[name]
                     slices_in = {
-                        r: windows[r].slice(before[windows[r].argument])
+                        r: _role_slice(program, dpu, r, windows[r], before)
                         for r in _INPUT_ROLES[family]
                         if r in windows
                     }
                     _check_preconditions(segment.plan, segment.kernel, slices_in)
                     device_in = dict(slices_in)
                     if segment.plan is not None and _carries_output_on_device(segment):
-                        device_in["initial_out"] = windows["out"].slice(
-                            before[windows["out"].argument]
+                        device_in["initial_out"] = _role_slice(
+                            program, dpu, "out", windows["out"], before
                         )
                     device_in = _padded_slices(segment.kernel, dpu, device_in)
                     heap = pack_inputs(segment.plan, segment.kernel, device_in)
@@ -3091,7 +3268,7 @@ class UpmemCtx(CodegenContext):
                             {
                                 **slices_in,
                                 **{
-                                    r: windows[r].slice(arrays[windows[r].argument])
+                                    r: _role_slice(program, dpu, r, windows[r], arrays)
                                     for r in _OUTPUT_ROLES[family]
                                     if r in windows
                                 },
@@ -3456,6 +3633,17 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                     continue
                 for role, data in values.items():
                     window = program.windows[name][role]
+                    rows = _mapped_rows(program, dpu, role)
+                    if rows is not None:
+                        # The DPU holds the owner map's rows, in ascending order.
+                        index = _row_index(window, rows)
+                        destination = caller_arrays[window.argument][index].copy()
+                        _store_exact(
+                            destination, np.asarray(data).reshape(-1)[: destination.size],
+                            f"{segment.kernel.family} role {role!r}",
+                        )
+                        caller_arrays[window.argument][index] = destination
+                        continue
                     destination = window.slice(caller_arrays[window.argument])
                     # A zero-padded work item keeps its leading elements.
                     _store_exact(
@@ -3492,6 +3680,7 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                     json.dumps(segment.plan.manifest(), sort_keys=True, default=str).encode()
                 ),
                 "host_steps": _host_steps(segment),
+                **({"row_map": program.row_map} if program.row_map is not None else {}),
             }
         )
     # The run writes decoded outputs into the caller's arrays in place;

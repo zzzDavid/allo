@@ -301,7 +301,93 @@ counts are unchanged.
   `scripts/prepare_upmem_tenon_campaign.py`. It checks the knob fan-out
   against the realizable catalog directly.
 
-## 8. Open
+## 8. Owner-map row placement (movement ties, 2026-11-02)
+
+Claim row 16 (movement ties survive to the cost ranking and execute) on
+UPMEM. The movement stage (`allo/spmw_layout_problem.py`, `layout-search.md`
+section 8) states a contraction's layout as a one-to-one GF(2) map from work
+bits (owner level `dpu`, then local bits) to iteration bits (`work0`, the row
+loop, the reduction loop). `tasklet` is not modelled for a one-dimensional
+grid; inside a DPU the rows stay in ascending order, so the plan's
+`tid * BLOCK + local` tasklet blocks and the carried F2 tasklet map are
+unchanged (`_check_tasklet_ownership` still passes).
+
+### 8.1 Realizable family
+
+`row_map_unrealizable_reason` accepts a tie on UPMEM when:
+
+* the kernel is one `MAC` with one accumulator of one output-row coordinate
+  (GEMM's two-coordinate output and scaled GEMV's MAC + SCALE are outside);
+* the owner bits come from the output-row bits only (no bit of `k`). A tie
+  with an owner bit from `k` splits a row's reduction across DPUs. UPMEM
+  accumulates in int32, so the reduction policy permits the regrouping, but
+  the templates do not combine partial sums across DPUs (each DPU writes
+  whole output rows); the rejection says so;
+* the work grid is one-dimensional, partitions the output rows into
+  consecutive per-work-item blocks in work-id order (a replicated grid is
+  outside), and no input reads the row loops without the whole row index
+  (MMTV batches are outside);
+* every DPU gets the same number of rows, counted on the active rows (a
+  masked row loop is accepted when it divides evenly).
+
+The lowering (`spmw_upmem._owner_row_map`) also requires the single-batch
+`matrix_vector` family on an even work grid and rejects other carried maps
+with that reason (InfeasibleSchedule at materialization).
+
+### 8.2 Realization
+
+`_owner_row_map` evaluates `owner_rows` (the rows of each flat owner unit,
+ascending) for the carried map and for the program map. DPU `d` (the `d`-th
+work item in work-id order) holds the rows of unit `d`. When that equals the
+program map the group carries no row map, so the identity reproduces today's
+fixtures byte for byte. Otherwise `_GroupProgram.dpu_rows` holds the
+assignment:
+
+* pack: DPU `d`'s `matrix` and `out` (and `initial_out`) slices are
+  `W[rows_d, cols]` and `y[rows_d]` (`_role_slice`); the vector is unchanged;
+  `pack_inputs`/`pack_expected` and the plan are unchanged, so the task image
+  (`task.c`) is identical and only the per-DPU MRAM images differ;
+* gather: `_run_upmem` writes DPU `d`'s output back to `y[rows_d]`;
+* `_bind_module` checks that each work item's IR windows are exactly the
+  rows the program map gives it (`_check_row_windows`);
+* the segment command gains ` row_map=<FNV-1a 64 digest>` and the run record
+  a `row_map` entry (`rows_moved`, `rows_per_dpu`, digest, sample row ->
+  `(dpu, local_row)`).
+
+### 8.3 Ties and simulator runs
+
+GEMV 1024 x 128 int32 over 8 DPUs (128 rows per DPU, unmasked; `M >
+DPUS * K / 2`, so splitting `k` never pays): minimum 3,584 B = program,
+proven; ties: the program (block) map and `rows cyclic over dpu` (DPU `d`
+holds rows `d, d + 8, ...`); `tie_count == realizable_tie_count == 2`,
+`chosen_label == "minimal"`, 4 scored candidates (2 ties x 2 keys), virtual
+estimate 646,015 for both. The structural tie-break selects the cyclic map
+in the default compile.
+
+Expected before running: the per-DPU work is identical (same task image, 128
+rows x 128 columns packed the same way), so cycles are equal when every DPU
+sees the same values; with random values they may differ because the DPU
+multiply's cost depends on the operand values and the DPUs hold other rows.
+
+| Tie | Input | Outputs | Cycles (max over DPUs) |
+|---|---|---|---|
+| program `dpu<-work0[0,1,2]` | random int32 in [-8, 8) | `W @ x` exact | 595,371 |
+| cyclic `dpu<-loop0[0,1,2]` | random | exact | 593,932 |
+| program | every row equal | exact | 604,829 |
+| cyclic | every row equal | exact | 604,829 |
+
+uPIMulator `logic_cycle`, 12 tasklets, `fused_replicated` decision; each run
+reported the same count on all 8 DPUs. Test:
+`tests/pim/test_upmem_owner_maps.py`.
+
+The pinned all-targets GEMV (768 x 128, 8 DPUs, 96 masked rows per DPU) is
+unchanged: its minimum (2,560 B against the program's 3,584) is `dpu <-
+loop0[4,5,6]`, which gives 6 DPUs 128 rows and 2 none; it is rejected for
+unequal row counts, the cyclic distribution has the program's movement and
+is not a tie. The 64-DPU x 12-row GEMV's minimum ties take owner bits from
+`k` and are rejected as reduction splits.
+
+## 9. Open
 
 * `_run_virtual` forwarding of `virtual_run_extra()` (spmw_codegen.py).
 * `a * x - b * y` and `+ c` need target-description patterns.
