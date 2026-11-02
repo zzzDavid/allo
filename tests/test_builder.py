@@ -816,9 +816,13 @@ def test_tuple():
 
 @pytest.mark.parametrize("T", [int8, int32, float32])
 def test_minmax(T):
+    # The sentinel must be representable in T: before audit F-02 the int8 case
+    # silently truncated 0x3F3F3F3F to 0x3F; now that is a compile-time error.
+    INIT = 0x3F if T == int8 else 0x3F3F3F3F
+
     def kernel(A: T[10]) -> (T[2], T[2]):
-        min_val: T[2] = 0x3F3F3F3F
-        max_val: T[2] = -0x3F3F3F3F
+        min_val: T[2] = INIT
+        max_val: T[2] = -INIT
         for i in range(10):
             min_val[0] = min(min_val[0], A[i])
             max_val[0] = max(max_val[0], A[i])

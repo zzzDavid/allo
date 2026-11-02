@@ -256,9 +256,8 @@ def test_kmeans_update_wide_epilogue_raises_instead_of_returning_wrong_values():
     # Audit U-02 (p6_hostgroup): a host-placed UPMEM group's signed wide
     # epilogue (t * scale) >> 40 went through uint64_t (logical shift of the
     # low bits). Host-placed groups run exactly this emission
-    # (spmw_upmem.UpmemCtx._bind_module). The scale is a runtime value: an
-    # integer literal such as -(1 << 40) is currently typed i32 by the
-    # frontend and folds to 0 before the backend sees it.
+    # (spmw_upmem.UpmemCtx._bind_module). The literal form of the scale is
+    # covered by the test below (audit F-02).
     def update(sums: int64[4, 8], scale: int64[1], C: int64[4, 8]):
         for c in range(4):
             for d in range(8):
@@ -269,6 +268,42 @@ def test_kmeans_update_wide_epilogue_raises_instead_of_returning_wrong_values():
         WideIntegerError, match="arith.shrsi on a 128-bit integer in function update"
     ):
         _wide(update)
+
+
+def test_kmeans_update_wide_epilogue_with_literal_scale_raises():
+    # Audit F-02: -(1 << 40) used to be typed i32 and fold to 0 (an i96
+    # product); it is now the int64 constant, so the product is i128 and the
+    # signed shift is rejected instead of computing (t * 0) >> 40.
+    def update(sums: int64[4, 8], C: int64[4, 8]):
+        for c in range(4):
+            for d in range(8):
+                t: int64 = sums[c, d]
+                C[c, d] = (t * -(1 << 40)) >> 40
+
+    assert "arith.constant 1099511627776 : i64" in str(
+        allo.customize(update, enable_tensor=False).module
+    )
+    with pytest.raises(
+        WideIntegerError, match="arith.shrsi on a 128-bit integer in function update"
+    ):
+        _wide(update)
+
+
+def test_wide_literal_multiplier_keeps_exact_low_bits():
+    # Audit F-02: the literal forms of the U-02 multipliers reach the
+    # backend exactly; add/mul on the low 64 bits are exact.
+    def kernel(A: int64[8], C: int64[8]):
+        for i in range(8):
+            m: int64 = -1099511627776
+            C[i] = A[i] * m + A[i] * -(1 << 40) + 3000000000
+
+    artifact = _wide(kernel)
+    out = np.zeros(8, np.int64)
+    artifact.compile()(_WIDE_A.copy(), out)
+    expected = [
+        _wrap(int(a) * -(1 << 40) * 2 + 3000000000, 64) for a in _WIDE_A
+    ]
+    assert out.tolist() == expected
 
 
 def test_wide_integer_abi_is_rejected():

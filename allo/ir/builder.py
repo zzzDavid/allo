@@ -2,6 +2,45 @@
 # SPDX-License-Identifier: Apache-2.0
 # Reference: taichi/python/taichi/lang/ast/transform.py
 # pylint: disable=no-name-in-module, unused-argument, unexpected-keyword-arg, no-value-for-parameter, eval-used
+"""Build MLIR from a type-inferred Allo AST.
+
+Integer literal typing (audit F-02).  An integer literal is never silently
+truncated.  "Literal" covers integer constants, module-level Python ints
+(other than meta_for / get_pid variables), and expressions built only from
+them with + - * // << >> & | ^ and unary - + ~ ("literal-only
+expressions"); `/`, `%` and `**` are not folded because Allo lowers them
+differently from Python.
+
+(a) Converted to a declared type.  A literal assigned (`=`, annotated
+    assignment, element store, `return`) to an Int/UInt type keeps its value
+    in that type if it is representable there; otherwise compilation stops
+    with a DTypeError naming the literal, the target type and its range.  A
+    literal operand of a binary operation must be representable in the
+    operation type that Allo's typing rules choose for it (under the
+    "default" rules only `//` and `/` by a literal wider than the dividend
+    can fail); the "cpp-style" rules never narrow a literal and keep C's
+    modular conversion of a negative literal to an unsigned operation type.
+    Fixed/UFixed/Float targets are not checked.
+(b) No type context.  A bare literal is int32 if it fits (the historical
+    default, and C's `int` under "cpp-style"), else int64, else uint64
+    (C's rule for a literal that fits only unsigned long long).  Integer
+    constants wider than 64 bits are a compile-time error when materialized:
+    Int(n > 64) is a legitimate storage type, but the MLIR Python bindings
+    read integer attributes through int64_t (wider values abort the process),
+    so Allo does not create them.  A literal-only expression evaluates with
+    Python's exact semantics: when Allo's own typing rules compute it exactly
+    (every operand and the result fit the inferred type and every shift
+    amount is below its width) the expression is lowered unchanged;
+    otherwise it is folded to its value, typed as a bare literal.  Hence
+    `1 << 40` is the int64 constant 1099511627776, `-(1 << 40)` is
+    -1099511627776, and `(1 << 64) - 1` is the uint64 all-ones value.
+(c) Shifts.  A constant shift amount must be non-negative, and when the
+    shifted operand is not constant the amount must be below that operand's
+    Int/UInt width (`x << 40` with x: int32 is an error, not an undefined C
+    shift).  When both operands are constant, (b) applies, and (a) then
+    rejects `y: int32 = 1 << 40`.  Shift amounts known only at run time are
+    not checked.
+"""
 
 import gc
 import ast
@@ -65,7 +104,7 @@ from .utils import (
     resolve_generic_types,
     parse_ast,
 )
-from .infer import TypeInferer
+from .infer import TypeInferer, check_int_literal_fits, int_value_fits
 from .types import (
     AlloType,
     Int,
@@ -312,6 +351,37 @@ def _stamp_spmw_abi_value_ids(function, ctx, argument_values):
     )
 
 
+class IntLiteral(MockConstant):
+    """An integer literal whose type is not the default int32."""
+
+    @property
+    def result(self):
+        dtype = self.dtype
+        if not isinstance(dtype, (Int, UInt)):
+            return super().result
+        if not int_value_fits(self.val, dtype):
+            raise DTypeError(
+                f"integer literal {self.val} is not representable in {dtype}"
+            )
+        if dtype.bits > 64:
+            raise DTypeError(
+                f"integer literal {self.val} needs a {dtype.bits}-bit constant; "
+                "Allo materializes integer constants of at most 64 bits"
+            )
+        bits = dtype.bits
+        pattern = self.val & ((1 << bits) - 1)
+        if pattern >> (bits - 1):
+            pattern -= 1 << bits
+        mlir_type = dtype.build()
+        # pylint: disable=too-many-function-args
+        const_op = arith_d.ConstantOp(
+            mlir_type, IntegerAttr.get(mlir_type, pattern), ip=self.ctx.get_ip()
+        )
+        if isinstance(dtype, UInt):
+            const_op.attributes["unsigned"] = UnitAttr.get()
+        return const_op.result
+
+
 class ASTBuilder(ASTVisitor):
     def __call__(self, ctx: ASTContext, node: ast.AST, file_name: str = None, **kwargs):
         if not ctx.file_name and file_name:
@@ -438,12 +508,35 @@ class ASTTransformer(ASTBuilder):
                 return op_
             return ret
         if node.id in ctx.global_vars:
-            return MockConstant(ctx.global_vars[node.id], ctx)
+            value = ctx.global_vars[node.id]
+            if isinstance(value, int):
+                return ASTTransformer.build_int_literal(ctx, node, value)
+            return MockConstant(value, ctx)
         raise RuntimeError("Unsupported Name")
 
     @staticmethod
     def build_Constant(ctx: ASTContext, node: ast.Constant):
+        if isinstance(node.value, int):
+            return ASTTransformer.build_int_literal(ctx, node, node.value)
         return MockConstant(node.value, ctx)
+
+    @staticmethod
+    def build_int_literal(ctx: ASTContext, node: ast.expr, value: int):
+        dtype = getattr(node, "dtype", None)
+        if not isinstance(dtype, (Int, UInt)) or (
+            isinstance(dtype, Int) and dtype.bits == 32 and int_value_fits(value, dtype)
+        ):
+            return MockConstant(value, ctx)
+        return IntLiteral(int(value), ctx, dtype=dtype)
+
+    @staticmethod
+    def check_int_literal_conversion(value: ast.expr, dtype: AlloType, context: str):
+        if (
+            isinstance(getattr(value, "const_value", None), int)
+            and getattr(value, "shape", None) == tuple()
+            and isinstance(dtype, (Int, UInt))
+        ):
+            check_int_literal_fits(value, dtype, context)
 
     @staticmethod
     def build_shaped_type(
@@ -1144,6 +1237,8 @@ class ASTTransformer(ASTBuilder):
 
     @staticmethod
     def build_UnaryOp(ctx: ASTContext, node: ast.UnaryOp):
+        if getattr(node, "folded", False):
+            return ASTTransformer.build_int_literal(ctx, node, node.const_value)
         value = build_stmt(ctx, node.operand)
         value_result = ASTTransformer.get_mlir_op_result(ctx, value)
         if isinstance(node.op, ast.Invert):
@@ -1230,6 +1325,8 @@ class ASTTransformer(ASTBuilder):
 
     @staticmethod
     def build_BinOp(ctx: ASTContext, node: ast.BinOp):
+        if getattr(node, "folded", False):
+            return ASTTransformer.build_int_literal(ctx, node, node.const_value)
         lhs = build_stmt(ctx, node.left)
         rhs = build_stmt(ctx, node.right)
         # Cast lhs and rhs to the same type
@@ -1319,6 +1416,9 @@ class ASTTransformer(ASTBuilder):
             else:
                 # dtype cast & broadcast
                 # for some OpView (e.g., linalg.transpose), op.result return a OpResultList
+                ASTTransformer.check_int_literal_conversion(
+                    value, target.dtype, f"assigned to `{ast.unparse(target)}`"
+                )
                 rhs = ASTTransformer.build_cast_op(
                     ctx, rhs, value.dtype, target.dtype, value.shape
                 )
@@ -4109,6 +4209,9 @@ class ASTTransformer(ASTBuilder):
             # return multiple values
             rets = []
             for i, n in enumerate(node.value.elts):
+                ASTTransformer.check_int_literal_conversion(
+                    n, ctx.top_func_tree.dtype[i], "returned"
+                )
                 ret = build_stmt(ctx, n)
                 ret = ASTTransformer.build_cast_op(
                     ctx,
@@ -4120,6 +4223,9 @@ class ASTTransformer(ASTBuilder):
                 rets.append(ASTTransformer.get_mlir_op_result(ctx, ret))
             return func_d.ReturnOp(rets, ip=ctx.pop_ip())
         # return a single value or none
+        ASTTransformer.check_int_literal_conversion(
+            node.value, ctx.top_func_tree.dtype, "returned"
+        )
         ret = build_stmt(ctx, node.value)
         if ret is None:
             return func_d.ReturnOp([], ip=ctx.pop_ip())

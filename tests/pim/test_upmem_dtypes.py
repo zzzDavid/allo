@@ -298,3 +298,48 @@ def test_kmeans_host_group_with_wide_shift_does_not_run():
     # yields a runnable program.
     with pytest.raises((NotImplementedError, ValueError)):
         _compile(kmeans, host_moves=host)
+
+
+def test_kmeans_host_group_with_literal_wide_scale_does_not_run():
+    # Audit F-02: the literal scale -(1 << 40) used to be typed i32 and fold
+    # to 0, so the host group computed (t * 0) >> 40 in 96 bits.  It is now
+    # the int64 constant; the 128-bit signed shift is rejected.
+
+    @df_region()
+    def kmeans(P: int32[KP, KD], C: int32[KK, KD], D: int64[KP, KK],
+               C_new: int64[KK, KD], counts: int32[KK]):
+        @allo.work(mapping=[1], args=[P, C, D])
+        def distances(lP: int32[KP, KD], lC: int32[KK, KD], lD: int64[KP, KK]):
+            for p in range(KP):
+                for c in range(KK):
+                    lD[p, c] = 0
+                    for d in range(KD):
+                        lD[p, c] += (lP[p, d] - lC[c, d]) * (lP[p, d] - lC[c, d])
+
+        @allo.work(mapping=[1], args=[P, D, C_new, counts])
+        def update(uP: int32[KP, KD], uD: int64[KP, KK], uC: int64[KK, KD],
+                   ucounts: int32[KK]):
+            sums: int64[KK, KD] = 0
+            for c0 in range(KK):
+                ucounts[c0] = 0
+            for p in range(KP):
+                best: int64 = uD[p, 0]
+                idx: int32 = 0
+                for c in range(KK):
+                    idx = c if uD[p, c] < best else idx
+                    best = uD[p, c] if uD[p, c] < best else best
+                ucounts[idx] += 1
+                for d in range(KD):
+                    sums[idx, d] += uP[p, d]
+            for c1 in range(KK):
+                for d1 in range(KD):
+                    t: int64 = sums[c1, d1]
+                    uC[c1, d1] = (t * -(1 << 40)) >> 40
+
+    @allo.host_program(kmeans)
+    def host(P, C, D, C_new, counts):
+        allo.launch("distances", P, C, D)
+        allo.launch("update", P, D, C_new, counts)
+
+    with pytest.raises(WideIntegerError, match="arith.shrsi on a 128-bit integer"):
+        _compile(kmeans, host_moves=host)

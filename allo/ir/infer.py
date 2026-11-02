@@ -4,6 +4,7 @@
 
 import ast
 import copy
+import operator
 import os
 import warnings
 import sympy
@@ -22,6 +23,8 @@ from .types import (
     int4,
     int8,
     int32,
+    int64,
+    uint64,
     float16,
     float32,
     float64,
@@ -41,6 +44,99 @@ from ..utils import (
 )
 from ..memory import DTensor, Layout
 from .utils import parse_ast, get_func_id_from_param_types, resolve_generic_types
+from .._mlir.exceptions import DTypeError
+
+
+# Integer literal typing (audit F-02); the rule is documented in builder.py.
+# Python evaluates these operators exactly on unbounded ints, and Allo's
+# integer lowering agrees with Python whenever no operand or result leaves
+# the operation type (FloorDiv lowers to arith.floordivsi, RShift to the
+# arithmetic arith.shrsi).  `/` and `%` are excluded: Allo lowers them to
+# truncating integer ops, so folding them with Python semantics would change
+# what the program computes.
+_FOLDABLE_INT_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.FloorDiv: operator.floordiv,
+    ast.LShift: operator.lshift,
+    ast.RShift: operator.rshift,
+    ast.BitAnd: operator.and_,
+    ast.BitOr: operator.or_,
+    ast.BitXor: operator.xor,
+}
+_FOLDABLE_INT_UNARYOPS = {
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+    ast.Invert: operator.invert,
+}
+
+
+def int_type_range(dtype):
+    """Inclusive value range of an Int or UInt type."""
+    if isinstance(dtype, UInt):
+        return 0, (1 << dtype.bits) - 1
+    return -(1 << (dtype.bits - 1)), (1 << (dtype.bits - 1)) - 1
+
+
+def int_value_fits(value, dtype):
+    lower, upper = int_type_range(dtype)
+    return lower <= value <= upper
+
+
+def int_literal_type(value):
+    """Type of an integer literal that has no type context: int32 when it
+    fits (the historical default), else int64, else uint64, else the
+    narrowest Int(n).  Constants wider than 64 bits are rejected when they
+    are materialized (see builder.py)."""
+    for dtype in (int32, int64, uint64):
+        if int_value_fits(value, dtype):
+            return dtype
+    magnitude = value if value >= 0 else -value - 1
+    return Int(magnitude.bit_length() + 1)
+
+
+def describe_int_literal(node):
+    text = ast.unparse(node)
+    value = node.const_value
+    return text if text == str(value) else f"{text} (= {value})"
+
+
+def check_int_literal_fits(node, dtype, context):
+    """Raise unless the compile-time integer `node` is representable in `dtype`."""
+    lower, upper = int_type_range(dtype)
+    if not lower <= node.const_value <= upper:
+        raise DTypeError(
+            f"integer literal {describe_int_literal(node)} is not representable "
+            f"in {dtype} ({context}); {dtype} holds [{lower}, {upper}]"
+        )
+
+
+def _is_int_constant(node):
+    return (
+        isinstance(getattr(node, "const_value", None), int)
+        and getattr(node, "shape", None) == tuple()
+    )
+
+
+def _settle_int_constant(node, value, operands, shift_amount=None):
+    """Record the exact value of a literal-only expression.  Allo's typing
+    rules stay in force when they compute it exactly; otherwise the node is
+    folded to a literal of `value` typed by `int_literal_type`.  An operand
+    wider than 64 bits always folds: it could not be materialized."""
+    node.const_value = value
+    dtype = node.dtype
+    exact = (
+        isinstance(dtype, Int)
+        and all(int_literal_type(v).bits <= 64 for v in operands)
+        and all(int_value_fits(v, dtype) for v in (*operands, value))
+        and (shift_amount is None or shift_amount < dtype.bits)
+    )
+    node.folded = not exact
+    if not exact:
+        node.dtype = int_literal_type(value)
+        node.shape = tuple()
+    return node
 
 
 # pylint: disable=too-many-public-methods
@@ -160,8 +256,13 @@ class TypeInferer(ASTVisitor):
         if node.id in ctx.global_vars:
             var = ctx.global_vars[node.id]
             if isinstance(var, int):
-                node.dtype = int32
                 node.shape = tuple()
+                if node.id in ctx.symbolic:
+                    # meta_for / get_pid variables change per instance.
+                    node.dtype = int32
+                else:
+                    node.dtype = int_literal_type(var)
+                    node.const_value = int(var)
             elif isinstance(var, float):
                 node.dtype = float32
                 node.shape = tuple()
@@ -177,7 +278,8 @@ class TypeInferer(ASTVisitor):
     def visit_Constant(ctx: ASTContext, node: ast.Constant):
         node.shape = tuple()
         if isinstance(node.value, int):
-            node.dtype = int32
+            node.dtype = int_literal_type(node.value)
+            node.const_value = int(node.value)
         elif isinstance(node.value, float):
             node.dtype = float32
         elif isinstance(node.value, str):
@@ -337,11 +439,68 @@ class TypeInferer(ASTVisitor):
         )
         node.shape = final_shape
         node.dims = (lhs_dims, rhs_dims)
+        TypeInferer.check_int_literal_operands(ctx, node, lhs, rhs)
         if ctx.verbose:
             print(
                 f"Broadcasted shape {lhs.shape} x {rhs.shape} -> {node.shape} for dims: {lhs_dims} & {rhs_dims}"
             )
         return node
+
+    @staticmethod
+    def check_int_literal_operands(ctx: ASTContext, node, lhs, rhs):
+        """Fold literal-only operations and reject integer literals that
+        the operation would truncate (rule in builder.py)."""
+        op = type(node.op)
+        is_shift = op in (ast.LShift, ast.RShift)
+        lhs_const, rhs_const = _is_int_constant(lhs), _is_int_constant(rhs)
+        node.const_value, node.folded = None, False
+        if is_shift and rhs_const and rhs.const_value < 0:
+            raise DTypeError(
+                f"negative shift amount {describe_int_literal(rhs)} in "
+                f"`{ast.unparse(node)}`"
+            )
+        foldable = (
+            isinstance(node, ast.BinOp)
+            and lhs_const
+            and rhs_const
+            and op in _FOLDABLE_INT_BINOPS
+        )
+        if foldable and (
+            (op is ast.FloorDiv and rhs.const_value == 0)
+            # Python would build a huge int; the shift check below rejects it.
+            or (op is ast.LShift and rhs.const_value > 4096)
+        ):
+            foldable = False
+        if foldable:
+            value = _FOLDABLE_INT_BINOPS[op](lhs.const_value, rhs.const_value)
+            _settle_int_constant(
+                node,
+                value,
+                [lhs.const_value] if is_shift else [lhs.const_value, rhs.const_value],
+                rhs.const_value if is_shift else None,
+            )
+            return
+        if not isinstance(node.dtype, (Int, UInt)):
+            return
+        if is_shift:
+            if rhs_const and rhs.const_value >= node.dtype.bits:
+                raise DTypeError(
+                    f"shift amount {describe_int_literal(rhs)} is not less than "
+                    f"the {node.dtype.bits}-bit width of the {node.dtype} operand "
+                    f"in `{ast.unparse(node)}`"
+                )
+            return
+        # The cpp-style rules never narrow a literal; mixing a negative
+        # literal with an unsigned operand is C's modular conversion there.
+        if ctx.typing_rule_set == "cpp-style":
+            return
+        for operand, is_const in ((lhs, lhs_const), (rhs, rhs_const)):
+            if is_const:
+                check_int_literal_fits(
+                    operand,
+                    node.dtype,
+                    f"operand of `{ast.unparse(node)}`, computed in {node.dtype}",
+                )
 
     @staticmethod
     def visit_UnaryOp(ctx: ASTContext, node: ast.UnaryOp):
@@ -355,6 +514,10 @@ class TypeInferer(ASTVisitor):
             node.dtype = Int(operand.dtype.bits)
         else:
             node.dtype = operand.dtype
+        node.const_value, node.folded = None, False
+        if _is_int_constant(operand) and type(node.op) in _FOLDABLE_INT_UNARYOPS:
+            value = _FOLDABLE_INT_UNARYOPS[type(node.op)](operand.const_value)
+            _settle_int_constant(node, value, [operand.const_value])
         return node
 
     @staticmethod
