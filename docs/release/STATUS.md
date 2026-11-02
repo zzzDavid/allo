@@ -1,6 +1,6 @@
 # Release status
 
-Updated: 2026-11-02 (round 6). Read `TASK.md` in the containing repository,
+Updated: 2026-11-02 (round 7). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -37,9 +37,12 @@ closed. Gate judgments are in `REVIEW.md`. What remains:
    evaluation scripts; committing the simulator overlays and skill-doc
    corrections in the containing repository; running the index removals in
    `RELEASE_CHECKLIST.md`.
-2. Open minor items: C-18 (cost evaluator anomaly, xfail), M-14 (AiM
-   elementwise single-channel placement to confirm), APU v1 realizes only
-   the work-grid owner map, P-17 (proprietary UPMEM SDK, documented).
+2. Open minor items: V1-16 (Gemini-I FP16 arithmetic not bit-reproducible
+   by an IEEE model; characterized on the board, needs GSI's GVML
+   definition), APU v1 realizes only the work-grid owner map, P-17
+   (proprietary UPMEM SDK, documented). C-18 is a documented evaluator
+   policy and M-14 (an AiM elementwise lowering that dropped work on
+   partitioned grids) is fixed.
 3. Final hardware evidence at the release revision: the round 6 board and
    card runs are recorded in `VALIDATION.md`; any later commit requires a
    re-run before a READY verdict.
