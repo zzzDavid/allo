@@ -574,6 +574,15 @@ def build_apu_v1_plan_graph(
 
     if not graph.activities:
         raise ValueError(f"APU v1 plan {plan.name!r} emitted no cost activities")
+    from .costs.apu_v1 import apu_v1_cost_validity
+
+    # The fitted affine event model covers only the native record-frequency
+    # and histogram recipes; contraction plans are priced per call.
+    validity = apu_v1_cost_validity(f"vector_contraction:{plan.name}", None, cost)
+    graph.metadata["cost_validity"] = validity
+    graph.metadata["estimate_validity"] = validity["cost_validity"]
+    if "tile_decision" in plan.metadata:
+        graph.metadata["tile_decision"] = plan.metadata["tile_decision"]
     return graph
 
 

@@ -732,12 +732,61 @@ def _layout_api():
     )
 
 
+GEMV_TILE_FAMILY = "spatial_gemv_group_reduction"
+# Reduction tiles a spatial GEMV may place in one 32K VR; each tile is one
+# cost-ranked candidate (``spatial_gemv_group_reduction_k<tile>``).
+_GEMV_REDUCTION_TILES = (32, 64, 128, 256, 512, 1024, 2048)
+_GEMV_VR_LANES = 32768
+# Resident vector tiles of the reduction axis the GEMV realization keeps live.
+_GEMV_MAX_RESIDENT_TILES = 10
+
+
+def _padded_extent(extent):
+    return 1 << (int(extent) - 1).bit_length()
+
+
+def gemv_reduction_tile_domain(analysis: ContractionAnalysis):
+    """Legal spatial-GEMV reduction tiles, in the former heuristic order.
+
+    A tile is legal when its padded width divides the 32K VR lanes and the
+    reduction axis needs at most ``_GEMV_MAX_RESIDENT_TILES`` resident tiles;
+    L3/VR capacity is checked again when each plan is realized.  Each entry is
+    ``(tile, padded_tile, resident_tiles, rows_per_vr, matrix_tiles)``.  The
+    order (fewest matrix tiles, fewest resident tiles, widest tile) only
+    breaks cost ties; selection ranks every entry by the cost program.
+    """
+
+    row_axis = analysis.output_axes[0]
+    rows = analysis.axis_extents[row_axis]
+    reduction_extent = analysis.axis_extents[analysis.reduction_axis]
+    entries = {}
+    for reduction_tile in _GEMV_REDUCTION_TILES:
+        tile = min(reduction_extent, reduction_tile)
+        padded_tile = _padded_extent(tile)
+        resident_count = (reduction_extent + padded_tile - 1) // padded_tile
+        if resident_count > _GEMV_MAX_RESIDENT_TILES:
+            continue
+        rows_per_vr = _GEMV_VR_LANES // padded_tile
+        matrix_tiles = ((rows + rows_per_vr - 1) // rows_per_vr) * resident_count
+        entries.setdefault(
+            tile, (tile, padded_tile, resident_count, rows_per_vr, matrix_tiles)
+        )
+    return tuple(
+        sorted(entries.values(), key=lambda item: (item[4], item[2], -item[1]))
+    )
+
+
 def _candidate_recipes(analysis: ContractionAnalysis):
     output_axes = analysis.output_axes
     reduction = analysis.reduction_axis
     singleton_gemv = (
         len(output_axes) == 2 and analysis.axis_extents[output_axes[1]] == 1
     )
+    gemv_tiles = gemv_reduction_tile_domain(analysis) if singleton_gemv else ()
+    if singleton_gemv and not gemv_tiles:
+        raise IllegalContractionError(
+            "spatial GEMV needs at most ten resident vector tiles"
+        )
     return (
         {
             "name": "baseline_spatial_reduction",
@@ -803,22 +852,32 @@ def _candidate_recipes(analysis: ContractionAnalysis):
             for lookup_storage in ("l3", "l4")
         ),
         *(
-            (
-                {
-                    "name": "spatial_gemv_group_reduction",
-                    "spatial_axes": output_axes + (reduction,),
-                    "temporal_axes": (),
-                    "temporal_strategy": "none",
-                    "reduction_strategy": "spatial",
-                    "coalesced": True,
-                    "broadcast": False,
-                    "accumulator_block": 1,
-                    "lookup_storage": "l3",
-                    "gemv": True,
+            {
+                "name": f"{GEMV_TILE_FAMILY}_k{tile}",
+                "spatial_axes": output_axes + (reduction,),
+                "temporal_axes": (),
+                "temporal_strategy": "none",
+                "reduction_strategy": "spatial",
+                "coalesced": True,
+                "broadcast": False,
+                "accumulator_block": 1,
+                "lookup_storage": "l3",
+                "gemv": True,
+                "gemv_tile": (tile, rows_per_vr),
+                "tile_decision": {
+                    "family": GEMV_TILE_FAMILY,
+                    "parameter": "reduction_tile",
+                    "tile": tile,
+                    "candidates": tuple(entry[0] for entry in gemv_tiles),
+                    "legality": (
+                        "padded tile divides the 32K VR lanes; at most "
+                        f"{_GEMV_MAX_RESIDENT_TILES} resident reduction tiles; "
+                        "L3/VR capacity re-checked at realization"
+                    ),
+                    "selection": "cost_ranked",
                 },
-            )
-            if singleton_gemv
-            else ()
+            }
+            for tile, _padded, _resident, rows_per_vr, _matrix in gemv_tiles
         ),
     )
 
@@ -1008,26 +1067,7 @@ def generate_apu_v1_vectorization_candidates(
     def iteration_layout(recipe):
         if recipe.get("gemv"):
             row_axis, column_axis = analysis.output_axes
-            reduction_extent = extents[analysis.reduction_axis]
-            choices = []
-            for reduction_tile in (32, 64, 128, 256, 512, 1024, 2048):
-                tile = min(reduction_extent, reduction_tile)
-                padded_tile = padded(tile)
-                resident_count = (reduction_extent + padded_tile - 1) // padded_tile
-                if resident_count > 10:
-                    continue
-                rows_per_vr = 32768 // padded_tile
-                matrix_tiles = (
-                    (extents[row_axis] + rows_per_vr - 1) // rows_per_vr
-                ) * resident_count
-                choices.append(
-                    (matrix_tiles, resident_count, -padded_tile, tile, rows_per_vr)
-                )
-            if not choices:
-                raise IllegalContractionError(
-                    "spatial GEMV needs at most ten resident vector tiles"
-                )
-            _calls, _resident, _neg_tile, reduction_tile, rows_per_vr = min(choices)
+            reduction_tile, rows_per_vr = recipe["gemv_tile"]
             spatial = {
                 row_axis: min(extents[row_axis], rows_per_vr),
                 column_axis: 1,
@@ -1776,6 +1816,11 @@ def generate_apu_v1_vectorization_candidates(
                 ),
             },
             "accumulator_block": accumulator_block,
+            **(
+                {"tile_decision": recipe["tile_decision"]}
+                if "tile_decision" in recipe
+                else {}
+            ),
             "product_operation": analysis.multiply_operation,
             "packed_word_bits": analysis.packed_word_bits,
             "combine_operation": analysis.combine_operation,
@@ -1831,4 +1876,6 @@ __all__ = [
     "analyze_apu_v1_contractions",
     "generate_apu_v1_vectorization_candidates",
     "generate_apu_v1_plans",
+    "gemv_reduction_tile_domain",
+    "GEMV_TILE_FAMILY",
 ]

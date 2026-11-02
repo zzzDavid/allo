@@ -17,12 +17,22 @@ Sources:
 * real-device microprofiles on 2026-07-01 for FP16 add/sub/mul and FP16 group
   reduction at group sizes 64, 128, and 256;
 * MICRO'25 APU artifact uint16 profiles in
-  ``micro-experiments/power-profile/latencies.csv``.
+  ``micro-experiments/power-profile/latencies.csv``;
+* the fitted affine event model of the paper's agent-assisted calibration
+  (``APU_V1_AFFINE_EVENT_MODEL`` below), which prices the aggregated events of
+  the native record-frequency and histogram recipes.
+
+Every estimate this program prices for a native recipe carries a validity
+label (``apu_v1_cost_validity``): ``calibrated`` inside the plan families and
+shapes the fitted model was validated on, ``extrapolated`` elsewhere.  See
+``docs/release/design/apu-v1-cost.md``.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
+from types import MappingProxyType
 
 from ...perf import cost, rule
 
@@ -123,6 +133,283 @@ MICRO_GET_ENTRY_16 = 60
 MICRO_ARC_STORE_L4_U16 = MICRO_PIO_STORE_PER_ELEMENT
 
 
+@dataclass(frozen=True)
+class APUv1AffineEvent:
+    """``round(activation + slope * count)`` CRUN cycles for one aggregated event.
+
+    The activation is charged once per aggregated event of a native recipe
+    graph (one event per GVML primitive family per launch); a zero count costs
+    nothing.  ``low_*``/``high_*`` name the two microbenchmarks whose median
+    CRUN the pair was solved from; each median includes the empty-route
+    intercept, so ``intercept + cycles(count)`` reproduces it.
+    """
+
+    feature: str
+    primitive: str
+    label: str
+    activation_cycles: float
+    slope_cycles_per_call: float
+    low_case: str
+    low_count: int
+    high_case: str
+    high_count: int
+    measured_medians_crun: tuple[float, float]
+
+    def cycles(self, count: int) -> int:
+        if count <= 0:
+            return 0
+        return max(1, int(round(self.activation_cycles + self.slope_cycles_per_call * count)))
+
+    def manifest(self) -> dict:
+        return {
+            "feature": self.feature,
+            "primitive": self.primitive,
+            "activation_cycles": self.activation_cycles,
+            "slope_cycles_per_call": self.slope_cycles_per_call,
+            "low_case": self.low_case,
+            "low_count": self.low_count,
+            "high_case": self.high_case,
+            "high_count": self.high_count,
+            "measured_medians_crun": list(self.measured_medians_crun),
+            "unit": "ARC CRUN device cycles",
+        }
+
+
+@dataclass(frozen=True)
+class APUv1AffineEventModel:
+    """The fitted event model with its provenance and validated domain."""
+
+    route_intercept_cycles: float
+    l4_l3_activation_cycles: float
+    l4_l3_cycles_per_byte: float
+    events: tuple[APUv1AffineEvent, ...]
+    # Native routes whose graphs are priced by the model (one aggregated
+    # event per primitive family).
+    priced_routes: frozenset[str]
+    # route -> {parameter: (min, max)} of the shapes the model was validated
+    # on against physical measurements without refitting.
+    validated_envelopes: MappingProxyType
+    provenance: MappingProxyType
+
+    def event(self, primitive: str) -> APUv1AffineEvent | None:
+        return next((e for e in self.events if e.primitive == primitive), None)
+
+    def l4_l3_cycles(self, transactions: int, byte_count: int) -> int:
+        if transactions <= 0:
+            return 0
+        return max(
+            1,
+            int(
+                round(
+                    self.l4_l3_activation_cycles * transactions
+                    + self.l4_l3_cycles_per_byte * byte_count
+                )
+            ),
+        )
+
+    def manifest(self) -> dict:
+        return {
+            "route_intercept_cycles": self.route_intercept_cycles,
+            "l4_l3_activation_cycles": self.l4_l3_activation_cycles,
+            "l4_l3_cycles_per_byte": self.l4_l3_cycles_per_byte,
+            "events": [event.manifest() for event in self.events],
+            "priced_routes": sorted(self.priced_routes),
+            "validated_envelopes": {
+                route: {name: list(bounds) for name, bounds in envelope.items()}
+                for route, envelope in self.validated_envelopes.items()
+            },
+            "provenance": dict(self.provenance),
+        }
+
+
+RECORD_FREQUENCY_ROUTE = "gvml_record_frequency_resident_chunks_pair_count"
+DENSE_HISTOGRAM_ROUTE = "gvml_dense_histogram_pair_count"
+
+# Fitted by the agent-assisted calibration study (paper Section 5, "Agent-Assisted
+# Cost Calibration") from 15 single-primitive microbenchmarks on one Gemini-I
+# board.  Values are copied verbatim (full precision) from
+# tenon-artifacts/agent-cost-calibration/2026-07-27-gemini-i/
+# confirmatory-affine-event-v1/freeze/affine-event-model.json (model fingerprint
+# 0f26de9d...dcfef); the rebuttal transfer studies reuse the same coefficients
+# (frozen-affine-model.json sha256 f89d8de6...be16).  Each pair is solved from the
+# median CRUN (7 measured runs after one warm-up) of a low/high call-count case.
+# The route intercept is the empty-route case q00; the L4->L3 terms come from
+# q01/q02.  The 15-observation fit has 15 parameters (saturated); adequacy was
+# tested only on held-out compositions (validated_envelopes).
+APU_V1_AFFINE_EVENT_MODEL = APUv1AffineEventModel(
+    route_intercept_cycles=2558.0,
+    l4_l3_activation_cycles=1842.3333333333333,
+    l4_l3_cycles_per_byte=0.7766927083333334,
+    events=(
+        APUv1AffineEvent(
+            "dma_l4_l1_32k", "DMA_L4_TO_L1_32K", "direct_dma_l4_to_l1_32k",
+            8477.0, 21808.0,
+            "q03-l4-l1-r1", 1, "q04-l4-l1-r4", 4, (32843.0, 98267.0),
+        ),
+        APUv1AffineEvent(
+            "gvml_load_16", "LOAD_L1_TO_VR16", "gvml_load_16",
+            1871.3650793650793, 25.634920634920636,
+            "q05-load-r1", 1, "q06-load-r64", 64, (4455.0, 6070.0),
+        ),
+        APUv1AffineEvent(
+            "gvml_eq_imm_16", "EQ_IMM_16", "gvml_eq_imm_16",
+            1880.7019607843138, 24.298039215686273,
+            "q07-eq-r1", 1, "q08-eq-r256", 256, (4463.0, 10659.0),
+        ),
+        APUv1AffineEvent(
+            "gvml_and_m", "AND_M", "gvml_and_m",
+            908.7905759162304, 27.209424083769633,
+            "q09-and-r1", 1, "q10-and-r192", 192, (3494.0, 8691.0),
+        ),
+        # The paper's example: "the fitted count rule adds a 5,887.79-cycle
+        # start-up cost to 876.21 cycles per call".
+        APUv1AffineEvent(
+            "gvml_2_fast_count_m_g32k", "FAST_COUNT_2M_G32K", "gvml_2_fast_count_m_g32k",
+            5887.793650793651, 876.2063492063492,
+            "q11-paired-count-r1", 1, "q12-paired-count-r64", 64, (9322.0, 64523.0),
+        ),
+        APUv1AffineEvent(
+            "scalar_l4_store_u16", "ARC_STORE_L4_U16", "scalar_l4_store_u16",
+            1235.1259842519685, 17.874015748031496,
+            "q13-store-r1", 1, "q14-store-r128", 128, (3811.0, 6081.0),
+        ),
+    ),
+    priced_routes=frozenset({RECORD_FREQUENCY_ROUTE, DENSE_HISTOGRAM_ROUTE}),
+    validated_envelopes=MappingProxyType(
+        {
+            # Confirmatory shapes (C, Q) = (2,160), (6,64), (9,24) and rebuttal
+            # plans (1,128), (3,64), (5,32), (8,16); 32,768 records; even Q.
+            RECORD_FREQUENCY_ROUTE: MappingProxyType(
+                {"chunks": (1, 9), "queries": (16, 160)}
+            ),
+            # Rebuttal histogram plans: 256 bins over one 32K frontier,
+            # 1..128 frontier reloads (the released recipe loads it once).
+            DENSE_HISTOGRAM_ROUTE: MappingProxyType(
+                {"bins": (256, 256), "frontier_loads": (1, 128)}
+            ),
+        }
+    ),
+    provenance=MappingProxyType(
+        {
+            "unit": "ARC CRUN device cycles (PROF total, no clock conversion)",
+            "algorithm": "paired-affine-event-v1",
+            "model_fingerprint": (
+                "0f26de9d9286e4efd1d880d70d947fd3000ea60b1a6dfb9548a5af027b6dcfef"
+            ),
+            "model_file": (
+                "tenon-artifacts/agent-cost-calibration/2026-07-27-gemini-i/"
+                "confirmatory-affine-event-v1/freeze/affine-event-model.json"
+            ),
+            "microbenchmarks": (
+                "tenon-artifacts/agent-cost-calibration/2026-07-27-gemini-i/"
+                "negative-pilot-c4q96-v3/measurements/calibration/q00..q14*.json "
+                "(15 cases, 1 warm-up + 7 runs each, median CRUN)"
+            ),
+            "measured_utc": "2026-07-27T22:31Z..22:57Z",
+            "board": (
+                "GSI Gemini-I PCI 1e4c:0010 rev 00 on zhang-capra-xcel, APUC 0; "
+                "platform fingerprint 1c28bbaf8ca49bdd6445a94a288bdc8f2f7414e5966493a5542f148ae6213974"
+            ),
+            "software": (
+                "GSI APU SDK 13.7.1, ARC GNU 2021.09, ledag-ssh 100.12.0.1.1000.25; "
+                "board firmware version not recorded in the archive"
+            ),
+            "fitted_on": (
+                "single-primitive microbenchmarks inside the native "
+                "record-frequency launch harness"
+            ),
+            "validated_on": (
+                "record frequency: 3 confirmatory shapes (2026-07-27) and 8 rebuttal "
+                "plans (2026-09-29, tenon-artifacts/rebuttal/reviewer-a/q1/evidence/"
+                "results/2026-09-29-gemini-calibration-v4); dense histogram: 8 "
+                "residency plans (2026-09-29, ...-gemini-histogram-validation-v1)"
+            ),
+        }
+    ),
+)
+
+
+def _affine_priced(event) -> bool:
+    attributes = event.attributes
+    return bool(attributes.get("native_aggregate")) and (
+        attributes.get("route") in APU_V1_AFFINE_EVENT_MODEL.priced_routes
+    )
+
+
+def _route_entry_step(event, ctx, apuc, arc):
+    if event.attributes.get("route_entry"):
+        ctx.step(
+            latency=max(1, int(round(APU_V1_AFFINE_EVENT_MODEL.route_intercept_cycles))),
+            occupy=[ctx.use(apuc), ctx.use(arc)],
+            name="calibrated_route_intercept",
+        )
+
+
+def apu_v1_cost_validity(route, inventory, cost=None) -> dict:
+    """Validity label of a native-recipe estimate under ``cost``.
+
+    ``calibrated``: ``cost`` carries ``APU_V1_AFFINE_EVENT_MODEL``, the route is
+    one of the validated families, every event has a fitted pair (no odd-count
+    ``gvml_count_m_g32k``), and the shape lies inside the validated envelope.
+    Everything else is ``extrapolated``, with the reasons listed.
+    """
+
+    spec = getattr(cost, "spec", cost)
+    model = getattr(spec, "apu_v1_calibration", None)
+    inventory = dict(inventory or {})
+    reasons = []
+    shape = {}
+    if model is None:
+        reasons.append("cost program carries no APU v1 calibration record")
+    elif route not in model.validated_envelopes:
+        reasons.append(
+            f"route {route!r} is outside the fitted families "
+            f"({', '.join(sorted(model.validated_envelopes))})"
+        )
+    else:
+        if int(inventory.get("gvml_count_m_g32k", 0)):
+            reasons.append(
+                "odd pair count issues gvml_count_m_g32k, which has no fitted "
+                "activation/slope pair"
+            )
+        if route == RECORD_FREQUENCY_ROUTE:
+            shape = {
+                "chunks": int(inventory.get("dma_l4_to_l1_32k", 0)),
+                "queries": int(inventory.get("scalar_l4_store_u16", 0)),
+            }
+        elif route == DENSE_HISTOGRAM_ROUTE:
+            shape = {
+                "bins": int(inventory.get("scalar_l4_store_u16", 0)),
+                "frontier_loads": int(inventory.get("dma_l4_to_l1_32k", 0)),
+            }
+        for name, (low, high) in model.validated_envelopes[route].items():
+            value = shape.get(name)
+            if value is None or not low <= value <= high:
+                reasons.append(f"{name}={value} outside validated [{low}, {high}]")
+    return {
+        "cost_validity": "extrapolated" if reasons else "calibrated",
+        "route": route,
+        "shape": shape,
+        "basis": (
+            "fitted affine event model (APU_V1_AFFINE_EVENT_MODEL) inside its "
+            "validated plan family and shape envelope"
+            if not reasons
+            else "; ".join(reasons)
+        ),
+        "validated_envelope": (
+            None
+            if model is None or route not in model.validated_envelopes
+            else {
+                name: list(bounds)
+                for name, bounds in model.validated_envelopes[route].items()
+            }
+        ),
+        "model_fingerprint": (
+            None if model is None else model.provenance["model_fingerprint"]
+        ),
+    }
+
+
 def _ceil_div(value, divisor):
     if divisor <= 0:
         raise ValueError("cost divisor must be positive")
@@ -196,7 +483,15 @@ def apu_v1_cost(target):
     def micro_vector_rule(operation, per_call, label):
         @rule(operation)
         def implementation(event, ctx):
-            cycles = max(1, int(round(per_call(event)))) * _count(event)
+            if _affine_priced(event):
+                _route_entry_step(event, ctx, apuc, arc)
+                affine = APU_V1_AFFINE_EVENT_MODEL.event(operation.name)
+                if affine is not None:
+                    cycles = affine.cycles(_count(event))
+                else:
+                    cycles = max(1, int(round(per_call(event)))) * _count(event)
+            else:
+                cycles = max(1, int(round(per_call(event)))) * _count(event)
             ctx.step(
                 latency=cycles,
                 occupy=[
@@ -410,7 +705,19 @@ def apu_v1_cost(target):
     def micro_move_rule(move, latency_fn, label, resources):
         @rule(move)
         def implementation(event, ctx):
-            cycles = max(1, int(round(latency_fn(event)))) * _count(event)
+            if _affine_priced(event):
+                _route_entry_step(event, ctx, apuc, arc)
+                affine = APU_V1_AFFINE_EVENT_MODEL.event(move.name)
+                if move.name == "DMA_L4_TO_L3":
+                    cycles = APU_V1_AFFINE_EVENT_MODEL.l4_l3_cycles(
+                        _count(event), _metric(event, "bytes", 0)
+                    )
+                elif affine is not None:
+                    cycles = affine.cycles(_count(event))
+                else:
+                    cycles = max(1, int(round(latency_fn(event)))) * _count(event)
+            else:
+                cycles = max(1, int(round(latency_fn(event)))) * _count(event)
             ctx.step(
                 latency=cycles,
                 occupy=[
@@ -494,7 +801,13 @@ def apu_v1_cost(target):
 
     @rule(target.move("ARC_STORE_L4_U16"))
     def arc_store_l4_u16(event, ctx):
-        cycles = MICRO_ARC_STORE_L4_U16 * _count(event)
+        if _affine_priced(event):
+            _route_entry_step(event, ctx, apuc, arc)
+            cycles = APU_V1_AFFINE_EVENT_MODEL.event("ARC_STORE_L4_U16").cycles(
+                _count(event)
+            )
+        else:
+            cycles = MICRO_ARC_STORE_L4_U16 * _count(event)
         ctx.step(
             latency=cycles,
             occupy=[
@@ -527,4 +840,14 @@ def apu_v1_cost(target):
             )
 
 
-__all__ = ["apu_v1_cost"]
+# Read by the native graph builder for the estimate validity label.
+apu_v1_cost.apu_v1_calibration = APU_V1_AFFINE_EVENT_MODEL
+
+
+__all__ = [
+    "APU_V1_AFFINE_EVENT_MODEL",
+    "APUv1AffineEvent",
+    "APUv1AffineEventModel",
+    "apu_v1_cost",
+    "apu_v1_cost_validity",
+]

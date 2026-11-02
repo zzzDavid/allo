@@ -7,6 +7,12 @@ their device source executes a proven GVML plan instead of that scalar loop
 nest.  This builder keeps those recipes on the normal target/cost path: every
 step is a target primitive interpreted by the bound APUv1 cost specification,
 and the exact lowering inventory remains attached to the graph for audit.
+
+Each emitted event aggregates every call of one GVML primitive family in one
+launch (``native_aggregate``); the first carries ``route_entry``.  The bound
+cost program may price such events with its fitted per-event activation and
+the route intercept (``costs/apu_v1.py``).  ``finish`` records the estimate's
+validity label (``estimate_validity`` / ``cost_validity``).
 """
 
 from __future__ import annotations
@@ -49,7 +55,12 @@ class APUv1NativeCostGraphBuilder:
             handle,
             work_id=(0,),
             metrics={"count": count, **metrics},
-            attributes={"route": self.route, "operation": operation},
+            attributes={
+                "route": self.route,
+                "operation": operation,
+                "native_aggregate": True,
+                "route_entry": self._event_index == 0,
+            },
         )
         self._dependencies = tuple(
             self.cost.emit(self.graph, event, self._dependencies)
@@ -75,6 +86,11 @@ class APUv1NativeCostGraphBuilder:
     def finish(self):
         if not self.graph.activities:
             raise ValueError("native APUv1 execution graph must contain an activity")
+        from .costs.apu_v1 import apu_v1_cost_validity
+
+        validity = apu_v1_cost_validity(self.route, self.inventory, self.cost)
+        self.graph.metadata["cost_validity"] = validity
+        self.graph.metadata["estimate_validity"] = validity["cost_validity"]
         return self.graph
 
 

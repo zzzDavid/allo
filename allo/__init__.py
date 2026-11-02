@@ -80,7 +80,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "CompiledCallable": ("allo.compiler", "CompiledCallable"),
     "APUv1VectorCallable": ("allo.pim.apu_v1_vector_program", "APUv1VectorCallable"),
     "APUv1Phase": ("allo.pim.apu_v1_program", "APUv1Phase"),
-    "APUv1PrecisionPolicy": ("allo.pim.apu_v1_program", "APUv1PrecisionPolicy"),
     "APUv1Program": ("allo.pim.apu_v1_program", "APUv1Program"),
     "APUG2ComposedContractionCallable": ("allo.pim.apu_g2_composed_program", "APUG2ComposedContractionCallable"),
     "APUG2ComposedContractionProgram": ("allo.pim.apu_g2_composed_program", "APUG2ComposedContractionProgram"),

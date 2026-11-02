@@ -36,7 +36,7 @@ from ..perf.graph import ExecutionGraph
 from ..spmw_apu_v1_build import _apu_v1_build_config
 from ..spmw_codegen import RunResult
 from .upmem_analysis import analyze_upmem_mlir
-from .apu_v1_hybrid import APUv1PrecisionPolicy, discover_apu_v1_hybrid_manifest
+from .apu_v1_hybrid import discover_apu_v1_hybrid_manifest
 
 
 _C_TYPES = {
@@ -66,19 +66,21 @@ _LOCAL_ARRAY = re.compile(
 
 @dataclass(frozen=True)
 class APUv1Phase:
-    """One complete Allo function lowered to scalar ARC C."""
+    """One complete Allo function for APU v1.
+
+    ``vectorize=False`` lowers the function to scalar ARC C on APUC 0;
+    ``vectorize="required"`` requires one native GVML recipe to prove it.
+    ``argument_bounds`` declares inclusive integer ranges of source arguments
+    (consumed by the native recipes).  An ``APUv1Program`` has exactly one
+    phase; precision policies, vector layouts and multi-phase dataflow fields
+    were removed with the hybrid runtime (release audit V1-11).
+    """
 
     kernel: object
     name: str | None = None
     instantiate: tuple = ()
     result_names: tuple[str, ...] = ()
     vectorize: str | bool = False
-    precision_policy: APUv1PrecisionPolicy | None = None
-    vector_layout: str | None = None
-    produces: tuple[str, ...] = ()
-    bindings: Mapping[str, str] | tuple[tuple[str, str], ...] = ()
-    dependencies: tuple[str, ...] = ()
-    zero_initialize: tuple[str, ...] = ()
     argument_bounds: object = ()
 
     def __post_init__(self):
@@ -89,23 +91,7 @@ class APUv1Phase:
         vectorize = "required" if self.vectorize is True else self.vectorize
         if vectorize not in {False, "required"}:
             raise ValueError("APUv1Phase.vectorize must be False or 'required'")
-        if self.precision_policy is not None and not isinstance(
-            self.precision_policy, APUv1PrecisionPolicy
-        ):
-            raise TypeError("precision_policy must be an APUv1PrecisionPolicy")
-        if self.vector_layout is not None and not isinstance(self.vector_layout, str):
-            raise TypeError("vector_layout must be a vector-plan name")
-        produces = tuple(self.produces)
-        dependencies = tuple(self.dependencies)
-        zero_initialize = tuple(self.zero_initialize)
-        if len(produces) != len(set(produces)):
-            raise ValueError("APUv1Phase.produces values must be unique")
-        if not set(zero_initialize) <= set(produces):
-            raise ValueError("zero_initialize values must also appear in produces")
-        bindings = dict(self.bindings)
         argument_bounds = dict(self.argument_bounds)
-        if any(not key or not value for key, value in bindings.items()):
-            raise ValueError("APUv1Phase bindings require non-empty names")
         source_parameters = set(inspect.signature(self.kernel).parameters)
         unknown_bounds = set(argument_bounds) - source_parameters
         if unknown_bounds:
@@ -123,10 +109,6 @@ class APUv1Phase:
                     f"argument_bounds[{name!r}] must be an inclusive integer pair"
                 )
         object.__setattr__(self, "vectorize", vectorize)
-        object.__setattr__(self, "produces", produces)
-        object.__setattr__(self, "bindings", MappingProxyType(bindings))
-        object.__setattr__(self, "dependencies", dependencies)
-        object.__setattr__(self, "zero_initialize", zero_initialize)
         object.__setattr__(
             self,
             "argument_bounds",
@@ -141,33 +123,19 @@ class APUv1Phase:
 
 
 class APUv1Program:
-    """An ordered logical APU program; physical execution may be hybrid."""
+    """A one-phase APU v1 program (``phases`` is a one-element tuple)."""
 
     def __init__(self, phases, *, name: str | None = None):
         self.phases = tuple(phases)
         if not self.phases or not all(
             isinstance(phase, APUv1Phase) for phase in self.phases
         ):
-            raise ValueError("APUv1Program requires one or more APUv1Phase values")
-        names = tuple(phase.phase_name for phase in self.phases)
-        if len(names) != len(set(names)):
-            raise ValueError("APUv1Program phase names must be unique")
-        seen = set()
-        produced = set()
-        for phase in self.phases:
-            unknown = set(phase.dependencies) - seen
-            if unknown:
-                raise ValueError(
-                    f"phase {phase.phase_name!r} has unknown/forward dependencies "
-                    f"{sorted(unknown)}"
-                )
-            overlap = produced & set(phase.produces)
-            if overlap:
-                raise ValueError(
-                    f"logical buffers have multiple producing phases: {sorted(overlap)}"
-                )
-            seen.add(phase.phase_name)
-            produced.update(phase.produces)
+            raise ValueError("APUv1Program requires one APUv1Phase value")
+        if len(self.phases) != 1:
+            raise ValueError(
+                "APUv1Program supports exactly one phase; multi-phase hybrid "
+                "programs were removed (compile each phase separately)"
+            )
         self.name = name or self.phases[0].phase_name
 
     def build(self):
@@ -196,6 +164,47 @@ class _Argument:
     @property
     def nbytes(self):
         return math.prod(self.shape) * self.numpy_dtype.itemsize
+
+
+# The device link has no libm, so ``sqrt``/``sqrtf`` calls in the portable C
+# are redirected to these helpers.  ``allo_sqrt`` follows IEEE special cases
+# (+-0, +inf, NaN; negative -> NaN), scales subnormals into the normal range,
+# starts from the exponent-halved power of two (within a factor of two of the
+# root) and runs Newton's iteration until it stops decreasing: after the first
+# step the iterate is above the root and decreases monotonically, and
+# quadratic convergence reaches double precision in at most six steps, so the
+# loop bound of ten is never the stopping reason for finite inputs.  The
+# result is within one ulp of the correctly rounded root on the whole double
+# range; ``allo_sqrtf`` rounds that to float.
+APU_V1_SQRT_HELPERS = """
+static double allo_sqrt(double value) {
+    union { double f; uint64_t u; } bits;
+    if (value != value || value == 0.0) return value;
+    if (value < 0.0) { bits.u = UINT64_C(0x7ff8000000000000); return bits.f; }
+    bits.f = value;
+    if ((bits.u >> 52) == 0x7ffu) return value;
+    double scale = 1.0;
+    if ((bits.u >> 52) == 0u) {
+        value *= 18014398509481984.0; /* 2^54 */
+        scale = 7.450580596923828125e-9; /* 2^-27 */
+        bits.f = value;
+    }
+    int64_t exponent = (int64_t)(bits.u >> 52) - 1023;
+    int64_t half = exponent >= 0 ? exponent / 2 : -((1 - exponent) / 2);
+    bits.u = (uint64_t)(half + 1023) << 52;
+    double root = bits.f;
+    root = 0.5 * (root + value / root);
+    for (int step = 0; step < 10; ++step) {
+        double next = 0.5 * (root + value / root);
+        if (!(next < root)) break;
+        root = next;
+    }
+    return root * scale;
+}
+static float allo_sqrtf(float value) {
+    return (float)allo_sqrt((double)value);
+}
+"""
 
 
 def _replace_local_arrays(source: str) -> tuple[str, int]:
@@ -240,7 +249,8 @@ def _replace_local_arrays(source: str) -> tuple[str, int]:
         )
 
     transformed = _LOCAL_ARRAY.sub(replace, source)
-    transformed = re.sub(r"\bsqrt\s*\(", "allo_sqrtf(", transformed)
+    transformed = re.sub(r"\bsqrtf\s*\(", "allo_sqrtf(", transformed)
+    transformed = re.sub(r"\bsqrt\s*\(", "allo_sqrt(", transformed)
     allocator = """
 static uint8_t *allo_l4_cursor;
 static void *allo_l4_alloc(size_t bytes) {
@@ -248,14 +258,7 @@ static void *allo_l4_alloc(size_t bytes) {
     allo_l4_cursor = (uint8_t *)(cursor + bytes);
     return (void *)cursor;
 }
-static float allo_sqrtf(float value) {
-    if (value <= 0.0f) return 0.0f;
-    float estimate = value > 1.0f ? value : 1.0f;
-    for (int i = 0; i < 16; ++i)
-        estimate = 0.5f * (estimate + value / estimate);
-    return estimate;
-}
-"""
+""" + APU_V1_SQRT_HELPERS
     first_function = transformed.find("void ")
     if first_function < 0:
         raise RuntimeError("portable C source contains no function")
@@ -750,6 +753,20 @@ class CompiledAPUv1Program:
                     attributes={"source": "retained_mlir"},
                 )
                 cost.emit(self.execution_graph, event)
+            if "cost_validity" not in self.execution_graph.metadata:
+                from .costs.apu_v1 import apu_v1_cost_validity
+
+                validity = apu_v1_cost_validity(
+                    "scalar_arc_c"
+                    if self.native_vector_lowering is None
+                    else self.native_vector_lowering.route,
+                    self.execution_graph.metadata.get("operation_inventory"),
+                    cost,
+                )
+                self.execution_graph.metadata["cost_validity"] = validity
+                self.execution_graph.metadata["estimate_validity"] = validity[
+                    "cost_validity"
+                ]
         if backend == "functional" and self.native_vector_lowering is not None:
             raise NotImplementedError(
                 f"APUv1Program backend='functional' executes the scalar ARC C on "
@@ -789,6 +806,7 @@ class CompiledAPUv1Program:
                 "model_fingerprint": estimate.model_fingerprint,
                 "cost_model": getattr(spec, "name", None),
                 "priced_target": self.target.name,
+                "cost_validity": self.execution_graph.metadata.get("cost_validity"),
             },
         )
 
@@ -988,7 +1006,6 @@ __all__ = [
     "launch_on_board",
     "parse_fresh_profile",
     "read_output_image",
-    "APUv1PrecisionPolicy",
     "APUv1Phase",
     "APUv1Program",
     "APUv1ProgramCallable",

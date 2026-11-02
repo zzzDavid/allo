@@ -230,6 +230,24 @@ def apu_v1_plan_regroups(plan) -> bool:
     return reduction.kind not in _ORDER_PRESERVING_REDUCTIONS
 
 
+def _tile_family(candidate_or_plan):
+    plan = getattr(candidate_or_plan, "plan", candidate_or_plan)
+    metadata = getattr(plan, "metadata", None) or {}
+    decision = metadata.get("tile_decision") or {}
+    return decision.get("family")
+
+
+def _family_members(candidates, name):
+    """Tile variants a family name (e.g. ``spatial_gemv_group_reduction``)
+    stands for; empty when ``name`` is an exact plan name."""
+
+    if any(candidate.name == name for candidate in candidates):
+        return ()
+    return tuple(
+        candidate for candidate in candidates if _tile_family(candidate) == name
+    )
+
+
 def _apply_reduction_policy(candidates, analysis, reduction_order, layout):
     """Prune plans that regroup a strict floating-point reduction.
 
@@ -258,6 +276,16 @@ def _apply_reduction_policy(candidates, analysis, reduction_order, layout):
         pruned_names = {requested}
     else:
         pruned_names = {name for name, _reason in pruned}
+        pruned_families = {
+            _tile_family(candidate)
+            for candidate in candidates
+            if candidate.name in pruned_names and _tile_family(candidate)
+        }
+        pruned_names |= {
+            family
+            for family in pruned_families
+            if not any(_tile_family(candidate) == family for candidate in keep)
+        }
     if isinstance(requested, str) and requested in pruned_names:
         raise ReductionOrderError(
             f"APU v1 plan {requested!r} regroups the {analysis.numeric_type} "
@@ -335,6 +363,18 @@ def _candidate_by_name(candidates, name: str):
 
 def _select_plan(candidates, ranked, layout):
     if isinstance(layout, str):
+        members = _family_members(candidates, layout)
+        if members:
+            # A family name keeps the tile a cost-ranked decision.
+            names = {candidate.name for candidate in members}
+            for estimate in ranked:
+                if estimate.plan.name in names:
+                    return estimate.plan
+            raise ValueError(
+                f"APU v1 plan family {layout!r} has tile variants "
+                + ", ".join(sorted(names))
+                + "; pass a cost program to rank them or name one variant"
+            )
         return _candidate_by_name(candidates, layout).plan
     if isinstance(layout, APUV1Plan):
         return layout
@@ -636,6 +676,51 @@ class APUv1VectorCallable:
     def ranked_plans(self):
         return tuple(estimate.plan for estimate in self.candidate_estimates)
 
+    @property
+    def cost_validity(self):
+        graph = self.execution_graph
+        return None if graph is None else graph.metadata.get("cost_validity")
+
+    @property
+    def tile_decision(self):
+        """The selected plan's tile decision and every tile candidate's
+        estimate (``None`` when the candidate was not realizable or was
+        pruned), or ``None`` for plans without a tile family."""
+
+        decision = self.selected_plan.metadata.get("tile_decision")
+        if not decision:
+            return None
+        family = decision["family"]
+        scored = {
+            estimate.plan.name: int(estimate.cycles)
+            for estimate in self.candidate_estimates
+        }
+        members = [
+            candidate
+            for candidate in self.candidates
+            if _tile_family(candidate) == family
+        ]
+        pruned = {name for name, _reason in self.reduction_policy_pruned}
+        return {
+            "family": family,
+            "parameter": decision["parameter"],
+            "selected_tile": decision["tile"],
+            "selected_plan": self.selected_plan.name,
+            "plan_selection": self.plan_selection,
+            "candidates": [
+                {
+                    "tile": candidate.plan.metadata["tile_decision"]["tile"],
+                    "plan": candidate.name,
+                    "cycles": scored.get(candidate.name),
+                }
+                for candidate in members
+            ],
+            "legal_tiles": list(decision["candidates"]),
+            "pruned_by_reduction_order": sorted(
+                name for name in pruned if name.startswith(family)
+            ),
+        }
+
     def estimate(self, plan=None):
         """Return the analytical estimate for the selected or named plan."""
 
@@ -757,6 +842,8 @@ class APUv1VectorCallable:
                 "outputs": outputs,
                 "plan": self.selected_plan.name,
                 "plan_selection": self.plan_selection,
+                "tile_decision": self.tile_decision,
+                "cost_validity": self.cost_validity,
                 "analytical": self.selected_estimate is not None,
                 "functional": True,
                 "numerics": numerics,

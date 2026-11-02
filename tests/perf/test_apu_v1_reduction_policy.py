@@ -60,19 +60,25 @@ def test_strict_ranks_only_source_order_plans():
     assert not any(apu_v1_plan_regroups(plan) for plan in compiled.ranked_plans)
     assert not apu_v1_plan_regroups(compiled.selected_plan)
     pruned = dict(compiled.reduction_policy_pruned)
-    assert {"baseline_spatial_reduction", "spatial_gemv_group_reduction"} <= set(pruned)
+    # Every GEMV reduction-tile variant regroups (V1-06 tile family).
+    assert "baseline_spatial_reduction" in pruned
+    assert {f"spatial_gemv_group_reduction_k{t}" for t in (32, 64, 128, 256)} <= set(
+        pruned
+    )
     assert all("reduction_order='strict' on a f16" in r for r in pruned.values())
     assert "gvml_add_subgrps" not in compiled.device_source()
 
     with pytest.raises(ReductionOrderError, match="spatial_gemv_group_reduction"):
         _compile(fp16_gemv, layout="spatial_gemv_group_reduction")
+    with pytest.raises(ReductionOrderError, match="spatial_gemv_group_reduction_k64"):
+        _compile(fp16_gemv, layout="spatial_gemv_group_reduction_k64")
 
 
 def test_reassociate_admits_tree_plans():
     compiled = _compile(fp16_gemv, reduction_order="reassociate")
     assert compiled.reduction_policy_pruned == ()
     assert any(apu_v1_plan_regroups(plan) for plan in compiled.ranked_plans)
-    assert compiled.selected_plan.name == "spatial_gemv_group_reduction"
+    assert compiled.selected_plan.name.startswith("spatial_gemv_group_reduction_k")
     assert "gvml_add_subgrps" in compiled.device_source()
 
 
