@@ -188,9 +188,12 @@ class APUv1Ctx(CodegenContext):
             # that movement, and the declared launch must be this lowering.
             transfers, allocations = self.program.candidate.realized_transfers()
             declared = {
-                (t.value, t.direction, tuple(t.route)) for t in effects.transfers
+                (t.value, t.direction, tuple(t.route), t.physical)
+                for t in effects.transfers
             }
-            realized = {(t.value, t.direction, tuple(t.route)) for t in transfers}
+            realized = {
+                (t.value, t.direction, tuple(t.route), t.physical) for t in transfers
+            }
             if declared != realized:
                 raise RuntimeError(
                     "APU v1 program realization moves "

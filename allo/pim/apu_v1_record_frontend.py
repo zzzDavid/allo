@@ -271,6 +271,8 @@ class APUv1RecordCandidate:
         from ..spmw_candidate import CandidateTransfer
 
         outputs = {argument.name for argument in self.lowered.outputs}
+        reads, writes = function_values(self.facts)
+        semantic = set(reads) | set(writes)
         transfers = []
         for argument in self.lowered.source_arguments:
             if argument.name in outputs:
@@ -280,8 +282,15 @@ class APUv1RecordCandidate:
                     )
                 )
             else:
+                # The runtime copies every source argument to L4; one the
+                # function never reads is a physical copy, not an input.
                 transfers.append(
-                    CandidateTransfer(argument.name, "in", ("host_copy", "l4"))
+                    CandidateTransfer(
+                        argument.name,
+                        "in",
+                        ("host_copy", "l4"),
+                        physical=argument.name not in semantic,
+                    )
                 )
         for argument in self.lowered.outputs:
             if argument.source == "result":

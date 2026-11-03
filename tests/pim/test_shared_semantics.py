@@ -939,10 +939,11 @@ def test_apu_v1_program_records_enter_the_common_pipeline():
     (anchor,) = virtual.trace.matches
     assert anchor.target_op_name == "NATIVE_VECTOR_PROGRAM"
     facts = virtual.trace.semantics
-    # The returned buffer is a parameter; its one store is the guarded,
-    # carried count over the 32768 items (its zero fill is the declaration's
-    # `linalg.fill`, not a store).
-    (counting,) = facts.effects
+    # The returned buffer is a parameter; its effects are the declaration's
+    # zero fill (whole buffer) and the guarded, carried count over the
+    # 32768 items.
+    fill, counting = facts.effects
+    assert fill.category == "fill" and fill.writes_whole_buffer and fill.term == "0"
     assert counting.destination.parameter == "counts" and counting.external
     assert counting.reads_destination and counting.guards
     assert counting.instances == 256 and counting.reduction_extent == 32768
@@ -1274,3 +1275,209 @@ def test_record_contract_cannot_hide_a_read_or_a_transfer(monkeypatch):
     monkeypatch.setattr(record_frontend, "apu_v1_program_candidates", host_only_out)
     with pytest.raises(RuntimeError, match="realization moves"):
         allo.compile(_record(keep_unselected), target, apu_v1_cost, backend="virtual")
+
+
+# --------------------------------------------------------------------------- #
+# (m) Retained effects: indirect loads, fills, unused arguments; whole
+#     launches only for verbatim programs (review round 17)
+# --------------------------------------------------------------------------- #
+
+
+def gather(
+    src: allo.ir.types.int32[8],
+    index: allo.ir.types.int32[8],
+    out: allo.ir.types.int32[8],
+):
+    for i in range(8):
+        out[i] = src[index[i]]
+
+
+def indirect_guard(
+    src: allo.ir.types.int32[8],
+    index: allo.ir.types.int32[8],
+    out: allo.ir.types.int32[8],
+):
+    for i in range(8):
+        if src[index[i]] > 0:
+            out[i] = 1
+
+
+def fill_only(src: allo.ir.types.int32[8]) -> allo.ir.types.int32[8]:
+    result: allo.ir.types.int32[8] = 7
+    return result
+
+
+def initialized_return(src: allo.ir.types.int32[8]) -> allo.ir.types.int32[8]:
+    result: allo.ir.types.int32[8] = 7
+    for i in range(4):
+        result[i] = src[i]
+    return result
+
+
+def unused_argument(src: allo.ir.types.int32[8], out: allo.ir.types.int32[8]):
+    for i in range(8):
+        out[i] = 7
+
+
+def _compile_record(fn, result_names=()):
+    return allo.compile(
+        allo.APUv1Program((allo.APUv1Phase(fn, result_names=result_names),)),
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="functional",
+    )
+
+
+def test_indirect_loads_are_retained_reads():
+    """``src[index[i]]`` reads ``index`` as well as ``src``, in the stored
+    value and in a guard; both are inputs, transfers and ABI inputs, and the
+    program executes."""
+    src = np.arange(-4, 4, dtype=np.int32)
+    index = np.arange(7, -1, -1, dtype=np.int32)
+    for kernel, expected, inputs in (
+        # The unguarded gather overwrites ``out`` whole; the guarded write
+        # keeps the untouched elements, so ``out`` is an input too.
+        (gather, src[index], ("src", "index")),
+        (indirect_guard, np.where(src[index] > 0, 1, 77), ("src", "index", "out")),
+    ):
+        compiled = _compile_record(kernel)
+        (effect,) = compiled.trace.semantics.effects
+        roles = {(a.parameter, a.role) for a in effect.reads}
+        kind = "guard" if kernel is indirect_guard else "load"
+        assert roles == {("src", kind), ("index", kind)}
+        effects = compiled.compiled.layout.extra["effects"]
+        assert effects.coverage.inputs == inputs
+        assert effects.abi_inputs == inputs
+        assert {(t.value, t.direction, t.physical) for t in effects.transfers} == {
+            ("src", "in", False),
+            ("index", "in", False),
+            ("out", "inout", False),
+        }
+        out = np.full(8, 77, np.int32)
+        run = compiled(src, index, out)
+        assert run.kind == "functional"
+        np.testing.assert_array_equal(out, expected)
+
+
+def test_fill_initializers_are_retained_effects():
+    """A declaration's fill is an observable effect of a returned buffer:
+    it is retained with its destination, value and whole extent, ordered
+    before the stores, and the realized program reproduces it."""
+    compiled = _compile_record(fill_only, ("result",))
+    (fill,) = compiled.trace.semantics.effects
+    assert fill.category == "fill" and fill.whole and fill.constant
+    assert fill.term == "7" and fill.destination.parameter == "result"
+    assert fill.writes_whole_buffer and fill.instances == 8 and fill.external
+    effects = compiled.compiled.layout.extra["effects"]
+    assert effects.coverage.inputs == () and effects.abi_outputs == ("result",)
+    (launch,) = effects.launches
+    assert launch.whole and launch.operations == (0,)
+    run = compiled(np.arange(8, dtype=np.int32))
+    np.testing.assert_array_equal(run.extra["outputs"]["result"], np.full(8, 7))
+
+    partial = _compile_record(initialized_return, ("result",))
+    fill, store = partial.trace.semantics.effects
+    assert fill.category == "fill" and fill.writes_whole_buffer
+    assert store.category != "fill" and not store.writes_whole_buffer
+    assert store.instances == 4 and [a.parameter for a in store.reads] == ["src"]
+    effects = partial.compiled.layout.extra["effects"]
+    assert effects.coverage.inputs == ("src",)
+    assert effects.launches[0].operations == (0, 1)
+    src = np.arange(-4, 4, dtype=np.int32)
+    run = partial(src)
+    np.testing.assert_array_equal(
+        run.extra["outputs"]["result"], np.array([-4, -3, -2, -1, 7, 7, 7, 7])
+    )
+
+
+def test_unused_arguments_are_physical_transfers_not_inputs(monkeypatch):
+    """The runtime copies every source argument; one the function never
+    reads is a physical transfer of a declared parameter, not a semantic
+    input, and declaring it as an input is refused."""
+    compiled = _compile_record(unused_argument)
+    effects = compiled.compiled.layout.extra["effects"]
+    assert effects.coverage.inputs == () and effects.abi_inputs == ()
+    assert {(t.value, t.direction, t.physical) for t in effects.transfers} == {
+        ("src", "in", True),
+        ("out", "inout", False),
+    }
+    out = np.full(8, 77, np.int32)
+    compiled(np.arange(8, dtype=np.int32), out)
+    np.testing.assert_array_equal(out, np.full(8, 7))
+
+    from allo.pim import apu_v1_record_frontend as record_frontend
+
+    original = record_frontend.apu_v1_program_candidates
+
+    def pretend_input(view, matches):
+        placements = original(view, matches)
+        for placement in placements:
+            effects = placement.extra["effects"]
+            placement.extra["effects"] = replace(
+                effects,
+                coverage=replace(effects.coverage, inputs=("src",)),
+                abi_inputs=("src",),
+                transfers=tuple(replace(t, physical=False) for t in effects.transfers),
+            )
+        return placements
+
+    monkeypatch.setattr(record_frontend, "apu_v1_program_candidates", pretend_input)
+    with pytest.raises(ValueError, match="reads \\['src'\\], the program reads \\[\\]"):
+        allo.compile(
+            allo.APUv1Program((allo.APUv1Phase(unused_argument),)),
+            build_apu_v1_target(),
+            apu_v1_cost,
+            backend="virtual",
+        )
+
+
+def test_whole_launches_are_reserved_for_verbatim_programs(monkeypatch):
+    """A planned program (a typed Gemini-II add) cannot escape the instance
+    and reduction tiling checks by declaring a whole-function launch."""
+    from allo.pim import apu_g2_record_frontend as records
+    from allo.pim.apu_g2_typed_program import APUG2ScalarType, APUG2TypedProgram
+    from allo.spmw_candidate import validate_candidate_effects
+
+    i4 = APUG2ScalarType(4, True)
+    add = APUG2TypedProgram("add", (i4, i4), i4, (64,))
+    target = build_apu_g2_target()
+    compiled = allo.compile(add, target, apu_g2_cost, backend="virtual")
+    placement = compiled.compiled.layout
+    assert not compiled.trace.semantics.verbatim
+    whole = replace(
+        placement.extra["effects"],
+        launches=tuple(
+            replace(l, instances=(0, 1), reduction=None, accumulator=None, whole=True)
+            for l in placement.extra["effects"].launches
+        ),
+    )
+    placement.extra["effects"] = whole
+    problems = validate_candidate_effects(
+        compiled.trace.matches, placement, matcher_view(target)
+    )
+    assert any("declared whole-function" in p for p in problems)
+
+    original = records.apu_g2_record_candidates
+
+    def whole_launch(*args):
+        placements = original(*args)
+        for candidate in placements:
+            effects = candidate.extra["effects"]
+            candidate.extra["effects"] = replace(
+                effects,
+                launches=tuple(
+                    replace(
+                        l,
+                        instances=(0, 1),
+                        reduction=None,
+                        accumulator=None,
+                        whole=True,
+                    )
+                    for l in effects.launches
+                ),
+            )
+        return placements
+
+    monkeypatch.setattr(records, "apu_g2_record_candidates", whole_launch)
+    with pytest.raises(ValueError, match="declared whole-function"):
+        allo.compile(add, target, apu_g2_cost, backend="virtual")

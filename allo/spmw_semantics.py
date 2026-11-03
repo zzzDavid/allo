@@ -315,7 +315,7 @@ class Epilogue:
 
 
 @dataclass(frozen=True)
-class StoreEffect:
+class StoreEffect:  # pylint: disable=too-many-instance-attributes
     """One externally visible store of the function, matched or not, with
     the facts the matcher retained from the IR: its destination, the loop
     nest and guards it executes under, the buffers its value and guards
@@ -335,6 +335,8 @@ class StoreEffect:
     conversions: tuple[str, ...]
     term: str
     constant: bool
+    # A whole-buffer write by construction (a ``linalg.fill`` initializer).
+    whole: bool = False
 
     @property
     def loop_vars(self) -> tuple[str, ...]:
@@ -366,6 +368,8 @@ class StoreEffect:
         range is exactly the buffer's extent in that dimension."""
         shape = self.destination.shape
         dims = self.dims
+        if self.whole:
+            return not self.guards
         if self.guards or shape is None or len(dims) != len(shape):
             return False
         if any(d is None for d in dims) or len(set(dims)) != len(dims):
@@ -386,7 +390,10 @@ class StoreEffect:
     def instances(self) -> int | None:
         """Result instances the store writes: the trips of the loops its
         coordinates range over (every enclosing loop when a coordinate is
-        not a plain loop variable)."""
+        not a plain loop variable); every element for a whole-buffer fill."""
+        if self.whole:
+            shape = self.destination.shape
+            return None if shape is None else _product_or_none(shape)
         dims = self.dims
         if dims and all(d is not None for d in dims):
             vars_ = set(dims)
@@ -1037,7 +1044,7 @@ def _store_effects(trace, function, facts, parameters_by_ref) -> tuple:
         parameter = parameters_by_ref.get(store.value_ref)
         destination = BufferAccess(
             role="store",
-            memref_name=store.memref_name,
+            memref_name=store.memref_name or facts.name_by_ref.get(store.value_ref),
             parameter=None if parameter is None else parameter.name,
             local=parameter is None,
             value_ref=store.value_ref,
@@ -1075,6 +1082,7 @@ def _store_effects(trace, function, facts, parameters_by_ref) -> tuple:
                 conversions=tuple(store.conversions),
                 term=store.term,
                 constant=bool(store.constant),
+                whole=bool(store.whole),
             )
         )
     return tuple(effects)

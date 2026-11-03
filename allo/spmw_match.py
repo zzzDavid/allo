@@ -189,6 +189,9 @@ STORE_COPY = "copy"
 STORE_ACCUMULATOR_INIT = "accumulator_init"
 STORE_LOCAL = "local"
 STORE_UNMATCHED = "unmatched"
+# A buffer initializer (``linalg.fill``): not a store site the matcher
+# classifies, but an observable effect retained for verbatim programs.
+STORE_FILL = "fill"
 
 
 @dataclass(frozen=True)
@@ -238,6 +241,9 @@ class StoreCoverage:
     term: str = ""  # rendered stored value
     constant: bool = False  # the stored value is a compile-time constant
     loop_names: tuple = ()  # ((induction var, source loop label), ...)
+    # The write covers the whole buffer by construction (a ``linalg.fill``
+    # initializer, category ``"fill"``) rather than one element.
+    whole: bool = False
 
 
 @dataclass

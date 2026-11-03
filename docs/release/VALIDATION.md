@@ -579,3 +579,21 @@ directory. Raw logs under `/tmp/g9/r17-*.log`, copied to
 | Gemini-II card from a wheel built on zhang-x4 from the round 17 sdist (`g2_installed_run17.sh`, `g2-installed-run.log`, `r17/g2/`; `-rA`) | host `en-ec-zhang-x4`, card `apu-00`; sdist of the round 17 tree (sha256 `07141fc8...`) built into wheel `2d6fa3484eabec2b...` with the host's gcc 11, clean venv of the `allo-dev` interpreter, run from `/tmp` under `flock /tmp/tenon-apu-g2.lock`. First run (`g2-installed-run.log`): 14 passed, 1 failed, the typed `div` device build dying with `ld: final link failed: No space left on device`: the host's `/tmp` was full of the build directories the earlier rounds' runs had kept (`TENON_APU_G2_KEEP_TMP=1`, 138 directories, 3.9 GB, all mine). Those were removed and the file rerun with the same wheel and venv without keeping temporaries (`g2_rerun17.sh`, `g2-installed-rerun.log`): **15 passed in 123.04 s**; per-case output kept with `-rA` |
 | black on `allo` and `tests` (Black 24.8.0, the lint script's stage; the one unformatted round 16 test file formatted); license headers; pylint on the new and changed modules | black clean on `allo` and `tests` (24.8.0); pylint: no findings in `apu_v1_record_frontend.py`, `record_frontend.py`, `spmw_candidate.py`, `spmw_semantics.py` (the pre-existing P-23 findings of `spmw_match_engine.py` are unchanged); license headers checked at commit |
 
+## Round 18 (2026-11-03): review findings X-03 and C-32; retained effects completed
+
+Same interpreter and `LLVM_BUILD_DIR` as round 12; checkout as working
+directory. Raw logs under `/tmp/g9/r18-*.log`, copied to
+`/work/shared/users/phd/nz264/tenon-release-evidence/r18/`.
+
+| Check (round 18 tree) | Result |
+|---|---|
+| the reviewer's `probe_effects.py` (`tenon-release-evidence/reviewer-r17/`, run unchanged; `r18/probe_effects-after.log`) | all five programs compile and execute with the baseline's results: `gather` and `indirect_guard` retain `index` as a read (value and guard), `fill_only` returns eight sevens from a retained fill effect, `initialized_return` retains the fill before the partial store, `unused_argument` moves `src` as a physical transfer with no semantic input |
+| the reviewer's `probe_whole.py` (`r18/probe_whole-after.log`) | the whole launch on the non-verbatim Gemini-II add is refused by the shared validator ("declared whole-function, but the program is not executed verbatim") and the full compile fails before pricing |
+| `tests/pim/test_shared_semantics.py` (45: sections a-l plus (m) indirect loads, fills, unused arguments, whole launches reserved for verbatim programs) | 45 passed (within `r18-a.log`) |
+| targeted batch (`r18-a.log`: the round 17 batch) | 305 passed, 2 skipped in 1044 s |
+| perf (`r18-perf.log`) | 534 passed in 644 s |
+| PIM non-device (`r18-pim.log`) | 506 passed, 54 skipped, 12 deselected, 0 failed in 4007 s (1:06:47); the skips are the `paper_full` rows and the Gemini-II card tests, which need the card host |
+| APU v1 board from the checkout (`r18-board.log`, `-m apu_v1_device -rA`) | 10 passed, 2 xfailed (V1-16), 93 deselected in 477 s: the two vector GEMM plans, the histogram `APUv1Program` row (its facts now hold the zero fill and the guarded carried count), seven G6 board semantics cases; per-case printed records kept |
+| Gemini-II card from a wheel built on zhang-x4 from the round 18 sdist (`g2_installed_run18.sh`, `g2-installed-run.log`, `r18/g2/`; `-rA`; temporaries not kept) | host `en-ec-zhang-x4`, card `apu-00`; sdist of the round 18 tree (sha256 `04b8e485...`) built into wheel `000f91ae8d2ca86d...` with the host's gcc 11, clean venv of the `allo-dev` interpreter, run from `/tmp` under `flock /tmp/tenon-apu-g2.lock`, build temporaries not kept: `tests/pim/test_apu_g2_hardware.py` **15 passed in 146.50 s**; per-case output kept with `-rA` |
+| black on `allo` and `tests` (24.8.0); license headers; pylint on the changed modules | black clean (24.8.0); pylint: no findings in `apu_v1_record_frontend.py`, `spmw_candidate.py`, `spmw_semantics.py` (the pre-existing P-23 findings of `spmw_match.py` and `spmw_match_engine.py` are unchanged); license headers checked at commit |
+

@@ -45,6 +45,7 @@ from ._mlir.ir import AsmState
 from .spmw_match import (
     STORE_ACCUMULATOR_INIT,
     STORE_COPY,
+    STORE_FILL,
     STORE_LOCAL,
     STORE_MATCHED,
     STORE_UNMATCHED,
@@ -2840,9 +2841,12 @@ def _term_loads(term, out: list) -> list:
     return out
 
 
-def _retained_loads(term) -> list:
-    """`RetainedLoad` records of every load under ``term``, in term order."""
-    out = []
+def _retained_loads(term, out=None) -> list:
+    """`RetainedLoad` records of every load under ``term``, in term order,
+    recursing through load addresses: ``src[index[i]]`` reads ``index`` as
+    well as ``src`` (a dependency the semantic contract must keep)."""
+    if out is None:
+        out = []
     for load in _term_loads(term, []):
         index_terms = getattr(load, "index_terms", None)
         out.append(
@@ -2859,6 +2863,8 @@ def _retained_loads(term) -> list:
                 ),
             )
         )
+        for index_term in index_terms or ():
+            _retained_loads(index_term, out)
     return out
 
 
@@ -3579,6 +3585,61 @@ class _FunctionCoverage:
             )
         return None
 
+    def _record_fill(self, index, coverage, loop_names) -> None:
+        """Retain a ``linalg.fill`` initializer as a whole-buffer effect:
+        its destination, value, loop nest and guards.  The matcher does not
+        classify fills (they initialize buffers a function declares); a
+        program that executes the function verbatim states them in its
+        contract, since a returned buffer's untouched elements hold them."""
+        op = self._op(index)
+        value_ssa = _value_name(op.operands[0], self.state)
+        buffer_ssa = _value_name(op.operands[1], self.state)
+        dest_ref = self._ref(op.operands[1])
+        alloc = self.defining_map.get(buffer_ssa)
+        name = None
+        if alloc is not None and "name" in alloc.attributes:
+            name = _attr_str(alloc.attributes["name"])
+        term = _trace_value(
+            value_ssa,
+            self.defining_map,
+            self.value_refs,
+            state=self.state,
+            scope=self.scope,
+        )
+        guard_terms = self._guard_terms(index)
+        coverage.stores.append(
+            StoreCoverage(
+                func_name=self.func_name,
+                store=f"linalg.fill@{buffer_ssa}",
+                memref_name=name,
+                enclosing_loops=tuple(self.sites[index][1]),
+                category=STORE_FILL,
+                detail=f"initializer {_render_term(term)}",
+                local=dest_ref not in self.arg_refs,
+                value_ref=dest_ref if isinstance(dest_ref, IRValueRef) else None,
+                memref_type=str(op.operands[1].type),
+                indices=(),
+                coords=None,
+                guards=tuple(
+                    f"{kind}({_render_term(cond)})" if cond is not None else kind
+                    for kind, cond in guard_terms
+                ),
+                loads=tuple(_retained_loads(term)),
+                guard_loads=tuple(
+                    load
+                    for _kind, cond in guard_terms
+                    if cond is not None
+                    for load in _retained_loads(cond)
+                ),
+                reads_destination=False,
+                conversions=tuple(_term_casts(term)),
+                term=_render_term(term),
+                constant=_const_value(term) is not None,
+                loop_names=loop_names,
+                whole=True,
+            )
+        )
+
     def _guard_terms(self, index) -> list:
         """``(kind, traced condition or None)`` for every guard frame
         enclosing the store, outermost first."""
@@ -3731,6 +3792,13 @@ class _FunctionCoverage:
         loop_names = tuple(
             sorted((getattr(self.state, "loop_names", {}) or {}).items())
         )
+        fills = [
+            index
+            for index, (op, _loops, _guards) in enumerate(self.sites)
+            if op.operation.name == "linalg.fill" and len(op.operands) >= 2
+        ]
+        for index in sorted(fills):
+            self._record_fill(index, coverage, loop_names)
         for index in self.stores:
             cat = category[index]
             dest_ref = self._ref(self._op(index).operands[1])

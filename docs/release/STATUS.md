@@ -3,7 +3,7 @@
 
 # Release status
 
-Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline; committed as `9255d29`, exercised from the installed wheel on the simulators, the APU v1 board and the Gemini-II card; round 16: the reviewer's three contract gaps closed (C-30b) and the last typed route removed; round 17: the `APUv1Program` facade replaced by the shared front stages on the phase's source with retained store effects (X-02)). Read `TASK.md` in the containing repository,
+Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline; committed as `9255d29`, exercised from the installed wheel on the simulators, the APU v1 board and the Gemini-II card; round 16: the reviewer's three contract gaps closed (C-30b) and the last typed route removed; round 17: the `APUv1Program` facade replaced by the shared front stages on the phase's source with retained store effects (X-02); round 18: indirect loads, fill initializers and unused arguments retained or represented correctly (X-03), whole launches reserved for verbatim programs (C-32)). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -72,6 +72,21 @@ then this file, then `ISSUES.md` for the next action.
    build path for a user without the patches is the open question the
    reviewer named.
 4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+
+## Round 18 (2026-11-03): what was done
+
+- Reviewer findings on `a73a62d`: three supported-program regressions of
+  the retained-effect contract (X-03: loads inside load addresses dropped,
+  `linalg.fill` initializers not effects, the runtime's copy of an unused
+  argument refused) and one validation hole (C-32: whole launches bypassed
+  the tiling checks on planned programs). Fixed: `_retained_loads` recurses
+  through addresses; fills are retained effects with whole extent, value
+  and order; `CandidateTransfer.physical` represents the runtime's copy of
+  a parameter the program neither reads nor writes; a whole launch on a
+  non-verbatim program is a contract problem. Regressions in section m of
+  `tests/pim/test_shared_semantics.py`; the reviewer's probes execute all
+  five programs with the baseline's results.
+- Evidence: VALIDATION.md round 18.
 
 ## Round 17 (2026-11-03): what was done
 
@@ -261,8 +276,9 @@ then this file, then `ISSUES.md` for the next action.
 
 ## Next concrete actions (in order)
 
-0. Independent review of the round 17 `APUv1Program` frontend (retained
-   store effects, verbatim contract, runtime-checked transfers).
+0. Independent review of the rounds 17-18 `APUv1Program` frontend (retained
+   store effects incl. fills and indirect loads, verbatim contract,
+   physical transfers, runtime-checked movement).
 1. G9, matcher backends: Samsung, AiM, UPMEM and AttAcc candidates declare
    `CandidateEffects` (coverage, value layouts on their handles, transfers,
    launches) and their enumerators consume `ProgramFacts` instead of

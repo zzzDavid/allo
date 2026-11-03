@@ -71,6 +71,10 @@ class CandidateTransfer:
     value: str
     direction: str  # "in" | "out" | "inout"
     route: tuple[str, ...]
+    # A physical copy the runtime performs of a declared ABI buffer the
+    # program's semantics neither read nor write (an unused argument a
+    # scalar program's runtime still sends); never a semantic input.
+    physical: bool = False
 
 
 @dataclass(frozen=True)
@@ -135,7 +139,12 @@ class CandidateEffects:
                 for v in self.value_layouts
             ],
             "transfers": [
-                {"value": t.value, "direction": t.direction, "route": list(t.route)}
+                {
+                    "value": t.value,
+                    "direction": t.direction,
+                    "route": list(t.route),
+                    "physical": t.physical,
+                }
                 for t in self.transfers
             ],
             "launches": [
@@ -476,11 +485,24 @@ def _check_value_layouts(effects, matches, inputs, outputs, locals_, view) -> li
     return problems
 
 
-def _check_transfers(effects, inputs, outputs, locals_) -> list:
-    """Every input transferred in, every output transferred out."""
+def _check_transfers(effects, inputs, outputs, locals_, parameters) -> list:
+    """Every input transferred in, every output transferred out; a physical
+    transfer names a declared parameter the program neither reads nor
+    writes and never stands in for a semantic one."""
     problems = []
     moved_in, moved_out = set(), set()
     for transfer in effects.transfers:
+        if transfer.physical:
+            if transfer.value not in parameters:
+                problems.append(
+                    f"physical transfer of {transfer.value!r}, not a parameter"
+                )
+            if transfer.value in inputs | outputs:
+                problems.append(
+                    f"physical transfer of {transfer.value!r}, which the program "
+                    "reads or writes (declare the semantic transfer)"
+                )
+            continue
         if transfer.value not in inputs | outputs | locals_:
             problems.append(f"transfers {transfer.value!r}, not a program buffer")
         if transfer.direction not in {"in", "out", "inout"}:
@@ -539,6 +561,11 @@ def _check_launches(effects, matches, view) -> list:
             problems.append(
                 f"launch {position} advances part of a function the program "
                 "executes verbatim; a verbatim program launches whole functions"
+            )
+        if verbatim is None and launch.whole:
+            problems.append(
+                f"launch {position} is declared whole-function, but the program is "
+                "not executed verbatim: its launches tile instances and reductions"
             )
     by_operation = {}
     for launch in effects.launches:
@@ -623,7 +650,7 @@ def validate_candidate_effects(matches, placement, view=None) -> list[str]:
     problems.extend(
         _check_value_layouts(effects, matches, inputs, outputs, locals_, view)
     )
-    problems.extend(_check_transfers(effects, inputs, outputs, locals_))
+    problems.extend(_check_transfers(effects, inputs, outputs, locals_, parameters))
 
     problems.extend(_check_launches(effects, matches, view))
 

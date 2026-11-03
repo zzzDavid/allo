@@ -124,11 +124,17 @@ through the same driver (`allo/spmw_codegen.py::compile_for_target`):
   scratch allocation the runtime performs). The shared validator checks it
   against the facts, the realization check against the runtime's actual
   movement. The typed dispatch table and the typed callable are deleted.
-  Known limit of the retained effects: a declaration's `linalg.fill`
-  initializer is not a store, so it is not an effect (Allo fills only the
-  buffers a function declares itself, never an argument, so inputs and
-  outputs are unaffected); scalar (non-memref) arguments are outside the
-  facts as before.
+  Round 18 (reviewer findings on round 17): a declaration's `linalg.fill`
+  initializer is an effect too (`StoreEffect` with category `fill`, whole
+  extent, its value and ordering; a returned buffer's untouched elements
+  hold it, and `result: int32[8] = 7` returned as is compiles again); load
+  addresses are followed recursively, so `src[index[i]]` reads `index` in
+  values, guards and destination indices; the runtime's copy of an
+  argument the function never reads is a *physical* transfer
+  (`CandidateTransfer.physical`), checked as a declared parameter that is
+  not a semantic input; and a whole-function launch is refused for any
+  program that is not executed verbatim. Scalar (non-memref) arguments
+  remain outside the facts.
 
 Removed in round 13: the planner-hook registry `_SOURCE_PLANNERS` and
 `compile()`'s target-name branches; `APUv1VectorCallable`,
