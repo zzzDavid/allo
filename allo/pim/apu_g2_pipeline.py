@@ -505,9 +505,7 @@ APUG2_TYPED_TICK_MEASUREMENTS = (
     APUG2TypedTickMeasurement(
         "composed_batched_gemm_i4_k128", "composed", 1_720, 1_750
     ),
-    APUG2TypedTickMeasurement(
-        "composed_pair_affine_i2_k128", "composed", 1_876, 1_838
-    ),
+    APUG2TypedTickMeasurement("composed_pair_affine_i2_k128", "composed", 1_876, 1_838),
     APUG2TypedTickMeasurement("composed_two_stream_i3_k256", "composed", 2_569, 2_554),
     APUG2TypedTickMeasurement(
         "composed_two_stream_accumulate_i3_k256", "composed", 2_754, 2_754

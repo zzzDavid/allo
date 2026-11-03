@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Design 05 — Host-side collective modeling: the `HostXcel` interface, residency, layout-derived distribution, and the `host_staging` cost concern
 
 *Architect spec — Phase-0 gate for `dev/06262026-host-side-collective-modeling`.*

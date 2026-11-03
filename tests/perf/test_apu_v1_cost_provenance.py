@@ -103,12 +103,16 @@ def _record_frequency(make_kernel, chunks, queries):
         for c in range(chunks)
     ]
     body.append("    " * (3 + chunks) + "counts[query] += 1")
-    source = f"""
+    source = (
+        f"""
 def rf(records: uint16[{chunks}, 32768], queries: uint16[{chunks}, {queries}]) -> uint16[{queries}]:
     counts: uint16[{queries}] = 0
     for query in range({queries}):
         for record in allo.reduction(32768):
-""" + "\n".join(body) + "\n    return counts\n"
+"""
+        + "\n".join(body)
+        + "\n    return counts\n"
+    )
     return make_kernel(source, "rf")
 
 

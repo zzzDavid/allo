@@ -59,9 +59,11 @@ def _compile(case, backend=None):
 @pytest.mark.parametrize(
     "case,spec,cent",
     [
-        params
-        if params[0].case_id in _DEFAULT_CASES
-        else pytest.param(*params, marks=pytest.mark.paper_full)
+        (
+            params
+            if params[0].case_id in _DEFAULT_CASES
+            else pytest.param(*params, marks=pytest.mark.paper_full)
+        )
         for params in iter_case_programs()
     ],
     ids=EXPECTED_CASE_IDS,
@@ -175,8 +177,15 @@ def test_probe_and_emit_derive_the_same_replicated_contraction():
     # builder produced at tenon@ebb90a6 (the matcher additionally pins the
     # mapping the typed record left to the lowerer's "auto" rule).
     fields = (
-        "outputs", "reduction", "batches", "replicas", "row", "channels",
-        "channels_per_replica", "input_source", "reduction_storage_extent",
+        "outputs",
+        "reduction",
+        "batches",
+        "replicas",
+        "row",
+        "channels",
+        "channels_per_replica",
+        "input_source",
+        "reduction_storage_extent",
     )
     assert {f: getattr(emitted[0], f) for f in fields} == {
         "outputs": 128,
@@ -189,6 +198,7 @@ def test_probe_and_emit_derive_the_same_replicated_contraction():
         "input_source": "gb",
         "reduction_storage_extent": None,
     }
+
 
 def test_case_table_is_exactly_the_fourteen_archived_cases():
     assert tuple(CENT_CASES) == EXPECTED_CASE_IDS

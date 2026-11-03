@@ -57,7 +57,9 @@ def test_public_compile_generates_ranks_and_executes_four_apu_plans():
 
     # The functional run reproduces the selected plan's FP16 grouping (a
     # subgroup tree for the baseline plan), not NumPy's.
-    np.testing.assert_allclose(result.astype(np.float32), reference, rtol=1e-2, atol=1e-2)
+    np.testing.assert_allclose(
+        result.astype(np.float32), reference, rtol=1e-2, atol=1e-2
+    )
     np.testing.assert_array_equal(run.extra["outputs"]["result"], result)
     assert run.cycles == compiled.estimate().cycles
     assert run.extra["plan"] == compiled.selected_plan.name

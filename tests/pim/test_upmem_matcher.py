@@ -65,7 +65,9 @@ def _candidate(problem, decision):
         "upmem_constants": (),
         **decision_fields(decision),
         "predicate_lowering": decision.predicate_lowering.value,
-        "upmem_features": tuple(physical_features(problem, decision).manifest().items()),
+        "upmem_features": tuple(
+            physical_features(problem, decision).manifest().items()
+        ),
     }
 
 

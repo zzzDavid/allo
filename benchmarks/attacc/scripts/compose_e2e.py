@@ -42,22 +42,38 @@ import tempfile
 from pathlib import Path
 
 LABEL = "tenon_time(ms)"
-CONFIGS = [(lin, lout, batch) for batch in (1, 4) for lin, lout in ((128, 2048), (2048, 128), (2048, 2048))]
+CONFIGS = [
+    (lin, lout, batch)
+    for batch in (1, 4)
+    for lin, lout in ((128, 2048), (2048, 128), (2048, 2048))
+]
 
 
 def _key(family, shape):
     rows, reduction, outputs = shape
-    return ("gemv" if family == "gemv" else "attn", int(rows), int(reduction), int(outputs))
+    return (
+        "gemv" if family == "gemv" else "attn",
+        int(rows),
+        int(reduction),
+        int(outputs),
+    )
 
 
-def tenon_tables(dcc_root: Path, times: dict, clock_mhz: float, missing: str, out: Path) -> dict:
+def tenon_tables(
+    dcc_root: Path, times: dict, clock_mhz: float, missing: str, out: Path
+) -> dict:
     filled = {"measured": 0, "baseline": 0}
     for name in ("@attacc-gemv_inference.csv", "@attacc-attn_inference.csv"):
         family = "gemv" if "gemv" in name else "attn"
         rows = list(csv.DictReader((dcc_root / "temp" / "simulation" / name).open()))
         header = list(rows[0]) + ([LABEL] if LABEL not in rows[0] else [])
         for row in rows:
-            key = (family, int(row["#head"]), int(row["input_dim"]), int(row["output_dim"]))
+            key = (
+                family,
+                int(row["#head"]),
+                int(row["input_dim"]),
+                int(row["output_dim"]),
+            )
             if key in times:
                 row[LABEL] = times[key] / (clock_mhz * 1e3)  # cycles -> ms
                 filled["measured"] += 1
@@ -104,7 +120,15 @@ def decode_ms(table_dir: Path, batch, lin, lout, *, gpu_only, pipe, parallel):
         pim["RES_ATTACC_LABEL"] = LABEL
         system.set_accelerator(model, DeviceType.PIM, pim)
     perfs = []
-    system.simulate(batch, lin, lout, perfs=perfs, pipe=pipe, parallel_ff=parallel, power_constraint=False)
+    system.simulate(
+        batch,
+        lin,
+        lout,
+        perfs=perfs,
+        pipe=pipe,
+        parallel_ff=parallel,
+        power_constraint=False,
+    )
     tag, config, time = perfs[0]
     # DCC's write_csv column order: 'g_time (ms)' is the decode latency.
     return (tag + config + time)[25]
@@ -113,8 +137,12 @@ def decode_ms(table_dir: Path, batch, lin, lout, *, gpu_only, pipe, parallel):
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--kernel-times", required=True)
-    parser.add_argument("--clock-mhz", type=float, default=1300.0,
-                        help="HBM3_5.2Gbps command clock (11,454 cycles = 0.008808 ms)")
+    parser.add_argument(
+        "--clock-mhz",
+        type=float,
+        default=1300.0,
+        help="HBM3_5.2Gbps command clock (11,454 cycles = 0.008808 ms)",
+    )
     parser.add_argument("--missing", choices=("error", "baseline"), default="error")
     args = parser.parse_args(argv)
     root = os.environ.get("ATTACC_DCC_ROOT")
@@ -123,16 +151,35 @@ def main(argv=None) -> int:
     dcc_root = Path(root).resolve()
     sys.path.insert(0, str(dcc_root))
     records = json.load(open(args.kernel_times))
-    times = {_key(r["family"], r["shape"]): int(r["memory_system_cycles"]) for r in records}
+    times = {
+        _key(r["family"], r["shape"]): int(r["memory_system_cycles"]) for r in records
+    }
     with tempfile.TemporaryDirectory(prefix="tenon-attacc-e2e-") as tmp:
         filled = tenon_tables(dcc_root, times, args.clock_mhz, args.missing, Path(tmp))
         rows = []
         for lin, lout, batch in CONFIGS:
-            gpu = decode_ms(Path(tmp), batch, lin, lout, gpu_only=True, pipe=0, parallel=False)
-            full = decode_ms(Path(tmp), batch, lin, lout, gpu_only=False, pipe=True, parallel=True)
-            rows.append({"lin": lin, "lout": lout, "batch": batch, "gpu_ms": gpu,
-                         "tenon_ms": full, "speedup": gpu / full})
-    print(json.dumps({"kind": "analytical-composition", "kernel_rows": filled, "configs": rows}, indent=1))
+            gpu = decode_ms(
+                Path(tmp), batch, lin, lout, gpu_only=True, pipe=0, parallel=False
+            )
+            full = decode_ms(
+                Path(tmp), batch, lin, lout, gpu_only=False, pipe=True, parallel=True
+            )
+            rows.append(
+                {
+                    "lin": lin,
+                    "lout": lout,
+                    "batch": batch,
+                    "gpu_ms": gpu,
+                    "tenon_ms": full,
+                    "speedup": gpu / full,
+                }
+            )
+    print(
+        json.dumps(
+            {"kind": "analytical-composition", "kernel_rows": filled, "configs": rows},
+            indent=1,
+        )
+    )
     return 0
 
 

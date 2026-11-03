@@ -205,7 +205,9 @@ def test_no_materializable_candidate_is_a_hard_error_listing_rejections(
 
     monkeypatch.setattr(spmw_samsung.SamsungCtx, "emit_program", broken)
     # The backend's own diagnostic surfaces, with every rejection in a note.
-    with pytest.raises(NotImplementedError, match="emitter cannot lower anything") as caught:
+    with pytest.raises(
+        NotImplementedError, match="emitter cannot lower anything"
+    ) as caught:
         autoschedule(target, trace, samsung_cost)
     (note,) = caught.value.__notes__
     assert "none materialized" in note
@@ -339,7 +341,10 @@ def test_joint_evaluation_beats_conflicting_per_group_minima(coupled_chain):
     assert [_residency(p) for p in per_group] == ["restage", "restage"]
     assert heuristic.placement_ranking.joint_evaluation == "per-group heuristic"
     assert heuristic.placement_ranking.joint is None
-    assert producer.per_group_position == heuristic.placement_ranking.kernels[0].chosen_position
+    assert (
+        producer.per_group_position
+        == heuristic.placement_ranking.kernels[0].chosen_position
+    )
 
     # The joint route keeps both endpoints resident and is cheaper as a whole.
     assert [_residency(p) for p in joint.layout] == ["resident", "resident"]
@@ -350,7 +355,10 @@ def test_joint_evaluation_beats_conflicting_per_group_minima(coupled_chain):
         ranking.per_group_cycles - ranking.program_cycles
         == _PRODUCER_RESTAGE - _CONSUMER_RESIDENT
     )
-    assert ranking.joint.incumbent == (producer.per_group_position, consumer.per_group_position)
+    assert ranking.joint.incumbent == (
+        producer.per_group_position,
+        consumer.per_group_position,
+    )
     assert ranking.joint.incumbent_rank > 0
     assert ranking.joint.termination == "exhausted"
     assert ranking.joint.assignments_evaluated == ranking.joint_assignments
@@ -423,7 +431,9 @@ def chained(W, V, x, y, z):
     _hx.gather(z, _hx.banks)
 
 
-@pytest.mark.parametrize("host_moves", [None, chained], ids=["no-host", "launch-schedule"])
+@pytest.mark.parametrize(
+    "host_moves", [None, chained], ids=["no-host", "launch-schedule"]
+)
 def test_routes_agree_and_program_cycles_is_the_estimate(host_moves):
     """The two-kernel program of test_host_program_analysis: the joint and
     the per-group routes select the same program, the label names the route,

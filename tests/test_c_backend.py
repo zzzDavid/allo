@@ -121,9 +121,9 @@ def test_portable_c_rejects_hls_only_integer_templates():
 
     # Only the unary math calls upstream qualified with ``hls::`` are
     # unqualified; every other HLS library construct is still rejected.
-    assert _portable_c11("float f(float x) { return hls::sqrt(x); }\n").count(
-        "hls::"
-    ) == 0
+    assert (
+        _portable_c11("float f(float x) { return hls::sqrt(x); }\n").count("hls::") == 0
+    )
     try:
         _portable_c11("void f(hls::stream<int> &s) {}\n")
     except PortableCError as error:
@@ -300,9 +300,7 @@ def test_wide_literal_multiplier_keeps_exact_low_bits():
     artifact = _wide(kernel)
     out = np.zeros(8, np.int64)
     artifact.compile()(_WIDE_A.copy(), out)
-    expected = [
-        _wrap(int(a) * -(1 << 40) * 2 + 3000000000, 64) for a in _WIDE_A
-    ]
+    expected = [_wrap(int(a) * -(1 << 40) * 2 + 3000000000, 64) for a in _WIDE_A]
     assert out.tolist() == expected
 
 

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Apply the Tenon uPIMulator patch to an upstream VIA-Research/uPIMulator
 # checkout and build the Go simulator.  Usage: apply.sh <path/to/uPIMulator>
 # See README.md in this directory for the pinned upstream commit and the

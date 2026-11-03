@@ -39,7 +39,6 @@ if TYPE_CHECKING:  # pragma: no cover
     from .spmw_codegen import Compiled
 
 
-
 _APU_V1_BUILD_MODE_ENV = "TENON_APU_V1_BUILD_MODE"
 _DEFAULT_APU_V1_BUILD_MODE = "release"
 _APU_V1_BUILD_MODES = frozenset(("debug", "release"))

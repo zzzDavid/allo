@@ -101,7 +101,9 @@ def attacc_geometry(target) -> AttAccGeometry:
             f"AttAcc target declares {banks['banks']} banks per channel but "
             f"{units} PIM units"
         )
-    groups = int(banks["pseudochannels"]) * int(banks["ranks"]) * int(banks["bank_groups"])
+    groups = (
+        int(banks["pseudochannels"]) * int(banks["ranks"]) * int(banks["bank_groups"])
+    )
     if units % groups:
         raise ValueError(f"{units} banks do not divide into {groups} bank groups")
     width = int(banks["width"])
@@ -292,7 +294,9 @@ class AttAccTiling:
             return value
         dims = tuple(tuple(int(item) for item in axis) for axis in value)
         if len(dims) != 3 or any(len(axis) != 3 for axis in dims):
-            raise ValueError(f"AttAcc tiling must be three (a, b, s) triples, got {value!r}")
+            raise ValueError(
+                f"AttAcc tiling must be three (a, b, s) triples, got {value!r}"
+            )
         return cls(dims)
 
     @property
@@ -325,9 +329,7 @@ def _round_up(nbytes: int, granule: int) -> int:
 def _fixed_form(dims, geometry) -> bool:
     """AttAcc's fixed per-channel bank split: one bank group's banks on the
     reduction, the channel's bank groups on the outputs."""
-    return (
-        dims[1][1] == geometry.banks_per_group and dims[2][1] == geometry.bank_groups
-    )
+    return dims[1][1] == geometry.banks_per_group and dims[2][1] == geometry.bank_groups
 
 
 def _row_footprint(tiling: AttAccTiling, kind: str, geometry, rows: int) -> int:
@@ -343,7 +345,9 @@ def _row_footprint(tiling: AttAccTiling, kind: str, geometry, rows: int) -> int:
     )
 
 
-def tiling_violations(kernel: AttAccKernel, tiling: AttAccTiling, geometry) -> list[str]:
+def tiling_violations(
+    kernel: AttAccKernel, tiling: AttAccTiling, geometry
+) -> list[str]:
     """Why ``tiling`` is not a legal AttAcc tiling of ``kernel`` (empty if legal)."""
     out = []
     for name, (a, b, s), extent in zip(
@@ -357,7 +361,10 @@ def tiling_violations(kernel: AttAccKernel, tiling: AttAccTiling, geometry) -> l
         out.append(f"channel product {tiling.channels} exceeds {geometry.channels}")
     if tiling.units > geometry.units:
         out.append(f"unit product {tiling.units} exceeds {geometry.units}")
-    if not out and _row_footprint(tiling, kernel.kind, geometry, 1) > geometry.bank_bytes:
+    if (
+        not out
+        and _row_footprint(tiling, kernel.kind, geometry, 1) > geometry.bank_bytes
+    ):
         out.append(
             f"one row needs {_row_footprint(tiling, kernel.kind, geometry, 1)} "
             f"bytes per bank; a bank holds {geometry.bank_bytes}"
@@ -404,8 +411,16 @@ def _space(kernel: AttAccKernel, geometry: AttAccGeometry) -> tuple[AttAccTiling
         bpg, groups = geometry.banks_per_group, geometry.bank_groups
         row_axis = (on_rows, 1, _ceil(rows, on_rows))
         for fixed in (
-            (row_axis, (1, bpg, _ceil(reduction, bpg)), (spare, groups, _ceil(outputs, groups * spare))),
-            (row_axis, (spare, bpg, _ceil(reduction, bpg * spare)), (1, groups, _ceil(outputs, groups))),
+            (
+                row_axis,
+                (1, bpg, _ceil(reduction, bpg)),
+                (spare, groups, _ceil(outputs, groups * spare)),
+            ),
+            (
+                row_axis,
+                (spare, bpg, _ceil(reduction, bpg * spare)),
+                (1, groups, _ceil(outputs, groups)),
+            ),
         ):
             if fixed not in out:
                 out.append(fixed)
@@ -418,7 +433,9 @@ def _space(kernel: AttAccKernel, geometry: AttAccGeometry) -> tuple[AttAccTiling
     return tuple(legal)
 
 
-def attacc_tiling_space(kernel: AttAccKernel, geometry: AttAccGeometry) -> list[AttAccTiling]:
+def attacc_tiling_space(
+    kernel: AttAccKernel, geometry: AttAccGeometry
+) -> list[AttAccTiling]:
     """Every legal tiling of ``kernel`` on ``geometry``, in enumeration order."""
     space = _space(kernel, geometry)
     if not space:
@@ -506,8 +523,11 @@ def attacc_command_counts(
     tiling = AttAccTiling.coerce(tiling)
     n, it = _iterations(tiling, kernel.kind, geometry)
     dims = [(tiling.dims[0][0], tiling.dims[0][1], it), tiling.dims[1], tiling.dims[2]]
-    fixed = dims[0][1] == 1 and dims[1][0] == 1 and dims[2][0] == 1 and _fixed_form(
-        dims, geometry
+    fixed = (
+        dims[0][1] == 1
+        and dims[1][0] == 1
+        and dims[2][0] == 1
+        and _fixed_form(dims, geometry)
     )
     if not fixed:
         dims = [(_pow2(a), _pow2(b), s) for a, b, s in dims]
@@ -584,7 +604,9 @@ def attacc_program(kernel, tiling, geometry) -> AttAccProgram:
     )
 
 
-def rank_attacc_tilings(kernel, geometry, cost_fn=None) -> list[tuple[AttAccTiling, float]]:
+def rank_attacc_tilings(
+    kernel, geometry, cost_fn=None
+) -> list[tuple[AttAccTiling, float]]:
     """Every legal tiling with its closed-form cycles, cheapest first.
 
     Ties keep enumeration order (the reference selector's first minimum).
@@ -597,7 +619,17 @@ def rank_attacc_tilings(kernel, geometry, cost_fn=None) -> list[tuple[AttAccTili
     if cost_fn is None:
         from .costs.attacc import attacc_kernel_cycles as cost_fn
     scored = [
-        (tiling, cost_fn(AttAccProgram(kernel, tiling, attacc_command_counts(kernel, tiling, geometry), geometry)))
+        (
+            tiling,
+            cost_fn(
+                AttAccProgram(
+                    kernel,
+                    tiling,
+                    attacc_command_counts(kernel, tiling, geometry),
+                    geometry,
+                )
+            ),
+        )
         for tiling in attacc_tiling_space(kernel, geometry)
     ]
     return sorted(scored, key=lambda item: item[1])

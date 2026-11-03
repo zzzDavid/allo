@@ -1,3 +1,5 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Deterministic exhaustive search over finite schedule decision domains.
 
 The core deliberately knows nothing about workloads, targets, or cost models.

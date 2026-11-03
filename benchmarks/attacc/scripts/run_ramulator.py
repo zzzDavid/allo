@@ -83,7 +83,9 @@ def _dcc_root() -> Path:
 
 def _simulator(dcc_root: Path) -> Path:
     binary = Path(
-        os.environ.get("ATTACC_RAMULATOR", dcc_root / "Ramulator2" / "ramulator2-AttAcc")
+        os.environ.get(
+            "ATTACC_RAMULATOR", dcc_root / "Ramulator2" / "ramulator2-AttAcc"
+        )
     ).resolve()
     if not binary.is_file():
         raise ExternalDependencyMissing(
@@ -116,12 +118,16 @@ def write_trace(dcc_root: Path, family: str, tiling, workdir: Path) -> Path:
     sys.path.insert(0, str(dcc_root))
     try:
         if family == "gemv":
-            generator = importlib.import_module("attacc_trace_gen.gen_trace_AttAcc_GEMV")
+            generator = importlib.import_module(
+                "attacc_trace_gen.gen_trace_AttAcc_GEMV"
+            )
             generator.set_mode_gemv("inference")
             trace = workdir / "kernel.trace"
             generator.run_GEMV(tiling, str(trace))
         else:
-            generator = importlib.import_module("attacc_trace_gen.gen_trace_AttAcc_ATTN")
+            generator = importlib.import_module(
+                "attacc_trace_gen.gen_trace_AttAcc_ATTN"
+            )
             generator.set_mode_attn("inference")
             trace = workdir / "kernel.trace"
             generator.run_attention(tiling, str(trace))
@@ -148,13 +154,23 @@ def run_simulator(binary: Path, dcc_root: Path, yaml_path: Path, workdir: Path) 
     ).resolve()
     command = [str(binary), "-f", str(yaml_path)]
     image = os.environ.get("ATTACC_RAMULATOR_IMAGE")
-    env = dict(os.environ, LD_LIBRARY_PATH=f"{libdir}:{os.environ.get('LD_LIBRARY_PATH', '')}")
+    env = dict(
+        os.environ, LD_LIBRARY_PATH=f"{libdir}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+    )
     if image:
         mounts = {str(dcc_root): "ro", str(workdir): "rw"}
         for path in (binary.parent, libdir):
             if not str(path).startswith(str(dcc_root)):
                 mounts[str(path)] = "ro"
-        docker = ["docker", "run", "--rm", "-w", str(workdir), "-e", f"LD_LIBRARY_PATH={libdir}"]
+        docker = [
+            "docker",
+            "run",
+            "--rm",
+            "-w",
+            str(workdir),
+            "-e",
+            f"LD_LIBRARY_PATH={libdir}",
+        ]
         for path, mode in mounts.items():
             docker += ["-v", f"{path}:{path}:{mode}"]
         command = docker + [image] + command
@@ -174,8 +190,12 @@ def main(argv=None) -> int:
     shape = parser.add_mutually_exclusive_group(required=True)
     shape.add_argument("--gemv", nargs=3, type=int, metavar=("H", "K", "N"))
     shape.add_argument("--attention", nargs=3, type=int, metavar=("H", "D", "L"))
-    parser.add_argument("--tiling", help="time this tiling (JSON) instead of the selected one")
-    parser.add_argument("--keep", action="store_true", help="keep the temporary directory")
+    parser.add_argument(
+        "--tiling", help="time this tiling (JSON) instead of the selected one"
+    )
+    parser.add_argument(
+        "--keep", action="store_true", help="keep the temporary directory"
+    )
     args = parser.parse_args(argv)
     family = "gemv" if args.gemv else "attention"
     dims = tuple(args.gemv or args.attention)

@@ -1,3 +1,5 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 # VERIFIER-OWNED probe script — do not edit source files
 # Probes the multi-op residency sim run directly, bypassing pytest skip-path.
 # Catches and prints the full exception when uPIMulator crashes.
@@ -34,12 +36,25 @@ for i in range(1, N + 1):
         base_unavail = sim_unavailable(base_res)
         search_unavail = sim_unavailable(search_res)
         if base_unavail or search_unavail:
-            print(f"  SKIP: sim_unavailable  base={base_unavail}  search={search_unavail}", flush=True)
-            print(f"  base stdout tail: {base_res.stdout[-300:] if base_res.stdout else '<none>'}", flush=True)
+            print(
+                f"  SKIP: sim_unavailable  base={base_unavail}  search={search_unavail}",
+                flush=True,
+            )
+            print(
+                f"  base stdout tail: {base_res.stdout[-300:] if base_res.stdout else '<none>'}",
+                flush=True,
+            )
             results.append("skip-unavail")
         else:
-            win = search_res.cycles is not None and base_res.cycles is not None and search_res.cycles < base_res.cycles
-            print(f"  PASS: base={base_res.cycles}  search={search_res.cycles}  win={win}", flush=True)
+            win = (
+                search_res.cycles is not None
+                and base_res.cycles is not None
+                and search_res.cycles < base_res.cycles
+            )
+            print(
+                f"  PASS: base={base_res.cycles}  search={search_res.cycles}  win={win}",
+                flush=True,
+            )
             results.append("pass" if win else "fail-no-win")
     except RuntimeError as e:
         print(f"  SKIP via RuntimeError: {str(e)[:400]}", flush=True)
@@ -52,4 +67,7 @@ for i in range(1, N + 1):
 print(f"\n=== summary: {results} ===", flush=True)
 pass_count = results.count("pass")
 skip_count = sum(1 for r in results if r.startswith("skip"))
-print(f"pass={pass_count}  skip={skip_count}  other={N - pass_count - skip_count}", flush=True)
+print(
+    f"pass={pass_count}  skip={skip_count}  other={N - pass_count - skip_count}",
+    flush=True,
+)

@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # UPMEM as a Tenon reference backend
 
 UPMEM is represented with the same three independent programming abstractions

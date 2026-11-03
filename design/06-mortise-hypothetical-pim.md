@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Design 06 — Mortise hypothetical PIM substrate: structure-only target, capacity-aware CostModel flavors, sweep + ablation seams
 
 Status: Phase-0b architect spec (GATING). Authoritative for tasks 003–007 in

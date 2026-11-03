@@ -204,7 +204,9 @@ def test_gemv_spellings_make_identical_decisions(gemv_decisions):
 
 def test_output_loop_is_not_a_batch_axis():
     compiled = _compile(gemv_inline, backend="virtual")
-    match = next(m for m in compiled.compiled.trace.matches if m.target_op_name == "MAC")
+    match = next(
+        m for m in compiled.compiled.trace.matches if m.target_op_name == "MAC"
+    )
     roles = match.extra["axis_roles"]
     i, j = (loop[0] for loop in match.enclosing_loops)
     assert roles["output"] == (i,)
@@ -217,7 +219,9 @@ def test_output_loop_is_not_a_batch_axis():
 
 def test_vector_indexing_result_loop_is_the_batch_axis():
     compiled = _compile(heads_qk, backend="virtual")
-    match = next(m for m in compiled.compiled.trace.matches if m.target_op_name == "MAC")
+    match = next(
+        m for m in compiled.compiled.trace.matches if m.target_op_name == "MAC"
+    )
     h, s, d = (loop[0] for loop in match.enclosing_loops)
     roles = match.extra["axis_roles"]
     assert (roles["batch"], roles["output"], roles["reduction"]) == ((h,), (s,), (d,))

@@ -130,7 +130,10 @@ def test_samsung_paper_gemv_movement_stage():
     # One movement profile (the program's); Samsung places rows by the owner
     # map, so its per-level block/cyclic row distributions are crossed as
     # separate realizable ties (layout-search.md section 8).
-    assert movement.ties[0].description == "pseudo_channel<-work0[0,1,2,3]; pim<-work1[0,1,2]"
+    assert (
+        movement.ties[0].description
+        == "pseudo_channel<-work0[0,1,2,3]; pim<-work1[0,1,2]"
+    )
     assert movement.tie_count == 4 and len(movement.ties) == 4
     assert all(tie.realizable for tie in movement.ties)
     assert {tie.cost for tie in movement.ties} == {72704}
@@ -343,7 +346,9 @@ def test_aim_and_upmem_report_movement_without_changing_cycles(
     if target.name == "upmem":
         assert all("UPMEM accumulates in int32" in r for r in reasons)
     else:
-        assert all("not that split" in r and "reduction_partitions" in r for r in reasons)
+        assert all(
+            "not that split" in r and "reduction_partitions" in r for r in reasons
+        )
     if target.name == "upmem":
         assert movement.optimality_scope == "coordinate layouts"
         assert movement.derived.is_masked

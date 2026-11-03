@@ -954,9 +954,8 @@ class APUv1VectorCallable:
         lifted = {}
         for value in self.realization.values:
             source = arrays.get(value.name)
-            if (
-                isinstance(source, np.ndarray)
-                and tuple(source.shape) + (1,) == tuple(value.shape)
+            if isinstance(source, np.ndarray) and tuple(source.shape) + (1,) == tuple(
+                value.shape
             ):
                 lifted[value.name] = source
                 arrays[value.name] = np.reshape(source, tuple(value.shape))

@@ -659,7 +659,6 @@ def build_apu_g2_recipe_graph(
     return graph
 
 
-
 def _typed_call_feature_arguments(operation: APUG2RecipeOperation) -> dict:
     """Widths and depth that :func:`apu_g2_typed_call_features` prices."""
 

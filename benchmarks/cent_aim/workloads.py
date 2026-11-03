@@ -980,9 +980,7 @@ def build_case(case_id: str, spec: DecodeSpec | None = None) -> CentCase:
 
     case, spec = _case_spec(case_id, spec)
     decode_region = build_decode_region(spec)
-    return CentCase(
-        decode_region, build_host_program(decode_region, case.stages, spec)
-    )
+    return CentCase(decode_region, build_host_program(decode_region, case.stages, spec))
 
 
 def iter_case_programs(

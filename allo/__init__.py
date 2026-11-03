@@ -46,6 +46,7 @@ from .spmw_target import (
     LaunchRecord,
     HostProgram,
 )
+
 # HostXcel collective surface removed (2026-06-30): host<->device transfers
 # are now explicit `allo.move`s declared on an @allo.unit(mode="host") scope,
 # naming device memory (e.g. hbm_pim.banks) as an endpoint. See spmw_target.py
@@ -81,27 +82,75 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "APUv1VectorCallable": ("allo.pim.apu_v1_vector_program", "APUv1VectorCallable"),
     "APUv1Phase": ("allo.pim.apu_v1_program", "APUv1Phase"),
     "APUv1Program": ("allo.pim.apu_v1_program", "APUv1Program"),
-    "APUG2ComposedContractionCallable": ("allo.pim.apu_g2_composed_program", "APUG2ComposedContractionCallable"),
-    "APUG2ComposedContractionProgram": ("allo.pim.apu_g2_composed_program", "APUG2ComposedContractionProgram"),
+    "APUG2ComposedContractionCallable": (
+        "allo.pim.apu_g2_composed_program",
+        "APUG2ComposedContractionCallable",
+    ),
+    "APUG2ComposedContractionProgram": (
+        "allo.pim.apu_g2_composed_program",
+        "APUG2ComposedContractionProgram",
+    ),
     "APUG2DotEpilogue": ("allo.pim.apu_g2_composed_program", "APUG2DotEpilogue"),
-    "APUG2DotEpilogueMode": ("allo.pim.apu_g2_composed_program", "APUG2DotEpilogueMode"),
-    "APUG2ComposedHostFiles": ("allo.pim.apu_g2_composed_layout", "APUG2ComposedHostFiles"),
-    "build_apu_g2_composed_host_command": ("allo.pim.apu_g2_composed_layout", "build_apu_g2_composed_host_command"),
-    "decode_apu_g2_u16_bitpatterns": ("allo.pim.apu_g2_composed_layout", "decode_apu_g2_u16_bitpatterns"),
-    "deinterleave_apu_g2_streams": ("allo.pim.apu_g2_composed_layout", "deinterleave_apu_g2_streams"),
-    "encode_apu_g2_u16_bitpatterns": ("allo.pim.apu_g2_composed_layout", "encode_apu_g2_u16_bitpatterns"),
-    "gather_apu_g2_composed_output": ("allo.pim.apu_g2_composed_layout", "gather_apu_g2_composed_output"),
-    "interleave_apu_g2_dot_streams": ("allo.pim.apu_g2_composed_layout", "interleave_apu_g2_dot_streams"),
-    "pack_apu_g2_batched_gemm_dots": ("allo.pim.apu_g2_composed_layout", "pack_apu_g2_batched_gemm_dots"),
-    "pack_apu_g2_composed_auxiliary": ("allo.pim.apu_g2_composed_layout", "pack_apu_g2_composed_auxiliary"),
-    "pack_apu_g2_composed_operand": ("allo.pim.apu_g2_composed_layout", "pack_apu_g2_composed_operand"),
-    "pack_apu_g2_matrix_vector_dots": ("allo.pim.apu_g2_composed_layout", "pack_apu_g2_matrix_vector_dots"),
+    "APUG2DotEpilogueMode": (
+        "allo.pim.apu_g2_composed_program",
+        "APUG2DotEpilogueMode",
+    ),
+    "APUG2ComposedHostFiles": (
+        "allo.pim.apu_g2_composed_layout",
+        "APUG2ComposedHostFiles",
+    ),
+    "build_apu_g2_composed_host_command": (
+        "allo.pim.apu_g2_composed_layout",
+        "build_apu_g2_composed_host_command",
+    ),
+    "decode_apu_g2_u16_bitpatterns": (
+        "allo.pim.apu_g2_composed_layout",
+        "decode_apu_g2_u16_bitpatterns",
+    ),
+    "deinterleave_apu_g2_streams": (
+        "allo.pim.apu_g2_composed_layout",
+        "deinterleave_apu_g2_streams",
+    ),
+    "encode_apu_g2_u16_bitpatterns": (
+        "allo.pim.apu_g2_composed_layout",
+        "encode_apu_g2_u16_bitpatterns",
+    ),
+    "gather_apu_g2_composed_output": (
+        "allo.pim.apu_g2_composed_layout",
+        "gather_apu_g2_composed_output",
+    ),
+    "interleave_apu_g2_dot_streams": (
+        "allo.pim.apu_g2_composed_layout",
+        "interleave_apu_g2_dot_streams",
+    ),
+    "pack_apu_g2_batched_gemm_dots": (
+        "allo.pim.apu_g2_composed_layout",
+        "pack_apu_g2_batched_gemm_dots",
+    ),
+    "pack_apu_g2_composed_auxiliary": (
+        "allo.pim.apu_g2_composed_layout",
+        "pack_apu_g2_composed_auxiliary",
+    ),
+    "pack_apu_g2_composed_operand": (
+        "allo.pim.apu_g2_composed_layout",
+        "pack_apu_g2_composed_operand",
+    ),
+    "pack_apu_g2_matrix_vector_dots": (
+        "allo.pim.apu_g2_composed_layout",
+        "pack_apu_g2_matrix_vector_dots",
+    ),
     "APUG2ScalarType": ("allo.pim.apu_g2_typed_program", "APUG2ScalarType"),
     "APUG2TypedCallable": ("allo.pim.apu_g2_typed_program", "APUG2TypedCallable"),
     "APUG2TypedOperation": ("allo.pim.apu_g2_typed_program", "APUG2TypedOperation"),
     "APUG2TypedProgram": ("allo.pim.apu_g2_typed_program", "APUG2TypedProgram"),
-    "pack_apu_g2_gemm_as_independent_dots": ("allo.pim.apu_g2_typed_program", "pack_apu_g2_gemm_as_independent_dots"),
-    "unpack_apu_g2_gemm_dots": ("allo.pim.apu_g2_typed_program", "unpack_apu_g2_gemm_dots"),
+    "pack_apu_g2_gemm_as_independent_dots": (
+        "allo.pim.apu_g2_typed_program",
+        "pack_apu_g2_gemm_as_independent_dots",
+    ),
+    "unpack_apu_g2_gemm_dots": (
+        "allo.pim.apu_g2_typed_program",
+        "unpack_apu_g2_gemm_dots",
+    ),
     "CompiledWorkload": ("allo.compiler", "CompiledWorkload"),
 }
 

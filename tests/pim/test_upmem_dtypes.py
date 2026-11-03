@@ -160,8 +160,18 @@ def _logistic(out):
         (_kmeans_distances(int32), "lD", "memref<24x4xi32>", "kmeans_distances"),
         (_logistic(int32), "lG", "memref<8xi32>", "feature_gradient"),
     ],
-    ids=["va-i64", "va-f32", "va-i16", "gemv-i64", "gemm-i64", "red-i32-cell",
-         "hist-i64", "sel-i64", "kmeans-i32-out", "logistic-i32-out"],
+    ids=[
+        "va-i64",
+        "va-f32",
+        "va-i16",
+        "gemv-i64",
+        "gemm-i64",
+        "red-i32-cell",
+        "hist-i64",
+        "sel-i64",
+        "kmeans-i32-out",
+        "logistic-i32-out",
+    ],
 )
 def test_unsupported_element_type_is_rejected_at_recognition(
     workload, operand, mlir_type, family
@@ -259,8 +269,13 @@ def test_kmeans_host_group_with_wide_shift_does_not_run():
     # host-placed update group went through uint64_t.
 
     @df_region()
-    def kmeans(P: int32[KP, KD], C: int32[KK, KD], D: int64[KP, KK],
-               C_new: int64[KK, KD], counts: int32[KK]):
+    def kmeans(
+        P: int32[KP, KD],
+        C: int32[KK, KD],
+        D: int64[KP, KK],
+        C_new: int64[KK, KD],
+        counts: int32[KK],
+    ):
         @allo.work(mapping=[1], args=[P, C, D])
         def distances(lP: int32[KP, KD], lC: int32[KK, KD], lD: int64[KP, KK]):
             for p in range(KP):
@@ -270,8 +285,9 @@ def test_kmeans_host_group_with_wide_shift_does_not_run():
                         lD[p, c] += (lP[p, d] - lC[c, d]) * (lP[p, d] - lC[c, d])
 
         @allo.work(mapping=[1], args=[P, D, C_new, counts])
-        def update(uP: int32[KP, KD], uD: int64[KP, KK], uC: int64[KK, KD],
-                   ucounts: int32[KK]):
+        def update(
+            uP: int32[KP, KD], uD: int64[KP, KK], uC: int64[KK, KD], ucounts: int32[KK]
+        ):
             sums: int64[KK, KD] = 0
             for c0 in range(KK):
                 ucounts[c0] = 0
@@ -306,8 +322,13 @@ def test_kmeans_host_group_with_literal_wide_scale_does_not_run():
     # the int64 constant; the 128-bit signed shift is rejected.
 
     @df_region()
-    def kmeans(P: int32[KP, KD], C: int32[KK, KD], D: int64[KP, KK],
-               C_new: int64[KK, KD], counts: int32[KK]):
+    def kmeans(
+        P: int32[KP, KD],
+        C: int32[KK, KD],
+        D: int64[KP, KK],
+        C_new: int64[KK, KD],
+        counts: int32[KK],
+    ):
         @allo.work(mapping=[1], args=[P, C, D])
         def distances(lP: int32[KP, KD], lC: int32[KK, KD], lD: int64[KP, KK]):
             for p in range(KP):
@@ -317,8 +338,9 @@ def test_kmeans_host_group_with_literal_wide_scale_does_not_run():
                         lD[p, c] += (lP[p, d] - lC[c, d]) * (lP[p, d] - lC[c, d])
 
         @allo.work(mapping=[1], args=[P, D, C_new, counts])
-        def update(uP: int32[KP, KD], uD: int64[KP, KK], uC: int64[KK, KD],
-                   ucounts: int32[KK]):
+        def update(
+            uP: int32[KP, KD], uD: int64[KP, KK], uC: int64[KK, KD], ucounts: int32[KK]
+        ):
             sums: int64[KK, KD] = 0
             for c0 in range(KK):
                 ucounts[c0] = 0

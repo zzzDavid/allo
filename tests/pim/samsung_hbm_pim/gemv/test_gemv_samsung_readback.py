@@ -37,7 +37,9 @@ def test_readback_rejects_absent_and_truncated_blob(tmp_path):
     with pytest.raises(RuntimeError, match=r"is absent; expected 512 bytes, got 0"):
         _samsung_read_bursts(blob, 16, "REDUCE", "driver said hello")
     np.zeros(10, dtype=np.float16).tofile(blob)
-    with pytest.raises(RuntimeError, match=r"too short; expected 512 bytes, got 20") as err:
+    with pytest.raises(
+        RuntimeError, match=r"too short; expected 512 bytes, got 20"
+    ) as err:
         _samsung_read_bursts(blob, 16, "REDUCE", "driver said hello")
     assert "driver said hello" in str(err.value)
     with pytest.raises(RuntimeError, match="ELTWISE readback"):

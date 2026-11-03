@@ -70,7 +70,9 @@ def pack_apu_g2_typed_operands(program: APUG2TypedProgram, operands) -> tuple:
         _pack_operand(
             operand,
             scalar_type.numpy_dtype,
-            fill=1 if program.operation is APUG2TypedOperation.DIV and index == 1 else 0,
+            fill=(
+                1 if program.operation is APUG2TypedOperation.DIV and index == 1 else 0
+            ),
         )
         for index, (operand, scalar_type) in enumerate(
             zip(operands, program.input_types)

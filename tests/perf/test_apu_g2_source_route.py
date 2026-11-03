@@ -20,7 +20,18 @@ import numpy as np
 import pytest
 
 import allo
-from allo.ir.types import int2, int3, int4, int8, int11, int12, int14, int15, int16, int32
+from allo.ir.types import (
+    int2,
+    int3,
+    int4,
+    int8,
+    int11,
+    int12,
+    int14,
+    int15,
+    int16,
+    int32,
+)
 from allo.ir.types import uint4, float16
 from allo.pim.apu_g2_composed_contraction import (
     APUG2ComposedContractionProgram,
@@ -247,8 +258,12 @@ def test_paper_kernel_packing_equals_host_helpers(paper, name):
     program = launch.program
     lhs = lhs.astype(program.input_types[0].numpy_dtype)
     rhs = rhs.astype(program.input_types[1].numpy_dtype)
-    np.testing.assert_array_equal(packed["lhs"], pack_apu_g2_composed_operand(program, lhs, 0))
-    np.testing.assert_array_equal(packed["rhs"], pack_apu_g2_composed_operand(program, rhs, 1))
+    np.testing.assert_array_equal(
+        packed["lhs"], pack_apu_g2_composed_operand(program, lhs, 0)
+    )
+    np.testing.assert_array_equal(
+        packed["rhs"], pack_apu_g2_composed_operand(program, rhs, 1)
+    )
     attest_apu_g2_composed_packing(
         program,
         lhs,
@@ -265,7 +280,9 @@ def test_paper_kernel_packing_equals_host_helpers(paper, name):
 
 
 def _artifact_fixture(case):
-    manifest = json.loads((ARTIFACT_ROOT / "inputs" / case / "manifest.json").read_text())
+    manifest = json.loads(
+        (ARTIFACT_ROOT / "inputs" / case / "manifest.json").read_text()
+    )
     arrays = {}
     for record in manifest["arrays"]:
         if record["role"] != "input":
@@ -297,7 +314,11 @@ def test_paper_kernel_packing_is_byte_identical_to_the_campaign(paper, name):
     }
     (packed,) = compiled.compiled.pack(**args)
     digests = tuple(
-        None if packed[key] is None else hashlib.sha256(packed[key].tobytes()).hexdigest()
+        (
+            None
+            if packed[key] is None
+            else hashlib.sha256(packed[key].tobytes()).hexdigest()
+        )
         for key in ("lhs", "rhs", "auxiliary")
     )
     assert digests == ARTIFACT_PACKED[name]
@@ -306,7 +327,9 @@ def test_paper_kernel_packing_is_byte_identical_to_the_campaign(paper, name):
     serialized = np.concatenate(
         [oracle[output].reshape(-1) for output in contract.outputs]
     ).astype("<i2")
-    archived = np.fromfile(ARTIFACT_ROOT / "inputs" / case / "oracle.i16le.bin", dtype="<i2")
+    archived = np.fromfile(
+        ARTIFACT_ROOT / "inputs" / case / "oracle.i16le.bin", dtype="<i2"
+    )
     np.testing.assert_array_equal(serialized, archived)
 
 
@@ -365,7 +388,9 @@ def gesummv_m512(A: int2[512, 128], B: int2[512, 128], x: int2[128], y: int15[51
         y[i] = 3 * t + 2 * u
 
 
-def bicg_n512(A: int3[512, 512], p: int3[512], r: int3[512], q: int15[512], s: int15[512]):
+def bicg_n512(
+    A: int3[512, 512], p: int3[512], r: int3[512], q: int15[512], s: int15[512]
+):
     for i in range(512):
         s[i] = 0
     for i in range(512):
@@ -397,7 +422,9 @@ def test_rename_only_variant_compiles_to_the_same_program(paper):
     renamed = _compile(renamed_gesummv)
     (launch,) = renamed.compiled.plan.launches
     (original,) = paper["gesummv"].compiled.plan.launches
-    assert launch.program.structural_fingerprint == original.program.structural_fingerprint
+    assert (
+        launch.program.structural_fingerprint == original.program.structural_fingerprint
+    )
     assert launch.layout_fingerprint == original.layout_fingerprint
     in_place = _compile(gemm_accumulate_in_place)
     (launch,) = in_place.compiled.plan.launches
@@ -409,11 +436,16 @@ def test_rename_only_variant_compiles_to_the_same_program(paper):
 
 def test_nearby_shapes_compile_and_tile_beyond_one_carrier():
     exact = _compile(gemm_n32)
-    assert [len(p.launches) for p in exact.compiled.ranking if p.name == "single/k1"] == [1]
+    assert [
+        len(p.launches) for p in exact.compiled.ranking if p.name == "single/k1"
+    ] == [1]
     beyond = _compile(gemm_n33)
     plans = {plan.name: plan for plan in beyond.compiled.ranking}
     # 2112 dots exceed the 2048-dot K=128 carrier: output tiles 2048 + 64 ...
-    assert [l.coordinates for l in plans["single/k1"].launches] == [(0, 2048), (2048, 2112)]
+    assert [l.coordinates for l in plans["single/k1"].launches] == [
+        (0, 2048),
+        (2048, 2112),
+    ]
     # ... or one 4096-dot K=64 carrier per reduction chunk, chained exactly.
     assert [l.accumulator for l in plans["single/k2"].launches] == ["none", "previous"]
     assert beyond.compiled.plan.name == "single/k2"
@@ -422,7 +454,10 @@ def test_nearby_shapes_compile_and_tile_beyond_one_carrier():
     assert m512.compiled.plan.launches[0].program.output_shape == (512,)
     k512 = _compile(bicg_n512)
     assert k512.compiled.plan.name == "fused/k2"
-    assert [l.program.reduction_extent for l in k512.compiled.plan.launches] == [256, 256]
+    assert [l.program.reduction_extent for l in k512.compiled.plan.launches] == [
+        256,
+        256,
+    ]
     transposed = _compile(gemm_transposed_lhs)
     assert transposed.compiled.contract.streams[0].packing_form == "broadcast_gather"
 
@@ -475,7 +510,9 @@ def float_gemv(A: float16[64, 128], x: float16[128], y: float16[64]):
         y[i] = acc
 
 
-def mixed_combined_types(A: int2[64, 128], B: int3[64, 128], x: int2[128], y: int16[64]):
+def mixed_combined_types(
+    A: int2[64, 128], B: int3[64, 128], x: int2[128], y: int16[64]
+):
     for i in range(64):
         t: int12 = 0
         u: int12 = 0
@@ -583,7 +620,11 @@ def test_virtual_run_is_labelled_and_leaves_outputs(paper):
     result = compiled(**args)
     assert result.kind == "virtual"
     assert result.backend == "virtual"
-    assert result.cycles == compiled.compiled.plan.estimate_cycles == compiled.estimate().cycles
+    assert (
+        result.cycles
+        == compiled.compiled.plan.estimate_cycles
+        == compiled.estimate().cycles
+    )
     assert result.extra["cost_model"] == "apu_g2_cost"
     assert result.extra["estimate_validity"] == "calibrated"
     np.testing.assert_array_equal(args["C"], before)
@@ -670,7 +711,9 @@ class _EmulatedCard:
                 build = Path(command[command.index("--build") + 1])
                 if build.name == "device":
                     (build / "bin").mkdir(parents=True, exist_ok=True)
-                    (build / "bin" / "tenon_apu_g2_tasks.update.bin").write_bytes(b"arc")
+                    (build / "bin" / "tenon_apu_g2_tasks.update.bin").write_bytes(
+                        b"arc"
+                    )
                 else:
                     build.mkdir(parents=True, exist_ok=True)
                     (build / "tenon_apu_g2_composed_dot").write_bytes(b"host")
@@ -678,15 +721,46 @@ class _EmulatedCard:
         return self._execute(command)
 
     def _execute(self, argv):
-        (host, lhs, rhs, aux, out, lb, ls, rb, rs, db, ab, asg, ob, osg, log, epi, reps, fp) = argv
-        lhs_v = np.fromfile(lhs, dtype=_storage(int(lb), ls == "1")).astype(np.int64).reshape(4, 65536)
-        rhs_v = np.fromfile(rhs, dtype=_storage(int(rb), rs == "1")).astype(np.int64).reshape(4, 65536)
+        (
+            host,
+            lhs,
+            rhs,
+            aux,
+            out,
+            lb,
+            ls,
+            rb,
+            rs,
+            db,
+            ab,
+            asg,
+            ob,
+            osg,
+            log,
+            epi,
+            reps,
+            fp,
+        ) = argv
+        lhs_v = (
+            np.fromfile(lhs, dtype=_storage(int(lb), ls == "1"))
+            .astype(np.int64)
+            .reshape(4, 65536)
+        )
+        rhs_v = (
+            np.fromfile(rhs, dtype=_storage(int(rb), rs == "1"))
+            .astype(np.int64)
+            .reshape(4, 65536)
+        )
         block = 1 << int(log)
         dots = (lhs_v * rhs_v).reshape(4, -1, block).sum(axis=2)
         heads = np.zeros((4, 65536), dtype=np.int64)
         heads[:, ::block] = dots
         if epi != "0":
-            aux_v = np.fromfile(aux, dtype=_storage(int(ab), asg == "1")).astype(np.int64).reshape(4, 65536)
+            aux_v = (
+                np.fromfile(aux, dtype=_storage(int(ab), asg == "1"))
+                .astype(np.int64)
+                .reshape(4, 65536)
+            )
             if epi == "1":
                 scaled = heads * aux_v
                 heads = scaled.copy()
@@ -697,7 +771,12 @@ class _EmulatedCard:
             heads[:, ::block] += 1
         heads.astype(_storage(int(ob), osg == "1")).tofile(out)
         self.launches.append(argv)
-        device = Path(host).parent.parent / "device" / "bin" / "tenon_apu_g2_tasks.update.bin"
+        device = (
+            Path(host).parent.parent
+            / "device"
+            / "bin"
+            / "tenon_apu_g2_tasks.update.bin"
+        )
         text = "\n".join(
             [
                 f"device_pipeline_ticks={1000 * int(reps)}",
@@ -770,7 +849,10 @@ def test_emulated_device_run_writes_exact_outputs(emulated_card, name):
     assert result.cycles == 1000 * len(launches)
     for record, launch in zip(launches, compiled.compiled.plan.launches):
         assert record["layout_fingerprint"] == launch.layout_fingerprint
-        assert record["packing_attestation"]["layout_fingerprint"] == launch.layout_fingerprint
+        assert (
+            record["packing_attestation"]["layout_fingerprint"]
+            == launch.layout_fingerprint
+        )
     assert len(emulated_card.launches) == len(launches)
     assert all(argv[16] == "20" for argv in emulated_card.launches)
 

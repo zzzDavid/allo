@@ -415,7 +415,11 @@ def test_pointwise_non_divisible_extents_compile_and_price_the_padded_program(n)
 
 def test_pointwise_layout_choice_is_no_longer_a_divisibility_artifact():
     # 1008 % 32 != 0 used to make the fused 256-byte decision illegal.
-    from allo.spmw_upmem import UPMEM_DECISION_DOMAINS, _legal_decisions, kernel_from_extra
+    from allo.spmw_upmem import (
+        UPMEM_DECISION_DOMAINS,
+        _legal_decisions,
+        kernel_from_extra,
+    )
 
     kernel = kernel_from_extra(
         {
@@ -495,7 +499,9 @@ def test_tasklet_private_wram_rejects_on_its_wram_footprint():
         vector_residency=UPMEMOperandResidency.TASKLET_PRIVATE_WRAM,
     )
     with pytest.raises(ValueError, match="WRAM bytes"):
-        physical_features(UPMEMPhysicalProblem.matrix_vector(96, 4096, batches=12), decision)
+        physical_features(
+            UPMEMPhysicalProblem.matrix_vector(96, 4096, batches=12), decision
+        )
 
 
 @pytest.mark.parametrize(
@@ -561,9 +567,10 @@ def test_constant_term_is_compile_time_axpby_only():
     plan = UPMEMElementwisePlan(16, operation="axpby", alpha=2, beta=-1, gamma=3)
     assert "<< 1" not in plan.device_source()
     assert plan.manifest()["coefficients"]["gamma"] == 3
-    assert "gamma" not in UPMEMElementwisePlan(16, operation="axpby").manifest()[
-        "coefficients"
-    ]
+    assert (
+        "gamma"
+        not in UPMEMElementwisePlan(16, operation="axpby").manifest()["coefficients"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -748,10 +755,18 @@ def _km_extra_op():
 
 def _km_no_divide():
     @df_region()
-    def km(P: int32[_KP, _KD], D: int64[_KP, _KK], C_new: int32[_KK, _KD], counts: int32[_KK]):
+    def km(
+        P: int32[_KP, _KD],
+        D: int64[_KP, _KK],
+        C_new: int32[_KK, _KD],
+        counts: int32[_KK],
+    ):
         @allo.work(mapping=[1], args=[P, D, C_new, counts])
         def update(
-            uP: int32[_KP, _KD], uD: int64[_KP, _KK], uC: int32[_KK, _KD], ucounts: int32[_KK]
+            uP: int32[_KP, _KD],
+            uD: int64[_KP, _KK],
+            uC: int32[_KK, _KD],
+            ucounts: int32[_KK],
         ):
             sums: int32[_KK, _KD] = 0
             for c0 in range(_KK):
@@ -774,10 +789,18 @@ def _km_no_divide():
 
 def _km_other_source():
     @df_region()
-    def km(P: int32[_KP, _KD], D: int64[_KP, _KK], C_new: int32[_KK, _KD], counts: int32[_KK]):
+    def km(
+        P: int32[_KP, _KD],
+        D: int64[_KP, _KK],
+        C_new: int32[_KK, _KD],
+        counts: int32[_KK],
+    ):
         @allo.work(mapping=[1], args=[P, D, C_new, counts])
         def update(
-            uP: int32[_KP, _KD], uD: int64[_KP, _KK], uC: int32[_KK, _KD], ucounts: int32[_KK]
+            uP: int32[_KP, _KD],
+            uD: int64[_KP, _KK],
+            uC: int32[_KK, _KD],
+            ucounts: int32[_KK],
         ):
             sums: int32[_KK, _KD] = 0
             for c0 in range(_KK):
@@ -803,10 +826,18 @@ def _km_copy_only():
     a plain copy of the sums: no division by the counts."""
 
     @df_region()
-    def km(P: int32[_KP, _KD], D: int64[_KP, _KK], C_new: int32[_KK, _KD], counts: int32[_KK]):
+    def km(
+        P: int32[_KP, _KD],
+        D: int64[_KP, _KK],
+        C_new: int32[_KK, _KD],
+        counts: int32[_KK],
+    ):
         @allo.work(mapping=[1], args=[P, D, C_new, counts])
         def update(
-            uP: int32[_KP, _KD], uD: int64[_KP, _KK], uC: int32[_KK, _KD], ucounts: int32[_KK]
+            uP: int32[_KP, _KD],
+            uD: int64[_KP, _KK],
+            uC: int32[_KK, _KD],
+            ucounts: int32[_KK],
         ):
             sums: int32[_KK, _KD] = 0
             for c0 in range(_KK):
@@ -831,10 +862,18 @@ def _km_index_mixed():
     """The division reads a loop index besides sums and counts."""
 
     @df_region()
-    def km(P: int32[_KP, _KD], D: int64[_KP, _KK], C_new: int32[_KK, _KD], counts: int32[_KK]):
+    def km(
+        P: int32[_KP, _KD],
+        D: int64[_KP, _KK],
+        C_new: int32[_KK, _KD],
+        counts: int32[_KK],
+    ):
         @allo.work(mapping=[1], args=[P, D, C_new, counts])
         def update(
-            uP: int32[_KP, _KD], uD: int64[_KP, _KK], uC: int32[_KK, _KD], ucounts: int32[_KK]
+            uP: int32[_KP, _KD],
+            uD: int64[_KP, _KK],
+            uC: int32[_KK, _KD],
+            ucounts: int32[_KK],
         ):
             sums: int32[_KK, _KD] = 0
             for c0 in range(_KK):
@@ -896,7 +935,9 @@ def test_uneven_gemv_partition_compiles_with_recorded_padding(dpus):
     last = 391 - (dpus - 1) * (391 // dpus)
     assert kernel.dpus == dpus
     assert kernel.geometry_value("rows") == last
-    assert [dict(g)["rows"] for g in kernel.streams] == [391 // dpus] * (dpus - 1) + [last]
+    assert [dict(g)["rows"] for g in kernel.streams] == [391 // dpus] * (dpus - 1) + [
+        last
+    ]
     fraction = padding_fraction(kernel)
     assert fraction == pytest.approx(1 - 391 / (last * dpus))
 
@@ -1008,7 +1049,9 @@ def test_sim_pointwise_forms_off_grid(expression):
     }[expression]
     result = _compile(pointwise_region(1000, expression))(A, B, C)
     assert result.kind == "simulator"
-    np.testing.assert_array_equal(C, want.astype(np.int64).astype(np.uint32).astype(np.int32))
+    np.testing.assert_array_equal(
+        C, want.astype(np.int64).astype(np.uint32).astype(np.int32)
+    )
 
 
 def test_sim_selection_general_predicate_with_carried_count():

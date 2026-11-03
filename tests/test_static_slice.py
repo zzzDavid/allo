@@ -36,9 +36,7 @@ def test_static_length_row_slice_with_scalar_offset():
         return tile
 
     s = allo.customize(kernel)
-    assert re.search(rf"memref\.subview .*\[{N}, {M}\]", str(s.module)), str(
-        s.module
-    )
+    assert re.search(rf"memref\.subview .*\[{N}, {M}\]", str(s.module)), str(s.module)
     mod = s.build()
     W = np.random.randint(-100, 100, size=(T * N, M)).astype(np.int32)
     for row0 in (0, 3, (T - 1) * N):

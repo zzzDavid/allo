@@ -1,3 +1,5 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Static Tenon GEMV workloads used by the Samsung HBM-PIM campaign.
 
 The three logical shapes are the shapes in Samsung PIMLibrary's compiler

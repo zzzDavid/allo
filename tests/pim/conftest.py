@@ -100,5 +100,3 @@ def board_lock():
 
     with apu_v1_board_lock():
         yield
-
-

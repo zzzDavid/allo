@@ -382,7 +382,9 @@ def k_scatter_mismatch(P: int32[12, 8], a: int32[12], b: int32[12], sums: int32[
 
 
 _IRREGULAR_OPS = {
-    "INC": dict(fn=lambda acc: acc + 1, accumulates=True, guarded=True, dst_index="any"),
+    "INC": dict(
+        fn=lambda acc: acc + 1, accumulates=True, guarded=True, dst_index="any"
+    ),
     "INC_UNGUARDED": dict(fn=lambda acc: acc + 1, accumulates=True, dst_index="any"),
     "COMPACT": dict(fn=lambda x: x, guarded=True, dst_index="any"),
     "SCATTER_ADD": dict(

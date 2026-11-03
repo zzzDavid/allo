@@ -55,7 +55,11 @@ def reassociate():
 
 def _ties_by_name(compiled):
     return {
-        tie.description.split(":")[0] if tie.description.startswith("rows ") else "program": tie
+        (
+            tie.description.split(":")[0]
+            if tie.description.startswith("rows ")
+            else "program"
+        ): tie
         for tie in compiled.placement_ranking.kernels[0].movement.ties
     }
 
@@ -139,14 +143,23 @@ def test_reduce_plan_carries_the_row_table_only_when_rows_move(reassociate, stri
     ties = _ties_by_name(strict)
     plain = _program(
         allo.compile(
-            _workload(), target, samsung_cost, layout=vendor, reduction_order="reassociate"
+            _workload(),
+            target,
+            samsung_cost,
+            layout=vendor,
+            reduction_order="reassociate",
         )
     )
     program = _program(_forced(vendor, ties["program"], reduction_order="reassociate"))
     cyclic = _program(_forced(vendor, ties[CYCLIC], reduction_order="reassociate"))
     plain_plan = spmw_samsung.samsung_reduce_plan(plain, geometry, 1)
-    assert spmw_samsung.samsung_reduce_plan(program, geometry, 1)["text"] == plain_plan["text"]
-    assert "row_slots" not in plain_plan["text"] and plain_plan["row_map_digest"] is None
+    assert (
+        spmw_samsung.samsung_reduce_plan(program, geometry, 1)["text"]
+        == plain_plan["text"]
+    )
+    assert (
+        "row_slots" not in plain_plan["text"] and plain_plan["row_map_digest"] is None
+    )
     plan = spmw_samsung.samsung_reduce_plan(cyclic, geometry, 1)
     (line,) = [l for l in plan["text"].splitlines() if l.startswith("row_slots ")]
     table = [int(v) for v in line.split()[1:]]
@@ -196,7 +209,9 @@ def gemv_inputs():
     return W, x, W.astype(np.float32) @ x.astype(np.float32)
 
 
-def test_vendor_program_runs_each_row_map(samsung_sim_gate, strict, reassociate, gemv_inputs):
+def test_vendor_program_runs_each_row_map(
+    samsung_sim_gate, strict, reassociate, gemv_inputs
+):
     W, x, ref = gemv_inputs
     vendor = spmw_samsung.samsung_vendor_gemv_layout(TARGET, reassociate.trace)
     ties = _ties_by_name(strict)
@@ -215,10 +230,16 @@ def test_vendor_program_runs_each_row_map(samsung_sim_gate, strict, reassociate,
     assert receipt["row_map_map"] == "permuted"
     assert receipt["row_map_rows_moved"] > 0
     assert receipt["row_map_digest"] == cyclic.extra["row_map"]["digest"]
-    assert "row_slots" in cyclic.extra["plan"] and "row_slots" not in identity.extra["plan"]
+    assert (
+        "row_slots" in cyclic.extra["plan"]
+        and "row_slots" not in identity.extra["plan"]
+    )
     # Row 1: next GRF_B entry of block 0 versus another pseudo-channel group.
     assert identity.extra["row_map"]["placement"][1] == {
-        "pass": 0, "channel": 0, "block": 0, "entry": 1
+        "pass": 0,
+        "channel": 0,
+        "block": 0,
+        "entry": 1,
     }
     assert cyclic.extra["row_map"]["placement"][1]["channel"] != 0
     for key in ("passes", "mac_groups_even", "mac_groups_odd", "column_commands"):
@@ -241,4 +262,6 @@ def test_default_ordered_program_runs_each_tie(samsung_sim_gate, strict, gemv_in
     assert np.array_equal(y0, y1)
     assert identity.extra["row_map"]["map"] == "identity"
     assert cyclic.extra["row_map"]["map"].startswith("permuted")
-    assert identity.extra["row_map"]["placement"] != cyclic.extra["row_map"]["placement"]
+    assert (
+        identity.extra["row_map"]["placement"] != cyclic.extra["row_map"]["placement"]
+    )

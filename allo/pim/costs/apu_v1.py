@@ -158,7 +158,9 @@ class APUv1AffineEvent:
     def cycles(self, count: int) -> int:
         if count <= 0:
             return 0
-        return max(1, int(round(self.activation_cycles + self.slope_cycles_per_call * count)))
+        return max(
+            1, int(round(self.activation_cycles + self.slope_cycles_per_call * count))
+        )
 
     def manifest(self) -> dict:
         return {
@@ -242,36 +244,78 @@ APU_V1_AFFINE_EVENT_MODEL = APUv1AffineEventModel(
     l4_l3_cycles_per_byte=0.7766927083333334,
     events=(
         APUv1AffineEvent(
-            "dma_l4_l1_32k", "DMA_L4_TO_L1_32K", "direct_dma_l4_to_l1_32k",
-            8477.0, 21808.0,
-            "q03-l4-l1-r1", 1, "q04-l4-l1-r4", 4, (32843.0, 98267.0),
+            "dma_l4_l1_32k",
+            "DMA_L4_TO_L1_32K",
+            "direct_dma_l4_to_l1_32k",
+            8477.0,
+            21808.0,
+            "q03-l4-l1-r1",
+            1,
+            "q04-l4-l1-r4",
+            4,
+            (32843.0, 98267.0),
         ),
         APUv1AffineEvent(
-            "gvml_load_16", "LOAD_L1_TO_VR16", "gvml_load_16",
-            1871.3650793650793, 25.634920634920636,
-            "q05-load-r1", 1, "q06-load-r64", 64, (4455.0, 6070.0),
+            "gvml_load_16",
+            "LOAD_L1_TO_VR16",
+            "gvml_load_16",
+            1871.3650793650793,
+            25.634920634920636,
+            "q05-load-r1",
+            1,
+            "q06-load-r64",
+            64,
+            (4455.0, 6070.0),
         ),
         APUv1AffineEvent(
-            "gvml_eq_imm_16", "EQ_IMM_16", "gvml_eq_imm_16",
-            1880.7019607843138, 24.298039215686273,
-            "q07-eq-r1", 1, "q08-eq-r256", 256, (4463.0, 10659.0),
+            "gvml_eq_imm_16",
+            "EQ_IMM_16",
+            "gvml_eq_imm_16",
+            1880.7019607843138,
+            24.298039215686273,
+            "q07-eq-r1",
+            1,
+            "q08-eq-r256",
+            256,
+            (4463.0, 10659.0),
         ),
         APUv1AffineEvent(
-            "gvml_and_m", "AND_M", "gvml_and_m",
-            908.7905759162304, 27.209424083769633,
-            "q09-and-r1", 1, "q10-and-r192", 192, (3494.0, 8691.0),
+            "gvml_and_m",
+            "AND_M",
+            "gvml_and_m",
+            908.7905759162304,
+            27.209424083769633,
+            "q09-and-r1",
+            1,
+            "q10-and-r192",
+            192,
+            (3494.0, 8691.0),
         ),
         # The paper's example: "the fitted count rule adds a 5,887.79-cycle
         # start-up cost to 876.21 cycles per call".
         APUv1AffineEvent(
-            "gvml_2_fast_count_m_g32k", "FAST_COUNT_2M_G32K", "gvml_2_fast_count_m_g32k",
-            5887.793650793651, 876.2063492063492,
-            "q11-paired-count-r1", 1, "q12-paired-count-r64", 64, (9322.0, 64523.0),
+            "gvml_2_fast_count_m_g32k",
+            "FAST_COUNT_2M_G32K",
+            "gvml_2_fast_count_m_g32k",
+            5887.793650793651,
+            876.2063492063492,
+            "q11-paired-count-r1",
+            1,
+            "q12-paired-count-r64",
+            64,
+            (9322.0, 64523.0),
         ),
         APUv1AffineEvent(
-            "scalar_l4_store_u16", "ARC_STORE_L4_U16", "scalar_l4_store_u16",
-            1235.1259842519685, 17.874015748031496,
-            "q13-store-r1", 1, "q14-store-r128", 128, (3811.0, 6081.0),
+            "scalar_l4_store_u16",
+            "ARC_STORE_L4_U16",
+            "scalar_l4_store_u16",
+            1235.1259842519685,
+            17.874015748031496,
+            "q13-store-r1",
+            1,
+            "q14-store-r128",
+            128,
+            (3811.0, 6081.0),
         ),
     ),
     priced_routes=frozenset({RECORD_FREQUENCY_ROUTE, DENSE_HISTOGRAM_ROUTE}),
@@ -339,7 +383,9 @@ def _affine_priced(event) -> bool:
 def _route_entry_step(event, ctx, apuc, arc):
     if event.attributes.get("route_entry"):
         ctx.step(
-            latency=max(1, int(round(APU_V1_AFFINE_EVENT_MODEL.route_intercept_cycles))),
+            latency=max(
+                1, int(round(APU_V1_AFFINE_EVENT_MODEL.route_intercept_cycles))
+            ),
             occupy=[ctx.use(apuc), ctx.use(arc)],
             name="calibrated_route_intercept",
         )

@@ -60,7 +60,13 @@ def gesummv(A: int2[GS_M, GS_K], B: int2[GS_M, GS_K], x: int2[GS_K], y: int15[GS
 BICG_N = 256
 
 
-def bicg(A: int3[BICG_N, BICG_N], p: int3[BICG_N], r: int3[BICG_N], q: int14[BICG_N], s: int14[BICG_N]):
+def bicg(
+    A: int3[BICG_N, BICG_N],
+    p: int3[BICG_N],
+    r: int3[BICG_N],
+    q: int14[BICG_N],
+    s: int14[BICG_N],
+):
     for i in range(BICG_N):
         s[i] = 0
     for i in range(BICG_N):
@@ -74,7 +80,13 @@ def bicg(A: int3[BICG_N, BICG_N], p: int3[BICG_N], r: int3[BICG_N], q: int14[BIC
 MVT_N = 256
 
 
-def mvt(A: int3[MVT_N, MVT_N], y1: int3[MVT_N], y2: int3[MVT_N], x1: int15[MVT_N], x2: int15[MVT_N]):
+def mvt(
+    A: int3[MVT_N, MVT_N],
+    y1: int3[MVT_N],
+    y2: int3[MVT_N],
+    x1: int15[MVT_N],
+    x2: int15[MVT_N],
+):
     for i in range(MVT_N):
         for j in range(MVT_N):
             x1[i] += A[i, j] * y1[j]

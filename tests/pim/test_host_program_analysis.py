@@ -18,7 +18,10 @@ import allo
 from allo.dataflow import region as _df_region
 from allo.ir.types import float32 as fp16
 from allo.spmw_host_program import (
-    analyze, resolve_shapes, schedule_residency, schedule_cost,
+    analyze,
+    resolve_shapes,
+    schedule_residency,
+    schedule_cost,
 )
 
 M, K, B = 4096, 1024, 8
@@ -38,7 +41,7 @@ def _gemv_top(W: fp16[M, K], X: fp16[B, K], Y: fp16[B, M]):
 
 @allo.host_program(_gemv_top)
 def _amortized(W, X, Y):
-    allo.host_xfer.scatter(W, _banks)            # preload ONCE -> resident
+    allo.host_xfer.scatter(W, _banks)  # preload ONCE -> resident
     for b in range(B):
         allo.host_xfer.broadcast(X[b], _grf_a)
         allo.launch("gemv", W, X[b], Y[b])
@@ -48,7 +51,7 @@ def _amortized(W, X, Y):
 @allo.host_program(_gemv_top)
 def _native(W, X, Y):
     for b in range(B):
-        allo.host_xfer.scatter(W, _banks)        # re-preload EVERY vector
+        allo.host_xfer.scatter(W, _banks)  # re-preload EVERY vector
         allo.host_xfer.broadcast(X[b], _grf_a)
         allo.launch("gemv", W, X[b], Y[b])
         allo.host_xfer.gather(Y[b], _banks)
@@ -66,7 +69,7 @@ def test_hoisted_scatter_coalesces_into_one_group():
     assert s.n_groups == 1 and s.n_launches == B
     assert s.groups[0].is_batched and len(s.groups[0].launches) == B
     assert s.groups[0].weight == "W" and s.groups[0].weight_shape == (M, K)
-    assert s.external_inputs[0] == "W"           # weight + B distinct X[b] rows
+    assert s.external_inputs[0] == "W"  # weight + B distinct X[b] rows
     assert s.final == "Y[%d]" % (B - 1)
 
 
@@ -91,9 +94,9 @@ def test_cost_and_run_share_one_analysis():
     er = lambda m, k, n: _E + _R
     amort = schedule_cost(_sched(_amortized), preload, er)
     native = schedule_cost(_sched(_native), preload, er)
-    assert amort == _P + B * (_E + _R)           # 42432
-    assert native == B * (_P + _E + _R)          # 122008
-    assert amort < native                        # the beat, from structure
+    assert amort == _P + B * (_E + _R)  # 42432
+    assert native == B * (_P + _E + _R)  # 122008
+    assert amort < native  # the beat, from structure
 
 
 def test_batch_one_is_parity():
@@ -108,10 +111,10 @@ def test_batch_one_is_parity():
 
     s = _sched(one)
     assert s.n_groups == 1 and s.n_launches == 1
-    assert schedule_residency(s) == (False, 1)   # one launch: nothing to amortize
+    assert schedule_residency(s) == (False, 1)  # one launch: nothing to amortize
     preload = lambda m, k: _P
     er = lambda m, k, n: _E + _R
-    assert schedule_cost(s, preload, er) == _P + _E + _R   # 15251
+    assert schedule_cost(s, preload, er) == _P + _E + _R  # 15251
 
 
 # --------------------------------------------------------------------- #
@@ -221,8 +224,7 @@ def test_launch_schedule_orders_host_transfers_between_kernels():
     g2_first = [
         a
         for a in acts
-        if group_of(a) == g2
-        and not any(group_of(by_id[d]) == g2 for d in a.depends_on)
+        if group_of(a) == g2 and not any(group_of(by_id[d]) == g2 for d in a.depends_on)
     ]
     assert g2_first and all(a.depends_on == (bcast_y.id,) for a in g2_first)
 
@@ -241,7 +243,11 @@ def test_legacy_order_schedule_matches_unscheduled_graph():
 def test_launch_schedule_binding_errors():
     trace = _virtual(list(_legacy_order.moves)).trace
     unknown = SimpleNamespace(
-        steps=[LaunchRecord("mv1", ()), LaunchRecord("mv3", ()), LaunchRecord("mv2", ())]
+        steps=[
+            LaunchRecord("mv1", ()),
+            LaunchRecord("mv3", ()),
+            LaunchRecord("mv2", ()),
+        ]
     )
     with pytest.raises(ValueError, match="no matched implementation"):
         launch_schedule(unknown, trace)
@@ -354,7 +360,9 @@ def test_samsung_reused_staging_is_rejected():
     "order, program",
     [("reassociate", "REDUCE"), ("strict", "TEMPORAL_REDUCE")],
 )
-def test_samsung_runs_chained_launches(samsung_sim_gate, record_property, order, program):
+def test_samsung_runs_chained_launches(
+    samsung_sim_gate, record_property, order, program
+):
     """z = V @ (W @ x) through two conductor invocations on fresh random
     inputs.  ``strict`` (the default) selects the ordered program (FP16
     accumulation in source order); ``reassociate`` the lane-parallel REDUCE

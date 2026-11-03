@@ -79,7 +79,9 @@ def strict_gemv():
     return allo.compile(workload, build_samsung_target(), samsung_cost)
 
 
-def test_strict_default_runs_the_ordered_program(samsung_sim_gate, strict_gemv, paper_operands):
+def test_strict_default_runs_the_ordered_program(
+    samsung_sim_gate, strict_gemv, paper_operands
+):
     W, x = paper_operands
     M, K = W.shape
     y = np.ones(M, dtype=np.float16)
@@ -106,7 +108,9 @@ def test_strict_default_runs_the_ordered_program(samsung_sim_gate, strict_gemv, 
     )
 
 
-def test_reassociating_program_differs_from_source_order(samsung_sim_gate, paper_operands):
+def test_reassociating_program_differs_from_source_order(
+    samsung_sim_gate, paper_operands
+):
     workload, M, _K = _paper_gemv()
     W, x = paper_operands
     compiled = allo.compile(

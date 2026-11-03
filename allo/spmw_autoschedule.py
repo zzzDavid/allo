@@ -664,15 +664,21 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             # Only the ordered program loads an initial accumulator (its first
             # CRF word moves it from the bank into GRF_B).
             pruned += [
-                (c.mode, "the REDUCE program zeroes GRF_B and cannot carry the "
-                 "accumulator's initial value")
+                (
+                    c.mode,
+                    "the REDUCE program zeroes GRF_B and cannot carry the "
+                    "accumulator's initial value",
+                )
                 for c in base_candidates
                 if c.mode in regrouping
             ]
         elif not may_regroup(matches):
             policy = strict_policies(matches)[0]
             pruned += [
-                (c.mode, f"{policy.describe()}; the REDUCE program {regrouping[c.mode]}")
+                (
+                    c.mode,
+                    f"{policy.describe()}; the REDUCE program {regrouping[c.mode]}",
+                )
                 for c in base_candidates
                 if c.mode in regrouping
             ]
@@ -692,7 +698,11 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             Placement(
                 placements=placements,
                 mode="all_bank",
-                extra={"fibers": list(fibers), "fiber_axis": "tile", "n_fibers": n_fibers},
+                extra={
+                    "fibers": list(fibers),
+                    "fiber_axis": "tile",
+                    "n_fibers": n_fibers,
+                },
                 layout=swizzled,
             )
         ]
@@ -1197,7 +1207,9 @@ def _attacc_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     from .spmw_attacc import attacc_base_placement
     from .spmw_knobs import cross_with_knobs
 
-    return cross_with_knobs(target, [attacc_base_placement(target, matches)], matches, {})
+    return cross_with_knobs(
+        target, [attacc_base_placement(target, matches)], matches, {}
+    )
 
 
 # --------------------------------------------------------------------- #
@@ -1361,7 +1373,9 @@ class SelectionPolicy:
     materialize: str = "lazy"
 
     def __post_init__(self):
-        if isinstance(self.joint_budget, bool) or not isinstance(self.joint_budget, int):
+        if isinstance(self.joint_budget, bool) or not isinstance(
+            self.joint_budget, int
+        ):
             raise TypeError("joint_budget must be an integer")
         if self.joint_budget < 0:
             raise ValueError("joint_budget must be non-negative")
@@ -1845,9 +1859,7 @@ def rank_matcher_placements(
         kernel_trace = MatchTrace(
             target_name=trace.target_name,
             module_name=trace.module_name,
-            matches=[
-                match for index in bucket_indices for match in buckets[index][1]
-            ],
+            matches=[match for index in bucket_indices for match in buckets[index][1]],
         )
         # With one group the group scope is the whole program, so its scores
         # are whole-program scores (same trace and launch schedule).
@@ -2181,7 +2193,9 @@ def rank_matcher_placements(
             trials = []
             for rank, position in enumerate(group.domain()):
                 trial = (
-                    assignment[:group_index] + (position,) + assignment[group_index + 1 :]
+                    assignment[:group_index]
+                    + (position,)
+                    + assignment[group_index + 1 :]
                 )
                 try:
                     trials.append((whole_cycles(trial), rank, position))
@@ -2243,7 +2257,9 @@ def rank_matcher_placements(
                 bound_cost.fingerprint,
             ),
         )
-        incumbent = dict(zip(names, assignment)) if per_group_cycles is not None else None
+        incumbent = (
+            dict(zip(names, assignment)) if per_group_cycles is not None else None
+        )
         try:
             try:
                 result = grid_search(
@@ -2312,7 +2328,9 @@ def rank_matcher_placements(
                 else result.ranked.index(incumbent_candidate)
             ),
             ties=sum(
-                1 for candidate in result.ranked if candidate.objective == winner.objective
+                1
+                for candidate in result.ranked
+                if candidate.objective == winner.objective
             ),
             chosen=tuple(
                 (group.group_id, position) for group, position in zip(groups, selected)
@@ -2347,9 +2365,13 @@ def rank_matcher_placements(
                 chosen_position=None if fallback else position,
                 per_group_position=None if fallback else group.winner,
                 probe_count=group.probe_count,
-                materialized=()
-                if fallback
-                else tuple(p for p, reason in group.probes.items() if reason is None),
+                materialized=(
+                    ()
+                    if fallback
+                    else tuple(
+                        p for p, reason in group.probes.items() if reason is None
+                    )
+                ),
             )
         )
     return MatcherScheduledPlacements(

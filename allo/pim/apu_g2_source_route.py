@@ -466,9 +466,7 @@ def analyze_apu_g2_source(workload, schedule, trace) -> APUG2SourceContract:
         raise APUG2SourceRouteError("more than one combining epilogue was matched")
 
     shapes, types = [], []
-    argument_types = [
-        str(argument.type) for argument in facts.function.arguments
-    ]
+    argument_types = [str(argument.type) for argument in facts.function.arguments]
     for name, text in zip(parameters, argument_types):
         shape, bits = _memref_shape_and_bits(text, f"argument '{name}'")
         shapes.append(shape)
@@ -591,9 +589,7 @@ def analyze_apu_g2_source(workload, schedule, trace) -> APUG2SourceContract:
             accumulator_type = _source_int(
                 acc_bits, facts.local_is_signed(local), f"accumulator '{local}'"
             )
-            result_vars = tuple(
-                var for var in loop_vars if var in set(loop_vars) - {k}
-            )
+            result_vars = tuple(var for var in loop_vars if var in set(loop_vars) - {k})
             accumulator = "zero"
             if acc.value_ref in combine_inputs:
                 if sinks:
@@ -793,8 +789,7 @@ def _check_widths(contract: APUG2SourceContract) -> None:
             second.rhs.scalar_type,
         ) or first.reduction_extent != second.reduction_extent:
             raise APUG2SourceRouteError(
-                "combined contractions have mixed operand types or reduction "
-                "extents"
+                "combined contractions have mixed operand types or reduction " "extents"
             )
         try:
             epilogue = APUG2DotEpilogue(coefficients=contract.coefficients)
@@ -957,8 +952,11 @@ def _fusable(contract) -> str | None:
     if contract.pair_affine:
         return None
     for name, a, b in (
-        ("operand types", (first.lhs.scalar_type, first.rhs.scalar_type),
-         (second.lhs.scalar_type, second.rhs.scalar_type)),
+        (
+            "operand types",
+            (first.lhs.scalar_type, first.rhs.scalar_type),
+            (second.lhs.scalar_type, second.rhs.scalar_type),
+        ),
         ("reduction extents", first.reduction_extent, second.reduction_extent),
         ("result extents", first.result_extents, second.result_extents),
         ("accumulator initialization", first.accumulator, second.accumulator),
@@ -1088,14 +1086,18 @@ def _source_operand(contract, name, value) -> np.ndarray:
     if array.dtype.kind not in "iu":
         raise TypeError(f"argument '{name}' must be an integer NumPy array")
     if array.shape != shape:
-        raise ValueError(f"argument '{name}' must have shape {shape}, got {array.shape}")
+        raise ValueError(
+            f"argument '{name}' must have shape {shape}, got {array.shape}"
+        )
     wide = array.astype(np.int64)
     if np.any(wide < scalar.minimum) or np.any(wide > scalar.maximum):
         raise ValueError(f"argument '{name}' has values outside {scalar.name}")
     return wide
 
 
-def apu_g2_stream_dots(stream: APUG2SourceStream, arrays) -> tuple[np.ndarray, np.ndarray]:
+def apu_g2_stream_dots(
+    stream: APUG2SourceStream, arrays
+) -> tuple[np.ndarray, np.ndarray]:
     """Logical ``(coordinates, K)`` dot operands of one stream (int64).
 
     Each operand is sliced to its loop extents, its dimensions transposed into
@@ -1125,7 +1127,12 @@ def apu_g2_source_oracle(contract, arrays, initial) -> dict[str, np.ndarray]:
 
     letters = {}
     for stream in contract.streams:
-        for var in (*stream.result_vars, stream.reduction_var, *stream.lhs.dims, *stream.rhs.dims):
+        for var in (
+            *stream.result_vars,
+            stream.reduction_var,
+            *stream.lhs.dims,
+            *stream.rhs.dims,
+        ):
             letters.setdefault(var, string.ascii_letters[len(letters)])
     values = []
     for stream in contract.streams:
@@ -1489,9 +1496,7 @@ def compile_apu_g2_source_workload(
             f"the function has effects outside the contraction family ({error})"
         ) from error
     contract = analyze_apu_g2_source(workload, schedule, trace)
-    program = APUG2SourceProgram(
-        contract, target, cost, backend=backend, layout=layout
-    )
+    program = APUG2SourceProgram(contract, target, cost, backend=backend, layout=layout)
     return schedule, trace, program
 
 

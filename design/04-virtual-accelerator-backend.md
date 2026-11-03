@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Design 04 — Virtual accelerator backend: decoupled `CostModel`, virtual runner, trip-count resolution
 
 Status: historical Phase-0 architect spec. The current public cost API is

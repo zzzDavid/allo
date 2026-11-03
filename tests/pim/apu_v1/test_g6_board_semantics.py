@@ -80,15 +80,23 @@ def test_aliased_output_reads_pre_call_values_on_board(apu_v1_device_gate):
     assert compiled.realization.carries_output_ingress
     result_is_left = L0.copy()
     _run(compiled, result_is_left, R0, result_is_left)
-    np.testing.assert_allclose(_f32(result_is_left), _f32(L0) + _f32(L0) @ _f32(R0), **TOL)
+    np.testing.assert_allclose(
+        _f32(result_is_left), _f32(L0) + _f32(L0) @ _f32(R0), **TOL
+    )
 
 
 def test_uint16_contraction_wraps_on_board(apu_v1_device_gate):
     rng = np.random.default_rng(702)
     top = (1 << 16) - 1
-    L = rng.integers(0, 1 << 16, size=(G6.UH_M, G6.UH_K), dtype=np.int64).astype(np.uint16)
-    R = rng.integers(0, 1 << 16, size=(G6.UH_K, G6.UH_N), dtype=np.int64).astype(np.uint16)
-    C0 = rng.integers(top - 16, top + 1, size=(G6.UH_M, G6.UH_N), dtype=np.int64).astype(np.uint16)
+    L = rng.integers(0, 1 << 16, size=(G6.UH_M, G6.UH_K), dtype=np.int64).astype(
+        np.uint16
+    )
+    R = rng.integers(0, 1 << 16, size=(G6.UH_K, G6.UH_N), dtype=np.int64).astype(
+        np.uint16
+    )
+    C0 = rng.integers(
+        top - 16, top + 1, size=(G6.UH_M, G6.UH_N), dtype=np.int64
+    ).astype(np.uint16)
     L[0, :] = top
     R[:, 0] = top
     C = C0.copy()
@@ -173,7 +181,9 @@ def _strict_and_reassociative_runs(M, K, seed):
 def test_strict_and_reassociative_gemv_values_on_board(apu_v1_device_gate, M, K, seed):
     """Both plans execute on the device and agree with FP32 within FP16
     tolerance; the strict plan does not regroup, the relaxed plan does."""
-    _W, _x, exact, y_strict, y_relaxed, _plan = _strict_and_reassociative_runs(M, K, seed)
+    _W, _x, exact, y_strict, y_relaxed, _plan = _strict_and_reassociative_runs(
+        M, K, seed
+    )
     np.testing.assert_allclose(_f32(y_strict), exact, rtol=1e-2, atol=1e-2)
     np.testing.assert_allclose(_f32(y_relaxed), exact, rtol=1e-2, atol=1e-2)
 
@@ -198,8 +208,14 @@ def test_strict_and_reassociative_gemv_bit_equal_to_models_on_board(
     W, x, _exact, y_strict, y_relaxed, plan = _strict_and_reassociative_runs(M, K, seed)
     source = G6._fp16_source_order(np.zeros(M), (W[:, k] * x[k] for k in range(K)))
     tree = G6._halving_tree_fp16(W * x, plan.reduction_strategy.group_size)
-    strict_mismatch = int(np.count_nonzero(y_strict.view(np.uint16) != source.view(np.uint16)))
-    relaxed_mismatch = int(np.count_nonzero(y_relaxed.view(np.uint16) != tree.view(np.uint16)))
-    print(f"APU_V1_BIT_MODEL strict_mismatch={strict_mismatch}/{M} relaxed_mismatch={relaxed_mismatch}/{M}")
+    strict_mismatch = int(
+        np.count_nonzero(y_strict.view(np.uint16) != source.view(np.uint16))
+    )
+    relaxed_mismatch = int(
+        np.count_nonzero(y_relaxed.view(np.uint16) != tree.view(np.uint16))
+    )
+    print(
+        f"APU_V1_BIT_MODEL strict_mismatch={strict_mismatch}/{M} relaxed_mismatch={relaxed_mismatch}/{M}"
+    )
     np.testing.assert_array_equal(y_strict.view(np.uint16), source.view(np.uint16))
     np.testing.assert_array_equal(y_relaxed.view(np.uint16), tree.view(np.uint16))

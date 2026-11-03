@@ -952,8 +952,12 @@ def split_movement_layout(layout):
 
     if not isinstance(layout, LinearLayout):
         return layout, None
-    keep = [i for i, n in enumerate(layout.out_dims) if not n.startswith(LAYOUT_DIM_PREFIX)]
-    moved = [i for i, n in enumerate(layout.out_dims) if n.startswith(LAYOUT_DIM_PREFIX)]
+    keep = [
+        i for i, n in enumerate(layout.out_dims) if not n.startswith(LAYOUT_DIM_PREFIX)
+    ]
+    moved = [
+        i for i, n in enumerate(layout.out_dims) if n.startswith(LAYOUT_DIM_PREFIX)
+    ]
     if not moved:
         return layout, None
 
@@ -981,7 +985,9 @@ def _split_reduction_bits(derived: DerivedLayoutProblem, matrix, acc) -> list[st
         if v in acc.variables:
             continue
         offset = problem.bit_offset(v)
-        bits = [b for b in range(variable.bits) if not innermost.contains(1 << (offset + b))]
+        bits = [
+            b for b in range(variable.bits) if not innermost.contains(1 << (offset + b))
+        ]
         if bits:
             split.append(f"{variable.name}[{','.join(map(str, bits))}]")
     return split
@@ -1001,7 +1007,9 @@ def owner_rows(derived: DerivedLayoutProblem, matrix) -> dict[int, list[int]]:
 
     acc = derived.accumulator()
     if acc is None or len(acc.terms) != 1 or len(acc.offsets) != 1:
-        raise LayoutDerivationError("the accumulator has no single output-row coordinate")
+        raise LayoutDerivationError(
+            "the accumulator has no single output-row coordinate"
+        )
     variables = [v for v in acc.variables if derived.variables[v].extent > 1]
     count = math.prod(derived.variables[v].extent for v in variables)
     if count > _MAX_OWNER_ROWS:
@@ -1011,7 +1019,9 @@ def owner_rows(derived: DerivedLayoutProblem, matrix) -> dict[int, list[int]]:
     coefficient = {v: a for a, v in acc.terms[0]}
     inverse = matrix.inverse()
     units: dict[int, list[int]] = {}
-    for point in itertools.product(*(range(derived.variables[v].extent) for v in variables)):
+    for point in itertools.product(
+        *(range(derived.variables[v].extent) for v in variables)
+    ):
         values = dict(zip(variables, point))
         row = acc.offsets[0] + sum(coefficient.get(v, 0) * x for v, x in values.items())
         units.setdefault(derived.owner_unit(inverse, values), []).append(row)
@@ -1047,7 +1057,9 @@ def reduction_partition_split(derived: DerivedLayoutProblem, matrix) -> int | No
     if width == 0 or width > variable.bits or variable.extent % (1 << width):
         return None
     if derived.owner_flag(matrix) != derived.owner_flag(
-        reduction_partition_assignment(derived, k, width).matrix(derived.coordinate_problem)
+        reduction_partition_assignment(derived, k, width).matrix(
+            derived.coordinate_problem
+        )
     ):
         return None
     return 1 << width
@@ -1122,7 +1134,9 @@ def row_map_unrealizable_reason(derived: DerivedLayoutProblem, matrix) -> str | 
         return _reduction_split_reason(derived, acc, split)
     if derived.target_name in _UNMASKED_ROW_TARGETS:
         masked = [
-            derived.variables[v].name for v in acc.variables if derived.variables[v].masked
+            derived.variables[v].name
+            for v in acc.variables
+            if derived.variables[v].masked
         ]
         if masked:
             return (
@@ -1196,7 +1210,9 @@ def row_distributions(derived: DerivedLayoutProblem):
     if acc is None or len(acc.terms) != 1:
         return []
     bits = [
-        (v, b) for _coefficient, v in acc.terms[0] for b in range(derived.variables[v].bits)
+        (v, b)
+        for _coefficient, v in acc.terms[0]
+        for b in range(derived.variables[v].bits)
     ]
     level_bits = derived.coordinate_problem.level_bits
     if sum(level_bits) > len(bits):

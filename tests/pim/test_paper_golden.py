@@ -48,26 +48,72 @@ _APU_V1 = "paper/latex/tables/eval-apuv1.tex"
 _LAYOUT = "paper/latex/tables/eval-layout-mechanisms.tex"
 
 PAPER_GOLDEN = (
-    GoldenRow("samsung_hbm_pim", "gemv_m4096_k256", 4_435, 0, f"{_SAMSUNG}: M=4096, K=256, B=1"),
-    GoldenRow("samsung_hbm_pim", "gemv_m4096_k512", 8_041, 0, f"{_SAMSUNG}: M=4096, K=512, B=1"),
-    GoldenRow("samsung_hbm_pim", "gemv_m8192_k256", 8_247, 0, f"{_SAMSUNG}: M=8192, K=256, B=1"),
+    GoldenRow(
+        "samsung_hbm_pim",
+        "gemv_m4096_k256",
+        4_435,
+        0,
+        f"{_SAMSUNG}: M=4096, K=256, B=1",
+    ),
+    GoldenRow(
+        "samsung_hbm_pim",
+        "gemv_m4096_k512",
+        8_041,
+        0,
+        f"{_SAMSUNG}: M=4096, K=512, B=1",
+    ),
+    GoldenRow(
+        "samsung_hbm_pim",
+        "gemv_m8192_k256",
+        8_247,
+        0,
+        f"{_SAMSUNG}: M=8192, K=256, B=1",
+    ),
     # Checked by samsung_hbm_pim/layout_swizzle/test_layout_swizzle_probe.py.
-    GoldenRow("samsung_hbm_pim", "xor_probe_identity", 148, 0, f"{_LAYOUT}: identity bank layout"),
-    GoldenRow("samsung_hbm_pim", "xor_probe_synthesized", 116, 0, f"{_LAYOUT}: synthesized XOR layout"),
-    GoldenRow("aim", "norm_residual_l128", 11_750, 0, f"{_AIM}: RMSNorm + Residual, L=128"),
+    GoldenRow(
+        "samsung_hbm_pim",
+        "xor_probe_identity",
+        148,
+        0,
+        f"{_LAYOUT}: identity bank layout",
+    ),
+    GoldenRow(
+        "samsung_hbm_pim",
+        "xor_probe_synthesized",
+        116,
+        0,
+        f"{_LAYOUT}: synthesized XOR layout",
+    ),
+    GoldenRow(
+        "aim", "norm_residual_l128", 11_750, 0, f"{_AIM}: RMSNorm + Residual, L=128"
+    ),
     GoldenRow("aim", "qkvo_rope_l128", 129_605, 0, f"{_AIM}: QKVO + RoPE, L=128"),
     GoldenRow("aim", "attention_l128", 11_010, 0, f"{_AIM}: Attention QK + SV, L=128"),
     GoldenRow("aim", "attention_l512", 18_126, 0, f"{_AIM}: Attention QK + SV, L=512"),
-    GoldenRow("aim", "attention_l4096", 95_090, 0, f"{_AIM}: Attention QK + SV, L=4096"),
-    GoldenRow("aim", "softmax_pim_l128", 6_307, 0, f"{_AIM}: Softmax PIM Portion, L=128"),
-    GoldenRow("aim", "softmax_pim_l512", 24_835, 0, f"{_AIM}: Softmax PIM Portion, L=512"),
-    GoldenRow("aim", "softmax_pim_l4096", 198_416, 0, f"{_AIM}: Softmax PIM Portion, L=4096"),
+    GoldenRow(
+        "aim", "attention_l4096", 95_090, 0, f"{_AIM}: Attention QK + SV, L=4096"
+    ),
+    GoldenRow(
+        "aim", "softmax_pim_l128", 6_307, 0, f"{_AIM}: Softmax PIM Portion, L=128"
+    ),
+    GoldenRow(
+        "aim", "softmax_pim_l512", 24_835, 0, f"{_AIM}: Softmax PIM Portion, L=512"
+    ),
+    GoldenRow(
+        "aim", "softmax_pim_l4096", 198_416, 0, f"{_AIM}: Softmax PIM Portion, L=4096"
+    ),
     GoldenRow("aim", "ffn_fc_l128", 250_433, 0, f"{_AIM}: FFN Projections, L=128"),
-    GoldenRow("aim", "ffn_activation_l128", 11_775, 0, f"{_AIM}: FFN SiLU + Gating, L=128"),
-    GoldenRow("aim", "ffn_complete_l128", 262_269, 0, f"{_AIM}: Complete Mapped FFN, L=128"),
+    GoldenRow(
+        "aim", "ffn_activation_l128", 11_775, 0, f"{_AIM}: FFN SiLU + Gating, L=128"
+    ),
+    GoldenRow(
+        "aim", "ffn_complete_l128", 262_269, 0, f"{_AIM}: Complete Mapped FFN, L=128"
+    ),
     GoldenRow("aim", "full_block_l128", 421_159, 0, f"{_AIM}: Mapped PIM Block, L=128"),
     GoldenRow("aim", "full_block_l512", 446_803, 0, f"{_AIM}: Mapped PIM Block, L=512"),
-    GoldenRow("aim", "full_block_l4096", 697_316, 0, f"{_AIM}: Mapped PIM Block, L=4096"),
+    GoldenRow(
+        "aim", "full_block_l4096", 697_316, 0, f"{_AIM}: Mapped PIM Block, L=4096"
+    ),
     # UPMEM rows hold uPIMulator logic cycles; the paper table prints
     # milliseconds = cycles / 350,000 (350 MHz logic clock).
     GoldenRow("upmem", "va", 114_534, 0, f"{_UPMEM}: VA, N=12288"),
@@ -81,26 +127,52 @@ PAPER_GOLDEN = (
     GoldenRow("upmem", "sel", 89_271, 0, f"{_UPMEM}: Selection, N=12288"),
     GoldenRow("upmem", "kmeans", 221_196, 0, f"{_UPMEM}: K-means, P=120, D=8, K=4"),
     GoldenRow("upmem", "linear_reg", 212_718, 0, f"{_UPMEM}: Linear reg., S=120, F=8"),
-    GoldenRow("upmem", "logistic_reg", 208_442, 0, f"{_UPMEM}: Logistic reg., S=120, F=8"),
+    GoldenRow(
+        "upmem", "logistic_reg", 208_442, 0, f"{_UPMEM}: Logistic reg., S=120, F=8"
+    ),
     GoldenRow("upmem", "1mm", 3_135_600, 0, f"{_UPMEM}: 1mm, M=12, K=64, N=128"),
     GoldenRow("upmem", "2mm", 6_271_190, 0, f"{_UPMEM}: 2mm, M=12, K=64, N=128"),
     GoldenRow("upmem", "3mm", 9_406_780, 0, f"{_UPMEM}: 3mm, M=12, K=64, N=128"),
     GoldenRow("upmem", "conv", 2_956_792, 0, f"{_UPMEM}: Conv im2col GEMM, P=192"),
     # Gemini-I rows hold the Tenon median device `crun`. Only the histogram row
     # runs on the board; the other four assert compile and GVML realization.
-    GoldenRow("apu_v1", "matrix_multiply", 8_764_900, 0.02, f"{_APU_V1}: MatMul 256x1024x1024"),
+    GoldenRow(
+        "apu_v1", "matrix_multiply", 8_764_900, 0.02, f"{_APU_V1}: MatMul 256x1024x1024"
+    ),
     GoldenRow("apu_v1", "kmeans", 624_677, 0.02, f"{_APU_V1}: K-Means P32768,D24,K10"),
-    GoldenRow("apu_v1", "histogram", 166_783, 0.02, f"{_APU_V1}: Histogram N32768,B256"),
-    GoldenRow("apu_v1", "linear_regression", 94_618.5, 0.02, f"{_APU_V1}: Linear Regression 8xN4096"),
-    GoldenRow("apu_v1", "word_count", 171_988, 0.02, f"{_APU_V1}: Word Count Q128,N32768"),
+    GoldenRow(
+        "apu_v1", "histogram", 166_783, 0.02, f"{_APU_V1}: Histogram N32768,B256"
+    ),
+    GoldenRow(
+        "apu_v1",
+        "linear_regression",
+        94_618.5,
+        0.02,
+        f"{_APU_V1}: Linear Regression 8xN4096",
+    ),
+    GoldenRow(
+        "apu_v1", "word_count", 171_988, 0.02, f"{_APU_V1}: Word Count Q128,N32768"
+    ),
     # Median of 3 board runs; checked by apu_v1/vector_gemm/test_vector_gemm_apu_v1.py.
-    GoldenRow("apu_v1", "vector_gemm_temporal_dma_coalescing", 93_449_834, 0.02, f"{_LAYOUT}: coalesced DMA"),
+    GoldenRow(
+        "apu_v1",
+        "vector_gemm_temporal_dma_coalescing",
+        93_449_834,
+        0.02,
+        f"{_LAYOUT}: coalesced DMA",
+    ),
     # Re-captured 2026-10-04 by user ruling (paper table still prints 7,349,987,
     # measured 2026-07-07): median of [7145109, 7145397, 7144077] on tenon@4a5104e
     # plus the uncommitted task-009 tree, TENON_APU_V1_BUILD_MODE=release (default),
     # GSI Gemini-I at PCI 0000:41:00.0 on zhang-capra-xcel, SDK 13.7.1. A clean
     # tenon@4a5104e gives the same number.
-    GoldenRow("apu_v1", "vector_gemm_temporal_dma_coalescing_broadcast_friendly", 7_145_109, 0.02, f"{_LAYOUT}: broadcast-friendly (re-captured 2026-10-04)"),
+    GoldenRow(
+        "apu_v1",
+        "vector_gemm_temporal_dma_coalescing_broadcast_friendly",
+        7_145_109,
+        0.02,
+        f"{_LAYOUT}: broadcast-friendly (re-captured 2026-10-04)",
+    ),
 )
 
 # Rows whose live check lives in a leaf test next to its workload.
@@ -180,7 +252,9 @@ def _ids(rows):
     return [f"{row.backend}-{row.case_id}" for row in rows]
 
 
-@pytest.mark.parametrize("row", _rows("samsung_hbm_pim"), ids=_ids(_rows("samsung_hbm_pim")))
+@pytest.mark.parametrize(
+    "row", _rows("samsung_hbm_pim"), ids=_ids(_rows("samsung_hbm_pim"))
+)
 def test_samsung_gemv_paper_cycles(row, samsung_sim_gate, record_property):
     """The paper row pins the vendor-equivalent program (dual_fiber, host GRF_A
     fill, shared CRF), selected explicitly with `samsung_vendor_gemv_layout`.
@@ -217,7 +291,9 @@ def test_samsung_gemv_paper_cycles(row, samsung_sim_gate, record_property):
     for name, compiled in (("vendor", vendor), ("default", default)):
         y = np.zeros(M, dtype=np.float16)
         result = compiled(W, x, y)
-        np.testing.assert_allclose(y.astype(np.float32), reference, rtol=1e-2, atol=1e-2)
+        np.testing.assert_allclose(
+            y.astype(np.float32), reference, rtol=1e-2, atol=1e-2
+        )
         cycles[name] = result.cycles
     mode = default.compiled.layout_ctx.programs[0].lever_record
     record_property("vendor_cycles", cycles["vendor"])
@@ -234,8 +310,11 @@ def test_samsung_gemv_paper_cycles(row, samsung_sim_gate, record_property):
 @pytest.mark.parametrize(
     "row",
     [
-        row if row.case_id in _AIM_DEFAULT_CASES
-        else pytest.param(row, marks=pytest.mark.paper_full)
+        (
+            row
+            if row.case_id in _AIM_DEFAULT_CASES
+            else pytest.param(row, marks=pytest.mark.paper_full)
+        )
         for row in _rows("aim")
     ],
     ids=_ids(_rows("aim")),
@@ -287,8 +366,12 @@ _SDK_BUILD = "d45e285c34b5ab53e02f9d8a7289725112a3a25c0c3ed8a8a15d47c41173963a"
 # runs/<case>, generated by the task 017 script recorded in its report.
 UPMEM_MEASUREMENTS = {
     "va": UpmemMeasurement(
-        task_c_sha256=("7e97e939d7e0c37e22c86fff6ffdc550ad6993dc35d1e32dfa6f9d742aa1d53f",),
-        fixture_sha256=("448d6e59c631dee761f7ba5409df9fb8885791d74db9b26b6c1ea3bfc15a8a75",),
+        task_c_sha256=(
+            "7e97e939d7e0c37e22c86fff6ffdc550ad6993dc35d1e32dfa6f9d742aa1d53f",
+        ),
+        fixture_sha256=(
+            "448d6e59c631dee761f7ba5409df9fb8885791d74db9b26b6c1ea3bfc15a8a75",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -297,8 +380,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "red": UpmemMeasurement(
-        task_c_sha256=("7279f8daef7c0a1a8a62a0e9b319bb379c30928188aec2fd892d56198f80d097",),
-        fixture_sha256=("bc642b2fb3e90c4cff0a57acd9589073d068fa36c0e9a93ac8ea41d0b7dbc06e",),
+        task_c_sha256=(
+            "7279f8daef7c0a1a8a62a0e9b319bb379c30928188aec2fd892d56198f80d097",
+        ),
+        fixture_sha256=(
+            "bc642b2fb3e90c4cff0a57acd9589073d068fa36c0e9a93ac8ea41d0b7dbc06e",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -307,8 +394,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "mtv": UpmemMeasurement(
-        task_c_sha256=("b347e3d442d6a6094ebafd69178932e08f63744fa5a85d824286ca83b2349c14",),
-        fixture_sha256=("e6b7df0cbb34fd28483553b02e1f6746207ba6b8bde86efc1df58c8bb5858aa2",),
+        task_c_sha256=(
+            "b347e3d442d6a6094ebafd69178932e08f63744fa5a85d824286ca83b2349c14",
+        ),
+        fixture_sha256=(
+            "e6b7df0cbb34fd28483553b02e1f6746207ba6b8bde86efc1df58c8bb5858aa2",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -317,8 +408,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "gemv": UpmemMeasurement(
-        task_c_sha256=("d36dd28dc542e85c2cda25048007e0f47ab2bd6068f4f931f55e6a623a4616a1",),
-        fixture_sha256=("2cd29d793cb37840018cce9509b81e8e3c099681a56df615479d9df3d791f91a",),
+        task_c_sha256=(
+            "d36dd28dc542e85c2cda25048007e0f47ab2bd6068f4f931f55e6a623a4616a1",
+        ),
+        fixture_sha256=(
+            "2cd29d793cb37840018cce9509b81e8e3c099681a56df615479d9df3d791f91a",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -327,8 +422,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "geva": UpmemMeasurement(
-        task_c_sha256=("3cc5a2ceef79ba0c6a1693402127be0728648ca9e338e65126b9573642fe8794",),
-        fixture_sha256=("93a8af7c85e74844f725980008aecefa26a85b0f7162fb48237c28f9cbe35cf4",),
+        task_c_sha256=(
+            "3cc5a2ceef79ba0c6a1693402127be0728648ca9e338e65126b9573642fe8794",
+        ),
+        fixture_sha256=(
+            "93a8af7c85e74844f725980008aecefa26a85b0f7162fb48237c28f9cbe35cf4",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -337,8 +436,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "ttv": UpmemMeasurement(
-        task_c_sha256=("1dbc21082ea1464c33a7b2c58e020e7893f73b2f844e261569832a1a5e61310d",),
-        fixture_sha256=("1a02249ffc9ee6cd1da6ef2b3cc953d45a63fc57c1ae44257d9bfafc1b407c88",),
+        task_c_sha256=(
+            "1dbc21082ea1464c33a7b2c58e020e7893f73b2f844e261569832a1a5e61310d",
+        ),
+        fixture_sha256=(
+            "1a02249ffc9ee6cd1da6ef2b3cc953d45a63fc57c1ae44257d9bfafc1b407c88",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -347,8 +450,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "mmtv": UpmemMeasurement(
-        task_c_sha256=("222ab09f55249761f65f31b2d20ffbcc302a4ec8cbabb8d10dddeaa1b9ac4992",),
-        fixture_sha256=("fb6d68f4243cac08887397600871fb320133c5a23d201e9bac7affbb94ff63bb",),
+        task_c_sha256=(
+            "222ab09f55249761f65f31b2d20ffbcc302a4ec8cbabb8d10dddeaa1b9ac4992",
+        ),
+        fixture_sha256=(
+            "fb6d68f4243cac08887397600871fb320133c5a23d201e9bac7affbb94ff63bb",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -357,8 +464,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "hist": UpmemMeasurement(
-        task_c_sha256=("98b58d813d0b7c08e617460ccda37f0f1c277f1b36fb86674c8612d07db1d232",),
-        fixture_sha256=("fadb05893635fe24f913ac010d9ff2cebcaf70618bc6a05dac6aa5937ddb3afd",),
+        task_c_sha256=(
+            "98b58d813d0b7c08e617460ccda37f0f1c277f1b36fb86674c8612d07db1d232",
+        ),
+        fixture_sha256=(
+            "fadb05893635fe24f913ac010d9ff2cebcaf70618bc6a05dac6aa5937ddb3afd",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -367,8 +478,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "sel": UpmemMeasurement(
-        task_c_sha256=("d30c8bf8b15942e536917d1c52a9296f204145611632dadd463116f0e7685ad7",),
-        fixture_sha256=("e809f4a458a2a0262c3b855e93fce17fe2716ba6e967916e81ba6666f0ecff3c",),
+        task_c_sha256=(
+            "d30c8bf8b15942e536917d1c52a9296f204145611632dadd463116f0e7685ad7",
+        ),
+        fixture_sha256=(
+            "e809f4a458a2a0262c3b855e93fce17fe2716ba6e967916e81ba6666f0ecff3c",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -377,8 +492,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "kmeans": UpmemMeasurement(
-        task_c_sha256=("89b894ac3829e0745f29157055ad8e504e70861e10ed27ee53ab858acc7db3c1",),
-        fixture_sha256=("821998100b4d16033da125d6f04dcebf2ad607d29ecfee7f1670b2408c087fdb",),
+        task_c_sha256=(
+            "89b894ac3829e0745f29157055ad8e504e70861e10ed27ee53ab858acc7db3c1",
+        ),
+        fixture_sha256=(
+            "821998100b4d16033da125d6f04dcebf2ad607d29ecfee7f1670b2408c087fdb",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -387,8 +506,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "linear_reg": UpmemMeasurement(
-        task_c_sha256=("42f78b28acfcd165593200d0801b8caa446b4c2fef0660a511e8fe1ee003dbd2",),
-        fixture_sha256=("1a285c8527f8934eb183feabe4db3b5859439fc93430afa904e3cec9243708aa",),
+        task_c_sha256=(
+            "42f78b28acfcd165593200d0801b8caa446b4c2fef0660a511e8fe1ee003dbd2",
+        ),
+        fixture_sha256=(
+            "1a285c8527f8934eb183feabe4db3b5859439fc93430afa904e3cec9243708aa",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -397,8 +520,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "logistic_reg": UpmemMeasurement(
-        task_c_sha256=("017a16453643c12be14733b05578f25c0bb435ea4a3f9493da8c755c3be39905",),
-        fixture_sha256=("0d18c583aa3a2dca956ac9f65bdd9eace84dff1c7d1684e3deda8f477e223321",),
+        task_c_sha256=(
+            "017a16453643c12be14733b05578f25c0bb435ea4a3f9493da8c755c3be39905",
+        ),
+        fixture_sha256=(
+            "0d18c583aa3a2dca956ac9f65bdd9eace84dff1c7d1684e3deda8f477e223321",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -407,8 +534,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "1mm": UpmemMeasurement(
-        task_c_sha256=("719bec9426c1242bdcf3db4812db80c4a0b4ec4d972d1fbe0853aa85eded7ef0",),
-        fixture_sha256=("58925272456d1b069d2e6e7d62efe0dabcaeaf2149751622c2a63cef00ebcf1e",),
+        task_c_sha256=(
+            "719bec9426c1242bdcf3db4812db80c4a0b4ec4d972d1fbe0853aa85eded7ef0",
+        ),
+        fixture_sha256=(
+            "58925272456d1b069d2e6e7d62efe0dabcaeaf2149751622c2a63cef00ebcf1e",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -417,8 +548,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "2mm": UpmemMeasurement(
-        task_c_sha256=("719bec9426c1242bdcf3db4812db80c4a0b4ec4d972d1fbe0853aa85eded7ef0",),
-        fixture_sha256=("48da1f839461f737e0b07952e38020bc1507e2e6b2f41db1ac16187431ac5bbf",),
+        task_c_sha256=(
+            "719bec9426c1242bdcf3db4812db80c4a0b4ec4d972d1fbe0853aa85eded7ef0",
+        ),
+        fixture_sha256=(
+            "48da1f839461f737e0b07952e38020bc1507e2e6b2f41db1ac16187431ac5bbf",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -427,8 +562,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "3mm": UpmemMeasurement(
-        task_c_sha256=("719bec9426c1242bdcf3db4812db80c4a0b4ec4d972d1fbe0853aa85eded7ef0",),
-        fixture_sha256=("f4941e138f55f02e1825c325f6acd30a08e4f6f4d596b927daee045361a428dc",),
+        task_c_sha256=(
+            "719bec9426c1242bdcf3db4812db80c4a0b4ec4d972d1fbe0853aa85eded7ef0",
+        ),
+        fixture_sha256=(
+            "f4941e138f55f02e1825c325f6acd30a08e4f6f4d596b927daee045361a428dc",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -437,8 +576,12 @@ UPMEM_MEASUREMENTS = {
         command="$UPIMULATOR --benchmark GENERIC --fixture_dir $FIXTURE --num_channels 1 --num_ranks_per_channel 1 --num_dpus_per_rank 1 --num_tasklets 12 --num_simulation_threads 16 --logic_frequency 350 --skip_compilation true --root_dirpath $ROOT --bin_dirpath $BIN --log_dirpath $LOG",
     ),
     "conv": UpmemMeasurement(
-        task_c_sha256=("82a54b9f5edfa7aead30b00738764a2c0f1fd409d9ffb901d66d02317b45716a",),
-        fixture_sha256=("1217eb9dfd670f024f7328d5f81a33059aefe6d7ba8886db22489285d90035c9",),
+        task_c_sha256=(
+            "82a54b9f5edfa7aead30b00738764a2c0f1fd409d9ffb901d66d02317b45716a",
+        ),
+        fixture_sha256=(
+            "1217eb9dfd670f024f7328d5f81a33059aefe6d7ba8886db22489285d90035c9",
+        ),
         simulator_sha256=_SIMULATOR,
         snapshot_sha256=_SNAPSHOT,
         sdk_build_sha256=_SDK_BUILD,
@@ -495,17 +638,26 @@ def test_upmem_program_provenance(row):
     ctx = compiled.compiled.layout_ctx
     bundle = ctx.prepare(canonical_inputs(row.case_id, root))
     dpu = [i for i, segment in enumerate(ctx.segments) if segment.kind == "dpu"]
-    assert tuple(
-        hashlib.sha256(ctx.segments[i].device_source.encode()).hexdigest() for i in dpu
-    ) == record.task_c_sha256
-    assert tuple(_fixture_digest(bundle.fixtures[i]) for i in dpu) == record.fixture_sha256
+    assert (
+        tuple(
+            hashlib.sha256(ctx.segments[i].device_source.encode()).hexdigest()
+            for i in dpu
+        )
+        == record.task_c_sha256
+    )
+    assert (
+        tuple(_fixture_digest(bundle.fixtures[i]) for i in dpu) == record.fixture_sha256
+    )
 
 
 @pytest.mark.parametrize(
     "row",
     [
-        row if row.case_id in _UPMEM_DEFAULT_CASES
-        else pytest.param(row, marks=pytest.mark.paper_full)
+        (
+            row
+            if row.case_id in _UPMEM_DEFAULT_CASES
+            else pytest.param(row, marks=pytest.mark.paper_full)
+        )
         for row in _rows("upmem")
     ],
     ids=_ids(_rows("upmem")),

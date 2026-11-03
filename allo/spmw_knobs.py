@@ -378,7 +378,11 @@ def _aim_batch_mapping_candidates(ctx: KnobCtx) -> list:
     # The lowerer accepts a reduction storage extent only for "channels".
     if (not gb_input or shape["batches"] == 1) and storage is None:
         values.append("flattened")
-    if gb_input and storage is None and aligned_reduction(shape["reduction"], lanes) <= cols:
+    if (
+        gb_input
+        and storage is None
+        and aligned_reduction(shape["reduction"], lanes) <= cols
+    ):
         values.append("row_packed")
     if gb_input:
         values.append("channels")
@@ -412,9 +416,7 @@ def _aim_replica_partitions_candidates(ctx: KnobCtx) -> list:
     if shape is not None:
         replicas = int(shape["replicas"])
     else:
-        scope = next(
-            (m.extra.get("spmw_work_scope") for m in ctx.matches), None
-        )
+        scope = next((m.extra.get("spmw_work_scope") for m in ctx.matches), None)
         group_shape = tuple(getattr(scope, "group_shape", ()) or ())
         replicas = math.prod(group_shape) if group_shape else 1
     domain = replica_partition_domain(replicas, channels)

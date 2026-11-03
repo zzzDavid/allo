@@ -85,7 +85,11 @@ def default():
 
 def _ties(compiled):
     return {
-        tie.description.split(":")[0] if tie.description.startswith("rows ") else "program": tie
+        (
+            tie.description.split(":")[0]
+            if tie.description.startswith("rows ")
+            else "program"
+        ): tie
         for tie in compiled.placement_ranking.kernels[0].movement.ties
     }
 
@@ -170,7 +174,10 @@ def test_cyclic_tie_places_rows_and_maps_results_back(default):
         rows = np.arange(unit, M, CHANNELS)
         assert slots[rows].tolist() == list(range(unit * ROWS, (unit + 1) * ROWS))
     for row, position in row_map["placement"].items():
-        assert position == {"slot": int(slots[row]), **_frontier_position(entry, int(slots[row]))}
+        assert position == {
+            "slot": int(slots[row]),
+            **_frontier_position(entry, int(slots[row])),
+        }
     # Host-side result mapping: slot s computes the row stored there, the host
     # reads row r from slot[r].
     rng = np.random.default_rng(0)
@@ -187,7 +194,9 @@ def test_reduction_partitions_split_is_routed_to_its_candidates():
 
     compiled = allo.compile(SKINNY, TARGET, aim_cost, **REASSOCIATE)
     movement = compiled.placement_ranking.kernels[0].movement
-    routed = [tie for tie in movement.ties if "reduction_partitions=32" in tie.description]
+    routed = [
+        tie for tie in movement.ties if "reduction_partitions=32" in tie.description
+    ]
     assert len(routed) == 1 and routed[0].realizable
     assert movement.chosen_label == "minimal"
     # Other members of the k-split class (high k bits) are rejected.
@@ -200,7 +209,9 @@ def test_reduction_partitions_split_is_routed_to_its_candidates():
     # The split on a placement that lowers P = 1 is refused with the reason.
     _sbk, abk = _aim_layout_candidates(TARGET, compiled.compiled.trace.matches)
     with pytest.raises(InfeasibleSchedule, match="reduction_partitions=32 split"):
-        allo.compile(SKINNY, TARGET, aim_cost, layout=_with_tie(abk, routed[0]), **REASSOCIATE)
+        allo.compile(
+            SKINNY, TARGET, aim_cost, layout=_with_tie(abk, routed[0]), **REASSOCIATE
+        )
 
 
 # --------------------------------------------------------------------- #

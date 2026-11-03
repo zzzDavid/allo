@@ -650,17 +650,23 @@ class UPMEMElementwisePlan(UPMEMPhysicalPlan):
             "coefficients": (
                 {"alpha": self.alpha, "binding": "compile_time"}
                 if self.operation == "scale"
-                else {
-                    "alpha": self.alpha,
-                    "beta": self.beta,
-                    **({"gamma": self.gamma} if self.gamma else {}),
-                    "binding": "compile_time",
-                }
-                if self.operation == "axpby" and not self.runtime_coefficients
                 else (
-                    {"alpha": self.alpha, "beta": self.beta, "binding": "runtime_mram"}
-                    if self.operation == "axpby"
-                    else None
+                    {
+                        "alpha": self.alpha,
+                        "beta": self.beta,
+                        **({"gamma": self.gamma} if self.gamma else {}),
+                        "binding": "compile_time",
+                    }
+                    if self.operation == "axpby" and not self.runtime_coefficients
+                    else (
+                        {
+                            "alpha": self.alpha,
+                            "beta": self.beta,
+                            "binding": "runtime_mram",
+                        }
+                        if self.operation == "axpby"
+                        else None
+                    )
                 )
             ),
             "elements": self.elements,
@@ -1333,7 +1339,9 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
             for logical_row in range(self.total_rows)
         )
 
-    def pack_private_inputs(self, matrix, vectors) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    def pack_private_inputs(
+        self, matrix, vectors
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """Matrix and vector words of the tasklet-private ABI, each row
         zero-padded to whole DMA chunks."""
 
@@ -1351,7 +1359,9 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
                 words.extend(tail)
             return tuple(words)
 
-        return padded(matrix_values, self.total_rows), padded(vector_values, self.batches)
+        return padded(matrix_values, self.total_rows), padded(
+            vector_values, self.batches
+        )
 
     def _physical_output_words(self) -> int:
         if self.vector_mode == "tasklet_private_wram":
@@ -1409,7 +1419,9 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
             )
             write_calls = self.batches
             read_bytes = (
-                matrix_bytes + vector_bytes + carried * self.batches * self.batch_output_bytes
+                matrix_bytes
+                + vector_bytes
+                + carried * self.batches * self.batch_output_bytes
             )
             write_bytes = self.batches * self.batch_output_bytes
             return {
@@ -1433,7 +1445,9 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
         compute_packets = self.total_rows * self.column_chunks
         read_calls = compute_packets + carried * UPMEM_ACTIVE_TASKLETS
         write_calls = UPMEM_ACTIVE_TASKLETS
-        read_bytes = compute_packets * self.packet_bytes + carried * self.padded_rows * 4
+        read_bytes = (
+            compute_packets * self.packet_bytes + carried * self.padded_rows * 4
+        )
         write_bytes = self.padded_rows * 4
         return {
             "mram_read_calls": read_calls,
@@ -1635,7 +1649,6 @@ int main(void) {{
 }}
 """
         )
-
 
     def _strided_private_wram_device_source(self) -> str:
         """Batch-resident MV for any batch count: tasklet ``t`` owns batches

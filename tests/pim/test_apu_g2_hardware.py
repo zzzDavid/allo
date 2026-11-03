@@ -42,7 +42,9 @@ def apu_g2_card_unavailable_reason() -> str | None:
     """None when the Gemini-II SDK, gsi_tool and an Available card exist."""
 
     missing = [
-        str(path) for path in spmw_simenv.apu_g2_required_sdk_paths() if not path.is_file()
+        str(path)
+        for path in spmw_simenv.apu_g2_required_sdk_paths()
+        if not path.is_file()
     ]
     if missing:
         return f"Gemini-II SDK incomplete under {spmw_simenv.apu_g2_sdk_root()}: missing {missing[0]}"
@@ -109,19 +111,54 @@ def _typed_cases(rng):
     i8 = lambda: rng.integers(-128, 128, size=full).astype(np.int8)
     u16 = lambda low: rng.integers(low, 1 << 16, size=full).astype(np.uint16)
     return [
-        ("add", APUG2TypedProgram("add", (S(16), S(16)), S(16), full, repetitions=REPETITIONS),
-         (i16(), i16()), lambda a, b: (a.astype(np.int64) + b).astype(np.int16)),
-        ("mul", APUG2TypedProgram("mul", (S(8), S(8)), S(16), full, repetitions=REPETITIONS),
-         (i8(), i8()), lambda a, b: a.astype(np.int64) * b),
-        ("div", APUG2TypedProgram("div", (S(16, False),) * 2, S(16, False), full, repetitions=REPETITIONS),
-         (u16(0), u16(1)), lambda a, b: a // b),
-        ("block_sum", APUG2TypedProgram("block_sum", (S(8, False),), S(16, False), full, 256, repetitions=REPETITIONS),
-         (rng.integers(0, 256, size=full).astype(np.uint8),),
-         lambda a: a.astype(np.int64).reshape(-1, 256).sum(axis=1)),
-        ("dot", APUG2TypedProgram("dot", (S(4), S(4)), S(15), (1985, 128), 128, repetitions=REPETITIONS),
-         (rng.integers(-8, 8, size=(1985, 128)).astype(np.int8),
-          rng.integers(-8, 8, size=(1985, 128)).astype(np.int8)),
-         lambda a, b: (a.astype(np.int64) * b).sum(axis=1)),
+        (
+            "add",
+            APUG2TypedProgram(
+                "add", (S(16), S(16)), S(16), full, repetitions=REPETITIONS
+            ),
+            (i16(), i16()),
+            lambda a, b: (a.astype(np.int64) + b).astype(np.int16),
+        ),
+        (
+            "mul",
+            APUG2TypedProgram(
+                "mul", (S(8), S(8)), S(16), full, repetitions=REPETITIONS
+            ),
+            (i8(), i8()),
+            lambda a, b: a.astype(np.int64) * b,
+        ),
+        (
+            "div",
+            APUG2TypedProgram(
+                "div", (S(16, False),) * 2, S(16, False), full, repetitions=REPETITIONS
+            ),
+            (u16(0), u16(1)),
+            lambda a, b: a // b,
+        ),
+        (
+            "block_sum",
+            APUG2TypedProgram(
+                "block_sum",
+                (S(8, False),),
+                S(16, False),
+                full,
+                256,
+                repetitions=REPETITIONS,
+            ),
+            (rng.integers(0, 256, size=full).astype(np.uint8),),
+            lambda a: a.astype(np.int64).reshape(-1, 256).sum(axis=1),
+        ),
+        (
+            "dot",
+            APUG2TypedProgram(
+                "dot", (S(4), S(4)), S(15), (1985, 128), 128, repetitions=REPETITIONS
+            ),
+            (
+                rng.integers(-8, 8, size=(1985, 128)).astype(np.int8),
+                rng.integers(-8, 8, size=(1985, 128)).astype(np.int8),
+            ),
+            lambda a, b: (a.astype(np.int64) * b).sum(axis=1),
+        ),
     ]
 
 
@@ -140,7 +177,9 @@ def test_typed_program_per_operation_on_card(apu_g2_card):
             name,
             result,
             estimate=int(compiled.estimate().cycles),
-            device_library_sha256=result.extra["project"]["artifact_sha256"]["device_library"],
+            device_library_sha256=result.extra["project"]["artifact_sha256"][
+                "device_library"
+            ],
         )
 
 
@@ -151,7 +190,9 @@ def _source_args(compiled, rng):
         scalar = contract.parameter_type(name)
         shape = contract.parameter_shape(name)
         low, high = scalar.minimum, scalar.maximum
-        carried = any(s.accumulator == "carried" and s.output == name for s in contract.streams)
+        carried = any(
+            s.accumulator == "carried" and s.output == name for s in contract.streams
+        )
         if name in contract.outputs and not carried:
             args[name] = np.zeros(shape, dtype=np.int16)
             continue
@@ -260,7 +301,9 @@ def test_echoed_fingerprint_mismatch_is_refused_on_card(apu_g2_card, monkeypatch
     def wrong_fingerprint(program, host, files):
         return (*original(program, host, files)[:-1], "f" * 64)
 
-    monkeypatch.setattr(runtime, "build_apu_g2_composed_host_command", wrong_fingerprint)
+    monkeypatch.setattr(
+        runtime, "build_apu_g2_composed_host_command", wrong_fingerprint
+    )
     compiled = allo.compile(PAPER_KERNELS["gemm"], build_apu_g2_target(), apu_g2_cost)
     compiled.compiled.repetitions = REPETITIONS
     args = _source_args(compiled, np.random.default_rng(SEED + 2))
@@ -382,7 +425,9 @@ def test_zero_results_overwrite_a_sentinel_on_card(apu_g2_card):
     out = np.full(full, 7, np.int16)
     result = add(a, b, out)
     np.testing.assert_array_equal(out, np.zeros(full, np.int16))
-    np.testing.assert_array_equal(result.extra["outputs"]["out"], np.zeros(full, np.int16))
+    np.testing.assert_array_equal(
+        result.extra["outputs"]["out"], np.zeros(full, np.int16)
+    )
     _record("g6_zero", "add_i16_a_minus_a", result)
 
     gemm = allo.compile(PAPER_KERNELS["gemm"], target, apu_g2_cost)

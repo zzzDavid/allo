@@ -77,7 +77,9 @@ VIRTUAL_TIMING_SCOPE = "analytical: device logic cycles incl. modeled host trans
 _BUILD_TIMEOUT_S = 600
 _SIMULATE_TIMEOUT_S = 1800
 _LOGIC_CYCLE = re.compile(r"^Logic\[(\d+)_(\d+)_(\d+)\]_logic_cycle:\s*(\d+)\s*$", re.M)
-_OBSERVED = re.compile(r"^observed_mram_heap_offset_(\d+)_execution_(\d+)_dpu_(\d+)\.raw\.bin$")
+_OBSERVED = re.compile(
+    r"^observed_mram_heap_offset_(\d+)_execution_(\d+)_dpu_(\d+)\.raw\.bin$"
+)
 # Region-local buffers get identities at or above this value
 # (``ir/builder.py::_spmw_source_value_id``); caller arguments are below it.
 _LOCAL_ABI_ID = 1 << 62
@@ -412,8 +414,10 @@ def _require_element_type(family: str, role: str, operand) -> None:
 
 
 def _require_int32_constant(family: str, name: str, value) -> None:
-    if not isinstance(value, int) or isinstance(value, bool) or not (
-        -(2**31) <= value < 2**31
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not (-(2**31) <= value < 2**31)
     ):
         raise NotImplementedError(
             f"UPMEM {family}: coefficient {name}={value!r} is not an int32 "
@@ -594,8 +598,12 @@ def _recognize_reduction(target, stream):
         return None
     (iv,) = (loop[0] for loop in match.enclosing_loops)
     operands = _data_operands(match)
-    cells = [op for op in operands.values() if op.memref_name == match.result_memref_name]
-    values = [op for op in operands.values() if op.memref_name != match.result_memref_name]
+    cells = [
+        op for op in operands.values() if op.memref_name == match.result_memref_name
+    ]
+    values = [
+        op for op in operands.values() if op.memref_name != match.result_memref_name
+    ]
     if len(cells) != 1 or len(values) != 1:
         return None
     (cell,), (value,) = cells, values
@@ -665,9 +673,7 @@ def _recognize_matrix_vector(target, stream):
     inputs = [operands.get("x"), operands.get("y")]
     if acc is None or not acc.is_loop_carried or None in inputs:
         return None
-    matrix = next(
-        (op for op in inputs if list(op.indices) == outer + [red_iv]), None
-    )
+    matrix = next((op for op in inputs if list(op.indices) == outer + [red_iv]), None)
     vector = next((op for op in inputs if op is not matrix), None)
     if matrix is None or vector is None or _memref_rank(matrix) != len(ivs):
         return None
@@ -864,11 +870,46 @@ _GEMM_DOMAIN = tuple(
         kc=kc,
     )
     for layout, dma_bytes, chunk, residency, nc, kc in (
-        (UPMEMDataLayout.FUSED_REPLICATED, 320, 16, UPMEMOperandResidency.FUSED_DMA_PACKET, 4, 16),
-        (UPMEMDataLayout.FUSED_REPLICATED, 576, 16, UPMEMOperandResidency.FUSED_DMA_PACKET, 8, 16),
-        (UPMEMDataLayout.FUSED_REPLICATED, 1088, 16, UPMEMOperandResidency.FUSED_DMA_PACKET, 16, 16),
-        (UPMEMDataLayout.FUSED_REPLICATED, 1056, 8, UPMEMOperandResidency.FUSED_DMA_PACKET, 32, 8),
-        (UPMEMDataLayout.SEPARATE, 2048, 64, UPMEMOperandResidency.SHARED_WRAM, 128, 64),
+        (
+            UPMEMDataLayout.FUSED_REPLICATED,
+            320,
+            16,
+            UPMEMOperandResidency.FUSED_DMA_PACKET,
+            4,
+            16,
+        ),
+        (
+            UPMEMDataLayout.FUSED_REPLICATED,
+            576,
+            16,
+            UPMEMOperandResidency.FUSED_DMA_PACKET,
+            8,
+            16,
+        ),
+        (
+            UPMEMDataLayout.FUSED_REPLICATED,
+            1088,
+            16,
+            UPMEMOperandResidency.FUSED_DMA_PACKET,
+            16,
+            16,
+        ),
+        (
+            UPMEMDataLayout.FUSED_REPLICATED,
+            1056,
+            8,
+            UPMEMOperandResidency.FUSED_DMA_PACKET,
+            32,
+            8,
+        ),
+        (
+            UPMEMDataLayout.SEPARATE,
+            2048,
+            64,
+            UPMEMOperandResidency.SHARED_WRAM,
+            128,
+            64,
+        ),
     )
 )
 
@@ -989,7 +1030,9 @@ def _recognize_histogram(target, stream):
     E = _engine()
     term = terms[0]
     unproven_truncation = None
-    if isinstance(term, E.WUnary) and term.fn.startswith(("arith.trunci<", "arith.index_cast<")):
+    if isinstance(term, E.WUnary) and term.fn.startswith(
+        ("arith.trunci<", "arith.index_cast<")
+    ):
         # The matcher kept a bin-index truncation it could not prove exact.
         # Recognize the shape so the element-type check names the real
         # problem for a non-int32 input; an int32 input whose index may
@@ -1148,7 +1191,9 @@ def _recognize_selection(target, stream):
         )
     tested, predicate = found
     if not _load_is(tested, value):
-        raise NotImplementedError("selection guard tests a value other than the copied one")
+        raise NotImplementedError(
+            "selection guard tests a value other than the copied one"
+        )
     terms = compact.extra.get("index_terms") or ()
     cell = counter.result_memref_name
     if not (
@@ -1195,7 +1240,9 @@ def _selection_plan(kernel, decision):
         )
     return UPMEMSelectionFlagsPlan(
         selection_padded_elements(
-            kernel.geometry_value("elements"), decision.tasklets, decision.chunk_elements
+            kernel.geometry_value("elements"),
+            decision.tasklets,
+            decision.chunk_elements,
         ),
         num_tasklets=decision.tasklets,
         dma_elements=decision.chunk_elements,
@@ -1259,17 +1306,29 @@ def _recognize_kmeans_distances(target, stream):
     x, y, acc = operands.get("x"), operands.get("y"), operands.get("acc")
     if None in (x, y, acc):
         return None
-    if list(x.indices) != [p, d] or list(y.indices) != [c, d] or list(acc.indices) != [p, c]:
+    if (
+        list(x.indices) != [p, d]
+        or list(y.indices) != [c, d]
+        or list(acc.indices) != [p, c]
+    ):
         return None
     _require_element_type("kmeans_distances", "points", x)
     _require_element_type("kmeans_distances", "centroids", y)
     _require_element_type("kmeans_distances", "out", acc)
     points, clusters, dimension = extents
     return {
-        "geometry": (("points", points), ("dimension", dimension), ("clusters", clusters)),
+        "geometry": (
+            ("points", points),
+            ("dimension", dimension),
+            ("clusters", clusters),
+        ),
         "anchor_op": "SQDIST_ACC",
         "constants": (),
-        "roles": (("points", x.memref_name), ("centroids", y.memref_name), ("out", acc.memref_name)),
+        "roles": (
+            ("points", x.memref_name),
+            ("centroids", y.memref_name),
+            ("out", acc.memref_name),
+        ),
         "accumulator_init": _accumulator_init("kmeans_distances", match),
     }
 
@@ -1408,7 +1467,11 @@ def _recognize_kmeans_update(target, stream):
 
 
 register_upmem_family(
-    "kmeans_update", _recognize_kmeans_update, lambda kernel, decision: None, None, _SINGLE_DOMAIN
+    "kmeans_update",
+    _recognize_kmeans_update,
+    lambda kernel, decision: None,
+    None,
+    _SINGLE_DOMAIN,
 )
 
 
@@ -1441,7 +1504,11 @@ def _recognize_feature_gradient(target, stream):
     if None in (x, y, acc) or len(acc.indices) != 1 or len(x.indices) != 2:
         return None
     s_iv, f_iv = x.indices
-    if acc.indices[0] != f_iv or list(y.indices) != [s_iv] or set(loops) != {s_iv, f_iv}:
+    if (
+        acc.indices[0] != f_iv
+        or list(y.indices) != [s_iv]
+        or set(loops) != {s_iv, f_iv}
+    ):
         return None
     _require_element_type("feature_gradient", "samples", x)
     _require_element_type("feature_gradient", "out", acc)
@@ -1455,8 +1522,15 @@ def _recognize_feature_gradient(target, stream):
     constants = dict(match.extra.get("constants", {}))
     alpha, beta = constants.get("alpha"), constants.get("beta")
     if match.target_op_name == "GRAD_LINEAR":
-        shift = (-alpha).bit_length() - 1 if isinstance(alpha, int) and alpha < 0 else -1
-        if not (0 <= shift <= 30 and alpha == -(2**shift) and isinstance(beta, int) and 0 <= beta <= 62):
+        shift = (
+            (-alpha).bit_length() - 1 if isinstance(alpha, int) and alpha < 0 else -1
+        )
+        if not (
+            0 <= shift <= 30
+            and alpha == -(2**shift)
+            and isinstance(beta, int)
+            and 0 <= beta <= 62
+        ):
             raise NotImplementedError(
                 f"linear gradient coefficients alpha={alpha}, beta={beta} are not "
                 "-(2**shift) and an overflow shift in 0..62"
@@ -1507,7 +1581,6 @@ register_upmem_family(
     None,
     _SINGLE_DOMAIN,
 )
-
 
 
 # --------------------------------------------------------------------- #
@@ -1593,7 +1666,9 @@ def _carrier_projection(layout) -> dict | None:
     projected = {}
     for name in ("tasklet", "lane"):
         vectors = layout.bases.get(name, [])
-        if any(value for vector in vectors for i, value in enumerate(vector) if i != index):
+        if any(
+            value for vector in vectors for i, value in enumerate(vector) if i != index
+        ):
             return None
         projected[name] = [(vector[index],) for vector in vectors]
     return projected
@@ -1821,7 +1896,10 @@ def upmem_cost_validity(kernel: UpmemKernel, decision: UPMEMPhysicalDecision) ->
             "nearest_calibrated_point": None,
         }
     validity = dict(calibration_validity(family.features(kernel), decision))
-    if kernel.accumulator_init == "carried" and validity["cost_validity"] == "calibrated":
+    if (
+        kernel.accumulator_init == "carried"
+        and validity["cost_validity"] == "calibrated"
+    ):
         validity["cost_validity"] = "extrapolated"
         validity["basis"] += "; carried-output loads are outside every anchor"
     return validity
@@ -1943,9 +2021,11 @@ def _eval_index(value, env, ctx) -> int:
     if name in ("arith.addi", "arith.subi", "arith.muli"):
         lhs = _eval_index(operation.operands[0], env, ctx)
         rhs = _eval_index(operation.operands[1], env, ctx)
-        return {"arith.addi": lhs + rhs, "arith.subi": lhs - rhs, "arith.muli": lhs * rhs}[
-            name
-        ]
+        return {
+            "arith.addi": lhs + rhs,
+            "arith.subi": lhs - rhs,
+            "arith.muli": lhs * rhs,
+        }[name]
     if name == "affine.apply":
         (result,) = _affine_indices(operation, list(operation.operands), env, ctx)
         return result
@@ -2187,11 +2267,13 @@ def _forwarded_scalar(function, alloc, handles, state) -> bool:
     their own."""
     body = _walk(function.regions[0].blocks[0], [])
     stores = [
-        op for op in body
+        op
+        for op in body
         if op.name in ("affine.store", "memref.store") and op.operands[1] == alloc
     ]
     loads = [
-        op for op in body
+        op
+        for op in body
         if op.name in ("affine.load", "memref.load") and op.operands[0] == alloc
     ]
     if len(stores) != 1:
@@ -2219,7 +2301,10 @@ def _check_coverage(function, state, matches) -> None:
         for match in matches
         for operand in match.operands
         if operand.is_loop_carried
-        or (operand.memref_name is not None and operand.memref_name == match.result_memref_name)
+        or (
+            operand.memref_name is not None
+            and operand.memref_name == match.result_memref_name
+        )
     }
     results = {match.result_memref_name for match in matches}
     for operation in _walk(function.regions[0].blocks[0], []):
@@ -2356,7 +2441,9 @@ def _union_windows(windows, role, name) -> "_Window":
     """The bounding window of several accesses to one argument."""
     windows = list(windows)
     if len({w.argument for w in windows}) != 1:
-        raise NotImplementedError(f"UPMEM role {role!r} ({name}) spans several arguments")
+        raise NotImplementedError(
+            f"UPMEM role {role!r} ({name}) spans several arguments"
+        )
     if len(windows) == 1:
         return windows[0]
     begin = [min(w.offsets[d] for w in windows) for d in range(len(windows[0].offsets))]
@@ -2364,7 +2451,9 @@ def _union_windows(windows, role, name) -> "_Window":
         max(w.offsets[d] + w.extents[d] for w in windows)
         for d in range(len(windows[0].offsets))
     ]
-    return _Window(windows[0].argument, tuple(begin), tuple(e - b for b, e in zip(begin, end)))
+    return _Window(
+        windows[0].argument, tuple(begin), tuple(e - b for b, e in zip(begin, end))
+    )
 
 
 def _check_preconditions(plan, kernel, slices) -> None:
@@ -2381,7 +2470,10 @@ def _check_preconditions(plan, kernel, slices) -> None:
                 )
     elif isinstance(plan, UPMEMFeatureGradientPlan):
         samples = np.asarray(slices["samples"]).astype(object)
-        x, label = samples[:, : plan.features], samples[:, plan.features : plan.features + 1]
+        x, label = (
+            samples[:, : plan.features],
+            samples[:, plan.features : plan.features + 1],
+        )
         if plan.formula is GradientFormula.LINEAR_FIXED_POINT:
             products = abs(x * label) * (1 << plan.shift)
         else:
@@ -2411,7 +2503,9 @@ def _packed_int(values, bits: int, what: str) -> bytes:
         )
     flat = array.reshape(-1)
     if array.dtype.kind == "O":
-        flat = np.asarray([operator.index(value) for value in flat.tolist()], dtype=object)
+        flat = np.asarray(
+            [operator.index(value) for value in flat.tolist()], dtype=object
+        )
     low, high = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
     if flat.size and not (low <= int(flat.min()) and int(flat.max()) <= high):
         index, value = next(
@@ -2503,7 +2597,9 @@ def _pack_fused_gemm(plan, lhs, rhs) -> list:
                             and column < plan.columns
                             and index < plan.reduction
                         )
-                        values.append(rhs[index * plan.columns + column] if valid else 0)
+                        values.append(
+                            rhs[index * plan.columns + column] if valid else 0
+                        )
     return values
 
 
@@ -2549,8 +2645,12 @@ def pack_inputs(plan, kernel: UpmemKernel, slices: Mapping) -> bytes:
         matrix, vector = _flat(slices["matrix"]), _flat(slices["vector"])
         if plan.vector_mode == "tasklet_private_wram":
             matrix_words, vector_words = plan.pack_private_inputs(matrix, vector)
-            _write_region(image, _region(plan, "matrix"), _i32(matrix_words, "matrix"), "matrix")
-            _write_region(image, _region(plan, "vector"), _i32(vector_words, "vector"), "vector")
+            _write_region(
+                image, _region(plan, "matrix"), _i32(matrix_words, "matrix"), "matrix"
+            )
+            _write_region(
+                image, _region(plan, "vector"), _i32(vector_words, "vector"), "vector"
+            )
         else:
             _write_region(
                 image,
@@ -2594,12 +2694,29 @@ def pack_inputs(plan, kernel: UpmemKernel, slices: Mapping) -> bytes:
             "packed_lhs_rhs",
         )
     elif isinstance(plan, (UPMEMHistogramPlan, UPMEMSelectionFlagsPlan)):
-        _write_region(image, _region(plan, "input"), _i32(_flat(slices["input"]), "input"), "input")
+        _write_region(
+            image,
+            _region(plan, "input"),
+            _i32(_flat(slices["input"]), "input"),
+            "input",
+        )
     elif isinstance(plan, UPMEMKMeansDistancesPlan):
-        fused = plan.pack_fused_pairs(_flat(slices["points"]), _flat(slices["centroids"]))
-        _write_region(image, _region(plan, "fused_pairs"), _i32(fused, "fused_pairs"), "fused_pairs")
+        fused = plan.pack_fused_pairs(
+            _flat(slices["points"]), _flat(slices["centroids"])
+        )
+        _write_region(
+            image,
+            _region(plan, "fused_pairs"),
+            _i32(fused, "fused_pairs"),
+            "fused_pairs",
+        )
     elif isinstance(plan, UPMEMFeatureGradientPlan):
-        _write_region(image, _region(plan, "samples"), _i32(_flat(slices["samples"]), "samples"), "samples")
+        _write_region(
+            image,
+            _region(plan, "samples"),
+            _i32(_flat(slices["samples"]), "samples"),
+            "samples",
+        )
     else:
         raise NotImplementedError(f"no UPMEM input packer for {type(plan).__name__}")
     if "initial_out" in slices:
@@ -2644,7 +2761,11 @@ def gather_outputs(plan, kernel: UpmemKernel, window: bytes) -> dict:
         values = np.frombuffer(window, dtype="<u4").astype(np.int64)
         return {"out": values[: plan.bins]}
     if isinstance(plan, UPMEMSelectionFlagsPlan):
-        return {"flags": np.frombuffer(window, dtype="<i4").astype(np.int64)[: plan.elements]}
+        return {
+            "flags": np.frombuffer(window, dtype="<i4").astype(np.int64)[
+                : plan.elements
+            ]
+        }
     if isinstance(plan, (UPMEMKMeansDistancesPlan, UPMEMFeatureGradientPlan)):
         return {"out": np.frombuffer(window, dtype="<i8").astype(np.int64)}
     raise NotImplementedError(f"no UPMEM output gather for {type(plan).__name__}")
@@ -2689,7 +2810,9 @@ def padding_fraction(kernel: UpmemKernel) -> float:
     if not kernel.streams:
         return 0.0
     full = dict(kernel.geometry)
-    (axis,) = {key for stream in kernel.streams for key, value in stream if value != full[key]}
+    (axis,) = {
+        key for stream in kernel.streams for key, value in stream if value != full[key]
+    }
     logical = sum(dict(stream)[axis] for stream in kernel.streams)
     return 1.0 - logical / (full[axis] * len(kernel.streams))
 
@@ -2796,8 +2919,12 @@ def _owner_row_map(target, kernel, matches, layouts):
     if dpu_rows == program_rows:
         return None, None, None
     owner_of = {row: d for d, held in enumerate(program_rows) for row in held}
-    moved = sum(1 for d, held in enumerate(dpu_rows) for row in held if owner_of[row] != d)
-    position = {row: (d, i) for d, held in enumerate(dpu_rows) for i, row in enumerate(held)}
+    moved = sum(
+        1 for d, held in enumerate(dpu_rows) for row in held if owner_of[row] != d
+    )
+    position = {
+        row: (d, i) for d, held in enumerate(dpu_rows) for i, row in enumerate(held)
+    }
     total = rows * kernel.dpus
     first = min(position)
     samples = sorted(
@@ -2809,7 +2936,10 @@ def _owner_row_map(target, kernel, matches, layouts):
         "rows_moved": moved,
         "rows_per_dpu": rows,
         "digest": _row_map_digest(row for held in dpu_rows for row in held),
-        "placement": {row: {"dpu": position[row][0], "local_row": position[row][1]} for row in samples},
+        "placement": {
+            row: {"dpu": position[row][0], "local_row": position[row][1]}
+            for row in samples
+        },
     }
     return dpu_rows, program_rows, record
 
@@ -2845,7 +2975,9 @@ def _mapped_rows(program, dpu, role):
 
 def _row_index(window, rows) -> tuple:
     """Index of ``rows`` (dimension 0) inside ``window``'s other dimensions."""
-    tail = tuple(slice(o, o + e) for o, e in zip(window.offsets[1:], window.extents[1:]))
+    tail = tuple(
+        slice(o, o + e) for o, e in zip(window.offsets[1:], window.extents[1:])
+    )
     return (np.asarray(rows, dtype=np.intp),) + tail
 
 
@@ -2906,7 +3038,9 @@ class UpmemCtx(CodegenContext):
 
         layout_by_scope = {
             scope: layout
-            for (scope, _matches), layout in zip(_bucket_for_autoschedule(trace), layouts)
+            for (scope, _matches), layout in zip(
+                _bucket_for_autoschedule(trace), layouts
+            )
         }
         by_group: dict[int, list[MatchedOp]] = {}
         for match in trace.matches:
@@ -2956,7 +3090,9 @@ class UpmemCtx(CodegenContext):
             device_source = "" if plan is None else plan.device_source()
             dpu_rows = program_rows = row_map = None
             if plan is not None:
-                self._check_carried_layout(kernel, plan, decision, chosen, layout_by_scope)
+                self._check_carried_layout(
+                    kernel, plan, decision, chosen, layout_by_scope
+                )
                 dpu_rows, program_rows, row_map = _owner_row_map(
                     self.target, kernel, matches, [layout_by_scope[s] for s in chosen]
                 )
@@ -2994,7 +3130,11 @@ class UpmemCtx(CodegenContext):
                     continue
                 if step.group_id not in groups:
                     raise ValueError(f"launch of unknown UPMEM group {step.group_id}")
-                if segments and segments[-1] is not None and segments[-1][0] == step.group_id:
+                if (
+                    segments
+                    and segments[-1] is not None
+                    and segments[-1][0] == step.group_id
+                ):
                     segments[-1] = (step.group_id, segments[-1][1] + 1)
                 else:
                     segments.append((step.group_id, 1))
@@ -3118,7 +3258,9 @@ class UpmemCtx(CodegenContext):
                             # (histogram input): bind through its loads under
                             # the anchor's loops.
                             owner = next(
-                                m for m in own if m.target_op_name == program.kernel.anchor_op
+                                m
+                                for m in own
+                                if m.target_op_name == program.kernel.anchor_op
                             )
                         ivs = None
                         accesses = [
@@ -3137,9 +3279,13 @@ class UpmemCtx(CodegenContext):
                             function,
                             state,
                             loops,
-                            ivs
-                            if ivs is not None
-                            else [_value_name(v, state) for v in list(op.operands)[1:]],
+                            (
+                                ivs
+                                if ivs is not None
+                                else [
+                                    _value_name(v, state) for v in list(op.operands)[1:]
+                                ]
+                            ),
                         )
                         for op in accesses
                     }
@@ -3186,7 +3332,8 @@ class UpmemCtx(CodegenContext):
         ]
         overall = (
             "calibrated"
-            if labels and all(label.get("cost_validity") == "calibrated" for label in labels)
+            if labels
+            and all(label.get("cost_validity") == "calibrated" for label in labels)
             else "extrapolated"
         )
         return {
@@ -3220,7 +3367,9 @@ class UpmemCtx(CodegenContext):
             )
         values = list(inputs.values()) if isinstance(inputs, Mapping) else list(inputs)
         if len(values) < self.arity:
-            raise TypeError(f"UPMEM program takes {self.arity} arrays, got {len(values)}")
+            raise TypeError(
+                f"UPMEM program takes {self.arity} arrays, got {len(values)}"
+            )
         return values[: self.arity]
 
     def _launch(self, program: _GroupProgram, arrays: list) -> None:
@@ -3316,7 +3465,8 @@ class UpmemCtx(CodegenContext):
                 "schema_version": 1,
             }
             files = tuple(
-                (_indexed_name("mram.input", i), blob) for i, blob in enumerate(inputs_blobs)
+                (_indexed_name("mram.input", i), blob)
+                for i, blob in enumerate(inputs_blobs)
             ) + tuple(
                 (_indexed_name("mram.output.expected", i), blob)
                 for i, blob in enumerate(expected_blobs)
@@ -3338,7 +3488,8 @@ def _host_steps(segment) -> list:
         {
             "kind": "gather_outputs",
             "dpus": kernel.dpus,
-            "bytes_per_dpu": _output_window(segment.plan)[1] - _output_window(segment.plan)[0],
+            "bytes_per_dpu": _output_window(segment.plan)[1]
+            - _output_window(segment.plan)[0],
             "priced_by": "host_moves GATHER_MRAM (when declared)",
         }
     ]
@@ -3348,7 +3499,9 @@ def _host_steps(segment) -> list:
                 "kind": "selection_compaction",
                 "elements": kernel.geometry_value("elements") * kernel.dpus,
                 "modeled_host_cycles": kernel.dpus
-                * upmem_costs.selection_compaction_cycles(kernel.geometry_value("elements")),
+                * upmem_costs.selection_compaction_cycles(
+                    kernel.geometry_value("elements")
+                ),
                 "priced_by": "costs/upmem.py selection_compaction_cycles",
             }
         )
@@ -3560,23 +3713,57 @@ def _run_upmem(compiled, **inputs) -> RunResult:
         run_dir = runs_root / run_key
         if run_dir.exists():
             shutil.rmtree(run_dir)
-        fixture_dir, bin_dir, log_dir = run_dir / "fixture", run_dir / "bin", run_dir / "log"
+        fixture_dir, bin_dir, log_dir = (
+            run_dir / "fixture",
+            run_dir / "bin",
+            run_dir / "log",
+        )
         fixture.write(fixture_dir)
         bin_dir.mkdir(parents=True)
         tasklets = segment.decision.tasklets
         dpus = segment.kernel.dpus
         build = [
-            "docker", "run", "--rm", "-v", f"{root}:/root/uPIMulator", image,
-            "python3", "/root/uPIMulator/benchmark/build.py",
-            "--num_dpus", "1", "--num_tasklets", str(tasklets), "--benchmark", slot,
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{root}:/root/uPIMulator",
+            image,
+            "python3",
+            "/root/uPIMulator/benchmark/build.py",
+            "--num_dpus",
+            "1",
+            "--num_tasklets",
+            str(tasklets),
+            "--benchmark",
+            slot,
         ]
         simulate = [
-            str(binary), "--benchmark", slot, "--fixture_dir", str(fixture_dir),
-            "--num_channels", "1", "--num_ranks_per_channel", "1",
-            "--num_dpus_per_rank", str(dpus), "--num_tasklets", str(tasklets),
-            "--num_simulation_threads", "16", "--logic_frequency", "350",
-            "--skip_compilation", "true", "--root_dirpath", str(root),
-            "--bin_dirpath", str(bin_dir), "--log_dirpath", str(log_dir),
+            str(binary),
+            "--benchmark",
+            slot,
+            "--fixture_dir",
+            str(fixture_dir),
+            "--num_channels",
+            "1",
+            "--num_ranks_per_channel",
+            "1",
+            "--num_dpus_per_rank",
+            str(dpus),
+            "--num_tasklets",
+            str(tasklets),
+            "--num_simulation_threads",
+            "16",
+            "--logic_frequency",
+            "350",
+            "--skip_compilation",
+            "true",
+            "--root_dirpath",
+            str(root),
+            "--bin_dirpath",
+            str(bin_dir),
+            "--log_dirpath",
+            str(log_dir),
         ]
         lock_path = root.parent / "run.lock"
         with lock_path.open("a+b") as lock:
@@ -3596,8 +3783,14 @@ def _run_upmem(compiled, **inputs) -> RunResult:
             # when UPIMULATOR_ROOT and UPIMULATOR_BIN name a user's own build.
             sdk_build = spmw_simenv.upmem_sdk_build_identity(sdk_sha)
             task_object = (
-                root / "benchmark" / "build" / slot / "dpu" / "CMakeFiles"
-                / f"{slot}_device.dir" / "task.c.o"
+                root
+                / "benchmark"
+                / "build"
+                / slot
+                / "dpu"
+                / "CMakeFiles"
+                / f"{slot}_device.dir"
+                / "task.c.o"
             )
             task_object_sha = _sha256(task_object.read_bytes())
             simulated = subprocess.run(
@@ -3615,7 +3808,9 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                     f"; first mismatch: {mismatch} (log: {run_dir / 'simulate.log'})"
                     if mismatch
                     else "\n"
-                    + "\n".join((simulated.stdout + simulated.stderr).splitlines()[-40:])
+                    + "\n".join(
+                        (simulated.stdout + simulated.stderr).splitlines()[-40:]
+                    )
                 )
             )
         log_text = log_path.read_text(errors="replace")
@@ -3639,12 +3834,17 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                     f"observed_mram_heap_offset_{offset}_execution_{execution}"
                     f"_dpu_{dpu}.raw.bin"
                 )
-                values = gather_outputs(segment.plan, segment.kernel, observed.read_bytes())
+                values = gather_outputs(
+                    segment.plan, segment.kernel, observed.read_bytes()
+                )
                 if "flags" in values:
                     own = dict(segment.kernel.stream_geometry(dpu))["elements"]
                     _selection_epilogue(
-                        segment, program.windows[name], values["flags"][:own],
-                        caller_arrays, bundle.states[index],
+                        segment,
+                        program.windows[name],
+                        values["flags"][:own],
+                        caller_arrays,
+                        bundle.states[index],
                     )
                     continue
                 for role, data in values.items():
@@ -3655,7 +3855,8 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                         index = _row_index(window, rows)
                         destination = caller_arrays[window.argument][index].copy()
                         _store_exact(
-                            destination, np.asarray(data).reshape(-1)[: destination.size],
+                            destination,
+                            np.asarray(data).reshape(-1)[: destination.size],
                             f"{segment.kernel.family} role {role!r}",
                         )
                         caller_arrays[window.argument][index] = destination
@@ -3663,7 +3864,8 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                     destination = window.slice(caller_arrays[window.argument])
                     # A zero-padded work item keeps its leading elements.
                     _store_exact(
-                        destination, np.asarray(data).reshape(-1)[: destination.size],
+                        destination,
+                        np.asarray(data).reshape(-1)[: destination.size],
                         f"{segment.kernel.family} role {role!r}",
                     )
 
@@ -3683,7 +3885,8 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                 "num_tasklets": tasklets,
                 "executions": segment.executions,
                 "logic_cycles_per_dpu": {
-                    f"{c}_{r}_{d}": cycles for (c, r, d), cycles in sorted(per_dpu.items())
+                    f"{c}_{r}_{d}": cycles
+                    for (c, r, d), cycles in sorted(per_dpu.items())
                 },
                 "logic_cycles": segment_cycles,
                 "timing_scope": _TIMING_SCOPE,
@@ -3693,7 +3896,9 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                 ],
                 "padding_fraction": padding_fraction(segment.kernel),
                 "plan_manifest_sha256": _sha256(
-                    json.dumps(segment.plan.manifest(), sort_keys=True, default=str).encode()
+                    json.dumps(
+                        segment.plan.manifest(), sort_keys=True, default=str
+                    ).encode()
                 ),
                 "host_steps": _host_steps(segment),
                 **({"row_map": program.row_map} if program.row_map is not None else {}),

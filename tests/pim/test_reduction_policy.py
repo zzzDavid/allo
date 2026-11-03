@@ -60,7 +60,11 @@ UPMEM_M, UPMEM_K, UPMEM_ROWS = 768, 128, 96
 @_df_region()
 def upmem_gemv(W: int32[UPMEM_M, UPMEM_K], x: int32[UPMEM_K], y: int32[UPMEM_M]):
     @allo.work(mapping=[8], args=[W, x, y])
-    def mv(local_W: int32[UPMEM_M, UPMEM_K], local_x: int32[UPMEM_K], local_y: int32[UPMEM_M]):
+    def mv(
+        local_W: int32[UPMEM_M, UPMEM_K],
+        local_x: int32[UPMEM_K],
+        local_y: int32[UPMEM_M],
+    ):
         (dpu,) = allo.get_wid()
         for i in range(UPMEM_ROWS):
             local_y[dpu * UPMEM_ROWS + i] = 0
@@ -76,7 +80,11 @@ AIM_M = AIM_K = 256
 @_df_region()
 def aim_gemv(W: bfloat16[AIM_M, AIM_K], x: bfloat16[AIM_K], y: bfloat16[AIM_M]):
     @allo.work(mapping=[32], args=[W, x, y])
-    def mv(local_W: bfloat16[AIM_M, AIM_K], local_x: bfloat16[AIM_K], local_y: bfloat16[AIM_M]):
+    def mv(
+        local_W: bfloat16[AIM_M, AIM_K],
+        local_x: bfloat16[AIM_K],
+        local_y: bfloat16[AIM_M],
+    ):
         (channel,) = allo.get_wid()
         row0 = channel * 8
         for i in range(8):
@@ -93,7 +101,9 @@ def _modes(compiled):
 
 @pytest.fixture(scope="module")
 def samsung_strict():
-    return allo.compile(small_gemv, build_samsung_target(), samsung_cost, backend="virtual")
+    return allo.compile(
+        small_gemv, build_samsung_target(), samsung_cost, backend="virtual"
+    )
 
 
 @pytest.fixture(scope="module")
@@ -121,7 +131,9 @@ def test_policy_semantics():
         assert ReductionPolicy("strict", integer).may_regroup
     assert ReductionPolicy("reassociate", "f32").may_regroup
     with pytest.raises(ValueError, match="reduction_order must be one of"):
-        allo.compile(small_gemv, build_samsung_target(), samsung_cost, reduction_order="fast")
+        allo.compile(
+            small_gemv, build_samsung_target(), samsung_cost, reduction_order="fast"
+        )
 
 
 def test_match_workload_stamps_accumulating_matches():
@@ -132,9 +144,13 @@ def test_match_workload_stamps_accumulating_matches():
     for match in strict.matches:
         assert match.extra["reduction_policy"] == ReductionPolicy("strict", "f16")
     relaxed = match_workload(target, module, reduction_order="reassociate")
-    assert {m.extra["reduction_policy"].order for m in relaxed.matches} == {"reassociate"}
+    assert {m.extra["reduction_policy"].order for m in relaxed.matches} == {
+        "reassociate"
+    }
 
-    elementwise = match_workload(target, customize(flat_add, enable_tensor=False).module)
+    elementwise = match_workload(
+        target, customize(flat_add, enable_tensor=False).module
+    )
     assert elementwise.matches
     assert all("reduction_policy" not in m.extra for m in elementwise.matches)
     assert all(reduction_policy(m) is None for m in elementwise.matches)
@@ -166,9 +182,12 @@ def test_samsung_strict_prunes_regrouping_placements(samsung_strict):
     (program,) = samsung_strict.compiled.layout_ctx.programs
     assert program.kind == "TEMPORAL_REDUCE"
     assert program.lever_record["grf_residency"] == {"local_x": "host"}
-    assert samsung_strict.compiled.layout_ctx.runtime_route(
-        samsung_strict.compiled.cmds
-    )[0] == "GENERIC_TEMPORAL_REDUCE"
+    assert (
+        samsung_strict.compiled.layout_ctx.runtime_route(samsung_strict.compiled.cmds)[
+            0
+        ]
+        == "GENERIC_TEMPORAL_REDUCE"
+    )
 
 
 def test_samsung_reassociate_ranks_both_families(samsung_reassociate):
@@ -194,9 +213,10 @@ def test_samsung_forced_regrouping_layout_fails_under_strict(samsung_reassociate
         allo.compile(small_gemv, target, samsung_cost, layout=vendor)
     # Under strict the vendor layout is not even enumerated.
     with pytest.raises(NotImplementedError, match="pruned: reduction_order='strict'"):
-        samsung_vendor_gemv_layout(target, allo.compile(
-            small_gemv, target, samsung_cost, backend="virtual"
-        ).trace)
+        samsung_vendor_gemv_layout(
+            target,
+            allo.compile(small_gemv, target, samsung_cost, backend="virtual").trace,
+        )
 
 
 def test_result_records_the_policy(samsung_strict, samsung_reassociate):
@@ -227,7 +247,9 @@ def test_strict_permits_splitting_an_integer_reduction():
     trace = match_workload(target, schedule.module)
     _stamp_matcher_work_scopes(target, schedule.module, trace)
     policies = {
-        m.extra["reduction_policy"] for m in trace.matches if "reduction_policy" in m.extra
+        m.extra["reduction_policy"]
+        for m in trace.matches
+        if "reduction_policy" in m.extra
     }
     assert policies == {ReductionPolicy("strict", "i32")}
     assert all(policy.may_regroup for policy in policies)

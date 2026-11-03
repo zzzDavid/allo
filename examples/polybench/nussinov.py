@@ -39,7 +39,9 @@ def nussinov_np(seq, table):
     return table
 
 
-def kernel_nussinov[T: (float32, int32, uint16), N: int32](seq: "T[N]", table: "T[N, N]"):
+def kernel_nussinov[
+    T: (float32, int32, uint16), N: int32
+](seq: "T[N]", table: "T[N, N]"):
     for i_inv in range(N):
         i: index = N - 1 - i_inv
         for j in range(i + 1, N):

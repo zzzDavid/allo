@@ -103,7 +103,9 @@ def _fill_then_load(fill_cycles, shared_bus=True):
         bus = HandleInstance("chip/bus", (0,) if shared_bus else (item,))
         graph.add(_activity(f"fill{item}", bus, latency=fill_cycles, occupancy=4))
         graph.add(
-            _activity(f"load{item}", bus, latency=26, occupancy=4, deps=(f"fill{item}",))
+            _activity(
+                f"load{item}", bus, latency=26, occupancy=4, deps=(f"fill{item}",)
+            )
         )
     return Evaluator().evaluate(graph)
 

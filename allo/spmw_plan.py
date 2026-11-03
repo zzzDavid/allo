@@ -438,9 +438,11 @@ class LaunchSchedule:
 
     def manifest(self) -> tuple:
         steps = tuple(
-            ("host", step.host_index)
-            if isinstance(step, HostStep)
-            else ("launch", step.kernel, step.group_id, step.ordinal)
+            (
+                ("host", step.host_index)
+                if isinstance(step, HostStep)
+                else ("launch", step.kernel, step.group_id, step.ordinal)
+            )
             for step in self.steps
         )
         if self.resident:

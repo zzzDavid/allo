@@ -2379,7 +2379,8 @@ def reference_partial_sums(details: dict, matrix, vector, *, arithmetic="bf16"):
     weights = np.asarray(matrix)
     inputs = np.asarray(vector)
     if exact and not (
-        np.issubdtype(weights.dtype, np.integer) and np.issubdtype(inputs.dtype, np.integer)
+        np.issubdtype(weights.dtype, np.integer)
+        and np.issubdtype(inputs.dtype, np.integer)
     ):
         raise ValueError("exact arithmetic needs integer operands")
     weights, inputs = weights.astype(dtype), inputs.astype(dtype)
@@ -2405,7 +2406,9 @@ def reference_partial_sums(details: dict, matrix, vector, *, arithmetic="bf16"):
         if len(channels) != width * replicas or len(set(channels)) != len(channels):
             raise ValueError("a channel group must bind one channel per accumulator")
         for local_batch in range(width):
-            batch, partition = divmod(int(group["batch_begin"]) + local_batch, partitions)
+            batch, partition = divmod(
+                int(group["batch_begin"]) + local_batch, partitions
+            )
             for replica in range(replicas):
                 running = np.zeros(outputs, dtype=dtype)
                 for chunk in group["row_chunks"]:

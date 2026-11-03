@@ -118,11 +118,15 @@ def test_host_transfer_prices_the_moved_slice():
     assert sliced == aim_costs.HOST_WRITE_BURST_CYCLES + 255 * aim_costs.N_CCD
     # a[0:4096] of a flat buffer.
     flat = {"shape": (131072,), "dtype_bits": 16, "bytes": 262144}
-    assert _host_event_cycles(
-        target, "GATHER_BANKS", {**flat, "host_slice": ((0, 4096),)}
-    ) == aim_costs.HOST_READ_BURST_CYCLES + 255 * aim_costs.N_CCD
+    assert (
+        _host_event_cycles(target, "GATHER_BANKS", {**flat, "host_slice": ((0, 4096),)})
+        == aim_costs.HOST_READ_BURST_CYCLES + 255 * aim_costs.N_CCD
+    )
     # A resident buffer is on the device before the program starts.
-    assert _host_event_cycles(target, "SCATTER_BANKS", {**whole, "host_resident": True}) == 0
+    assert (
+        _host_event_cycles(target, "SCATTER_BANKS", {**whole, "host_resident": True})
+        == 0
+    )
 
 
 # M-07 ------------------------------------------------------------------ #
@@ -182,7 +186,13 @@ def test_failed_simulator_run_reports_no_cycles(monkeypatch, tmp_path):
 def test_single_isr_encoder_and_target_slot_conventions():
     from allo.spmw_aim import AimCtx, _bank_slot_conventions
 
-    for name in ("cmd", "_ISR_FIELDS", "_operand_text", "_handle_to_fields", "_unit_env"):
+    for name in (
+        "cmd",
+        "_ISR_FIELDS",
+        "_operand_text",
+        "_handle_to_fields",
+        "_unit_env",
+    ):
         assert name not in AimCtx.__dict__
     target = build_aim_target()
     host = {"SCATTER_BANKS", "GATHER_BANKS", "BCAST_BANKS"}

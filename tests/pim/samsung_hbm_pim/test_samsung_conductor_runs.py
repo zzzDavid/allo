@@ -138,7 +138,9 @@ def test_canonical_run_reports_program_plan_and_padding(samsung_sim_gate, gemv_i
     target = build_samsung_target()
     default = allo.compile(workload, target, samsung_cost, **REASSOCIATE)
     compiled = allo.compile(
-        workload, target, samsung_cost,
+        workload,
+        target,
+        samsung_cost,
         layout=spmw_samsung.samsung_vendor_gemv_layout(target, default.trace),
         **REASSOCIATE,
     )
@@ -151,7 +153,11 @@ def test_canonical_run_reports_program_plan_and_padding(samsung_sim_gate, gemv_i
     extra = result.extra
     assert extra["crf"] == spmw_samsung._samsung_cmds_text(compiled.compiled.cmds)
     assert extra["conductor"]["pimcmdgen_calls"] == 0
-    assert extra["conductor"]["mac_groups_even"] == extra["conductor"]["mac_groups_odd"] == 8
+    assert (
+        extra["conductor"]["mac_groups_even"]
+        == extra["conductor"]["mac_groups_odd"]
+        == 8
+    )
     assert extra["logical_shape"] == {"rows": 4096, "reduction": 256, "columns": 1}
     assert extra["padded_shape"] == {"rows": 4096, "reduction": 256, "columns": 1}
     assert extra["padding_fraction"] == 0.0
@@ -159,7 +165,9 @@ def test_canonical_run_reports_program_plan_and_padding(samsung_sim_gate, gemv_i
     assert sum(extra["cycle_phases"].values()) == result.cycles
 
 
-def test_noncanonical_placements_execute_their_own_programs(samsung_sim_gate, gemv_inputs):
+def test_noncanonical_placements_execute_their_own_programs(
+    samsung_sim_gate, gemv_inputs
+):
     workload, _M, _K = _workloads()["gemv_m4096_k256"]
     W, x, ref = gemv_inputs
     cycles = {}
@@ -205,9 +213,19 @@ def test_ragged_shape_reports_padding(samsung_sim_gate):
     )
     result = compiled(W, x, y)
     np.testing.assert_allclose(_f32(y), _f32(W) @ _f32(x), rtol=1e-2, atol=1e-2)
-    assert result.extra["logical_shape"] == {"rows": 2048, "reduction": 100, "columns": 1}
-    assert result.extra["padded_shape"] == {"rows": 4096, "reduction": 128, "columns": 1}
-    assert result.extra["padding_fraction"] == pytest.approx(1 - 2048 * 100 / (4096 * 128))
+    assert result.extra["logical_shape"] == {
+        "rows": 2048,
+        "reduction": 100,
+        "columns": 1,
+    }
+    assert result.extra["padded_shape"] == {
+        "rows": 4096,
+        "reduction": 128,
+        "columns": 1,
+    }
+    assert result.extra["padding_fraction"] == pytest.approx(
+        1 - 2048 * 100 / (4096 * 128)
+    )
 
 
 def test_gemm_matrix_residency_lever_changes_staging(samsung_sim_gate):
@@ -241,7 +259,9 @@ def test_gemm_matrix_residency_lever_changes_staging(samsung_sim_gate):
 )
 def test_elementwise_ops_run_exactly(samsung_sim_gate, workload, n_inputs, reference):
     rng = np.random.default_rng(3)
-    inputs = [(rng.standard_normal(ELT_N) * 0.5).astype(np.float16) for _ in range(n_inputs)]
+    inputs = [
+        (rng.standard_normal(ELT_N) * 0.5).astype(np.float16) for _ in range(n_inputs)
+    ]
     out = np.zeros(ELT_N, dtype=np.float16)
     compiled = allo.compile(workload, build_samsung_target(), samsung_cost)
     result = compiled(*inputs, out)

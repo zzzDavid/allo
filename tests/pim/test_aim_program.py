@@ -856,4 +856,3 @@ def test_negative_channel_indices_fail_before_mask_encoding():
     # -1 would otherwise set bit 32 and silently dispatch to zero channels.
     with pytest.raises(ValueError, match="channel indices must be nonnegative"):
         AimContraction(outputs=16, reduction=16, channels=(-1,))
-

@@ -41,20 +41,30 @@ def main() -> int:
         for item in GPT13B_INSTANCES
     ]
     start = time.process_time()
-    candidates = sum(len(attacc_tiling_space(kernel, geometry)) for _item, kernel in kernels)
+    candidates = sum(
+        len(attacc_tiling_space(kernel, geometry)) for _item, kernel in kernels
+    )
     enumerate_s = time.process_time() - start
     _space.cache_clear()  # time enumeration again inside the selector
     start = time.process_time()
-    selected = {item.id: rank_attacc_tilings(kernel, geometry)[0][0] for item, kernel in kernels}
+    selected = {
+        item.id: rank_attacc_tilings(kernel, geometry)[0][0] for item, kernel in kernels
+    }
     select_s = time.process_time() - start
-    matched = sum(selected[item.id].dcc_tiling() == expected[item.id] for item, _ in kernels)
-    print(json.dumps({
-        "instances": len(kernels),
-        "candidates": candidates,
-        "enumerate_cpu_s": round(enumerate_s, 2),
-        "enumerate_count_cost_select_cpu_s": round(select_s, 2),
-        "first_minimum_equals_paper": matched,
-    }))
+    matched = sum(
+        selected[item.id].dcc_tiling() == expected[item.id] for item, _ in kernels
+    )
+    print(
+        json.dumps(
+            {
+                "instances": len(kernels),
+                "candidates": candidates,
+                "enumerate_cpu_s": round(enumerate_s, 2),
+                "enumerate_count_cost_select_cpu_s": round(select_s, 2),
+                "first_minimum_equals_paper": matched,
+            }
+        )
+    )
     return 0
 
 

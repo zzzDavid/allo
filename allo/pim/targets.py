@@ -1508,6 +1508,7 @@ def build_apu_g2_contraction_patterns():
 
     return patterns
 
+
 def build_apu_g2_target():
     """Preferred hardware name for :func:`build_apu_v2_target`.
 

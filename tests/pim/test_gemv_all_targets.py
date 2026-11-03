@@ -94,7 +94,11 @@ _AIM_ROWS = AIM_M // _AIM_MAPPING[0]
 @_df_region()
 def aim_gemv(W: bfloat16[AIM_M, AIM_K], x: bfloat16[AIM_K], y: bfloat16[AIM_M]):
     @allo.work(mapping=_AIM_MAPPING, args=[W, x, y])
-    def mv(local_W: bfloat16[AIM_M, AIM_K], local_x: bfloat16[AIM_K], local_y: bfloat16[AIM_M]):
+    def mv(
+        local_W: bfloat16[AIM_M, AIM_K],
+        local_x: bfloat16[AIM_K],
+        local_y: bfloat16[AIM_M],
+    ):
         (channel,) = allo.get_wid()
         row0 = channel * _AIM_ROWS
         for i in range(_AIM_ROWS):
@@ -198,7 +202,11 @@ _UPMEM_ROWS = UPMEM_M // _UPMEM_MAPPING[0]
 @_df_region()
 def upmem_gemv(W: int32[UPMEM_M, UPMEM_K], x: int32[UPMEM_K], y: int32[UPMEM_M]):
     @allo.work(mapping=_UPMEM_MAPPING, args=[W, x, y])
-    def mv(local_W: int32[UPMEM_M, UPMEM_K], local_x: int32[UPMEM_K], local_y: int32[UPMEM_M]):
+    def mv(
+        local_W: int32[UPMEM_M, UPMEM_K],
+        local_x: int32[UPMEM_K],
+        local_y: int32[UPMEM_M],
+    ):
         (dpu,) = allo.get_wid()
         for i in range(_UPMEM_ROWS):
             local_y[dpu * _UPMEM_ROWS + i] = 0
@@ -211,7 +219,11 @@ def upmem_gemv(W: int32[UPMEM_M, UPMEM_K], x: int32[UPMEM_K], y: int32[UPMEM_M])
 @_df_region()
 def upmem_gemv_row0(W: int32[UPMEM_M, UPMEM_K], x: int32[UPMEM_K], y: int32[UPMEM_M]):
     @allo.work(mapping=_UPMEM_MAPPING, args=[W, x, y])
-    def mv(local_W: int32[UPMEM_M, UPMEM_K], local_x: int32[UPMEM_K], local_y: int32[UPMEM_M]):
+    def mv(
+        local_W: int32[UPMEM_M, UPMEM_K],
+        local_x: int32[UPMEM_K],
+        local_y: int32[UPMEM_M],
+    ):
         (dpu,) = allo.get_wid()
         row0 = dpu * _UPMEM_ROWS
         for i in range(_UPMEM_ROWS):
@@ -221,9 +233,15 @@ def upmem_gemv_row0(W: int32[UPMEM_M, UPMEM_K], x: int32[UPMEM_K], y: int32[UPME
 
 
 @_df_region()
-def upmem_gemv_data_temp(W: int32[UPMEM_M, UPMEM_K], x: int32[UPMEM_K], y: int32[UPMEM_M]):
+def upmem_gemv_data_temp(
+    W: int32[UPMEM_M, UPMEM_K], x: int32[UPMEM_K], y: int32[UPMEM_M]
+):
     @allo.work(mapping=_UPMEM_MAPPING, args=[W, x, y])
-    def mv(local_W: int32[UPMEM_M, UPMEM_K], local_x: int32[UPMEM_K], local_y: int32[UPMEM_M]):
+    def mv(
+        local_W: int32[UPMEM_M, UPMEM_K],
+        local_x: int32[UPMEM_K],
+        local_y: int32[UPMEM_M],
+    ):
         (dpu,) = allo.get_wid()
         for i in range(_UPMEM_ROWS):
             t: int32 = local_W[dpu * _UPMEM_ROWS + i, 0] - 1

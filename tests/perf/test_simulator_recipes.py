@@ -47,9 +47,7 @@ SAMSUNG_PATCHES = {
     "Burst.h.patch": "src/Burst.h",
 }
 
-LIMITATION = (
-    "cannot be built from the release repository alone"
-)
+LIMITATION = "cannot be built from the release repository alone"
 
 
 @pytest.mark.parametrize("relpath", RECIPE_FILES)
@@ -95,8 +93,11 @@ def test_no_samsung_patch_is_tracked_or_shipped():
         check=False,
     )
     if tracked.returncode == 0:
-        assert not [p for p in tracked.stdout.split() if p.endswith(".patch")
-                    and p.startswith("simulators/PIMSimulator/")]
+        assert not [
+            p
+            for p in tracked.stdout.split()
+            if p.endswith(".patch") and p.startswith("simulators/PIMSimulator/")
+        ]
     assert "simulators/PIMSimulator/patches/" in (REPO / ".gitignore").read_text()
     manifest = (REPO / "MANIFEST.in").read_text().splitlines()
     assert "graft simulators" in manifest
@@ -106,7 +107,9 @@ def test_no_samsung_patch_is_tracked_or_shipped():
 def _pimsim_overlay(tmp_path: Path) -> Path:
     """Copy of simulators/PIMSimulator without any sibling patches/ directory."""
     overlay = tmp_path / "overlay"
-    shutil.copytree(SIM / "PIMSimulator", overlay, ignore=shutil.ignore_patterns("patches"))
+    shutil.copytree(
+        SIM / "PIMSimulator", overlay, ignore=shutil.ignore_patterns("patches")
+    )
     return overlay
 
 
@@ -215,7 +218,10 @@ def test_pimsimulator_apply_uses_supplied_patches(tmp_path, route):
 
 def test_sdist_ships_the_simulator_recipes(sdist_members):  # noqa: F811
     members, _top = sdist_members
-    missing = [f"simulators/{relpath}" for relpath in RECIPE_FILES
-               if f"simulators/{relpath}" not in members]
+    missing = [
+        f"simulators/{relpath}"
+        for relpath in RECIPE_FILES
+        if f"simulators/{relpath}" not in members
+    ]
     assert not missing, missing
     assert not [m for m in members if m.startswith("simulators/PIMSimulator/patches")]

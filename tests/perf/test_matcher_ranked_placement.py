@@ -265,9 +265,7 @@ def test_ranked_falls_through_infeasible_codegen(gemv_case, monkeypatch):
             raise InfeasibleSchedule("forced top-rank rejection")
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(
-        spmw_codegen, "_materialize_matcher_codegen", first_infeasible
-    )
+    monkeypatch.setattr(spmw_codegen, "_materialize_matcher_codegen", first_infeasible)
     kernel = autoschedule(target, trace, samsung_cost).placement_ranking.kernels[0]
 
     # The top-ranked candidate is rejected by the forced probe; other

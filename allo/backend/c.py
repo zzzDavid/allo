@@ -173,7 +173,9 @@ def _check_wide_integers(module, top_func_name: str) -> None:
             continue
         name = str(function.attributes["sym_name"]).strip('"')
         if name == top_func_name:
-            signature = FunctionType(TypeAttr(function.attributes["function_type"]).value)
+            signature = FunctionType(
+                TypeAttr(function.attributes["function_type"]).value
+            )
             width = _wide_width(list(signature.inputs) + list(signature.results))
             if width is not None:
                 raise WideIntegerError(
@@ -190,8 +192,9 @@ def _check_wide_integers(module, top_func_name: str) -> None:
                     if width is None or _wide_op_is_exact(operation):
                         continue
                     reason = _WIDE_REASONS.get(
-                        operation.name, "the operation is not proven to depend only "
-                        "on the low 64 bits"
+                        operation.name,
+                        "the operation is not proven to depend only "
+                        "on the low 64 bits",
                     )
                     raise WideIntegerError(
                         f"portable C cannot lower {operation.name} on a {width}-bit "

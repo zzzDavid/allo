@@ -31,7 +31,9 @@ import time
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--family", choices=("gemv", "attention"))
-    parser.add_argument("--every", type=int, default=1, help="check every N-th instance")
+    parser.add_argument(
+        "--every", type=int, default=1, help="check every N-th instance"
+    )
     parser.add_argument("--out", help="write the per-instance records as JSON")
     args = parser.parse_args(argv)
 

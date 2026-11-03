@@ -62,7 +62,9 @@ def _assert_broadcast_friendly_structure(compiled):
 @pytest.mark.parametrize("plan", sorted(PLANS))
 def test_vector_gemm_apu_v1(plan, apu_v1_device_gate):
     row = _GOLDEN.golden_row(PLANS[plan])
-    compiled = allo.compile(vector_gemm, build_apu_v1_target(), apu_v1_cost, layout=plan)
+    compiled = allo.compile(
+        vector_gemm, build_apu_v1_target(), apu_v1_cost, layout=plan
+    )
     assert compiled.selected_plan.name == plan
     if plan == "temporal_dma_coalescing_broadcast_friendly":
         _assert_broadcast_friendly_structure(compiled)

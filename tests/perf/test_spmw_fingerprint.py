@@ -19,7 +19,7 @@ PAYLOADS = (
     1.5,
     {"b": [1, 2.25, {"z": "y", "a": None}], "a": True, "nested": {"k": [False, -0.5]}},
     [[1, [2, [3, {"deep": "value"}]]], "x", 3.0e-12],
-    {"unicode": "café λ", "escaped": "quote\" backslash\\"},
+    {"unicode": "café λ", "escaped": 'quote" backslash\\'},
 )
 
 
@@ -47,8 +47,9 @@ def _matcher_inline(value):
 def _cost_inline(value):
     # perf/cost._canonical_json, then .encode()
     return hashlib.sha256(
-        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-        .encode()
+        json.dumps(
+            value, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ).encode()
     ).hexdigest()
 
 

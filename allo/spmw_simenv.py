@@ -264,7 +264,9 @@ def sdk_build_manifest_sha256(root: Path) -> str:
     """Recompute the pinned SDK object manifest hash for a uPIMulator root."""
     build = Path(root) / "sdk" / "build"
     objects = sorted(
-        path.relative_to(build).as_posix() for path in build.rglob("*.o") if path.is_file()
+        path.relative_to(build).as_posix()
+        for path in build.rglob("*.o")
+        if path.is_file()
     )
     text = "".join(
         f"{hashlib.sha256((build / rel).read_bytes()).hexdigest()}  ./{rel}\n"
@@ -537,8 +539,7 @@ def apu_v1_unavailable_reason() -> str | None:
     arc_base = apu_v1_toolchain_base()
     if not arc_base.exists():
         return (
-            f"ARC toolchain missing at {arc_base} "
-            "(set TENON_APU_V1_TOOLCHAIN_BASE)"
+            f"ARC toolchain missing at {arc_base} " "(set TENON_APU_V1_TOOLCHAIN_BASE)"
         )
     template = apu_v1_template_dir()
     if not template.exists():

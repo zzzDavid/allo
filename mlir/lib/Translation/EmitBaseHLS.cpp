@@ -50,8 +50,8 @@ void ModuleEmitterBase::emitPopcount(Operation *op, unsigned bitwidth) {
   os << ")";
   unsigned storageWidth = narrow ? 32 : 64;
   if (bitwidth < storageWidth)
-    os << " & ((1" << (narrow ? "u" : "ull") << " << " << bitwidth
-       << ") - 1" << (narrow ? "u" : "ull") << ")";
+    os << " & ((1" << (narrow ? "u" : "ull") << " << " << bitwidth << ") - 1"
+       << (narrow ? "u" : "ull") << ")";
   os << ");";
   emitInfoAndNewLine(op);
   emitNestedLoopTail(rank);

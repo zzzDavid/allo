@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # AiM and UPMEM LinearLayout integration
 
 This note records where the F2 `LinearLayout` is now load-bearing for the AiM

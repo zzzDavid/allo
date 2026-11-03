@@ -769,7 +769,9 @@ def matrix_vector_rows_per_tasklet(rows: int, tasklets: int) -> int:
     return max(2, _tasklet_block(rows, tasklets))
 
 
-def private_batch_output_bytes(rows_per_batch: int, output_element_bytes: int = 4) -> int:
+def private_batch_output_bytes(
+    rows_per_batch: int, output_element_bytes: int = 4
+) -> int:
     """Bytes of one batch's output DMA in the tasklet-private MV template:
     the batch rows, rounded up to the 8-byte DMA granule."""
 
@@ -1519,7 +1521,10 @@ def _problem_summary(problem: UPMEMPhysicalProblem) -> dict[str, object]:
         UPMEMKernelKind.MATRIX_VECTOR: ("batches", "rows", "reduction"),
         UPMEMKernelKind.GEMM: ("rows", "columns", "reduction"),
     }[problem.kind]
-    return {"kind": problem.kind.value, **{name: getattr(problem, name) for name in fields}}
+    return {
+        "kind": problem.kind.value,
+        **{name: getattr(problem, name) for name in fields},
+    }
 
 
 def calibration_validity(
@@ -1553,7 +1558,9 @@ def calibration_validity(
         rank = (-shared, distance, row.evidence_id)
         if best is None or rank < best:
             best, nearest = rank, row
-    exact = estimate.calibration_status == "calibrated_exact_problem_and_decision_stratum"
+    exact = (
+        estimate.calibration_status == "calibrated_exact_problem_and_decision_stratum"
+    )
     return {
         "cost_validity": "calibrated" if exact else "extrapolated",
         "calibration_status": estimate.calibration_status,
@@ -1561,22 +1568,26 @@ def calibration_validity(
         "basis": (
             "uPIMulator anchors of the same problem and decision stratum"
             if exact
-            else "analytical model scaled by the stratum's mean anchor ratio"
-            if estimate.calibration_evidence_ids
-            else "raw analytical model (no anchor in this stratum, factor 1.0)"
+            else (
+                "analytical model scaled by the stratum's mean anchor ratio"
+                if estimate.calibration_evidence_ids
+                else "raw analytical model (no anchor in this stratum, factor 1.0)"
+            )
         ),
-        "nearest_calibrated_point": None
-        if nearest is None
-        else {
-            "evidence_id": nearest.evidence_id,
-            "problem": _problem_summary(nearest.problem),
-            "decision": {
-                "layout": nearest.decision.layout.value,
-                "dma_bytes": nearest.decision.dma_bytes,
-                "chunk_elements": nearest.decision.chunk_elements,
-            },
-            "logic_cycles": nearest.logic_cycles,
-        },
+        "nearest_calibrated_point": (
+            None
+            if nearest is None
+            else {
+                "evidence_id": nearest.evidence_id,
+                "problem": _problem_summary(nearest.problem),
+                "decision": {
+                    "layout": nearest.decision.layout.value,
+                    "dma_bytes": nearest.decision.dma_bytes,
+                    "chunk_elements": nearest.decision.chunk_elements,
+                },
+                "logic_cycles": nearest.logic_cycles,
+            }
+        ),
     }
 
 

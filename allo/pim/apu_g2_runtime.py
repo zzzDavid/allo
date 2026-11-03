@@ -136,6 +136,7 @@ def apu_g2_cmake_arguments() -> list[str]:
         f"-DTENON_APU_G2_DEVICE_INDEX={apu_g2_device_index()}",
     ]
 
+
 _TICK_FIELDS = {
     "input_copy": "device_input_copy_ticks",
     "add": "device_add_ticks",
@@ -222,7 +223,9 @@ def freeze_apu_g2_runtime_artifact(
     build_json = _canonical_json(dict(build_manifest))
     abi_json = _canonical_json(dict(abi_manifest))
     modes_json = _canonical_json(modes)
-    inventory = [(f"project/{relative}", bytes_digest(data)) for relative, data in files]
+    inventory = [
+        (f"project/{relative}", bytes_digest(data)) for relative, data in files
+    ]
     inventory.extend(
         (
             ("contract/build.json", bytes_digest(build_json.encode("ascii"))),

@@ -1,3 +1,5 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Canonical-JSON content digests shared by the SPMW/PIM compiler.
 
 These are identities and cache keys: they are recorded or compared as

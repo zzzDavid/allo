@@ -147,28 +147,61 @@ def test_autoscheduler_and_virtual_backend_share_cost_program(monkeypatch):
 
 
 def _gemv_program(rows, reduction):
-    from allo.spmw_samsung import SamsungContraction, SamsungProgram, samsung_target_facts
+    from allo.spmw_samsung import (
+        SamsungContraction,
+        SamsungProgram,
+        samsung_target_facts,
+    )
 
     facts = samsung_target_facts(build_samsung_target())
     tiles = -(-reduction // (facts.grf_a_entries * facts.lanes))
     contraction = SamsungContraction(
-        matrix_memref="W", vector_memref="x", acc_memref="acc", matrix_role="x",
-        vector_role="y", reduction_var="k", row_var="i", column_var=None,
-        K=reduction, rows_per_item=rows, N=1, matrix_shape=(rows, reduction),
-        vector_shape=(reduction,), matrix_k_axis=1, vector_k_axis=0, row_offset=0,
+        matrix_memref="W",
+        vector_memref="x",
+        acc_memref="acc",
+        matrix_role="x",
+        vector_role="y",
+        reduction_var="k",
+        row_var="i",
+        column_var=None,
+        K=reduction,
+        rows_per_item=rows,
+        N=1,
+        matrix_shape=(rows, reduction),
+        vector_shape=(reduction,),
+        matrix_k_axis=1,
+        vector_k_axis=0,
+        row_offset=0,
         output_memref="y",
     )
     return SamsungProgram(
-        kind="REDUCE", group_id=0, start=0, end=0,
+        kind="REDUCE",
+        group_id=0,
+        start=0,
+        end=0,
         binds=((0, "matrix", 0, -1, 0), (2, "drain", 1, -1, 0)),
-        facts=facts, crf_issue="shared", work_items=1, contraction=contraction,
-        rows=rows, k_tiles=tiles, tile_fiber=(0,) * tiles,
+        facts=facts,
+        crf_issue="shared",
+        work_items=1,
+        contraction=contraction,
+        rows=rows,
+        k_tiles=tiles,
+        tile_fiber=(0,) * tiles,
         rows_per_block=facts.grf_b_entries,
     )
 
 
-GEOMETRY = {"channels": 64, "pim_blocks": 8, "grf_a": 8, "grf_b": 8, "lanes": 16,
-            "crf_words": 32, "banks": 16, "cols_per_row": 32, "rows": 16384}
+GEOMETRY = {
+    "channels": 64,
+    "pim_blocks": 8,
+    "grf_a": 8,
+    "grf_b": 8,
+    "lanes": 16,
+    "crf_words": 32,
+    "banks": 16,
+    "cols_per_row": 32,
+    "rows": 16384,
+}
 
 
 def test_reduce_plan_pads_rows_to_whole_passes_and_k_to_tiles():
@@ -194,8 +227,13 @@ def test_reduce_run_zero_pads_into_physical_slots(monkeypatch, tmp_path):
     monkeypatch.setattr(spmw_samsung, "_invoke_conductor", fake_conductor)
     program = _gemv_program(1024, 1408)
     result = spmw_samsung._samsung_run_reduce(
-        None, program, [PIMCmd(type_="EXIT")], tmp_path, GEOMETRY,
-        np.ones((1024, 1408), dtype=np.float16), np.ones((1, 1408), dtype=np.float16),
+        None,
+        program,
+        [PIMCmd(type_="EXIT")],
+        tmp_path,
+        GEOMETRY,
+        np.ones((1024, 1408), dtype=np.float16),
+        np.ones((1, 1408), dtype=np.float16),
     )
 
     assert result["cycles"] == 17

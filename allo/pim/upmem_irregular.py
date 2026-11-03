@@ -855,10 +855,14 @@ class SelectionPredicate:
             literal = getattr(self, name)
             if literal is None and name == "mask":
                 continue
-            if isinstance(literal, bool) or not isinstance(literal, int) or not (
-                -(1 << 31) <= literal < (1 << 32)
+            if (
+                isinstance(literal, bool)
+                or not isinstance(literal, int)
+                or not (-(1 << 31) <= literal < (1 << 32))
             ):
-                raise ValueError(f"selection {name} {literal!r} is not a 32-bit literal")
+                raise ValueError(
+                    f"selection {name} {literal!r} is not a 32-bit literal"
+                )
 
     @staticmethod
     def _as(value: int, unsigned: bool) -> int:
@@ -914,7 +918,9 @@ class UPMEMSelectionFlagsPlan(_UPMEMIrregularPlan):
         object.__setattr__(self, "elements", _positive_int(self.elements, "elements"))
         object.__setattr__(self, "num_tasklets", _validate_tasklets(self.num_tasklets))
         object.__setattr__(self, "dma_elements", _validate_dma_words(self.dma_elements))
-        if self.predicate != "odd" and not isinstance(self.predicate, SelectionPredicate):
+        if self.predicate != "odd" and not isinstance(
+            self.predicate, SelectionPredicate
+        ):
             raise ValueError(
                 "the selection-flags plan supports predicate='odd' or a "
                 "SelectionPredicate ((x & mask) cmp value)"
@@ -1047,9 +1053,7 @@ class UPMEMSelectionFlagsPlan(_UPMEMIrregularPlan):
         n, nt = self.elements, self.num_tasklets
         dma, local = self.dma_elements, self.local_elements
         if self.encoding == "mask":
-            body = (
-                f"      buffer[i] = ({self.predicate.c_condition('buffer[i]')}) ? 1 : 0;"
-            )
+            body = f"      buffer[i] = ({self.predicate.c_condition('buffer[i]')}) ? 1 : 0;"
             title = "selection-predicate mask"
         else:
             body = """      if ((buffer[i] & 1) == 0)

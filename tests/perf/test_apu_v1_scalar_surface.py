@@ -54,7 +54,16 @@ def helper(tmp_path_factory):
     )
     library = root / "helper.so"
     subprocess.run(
-        [compiler, "-O2", "-fno-builtin", "-shared", "-fPIC", str(source), "-o", str(library)],
+        [
+            compiler,
+            "-O2",
+            "-fno-builtin",
+            "-shared",
+            "-fPIC",
+            str(source),
+            "-o",
+            str(library),
+        ],
         check=True,
     )
     lib = ctypes.CDLL(str(library))

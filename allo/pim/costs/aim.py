@@ -156,7 +156,9 @@ def _contraction_profile_cycles(candidate, geometry):
             operation, geometry, _sbk_banks(candidate, geometry)
         )
     except ValueError as error:
-        raise InfeasibleSchedule(f"AiM contraction is not realizable: {error}") from error
+        raise InfeasibleSchedule(
+            f"AiM contraction is not realizable: {error}"
+        ) from error
     counts = profile["counts"]
     mac_lines = profile["mac_lines"]
     mac_cycles = (profile["mac_columns"] - mac_lines) * N_CCD + mac_lines * CMD_MAC
@@ -182,7 +184,9 @@ def host_reduction_cycles(record, geometry):
     them and writes the merged entry back: (P + 1) entries cross the link per
     merged vector, plus one host add per partial beyond the first.
     """
-    vectors = _ceil_div(record.outputs, geometry.lanes) * record.batches * record.replicas
+    vectors = (
+        _ceil_div(record.outputs, geometry.lanes) * record.batches * record.replicas
+    )
     entry_bytes = geometry.vector_bits // 8
     link_bytes = vectors * (record.partitions + 1) * entry_bytes
     return (
@@ -214,7 +218,9 @@ def _ewmul_profile_cycles(elements, partitions, geometry):
     span = _ceil_div(max(1, elements), partitions * geometry.bank_groups)
     cycles = 0
     for row_start in range(0, span, geometry.row_elements):
-        columns = _ceil_div(min(geometry.row_elements, span - row_start), geometry.lanes)
+        columns = _ceil_div(
+            min(geometry.row_elements, span - row_start), geometry.lanes
+        )
         cycles += N_RCD_EWMUL + (columns - 1) * N_CCD + CMD_EWMUL
     return cycles
 
@@ -317,7 +323,9 @@ def aim_cost(target):
                 "(the work grid codegen lowers); use the AiM enumerator"
             )
         if any(int(value) != 0 for value in event.work_id):
-            ctx.step(cycles=0, occupy=[ctx.use(event.primitive)], name="ewadd_in_kernel")
+            ctx.step(
+                cycles=0, occupy=[ctx.use(event.primitive)], name="ewadd_in_kernel"
+            )
             return
         per_item = grid.get("elements_per_item")
         elements = _metric(event, "iterations") if per_item is None else int(per_item)

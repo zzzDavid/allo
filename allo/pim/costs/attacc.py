@@ -121,7 +121,9 @@ def attention_cycles(counts, lanes: int, timing: AttAccTiming = HBM3_5_2GBPS) ->
     return (mac_q * timing.n_ccdab + data_bus) / ch
 
 
-def attacc_kernel_cycles(program: AttAccProgram, timing: AttAccTiming = HBM3_5_2GBPS) -> float:
+def attacc_kernel_cycles(
+    program: AttAccProgram, timing: AttAccTiming = HBM3_5_2GBPS
+) -> float:
     """Closed-form cycles of one kernel program (the selection cost)."""
     if program.kernel.kind == "gemv":
         return gemv_cycles(program.counts, timing)
@@ -154,7 +156,11 @@ def attacc_cost_program(timing: AttAccTiming = HBM3_5_2GBPS, *, name=None):
         def record(event, ctx, kind, label):
             program = _candidate_program(event, geometry)
             if program.kernel.kind != kind:
-                ctx.step(cycles=0, occupy=[ctx.use(event.primitive)], name=f"{label}_in_record")
+                ctx.step(
+                    cycles=0,
+                    occupy=[ctx.use(event.primitive)],
+                    name=f"{label}_in_record",
+                )
                 return
             # Integer cycle unit of the cost engine (module docstring).
             latency = int(attacc_kernel_cycles(program, timing))
@@ -177,7 +183,11 @@ def attacc_cost_program(timing: AttAccTiming = HBM3_5_2GBPS, *, name=None):
 
         def in_record(label):
             def priced_inside(event, ctx):
-                ctx.step(cycles=0, occupy=[ctx.use(event.primitive)], name=f"{label}_in_record")
+                ctx.step(
+                    cycles=0,
+                    occupy=[ctx.use(event.primitive)],
+                    name=f"{label}_in_record",
+                )
 
             return priced_inside
 

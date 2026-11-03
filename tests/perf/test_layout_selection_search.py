@@ -246,7 +246,7 @@ def _vector_coords(x_map, indices):
         return coordinate_forms(*indices)
     if "floordiv" in x_map:
         return (None,)
-    return (tuple(sorted((name, 1) for name in indices)), 0),
+    return ((tuple(sorted((name, 1) for name in indices)), 0),)
 
 
 def _gemv_group(
@@ -285,7 +285,13 @@ def _gemv_group(
                     coords=coordinate_forms("%20", kk),
                 )
                 acc = OperandBinding(
-                    "acc", "acc", [], True, "memref<f16>", None, "affine_map<() -> ()>",
+                    "acc",
+                    "acc",
+                    [],
+                    True,
+                    "memref<f16>",
+                    None,
+                    "affine_map<() -> ()>",
                     coords=(),
                 )
                 extra_sink = {
@@ -462,9 +468,11 @@ def test_bounded_problems_use_algorithm_1():
     # the strict default these are all the minimum ties.
     realizable = [t for t in movement.ties if t.realizable]
     assert realizable
-    assert all(t.realizable_reason is None for t in realizable) if hasattr(
-        realizable[0], "realizable_reason"
-    ) else True
+    assert (
+        all(t.realizable_reason is None for t in realizable)
+        if hasattr(realizable[0], "realizable_reason")
+        else True
+    )
 
 
 def test_tiny_budget_marks_the_analysis_incomplete():

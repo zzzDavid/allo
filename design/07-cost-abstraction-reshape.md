@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Design 07 — Cost-abstraction reshape: phase timeline, placed-trace context, knob-cost seam, provenance policy
 
 Phase-0 architect spec for `autosched-cost-model-fidelity` (task file

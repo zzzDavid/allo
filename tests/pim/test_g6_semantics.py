@@ -530,7 +530,9 @@ def test_upmem_call_aliases_read_pre_call_values():
     a0 = rng.integers(I32_MIN, I32_MAX, size=UN, dtype=np.int64).astype(np.int32)
     a = a0.copy()
     _upmem(upmem_add)(a, a, a)
-    np.testing.assert_array_equal(a, (2 * a0.astype(np.int64)).astype(np.uint32).astype(np.int32))
+    np.testing.assert_array_equal(
+        a, (2 * a0.astype(np.int64)).astype(np.uint32).astype(np.int32)
+    )
 
     m0 = rng.integers(-20, 20, size=(UG, UG), dtype=np.int32)
     m = m0.copy()
@@ -575,7 +577,9 @@ def test_apu_v1_device_route_stages_aliases_and_zero_fills(monkeypatch):
     seen = []
 
     def record(compiled, arrays):
-        seen.append({name: np.array(value, copy=True) for name, value in arrays.items()})
+        seen.append(
+            {name: np.array(value, copy=True) for name, value in arrays.items()}
+        )
         seen[-1]["_shares"] = {
             name: np.shares_memory(value, arrays[compiled.analysis.output.value])
             for name, value in arrays.items()
@@ -700,7 +704,9 @@ def test_apu_v1_uint16_contraction_wraps_at_the_extremes():
     top = (1 << 16) - 1
     L = rng.integers(0, 1 << 16, size=(UH_M, UH_K), dtype=np.int64).astype(np.uint16)
     R = rng.integers(0, 1 << 16, size=(UH_K, UH_N), dtype=np.int64).astype(np.uint16)
-    C0 = rng.integers(top - 16, top + 1, size=(UH_M, UH_N), dtype=np.int64).astype(np.uint16)
+    C0 = rng.integers(top - 16, top + 1, size=(UH_M, UH_N), dtype=np.int64).astype(
+        np.uint16
+    )
     L[0, :] = top
     R[:, 0] = top
     C = C0.copy()
@@ -724,7 +730,9 @@ def test_apu_g2_int4_gemm_reaches_both_ends_of_the_exact_range(emulated_card):
 
 
 def test_apu_g2_dot_wider_than_its_accumulator_is_rejected():
-    with pytest.raises(APUG2SourceRouteError, match="narrower than the exact int17 sum"):
+    with pytest.raises(
+        APUG2SourceRouteError, match="narrower than the exact int17 sum"
+    ):
         _g2(g2_dot_i8_k2)
 
 
@@ -743,7 +751,9 @@ def test_apu_v1_fp16_carried_output_follows_the_source_order():
     C = C0.copy()
     result = compiled(L, R, C)
     assert result.extra["numerics"] == "source order"
-    want = _fp16_source_order(C0, (L[:, d : d + 1] * R[d : d + 1, :] for d in range(ZK)))
+    want = _fp16_source_order(
+        C0, (L[:, d : d + 1] * R[d : d + 1, :] for d in range(ZK))
+    )
     np.testing.assert_array_equal(C.view(np.uint16), want.view(np.uint16))
     from_zero = _fp16_source_order(
         np.zeros_like(C0), (L[:, d : d + 1] * R[d : d + 1, :] for d in range(ZK))
@@ -761,7 +771,9 @@ def test_aim_sbk_and_abk_simulate_in_cost_order(aim_sim_gate):
 
     target = build_aim_target()
     ranked = allo.compile(aim_gemv, target, aim_cost, backend="virtual", **REASSOCIATE)
-    sbk_layout, abk_layout = _aim_layout_candidates(target, ranked.compiled.trace.matches)
+    sbk_layout, abk_layout = _aim_layout_candidates(
+        target, ranked.compiled.trace.matches
+    )
     rng = np.random.default_rng(631)
     operands = (
         (rng.standard_normal((AIM_N, AIM_N)) * 0.1).astype(np.float32),
@@ -770,11 +782,18 @@ def test_aim_sbk_and_abk_simulate_in_cost_order(aim_sim_gate):
     )
     runs = {}
     for name, layout in (("sbk", sbk_layout), ("abk", abk_layout)):
-        compiled = allo.compile(aim_gemv, target, aim_cost, layout=layout, **REASSOCIATE)
+        compiled = allo.compile(
+            aim_gemv, target, aim_cost, layout=layout, **REASSOCIATE
+        )
         result = compiled(*operands)
         assert result.kind == "simulator-timing-only" and result.outputs == {}
         runs[name] = (int(compiled.estimate().cycles), int(result.cycles))
-        _record("aim_bank_scope", layout=name, estimate=runs[name][0], simulated=runs[name][1])
+        _record(
+            "aim_bank_scope",
+            layout=name,
+            estimate=runs[name][0],
+            simulated=runs[name][1],
+        )
     assert runs["sbk"][0] > runs["abk"][0]
     assert runs["sbk"][1] > runs["abk"][1]
 
@@ -800,13 +819,21 @@ def test_upmem_two_pointwise_decisions_execute_identically():
     runs = {}
     for key in (("fused_replicated", 256), ("separate", 64)):
         compiled = allo.compile(region, target, upmem_cost, layout=decisions[key])
-        (segment,) = [s for s in compiled.compiled.layout_ctx.segments if s.kind == "dpu"]
+        (segment,) = [
+            s for s in compiled.compiled.layout_ctx.segments if s.kind == "dpu"
+        ]
         C = np.full(n, -7, np.int32)
         result = compiled(A, B, C)
         np.testing.assert_array_equal(C, want)
         source = hashlib.sha256(segment.plan.device_source().encode()).hexdigest()
         runs[key] = (int(compiled.estimate().cycles), int(result.cycles), source)
-        _record("upmem_pointwise", decision=list(key), estimate=runs[key][0], simulated=runs[key][1], device_source_sha256=source)
+        _record(
+            "upmem_pointwise",
+            decision=list(key),
+            estimate=runs[key][0],
+            simulated=runs[key][1],
+            device_source_sha256=source,
+        )
     fused, separate = runs[("fused_replicated", 256)], runs[("separate", 64)]
     assert fused[2] != separate[2]
     assert fused[1] != separate[1]
@@ -906,7 +933,9 @@ def _halving_tree_fp16(products, group):
     return out
 
 
-@pytest.mark.parametrize("M, K, seed", [(512, 256, 651), (384, 200, 652)], ids=["full_group", "padded_group"])
+@pytest.mark.parametrize(
+    "M, K, seed", [(512, 256, 651), (384, 200, 652)], ids=["full_group", "padded_group"]
+)
 def test_apu_v1_strict_and_reassociative_gemv(M, K, seed):
     def gemv(W: float16[M, K], x: float16[K], y: float16[M]):
         for i in allo.grid(M):
@@ -917,7 +946,9 @@ def test_apu_v1_strict_and_reassociative_gemv(M, K, seed):
     W = (rng.standard_normal((M, K)) * 0.2).astype(np.float16)
     x = (rng.standard_normal(K) * 0.2).astype(np.float16)
     exact = _f32(W) @ _f32(x)
-    source = _fp16_source_order(np.zeros(M, np.float16), (W[:, k] * x[k] for k in range(K)))
+    source = _fp16_source_order(
+        np.zeros(M, np.float16), (W[:, k] * x[k] for k in range(K))
+    )
 
     strict = _apu_v1(gemv)
     assert not apu_v1_plan_regroups(strict.selected_plan)
@@ -934,11 +965,20 @@ def test_apu_v1_strict_and_reassociative_gemv(M, K, seed):
     y = np.zeros(M, np.float16)
     result = relaxed(W, x, y)
     assert result.extra["plan_regroups_reduction"] is True
-    np.testing.assert_array_equal(y.view(np.uint16), _halving_tree_fp16(W * x, group).view(np.uint16))
+    np.testing.assert_array_equal(
+        y.view(np.uint16), _halving_tree_fp16(W * x, group).view(np.uint16)
+    )
     differing = int(np.count_nonzero(y.view(np.uint16) != source.view(np.uint16)))
     assert differing > M // 2
     np.testing.assert_allclose(_f32(y), exact, rtol=1e-2, atol=1e-2)
-    _record("apu_v1_reduction_order", M=M, K=K, plan=plan.name, group=group, rows_differing_from_source_order=differing)
+    _record(
+        "apu_v1_reduction_order",
+        M=M,
+        K=K,
+        plan=plan.name,
+        group=group,
+        rows_differing_from_source_order=differing,
+    )
 
 
 def test_apu_v1_odd_gemm_shape_follows_the_source_order():
@@ -954,11 +994,15 @@ def test_apu_v1_odd_gemm_shape_follows_the_source_order():
     assert compiled.realization is not None, compiled.realization_error
     C = np.zeros((37, 23), np.float16)
     compiled(L, R, C)
-    want = _fp16_source_order(np.zeros((37, 23)), (L[:, d : d + 1] * R[d : d + 1, :] for d in range(19)))
+    want = _fp16_source_order(
+        np.zeros((37, 23)), (L[:, d : d + 1] * R[d : d + 1, :] for d in range(19))
+    )
     np.testing.assert_array_equal(C.view(np.uint16), want.view(np.uint16))
 
 
-def test_apu_g2_garbage_outside_the_layout_is_refused_before_launch(monkeypatch, emulated_card):
+def test_apu_g2_garbage_outside_the_layout_is_refused_before_launch(
+    monkeypatch, emulated_card
+):
     import allo.pim.apu_g2_composed_runtime as runtime
     from allo.pim.apu_g2_composed_layout import apu_g2_composed_layout_image
 

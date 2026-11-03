@@ -60,7 +60,9 @@ from allo.pim.targets import (
 )
 
 REPO = Path(__file__).resolve().parents[2]
-SAMSUNG_GEMV_FILE = Path(__file__).resolve().parent / "samsung_hbm_pim" / "gemv" / "workload.py"
+SAMSUNG_GEMV_FILE = (
+    Path(__file__).resolve().parent / "samsung_hbm_pim" / "gemv" / "workload.py"
+)
 REASSOCIATE = {"reduction_order": "reassociate"}
 
 
@@ -180,7 +182,9 @@ def _samsung_decision(compiled):
     ranking = compiled.placement_ranking
     # A layout= compile is not ranked.
     (kernel,) = ranking.kernels if ranking is not None else (None,)
-    layouts = sorted({str(getattr(p, "layout", None)) for p in compiled.compiled.layout})
+    layouts = sorted(
+        {str(getattr(p, "layout", None)) for p in compiled.compiled.layout}
+    )
     return {
         "kind": program.kind,
         "lever": lever,
@@ -312,7 +316,9 @@ SAMSUNG_NO_FIBER_TERM = _rebound_cost(
 )
 
 
-def test_samsung_host_fill_cost_flip_reaches_execution(samsung_sim_gate, record_property):
+def test_samsung_host_fill_cost_flip_reaches_execution(
+    samsung_sim_gate, record_property
+):
     """Stock and perturbed cost programs select different placements; both
     execute correctly; a fixed layout compiles to the same program under both.
 
@@ -335,7 +341,10 @@ def test_samsung_host_fill_cost_flip_reaches_execution(samsung_sim_gate, record_
     assert _samsung_placement(moved) == ("bank_row", {"crf"})
     stock_decision, moved_decision = _samsung_decision(stock), _samsung_decision(moved)
     assert stock_decision["crf"] != moved_decision["crf"]
-    assert moved_decision["opcodes"]["FILL"] == stock_decision["opcodes"].get("FILL", 0) + 2
+    assert (
+        moved_decision["opcodes"]["FILL"]
+        == stock_decision["opcodes"].get("FILL", 0) + 2
+    )
     # Legality does not read the cost: the same candidates are scored, and a
     # candidate probed under both programs is rejected for the same reason
     # (code generation is lazy, in cost order, so the probed sets differ).
@@ -356,7 +365,9 @@ def test_samsung_host_fill_cost_flip_reaches_execution(samsung_sim_gate, record_
     # moves (the vendor placement fills GRF_A from the host).
     vendor = spmw_samsung.samsung_vendor_gemv_layout(target, stock.trace)
     pinned = {
-        name: allo.compile(workload, target, spec, layout=vendor, backend="virtual", **REASSOCIATE)
+        name: allo.compile(
+            workload, target, spec, layout=vendor, backend="virtual", **REASSOCIATE
+        )
         for name, spec in (("stock", samsung_cost), ("moved", SAMSUNG_HOST_BUS_X8))
     }
     pinned_decisions = {name: _samsung_decision(c) for name, c in pinned.items()}
@@ -367,13 +378,25 @@ def test_samsung_host_fill_cost_flip_reaches_execution(samsung_sim_gate, record_
     # Each cost program prices its own pick below the other's.
     cross = {
         "stock_pick_under_moved": allo.compile(
-            workload, target, SAMSUNG_HOST_BUS_X8,
-            layout=list(stock.compiled.layout), backend="virtual", **REASSOCIATE,
-        ).estimate().cycles,
+            workload,
+            target,
+            SAMSUNG_HOST_BUS_X8,
+            layout=list(stock.compiled.layout),
+            backend="virtual",
+            **REASSOCIATE,
+        )
+        .estimate()
+        .cycles,
         "moved_pick_under_stock": allo.compile(
-            workload, target, samsung_cost,
-            layout=list(moved.compiled.layout), backend="virtual", **REASSOCIATE,
-        ).estimate().cycles,
+            workload,
+            target,
+            samsung_cost,
+            layout=list(moved.compiled.layout),
+            backend="virtual",
+            **REASSOCIATE,
+        )
+        .estimate()
+        .cycles,
     }
     assert stock.estimate().cycles < cross["moved_pick_under_stock"]
     # The CRF-filled program issues no host broadcast: its estimate does not
@@ -419,18 +442,24 @@ def test_samsung_fiber_term_removal_keeps_bank_row_by_construction():
     tile per work item at K=256)."""
     workload, _M, _K = _samsung_paper_gemv()
     target = build_samsung_target()
-    stock = allo.compile(workload, target, samsung_cost, backend="virtual", **REASSOCIATE)
+    stock = allo.compile(
+        workload, target, samsung_cost, backend="virtual", **REASSOCIATE
+    )
     moved = allo.compile(
         workload, target, SAMSUNG_NO_FIBER_TERM, backend="virtual", **REASSOCIATE
     )
-    assert _samsung_placement(stock) == _samsung_placement(moved) == ("bank_row", {"host"})
+    assert (
+        _samsung_placement(stock) == _samsung_placement(moved) == ("bank_row", {"host"})
+    )
     assert stock.estimate().cycles == moved.estimate().cycles
 
     vendor = spmw_samsung.samsung_vendor_gemv_layout(target, stock.trace)
     estimates = {
         spec.name: allo.compile(
             workload, target, spec, layout=vendor, backend="virtual", **REASSOCIATE
-        ).estimate().cycles
+        )
+        .estimate()
+        .cycles
         for spec in (samsung_cost, SAMSUNG_NO_FIBER_TERM)
     }
     assert (
@@ -453,13 +482,17 @@ def test_samsung_host_burst_cost_shows_the_documented_list_scheduling_anomaly():
     of the last unit's fill)."""
     workload, _M, _K = _samsung_paper_gemv()
     target = build_samsung_target()
-    stock = allo.compile(workload, target, samsung_cost, backend="virtual", **REASSOCIATE)
+    stock = allo.compile(
+        workload, target, samsung_cost, backend="virtual", **REASSOCIATE
+    )
     layout = list(stock.compiled.layout)
     estimates = {
         b: allo.compile(
             workload,
             target,
-            _rebound_cost(samsung_cost, samsung_costs, f"samsung_burst_{b}", HOST_BURST_CYCLES=b),
+            _rebound_cost(
+                samsung_cost, samsung_costs, f"samsung_burst_{b}", HOST_BURST_CYCLES=b
+            ),
             layout=layout,
             backend="virtual",
             **REASSOCIATE,
@@ -469,7 +502,9 @@ def test_samsung_host_burst_cost_shows_the_documented_list_scheduling_anomaly():
 
     def fill_start(estimate, unit):
         (span,) = [
-            span for name, span in estimate.spans.items() if f":0.{unit}:pre:0:LD_A:" in name
+            span
+            for name, span in estimate.spans.items()
+            if f":0.{unit}:pre:0:LD_A:" in name
         ]
         return span.start_cycle
 
@@ -514,9 +549,11 @@ def test_upmem_calibration_flip_reaches_execution(monkeypatch, record_property):
     moved_pick = _placements(moved.compiled.layout)
     stock_pick_under_moved = pinned.estimate().cycles
     monkeypatch.undo()
-    moved_pick_under_stock = allo.compile(
-        upmem_va, target, upmem_cost, layout=moved_pick, backend="virtual"
-    ).estimate().cycles
+    moved_pick_under_stock = (
+        allo.compile(upmem_va, target, upmem_cost, layout=moved_pick, backend="virtual")
+        .estimate()
+        .cycles
+    )
 
     stock_decision, moved_decision = _upmem_decision(stock), _upmem_decision(moved)
     assert stock_decision["modes"] != moved_decision["modes"]
@@ -546,8 +583,16 @@ def test_upmem_calibration_flip_reaches_execution(monkeypatch, record_property):
     record_property(
         "upmem_cost_flip",
         {
-            "stock": (stock_decision["modes"], stock.estimate().cycles, cycles["stock"]),
-            "moved": (moved_decision["modes"], moved.estimate().cycles, cycles["moved"]),
+            "stock": (
+                stock_decision["modes"],
+                stock.estimate().cycles,
+                cycles["stock"],
+            ),
+            "moved": (
+                moved_decision["modes"],
+                moved.estimate().cycles,
+                cycles["moved"],
+            ),
             "stock_pick_under_moved": stock_pick_under_moved,
             "moved_pick_under_stock": moved_pick_under_stock,
             "perturbed_matches_simulator": perturbed_matches_simulator,
@@ -563,7 +608,9 @@ def _apu_contraction(left: float16[4, 8], right: float16[8, 6], result: float16[
             result[row, column] += left[row, depth] * right[depth, column]
 
 
-def test_apu_v1_pio_cost_flip_reaches_functional_execution(monkeypatch, record_property):
+def test_apu_v1_pio_cost_flip_reaches_functional_execution(
+    monkeypatch, record_property
+):
     """PIO operand loads priced 20x: the plans that load operands by PIO
     (spatial reduction, SVP) lose to the DMA-coalescing plans; the DMA plans'
     estimates do not move (they issue no PIO load). Both selected plans run
@@ -574,14 +621,21 @@ def test_apu_v1_pio_cost_flip_reaches_functional_execution(monkeypatch, record_p
 
     def compile_(**kwargs):
         return allo.compile(
-            _apu_contraction, target, apu_v1_cost, backend="functional", **REASSOCIATE, **kwargs
+            _apu_contraction,
+            target,
+            apu_v1_cost,
+            backend="functional",
+            **REASSOCIATE,
+            **kwargs,
         )
 
     stock = compile_()
     stock_estimates = {e.plan.name: e.cycles for e in stock.candidate_estimates}
     stock_fingerprint = apu_v1_cost.bind(target).fingerprint
     monkeypatch.setattr(
-        apu_v1_costs, "MICRO_PIO_LOAD_PER_ELEMENT", 20 * apu_v1_costs.MICRO_PIO_LOAD_PER_ELEMENT
+        apu_v1_costs,
+        "MICRO_PIO_LOAD_PER_ELEMENT",
+        20 * apu_v1_costs.MICRO_PIO_LOAD_PER_ELEMENT,
     )
     assert apu_v1_cost.bind(target).fingerprint != stock_fingerprint
     moved = compile_()
@@ -590,7 +644,10 @@ def test_apu_v1_pio_cost_flip_reaches_functional_execution(monkeypatch, record_p
 
     assert stock.selected_plan.name == "baseline_spatial_reduction"
     assert moved.selected_plan.name.startswith("temporal_dma_coalescing")
-    for name in ("temporal_dma_coalescing", "temporal_dma_coalescing_broadcast_friendly"):
+    for name in (
+        "temporal_dma_coalescing",
+        "temporal_dma_coalescing_broadcast_friendly",
+    ):
         assert moved_estimates[name] == stock_estimates[name]
     for name in ("baseline_spatial_reduction", "temporal_svp"):
         assert moved_estimates[name] > stock_estimates[name]
@@ -608,7 +665,10 @@ def test_apu_v1_pio_cost_flip_reaches_functional_execution(monkeypatch, record_p
     for name, compiled in (("stock", stock), ("moved", moved)):
         result = np.zeros((4, 6), dtype=np.float16)
         run = compiled(left, right, result)
-        assert run.kind == "functional" and run.extra["plan"] == compiled.selected_plan.name
+        assert (
+            run.kind == "functional"
+            and run.extra["plan"] == compiled.selected_plan.name
+        )
         np.testing.assert_allclose(
             _f32(result), reference, rtol=1e-2, atol=1e-2, err_msg=f"{name} seed {seed}"
         )
@@ -680,12 +740,17 @@ def test_samsung_eight_channel_target(tmp_path, samsung_sim_gate, record_propert
     with pytest.raises(ValueError, match="outside 'pseudo_channel' extent 8"):
         allo.compile(paper, t8, samsung_cost, backend="virtual", **REASSOCIATE)
 
-    c8 = allo.compile(samsung_gemv_8x8, t8, samsung_cost, backend="virtual", **REASSOCIATE)
+    c8 = allo.compile(
+        samsung_gemv_8x8, t8, samsung_cost, backend="virtual", **REASSOCIATE
+    )
     c16 = allo.compile(paper, t16, samsung_cost, backend="virtual", **REASSOCIATE)
     d8, d16 = _samsung_decision(c8), _samsung_decision(c16)
     assert (d8["bucket_count"], d16["bucket_count"]) == (64, 128)
     assert (len(_graph_streams(c8)), len(_graph_streams(c16))) == (64, 128)
-    assert (_graph_channels(c8), _graph_channels(c16)) == (set(range(8)), set(range(16)))
+    assert (_graph_channels(c8), _graph_channels(c16)) == (
+        set(range(8)),
+        set(range(16)),
+    )
     (p8,), (p16,) = c8.compiled.layout_ctx.programs, c16.compiled.layout_ctx.programs
     assert (p8.facts.channels, p16.facts.channels) == (8, 16)
     assert (p8.work_items, p16.work_items) == (64, 128)
@@ -710,7 +775,11 @@ def test_samsung_eight_channel_target(tmp_path, samsung_sim_gate, record_propert
         y = np.zeros(M, dtype=np.float16)
         result = allo.compile(workload, target, samsung_cost, **REASSOCIATE)(W, x, y)
         np.testing.assert_allclose(
-            _f32(y), _f32(W) @ _f32(x), rtol=1e-2, atol=1e-2, err_msg=f"{name} seed {seed}"
+            _f32(y),
+            _f32(W) @ _f32(x),
+            rtol=1e-2,
+            atol=1e-2,
+            err_msg=f"{name} seed {seed}",
         )
         runs[name] = (result.cycles, result.extra["padded_shape"], result.extra["crf"])
     record_property("samsung_8ch_sim_cycles", {k: v[0] for k, v in runs.items()})
@@ -737,10 +806,16 @@ def test_upmem_thirty_two_dpu_target(tmp_path):
     assert t64.work_grid() == ([64, 24], 1536)
 
     with pytest.raises(ValueError, match="outside 'dpu' extent 32"):
-        allo.compile(uneven_gemv_region(391, 65, 64), t32, upmem_cost, backend="virtual")
+        allo.compile(
+            uneven_gemv_region(391, 65, 64), t32, upmem_cost, backend="virtual"
+        )
 
-    on32 = allo.compile(uneven_gemv_region(391, 65, 32), t32, upmem_cost, backend="virtual")
-    on64 = allo.compile(uneven_gemv_region(391, 65, 32), t64, upmem_cost, backend="virtual")
+    on32 = allo.compile(
+        uneven_gemv_region(391, 65, 32), t32, upmem_cost, backend="virtual"
+    )
+    on64 = allo.compile(
+        uneven_gemv_region(391, 65, 32), t64, upmem_cost, backend="virtual"
+    )
     (segment,) = _upmem_dpu_segments(on32)
     kernel = segment.kernel
     last = 391 - 31 * (391 // 32)
@@ -755,7 +830,7 @@ def test_upmem_thirty_two_dpu_target(tmp_path):
 # (a) Renames with normalized decisions
 # ===================================================================== #
 
-_RENAMED_SAMSUNG = '''
+_RENAMED_SAMSUNG = """
 import allo
 from allo.dataflow import region as zone
 from allo.ir.types import float16 as half
@@ -774,7 +849,7 @@ def projection_unit(weights: half[ROWS_TOTAL, DEPTH], probe: half[DEPTH], answer
             for t in range(DEPTH):
                 total += wt[base + r, t] * pv[t]
             out[base + r] = total
-'''
+"""
 
 
 @pytest.mark.parametrize("order", ["strict", "reassociate"])
@@ -797,7 +872,9 @@ def test_samsung_renamed_gemv_same_decision_and_cycles(
     }
     decisions = {name: _samsung_decision(c) for name, c in compiled.items()}
     assert decisions["renamed"] == decisions["original"]
-    assert compiled["renamed"].estimate().cycles == compiled["original"].estimate().cycles
+    assert (
+        compiled["renamed"].estimate().cycles == compiled["original"].estimate().cycles
+    )
 
     seed = _seed()
     rng = np.random.default_rng(seed)
@@ -808,16 +885,21 @@ def test_samsung_renamed_gemv_same_decision_and_cycles(
         y = np.zeros(M, dtype=np.float16)
         result = c(W, x, y)
         outputs[name], cycles[name] = y, result.cycles
-    record_property("samsung_rename_cycles", (order, decisions["original"]["kind"], cycles))
+    record_property(
+        "samsung_rename_cycles", (order, decisions["original"]["kind"], cycles)
+    )
     np.testing.assert_allclose(
-        _f32(outputs["original"]), _f32(W) @ _f32(x), rtol=1e-2, atol=1e-2,
+        _f32(outputs["original"]),
+        _f32(W) @ _f32(x),
+        rtol=1e-2,
+        atol=1e-2,
         err_msg=f"seed {seed}",
     )
     np.testing.assert_array_equal(outputs["renamed"], outputs["original"])
     assert cycles["renamed"] == cycles["original"]
 
 
-_RENAMED_UPMEM = '''
+_RENAMED_UPMEM = """
 import allo
 from allo.dataflow import region as zone
 from allo.ir.types import int32 as word
@@ -835,7 +917,7 @@ def banded_product(table: word[HEIGHT, WIDTH], weights: word[WIDTH], sums: word[
             sv[core * SHARE + r] = 0
             for c in range(WIDTH):
                 sv[core * SHARE + r] += tb[core * SHARE + r, c] * wv[c]
-'''
+"""
 
 
 def test_upmem_renamed_gemv_same_decision_and_cycles(tmp_path, record_property):
@@ -853,9 +935,10 @@ def test_upmem_renamed_gemv_same_decision_and_cycles(tmp_path, record_property):
     moved = allo.compile(renamed, target, upmem_cost)
     names = {"tb": "local_W", "wv": "local_x", "sv": "local_y", "per_core": "mv"}
     (segment,) = _upmem_dpu_segments(moved)
-    assert dict(segment.kernel.roles).keys() == dict(
-        _upmem_dpu_segments(original)[0].kernel.roles
-    ).keys()
+    assert (
+        dict(segment.kernel.roles).keys()
+        == dict(_upmem_dpu_segments(original)[0].kernel.roles).keys()
+    )
     assert _upmem_decision(moved, names) == _upmem_decision(original)
     assert moved.estimate().cycles == original.estimate().cycles
 
@@ -892,7 +975,9 @@ def ew_mad(a: float16[EW_N], b: float16[EW_N], d: float16[EW_N], c: float16[EW_N
 
 
 @_df_region()
-def ew_mad_swapped(a: float16[EW_N], b: float16[EW_N], d: float16[EW_N], c: float16[EW_N]):
+def ew_mad_swapped(
+    a: float16[EW_N], b: float16[EW_N], d: float16[EW_N], c: float16[EW_N]
+):
     @allo.work(mapping=[1], args=[a, b, d, c])
     def k(la: float16[EW_N], lb: float16[EW_N], ld: float16[EW_N], lc: float16[EW_N]):
         for i in range(EW_N):
@@ -1016,7 +1101,9 @@ def test_upmem_axpby_coefficients_at_fixed_shape(record_property):
     kernels = {k: _upmem_dpu_segments(c)[0].kernel for k, c in compiled.items()}
     for coefficients, kernel in kernels.items():
         assert kernel.family == "pointwise"
-        assert set(coefficients) <= {int(v) for _n, v in kernel.constants}, kernel.constants
+        assert set(coefficients) <= {
+            int(v) for _n, v in kernel.constants
+        }, kernel.constants
     first, second = decisions[(3, -7)], decisions[(2, 5)]
     assert first["modes"] == second["modes"]
     assert first["segments"][0][-1] != second["segments"][0][-1]  # device source
@@ -1090,7 +1177,9 @@ def aim_gemv_sub(W: bfloat16[AIM_M, AIM_K], x: bfloat16[AIM_K], y: bfloat16[AIM_
 
 def _aim_opcodes(compiled):
     return Counter(
-        line.split()[1] for line in map(str, compiled.compiled.cmds) if len(line.split()) > 1
+        line.split()[1]
+        for line in map(str, compiled.compiled.cmds)
+        if len(line.split()) > 1
     )
 
 
@@ -1123,7 +1212,9 @@ def _aim_issued_elements(compiled):
         fields = line.split()
         if fields[:2] == ["AiM", "EWMUL"]:
             columns, mask = int(fields[2]), int(fields[3])
-            issued["mul"] += columns * AIM_LANES * AIM_BANK_GROUPS * bin(mask).count("1")
+            issued["mul"] += (
+                columns * AIM_LANES * AIM_BANK_GROUPS * bin(mask).count("1")
+            )
         elif fields[:2] == ["AiM", "EWADD"]:
             issued["add"] += int(fields[2]) * AIM_LANES
     return issued
@@ -1140,13 +1231,19 @@ def test_aim_elementwise_grid_issues_every_work_item():
     assert program == AIM_N
     mul = allo.compile(aim_ew_mul, target, aim_cost, backend="virtual")
     add = allo.compile(aim_ew_add, target, aim_cost, backend="virtual")
-    assert list(map(str, mul.compiled.cmds)) == [f"AiM EWMUL 2 {2**32 - 1} 0", "AiM EOC"]
+    assert list(map(str, mul.compiled.cmds)) == [
+        f"AiM EWMUL 2 {2**32 - 1} 0",
+        "AiM EOC",
+    ]
     assert _aim_issued_elements(mul) == {"mul": program}
     assert _aim_issued_elements(add) == {"add": program}
     # The ADD estimate prices the issued EWADD inventory: one command of
     # 4096 / 16 = 256 GPR columns at one cycle each (it was 8 when the cost
     # program priced 32 parallel 8-column EWADDs).
-    assert list(map(str, add.compiled.cmds)) == [f"AiM EWADD {program // AIM_LANES} 0 256", "AiM EOC"]
+    assert list(map(str, add.compiled.cmds)) == [
+        f"AiM EWADD {program // AIM_LANES} 0 256",
+        "AiM EOC",
+    ]
     assert add.estimate().cycles == program // AIM_LANES == 256
 
     with pytest.raises(NotImplementedError, match="do not tile the operands"):
@@ -1172,7 +1269,9 @@ def test_aim_elementwise_grid_simulates_every_work_item(aim_sim_gate):
     result = compiled(a, a, np.zeros_like(a))
     per_channel = {
         int(ch): int(count)
-        for ch, count in re.findall(r"CH(\d+)_num_EWMUL16_commands:\s*(\d+)", result.stdout)
+        for ch, count in re.findall(
+            r"CH(\d+)_num_EWMUL16_commands:\s*(\d+)", result.stdout
+        )
     }
     assert per_channel == {ch: 2 for ch in range(32)}
     assert sum(per_channel.values()) * AIM_LANES * AIM_BANK_GROUPS == AIM_N
@@ -1212,7 +1311,9 @@ def test_samsung_two_kernel_program_composes_transparently(
 
     target = build_samsung_target()
     kw = {"reduction_order": order}
-    chained = allo.compile(_two_kernels, target, samsung_cost, host_moves=_chained, **kw)
+    chained = allo.compile(
+        _two_kernels, target, samsung_cost, host_moves=_chained, **kw
+    )
     alone = allo.compile(_mv2_alone, target, samsung_cost, **kw)
 
     seed = _seed()
@@ -1325,7 +1426,9 @@ def test_upmem_kmeans_distances_and_update_execute(record_property):
     update group reading the distances; compared with an independent NumPy
     k-means step (squared distances, first-minimum assignment, rounded mean)."""
     target = build_upmem_target()
-    compiled = allo.compile(kmeans_step, target, upmem_cost, host_moves=kmeans_step_host)
+    compiled = allo.compile(
+        kmeans_step, target, upmem_cost, host_moves=kmeans_step_host
+    )
     segments = compiled.compiled.layout_ctx.segments
     assert [s.kind for s in segments] == ["dpu", "host"]
     assert segments[1].kernel.family == "kmeans_update"
@@ -1426,7 +1529,7 @@ def test_upmem_without_archives_names_the_variables_or_runs_a_user_build(no_arch
     assert result.extra["upmem"][0]["sdk_build"].startswith("user-build:")
 
 
-_SDIST_SMOKE = '''
+_SDIST_SMOKE = """
 import os
 import sys
 
@@ -1457,9 +1560,9 @@ leaked = sorted(
 print("MODE", compiled.compiled.layout_ctx.programs[0].lever_record["mode"])
 print("CYCLES", compiled.estimate().cycles)
 print("LEAKED", ",".join(leaked))
-'''
+"""
 
-_SDIST_WORKLOAD = '''
+_SDIST_WORKLOAD = """
 import allo
 from allo.dataflow import region
 from allo.ir.types import float16
@@ -1478,7 +1581,7 @@ def gemv(W: float16[M, K], x: float16[K], y: float16[M]):
             for k in range(K):
                 acc += lW[row0 + i, k] * lx[k]
             ly[row0 + i] = acc
-'''
+"""
 
 
 def test_sdist_tree_compiles_samsung_gemv_outside_the_checkout(tmp_path, no_archives):
@@ -1495,13 +1598,26 @@ def test_sdist_tree_compiles_samsung_gemv_outside_the_checkout(tmp_path, no_arch
     dist = tmp_path / "dist"
     if importlib.util.find_spec("build") is not None:
         command = [
-            sys.executable, "-m", "build", "--sdist", "--no-isolation",
-            "--outdir", str(dist), str(REPO),
+            sys.executable,
+            "-m",
+            "build",
+            "--sdist",
+            "--no-isolation",
+            "--outdir",
+            str(dist),
+            str(REPO),
         ]
     else:  # the same fallback as tests/perf/test_packaging.py::sdist_members
         command = [
-            sys.executable, "setup.py", "--quiet", "egg_info", "--egg-base", str(dist),
-            "sdist", "--dist-dir", str(dist),
+            sys.executable,
+            "setup.py",
+            "--quiet",
+            "egg_info",
+            "--egg-base",
+            str(dist),
+            "sdist",
+            "--dist-dir",
+            str(dist),
         ]
     dist.mkdir()
     built = subprocess.run(
@@ -1533,7 +1649,12 @@ def test_sdist_tree_compiles_samsung_gemv_outside_the_checkout(tmp_path, no_arch
     env["HOME"] = str(tmp_path / "home")
     run = subprocess.run(
         [sys.executable, "-s", str(scripts / "smoke.py"), str(tree), str(scripts)],
-        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=600, check=False,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
     )
     assert run.returncode == 0, (run.stdout + run.stderr)[-3000:]
     lines = dict(line.split(" ", 1) for line in run.stdout.splitlines() if " " in line)

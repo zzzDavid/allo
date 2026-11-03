@@ -119,7 +119,9 @@ class AttAccCtx(CodegenContext):
     def resolve_moves(self, role, src_handle, dst_handle):
         return (None, None)
 
-    def emit_program(self, trace, layouts, *, schedule=None, host_moves=(), module=None):
+    def emit_program(
+        self, trace, layouts, *, schedule=None, host_moves=(), module=None
+    ):
         from .pim.schedule_search import InfeasibleSchedule
         from .spmw_autoschedule import Placement, _bucket_for_autoschedule
 

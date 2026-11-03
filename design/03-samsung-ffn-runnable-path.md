@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Design 03 — Samsung FFN 256-1024-256: runnable-path ruling
 
 *Architect, 2026-06-17. Task 028 (needs-arch). Inputs: coder-003 report

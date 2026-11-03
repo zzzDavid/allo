@@ -76,7 +76,9 @@ def test_aim_knobs_registered_logged_and_realizable(monkeypatch):
     modes = [mode for _p, _c, mode in kernel.scores]
     for mode in modes:
         assert all(
-            f"+{name}=" in mode for name in AIM_KNOBS if name not in LAYOUT_CARRIED_KNOBS
+            f"+{name}=" in mode
+            for name in AIM_KNOBS
+            if name not in LAYOUT_CARRIED_KNOBS
         ), mode
         if "+reduction_partitions=" in mode:
             assert _knob(mode, "batch_mapping") == "channels", mode

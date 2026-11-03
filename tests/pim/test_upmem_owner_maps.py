@@ -66,7 +66,11 @@ def default():
 
 def _ties(compiled):
     return {
-        tie.description.split(":")[0] if tie.description.startswith("rows ") else "program": tie
+        (
+            tie.description.split(":")[0]
+            if tie.description.startswith("rows ")
+            else "program"
+        ): tie
         for tie in compiled.placement_ranking.kernels[0].movement.ties
     }
 
@@ -171,7 +175,9 @@ def test_cyclic_tie_packs_each_dpu_from_its_rows(default):
         heap = pack_inputs(group.plan, group.kernel, {"matrix": W[rows], "vector": x})
         assert files[record["mram_heap_input"]["file"]] == heap
         _offset, expected = pack_expected(
-            group.plan, group.kernel, {"matrix": W[rows], "vector": x, "out": (W @ x)[rows]}
+            group.plan,
+            group.kernel,
+            {"matrix": W[rows], "vector": x, "out": (W @ x)[rows]},
         )
         assert files[record["mram_heap_output"]["file"]] == expected
     assert _fixtures(cyclic, W, x, y) != _fixtures(identity, W, x, y)

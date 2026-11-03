@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # design/ index: historical rationale, not the current tree
 
 The notes in this directory are architect specs and rulings written between

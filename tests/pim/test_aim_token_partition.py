@@ -204,7 +204,11 @@ def budget_variants(target, compiled, budget=CHANNEL_BUDGET):
         ):
             per_partition[partitions] = (cycles, mode, placement)
     head_only = min(
-        (s for s in sv if _partitions(s[1]) == 1 and _knob(s[1], "batch_mapping") == "channels"),
+        (
+            s
+            for s in sv
+            if _partitions(s[1]) == 1 and _knob(s[1], "batch_mapping") == "channels"
+        ),
         key=lambda s: s[0],
     )
     selected = min(per_partition.values(), key=lambda s: s[0])
@@ -235,7 +239,8 @@ def _sv_entry(compiled):
     return next(
         entry
         for entry in manifest
-        if entry["kind"] == "contraction" and str(entry["name"]).startswith("attention_sv")
+        if entry["kind"] == "contraction"
+        and str(entry["name"]).startswith("attention_sv")
     )
 
 
@@ -259,10 +264,14 @@ def check_merge_numerics(compiled, heads, tokens, seed=0):
     merged = host.merge(partials)[0]
     np.testing.assert_array_equal(merged, np.einsum("hds,hs->hd", values, probs))
     # BF16 operands under the declared readout contract.
-    values = bf16_round(rng.standard_normal((heads, HEAD_DIM, tokens)).astype(np.float32))
+    values = bf16_round(
+        rng.standard_normal((heads, HEAD_DIM, tokens)).astype(np.float32)
+    )
     probs = bf16_round(rng.random((heads, tokens)).astype(np.float32))
     merged = host.merge(reference_partial_sums(entry, values, probs))[0]
-    reference = np.einsum("hds,hs->hd", values.astype(np.float64), probs.astype(np.float64))
+    reference = np.einsum(
+        "hds,hs->hd", values.astype(np.float64), probs.astype(np.float64)
+    )
     scale = np.max(np.abs(reference))
     error = float(np.max(np.abs(merged - reference)) / scale)
     # BF16 readout per row chunk: a few units of the 2^-8 BF16 epsilon.
@@ -343,14 +352,20 @@ def test_partitioned_program_host_step_cost_and_numerics(partitions):
     ctx = built.compiled.layout_ctx
     (step,) = ctx.host_steps
     assert isinstance(step, AimHostReduction)
-    assert (step.partitions, step.outputs, step.batches) == (partitions, HEAD_DIM, heads)
+    assert (step.partitions, step.outputs, step.batches) == (
+        partitions,
+        HEAD_DIM,
+        heads,
+    )
     entry = _sv_entry(built)
     host_entry = next(e for e in ctx.lowering_manifest if e["kind"] == "hostreduction")
     assert host_entry["command_count"] == 0 and host_entry["executes_on"] == "host"
     assert entry["reduction_partition"]["local_reduction"] == tokens // partitions
     # Every (head, partition) accumulator owns one channel of the group.
     channels = {c for group in entry["groups"] for c in group["active_channels"]}
-    assert len(channels) == min(heads * partitions, int(_knob(mode, "replica_partitions")))
+    assert len(channels) == min(
+        heads * partitions, int(_knob(mode, "replica_partitions"))
+    )
     assert entry["program_scalar_macs"] == heads * HEAD_DIM * tokens
 
     # The cost program prices the host step with the declared link model and
@@ -370,9 +385,9 @@ def test_partitioned_program_host_step_cost_and_numerics(partitions):
     )
     assert virtual.run_backend().cycles == cycles
     graph = virtual.compiled.execution_graph
-    assert [a.latency_cycles for a in graph.activities if a.label == "host_reduction"] == [
-        expected
-    ]
+    assert [
+        a.latency_cycles for a in graph.activities if a.label == "host_reduction"
+    ] == [expected]
 
     error = check_merge_numerics(built, heads, tokens)
     assert error is not None
@@ -394,16 +409,18 @@ def test_cache_append_into_partitioned_layout():
         attention, target, aim_cost, host_moves=program, layout=[placement], **_POLICY
     )
     channels = target.unit("channel").axes["channel"]
-    writes = [line.split() for line in built.compiled.cmds if line.startswith("AiM WR_ABK")]
-    owners = {
-        channels - 1 - int(math.log2(int(fields[3]))) for fields in writes
-    }
+    writes = [
+        line.split() for line in built.compiled.cmds if line.startswith("AiM WR_ABK")
+    ]
+    owners = {channels - 1 - int(math.log2(int(fields[3]))) for fields in writes}
     # Token L-1 lives in partition (L-1) % P: only that partition's channels
     # receive it, at local row (L-1) // P // row_elements.
     cpr = int(_knob(mode, "replica_partitions"))
     position = tokens - 1
     assert owners == {
-        c for c in range(min(cpr, heads * partitions)) if c % partitions == position % partitions
+        c
+        for c in range(min(cpr, heads * partitions))
+        if c % partitions == position % partitions
     }
     assert writes
 
@@ -419,7 +436,9 @@ def run_workload(heads, tokens, *, simulate=True):
     variants = budget_variants(target, ranked)
     geometry = _target_geometry(target)
     rows = {}
-    labelled = [(f"P{p}", choice) for p, choice in sorted(variants.per_partition.items())]
+    labelled = [
+        (f"P{p}", choice) for p, choice in sorted(variants.per_partition.items())
+    ]
     if variants.head_only[1] != variants.per_partition[1][1]:
         labelled.append(("head-only", variants.head_only))
     for label, choice in labelled:
@@ -428,15 +447,19 @@ def run_workload(heads, tokens, *, simulate=True):
             host_reduction_cycles(step, geometry)
             for step in built.compiled.layout_ctx.host_steps
         )
-        estimate = allo.compile(
-            attention,
-            target,
-            aim_cost,
-            backend="virtual",
-            host_moves=program,
-            layout=built.compiled.layout,
-            **_POLICY,
-        ).run_backend().cycles
+        estimate = (
+            allo.compile(
+                attention,
+                target,
+                aim_cost,
+                backend="virtual",
+                host_moves=program,
+                layout=built.compiled.layout,
+                **_POLICY,
+            )
+            .run_backend()
+            .cycles
+        )
         device = built.run_backend().cycles if simulate else None
         rows[label] = SimpleNamespace(
             mode=choice[1],

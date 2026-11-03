@@ -63,8 +63,10 @@ def test_template_staging_copies_only_the_build_inputs_with_their_origin(
     )
     assert staged == sorted((*apu_v1_build._TEMPLATE_FILES, "THIRD_PARTY.txt"))
     assert [relative for relative, _ in copied] == list(apu_v1_build._TEMPLATE_FILES)
-    for script in ("fix-gvml-lib-for-the-gnu-toolchain-for-arc.sh",
-                   "generate-gnu-linker-command-file-for-cores-1-2-3.sh"):
+    for script in (
+        "fix-gvml-lib-for-the-gnu-toolchain-for-arc.sh",
+        "generate-gnu-linker-command-file-for-cores-1-2-3.sh",
+    ):
         assert os.stat(project / "Common" / script).st_mode & stat.S_IXUSR
 
     notice = (project / "THIRD_PARTY.txt").read_text()

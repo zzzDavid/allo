@@ -1,3 +1,5 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Focused gates for the workload-neutral finite-domain search core."""
 
 from dataclasses import dataclass

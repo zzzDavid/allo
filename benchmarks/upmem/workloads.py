@@ -39,7 +39,17 @@ UPMEM_CASES = (
     "conv",
 )
 REGULAR_CASES = (
-    "va", "red", "mtv", "gemv", "geva", "ttv", "mmtv", "1mm", "2mm", "3mm", "conv",
+    "va",
+    "red",
+    "mtv",
+    "gemv",
+    "geva",
+    "ttv",
+    "mmtv",
+    "1mm",
+    "2mm",
+    "3mm",
+    "conv",
 )
 
 GEVA_ALPHA, GEVA_BETA = 2, -1
@@ -71,7 +81,9 @@ def pointwise_workload(n: int, dpus: int = 1, *, axpby: bool = False):
             def axpby(lA: int32[_up_n], lB: int32[_up_n], lC: int32[_up_n]):
                 (d,) = allo.get_wid()
                 for i in range(_up_s):
-                    lC[d * _up_s + i] = GEVA_ALPHA * lA[d * _up_s + i] + GEVA_BETA * lB[d * _up_s + i]
+                    lC[d * _up_s + i] = (
+                        GEVA_ALPHA * lA[d * _up_s + i] + GEVA_BETA * lB[d * _up_s + i]
+                    )
 
         return geva
 
@@ -149,7 +161,9 @@ def ttv_workload(m: int, n: int, k: int):
     @_df_region()
     def ttv(A: int32[_up_m, _up_n, _up_k], x: int32[_up_k], C: int32[_up_m, _up_n]):
         @allo.work(mapping=[1], args=[A, x, C])
-        def tv(lA: int32[_up_m, _up_n, _up_k], lx: int32[_up_k], lC: int32[_up_m, _up_n]):
+        def tv(
+            lA: int32[_up_m, _up_n, _up_k], lx: int32[_up_k], lC: int32[_up_m, _up_n]
+        ):
             for a in range(_up_m):
                 for b in range(_up_n):
                     lC[a, b] = 0
@@ -166,9 +180,15 @@ def mmtv_workload(m: int, n: int, k: int):
     _up_k = k
 
     @_df_region()
-    def mmtv(A: int32[_up_m, _up_n, _up_k], B: int32[_up_m, _up_k], C: int32[_up_m, _up_n]):
+    def mmtv(
+        A: int32[_up_m, _up_n, _up_k], B: int32[_up_m, _up_k], C: int32[_up_m, _up_n]
+    ):
         @allo.work(mapping=[1], args=[A, B, C])
-        def btv(lA: int32[_up_m, _up_n, _up_k], lB: int32[_up_m, _up_k], lC: int32[_up_m, _up_n]):
+        def btv(
+            lA: int32[_up_m, _up_n, _up_k],
+            lB: int32[_up_m, _up_k],
+            lC: int32[_up_m, _up_n],
+        ):
             for a in range(_up_m):
                 for b in range(_up_n):
                     lC[a, b] = 0
@@ -185,7 +205,11 @@ def gemm_workload(rows: int, reduction: int, columns: int):
     _up_cols = columns
 
     @_df_region()
-    def gemm(A: int32[_up_rows, _up_red], B: int32[_up_red, _up_cols], C: int32[_up_rows, _up_cols]):
+    def gemm(
+        A: int32[_up_rows, _up_red],
+        B: int32[_up_red, _up_cols],
+        C: int32[_up_rows, _up_cols],
+    ):
         @allo.work(mapping=[1], args=[A, B, C])
         def mm(
             lA: int32[_up_rows, _up_red],
@@ -460,14 +484,23 @@ _EXTRA_OUTPUTS = {
 
 def canonical_inputs(case_id: str, root: Path | None = None) -> dict:
     """The archived canonical inputs, plus a zeroed output, by parameter name."""
-    base = (Path(root) if root is not None else artifacts_root()) / "upmem" / "inputs" / case_id
+    base = (
+        (Path(root) if root is not None else artifacts_root())
+        / "upmem"
+        / "inputs"
+        / case_id
+    )
     metadata = json.loads((base / "metadata.json").read_text())
     inputs = {}
     for name, filename, shape in _ARGUMENTS[case_id]:
         if filename not in metadata["files"]:
             raise FileNotFoundError(f"{case_id}: {filename} missing from metadata.json")
-        inputs[name] = np.fromfile(base / filename, dtype="<i4").astype(np.int32).reshape(shape)
-    outputs = ((_OUTPUTS[case_id],) if case_id in _OUTPUTS else ()) + _EXTRA_OUTPUTS.get(case_id, ())
+        inputs[name] = (
+            np.fromfile(base / filename, dtype="<i4").astype(np.int32).reshape(shape)
+        )
+    outputs = (
+        (_OUTPUTS[case_id],) if case_id in _OUTPUTS else ()
+    ) + _EXTRA_OUTPUTS.get(case_id, ())
     for name, shape, dtype in outputs:
         inputs[name] = np.zeros(shape, dtype=dtype)
     return inputs
@@ -475,6 +508,7 @@ def canonical_inputs(case_id: str, root: Path | None = None) -> dict:
 
 def numpy_reference(case_id: str, inputs: dict) -> np.ndarray:
     """The case's output computed in NumPy with int32 wraparound semantics."""
+
     def i32(value):
         return np.asarray(value, dtype=np.int64).astype(np.int32)
 
@@ -485,7 +519,10 @@ def numpy_reference(case_id: str, inputs: dict) -> np.ndarray:
     if case_id == "sel":
         values = inputs["A"]
         kept = values[(values & 1) != 0]
-        return {"out": kept.astype(np.int32), "count": np.array([kept.size], dtype=np.int32)}
+        return {
+            "out": kept.astype(np.int32),
+            "count": np.array([kept.size], dtype=np.int32),
+        }
     if case_id == "kmeans":
         points = inputs["P"].astype(np.int64)
         centroids = inputs["C"].astype(np.int64)
@@ -523,17 +560,26 @@ def numpy_reference(case_id: str, inputs: dict) -> np.ndarray:
     if case_id == "va":
         return i32(inputs["A"].astype(np.int64) + inputs["B"])
     if case_id == "geva":
-        return i32(GEVA_ALPHA * inputs["A"].astype(np.int64) + GEVA_BETA * inputs["B"].astype(np.int64))
+        return i32(
+            GEVA_ALPHA * inputs["A"].astype(np.int64)
+            + GEVA_BETA * inputs["B"].astype(np.int64)
+        )
     if case_id == "red":
         return np.array([inputs["A"].astype(np.int64).sum()], dtype=np.int64)
     if case_id == "mtv":
         return i32(inputs["A"].astype(np.int64) @ inputs["x"].astype(np.int64))
     if case_id == "gemv":
-        return i32(GEMV_ALPHA * (inputs["A"].astype(np.int64) @ inputs["x"].astype(np.int64)))
+        return i32(
+            GEMV_ALPHA * (inputs["A"].astype(np.int64) @ inputs["x"].astype(np.int64))
+        )
     if case_id == "ttv":
         return i32(inputs["A"].astype(np.int64) @ inputs["x"].astype(np.int64))
     if case_id == "mmtv":
-        return i32(np.einsum("mnk,mk->mn", inputs["A"].astype(np.int64), inputs["B"].astype(np.int64)))
+        return i32(
+            np.einsum(
+                "mnk,mk->mn", inputs["A"].astype(np.int64), inputs["B"].astype(np.int64)
+            )
+        )
     return i32(inputs["A"].astype(np.int64) @ inputs["B"].astype(np.int64))
 
 

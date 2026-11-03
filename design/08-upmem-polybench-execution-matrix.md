@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # UPMEM PolyBench execution matrix
 
 This document is an implementation inventory for faithful execution of the 30

@@ -324,8 +324,15 @@ class Op:
         # (the default) means the device rounds after every operation, so
         # only single operations, where both roundings provably agree, are
         # matched through such a store.
-        if intermediate is not None and intermediate not in ("f16", "bf16", "f32", "f64"):
-            raise ValueError("operation intermediate must be one of f16, bf16, f32, f64")
+        if intermediate is not None and intermediate not in (
+            "f16",
+            "bf16",
+            "f32",
+            "f64",
+        ):
+            raise ValueError(
+                "operation intermediate must be one of f16, bf16, f32, f64"
+            )
         self.intermediate = intermediate
 
     def __repr__(self):
@@ -876,9 +883,7 @@ def pattern_admits(pattern, handle) -> bool:
     if isinstance(pattern, Register):
         return isinstance(handle, Register) and same_storage(pattern, handle)
     if isinstance(pattern, Memory):
-        return isinstance(handle, (Memory, MemoryRef)) and same_storage(
-            pattern, handle
-        )
+        return isinstance(handle, (Memory, MemoryRef)) and same_storage(pattern, handle)
     if isinstance(pattern, MemoryRef):
         return isinstance(handle, (Memory, MemoryRef)) and same_storage(
             pattern.memory, handle

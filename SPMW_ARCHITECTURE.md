@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Tenon architecture in Allo
 
 This document maps the Tenon (SPMW) implementation as it is in the working

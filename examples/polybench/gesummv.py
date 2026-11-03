@@ -37,7 +37,9 @@ def compute_tmp[
         y_out[i1] = yy[i1]
 
 
-def compute_y[T: (float32, int32, uint16), N: int32](y_in: "T[N]", y_out: "T[N]", tmp: "T[N]"):
+def compute_y[
+    T: (float32, int32, uint16), N: int32
+](y_in: "T[N]", y_out: "T[N]", tmp: "T[N]"):
     for i0 in allo.grid(N, name="load"):
         y_out[i0] = alpha * tmp[i0] + beta * y_in[i0]
 

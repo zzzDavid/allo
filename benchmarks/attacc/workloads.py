@@ -55,8 +55,16 @@ class AttAccInstance:
 def _instances():
     out = []
     for heads in (8, 32):
-        out.append(AttAccInstance(f"qkv_gemv_nh{heads}_in5120_out384", "gemv", heads, 5120, 384))
-        out.append(AttAccInstance(f"proj_gemv_nh{heads}_in128_out5120", "gemv", heads, 128, 5120))
+        out.append(
+            AttAccInstance(
+                f"qkv_gemv_nh{heads}_in5120_out384", "gemv", heads, 5120, 384
+            )
+        )
+        out.append(
+            AttAccInstance(
+                f"proj_gemv_nh{heads}_in128_out5120", "gemv", heads, 128, 5120
+            )
+        )
     for heads in (8, 32):
         for length in range(144, 4096 + 1, 16):
             out.append(
@@ -91,7 +99,9 @@ def gemv_region(H: int, K: int, N: int):
 
     @_df_region()
     def attacc_gemv(
-        W: float16[_aa_h, _aa_n, _aa_k], x: float16[_aa_h, _aa_k], y: float16[_aa_h, _aa_n]
+        W: float16[_aa_h, _aa_n, _aa_k],
+        x: float16[_aa_h, _aa_k],
+        y: float16[_aa_h, _aa_n],
     ):
         @allo.work(mapping=[1], args=[W, x, y])
         def gemv(

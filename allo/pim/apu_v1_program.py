@@ -251,14 +251,17 @@ def _replace_local_arrays(source: str) -> tuple[str, int]:
     transformed = _LOCAL_ARRAY.sub(replace, source)
     transformed = re.sub(r"\bsqrtf\s*\(", "allo_sqrtf(", transformed)
     transformed = re.sub(r"\bsqrt\s*\(", "allo_sqrt(", transformed)
-    allocator = """
+    allocator = (
+        """
 static uint8_t *allo_l4_cursor;
 static void *allo_l4_alloc(size_t bytes) {
     uintptr_t cursor = ((uintptr_t)allo_l4_cursor + 7u) & ~(uintptr_t)7u;
     allo_l4_cursor = (uint8_t *)(cursor + bytes);
     return (void *)cursor;
 }
-""" + APU_V1_SQRT_HELPERS
+"""
+        + APU_V1_SQRT_HELPERS
+    )
     first_function = transformed.find("void ")
     if first_function < 0:
         raise RuntimeError("portable C source contains no function")
@@ -504,7 +507,11 @@ def fresh_profile_records(before: str, after: str) -> list:
     before_records = list(_TOTAL_RECORD.finditer(before))
     if not before_records:
         return after_records
-    anchor = before[before_records[max(0, len(before_records) - 3)].start() : before_records[-1].end()]
+    anchor = before[
+        before_records[max(0, len(before_records) - 3)]
+        .start() : before_records[-1]
+        .end()
+    ]
     position = after.rfind(anchor)
     if position < 0:
         raise RuntimeError(
@@ -516,7 +523,9 @@ def fresh_profile_records(before: str, after: str) -> list:
     return [record for record in after_records if record.start() >= boundary]
 
 
-def parse_fresh_profile(before: str, after: str, expected_records: int) -> tuple[int, ...]:
+def parse_fresh_profile(
+    before: str, after: str, expected_records: int
+) -> tuple[int, ...]:
     """Return the CRUN of exactly ``expected_records`` fresh ``total`` records.
 
     Anything but exactly the expected number of records appended by the
@@ -753,9 +762,11 @@ class CompiledAPUv1Program:
                 from .costs.apu_v1 import apu_v1_cost_validity
 
                 validity = apu_v1_cost_validity(
-                    "scalar_arc_c"
-                    if self.native_vector_lowering is None
-                    else self.native_vector_lowering.route,
+                    (
+                        "scalar_arc_c"
+                        if self.native_vector_lowering is None
+                        else self.native_vector_lowering.route
+                    ),
                     self.execution_graph.metadata.get("operation_inventory"),
                     cost,
                 )
@@ -818,7 +829,9 @@ class CompiledAPUv1Program:
         returned = self._host_module(
             *(sources[argument.name] for argument in self.source_arguments)
         )
-        results = [argument for argument in self.arguments if argument.source == "result"]
+        results = [
+            argument for argument in self.arguments if argument.source == "result"
+        ]
         if len(results) == 1:
             returned = (returned,)
         returned = dict(zip((argument.name for argument in results), returned or ()))
@@ -850,7 +863,9 @@ class CompiledAPUv1Program:
 
     def run(self, **inputs):
         from ..spmw_codegen import SimulatorUnavailable
-        from ..spmw_simenv import apu_v1_unavailable_reason as _apu_v1_unavailable_reason
+        from ..spmw_simenv import (
+            apu_v1_unavailable_reason as _apu_v1_unavailable_reason,
+        )
 
         if self.backend == "virtual":
             return self._run_virtual(inputs)

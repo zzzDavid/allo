@@ -107,7 +107,9 @@ def test_functional_numerics_follow_the_selected_plan(operands):
         products = (products[:, :width] + products[:, width : 2 * width]).astype(
             np.float16
         )
-    np.testing.assert_array_equal(y, (np.float16(0) + products[:, 0]).astype(np.float16))
+    np.testing.assert_array_equal(
+        y, (np.float16(0) + products[:, 0]).astype(np.float16)
+    )
     assert np.any(y.view(np.uint16) != source.view(np.uint16))
     np.testing.assert_allclose(y.astype(np.float32), exact, rtol=1e-2, atol=1e-2)
 
