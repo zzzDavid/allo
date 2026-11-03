@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Shared compilation path: required migration
 
 Status: **required, not implemented**. User scope addition on 2026-11-02.

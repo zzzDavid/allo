@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Evidence beyond the original examples (gate G6)
 
 This document maps the G6 probe list in `TASK.md` onto the tests that exist in

@@ -1,6 +1,9 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Release status
 
-Updated: 2026-11-02 (round 8: reviewer rejection of `e41ebbd`, matcher cast/copy contracts, simulator recipes in the release repository, gate G9 added). Read `TASK.md` in the containing repository,
+Updated: 2026-11-02 (round 9: second reviewer rejection at `ee8f522`; float-precision and output-map contracts repaired). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -35,16 +38,33 @@ then this file, then `ISSUES.md` for the next action.
    implemented. Design seed: `design/shared-compilation-path.md`.
 2. **G2**: the independent reviewer disproved the round 7 PASS with two
    executed wrong-code probes at `e41ebbd` (C-19 casts erased, C-20 guarded
-   copies). Repaired in round 8 with a signedness fix found during the
-   review of the repair (C-21); awaiting independent review and execution
-   evidence at the new revision.
-3. **G7/G8 evidence**: installed-artifact runs (wheel built from the
-   candidate, installed outside the checkout) on the simulators, the APU v1
-   board and the Gemini-II card are required at the candidate revision; the
-   last hardware runs were at `1ea8756`. The Samsung simulator route is not
-   buildable from the release repository without Samsung's permission for
-   the five patches (P-04); AiM and UPMEM are.
+   copies), repaired in round 8 (plus C-21), and then found two more at
+   `ee8f522` (C-22 float precision silently changed, C-23 output access
+   maps lost). Round 9 repairs both with stated contracts and regressions;
+   awaiting independent review and execution evidence at the new revision.
+3. **G7/G8 evidence**: at `7bdb475` the installed artifact (wheel from the
+   committed sdist, clean venv, run outside the checkout) was exercised on
+   the three simulators, the APU v1 board and, from a wheel built on
+   zhang-x4, the Gemini-II card (VALIDATION.md round 9). Still open for G7:
+   the Samsung simulator route is not buildable from the release repository
+   without Samsung's permission for the five patches (P-04); the compatible
+   build path for a user without the patches is the open question the
+   reviewer named.
 4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+
+## Round 9 (2026-11-02): what was done
+
+- Float precision (C-22): `truncf` at a store is transparent only for a
+  single operation on destination-typed leaves (double-rounding theorem);
+  compound expressions bind only to an op declaring `intermediate="f32"`
+  (AiM `AF` lookup table); `precision_notes` removed; the reviewer's
+  program is rejected; numerical tests independent of the matcher.
+- Output maps (C-23): resolved affine coordinates on stores, operands and
+  sinks; `output_map_problem` identity contract enforced by Samsung, AiM,
+  AttAcc, the layout derivation and the copy contract; Samsung's
+  opaque-coordinate trust removed; the reviewer's reversed-row program is
+  rejected; simulator value check with row-identifying inputs.
+- License headers on all release documents; P-22 corrected.
 
 ## Round 8 (2026-11-02): what was done
 
@@ -71,14 +91,9 @@ then this file, then `ISSUES.md` for the next action.
 ## Next concrete actions (in order)
 
 1. Independent review of the round 8 matcher contracts.
-2. Installed-artifact evidence at this revision: done for virtual, Samsung,
-   AiM, UPMEM and the APU v1 board from a clean venv at `9cd8fb3`
-   (VALIDATION.md round 8). Still to do: Gemini-II card on zhang-x4
-   (remote lock; the shared checkout is visible there, the `spmw` env is
-   not, and the wheel's RUNPATH points at this server's conda lib
-   directory, so build or install the artifact with the `allo-dev`
-   interpreter there). New: U-16 (hoisted row base on UPMEM), P-22
-   (install pitfalls).
+2. Installed-artifact evidence: complete at `7bdb475` for virtual,
+   Samsung, AiM, UPMEM, the APU v1 board and the Gemini-II card
+   (VALIDATION.md round 9). Repeat after any later code commit.
 3. G9: refine `design/shared-compilation-path.md` from source (stage
    inventory, reusable pieces, missing contracts), then the first vertical
    slice through one matcher backend, then the APU routes; remove the

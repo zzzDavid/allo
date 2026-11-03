@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # APU v1 (Gemini-I): cost provenance, validity, tile selection, scalar sqrt
 
 Status: describes the code after the V1-05, V1-06, V1-11 and V1-12 repairs

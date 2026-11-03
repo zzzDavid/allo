@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # UPMEM backend release audit
 
 Audit date: 2026-11-01. Code: `experiments/allo` branch `tenon` @ `8160d6d`

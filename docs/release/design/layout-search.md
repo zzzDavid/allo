@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Minimum-movement layout search (paper Section IV)
 
 Status: implemented as a standalone package library (`allo/pim/gf2.py`,

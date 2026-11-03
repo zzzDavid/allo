@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Core (target-neutral) compiler audit
 
 Scope: `experiments/allo` branch `tenon` @ `8160d6d`, the target-neutral part of

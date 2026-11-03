@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Release audit: packaging, installation, documentation, licensing, environment coupling
 
 Gate: TASK.md G7 (plus the G8 capability-matrix requirement), RELEASE_AUDIT.md A11/A12.

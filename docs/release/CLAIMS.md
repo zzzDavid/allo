@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Paper-to-implementation claim matrix (G1)
 
 Frozen paper: `zzzDavid/tenon-hpca27` `main` @ `30b6f49e64583b5d301d2a5e8b902498f5578e4e`
@@ -72,8 +75,9 @@ backend audits.
 ## Summary
 
 Implemented and reachable through `allo.compile`: the three languages; the
-matcher with store coverage, accumulator-init facts, axis roles, exact-cast
-and output-copy contracts; the reduction-order policy; the target-neutral
+matcher with store coverage, accumulator-init facts, axis roles, exact-cast,
+single-rounding float narrowing, resolved access coordinates with the
+identity output-map contract, and output-copy contracts; the reduction-order policy; the target-neutral
 legality pass; the movement stage with the Section IV algebra and searches
 (ties realized on Samsung, UPMEM and AiM); lazy materialization with recorded
 rejections and bounded joint evaluation; the cost evaluator; four matcher

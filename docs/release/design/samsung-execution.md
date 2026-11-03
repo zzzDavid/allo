@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Samsung HBM-PIM: selected-program execution contract
 
 Status: design, written before the S-01/S-05/S-06/S-07/S-09/S-10 repair

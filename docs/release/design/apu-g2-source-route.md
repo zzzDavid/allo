@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Gemini-II source route, typed tick model, and card operation
 
 Status: implemented (working tree on top of `6efaca5`), compile-only and

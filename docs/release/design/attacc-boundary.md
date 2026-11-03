@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # AttAcc release boundary (recommendation)
 
 Status: recommendation, not implemented (2026-11-02). Addresses release audit

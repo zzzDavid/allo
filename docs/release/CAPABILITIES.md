@@ -168,15 +168,25 @@ without coefficients.
   looked through only when it is exact (`cast_is_exact`), a constant only
   when proven representable, a store-side narrowing only when proven exact
   (integer: the leaves fit the destination width or the value provably
-  fits; float: every leaf is a destination-type value, recorded in
-  `MatchTrace.precision_notes`), and any other conversion (`int(acc)` on an
-  FP16 output, `fptosi`, an unproven `trunci`) matches no target op and is
+  fits; float: a single operation on destination-type leaves, where
+  rounding once in f32 and then to f16/bf16 equals the device's correctly
+  rounded operation; a compound expression such as
+  `float(a)*float(b)+float(c)` keeps f32 intermediates and is rejected
+  unless the target op declares `intermediate="f32"`, as the AiM `AF`
+  lookup table does), and any other conversion (`int(acc)` on an FP16
+  output, `fptosi`, an unproven `trunci`) matches no target op and is
   rejected naming the conversion; an output copy must run under exactly its
   producer's guards, exactly once per produced element (never inside the
-  reduction loop) and into a buffer of the producer's type, otherwise it is
-  rejected (`if cond: out[i] = acc` is unsupported, not silently
-  unconditional). Signless loads are read as signed or unsigned according
-  to the frontend's extension; unknown signedness uses the union range.
+  reduction loop), read the element its producer stored, and write a
+  buffer of the producer's type, otherwise it is rejected
+  (`if cond: out[i] = acc` is unsupported, not silently unconditional).
+  Output access maps are the identity: every store and operand coordinate
+  is resolved to an affine form and a contraction's result must be stored
+  at the coordinate its matrix row was read from (`out[M-1-row]`,
+  `out[0]` for every row, `out[row+1]` are rejected on Samsung, AiM and
+  AttAcc and by the layout derivation; no backend realizes a permuted
+  output). Signless loads are read as signed or unsigned according to the
+  frontend's extension; unknown signedness uses the union range.
 - Placement legality (`allo/spmw_legality.py`) filters enumerated
   candidates and rejects illegal `layout=` (C-01 fixed); the work grid must
   map onto the unit tree in a documented form (C-04 fixed).

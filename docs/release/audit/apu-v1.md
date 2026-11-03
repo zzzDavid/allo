@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # GSI APU v1 (Gemini-I) backend: release-readiness audit
 
 Read-only audit of `experiments/allo` (branch `tenon`, 8160d6d) against TASK.md

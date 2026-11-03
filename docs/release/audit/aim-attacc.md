@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Release audit: SK hynix AiM backend and the AttAcc evaluation path
 
 > User clarification: AiM's simulator is timing-only, and this is acceptable

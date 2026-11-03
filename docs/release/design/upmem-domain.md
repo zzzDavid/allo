@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # UPMEM backend: supported domain, legality, initialization and cost scope
 
 Status: describes the code after the U-03/U-04/U-05/U-06/U-09/U-10/U-11..U-15

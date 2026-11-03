@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Reduction-order policy
 
 Status: implemented for release issues C-09 (core), S-03 (Samsung ordered

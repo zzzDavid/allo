@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Release audit: GSI APU v2 / Gemini-II (G2) backend
 
 - Candidate: `experiments/allo` branch `tenon` @ `8160d6d82c28211900e156fcff6e0b452e94131d`

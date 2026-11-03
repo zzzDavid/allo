@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # Placement selection contract (paper Section III-F, "Autoscheduling")
 
 Status: implemented in `allo/spmw_autoschedule.py::rank_matcher_placements`

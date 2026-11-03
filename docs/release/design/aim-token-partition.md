@@ -1,3 +1,6 @@
+<!--- Copyright Allo authors. All Rights Reserved. -->
+<!--- SPDX-License-Identifier: Apache-2.0  -->
+
 # AiM token partitioning and cost-route repairs
 
 Status: implemented on `tenon` (working tree after `6efaca5`). Addresses
