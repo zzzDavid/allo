@@ -378,6 +378,11 @@ def _int_target(*names):
         "AF_LUT": dict(fn=lambda x: 0.5 * tanh(0.5 * x) + 0.5, intermediate="f32"),
         "MUL": dict(fn=lambda a, b: a * b),
         "HALF": dict(fn=lambda x: 0.5 * x),
+        "GRAD_LINEAR": dict(
+            fn=lambda x, y, acc, alpha, beta: acc + (((x * y) * alpha) >> beta),
+            accumulates=True,
+            const_params=("alpha", "beta"),
+        ),
     }
 
     @allo.target("narrowing_" + "_".join(n.lower() for n in names))
@@ -417,6 +422,29 @@ def test_widened_integer_accumulation_matches_in_the_stored_width():
     assert trace.coverage.errors == []
     (mac,) = trace.matches
     assert mac.extra["accumulator_init"] == "zero"
+
+
+def shifted_gradient(S: int32[16, 9], G: int64[8]):
+    for f in range(8):
+        G[f] = 0
+    for s in range(16):
+        for f in range(8):
+            t: int64 = (S[s, f] * S[s, 8]) * -32
+            G[f] += t >> 8
+
+
+def test_shift_of_a_wrapped_temporary_narrows_by_its_own_width():
+    """``t`` is an int64 temporary whose product may wrap in i64, so the
+    interval analysis cannot bound it; ``t >> 8`` is nevertheless an i64
+    value as the IR computes it, and the i65 sum ``G + (t >> 8)`` truncated
+    back to int64 is the i64 evaluation of ``acc + ((x * y) * alpha) >> beta``
+    (the paper's UPMEM linear-regression gradient).  The round 11 interval
+    width check had left the truncation visible and refused the kernel."""
+    trace = _trace(shifted_gradient, "GRAD_LINEAR")
+    assert trace.coverage.errors == []
+    (grad,) = trace.matches
+    assert grad.target_op_name == "GRAD_LINEAR"
+    assert grad.extra["accumulator_init"] == "zero"
 
 
 def gemm_wide_acc_fits(A: int4[8, 16], B: int4[16, 8], C: int15[8, 8]):

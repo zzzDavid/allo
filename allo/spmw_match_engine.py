@@ -770,6 +770,18 @@ def _narrow_integer(term, bits: int, loop_bounds):
             if arg is None
             else WUnary("neg", arg, term.ssa_name, result_type=f"i{bits}")
         )
+    # Any other operation the IR itself evaluates in at most ``bits`` bits
+    # is a ``bits``-bit value whatever its range: its result type bounds it,
+    # and the exact widening that feeds it to the wider parent is undone by
+    # the truncation.  The structural rules above come first so a product
+    # the interval analysis can bound keeps its proven range for the
+    # diagnostics; this covers the rest, e.g. a right shift of an int64
+    # temporary under an i65 sum when the shifted product may have wrapped
+    # in its own width (the UPMEM linear-regression gradient, C-31).
+    if isinstance(term, (WBinOp, WUnary)):
+        width = _int_bits(term.result_type or "")
+        if width is not None and width <= bits:
+            return term
     return None
 
 

@@ -55,14 +55,19 @@ def test_docker_timeout_is_reported_separately_from_missing_image(monkeypatch):
         spmw_aim._run_aim(SimpleNamespace(cmds=[]))
 
 
-def test_gemini_ii_has_no_source_runner():
-    # The typed APUg2 programs own Gemini-II execution; there is no matcher
-    # runner, context or Docker gate for a source workload.
+def test_gemini_ii_has_no_simulator_runner():
+    # Gemini-II source workloads and typed records run through the shared
+    # backend table (round 13: `allo.spmw_apu_g2`, the card runner); there is
+    # no simulator, Docker gate or `spmw_apu_v2` module for the target.
     import importlib
 
     from allo.spmw_codegen import _BACKENDS
 
-    assert "apu_v2" not in _BACKENDS
+    assert _BACKENDS["apu_v2"] == (
+        "allo.spmw_apu_g2",
+        "APUG2SourceCtx",
+        "_run_apu_g2",
+    )
     assert simulator_unavailable_reason("apu_v2") == (
         "no simulator runner for target 'apu_v2'"
     )

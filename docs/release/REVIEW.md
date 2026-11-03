@@ -539,8 +539,24 @@ asked for the typed-record migration:
   are whole-function lowerings the matcher does not cover); that is the
   remaining slice 4 item and is stated as such.
 
-Gate G9 remains **FAIL** until `APUv1Program` is migrated and the card and
-installed-artifact traces exist.
+Evidence at the commit `9255d29` (VALIDATION.md round 15): the full
+`tests/perf` and non-device `tests/pim` suites; the installed wheel on the
+three simulators with the reviewer probes of rounds 8 to 14; the APU v1
+board and the Gemini-II card from installed wheels (3 and 15 passed). One
+perf test still asserted the pre-round-13 backend table and was corrected
+to the current contract (no code change). The PIM suite exposed one
+regression from round 11 (C-31): the paper's UPMEM linear-regression
+gradient was refused because the integer narrowing proof had no rule for
+a right shift whose operand the interval analysis can no longer bound.
+Judgment: the operation's own result width bounds it, so the rule is
+sound and narrow; it is fixed with a regression test and the suites rerun
+(VALIDATION.md round 15). The round 10 suite had passed this row on an
+interval the IR does not hold, so the earlier PASS was not evidence for
+it.
+
+Gate G9 remains **FAIL** until `APUv1Program` is migrated, the matcher
+backends declare their effects, and the slice 5 traces (forced alternatives
+and cost perturbations on both hardware hosts) exist.
 
 ## Rejected shortcuts
 
@@ -590,7 +606,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 | G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1; open: C-18 evaluator anomaly, uniform movement weights |
 | G6 evidence beyond examples | **PARTIAL (reopened in round 8)** | EVIDENCE.md tables plus the round 6 probe files; remaining gaps are hardware-only confirmations listed in VALIDATION.md; the independent reviewer's probes varied the output conversion and a store guard, which the round 6 campaign had not, and found two silent defects; the campaign is kept as regression evidence, not as proof of generality; new probes must target the shared semantic contracts on every route |
 | G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install at ffb4a78 (needs repeating at the candidate, INSTALL.md section 6); AiM and UPMEM simulator recipes now ship in `simulators/` and were rebuilt from the release copies; Samsung's route is not buildable from the release repository without Samsung's permission for the five patches (P-04, documented, `apply.sh` refuses); architecture doc update for the shared pipeline pending (G9); P-17 documented proprietary SDK |
-| G8 backend execution | **evidence complete at 67f89fd, pending independent review** | installed-artifact runs at the round 10 repair: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed); all reviewer probes of rounds 8 to 10 rejected or executed correctly through the installed wheel (VALIDATION.md round 10); AttAcc analytical by design; AiM timing-only as accepted |
-| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-15: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, an enforced typed candidate contract (C-30), supplied placements rebound (C-28), orchestration and launch bindings validated before selection (C-29, C-29b), Gemini-II typed records as frontends of the pipeline (ISSUES X-01); open: `APUv1Program` (typed route), card and installed-artifact stage traces |
+| G8 backend execution | **evidence complete at 9255d29, pending independent review** | installed-artifact runs at the round 10 repair (VALIDATION.md round 10) and again at the round 15 commit: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock, 3 passed) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed through the shared pipeline); all reviewer probes of rounds 8 to 14 rejected or executed correctly through the installed wheel (VALIDATION.md round 15); AttAcc analytical by design; AiM timing-only as accepted |
+| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-15: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, an enforced typed candidate contract (C-30), supplied placements rebound (C-28), orchestration and launch bindings validated before selection (C-29, C-29b), Gemini-II typed records as frontends of the pipeline (ISSUES X-01); both hardware hosts and the installed wheel exercised at `9255d29`; open: `APUv1Program` (typed route), matcher backends' effects, slice 5 traces of forced alternatives and cost perturbations on hardware |
 
 Verdict: **NOT READY**. Blockers: G9 (X-01) is in progress (`APUv1Program` migration, slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.

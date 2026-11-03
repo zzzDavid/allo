@@ -3,7 +3,7 @@
 
 # Release status
 
-Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline). Read `TASK.md` in the containing repository,
+Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline; committed as `9255d29`, exercised from the installed wheel on the simulators, the APU v1 board and the Gemini-II card). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -41,9 +41,12 @@ then this file, then `ISSUES.md` for the next action.
    plans are `autoschedule` candidates priced, ranked, materialized and run
    through `compile_for_target`; the planner seam is gone), the enforced
    candidate contract and the Gemini-II typed-record frontends in rounds
-   14-15. Open: `APUv1Program` (the remaining typed route), Gemini-II card
-   and installed-artifact stage traces (slice 5). Map and status:
-   `design/shared-compilation-path.md`.
+   14-15. At `9255d29` the installed wheel ran the shared pipeline on the
+   simulators, the APU v1 board and the Gemini-II card (VALIDATION.md
+   round 15). Open: `APUv1Program` (the remaining typed route), the matcher
+   backends' effects declarations, and the slice 5 traces of forced
+   alternatives and cost perturbations on both hardware hosts. Map and
+   status: `design/shared-compilation-path.md`.
 2. **G2**: the independent reviewer disproved the round 7 PASS with two
    executed wrong-code probes at `e41ebbd` (C-19 casts erased, C-20 guarded
    copies), repaired in round 8 (plus C-21), and then found two more at
@@ -54,10 +57,11 @@ then this file, then `ISSUES.md` for the next action.
    arithmetic bound to the operands'-type op). Rounds 9 to 11 repair them with
    stated contracts, an external-effect realization check before selection
    and value-checked regressions; awaiting independent review.
-3. **G7/G8 evidence**: at `7bdb475` the installed artifact (wheel from the
-   committed sdist, clean venv, run outside the checkout) was exercised on
-   the three simulators, the APU v1 board and, from a wheel built on
-   zhang-x4, the Gemini-II card (VALIDATION.md round 9). Still open for G7:
+3. **G7/G8 evidence**: at `7bdb475` (round 9), `e60973f` (round 10) and
+   `9255d29` (round 15) the installed artifact (wheel from the committed
+   sdist, clean venv, run outside the checkout) was exercised on the three
+   simulators, the APU v1 board and, from a wheel built on zhang-x4, the
+   Gemini-II card (VALIDATION.md rounds 9, 10 and 15). Still open for G7:
    the Samsung simulator route is not buildable from the release repository
    without Samsung's permission for the five patches (P-04); the compatible
    build path for a user without the patches is the open question the
@@ -79,6 +83,17 @@ then this file, then `ISSUES.md` for the next action.
   `APUv1Program` only.
 - Verdict item 1 and the next-action list updated: `APUv1Program` is the
   remaining typed route; card and installed-artifact traces pending.
+- Evidence at the commit `9255d29`: full `tests/perf` (533 passed; one
+  stale expectation about the Gemini-II backend table corrected, no code
+  change) and `tests/pim` non-device suites; the sdist and wheel of the
+  committed tree installed into a clean venv and run outside the checkout
+  on the Samsung, AiM and UPMEM simulators with every reviewer probe of
+  rounds 8 to 14; the APU v1 board (3 passed) and, from a wheel built on
+  zhang-x4, the Gemini-II card (15 passed) through the shared pipeline
+  (VALIDATION.md round 15). The PIM suite found one regression from the
+  round 11 precision contract (C-31: the UPMEM linear-regression gradient
+  refused); fixed in the narrowing proof with a regression test, suites
+  rerun.
 
 ## Round 14 (2026-11-03): what was done
 
@@ -207,11 +222,10 @@ then this file, then `ISSUES.md` for the next action.
    `_PROGRAM_ROUTES` early return; the hybrid manifest's scalar ABI from
    the retained IR instead of text; the matcher backends declare
    `CandidateEffects`.
-2. G9 slice 5: stage traces on the Gemini-II card (zhang-x4, shared lock,
-   wheel built there), the installed artifact and the APU v1 board at the
-   candidate revision; forced alternatives and cost perturbations reaching
-   generated code and launches; refresh the full `tests/perf` and
-   `tests/pim` suites.
+2. G9 slice 5 (remaining): stage traces of forced alternatives and cost
+   perturbations reaching generated code and launches on the APU v1 board
+   and the Gemini-II card at one revision (the installed-wheel runs on both
+   hosts and the full suites at `9255d29` are in VALIDATION.md round 15).
 3. Independent review of the candidate boundary (C-28, C-29) and the
    remaining semantic items; then the deferred installation and lint work
    (P-04 Samsung patches, P-23 pylint stage).

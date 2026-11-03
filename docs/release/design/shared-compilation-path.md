@@ -296,4 +296,8 @@ Observations that fix the migration order:
    14); `APUv1Program` remains to be normalized.
 5. **Evidence.** Stage traces for one representative program per target,
    forced alternatives and cost perturbations reaching generated code and
-   launches, simulator and both hardware hosts, installed artifact.
+   launches, simulator and both hardware hosts, installed artifact. At
+   `9255d29` (round 15) the installed wheel ran the shared pipeline on the
+   three simulators, the APU v1 board and the Gemini-II card, and the full
+   suites passed (VALIDATION.md round 15); the forced-alternative and
+   cost-perturbation traces on hardware remain.
