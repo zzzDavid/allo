@@ -52,6 +52,10 @@ def abs_(x):
     return abs(x)
 
 
+def popcount(x):
+    return bin(x & ((1 << 64) - 1)).count("1")
+
+
 def select(cond, a, b):
     return a if cond else b
 

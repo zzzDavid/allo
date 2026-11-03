@@ -87,10 +87,13 @@ evaluation-only paths, documented as such: E11 (Gemini-I source-order run
 script), the DRAM half of E14, E15, and the AttAcc reference-best study,
 Ramulator2-AttAcc timing and DCC decode composition of E16.
 
-Not yet true, and required by gate G9 (user scope addition 2026-11-02, ISSUES
-X-01): one shared orchestration with explicit stage contracts for every
-target. Today the matcher backends, the APU v1 vector route and the Gemini-II
-source route reach `allo.compile` through three end-to-end paths; the shared
-semantic checks of round 8 (exact-cast and output-copy contracts, C-19 to
-C-21) run in the matcher, which the Gemini-II source route already uses and
-the APU v1 vector route does not.
+Required by gate G9 (user scope addition 2026-11-02, ISSUES X-01) and in
+progress: one shared orchestration with explicit stage contracts for every
+target. Since round 12 every ordinary source workload passes the same front
+stages (`allo/spmw_pipeline.py`: frontend, matcher, coverage/semantic
+contracts C-19 to C-26, shared facts `allo/spmw_semantics.py`) before any
+backend planner; the Gemini-II contract and the APU v1 vector analysis are
+derived from those facts (the APU v1 MLIR-text analysis is out of the public
+route). Not yet done: the APU plans are selected by their own searches rather
+than as `rank_matcher_placements` candidates; typed records do not normalize
+into the shared contracts (`design/shared-compilation-path.md`).

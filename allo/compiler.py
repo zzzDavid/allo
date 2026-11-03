@@ -15,12 +15,10 @@ from typing import Callable
 
 import numpy as np
 
-from .customize import customize
 from .ir.builder import _spmw_group_contract
 from .perf import BoundCostSpec, CostSpec
 from .pim.apu_v1_program import APUv1Program, compile_apu_v1_program
 from .pim.apu_v1_vector_program import compile_apu_v1_vector_workload
-from .pim.apu_v1_vectorize import NoContractionError
 from .pim.apu_g2_composed_program import (
     APUG2ComposedContractionProgram,
     compile_apu_g2_composed_program,
@@ -33,7 +31,7 @@ from .pim.apu_g2_source_route import compile_apu_g2_source_workload
 from .spmw_autoschedule import MatcherWorkScope, _retain_matcher_work_scope
 from .spmw_codegen import RunResult, compile_for_target, source_backend_binding
 from .spmw_liveness import MatcherValueId, trace_liveness
-from .spmw_match_engine import match_workload, require_match_coverage
+from .spmw_pipeline import normalize_source
 from .spmw_plan import BufferMetricManifest, launch_schedule
 from .spmw_reduction_policy import (
     POLICY_KEY,
@@ -800,6 +798,92 @@ def _compile_program(
     return route.compile_fn(workload, target, cost=bound_cost, backend=backend)
 
 
+def _plan_apu_g2_source(
+    program, bound_cost, *, backend, host_moves, layout, reduction_order
+):
+    """Gemini-II planner over the shared facts: composed-dot launch plans."""
+
+    if bound_cost is None:
+        raise ValueError(
+            "Gemini-II source workloads need an executable cost program "
+            "(apu_g2_cost) to rank their launch plans"
+        )
+    schedule, trace, compiled = compile_apu_g2_source_workload(
+        program.workload,
+        program.target,
+        cost=bound_cost,
+        backend=backend,
+        host_moves=host_moves,
+        layout=layout,
+        program=program,
+    )
+    return CompiledCallable(
+        program.workload,
+        program.target,
+        schedule,
+        trace,
+        compiled,
+        cost=bound_cost,
+        reduction_order=reduction_order,
+    )
+
+
+def _plan_apu_v1_vector(
+    program, bound_cost, *, backend, host_moves, layout, reduction_order
+):
+    """APU v1 planner over the shared facts: the vector recipe catalog."""
+
+    if host_moves is not None:
+        raise ValueError(
+            "APU v1 vector plans derive their transfers; host_moves is not accepted"
+        )
+    return compile_apu_v1_vector_workload(
+        program.workload,
+        program.target,
+        program,
+        cost=bound_cost,
+        layout=layout,
+        backend=backend,
+        reduction_order=reduction_order,
+    )
+
+
+def _apu_v1_vector_applies(program) -> bool:
+    # Dataflow regions retain their matcher/group implementation through
+    # typed structural scope attributes stamped on retained IR kernel
+    # functions; they take the matcher route.  A plain function takes the
+    # vector planner when the shared facts hold a contraction; otherwise the
+    # matcher route reports what it can and cannot lower.
+    if _module_has_retained_matcher_scopes(program.schedule.module):
+        return False
+    return bool(program.program_facts().contractions)
+
+
+@dataclass(frozen=True)
+class _SourcePlanner:
+    """A backend planner over the shared semantic facts."""
+
+    applies: Callable  # (SourceProgram) -> bool
+    plan: Callable  # (SourceProgram, bound_cost, **options) -> CompiledWorkload
+
+
+# Backend planners that consume the shared semantic facts.  They are the
+# APU routes whose candidate plans are not yet matcher placements (gate G9
+# slice 3 folds them into `autoschedule` enumerators); every other target
+# plans through `compile_for_target`.
+_SOURCE_PLANNERS: dict[str, _SourcePlanner] = {
+    "apu_v2": _SourcePlanner(lambda program: True, _plan_apu_g2_source),
+    "apu_v1": _SourcePlanner(_apu_v1_vector_applies, _plan_apu_v1_vector),
+}
+
+
+def _source_planner(target, program):
+    entry = _SOURCE_PLANNERS.get(getattr(target, "name", None))
+    if entry is None or not entry.applies(program):
+        return None
+    return entry.plan
+
+
 def compile(
     workload,
     target,
@@ -812,28 +896,33 @@ def compile(
 ) -> CompiledWorkload:
     """Compile ``workload`` for ``target`` and return a NumPy-callable object.
 
-    The pipeline has four stages:
+    Stages (release gate G9, ``docs/release/design/shared-compilation-path.md``):
 
-    1. Typed program frontends. ``APUv1Program``, ``APUG2TypedProgram`` and
-       ``APUG2ComposedContractionProgram`` each compile through their own
-       route. ``APUv1Program`` accepts
-       ``backend in (None, "virtual", "functional")``: ``None`` builds and
-       launches on the board, ``"virtual"`` evaluates the retained cost graph
-       without touching the device, and ``"functional"`` executes the
-       retained MLIR-derived portable C on the host (scalar ARC programs
-       only; native-vector programs reject it at compile time). The APU v2
-       routes validate ``backend`` themselves. No typed route accepts
-       ``host_moves`` or ``layout``. An ordinary source workload on
-       Gemini-II (``apu_v2``) goes through the composed-dot source route
-       (``allo.pim.apu_g2_source_route``): integer contractions are matched,
-       lowered to cost-ranked composed-dot launch plans (``layout=`` names a
-       plan), and anything outside that family raises
-       ``APUG2SourceRouteError`` (a NotImplementedError).
-    2. Source frontend. A plain ``@allo`` workload is customized to MLIR.
-    3. Contraction frontend (APU v1, non-dataflow only). Contractions go
-       through the APU v1 layout-plan vector path; anything else falls through.
-    4. Matcher. The workload is matched against the target, the ranked
-       autoscheduler picks placements, and backend codegen emits commands.
+    1. **Typed program frontends.** ``APUv1Program``, ``APUG2TypedProgram``
+       and ``APUG2ComposedContractionProgram`` are program records that fix
+       their own plan; each compiles through its typed route
+       (``_PROGRAM_ROUTES``).  ``APUv1Program`` accepts
+       ``backend in (None, "virtual", "functional")``; the APU v2 records
+       validate ``backend`` themselves; no typed route accepts
+       ``host_moves`` or ``layout``.
+    2. **Shared front stages** (every ordinary source workload, every
+       target; :func:`allo.spmw_pipeline.normalize_source`): the ``@allo``
+       function is customized to MLIR, matched against the target's
+       operation patterns (or the source-idiom view a backend declares as
+       ``target.spmw_match_view``), its stores are classified and the
+       coverage, accumulator-initialization, conversion, alias and copy
+       contracts are enforced (``UnsupportedWorkloadError``), and the shared
+       semantic facts are derived (:func:`allo.spmw_semantics.analyze_program`).
+    3. **Backend planning.** A backend whose candidate plans are not yet
+       matcher placements consumes the shared facts through a planner hook
+       (``_SOURCE_PLANNERS``): Gemini-II (``apu_v2``) derives its composed-dot
+       contract and ranks launch plans (``layout=`` names a plan; anything
+       outside the family raises ``APUG2SourceRouteError``); APU v1 plans a
+       matched contraction of a plain function with its vector recipes
+       (``allo.pim.apu_v1_vectorize``).  Every other target, and an APU v1
+       dataflow region or plain function without a contraction, continues
+       with the matcher route: the ranked autoscheduler picks placements
+       and backend codegen emits commands (``compile_for_target``).
 
     A source workload on UPMEM lowers each matched kernel group to a
     calibrated physical plan and runs it on the provenance uPIMulator; a run
@@ -896,54 +985,23 @@ def compile(
                 reduction_order,
             )
     reduction_order = normalize_reduction_order(reduction_order)
-    if target.name == "apu_v2":
-        # Ordinary source: matched integer contractions lowered to ranked
-        # composed-dot launch plans; anything else raises
-        # APUG2SourceRouteError (a NotImplementedError naming the family).
-        if bound_cost is None:
-            raise ValueError(
-                "Gemini-II source workloads need an executable cost program "
-                "(apu_g2_cost) to rank their launch plans"
-            )
-        schedule, trace, compiled = compile_apu_g2_source_workload(
-            workload,
-            target,
-            cost=bound_cost,
+
+    # Shared front stages: frontend, matcher, coverage/semantic contracts and
+    # the semantic facts, identical for every target.
+    program = normalize_source(workload, target, reduction_order=reduction_order)
+    schedule, trace = program.schedule, program.trace
+
+    planner = _source_planner(target, program)
+    if planner is not None:
+        return planner(
+            program,
+            bound_cost,
             backend=backend,
             host_moves=host_moves,
             layout=layout,
-        )
-        return CompiledCallable(
-            workload,
-            target,
-            schedule,
-            trace,
-            compiled,
-            cost=bound_cost,
             reduction_order=reduction_order,
         )
 
-    schedule = customize(workload, enable_tensor=False)
-    # Dataflow regions retain their matcher/group implementation through typed
-    # structural scope attributes stamped on retained IR kernel functions.
-    if target.name == "apu_v1" and not _module_has_retained_matcher_scopes(
-        schedule.module
-    ):
-        try:
-            return compile_apu_v1_vector_workload(
-                workload,
-                target,
-                schedule,
-                cost=bound_cost,
-                layout=layout,
-                backend=backend,
-                reduction_order=reduction_order,
-            )
-        except NoContractionError:
-            pass
-
-    trace = match_workload(target, schedule.module, reduction_order=reduction_order)
-    require_match_coverage(trace, target=target, defer_unknown=True)
     require_matcher_route_policy(target, trace)
     _stamp_matcher_work_scopes(target, schedule.module, trace)
     launch_order = None

@@ -452,7 +452,10 @@ def test_upmem_in_place_pointwise_is_rejected_as_unmatched():
 
 
 def test_apu_v1_source_aliases_are_rejected():
-    with pytest.raises(IllegalContractionError, match="aliases the output"):
+    """The operand/result alias is the shared matcher contract (the same
+    rejection as Samsung, UPMEM and AiM above); two multiplicands in one
+    buffer is an APU v1 value-layout restriction."""
+    with pytest.raises(UnsupportedWorkloadError, match="aliases its result"):
         _apu_v1(apu_gemv_in_place)
     with pytest.raises(IllegalContractionError, match="read one buffer"):
         _apu_v1(apu_gemm_self)
@@ -460,7 +463,7 @@ def test_apu_v1_source_aliases_are_rejected():
 
 def test_apu_g2_source_aliases_are_rejected():
     for workload in (g2_gemv_in_place, g2_gemv_carried_in_place):
-        with pytest.raises(APUG2SourceRouteError, match="aliases its result"):
+        with pytest.raises(UnsupportedWorkloadError, match="aliases its result"):
             _g2(workload)
 
 
@@ -468,8 +471,9 @@ def test_apu_g2_operand_wider_than_the_accumulator_is_refused_visibly():
     """``acc: int15 += A * y`` with ``y: int16`` truncates a value whose
     operand is wider than the accumulator; the device would have to narrow
     the operand, which no target op declares, so the matcher keeps the
-    truncation visible and coverage fails instead of matching a MAC."""
-    with pytest.raises(APUG2SourceRouteError, match=r"arith\.trunci<i21->i15>"):
+    truncation visible and the shared coverage check fails before the
+    Gemini-II planner runs."""
+    with pytest.raises(UnsupportedWorkloadError, match=r"arith\.trunci<i21->i15>"):
         _g2(g2_gemv_in_place_wide_operand)
 
 
@@ -616,11 +620,18 @@ def test_apu_v1_device_route_stages_aliases_and_zero_fills(monkeypatch):
 
 @pytest.mark.parametrize(
     "workload, what",
-    [(apu_gemm_one_filled, "constant 1.0"), (apu_gemm_half_filled, "half the rows")],
+    [
+        (apu_gemm_one_filled, "nonzero constant 1.0"),
+        (apu_gemm_half_filled, "does not fill the whole buffer"),
+    ],
     ids=["one_filled", "half_filled"],
 )
 def test_apu_v1_output_store_other_than_a_zero_fill_is_rejected(workload, what):
-    with pytest.raises(IllegalContractionError, match="not a preceding literal-0 fill"):
+    """The accumulator-initialization contract is shared: a nonzero or
+    partial initializer is refused by the matcher's coverage analysis before
+    the APU v1 planner sees the program (previously the vector route's own
+    text analysis made this judgment)."""
+    with pytest.raises(UnsupportedWorkloadError, match=what):
         _apu_v1(workload, backend="virtual")
 
 

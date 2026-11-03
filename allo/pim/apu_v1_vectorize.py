@@ -1,12 +1,15 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MLIR contraction analysis and APU v1 vector-plan candidate generation.
+"""APU v1 contraction legality and vector-plan candidate generation.
 
-This module is deliberately independent of code generation and runtime.  It
-recognizes reduction updates from retained Allo MLIR, recovers logical loop
-axes and memory accesses, proves the output/reduction independence needed for
-vector execution, and materializes named layout candidates.  No decision
-depends on a Python function or kernel name.
+This module is deliberately independent of code generation and runtime.  The
+public source route receives the shared semantic facts of the matched program
+(:func:`allo.spmw_semantics.analyze_program`, derived from the matcher's
+structural analysis) and applies the vector plans' legality to them
+(`contraction_analysis_from_facts`); it then materializes named layout
+candidates.  No decision depends on a Python function or kernel name.  The
+older text parser (`analyze_apu_v1_contractions`) remains only for the typed
+hybrid route and is slated for removal with it (release gate G9, slice 4).
 
 The accepted analysis core is a dense one-reduction contraction with one or
 more parallel output axes.  APU plan generation currently realizes the
@@ -784,7 +787,12 @@ def analyze_apu_v1_contractions(module_or_text) -> tuple[ContractionAnalysis, ..
 
 
 def analyze_apu_v1_contraction(module_or_text, *, function: str | None = None):
-    """Return one contraction, optionally selected by MLIR function name."""
+    """Return one contraction, optionally selected by MLIR function name.
+
+    Text-parser entry kept for the typed hybrid route
+    (:mod:`allo.pim.apu_v1_hybrid`); the public source route derives its
+    analysis from the shared semantic facts (`apu_v1_contraction_analysis`).
+    """
     analyses = analyze_apu_v1_contractions(module_or_text)
     if function is not None:
         analyses = tuple(item for item in analyses if item.function == function)
@@ -797,6 +805,293 @@ def analyze_apu_v1_contraction(module_or_text, *, function: str | None = None):
             f"expected exactly one contraction, found {len(analyses)}; select function="
         )
     return analyses[0]
+
+
+# --------------------------------------------------------------------------- #
+# Shared semantic facts -> APU v1 contraction analysis (release gate G9)
+# --------------------------------------------------------------------------- #
+#
+# The public source route no longer re-parses MLIR text.  The matcher's
+# structural analysis (`allo.spmw_semantics.analyze_program`) establishes the
+# contraction facts once; this adapter applies the APU v1 vector plans'
+# legality to them and produces the `ContractionAnalysis` the recipe
+# catalog, realizer, cost model and runtime consume.  Every rule below is a
+# target restriction (what a GVML value layout can represent), not a
+# reinterpretation of the program.
+
+
+def _apu_v1_access(access, labels, function: str, what: str) -> ValueAccess:
+    """A `ValueAccess` over source loop labels; rejects non-plain subscripts."""
+
+    if access.shape is None or access.element is None:
+        raise IllegalContractionError(
+            f"{function}: {what} {access.memref_name!r} has no retained shape or "
+            "element type"
+        )
+    if len(access.dims) != len(access.shape):
+        raise IllegalContractionError(
+            f"{function}: {what} {access.memref_name!r} is not indexed in every "
+            "dimension"
+        )
+    if any(dim is None for dim in access.dims):
+        raise IllegalContractionError(
+            f"{function}: {what} {access.memref_name!r} is subscripted by an "
+            "expression that is not a plain loop variable; APU v1 vector plans "
+            "address whole buffers by loop axes"
+        )
+    return ValueAccess(
+        value=access.parameter or access.memref_name,
+        indices=tuple(labels[dim] for dim in access.dims),
+        mode="affine" if access.index_map is not None else "memref",
+        dtype=access.element.source_text,
+        shape=tuple(access.shape),
+    )
+
+
+def _apu_v1_sink_access(sink, labels, function: str) -> ValueAccess:
+    if sink.shape is None or sink.element is None:
+        raise IllegalContractionError(
+            f"{function}: the result is copied to {sink.memref_name!r}, whose shape "
+            "or element type is not retained"
+        )
+    if len(sink.dims) != len(sink.shape) or any(dim is None for dim in sink.dims):
+        raise IllegalContractionError(
+            f"{function}: the result is copied to {sink.memref_name!r} at a "
+            "subscript that is not a plain loop variable"
+        )
+    return ValueAccess(
+        value=sink.parameter or sink.memref_name,
+        indices=tuple(labels[dim] for dim in sink.dims),
+        mode="affine",
+        dtype=sink.element.source_text,
+        shape=tuple(sink.shape),
+    )
+
+
+def contraction_analysis_from_facts(contraction) -> ContractionAnalysis:
+    """APU v1 vector legality over one shared `Contraction` fact.
+
+    Accepted: one unguarded ``range(N)`` loop nest with exactly one reduction
+    loop; two distinct input buffers subscripted by plain loop variables, both
+    indexed by the reduction loop; an accumulator that is either a function
+    argument indexed by the result loops (``C[i, j] += ...``, carried or
+    zero-filled) or a local scalar copied once into a function argument
+    (``acc = 0; ...; C[i, j] = acc``); one element type throughout (a VR lane
+    holds one 16-bit type); loop extents equal to the buffer extents (the
+    plans transfer whole buffers).  Everything else raises
+    :class:`IllegalContractionError` naming the restriction.
+    """
+
+    c = contraction
+    function = c.function
+    if c.roles_unresolved:
+        raise IllegalContractionError(
+            f"{function}: the loop roles of the contraction are not proven "
+            f"({c.roles_unresolved})"
+        )
+    if c.guards:
+        raise IllegalContractionError(
+            f"{function}: the contraction is under a condition; APU v1 vector "
+            "plans execute every iteration of the loop nest"
+        )
+    if len(c.inputs) != 2:
+        raise IllegalContractionError(
+            f"{function}: expected two buffer inputs, found {len(c.inputs)}"
+        )
+    for loop in c.loops:
+        if loop.trip is None or not loop.normalized:
+            raise IllegalContractionError(
+                f"{function}: loop {loop.label!r} is not 'range(N)' with a constant "
+                "N; APU v1 vector plans map whole loop extents onto value layouts"
+            )
+    labels = {loop.var: loop.label for loop in c.loops}
+    if len(set(labels.values())) != len(labels):
+        labels = {loop.var: loop.var for loop in c.loops}
+    if len(c.reduction_vars) != 1:
+        raise IllegalContractionError(
+            f"{function}: expected one reduction axis, found "
+            f"{[labels[v] for v in c.reduction_vars]}"
+        )
+    (reduction_var,) = c.reduction_vars
+    result_vars = c.result_vars
+    if not result_vars:
+        raise IllegalContractionError(
+            f"{function}: vector contraction needs at least one output axis"
+        )
+
+    lhs = _apu_v1_access(c.inputs[0], labels, function, "operand")
+    rhs = _apu_v1_access(c.inputs[1], labels, function, "operand")
+    acc = c.accumulator
+    if acc.local:
+        # ``acc: T = 0; for k: acc += ...; C[...] = acc``: the result lives in
+        # the single external sink.  The plan computes the sink from zero.
+        if c.accumulator_init != "zero":
+            raise IllegalContractionError(
+                f"{function}: local accumulator {acc.memref_name!r} is initialized "
+                f"as {c.accumulator_init!r}"
+            )
+        sinks = c.external_sinks
+        if len(c.sinks) != 1 or len(sinks) != 1:
+            raise IllegalContractionError(
+                f"{function}: the local accumulator {acc.memref_name!r} is copied "
+                f"to {len(c.sinks)} buffer(s); APU v1 vector plans write exactly "
+                "one output buffer"
+            )
+        output = _apu_v1_sink_access(sinks[0], labels, function)
+        accumulator = output
+        output_initializer = "zero"
+        if acc.element is None or acc.element != sinks[0].element:
+            raise IllegalContractionError(
+                f"{function}: the accumulator {acc.memref_name!r} and its output "
+                f"{sinks[0].memref_name!r} have different element types; a VR lane "
+                "holds one type"
+            )
+    else:
+        if c.sinks:
+            raise IllegalContractionError(
+                f"{function}: the result {acc.memref_name!r} is also copied to "
+                f"{[s.memref_name for s in c.sinks]}; APU v1 vector plans write the "
+                "accumulator buffer only"
+            )
+        if c.accumulator_init not in ("zero", "carried"):
+            raise IllegalContractionError(
+                f"{function}: output {acc.memref_name!r} is also written by a store "
+                "that is not a preceding literal-0 fill of every element; APU v1 "
+                "vector plans support only 'C[...] += ...' onto the caller's output "
+                "or after such a fill"
+            )
+        output = _apu_v1_access(acc, labels, function, "accumulator")
+        accumulator = output
+        output_initializer = c.accumulator_init
+
+    output_axes = tuple(output.indices)
+    if len(set(output_axes)) != len(output_axes):
+        raise IllegalContractionError(
+            f"{function}: output {output.value}{output_axes} is not indexed by "
+            "distinct enclosing loop axes"
+        )
+    result_labels = tuple(labels[v] for v in result_vars)
+    if set(output_axes) != set(result_labels):
+        raise IllegalContractionError(
+            f"{function}: output {output.value}{output_axes} is not indexed by "
+            f"exactly the result loops {result_labels}"
+        )
+    reduction = labels[reduction_var]
+    if reduction not in lhs.indices or reduction not in rhs.indices:
+        raise IllegalContractionError(
+            f"{function}: both multiplicands must reference reduction axis "
+            f"{reduction!r}"
+        )
+    if c.input_aliases_accumulator:
+        raise IllegalContractionError(
+            f"{function}: operand {c.input_aliases_accumulator} aliases the output "
+            f"{output.value}; a vector plan reads every operand before it writes "
+            "the output; write the result to a separate buffer"
+        )
+    if c.same_buffer or (
+        c.inputs[0].value_ref is not None
+        and c.inputs[0].value_ref == c.inputs[1].value_ref
+    ):
+        raise IllegalContractionError(
+            f"{function}: both multiplicands {lhs.value}{lhs.indices} and "
+            f"{rhs.value}{rhs.indices} read one buffer; pass it as two parameters"
+        )
+    legal = set(output_axes) | {reduction}
+    for access in (lhs, rhs):
+        unknown = set(access.indices) - legal
+        if unknown:
+            raise IllegalContractionError(
+                f"{function}: access {access.value}{access.indices} uses "
+                f"non-contraction indices {sorted(unknown)}"
+            )
+    for axis in output_axes:
+        if axis not in lhs.indices and axis not in rhs.indices:
+            raise IllegalContractionError(
+                f"{function}: output axis {axis!r} does not index either input"
+            )
+    extents = {labels[loop.var]: loop.trip for loop in c.loops}
+    for access in (lhs, rhs, output):
+        for axis, extent in zip(access.indices, access.shape):
+            if extents[axis] != extent:
+                raise IllegalContractionError(
+                    f"{function}: {access.value}{access.indices} has extent {extent} "
+                    f"along {axis!r} but the loop runs {extents[axis]} iterations; "
+                    "APU v1 vector plans transfer whole buffers, so loop extents "
+                    "must equal the buffer extents"
+                )
+    numeric = c.numeric
+    if numeric is None:
+        raise IllegalContractionError(f"{function}: the accumulator type is unknown")
+    if {lhs.dtype, rhs.dtype, output.dtype} != {numeric.source_text}:
+        raise IllegalContractionError(
+            f"{function}: operands {lhs.dtype}, {rhs.dtype} and output "
+            f"{output.dtype} mix element types; a VR lane holds one 16-bit type"
+        )
+
+    axes = tuple(
+        LogicalAxis(
+            name=labels[loop.var],
+            extent=loop.trip,
+            lower_bound=loop.lower,
+            upper_bound=loop.upper,
+            step=loop.step,
+            reduction=loop.var == reduction_var,
+            ssa_name=loop.var,
+        )
+        for loop in c.loops
+    )
+    return ContractionAnalysis(
+        function,
+        axes,
+        output_axes,
+        output_axes,
+        reduction,
+        lhs,
+        rhs,
+        accumulator,
+        output,
+        c.product_operation,
+        c.accumulate_operation,
+        numeric.source_text,
+        numeric.bits if c.product_kind == "popcount" else None,
+        output_initializer=output_initializer,
+    )
+
+
+def apu_v1_contraction_analysis(program) -> ContractionAnalysis:
+    """The one contraction of a shared `ProgramFacts` the vector plans lower.
+
+    Raises :class:`NoContractionError` when the matched program has no
+    contraction (the caller may route it elsewhere) and
+    :class:`IllegalContractionError` when it has one the vector plans cannot
+    realize, or effects besides it.
+    """
+
+    if not program.contractions:
+        raise NoContractionError(
+            f"{program.function}: the matched program contains no mul-add "
+            "contraction"
+        )
+    if program.foreign_functions:
+        raise IllegalContractionError(
+            f"{program.function}: matched code also lives in "
+            f"{list(program.foreign_functions)}; the vector plans lower one function"
+        )
+    if len(program.contractions) != 1:
+        raise IllegalContractionError(
+            f"{program.function}: {len(program.contractions)} contractions were "
+            "matched; APU v1 vector plans lower exactly one contraction per "
+            "function"
+        )
+    extra = [m.target_op_name for m in program.other_matches] + [
+        e.target_op_name for e in program.epilogues
+    ]
+    if extra:
+        raise IllegalContractionError(
+            f"{program.function}: the function also computes {extra}, which the "
+            "APU v1 vector plans do not realize alongside the contraction"
+        )
+    return contraction_analysis_from_facts(program.contractions[0])
 
 
 def _layout_api():
@@ -1040,14 +1335,17 @@ def _lift_unit_output_axis(analysis: ContractionAnalysis) -> ContractionAnalysis
 
 
 def generate_apu_v1_vectorization_candidates(
-    module_or_analysis,
+    analysis_or_program,
 ) -> tuple[VectorizationCandidate, ...]:
-    """Create MICRO-motivated plans for a proven contraction."""
-    analysis = (
-        module_or_analysis
-        if isinstance(module_or_analysis, ContractionAnalysis)
-        else analyze_apu_v1_contraction(module_or_analysis)
-    )
+    """Create MICRO-motivated plans for a proven contraction.
+
+    Takes a `ContractionAnalysis` or the shared `ProgramFacts`
+    (:func:`allo.spmw_semantics.analyze_program`) of the matched source.
+    """
+    if isinstance(analysis_or_program, ContractionAnalysis):
+        analysis = analysis_or_program
+    else:
+        analysis = apu_v1_contraction_analysis(analysis_or_program)
     if analysis.output_initializer == "other":
         # Vector plans either accumulate onto the caller's output or start
         # from zero; any other store into the output would be dropped.
@@ -1967,12 +2265,12 @@ def generate_apu_v1_vectorization_candidates(
     return tuple(candidates)
 
 
-def generate_apu_v1_plans(module_or_analysis) -> tuple[object, ...]:
+def generate_apu_v1_plans(analysis_or_program) -> tuple[object, ...]:
     """Return only the immutable :class:`APUV1Plan` values."""
 
     return tuple(
         candidate.plan
-        for candidate in generate_apu_v1_vectorization_candidates(module_or_analysis)
+        for candidate in generate_apu_v1_vectorization_candidates(analysis_or_program)
     )
 
 
@@ -1986,6 +2284,8 @@ __all__ = [
     "VectorizationCandidate",
     "analyze_apu_v1_contraction",
     "analyze_apu_v1_contractions",
+    "apu_v1_contraction_analysis",
+    "contraction_analysis_from_facts",
     "generate_apu_v1_vectorization_candidates",
     "generate_apu_v1_plans",
     "gemv_reduction_tile_domain",

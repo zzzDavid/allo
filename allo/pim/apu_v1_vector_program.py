@@ -978,32 +978,39 @@ class APUv1VectorCallable:
 def compile_apu_v1_vector_workload(
     workload,
     target,
-    schedule,
+    program,
     *,
     cost=None,
     layout=None,
     backend=None,
     reduction_order=None,
 ):
-    """Analyze one ordinary Allo contraction and return its public callable.
+    """Plan one matched Allo contraction and return its public callable.
 
+    ``program`` is the :class:`allo.spmw_pipeline.SourceProgram` of the
+    shared front stages (frontend, matcher, coverage and semantic analysis
+    have already run); the vector plans are generated from its shared facts.
     Under ``reduction_order="strict"`` (the default) a floating-point
     contraction ranks only plans that keep the source accumulation order.
     """
 
     if getattr(target, "name", None) != "apu_v1":
         raise ValueError("APU v1 vector workloads require the apu_v1 target")
-    candidates = generate_apu_v1_vectorization_candidates(schedule.module)
-    return APUv1VectorCallable(
+    facts = program.program_facts()
+    candidates = generate_apu_v1_vectorization_candidates(facts)
+    compiled = APUv1VectorCallable(
         workload,
         target,
-        schedule,
+        program.schedule,
         candidates,
         cost=cost,
         layout=layout,
         backend=backend,
         reduction_order=reduction_order,
     )
+    compiled.trace = program.trace
+    compiled.program_facts = facts
+    return compiled
 
 
 __all__ = [

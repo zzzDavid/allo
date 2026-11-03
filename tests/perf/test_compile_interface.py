@@ -209,15 +209,17 @@ def _matched_function(name, work_id, target_op_name="MAC"):
 
 def _patch_pipeline(monkeypatch):
     compiler_api = importlib.import_module("allo.compiler")
+    pipeline = importlib.import_module("allo.spmw_pipeline")
     fake = _FakeCompiled()
     captured = {}
+    # The shared front stages (frontend, matcher) live in allo.spmw_pipeline.
     monkeypatch.setattr(
-        compiler_api,
+        pipeline,
         "customize",
         lambda workload, enable_tensor=False: SimpleNamespace(module="module"),
     )
     monkeypatch.setattr(
-        compiler_api,
+        pipeline,
         "match_workload",
         lambda target, module, **kwargs: SimpleNamespace(
             target_name=target.name, coverage=None, matches=[]
@@ -752,8 +754,9 @@ def test_public_compile_selects_matcher_adapter_from_retained_ir(monkeypatch):
             )
     trace = MatchTrace("apu_v1", "retained_adapter", matches)
     fake = _FakeCompiled()
-    monkeypatch.setattr(compiler_api, "customize", lambda *args, **kwargs: schedule)
-    monkeypatch.setattr(compiler_api, "match_workload", lambda *args, **kwargs: trace)
+    pipeline = importlib.import_module("allo.spmw_pipeline")
+    monkeypatch.setattr(pipeline, "customize", lambda *args, **kwargs: schedule)
+    monkeypatch.setattr(pipeline, "match_workload", lambda *args, **kwargs: trace)
     monkeypatch.setattr(
         compiler_api, "compile_for_target", lambda *args, **kwargs: fake
     )

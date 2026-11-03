@@ -142,15 +142,32 @@ evaluated jointly within a documented budget (Section 2.6 and
    compile_apu_g2_typed_program`, `APUG2ComposedContractionProgram ->
    compile_apu_g2_composed_program`. They refuse `host_moves`, `layout` and
    `reduction_order`.
-3. `target.name == "apu_v2"` with a source workload goes to
-   `apu_g2_source_route.compile_apu_g2_source_workload` (Section 3.5).
-4. Otherwise `customize(workload, enable_tensor=False)` produces the MLIR
-   module. On `apu_v1` without retained dataflow scopes the APU v1 vector
-   route is tried first (`compile_apu_v1_vector_workload`;
-   `NoContractionError` falls through).
-5. Matcher route: `match_workload`, `require_match_coverage(...,
-   defer_unknown=True)`, `require_matcher_route_policy`,
-   `_stamp_matcher_work_scopes`, then `spmw_codegen.compile_for_target`.
+3. Shared front stages for every ordinary source workload
+   (`allo/spmw_pipeline.py::normalize_source`, gate G9):
+   `customize(workload, enable_tensor=False)` produces the MLIR module;
+   `match_workload(matcher_view(target), module)` matches it against the
+   target's patterns, or against the source-idiom view a backend declares
+   as `target.spmw_match_view` (Gemini-II: `build_apu_g2_contraction_patterns()`,
+   because its hardware description has no matchable primitive);
+   `require_match_coverage(..., defer_unknown=True)` enforces the coverage,
+   accumulator-initialization, conversion, alias, copy and precision
+   contracts (`UnsupportedWorkloadError`) before any planner; the shared
+   semantic facts (`allo/spmw_semantics.py::analyze_program` ->
+   `ProgramFacts`: parameters with element types and signedness, each
+   contraction's loop nest, roles, accesses, accumulator initialization,
+   output sinks, guards, operations, policy; epilogues) are derived from
+   that trace on first use (`SourceProgram.program_facts()`).
+4. Backend planners over the shared facts (`_SOURCE_PLANNERS`, an explicit
+   seam until the APU plans become `autoschedule` candidates): `apu_v2` ->
+   `apu_g2_source_route.compile_apu_g2_source_workload(program=...)`
+   (Section 3.5); `apu_v1` on a plain function whose facts hold a
+   contraction -> `compile_apu_v1_vector_workload(program=...)` (Section
+   3.4). Dataflow regions and contraction-free functions on `apu_v1`
+   continue below.
+5. Matcher route: `require_matcher_route_policy`,
+   `_stamp_matcher_work_scopes`, then `spmw_codegen.compile_for_target`
+   (autoschedule enumerators, legality, movement stage, ranking, backend
+   context, runner).
 
 ### 2.1 Frontend (`allo/customize.py`, `allo/ir/`)
 
@@ -616,10 +633,18 @@ profile freshness by diffing the device log before and after the launch
 
 * **Vector contraction route** (`apu_v1_vector_program.py`,
   `apu_v1_vectorize.py`, `apu_v1_layout.py`, `apu_v1_vector_codegen.py`,
-  `apu_v1_vector_cost.py`, `apu_v1_vector_runtime.py`). Input: a plain
-  `@allo` function whose stores are rank-2 contractions (FP16/uint16 multiply,
-  bitwise and XNOR-popcount forms); 1-D GEMV is lifted with a unit axis.
-  `generate_apu_v1_vectorization_candidates` builds a finite recipe catalog
+  `apu_v1_vector_cost.py`, `apu_v1_vector_runtime.py`). Input: the shared
+  facts of a plain `@allo` function whose matched effect is one rank-2
+  contraction (FP16/uint16 multiply-add; accumulator a function argument,
+  carried or zero-filled, or a local scalar copied once to the output);
+  1-D GEMV is lifted with a unit axis. `apu_v1_contraction_analysis`
+  (`apu_v1_vectorize.py`) applies the vector plans' legality to the
+  `ProgramFacts` (one unguarded `range(N)` nest, one reduction loop on both
+  inputs, plain subscripts, distinct input buffers, one 16-bit element
+  type, loop extents equal to buffer extents) and yields the
+  `ContractionAnalysis`; the older MLIR-text parser remains only for the
+  hybrid typed route. `generate_apu_v1_vectorization_candidates` builds a
+  finite recipe catalog
   of `APUV1Plan`s (temporal SVP, DMA coalescing with accumulator depths,
   spatial group reduction, ...); `_apply_reduction_policy` removes
   regrouping plans under strict (`apu_v1_plan_regroups`);
@@ -703,9 +728,11 @@ G2-06).
   against the plan before launch (`attest_apu_g2_composed_packing`,
   G2-08).
 * **Source route** (`apu_g2_source_route.py`,
-  `compile_apu_g2_source_workload`): a plain integer contraction function is
-  matched against `build_apu_g2_contraction_patterns()` (`MAC`, `AXPBY`),
-  `analyze_apu_g2_source` derives the `APUG2SourceContract` (K, result
+  `compile_apu_g2_source_workload`): a plain integer contraction function
+  passes the shared front stages, matched against the target's declared
+  view `build_apu_g2_contraction_patterns()` (`MAC`, `AXPBY`, the latter
+  declaring `intermediate="i24"` for its wide epilogue);
+  `analyze_apu_g2_source(ProgramFacts)` derives the `APUG2SourceContract` (K, result
   coordinates, transposition, broadcast, epilogue, exact widths; rejects
   wrapping, non-power-of-two K, mixed signedness, K > 512),
   `enumerate_apu_g2_launch_plans` builds `single`/`fused`/`separate` x
@@ -881,7 +908,9 @@ Allo alone.
 
 | Module | Responsibility |
 |---|---|
-| `allo/compiler.py` | `allo.compile`, route dispatch, `CompiledCallable`, work-scope stamping, carried-accumulator binding |
+| `allo/compiler.py` | `allo.compile`, typed routes, planner hooks over the shared facts, `CompiledCallable`, work-scope stamping, carried-accumulator binding |
+| `allo/spmw_pipeline.py` | shared front stages of every source workload: frontend, matcher view, coverage contracts, `SourceProgram` |
+| `allo/spmw_semantics.py` | shared semantic facts (`ProgramFacts`, `Contraction`, `Epilogue`, `BufferAccess`, `OutputSink`, `ElementType`) derived from the match trace and retained IR types |
 | `allo/spmw_target.py` | target language: units, memories, registers, ops, moves, patterns, host-move recording, host programs |
 | `allo/spmw_match.py`, `allo/spmw_match_engine.py` | matcher data model, pattern compilation, store coverage, axis roles |
 | `allo/spmw_reduction_policy.py` | reduction-order policy, stamps, route gates |

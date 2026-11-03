@@ -63,6 +63,7 @@ from allo.pim.costs.apu_g2 import (
     fit_apu_g2_typed_tick_model,
 )
 from allo.pim.targets import build_apu_g2_target
+from allo.spmw_match import UnsupportedWorkloadError
 from benchmarks.apu_g2.workloads import PAPER_KERNELS
 
 I3 = APUG2ScalarType(3, True)
@@ -548,22 +549,31 @@ def extra_effect(A: int4[64, 128], x: int4[128], y: int15[64], z: int8[64]):
 
 
 @pytest.mark.parametrize(
-    "workload, reason",
+    "workload, reason, shared",
     [
-        (k96, "power of two"),
-        (mixed_signedness, "mix signed and unsigned"),
-        (three_products, "at most two products"),
-        # the matcher refuses the widening copy of an int12 accumulator
-        # (its range exceeds int12 but the device computes an exact int15)
-        (narrow_accumulator, "copies a i12 result into a i15 buffer"),
-        (float_gemv, "not an integer buffer"),
-        (mixed_combined_types, "mixed operand types"),
-        (k1024, "at most 256"),
-        (offset_access, "plain loop variable"),
-        (extra_effect, "outside the contraction family"),
+        (k96, "power of two", False),
+        (mixed_signedness, "mix signed and unsigned", False),
+        (three_products, "at most two products", False),
+        # the shared copy contract refuses the widening copy of an int12
+        # accumulator (its range exceeds int12 but the device computes an
+        # exact int15) before any backend planner runs
+        (narrow_accumulator, "copies a i12 result into a i15 buffer", True),
+        (float_gemv, "only integers are lowered", False),
+        (mixed_combined_types, "mixed operand types", False),
+        (k1024, "at most 256", False),
+        (offset_access, "plain loop variable", False),
+        # an effect no target op implements is a shared coverage rejection
+        (extra_effect, "matches no target op", True),
     ],
 )
-def test_unsupported_forms_raise_a_finite_error(workload, reason):
+def test_unsupported_forms_raise_a_finite_error(workload, reason, shared):
+    """Programs outside the family raise a finite error: the shared semantic
+    checks (coverage, copy contract) reject for their own reason on every
+    target; the Gemini-II legality rejects the rest naming the typed route."""
+    if shared:
+        with pytest.raises(UnsupportedWorkloadError, match=reason):
+            _compile(workload)
+        return
     with pytest.raises(APUG2SourceRouteError, match=reason) as error:
         _compile(workload)
     assert isinstance(error.value, NotImplementedError)

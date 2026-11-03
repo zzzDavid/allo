@@ -117,7 +117,7 @@ by diffing the device log before and after the launch (V1-07 fixed).
 
 | Aspect | Source contraction route | `APUv1Program` scalar route | Native recipes |
 |---|---|---|---|
-| Input | Plain `@allo` function (not a dataflow region) whose stores are rank-2 contractions `C[i,j] += A[i,k]*B[k,j]` (FP16/uint16 multiply, and/or/xor, XNOR-popcount); 1-D GEMV lifted with a unit axis | `APUv1Program([APUv1Phase(fn, vectorize=False)])`: the whole function lowered to C11 with `emit_c_from_mlir`, runs on APUC 0; one phase only | `APUv1Program([APUv1Phase(fn, vectorize="required")])` proven by exactly one of four recipes (dense 256-bin histogram, squared-L2 argmin, bivariate moments, record frequency) with a strict MLIR parser and symbolic executor; mismatches raise `APUv1NativeRecipeMismatch` (V1-01 fixed) |
+| Input | Plain `@allo` function (not a dataflow region) whose matched effect is one rank-2 contraction `C[i,j] += A[i,k]*B[k,j]` (FP16/uint16 multiply-add; the accumulator a function argument, carried or zero-filled, or since round 12 a local scalar copied once to the output `acc = 0; ...; C[i,j] = acc`); 1-D GEMV lifted with a unit axis. The shared front stages run first (matcher coverage, alias, cast, copy and precision contracts, `ProgramFacts`); bitwise and XNOR-popcount products are not matchable on the target yet (ISSUES V1-18) | `APUv1Program([APUv1Phase(fn, vectorize=False)])`: the whole function lowered to C11 with `emit_c_from_mlir`, runs on APUC 0; one phase only | `APUv1Program([APUv1Phase(fn, vectorize="required")])` proven by exactly one of four recipes (dense 256-bin histogram, squared-L2 argmin, bivariate moments, record frequency) with a strict MLIR parser and symbolic executor; mismatches raise `APUv1NativeRecipeMismatch` (V1-01 fixed) |
 | Plan selection | Finite recipe catalog (`temporal_svp`, `temporal_dma_coalescing*`, `..._acc{2,4,8}`, `spatial_gemv_group_reduction_k<tile>`, ...); regrouping plans pruned under `"strict"` (`reduction_policy_pruned`); every surviving plan realized to GVML, infeasible ones dropped, ranked by `apu_v1_cost` on the materialized instructions (`schedule_search.grid_search`); `layout=<plan>` forces a plan; `cost=None` without `layout=` is an error (V1-10) | none | the recognizer's single template |
 | Analytical | yes (`kind="virtual"`: the selected plan's retained cost graph only, no outputs, caller arrays untouched, `cost_validity` label; `tests/perf/test_run_result_contract.py`) | yes (`kind="virtual"`, V1-04 fixed) | yes |
 | Host functional | yes (`kind="functional"`: a host-side NumPy model of the selected plan's arithmetic order, not compiled device code; `cycles` is the analytical estimate) | yes (retained portable C on the host) | rejected at compile time |
@@ -221,10 +221,15 @@ without coefficients.
   (F-02 fixed).
 - `RunResult.kind` is set on every route and validated; non-executed kinds
   never write caller arrays (G2-07, S-02, V1-09, M-08 fixed).
-- Not one pipeline yet (gate G9, ISSUES X-01): Samsung, AiM, UPMEM and
-  AttAcc share the matcher/legality/placement path; the APU v1 vector route
-  and the Gemini-II source route plan and launch through their own
-  end-to-end paths (the Gemini-II route runs the shared matcher checks
-  above, the APU v1 vector route does not). The typed APU records are
-  frontends to those routes. Until the migration lands, "supported" for the
-  APUs means supported by those routes.
+- One shared front end since round 12 (gate G9, ISSUES X-01, in progress):
+  every ordinary source workload on every target passes
+  `allo/spmw_pipeline.py::normalize_source` (frontend, matcher against the
+  target or its declared `spmw_match_view`, the coverage/semantic contracts
+  above, the shared facts `allo/spmw_semantics.py::ProgramFacts`). Samsung,
+  AiM, UPMEM and AttAcc continue with the matcher/legality/placement path;
+  Gemini-II and APU v1 derive their contraction contracts from the shared
+  facts and still select among their own candidate plans (planner hooks in
+  `allo/compiler.py`); the typed APU records are frontends to those routes.
+  Until the remaining slices land (plans as common candidates, typed
+  normalization), "supported" for the APUs means supported by those planners
+  within the shared semantic contract.

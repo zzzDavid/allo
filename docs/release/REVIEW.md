@@ -33,6 +33,10 @@ what was accepted and why.
    a trace that reaches codegen implements every store of the source with
    the source's values (up to the recorded float precision contract), and
    the device may zero an accumulator only when the source does.
+   Round 12: this stage runs for every target through
+   `spmw_pipeline.normalize_source` and yields the shared facts
+   `spmw_semantics.ProgramFacts`; a backend planner may refine them with
+   target legality, never reinterpret them.
 2. **Matcher to autoscheduler.** Axis roles (`axis_roles`: reduction,
    output, batch, matrix/vector operand, work-axis) are stamped structurally
    from index sets including the store index. Consumers must not re-derive
@@ -367,6 +371,60 @@ two tests, a verifier probe and both simulator `apply.sh`).
   device's FP16 multiply (inf for 256 * 256) is the source's value; it
   stays accepted and is executed as a regression.
 
+## Round 12 (2026-11-02): gate G9 slices 1-2, shared front stages and semantic facts
+
+User priority (2026-11-02): implement the shared compilation path before
+the remaining arithmetic repairs. Reviewed increments:
+
+- Inherited round 11 checkpoint (uncommitted at the start of the round;
+  C-25 follow-up and C-26). Its focused tests did not pass as left: the
+  precision contract refused the Gemini-II `gesummv` epilogue (integer
+  intermediate), one Samsung check fired before the more specific
+  coordinate message, and one test still expected the old `out` key.
+  Accepted after a bounded reconciliation: `Op.intermediate` accepts an
+  integer width and `AXPBY` declares `i24` (truthful: the epilogue runs in
+  typed VL64 lanes and `_check_widths` proves the combined width); check
+  order in `samsung_elementwise`; the test asserts the memref-named keys.
+  The reviewer's round 10 probes are regressions in
+  `tests/pim/test_match_coverage.py`. Committed separately (`c8a513c`).
+- Shared front stages (`allo/spmw_pipeline.py`) and semantic facts
+  (`allo/spmw_semantics.py`). Review questions and answers: the facts are
+  derived from the matcher's structural analysis and the retained IR types
+  (`_build_ir_value_refs` gives the same canonical identities the matcher
+  used; `itypes`/`unsigned` give signedness), never from text; a fact that
+  is not established is recorded (`roles_unresolved`, `dims` entries of
+  `None`, element `None`) and both planners fail closed on it. The
+  Gemini-II target declares its source-idiom view as a property
+  (`spmw_match_view`); the driver does not branch on the name to choose a
+  pattern set. The planner hooks (`_SOURCE_PLANNERS`) are a name-keyed
+  registry: judged an explicit seam for slice 3, not unification (the
+  design document says so; X-01 stays open).
+- Gemini-II contract over the facts: the five paper kernels keep their
+  contracts, packings and fingerprints (`test_apu_g2_source_route.py`);
+  the domain rules (lanes, power-of-two reductions, widths) are unchanged
+  target legality. Removed: the route's own module walk and access-map
+  parser.
+- APU v1 over the facts: the recipe catalog, realizer, cost model and
+  runtime are unchanged; the vector plans' restrictions are now explicit
+  legality over the facts, including two new explicit refusals (loop
+  extents must equal buffer extents; mixed element types) and one new
+  accepted form (local scalar accumulator copied to the output), executed
+  on the functional backend against an independent FP16 source-order loop;
+  the board GEMV test ran through the new path. Found and closed: V1-17
+  (a guarded contraction planned unguarded by the text analysis). Domain
+  change recorded honestly: V1-18 (bitwise/XNOR products no longer
+  reachable until declared matchable).
+- Tests whose expectations changed were each judged on semantics: the
+  shared stage now raises `UnsupportedWorkloadError` where a route raised
+  its own type for the same reason (alias, nonzero/partial initializer,
+  narrowing copy, wide operand, extra effect); no rejection became an
+  acceptance.
+
+Gate G9 remains **FAIL**: the APU candidate plans are not common
+candidates of the selection stage, typed records are not normalized, and
+the stage traces on the Gemini-II card and the installed artifact are
+pending.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -416,6 +474,6 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 | G6 evidence beyond examples | **PARTIAL (reopened in round 8)** | EVIDENCE.md tables plus the round 6 probe files; remaining gaps are hardware-only confirmations listed in VALIDATION.md; the independent reviewer's probes varied the output conversion and a store guard, which the round 6 campaign had not, and found two silent defects; the campaign is kept as regression evidence, not as proof of generality; new probes must target the shared semantic contracts on every route |
 | G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install at ffb4a78 (needs repeating at the candidate, INSTALL.md section 6); AiM and UPMEM simulator recipes now ship in `simulators/` and were rebuilt from the release copies; Samsung's route is not buildable from the release repository without Samsung's permission for the five patches (P-04, documented, `apply.sh` refuses); architecture doc update for the shared pipeline pending (G9); P-17 documented proprietary SDK |
 | G8 backend execution | **evidence complete at 67f89fd, pending independent review** | installed-artifact runs at the round 10 repair: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed); all reviewer probes of rounds 8 to 10 rejected or executed correctly through the installed wheel (VALIDATION.md round 10); AttAcc analytical by design; AiM timing-only as accepted |
-| G9 one shared compilation pipeline incl. both APUs | **FAIL** | required by the user on 2026-11-02; three end-to-end routes remain in `allo/compiler.py` (ISSUES X-01); design seed in `design/shared-compilation-path.md` |
+| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | required by the user on 2026-11-02; round 12 landed the shared front stages and semantic facts for every target and moved both APU contract derivations onto them (slices 1-2 of `design/shared-compilation-path.md`, ISSUES X-01); the APU candidate plans are still selected by their own searches, typed records are not normalized, card/installed stage traces pending |
 
-Verdict: **NOT READY**. Blockers: G9 (X-01) is not implemented; G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.
+Verdict: **NOT READY**. Blockers: G9 (X-01) is in progress (slices 3-5 open); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.

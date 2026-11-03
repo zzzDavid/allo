@@ -1520,10 +1520,15 @@ def build_apu_g2_target():
     """Preferred hardware name for :func:`build_apu_v2_target`.
 
     ``target.name`` remains ``"apu_v2"`` so existing Tenon registries and
-    archived results keep a stable backend key.
+    archived results keep a stable backend key.  The hardware description
+    declares only unmatchable typed primitives; ordinary source is matched
+    against the source-idiom view (`build_apu_g2_contraction_patterns`),
+    which the shared pipeline finds through ``spmw_match_view``.
     """
 
-    return build_apu_v2_target()
+    device = build_apu_v2_target()
+    device.spmw_match_view = build_apu_g2_contraction_patterns()
+    return device
 
 
 # --------------------------------------------------------------------- #

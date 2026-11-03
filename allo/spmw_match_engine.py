@@ -133,6 +133,7 @@ _PATTERN_UNARY_CALLS = {
     "tanh": "tanh",
     "erf": "erf",
     "abs_": "abs",
+    "popcount": "popcount",
 }
 
 _AST_CMPOP_TO_PRED = {
@@ -383,6 +384,8 @@ _MATH_UNARY = {
     "math.tanh": "tanh",
     "math.erf": "erf",
     "math.absf": "abs",
+    # ``allo.popcount`` on a scalar lowers to ``math.ctpop``.
+    "math.ctpop": "popcount",
 }
 
 # arith.CmpFPredicate / arith.CmpIPredicate enum order; the IR attribute is
@@ -985,6 +988,10 @@ class ValueNames:
         # bounds are constants (the iv ranges over [lower, upper)); used to
         # prove that a narrowing cast of a loop index is exact.
         self.loop_bounds: dict[str, tuple[int, int]] = {}
+        # affine.for induction variable name -> the frontend's ``loop_name``
+        # attribute (the source loop label), when retained.  Diagnostics and
+        # the shared semantic facts use it; matching never does.
+        self.loop_names: dict[str, str] = {}
         taken: set = set()
 
         def assign(value):
@@ -1017,9 +1024,14 @@ class ValueNames:
         attrs = op.attributes
         try:
             iv = self._names[op.regions[0].blocks[0].arguments[0]]
+        except (KeyError, IndexError):
+            return
+        if "loop_name" in attrs:
+            self.loop_names[iv] = _attr_str(attrs["loop_name"])
+        try:
             lo = _AFFINE_CONST_RE.match(str(attrs["lowerBoundMap"]).strip())
             hi = _AFFINE_CONST_RE.match(str(attrs["upperBoundMap"]).strip())
-        except (KeyError, IndexError):
+        except KeyError:
             return
         if lo and hi:
             self.loop_bounds[iv] = (int(lo.group(1)), int(hi.group(1)))
@@ -2251,6 +2263,15 @@ def _try_match_at_store(
                     extra["index_terms"] = index_terms
                 if guards:
                     extra["guards"] = guard_terms
+                retained_loop_names = getattr(state, "loop_names", None)
+                if retained_loop_names:
+                    # Source loop labels of the enclosing loops (diagnostics
+                    # and the shared semantic facts; never used to match).
+                    extra["loop_names"] = {
+                        loop[0]: retained_loop_names[loop[0]]
+                        for loop in enclosing_loops
+                        if loop[0] in retained_loop_names
+                    }
                 # op_range — first contributing load through the store.
                 return MatchedOp(
                     target_op_name=op_obj.name,

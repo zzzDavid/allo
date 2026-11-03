@@ -35,9 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import importlib
-import inspect
 import math
-import re
 import string
 
 import numpy as np
@@ -263,27 +261,6 @@ def _log2(value: int) -> int:
     return int(value).bit_length() - 1
 
 
-_ELEMENT_RE = re.compile(r"^memref<(?:(?:\d+x)*)(i(\d+)|[a-z]+\d*)>$")
-_SHAPE_RE = re.compile(r"^memref<((?:\d+x)*)")
-_CONST_MAP_RE = re.compile(r"\(\s*(-?\d+)\s*\)>?\s*$")
-
-
-def _memref_shape_and_bits(text: str | None, what: str) -> tuple[tuple[int, ...], int]:
-    if text is None:
-        raise APUG2SourceRouteError(f"{what} has no retained memref type")
-    text = text.strip()
-    match = _ELEMENT_RE.match(text)
-    if match is None:
-        raise APUG2SourceRouteError(f"{what} has an unsupported memref type {text}")
-    if match.group(2) is None:
-        raise APUG2SourceRouteError(
-            f"{what} has element type {match.group(1)}; only integers are lowered"
-        )
-    dims = _SHAPE_RE.match(text).group(1)
-    shape = tuple(int(item) for item in dims.split("x") if item)
-    return shape, int(match.group(2))
-
-
 def _source_int(bits: int, signed: bool, what: str) -> APUG2SourceIntType:
     if not 1 <= bits <= 64:
         raise APUG2SourceRouteError(f"{what} is a {bits}-bit integer")
@@ -298,165 +275,78 @@ def _scalar(bits: int, signed: bool, what: str) -> APUG2ScalarType:
     return APUG2ScalarType(bits, signed)
 
 
-def _constant_bound(text: str) -> int | None:
-    text = str(text).strip()
-    try:
-        return int(text)
-    except ValueError:
-        pass
-    match = _CONST_MAP_RE.search(text)
-    return None if match is None else int(match.group(1))
+def _int_type(element, what: str) -> APUG2SourceIntType:
+    """The source integer type of a buffer from its shared element fact."""
+
+    if element is None:
+        raise APUG2SourceRouteError(f"{what} has no retained element type")
+    if not element.is_integer:
+        raise APUG2SourceRouteError(
+            f"{what} has element type {element.text}; only integers are lowered"
+        )
+    if element.signed is None:
+        raise APUG2SourceRouteError(f"{what} is not an integer buffer")
+    return _source_int(element.bits, element.signed, what)
 
 
-def _map_dims(index_map: str | None, indices, what: str) -> tuple[str, ...]:
-    """Loop variable of every accessed dimension, through an affine map."""
+def _plain_dims(access, what: str) -> tuple[str, ...]:
+    """Loop variable of every accessed dimension (plain subscripts only)."""
 
-    indices = list(indices)
-    if index_map is None:
-        return tuple(indices)
-    text = str(index_map).strip()
-    match = re.match(r"^affine_map<\((.*?)\)(?:\[.*?\])?\s*->\s*\((.*)\)>$", text)
-    if match is None:
-        raise APUG2SourceRouteError(f"{what} uses an unparsable access map {text}")
-    dims = [item.strip() for item in match.group(1).split(",") if item.strip()]
-    results = [item.strip() for item in match.group(2).split(",") if item.strip()]
-    if len(dims) != len(indices):
-        raise APUG2SourceRouteError(f"{what} access map does not match its indices")
-    resolved = []
-    for result in results:
-        if result not in dims:
-            raise APUG2SourceRouteError(
-                f"{what} is indexed by '{result}'; every subscript must be one "
-                "plain loop variable"
-            )
-        resolved.append(indices[dims.index(result)])
-    return tuple(resolved)
+    if access.shape is None:
+        raise APUG2SourceRouteError(f"{what} has no retained memref type")
+    if len(access.dims) != len(access.shape):
+        raise APUG2SourceRouteError(f"{what} is not indexed in every dimension")
+    if any(dim is None for dim in access.dims):
+        raise APUG2SourceRouteError(
+            f"{what} is indexed by an expression; every subscript must be one "
+            "plain loop variable"
+        )
+    return tuple(access.dims)
 
 
-def _walk_operations(operation):
-    for region in operation.regions:
-        for block in region.blocks:
-            for child in block.operations:
-                yield child
-                yield from _walk_operations(child)
-
-
-def _string_attribute(operation, name: str) -> str | None:
-    if name not in operation.attributes:
-        return None
-    text = str(operation.attributes[name])
-    return text[1:-1] if text.startswith('"') and text.endswith('"') else text
-
-
-class _FunctionFacts:
-    """Signedness and store maps read from the retained top function."""
-
-    def __init__(self, schedule, parameters):
-        self.function = schedule.top_func
-        self.name = schedule.top_func_name
-        itypes = _string_attribute(self.function, "itypes") or ""
-        if len(itypes) != len(parameters):
-            raise APUG2SourceRouteError(
-                "the function signature carries no per-argument signedness"
-            )
-        self.argument_signed = {}
-        for name, code in zip(parameters, itypes):
-            if code not in ("s", "u"):
-                raise APUG2SourceRouteError(
-                    f"argument '{name}' is not an integer buffer"
-                )
-            self.argument_signed[name] = code == "s"
-        self.local_signed: dict[str, set] = {}
-        self.stores: dict[str, list] = {}
-        for operation in _walk_operations(self.function):
-            name = operation.operation.name
-            if name in ("memref.alloc", "memref.alloca"):
-                local = _string_attribute(operation, "name")
-                if local is not None:
-                    self.local_signed.setdefault(local, set()).add(
-                        "unsigned" not in operation.attributes
-                    )
-            elif name in ("affine.store", "memref.store"):
-                target = _string_attribute(operation, "to")
-                if target is not None:
-                    self.stores.setdefault(target, []).append(operation)
-
-    def local_is_signed(self, name: str) -> bool:
-        flags = self.local_signed.get(name)
-        if not flags or len(flags) != 1:
-            raise APUG2SourceRouteError(
-                f"local accumulator '{name}' has no unique declaration"
-            )
-        return next(iter(flags))
-
-    def identity_store(self, buffer: str) -> bool:
-        """Every store into ``buffer`` uses an identity access map."""
-
-        for operation in self.stores.get(buffer, ()):
-            if operation.operation.name != "affine.store":
-                continue
-            if "map" not in operation.attributes:
-                continue
-            text = str(operation.attributes["map"])
-            match = re.match(r"^affine_map<\((.*?)\)\s*->\s*\((.*)\)>$", text)
-            if match is None or match.group(1).replace(" ", "") != match.group(
-                2
-            ).replace(" ", ""):
-                return False
-        return True
-
-
-def _argument_parameter(binding, parameters, what: str) -> str:
-    return _ref_parameter(getattr(binding, "value_ref", None), parameters, what)
-
-
-def _ref_parameter(ref, parameters, what: str) -> str:
-    if ref is not None and ref.namespace == "mlir" and len(ref.path) == 3:
-        if ref.path[1] == 0 and 0 <= ref.path[2] < len(parameters):
-            return parameters[ref.path[2]]
-    raise APUG2SourceRouteError(f"{what} is not a function argument")
-
-
-def _loop_trips(match, what: str) -> dict[str, int]:
-    trips = {}
-    for var, lower, upper, step in match.enclosing_loops:
-        low = _constant_bound(lower)
-        high = _constant_bound(upper)
-        if low is None or high is None or int(step) != 1 or low != 0:
-            raise APUG2SourceRouteError(
-                f"{what} is nested in a loop that is not 'range(N)' with a "
-                "constant N"
-            )
-        trips[var] = high
-    return trips
-
-
-def _source_loop_names(trace_matches) -> dict[str, str]:
+def _source_loop_names(items) -> dict[str, str]:
     """Stable, name-free labels for loop variables (``l0``, ``l1``...)."""
 
     names: dict[str, str] = {}
-    for match in trace_matches:
-        for var, *_rest in match.enclosing_loops:
+    for item in items:
+        for var in item.loop_vars:
             names.setdefault(var, f"l{len(names)}")
     return names
 
 
-def analyze_apu_g2_source(workload, schedule, trace) -> APUG2SourceContract:
-    """Derive the contraction contract of one matched source function."""
+def analyze_apu_g2_source(program) -> APUG2SourceContract:
+    """Derive the Gemini-II contraction contract from the shared facts.
 
-    parameters = tuple(inspect.signature(workload).parameters)
-    facts = _FunctionFacts(schedule, parameters)
-    matches = list(trace.matches)
-    if not matches:
-        raise APUG2SourceRouteError("no contraction was matched")
-    foreign = sorted({m.func_name for m in matches if m.func_name != facts.name})
-    if foreign:
+    ``program`` is the :class:`allo.spmw_semantics.ProgramFacts` of the
+    matched source (one maintained semantic analysis for every target).  This
+    function applies the composed-dot family's legality to those facts:
+    integer buffers of 1..64 bits with operands in 2..24-bit lanes, at most
+    two unguarded ``acc += x * y`` reductions over ``range(N)`` loops with
+    plain loop-variable subscripts, each accumulating into a function
+    argument or into a local scalar copied once to an argument (or combined
+    by one ``alpha * x + beta * y`` epilogue with literal coefficients), and
+    results covering their output buffers.  It refines the facts; it never
+    reinterprets them.
+    """
+
+    facts = program
+    if facts.foreign_functions:
         raise APUG2SourceRouteError(
-            f"matched code lives in {foreign}, not the top function "
-            f"'{facts.name}' (dataflow regions and work grids are not lowered)"
+            f"matched code lives in {list(facts.foreign_functions)}, not the top "
+            f"function '{facts.function}' (dataflow regions and work grids are not "
+            "lowered)"
         )
-    macs = [m for m in matches if m.target_op_name == "MAC"]
-    combines = [m for m in matches if m.target_op_name == "AXPBY"]
+    macs = [c for c in facts.contractions if c.target_op_name == "MAC"]
+    combines = [e for e in facts.epilogues if e.target_op_name == "AXPBY"]
+    extra = [c.target_op_name for c in facts.contractions if c.target_op_name != "MAC"]
+    extra += [e.target_op_name for e in facts.epilogues if e.target_op_name != "AXPBY"]
+    extra += [m.target_op_name for m in facts.other_matches]
+    if extra:
+        raise APUG2SourceRouteError(
+            f"the function computes {extra}, outside the contraction family"
+        )
+    if not macs:
+        raise APUG2SourceRouteError("no contraction was matched")
     if len(macs) > 2:
         raise APUG2SourceRouteError(
             f"{len(macs)} contractions were matched; at most two products "
@@ -465,14 +355,12 @@ def analyze_apu_g2_source(workload, schedule, trace) -> APUG2SourceContract:
     if len(combines) > 1:
         raise APUG2SourceRouteError("more than one combining epilogue was matched")
 
-    shapes, types = [], []
-    argument_types = [str(argument.type) for argument in facts.function.arguments]
-    for name, text in zip(parameters, argument_types):
-        shape, bits = _memref_shape_and_bits(text, f"argument '{name}'")
-        shapes.append(shape)
-        types.append(
-            _source_int(bits, facts.argument_signed[name], f"argument '{name}'")
-        )
+    parameters = facts.parameter_names
+    shapes = [parameter.shape for parameter in facts.parameters]
+    types = [
+        _int_type(parameter.element, f"argument '{parameter.name}'")
+        for parameter in facts.parameters
+    ]
 
     def parameter_type(name):
         return types[parameters.index(name)]
@@ -480,48 +368,49 @@ def analyze_apu_g2_source(workload, schedule, trace) -> APUG2SourceContract:
     def parameter_shape(name):
         return shapes[parameters.index(name)]
 
+    def argument_name(access, what):
+        if access.local or access.parameter is None:
+            raise APUG2SourceRouteError(f"{what} is not a function argument")
+        return access.parameter
+
     combine_inputs = set()
     if combines:
-        combine = combines[0]
-        for operand in combine.operands:
-            if operand.role in ("x", "y"):
-                combine_inputs.add(operand.value_ref)
+        combine_inputs = {operand.value_ref for operand in combines[0].operands}
+        combine_inputs.discard(None)
 
     streams = []
-    for index, match in enumerate(macs):
+    for index, contraction in enumerate(macs):
         what = f"contraction {index}"
-        if match.extra.get("guards"):
+        if contraction.guards:
             raise APUG2SourceRouteError(f"{what} is guarded by a condition")
-        trips = _loop_trips(match, what)
-        roles = match.extra.get("axis_roles") or {}
-        if roles.get("unresolved"):
-            raise APUG2SourceRouteError(f"{what}: {roles['unresolved']}")
-        reduction = tuple(roles.get("reduction", ()))
+        for loop in contraction.loops:
+            if loop.trip is None or not loop.normalized:
+                raise APUG2SourceRouteError(
+                    f"{what} is nested in a loop that is not 'range(N)' with a "
+                    "constant N"
+                )
+        trips = {loop.var: loop.trip for loop in contraction.loops}
+        if contraction.roles_unresolved:
+            raise APUG2SourceRouteError(f"{what}: {contraction.roles_unresolved}")
+        reduction = contraction.reduction_vars
         if len(reduction) != 1:
             raise APUG2SourceRouteError(
                 f"{what} reduces over {len(reduction)} loops; exactly one "
                 "reduction loop is lowered"
             )
         (k,) = reduction
-        loop_vars = [loop[0] for loop in match.enclosing_loops]
-        accumulators = [op for op in match.operands if op.is_loop_carried]
-        inputs = {op.role: op for op in match.operands if not op.is_loop_carried}
-        if len(accumulators) != 1 or set(inputs) != {"x", "y"}:
+        loop_vars = list(contraction.loop_vars)
+        inputs = {access.role: access for access in contraction.inputs}
+        acc = contraction.accumulator
+        if set(inputs) != {"x", "y"}:
             raise APUG2SourceRouteError(f"{what} is not 'acc += x * y'")
-        (acc,) = accumulators
 
         accesses = {}
         for role in ("x", "y"):
-            binding = inputs[role]
-            parameter = _argument_parameter(binding, parameters, f"{what} input")
-            dims = _map_dims(
-                binding.index_map, binding.indices, f"{what} input '{parameter}'"
-            )
+            access = inputs[role]
+            parameter = argument_name(access, f"{what} input")
+            dims = _plain_dims(access, f"{what} input '{parameter}'")
             shape = parameter_shape(parameter)
-            if len(dims) != len(shape):
-                raise APUG2SourceRouteError(
-                    f"{what} input '{parameter}' is not indexed in every dimension"
-                )
             if len(set(dims)) != len(dims) or any(v not in loop_vars for v in dims):
                 raise APUG2SourceRouteError(
                     f"{what} input '{parameter}' must use distinct enclosing "
@@ -539,27 +428,17 @@ def analyze_apu_g2_source(workload, schedule, trace) -> APUG2SourceContract:
                 shape,
                 _scalar(source.bits, source.signed, f"operand '{parameter}'"),
             )
-        matrix_role = roles.get("matrix") or "x"
+        matrix_role = contraction.matrix.role if contraction.matrix else "x"
         lhs = accesses[matrix_role]
         rhs = accesses["y" if matrix_role == "x" else "x"]
 
-        init = match.extra.get("accumulator_init")
-        # A carried accumulator's own store is recorded as its output sink
-        # (the matcher's coverage analysis); only copies to other buffers
-        # count as "copying it out".
-        sinks = [
-            sink
-            for sink in (match.extra.get("output_sinks") or ())
-            if sink[0] != acc.memref_name
-        ]
-        store_indices = list(match.extra.get("store_indices") or ())
-        if store_indices:
+        init = contraction.accumulator_init
+        sinks = list(contraction.sinks)
+        if not acc.local:
             # Accumulates directly into a buffer: the result coordinates are
             # its subscripts, in dimension order.
-            output = _argument_parameter(acc, parameters, f"{what} accumulator")
-            result_vars = _map_dims(
-                acc.index_map, acc.indices, f"{what} accumulator '{output}'"
-            )
+            output = argument_name(acc, f"{what} accumulator")
+            result_vars = _plain_dims(acc, f"{what} accumulator '{output}'")
             if sinks:
                 raise APUG2SourceRouteError(
                     f"{what} accumulates into '{output}' and also copies it out"
@@ -579,19 +458,29 @@ def analyze_apu_g2_source(workload, schedule, trace) -> APUG2SourceContract:
                     f"{what} local accumulator is initialized as {init!r}"
                 )
             local = acc.memref_name
-            acc_shape, acc_bits = _memref_shape_and_bits(
-                acc.memref_type, f"{what} accumulator '{local}'"
-            )
-            if acc_shape:
+            if acc.shape is None or acc.element is None:
+                raise APUG2SourceRouteError(
+                    f"{what} accumulator '{local}' has no retained memref type"
+                )
+            if acc.shape:
                 raise APUG2SourceRouteError(
                     f"{what} accumulator '{local}' must be a scalar local"
                 )
+            if not acc.element.is_integer:
+                raise APUG2SourceRouteError(
+                    f"{what} accumulator '{local}' has element type "
+                    f"{acc.element.text}; only integers are lowered"
+                )
+            if acc.element.signed is None:
+                raise APUG2SourceRouteError(
+                    f"local accumulator '{local}' has no unique declaration"
+                )
             accumulator_type = _source_int(
-                acc_bits, facts.local_is_signed(local), f"accumulator '{local}'"
+                acc.element.bits, acc.element.signed, f"accumulator '{local}'"
             )
-            result_vars = tuple(var for var in loop_vars if var in set(loop_vars) - {k})
+            result_vars = tuple(var for var in loop_vars if var != k)
             accumulator = "zero"
-            if acc.value_ref in combine_inputs:
+            if acc.value_ref is not None and acc.value_ref in combine_inputs:
                 if sinks:
                     raise APUG2SourceRouteError(
                         f"{what} result is both combined and copied out"
@@ -603,16 +492,20 @@ def analyze_apu_g2_source(workload, schedule, trace) -> APUG2SourceContract:
                         f"{what} result is copied to {len(sinks)} buffers; "
                         "exactly one output per contraction is lowered"
                     )
-                output, index_text = sinks[0]
-                if output not in parameters:
+                sink = sinks[0]
+                output = sink.parameter
+                if sink.local or output is None or output not in parameters:
                     raise APUG2SourceRouteError(
-                        f"{what} result is copied to '{output}', which is not "
-                        "a function argument"
+                        f"{what} result is copied to '{sink.memref_name}', which "
+                        "is not a function argument"
                     )
-                subscripts = tuple(item.strip() for item in index_text.split(","))
-                if sorted(subscripts) != sorted(result_vars) or len(
-                    set(subscripts)
-                ) != len(subscripts):
+                subscripts = tuple(sink.dims)
+                index_text = ", ".join(sink.indices)
+                if (
+                    any(dim is None for dim in subscripts)
+                    or sorted(subscripts) != sorted(result_vars)
+                    or len(set(subscripts)) != len(subscripts)
+                ):
                     raise APUG2SourceRouteError(
                         f"{what} result is stored to '{output}[{index_text}]'; "
                         "the subscripts must be the result loop variables"
@@ -656,13 +549,16 @@ def analyze_apu_g2_source(workload, schedule, trace) -> APUG2SourceContract:
     coefficients = combined_output = combined_type = None
     if combines:
         combine = combines[0]
-        operands = {op.role: op for op in combine.operands}
+        operands = {operand.role: operand for operand in combine.operands}
+        if set(operands) != {"x", "y"}:
+            raise APUG2SourceRouteError(
+                "the 'alpha*x + beta*y' epilogue must combine two accumulators"
+            )
         refs = [operands[role].value_ref for role in ("x", "y")]
         by_ref = {}
-        for match, stream in zip(macs, streams):
-            acc = next(op for op in match.operands if op.is_loop_carried)
-            by_ref[acc.value_ref] = stream
-        if len(streams) != 2 or any(ref not in by_ref for ref in refs):
+        for contraction, stream in zip(macs, streams):
+            by_ref[contraction.accumulator.value_ref] = stream
+        if len(streams) != 2 or any(ref is None or ref not in by_ref for ref in refs):
             raise APUG2SourceRouteError(
                 "the 'alpha*x + beta*y' epilogue must combine the two "
                 "contraction accumulators"
@@ -670,24 +566,27 @@ def analyze_apu_g2_source(workload, schedule, trace) -> APUG2SourceContract:
         if refs[0] == refs[1]:
             raise APUG2SourceRouteError("the epilogue combines one stream twice")
         ordered = (by_ref[refs[0]], by_ref[refs[1]])
-        constants = combine.extra.get("constants") or {}
+        constants = combine.constants
         try:
             coefficients = (int(constants["alpha"]), int(constants["beta"]))
         except (KeyError, TypeError, ValueError) as error:
             raise APUG2SourceRouteError(
                 "the epilogue coefficients are not integer literals"
             ) from error
-        combined_output = _ref_parameter(
-            combine.result_value_ref, parameters, "the combined result"
-        )
-        loops = [loop[0] for loop in combine.enclosing_loops]
-        store = tuple(combine.extra.get("store_indices") or ())
+        if combine.result.local or combine.result.parameter is None:
+            raise APUG2SourceRouteError(
+                "the combined result is not a function argument"
+            )
+        combined_output = combine.result.parameter
+        loops = list(combine.loop_vars)
+        store = tuple(combine.result.dims)
         first, second = ordered
         if (
             first.result_vars != second.result_vars
             or tuple(loops) != tuple(v for v in loops if v in first.result_vars)
+            or any(dim is None for dim in store)
             or sorted(store) != sorted(first.result_vars)
-            or not facts.identity_store(combined_output)
+            or len(set(store)) != len(store)
         ):
             raise APUG2SourceRouteError(
                 "the combined result must be stored at the contractions' "
@@ -718,7 +617,7 @@ def analyze_apu_g2_source(workload, schedule, trace) -> APUG2SourceContract:
         raise APUG2SourceRouteError("two contractions write the same output")
 
     contract = APUG2SourceContract(
-        function=facts.name,
+        function=facts.function,
         parameters=parameters,
         parameter_shapes=tuple(shapes),
         parameter_types=tuple(types),
@@ -1469,13 +1368,25 @@ class APUG2SourceProgram:
 
 
 def compile_apu_g2_source_workload(
-    workload, target, *, cost, backend=None, host_moves=None, layout=None
+    workload,
+    target,
+    *,
+    cost,
+    backend=None,
+    host_moves=None,
+    layout=None,
+    program=None,
 ):
-    """``allo.compile`` route for ordinary source workloads on ``apu_v2``."""
+    """``allo.compile`` planner for ordinary source workloads on ``apu_v2``.
 
-    from ..customize import customize
-    from ..spmw_match_engine import match_workload, require_match_coverage
-    from .targets import build_apu_g2_contraction_patterns
+    ``program`` is the :class:`allo.spmw_pipeline.SourceProgram` produced by
+    the shared front stages (frontend, matcher, coverage, semantic analysis);
+    when omitted those stages run here, so the function is also usable on
+    its own.  The Gemini-II contract is derived from the shared facts and the
+    composed-dot launch plans are enumerated, priced and selected.
+    """
+
+    from ..spmw_pipeline import normalize_source
 
     if host_moves is not None:
         raise ValueError(
@@ -1486,18 +1397,13 @@ def compile_apu_g2_source_workload(
         raise TypeError("layout= on Gemini-II names a launch plan (a string)")
     if not isinstance(cost, BoundCostSpec) or cost.target is not target:
         raise TypeError("the Gemini-II source route requires a target-bound cost")
-    schedule = customize(workload, enable_tensor=False)
-    patterns = build_apu_g2_contraction_patterns()
-    trace = match_workload(patterns, schedule.module)
-    try:
-        require_match_coverage(trace, target=patterns, defer_unknown=True)
-    except ValueError as error:
-        raise APUG2SourceRouteError(
-            f"the function has effects outside the contraction family ({error})"
-        ) from error
-    contract = analyze_apu_g2_source(workload, schedule, trace)
-    program = APUG2SourceProgram(contract, target, cost, backend=backend, layout=layout)
-    return schedule, trace, program
+    if program is None:
+        program = normalize_source(workload, target)
+    contract = analyze_apu_g2_source(program.program_facts())
+    compiled = APUG2SourceProgram(
+        contract, target, cost, backend=backend, layout=layout
+    )
+    return program.schedule, program.trace, compiled
 
 
 __all__ = [

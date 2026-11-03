@@ -419,3 +419,37 @@ copied to `/work/shared/users/phd/nz264/tenon-release-evidence/r11/`.
 | `larger_output`: 4097-element output for a 4096-element loop | compiled; failed only at readback with a shape error | refused at compile time: "the output 'y' is a f16 buffer of shape (4097,) but the element loop writes 4096 FP16 results" |
 | `wide_sum` / `wide_product`: FP16 inputs, FP32 output, `float(a[i]) + float(b[i])` and `float(a[i]) * float(b[i])` (source 65536) | compiled, simulator returned inf | refused: "computes add(a, b) ... the source evaluates this operation in f32 on f16 operands ... a target op computes in its operands' type f16" |
 | `narrow_then_widen` control: `y_f32[i] = a[i] * b[i]` | inf (correct) | compiles and executes: inf, equal to the source |
+
+## Round 12 (2026-11-02): gate G9 slices 1-2 (shared front stages, semantic facts)
+
+Interpreter `/work/zhang-capra/users/nz264/miniforge3/envs/spmw/bin/python`
+(3.12.13, numpy 2.3.5, pytest 9.1.1), `LLVM_BUILD_DIR=/work/shared/common/llvm-project-main/build-rhel8`,
+checkout as working directory. Raw logs under `/tmp/g9/`, copied to
+`/work/shared/users/phd/nz264/tenon-release-evidence/r12/`.
+
+Inherited round 11 checkpoint, as found (uncommitted at `f732b22`,
+`baseline-a.log`): `test_apu_v1_vector_compile/tile_selection/reduction_policy`,
+`test_apu_g2_source_route`, `test_compile_interface`, `test_match_coverage`:
+7 failed, 93 passed, 18 errors. Causes: the C-26 contract refused the
+Gemini-II `gesummv` epilogue (integer intermediate; 16 errors/failures),
+`test_elementwise_destination_must_be_the_element_read` saw the new extent
+message first, `test_identity_copies_are_required_outputs` expected the old
+`out` key, `test_dataflow_build_does_not_validate_retained_scopes` needs
+`LLVM_BUILD_DIR`. After the bounded reconciliation (`checkpoint-recon.log`):
+`test_match_coverage` + `test_apu_g2_source_route`: 87 passed.
+
+| Check (round 12 tree) | Result |
+|---|---|
+| probe of the guarded contraction (`probe_guard_old2.py`) against the installed round 10 wheel (`/tmp/tenon-release/r9/pkg10/venv2`, `cd /tmp`, `python -I`) | `guarded_outer` (`if r < 4:` around the reduction): compiled, plan `temporal_svp`, axis extents `{col: 8, arg4: 4, d: 16}` (whole 8-row problem; V1-17); `guarded_rows`/`guarded_data` refused for a wrong reason ("reduction axis 'd' indexes the output"); functional run of `guarded_outer` crashed (`ValueError: setting an array element with a sequence`) |
+| same probe on the round 12 tree | all three refused by the shared coverage check: "store ... under a guard: computes add(C, mul(L, R)) ... which matches no target op" |
+| smoke (`smoke1.py`): GEMM carried, GEMM with local accumulator, 1-D GEMV on APU v1 (`backend="functional"`), Gemini-II gemm | plans `baseline_spatial_reduction` x2 (`output_initializer` carried / zero), `spatial_gemv_group_reduction_k32`; max abs error vs float32 reference 2.2e-3, 2.2e-3, 8.0e-3; Gemini-II `single/k1`, packing form `pack_apu_g2_batched_gemm_dots` |
+| `tests/pim/test_shared_semantics.py` (new) | 10 passed |
+| `test_apu_g2_source_route`, `test_compile_interface`, `test_g6_semantics -k "apu or unsupported or compile" -m "not apu_v1_device"` (`g9-c.log`) | 88 passed, 13 deselected (five expectations moved to the shared `UnsupportedWorkloadError`: APU v1 alias, Gemini-II aliases, Gemini-II wide operand, APU v1 nonzero/partial initializers; three Gemini-II unsupported-form rows and the pipeline monkeypatches updated) |
+| matcher/APU regression (`g9-d.log`): `test_match_patterns`, `test_aim_matcher`, `test_upmem_matcher`, `test_layout_selection`, `test_legality`, `test_matcher_ranked_placement`, `test_host_transfer_dispatch`, `test_aim_axis_roles`, `test_reduction_policy`, `test_apu_v1_vector_compile`, `test_apu_v1_tile_selection`, `test_apu_v1_reduction_policy`, `test_run_result_contract`, `test_apu_g2_typed_program`, `test_apu_g2_composed_contraction`, `test_import_surface` | 130 passed, 2 skipped in 544 s |
+| `tests/pim/test_gemv_all_targets.py` (Samsung and AiM simulators, UPMEM uPIMulator, APU v1 board under the board lock; `g9-e-gemv.log`) | 6 passed in 141 s: Samsung simulator, Gemini-II source rejection, AiM simulator (two tests), UPMEM uPIMulator and `test_gemv_apu_v1` on the Gemini-I board, all through the shared front stages (the board launch went through `compile_apu_v1_vector_workload(program=...)` with the facts-derived analysis) |
+| black on the changed files | clean; pylint on the new modules: no findings (`Contraction` carries a documented `too-many-instance-attributes` disable) |
+
+Not run this round (pending, slice 5): the full `tests/perf` and `tests/pim`
+suites, the installed-artifact runs, the Gemini-II card. The round 12 code
+is the first increment of G9 and is submitted for architectural review
+before those runs.

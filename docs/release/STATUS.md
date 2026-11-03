@@ -3,7 +3,7 @@
 
 # Release status
 
-Updated: 2026-11-02 (round 11: fourth reviewer rejection at `f732b22`; destination identities and arithmetic precision repaired; lint: header, black and clang-format stages pass, pylint stage carries pre-existing findings, P-23). Read `TASK.md` in the containing repository,
+Updated: 2026-11-02 (round 12: gate G9 slices 1-2 implemented, shared front stages and semantic facts for every target, both APU contract derivations on them; the round 11 checkpoint reconciled and committed separately). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -34,8 +34,13 @@ then this file, then `ISSUES.md` for the next action.
 **NOT READY.** Gate judgments are in `REVIEW.md`. Blockers, in order:
 
 1. **G9 (X-01)**: the shared compilation pipeline for all targets including
-   APU v1 and Gemini-II is required by the user (2026-11-02) and not
-   implemented. Design seed: `design/shared-compilation-path.md`.
+   APU v1 and Gemini-II is required by the user (2026-11-02) and in
+   progress: slices 1-2 landed in round 12 (shared front stages
+   `allo/spmw_pipeline.py`, semantic facts `allo/spmw_semantics.py`, both
+   APU contract derivations over them, the APU v1 MLIR-text analysis out of
+   the public route). Open: APU plans as common selection candidates
+   (slice 3), typed records (slice 4), hardware/installed stage traces
+   (slice 5). Map and status: `design/shared-compilation-path.md`.
 2. **G2**: the independent reviewer disproved the round 7 PASS with two
    executed wrong-code probes at `e41ebbd` (C-19 casts erased, C-20 guarded
    copies), repaired in round 8 (plus C-21), and then found two more at
@@ -55,6 +60,32 @@ then this file, then `ISSUES.md` for the next action.
    build path for a user without the patches is the open question the
    reviewer named.
 4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+
+## Round 12 (2026-11-02): what was done
+
+- Inherited uncommitted round 11 checkpoint inspected: its focused tests
+  failed (Gemini-II `gesummv` refused by the integer precision contract,
+  one Samsung check order, one stale key expectation); reconciled in a
+  bounded way (integer `Op.intermediate`, `AXPBY` declares `i24`, check
+  order, test expectation) and committed on its own.
+- G9 slice 1: `allo/spmw_semantics.py` (`ProgramFacts`, `Contraction`,
+  `Epilogue`, `BufferAccess`, `OutputSink`, `ElementType`) derived from the
+  `MatchTrace` and retained IR types; the matcher retains source loop names
+  (`extra["loop_names"]`) and traces `math.ctpop` as `popcount`.
+- G9 slice 2: `allo/spmw_pipeline.py::normalize_source` is the one front
+  end of `allo.compile` for every target (`matcher_view(target)` for the
+  Gemini-II source-idiom view declared on the target); the Gemini-II
+  contract and the APU v1 vector analysis consume the facts; the APU v1
+  text parser and the Gemini-II module walk are out of the public route;
+  planner hooks `_SOURCE_PLANNERS` replace the name branches in `compile()`
+  as an explicit seam for slice 3.
+- Found by the migration: V1-17 (guarded contraction planned unguarded by
+  the old APU v1 analysis; closed), V1-18 (bitwise/XNOR products not
+  matchable; recorded). New supported form on APU v1: local scalar
+  accumulator copied to the output (executed on the functional backend).
+- Tests: `tests/pim/test_shared_semantics.py` (10); expectations in
+  `test_g6_semantics.py`, `test_apu_g2_source_route.py`,
+  `test_compile_interface.py` moved to the shared error type.
 
 ## Round 11 (2026-11-02): what was done
 
@@ -123,10 +154,13 @@ then this file, then `ISSUES.md` for the next action.
    (VALIDATION.md round 10). Repeat after any later code commit.
 3. Lint: header, black and clang-format stages pass; the pylint stage
    carries pre-existing fork-wide findings (P-23).
-4. G9: refine `design/shared-compilation-path.md` from source (stage
-   inventory, reusable pieces, missing contracts), then the first vertical
-   slice through one matcher backend, then the APU routes; remove the
-   public bypasses once covered.
+4. G9 slice 3: register the APU v1 recipes and the Gemini-II launch plans
+   as `autoschedule` enumerators producing `Placement`s with explicit
+   effects, priced through the graph path and selected in
+   `rank_matcher_placements`; then slice 4 (typed records normalize into
+   the shared contracts; remove `_SOURCE_PLANNERS` and the hybrid text
+   parser) and slice 5 (stage traces on simulators, APU v1 board,
+   Gemini-II card, installed artifact).
 
 ## Round 6 (2026-11-02): what was done
 
