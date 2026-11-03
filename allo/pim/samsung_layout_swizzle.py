@@ -214,6 +214,7 @@ def select_autoscheduled_xor_layout(
     from .targets import build_samsung_target
     from ..spmw_autoschedule import autoschedule
     from ..spmw_match import MatchTrace, MatchedOp, OperandBinding
+    from ..spmw_match_engine import coordinate_forms
     from ..spmw_reduction_policy import stamp_reduction_policy
 
     target = build_samsung_target()
@@ -226,12 +227,22 @@ def select_autoscheduled_xor_layout(
         work_id=(0, 0),
         enclosing_loops=[("i", "0", "1", 1), ("k", "0", str(reduction), 1)],
         operands=[
-            OperandBinding("x", "x", ["k"], memref_type=f"memref<{reduction}xf16>"),
             OperandBinding(
-                "y", "W", ["i", "k"], memref_type=f"memref<1x{reduction}xf16>"
+                "x",
+                "x",
+                ["k"],
+                memref_type=f"memref<{reduction}xf16>",
+                coords=coordinate_forms("k"),
             ),
             OperandBinding(
-                "acc", "acc", is_loop_carried=True, memref_type="memref<f16>"
+                "y",
+                "W",
+                ["i", "k"],
+                memref_type=f"memref<1x{reduction}xf16>",
+                coords=coordinate_forms("i", "k"),
+            ),
+            OperandBinding(
+                "acc", "acc", is_loop_carried=True, memref_type="memref<f16>", coords=()
             ),
         ],
         result_memref_name="acc",
@@ -240,6 +251,9 @@ def select_autoscheduled_xor_layout(
             "accumulator_init": "zero",
             "axis_roles": {"reduction": ("k",), "output": ("i",)},
             "output_sinks": [("y", "i")],
+            # resolved coordinates a traced match would carry
+            "store_coords": (),
+            "output_sink_coords": [coordinate_forms("i")],
         },
     )
     # The probe studies the REDUCE bank layouts, which regroup the reduction.

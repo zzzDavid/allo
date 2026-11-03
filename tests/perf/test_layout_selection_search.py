@@ -50,6 +50,7 @@ from allo.spmw_layout_problem import (
     analyze_kernel_movement,
     derive_layout_problem,
 )
+from allo.spmw_match_engine import coordinate_forms
 from allo.spmw_match import MatchedOp, OperandBinding
 
 R, W = AccessMode.READ, AccessMode.WRITE_ACCUMULATE
@@ -236,6 +237,18 @@ class _Policy:
         self.may_regroup = may_regroup
 
 
+def _vector_coords(x_map, indices):
+    """Resolved coordinates of the synthetic vector access: the identity
+    map reads ``x[k]``; a 2-D map reads a sum of two variables (an atom the
+    matcher would not expand; the derivation rejects it as not injective);
+    a floordiv map has no affine coordinate."""
+    if x_map == "affine_map<(d0) -> (d0)>":
+        return coordinate_forms(*indices)
+    if "floordiv" in x_map:
+        return (None,)
+    return (tuple(sorted((name, 1) for name in indices)), 0),
+
+
 def _gemv_group(
     *,
     grid=(16, 8),
@@ -262,13 +275,24 @@ def _gemv_group(
             if len(grid) == 1:
                 base = row_base(work) if row_base else p * rows
             if opaque_matrix:
+                # the matrix row is an SSA value the trace did not resolve
                 matrix_operand = OperandBinding(
-                    "x", matrix, ["%20", kk], False, f"memref<4096x{k}xf16>"
+                    "x",
+                    matrix,
+                    ["%20", kk],
+                    False,
+                    f"memref<4096x{k}xf16>",
+                    coords=coordinate_forms("%20", kk),
                 )
                 acc = OperandBinding(
-                    "acc", "acc", [], True, "memref<f16>", None, "affine_map<() -> ()>"
+                    "acc", "acc", [], True, "memref<f16>", None, "affine_map<() -> ()>",
+                    coords=(),
                 )
-                extra_sink = {"output_sinks": [(out, f"add({base}, {i})")]}
+                extra_sink = {
+                    "output_sinks": [(out, f"add({base}, {i})")],
+                    "store_coords": (),
+                    "output_sink_coords": [coordinate_forms((i, base))],
+                }
             else:
                 matrix_operand = OperandBinding(
                     "x",
@@ -278,6 +302,7 @@ def _gemv_group(
                     f"memref<4096x{k}xf16>",
                     None,
                     f"affine_map<(d0, d1) -> (d0 + {base}, d1)>",
+                    coords=coordinate_forms((i, base), kk),
                 )
                 acc = OperandBinding(
                     "acc",
@@ -287,8 +312,9 @@ def _gemv_group(
                     "memref<4096xf16>",
                     None,
                     f"affine_map<(d0) -> (d0 + {base})>",
+                    coords=coordinate_forms((i, base)),
                 )
-                extra_sink = {}
+                extra_sink = {"store_coords": coordinate_forms((i, base))}
             extra = {
                 "spmw_work_scope": MatcherWorkScope(1, work, tuple(grid)),
                 "accumulator_init": "zero",
@@ -318,6 +344,7 @@ def _gemv_group(
                             f"memref<{k}xf16>",
                             None,
                             x_map,
+                            coords=_vector_coords(x_map, x_indices or [kk]),
                         ),
                         acc,
                     ],
@@ -377,14 +404,12 @@ def test_rename_only_variant_gives_the_same_problem():
     assert first.optimality_proven and first.program_label == "minimal"
 
 
-def test_opaque_matrix_row_resolution_is_recorded():
-    derived = derive_layout_problem(
-        build_samsung_target(), _gemv_group(opaque_matrix=True)
-    )
-    assert {a.memref: a for a in derived.accesses}["local_W"].variables == (0, 1, 2, 3)
-    assert any(
-        "SSA value the matcher retains only by name" in a for a in derived.assumptions
-    )
+def test_unresolved_opaque_matrix_row_is_rejected():
+    """A matrix row the trace retains only as an SSA name is no longer
+    assumed equal to the store row (C-23): without the matcher's proof that
+    the output map is the identity, the derivation refuses."""
+    with pytest.raises(LayoutDerivationError, match="output map is not the identity"):
+        derive_layout_problem(build_samsung_target(), _gemv_group(opaque_matrix=True))
 
 
 @pytest.mark.parametrize(

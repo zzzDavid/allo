@@ -263,6 +263,7 @@ class Op:
         guarded=False,
         dst_index="affine",
         iv_params=(),
+        intermediate=None,
     ):
         self.owner = owner
         self.name = name
@@ -313,6 +314,19 @@ class Op:
                 raise ValueError(
                     f"operation {name!r} iv_params {unknown} are not parameters of fn"
                 )
+
+        # Float type name (``"f32"``, ``"f64"``) when the device evaluates this
+        # op's whole declared expression with intermediates of at least that
+        # precision and rounds once into the destination element type (a
+        # lookup table, a fused datapath).  Lets the matcher bind a source
+        # expression the frontend evaluated in that type and rounded once at
+        # the store (``y[i] = f(float(x[i]))`` with a ``bf16`` ``y``).  None
+        # (the default) means the device rounds after every operation, so
+        # only single operations, where both roundings provably agree, are
+        # matched through such a store.
+        if intermediate is not None and intermediate not in ("f16", "bf16", "f32", "f64"):
+            raise ValueError("operation intermediate must be one of f16, bf16, f32, f64")
+        self.intermediate = intermediate
 
     def __repr__(self):
         return f"Op({self.name!r}, accumulates={self.accumulates})"
@@ -747,8 +761,14 @@ def op(
     guarded=False,
     dst_index="affine",
     iv_params=(),
+    intermediate=None,
 ):
-    """Attach an Op to the current unit; return the handle."""
+    """Attach an Op to the current unit; return the handle.
+
+    ``intermediate`` (``"f32"``/``"f64"``) declares that the device computes
+    the whole of ``fn`` with intermediates of at least that precision and
+    rounds once into the destination element type; see ``Op``.
+    """
     if not _target_stack:
         raise RuntimeError("allo.op must be called inside @allo.target/@allo.unit")
     cur = _target_stack[-1]
@@ -769,6 +789,7 @@ def op(
         guarded=guarded,
         dst_index=dst_index,
         iv_params=iv_params,
+        intermediate=intermediate,
     )
     cur.ops[name] = o
     return o

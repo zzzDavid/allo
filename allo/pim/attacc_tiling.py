@@ -169,6 +169,14 @@ def _contraction_extents(match) -> tuple[int, int, int]:
             f"AttAcc: the MAC in {match.func_name} reads one buffer twice; the "
             "AttAcc MAC multiplies a bank-resident matrix by a GEMV-buffer vector"
         )
+    from ..spmw_match_engine import output_map_problem
+
+    problem = output_map_problem(match)
+    if problem is not None:
+        raise AttAccDomainError(
+            f"AttAcc: the MAC in {match.func_name} does not write each result at "
+            f"the row it reads: {problem}"
+        )
     trips = roles["trips"]
 
     def extent(axes):

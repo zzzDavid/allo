@@ -273,11 +273,6 @@ def _coordinates(operand):
     ]
 
 
-def _is_opaque(coord, loop_vars):
-    """An SSA value the matcher retains only by name (not a loop variable)."""
-    return re.fullmatch(r"%\w+", coord.strip()) is not None and coord.strip() not in loop_vars
-
-
 def samsung_contraction(match: MatchedOp) -> SamsungContraction:
     """Classify one MAC match; raise SamsungUnsupported with the reason."""
 
@@ -357,21 +352,33 @@ def samsung_contraction(match: MatchedOp) -> SamsungContraction:
             + f" (coordinates: {[(op.memref_name, coords[op.role]) for op in inputs]})"
         )
     matrix, vector = matrices[0], vectors[0]
-    (matrix_row,) = free[matrix.role]
-    # The matrix row coordinate: the row loop plus a constant (checked against
-    # the store below), a constant, or an SSA value the matcher retains only
-    # by name (then the store row is trusted; see the design note).
-    if _is_opaque(matrix_row, loop_vars):
-        matrix_row_offset = None
-    elif row_var is not None and _affine_offset(matrix_row, row_var) is not None:
-        matrix_row_offset = _affine_offset(matrix_row, row_var)
-    elif row_var is None and re.fullmatch(r"\d+", matrix_row.strip()):
-        matrix_row_offset = int(matrix_row)
-    else:
-        reject(
-            f"the matrix row coordinate {matrix_row!r} is not the output row "
-            f"({row_var or 'a constant'}) plus a constant"
-        )
+    from .spmw_match_engine import _render_form, output_map_problem
+
+    # Output map (C-23): the conductor writes each result at the matrix row
+    # it reads, so the store coordinates must be exactly the operands' row
+    # coordinates as the matcher resolved them (`store_coords`, operand
+    # ``coords``); index text is never trusted.
+    problem = output_map_problem(match)
+    if problem is not None:
+        reject(f"the output map is not the identity the lowering realizes: {problem}")
+    (matrix_row_position,) = [
+        i for i, x in enumerate(coords[matrix.role]) if _affine_offset(x, k) != 0
+    ]
+    # A scalar accumulator reaches the output through its single copy, whose
+    # resolved coordinates the coverage analysis stamps as
+    # ``output_sink_coords``; ``y[i] += ...`` stores the output directly.
+    store_coords = match.extra.get("store_coords")
+    sink_coords = match.extra.get("output_sink_coords") or []
+    if not store_coords and len(sink_coords) == 1:
+        store_coords = sink_coords[0]
+    if (
+        matrix.coords is None
+        or matrix.coords[matrix_row_position] is None
+        or not store_coords
+        or any(c is None for c in store_coords)
+    ):
+        reject("the matrix row or store coordinates were not resolved by the matcher")
+    matrix_row_form = matrix.coords[matrix_row_position]
     m_dims, m_elt = _memref_dims(matrix.memref_type)
     v_dims, v_elt = _memref_dims(vector.memref_type)
     _a_dims, a_elt = _memref_dims(accs[0].memref_type)
@@ -390,26 +397,33 @@ def samsung_contraction(match: MatchedOp) -> SamsungContraction:
     sinks = match.extra.get("output_sinks") or []
     if len(sinks) != 1:
         reject(f"expected one store of the accumulator, got {sinks!r}")
-    output_memref, sink_text = sinks[0]
-    dims = _split_top_level(sink_text)
-    if len(dims) != (1 if column_var is None else 2):
-        reject(f"store index {sink_text!r} does not match the loop nest")
+    output_memref, _sink_text = sinks[0]
+    if len(store_coords) != (1 if column_var is None else 2):
+        reject(
+            f"store index [{', '.join(_render_form(c) for c in store_coords)}] "
+            "does not match the loop nest"
+        )
+    row_form = store_coords[0]
+    atoms = dict(row_form[0])
     if row_var is None:
-        row_offset = int(dims[0]) if re.fullmatch(r"\d+", dims[0].strip()) else None
+        row_offset = row_form[1] if not atoms else None
     else:
-        row_offset = _affine_offset(dims[0], row_var)
+        row_offset = row_form[1] if atoms == {row_var: 1} else None
     if row_offset is None or row_offset < 0:
         reject(
-            f"store row index {dims[0]!r} is not the row loop "
-            f"({row_var or 'none'}) plus a constant"
+            f"store row index {_render_form(row_form)} is not the row loop "
+            f"({row_var or 'none'}) plus a non-negative constant"
         )
-    if matrix_row_offset is not None and matrix_row_offset != row_offset:
+    if matrix_row_form != row_form:
         reject(
-            f"the matrix row coordinate {matrix_row!r} and the store row "
-            f"{dims[0]!r} differ"
+            f"the matrix row coordinate {_render_form(matrix_row_form)} and the "
+            f"store row {_render_form(row_form)} differ"
         )
-    if column_var is not None and dims[1].strip() != column_var:
-        reject(f"store column index {dims[1]!r} is not the column loop {column_var}")
+    if column_var is not None and store_coords[1] != (((column_var, 1),), 0):
+        reject(
+            f"store column index {_render_form(store_coords[1])} is not the column "
+            f"loop {column_var}"
+        )
     return SamsungContraction(
         matrix_memref=matrix.memref_name,
         vector_memref=vector.memref_name,

@@ -1983,6 +1983,15 @@ def contraction_shape(match, *, replicated: bool, replicas: int) -> dict:
         )
     if not match.enclosing_loops:
         raise ValueError("AiM MAC match has no reduction loop")
+    from ..spmw_match_engine import output_map_problem
+
+    problem = output_map_problem(match)
+    if problem is not None:
+        # The trace addresses each result by the matrix row it reads (C-23).
+        raise ValueError(
+            f"AiM {match.func_name}: the output map is not the identity the "
+            f"lowering realizes: {problem}"
+        )
     matrix, vector = mac_operands(match)
     same_buffer = matrix.memref_name == vector.memref_name
     if not same_buffer and matrix.role != roles["matrix"]:

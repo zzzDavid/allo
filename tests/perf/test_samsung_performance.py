@@ -34,16 +34,30 @@ def _bound_mac(work_id=(0, 0)):
     # A structurally complete GEMV match: y[i] = sum_k W[i, k] * x[k].
     match = _mac(work_id)
     match.enclosing_loops = [("i", "0", "8", 1), ("k", "0", "128", 1)]
+    from allo.spmw_match_engine import coordinate_forms
+
     match.operands = [
-        OperandBinding("x", "x", ["k"], memref_type="memref<128xf16>"),
-        OperandBinding("y", "W", ["i", "k"], memref_type="memref<8x128xf16>"),
-        OperandBinding("acc", "acc", is_loop_carried=True, memref_type="memref<f16>"),
+        OperandBinding(
+            "x", "x", ["k"], memref_type="memref<128xf16>", coords=coordinate_forms("k")
+        ),
+        OperandBinding(
+            "y",
+            "W",
+            ["i", "k"],
+            memref_type="memref<8x128xf16>",
+            coords=coordinate_forms("i", "k"),
+        ),
+        OperandBinding(
+            "acc", "acc", is_loop_carried=True, memref_type="memref<f16>", coords=()
+        ),
     ]
     match.result_memref_name = "acc"
     match.extra = {
         "accumulator_init": "zero",
         "axis_roles": {"reduction": ("k",), "output": ("i",)},
         "output_sinks": [("y", "i")],
+        "store_coords": (),
+        "output_sink_coords": [coordinate_forms("i")],
     }
     # The REDUCE placements regroup the FP16 reduction: permit it explicitly.
     from allo.spmw_reduction_policy import stamp_reduction_policy

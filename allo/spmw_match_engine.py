@@ -798,33 +798,62 @@ def _float_leaf_fits(term, dst: str, loop_bounds) -> bool:
     return False
 
 
-def _narrow_float(term, dst: str, state):
-    """Accept ``truncf`` to ``dst`` as the destination-precision rounding of
-    an expression over ``dst``-typed leaves, or return None.
+def _is_float_leaf(term) -> bool:
+    return isinstance(term, (WLoad, WConst, WBlockArg))
 
-    The frontend evaluates ``bf16`` arithmetic in ``f32`` and rounds once at
-    the store.  When every leaf is a ``dst`` value, the stored expression is
-    the source expression over ``dst`` operands and a target op declared on
-    ``dst`` computes it; the only difference is where intermediate rounding
-    happens (once at the store in the source, per operation in a device that
-    computes natively in ``dst``).  That is a precision contract, recorded in
-    the trace's ``precision_notes`` so backends and reports state it, not a
-    change of the computed function.  A leaf that is not a ``dst`` value
-    (an ``f32`` input, a constant that ``dst`` cannot represent) means the
-    source really computes in the wider type and the cast stays visible.
+
+def _single_float_operation(term) -> bool:
+    """True when ``term`` is one arithmetic operation on leaves (or a leaf):
+    a leaf, ``-leaf``, ``leaf (+|-|*|/) leaf`` (one rounding, see
+    `_narrow_float`) or ``min``/``max`` of leaves (no rounding at all: the
+    result is one of the operands)."""
+    if _is_float_leaf(term):
+        return True
+    if isinstance(term, WUnary):
+        return term.fn == "neg" and _is_float_leaf(term.arg)
+    if isinstance(term, WBinOp):
+        return term.op in ("add", "sub", "mul", "div", "min", "max") and _is_float_leaf(
+            term.lhs
+        ) and _is_float_leaf(term.rhs)
+    return False
+
+
+def _truncf_types(fn: str) -> tuple[str, str] | None:
+    """``("f32", "bf16")`` for the unary term name ``arith.truncf<f32->bf16>``."""
+    m = re.fullmatch(r"arith\.truncf<([^-]+)->([^>]+)>", fn)
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _narrow_float(term, src: str, dst: str, state):
+    """Accept ``truncf`` from ``src`` to ``dst`` at a store as exactly the
+    ``dst``-precision operation on ``dst`` operands, or return None.
+
+    The frontend evaluates ``float(a[i]) * float(b[i])`` (and arithmetic on
+    ``bf16`` values mixed with ``f32`` literals) in ``src`` and rounds once at
+    the store.  A device op declared on ``dst`` rounds after every operation.
+    The two agree, bit for bit, only for a *single* operation on ``dst``
+    values: rounding the exact result first to ``src`` and then to ``dst``
+    equals rounding it once to ``dst`` whenever ``src`` carries at least
+    ``2 p + 2`` significand bits for a ``p``-bit ``dst`` (Figueroa, "When is
+    double rounding innocuous?", 1995; f16 and bf16 in f32, f32 in f64 all
+    satisfy it; the device's single rounding is the correctly rounded
+    operation).  A compound expression keeps ``src``-precision intermediates
+    in the source (``256 * 256 + (-65504)`` is 32 in f32, overflow in f16),
+    so the cast stays visible: only an op that declares ``intermediate``
+    precision at least ``src`` may bind it (see ``_try_match_at_store``).
+    Leaves must be ``dst`` values (loads of ``dst``, constants ``dst``
+    represents exactly); an ``f32`` input means the source really computes
+    in ``f32``.
     """
-    if dst not in _FLOAT_SIGNIFICAND_BITS:
+    if dst not in _FLOAT_SIGNIFICAND_BITS or src not in _FLOAT_SIGNIFICAND_BITS:
+        return None
+    if _FLOAT_SIGNIFICAND_BITS[src] < 2 * _FLOAT_SIGNIFICAND_BITS[dst] + 2:
         return None
     loop_bounds = getattr(state, "loop_bounds", {})
     if not _float_leaf_fits(term, dst, loop_bounds):
         return None
-    notes = getattr(state, "rounding_notes", None)
-    if notes is not None:
-        notes.append(
-            f"{_render_term(term)} is rounded to {dst} at the store; the source "
-            f"evaluates the intermediates in a wider float type, a device that "
-            f"computes natively in {dst} rounds per operation"
-        )
+    if not _single_float_operation(term):
+        return None
     return term
 
 
@@ -855,10 +884,6 @@ class ValueNames:
         # bounds are constants (the iv ranges over [lower, upper)); used to
         # prove that a narrowing cast of a loop index is exact.
         self.loop_bounds: dict[str, tuple[int, int]] = {}
-        # Float narrowings accepted as destination-precision rounding of the
-        # stored expression (see `_narrow_float`), for the trace's
-        # `precision_notes`.
-        self.rounding_notes: list[str] = []
         taken: set = set()
 
         def assign(value):
@@ -1162,7 +1187,9 @@ def _trace_value(
         if op_name in ("arith.trunci", "arith.index_cast") and _int_bits(dst) is not None:
             narrowed = _narrow_integer(inner, _int_bits(dst), getattr(state, "loop_bounds", {}))
         elif op_name == "arith.truncf":
-            narrowed = _narrow_float(inner, dst, state)
+            narrowed = _narrow_float(
+                inner, _scalar_type_text(src.operands[0].type), dst, state
+            )
         elif op_name in ("arith.sitofp", "arith.uitofp") and isinstance(inner, WBlockArg):
             bounds = getattr(state, "loop_bounds", {}).get(inner.ssa_name)
             bits = _FLOAT_SIGNIFICAND_BITS.get(dst)
@@ -1740,6 +1767,7 @@ def _operand_bindings(
                     memref_type=term.memref_type,
                     value_ref=term.value_ref,
                     index_map=term.index_map,
+                    coords=_coords_of_terms(term.index_terms, term.index_map),
                 )
             )
         elif isinstance(term, WBlockArg):
@@ -1950,10 +1978,30 @@ def _try_match_at_store(
                 # (that is a scatter, spec 004 M6 and its 016 review).
                 if not any_index and store_data_dependent:
                     continue
+                candidate = t
+                if isinstance(t, WUnary) and t.fn.startswith("arith.truncf<"):
+                    # A store-side float narrowing the matcher kept visible
+                    # (compound expression evaluated in the wider type): only
+                    # an op that declares it evaluates its whole expression
+                    # with at least that intermediate precision and rounds
+                    # once may bind the expression under the cast.
+                    types = _truncf_types(t.fn)
+                    declared = getattr(op_obj, "intermediate", None)
+                    if (
+                        types is None
+                        or declared is None
+                        or _FLOAT_SIGNIFICAND_BITS.get(declared, 0)
+                        < _FLOAT_SIGNIFICAND_BITS.get(types[0], 1 << 30)
+                        or not _float_leaf_fits(
+                            t.arg, types[1], getattr(state, "loop_bounds", {})
+                        )
+                    ):
+                        continue
+                    candidate = t.arg
                 pat = compile_op_pattern(op_obj)
                 bindings: dict[str, Any] = {}
                 kinds = _param_kinds(op_obj, pat)
-                if not _unify(pat.body, t, bindings, kinds):
+                if not _unify(pat.body, candidate, bindings, kinds):
                     continue
                 constants = None
                 if kinds is None:
@@ -2028,6 +2076,11 @@ def _try_match_at_store(
                     ):
                         continue
                 extra = {"store_indices": list(store_indices)}
+                if index_terms is not None:
+                    # Resolved store coordinates (`affine_form`); consumers
+                    # compare them with the operands' ``coords`` instead of
+                    # reading index text (`output_map_problem`).
+                    extra["store_coords"] = _coords_of_terms(index_terms, store_map)
                 if index_terms is not None and not any(
                     _term_loads(t, []) for t in index_terms
                 ):
@@ -2379,7 +2432,6 @@ def match_workload(target, mlir_module, *, reduction_order=None) -> MatchTrace:
         coverage=MatchCoverage(),
     )
     coverage_problems: dict = {}
-    function_states: list = []
 
     # Iterate every func.func at the module top level.
     for func in mlir_module.body.operations:
@@ -2398,7 +2450,6 @@ def match_workload(target, mlir_module, *, reduction_order=None) -> MatchTrace:
         # state per function yields the same names in linear time.
         state = ValueNames(func, AsmState(func))
         defining_map = _build_defining_map(func, state=state)
-        function_states.append((func_name, state))
 
         body = func.regions[0].blocks[0]
         scope = _build_function_scope(func, value_refs, state=state)
@@ -2441,14 +2492,6 @@ def match_workload(target, mlir_module, *, reduction_order=None) -> MatchTrace:
         (tuple(functions), message) for message, functions in coverage_problems.values()
     ]
     trace.coverage.errors = _format_coverage_problems(trace.coverage.problems)
-    # (a store's value is traced more than once; keep each note once)
-    trace.precision_notes = list(
-        dict.fromkeys(
-            f"function '{name}': {note}"
-            for name, state in function_states
-            for note in getattr(state, "rounding_notes", ())
-        )
-    )
 
     # SPEC-026 §1.2: stamp the batch dim on each match (one source of
     # truth for cost/codegen). Additive; default batch_dim=1.
@@ -2606,6 +2649,241 @@ def _term_loads(term, out: list) -> list:
         for t in (term.cond, term.a, term.b):
             _term_loads(t, out)
     return out
+
+
+def affine_form(term):
+    """``term`` as an affine coordinate ``((atom, coefficient), ...), constant``
+    over loop variables and load-free SSA atoms, or None when the coordinate
+    depends on loaded data.
+
+    Atoms are SSA names: loop induction variables and any load-free value
+    the analysis does not expand (a product of two variables, a shift, a
+    select).  Equal forms denote equal coordinates in every execution of the
+    function; the converse is not claimed.
+    """
+
+    def norm(coefs, const):
+        return (tuple(sorted((k, v) for k, v in coefs.items() if v)), int(const))
+
+    def atom(t):
+        name = getattr(t, "ssa_name", None)
+        if name is None or _term_loads(t, []):
+            return None
+        return norm({name: 1}, 0)
+
+    if isinstance(term, WConst):
+        value = term.value
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return norm({}, value)
+    if isinstance(term, WBlockArg):
+        return norm({term.ssa_name: 1}, 0)
+    if isinstance(term, WLoad):
+        return None
+    if isinstance(term, WUnary):
+        if term.fn == "neg":
+            inner = affine_form(term.arg)
+            if inner is None:
+                return None
+            return norm({k: -v for k, v in inner[0]}, -inner[1])
+        return atom(term)
+    if isinstance(term, WBinOp):
+        lhs, rhs = affine_form(term.lhs), affine_form(term.rhs)
+        if lhs is not None and rhs is not None:
+            if term.op in ("add", "sub"):
+                sign = 1 if term.op == "add" else -1
+                coefs = dict(lhs[0])
+                for k, v in rhs[0]:
+                    coefs[k] = coefs.get(k, 0) + sign * v
+                return norm(coefs, lhs[1] + sign * rhs[1])
+            if term.op == "mul":
+                if not lhs[0]:
+                    return norm({k: v * lhs[1] for k, v in rhs[0]}, rhs[1] * lhs[1])
+                if not rhs[0]:
+                    return norm({k: v * rhs[1] for k, v in lhs[0]}, lhs[1] * rhs[1])
+        return atom(term)
+    return atom(term)
+
+
+_ACCESS_MAP_RE = re.compile(r"affine_map<\(([^)]*)\)(\[[^\]]*\])?\s*->\s*\((.*)\)>")
+
+
+def _form_scale(form, factor):
+    return (tuple((k, v * factor) for k, v in form[0] if v * factor), form[1] * factor)
+
+
+def _form_add(a, b, sign=1):
+    coefs = dict(a[0])
+    for k, v in b[0]:
+        coefs[k] = coefs.get(k, 0) + sign * v
+    return (tuple(sorted((k, v) for k, v in coefs.items() if v)), a[1] + sign * b[1])
+
+
+def _eval_affine_expr(node, dims):
+    """Affine-map result expression (Python AST over ``dN`` names) as a form."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return ((), int(node.value))
+    if isinstance(node, ast.Name):
+        return dims.get(node.id)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        inner = _eval_affine_expr(node.operand, dims)
+        return None if inner is None else _form_scale(inner, -1)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+        lhs = _eval_affine_expr(node.left, dims)
+        rhs = _eval_affine_expr(node.right, dims)
+        if lhs is None or rhs is None:
+            return None
+        if isinstance(node.op, ast.Mult):
+            if not lhs[0]:
+                return _form_scale(rhs, lhs[1])
+            if not rhs[0]:
+                return _form_scale(lhs, rhs[1])
+            return None
+        return _form_add(lhs, rhs, 1 if isinstance(node.op, ast.Add) else -1)
+    return None  # floordiv, ceildiv, mod, symbols: not an affine coordinate
+
+
+def coordinate_forms(*coords):
+    """Resolved coordinate forms for a hand-assembled match: each entry is a
+    variable name (``"i"``), an integer, or ``(name, offset)``.  Production
+    matches get their forms from the IR (`affine_form`); harnesses and tests
+    that build `MatchedOp`s by hand state them with this helper."""
+    out = []
+    for coord in coords:
+        if isinstance(coord, bool):
+            raise TypeError("coordinate must be a name, an int or (name, offset)")
+        if isinstance(coord, int):
+            out.append(((), coord))
+        elif isinstance(coord, str):
+            out.append((((coord, 1),), 0))
+        else:
+            name, offset = coord
+            out.append((((name, 1),), int(offset)))
+    return tuple(out)
+
+
+def _coords_of_terms(index_terms, index_map=None):
+    """Resolved coordinates of an access: the operands' forms, composed
+    with the ``affine.load``/``affine.store`` map when there is one
+    (``affine_map<(d0) -> (d0 + 48)>`` over ``[i]`` is the coordinate
+    ``i + 48``).  None entries are coordinates that are not affine in
+    load-free values."""
+    if index_terms is None:
+        return None
+    operand_forms = tuple(affine_form(t) for t in index_terms)
+    if index_map is None:
+        return operand_forms
+    found = _ACCESS_MAP_RE.fullmatch(str(index_map).strip())
+    if not found or (found.group(2) and found.group(2).strip("[] ")):
+        return None
+    dim_names = [d.strip() for d in found.group(1).split(",") if d.strip()]
+    if len(dim_names) != len(operand_forms):
+        return None
+    dims = dict(zip(dim_names, operand_forms))
+    results = _split_affine_results(found.group(3))
+    coords = []
+    for text in results:
+        if re.search(r"floordiv|ceildiv|\bmod\b", text):
+            coords.append(None)
+            continue
+        try:
+            tree = ast.parse(text.strip(), mode="eval")
+        except SyntaxError:
+            coords.append(None)
+            continue
+        coords.append(_eval_affine_expr(tree.body, dims))
+    return tuple(coords)
+
+
+def _split_affine_results(text: str) -> list[str]:
+    parts, depth, current = [], 0, []
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    if current or parts:
+        parts.append("".join(current))
+    return [p for p in parts if p.strip()]
+
+
+def _form_mentions(form, names) -> bool:
+    return any(atom in names for atom, _coef in form[0])
+
+
+def _render_form(form) -> str:
+    parts = [
+        (f"{coef}*{atom}" if coef != 1 else atom) for atom, coef in form[0]
+    ]
+    if form[1] or not parts:
+        parts.append(str(form[1]))
+    return " + ".join(parts).replace("+ -", "- ")
+
+
+def output_map_problem(match) -> str | None:
+    """Why the match's result coordinates are not the identity image of its
+    operands' coordinates, or None when they are.
+
+    A contraction backend writes the result of the row it reads: element
+    ``y[f]`` receives the products of ``W[f, k]``.  That is sound only when
+    every non-reduction coordinate of every input operand (``f``, resolved
+    with `affine_form`) is literally one of the store's coordinates.  A
+    store coordinate that no operand carries (a loop variable the operands
+    do not read, a constant element) is permitted; a reversed, shifted or
+    broadcast result (``out[M - 1 - row]``, ``out[row + 1]``, ``out[0]`` for
+    every row) is not, and no backend may silently write the identity
+    instead.  Unresolved or data-dependent coordinates are reported.
+    """
+    store = match.extra.get("store_coords")
+    if store is None:
+        return "the store's coordinates were not resolved by the matcher"
+    # A scalar accumulator (``acc[] += ...``) reaches the output through its
+    # copies: the result coordinates are the sinks' (`output_sink_coords`,
+    # stamped by the coverage analysis); every sink must be the identity.
+    sink_coords = match.extra.get("output_sink_coords")
+    if not store and sink_coords:
+        problems = [
+            _output_map_problem_for(match, coords, f"sink {memref}")
+            for (memref, _text), coords in zip(match.extra.get("output_sinks", ()), sink_coords)
+        ]
+        return next((p for p in problems if p is not None), None)
+    if not store and match.extra.get("output_sinks"):
+        return "the result sinks' coordinates were not resolved by the matcher"
+    return _output_map_problem_for(match, store, "the store")
+
+
+def _output_map_problem_for(match, store, what) -> str | None:
+    if store is None:
+        return f"the coordinates of {what} were not resolved by the matcher"
+    if any(c is None for c in store):
+        return f"a coordinate of {what} depends on loaded data"
+    roles = match.extra.get("axis_roles") or {}
+    reduction = set(roles.get("reduction") or ())
+    store_set = set(store)
+    for operand in match.operands:
+        if operand.is_loop_carried or operand.memref_name is None:
+            continue
+        if operand.coords is None:
+            return f"the coordinates of operand {operand.memref_name!r} were not resolved"
+        for coord in operand.coords:
+            if coord is None:
+                return f"operand {operand.memref_name!r} has a data-dependent coordinate"
+            if _form_mentions(coord, reduction):
+                continue
+            if coord not in store_set:
+                return (
+                    f"operand {operand.memref_name!r} is read at coordinate "
+                    f"{_render_form(coord)} but the result is stored at "
+                    f"[{', '.join(_render_form(c) for c in store)}]; the output "
+                    "map is not the identity, and the target lowering writes each "
+                    "result at the coordinate it reads"
+                )
+    return None
 
 
 def _render_guards(guards) -> str:
@@ -2962,6 +3240,29 @@ class _FunctionCoverage:
                     f"produced once per iteration of {result_loops or '[]'}; the "
                     "copy must execute exactly once per produced element"
                 )
+        source_terms = tuple(
+            _trace_value(
+                _value_name(operand, self.state),
+                self.defining_map,
+                self.value_refs,
+                state=self.state,
+                scope=self.scope,
+            )
+            for operand in list(source.operands)[1:]
+        )
+        source_map = (
+            str(source.attributes["map"]) if "map" in source.attributes else None
+        )
+        for j in producers:
+            if source_map != self._store_map(j) or not _terms_eq(
+                source_terms, self._store_index_terms(j)
+            ):
+                return (
+                    "copies element "
+                    f"[{', '.join(_render_term(t) for t in source_terms)}] of the "
+                    f"result, but its producer stores element "
+                    f"[{', '.join(_render_term(t) for t in self._store_index_terms(j))}]"
+                )
         try:
             source_type = str(source.operands[0].type.element_type)
             dest_type = str(self._op(index).operands[1].type.element_type)
@@ -3057,11 +3358,19 @@ class _FunctionCoverage:
                     category[index] = STORE_COPY
                     copy_producers[index] = producers
                     sink = (self._dest_name(index), self._index_text(index))
+                    sink_coords = _coords_of_terms(
+                        self._store_index_terms(index), self._store_map(index)
+                    )
                     for j in producers:
                         for match in self.site_matches[j]:
                             sinks = match.extra.setdefault("output_sinks", [])
                             if sink not in sinks:
                                 sinks.append(sink)
+                                # Resolved sink coordinates, one entry per
+                                # sink (`output_map_problem`).
+                                match.extra.setdefault("output_sink_coords", []).append(
+                                    sink_coords
+                                )
                     detail[index] = f"copy of {_render_term(self._term(index))}"
                     continue
             if self._is_local(index):
@@ -3083,6 +3392,11 @@ class _FunctionCoverage:
                     sinks = match.extra.setdefault("output_sinks", [])
                     if sink not in sinks:
                         sinks.append(sink)
+                        match.extra.setdefault("output_sink_coords", []).append(
+                            _coords_of_terms(
+                                self._store_index_terms(index), self._store_map(index)
+                            )
+                        )
                 if found:
                     loops = self.sites[index][1]
                     problems.setdefault(

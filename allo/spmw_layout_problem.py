@@ -918,11 +918,18 @@ def _resolve_opaque(match, op, memref, coords, parsed, opaque, loop_pos, assumpt
     sink_form = _linear_form(sinks[0][1], sinks[0][0])
     if any(name not in loop_pos for name in sink_form[0]):
         raise LayoutDerivationError(reason)
+    from .spmw_match_engine import output_map_problem
+
+    problem = output_map_problem(match)
+    if problem is not None:
+        # The matcher resolved the operand and store coordinates and they do
+        # not coincide (C-23): the coordinate is not the sink row.
+        raise LayoutDerivationError(f"{reason}; {problem}")
     assumptions.append(
         f"{memref} coordinate {position} ({coords[position]!r}, an SSA value the "
-        f"matcher retains only by name) is taken equal to the store row of "
-        f"{sinks[0][0]} in every work item, the rule "
-        "spmw_samsung.samsung_contraction applies"
+        f"layout derivation reads only by name) equals the store row of "
+        f"{sinks[0][0]}: the matcher's resolved coordinates "
+        "(spmw_match_engine.output_map_problem) prove the identity output map"
     )
     resolved = list(parsed)
     resolved[position] = sink_form

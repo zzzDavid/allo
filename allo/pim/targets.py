@@ -383,12 +383,19 @@ def build_aim_target():
                 # ``tanh``.
                 # AF reads the MAC accumulator latch (CENT/JSSC'23 issue order
                 # MAC -> AF -> RD_AF; the AF ISR has no GPR operand).
+                # A lookup table maps each input to one stored output value:
+                # the whole expression is evaluated off-line in wide precision
+                # and rounded once into the table's BF16 entry, so a source
+                # that evaluates the expression in f32 and rounds once at the
+                # store (`y[i] = 0.5 * tanh(0.5 * x[i]) + 0.5` with f32
+                # literals) binds to it (`intermediate`).
                 allo.op(
                     "AF",
                     src=(mac_reg,),
                     dst=af_reg,
                     fn=lambda x: 0.5 * math.tanh(0.5 * x) + 0.5,
                     vector_width=16,
+                    intermediate="f32",
                 )
 
                 @allo.unit(mapping={"bank_group": 4})

@@ -373,6 +373,10 @@ def _int_target(*names):
             iv_params=("i",),
         ),
         "AF": dict(fn=lambda x: 0.5 * tanh(0.5 * x) + 0.5),
+        # the same activation as a lookup table: one rounding at the output
+        "AF_LUT": dict(fn=lambda x: 0.5 * tanh(0.5 * x) + 0.5, intermediate="f32"),
+        "MUL": dict(fn=lambda a, b: a * b),
+        "HALF": dict(fn=lambda x: 0.5 * x),
     }
 
     @allo.target("narrowing_" + "_".join(n.lower() for n in names))
@@ -478,21 +482,256 @@ def activation_bf16_f32_constant(acc: bf16[64], sg: bf16[64]):
         sg[i] = 0.1 * allo.tanh(0.5 * acc[i]) + 0.5
 
 
-def test_bf16_store_rounding_is_a_recorded_precision_contract():
-    """bf16 arithmetic is evaluated in f32 and rounded once at the store.
-    With every leaf a bf16 value the stored expression is the bf16
-    expression the AF op declares; the matcher records that the device
-    rounds per operation instead.  A constant bf16 cannot represent (0.1)
-    makes the source genuinely f32 and the store is refused."""
-    trace = _trace(activation_bf16, "AF")
+def scale_bf16(acc: bf16[64], y: bf16[64]):
+    for i in range(64):
+        y[i] = 0.5 * acc[i]
+
+
+def product_bf16(a: bf16[64], b: bf16[64], y: bf16[64]):
+    for i in range(64):
+        y[i] = float(a[i]) * float(b[i])
+
+
+def test_store_rounding_of_a_single_operation_is_exact():
+    """``0.5 * acc[i]`` and ``float(a) * float(b)`` are evaluated in f32 and
+    rounded once at the bf16 store.  For one operation on bf16 values that
+    equals the correctly rounded bf16 operation a device performs (double
+    rounding is innocuous when the wide type has at least 2p + 2 significand
+    bits: 24 >= 2 * 8 + 2), so the cast is transparent and the op matches."""
+    trace = _trace(scale_bf16, "HALF")
     assert trace.coverage.errors == []
-    assert [m.target_op_name for m in trace.matches] == ["AF"]
-    (note,) = trace.precision_notes
-    assert "rounded to bf16 at the store" in note
+    assert [m.target_op_name for m in trace.matches] == ["HALF"]
+    trace = _trace(product_bf16, "MUL")
+    assert trace.coverage.errors == []
+    assert [m.target_op_name for m in trace.matches] == ["MUL"]
+
+
+def test_compound_store_rounding_needs_a_declared_wide_intermediate():
+    """``0.5 * tanh(0.5 * acc[i]) + 0.5`` keeps f32 intermediates in the
+    source and rounds once; a device that rounds after every operation
+    computes something else, so the cast stays visible and no ordinary op
+    matches.  An op declaring ``intermediate="f32"`` (a lookup table rounds
+    once) binds the expression.  An f32 constant the destination cannot
+    represent (0.1) makes the source genuinely f32: refused either way."""
+    with pytest.raises(UnsupportedWorkloadError) as info:
+        require_match_coverage(_trace(activation_bf16, "AF"))
+    assert "arith.truncf<f32->bf16>" in str(info.value)
+
+    trace = _trace(activation_bf16, "AF_LUT")
+    assert trace.coverage.errors == []
+    assert [m.target_op_name for m in trace.matches] == ["AF_LUT"]
 
     with pytest.raises(UnsupportedWorkloadError) as info:
-        require_match_coverage(_trace(activation_bf16_f32_constant, "AF"))
+        require_match_coverage(_trace(activation_bf16_f32_constant, "AF_LUT"))
     assert "arith.truncf<f32->bf16>" in str(info.value)
+
+
+def test_single_rounding_is_exact_and_compound_rounding_is_not():
+    """Numerical basis of the two rules above, independent of the matcher.
+
+    One operation: rounding the exact result to f32 and then to f16 equals
+    rounding it once to f16 (checked on random pairs against exact rational
+    arithmetic).  Two operations: the f32-intermediate source and the
+    per-operation f16 device differ; the reviewer's two counterexamples
+    (overflow of the intermediate, and cancellation that loses the low
+    product bits) are kept verbatim."""
+    import numpy as np
+    from fractions import Fraction
+
+    rng = np.random.default_rng(3)
+    a = (rng.standard_normal(4096) * 8).astype(np.float16)
+    b = (rng.standard_normal(4096) * 8).astype(np.float16)
+    ops = {
+        "add": (lambda p, q: p + q, np.add),
+        "sub": (lambda p, q: p - q, np.subtract),
+        "mul": (lambda p, q: p * q, np.multiply),
+        "div": (lambda p, q: p / q, np.divide),
+    }
+    for name, (exact_op, np_op) in ops.items():
+        keep = b != 0 if name == "div" else np.ones_like(b, dtype=bool)
+        exact = [
+            exact_op(Fraction(float(x)), Fraction(float(y)))
+            for x, y in zip(a[keep], b[keep])
+        ]
+        # float(Fraction) is correctly rounded to f64; f64 -> f16 is then a
+        # single rounding of an exact value (sums and products of f16
+        # values are exact in f64), or an innocuous double rounding (div).
+        once = np.array([np.float16(float(e)) for e in exact], dtype=np.float16)
+        via_f32 = np_op(a[keep].astype(np.float32), b[keep].astype(np.float32)).astype(
+            np.float16
+        )
+        np.testing.assert_array_equal(via_f32, once, err_msg=name)
+
+    def source(x, y, z):  # f32 intermediates, one rounding at the store
+        return np.float16(np.float32(x) * np.float32(y) + np.float32(z))
+
+    def device(x, y, z):  # rounds after every operation
+        with np.errstate(over="ignore"):
+            return np.float16(np.float16(np.float16(x) * np.float16(y)) + np.float16(z))
+
+    assert source(256, 256, -65504) == np.float16(32)
+    assert np.isinf(device(256, 256, -65504))
+    tiny = 1 + 2.0**-10
+    assert source(tiny, tiny, -(1 + 2.0**-9)) == np.float16(2.0**-20)
+    assert device(tiny, tiny, -(1 + 2.0**-9)) == np.float16(0)
+
+
+N_MAD = 4096
+
+
+@_df_region()
+def samsung_widened_mad(A: fp16[N_MAD], B: fp16[N_MAD], C: fp16[N_MAD], Y: fp16[N_MAD]):
+    @allo.work(mapping=[1], args=[A, B, C, Y])
+    def calc(a: fp16[N_MAD], b: fp16[N_MAD], c: fp16[N_MAD], y: fp16[N_MAD]):
+        for i in range(N_MAD):
+            y[i] = float(a[i]) * float(b[i]) + float(c[i])
+
+
+def test_widened_multiply_add_is_not_lowered_to_the_fp16_mad():
+    """The reviewer's probe: the source keeps the product in f32 (256 * 256
+    then - 65504 is 32); the Samsung MAD rounds the product to FP16 (inf).
+    No Samsung op declares a wide intermediate, so compilation fails."""
+    with pytest.raises(UnsupportedWorkloadError) as info:
+        _compile(samsung_widened_mad)
+    assert "arith.truncf<f32->f16>" in str(info.value)
+
+
+# --------------------------------------------------------------------------- #
+# Output access maps (release review, round 9)
+# --------------------------------------------------------------------------- #
+
+import numpy as np
+
+
+@_df_region()
+def gemv_reversed_rows(W: fp16[M, K], x: fp16[K], y: fp16[M]):
+    @allo.work(mapping=[16, 8], args=[W, x, y])
+    def calc(w: fp16[M, K], v: fp16[K], out: fp16[M]):
+        p, u = allo.get_wid()
+        row = p * 8 + u
+        acc: fp16 = 0
+        for k in range(K):
+            acc += w[row, k] * v[k]
+        out[M - 1 - row] = acc
+
+
+@_df_region()
+def gemv_broadcast_row(W: fp16[M, K], x: fp16[K], y: fp16[M]):
+    @allo.work(mapping=[16, 8], args=[W, x, y])
+    def calc(w: fp16[M, K], v: fp16[K], out: fp16[M]):
+        p, u = allo.get_wid()
+        row = p * 8 + u
+        acc: fp16 = 0
+        for k in range(K):
+            acc += w[row, k] * v[k]
+        out[0] = acc
+
+
+@_df_region()
+def gemv_identity_rows(W: fp16[M, K], x: fp16[K], y: fp16[M]):
+    @allo.work(mapping=[16, 8], args=[W, x, y])
+    def calc(w: fp16[M, K], v: fp16[K], out: fp16[M]):
+        p, u = allo.get_wid()
+        row = p * 8 + u
+        acc: fp16 = 0
+        for k in range(K):
+            acc += w[row, k] * v[k]
+        out[row] = acc
+
+
+@_df_region()
+def gemv_hoisted_rows(W: fp16[M, K], x: fp16[K], y: fp16[M]):
+    @allo.work(mapping=[16, 8], args=[W, x, y])
+    def calc(w: fp16[M, K], v: fp16[K], out: fp16[M]):
+        p, u = allo.get_wid()
+        base = u + p * 8
+        acc: fp16 = 0
+        for k in range(K):
+            acc += w[base, k] * v[k]
+        out[base] = acc
+
+
+def test_non_identity_output_maps_are_rejected_before_execution():
+    """``out[M - 1 - row]`` and ``out[0]`` write the result somewhere other
+    than the matrix row it came from; the Samsung lowering writes each result
+    at the row it reads (the reviewer's probe returned 0..127 for a source
+    that produces 127..0), so both are refused with the resolved coordinates."""
+    for workload in (gemv_reversed_rows, gemv_broadcast_row):
+        with pytest.raises(Exception, match="output map is not the identity") as info:
+            _compile(workload)
+        assert "is read at coordinate" in str(info.value)
+
+
+def test_identity_and_hoisted_row_coordinates_compile_alike():
+    """A renamed and re-associated row coordinate (``base = u + p * 8``) is
+    the same resolved coordinate as ``row = p * 8 + u``: both compile to the
+    same program."""
+    identity = _compile(gemv_identity_rows)
+    hoisted = _compile(gemv_hoisted_rows)
+    assert identity.estimate().cycles == hoisted.estimate().cycles
+    assert [str(c) for c in identity.compiled.cmds] == [str(c) for c in hoisted.compiled.cmds]
+
+
+def test_output_rows_are_written_at_the_rows_read(samsung_sim_gate):
+    """Value check with a row-identifying input: W[:, 0] = row index, x = 1,
+    so y must equal 0..M-1 in order (a reversed or broadcast map would show)."""
+    compiled = allo.compile(gemv_identity_rows, build_samsung_target(), samsung_cost)
+    W = np.zeros((M, K), dtype=np.float16)
+    W[:, 0] = np.arange(M)
+    x = np.ones(K, dtype=np.float16)
+    y = np.full(M, 99, dtype=np.float16)
+    result = compiled(W, x, y)
+    assert result.kind == "simulator"
+    np.testing.assert_array_equal(y, np.arange(M, dtype=np.float16))
+
+
+def test_aim_reversed_output_rows_are_rejected():
+    from allo.ir.types import bfloat16 as bf16t
+    from allo.pim.costs import aim_cost
+    from allo.pim.targets import build_aim_target
+
+    AM = AK = 256
+    AROWS = AM // 32
+
+    @_df_region()
+    def aim_rev(W: bf16t[AM, AK], x: bf16t[AK], y: bf16t[AM]):
+        @allo.work(mapping=[32], args=[W, x, y])
+        def mv(lW: bf16t[AM, AK], lx: bf16t[AK], ly: bf16t[AM]):
+            (ch,) = allo.get_wid()
+            row0 = ch * AROWS
+            for i in range(AROWS):
+                acc: bf16t = 0
+                for j in range(AK):
+                    acc += lW[row0 + i, j] * lx[j]
+                ly[AM - 1 - (row0 + i)] = acc
+
+    with pytest.raises(Exception, match="output map is not the identity"):
+        allo.compile(
+            aim_rev, build_aim_target(), aim_cost, backend="virtual", reduction_order="reassociate"
+        )
+
+
+N_EW = 256
+
+
+@_df_region()
+def add_then_copy_reversed(A: fp16[N_EW], B: fp16[N_EW], T: fp16[N_EW], Y: fp16[N_EW]):
+    @allo.work(mapping=[1], args=[A, B, T, Y])
+    def calc(a: fp16[N_EW], b: fp16[N_EW], t: fp16[N_EW], y: fp16[N_EW]):
+        for i in range(N_EW):
+            t[i] = a[i] + b[i]
+            y[i] = t[N_EW - 1 - i]
+
+
+def test_copy_must_read_the_element_its_producer_wrote():
+    """``y[i] = t[N - 1 - i]`` in the producer's own loop reads a different
+    element of the matched result than ``t[i] = a[i] + b[i]`` produced (one
+    not yet written); the copy contract refuses it instead of treating it as
+    a plain output copy.  (A copy in a separate loop is already refused by
+    the once-per-produced-element rule.)"""
+    with pytest.raises(UnsupportedWorkloadError, match="copies element") as info:
+        _compile(add_then_copy_reversed)
+    assert "its producer stores element" in str(info.value)
 
 
 def vadd_i32(A: int32[16], B: int32[16], C: int32[16]):
