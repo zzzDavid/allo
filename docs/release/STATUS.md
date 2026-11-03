@@ -3,7 +3,7 @@
 
 # Release status
 
-Updated: 2026-11-02 (round 9: second reviewer rejection at `ee8f522`; float-precision and output-map contracts repaired). Read `TASK.md` in the containing repository,
+Updated: 2026-11-02 (round 10: third reviewer rejection at `620a230`; elementwise destination maps and dropped copies repaired; full lint passes). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -40,8 +40,10 @@ then this file, then `ISSUES.md` for the next action.
    executed wrong-code probes at `e41ebbd` (C-19 casts erased, C-20 guarded
    copies), repaired in round 8 (plus C-21), and then found two more at
    `ee8f522` (C-22 float precision silently changed, C-23 output access
-   maps lost). Round 9 repairs both with stated contracts and regressions;
-   awaiting independent review and execution evidence at the new revision.
+   maps lost), and two more at `620a230` (C-24 elementwise destination
+   maps, C-25 accepted copies dropped). Rounds 9 and 10 repair them with
+   stated contracts, an external-effect realization check before selection
+   and value-checked regressions; awaiting independent review.
 3. **G7/G8 evidence**: at `7bdb475` the installed artifact (wheel from the
    committed sdist, clean venv, run outside the checkout) was exercised on
    the three simulators, the APU v1 board and, from a wheel built on
@@ -51,6 +53,17 @@ then this file, then `ISSUES.md` for the next action.
    build path for a user without the patches is the open question the
    reviewer named.
 4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+
+## Round 10 (2026-11-02): what was done
+
+- Elementwise destination maps (C-24): Samsung and AiM elementwise
+  lowerings require the resolved identity map.
+- Dropped copies (C-25): copy destination contract in the matcher;
+  `external_effects` / `require_effects_realized` in `compile_for_target`;
+  Samsung elementwise realizes identity copies (`sink_memrefs`,
+  `SourceBackendBinding.outputs`, `_copy_outputs` requires every
+  destination); other backends refuse such copies at compile time.
+- Full `task_lint.sh` header check passes against `origin/main`.
 
 ## Round 9 (2026-11-02): what was done
 
@@ -91,10 +104,12 @@ then this file, then `ISSUES.md` for the next action.
 ## Next concrete actions (in order)
 
 1. Independent review of the round 8 matcher contracts.
-2. Installed-artifact evidence: complete at `7bdb475` for virtual,
+2. Installed-artifact evidence: complete at `67f89fd` for virtual,
    Samsung, AiM, UPMEM, the APU v1 board and the Gemini-II card
-   (VALIDATION.md round 9). Repeat after any later code commit.
-3. G9: refine `design/shared-compilation-path.md` from source (stage
+   (VALIDATION.md round 10). Repeat after any later code commit.
+3. Lint: header, black and clang-format stages pass; the pylint stage
+   carries pre-existing fork-wide findings (P-23).
+4. G9: refine `design/shared-compilation-path.md` from source (stage
    inventory, reusable pieces, missing contracts), then the first vertical
    slice through one matcher backend, then the APU routes; remove the
    public bypasses once covered.

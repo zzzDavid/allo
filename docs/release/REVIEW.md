@@ -313,6 +313,39 @@ Other corrections in this round: license headers on the release documents
 (lint), and the P-22 ledger entry no longer claims development requirements
 in the wheel metadata (the wheel carries exactly the ten runtime entries).
 
+## Round 10 (2026-11-02): third independent rejection (620a230) and the repairs
+
+The reviewer's simulator probes found two more silent defects, through the
+checkout and the recorded installed wheel:
+
+- Elementwise destination maps (C-24). The round 9 contract was enforced
+  for contractions; the Samsung elementwise classifier still read
+  affine-map operands. Repair: the classifier and AiM's elementwise
+  derivation use the resolved coordinate forms and the shared identity
+  contract. Review judgment: no reversal-specific check; shifted and
+  broadcast destinations and shifted inputs fail the same rule.
+- Disappearing copies (C-25). A copy of an array result was "covered" by
+  the coverage analysis without anyone realizing it, and the runtime's
+  output check only knew the one bound output. Repair in three parts: the
+  copy contract now fixes the destination relation (same element), the
+  coverage records externally visible writes and `compile_for_target`
+  refuses any effect the backend does not declare it realizes, and the
+  Samsung elementwise program realizes identity copies by writing every
+  sink (declared through `realized_effects`, mapped through
+  `SourceBackendBinding.outputs`, required by `_copy_outputs`). Reviewer
+  note: the realization is a host-side duplicate of the gathered result,
+  which is exactly the source's `y[i] = t[i]`; it is reported in
+  `RunResult.extra["copies"]` and is not device work. Backends without a
+  declaration fall back to the pre-existing implicit set (own result,
+  sinks of a local producer), so a copy of an external array result on
+  AiM, UPMEM or AttAcc is now a compile-time refusal instead of a dropped
+  write.
+
+Lint: the full `scripts/lint/task_lint.sh` header check against
+`origin/main` now passes (headers added to 17 fork-authored files: the
+architecture document, the historical `design/` notes, two source modules,
+two tests, a verifier probe and both simulator `apply.sh`).
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -355,13 +388,13 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 | Gate | Judgment | Basis |
 |---|---|---|
 | G1 correspondence | **PASS (round 7 judgment, to be re-challenged under G9)** | every substantive mechanism of Sections III and IV has a maintained implementation reachable through `allo.compile` (CLAIMS.md); row 16 realized on Samsung, UPMEM and AiM; the remaining external items are evaluation scripts documented as such (E11, E14 DRAM half, E15, the AttAcc reference-best study and e2e composition); under the user's G9 framing the APU v1 vector route and the Gemini-II source route are release APIs but not the shared pipeline (X-01) |
-| G2 semantic preservation / explicit failure | **FAIL at ee8f522; repaired in round 9, pending independent review** | the reviewer's float-precision and output-map probes returned wrong values through the public route and the installed wheel at ee8f522 (C-22, C-23); both are now rejected before any backend, with the contracts stated in source (`_narrow_float`, `output_map_problem`) and regressions including a simulator value check; the round 8 probes still reject |
+| G2 semantic preservation / explicit failure | **FAIL at 620a230; repaired in round 10, pending independent review** | the reviewer's elementwise destination-map and dropped-copy probes executed with wrong or missing results at 620a230 (C-24, C-25); both are refused or realized now, with the external-effect check in `compile_for_target` and value-checked simulator regressions; the round 8 and 9 probes still reject |
 | G3 general mechanisms | **PASS (round 7 judgment, to be re-challenged)** | structural recognizers and template-derived legality on every backend; renamed and neighbouring programs compile to the same normalized decisions; open minor: M-14; round 8 added no case entries: the cast and copy contracts are proofs over the IR, not spellings |
-| G4 search/layout/selected-program integrity | **PARTIAL (reopened in round 9)** | the executed output mapping differed from the source on the matcher backends until C-23; the layout derivation's opaque-coordinate assumption is now a proof obligation; re-judge after independent review of the resolved-coordinate contract; the APU routes' planners remain outside the shared selection stage until G9 |
+| G4 search/layout/selected-program integrity | **PARTIAL (reopened in rounds 9 and 10)** | the executed program dropped accepted copies until C-25; required outputs are now derived from the trace's complete external effects and checked against the backend's declaration before selection; re-judge after independent review; the APU routes' planners remain outside the shared selection stage until G9 |
 | G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1; open: C-18 evaluator anomaly, uniform movement weights |
 | G6 evidence beyond examples | **PARTIAL (reopened in round 8)** | EVIDENCE.md tables plus the round 6 probe files; remaining gaps are hardware-only confirmations listed in VALIDATION.md; the independent reviewer's probes varied the output conversion and a store guard, which the round 6 campaign had not, and found two silent defects; the campaign is kept as regression evidence, not as proof of generality; new probes must target the shared semantic contracts on every route |
 | G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install at ffb4a78 (needs repeating at the candidate, INSTALL.md section 6); AiM and UPMEM simulator recipes now ship in `simulators/` and were rebuilt from the release copies; Samsung's route is not buildable from the release repository without Samsung's permission for the five patches (P-04, documented, `apply.sh` refuses); architecture doc update for the shared pipeline pending (G9); P-17 documented proprietary SDK |
-| G8 backend execution | **evidence complete at 7bdb475, pending independent review** | installed-artifact runs at the repair commit: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed); all four reviewer probes rejected through the installed wheel (VALIDATION.md round 9); AttAcc analytical by design; AiM timing-only as accepted |
+| G8 backend execution | **evidence complete at 67f89fd, pending independent review** | installed-artifact runs at the round 10 repair: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed); all reviewer probes of rounds 8 to 10 rejected or executed correctly through the installed wheel (VALIDATION.md round 10); AttAcc analytical by design; AiM timing-only as accepted |
 | G9 one shared compilation pipeline incl. both APUs | **FAIL** | required by the user on 2026-11-02; three end-to-end routes remain in `allo/compiler.py` (ISSUES X-01); design seed in `design/shared-compilation-path.md` |
 
 Verdict: **NOT READY**. Blockers: G9 (X-01) is not implemented; G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.

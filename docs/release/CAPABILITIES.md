@@ -185,7 +185,15 @@ without coefficients.
   at the coordinate its matrix row was read from (`out[M-1-row]`,
   `out[0]` for every row, `out[row+1]` are rejected on Samsung, AiM and
   AttAcc and by the layout derivation; no backend realizes a permuted
-  output). Signless loads are read as signed or unsigned according to the
+  output); an elementwise result is written at the element it was read
+  from (Samsung and AiM reject reversed, shifted or broadcast destinations
+  and shifted inputs). Copies of a result into another buffer are accepted
+  only element for element and count as effects: every externally visible
+  write of the source (matched stores and accepted copies into function
+  arguments, `external_effects`) must be declared realized by the backend
+  (`require_effects_realized`) or compilation stops; Samsung's elementwise
+  program writes the result into every such sink, the other backends refuse
+  copies of external array results (C-25). Signless loads are read as signed or unsigned according to the
   frontend's extension; unknown signedness uses the union range.
 - Placement legality (`allo/spmw_legality.py`) filters enumerated
   candidates and rejects illegal `layout=` (C-01 fixed); the work grid must
