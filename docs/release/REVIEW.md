@@ -463,6 +463,44 @@ the semantic boundary plus the incompleteness of the candidate stage:
 
 Gate G9 remains **FAIL** until slices 4 and 5 are complete and reviewed.
 
+## Round 14 (2026-11-03): independent review of d2c7a65, candidate boundary
+
+The reviewer accepted slice 3's shared enumeration, ranking and
+materialization and found that the new boundary admitted wrong programs:
+
+- C-28 (blocker, fixed). A supplied placement was executed as an artifact
+  (stale payload, stale contract, policy bypass). Judgment: a placement is
+  a decision; the common boundary now rebinds it to the current program's
+  candidate under the current policy or refuses it
+  (`spmw_candidate.rebind_supplied_layouts`), for every target; the
+  reviewer's transposed-access and strict-reuse probes are regressions on
+  both APUs, checking the planned program, the packing and the functional
+  run rather than Python-source execution. Handle-only placements of the
+  matcher backends keep their legality path and are refused when their mode
+  was policy-pruned (Samsung's own emit-time check remains).
+- C-29 (blocker, fixed by explicit refusal). The APU hooks dropped launch
+  schedules and host moves. Judgment: until repeated launches and
+  interleaved transfers are implemented for these backends, the capability
+  is declared and checked before selection (`validate_orchestration`); the
+  graph and the runtime never see an orchestration they cannot honor. The
+  single-launch host program and `host_moves=[]` remain valid.
+- Candidate effects as an enforced contract (the reviewer's third item).
+  `CandidateEffects` is one typed record for every plan backend; the driver
+  validates it per candidate before costing (a violating candidate is
+  recorded as a contract rejection, never priced), on the selected
+  placements, and against the realized artifact (`check_realization`: APU
+  v1 realization ABI, Gemini-II contract outputs and launch count). A
+  regression injects a wrong coverage and shows the rejection. The matcher
+  backends declare no effects yet (recorded under X-01).
+- The APU v1 MLIR-text contraction parser is deleted together with the
+  hybrid route's dead vector-region planning (the typed route already
+  refused vector regions; required-vector phases are proven by the native
+  recipes). The hybrid manifest still reads the scalar ABI from MLIR text
+  (recorded).
+
+Gate G9 remains **FAIL**: typed records still dispatch through
+`_PROGRAM_ROUTES`; card and installed-artifact traces pending.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -512,6 +550,6 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 | G6 evidence beyond examples | **PARTIAL (reopened in round 8)** | EVIDENCE.md tables plus the round 6 probe files; remaining gaps are hardware-only confirmations listed in VALIDATION.md; the independent reviewer's probes varied the output conversion and a store guard, which the round 6 campaign had not, and found two silent defects; the campaign is kept as regression evidence, not as proof of generality; new probes must target the shared semantic contracts on every route |
 | G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install at ffb4a78 (needs repeating at the candidate, INSTALL.md section 6); AiM and UPMEM simulator recipes now ship in `simulators/` and were rebuilt from the release copies; Samsung's route is not buildable from the release repository without Samsung's permission for the five patches (P-04, documented, `apply.sh` refuses); architecture doc update for the shared pipeline pending (G9); P-17 documented proprietary SDK |
 | G8 backend execution | **evidence complete at 67f89fd, pending independent review** | installed-artifact runs at the round 10 repair: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed); all reviewer probes of rounds 8 to 10 rejected or executed correctly through the installed wheel (VALIDATION.md round 10); AttAcc analytical by design; AiM timing-only as accepted |
-| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | required by the user on 2026-11-02; rounds 12-13 landed the shared front stages, the semantic facts and the common candidate pipeline with both APUs' plans as ranked candidates (slices 1-3 of `design/shared-compilation-path.md`, ISSUES X-01); open: typed records (slice 4), card and installed-artifact stage traces (slice 5) |
+| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-14: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, the typed candidate contract validated per candidate and against the artifact, supplied placements rebound under the current program and policy, unsupported orchestration refused before selection (ISSUES X-01, C-28, C-29); open: typed records (slice 4), card and installed-artifact stage traces (slice 5) |
 
-Verdict: **NOT READY**. Blockers: G9 (X-01) is in progress (slices 4-5 open); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.
+Verdict: **NOT READY**. Blockers: G9 (X-01) is in progress (slice 4 typed records, slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.

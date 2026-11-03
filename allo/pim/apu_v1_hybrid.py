@@ -15,14 +15,7 @@ import re
 from types import MappingProxyType
 from typing import Mapping
 
-from .apu_v1_vector_cost import rank_apu_v1_plans
-from .apu_v1_vectorize import (
-    ContractionAnalysis,
-    NoContractionError,
-    ValueAccess,
-    analyze_apu_v1_contractions,
-    generate_apu_v1_vectorization_candidates,
-)
+from .apu_v1_vectorize import ContractionAnalysis
 
 
 _DTYPE = r"bf16|f16|f32|f64|i\d+|ui\d+"
@@ -320,83 +313,6 @@ class APUv1HybridManifest:
         }
 
 
-def _adapt_analysis(analysis, dtype):
-    def access(value: ValueAccess):
-        return replace(value, dtype=dtype)
-
-    return replace(
-        analysis,
-        lhs=access(analysis.lhs),
-        rhs=access(analysis.rhs),
-        accumulator=access(analysis.accumulator),
-        output=access(analysis.output),
-        numeric_type=dtype,
-    )
-
-
-def _bind_analysis_values(analysis, semantic, formals, actual_values):
-    """Replace helper-local value labels with the caller's retained SSA values."""
-
-    actual_by_formal = {
-        formal.group("ssa"): actual for formal, actual in zip(formals, actual_values)
-    }
-
-    def bind(access):
-        formal = semantic.get(access.value)
-        if formal is None or formal not in actual_by_formal:
-            raise ValueError(
-                f"cannot bind contraction value {access.value!r} to the call ABI"
-            )
-        return replace(access, value=actual_by_formal[formal])
-
-    return replace(
-        analysis,
-        lhs=bind(analysis.lhs),
-        rhs=bind(analysis.rhs),
-        accumulator=bind(analysis.accumulator),
-        output=bind(analysis.output),
-    )
-
-
-def _select_vector_plan(analysis, target, cost, layout):
-    candidates = generate_apu_v1_vectorization_candidates(analysis)
-    plans = tuple(candidate.plan for candidate in candidates)
-    estimates = rank_apu_v1_plans(plans, target, cost) if cost is not None else ()
-    from .apu_v1_vector_program import _realize
-
-    realization_errors = {}
-    legal = []
-    for plan in plans:
-        realization, error = _realize(analysis, plan)
-        if realization is None:
-            realization_errors[plan.name] = error
-        else:
-            legal.append(plan)
-    if not legal:
-        details = "; ".join(
-            f"{name}: {error}" for name, error in realization_errors.items()
-        )
-        raise ValueError(f"no physically realizable APU vector plan: {details}")
-    if layout is None:
-        ranked = tuple(item.plan for item in estimates) if estimates else plans[::-1]
-        selected = next(plan for plan in ranked if plan in legal)
-    else:
-        selected = next((plan for plan in plans if plan.name == layout), None)
-        if selected is None:
-            raise ValueError(
-                f"unknown hybrid APU vector plan {layout!r} for {analysis.function!r}"
-            )
-        if selected not in legal:
-            raise ValueError(
-                f"hybrid APU vector plan {layout!r} is not physically realizable: "
-                f"{realization_errors[selected.name]}"
-            )
-    estimate = next(
-        (item for item in estimates if item.plan.name == selected.name), None
-    )
-    return plans, selected, estimate
-
-
 def _formal_accesses(lines):
     reads, writes, semantic = set(), set(), {}
     for line in lines:
@@ -434,19 +350,17 @@ def discover_apu_v1_hybrid_manifest(
     if vectorize not in {False, "required"}:
         raise ValueError("APUv1Phase.vectorize must be False or 'required'")
 
-    # Contraction discovery is a vector-lowering concern.  Scalar phases may
-    # contain arbitrary PolyBench loop nests and must not be rejected merely
-    # because one happens to resemble an unsupported contraction.
-    analyses = {}
     if vectorize == "required":
-        try:
-            analyses = {
-                item.function: item for item in analyze_apu_v1_contractions(text)
-            }
-        except NoContractionError:
-            analyses = {}
-    if vectorize == "required" and not analyses:
-        raise NoContractionError("selected APU phase contains no rank-2 contraction")
+        # Required-vector phases are proven by the native recipes
+        # (`apu_v1_native_vector.discover_apu_v1_native_vector_lowering`) before
+        # this manifest is discovered; the hybrid vector regions and their own
+        # MLIR-text contraction analysis were removed (release round 14).
+        # Ordinary contractions compile through `allo.compile`.
+        raise NotImplementedError(
+            "APUv1Phase(vectorize='required') is proven by the native recipes; "
+            "hybrid vector regions were removed. Compile a contraction as a plain "
+            "@allo function through allo.compile for the APU v1 vector plans."
+        )
 
     source_names = tuple(inspect.signature(phase.kernel).parameters)
     source_abi = [item for item in artifact.arguments if item.source == "argument"]
@@ -590,46 +504,12 @@ def discover_apu_v1_hybrid_manifest(
         if len(formals) != len(actual_values):
             raise ValueError(f"call ABI mismatch for region function {function!r}")
         read_formals, write_formals, semantic = _formal_accesses(functions[function])
-        analysis = analyses.get(function)
-        selected = bool(analysis is not None and vectorize == "required")
+        # Every region is a scalar ARC region (vector regions were removed).
+        analysis = None
+        selected = False
         compute_analysis = None
         plans = ()
         selected_plan = selected_estimate = None
-        if selected:
-            compute_analysis = analysis
-            if analysis.numeric_type not in {
-                "f16",
-                "i1",
-                "i8",
-                "i16",
-                "ui1",
-                "ui8",
-                "ui16",
-            }:
-                if precision is None:
-                    raise ValueError(
-                        f"selected vector region {function!r} uses {analysis.numeric_type}; "
-                        "an explicit precision_policy is required"
-                    )
-                else:
-                    if precision.storage_dtype != analysis.numeric_type:
-                        raise ValueError(
-                            f"precision policy storage dtype {precision.storage_dtype} "
-                            f"does not match {analysis.numeric_type}"
-                        )
-                    compute_analysis = _adapt_analysis(
-                        analysis, precision.compute_dtype
-                    )
-            if selected:
-                compute_analysis = _bind_analysis_values(
-                    compute_analysis, semantic, formals, actual_values
-                )
-                plans, selected_plan, selected_estimate = _select_vector_plan(
-                    compute_analysis,
-                    target,
-                    cost,
-                    getattr(phase, "vector_layout", None),
-                )
         kind = "vector" if selected else "scalar"
         role_formals = {}
         if analysis is not None:

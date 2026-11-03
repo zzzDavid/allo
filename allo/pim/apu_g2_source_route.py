@@ -1465,41 +1465,68 @@ class APUG2SourceCandidate:
     def matches_request(self, request) -> bool:
         return isinstance(request, str) and request == self.plan.name
 
-    def effects(self) -> dict[str, object]:
-        """Scheduling effects visible through the shared candidate contract."""
+    def effects(self):
+        """Scheduling effects in the common candidate contract."""
+        from ..spmw_candidate import (
+            CandidateCoverage,
+            CandidateEffects,
+            CandidateLaunch,
+            CandidateTransfer,
+            CandidateValueLayout,
+        )
+
         contract = self.contract
-        return {
-            "coverage": {
-                "function": contract.function,
-                "streams": len(contract.streams),
-                "epilogue": "pair_affine" if contract.pair_affine else None,
-                "outputs": list(contract.outputs),
-            },
-            "value_layouts": [
-                {
-                    "stream": index,
-                    "packing": stream.packing_form,
-                    "result_extents": list(stream.result_extents),
-                    "reduction_extent": stream.reduction_extent,
-                }
-                for index, stream in enumerate(contract.streams)
-            ],
-            "transfers": [
-                "host packing of every launch's lhs/rhs carriers",
-                "device result readback per launch",
-            ],
-            "launch_order": [
-                (list(launch.streams), list(launch.coordinates), launch.accumulator)
-                for launch in self.plan.launches
-            ],
-            "abi": {
-                "inputs": [
-                    name for name in contract.parameters if name not in contract.outputs
-                ],
-                "outputs": list(contract.outputs),
-            },
-            "device_scope": "one Gemini-II card, launches back to back",
-        }
+        names = dict(contract.loop_names)
+        inputs = tuple(
+            dict.fromkeys(
+                access.parameter
+                for stream in contract.streams
+                for access in (stream.lhs, stream.rhs)
+            )
+        )
+        operations = ["MAC"] * len(contract.streams)
+        if contract.pair_affine:
+            operations.append("AXPBY")
+        return CandidateEffects(
+            coverage=CandidateCoverage(
+                function=contract.function,
+                operations=tuple(dict.fromkeys(operations)),
+                inputs=inputs,
+                outputs=tuple(contract.outputs),
+            ),
+            value_layouts=tuple(
+                CandidateValueLayout(
+                    access.parameter,
+                    tuple(names.get(d, d) for d in access.dims),
+                    stream.packing_form,
+                )
+                for stream in contract.streams
+                for access in (stream.lhs, stream.rhs)
+            ),
+            transfers=tuple(
+                [CandidateTransfer(name, "in", ("host_pack", "l1")) for name in inputs]
+                + [
+                    CandidateTransfer(name, "out", ("device_readback",))
+                    for name in contract.outputs
+                ]
+            ),
+            launches=tuple(
+                CandidateLaunch(
+                    index,
+                    "composed_dot",
+                    (
+                        tuple(launch.streams),
+                        tuple(launch.coordinates),
+                        tuple(launch.reduction),
+                    ),
+                    launch.accumulator,
+                )
+                for index, launch in enumerate(self.plan.launches)
+            ),
+            abi_inputs=inputs,
+            abi_outputs=tuple(contract.outputs),
+            device_scope="one Gemini-II card, launches back to back",
+        )
 
 
 def apu_g2_source_candidates(target, matches) -> list:
@@ -1550,7 +1577,7 @@ def apu_g2_source_candidates(target, matches) -> list:
                     "payload": payload,
                     "whole_device_launch": True,
                     "launch_count": len(plan.launches),
-                    **payload.effects(),
+                    "effects": payload.effects(),
                 },
             )
         )

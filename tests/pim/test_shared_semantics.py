@@ -29,6 +29,7 @@ from allo.pim.targets import (
     build_samsung_target,
 )
 from allo.spmw_match import MatchTrace, UnsupportedWorkloadError
+from allo.spmw_reduction_policy import ReductionOrderError
 from allo.spmw_pipeline import matcher_view, normalize_source
 from allo.spmw_semantics import ProgramFacts, analyze_program
 
@@ -352,8 +353,11 @@ def test_apu_v1_plans_are_candidates_of_the_shared_ranking():
     for _position, placement in kernel.candidates:
         extra = placement.extra
         assert extra["candidate_plan"] == placement.mode
-        assert extra["coverage"]["output"] == "result"
-        assert extra["value_layouts"] and extra["transfers"] and extra["abi"]
+        effects = extra["effects"]
+        assert effects.coverage.outputs == ("result",)
+        assert effects.coverage.inputs == ("left", "right")
+        assert effects.value_layouts and effects.transfers and effects.launches
+        assert effects.abi_outputs == ("result",)
         assert extra["whole_device_launch"]
     # The selected program's graph is the one the estimate reports.
     assert compiled.execution_graph.metadata["plan"] == compiled.selected_plan.name
@@ -381,7 +385,9 @@ def test_apu_g2_plans_are_candidates_of_the_shared_ranking():
     for _position, placement in kernel.candidates:
         extra = placement.extra
         assert extra["candidate_plan"] == placement.mode
-        assert extra["launch_order"] and extra["abi"]["outputs"] == ["C"]
+        effects = extra["effects"]
+        assert effects.launches and effects.abi_outputs == ("C",)
+        assert effects.coverage.inputs == ("A", "B")
     forced = allo.compile(
         g2_gemm, build_apu_g2_target(), apu_g2_cost, layout="single/k2"
     )
@@ -393,3 +399,201 @@ def test_apu_g2_plans_are_candidates_of_the_shared_ranking():
     assert route(forced) != route(compiled)
     assert forced.compiled.cmds != compiled.compiled.cmds
     assert forced.estimate().cycles == kernel.scores[1][1]
+
+
+# --------------------------------------------------------------------------- #
+# (g) Candidate boundary: supplied placements, policy and orchestration
+#     (review round 13)
+# --------------------------------------------------------------------------- #
+
+
+def gemm_t(left: float16[4, 4], right: float16[4, 4], result: float16[4, 4]):
+    for i, j in allo.grid(4, 4):
+        for k in range(4):
+            result[i, j] += left[k, i] * right[k, j]
+
+
+def gemm_n(left: float16[4, 4], right: float16[4, 4], result: float16[4, 4]):
+    for i, j in allo.grid(4, 4):
+        for k in range(4):
+            result[i, j] += left[i, k] * right[k, j]
+
+
+def ig_n(L: int4[4, 4], R: int4[4, 4], C: int15[4, 4]):
+    for i, j in allo.grid(4, 4):
+        acc: int15 = 0
+        for k in range(4):
+            acc += L[i, k] * R[k, j]
+        C[i, j] = acc
+
+
+def ig_t(L: int4[4, 4], R: int4[4, 4], C: int15[4, 4]):
+    for i, j in allo.grid(4, 4):
+        acc: int15 = 0
+        for k in range(4):
+            acc += L[k, i] * R[k, j]
+        C[i, j] = acc
+
+
+def test_supplied_placement_is_rebound_to_the_current_program_apu_v1():
+    """The reviewer's probe: a placement selected for ``L @ R`` supplied to
+    the compilation of ``L.T @ R`` is a decision, not an executable; it is
+    rebound to the transposed program's own candidate and the functional
+    run computes the transposed product."""
+    target = build_apu_v1_target()
+    first = allo.compile(
+        gemm_n,
+        target,
+        apu_v1_cost,
+        backend="functional",
+        reduction_order="reassociate",
+        layout="baseline_spatial_reduction",
+    )
+    rebound = allo.compile(
+        gemm_t,
+        target,
+        apu_v1_cost,
+        backend="functional",
+        reduction_order="reassociate",
+        layout=first.compiled.layout,
+    )
+    assert rebound.analysis.function == "gemm_t"
+    assert rebound.analysis.lhs.indices == ("k", "i")
+    assert rebound.selected_plan.name == "baseline_spatial_reduction"
+    assert rebound.plan_selection == "explicit_layout"
+    L = (np.arange(16, dtype=np.float16).reshape(4, 4) % 4).astype(np.float16)
+    R = np.eye(4, dtype=np.float16)
+    out = np.zeros((4, 4), np.float16)
+    rebound(L, R, out)
+    np.testing.assert_array_equal(out, L.T @ R)
+
+
+def test_supplied_placement_is_rebound_to_the_current_program_apu_g2():
+    target = build_apu_g2_target()
+    first = allo.compile(ig_n, target, apu_g2_cost, backend="virtual")
+    rebound = allo.compile(
+        ig_t, target, apu_g2_cost, backend="virtual", layout=first.compiled.layout
+    )
+    fresh = allo.compile(ig_t, target, apu_g2_cost, backend="virtual")
+    assert rebound.contract.function == "ig_t"
+    assert rebound.contract.manifest() == fresh.contract.manifest()
+    assert rebound.plan.name == fresh.plan.name
+    L = (np.arange(16, dtype=np.int8).reshape(4, 4) % 4).astype(np.int8)
+    R = np.eye(4, dtype=np.int8)
+    C = np.zeros((4, 4), np.int16)
+    packed = rebound.pack(L=L, R=R, C=C)[0]["lhs"]
+    np.testing.assert_array_equal(packed, fresh.pack(L=L, R=R, C=C)[0]["lhs"])
+
+
+def test_supplied_regrouping_placement_is_refused_under_strict_policy():
+    target = build_apu_v1_target()
+    regroup = allo.compile(
+        gemm_n,
+        target,
+        apu_v1_cost,
+        backend="functional",
+        reduction_order="reassociate",
+        layout="baseline_spatial_reduction",
+    )
+    with pytest.raises(ReductionOrderError, match="baseline_spatial_reduction"):
+        allo.compile(
+            gemm_n,
+            target,
+            apu_v1_cost,
+            backend="functional",
+            reduction_order="strict",
+            layout=regroup.compiled.layout,
+        )
+    # A strict-legal plan supplied as a placement is still accepted.
+    strict = allo.compile(gemm_n, target, apu_v1_cost, backend="functional")
+    again = allo.compile(
+        gemm_n,
+        target,
+        apu_v1_cost,
+        backend="functional",
+        layout=strict.compiled.layout,
+    )
+    assert again.selected_plan.name == strict.selected_plan.name
+    assert not again.compiled.layout.extra["regroups_reduction"]
+
+
+@allo.host_program(gemm_n)
+def launch_gemm_twice(left, right, result):
+    allo.launch("gemm_n", left, right, result)
+    allo.launch("gemm_n", left, right, result)
+
+
+@allo.host_program(gemm_n)
+def launch_gemm_once(left, right, result):
+    allo.launch("gemm_n", left, right, result)
+
+
+@allo.host_program(ig_n)
+def launch_ig_twice(L, R, C):
+    allo.launch("ig_n", L, R, C)
+    allo.launch("ig_n", L, R, C)
+
+
+def test_unsupported_host_programs_are_refused_by_the_apu_backends():
+    """A host program that launches the kernel twice is neither priced as
+    one launch nor executed once: both APU backends refuse it before
+    selection, naming the capability; a single launch and an empty host
+    move list remain valid."""
+    with pytest.raises(NotImplementedError, match="launch"):
+        allo.compile(
+            gemm_n,
+            build_apu_v1_target(),
+            apu_v1_cost,
+            backend="functional",
+            host_moves=launch_gemm_twice,
+        )
+    with pytest.raises(NotImplementedError, match="launch"):
+        allo.compile(
+            ig_n,
+            build_apu_g2_target(),
+            apu_g2_cost,
+            backend="virtual",
+            host_moves=launch_ig_twice,
+        )
+    once = allo.compile(
+        gemm_n,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="functional",
+        host_moves=launch_gemm_once,
+    )
+    assert len(once.compiled.launch_schedule.steps) == 1
+    empty = allo.compile(
+        ig_n, build_apu_g2_target(), apu_g2_cost, backend="virtual", host_moves=[]
+    )
+    assert empty.plan.name == "single/k1"
+
+
+def test_candidate_effects_are_validated_against_the_program(monkeypatch):
+    """A candidate whose declared coverage does not describe the program is
+    rejected by the shared driver, not priced."""
+    from allo.pim import apu_v1_vector_program as vector
+    from allo.spmw_candidate import CandidateCoverage
+
+    original = vector.apu_v1_vector_candidates
+
+    def wrong_coverage(target, matches):
+        placements = original(target, matches)
+        from dataclasses import replace
+
+        for placement in placements:
+            effects = placement.extra["effects"]
+            placement.extra["effects"] = replace(
+                effects,
+                coverage=CandidateCoverage(
+                    effects.coverage.function,
+                    effects.coverage.operations,
+                    effects.coverage.inputs,
+                    ("elsewhere",),
+                ),
+            )
+        return placements
+
+    monkeypatch.setattr(vector, "apu_v1_vector_candidates", wrong_coverage)
+    with pytest.raises(ValueError, match="violates the candidate contract"):
+        allo.compile(gemm_n, build_apu_v1_target(), apu_v1_cost, backend="virtual")

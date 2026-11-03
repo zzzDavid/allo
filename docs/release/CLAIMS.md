@@ -96,5 +96,7 @@ coverage/semantic contracts C-19 to C-27, shared facts
 (`compile_for_target`: enumeration, legality, movement stage, cost, ranking,
 materialization), with the APU v1 vector plans and the Gemini-II launch plans
 as candidates of `rank_matcher_placements` (rows 24 and E9/E10 now go through
-it). Not yet done: typed records do not normalize into the shared contracts;
-card and installed-artifact stage traces (`design/shared-compilation-path.md`).
+it), and since round 14 under an enforced typed candidate contract with
+supplied placements rebound to the current program (C-28, C-29). Not yet
+done: typed records do not normalize into the shared contracts; card and
+installed-artifact stage traces (`design/shared-compilation-path.md`).

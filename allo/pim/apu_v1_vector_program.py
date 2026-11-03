@@ -493,51 +493,61 @@ class APUv1VectorCandidate:
             return _same_apu_v1_physical_plan(request, self.plan)
         return False
 
-    def effects(self) -> dict[str, Any]:
-        """The plan's scheduling effects, visible through the shared
-        candidate contract (what the realization does, in words the driver
-        and a reviewer can read without the GVML payload)."""
+    def effects(self):
+        """The plan's semantic and scheduling effects in the common candidate
+        contract (`allo.spmw_candidate.CandidateEffects`), checked by the
+        shared driver against the program and the realized artifact."""
+
+        from ..spmw_candidate import (
+            CandidateCoverage,
+            CandidateEffects,
+            CandidateLaunch,
+            CandidateTransfer,
+            CandidateValueLayout,
+        )
 
         plan = self.plan
         analysis = self.analysis
-        return {
-            "coverage": {
-                "function": analysis.function,
-                "operation": f"{analysis.multiply_operation}/{analysis.combine_operation}",
-                "output": analysis.output.value,
-                "output_initializer": analysis.output_initializer,
-                "inputs": [analysis.lhs.value, analysis.rhs.value],
-            },
-            "value_layouts": [
-                {
-                    "value": layout.value,
-                    "axes": list(layout.axes),
-                    "storage": getattr(layout, "storage", None),
-                }
+        output = analysis.output.value
+        return CandidateEffects(
+            coverage=CandidateCoverage(
+                function=analysis.function,
+                operations=("MAC",),
+                inputs=(analysis.lhs.value, analysis.rhs.value),
+                outputs=(output,),
+            ),
+            value_layouts=tuple(
+                CandidateValueLayout(
+                    layout.value, tuple(layout.axes), getattr(layout, "storage", None)
+                )
                 for layout in plan.value_layouts
-            ],
-            "transfers": [
-                {
-                    "value": transfer.value,
-                    "route": [step.kind for step in transfer.route],
-                }
+            ),
+            transfers=tuple(
+                CandidateTransfer(
+                    transfer.value,
+                    "inout" if transfer.value == output else "in",
+                    tuple(step.kind for step in transfer.route),
+                )
                 for transfer in plan.transfers
-            ],
-            "launch_order": [
-                plan.temporal_strategy,
-                getattr(plan.reduction_strategy, "kind", "none"),
-            ],
-            "abi": [
-                {
-                    "value": layout.value,
-                    "intent": (
-                        "inout" if layout.value == analysis.output.value else "in"
+            ),
+            launches=(
+                CandidateLaunch(
+                    0,
+                    "gvml_program",
+                    (
+                        plan.name,
+                        plan.temporal_strategy,
+                        getattr(plan.reduction_strategy, "kind", "none"),
                     ),
-                }
-                for layout in plan.value_layouts
-            ],
-            "device_scope": "one APUC, whole problem (single launch)",
-        }
+                    analysis.output_initializer,
+                ),
+            ),
+            abi_inputs=tuple(
+                layout.value for layout in plan.value_layouts if layout.value != output
+            ),
+            abi_outputs=(output,),
+            device_scope="one APUC, whole problem, single launch",
+        )
 
 
 def _candidate_placements(target, facts, candidates, pruned):
@@ -568,7 +578,7 @@ def _candidate_placements(target, facts, candidates, pruned):
             "whole_device_launch": True,
             "reduction_policy_pruned": tuple(pruned),
             "regroups_reduction": payload.regroups,
-            **payload.effects(),
+            "effects": payload.effects(),
         }
         if "tile_decision" in candidate.plan.metadata:
             extra["tile_decision"] = dict(candidate.plan.metadata["tile_decision"])

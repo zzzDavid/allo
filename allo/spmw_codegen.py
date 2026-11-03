@@ -1549,6 +1549,40 @@ def _materialize_matcher_codegen(
     )
 
 
+def _single_launch_orchestration(name, trace, launch_schedule, host_moves, what):
+    """Shared capability rule of the APU plan backends: the plan owns its
+    launches and transfers, so an explicit host program is accepted only
+    when it is the plan's own orchestration (one launch of every kernel
+    group, no host transfer steps) and no explicit host moves are given.
+    Anything else is refused here, before selection, instead of being
+    dropped by the graph and the runtime."""
+
+    from .spmw_plan import HostStep, LaunchStep
+
+    if host_moves:
+        raise NotImplementedError(
+            f"{name}: explicit host transfers (host_moves) are not implemented for "
+            f"{what}, which derive their own transfers; pass no host moves"
+        )
+    if launch_schedule is None:
+        return
+    host_steps = [s for s in launch_schedule.steps if isinstance(s, HostStep)]
+    launches = {}
+    for step in launch_schedule.steps:
+        if isinstance(step, LaunchStep):
+            launches[step.group_id] = launches.get(step.group_id, 0) + 1
+    if host_steps or any(count != 1 for count in launches.values()):
+        raise NotImplementedError(
+            f"{name}: the host program requests "
+            f"{sorted(launches.values())} launch(es) per kernel group and "
+            f"{len(host_steps)} host transfer step(s); {what} execute one launch "
+            "of the whole problem per kernel group and own their transfers. "
+            "Repeated launches, interleaved transfers and launch ordering are not "
+            "implemented for this backend; express them as separate compilations "
+            "or drop the host program."
+        )
+
+
 def _select_named_candidates(view, trace, request):
     """Without a cost program, ``layout=request`` must designate exactly one
     legal candidate of every kernel; those candidates are the program."""
@@ -1744,6 +1778,13 @@ def compile_for_target(
         )
     ctx_cls = backend_context_class(target_name)
 
+    # Orchestration capability (gate G9): a backend states which supplied
+    # host programs and transfers it implements; anything else is refused
+    # before selection instead of being dropped by the graph or the runtime.
+    validate_orchestration = getattr(ctx_cls, "validate_orchestration", None)
+    if validate_orchestration is not None:
+        validate_orchestration(trace, launch_schedule, resolved_host_moves)
+
     # Release gate G2 (C-24): every externally visible write of the source
     # (matched stores and accepted copies into function arguments) must be
     # realized by this backend, or compilation stops here.
@@ -1792,6 +1833,20 @@ def compile_for_target(
             f"layout list has {len(layouts)} entries but trace has "
             f"{len(buckets)} @allo.work kernels"
         )
+    if explicit_layout:
+        # A supplied placement is a decision, not an executable: it is
+        # rebound to the candidate of the current program with the same
+        # decision after legality and the current reduction-order policy
+        # (`spmw_candidate.rebind_supplied_layouts`); a backend plan from
+        # another compilation is never executed as such.
+        from .spmw_candidate import rebind_supplied_layouts
+
+        layouts = rebind_supplied_layouts(view, trace, layouts)
+    # The selected candidates' declared effects against the program.
+    from .spmw_candidate import require_candidate_effects
+
+    for (_scope, bucket_matches), placement in zip(buckets, layouts):
+        require_candidate_effects(bucket_matches, placement, "selected placement")
     if not explicit_layout:
         # The autoscheduler filtered its candidates; re-check what survived
         # the cross-kernel reconciliation.
@@ -1815,6 +1870,10 @@ def compile_for_target(
         host_moves=resolved_host_moves,
         module=module,
     )
+    # The realized program against the selected candidate's declared effects.
+    check_realization = getattr(ctx, "check_realization", None)
+    if check_realization is not None:
+        check_realization(layouts)
 
     # `Compiled.layout` historically held a single Placement; preserve
     # that for back-compat when there's only one kernel.

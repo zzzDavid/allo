@@ -17,9 +17,10 @@ import allo
 from allo.ir.types import float16
 from allo.pim.apu_v1_vectorize import (
     GEMV_TILE_FAMILY,
-    analyze_apu_v1_contraction,
+    apu_v1_contraction_analysis,
     gemv_reduction_tile_domain,
 )
+from allo.spmw_pipeline import normalize_source
 from allo.pim.costs import apu_v1_cost
 from allo.pim.targets import build_apu_v1_target
 
@@ -73,7 +74,9 @@ def test_paper_gemv_ranks_all_four_tiles(gemv):
 
 
 def test_tile_domain_is_derived_from_lanes_and_residency():
-    analysis = analyze_apu_v1_contraction(allo.customize(paper_gemv).module)
+    analysis = apu_v1_contraction_analysis(
+        normalize_source(paper_gemv, TARGET).program_facts()
+    )
     domain = gemv_reduction_tile_domain(analysis)
     for tile, padded, resident, rows_per_vr, matrix_tiles in domain:
         assert padded * rows_per_vr == 32768

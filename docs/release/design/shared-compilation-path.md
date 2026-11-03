@@ -38,6 +38,37 @@ through the same driver (`allo/spmw_codegen.py::compile_for_target`):
 | work grid | `_check_work_grid(target, trace, layouts=...)`: a single item is accepted when every selected placement declares `whole_device_launch` | the plan decomposes the one item over the APUC | the launches cover the whole problem |
 | artifact and runner | `Compiled` (graph, cmds, ranking, runtime ABI) wrapped by `CompiledCallable`; `backend_program` is the context's program and its documented `INTROSPECTION` names are forwarded (`compiled.selected_plan`, `compiled.plan`) | `_run_apu_v1`: vector program on the board or the functional host model; grouped program through the low-mode project | `_run_apu_g2`: pack, launch, oracle check |
 
+### Round 14: the candidate contract is enforced, not described
+
+- `allo/spmw_candidate.py::CandidateEffects` (coverage: function,
+  operations, inputs, outputs; value layouts; transfers with direction and
+  route; launches; ABI inputs/outputs; device scope) is the one typed record
+  both plan backends attach to their candidates (`extra["effects"]`).
+  `validate_candidate_effects` checks it against the work item's semantic
+  program (every external destination covered, every value a program
+  buffer, every ABI name a parameter, at least one launch) in
+  `autoschedule` before costing (a violation is a recorded rejection) and
+  in `compile_for_target` on the selected placements; the context's
+  `check_realization` compares the realized program (APU v1 realization
+  ABI; Gemini-II contract outputs and launch count) with the declared
+  effects after materialization.
+- `rebind_supplied_layouts`: a caller-supplied placement is a decision.
+  The current enumeration (legality, current reduction-order policy) is
+  searched for the same physical decision; a backend plan without one is
+  rebound by plan name or refused; a handle-only placement whose mode the
+  policy pruned raises `ReductionOrderError`. No supplied payload is ever
+  executed (C-28).
+- `validate_orchestration` on the backend contexts: the APU plan backends
+  declare that they execute one launch of the whole problem per kernel
+  group and own their transfers; a host program with repeated launches,
+  host transfer steps or explicit host moves is refused before selection
+  instead of being dropped (C-29). Implementing repeated launches on these
+  backends is future work; the matcher backends keep their schedule
+  handling (Samsung honors schedules; AiM/UPMEM/AttAcc price them through
+  the graph and are not changed here).
+- The APU v1 MLIR-text contraction parser is gone; the hybrid route's dead
+  vector-region planning went with it.
+
 Removed in round 13: the planner-hook registry `_SOURCE_PLANNERS` and
 `compile()`'s target-name branches; `APUv1VectorCallable`,
 `compile_apu_v1_vector_workload`, `search_apu_v1_vector_plans` and the
@@ -96,10 +127,12 @@ Not yet done (the remaining slices):
 
 - the typed program records (`APUv1Program`, `APUG2TypedProgram`,
   `APUG2ComposedContractionProgram`) do not normalize into the shared
-  contracts (slice 4); the hybrid typed route still uses the text parser;
-- the matcher backends' enumerators read `MatchedOp` directly; the facts are
-  available on every match (`extra["program_facts"]`) but Samsung, AiM,
-  UPMEM and AttAcc do not consume them yet;
+  contracts (slice 4); the hybrid manifest still reads the scalar ABI from
+  MLIR text;
+- the matcher backends' enumerators read `MatchedOp` directly and declare
+  no `CandidateEffects`; the facts are available on every match
+  (`extra["program_facts"]`) but Samsung, AiM, UPMEM and AttAcc do not
+  consume them yet;
 - stage traces on the Gemini-II card and the installed artifact (slice 5);
   the APU v1 board and the three simulators ran through the round 13 tree
   (VALIDATION round 13).

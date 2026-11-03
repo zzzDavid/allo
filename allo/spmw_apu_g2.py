@@ -50,7 +50,18 @@ class APUG2SourceCtx(CodegenContext):
         return payloads[0]
 
     @classmethod
-    def candidate_execution_graph(cls, target, _trace, layout, bound_cost, **_options):
+    def validate_orchestration(cls, trace, launch_schedule, host_moves) -> None:
+        """A launch plan is the program's orchestration: one plan per kernel
+        group, its launches back to back, host packing per launch."""
+
+        from .spmw_codegen import _single_launch_orchestration
+
+        _single_launch_orchestration(
+            "apu_v2", trace, launch_schedule, host_moves, "Gemini-II launch plans"
+        )
+
+    @classmethod
+    def candidate_execution_graph(cls, target, trace, layout, bound_cost, **options):
         """Price a launch-plan candidate: every launch's issued recipe,
         back to back (`price_apu_g2_launch_plan`); the plan keeps the
         graph and its estimate for inspection."""
@@ -60,6 +71,9 @@ class APUG2SourceCtx(CodegenContext):
         payload = cls._payload(layout)
         if payload is None:
             return None
+        cls.validate_orchestration(
+            trace, options.get("launch_schedule"), options.get("host_moves") or ()
+        )
         plan = payload.plan
         fingerprint = getattr(bound_cost, "fingerprint", None)
         graph = plan.execution_graph
@@ -83,6 +97,7 @@ class APUG2SourceCtx(CodegenContext):
                 "Gemini-II executes composed-dot launch plans only; the selected "
                 "placement carries no launch plan"
             )
+        self.validate_orchestration(trace, schedule, host_moves)
         (placement,) = layouts if isinstance(layouts, (list, tuple)) else [layouts]
         selection = (
             "forced"
@@ -104,6 +119,32 @@ class APUG2SourceCtx(CodegenContext):
             f"program={launch.program.structural_fingerprint}"
             for index, launch in enumerate(payload.plan.launches)
         ]
+
+    def check_realization(self, layouts) -> None:
+        """The realized launch program against the candidate's contract."""
+
+        from .spmw_candidate import candidate_effects
+
+        if self.program is None:
+            return
+        (placement,) = layouts if isinstance(layouts, (list, tuple)) else [layouts]
+        effects = candidate_effects(placement)
+        if effects is None:
+            raise RuntimeError("Gemini-II candidate declares no effects")
+        contract = self.program.contract
+        if set(contract.outputs) != set(effects.abi_outputs) or len(
+            self.program.plan.launches
+        ) != len(effects.launches):
+            raise RuntimeError(
+                "Gemini-II realization differs from the candidate contract: "
+                f"outputs {sorted(contract.outputs)} vs {sorted(effects.abi_outputs)}, "
+                f"{len(self.program.plan.launches)} launches vs {len(effects.launches)}"
+            )
+        if contract.function != effects.coverage.function:
+            raise RuntimeError(
+                f"Gemini-II realization covers {contract.function!r}, the candidate "
+                f"declared {effects.coverage.function!r}"
+            )
 
     def runtime_route(self, commands) -> tuple[str, tuple]:
         if self.program is None:

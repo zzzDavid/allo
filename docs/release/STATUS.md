@@ -3,7 +3,7 @@
 
 # Release status
 
-Updated: 2026-11-02 (round 13: gate G9 slice 3 implemented, both APUs' plans are candidates of the common selection stage; reviewer findings C-27 and G2-13 fixed). Read `TASK.md` in the containing repository,
+Updated: 2026-11-03 (round 14: candidate boundary enforced, supplied placements rebound under the current program and policy (C-28), unsupported orchestration refused (C-29), the typed candidate contract validated per candidate and artifact, the APU v1 MLIR-text parser deleted). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -61,6 +61,20 @@ then this file, then `ISSUES.md` for the next action.
    build path for a user without the patches is the open question the
    reviewer named.
 4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+
+## Round 14 (2026-11-03): what was done
+
+- Reviewer findings on `d2c7a65`: C-28 (supplied placements executed as
+  stale artifacts; now rebound through `spmw_candidate.rebind_supplied_layouts`
+  under the current program and policy, or refused) and C-29 (APU hooks
+  dropped launch schedules and host moves; now refused before selection by
+  `validate_orchestration`) fixed with executed regressions on both APUs.
+- `allo/spmw_candidate.py`: `CandidateEffects`, the typed common candidate
+  contract of the plan backends, validated per candidate before costing, on
+  the selected placements and against the realized artifact.
+- The APU v1 MLIR-text contraction parser and the hybrid route's dead
+  vector-region planning are deleted; `tests/perf/test_apu_v1_tile_selection.py`
+  reads the analysis from the shared facts.
 
 ## Round 13 (2026-11-02): what was done
 
@@ -169,17 +183,19 @@ then this file, then `ISSUES.md` for the next action.
 
 ## Next concrete actions (in order)
 
-1. Independent review of the round 8 matcher contracts.
-2. Installed-artifact evidence: complete at `67f89fd` for virtual,
-   Samsung, AiM, UPMEM, the APU v1 board and the Gemini-II card
-   (VALIDATION.md round 10). Repeat after any later code commit.
-3. Lint: header, black and clang-format stages pass; the pylint stage
-   carries pre-existing fork-wide findings (P-23).
-4. G9 slice 4: typed records (`APUv1Program`, `APUG2TypedProgram`,
-   `APUG2ComposedContractionProgram`) normalize into the shared contracts;
-   remove the hybrid route's MLIR-text parser. Slice 5: stage traces on the
-   Gemini-II card (zhang-x4) and the installed artifact; refresh the full
-   suites.
+1. G9 slice 4: typed records (`APUv1Program`, `APUG2TypedProgram`,
+   `APUG2ComposedContractionProgram`) normalize into the shared contracts
+   (facts or candidate placements) and enter the same legality, selection
+   and materialization stages; remove the `_PROGRAM_ROUTES` early return;
+   the hybrid manifest's scalar ABI from the retained IR instead of text.
+2. G9 slice 5: stage traces on the Gemini-II card (zhang-x4, shared lock,
+   wheel built there), the installed artifact and the APU v1 board at the
+   candidate revision; forced alternatives and cost perturbations reaching
+   generated code and launches; refresh the full `tests/perf` and
+   `tests/pim` suites.
+3. Independent review of the candidate boundary (C-28, C-29) and the
+   remaining semantic items; then the deferred installation and lint work
+   (P-04 Samsung patches, P-23 pylint stage).
 
 ## Round 6 (2026-11-02): what was done
 

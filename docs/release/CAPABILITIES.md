@@ -230,8 +230,13 @@ without coefficients.
   (enumerator, legality, movement stage, cost, `rank_matcher_placements`,
   materialization, runner). The APU v1 GVML vector plans and the Gemini-II
   composed-dot launch plans are candidates of that ranking with their
-  effects stated in the placement contract; `layout=` names a candidate or
-  family on every target. Plain helper-function calls in ordinary source are
+  effects stated in the typed candidate contract
+  (`allo/spmw_candidate.py::CandidateEffects`), validated per candidate,
+  on the selected placements and against the realized artifact; `layout=`
+  names a candidate or family on every target and a supplied placement is
+  rebound to the current program's candidate under the current policy
+  (C-28); a host program the APU backends cannot honor is refused before
+  selection (C-29). Plain helper-function calls in ordinary source are
   refused at the shared boundary (C-27); dataflow regions remain the
   interprocedural form. The typed APU records are still separate frontends
   (slice 4 open).

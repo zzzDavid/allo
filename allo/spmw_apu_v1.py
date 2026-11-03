@@ -74,7 +74,18 @@ class APUv1Ctx(CodegenContext):
         return payloads[0]
 
     @classmethod
-    def candidate_execution_graph(cls, target, _trace, layout, bound_cost, **_options):
+    def validate_orchestration(cls, trace, launch_schedule, host_moves) -> None:
+        """Vector plans and the grouped program execute one launch of the
+        whole problem per kernel group and own their transfers."""
+
+        from .spmw_codegen import _single_launch_orchestration
+
+        _single_launch_orchestration(
+            "apu_v1", trace, launch_schedule, host_moves, "APU v1 programs"
+        )
+
+    @classmethod
+    def candidate_execution_graph(cls, target, trace, layout, bound_cost, **options):
         """Price a vector-plan candidate from its materialized GVML inventory
         (``apu_v1_cost`` over the realized operations); None for the grouped
         matcher placements, which take the generic lowering."""
@@ -85,6 +96,9 @@ class APUv1Ctx(CodegenContext):
         payload = cls._vector_payloads(layout)
         if payload is None:
             return None
+        cls.validate_orchestration(
+            trace, options.get("launch_schedule"), options.get("host_moves") or ()
+        )
         if payload.realization is None:
             raise InfeasibleSchedule(
                 payload.realization_error
@@ -121,9 +135,36 @@ class APUv1Ctx(CodegenContext):
                 payload.realization_error
                 or "APU v1 plan has no faithful GVML " "realization"
             )
+        self.validate_orchestration(trace, schedule, host_moves)
         (placement,) = layouts if isinstance(layouts, (list, tuple)) else [layouts]
         self.program = APUv1VectorProgram(self.target, payload, trace, placement)
         self.cmds = list(payload.realization.device_source().splitlines())
+
+    def check_realization(self, layouts) -> None:
+        """The realized GVML program against the candidate's declared ABI."""
+
+        from .spmw_candidate import candidate_effects
+
+        if self.program is None:
+            return
+        (placement,) = layouts if isinstance(layouts, (list, tuple)) else [layouts]
+        effects = candidate_effects(placement)
+        if effects is None:
+            raise RuntimeError("APU v1 vector candidate declares no effects")
+        values = {value.name: value.intent for value in self.program.realization.values}
+        realized_outputs = {
+            n for n, intent in values.items() if intent in {"out", "inout"}
+        }
+        realized_inputs = {n for n, intent in values.items() if intent == "in"}
+        if realized_outputs != set(effects.abi_outputs) or realized_inputs != set(
+            effects.abi_inputs
+        ):
+            raise RuntimeError(
+                "APU v1 realization ABI differs from the candidate contract: "
+                f"realized inputs {sorted(realized_inputs)} / outputs "
+                f"{sorted(realized_outputs)}, declared {sorted(effects.abi_inputs)} / "
+                f"{sorted(effects.abi_outputs)}"
+            )
 
     def runtime_route(self, commands) -> tuple[str, tuple]:
         if self.program is None:

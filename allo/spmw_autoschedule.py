@@ -1404,6 +1404,7 @@ def autoschedule(
     # target description does not permit never reach ranking. Each is
     # recorded as a rejection of its kernel with position None (it never
     # entered the choice set).
+    from .spmw_candidate import validate_candidate_effects
     from .spmw_legality import IllegalPlacement, check_placement
 
     from dataclasses import replace
@@ -1421,6 +1422,19 @@ def autoschedule(
         for candidate in candidates:
             verdict = check_placement(target_, matches, candidate)
             if verdict.legal:
+                # The common candidate contract (gate G9): declared effects
+                # must describe this work item's program.
+                problems = validate_candidate_effects(matches, candidate)
+                if problems:
+                    reasons = illegal.setdefault(
+                        _matcher_work_scope(matches[0]).group_id, {}
+                    )
+                    reason = (
+                        f"candidate {candidate.mode!r} violates the candidate "
+                        "contract: " + "; ".join(problems)
+                    )
+                    reasons[reason] = reasons.get(reason, 0) + 1
+                    continue
                 kept.append(candidate)
                 continue
             verdicts.append(verdict)
@@ -1431,6 +1445,14 @@ def autoschedule(
             reason = f"illegal placement {candidate.mode!r}: {anonymous.describe()}"
             reasons[reason] = reasons.get(reason, 0) + 1
         if candidates and not kept:
+            if not verdicts:
+                group_reasons = illegal.get(
+                    _matcher_work_scope(matches[0]).group_id, {}
+                )
+                raise ValueError(
+                    f"every enumerated candidate for {matches[0].func_name!r} "
+                    "violates the candidate contract: " + "; ".join(group_reasons)
+                )
             raise IllegalPlacement(
                 LegalityVerdict(tuple(v for vd in verdicts for v in vd.violations)),
                 f"placement: every enumerated candidate for {matches[0].func_name!r}",
