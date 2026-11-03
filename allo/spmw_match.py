@@ -192,8 +192,23 @@ STORE_UNMATCHED = "unmatched"
 
 
 @dataclass(frozen=True)
+class RetainedLoad:
+    """One load the stored value or a guard of a store reads, as retained
+    from the IR (the shared semantic facts of whole-function programs)."""
+
+    memref_name: str | None
+    value_ref: IRValueRef | None
+    memref_type: str | None
+    indices: tuple[str, ...]
+    index_map: str | None
+    coords: tuple | None
+
+
+@dataclass(frozen=True)
 class StoreCoverage:
-    """How one store site of the workload is implemented."""
+    """How one store site of the workload is implemented, with the facts
+    retained from the IR that describe its effect (loops, guards, the
+    buffers it reads, conversions, whether it reads its own destination)."""
 
     func_name: str
     # ``"<store op>@<stored ssa>"``, the same handle as ``MatchedOp.op_range[1]``.
@@ -203,12 +218,26 @@ class StoreCoverage:
     category: str
     detail: str = ""
     # True when the destination is a buffer local to the function (an
-    # ``alloc``): the write is not observable by the caller.  Externally
-    # visible writes (function arguments) are the effects a backend must
-    # realize (`spmw_match_engine.external_effects`).
+    # ``alloc``): the write is not observable by the caller unless the
+    # function returns the buffer.  Externally visible writes (function
+    # arguments) are the effects a backend must realize
+    # (`spmw_match_engine.external_effects`).
     local: bool = False
     # Retained identity of the destination buffer (None outside a scope).
     value_ref: IRValueRef | None = None
+    # Retained facts of the store's effect.
+    memref_type: str | None = None
+    indices: tuple[str, ...] = ()
+    coords: tuple | None = None
+    guards: tuple[str, ...] = ()  # rendered guard frames, outermost first
+    loads: tuple = ()  # RetainedLoad of the stored value, in term order
+    guard_loads: tuple = ()  # RetainedLoad of the guard conditions
+    index_loads: tuple = ()  # RetainedLoad of data-dependent store indices
+    reads_destination: bool = False  # the value reads the element it stores
+    conversions: tuple[str, ...] = ()  # cast operations in the stored value
+    term: str = ""  # rendered stored value
+    constant: bool = False  # the stored value is a compile-time constant
+    loop_names: tuple = ()  # ((induction var, source loop label), ...)
 
 
 @dataclass

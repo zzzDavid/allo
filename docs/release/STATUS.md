@@ -3,7 +3,7 @@
 
 # Release status
 
-Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline; committed as `9255d29`, exercised from the installed wheel on the simulators, the APU v1 board and the Gemini-II card; round 16: the reviewer's three contract gaps closed (C-30b) and `APUv1Program` migrated into the shared pipeline, the last typed route removed). Read `TASK.md` in the containing repository,
+Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline; committed as `9255d29`, exercised from the installed wheel on the simulators, the APU v1 board and the Gemini-II card; round 16: the reviewer's three contract gaps closed (C-30b) and the last typed route removed; round 17: the `APUv1Program` facade replaced by the shared front stages on the phase's source with retained store effects (X-02)). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -43,11 +43,12 @@ then this file, then `ISSUES.md` for the next action.
    candidate contract and the Gemini-II typed-record frontends in rounds
    14-15. At `9255d29` the installed wheel ran the shared pipeline on the
    simulators, the APU v1 board and the Gemini-II card (VALIDATION.md
-   round 15). Round 16 closed the reviewer's three contract gaps (C-30b:
-   ordered reduction partitions with multiplicity, accumulator chains
-   against the source initialization, extents of every operation) and
-   migrated `APUv1Program` into the shared pipeline; no typed route
-   remains. Open: the matcher backends' effects declarations and facts
+   round 15). Round 16 closed the reviewer's three contract gaps (C-30b)
+   and removed the typed route, but its `APUv1Program` migration was a
+   facade (X-02); round 17 runs the shared front stages on the phase's
+   source and derives the record's contract from retained store effects
+   (guards, carried reads, preserved output regions). Open: independent
+   review of round 17, the matcher backends' effects declarations and facts
    consumption, the hybrid manifest's scalar ABI from retained IR, and the
    slice 5 traces of forced alternatives and cost perturbations on both
    hardware hosts. Map and status: `design/shared-compilation-path.md`.
@@ -71,6 +72,27 @@ then this file, then `ISSUES.md` for the next action.
    build path for a user without the patches is the open question the
    reviewer named.
 4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+
+## Round 17 (2026-11-03): what was done
+
+- Reviewer finding on `bba11f0` (X-02): the round 16 `APUv1Program`
+  frontend built the lowering first and stood a body-less synthetic match
+  for the function, so a guarded write declared its output write-only.
+  Replaced: the phase's source goes through the shared front stages; the
+  matcher retains every store's loop nest, guards, reads (through local
+  temporaries and data-dependent indices), conversions and carried state
+  (`StoreCoverage`), the semantics state them as `ProgramFacts.effects`
+  (`StoreEffect`, returned buffers as parameters, `verbatim=True`); the
+  enumerator builds the lowering from the same retained schedule; the
+  candidate's contract is derived by `spmw_candidate.verbatim_values`
+  (preserved output regions and carried reads are inputs), one
+  whole-function launch advances every effect, and the realization check
+  compares declared transfers and allocations with the runtime's actual
+  movement. The reviewer's reproducer passes; section l of
+  `tests/pim/test_shared_semantics.py` holds the regressions.
+- Documentation corrected: slice 4 is described as done pending review of
+  round 17, not as completed in round 16.
+- Evidence: VALIDATION.md round 17.
 
 ## Round 16 (2026-11-03): what was done
 
@@ -239,6 +261,8 @@ then this file, then `ISSUES.md` for the next action.
 
 ## Next concrete actions (in order)
 
+0. Independent review of the round 17 `APUv1Program` frontend (retained
+   store effects, verbatim contract, runtime-checked transfers).
 1. G9, matcher backends: Samsung, AiM, UPMEM and AttAcc candidates declare
    `CandidateEffects` (coverage, value layouts on their handles, transfers,
    launches) and their enumerators consume `ProgramFacts` instead of

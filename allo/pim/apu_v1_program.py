@@ -611,6 +611,15 @@ def read_output_image(path, role: str, dtype, shape) -> np.ndarray:
 _APU_V1_PROGRAM_BACKENDS = (None, "virtual", "functional")
 
 
+def customize_apu_v1_phase(phase):
+    """The retained MLIR schedule of one phase (``enable_tensor=False``,
+    the phase's ``instantiate`` list)."""
+    kwargs = {"enable_tensor": False}
+    if phase.instantiate:
+        kwargs["instantiate"] = list(phase.instantiate)
+    return customize(phase.kernel, **kwargs)
+
+
 class CompiledAPUv1Program:
     """One single-phase APUv1Program lowered to scalar ARC C or a native recipe.
 
@@ -626,7 +635,7 @@ class CompiledAPUv1Program:
       execution path, so they reject ``"functional"`` at compile time.
     """
 
-    def __init__(self, program, target, cost=None, backend=None):
+    def __init__(self, program, target, cost=None, backend=None, *, schedule=None):
         if backend not in _APU_V1_PROGRAM_BACKENDS:
             raise ValueError(
                 "APUv1Program supports backend=None (device), 'virtual', or "
@@ -647,10 +656,13 @@ class CompiledAPUv1Program:
                 "multi-phase APUv1Program requires the hybrid orchestration backend"
             )
         phase = program.phases[0]
-        kwargs = {"enable_tensor": False}
-        if phase.instantiate:
-            kwargs["instantiate"] = list(phase.instantiate)
-        self.schedule = customize(phase.kernel, **kwargs)
+        if schedule is None:
+            # The shared front stages normally customize the phase once
+            # (`apu_v1_record_frontend.normalize_apu_v1_program`) and hand
+            # the retained schedule here, so the lowering and the semantic
+            # facts come from the same IR.
+            schedule = customize_apu_v1_phase(phase)
+        self.schedule = schedule
         self.artifact = emit_c_from_mlir(
             self.schedule.module,
             self.schedule.top_func_name,
@@ -1006,4 +1018,5 @@ __all__ = [
     "APUv1Phase",
     "APUv1Program",
     "CompiledAPUv1Program",
+    "customize_apu_v1_phase",
 ]

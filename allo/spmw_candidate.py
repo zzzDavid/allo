@@ -93,6 +93,12 @@ class CandidateLaunch:
     reduction: tuple[int, int] | None = None
     accumulator: str | None = None
     covers: tuple = ()  # backend detail (plan name, tile coordinates)
+    # A whole-function launch: the device executes the function verbatim,
+    # advancing every covered store effect over its complete iteration
+    # space in program order (``instances`` is ``(0, 1)``: one execution;
+    # ``reduction`` and ``accumulator`` are None, the function's own
+    # control flow carries its accumulators).
+    whole: bool = False
 
 
 @dataclass(frozen=True)
@@ -107,6 +113,9 @@ class CandidateEffects:
     # Axes the plan adds to the program's loops (a unit axis a 1-D GEMV is
     # lifted with), with their extents.
     synthetic_axes: tuple[tuple[str, int], ...] = ()
+    # Device allocations the program needs beyond its values:
+    # ``(name, bytes, storage)`` (a scalar program's local-array scratch).
+    allocations: tuple[tuple[str, int, str], ...] = ()
 
     def manifest(self) -> dict[str, Any]:
         return {
@@ -138,11 +147,13 @@ class CandidateEffects:
                     "reduction": None if l.reduction is None else list(l.reduction),
                     "accumulator": l.accumulator,
                     "covers": list(l.covers),
+                    "whole": l.whole,
                 }
                 for l in self.launches
             ],
             "abi": {"inputs": list(self.abi_inputs), "outputs": list(self.abi_outputs)},
             "synthetic_axes": [list(item) for item in self.synthetic_axes],
+            "allocations": [list(item) for item in self.allocations],
             "device_scope": self.device_scope,
         }
 
@@ -153,10 +164,70 @@ def candidate_effects(placement) -> CandidateEffects | None:
     return effects if isinstance(effects, CandidateEffects) else None
 
 
+def _verbatim_facts(matches):
+    """The `ProgramFacts` of a work item whose program executes the
+    function verbatim (``facts.verbatim``), else None."""
+    facts = matches[0].extra.get("program_facts") if matches else None
+    return facts if getattr(facts, "verbatim", False) else None
+
+
+def verbatim_values(facts):
+    """``(inputs, outputs, locals)`` of a function a program executes
+    verbatim, from its retained store effects (`ProgramFacts.effects`):
+
+    * an argument is an input when any store's value, guard or index reads
+      it (through local temporaries too), when a store reads the element
+      it writes in it (a carried value), or when the function does not
+      overwrite it whole and unconditionally (the elements it leaves alone
+      keep the caller's values);
+    * every argument or returned buffer the function stores to is an
+      output; internal temporaries are the locals.
+
+    Inputs and outputs are in parameter order.
+    """
+    arguments = [p.name for p in facts.parameters if not p.returned]
+    reads, writes, locals_ = set(), set(), set()
+    for effect in facts.effects:
+        destination = effect.destination
+        if destination.local:
+            if destination.memref_name is not None:
+                locals_.add(destination.memref_name)
+        else:
+            writes.add(destination.parameter)
+            if destination.parameter in arguments and (
+                effect.reads_destination or not effect.writes_whole_buffer
+            ):
+                reads.add(destination.parameter)
+        for access in effect.reads:
+            if not access.local and access.parameter in arguments:
+                reads.add(access.parameter)
+    order = list(facts.parameter_names)
+    return (
+        tuple(name for name in order if name in reads),
+        tuple(name for name in order if name in writes),
+        frozenset(locals_),
+    )
+
+
+def _verbatim_values(facts, matches):
+    inputs, outputs, locals_ = verbatim_values(facts)
+    operations = {match.target_op_name for match in matches}
+    return (
+        set(inputs),
+        set(outputs),
+        set(locals_),
+        operations,
+        set(facts.parameter_names),
+    )
+
+
 def _program_values(matches):
     """The buffers of one work item's matches: inputs, external
     destinations, local destinations, operations, parameter names."""
 
+    facts = _verbatim_facts(matches)
+    if facts is not None:
+        return _verbatim_values(facts, matches)
     inputs, outputs, locals_, operations = set(), set(), set(), set()
     for match in matches:
         operations.add(match.target_op_name)
@@ -250,6 +321,11 @@ def _operation_extents(matches) -> dict:
     when the extent is unknown (the launches cannot be checked, which is a
     contract problem)."""
     out = {}
+    verbatim = _verbatim_facts(matches)
+    if verbatim is not None:
+        for index, effect in enumerate(verbatim.effects):
+            out[index] = (effect.instances, effect.reduction_extent, None)
+        return out
     for index, match in enumerate(matches):
         facts = match.extra.get("semantic_facts")
         if facts is not None and hasattr(facts, "reduction_vars"):
@@ -385,7 +461,14 @@ def _check_value_layouts(effects, matches, inputs, outputs, locals_, view) -> li
     missing_layouts = (inputs | outputs) - laid_out
     if missing_layouts:
         problems.append(f"no value layout for {sorted(missing_layouts)}")
-    if loop_labels and not loop_labels <= covered_axes:
+    if (
+        loop_labels
+        and not loop_labels <= covered_axes
+        and _verbatim_facts(matches) is None
+    ):
+        # A verbatim program keeps its buffers whole in device memory and
+        # runs the function's loops itself; distributed layouts over the
+        # program's loops are the contract of a planned program.
         problems.append(
             f"loops {sorted(loop_labels - covered_axes)} of the program appear in "
             "no value layout (iteration coverage)"
@@ -414,6 +497,81 @@ def _check_transfers(effects, inputs, outputs, locals_) -> list:
         problems.append(
             f"outputs {sorted(outputs - moved_out)} are never transferred out"
         )
+    return problems
+
+
+def _check_launches(effects, matches, view) -> list:
+    """Launches: ordered, each covering declared operations; per operation the
+    instance ranges tile its result instances, and per instance range the
+    launches form an ordered partition of the reduction whose accumulator
+    chain starts as the source initializes it and continues from the
+    previous launch; a verbatim program launches whole functions.  Declared
+    allocations name declared storage."""
+    problems = []
+    verbatim = _verbatim_facts(matches)
+    operation_count = len(verbatim.effects) if verbatim is not None else len(matches)
+    if not effects.launches:
+        problems.append("declares no launch")
+    for position, launch in enumerate(effects.launches):
+        if launch.index != position:
+            problems.append(f"launch {launch.index} is out of order at {position}")
+        if not launch.kind:
+            problems.append(f"launch {position} has no kind")
+        if not launch.operations:
+            problems.append(f"launch {position} advances no operation")
+        for op in launch.operations:
+            if not 0 <= op < operation_count:
+                problems.append(f"launch {position} names operation {op}, not matched")
+        a, b = launch.instances
+        if not 0 <= a < b:
+            problems.append(f"launch {position} covers no instances")
+        if launch.whole and (
+            tuple(launch.instances) != (0, 1)
+            or launch.reduction is not None
+            or launch.accumulator is not None
+        ):
+            problems.append(
+                f"whole-function launch {position} declares instances, a reduction "
+                "range or an accumulator mode; the function's own control flow "
+                "carries those"
+            )
+        if verbatim is not None and not launch.whole:
+            problems.append(
+                f"launch {position} advances part of a function the program "
+                "executes verbatim; a verbatim program launches whole functions"
+            )
+    by_operation = {}
+    for launch in effects.launches:
+        for op in launch.operations:
+            if 0 <= op < operation_count:
+                by_operation.setdefault(op, []).append(launch)
+    extents = _operation_extents(matches)
+    for op, launches in by_operation.items():
+        if all(launch.whole for launch in launches):
+            if len(launches) != 1:
+                problems.append(
+                    f"operation {op} is advanced by {len(launches)} whole-function "
+                    "launches, not one"
+                )
+            extent = extents.get(op)
+            if extent is None or extent[0] is None:
+                problems.append(
+                    f"operation {op} has no known instance extent to check launches"
+                )
+            continue
+        problems.extend(_check_operation_launches(op, launches, extents.get(op)))
+    uncovered = set(range(operation_count)) - set(by_operation)
+    if uncovered:
+        problems.append(f"operations {sorted(uncovered)} are advanced by no launch")
+    for name, size, storage in effects.allocations:
+        if not name or int(size) < 0:
+            problems.append(f"allocation {name!r} of {size} bytes is malformed")
+        if not _storage_declared(view, storage):
+            problems.append(
+                f"allocation {name!r} names storage {storage!r}, which the target "
+                "does not declare"
+            )
+
     return problems
 
 
@@ -467,37 +625,7 @@ def validate_candidate_effects(matches, placement, view=None) -> list[str]:
     )
     problems.extend(_check_transfers(effects, inputs, outputs, locals_))
 
-    # Launches: ordered, each covering declared operations; per operation the
-    # instance ranges tile its result instances, and per instance range the
-    # launches form an ordered partition of the reduction whose accumulator
-    # chain starts as the source initializes it and continues from the
-    # previous launch.
-    if not effects.launches:
-        problems.append("declares no launch")
-    for position, launch in enumerate(effects.launches):
-        if launch.index != position:
-            problems.append(f"launch {launch.index} is out of order at {position}")
-        if not launch.kind:
-            problems.append(f"launch {position} has no kind")
-        if not launch.operations:
-            problems.append(f"launch {position} advances no operation")
-        for op in launch.operations:
-            if not 0 <= op < len(matches):
-                problems.append(f"launch {position} names operation {op}, not matched")
-        a, b = launch.instances
-        if not 0 <= a < b:
-            problems.append(f"launch {position} covers no instances")
-    by_operation = {}
-    for launch in effects.launches:
-        for op in launch.operations:
-            if 0 <= op < len(matches):
-                by_operation.setdefault(op, []).append(launch)
-    extents = _operation_extents(matches)
-    for op, launches in by_operation.items():
-        problems.extend(_check_operation_launches(op, launches, extents.get(op)))
-    uncovered = set(range(len(matches))) - set(by_operation)
-    if uncovered:
-        problems.append(f"operations {sorted(uncovered)} are advanced by no launch")
+    problems.extend(_check_launches(effects, matches, view))
 
     # ABI.
     if set(effects.abi_outputs) != set(coverage.outputs):
@@ -654,4 +782,5 @@ __all__ = [
     "rebind_supplied_layouts",
     "require_candidate_effects",
     "validate_candidate_effects",
+    "verbatim_values",
 ]

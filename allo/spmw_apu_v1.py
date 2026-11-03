@@ -182,14 +182,45 @@ class APUv1Ctx(CodegenContext):
         from .pim.apu_v1_record_frontend import APUv1RecordProgram
 
         if isinstance(self.program, APUv1RecordProgram):
-            # The realization is the lowering itself: its effects, derived
-            # again from the lowered program, must be the declared ones.
-            actual = self.program.candidate.effects()
-            if actual != effects:
+            # The realized runtime moves every source argument to L4, reads
+            # the outputs back and allocates the scalar program's scratch:
+            # the declaration's transfers and allocations must be exactly
+            # that movement, and the declared launch must be this lowering.
+            transfers, allocations = self.program.candidate.realized_transfers()
+            declared = {
+                (t.value, t.direction, tuple(t.route)) for t in effects.transfers
+            }
+            realized = {(t.value, t.direction, tuple(t.route)) for t in transfers}
+            if declared != realized:
                 raise RuntimeError(
-                    "APU v1 program realization differs from the candidate "
-                    f"contract: realized {actual.manifest()}, declared "
-                    f"{effects.manifest()}"
+                    "APU v1 program realization moves "
+                    f"{sorted(realized)}, the candidate declared {sorted(declared)}"
+                )
+            if tuple(effects.allocations) != tuple(allocations):
+                raise RuntimeError(
+                    "APU v1 program realization allocates "
+                    f"{list(allocations)}, the candidate declared "
+                    f"{list(effects.allocations)}"
+                )
+            lowered = self.program.lowered
+            abi_outputs = {argument.name for argument in lowered.outputs}
+            if not set(effects.abi_outputs) <= abi_outputs:
+                raise RuntimeError(
+                    "APU v1 program realization writes "
+                    f"{sorted(abi_outputs)}, the candidate declared outputs "
+                    f"{sorted(effects.abi_outputs)}"
+                )
+            (launch,) = effects.launches
+            from .pim.apu_v1_record_frontend import program_fingerprint
+
+            if not launch.whole or launch.covers != (
+                lowered.route,
+                program_fingerprint(lowered),
+            ):
+                raise RuntimeError(
+                    "APU v1 program realization is the whole-function lowering "
+                    f"{lowered.route!r}; the candidate declares launch "
+                    f"{(launch.kind, launch.whole, launch.covers)}"
                 )
             return
         realization = self.program.realization

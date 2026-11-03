@@ -53,6 +53,7 @@ from .spmw_match import (
     MatchedOp,
     MatchTrace,
     OperandBinding,
+    RetainedLoad,
     StoreCoverage,
     UnsupportedWorkloadError,
 )
@@ -2839,6 +2840,50 @@ def _term_loads(term, out: list) -> list:
     return out
 
 
+def _retained_loads(term) -> list:
+    """`RetainedLoad` records of every load under ``term``, in term order."""
+    out = []
+    for load in _term_loads(term, []):
+        index_terms = getattr(load, "index_terms", None)
+        out.append(
+            RetainedLoad(
+                memref_name=load.memref_name,
+                value_ref=load.value_ref,
+                memref_type=load.memref_type,
+                indices=tuple(str(i) for i in load.indices),
+                index_map=load.index_map,
+                coords=(
+                    _coords_of_terms(index_terms, load.index_map)
+                    if index_terms is not None
+                    else None
+                ),
+            )
+        )
+    return out
+
+
+def _term_casts(term) -> list[str]:
+    """Cast operations applied inside ``term`` (``arith.trunci``, ...), in
+    term order, each once."""
+    out: list[str] = []
+
+    def visit(node):
+        if isinstance(node, WUnary):
+            name = node.fn.split("<", 1)[0]
+            if name in _CAST_OPS and name not in out:
+                out.append(name)
+            visit(node.arg)
+        elif isinstance(node, (WBinOp, WCmp)):
+            visit(node.lhs)
+            visit(node.rhs)
+        elif isinstance(node, WSelect):
+            for child in (node.cond, node.a, node.b):
+                visit(child)
+
+    visit(term)
+    return out
+
+
 def affine_form(term):
     """``term`` as an affine coordinate ``((atom, coefficient), ...), constant``
     over loop variables and load-free SSA atoms, or None when the coordinate
@@ -3534,6 +3579,29 @@ class _FunctionCoverage:
             )
         return None
 
+    def _guard_terms(self, index) -> list:
+        """``(kind, traced condition or None)`` for every guard frame
+        enclosing the store, outermost first."""
+        out = []
+        for frame in self.sites[index][2]:
+            kind = frame[0]
+            if kind in ("if", "not") and len(frame) > 1:
+                out.append(
+                    (
+                        kind,
+                        _trace_value(
+                            frame[1],
+                            self.defining_map,
+                            self.value_refs,
+                            state=self.state,
+                            scope=self.scope,
+                        ),
+                    )
+                )
+            else:
+                out.append((str(kind), None))
+        return out
+
     def _is_local(self, index) -> bool:
         owner = getattr(self._op(index).operands[1], "owner", None)
         name = getattr(getattr(owner, "operation", owner), "name", None)
@@ -3660,12 +3728,18 @@ class _FunctionCoverage:
                         ],
                     )[1].append(self.func_name)
 
+        loop_names = tuple(
+            sorted((getattr(self.state, "loop_names", {}) or {}).items())
+        )
         for index in self.stores:
             cat = category[index]
             dest_ref = self._ref(self._op(index).operands[1])
             local = self._is_local(index)
             for match in self.site_matches.get(index, ()):
                 match.extra["result_is_local"] = local
+            op = self._op(index)
+            term = self._term(index)
+            guard_terms = self._guard_terms(index)
             coverage.stores.append(
                 StoreCoverage(
                     func_name=self.func_name,
@@ -3676,6 +3750,43 @@ class _FunctionCoverage:
                     detail=detail.get(index, ""),
                     local=local,
                     value_ref=dest_ref if isinstance(dest_ref, IRValueRef) else None,
+                    memref_type=str(op.operands[1].type),
+                    indices=tuple(self._access_key(index)),
+                    coords=_coords_of_terms(
+                        self._store_index_terms(index), self._store_map(index)
+                    ),
+                    guards=tuple(
+                        f"{kind}({_render_term(cond)})" if cond is not None else kind
+                        for kind, cond in guard_terms
+                    ),
+                    loads=tuple(_retained_loads(term)),
+                    guard_loads=tuple(
+                        load
+                        for _kind, cond in guard_terms
+                        if cond is not None
+                        for load in _retained_loads(cond)
+                    ),
+                    index_loads=tuple(
+                        load
+                        for index_term in self._store_index_terms(index)
+                        for load in _retained_loads(index_term)
+                    ),
+                    reads_destination=self._reads_own_element(index)
+                    or any(
+                        load.value_ref == dest_ref
+                        and self._same_access(
+                            load.index_map,
+                            load.index_terms,
+                            self._store_map(index),
+                            self._store_index_terms(index),
+                        )
+                        for load in _term_loads(term, [])
+                        if load.index_terms is not None
+                    ),
+                    conversions=tuple(_term_casts(term)),
+                    term=_render_term(term),
+                    constant=_const_value(term) is not None,
+                    loop_names=loop_names,
                 )
             )
             if cat == STORE_UNMATCHED:
@@ -4102,11 +4213,16 @@ def require_match_coverage(
     if coverage is None or not coverage.problems:
         return checked
     exempt = _host_executed_functions(target, checked)
+    verbatim = frozenset(getattr(trace, "verbatim_functions", ()) or ())
     if exempt is None:
-        if defer_unknown:
+        if not verbatim and defer_unknown:
             return checked
         exempt = frozenset()
-    errors = _format_coverage_problems(coverage.problems, exempt)
+    # A function a program record executes verbatim from its own retained
+    # IR (an ``APUv1Program`` phase) implements every store itself; its
+    # store facts are retained in the coverage and stated as the record's
+    # effects, so its coverage problems are not dropped effects.
+    errors = _format_coverage_problems(coverage.problems, exempt | verbatim)
     if errors:
         raise UnsupportedWorkloadError(
             f"workload is not supported by target {trace.target_name!r}:\n  - "

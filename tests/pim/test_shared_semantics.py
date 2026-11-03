@@ -887,10 +887,22 @@ def test_apu_v1_program_records_enter_the_common_pipeline():
     compiled = allo.compile(scalar, target, apu_v1_cost, backend="functional")
     assert isinstance(compiled, allo.compiler.CompiledCallable)
     facts = compiled.trace.semantics
-    assert facts.frontend is scalar and facts.contractions == ()
-    (match,) = facts.trace.matches
-    assert match.target_op_name == "ARC_SCALAR_PROGRAM"
-    assert match.extra["result_instances"] == 64
+    assert facts.frontend is scalar and facts.verbatim
+    # The shared front stages ran on the phase's own source: the coverage
+    # retained every store (the local accumulator and the output), with its
+    # loop nest, guards, reads and carried state.
+    assert compiled.trace.coverage is not None
+    assert [
+        e.destination.parameter or e.destination.memref_name for e in facts.effects
+    ] == ["total", "total", "out"]
+    total_update, output_store = facts.effects[1], facts.effects[2]
+    assert total_update.destination.local and total_update.guards
+    assert {a.parameter for a in total_update.reads if not a.local} == {"values"}
+    assert output_store.writes_whole_buffer and output_store.instances == 64
+    assert output_store.loops[0].trip == 64 and not output_store.guards
+    (anchor,) = compiled.trace.matches
+    assert anchor.target_op_name == "ARC_SCALAR_PROGRAM"
+    assert anchor.extra["whole_function"]
     effects = compiled.compiled.layout.extra["effects"]
     assert effects.coverage.inputs == ("values",) and effects.abi_outputs == ("out",)
     assert {(v.value, v.storage) for v in effects.value_layouts} == {
@@ -898,8 +910,10 @@ def test_apu_v1_program_records_enter_the_common_pipeline():
         ("out", "l4"),
     }
     (launch,) = effects.launches
-    assert launch.kind == "scalar_arc_c" and launch.instances == (0, 64)
+    assert launch.kind == "scalar_arc_c" and launch.whole
+    assert launch.instances == (0, 1) and launch.operations == (0, 1, 2)
     assert launch.reduction is None and launch.covers[0] == "scalar_arc_c"
+    assert effects.allocations == (("allo_scratch", 8, "l4"),)
     (kernel,) = compiled.placement_ranking.kernels
     assert [mode for _p, _c, mode in kernel.scores] == ["scan_scalar"]
     program = compiled.backend_program
@@ -922,11 +936,20 @@ def test_apu_v1_program_records_enter_the_common_pipeline():
     )
     native = allo.APUv1Program((phase,), name="histogram_record")
     virtual = allo.compile(native, target, apu_v1_cost, backend="virtual")
-    (match,) = virtual.trace.semantics.trace.matches
-    assert match.target_op_name == "NATIVE_VECTOR_PROGRAM"
+    (anchor,) = virtual.trace.matches
+    assert anchor.target_op_name == "NATIVE_VECTOR_PROGRAM"
+    facts = virtual.trace.semantics
+    # The returned buffer is a parameter; its one store is the guarded,
+    # carried count over the 32768 items (its zero fill is the declaration's
+    # `linalg.fill`, not a store).
+    (counting,) = facts.effects
+    assert counting.destination.parameter == "counts" and counting.external
+    assert counting.reads_destination and counting.guards
+    assert counting.instances == 256 and counting.reduction_extent == 32768
+    assert [p.name for p in facts.parameters if p.returned] == ["counts"]
     effects = virtual.compiled.layout.extra["effects"]
     (launch,) = effects.launches
-    assert launch.kind == "native_vector" and launch.instances == (0, 256)
+    assert launch.kind == "native_vector" and launch.whole
     assert launch.covers[0] == virtual.native_vector_lowering.route
     assert effects.coverage.outputs == ("counts",) and effects.abi_inputs == ("values",)
     assert virtual.execution_graph.metadata["estimate_validity"] == "calibrated"
@@ -950,19 +973,22 @@ def test_apu_v1_program_records_enter_the_common_pipeline():
 
     original = record_frontend.apu_v1_program_candidates
 
-    def one_instance(view, matches):
+    def partial_launch(view, matches):
         placements = original(view, matches)
         for placement in placements:
             effects = placement.extra["effects"]
             placement.extra["effects"] = replace(
                 effects,
-                launches=tuple(replace(l, instances=(0, 1)) for l in effects.launches),
+                launches=tuple(
+                    replace(l, whole=False, instances=(0, 64), operations=(2,))
+                    for l in effects.launches
+                ),
             )
         return placements
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(record_frontend, "apu_v1_program_candidates", one_instance)
-        with pytest.raises(ValueError, match="not a tiling of \\[0, 64\\)"):
+        patch.setattr(record_frontend, "apu_v1_program_candidates", partial_launch)
+        with pytest.raises(ValueError, match="executes verbatim"):
             allo.compile(scalar, target, apu_v1_cost, backend="virtual")
 
 
@@ -1120,3 +1146,131 @@ def test_elementwise_record_launch_must_cover_every_result_instance(monkeypatch)
     with pytest.raises(RuntimeError, match="differs from the candidate contract"):
         allo.compile(add, build_apu_g2_target(), apu_g2_cost, backend="virtual")
     assert APUG2SourceCtx.check_realization is not None
+
+
+# --------------------------------------------------------------------------- #
+# (l) Whole-function programs keep their source semantics (review round 16)
+# --------------------------------------------------------------------------- #
+
+
+def keep_unselected(src: allo.ir.types.int32[8], out: allo.ir.types.int32[8]):
+    for i in range(8):
+        if src[i] > 0:
+            out[i] = src[i] + 1
+
+
+def shift_right(src: allo.ir.types.int32[8], out: allo.ir.types.int32[8]):
+    for i in range(7):
+        out[i + 1] = src[i]
+
+
+def accumulate_into(src: allo.ir.types.int32[8], out: allo.ir.types.int32[8]):
+    for i in range(8):
+        out[i] = out[i] + src[i]
+
+
+def overwrite(src: allo.ir.types.int32[8], out: allo.ir.types.int32[8]):
+    for i in range(8):
+        out[i] = src[i] + 1
+
+
+def _record(fn):
+    return allo.APUv1Program((allo.APUv1Phase(fn),))
+
+
+@pytest.mark.parametrize(
+    "kernel, inputs, guarded, carried, whole",
+    [
+        (keep_unselected, ("src", "out"), True, False, False),
+        (shift_right, ("src", "out"), False, False, False),
+        (accumulate_into, ("src", "out"), False, True, True),
+        (overwrite, ("src",), False, False, True),
+    ],
+    ids=["guarded", "shifted", "carried", "whole"],
+)
+def test_output_input_dependency_is_in_the_record_contract(
+    kernel, inputs, guarded, carried, whole
+):
+    """A whole-function program's contract comes from the shared front
+    stages run on its own source: a guarded or partial write, or a carried
+    read, makes the output's initial contents an input of the program; an
+    unconditional whole overwrite does not."""
+    compiled = allo.compile(
+        _record(kernel), build_apu_v1_target(), apu_v1_cost, backend="functional"
+    )
+    (effect,) = compiled.trace.semantics.effects
+    assert bool(effect.guards) == guarded
+    assert effect.reads_destination == carried
+    assert effect.writes_whole_buffer == whole
+    effects = compiled.compiled.layout.extra["effects"]
+    assert effects.coverage.inputs == inputs and effects.abi_inputs == inputs
+    assert [(t.value, t.direction) for t in effects.transfers] == [
+        ("src", "in"),
+        ("out", "inout"),
+    ]
+    src = np.arange(-4, 4, dtype=np.int32)
+    results = []
+    for sentinel in (11, 73):
+        out = np.full(8, sentinel, np.int32)
+        run = compiled(src, out)
+        assert run.kind == "functional"
+        results.append(out.copy())
+    if "out" in inputs:
+        assert np.any(results[0] != results[1])
+    else:
+        np.testing.assert_array_equal(results[0], results[1])
+    if kernel is keep_unselected:
+        np.testing.assert_array_equal(results[0], np.where(src > 0, src + 1, 11))
+
+
+def test_record_contract_cannot_hide_a_read_or_a_transfer(monkeypatch):
+    """Declaring the guarded output as write-only, or dropping the movement
+    the runtime performs, is refused: by the shared validator against the
+    retained facts, and by the realization check against the runtime."""
+    from allo.pim import apu_v1_record_frontend as record_frontend
+
+    original = record_frontend.apu_v1_program_candidates
+    target = build_apu_v1_target()
+
+    def output_only(view, matches):
+        placements = original(view, matches)
+        for placement in placements:
+            effects = placement.extra["effects"]
+            placement.extra["effects"] = replace(
+                effects,
+                coverage=replace(effects.coverage, inputs=("src",)),
+                abi_inputs=("src",),
+            )
+        return placements
+
+    monkeypatch.setattr(record_frontend, "apu_v1_program_candidates", output_only)
+    with pytest.raises(ValueError, match="reads \\['src'\\], the program reads"):
+        allo.compile(_record(keep_unselected), target, apu_v1_cost, backend="virtual")
+
+    def no_scratch(view, matches):
+        placements = original(view, matches)
+        for placement in placements:
+            effects = placement.extra["effects"]
+            placement.extra["effects"] = replace(effects, allocations=())
+        return placements
+
+    monkeypatch.setattr(record_frontend, "apu_v1_program_candidates", no_scratch)
+    with pytest.raises(RuntimeError, match="realization allocates"):
+        allo.compile(_record(keep_unselected), target, apu_v1_cost, backend="virtual")
+
+    def host_only_out(view, matches):
+        placements = original(view, matches)
+        for placement in placements:
+            effects = placement.extra["effects"]
+            placement.extra["effects"] = replace(
+                effects,
+                transfers=tuple(
+                    replace(t, route=("host_readback",)) if t.value == "out" else t
+                    for t in effects.transfers
+                ),
+            )
+        return placements
+
+    monkeypatch.setattr(record_frontend, "apu_v1_program_candidates", host_only_out)
+    with pytest.raises(RuntimeError, match="realization moves"):
+        allo.compile(_record(keep_unselected), target, apu_v1_cost, backend="virtual")

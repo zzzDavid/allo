@@ -452,10 +452,7 @@ def test_record_frequency_nearby_shapes_compile_and_out_of_domain_rejects(
     make_kernel,
 ):
     odd = _compile(*_word_count(make_kernel, Q=127))
-    assert (
-        odd.native_vector_lowering.operation_inventory()["gvml_count_m_g32k"]
-        == 1
-    )
+    assert odd.native_vector_lowering.operation_inventory()["gvml_count_m_g32k"] == 1
     # Resident chunks are bounded by the target's writable VRs (one scratch).
     widest = _compile(*_word_count(make_kernel, C=14, Q=16))
     assert widest.native_vector_lowering.analysis.chunks == 14

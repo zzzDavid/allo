@@ -610,6 +610,40 @@ retained IR, and the slice 5 traces (forced alternatives and cost
 perturbations on both hardware hosts, with per-case provenance kept in the
 logs) exist.
 
+## Round 17 (2026-11-03): independent review of bba11f0; the APUv1Program facade
+
+The reviewer accepted the C-30b repairs and the removal of the typed
+dispatcher, and rejected the `APUv1Program` migration as a facade around
+an independent lowering (X-02): the lowering was constructed before any
+shared semantics, the function's body was replaced by one synthetic
+body-less match, and the contract came from the scalar ABI's modes, so a
+guarded write declared its output as write-only while its initial
+contents reached the result; the shared validators never saw the
+function. Judgment: an `APUv1Phase` contains source, and its semantics
+are the shared front stages' business. Round 17 runs them on the phase
+(one `customize`, the matcher, the coverage check with the function marked
+verbatim so that its unmatched stores are implemented, not dropped, and
+the semantic analysis), retains every store's facts (loop nest, guards,
+reads through local temporaries and data-dependent indices, conversions,
+carried state) as `ProgramFacts.effects`, builds the lowering from the
+same retained schedule, derives the candidate's contract from those facts
+in the shared validator's own terms (an argument is an input when read,
+read at the element written, or not overwritten whole and
+unconditionally), and compares the declared transfers and allocations
+with what the runtime actually moves and allocates. The reviewer's
+reproducer passes; guarded, shifted, carried and whole writes are
+regressions, and hiding a read, a transfer or the scratch allocation is
+refused. The matched operations of a verbatim function stay in the facts
+(their contracts were checked by the matcher) and are not placed against
+op patterns the verbatim program never uses.
+
+The lint script's Black stage (Black 24.8.0) had one unformatted test
+file from round 16; it is formatted in this round.
+
+Gate G9 remains **FAIL** until this round is reviewed, the matcher
+backends declare their effects and consume the facts, the hybrid manifest
+reads the scalar ABI from the retained IR, and the slice 5 traces exist.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -659,6 +693,6 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 | G6 evidence beyond examples | **PARTIAL (reopened in round 8)** | EVIDENCE.md tables plus the round 6 probe files; remaining gaps are hardware-only confirmations listed in VALIDATION.md; the independent reviewer's probes varied the output conversion and a store guard, which the round 6 campaign had not, and found two silent defects; the campaign is kept as regression evidence, not as proof of generality; new probes must target the shared semantic contracts on every route |
 | G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install at ffb4a78 (needs repeating at the candidate, INSTALL.md section 6); AiM and UPMEM simulator recipes now ship in `simulators/` and were rebuilt from the release copies; Samsung's route is not buildable from the release repository without Samsung's permission for the five patches (P-04, documented, `apply.sh` refuses); architecture doc update for the shared pipeline pending (G9); P-17 documented proprietary SDK |
 | G8 backend execution | **evidence complete at 9255d29, pending independent review** | installed-artifact runs at the round 10 repair (VALIDATION.md round 10) and again at the round 15 commit: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock, 3 passed) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed through the shared pipeline); all reviewer probes of rounds 8 to 14 rejected or executed correctly through the installed wheel (VALIDATION.md round 15); AttAcc analytical by design; AiM timing-only as accepted |
-| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-15: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, an enforced typed candidate contract (C-30), supplied placements rebound (C-28), orchestration and launch bindings validated before selection (C-29, C-29b), Gemini-II typed records and `APUv1Program` as frontends of the pipeline (ISSUES X-01; round 16 removed the last typed route), the launch chain, accumulator modes and every operation's extent enforced (C-30b); both hardware hosts and the installed wheel exercised at `9255d29`; open: matcher backends' effects and facts consumption, the hybrid manifest's text ABI, slice 5 traces of forced alternatives and cost perturbations on hardware |
+| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-15: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, an enforced typed candidate contract (C-30), supplied placements rebound (C-28), orchestration and launch bindings validated before selection (C-29, C-29b), Gemini-II typed records and `APUv1Program` as frontends of the pipeline (ISSUES X-01; round 16 removed the last typed route, round 17 replaced the `APUv1Program` facade by the shared front stages with retained store effects, X-02), the launch chain, accumulator modes and every operation's extent enforced (C-30b); both hardware hosts and the installed wheel exercised at `9255d29`; open: review of round 17, matcher backends' effects and facts consumption, the hybrid manifest's text ABI, slice 5 traces of forced alternatives and cost perturbations on hardware |
 
-Verdict: **NOT READY**. Blockers: G9 (X-01) is in progress (matcher backends' effects, hybrid manifest ABI, slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.
+Verdict: **NOT READY**. Blockers: G9 (X-01, X-02) is in progress (review of the round 17 `APUv1Program` frontend, matcher backends' effects, hybrid manifest ABI, slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.

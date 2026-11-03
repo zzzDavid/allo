@@ -103,17 +103,32 @@ through the same driver (`allo/spmw_codegen.py::compile_for_target`):
   artifact (the record's call convention is the `RecordWorkload`
   signature; ``out`` may be omitted). Accumulate epilogues are a
   zero-initialized local dot plus an `ADD` with the seed input. The typed
-  and composed callables are deleted. Round 16: `APUv1Program` is a
-  frontend too (`allo/pim/apu_v1_record_frontend.py`): its lowering (scalar
-  ARC C of the retained MLIR, or one proven native recipe) is run once at
-  normalization, its external effects (the buffers the scalar ABI reads and
-  writes) are stated as one synthetic whole-function match
-  (`ARC_SCALAR_PROGRAM` / `NATIVE_VECTOR_PROGRAM`, declared on the target's
-  ARC unit over L4) with `ProgramFacts` whose `frontend` is the record, and
-  the lowering is the record's candidate: L4 value layouts, host transfers,
-  one launch over every result instance, the retained cost graph as its
-  price, `APUv1RecordProgram` as the materialized program. The typed
-  dispatch table (`_PROGRAM_ROUTES`) and the typed callable are deleted.
+  and composed callables are deleted. Round 16 moved `APUv1Program` onto
+  the pipeline as a facade (the lowering was built first and one synthetic
+  body-less match stood for the function; the reviewer rejected that: the
+  scalar ABI's modes missed preserved output regions, so a guarded write
+  declared its output as write-only). Round 17 replaces it
+  (`allo/pim/apu_v1_record_frontend.py`): the phase's source goes through
+  the shared front stages (one `customize`, `match_workload`,
+  `require_match_coverage` with the function marked *verbatim*,
+  `analyze_program(verbatim=True)`); the matcher now retains every store's
+  facts in the coverage (`StoreCoverage`: loop nest, guards, the loads of
+  the value, guards and data-dependent indices, conversions, whether the
+  element written is read) and the semantics turn them into
+  `ProgramFacts.effects` (`StoreEffect`, returned buffers as parameters);
+  the lowering is built from the same retained schedule by the enumerator
+  and the candidate's contract is derived from the facts
+  (`spmw_candidate.verbatim_values`: an argument is an input when read, read
+  at the element written, or not overwritten whole and unconditionally; one
+  whole-function launch advancing every store effect; the transfers and
+  scratch allocation the runtime performs). The shared validator checks it
+  against the facts, the realization check against the runtime's actual
+  movement. The typed dispatch table and the typed callable are deleted.
+  Known limit of the retained effects: a declaration's `linalg.fill`
+  initializer is not a store, so it is not an effect (Allo fills only the
+  buffers a function declares itself, never an argument, so inputs and
+  outputs are unaffected); scalar (non-memref) arguments are outside the
+  facts as before.
 
 Removed in round 13: the planner-hook registry `_SOURCE_PLANNERS` and
 `compile()`'s target-name branches; `APUv1VectorCallable`,
@@ -144,7 +159,7 @@ table above for the APUs):
 | Gemini-II (`apu_v2`) | `allo/compiler.py::_plan_apu_g2_source` -> `apu_g2_source_route.compile_apu_g2_source_workload(program=...)` -> `analyze_apu_g2_source(ProgramFacts)` -> `APUG2SourceContract` -> launch-plan enumeration, pricing, ranking -> `APUG2SourceProgram` | the shared facts only. Removed: the route's own `_FunctionFacts` module walk (argument `itypes`, local `unsigned`, identity-store check), its `_map_dims` access-map parser, `_memref_shape_and_bits` and `_loop_trips`; the contract's domain rules (integer lanes 2..24 bits, power-of-two reductions, at most two products, result covers the output, `_check_widths`) remain as target legality over the facts | slice 1 done |
 | APU v1 (`apu_v1`), plain function with a matched contraction | `allo/compiler.py::_plan_apu_v1_vector` -> `apu_v1_vector_program.compile_apu_v1_vector_workload(program=...)` -> `apu_v1_vectorize.apu_v1_contraction_analysis(ProgramFacts)` -> `ContractionAnalysis` -> recipe catalog -> `grid_search` over realized plans -> `APUv1VectorCallable` (`.trace`, `.program_facts` retained) | the shared facts only. Removed from the public route: `analyze_apu_v1_contractions`, the regex MLIR-text parser (it remains, marked, for the typed hybrid route `apu_v1_hybrid.discover_apu_v1_hybrid_manifest`, slice 4). The vector plans' restrictions are applied as legality over the facts (`contraction_analysis_from_facts`): one unguarded `range(N)` nest, one reduction loop indexing both inputs, plain loop-variable subscripts, two distinct input buffers, accumulator a function argument (carried or zero-filled) or a local scalar copied once to an argument (new: the `acc = 0; ...; C[i, j] = acc` form compiles and executes), one 16-bit element type, loop extents equal to buffer extents (new explicit rejection of partial coverage) | slice 2 done |
 | APU v1 dataflow region (`@allo.work` scopes) or plain function without a contraction | matcher route (`spmw_apu_v1.APUv1Ctx`, grouped FP16 MAC) | the trace | unchanged |
-| typed records (`APUG2TypedProgram`, `APUG2ComposedContractionProgram`; round 15) and `APUv1Program` (round 16) | record frontends (`apu_g2_record_frontend.normalize_apu_g2_record`, `apu_v1_record_frontend.normalize_apu_v1_program`) -> synthetic matches + `ProgramFacts(frontend=record)` -> the target's enumerator emits the record's realization as a candidate -> shared legality, candidate contract, pricing, ranking, materialization, `CompiledCallable` | the shared contract (the record's semantics stated as the matcher's structural facts) | slice 4 done |
+| typed records (`APUG2TypedProgram`, `APUG2ComposedContractionProgram`; round 15) and `APUv1Program` (rounds 16-17) | record frontends (`apu_g2_record_frontend.normalize_apu_g2_record`: synthetic matches + `ProgramFacts(frontend=record)`; `apu_v1_record_frontend.normalize_apu_v1_program`: the shared front stages on the phase's source, `ProgramFacts(verbatim=True, effects=...)`) -> the target's enumerator emits the record's realization as a candidate -> shared legality, candidate contract, pricing, ranking, materialization, `CompiledCallable` | the shared contract (synthetic structural facts for source-less records; the retained store effects of the source for `APUv1Program`) | slice 4 done, pending review of round 17 |
 
 Consequences observed and tested (`tests/pim/test_shared_semantics.py`):
 
@@ -299,7 +314,9 @@ Observations that fix the migration order:
 4. **Typed records.** `APUG2TypedProgram` and
    `APUG2ComposedContractionProgram` normalize into the slice 1/3 contracts
    (done, round 15); the hybrid route's MLIR-text parser is removed (round
-   14); `APUv1Program` normalizes into the same contracts (done, round 16).
+   14); `APUv1Program` normalizes through the shared front stages with its
+   source semantics retained (round 17, after the round 16 facade was
+   rejected).
 5. **Evidence.** Stage traces for one representative program per target,
    forced alternatives and cost perturbations reaching generated code and
    launches, simulator and both hardware hosts, installed artifact. At

@@ -87,10 +87,13 @@ Two other workload kinds reach `allo.compile`:
   (`allo/pim/apu_g2_composed_contraction.py`) are frontends of the shared
   pipeline (`allo/pim/apu_g2_record_frontend.py`, Section 2.0);
   `allo.APUv1Program` / `allo.APUv1Phase` (`allo/pim/apu_v1_program.py`)
-  is a frontend too (`allo/pim/apu_v1_record_frontend.py`, round 16): its
-  whole-function lowering (scalar ARC C or one proven native GVML recipe)
-  states its effects in the shared program contract and is the record's
-  candidate of the common pipeline.
+  is a frontend too (`allo/pim/apu_v1_record_frontend.py`, rounds 16-17):
+  its phase's source goes through the shared front stages (customize,
+  matcher, coverage with the verbatim exemption, semantic facts that
+  retain every store's loops, guards, reads, conversions and carried
+  state), and its whole-function lowering (scalar ARC C or one proven
+  native GVML recipe) is the record's candidate of the common pipeline,
+  whose contract is derived from those facts.
 
 ### 1.3 Cost language (`allo/perf/`)
 
@@ -151,16 +154,26 @@ evaluated jointly within a documented budget (Section 2.6 and
    record's realization is one candidate of step 4 (the view declares the
    typed operations; the record's recipe graph prices it;
    `APUG2RecordProgram` is the materialized program). `APUv1Program`:
-   `allo.pim.apu_v1_record_frontend.normalize_apu_v1_program` lowers the
-   phase once (`CompiledAPUv1Program`: retained MLIR, portable C, scalar
-   ABI, native recipe discovery) and states the program's external effects
-   as one synthetic `ARC_SCALAR_PROGRAM` / `NATIVE_VECTOR_PROGRAM` match
-   over the buffers it reads and writes; the lowering is the record's one
-   candidate (`APUv1RecordCandidate`, L4 value layouts, one launch over
-   every result instance), priced by its retained graph and materialized
-   as `APUv1RecordProgram`. Records fix their own reduction grouping and
-   refuse `reduction_order`; `host_moves` and `layout` follow the common
-   rules (a single-launch orchestration, a candidate name).
+   `allo.pim.apu_v1_record_frontend.normalize_apu_v1_program` runs the
+   shared front stages on the phase's source (one `customize`,
+   `match_workload`, `require_match_coverage` with the function marked
+   verbatim so its unmatched stores are not dropped effects, and
+   `analyze_program(verbatim=True)`, whose `ProgramFacts.effects` retain
+   every store's loop nest, guards, reads through local temporaries,
+   data-dependent indices, conversions and carried state, with returned
+   buffers as parameters); one anchor match of `ARC_SCALAR_PROGRAM` /
+   `NATIVE_VECTOR_PROGRAM` is the scheduled work item. The `apu_v1`
+   enumerator builds the lowering from the same retained schedule
+   (`CompiledAPUv1Program`) and declares the record's candidate from the
+   facts (`allo.spmw_candidate.verbatim_values`: an argument is an input
+   when the function reads it, reads the element it writes, or does not
+   overwrite it whole and unconditionally; one whole-function launch
+   advancing every store effect; L4 value layouts; the transfers and
+   scratch allocation its runtime performs). The shared validator checks
+   the declaration against the facts, and the realization check compares
+   the declared transfers and allocations with the runtime's actual
+   movement. Records fix their own reduction grouping and refuse
+   `reduction_order`; `host_moves` and `layout` follow the common rules.
 3. Shared front stages for every ordinary source workload
    (`allo/spmw_pipeline.py::normalize_source`, gate G9):
    `customize(workload, enable_tensor=False)` produces the MLIR module;
@@ -900,13 +913,15 @@ Follow the AiM backend as the smallest complete example
    `tests/perf/test_simulator_unavailable.py`, `tests/perf/test_run_result_contract.py`,
    `tests/pim/test_import_surface.py`, and `docs/release/CAPABILITIES.md`.
 
-A program record without source (no matcher) is a *frontend* of the same
-pipeline instead: a `normalize_<record>` function states its semantics as
-synthetic matches plus `ProgramFacts` (`allo/pim/record_frontend.py`
-helpers), the target's enumerator turns the record into candidates whose
-`CandidateEffects` the shared validator checks, and the backend context
-materializes and runs them (`apu_g2_record_frontend.py`,
-`apu_v1_record_frontend.py` are the two examples).
+A program record is a *frontend* of the same pipeline instead: a
+`normalize_<record>` function states its semantics as `ProgramFacts` (from
+the shared front stages run on the record's source when it has one, as
+`APUv1Program` does; as synthetic matches with the matcher's structural
+facts when it has none, as the Gemini-II typed records do;
+`allo/pim/record_frontend.py` holds the shared helpers), the target's
+enumerator turns the record into candidates whose `CandidateEffects` the
+shared validator checks, and the backend context materializes and runs
+them (`apu_g2_record_frontend.py`, `apu_v1_record_frontend.py`).
 
 ## 5. Inspecting a chosen program
 

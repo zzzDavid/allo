@@ -136,6 +136,9 @@ class Parameter:
     shape: tuple[int, ...]
     element: ElementType
     value_ref: IRValueRef | None
+    # True for a buffer the function allocates and returns (a result), as
+    # opposed to an argument the caller passes.
+    returned: bool = False
 
 
 @dataclass(frozen=True)
@@ -312,6 +315,110 @@ class Epilogue:
 
 
 @dataclass(frozen=True)
+class StoreEffect:
+    """One externally visible store of the function, matched or not, with
+    the facts the matcher retained from the IR: its destination, the loop
+    nest and guards it executes under, the buffers its value and guards
+    read, whether it reads the element it writes (a carried value), the
+    conversions in its value.  The complete effect set of a function is the
+    semantic contract of a program that executes the function verbatim
+    (an ``APUv1Program`` phase)."""
+
+    function: str
+    store: str
+    category: str
+    destination: BufferAccess
+    loops: tuple[LoopAxis, ...]
+    guards: tuple[str, ...]
+    reads: tuple[BufferAccess, ...]
+    reads_destination: bool
+    conversions: tuple[str, ...]
+    term: str
+    constant: bool
+
+    @property
+    def loop_vars(self) -> tuple[str, ...]:
+        return tuple(loop.var for loop in self.loops)
+
+    @property
+    def trips(self) -> dict[str, int | None]:
+        return {loop.var: loop.trip for loop in self.loops}
+
+    @property
+    def loop_labels(self) -> dict[str, str]:
+        return {loop.var: loop.label for loop in self.loops}
+
+    @property
+    def external(self) -> bool:
+        """The destination is visible to the caller (an argument or a
+        returned buffer)."""
+        return not self.destination.local
+
+    @property
+    def dims(self) -> tuple[str | None, ...]:
+        """The loop variable each destination coordinate is, or None."""
+        return self.destination.dims
+
+    @property
+    def writes_whole_buffer(self) -> bool:
+        """Every element of the destination is written unconditionally: no
+        guard, every coordinate a distinct enclosing loop variable whose
+        range is exactly the buffer's extent in that dimension."""
+        shape = self.destination.shape
+        dims = self.dims
+        if self.guards or shape is None or len(dims) != len(shape):
+            return False
+        if any(d is None for d in dims) or len(set(dims)) != len(dims):
+            return False
+        by_var = {loop.var: loop for loop in self.loops}
+        for var, extent in zip(dims, shape):
+            loop = by_var.get(var)
+            if (
+                loop is None
+                or loop.lower != 0
+                or loop.upper != int(extent)
+                or loop.step != 1
+            ):
+                return False
+        return True
+
+    @property
+    def instances(self) -> int | None:
+        """Result instances the store writes: the trips of the loops its
+        coordinates range over (every enclosing loop when a coordinate is
+        not a plain loop variable)."""
+        dims = self.dims
+        if dims and all(d is not None for d in dims):
+            vars_ = set(dims)
+        else:
+            vars_ = set(self.loop_vars)
+        return _product_or_none(loop.trip for loop in self.loops if loop.var in vars_)
+
+    @property
+    def reduction_extent(self) -> int | None:
+        """Trips of the enclosing loops that do not move the destination
+        element when the value is carried across them; None otherwise."""
+        if not self.reads_destination:
+            return None
+        dims = self.dims
+        if not dims or any(d is None for d in dims):
+            return None
+        vars_ = set(dims)
+        return _product_or_none(
+            loop.trip for loop in self.loops if loop.var not in vars_
+        )
+
+
+def _product_or_none(values) -> int | None:
+    total = 1
+    for value in values:
+        if value is None:
+            return None
+        total *= int(value)
+    return total
+
+
+@dataclass(frozen=True)
 class ProgramFacts:
     """The semantic contract of one analyzed function."""
 
@@ -326,6 +433,15 @@ class ProgramFacts:
     # without source); None for ordinary source.  The backend enumerator of
     # the record's target turns it into the record's candidate.
     frontend: Any = None
+    # Every externally visible store of the function, in program order,
+    # with its retained facts (`StoreEffect`); () for a trace without
+    # coverage (a hand-assembled or synthetic trace).
+    effects: tuple = ()
+    # True when the program executes the whole function verbatim from its
+    # retained IR (an ``APUv1Program`` phase): ``effects`` is then the
+    # semantic contract the candidate and the realization are checked
+    # against, matched or not.
+    verbatim: bool = False
 
     def parameter(self, name: str) -> Parameter:
         for parameter in self.parameters:
@@ -472,6 +588,15 @@ class _ModuleFacts:
             if ref is not None:
                 self.type_by_ref[ref] = text
                 self.signed_by_ref[ref] = signed
+        # Buffers the function returns: allocated locally, visible to the
+        # caller as results (an ``APUv1Program`` phase's ``result_names``).
+        self.returned_refs: list = []
+        for operation in _walk(self.function):
+            if operation.operation.name == "func.return":
+                for operand in operation.operands:
+                    ref = self.refs.get(operand)
+                    if ref is not None and str(operand.type).startswith("memref<"):
+                        self.returned_refs.append(ref)
         for operation in _walk(self.function):
             if operation.operation.name in {"memref.alloc", "memref.alloca"}:
                 if not operation.results:
@@ -679,6 +804,8 @@ def analyze_program(
     *,
     function: str | None = None,
     parameter_names=None,
+    result_names=None,
+    verbatim: bool = False,
 ) -> ProgramFacts:
     """Derive the shared semantic facts of one function from a match trace.
 
@@ -724,6 +851,32 @@ def analyze_program(
         except SemanticAnalysisError as error:
             raise SemanticAnalysisError(f"argument {name!r}: {error}") from error
         parameters.append(Parameter(name, ordinal, shape, element, ref))
+    # Returned buffers are parameters too (named by ``result_names`` or
+    # ``result<k>``), after the arguments.
+    for position, ref in enumerate(facts.returned_refs):
+        parsed = parse_memref_type(facts.type_by_ref.get(ref))
+        if parsed is None:
+            continue
+        shape, element_text = parsed
+        name = (
+            str(result_names[position])
+            if result_names is not None and position < len(result_names)
+            else f"result{position}"
+        )
+        try:
+            element = ElementType.parse(element_text, facts.signed_by_ref.get(ref))
+        except SemanticAnalysisError as error:
+            raise SemanticAnalysisError(f"result {name!r}: {error}") from error
+        parameters.append(
+            Parameter(
+                name,
+                len(facts.argument_types) + position,
+                shape,
+                element,
+                ref,
+                returned=True,
+            )
+        )
     parameters_by_ref = {p.value_ref: p for p in parameters if p.value_ref is not None}
 
     contractions: list[Contraction] = []
@@ -834,7 +987,97 @@ def analyze_program(
         other_matches=tuple(others),
         foreign_functions=tuple(foreign),
         trace=trace,
+        effects=_store_effects(trace, function, facts, parameters_by_ref),
+        verbatim=verbatim,
     )
+
+
+def _retained_access(role, load, facts, parameters_by_ref, loop_vars) -> BufferAccess:
+    parameter = parameters_by_ref.get(load.value_ref)
+    return BufferAccess(
+        role=role,
+        memref_name=load.memref_name,
+        parameter=None if parameter is None else parameter.name,
+        local=parameter is None,
+        value_ref=load.value_ref,
+        shape=facts.shape(load.memref_type, load.value_ref),
+        element=facts.element(load.memref_type, load.value_ref),
+        coords=load.coords,
+        dims=_plain_dims(load.coords, loop_vars),
+        indices=tuple(load.indices),
+        index_map=load.index_map,
+    )
+
+
+def _store_effects(trace, function, facts, parameters_by_ref) -> tuple:
+    """`StoreEffect` of every store of ``function`` in the trace's coverage,
+    in program order: stores to arguments and returned buffers are the
+    function's external effects (``destination.local`` is False); stores to
+    internal temporaries are kept too (``destination.local`` is True), since
+    the buffers their values and guards read are reads of the function."""
+    coverage = getattr(trace, "coverage", None)
+    if coverage is None:
+        return ()
+    effects = []
+    for store in coverage.stores:
+        if store.func_name != function:
+            continue
+        names = dict(store.loop_names)
+        loops = tuple(
+            LoopAxis(
+                var=str(var),
+                name=names.get(str(var)),
+                lower=_static_bound(lower),
+                upper=_static_bound(upper),
+                step=int(step) if str(step).lstrip("-").isdigit() else 0,
+            )
+            for var, lower, upper, step in store.enclosing_loops
+        )
+        loop_vars = {loop.var for loop in loops}
+        parameter = parameters_by_ref.get(store.value_ref)
+        destination = BufferAccess(
+            role="store",
+            memref_name=store.memref_name,
+            parameter=None if parameter is None else parameter.name,
+            local=parameter is None,
+            value_ref=store.value_ref,
+            shape=facts.shape(store.memref_type, store.value_ref),
+            element=facts.element(store.memref_type, store.value_ref),
+            coords=store.coords,
+            dims=_plain_dims(store.coords, loop_vars),
+            indices=tuple(store.indices),
+            index_map=None,
+        )
+        reads = (
+            tuple(
+                _retained_access("load", load, facts, parameters_by_ref, loop_vars)
+                for load in store.loads
+            )
+            + tuple(
+                _retained_access("guard", load, facts, parameters_by_ref, loop_vars)
+                for load in store.guard_loads
+            )
+            + tuple(
+                _retained_access("index", load, facts, parameters_by_ref, loop_vars)
+                for load in store.index_loads
+            )
+        )
+        effects.append(
+            StoreEffect(
+                function=function,
+                store=store.store,
+                category=store.category,
+                destination=destination,
+                loops=loops,
+                guards=tuple(store.guards),
+                reads=reads,
+                reads_destination=bool(store.reads_destination),
+                conversions=tuple(store.conversions),
+                term=store.term,
+                constant=bool(store.constant),
+            )
+        )
+    return tuple(effects)
 
 
 def product_extent(values) -> int:
@@ -866,6 +1109,7 @@ __all__ = [
     "Parameter",
     "ProgramFacts",
     "SemanticAnalysisError",
+    "StoreEffect",
     "analyze_program",
     "parse_memref_type",
     "stamp_program_facts",
