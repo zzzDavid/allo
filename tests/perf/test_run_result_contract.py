@@ -180,10 +180,10 @@ def test_apu_v1_program_functional_executes_scalar_c_on_host(no_apu_v1_device):
 
 
 def test_apu_v1_program_virtual_requires_cost():
-    with pytest.raises(ValueError, match="needs a cost spec"):
-        allo.pim.apu_v1_program.compile_apu_v1_program(
-            _program(_scan), build_apu_v1_target(), backend="virtual"
-        )
+    # The shared pipeline selects the record's candidate by cost ranking;
+    # without a cost program only a named candidate can be materialized.
+    with pytest.raises(ValueError, match="selected by cost ranking"):
+        allo.compile(_program(_scan), build_apu_v1_target(), backend="virtual")
 
 
 def _vector_contraction(

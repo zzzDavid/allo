@@ -193,17 +193,6 @@ def _program_values(matches):
     return inputs, outputs, locals_, operations, parameters
 
 
-def _semantic_contractions(matches):
-    """The shared `Contraction` facts of the work item's accumulating
-    matches, in match order."""
-    out = []
-    for match in matches:
-        facts = match.extra.get("semantic_facts")
-        if facts is not None and hasattr(facts, "reduction_vars"):
-            out.append(facts)
-    return out
-
-
 def _semantic_loop_labels(matches) -> set:
     """Loop labels of every match's shared facts (contractions and
     epilogues alike)."""
@@ -242,49 +231,131 @@ def _tiles(ranges, extent) -> bool:
     return all(a < b for a, b in spans)
 
 
-def validate_candidate_effects(matches, placement, view=None) -> list[str]:
-    """Problems of a candidate's declared effects against the semantic
-    program of ``matches`` (and the storage declarations of ``view`` when
-    given); empty when consistent or when the candidate declares no effects
-    (a handle-only matcher placement).
+def _product(values) -> int | None:
+    total = 1
+    for value in values:
+        if value is None:
+            return None
+        total *= int(value)
+    return total
 
-    Checked: coverage (function, operations, inputs and outputs exactly the
-    program's); value layouts for every input and output over the program's
-    loop labels and declared synthetic axes, on declared storage, together
-    covering every loop of every contraction; a transfer in for every input
-    and out for every output; launches indexed 0..n-1 whose instance ranges
-    tile every covered operation's result instances and whose reduction
-    ranges tile its reduction extent; ABI equal to the coverage.
-    """
 
-    effects = candidate_effects(placement)
-    if effects is None:
-        return []
-    inputs, outputs, locals_, operations, parameters = _program_values(matches)
-    functions = {match.func_name for match in matches}
-    contractions = _semantic_contractions(matches)
+def _operation_extents(matches) -> dict:
+    """Per matched operation (original match index): ``(instances,
+    reduction_extent, accumulator_init)``.  A contraction's instances are
+    its result (output and batch) trips and its reduction extent the
+    reduction trips; an epilogue or other elementwise operation has the
+    product of its loop trips and no reduction; a whole-function record
+    states its instance count in ``extra["result_instances"]``.  ``None``
+    when the extent is unknown (the launches cannot be checked, which is a
+    contract problem)."""
+    out = {}
+    for index, match in enumerate(matches):
+        facts = match.extra.get("semantic_facts")
+        if facts is not None and hasattr(facts, "reduction_vars"):
+            trips = facts.trips
+            out[index] = (
+                _product(trips.get(v) for v in facts.result_vars),
+                _product(trips.get(v) for v in facts.reduction_vars),
+                facts.accumulator_init,
+            )
+        elif facts is not None and hasattr(facts, "loop_vars"):
+            out[index] = (
+                _product(loop.trip for loop in facts.loops),
+                None,
+                None,
+            )
+        else:
+            declared = match.extra.get("result_instances")
+            out[index] = (
+                (int(declared), None, match.extra.get("accumulator_init"))
+                if declared
+                else None
+            )
+    return out
+
+
+def _ordered_partition(ranges, extent) -> bool:
+    """``ranges`` in launch order are exactly ``[0, a1), [a1, a2), ...,
+    [ak, extent)``: contiguous, ascending, without repetition."""
+    spans = [(int(a), int(b)) for a, b in ranges]
+    if not spans or spans[0][0] != 0 or spans[-1][1] != extent:
+        return False
+    for (_a0, b0), (a1, _b1) in zip(spans, spans[1:]):
+        if a1 != b0:
+            return False
+    return all(a < b for a, b in spans)
+
+
+_FIRST_ACCUMULATOR = {"zero": {"zero", "none"}, "carried": {"carried"}}
+
+
+def _check_operation_launches(op, launches, extent) -> list[str]:
+    """Problems of the launches advancing operation ``op`` against its
+    extents ``(instances, reduction_extent, accumulator_init)``."""
+    if extent is None or extent[0] is None:
+        return [f"operation {op} has no known instance extent to check launches"]
+    instances, reduction_extent, init = extent
     problems = []
-    coverage = effects.coverage
-    if coverage.function not in functions:
+    chains = {}
+    for launch in launches:
+        chains.setdefault(tuple(int(v) for v in launch.instances), []).append(launch)
+    if instances and not _tiles(chains.keys(), instances):
         problems.append(
-            f"covers function {coverage.function!r}, not {sorted(functions)}"
+            f"the launches of operation {op} cover instances "
+            f"{sorted(chains)}, not a tiling of [0, {instances})"
         )
-    if set(coverage.operations) != operations:
-        problems.append(
-            f"covers operations {sorted(coverage.operations)}, the work item "
-            f"matches {sorted(operations)}"
-        )
-    if set(coverage.outputs) != outputs:
-        problems.append(
-            f"writes {sorted(coverage.outputs)}, the program's external "
-            f"destinations are {sorted(outputs)}"
-        )
-    if set(coverage.inputs) != inputs:
-        problems.append(
-            f"reads {sorted(coverage.inputs)}, the program reads {sorted(inputs)}"
-        )
+    for instance_range, chain in chains.items():
+        if reduction_extent is None:
+            # A non-reducing operation is computed once per instance.
+            if len(chain) != 1:
+                problems.append(
+                    f"operation {op} over instances {instance_range} is advanced "
+                    f"by {len(chain)} launches, not one"
+                )
+            continue
+        ranges = [launch.reduction for launch in chain]
+        if any(r is None for r in ranges):
+            if reduction_extent > 1:
+                problems.append(
+                    f"a launch of operation {op} declares no reduction range "
+                    f"for a reduction of {reduction_extent}"
+                )
+            continue
+        if reduction_extent and not _ordered_partition(ranges, reduction_extent):
+            problems.append(
+                f"the launches of operation {op} over instances {instance_range} "
+                f"sum {ranges} in order, not an ordered partition of "
+                f"[0, {reduction_extent}) (a repeated or out-of-order chunk "
+                "would add a partial sum twice)"
+            )
+        allowed = _FIRST_ACCUMULATOR.get(init)
+        if allowed is None:
+            problems.append(
+                f"operation {op} has accumulator initialization {init!r}, which "
+                "the candidate contract cannot chain launches for"
+            )
+            continue
+        first = chain[0]
+        if first.accumulator not in allowed:
+            problems.append(
+                f"launch {first.index} of operation {op} starts its accumulator as "
+                f"{first.accumulator!r}; the source initializes it as {init!r}"
+            )
+        for later in chain[1:]:
+            if later.accumulator != "previous":
+                problems.append(
+                    f"launch {later.index} of operation {op} continues the "
+                    f"reduction with accumulator {later.accumulator!r}, not "
+                    "'previous' (the preceding launch's partial sum)"
+                )
+    return problems
 
-    # Value layouts: every input and output, over program axes, on storage.
+
+def _check_value_layouts(effects, matches, inputs, outputs, locals_, view) -> list:
+    """Every input and output laid out over program axes (or declared
+    synthetic axes) on declared storage; every program loop covered."""
+    problems = []
     loop_labels = _semantic_loop_labels(matches)
     synthetic = {name for name, _extent in effects.synthetic_axes}
     for name, extent in effects.synthetic_axes:
@@ -319,19 +390,23 @@ def validate_candidate_effects(matches, placement, view=None) -> list[str]:
             f"loops {sorted(loop_labels - covered_axes)} of the program appear in "
             "no value layout (iteration coverage)"
         )
+    return problems
 
-    # Transfers: every input in, every output out.
+
+def _check_transfers(effects, inputs, outputs, locals_) -> list:
+    """Every input transferred in, every output transferred out."""
+    problems = []
     moved_in, moved_out = set(), set()
     for transfer in effects.transfers:
         if transfer.value not in inputs | outputs | locals_:
             problems.append(f"transfers {transfer.value!r}, not a program buffer")
-        if transfer.direction not in ("in", "out", "inout"):
+        if transfer.direction not in {"in", "out", "inout"}:
             problems.append(f"transfer of {transfer.value!r} has no direction")
         if not transfer.route:
             problems.append(f"transfer of {transfer.value!r} has no route")
-        if transfer.direction in ("in", "inout"):
+        if transfer.direction in {"in", "inout"}:
             moved_in.add(transfer.value)
-        if transfer.direction in ("out", "inout"):
+        if transfer.direction in {"out", "inout"}:
             moved_out.add(transfer.value)
     if not inputs <= moved_in:
         problems.append(f"inputs {sorted(inputs - moved_in)} are never transferred in")
@@ -339,9 +414,64 @@ def validate_candidate_effects(matches, placement, view=None) -> list[str]:
         problems.append(
             f"outputs {sorted(outputs - moved_out)} are never transferred out"
         )
+    return problems
 
-    # Launches: ordered, each covering declared operations, tiling instances
-    # and reductions.
+
+def validate_candidate_effects(matches, placement, view=None) -> list[str]:
+    """Problems of a candidate's declared effects against the semantic
+    program of ``matches`` (and the storage declarations of ``view`` when
+    given); empty when consistent or when the candidate declares no effects
+    (a handle-only matcher placement).
+
+    Checked: coverage (function, operations, inputs and outputs exactly the
+    program's); value layouts for every input and output over the program's
+    loop labels and declared synthetic axes, on declared storage, together
+    covering every loop of every contraction; a transfer in for every input
+    and out for every output; launches indexed 0..n-1 whose instance ranges
+    tile every covered operation's result instances (contractions,
+    epilogues and whole-function records alike) and whose reduction ranges
+    form, per instance range and in launch order, a partition of the
+    reduction extent with an accumulator chain that starts as the source
+    initializes the accumulator and continues from the previous launch;
+    ABI equal to the coverage.
+    """
+
+    effects = candidate_effects(placement)
+    if effects is None:
+        return []
+    inputs, outputs, locals_, operations, parameters = _program_values(matches)
+    functions = {match.func_name for match in matches}
+    problems = []
+    coverage = effects.coverage
+    if coverage.function not in functions:
+        problems.append(
+            f"covers function {coverage.function!r}, not {sorted(functions)}"
+        )
+    if set(coverage.operations) != operations:
+        problems.append(
+            f"covers operations {sorted(coverage.operations)}, the work item "
+            f"matches {sorted(operations)}"
+        )
+    if set(coverage.outputs) != outputs:
+        problems.append(
+            f"writes {sorted(coverage.outputs)}, the program's external "
+            f"destinations are {sorted(outputs)}"
+        )
+    if set(coverage.inputs) != inputs:
+        problems.append(
+            f"reads {sorted(coverage.inputs)}, the program reads {sorted(inputs)}"
+        )
+
+    problems.extend(
+        _check_value_layouts(effects, matches, inputs, outputs, locals_, view)
+    )
+    problems.extend(_check_transfers(effects, inputs, outputs, locals_))
+
+    # Launches: ordered, each covering declared operations; per operation the
+    # instance ranges tile its result instances, and per instance range the
+    # launches form an ordered partition of the reduction whose accumulator
+    # chain starts as the source initializes it and continues from the
+    # previous launch.
     if not effects.launches:
         problems.append("declares no launch")
     for position, launch in enumerate(effects.launches):
@@ -360,46 +490,14 @@ def validate_candidate_effects(matches, placement, view=None) -> list[str]:
     by_operation = {}
     for launch in effects.launches:
         for op in launch.operations:
-            by_operation.setdefault(op, []).append(launch)
+            if 0 <= op < len(matches):
+                by_operation.setdefault(op, []).append(launch)
+    extents = _operation_extents(matches)
     for op, launches in by_operation.items():
-        contraction = contractions[op] if op < len(contractions) else None
-        if contraction is None:
-            continue
-        trips = contraction.trips
-        extent = 1
-        for var in contraction.result_vars:
-            extent *= int(trips.get(var) or 0)
-        reduction_extent = 1
-        for var in contraction.reduction_vars:
-            reduction_extent *= int(trips.get(var) or 0)
-        instance_ranges = {tuple(launch.instances) for launch in launches}
-        if extent and not _tiles(instance_ranges, extent):
-            problems.append(
-                f"the launches of operation {op} cover instances "
-                f"{sorted(instance_ranges)}, not a tiling of [0, {extent})"
-            )
-        for instance_range in instance_ranges:
-            reductions = [
-                launch.reduction
-                for launch in launches
-                if tuple(launch.instances) == instance_range
-            ]
-            if any(r is None for r in reductions):
-                if reduction_extent > 1:
-                    problems.append(
-                        f"a launch of operation {op} declares no reduction range "
-                        f"for a reduction of {reduction_extent}"
-                    )
-                continue
-            if reduction_extent and not _tiles(reductions, reduction_extent):
-                problems.append(
-                    f"the launches of operation {op} over instances {instance_range} "
-                    f"sum {sorted(reductions)}, not a tiling of [0, {reduction_extent})"
-                )
-    if contractions:
-        uncovered = set(range(len(matches))) - set(by_operation)
-        if uncovered:
-            problems.append(f"operations {sorted(uncovered)} are advanced by no launch")
+        problems.extend(_check_operation_launches(op, launches, extents.get(op)))
+    uncovered = set(range(len(matches))) - set(by_operation)
+    if uncovered:
+        problems.append(f"operations {sorted(uncovered)} are advanced by no launch")
 
     # ABI.
     if set(effects.abi_outputs) != set(coverage.outputs):

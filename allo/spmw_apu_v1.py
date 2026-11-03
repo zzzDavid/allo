@@ -58,18 +58,23 @@ class APUv1Ctx(CodegenContext):
 
     @staticmethod
     def _vector_payloads(layouts):
+        """The one plan-carrying payload of ``layouts`` (a vector plan of a
+        plain-function contraction or the lowering of an ``APUv1Program``
+        record), None for handle-only grouped placements."""
+        from .pim.apu_v1_record_frontend import APUv1RecordCandidate
         from .pim.apu_v1_vector_program import APUv1VectorCandidate
 
+        kinds = (APUv1VectorCandidate, APUv1RecordCandidate)
         layouts = layouts if isinstance(layouts, (list, tuple)) else [layouts]
         payloads = [
             (getattr(layout, "extra", None) or {}).get("payload") for layout in layouts
         ]
-        if not any(isinstance(p, APUv1VectorCandidate) for p in payloads):
+        if not any(isinstance(p, kinds) for p in payloads):
             return None
-        if len(payloads) != 1 or not isinstance(payloads[0], APUv1VectorCandidate):
+        if len(payloads) != 1 or not isinstance(payloads[0], kinds):
             raise NotImplementedError(
-                "APU v1 vector plans realize one plain-function contraction per "
-                "program; a multi-kernel program mixes candidates"
+                "APU v1 vector plans and program records realize one "
+                "plain-function program; a multi-kernel program mixes candidates"
             )
         return payloads[0]
 
@@ -99,6 +104,12 @@ class APUv1Ctx(CodegenContext):
         cls.validate_orchestration(
             trace, options.get("launch_schedule"), options.get("host_moves") or ()
         )
+        from .pim.apu_v1_record_frontend import APUv1RecordCandidate
+
+        if isinstance(payload, APUv1RecordCandidate):
+            # The record's retained graph: the native recipe's structural
+            # graph or the scalar C instruction count of the retained MLIR.
+            return payload.lowered.execution_graph_for(bound_cost)
         if payload.realization is None:
             raise InfeasibleSchedule(
                 payload.realization_error
@@ -130,6 +141,22 @@ class APUv1Ctx(CodegenContext):
                 trace, layouts, schedule=schedule, host_moves=host_moves, module=module
             )
             return
+        from .pim.apu_v1_record_frontend import APUv1RecordCandidate, APUv1RecordProgram
+
+        if isinstance(payload, APUv1RecordCandidate):
+            self.validate_orchestration(trace, schedule, host_moves)
+            # A native recipe has no host execution path: refuse
+            # backend="functional" here, before an artifact exists.
+            payload.lowered.check_backend(getattr(self, "backend", None))
+            (placement,) = layouts if isinstance(layouts, (list, tuple)) else [layouts]
+            selection = (
+                "forced"
+                if placement.extra.get("candidate_selection") == "forced"
+                else "cost"
+            )
+            self.program = APUv1RecordProgram(payload, selection)
+            self.cmds = list(payload.lowered.device_source.splitlines())
+            return
         if payload.realization is None:
             raise InfeasibleSchedule(
                 payload.realization_error
@@ -152,6 +179,19 @@ class APUv1Ctx(CodegenContext):
         effects = candidate_effects(placement)
         if effects is None:
             raise RuntimeError("APU v1 vector candidate declares no effects")
+        from .pim.apu_v1_record_frontend import APUv1RecordProgram
+
+        if isinstance(self.program, APUv1RecordProgram):
+            # The realization is the lowering itself: its effects, derived
+            # again from the lowered program, must be the declared ones.
+            actual = self.program.candidate.effects()
+            if actual != effects:
+                raise RuntimeError(
+                    "APU v1 program realization differs from the candidate "
+                    f"contract: realized {actual.manifest()}, declared "
+                    f"{effects.manifest()}"
+                )
+            return
         realization = self.program.realization
         values = {value.name: value.intent for value in realization.values}
         realized_outputs = {
@@ -198,10 +238,41 @@ class APUv1Ctx(CodegenContext):
                 f"{plan.name!r}; the candidate declares launches "
                 f"{[(l.kind, l.covers) for l in launches]}"
             )
+        analysis = self.program.candidate.analysis
+        extents = analysis.axis_extents
+        instances = 1
+        for axis in analysis.output_axes:
+            instances *= int(extents[axis])
+        realized = (
+            (0, instances),
+            (0, int(extents[analysis.reduction_axis])),
+            analysis.output_initializer,
+        )
+        declared = (
+            tuple(launches[0].instances),
+            tuple(launches[0].reduction or ()),
+            launches[0].accumulator,
+        )
+        if realized != declared:
+            raise RuntimeError(
+                "APU v1 realization launch differs from the candidate contract: "
+                f"realized (instances, reduction, accumulator) {realized}, "
+                f"declared {declared}"
+            )
 
     def runtime_route(self, commands) -> tuple[str, tuple]:
         if self.program is None:
             return super().runtime_route(commands)
+        from .pim.apu_v1_record_frontend import APUv1RecordProgram
+
+        if isinstance(self.program, APUv1RecordProgram):
+            decision = self.program.candidate.decision()
+            kind = (
+                "apu-v1-scalar-arc-v1"
+                if decision[0] == "scalar_arc_c"
+                else "apu-v1-native-recipe-v1"
+            )
+            return kind, decision[1:]
         decision = self.program.candidate.decision()
         return "apu-v1-vector-gvml-v1", (self.program.selected_plan.name, decision[-1])
 

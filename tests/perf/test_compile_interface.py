@@ -258,45 +258,39 @@ def test_allo_compile_returns_signature_compatible_numpy_callable(monkeypatch):
     assert "promotion_evidence" not in inspect.signature(allo.compile).parameters
 
 
-def test_program_routes_are_disjoint_and_in_dispatch_order():
+def test_no_typed_program_route_remains():
     compiler_api = importlib.import_module("allo.compiler")
-    types = [route.program_type for route in compiler_api._PROGRAM_ROUTES]
-    # The Gemini-II records are frontends of the shared pipeline since round
-    # 15; APUv1Program is the remaining typed route (gate G9).
-    assert [t.__name__ for t in types] == ["APUv1Program"]
-    for left in types:
-        for right in types:
-            if left is not right:
-                assert not issubclass(left, right)
+    # Every program record (the Gemini-II typed and composed records since
+    # round 15, APUv1Program since round 16) is a frontend of the shared
+    # pipeline: there is no dispatch table of typed compile functions.
+    assert not hasattr(compiler_api, "_PROGRAM_ROUTES")
+    assert not hasattr(compiler_api, "_compile_program")
+    assert not hasattr(allo.pim.apu_v1_program, "compile_apu_v1_program")
+    assert not hasattr(allo.pim.apu_v1_program, "APUv1ProgramCallable")
     # AiM and UPMEM compile only through the matcher.
     for removed in ("AimProgram", "UPMEMProgram"):
         assert not hasattr(allo, removed)
 
 
-def test_typed_program_route_rejects_host_moves_and_foreign_backend(monkeypatch):
-    compiler_api = importlib.import_module("allo.compiler")
-    route = next(
-        r for r in compiler_api._PROGRAM_ROUTES if r.program_type is allo.APUv1Program
-    )
-    program = object.__new__(allo.APUv1Program)
-    monkeypatch.setattr(
-        compiler_api,
-        "_PROGRAM_ROUTES",
-        (
-            compiler_api._ProgramRoute(
-                allo.APUv1Program,
-                lambda *a, **k: pytest.fail("route must reject first"),
-                route.backends,
-                route.backend_error,
-                route.owner,
-            ),
-        ),
-    )
-    target = SimpleNamespace(name="apu_v1")
-    with pytest.raises(ValueError, match="device, virtual, or functional"):
-        allo.compile(program, target, backend="simulator")
-    with pytest.raises(ValueError, match="owns its scalar L4 ABI"):
-        allo.compile(program, target, host_moves=[])
+def test_apu_v1_program_record_refuses_a_reduction_order_and_a_foreign_backend():
+    from allo.ir.types import int32
+    from allo.pim.costs import apu_v1_cost
+    from allo.pim.targets import build_apu_v1_target
+
+    def count_up(values: int32[8], out: int32[8]):
+        for i in range(8):
+            out[i] = values[i] + 1
+
+    program = allo.APUv1Program((allo.APUv1Phase(count_up),), name="count_up")
+    target = build_apu_v1_target()
+    with pytest.raises(ValueError, match="fixes its reduction grouping"):
+        allo.compile(
+            program, target, apu_v1_cost, backend="virtual", reduction_order="strict"
+        )
+    with pytest.raises(ValueError, match="device.*virtual.*functional"):
+        allo.compile(program, target, apu_v1_cost, backend="simulator")
+    with pytest.raises(ValueError, match="requires the apu_v1 target"):
+        allo.compile(program, SimpleNamespace(name="aim"), backend="virtual")
 
 
 def test_compile_ignores_host_move_sidecars(monkeypatch):

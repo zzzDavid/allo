@@ -732,55 +732,82 @@ class CompiledAPUv1Program:
             self.scratch_bytes = self.native_vector_lowering.scratch_bytes
             self.device_source = self.native_vector_lowering.emit_device_source()
         self.execution_graph = ExecutionGraph(program.name)
+        self._graph_fingerprint = None
         if cost is not None:
-            if self.native_vector_lowering is not None and hasattr(
-                self.native_vector_lowering, "build_execution_graph"
-            ):
-                self.execution_graph = (
-                    self.native_vector_lowering.build_execution_graph(target, cost)
-                )
-            else:
-                fallback = max(
-                    (
-                        extent
-                        for argument in self.arguments
-                        for extent in argument.shape
-                    ),
-                    default=1,
-                )
-                summary = analyze_upmem_mlir(
-                    self.artifact.source_mlir, dynamic_trip_count=fallback
-                )
-                event = CostEvent.create(
-                    "scalar_c",
-                    target.op("SCALAR_C"),
-                    metrics={"instructions": summary.total_instruction_count},
-                    attributes={"source": "retained_mlir"},
-                )
-                cost.emit(self.execution_graph, event)
-            if "cost_validity" not in self.execution_graph.metadata:
-                from .costs.apu_v1 import apu_v1_cost_validity
+            self.execution_graph = self.execution_graph_for(cost)
+        self.check_backend(backend)
 
-                validity = apu_v1_cost_validity(
-                    (
-                        "scalar_arc_c"
-                        if self.native_vector_lowering is None
-                        else self.native_vector_lowering.route
-                    ),
-                    self.execution_graph.metadata.get("operation_inventory"),
-                    cost,
-                )
-                self.execution_graph.metadata["cost_validity"] = validity
-                self.execution_graph.metadata["estimate_validity"] = validity[
-                    "cost_validity"
-                ]
+    @property
+    def route(self) -> str:
+        """``"scalar_arc_c"`` or the proven native recipe's route."""
+        if self.native_vector_lowering is None:
+            return "scalar_arc_c"
+        return self.native_vector_lowering.route
+
+    def check_backend(self, backend) -> None:
+        """Refuse a backend this lowering cannot serve: anything but the
+        device, the virtual runner or the host functional C, and
+        ``"functional"`` for a native recipe (no host execution path)."""
+        if backend not in (None, "device", "virtual", "functional"):
+            raise ValueError(
+                "APUv1Program supports backend=None (device), 'virtual', or "
+                f"'functional'; got {backend!r}"
+            )
         if backend == "functional" and self.native_vector_lowering is not None:
             raise NotImplementedError(
                 f"APUv1Program backend='functional' executes the scalar ARC C on "
-                f"the host; {program.name!r} lowers to the native vector route "
+                f"the host; {self.program.name!r} lowers to the native vector route "
                 f"{self.native_vector_lowering.route!r}, whose GVML program has no "
                 "host execution path. Use backend=None (device) or 'virtual'"
             )
+
+    def execution_graph_for(self, cost):
+        """The retained cost graph of this lowering under ``cost``: the
+        native recipe's structural graph, or the scalar C instruction count
+        of the retained MLIR priced as one ``SCALAR_C`` event.  Cached per
+        cost fingerprint and kept as ``execution_graph``."""
+        fingerprint = getattr(cost, "fingerprint", None)
+        if (
+            self._graph_fingerprint is not None
+            and self._graph_fingerprint == (id(cost), fingerprint)
+            and self.execution_graph is not None
+        ):
+            return self.execution_graph
+        target = self.target
+        graph = ExecutionGraph(self.program.name)
+        if self.native_vector_lowering is not None and hasattr(
+            self.native_vector_lowering, "build_execution_graph"
+        ):
+            graph = self.native_vector_lowering.build_execution_graph(target, cost)
+        else:
+            fallback = max(
+                (extent for argument in self.arguments for extent in argument.shape),
+                default=1,
+            )
+            summary = analyze_upmem_mlir(
+                self.artifact.source_mlir, dynamic_trip_count=fallback
+            )
+            event = CostEvent.create(
+                "scalar_c",
+                target.op("SCALAR_C"),
+                metrics={"instructions": summary.total_instruction_count},
+                attributes={"source": "retained_mlir"},
+            )
+            cost.emit(graph, event)
+        if "cost_validity" not in graph.metadata:
+            from .costs.apu_v1 import apu_v1_cost_validity
+
+            validity = apu_v1_cost_validity(
+                self.route, graph.metadata.get("operation_inventory"), cost
+            )
+            graph.metadata["cost_validity"] = validity
+            graph.metadata["estimate_validity"] = validity["cost_validity"]
+        graph.metadata.setdefault("launch_count", 1)
+        graph.metadata.setdefault("plan", self.route)
+        self.execution_graph = graph
+        self.cost = cost
+        self._graph_fingerprint = (id(cost), fingerprint)
+        return graph
 
     def _checked_sources(self, inputs):
         normalized = {}
@@ -870,7 +897,13 @@ class CompiledAPUv1Program:
         if self.backend == "virtual":
             return self._run_virtual(inputs)
         if self.backend == "functional":
+            self.check_backend("functional")
             return self._run_functional(inputs)
+        if self.backend not in (None, "device"):
+            raise ValueError(
+                "APUv1Program supports backend=None (device), 'virtual', or "
+                f"'functional'; got {self.backend!r}"
+            )
         reason = _apu_v1_unavailable_reason() or _ledag_available_reason()
         if reason:
             raise SimulatorUnavailable("apu_v1", reason)
@@ -964,53 +997,6 @@ class CompiledAPUv1Program:
                 shutil.rmtree(root, ignore_errors=True)
 
 
-class APUv1ProgramCallable:
-    def __init__(self, compiled):
-        self.compiled = compiled
-        self.program = compiled.program
-        self.target = compiled.target
-        self.cost = compiled.cost
-        self.arguments = compiled.source_arguments
-        self.signature = inspect.Signature(
-            inspect.Parameter(arg.name, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            for arg in self.arguments
-        )
-        self.__signature__ = self.signature
-        self.last_result = None
-
-    @property
-    def execution_graph(self):
-        return self.compiled.execution_graph
-
-    @property
-    def hybrid_manifest(self):
-        return self.compiled.hybrid_manifest
-
-    def __call__(self, *args, **kwargs):
-        bound = self.signature.bind(*args, **kwargs)
-        result = self.compiled.run(**bound.arguments)
-        self.last_result = result
-        return result
-
-    run = __call__
-
-    def run_backend(self, **inputs):
-        return self(**inputs)
-
-    def estimate(self):
-        if self.cost is None:
-            raise RuntimeError("compiled APU v1 program has no cost spec")
-        return self.cost.evaluate(self.execution_graph)
-
-
-def compile_apu_v1_program(program, target, *, cost=None, backend=None):
-    if target.name != "apu_v1":
-        raise ValueError("APUv1Program requires the apu_v1 target")
-    return APUv1ProgramCallable(
-        CompiledAPUv1Program(program, target, cost=cost, backend=backend)
-    )
-
-
 __all__ = [
     "apu_v1_board_lock",
     "apu_v1_lock_path",
@@ -1019,7 +1005,5 @@ __all__ = [
     "read_output_image",
     "APUv1Phase",
     "APUv1Program",
-    "APUv1ProgramCallable",
     "CompiledAPUv1Program",
-    "compile_apu_v1_program",
 ]

@@ -80,7 +80,7 @@ def _rejects(kernel, result_names, recipe, pattern, bounds=None):
 
 
 def _normalized_source(compiled, renames):
-    source = compiled.compiled.device_source
+    source = compiled.device_source
     for old, new in renames.items():
         # Role names appear inside identifiers such as `mem_hndl_<role>`.
         source = re.sub(
@@ -123,18 +123,18 @@ def _histogram(make_kernel, **overrides):
 
 def test_histogram_paper_and_renamed_kernels_emit_identical_gvml(make_kernel):
     paper = _compile(*_histogram(make_kernel))
-    lowering = paper.compiled.native_vector_lowering
+    lowering = paper.native_vector_lowering
     assert lowering.route == "gvml_dense_histogram_pair_count"
     assert (lowering.analysis.items, lowering.analysis.bins) == (32768, 256)
 
     renamed = _compile(
         *_histogram(make_kernel, f="tally", v="samples", c="hits", b="k", i="n")
     )
-    assert renamed.compiled.native_vector_lowering.route == lowering.route
+    assert renamed.native_vector_lowering.route == lowering.route
     assert renamed.estimate().cycles == paper.estimate().cycles
     assert (
         _normalized_source(renamed, {"samples": "values", "hits": "counts"})
-        == paper.compiled.device_source
+        == paper.device_source
     )
 
 
@@ -154,11 +154,11 @@ def test_histogram_semantic_mutations_are_rejected(make_kernel, overrides, patte
 
 def test_histogram_nearby_bin_counts_compile_and_out_of_domain_rejects(make_kernel):
     odd = _compile(*_histogram(make_kernel, B=255))
-    analysis = odd.compiled.native_vector_lowering.analysis
+    analysis = odd.native_vector_lowering.analysis
     assert analysis.bins == 255
-    source = odd.compiled.device_source
+    source = odd.device_source
     assert "gvml_count_m_g32k(&count, GVML_MRK0);" in source
-    assert odd.compiled.native_vector_lowering.operation_inventory() == {
+    assert odd.native_vector_lowering.operation_inventory() == {
         "dma_l4_to_l1_32k": 1,
         "gvml_load_16": 1,
         "gvml_eq_imm_16": 255,
@@ -167,7 +167,7 @@ def test_histogram_nearby_bin_counts_compile_and_out_of_domain_rejects(make_kern
         "scalar_l4_store_u16": 255,
     }
     small = _compile(*_histogram(make_kernel, B=64))
-    assert small.compiled.native_vector_lowering.analysis.bins == 64
+    assert small.native_vector_lowering.analysis.bins == 64
     _rejects(
         *_histogram(make_kernel, N=16384), "dense_histogram", r"exactly one complete"
     )
@@ -227,7 +227,7 @@ def _argmin(make_kernel, **overrides):
 def test_argmin_paper_and_renamed_kernels_emit_identical_gvml(make_kernel):
     bounds = {"points": (0, 31), "centers": (0, 31)}
     paper = _compile(_argmin(make_kernel), bounds=bounds)
-    lowering = paper.compiled.native_vector_lowering
+    lowering = paper.native_vector_lowering
     assert lowering.route == "gvml_squared_l2_argmin_center_streaming"
     analysis = lowering.analysis
     assert (analysis.dimensions, analysis.candidates) == (24, 10)
@@ -253,12 +253,12 @@ def test_argmin_paper_and_renamed_kernels_emit_identical_gvml(make_kernel):
     assert renamed.estimate().cycles == paper.estimate().cycles
     assert (
         _normalized_source(renamed, {"xs": "points", "mu": "centers", "lab": "labels"})
-        == paper.compiled.device_source
+        == paper.device_source
     )
 
     # `best > dist` is the same strict improvement written mirrored.
     mirrored = _compile(_argmin(make_kernel, cond="best_distance > distance"))
-    assert mirrored.compiled.native_vector_lowering.analysis.comparison == "slt"
+    assert mirrored.native_vector_lowering.analysis.comparison == "slt"
 
 
 @pytest.mark.parametrize(
@@ -283,7 +283,7 @@ def test_argmin_semantic_mutations_are_rejected(make_kernel, overrides, pattern)
 def test_argmin_nearby_shapes_compile_and_out_of_domain_rejects(make_kernel):
     for dims, candidates in ((23, 11), (48, 2)):
         compiled = _compile(_argmin(make_kernel, D=dims, K=candidates))
-        analysis = compiled.compiled.native_vector_lowering.analysis
+        analysis = compiled.native_vector_lowering.analysis
         assert (analysis.dimensions, analysis.candidates) == (dims, candidates)
     _rejects(_argmin(make_kernel, D=49), (), "squared_l2_argmin", r"48 VMRs")
 
@@ -328,7 +328,7 @@ def _moments(make_kernel, **overrides):
 
 def test_moments_paper_and_renamed_kernels_emit_identical_gvml(make_kernel):
     paper = _compile(*_moments(make_kernel))
-    lowering = paper.compiled.native_vector_lowering
+    lowering = paper.native_vector_lowering
     assert lowering.route == "gvml_bivariate_moments_fused_group_reduce"
     assert (lowering.analysis.x_role, lowering.analysis.y_role) == ("x", "y")
 
@@ -338,7 +338,7 @@ def test_moments_paper_and_renamed_kernels_emit_identical_gvml(make_kernel):
     assert renamed.estimate().cycles == paper.estimate().cycles
     assert (
         _normalized_source(renamed, {"u": "x", "v": "y", "acc": "stats"})
-        == paper.compiled.device_source
+        == paper.device_source
     )
 
 
@@ -360,10 +360,10 @@ def test_moments_semantic_mutations_are_rejected(make_kernel, overrides, pattern
 
 def test_moments_nearby_shapes_compile_and_out_of_domain_rejects(make_kernel):
     full = _compile(*_moments(make_kernel, B=16, P=2048))
-    assert full.compiled.native_vector_lowering.analysis.batches == 16
+    assert full.native_vector_lowering.analysis.batches == 16
     # A partial frontier is zero padded; the padding groups are never read.
     partial = _compile(*_moments(make_kernel, B=4, P=4096))
-    lowering = partial.compiled.native_vector_lowering
+    lowering = partial.native_vector_lowering
     x = np.arange(4 * 4096, dtype=np.uint16).reshape(4, 4096)
     packed = lowering.pack_inputs({"x": x, "y": x})
     assert packed["x"].shape == (32768,)
@@ -416,7 +416,7 @@ def _word_count(make_kernel, cross=False, **overrides):
 
 def test_record_frequency_paper_and_renamed_kernels_emit_identical_gvml(make_kernel):
     paper = _compile(*_word_count(make_kernel))
-    lowering = paper.compiled.native_vector_lowering
+    lowering = paper.native_vector_lowering
     assert lowering.route == "gvml_record_frequency_resident_chunks_pair_count"
     assert (lowering.analysis.chunks, lowering.analysis.queries) == (3, 128)
 
@@ -430,7 +430,7 @@ def test_record_frequency_paper_and_renamed_kernels_emit_identical_gvml(make_ker
         _normalized_source(
             renamed, {"recs": "tokens", "keys": "queries", "hits": "counts"}
         )
-        == paper.compiled.device_source
+        == paper.device_source
     )
 
 
@@ -453,12 +453,12 @@ def test_record_frequency_nearby_shapes_compile_and_out_of_domain_rejects(
 ):
     odd = _compile(*_word_count(make_kernel, Q=127))
     assert (
-        odd.compiled.native_vector_lowering.operation_inventory()["gvml_count_m_g32k"]
+        odd.native_vector_lowering.operation_inventory()["gvml_count_m_g32k"]
         == 1
     )
     # Resident chunks are bounded by the target's writable VRs (one scratch).
     widest = _compile(*_word_count(make_kernel, C=14, Q=16))
-    assert widest.compiled.native_vector_lowering.analysis.chunks == 14
+    assert widest.native_vector_lowering.analysis.chunks == 14
     _rejects(
         *_word_count(make_kernel, C=15, Q=16),
         "record_frequency",
@@ -559,7 +559,7 @@ def test_semantics_preserving_variants_are_accepted(make_kernel, case):
     source, results, route = VARIANTS[case]
     name = source.split("def ", 1)[1].split("(", 1)[0]
     compiled = _compile(make_kernel(source, name), results)
-    assert compiled.compiled.native_vector_lowering.route == route
+    assert compiled.native_vector_lowering.route == route
 
 
 REJECTED_VARIANTS = {

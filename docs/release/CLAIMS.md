@@ -99,6 +99,9 @@ as candidates of `rank_matcher_placements` (rows 24 and E9/E10 now go through
 it), since round 14 with supplied placements rebound to the current program
 (C-28, C-29) and since round 15 under a field-by-field enforced candidate
 contract (C-30) with the Gemini-II typed records as frontends of the same
-pipeline. Not yet done: `APUv1Program` does not normalize into the shared
-contracts; card and installed-artifact stage traces
-(`design/shared-compilation-path.md`).
+pipeline, and since round 16 with `APUv1Program` as a frontend of the same
+pipeline and the launch chain, accumulator modes and every operation's
+extent enforced by the contract (C-30 follow-up). Not yet done: the matcher
+backends declare no `CandidateEffects`; the hybrid manifest's scalar ABI
+from retained IR; forced-alternative and cost-perturbation traces on both
+hardware hosts (`design/shared-compilation-path.md`).

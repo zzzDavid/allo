@@ -142,8 +142,8 @@ def test_scalar_program_uses_the_helper_and_matches_the_functional_route(kernel)
     program = allo.APUv1Program((allo.APUv1Phase(kernel, result_names=("y",)),))
     target = build_apu_v1_target()
     virtual = allo.compile(program, target, apu_v1_cost, backend="virtual")
-    assert "= allo_sqrt(" in virtual.compiled.device_source
-    assert "static double allo_sqrt(double value)" in virtual.compiled.device_source
+    assert "= allo_sqrt(" in virtual.device_source
+    assert "static double allo_sqrt(double value)" in virtual.device_source
     validity = virtual.execution_graph.metadata["cost_validity"]
     assert validity["cost_validity"] == "extrapolated"
 

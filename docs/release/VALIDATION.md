@@ -542,3 +542,21 @@ stage traces of forced alternatives and cost perturbations reaching
 generated code and launches on both hardware hosts at one revision (the
 board and card runs above exercise the selected candidates and the
 fixed-layout GEMM plans).
+
+## Round 16 (2026-11-03): review findings C-30b; APUv1Program in the shared pipeline
+
+Same interpreter and `LLVM_BUILD_DIR` as round 12; checkout as working
+directory. Raw logs under `/tmp/g9/r16-*.log`, copied to
+`/work/shared/users/phd/nz264/tenon-release-evidence/r16/`.
+
+| Check (round 16 tree) | Result |
+|---|---|
+| the reviewer's round 15 reproducers (`tenon-release-evidence/reviewer-r15/test_contract_gaps.py`, run unchanged) | the valid 3x8x5 int4 source still executes exactly on the emulated card; the three accepted-invalid cases now fail at compile: the duplicated partial is refused ("sum [(0, 4), (4, 8), (4, 8)] in order, not an ordered partition of [0, 8)"), the carried accumulator declared zero is refused ("starts its accumulator as 'zero'; the source initializes it as 'carried'"), the one-instance typed add is refused ("cover instances [(0, 1)], not a tiling of [0, 64)") |
+| `tests/pim/test_shared_semantics.py` (36: previous sections plus (j) `APUv1Program` records through the common pipeline and (k) the launch chain, accumulator modes and every operation's extent) | 36 passed (within `r16-a.log`) |
+| APU v1 program tests through the shared pipeline (`test_apu_v1_native_reductions`, `test_apu_v1_distance_argmin`, `test_apu_v1_recognizers`, `test_apu_v1_scalar_surface`, `test_apu_v1_cost_provenance`, `test_run_result_contract`, `test_compile_interface`), the Gemini-II record and source tests, APU v1 vector compile, tile selection and reduction policy, import surface (`r16-a.log`) | 222 passed in 109 s; the reviewer's file run afterwards: 1 passed (the valid source), 3 failed at compile (the three accepted-invalid contracts) |
+| perf (`r16-perf.log`) | 534 passed in 601 s |
+| PIM non-device (`r16-pim.log`) | 493 passed, 54 skipped, 12 deselected, 4 failed in 3901 s. The four failures, `test_paper_golden.py::test_apu_v1_paper_kernel_compiles_to_gvml[apu_v1-{kmeans,histogram,linear_regression,word_count}]`, read the native lowering through the old typed callable's `.compiled` attribute path; the lowering is now the selected candidate of the shared pipeline and its introspection is forwarded by the artifact (`compiled.native_vector_lowering`, `.device_source`, `.route`); the test was pointed at the forwarded attributes (no code change) and its five rows pass (5 passed). The virtual estimates of the paper kernels are unchanged (the same retained graphs price the same lowerings) |
+| APU v1 board from the checkout (`r16-board.log`, `-m apu_v1_device -rA`: vector GEMM plans, GEMV on all targets, the paper golden board rows including the histogram `APUv1Program` through the shared pipeline, G6 board semantics; per-case printed records kept) | 10 passed, 2 xfailed, 93 deselected in 466 s (`test_vector_gemm_apu_v1` x2, `test_apu_v1_board_median_cycles[apu_v1-histogram]` through the record frontend and the shared pipeline, seven G6 board semantics cases; the two xfails are the documented V1-16 bit-equality expectations); the log keeps every case's printed records |
+| Gemini-II card from a wheel built on zhang-x4 from the round 16 sdist (`g2_installed_run16.sh`, `g2-installed-run.log`, `r16/g2/`; `-rA` keeps each case's printed records) | host `en-ec-zhang-x4`, card `apu-00` Available, FW `GSI_G2_Infrastructure_V1.24.1`; sdist of the round 16 tree sha256 `05ae7a97...afa6a` built into wheel sha256 `a1dd070a57b20f21ec01d17f68be24484bad19086fb013edc6a2d486e9a3eeb5` with the host's gcc 11, clean venv of the `allo-dev` interpreter, run from `/tmp` under `flock /tmp/tenon-apu-g2.lock`: `tests/pim/test_apu_g2_hardware.py` **15 passed in 146.08 s** (the typed and composed records through the record frontend with the recomputed-effects realization check, the source launch plans under the ordered-partition and accumulator-chain rules); per-case output kept with `-rA` |
+| black on `allo` and `tests`; license headers; pylint on the new and changed modules (`apu_v1_record_frontend.py`, `record_frontend.py`, `spmw_candidate.py`, `apu_g2_record_frontend.py`) | clean; no pylint findings |
+

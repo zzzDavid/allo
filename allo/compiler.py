@@ -17,7 +17,7 @@ import numpy as np
 
 from .ir.builder import _spmw_group_contract
 from .perf import BoundCostSpec, CostSpec
-from .pim.apu_v1_program import APUv1Program, compile_apu_v1_program
+from .pim.apu_v1_record_frontend import is_apu_v1_program, normalize_apu_v1_program
 from .spmw_autoschedule import MatcherWorkScope, _retain_matcher_work_scope
 from .spmw_codegen import RunResult, compile_for_target, source_backend_binding
 from .spmw_liveness import MatcherValueId, trace_liveness
@@ -814,43 +814,6 @@ class CompiledWorkload(typing.Protocol):
     def run(self, *args, **kwargs) -> RunResult: ...
 
 
-@dataclass(frozen=True)
-class _ProgramRoute:
-    program_type: type
-    compile_fn: Callable[..., CompiledWorkload]  # (program, target, *, cost, backend)
-    backends: frozenset | None  # None: compile_fn validates backend itself
-    backend_error: str | None  # ValueError text for a backend outside ``backends``
-    owner: str  # ValueError text when host_moves/layout are passed
-
-
-_PROGRAM_ROUTES: tuple[_ProgramRoute, ...] = (
-    _ProgramRoute(
-        APUv1Program,
-        compile_apu_v1_program,
-        frozenset({None, "virtual", "functional"}),
-        "APUv1Program supports the device, virtual, or functional backend",
-        "APUv1Program owns its scalar L4 ABI",
-    ),
-)
-
-
-def _compile_program(
-    route, workload, target, bound_cost, backend, host_moves, layout, reduction_order
-):
-    if route.backends is not None and backend not in route.backends:
-        raise ValueError(route.backend_error)
-    if host_moves is not None or layout is not None:
-        raise ValueError(route.owner)
-    if reduction_order is not None:
-        # A typed program record spells out its own reduction grouping; the
-        # policy selects among schedules of ordinary source workloads only.
-        raise ValueError(
-            f"{route.program_type.__name__} fixes its reduction grouping in the "
-            "program record; reduction_order applies to source workloads"
-        )
-    return route.compile_fn(workload, target, cost=bound_cost, backend=backend)
-
-
 def compile(
     workload,
     target,
@@ -865,15 +828,13 @@ def compile(
 
     Stages (release gate G9, ``docs/release/design/shared-compilation-path.md``):
 
-    1. **Typed program frontends.** ``APUG2TypedProgram`` and
-       ``APUG2ComposedContractionProgram`` are program records without
-       source: their semantics are stated in the shared program contract and
-       their realization is one candidate of the common pipeline below
-       (`allo.pim.apu_g2_record_frontend`).  ``APUv1Program`` still compiles
-       through its own typed route (``_PROGRAM_ROUTES``; the remaining
-       migration item of gate G9) and accepts
-       ``backend in (None, "virtual", "functional")`` but no ``host_moves``
-       or ``layout``.
+    1. **Typed program frontends.** ``APUG2TypedProgram``,
+       ``APUG2ComposedContractionProgram`` and ``APUv1Program`` are program
+       records without source: their semantics are stated in the shared
+       program contract and their realization is one candidate of the
+       common pipeline below (`allo.pim.apu_g2_record_frontend`,
+       `allo.pim.apu_v1_record_frontend`).  A record fixes its own
+       reduction grouping and rejects ``reduction_order``.
     2. **Shared front stages** (every ordinary source workload, every
        target; :func:`allo.spmw_pipeline.normalize_source`): the ``@allo``
        function is customized to MLIR, matched against the target's
@@ -942,22 +903,19 @@ def compile(
     workload = _materialize_workload(workload)
     target = _materialize_target(target)
     bound_cost = _resolve_cost(target, cost)
-
-    for route in _PROGRAM_ROUTES:
-        if isinstance(workload, route.program_type):
-            return _compile_program(
-                route,
-                workload,
-                target,
-                bound_cost,
-                backend,
-                host_moves,
-                layout,
-                reduction_order,
-            )
+    requested_order = reduction_order
     reduction_order = normalize_reduction_order(reduction_order)
 
-    if is_apu_g2_record(workload):
+    if is_apu_v1_program(workload):
+        # An APU v1 whole-function program record is a frontend: its lowering
+        # (scalar ARC C or a proven native recipe) states its effects in the
+        # shared program contract and is the record's candidate of the
+        # common pipeline (`allo.pim.apu_v1_record_frontend`).
+        program = normalize_apu_v1_program(
+            workload, target, reduction_order=requested_order
+        )
+        workload = program.workload
+    elif is_apu_g2_record(workload):
         # A typed Gemini-II program record is a frontend: its semantics are
         # stated in the shared program contract and its realization is a
         # candidate of the common pipeline (`allo.pim.apu_g2_record_frontend`).

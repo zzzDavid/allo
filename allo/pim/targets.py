@@ -1195,6 +1195,25 @@ def build_apu_v1_target():
                     fn=lambda x: x,
                     matchable=False,
                 )
+                # Whole-function programs of an ``APUv1Program`` record (gate
+                # G9): the ARC executes the function's portable C over its L4
+                # buffers, or issues one proven native GVML recipe over them.
+                # Never matched from source; the record frontend states the
+                # program's effects in the shared candidate contract.
+                allo.op(
+                    "ARC_SCALAR_PROGRAM",
+                    src=(l4,),
+                    dst=l4,
+                    fn=lambda x: x,
+                    matchable=False,
+                )
+                allo.op(
+                    "NATIVE_VECTOR_PROGRAM",
+                    src=(l4,),
+                    dst=l4,
+                    fn=lambda x: x,
+                    matchable=False,
+                )
                 allo.move("ARC_STORE_L4_U16", src=vior, dst=l4)
 
     return device

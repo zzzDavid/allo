@@ -66,7 +66,7 @@ def _compile(kernel, result_name):
         build_apu_v1_target(),
         apu_v1_cost,
         backend="virtual",
-    ).compiled
+    ).lowered
 
 
 def _assert_native_cost_graph(

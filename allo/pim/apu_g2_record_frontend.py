@@ -27,7 +27,6 @@ allocates it and returns it in ``RunResult.extra["outputs"]``.
 from __future__ import annotations
 
 import importlib
-import inspect
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -35,15 +34,13 @@ from typing import Any
 import numpy as np
 
 from ..spmw_codegen import RunResult
-from ..spmw_match import IRValueRef, MatchedOp, MatchTrace, OperandBinding
+from ..spmw_match import MatchedOp, MatchTrace
 from ..spmw_match_engine import coordinate_forms
 from ..spmw_reduction_policy import ReductionPolicy, normalize_reduction_order
 from ..spmw_semantics import (
-    BufferAccess,
     Contraction,
     ElementType,
     Epilogue,
-    LoopAxis,
     Parameter,
     ProgramFacts,
     stamp_program_facts,
@@ -53,6 +50,15 @@ from .apu_g2_composed_contraction import (
     APUG2DotEpilogueMode,
 )
 from .apu_g2_typed_program import APUG2TypedOperation, APUG2TypedProgram
+from .record_frontend import (
+    RecordWorkload as _RecordWorkload,
+    buffer_access,
+    loop_axis,
+    loop_tuple,
+    memref_type_text,
+    operand_binding,
+    record_ref,
+)
 
 RECORD_TYPES = (APUG2TypedProgram, APUG2ComposedContractionProgram)
 
@@ -114,34 +120,11 @@ def record_parameter_types(record) -> dict[str, Any]:
     return dict(zip(names, types))
 
 
-class RecordWorkload:
-    """Callable stand-in for a program record: the signature of its call
-    convention (``out`` optional) and its name.  It never executes; the
-    realized program does."""
+class RecordWorkload(_RecordWorkload):
+    """Callable stand-in for a Gemini-II record (``out`` optional)."""
 
     def __init__(self, record):
-        self.record = record
-        names = record_parameter_names(record)
-        self.__name__ = record.name
-        self.__qualname__ = record.name
-        self.__signature__ = inspect.Signature(
-            parameters=tuple(
-                inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-                for name in names[:-1]
-            )
-            + (
-                inspect.Parameter(
-                    "out", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None
-                ),
-            )
-        )
-        self.__annotations__ = {}
-
-    def __call__(self, *args, **kwargs):
-        raise RuntimeError(
-            f"{self.record.name} is a device program record; call the compiled "
-            "artifact returned by allo.compile"
-        )
+        super().__init__(record, record_parameter_names(record), optional=("out",))
 
 
 # --------------------------------------------------------------------------- #
@@ -155,50 +138,12 @@ def _element(scalar) -> ElementType:
     )
 
 
-def _ref(ordinal: int) -> IRValueRef:
-    return IRValueRef("record", (int(ordinal),))
-
-
-def _loop(var: str, extent: int) -> LoopAxis:
-    return LoopAxis(var=var, name=var, lower=0, upper=int(extent), step=1)
-
-
-def _loop_tuple(var: str, extent: int):
-    return (var, "0", str(int(extent)), 1)
-
-
-def _access(role, name, ordinal, shape, element, dims, coords, local=False):
-    return BufferAccess(
-        role=role,
-        memref_name=name,
-        parameter=None if local else name,
-        local=local,
-        value_ref=_ref(ordinal),
-        shape=tuple(shape),
-        element=element,
-        coords=coords,
-        dims=tuple(dims),
-        indices=tuple(d if d is not None else "?" for d in dims),
-        index_map=None,
-    )
-
-
-def _binding(role, name, ordinal, indices, coords, memref_type, carried=False):
-    return OperandBinding(
-        role=role,
-        memref_name=name,
-        indices=list(indices),
-        is_loop_carried=carried,
-        memref_type=memref_type,
-        value_ref=_ref(ordinal),
-        index_map=None,
-        coords=coords,
-    )
-
-
-def _memref_type(shape, element) -> str:
-    dims = "x".join(str(int(d)) for d in shape)
-    return f"memref<{dims}x{element.text}>" if dims else f"memref<{element.text}>"
+_ref = record_ref
+_loop = loop_axis
+_loop_tuple = loop_tuple
+_access = buffer_access
+_binding = operand_binding
+_memref_type = memref_type_text
 
 
 def _policy(order, element) -> ReductionPolicy:

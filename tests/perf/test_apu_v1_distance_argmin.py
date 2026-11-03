@@ -52,7 +52,7 @@ def _compile():
 
 def test_required_vector_phase_selects_complete_center_streaming_route():
     callable_program = _compile()
-    compiled = callable_program.compiled
+    compiled = callable_program
     lowering = compiled.native_vector_lowering
     assert isinstance(lowering, APUv1SquaredL2ArgminLowering)
     assert lowering.route == "gvml_squared_l2_argmin_center_streaming"

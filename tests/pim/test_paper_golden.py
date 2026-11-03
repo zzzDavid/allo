@@ -725,10 +725,13 @@ def test_apu_v1_paper_kernel_compiles_to_gvml(row):
         assert compiled.realization is not None, compiled.realization_error
         assert "gvml_" in compiled.realization.device_source()
     else:
-        lowering = compiled.compiled.native_vector_lowering
+        # The record's lowering is the selected candidate of the shared
+        # pipeline; its introspection is forwarded by the artifact.
+        lowering = compiled.native_vector_lowering
         assert lowering is not None
         assert lowering.route == _APU_V1_NATIVE_ROUTES[row.case_id]
-        assert "gvml_" in compiled.compiled.device_source
+        assert "gvml_" in compiled.device_source
+        assert compiled.route == lowering.route
 
 
 @pytest.mark.apu_v1_device

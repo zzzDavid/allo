@@ -87,7 +87,10 @@ Two other workload kinds reach `allo.compile`:
   (`allo/pim/apu_g2_composed_contraction.py`) are frontends of the shared
   pipeline (`allo/pim/apu_g2_record_frontend.py`, Section 2.0);
   `allo.APUv1Program` / `allo.APUv1Phase` (`allo/pim/apu_v1_program.py`)
-  still bypasses the matcher (the remaining typed route of gate G9).
+  is a frontend too (`allo/pim/apu_v1_record_frontend.py`, round 16): its
+  whole-function lowering (scalar ARC C or one proven native GVML recipe)
+  states its effects in the shared program contract and is the record's
+  candidate of the common pipeline.
 
 ### 1.3 Cost language (`allo/perf/`)
 
@@ -140,16 +143,24 @@ evaluated jointly within a documented budget (Section 2.6 and
 1. `_materialize_workload` (calls `build()` when present),
    `_materialize_target` (calls a zero-argument builder), `_resolve_cost`
    (binds a `CostSpec` to the target).
-2. `APUv1Program` routes through `_PROGRAM_ROUTES` (`compile_apu_v1_program`;
-   it refuses `host_moves`, `layout` and `reduction_order`); this is the
-   remaining typed route of gate G9. `APUG2TypedProgram` and
-   `APUG2ComposedContractionProgram` are frontends of the shared pipeline:
+2. Program records are frontends of the shared pipeline; there is no typed
+   dispatch table. `APUG2TypedProgram` and `APUG2ComposedContractionProgram`:
    `allo.pim.apu_g2_record_frontend.normalize_apu_g2_record` states the
    record's semantics as the shared program contract (synthetic matches with
    the matcher's structural facts and the derived `ProgramFacts`), and the
    record's realization is one candidate of step 4 (the view declares the
    typed operations; the record's recipe graph prices it;
-   `APUG2RecordProgram` is the materialized program).
+   `APUG2RecordProgram` is the materialized program). `APUv1Program`:
+   `allo.pim.apu_v1_record_frontend.normalize_apu_v1_program` lowers the
+   phase once (`CompiledAPUv1Program`: retained MLIR, portable C, scalar
+   ABI, native recipe discovery) and states the program's external effects
+   as one synthetic `ARC_SCALAR_PROGRAM` / `NATIVE_VECTOR_PROGRAM` match
+   over the buffers it reads and writes; the lowering is the record's one
+   candidate (`APUv1RecordCandidate`, L4 value layouts, one launch over
+   every result instance), priced by its retained graph and materialized
+   as `APUv1RecordProgram`. Records fix their own reduction grouping and
+   refuse `reduction_order`; `host_moves` and `layout` follow the common
+   rules (a single-launch orchestration, a candidate name).
 3. Shared front stages for every ordinary source workload
    (`allo/spmw_pipeline.py::normalize_source`, gate G9):
    `customize(workload, enable_tensor=False)` produces the MLIR module;
@@ -706,11 +717,13 @@ profile freshness by diffing the device log before and after the launch
   user's GSI SDK `example-gvml` project (`TENON_APU_V1_TEMPLATE_DIR`;
   `spmw_apu_v1_build._TEMPLATE_FILES`) and records their origin and SHA-256
   in the project's `THIRD_PARTY.txt`; Tenon does not redistribute them (V1-08).
-* **`APUv1Program` scalar route** (`apu_v1_program.py`): one
-  `APUv1Phase(kernel, vectorize=False)`; the whole function lowers to
-  portable C11 (`emit_c_from_mlir`) and runs on APUC 0. Backends `None`
-  (device), `"virtual"` (retained cost graph), `"functional"` (host
-  execution of the same C; V1-04). Multi-phase programs raise.
+* **`APUv1Program` scalar programs** (`apu_v1_program.py`,
+  `apu_v1_record_frontend.py`): one `APUv1Phase(kernel, vectorize=False)`;
+  the whole function lowers to portable C11 (`emit_c_from_mlir`) and runs
+  on APUC 0 as the record's candidate of the shared pipeline. Backends
+  `None` (device), `"virtual"` (the shared virtual runner over the retained
+  cost graph), `"functional"` (host execution of the same C; V1-04).
+  Multi-phase programs raise.
 * **Native recipes** (`apu_v1_native_vector.py`, `apu_v1_histogram.py`,
   `apu_v1_distance_argmin.py`, `apu_v1_moments.py`,
   `apu_v1_record_frequency.py`, `apu_v1_native_cost.py`):
@@ -887,9 +900,13 @@ Follow the AiM backend as the smallest complete example
    `tests/perf/test_simulator_unavailable.py`, `tests/perf/test_run_result_contract.py`,
    `tests/pim/test_import_surface.py`, and `docs/release/CAPABILITIES.md`.
 
-A typed route (no matcher) instead adds a `_ProgramRoute` entry in
-`allo/compiler.py::_PROGRAM_ROUTES` with its own `compile_fn(program,
-target, *, cost, backend)`.
+A program record without source (no matcher) is a *frontend* of the same
+pipeline instead: a `normalize_<record>` function states its semantics as
+synthetic matches plus `ProgramFacts` (`allo/pim/record_frontend.py`
+helpers), the target's enumerator turns the record into candidates whose
+`CandidateEffects` the shared validator checks, and the backend context
+materializes and runs them (`apu_g2_record_frontend.py`,
+`apu_v1_record_frontend.py` are the two examples).
 
 ## 5. Inspecting a chosen program
 
@@ -913,8 +930,10 @@ For the APU v1 vector route: `compiled.plans`, `compiled.ranked_plans`,
 `compiled.plan_selection`, `compiled.reduction_policy_pruned`,
 `compiled.execution_graph`, `compiled.estimate(plan=None)`;
 `result.extra["plan"]`, `["plan_selection"]`, `["plan_regroups_reduction"]`,
-`["numerics"]`, `["board_lock"]`. For `APUv1Program`: `compiled.hybrid_manifest`,
-`compiled.native_vector_lowering`, `compiled.device_source`. For Gemini-II
+`["numerics"]`, `["board_lock"]`. For `APUv1Program`: `compiled.route`,
+`compiled.hybrid_manifest`, `compiled.native_vector_lowering`,
+`compiled.device_source`, `compiled.lowered` (the `CompiledAPUv1Program`).
+For Gemini-II
 source: `compiled.compiled.plan`, `.ranking`, `.rejected`, `.selection`,
 `.placement_ranking`, `.manifest()`, `.repetitions`; `result.extra`
 carries `layout_fingerprint`, `program_fingerprint`, `packing_attestation`,
@@ -942,7 +961,8 @@ Allo alone.
 
 | Module | Responsibility |
 |---|---|
-| `allo/compiler.py` | `allo.compile`, typed routes, planner hooks over the shared facts, `CompiledCallable`, work-scope stamping, carried-accumulator binding |
+| `allo/compiler.py` | `allo.compile` (record frontends, shared front stages, common candidate pipeline), `CompiledCallable`, work-scope stamping, carried-accumulator binding |
+| `allo/pim/record_frontend.py`, `allo/pim/apu_v1_record_frontend.py`, `allo/pim/apu_g2_record_frontend.py` | program records as frontends: synthetic semantic contract, record candidates with declared effects, realized record programs |
 | `allo/spmw_pipeline.py` | shared front stages of every source workload: frontend, matcher view, coverage contracts, `SourceProgram` |
 | `allo/spmw_semantics.py` | shared semantic facts (`ProgramFacts`, `Contraction`, `Epilogue`, `BufferAccess`, `OutputSink`, `ElementType`) derived from the match trace and retained IR types |
 | `allo/spmw_target.py` | target language: units, memories, registers, ops, moves, patterns, host-move recording, host programs |

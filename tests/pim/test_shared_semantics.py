@@ -712,7 +712,7 @@ def _corrupted(original, mutate):
                 e,
                 launches=tuple(replace(l, reduction=(0, 2)) for l in e.launches),
             ),
-            "not a tiling",
+            "not an ordered partition",
         ),
     ],
     ids=["inputs", "transfers", "axis", "storage", "launch_index", "reduction"],
@@ -851,3 +851,272 @@ def test_gemini_ii_records_enter_the_common_pipeline():
         np.zeros((256, 2), np.int16),
     )
     assert run.kind == "virtual" and run.extra["outputs"] == {}
+
+
+# --------------------------------------------------------------------------- #
+# (j) APUv1Program records as frontends of the shared pipeline (slice 4)
+# --------------------------------------------------------------------------- #
+
+
+def scan_scalar(values: allo.ir.types.int32[64], out: allo.ir.types.int32[64]):
+    total: allo.ir.types.int32 = 0
+    for i in range(64):
+        if values[i] > 3:
+            total += values[i]
+        out[i] = total
+
+
+def dense_histogram_record(values: uint16[32768]) -> uint16[256]:
+    counts: uint16[256] = 0
+    for bin_index in range(256):
+        for item in allo.reduction(32768):
+            if values[item] == bin_index:
+                counts[bin_index] += 1
+    return counts
+
+
+def test_apu_v1_program_records_enter_the_common_pipeline():
+    """An ``APUv1Program`` (scalar ARC C or a native recipe) is a frontend:
+    its effects are stated in the shared contract, its lowering is the one
+    candidate validated, priced, ranked and materialized by the common
+    pipeline, and the shared artifact runs it."""
+    from allo.pim.apu_v1_record_frontend import APUv1RecordProgram
+
+    target = build_apu_v1_target()
+    scalar = allo.APUv1Program((allo.APUv1Phase(scan_scalar),), name="scan_scalar")
+    compiled = allo.compile(scalar, target, apu_v1_cost, backend="functional")
+    assert isinstance(compiled, allo.compiler.CompiledCallable)
+    facts = compiled.trace.semantics
+    assert facts.frontend is scalar and facts.contractions == ()
+    (match,) = facts.trace.matches
+    assert match.target_op_name == "ARC_SCALAR_PROGRAM"
+    assert match.extra["result_instances"] == 64
+    effects = compiled.compiled.layout.extra["effects"]
+    assert effects.coverage.inputs == ("values",) and effects.abi_outputs == ("out",)
+    assert {(v.value, v.storage) for v in effects.value_layouts} == {
+        ("values", "l4"),
+        ("out", "l4"),
+    }
+    (launch,) = effects.launches
+    assert launch.kind == "scalar_arc_c" and launch.instances == (0, 64)
+    assert launch.reduction is None and launch.covers[0] == "scalar_arc_c"
+    (kernel,) = compiled.placement_ranking.kernels
+    assert [mode for _p, _c, mode in kernel.scores] == ["scan_scalar"]
+    program = compiled.backend_program
+    assert isinstance(program, APUv1RecordProgram) and program.record is scalar
+    assert compiled.route == "scalar_arc_c" and compiled.native_vector_lowering is None
+    assert "allo_scratch" in compiled.device_source
+    assert tuple(inspect.signature(compiled).parameters) == ("values", "out")
+    assert compiled.estimate().cycles > 0
+    assert compiled.execution_graph.metadata["launch_count"] == 1
+    values = np.arange(64, dtype=np.int32) % 7
+    out = np.zeros(64, np.int32)
+    run = compiled(values, out)
+    assert run.kind == "functional" and run.cycles is None
+    np.testing.assert_array_equal(
+        out, np.cumsum(np.where(values > 3, values, 0)).astype(np.int32)
+    )
+
+    phase = allo.APUv1Phase(
+        dense_histogram_record, result_names=("counts",), vectorize="required"
+    )
+    native = allo.APUv1Program((phase,), name="histogram_record")
+    virtual = allo.compile(native, target, apu_v1_cost, backend="virtual")
+    (match,) = virtual.trace.semantics.trace.matches
+    assert match.target_op_name == "NATIVE_VECTOR_PROGRAM"
+    effects = virtual.compiled.layout.extra["effects"]
+    (launch,) = effects.launches
+    assert launch.kind == "native_vector" and launch.instances == (0, 256)
+    assert launch.covers[0] == virtual.native_vector_lowering.route
+    assert effects.coverage.outputs == ("counts",) and effects.abi_inputs == ("values",)
+    assert virtual.execution_graph.metadata["estimate_validity"] == "calibrated"
+    run = virtual(np.zeros(32768, np.uint16))
+    assert run.kind == "virtual" and run.cycles == virtual.estimate().cycles > 0
+    assert run.extra["native_vector_route"] == virtual.native_vector_lowering.route
+    # The route's own name or family selects it; a foreign name is refused;
+    # a native recipe has no host execution path.
+    forced = allo.compile(
+        native, target, apu_v1_cost, backend="virtual", layout="native_vector"
+    )
+    assert forced.backend_program.selection == "forced"
+    with pytest.raises(ValueError, match="names no candidate"):
+        allo.compile(
+            native, target, apu_v1_cost, backend="virtual", layout="temporal_svp"
+        )
+    with pytest.raises(NotImplementedError, match="no host execution path"):
+        allo.compile(native, target, apu_v1_cost, backend="functional")
+    # The same shared contract checks a record candidate's declared effects.
+    from allo.pim import apu_v1_record_frontend as record_frontend
+
+    original = record_frontend.apu_v1_program_candidates
+
+    def one_instance(view, matches):
+        placements = original(view, matches)
+        for placement in placements:
+            effects = placement.extra["effects"]
+            placement.extra["effects"] = replace(
+                effects,
+                launches=tuple(replace(l, instances=(0, 1)) for l in effects.launches),
+            )
+        return placements
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(record_frontend, "apu_v1_program_candidates", one_instance)
+        with pytest.raises(ValueError, match="not a tiling of \\[0, 64\\)"):
+            allo.compile(scalar, target, apu_v1_cost, backend="virtual")
+
+
+# --------------------------------------------------------------------------- #
+# (k) The candidate contract's launch chain, accumulator modes and extents
+#     of every operation (review round 15, C-30 follow-up)
+# --------------------------------------------------------------------------- #
+
+
+def carry_grid(L: float16[3, 8], R: float16[8, 5], Z: float16[3, 5]):
+    for rr, cc in allo.grid(3, 5):
+        for kk in range(8):
+            Z[rr, cc] += L[rr, kk] * R[kk, cc]
+
+
+def offset_grid(L: int4[3, 8], R: int4[8, 5], Z: int15[3, 5]):
+    for rr, cc in allo.grid(3, 5):
+        tmp: int15 = 0
+        for kk in range(8):
+            tmp += L[rr, kk] * R[kk, cc]
+        Z[rr, cc] = tmp
+
+
+def test_repeated_reduction_chunk_is_rejected_before_selection(monkeypatch):
+    """A plan whose launches sum a chunk twice (its effects describing those
+    launches accurately) is refused by the contract: the reduction ranges of
+    one instance range must be an ordered partition, not a set that tiles."""
+    from allo.pim import apu_g2_source_route as route
+
+    original = route.apu_g2_source_candidates
+
+    def duplicated(target, matches):
+        candidates = original(target, matches)
+        for placement in candidates:
+            if placement.mode != "single/k2":
+                continue
+            payload = placement.extra["payload"]
+            first, second = payload.plan.launches
+            payload.plan.launches = (first, replace(second, final=False), second)
+            placement.extra["effects"] = payload.effects()
+            placement.extra["candidate_decision"] = payload.decision()
+            placement.extra["launch_count"] = 3
+        return candidates
+
+    monkeypatch.setattr(route, "apu_g2_source_candidates", duplicated)
+    with pytest.raises(
+        (ValueError, RuntimeError), match="ordered partition|cost stage rejected"
+    ) as error:
+        allo.compile(
+            offset_grid, build_apu_g2_target(), apu_g2_cost, layout="single/k2"
+        )
+    assert "ordered partition" in str(error.value)
+
+
+def test_declared_accumulator_mode_must_match_the_source_initialization(
+    monkeypatch,
+):
+    """A carried source accumulator cannot be declared as zero-started (nor
+    the reverse), and a continuation launch must start from the previous
+    launch's partial sum."""
+    from allo.pim import apu_v1_vector_program as vector
+    from allo.pim import apu_g2_source_route as route
+
+    original_vector = vector.apu_v1_vector_candidates
+
+    def declared_zero(target, matches):
+        candidates = original_vector(target, matches)
+        for placement in candidates:
+            effects = placement.extra["effects"]
+            placement.extra["effects"] = replace(
+                effects,
+                launches=tuple(
+                    replace(l, accumulator="zero") for l in effects.launches
+                ),
+            )
+        return candidates
+
+    monkeypatch.setattr(vector, "apu_v1_vector_candidates", declared_zero)
+    with pytest.raises(ValueError, match="starts its accumulator as 'zero'") as error:
+        allo.compile(
+            carry_grid,
+            build_apu_v1_target(),
+            apu_v1_cost,
+            backend="virtual",
+            reduction_order="reassociate",
+        )
+    assert "the source initializes it as 'carried'" in str(error.value)
+
+    original = route.apu_g2_source_candidates
+
+    def continuation_carried(target, matches):
+        candidates = original(target, matches)
+        for placement in candidates:
+            effects = placement.extra["effects"]
+            placement.extra["effects"] = replace(
+                effects,
+                launches=tuple(
+                    replace(l, accumulator="carried") if l.index else l
+                    for l in effects.launches
+                ),
+            )
+        return candidates
+
+    monkeypatch.setattr(route, "apu_g2_source_candidates", continuation_carried)
+    with pytest.raises(ValueError, match="not 'previous'"):
+        allo.compile(
+            offset_grid, build_apu_g2_target(), apu_g2_cost, layout="single/k2"
+        )
+
+
+def test_elementwise_record_launch_must_cover_every_result_instance(monkeypatch):
+    """A typed elementwise record (no contraction) has an instance extent
+    too: its loop trips.  A launch declaring one instance for a 64-element
+    add is refused, and the realized record is compared with the declared
+    effects field by field."""
+    from allo.pim import apu_g2_record_frontend as records
+    from allo.pim.apu_g2_typed_program import APUG2ScalarType, APUG2TypedProgram
+
+    original = records.apu_g2_record_candidates
+
+    def one_instance(*args):
+        candidates = original(*args)
+        for placement in candidates:
+            effects = placement.extra["effects"]
+            placement.extra["effects"] = replace(
+                effects,
+                launches=tuple(replace(l, instances=(0, 1)) for l in effects.launches),
+            )
+        return candidates
+
+    monkeypatch.setattr(records, "apu_g2_record_candidates", one_instance)
+    i4 = APUG2ScalarType(4, True)
+    add = APUG2TypedProgram("add", (i4, i4), i4, (64,))
+    with pytest.raises(ValueError, match="not a tiling of \\[0, 64\\)"):
+        allo.compile(add, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    monkeypatch.undo()
+
+    # A declaration that passes the contract but is not the record's own
+    # effects is caught when the realization is compared with it.
+    from allo.spmw_apu_g2 import APUG2SourceCtx
+
+    def swapped_route(*args):
+        candidates = original(*args)
+        for placement in candidates:
+            effects = placement.extra["effects"]
+            placement.extra["effects"] = replace(
+                effects,
+                transfers=tuple(
+                    replace(t, route=("elsewhere",)) for t in effects.transfers
+                ),
+            )
+        return candidates
+
+    monkeypatch.setattr(records, "apu_g2_record_candidates", swapped_route)
+    with pytest.raises(RuntimeError, match="differs from the candidate contract"):
+        allo.compile(add, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    assert APUG2SourceCtx.check_realization is not None

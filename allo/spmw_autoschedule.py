@@ -1124,9 +1124,11 @@ def _upmem_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
 
 @register_enumerator("apu_v1")
 def _apu_v1_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
-    """APU v1 candidates: the GVML vector plans of a plain-function
-    contraction (`allo.pim.apu_v1_vector_program.apu_v1_vector_candidates`),
-    or the grouped-tree program of a dataflow region's work item
+    """APU v1 candidates: the lowering of an ``APUv1Program`` record
+    (`allo.pim.apu_v1_record_frontend.apu_v1_program_candidates`), the GVML
+    vector plans of a plain-function contraction
+    (`allo.pim.apu_v1_vector_program.apu_v1_vector_candidates`), or the
+    grouped-tree program of a dataflow region's work item
     (`_apu_v1_grouped_enumerate`).  The reduction-order policy is consulted
     here: regrouping vector plans are pruned under a strict float policy and
     the grouped program, which always regroups, is refused."""
@@ -1136,6 +1138,16 @@ def _apu_v1_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
         no_strict_program_error,
     )
 
+    facts = matches[0].extra.get("program_facts")
+    if getattr(facts, "frontend", None) is not None:
+        from .pim.apu_v1_record_frontend import (
+            apu_v1_program_candidates,
+            is_apu_v1_program,
+        )
+
+        if is_apu_v1_program(facts.frontend):
+            # An ``APUv1Program`` record: its lowering is the one candidate.
+            return apu_v1_program_candidates(target, matches)
     scope = _matcher_work_scope(matches[0])
     if not scope.group_shape:
         from .pim.apu_v1_vector_program import apu_v1_vector_candidates
@@ -1418,7 +1430,7 @@ def autoschedule(
         candidates = enumerator(target_, matches)
         if candidate_filter is not None:
             candidates = select_candidates(candidates, candidate_filter, matches)
-        kept, verdicts = [], []
+        kept, verdicts, violated = [], [], {}
         for candidate in candidates:
             verdict = check_placement(target_, matches, candidate)
             if verdict.legal:
@@ -1434,6 +1446,7 @@ def autoschedule(
                         "contract: " + "; ".join(problems)
                     )
                     reasons[reason] = reasons.get(reason, 0) + 1
+                    violated[candidate.mode] = reason
                     continue
                 kept.append(candidate)
                 continue
@@ -1444,6 +1457,17 @@ def autoschedule(
             reasons = illegal.setdefault(_matcher_work_scope(matches[0]).group_id, {})
             reason = f"illegal placement {candidate.mode!r}: {anonymous.describe()}"
             reasons[reason] = reasons.get(reason, 0) + 1
+        if candidate_filter is not None and violated:
+            # A layout request that names only contract-violating
+            # candidates is refused with their reasons, not left to the
+            # ranking to report as an empty selection.
+            requested = [c for c in candidates if not c.extra.get("candidate_excluded")]
+            if requested and all(c.mode in violated for c in requested):
+                raise ValueError(
+                    f"the layout request of {matches[0].func_name!r} names only "
+                    "candidates that violate the candidate contract: "
+                    + "; ".join(violated[c.mode] for c in requested)
+                )
         if candidates and not kept:
             if not verdicts:
                 group_reasons = illegal.get(

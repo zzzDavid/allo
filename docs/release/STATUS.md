@@ -3,7 +3,7 @@
 
 # Release status
 
-Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline; committed as `9255d29`, exercised from the installed wheel on the simulators, the APU v1 board and the Gemini-II card). Read `TASK.md` in the containing repository,
+Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline; committed as `9255d29`, exercised from the installed wheel on the simulators, the APU v1 board and the Gemini-II card; round 16: the reviewer's three contract gaps closed (C-30b) and `APUv1Program` migrated into the shared pipeline, the last typed route removed). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -43,10 +43,14 @@ then this file, then `ISSUES.md` for the next action.
    candidate contract and the Gemini-II typed-record frontends in rounds
    14-15. At `9255d29` the installed wheel ran the shared pipeline on the
    simulators, the APU v1 board and the Gemini-II card (VALIDATION.md
-   round 15). Open: `APUv1Program` (the remaining typed route), the matcher
-   backends' effects declarations, and the slice 5 traces of forced
-   alternatives and cost perturbations on both hardware hosts. Map and
-   status: `design/shared-compilation-path.md`.
+   round 15). Round 16 closed the reviewer's three contract gaps (C-30b:
+   ordered reduction partitions with multiplicity, accumulator chains
+   against the source initialization, extents of every operation) and
+   migrated `APUv1Program` into the shared pipeline; no typed route
+   remains. Open: the matcher backends' effects declarations and facts
+   consumption, the hybrid manifest's scalar ABI from retained IR, and the
+   slice 5 traces of forced alternatives and cost perturbations on both
+   hardware hosts. Map and status: `design/shared-compilation-path.md`.
 2. **G2**: the independent reviewer disproved the round 7 PASS with two
    executed wrong-code probes at `e41ebbd` (C-19 casts erased, C-20 guarded
    copies), repaired in round 8 (plus C-21), and then found two more at
@@ -67,6 +71,25 @@ then this file, then `ISSUES.md` for the next action.
    build path for a user without the patches is the open question the
    reviewer named.
 4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+
+## Round 16 (2026-11-03): what was done
+
+- Reviewer findings on `9255d29`/`0f6c321` (C-30b): the shared validator
+  derives an extent for every matched operation, requires the launches of
+  one instance range to be an ordered partition of the reduction with
+  multiplicity, and checks the accumulator chain against the source
+  initialization; the realization checks compare instances, reduction and
+  initializer (APU v1 vector plans) or the recomputed effects (record
+  programs). The reviewer's three reproducers are rejection regressions.
+- G9 slice 4 completed: `APUv1Program` is a frontend of the shared pipeline
+  (`allo/pim/apu_v1_record_frontend.py`; `record_frontend.py` holds the
+  helpers both record frontends share); `_PROGRAM_ROUTES`,
+  `_compile_program`, `compile_apu_v1_program` and `APUv1ProgramCallable`
+  are deleted; `compiled.native_vector_lowering`, `.device_source`,
+  `.hybrid_manifest`, `.route`, `.lowered` are forwarded by the shared
+  `CompiledCallable`. A layout request naming only contract-violating
+  candidates is refused with their reasons.
+- Evidence: VALIDATION.md round 16.
 
 ## Round 15 (2026-11-03): what was done
 
@@ -216,19 +239,20 @@ then this file, then `ISSUES.md` for the next action.
 
 ## Next concrete actions (in order)
 
-1. G9 slice 4 (remaining): `APUv1Program` (scalar ARC programs, native
-   recipes) normalizes into the shared contracts and enters the same
-   legality, selection and materialization stages; remove the
-   `_PROGRAM_ROUTES` early return; the hybrid manifest's scalar ABI from
-   the retained IR instead of text; the matcher backends declare
-   `CandidateEffects`.
-2. G9 slice 5 (remaining): stage traces of forced alternatives and cost
-   perturbations reaching generated code and launches on the APU v1 board
-   and the Gemini-II card at one revision (the installed-wheel runs on both
-   hosts and the full suites at `9255d29` are in VALIDATION.md round 15).
-3. Independent review of the candidate boundary (C-28, C-29) and the
-   remaining semantic items; then the deferred installation and lint work
-   (P-04 Samsung patches, P-23 pylint stage).
+1. G9, matcher backends: Samsung, AiM, UPMEM and AttAcc candidates declare
+   `CandidateEffects` (coverage, value layouts on their handles, transfers,
+   launches) and their enumerators consume `ProgramFacts` instead of
+   re-reading `MatchedOp` fields; the shared validator then applies to
+   every target.
+2. G9, APU v1: the hybrid manifest's scalar ABI from the retained IR
+   (`apu_v1_hybrid.discover_apu_v1_hybrid_manifest`) instead of MLIR text.
+3. G9 slice 5: traces of forced alternatives and cost perturbations
+   reaching generated code and launches on the APU v1 board and the
+   Gemini-II card at one revision, run with `-rA`/`-s` so each case's
+   printed provenance is kept in the logs; installed-wheel runs at that
+   revision.
+4. Independent review; then the deferred installation and lint work (P-04
+   Samsung patches, P-23 pylint stage) and the open minor items.
 
 ## Round 6 (2026-11-02): what was done
 

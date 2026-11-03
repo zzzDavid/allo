@@ -1876,6 +1876,9 @@ def compile_for_target(
         _check_work_grid(target, trace, layouts=layouts)
 
     ctx = ctx_cls(target)
+    # The backend the artifact will run on: a context may refuse a backend
+    # its selected program cannot serve at materialization time.
+    ctx.backend = backend
     _walk_and_emit(
         target,
         trace,

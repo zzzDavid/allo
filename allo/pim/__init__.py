@@ -14,6 +14,7 @@ from .targets import (
 )
 from .costs import aim_cost, apu_g2_cost, apu_v1_cost, samsung_cost, upmem_cost
 from .apu_v1_program import APUv1Phase, APUv1Program
+from .apu_v1_record_frontend import APUv1RecordCandidate, APUv1RecordProgram
 from .apu_v1_hybrid import (
     APUv1BarrierManifest,
     APUv1ConversionManifest,
@@ -206,6 +207,8 @@ __all__ = [
     "apu_g2_cost",
     "APUv1Phase",
     "APUv1Program",
+    "APUv1RecordCandidate",
+    "APUv1RecordProgram",
     "APUv1BarrierManifest",
     "APUv1ConversionManifest",
     "APUv1HybridManifest",

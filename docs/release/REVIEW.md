@@ -558,6 +558,58 @@ Gate G9 remains **FAIL** until `APUv1Program` is migrated, the matcher
 backends declare their effects, and the slice 5 traces (forced alternatives
 and cost perturbations on both hardware hosts) exist.
 
+## Round 16 (2026-11-03): independent review of 9255d29 and 0f6c321; contract gaps, APUv1Program
+
+The reviewer accepted the round 15 progress (records in the shared
+pipeline, launch bindings checked, no manufactured pass in the changed
+expectations, frozen paper intact) and found C-30 partially repaired, with
+three accepted-invalid contracts (C-30b):
+
+- Repeated reduction chunks (fixed). `_tiles` worked on a set of ranges,
+  so a plan summing one chunk twice passed when its effects described it
+  accurately; the runtime oracle caught the wrong value after execution.
+  Judgment: the contract must establish the ordered accumulation chain
+  before selection. Per operation and instance range, the launches'
+  reduction ranges now have to be an ordered partition with multiplicity,
+  and the accumulator chain has to start as the source initializes the
+  accumulator and continue from the previous launch.
+- Accumulator modes unchecked (fixed). A carried contraction declared as
+  zero-started was accepted, and the APU v1 realization check compared
+  launch count, kind and plan name only. Judgment: initialization and
+  continuation modes are checked against the semantic facts in the shared
+  validator and the realization checks compare instances, reduction range
+  and initializer (APU v1 vector plans) or the complete recomputed effects
+  (record programs on both APUs).
+- Extents of non-contraction operations (fixed). The extent check indexed
+  a filtered contraction list by original match indices and skipped
+  elementwise operations, so a 64-element typed add accepted one declared
+  instance. Judgment: every matched operation has an extent (contraction
+  trips, epilogue loop trips, a record's declared result instances) or the
+  candidate is refused.
+
+The reviewer's three reproducers are rejection regressions
+(`test_shared_semantics.py` section k); their original file now fails at
+compile on all three.
+
+Slice 4 completed as directed: `APUv1Program` normalizes into the shared
+contracts (`allo/pim/apu_v1_record_frontend.py`) and the early return in
+`allo/compiler.py` is gone with the typed route's callable. Judgment on
+the semantic statement of a whole-function program: the matcher cannot
+recognize it, so its contract is its external effects (the scalar ABI's
+reads and writes, one launch over the result buffer's elements), stated on
+non-matchable target operations declared on the ARC unit over L4; the
+shared validator checks the candidate against exactly that program, and
+the realization check recomputes the effects from the lowered program.
+Native recipes keep their structural proof as the lowering; their
+`backend="functional"` refusal is made at materialization, before an
+artifact exists.
+
+Gate G9 remains **FAIL** until the matcher backends declare their effects
+and consume the facts, the hybrid manifest reads the scalar ABI from the
+retained IR, and the slice 5 traces (forced alternatives and cost
+perturbations on both hardware hosts, with per-case provenance kept in the
+logs) exist.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -607,6 +659,6 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 | G6 evidence beyond examples | **PARTIAL (reopened in round 8)** | EVIDENCE.md tables plus the round 6 probe files; remaining gaps are hardware-only confirmations listed in VALIDATION.md; the independent reviewer's probes varied the output conversion and a store guard, which the round 6 campaign had not, and found two silent defects; the campaign is kept as regression evidence, not as proof of generality; new probes must target the shared semantic contracts on every route |
 | G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install at ffb4a78 (needs repeating at the candidate, INSTALL.md section 6); AiM and UPMEM simulator recipes now ship in `simulators/` and were rebuilt from the release copies; Samsung's route is not buildable from the release repository without Samsung's permission for the five patches (P-04, documented, `apply.sh` refuses); architecture doc update for the shared pipeline pending (G9); P-17 documented proprietary SDK |
 | G8 backend execution | **evidence complete at 9255d29, pending independent review** | installed-artifact runs at the round 10 repair (VALIDATION.md round 10) and again at the round 15 commit: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock, 3 passed) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed through the shared pipeline); all reviewer probes of rounds 8 to 14 rejected or executed correctly through the installed wheel (VALIDATION.md round 15); AttAcc analytical by design; AiM timing-only as accepted |
-| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-15: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, an enforced typed candidate contract (C-30), supplied placements rebound (C-28), orchestration and launch bindings validated before selection (C-29, C-29b), Gemini-II typed records as frontends of the pipeline (ISSUES X-01); both hardware hosts and the installed wheel exercised at `9255d29`; open: `APUv1Program` (typed route), matcher backends' effects, slice 5 traces of forced alternatives and cost perturbations on hardware |
+| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-15: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, an enforced typed candidate contract (C-30), supplied placements rebound (C-28), orchestration and launch bindings validated before selection (C-29, C-29b), Gemini-II typed records and `APUv1Program` as frontends of the pipeline (ISSUES X-01; round 16 removed the last typed route), the launch chain, accumulator modes and every operation's extent enforced (C-30b); both hardware hosts and the installed wheel exercised at `9255d29`; open: matcher backends' effects and facts consumption, the hybrid manifest's text ABI, slice 5 traces of forced alternatives and cost perturbations on hardware |
 
-Verdict: **NOT READY**. Blockers: G9 (X-01) is in progress (`APUv1Program` migration, slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.
+Verdict: **NOT READY**. Blockers: G9 (X-01) is in progress (matcher backends' effects, hybrid manifest ABI, slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.

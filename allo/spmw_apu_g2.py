@@ -154,19 +154,22 @@ class APUG2SourceCtx(CodegenContext):
         effects = candidate_effects(placement)
         if effects is None:
             raise RuntimeError("Gemini-II candidate declares no effects")
-        from .pim.apu_g2_record_frontend import APUG2RecordProgram, record_fingerprint
+        from .pim.apu_g2_record_frontend import APUG2RecordProgram
 
         if isinstance(self.program, APUG2RecordProgram):
+            # The realization is the record itself: its effects, derived
+            # again from the record and the facts (coverage, layouts,
+            # transfers, the one launch's instances, reduction and
+            # accumulator, ABI), must be the declared ones.
+            from .pim.apu_g2_record_frontend import APUG2RecordCandidate
+
             record = self.program.record
-            (launch,) = effects.launches
-            if (
-                effects.abi_outputs != ("out",)
-                or launch.covers[:2] != (record.name, record_fingerprint(record))
-                or effects.coverage.function != record.name
-            ):
+            actual = APUG2RecordCandidate(record, self.program.facts).effects()
+            if actual != effects:
                 raise RuntimeError(
                     f"Gemini-II record realization {record.name!r} differs from the "
-                    "candidate contract"
+                    f"candidate contract: realized {actual.manifest()}, declared "
+                    f"{effects.manifest()}"
                 )
             return
         contract = self.program.contract

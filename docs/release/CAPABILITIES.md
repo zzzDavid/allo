@@ -18,7 +18,9 @@ Terms used below:
   the APU v1 vector route and the Gemini-II source route) passed to
   `allo.compile(workload, target, cost)`. *Typed*: a typed program object
   (`APUv1Program`, `APUG2TypedProgram`, `APUG2ComposedContractionProgram`)
-  passed to `allo.compile`; these bypass the matcher.
+  passed to `allo.compile`; they have no source for the matcher and enter
+  the shared pipeline as frontends (their semantics stated in the shared
+  program contract, their realization a candidate of the common selection).
 - **Modes**, matching `RunResult.kind`: *compile-only* (emit and inspect, no
   run), *analytical* (`backend="virtual"`, `kind="virtual"`; cost-program
   evaluation of the retained execution graph; nothing executes and caller
@@ -241,5 +243,6 @@ without coefficients.
   target, the priced graph and the realized program (C-30). Plain
   helper-function calls in ordinary source are refused at the shared
   boundary (C-27); dataflow regions remain the interprocedural form. The
-  Gemini-II typed records are frontends of this pipeline; `APUv1Program`
-  is still a separate frontend (slice 4, remaining).
+  Gemini-II typed records and `APUv1Program` are frontends of this
+  pipeline (rounds 15 and 16); the matcher backends' candidates do not
+  declare `CandidateEffects` yet.
