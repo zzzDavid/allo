@@ -7,9 +7,9 @@ import inspect
 import numpy as np
 
 import allo
+from allo.compiler import CompiledCallable
 from allo.pim.apu_g2_typed_program import (
     APUG2ScalarType,
-    APUG2TypedCallable,
     APUG2TypedOperation,
     APUG2TypedProgram,
     build_apu_g2_typed_recipe,
@@ -66,7 +66,7 @@ def test_allo_compile_builds_virtual_typed_callables_for_all_profiles():
             apu_g2_cost,
             backend="virtual",
         )
-        assert isinstance(compiled, APUG2TypedCallable)
+        assert isinstance(compiled, CompiledCallable)
         assert compiled.estimate().cycles > 0
         assert compiled.execution_graph.metadata["physical_recipe"] is True
         assert (

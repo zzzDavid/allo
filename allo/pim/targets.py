@@ -1522,6 +1522,24 @@ def build_apu_g2_contraction_patterns():
                     const_params=("alpha", "beta"),
                     intermediate="i24",
                 )
+                # Operations the typed program records
+                # (`allo.pim.apu_g2_record_frontend`) state their semantics
+                # with.  Not matchable from ordinary source yet: no source
+                # lowering of an elementwise or block-sum typed program exists.
+                allo.op(
+                    "SUM",
+                    src=(seg0,),
+                    dst=seg1,
+                    accumulates=True,
+                    fn=lambda x, acc: acc + x,
+                    matchable=False,
+                )
+                for name, fn in (
+                    ("ADD", lambda x, y: x + y),
+                    ("MUL", lambda x, y: x * y),
+                    ("DIV", lambda x, y: x // y),
+                ):
+                    allo.op(name, src=(seg0, seg0), dst=seg1, fn=fn, matchable=False)
 
     return patterns
 

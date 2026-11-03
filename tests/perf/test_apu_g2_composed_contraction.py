@@ -220,7 +220,7 @@ def test_compile_exports_and_semantic_signatures_are_exact():
             apu_g2_cost,
             backend="virtual",
         )
-        assert isinstance(compiled, allo.APUG2ComposedContractionCallable)
+        assert isinstance(compiled, allo.CompiledCallable)
         assert compiled.estimate().cycles > 0
         names = tuple(inspect.signature(compiled).parameters)
         if program.epilogue.mode.value == "accumulate":

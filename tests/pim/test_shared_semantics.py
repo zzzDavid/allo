@@ -13,6 +13,8 @@ output) now compiles and executes through the shared path.
 
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import pytest
 
@@ -29,7 +31,9 @@ from allo.pim.targets import (
     build_samsung_target,
 )
 from allo.spmw_match import MatchTrace, UnsupportedWorkloadError
+from allo.spmw_candidate import CandidateValueLayout
 from allo.spmw_reduction_policy import ReductionOrderError
+from dataclasses import replace
 from allo.spmw_pipeline import matcher_view, normalize_source
 from allo.spmw_semantics import ProgramFacts, analyze_program
 
@@ -597,3 +601,253 @@ def test_candidate_effects_are_validated_against_the_program(monkeypatch):
     monkeypatch.setattr(vector, "apu_v1_vector_candidates", wrong_coverage)
     with pytest.raises(ValueError, match="violates the candidate contract"):
         allo.compile(gemm_n, build_apu_v1_target(), apu_v1_cost, backend="virtual")
+
+
+# --------------------------------------------------------------------------- #
+# (h) Launch bindings and the enforced candidate contract (review round 14)
+# --------------------------------------------------------------------------- #
+
+
+@allo.host_program(gemm_n)
+def launch_swapped(left, right, result):
+    allo.launch("gemm_n", right, left, result)
+
+
+@allo.host_program(gemm_n)
+def launch_without_operands(left, right, result):
+    allo.launch("gemm_n")
+
+
+@allo.host_program(ig_n)
+def launch_ig_swapped(L, R, C):
+    allo.launch("ig_n", R, L, C)
+
+
+def test_launch_operands_are_validated_against_the_kernel_abi():
+    """The reviewer's probe: ``allo.launch('fold_blocks', B, A, Z)`` was
+    accepted and executed ``A @ B``; a launch without operands executed too.
+    Operands are now retained on the schedule and checked against the
+    kernel's declared buffers, for every target, before selection."""
+    with pytest.raises(ValueError, match="rebind its ABI"):
+        allo.compile(
+            gemm_n,
+            build_apu_v1_target(),
+            apu_v1_cost,
+            backend="functional",
+            host_moves=launch_swapped,
+        )
+    with pytest.raises(ValueError, match="0 operand"):
+        allo.compile(
+            gemm_n,
+            build_apu_v1_target(),
+            apu_v1_cost,
+            backend="functional",
+            host_moves=launch_without_operands,
+        )
+    with pytest.raises(ValueError, match="rebind its ABI"):
+        allo.compile(
+            ig_n,
+            build_apu_g2_target(),
+            apu_g2_cost,
+            backend="virtual",
+            host_moves=launch_ig_swapped,
+        )
+    once = allo.compile(
+        gemm_n,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="functional",
+        host_moves=launch_gemm_once,
+    )
+    (step,) = once.compiled.launch_schedule.steps
+    assert step.operands == ("left", "right", "result")
+
+
+def _corrupted(original, mutate):
+    def enumerate_changed(target, matches):
+        placements = original(target, matches)
+        for placement in placements:
+            placement.extra["effects"] = mutate(placement.extra["effects"])
+        return placements
+
+    return enumerate_changed
+
+
+@pytest.mark.parametrize(
+    "mutation, reason",
+    [
+        (lambda e: replace(e, coverage=replace(e.coverage, inputs=())), "reads"),
+        (lambda e: replace(e, transfers=()), "never transferred"),
+        (
+            lambda e: replace(
+                e,
+                value_layouts=(
+                    CandidateValueLayout(e.abi_outputs[0], ("nonexistent_axis",), "vr"),
+                )
+                + e.value_layouts[1:],
+            ),
+            "not a loop of the program",
+        ),
+        (
+            lambda e: replace(
+                e,
+                value_layouts=tuple(
+                    replace(v, storage="not_a_storage") for v in e.value_layouts
+                ),
+            ),
+            "does not declare",
+        ),
+        (
+            lambda e: replace(
+                e,
+                launches=tuple(
+                    replace(l, index=-7, kind="nothing", instances=(0, 1))
+                    for l in e.launches
+                ),
+            ),
+            "out of order",
+        ),
+        (
+            lambda e: replace(
+                e,
+                launches=tuple(replace(l, reduction=(0, 2)) for l in e.launches),
+            ),
+            "not a tiling",
+        ),
+    ],
+    ids=["inputs", "transfers", "axis", "storage", "launch_index", "reduction"],
+)
+def test_candidate_effects_fault_injection_is_rejected(monkeypatch, mutation, reason):
+    """Every field of the candidate contract is checked against the program
+    and the target (the reviewer's fault injection): a corrupted candidate
+    is rejected before costing on both APU backends."""
+    from allo.pim import apu_v1_vector_program as vector
+    from allo.pim import apu_g2_source_route as route
+
+    monkeypatch.setattr(
+        vector,
+        "apu_v1_vector_candidates",
+        _corrupted(vector.apu_v1_vector_candidates, mutation),
+    )
+    with pytest.raises(ValueError, match="violates the candidate contract") as error:
+        allo.compile(gemm_n, build_apu_v1_target(), apu_v1_cost, backend="virtual")
+    assert reason in str(error.value)
+    monkeypatch.setattr(
+        route,
+        "apu_g2_source_candidates",
+        _corrupted(route.apu_g2_source_candidates, mutation),
+    )
+    with pytest.raises(ValueError, match="violates the candidate contract") as error:
+        allo.compile(ig_n, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    assert reason in str(error.value)
+
+
+def test_cost_graph_must_agree_with_the_declared_launches(monkeypatch):
+    """The priced graph of a candidate must describe its declared launches:
+    a graph that prices another plan or launch count is refused."""
+    from allo.spmw_apu_g2 import APUG2SourceCtx
+
+    original = APUG2SourceCtx.candidate_execution_graph
+
+    def wrong_count(target, trace, layout, bound_cost, **options):
+        graph = original(target, trace, layout, bound_cost, **options)
+        if graph is not None:
+            graph.metadata["launch_count"] = 5
+        return graph
+
+    monkeypatch.setattr(
+        APUG2SourceCtx,
+        "candidate_execution_graph",
+        classmethod(lambda cls, *a, **k: wrong_count(*a, **k)),
+    )
+    with pytest.raises(ValueError, match="prices 5 launch"):
+        allo.compile(ig_n, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+
+
+def test_declared_effects_match_the_realized_programs():
+    """The selected candidates' effects are typed and complete on both APUs
+    and the realization checks compared them with the artifact."""
+    v1 = allo.compile(
+        gemm_n,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="virtual",
+        reduction_order="reassociate",
+    )
+    effects = v1.compiled.layout.extra["effects"]
+    assert effects.coverage.inputs == ("left", "right")
+    assert {v.value for v in effects.value_layouts} == {"left", "right", "result"}
+    assert all(v.storage == "vr" for v in effects.value_layouts)
+    assert {t.direction for t in effects.transfers} == {"in", "inout"}
+    (launch,) = effects.launches
+    assert launch.operations == (0,) and launch.instances == (0, 16)
+    assert launch.reduction == (0, 4) and launch.covers[0] == v1.selected_plan.name
+    g2 = allo.compile(ig_n, build_apu_g2_target(), apu_g2_cost, layout="single/k2")
+    effects = g2.compiled.layout.extra["effects"]
+    assert [l.reduction for l in effects.launches] == [(0, 2), (2, 4)]
+    assert [l.accumulator for l in effects.launches] == ["none", "previous"]
+    assert all(l.instances == (0, 16) for l in effects.launches)
+    assert {v.storage for v in effects.value_layouts} == {"mmb"}
+
+
+# --------------------------------------------------------------------------- #
+# (i) Typed Gemini-II records as frontends of the shared pipeline (slice 4)
+# --------------------------------------------------------------------------- #
+
+
+def test_gemini_ii_records_enter_the_common_pipeline():
+    from allo.pim.apu_g2_record_frontend import APUG2RecordProgram
+    from allo.pim.apu_g2_typed_program import APUG2ScalarType, APUG2TypedProgram
+
+    I4 = APUG2ScalarType(4, True)
+    I15 = APUG2ScalarType(15, True)
+    I14 = APUG2ScalarType(14, True)
+    I3 = APUG2ScalarType(3, True)
+    target = build_apu_g2_target()
+    typed = APUG2TypedProgram("dot", (I4, I4), I15, (64, 128), reduction_extent=128)
+    compiled = allo.compile(typed, target, apu_g2_cost, backend="virtual")
+    assert isinstance(compiled, allo.CompiledCallable)
+    # The record's semantics are in the shared contract and its candidate
+    # passed legality, the candidate contract, costing and ranking.
+    facts = compiled.trace.semantics
+    assert facts.frontend is typed and facts.function == typed.name
+    (contraction,) = facts.contractions
+    assert [contraction.loop_labels[v] for v in contraction.reduction_vars] == ["k"]
+    (kernel,) = compiled.placement_ranking.kernels
+    assert [mode for _p, _c, mode in kernel.scores] == [typed.name]
+    effects = compiled.compiled.layout.extra["effects"]
+    assert effects.coverage.inputs == ("lhs", "rhs") and effects.abi_outputs == ("out",)
+    (launch,) = effects.launches
+    assert launch.instances == (0, 64) and launch.reduction == (0, 128)
+    program = compiled.backend_program
+    assert isinstance(program, APUG2RecordProgram) and program.record is typed
+    assert compiled.estimate().cycles > 0
+    assert tuple(inspect.signature(compiled).parameters) == ("lhs", "rhs", "out")
+    # A family name selects the record's realization; a foreign plan is refused.
+    forced = allo.compile(
+        typed, target, apu_g2_cost, backend="virtual", layout="typed_vl64"
+    )
+    assert forced.backend_program.selection == "forced"
+    with pytest.raises(ValueError, match="names no candidate"):
+        allo.compile(typed, target, apu_g2_cost, backend="virtual", layout="single/k1")
+
+    composed = allo.APUG2ComposedContractionProgram(
+        (I3, I3), I15, (256, 2), 256, allo.APUG2DotEpilogue((1,), I14)
+    )
+    accumulate = allo.compile(composed, target, apu_g2_cost, backend="virtual")
+    facts = accumulate.trace.semantics
+    assert [m.target_op_name for m in facts.trace.matches] == ["MAC", "ADD"]
+    effects = accumulate.compiled.layout.extra["effects"]
+    assert set(effects.coverage.inputs) == {"lhs", "rhs", "accumulator"}
+    assert tuple(inspect.signature(accumulate).parameters) == (
+        "lhs",
+        "rhs",
+        "accumulator",
+        "out",
+    )
+    run = accumulate(
+        np.zeros((512, 256), np.int8),
+        np.zeros((512, 256), np.int8),
+        np.zeros((256, 2), np.int16),
+    )
+    assert run.kind == "virtual" and run.extra["outputs"] == {}

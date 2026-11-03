@@ -416,11 +416,18 @@ class HostStep:
 
 @dataclass(frozen=True)
 class LaunchStep:
-    """One kernel launch bound to its matcher group."""
+    """One kernel launch bound to its matcher group.
+
+    ``operands`` are the region buffers the host program passed to
+    ``allo.launch`` (base parameter names, in call order); they equal the
+    kernel's declared ABI buffers (`launch_schedule` validates arity and
+    binding before any backend sees the schedule).
+    """
 
     kernel: str
     group_id: int
     ordinal: int
+    operands: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -441,7 +448,13 @@ class LaunchSchedule:
             (
                 ("host", step.host_index)
                 if isinstance(step, HostStep)
-                else ("launch", step.kernel, step.group_id, step.ordinal)
+                else (
+                    "launch",
+                    step.kernel,
+                    step.group_id,
+                    step.ordinal,
+                    tuple(step.operands),
+                )
             )
             for step in self.steps
         )
@@ -450,10 +463,70 @@ class LaunchSchedule:
         return steps
 
 
-def launch_schedule(host_program, trace) -> LaunchSchedule:
-    """Bind a recorded ``HostProgram`` to the matcher groups of ``trace``."""
+def _kernel_abi_names(module, parameters, entry_kernel):
+    """Declared ABI buffers of every kernel of ``module``, by kernel name: the
+    region parameters a dataflow kernel binds (``spmw.abi_value_ids``), or
+    every parameter for the plain entry function."""
+    from .spmw_match_engine import _attr_str, _parse_work_id, _retained_abi_value_ids
+
+    names = [name for name, _shape in parameters]
+    out = {}
+    body = getattr(module, "body", None)
+    for function in getattr(body, "operations", ()):
+        if getattr(getattr(function, "operation", None), "name", None) != "func.func":
+            continue
+        symbol = _attr_str(function.attributes["sym_name"])
+        kernel = _parse_work_id(symbol)[0]
+        try:
+            ids = _retained_abi_value_ids(function)
+        except (KeyError, ValueError, TypeError, AttributeError):
+            ids = None
+        if ids is not None:
+            if all(0 <= i < len(names) for i in ids):
+                out.setdefault(kernel, tuple(names[i] for i in ids))
+        elif kernel == entry_kernel and names:
+            out.setdefault(kernel, tuple(names))
+    return out
+
+
+def _check_launch_binding(record, declared):
+    """Arity and binding of one ``allo.launch`` against the kernel's ABI."""
+    operands = tuple(getattr(token, "base", token) for token in record.operands)
+    if declared is None:
+        return operands
+    if len(operands) != len(declared):
+        raise ValueError(
+            f"host program launches kernel {record.kernel!r} with "
+            f"{len(operands)} operand(s) {list(operands)}; the kernel binds "
+            f"{len(declared)} buffer(s) {list(declared)} and every launch must "
+            "pass them (sliced references such as X[b] address their base buffer)"
+        )
+    if operands != tuple(declared):
+        raise ValueError(
+            f"host program launches kernel {record.kernel!r} with operands "
+            f"{list(operands)}, which rebind its ABI {list(declared)}; a launch "
+            "must pass the kernel's buffers in declaration order (permuted or "
+            "substituted operands are not lowered)"
+        )
+    return operands
+
+
+def launch_schedule(host_program, trace, *, module=None) -> LaunchSchedule:
+    """Bind a recorded ``HostProgram`` to the matcher groups of ``trace``.
+
+    Every launch's operands are checked against the kernel's declared ABI
+    buffers (arity and order) when ``module`` is given; a launch that passes
+    no operands, too few, or a permutation is refused here, before selection,
+    because no backend lowers a rebinding of a kernel's ABI.
+    """
     from .spmw_match_engine import _parse_work_id
     from .spmw_target import HostMoveRecord, LaunchRecord
+
+    parameters = _region_parameters(getattr(host_program, "region", None))
+    entry = _parse_work_id(trace.matches[0].func_name)[0] if trace.matches else None
+    declared = (
+        _kernel_abi_names(module, parameters, entry) if module is not None else {}
+    )
 
     groups_by_kernel = {}
     group_order = []
@@ -488,7 +561,8 @@ def launch_schedule(host_program, trace) -> LaunchSchedule:
             group_id = groups[0]
             ordinal = ordinals.get(group_id, 0)
             ordinals[group_id] = ordinal + 1
-            steps.append(LaunchStep(record.kernel, group_id, ordinal))
+            operands = _check_launch_binding(record, declared.get(record.kernel))
+            steps.append(LaunchStep(record.kernel, group_id, ordinal, operands))
         else:
             raise ValueError(f"unknown host program step {record!r}")
 
@@ -500,7 +574,7 @@ def launch_schedule(host_program, trace) -> LaunchSchedule:
     return LaunchSchedule(
         tuple(steps),
         frozenset(getattr(host_program, "resident", ()) or ()),
-        _region_parameters(getattr(host_program, "region", None)),
+        parameters,
     )
 
 
@@ -542,7 +616,13 @@ def _candidate_execution_graph(target, trace, layout, bound_cost, **options):
     hook = getattr(backend_context_class(name), "candidate_execution_graph", None)
     if hook is None:
         return None
-    return hook(target, trace, layout, bound_cost, **options)
+    graph = hook(target, trace, layout, bound_cost, **options)
+    if graph is not None:
+        from .spmw_candidate import check_graph_consistency
+
+        for placement in layout if isinstance(layout, (list, tuple)) else [layout]:
+            check_graph_consistency(placement, graph)
+    return graph
 
 
 def build_execution_graph(

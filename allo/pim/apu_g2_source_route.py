@@ -34,6 +34,7 @@ Nothing here consults benchmark names or shapes; see
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 import importlib
 import math
 import string
@@ -1439,6 +1440,7 @@ class APUG2SourceCandidate:
     plan: APUG2LaunchPlan
     catalog: tuple
     rejected: tuple
+    facts: Any = None
 
     @property
     def name(self) -> str:
@@ -1466,7 +1468,13 @@ class APUG2SourceCandidate:
         return isinstance(request, str) and request == self.plan.name
 
     def effects(self):
-        """Scheduling effects in the common candidate contract."""
+        """Scheduling effects in the common candidate contract.
+
+        ``facts`` (the shared `ProgramFacts`) supplies the loop labels the
+        value layouts are stated over; stream ``i`` of the contract is the
+        work item's contraction ``i`` (the pair-affine epilogue keeps the
+        contraction order).
+        """
         from ..spmw_candidate import (
             CandidateCoverage,
             CandidateEffects,
@@ -1476,7 +1484,9 @@ class APUG2SourceCandidate:
         )
 
         contract = self.contract
-        names = dict(contract.loop_names)
+        labels = {}
+        for contraction in getattr(self.facts, "contractions", ()):
+            labels.update(contraction.loop_labels)
         inputs = tuple(
             dict.fromkeys(
                 access.parameter
@@ -1487,6 +1497,56 @@ class APUG2SourceCandidate:
         operations = ["MAC"] * len(contract.streams)
         if contract.pair_affine:
             operations.append("AXPBY")
+        layouts = {}
+        for stream in contract.streams:
+            for access in (stream.lhs, stream.rhs):
+                layouts.setdefault(
+                    access.parameter,
+                    CandidateValueLayout(
+                        access.parameter,
+                        tuple(labels.get(d, d) for d in access.dims),
+                        "mmb",
+                        stream.packing_form,
+                    ),
+                )
+        for stream in contract.streams:
+            if stream.output is not None:
+                layouts.setdefault(
+                    stream.output,
+                    CandidateValueLayout(
+                        stream.output,
+                        tuple(labels.get(v, v) for v in stream.result_vars),
+                        "mmb",
+                        "device_readback",
+                    ),
+                )
+        if contract.combined_output is not None:
+            layouts.setdefault(
+                contract.combined_output,
+                CandidateValueLayout(
+                    contract.combined_output,
+                    tuple(labels.get(v, v) for v in contract.streams[0].result_vars),
+                    "mmb",
+                    "device_readback",
+                ),
+            )
+        epilogue_op = len(contract.streams) if contract.pair_affine else None
+        launches = []
+        for index, launch in enumerate(self.plan.launches):
+            ops = tuple(dict.fromkeys(int(s) for s in launch.streams))
+            if epilogue_op is not None and launch.final:
+                ops = ops + (epilogue_op,)
+            launches.append(
+                CandidateLaunch(
+                    index=index,
+                    kind="composed_dot",
+                    operations=ops,
+                    instances=tuple(int(v) for v in launch.coordinates),
+                    reduction=tuple(int(v) for v in launch.reduction),
+                    accumulator=launch.accumulator,
+                    covers=(self.plan.name, tuple(launch.streams)),
+                )
+            )
         return CandidateEffects(
             coverage=CandidateCoverage(
                 function=contract.function,
@@ -1494,15 +1554,7 @@ class APUG2SourceCandidate:
                 inputs=inputs,
                 outputs=tuple(contract.outputs),
             ),
-            value_layouts=tuple(
-                CandidateValueLayout(
-                    access.parameter,
-                    tuple(names.get(d, d) for d in access.dims),
-                    stream.packing_form,
-                )
-                for stream in contract.streams
-                for access in (stream.lhs, stream.rhs)
-            ),
+            value_layouts=tuple(layouts.values()),
             transfers=tuple(
                 [CandidateTransfer(name, "in", ("host_pack", "l1")) for name in inputs]
                 + [
@@ -1510,19 +1562,7 @@ class APUG2SourceCandidate:
                     for name in contract.outputs
                 ]
             ),
-            launches=tuple(
-                CandidateLaunch(
-                    index,
-                    "composed_dot",
-                    (
-                        tuple(launch.streams),
-                        tuple(launch.coordinates),
-                        tuple(launch.reduction),
-                    ),
-                    launch.accumulator,
-                )
-                for index, launch in enumerate(self.plan.launches)
-            ),
+            launches=tuple(launches),
             abi_inputs=inputs,
             abi_outputs=tuple(contract.outputs),
             device_scope="one Gemini-II card, launches back to back",
@@ -1550,6 +1590,12 @@ def apu_g2_source_candidates(target, matches) -> list:
             "function (dataflow regions and work grids are not lowered; the "
             "shared semantic facts of the entry function are required)"
         )
+    frontend = getattr(facts, "frontend", None)
+    if frontend is not None:
+        from .apu_g2_record_frontend import apu_g2_record_candidates, is_apu_g2_record
+
+        if is_apu_g2_record(frontend):
+            return apu_g2_record_candidates(target, facts, frontend)
     contract = analyze_apu_g2_source(facts)
     plans, rejected = enumerate_apu_g2_launch_plans(contract)
     catalog = tuple(plans)
@@ -1566,7 +1612,7 @@ def apu_g2_source_candidates(target, matches) -> list:
             registers[epilogue.result.memref_name] = seg1
     placements = []
     for plan in plans:
-        payload = APUG2SourceCandidate(contract, plan, catalog, tuple(rejected))
+        payload = APUG2SourceCandidate(contract, plan, catalog, tuple(rejected), facts)
         placements.append(
             Placement(
                 placements=dict(registers),

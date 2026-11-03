@@ -59,7 +59,7 @@ class SourceProgram:
 
     @property
     def module(self):
-        return self.schedule.module
+        return getattr(self.schedule, "module", None)
 
     @property
     def entry_function(self) -> str | None:
@@ -77,6 +77,8 @@ class SourceProgram:
         """
 
         if self.facts is None:
+            if self.schedule is None:
+                raise RuntimeError("a program without a module has no derived facts")
             self.facts = analyze_program(
                 self.match_target,
                 self.schedule.module,

@@ -261,11 +261,9 @@ def test_allo_compile_returns_signature_compatible_numpy_callable(monkeypatch):
 def test_program_routes_are_disjoint_and_in_dispatch_order():
     compiler_api = importlib.import_module("allo.compiler")
     types = [route.program_type for route in compiler_api._PROGRAM_ROUTES]
-    assert [t.__name__ for t in types] == [
-        "APUv1Program",
-        "APUG2TypedProgram",
-        "APUG2ComposedContractionProgram",
-    ]
+    # The Gemini-II records are frontends of the shared pipeline since round
+    # 15; APUv1Program is the remaining typed route (gate G9).
+    assert [t.__name__ for t in types] == ["APUv1Program"]
     for left in types:
         for right in types:
             if left is not right:

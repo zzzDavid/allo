@@ -69,6 +69,45 @@ through the same driver (`allo/spmw_codegen.py::compile_for_target`):
 - The APU v1 MLIR-text contraction parser is gone; the hybrid route's dead
   vector-region planning went with it.
 
+### Round 15: launch bindings, the enforced contract, typed Gemini-II records
+
+- Launch bindings (C-29b). `LaunchStep.operands` retains the base buffer
+  names of every `allo.launch`; `launch_schedule(host_program, trace,
+  module=...)` derives each kernel's declared ABI buffers (`spmw.abi_value_ids`
+  for dataflow kernels, the parameters for a plain entry) and refuses a
+  launch with a different arity or order before selection, for every
+  target. The APU backends' `_single_launch_orchestration` also requires the
+  launches to cover the kernel groups once each in program order.
+- Enforced contract (C-30). `CandidateLaunch(index, kind, operations,
+  instances, reduction, accumulator, covers)`; `validate_candidate_effects`
+  checks coverage equality, a value layout for every input and output over
+  the program's loop labels (plus declared `synthetic_axes`) on a storage
+  the target declares, every loop covered by some layout, transfer
+  completeness, launches indexed 0..n-1 whose instance ranges tile each
+  covered operation's result instances and whose reduction ranges tile its
+  reduction extent, ABI equality; `check_graph_consistency` compares the
+  priced graph (launch count, plan) with the declaration; the contexts'
+  `check_realization` compares value layouts, transfers and launches with
+  the materialized program.
+- Typed Gemini-II records (`allo/pim/apu_g2_record_frontend.py`).
+  `normalize_apu_g2_record` states a record's semantics as synthetic
+  matches (the structural facts the matcher stamps: loops, axis roles,
+  resolved coordinates, accumulator initialization, reduction policy) and
+  the derived `ProgramFacts` (`frontend` = the record); the `apu_v2`
+  enumerator emits the record's realization as one candidate
+  (`apu_g2_record_candidates`), legality checks it against the view (which
+  declares the typed `ADD`/`MUL`/`DIV`/`SUM` operations, not matchable from
+  source), the candidate contract, the record's recipe graph through
+  `candidate_execution_graph`, ranking, `APUG2RecordProgram` as the
+  materialized program and the shared `Compiled`/`CompiledCallable`
+  artifact (the record's call convention is the `RecordWorkload`
+  signature; ``out`` may be omitted). Accumulate epilogues are a
+  zero-initialized local dot plus an `ADD` with the seed input. The typed
+  and composed callables are deleted. `APUv1Program` remains on
+  `_PROGRAM_ROUTES`: its scalar ARC programs are whole-function lowerings
+  and its native recipes are proven by their own structural executor; that
+  migration is the remaining slice 4 item.
+
 Removed in round 13: the planner-hook registry `_SOURCE_PLANNERS` and
 `compile()`'s target-name branches; `APUv1VectorCallable`,
 `compile_apu_v1_vector_workload`, `search_apu_v1_vector_plans` and the
@@ -125,10 +164,9 @@ Consequences observed and tested (`tests/pim/test_shared_semantics.py`):
 
 Not yet done (the remaining slices):
 
-- the typed program records (`APUv1Program`, `APUG2TypedProgram`,
-  `APUG2ComposedContractionProgram`) do not normalize into the shared
-  contracts (slice 4); the hybrid manifest still reads the scalar ABI from
-  MLIR text;
+- `APUv1Program` does not normalize into the shared contracts (slice 4,
+  remaining); the hybrid manifest still reads the scalar ABI from MLIR
+  text;
 - the matcher backends' enumerators read `MatchedOp` directly and declare
   no `CandidateEffects`; the facts are available on every match
   (`extra["program_facts"]`) but Samsung, AiM, UPMEM and AttAcc do not
@@ -252,9 +290,10 @@ Observations that fix the migration order:
    `rank_matcher_placements`; materialized through `compile_for_target`
    backend contexts. The `apu_v2` and `apu_v1` branches of `compile()` and
    the planner hooks are gone.
-4. **Typed records.** Normalize `APUv1Program`, `APUG2TypedProgram` and
-   `APUG2ComposedContractionProgram` into the slice 1/3 contracts; remove
-   the hybrid route's MLIR-text parser.
+4. **Typed records.** `APUG2TypedProgram` and
+   `APUG2ComposedContractionProgram` normalize into the slice 1/3 contracts
+   (done, round 15); the hybrid route's MLIR-text parser is removed (round
+   14); `APUv1Program` remains to be normalized.
 5. **Evidence.** Stage traces for one representative program per target,
    forced alternatives and cost perturbations reaching generated code and
    launches, simulator and both hardware hosts, installed artifact.

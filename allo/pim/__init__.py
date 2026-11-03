@@ -70,7 +70,6 @@ from .apu_g2_layout import (
     build_apu_g2_u16_layout,
 )
 from .apu_g2_composed_program import (
-    APUG2ComposedContractionCallable,
     APUG2ComposedContractionProgram,
     APUG2DotEpilogue,
     APUG2DotEpilogueMode,
@@ -90,7 +89,6 @@ from .apu_g2_composed_layout import (
 )
 from .apu_g2_typed_program import (
     APUG2ScalarType,
-    APUG2TypedCallable,
     APUG2TypedOperation,
     APUG2TypedProgram,
     pack_apu_g2_gemm_as_independent_dots,
@@ -253,7 +251,6 @@ __all__ = [
     "APUG2_U16_SHAPE",
     "APUG2_VECTOR_LANES",
     "build_apu_g2_u16_layout",
-    "APUG2ComposedContractionCallable",
     "APUG2ComposedContractionProgram",
     "APUG2DotEpilogue",
     "APUG2DotEpilogueMode",
@@ -269,7 +266,6 @@ __all__ = [
     "pack_apu_g2_composed_operand",
     "pack_apu_g2_matrix_vector_dots",
     "APUG2ScalarType",
-    "APUG2TypedCallable",
     "APUG2TypedOperation",
     "APUG2TypedProgram",
     "pack_apu_g2_gemm_as_independent_dots",

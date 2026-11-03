@@ -34,15 +34,17 @@ class APUG2SourceCtx(CodegenContext):
 
     @staticmethod
     def _payload(layouts):
+        from .pim.apu_g2_record_frontend import APUG2RecordCandidate
         from .pim.apu_g2_source_route import APUG2SourceCandidate
 
+        kinds = (APUG2SourceCandidate, APUG2RecordCandidate)
         layouts = layouts if isinstance(layouts, (list, tuple)) else [layouts]
         payloads = [
             (getattr(layout, "extra", None) or {}).get("payload") for layout in layouts
         ]
-        if not any(isinstance(p, APUG2SourceCandidate) for p in payloads):
+        if not any(isinstance(p, kinds) for p in payloads):
             return None
-        if len(payloads) != 1 or not isinstance(payloads[0], APUG2SourceCandidate):
+        if len(payloads) != 1 or not isinstance(payloads[0], kinds):
             raise NotImplementedError(
                 "Gemini-II launch plans realize one plain-function program; a "
                 "multi-kernel program mixes candidates"
@@ -74,6 +76,12 @@ class APUG2SourceCtx(CodegenContext):
         cls.validate_orchestration(
             trace, options.get("launch_schedule"), options.get("host_moves") or ()
         )
+        from .pim.apu_g2_record_frontend import APUG2RecordCandidate
+
+        if isinstance(payload, APUG2RecordCandidate):
+            from .pim.apu_g2_record_frontend import record_execution_graph
+
+            return record_execution_graph(payload.record, target, bound_cost)
         plan = payload.plan
         fingerprint = getattr(bound_cost, "fingerprint", None)
         graph = plan.execution_graph
@@ -104,6 +112,19 @@ class APUG2SourceCtx(CodegenContext):
             if placement.extra.get("candidate_selection") == "forced"
             else "cost"
         )
+        from .pim.apu_g2_record_frontend import (
+            APUG2RecordCandidate,
+            APUG2RecordProgram,
+            record_fingerprint,
+        )
+
+        if isinstance(payload, APUG2RecordCandidate):
+            self.program = APUG2RecordProgram(payload.record, payload.facts, selection)
+            self.cmds = [
+                f"record {payload.record.name}: {payload.kind} "
+                f"{record_fingerprint(payload.record)}"
+            ]
+            return
         self.program = APUG2SourceProgram(
             payload.contract,
             self.target,
@@ -121,7 +142,9 @@ class APUG2SourceCtx(CodegenContext):
         ]
 
     def check_realization(self, layouts) -> None:
-        """The realized launch program against the candidate's contract."""
+        """The realized launch program against the candidate's contract:
+        function, outputs, inputs and every launch (instances, reduction
+        range, accumulator mode, streams), in order."""
 
         from .spmw_candidate import candidate_effects
 
@@ -131,24 +154,78 @@ class APUG2SourceCtx(CodegenContext):
         effects = candidate_effects(placement)
         if effects is None:
             raise RuntimeError("Gemini-II candidate declares no effects")
+        from .pim.apu_g2_record_frontend import APUG2RecordProgram, record_fingerprint
+
+        if isinstance(self.program, APUG2RecordProgram):
+            record = self.program.record
+            (launch,) = effects.launches
+            if (
+                effects.abi_outputs != ("out",)
+                or launch.covers[:2] != (record.name, record_fingerprint(record))
+                or effects.coverage.function != record.name
+            ):
+                raise RuntimeError(
+                    f"Gemini-II record realization {record.name!r} differs from the "
+                    "candidate contract"
+                )
+            return
         contract = self.program.contract
-        if set(contract.outputs) != set(effects.abi_outputs) or len(
-            self.program.plan.launches
-        ) != len(effects.launches):
+        plan = self.program.plan
+        if set(contract.outputs) != set(effects.abi_outputs):
             raise RuntimeError(
                 "Gemini-II realization differs from the candidate contract: "
-                f"outputs {sorted(contract.outputs)} vs {sorted(effects.abi_outputs)}, "
-                f"{len(self.program.plan.launches)} launches vs {len(effects.launches)}"
+                f"outputs {sorted(contract.outputs)} vs {sorted(effects.abi_outputs)}"
             )
         if contract.function != effects.coverage.function:
             raise RuntimeError(
                 f"Gemini-II realization covers {contract.function!r}, the candidate "
                 f"declared {effects.coverage.function!r}"
             )
+        realized = [
+            (
+                tuple(int(v) for v in launch.coordinates),
+                tuple(int(v) for v in launch.reduction),
+                launch.accumulator,
+                tuple(launch.streams),
+            )
+            for launch in plan.launches
+        ]
+        declared = [
+            (
+                tuple(launch.instances),
+                tuple(launch.reduction or ()),
+                launch.accumulator,
+                tuple(launch.covers[1]) if len(launch.covers) > 1 else (),
+            )
+            for launch in effects.launches
+        ]
+        if realized != declared or any(
+            launch.kind != "composed_dot" or launch.covers[:1] != (plan.name,)
+            for launch in effects.launches
+        ):
+            raise RuntimeError(
+                "Gemini-II realization launches differ from the candidate contract: "
+                f"realized {realized}, declared {declared}"
+            )
+        inputs = {
+            access.parameter
+            for stream in contract.streams
+            for access in (stream.lhs, stream.rhs)
+        }
+        if inputs != set(effects.abi_inputs):
+            raise RuntimeError(
+                f"Gemini-II realization reads {sorted(inputs)}, the candidate "
+                f"declared {sorted(effects.abi_inputs)}"
+            )
 
     def runtime_route(self, commands) -> tuple[str, tuple]:
         if self.program is None:
             return super().runtime_route(commands)
+        from .pim.apu_g2_record_frontend import APUG2RecordProgram, record_fingerprint
+
+        if isinstance(self.program, APUG2RecordProgram):
+            record = self.program.record
+            return "apu-g2-record-v1", (record.name, record_fingerprint(record))
         return "apu-g2-composed-dot-v1", tuple(
             launch.layout_fingerprint for launch in self.program.plan.launches
         )

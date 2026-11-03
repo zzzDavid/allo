@@ -505,10 +505,20 @@ class APUv1VectorCandidate:
             CandidateTransfer,
             CandidateValueLayout,
         )
+        from .apu_v1_vectorize import _UNIT_AXIS
 
         plan = self.plan
         analysis = self.analysis
         output = analysis.output.value
+        extents = analysis.axis_extents
+        instances = 1
+        for axis in analysis.output_axes:
+            instances *= int(extents[axis])
+        synthetic = (
+            ((_UNIT_AXIS, 1),)
+            if any(axis.name == _UNIT_AXIS for axis in analysis.axes)
+            else ()
+        )
         return CandidateEffects(
             coverage=CandidateCoverage(
                 function=analysis.function,
@@ -532,14 +542,17 @@ class APUv1VectorCandidate:
             ),
             launches=(
                 CandidateLaunch(
-                    0,
-                    "gvml_program",
-                    (
+                    index=0,
+                    kind="gvml_program",
+                    operations=(0,),
+                    instances=(0, instances),
+                    reduction=(0, int(extents[analysis.reduction_axis])),
+                    accumulator=analysis.output_initializer,
+                    covers=(
                         plan.name,
                         plan.temporal_strategy,
                         getattr(plan.reduction_strategy, "kind", "none"),
                     ),
-                    analysis.output_initializer,
                 ),
             ),
             abi_inputs=tuple(
@@ -547,6 +560,7 @@ class APUv1VectorCandidate:
             ),
             abi_outputs=(output,),
             device_scope="one APUC, whole problem, single launch",
+            synthetic_axes=synthetic,
         )
 
 

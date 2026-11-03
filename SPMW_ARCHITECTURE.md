@@ -81,10 +81,13 @@ Two other workload kinds reach `allo.compile`:
   contraction route (`allo/pim/apu_v1_vector_program.py`) and the Gemini-II
   source route (`allo/pim/apu_g2_source_route.py`) accept it; on the
   matcher backends it is matched as a single work item;
-* typed program records that bypass the matcher: `allo.APUv1Program` /
-  `allo.APUv1Phase` (`allo/pim/apu_v1_program.py`), `allo.APUG2TypedProgram`
-  (`allo/pim/apu_g2_typed_program.py`), `allo.APUG2ComposedContractionProgram`
-  (`allo/pim/apu_g2_composed_contraction.py`).
+* typed program records: `allo.APUG2TypedProgram`
+  (`allo/pim/apu_g2_typed_program.py`) and
+  `allo.APUG2ComposedContractionProgram`
+  (`allo/pim/apu_g2_composed_contraction.py`) are frontends of the shared
+  pipeline (`allo/pim/apu_g2_record_frontend.py`, Section 2.0);
+  `allo.APUv1Program` / `allo.APUv1Phase` (`allo/pim/apu_v1_program.py`)
+  still bypasses the matcher (the remaining typed route of gate G9).
 
 ### 1.3 Cost language (`allo/perf/`)
 
@@ -137,11 +140,16 @@ evaluated jointly within a documented budget (Section 2.6 and
 1. `_materialize_workload` (calls `build()` when present),
    `_materialize_target` (calls a zero-argument builder), `_resolve_cost`
    (binds a `CostSpec` to the target).
-2. Typed records route through `_PROGRAM_ROUTES`: `APUv1Program ->
-   compile_apu_v1_program`, `APUG2TypedProgram ->
-   compile_apu_g2_typed_program`, `APUG2ComposedContractionProgram ->
-   compile_apu_g2_composed_program`. They refuse `host_moves`, `layout` and
-   `reduction_order`.
+2. `APUv1Program` routes through `_PROGRAM_ROUTES` (`compile_apu_v1_program`;
+   it refuses `host_moves`, `layout` and `reduction_order`); this is the
+   remaining typed route of gate G9. `APUG2TypedProgram` and
+   `APUG2ComposedContractionProgram` are frontends of the shared pipeline:
+   `allo.pim.apu_g2_record_frontend.normalize_apu_g2_record` states the
+   record's semantics as the shared program contract (synthetic matches with
+   the matcher's structural facts and the derived `ProgramFacts`), and the
+   record's realization is one candidate of step 4 (the view declares the
+   typed operations; the record's recipe graph prices it;
+   `APUG2RecordProgram` is the materialized program).
 3. Shared front stages for every ordinary source workload
    (`allo/spmw_pipeline.py::normalize_source`, gate G9):
    `customize(workload, enable_tensor=False)` produces the MLIR module;
@@ -168,10 +176,17 @@ evaluated jointly within a documented budget (Section 2.6 and
    by the backend context and the runner.  ``layout=`` names a candidate,
    a candidate family or a backend plan object and restricts the selection
    (`spmw_autoschedule.select_candidates`); every candidate stays scored.
-   The realized backend program of the selected candidate (the context's
-   ``program``) is reachable as ``CompiledCallable.backend_program``; its
-   documented ``INTROSPECTION`` names are forwarded
-   (``compiled.selected_plan``, ``compiled.plan``).
+   A caller-supplied placement is rebound to the current program's
+   candidate under the current reduction policy
+   (`spmw_candidate.rebind_supplied_layouts`); a backend plan's effects are
+   the typed `CandidateEffects`, validated per candidate, on the selected
+   placements, against the priced graph and against the realized program;
+   a host program is checked for launch arity and operand binding
+   (`spmw_plan.launch_schedule`) and for what the backend can honor
+   (`validate_orchestration`).  The realized backend program of the
+   selected candidate (the context's ``program``) is reachable as
+   ``CompiledCallable.backend_program``; its documented ``INTROSPECTION``
+   names are forwarded (``compiled.selected_plan``, ``compiled.plan``).
 
 ### 2.1 Frontend (`allo/customize.py`, `allo/ir/`)
 
@@ -724,18 +739,24 @@ SDK files, `gsi_tool`, an `Available` card with core 0 idle, and device
 index 0 (other indices rejected until `DeviceConfig` semantics are verified;
 G2-06).
 
-* **Typed route** (`APUG2TypedProgram`, `apu_g2_typed_program.py`,
-  `apu_g2_typed_runtime.run_apu_g2_typed`): exact-width `add`, `mul`,
-  `div`, `block_sum`, `dot` records; fixed layout, nothing ranked;
-  `layout=`/`host_moves=` rejected.
-* **Composed route** (`APUG2ComposedContractionProgram`,
+* **Typed records** (`APUG2TypedProgram`, `apu_g2_typed_program.py`,
+  `apu_g2_typed_runtime.run_apu_g2_typed`: exact-width `add`, `mul`, `div`,
+  `block_sum`, `dot`; and `APUG2ComposedContractionProgram`,
   `apu_g2_composed_program.py`, `apu_g2_composed_layout.py`,
-  `apu_g2_composed_runtime.run_apu_g2_composed`): independent dot products
+  `apu_g2_composed_runtime.run_apu_g2_composed`: independent dot products
   `(dot_count, K)` with identity, pair-affine or accumulate epilogue on one
-  `(4, 65536)` carrier (`APUG2DotTilePlan`, a `LinearLayout` over F2);
-  larger problems are rejected naming the capacity; packing is attested
-  against the plan before launch (`attest_apu_g2_composed_packing`,
-  G2-08).
+  `(4, 65536)` carrier, `APUG2DotTilePlan`, a `LinearLayout` over F2; larger
+  problems rejected naming the capacity; packing attested against the plan
+  before launch, G2-08).  Both are frontends of the shared pipeline
+  (`apu_g2_record_frontend.py`): `normalize_apu_g2_record` states the
+  record's semantics as synthetic matches with the matcher's structural
+  facts and the derived `ProgramFacts`; the ``apu_v2`` enumerator emits the
+  record's realization as one candidate with its `CandidateEffects`;
+  legality (the view declares `SUM`/`ADD`/`MUL`/`DIV` for them), the
+  candidate contract, the record's recipe graph, ranking,
+  `APUG2RecordProgram` and the shared artifact follow; ``out`` may be
+  omitted in a call and is then allocated and returned in
+  ``RunResult.extra["outputs"]``.
 * **Source route** (`apu_g2_source_route.py`,
   `compile_apu_g2_source_workload`): a plain integer contraction function
   passes the shared front stages, matched against the target's declared
@@ -945,7 +966,9 @@ Allo alone.
 | `allo/spmw_upmem.py`, `allo/pim/upmem_physical.py`, `allo/pim/upmem_physical_search.py`, `allo/pim/upmem_irregular.py`, `allo/pim/upmem_analysis.py`, `allo/pim/upmem_calibration.py` | UPMEM families, templates, physical decision catalog and calibration, MLIR instruction summary, calibration tooling |
 | `allo/backend/c.py` | MLIR to portable C (UPMEM oracle and host groups, APU v1 scalar programs) |
 | `allo/spmw_apu_v1.py`, `allo/spmw_apu_v1_build.py` | APU v1 backend context (vector-plan candidates and the grouped program), runner, GVML project emission |
-| `allo/spmw_apu_g2.py` | Gemini-II backend context (launch-plan candidates) and runner |
+| `allo/spmw_apu_g2.py` | Gemini-II backend context (launch-plan and record candidates) and runner |
+| `allo/spmw_candidate.py` | common candidate contract: `CandidateEffects`, per-candidate/artifact validation, supplied-placement rebinding, graph consistency |
+| `allo/pim/apu_g2_record_frontend.py` | Gemini-II typed program records as frontends: synthetic semantic contract, record candidate, realized program |
 | `allo/pim/apu_v1_*.py` | APU v1 vector plans, codegen, cost bridge, runtime, typed scalar programs, native recipes, hybrid manifest |
 | `allo/pim/apu_g2_*.py`, `allo/pim/templates/apu_g2/` | Gemini-II typed, composed and source routes, tick model, runtimes, project templates |
 | `allo/pim/schedule_search.py` | generic materialize-then-score grid search (joint evaluation of complete assignments) |

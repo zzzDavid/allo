@@ -18,17 +18,10 @@ import numpy as np
 from .ir.builder import _spmw_group_contract
 from .perf import BoundCostSpec, CostSpec
 from .pim.apu_v1_program import APUv1Program, compile_apu_v1_program
-from .pim.apu_g2_composed_program import (
-    APUG2ComposedContractionProgram,
-    compile_apu_g2_composed_program,
-)
-from .pim.apu_g2_typed_program import (
-    APUG2TypedProgram,
-    compile_apu_g2_typed_program,
-)
 from .spmw_autoschedule import MatcherWorkScope, _retain_matcher_work_scope
 from .spmw_codegen import RunResult, compile_for_target, source_backend_binding
 from .spmw_liveness import MatcherValueId, trace_liveness
+from .pim.apu_g2_record_frontend import is_apu_g2_record, normalize_apu_g2_record
 from .spmw_pipeline import normalize_source
 from .spmw_plan import BufferMetricManifest, launch_schedule
 from .spmw_reduction_policy import (
@@ -838,20 +831,6 @@ _PROGRAM_ROUTES: tuple[_ProgramRoute, ...] = (
         "APUv1Program supports the device, virtual, or functional backend",
         "APUv1Program owns its scalar L4 ABI",
     ),
-    _ProgramRoute(
-        APUG2TypedProgram,
-        compile_apu_g2_typed_program,
-        None,
-        None,
-        "APUG2TypedProgram owns its VL64 layout and hardware ABI",
-    ),
-    _ProgramRoute(
-        APUG2ComposedContractionProgram,
-        compile_apu_g2_composed_program,
-        None,
-        None,
-        "APUG2ComposedContractionProgram owns its LinearLayout and ABI",
-    ),
 )
 
 
@@ -886,13 +865,15 @@ def compile(
 
     Stages (release gate G9, ``docs/release/design/shared-compilation-path.md``):
 
-    1. **Typed program frontends.** ``APUv1Program``, ``APUG2TypedProgram``
-       and ``APUG2ComposedContractionProgram`` are program records that fix
-       their own plan; each compiles through its typed route
-       (``_PROGRAM_ROUTES``).  ``APUv1Program`` accepts
-       ``backend in (None, "virtual", "functional")``; the APU v2 records
-       validate ``backend`` themselves; no typed route accepts
-       ``host_moves`` or ``layout``.
+    1. **Typed program frontends.** ``APUG2TypedProgram`` and
+       ``APUG2ComposedContractionProgram`` are program records without
+       source: their semantics are stated in the shared program contract and
+       their realization is one candidate of the common pipeline below
+       (`allo.pim.apu_g2_record_frontend`).  ``APUv1Program`` still compiles
+       through its own typed route (``_PROGRAM_ROUTES``; the remaining
+       migration item of gate G9) and accepts
+       ``backend in (None, "virtual", "functional")`` but no ``host_moves``
+       or ``layout``.
     2. **Shared front stages** (every ordinary source workload, every
        target; :func:`allo.spmw_pipeline.normalize_source`): the ``@allo``
        function is customized to MLIR, matched against the target's
@@ -976,21 +957,32 @@ def compile(
             )
     reduction_order = normalize_reduction_order(reduction_order)
 
-    # Shared front stages: frontend, matcher, coverage/semantic contracts and
-    # the semantic facts, identical for every target.
-    program = normalize_source(workload, target, reduction_order=reduction_order)
+    if is_apu_g2_record(workload):
+        # A typed Gemini-II program record is a frontend: its semantics are
+        # stated in the shared program contract and its realization is a
+        # candidate of the common pipeline (`allo.pim.apu_g2_record_frontend`).
+        program = normalize_apu_g2_record(
+            workload, target, reduction_order=reduction_order
+        )
+        workload = program.workload
+    else:
+        # Shared front stages: frontend, matcher, coverage/semantic contracts
+        # and the semantic facts, identical for every target.
+        program = normalize_source(workload, target, reduction_order=reduction_order)
+        if program.trace.matches:
+            # Derived once here and stamped on the trace: the backend
+            # enumerators and contexts read these facts, never the IR text.
+            program.program_facts()
     schedule, trace = program.schedule, program.trace
-    if trace.matches:
-        # Derived once here and stamped on the trace: the backend enumerators
-        # and contexts read these facts, never the IR text.
-        program.program_facts()
+    module = program.module
 
     require_matcher_route_policy(target, trace)
-    _stamp_matcher_work_scopes(target, schedule.module, trace)
+    if module is not None:
+        _stamp_matcher_work_scopes(target, module, trace)
     launch_order = None
     if isinstance(host_moves, HostProgram):
         if host_moves.launches:
-            launch_order = launch_schedule(host_moves, trace)
+            launch_order = launch_schedule(host_moves, trace, module=module)
         records = list(host_moves.moves)
     else:
         records = list(host_moves or ())
@@ -1002,7 +994,7 @@ def compile(
         host_moves=records,
         buffer_metrics=_buffer_metric_manifest(workload, trace, records),
         cost=bound_cost,
-        module=schedule.module,
+        module=module,
         launch_schedule=launch_order,
     )
     return CompiledCallable(

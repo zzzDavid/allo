@@ -1424,7 +1424,7 @@ def autoschedule(
             if verdict.legal:
                 # The common candidate contract (gate G9): declared effects
                 # must describe this work item's program.
-                problems = validate_candidate_effects(matches, candidate)
+                problems = validate_candidate_effects(matches, candidate, target_)
                 if problems:
                     reasons = illegal.setdefault(
                         _matcher_work_scope(matches[0]).group_id, {}

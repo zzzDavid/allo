@@ -82,10 +82,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "APUv1VectorProgram": ("allo.pim.apu_v1_vector_program", "APUv1VectorProgram"),
     "APUv1Phase": ("allo.pim.apu_v1_program", "APUv1Phase"),
     "APUv1Program": ("allo.pim.apu_v1_program", "APUv1Program"),
-    "APUG2ComposedContractionCallable": (
-        "allo.pim.apu_g2_composed_program",
-        "APUG2ComposedContractionCallable",
-    ),
     "APUG2ComposedContractionProgram": (
         "allo.pim.apu_g2_composed_program",
         "APUG2ComposedContractionProgram",
@@ -140,7 +136,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "pack_apu_g2_matrix_vector_dots",
     ),
     "APUG2ScalarType": ("allo.pim.apu_g2_typed_program", "APUG2ScalarType"),
-    "APUG2TypedCallable": ("allo.pim.apu_g2_typed_program", "APUG2TypedCallable"),
     "APUG2TypedOperation": ("allo.pim.apu_g2_typed_program", "APUG2TypedOperation"),
     "APUG2TypedProgram": ("allo.pim.apu_g2_typed_program", "APUG2TypedProgram"),
     "pack_apu_g2_gemm_as_independent_dots": (

@@ -141,7 +141,8 @@ class APUv1Ctx(CodegenContext):
         self.cmds = list(payload.realization.device_source().splitlines())
 
     def check_realization(self, layouts) -> None:
-        """The realized GVML program against the candidate's declared ABI."""
+        """The realized GVML program against the candidate's declared
+        contract: ABI, value layouts, transfers and the single launch."""
 
         from .spmw_candidate import candidate_effects
 
@@ -151,7 +152,8 @@ class APUv1Ctx(CodegenContext):
         effects = candidate_effects(placement)
         if effects is None:
             raise RuntimeError("APU v1 vector candidate declares no effects")
-        values = {value.name: value.intent for value in self.program.realization.values}
+        realization = self.program.realization
+        values = {value.name: value.intent for value in realization.values}
         realized_outputs = {
             n for n, intent in values.items() if intent in {"out", "inout"}
         }
@@ -164,6 +166,37 @@ class APUv1Ctx(CodegenContext):
                 f"realized inputs {sorted(realized_inputs)} / outputs "
                 f"{sorted(realized_outputs)}, declared {sorted(effects.abi_inputs)} / "
                 f"{sorted(effects.abi_outputs)}"
+            )
+        plan = realization.plan
+        declared_layouts = {(v.value, tuple(v.axes)) for v in effects.value_layouts}
+        realized_layouts = {(v.value, tuple(v.axes)) for v in plan.value_layouts}
+        if declared_layouts != realized_layouts:
+            raise RuntimeError(
+                "APU v1 realization value layouts differ from the candidate "
+                f"contract: realized {sorted(realized_layouts)}, declared "
+                f"{sorted(declared_layouts)}"
+            )
+        declared_transfers = {(t.value, tuple(t.route)) for t in effects.transfers}
+        realized_transfers = {
+            (t.value, tuple(step.kind for step in t.route)) for t in plan.transfers
+        }
+        if declared_transfers != realized_transfers:
+            raise RuntimeError(
+                "APU v1 realization transfers differ from the candidate contract: "
+                f"realized {sorted(realized_transfers)}, declared "
+                f"{sorted(declared_transfers)}"
+            )
+        launches = effects.launches
+        if (
+            len(launches) != 1
+            or launches[0].kind != "gvml_program"
+            or not launches[0].covers
+            or launches[0].covers[0] != plan.name
+        ):
+            raise RuntimeError(
+                "APU v1 realization is one GVML program of plan "
+                f"{plan.name!r}; the candidate declares launches "
+                f"{[(l.kind, l.covers) for l in launches]}"
             )
 
     def runtime_route(self, commands) -> tuple[str, tuple]:

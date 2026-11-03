@@ -1566,11 +1566,26 @@ def _single_launch_orchestration(name, trace, launch_schedule, host_moves, what)
         )
     if launch_schedule is None:
         return
+    from .spmw_autoschedule import _matcher_work_scope
+
     host_steps = [s for s in launch_schedule.steps if isinstance(s, HostStep)]
     launches = {}
+    order = []
     for step in launch_schedule.steps:
         if isinstance(step, LaunchStep):
             launches[step.group_id] = launches.get(step.group_id, 0) + 1
+            order.append(step.group_id)
+    trace_order = []
+    for match in trace.matches:
+        group_id = _matcher_work_scope(match).group_id
+        if group_id not in trace_order:
+            trace_order.append(group_id)
+    if order != trace_order:
+        raise NotImplementedError(
+            f"{name}: the host program launches kernel groups in the order {order}; "
+            f"{what} execute the program's kernel groups once each in program "
+            f"order {trace_order}, and another order or coverage is not implemented"
+        )
     if host_steps or any(count != 1 for count in launches.values()):
         raise NotImplementedError(
             f"{name}: the host program requests "
@@ -1846,7 +1861,7 @@ def compile_for_target(
     from .spmw_candidate import require_candidate_effects
 
     for (_scope, bucket_matches), placement in zip(buckets, layouts):
-        require_candidate_effects(bucket_matches, placement, "selected placement")
+        require_candidate_effects(bucket_matches, placement, "selected placement", view)
     if not explicit_layout:
         # The autoscheduler filtered its candidates; re-check what survived
         # the cross-kernel reconciliation.

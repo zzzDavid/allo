@@ -3,7 +3,7 @@
 
 # Release status
 
-Updated: 2026-11-03 (round 14: candidate boundary enforced, supplied placements rebound under the current program and policy (C-28), unsupported orchestration refused (C-29), the typed candidate contract validated per candidate and artifact, the APU v1 MLIR-text parser deleted). Read `TASK.md` in the containing repository,
+Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -39,9 +39,11 @@ then this file, then `ISSUES.md` for the next action.
    `allo/spmw_pipeline.py`, semantic facts `allo/spmw_semantics.py`) and
    slice 3 in round 13 (the APU v1 vector plans and the Gemini-II launch
    plans are `autoschedule` candidates priced, ranked, materialized and run
-   through `compile_for_target`; the planner seam is gone). Open: typed
-   records (slice 4), Gemini-II card and installed-artifact stage traces
-   (slice 5). Map and status: `design/shared-compilation-path.md`.
+   through `compile_for_target`; the planner seam is gone), the enforced
+   candidate contract and the Gemini-II typed-record frontends in rounds
+   14-15. Open: `APUv1Program` (the remaining typed route), Gemini-II card
+   and installed-artifact stage traces (slice 5). Map and status:
+   `design/shared-compilation-path.md`.
 2. **G2**: the independent reviewer disproved the round 7 PASS with two
    executed wrong-code probes at `e41ebbd` (C-19 casts erased, C-20 guarded
    copies), repaired in round 8 (plus C-21), and then found two more at
@@ -61,6 +63,22 @@ then this file, then `ISSUES.md` for the next action.
    build path for a user without the patches is the open question the
    reviewer named.
 4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+
+## Round 15 (2026-11-03): what was done
+
+- Reviewer findings on `5a07639`: C-29b (launch operands dropped; now
+  retained on `LaunchStep` and validated against each kernel's declared
+  ABI before selection, for every target) and C-30 (candidate effects
+  descriptive; now a typed contract with per-field validation against the
+  facts, the target, the priced graph and the realized program) fixed with
+  regressions (`tests/pim/test_shared_semantics.py` sections h and i).
+- G9 slice 4, Gemini-II records: `allo/pim/apu_g2_record_frontend.py`
+  normalizes `APUG2TypedProgram` and `APUG2ComposedContractionProgram` into
+  the shared program contract; their realization is a candidate of the
+  common pipeline; the typed callables are deleted; `_PROGRAM_ROUTES` holds
+  `APUv1Program` only.
+- Verdict item 1 and the next-action list updated: `APUv1Program` is the
+  remaining typed route; card and installed-artifact traces pending.
 
 ## Round 14 (2026-11-03): what was done
 
@@ -183,11 +201,12 @@ then this file, then `ISSUES.md` for the next action.
 
 ## Next concrete actions (in order)
 
-1. G9 slice 4: typed records (`APUv1Program`, `APUG2TypedProgram`,
-   `APUG2ComposedContractionProgram`) normalize into the shared contracts
-   (facts or candidate placements) and enter the same legality, selection
-   and materialization stages; remove the `_PROGRAM_ROUTES` early return;
-   the hybrid manifest's scalar ABI from the retained IR instead of text.
+1. G9 slice 4 (remaining): `APUv1Program` (scalar ARC programs, native
+   recipes) normalizes into the shared contracts and enters the same
+   legality, selection and materialization stages; remove the
+   `_PROGRAM_ROUTES` early return; the hybrid manifest's scalar ABI from
+   the retained IR instead of text; the matcher backends declare
+   `CandidateEffects`.
 2. G9 slice 5: stage traces on the Gemini-II card (zhang-x4, shared lock,
    wheel built there), the installed artifact and the APU v1 board at the
    candidate revision; forced alternatives and cost perturbations reaching

@@ -176,9 +176,18 @@ def _logistic(out):
 def test_unsupported_element_type_is_rejected_at_recognition(
     workload, operand, mlir_type, family
 ):
-    with pytest.raises(NotImplementedError) as error:
+    from allo.spmw_match import UnsupportedWorkloadError
+
+    with pytest.raises((NotImplementedError, UnsupportedWorkloadError)) as error:
         _compile(workload)
     message = str(error.value)
+    if isinstance(error.value, UnsupportedWorkloadError):
+        # A pointwise add of int16 operands into an int32 output evaluates in
+        # a wider type than its operands: the shared precision contract
+        # (C-26) refuses it before UPMEM's recognition names the family.
+        assert "evaluates this operation in" in message
+        assert f"'{operand}'" in message or operand in message
+        return
     assert f"UPMEM {family}" in message
     if mlir_type is None:
         # The int32 reduction cell: name the cell, not the input.
@@ -199,10 +208,17 @@ def test_unsupported_element_type_is_rejected_at_recognition(
 )
 def test_signedness_and_output_type_are_checked_on_the_abi(workload, operand, dtype):
     # Signless MLIR hides uint32 and the pointwise output's type from the
-    # matcher; the final compile checks the work function's ABI.
-    with pytest.raises(NotImplementedError) as error:
+    # matcher; the final compile checks the work function's ABI.  An int32
+    # add stored into an int64 output is refused earlier by the shared
+    # precision contract (C-26: the source evaluates it in a wider type).
+    from allo.spmw_match import UnsupportedWorkloadError
+
+    with pytest.raises((NotImplementedError, UnsupportedWorkloadError)) as error:
         _compile(workload)
     message = str(error.value)
+    if isinstance(error.value, UnsupportedWorkloadError):
+        assert "evaluates this operation in" in message
+        return
     assert f"{operand!r}" in message and f"element type {dtype}" in message
     assert "supported:" in message and "out: int32" in message
 

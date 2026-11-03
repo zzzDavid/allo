@@ -235,8 +235,11 @@ without coefficients.
   on the selected placements and against the realized artifact; `layout=`
   names a candidate or family on every target and a supplied placement is
   rebound to the current program's candidate under the current policy
-  (C-28); a host program the APU backends cannot honor is refused before
-  selection (C-29). Plain helper-function calls in ordinary source are
-  refused at the shared boundary (C-27); dataflow regions remain the
-  interprocedural form. The typed APU records are still separate frontends
-  (slice 4 open).
+  (C-28); a host program the APU backends cannot honor, or a launch whose
+  operands rebind a kernel's ABI, is refused before selection (C-29,
+  C-29b); the contract is enforced field by field against the facts, the
+  target, the priced graph and the realized program (C-30). Plain
+  helper-function calls in ordinary source are refused at the shared
+  boundary (C-27); dataflow regions remain the interprocedural form. The
+  Gemini-II typed records are frontends of this pipeline; `APUv1Program`
+  is still a separate frontend (slice 4, remaining).

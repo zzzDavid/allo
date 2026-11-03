@@ -52,9 +52,18 @@ class CandidateCoverage:
 
 @dataclass(frozen=True)
 class CandidateValueLayout:
+    """Where and how one program buffer lives on the device.
+
+    ``axes`` are the program's loop labels (plus declared synthetic axes)
+    the value is laid out over; ``storage`` is a declared storage of the
+    target (a handle name or a register family prefix); ``packing`` names a
+    backend packing form when the layout is a host-packed carrier.
+    """
+
     value: str
     axes: tuple[str, ...]
     storage: str | None = None
+    packing: str | None = None
 
 
 @dataclass(frozen=True)
@@ -66,10 +75,24 @@ class CandidateTransfer:
 
 @dataclass(frozen=True)
 class CandidateLaunch:
+    """One device launch of the plan and the instances it computes.
+
+    ``operations`` are the indices of the work item's matched operations
+    (contractions in match order) the launch advances; ``instances`` is the
+    half-open range of result instances (flattened result coordinates) it
+    covers; ``reduction`` the half-open range of the reduction axis it sums
+    (``None`` for a non-reducing operation); ``accumulator`` how it starts
+    (``"zero"``, ``"carried"``, ``"none"``, ``"previous"``).  Launches are
+    indexed 0..n-1 in execution order.
+    """
+
     index: int
     kind: str
-    covers: tuple  # what the launch computes (plan name, stream/tile coordinates)
+    operations: tuple[int, ...]
+    instances: tuple[int, int]
+    reduction: tuple[int, int] | None = None
     accumulator: str | None = None
+    covers: tuple = ()  # backend detail (plan name, tile coordinates)
 
 
 @dataclass(frozen=True)
@@ -81,6 +104,9 @@ class CandidateEffects:
     abi_inputs: tuple[str, ...]
     abi_outputs: tuple[str, ...]
     device_scope: str
+    # Axes the plan adds to the program's loops (a unit axis a 1-D GEMV is
+    # lifted with), with their extents.
+    synthetic_axes: tuple[tuple[str, int], ...] = ()
 
     def manifest(self) -> dict[str, Any]:
         return {
@@ -91,7 +117,12 @@ class CandidateEffects:
                 "outputs": list(self.coverage.outputs),
             },
             "value_layouts": [
-                {"value": v.value, "axes": list(v.axes), "storage": v.storage}
+                {
+                    "value": v.value,
+                    "axes": list(v.axes),
+                    "storage": v.storage,
+                    "packing": v.packing,
+                }
                 for v in self.value_layouts
             ],
             "transfers": [
@@ -102,12 +133,16 @@ class CandidateEffects:
                 {
                     "index": l.index,
                     "kind": l.kind,
-                    "covers": list(l.covers),
+                    "operations": list(l.operations),
+                    "instances": list(l.instances),
+                    "reduction": None if l.reduction is None else list(l.reduction),
                     "accumulator": l.accumulator,
+                    "covers": list(l.covers),
                 }
                 for l in self.launches
             ],
             "abi": {"inputs": list(self.abi_inputs), "outputs": list(self.abi_outputs)},
+            "synthetic_axes": [list(item) for item in self.synthetic_axes],
             "device_scope": self.device_scope,
         }
 
@@ -120,13 +155,19 @@ def candidate_effects(placement) -> CandidateEffects | None:
 
 def _program_values(matches):
     """The buffers of one work item's matches: inputs, external
-    destinations, local destinations, parameter names (from the facts)."""
+    destinations, local destinations, operations, parameter names."""
 
     inputs, outputs, locals_, operations = set(), set(), set(), set()
     for match in matches:
         operations.add(match.target_op_name)
         for operand in match.operands:
-            if operand.memref_name is None or operand.is_loop_carried:
+            if operand.memref_name is None:
+                continue
+            if operand.is_loop_carried:
+                # An accumulator seeded from a buffer other than the result
+                # destination (a record's ``accumulator`` input) is read.
+                if operand.memref_name != match.result_memref_name:
+                    inputs.add(operand.memref_name)
                 continue
             inputs.add(operand.memref_name)
         if match.result_memref_name is not None:
@@ -146,19 +187,82 @@ def _program_values(matches):
                 outputs.add(memref)
     facts = matches[0].extra.get("program_facts") if matches else None
     parameters = set(getattr(facts, "parameter_names", ()) or ())
+    # Accumulator buffers that are outputs (carried accumulators) are also
+    # read; the loop-carried operand is not an input of the program.
+    inputs -= locals_
     return inputs, outputs, locals_, operations, parameters
 
 
-def validate_candidate_effects(matches, placement) -> list[str]:
+def _semantic_contractions(matches):
+    """The shared `Contraction` facts of the work item's accumulating
+    matches, in match order."""
+    out = []
+    for match in matches:
+        facts = match.extra.get("semantic_facts")
+        if facts is not None and hasattr(facts, "reduction_vars"):
+            out.append(facts)
+    return out
+
+
+def _semantic_loop_labels(matches) -> set:
+    """Loop labels of every match's shared facts (contractions and
+    epilogues alike)."""
+    labels = set()
+    for match in matches:
+        facts = match.extra.get("semantic_facts")
+        for loop in getattr(facts, "loops", ()) or ():
+            labels.add(loop.label)
+    return labels
+
+
+def _storage_declared(view, storage) -> bool:
+    if view is None or storage is None:
+        return storage is not None
+    handles = getattr(view, "_handles", None)
+    names = set(handles) if isinstance(handles, dict) else set()
+    for unit in getattr(view, "_walk", lambda: ())():
+        names.add(getattr(unit, "name", None))
+    if storage in names:
+        return True
+    # A register family (``vr`` for ``vr0``..``vr14``).
+    return any(
+        name is not None and name.startswith(storage) and name[len(storage) :].isdigit()
+        for name in names
+    )
+
+
+def _tiles(ranges, extent) -> bool:
+    """``ranges`` (half-open) partition ``[0, extent)`` exactly."""
+    spans = sorted(set((int(a), int(b)) for a, b in ranges))
+    if not spans or spans[0][0] != 0 or spans[-1][1] != extent:
+        return False
+    for (_a0, b0), (a1, _b1) in zip(spans, spans[1:]):
+        if a1 != b0:
+            return False
+    return all(a < b for a, b in spans)
+
+
+def validate_candidate_effects(matches, placement, view=None) -> list[str]:
     """Problems of a candidate's declared effects against the semantic
-    program of ``matches``; empty when consistent or when the candidate
-    declares no effects (a handle-only matcher placement)."""
+    program of ``matches`` (and the storage declarations of ``view`` when
+    given); empty when consistent or when the candidate declares no effects
+    (a handle-only matcher placement).
+
+    Checked: coverage (function, operations, inputs and outputs exactly the
+    program's); value layouts for every input and output over the program's
+    loop labels and declared synthetic axes, on declared storage, together
+    covering every loop of every contraction; a transfer in for every input
+    and out for every output; launches indexed 0..n-1 whose instance ranges
+    tile every covered operation's result instances and whose reduction
+    ranges tile its reduction extent; ABI equal to the coverage.
+    """
 
     effects = candidate_effects(placement)
     if effects is None:
         return []
     inputs, outputs, locals_, operations, parameters = _program_values(matches)
     functions = {match.func_name for match in matches}
+    contractions = _semantic_contractions(matches)
     problems = []
     coverage = effects.coverage
     if coverage.function not in functions:
@@ -175,26 +279,138 @@ def validate_candidate_effects(matches, placement) -> list[str]:
             f"writes {sorted(coverage.outputs)}, the program's external "
             f"destinations are {sorted(outputs)}"
         )
-    if not set(coverage.inputs) <= inputs | outputs:
+    if set(coverage.inputs) != inputs:
         problems.append(
-            f"reads {sorted(set(coverage.inputs) - inputs - outputs)}, which the "
-            "program does not read"
+            f"reads {sorted(coverage.inputs)}, the program reads {sorted(inputs)}"
         )
-    known = inputs | outputs | locals_
+
+    # Value layouts: every input and output, over program axes, on storage.
+    loop_labels = _semantic_loop_labels(matches)
+    synthetic = {name for name, _extent in effects.synthetic_axes}
+    for name, extent in effects.synthetic_axes:
+        if name in loop_labels or int(extent) < 1:
+            problems.append(f"synthetic axis {name!r} is not a fresh positive axis")
+    laid_out = set()
+    covered_axes = set()
     for layout in effects.value_layouts:
-        if layout.value not in known:
+        if layout.value not in inputs | outputs | locals_:
             problems.append(f"lays out {layout.value!r}, not a program buffer")
+            continue
+        laid_out.add(layout.value)
+        if len(set(layout.axes)) != len(layout.axes):
+            problems.append(f"layout of {layout.value!r} repeats an axis")
+        for axis in layout.axes:
+            if axis not in loop_labels and axis not in synthetic:
+                problems.append(
+                    f"layout of {layout.value!r} uses axis {axis!r}, which is not "
+                    f"a loop of the program ({sorted(loop_labels)}) nor declared"
+                )
+        covered_axes.update(layout.axes)
+        if not _storage_declared(view, layout.storage):
+            problems.append(
+                f"layout of {layout.value!r} names storage {layout.storage!r}, "
+                "which the target does not declare"
+            )
+    missing_layouts = (inputs | outputs) - laid_out
+    if missing_layouts:
+        problems.append(f"no value layout for {sorted(missing_layouts)}")
+    if loop_labels and not loop_labels <= covered_axes:
+        problems.append(
+            f"loops {sorted(loop_labels - covered_axes)} of the program appear in "
+            "no value layout (iteration coverage)"
+        )
+
+    # Transfers: every input in, every output out.
+    moved_in, moved_out = set(), set()
     for transfer in effects.transfers:
-        if transfer.value not in known:
+        if transfer.value not in inputs | outputs | locals_:
             problems.append(f"transfers {transfer.value!r}, not a program buffer")
         if transfer.direction not in ("in", "out", "inout"):
             problems.append(f"transfer of {transfer.value!r} has no direction")
+        if not transfer.route:
+            problems.append(f"transfer of {transfer.value!r} has no route")
+        if transfer.direction in ("in", "inout"):
+            moved_in.add(transfer.value)
+        if transfer.direction in ("out", "inout"):
+            moved_out.add(transfer.value)
+    if not inputs <= moved_in:
+        problems.append(f"inputs {sorted(inputs - moved_in)} are never transferred in")
+    if not outputs <= moved_out:
+        problems.append(
+            f"outputs {sorted(outputs - moved_out)} are never transferred out"
+        )
+
+    # Launches: ordered, each covering declared operations, tiling instances
+    # and reductions.
     if not effects.launches:
         problems.append("declares no launch")
+    for position, launch in enumerate(effects.launches):
+        if launch.index != position:
+            problems.append(f"launch {launch.index} is out of order at {position}")
+        if not launch.kind:
+            problems.append(f"launch {position} has no kind")
+        if not launch.operations:
+            problems.append(f"launch {position} advances no operation")
+        for op in launch.operations:
+            if not 0 <= op < len(matches):
+                problems.append(f"launch {position} names operation {op}, not matched")
+        a, b = launch.instances
+        if not 0 <= a < b:
+            problems.append(f"launch {position} covers no instances")
+    by_operation = {}
+    for launch in effects.launches:
+        for op in launch.operations:
+            by_operation.setdefault(op, []).append(launch)
+    for op, launches in by_operation.items():
+        contraction = contractions[op] if op < len(contractions) else None
+        if contraction is None:
+            continue
+        trips = contraction.trips
+        extent = 1
+        for var in contraction.result_vars:
+            extent *= int(trips.get(var) or 0)
+        reduction_extent = 1
+        for var in contraction.reduction_vars:
+            reduction_extent *= int(trips.get(var) or 0)
+        instance_ranges = {tuple(launch.instances) for launch in launches}
+        if extent and not _tiles(instance_ranges, extent):
+            problems.append(
+                f"the launches of operation {op} cover instances "
+                f"{sorted(instance_ranges)}, not a tiling of [0, {extent})"
+            )
+        for instance_range in instance_ranges:
+            reductions = [
+                launch.reduction
+                for launch in launches
+                if tuple(launch.instances) == instance_range
+            ]
+            if any(r is None for r in reductions):
+                if reduction_extent > 1:
+                    problems.append(
+                        f"a launch of operation {op} declares no reduction range "
+                        f"for a reduction of {reduction_extent}"
+                    )
+                continue
+            if reduction_extent and not _tiles(reductions, reduction_extent):
+                problems.append(
+                    f"the launches of operation {op} over instances {instance_range} "
+                    f"sum {sorted(reductions)}, not a tiling of [0, {reduction_extent})"
+                )
+    if contractions:
+        uncovered = set(range(len(matches))) - set(by_operation)
+        if uncovered:
+            problems.append(f"operations {sorted(uncovered)} are advanced by no launch")
+
+    # ABI.
     if set(effects.abi_outputs) != set(coverage.outputs):
         problems.append(
             f"ABI outputs {sorted(effects.abi_outputs)} differ from the coverage "
             f"outputs {sorted(coverage.outputs)}"
+        )
+    if set(effects.abi_inputs) != set(coverage.inputs):
+        problems.append(
+            f"ABI inputs {sorted(effects.abi_inputs)} differ from the coverage "
+            f"inputs {sorted(coverage.inputs)}"
         )
     if parameters and not set(effects.abi_inputs) | set(effects.abi_outputs) <= (
         parameters
@@ -207,12 +423,34 @@ def validate_candidate_effects(matches, placement) -> list[str]:
     return problems
 
 
-def require_candidate_effects(matches, placement, what: str) -> None:
-    problems = validate_candidate_effects(matches, placement)
+def require_candidate_effects(matches, placement, what: str, view=None) -> None:
+    problems = validate_candidate_effects(matches, placement, view)
     if problems:
         raise ValueError(
             f"{what}: candidate {getattr(placement, 'mode', '')!r} violates the "
             "candidate contract: " + "; ".join(problems)
+        )
+
+
+def check_graph_consistency(placement, graph) -> None:
+    """The priced graph must describe the candidate's declared launches: a
+    graph that states its launch count or plan must agree with the effects."""
+    effects = candidate_effects(placement)
+    if effects is None or graph is None:
+        return
+    metadata = getattr(graph, "metadata", {}) or {}
+    count = metadata.get("launch_count")
+    if count is not None and int(count) != len(effects.launches):
+        raise ValueError(
+            f"candidate {placement.mode!r}: the cost graph prices {count} launch(es) "
+            f"but the candidate declares {len(effects.launches)}"
+        )
+    plan = metadata.get("plan")
+    declared = {launch.covers[0] for launch in effects.launches if launch.covers}
+    if plan is not None and declared and plan not in declared:
+        raise ValueError(
+            f"candidate {placement.mode!r}: the cost graph prices plan {plan!r} but "
+            f"the candidate's launches declare {sorted(declared)}"
         )
 
 
@@ -314,6 +552,7 @@ __all__ = [
     "CandidateTransfer",
     "CandidateValueLayout",
     "candidate_effects",
+    "check_graph_consistency",
     "rebind_supplied_layouts",
     "require_candidate_effects",
     "validate_candidate_effects",

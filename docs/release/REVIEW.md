@@ -501,6 +501,47 @@ materialization and found that the new boundary admitted wrong programs:
 Gate G9 remains **FAIL**: typed records still dispatch through
 `_PROGRAM_ROUTES`; card and installed-artifact traces pending.
 
+## Round 15 (2026-11-03): independent review of 5a07639; launch bindings, enforced effects, typed records
+
+The reviewer found the round 14 boundaries incomplete in two ways and
+asked for the typed-record migration:
+
+- C-29b (fixed). Operand bindings of `allo.launch` were dropped; permuted
+  and empty operand lists executed. Judgment: a launch's operands are part
+  of the orchestration contract; they are retained on the schedule and
+  checked against the kernel's declared ABI (dataflow kernels through their
+  retained ABI identities, plain functions through their parameters) before
+  selection, for every target; permutations are refused rather than
+  lowered. The APU rule additionally checks that launches cover the kernel
+  groups once each in program order.
+- C-30 (fixed). The candidate effects were descriptive. Judgment: the
+  contract is now typed (launches carry operations, instance and reduction
+  ranges) and every field is checked against the semantic facts and the
+  target: coverage equality, layouts over program loops on declared
+  storage with iteration coverage, transfer completeness, ordered launches
+  tiling instances and reductions, ABI equality, graph consistency, and a
+  realization check that compares layouts, transfers and launches with the
+  materialized program. The reviewer's fault injection, re-expressed in the
+  typed fields, is a six-way regression on both APUs. The matcher backends
+  still declare no effects (recorded).
+- Slice 4, Gemini-II records (done). `APUG2TypedProgram` and
+  `APUG2ComposedContractionProgram` are frontends: their semantics are
+  stated as synthetic matches carrying the structural facts the matcher
+  stamps (loops, roles, accesses, accumulator initialization, policy) and
+  the derived `ProgramFacts`; the `apu_v2` enumerator produces the record's
+  realization as one candidate; legality (the view declares the typed
+  operations), the candidate contract, pricing through the record's recipe
+  graph, ranking, materialization (`APUG2RecordProgram`) and the shared
+  artifact follow. The separate callables are deleted. Judgment on the
+  accumulate epilogue: modeled as a zero-initialized local dot plus an ADD
+  with the seed input, which is what the device computes. `APUv1Program`
+  remains on the typed route (its scalar ARC programs and native recipes
+  are whole-function lowerings the matcher does not cover); that is the
+  remaining slice 4 item and is stated as such.
+
+Gate G9 remains **FAIL** until `APUv1Program` is migrated and the card and
+installed-artifact traces exist.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -550,6 +591,6 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 | G6 evidence beyond examples | **PARTIAL (reopened in round 8)** | EVIDENCE.md tables plus the round 6 probe files; remaining gaps are hardware-only confirmations listed in VALIDATION.md; the independent reviewer's probes varied the output conversion and a store guard, which the round 6 campaign had not, and found two silent defects; the campaign is kept as regression evidence, not as proof of generality; new probes must target the shared semantic contracts on every route |
 | G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install at ffb4a78 (needs repeating at the candidate, INSTALL.md section 6); AiM and UPMEM simulator recipes now ship in `simulators/` and were rebuilt from the release copies; Samsung's route is not buildable from the release repository without Samsung's permission for the five patches (P-04, documented, `apply.sh` refuses); architecture doc update for the shared pipeline pending (G9); P-17 documented proprietary SDK |
 | G8 backend execution | **evidence complete at 67f89fd, pending independent review** | installed-artifact runs at the round 10 repair: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed); all reviewer probes of rounds 8 to 10 rejected or executed correctly through the installed wheel (VALIDATION.md round 10); AttAcc analytical by design; AiM timing-only as accepted |
-| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-14: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, the typed candidate contract validated per candidate and against the artifact, supplied placements rebound under the current program and policy, unsupported orchestration refused before selection (ISSUES X-01, C-28, C-29); open: typed records (slice 4), card and installed-artifact stage traces (slice 5) |
+| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-15: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, an enforced typed candidate contract (C-30), supplied placements rebound (C-28), orchestration and launch bindings validated before selection (C-29, C-29b), Gemini-II typed records as frontends of the pipeline (ISSUES X-01); open: `APUv1Program` (typed route), card and installed-artifact stage traces |
 
-Verdict: **NOT READY**. Blockers: G9 (X-01) is in progress (slice 4 typed records, slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.
+Verdict: **NOT READY**. Blockers: G9 (X-01) is in progress (`APUv1Program` migration, slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.

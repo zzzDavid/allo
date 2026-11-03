@@ -322,6 +322,10 @@ class ProgramFacts:
     other_matches: tuple[MatchedOp, ...]
     foreign_functions: tuple[str, ...]  # functions with matches outside this one
     trace: MatchTrace = field(repr=False)
+    # A typed program record these facts were normalized from (a frontend
+    # without source); None for ordinary source.  The backend enumerator of
+    # the record's target turns it into the record's candidate.
+    frontend: Any = None
 
     def parameter(self, name: str) -> Parameter:
         for parameter in self.parameters:
