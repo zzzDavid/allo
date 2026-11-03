@@ -476,6 +476,9 @@ class SamsungElementwise:
     input_roles: tuple
     output_memref: str
     n: int
+    # Buffers the source copies the result into element for element
+    # (accepted copies, C-24); the runtime writes the result to each.
+    sink_memrefs: tuple = ()
 
 
 def samsung_elementwise(matches) -> SamsungElementwise:
@@ -508,31 +511,64 @@ def samsung_elementwise(matches) -> SamsungElementwise:
     var = m.enclosing_loops[0][0]
     if n is None:
         reject("the element loop needs a static [0, n) range with step 1")
-    identity = (None, "affine_map<(d0) -> (d0)>")
+    from .spmw_match_engine import _render_form, coordinate_forms, output_map_problem
+
+    element = coordinate_forms(var)  # the resolved coordinate ``var``
     inputs = [o for o in m.operands if not o.is_loop_carried]
     if any(o.is_loop_carried for o in m.operands):
         reject("an elementwise op cannot carry an accumulator")
     for o in inputs:
         dims, elt = _memref_dims(o.memref_type)
-        if o.indices != [var] or o.index_map not in identity:
+        # Resolved coordinates (C-23/C-24), never index text: the input is
+        # read at exactly the element the loop variable names.
+        if o.coords is None or tuple(o.coords) != element:
+            shown = (
+                [_render_form(c) if c else "?" for c in o.coords] if o.coords else "?"
+            )
             reject(
-                f"input {o.memref_name!r} is not indexed by the element loop {var} "
-                f"(index {o.indices}); a partitioned work grid indexes elements "
-                "through expressions the lowering cannot prove elementwise, so write "
-                "one work item whose loop walks the whole extent"
+                f"input {o.memref_name!r} is read at coordinate {shown}, not at the "
+                f"element loop {var}; the lowering walks one element per iteration "
+                "(a partitioned work grid, a shift or a broadcast is not elementwise)"
             )
         if dims != (n,) or elt != "f16":
-            reject(f"input {o.memref_name!r} must be a 1-D FP16 buffer of {n} elements")
-    if list(m.extra.get("store_indices") or []) != [var] or m.result_memref_name is None:
-        reject(f"the result must be stored at the element loop index {var}")
+            reject(
+                f"input {o.memref_name!r} is a {elt} buffer of shape {dims} but the "
+                f"element loop walks {n} elements; the lowering needs one work item "
+                "whose loop walks the whole 1-D FP16 extent (a partitioned work grid "
+                "is not supported)"
+            )
+    store_coords = m.extra.get("store_coords")
+    if (
+        m.result_memref_name is None
+        or store_coords is None
+        or tuple(store_coords) != element
+    ):
+        shown = (
+            [_render_form(c) if c else "?" for c in store_coords]
+            if store_coords
+            else "?"
+        )
+        reject(
+            f"the result is stored at coordinate {shown}, not at the element loop "
+            f"index {var}; the lowering writes element i of the output from element "
+            "i of the inputs, so a reversed, shifted or broadcast destination is "
+            "not realized"
+        )
+    problem = output_map_problem(m)
+    if problem is not None:
+        reject(f"the output map is not the identity the lowering realizes: {problem}")
     if len({o.memref_name for o in inputs}) != len(inputs):
         reject("one buffer bound to several inputs is not supported")
+    # Copies the matcher accepted are element-for-element copies of the result
+    # (`_copy_contract_problem`); the runtime writes the result to each sink.
+    sinks = tuple(memref for memref, _text in m.extra.get("output_sinks", ()))
     return SamsungElementwise(
         op=op,
         input_memrefs=tuple(o.memref_name for o in inputs),
         input_roles=tuple(o.role for o in inputs),
         output_memref=m.result_memref_name,
         n=n,
+        sink_memrefs=sinks,
     )
 
 
@@ -587,6 +623,22 @@ class SamsungCtx(CodegenContext):
     """
 
     _REG_TO_OPD = {"grf_a": "GRF_A", "grf_b": "GRF_B"}
+
+    @staticmethod
+    def realized_effects(trace):
+        """Destination refs the Samsung lowerings write: each match's own
+        destination and every accepted copy sink (the REDUCE programs write
+        the contraction's sink, the elementwise program writes its result and
+        every sink element for element).  `require_effects_realized` compares
+        this with the source's external effects."""
+        realized = set()
+        for match in trace.matches:
+            if match.result_value_ref is not None:
+                realized.add(match.result_value_ref)
+            for ref, _local in match.extra.get("output_sink_refs", ()):
+                if ref is not None:
+                    realized.add(ref)
+        return realized
 
     def __init__(self, target):
         super().__init__(target)
@@ -723,7 +775,9 @@ class SamsungCtx(CodegenContext):
         self.cmds[-1].loopCounter_ = int(loop_counter)
         self.cmds[-1].loopOffset_ = int(loop_offset)
 
-    def emit_program(self, trace, layouts, *, schedule=None, host_moves=(), module=None):
+    def emit_program(
+        self, trace, layouts, *, schedule=None, host_moves=(), module=None
+    ):
         from .spmw_autoschedule import (
             _bucket_for_autoschedule,
             _matcher_placement_decision,
@@ -735,7 +789,9 @@ class SamsungCtx(CodegenContext):
 
         layout_by_scope = {
             scope: layout
-            for (scope, _matches), layout in zip(_bucket_for_autoschedule(trace), layouts)
+            for (scope, _matches), layout in zip(
+                _bucket_for_autoschedule(trace), layouts
+            )
         }
         groups: dict = {}
         for work_id, matches in _bucket_by_work_id(trace):
@@ -799,7 +855,8 @@ class SamsungCtx(CodegenContext):
                 for work_id, matches in buckets:
                     self.host_schedule.append(
                         HostTrigger(
-                            work_id, sum(1 for m in matches if m.target_op_name == "MAC")
+                            work_id,
+                            sum(1 for m in matches if m.target_op_name == "MAC"),
                         )
                     )
 
@@ -807,7 +864,9 @@ class SamsungCtx(CodegenContext):
         extra = layout.extra or {}
         tile = extra.get("tile")
         if tile is not None and not getattr(tile, "is_identity", True):
-            raise _infeasible("the Samsung lowering does not realize a non-identity tile")
+            raise _infeasible(
+                "the Samsung lowering does not realize a non-identity tile"
+            )
         if extra.get("double_buffer"):
             raise _infeasible("the Samsung lowering has no double-buffer pair")
 
@@ -956,7 +1015,10 @@ class SamsungCtx(CodegenContext):
         if slots == list(range(rows_total)):
             return None, "identity"
         moved = sum(1 for row, slot in enumerate(slots) if row != slot)
-        return tuple(slots), f"permuted ({moved} of {rows_total} rows moved, {R} per unit)"
+        return (
+            tuple(slots),
+            f"permuted ({moved} of {rows_total} rows moved, {R} per unit)",
+        )
 
     def _emit_reduce(self, group_id, buckets, layout, issue):
         from .spmw_reduction_policy import may_regroup, no_strict_program_error
@@ -1467,7 +1529,9 @@ def _row_map_digest(values) -> str:
     return f"{digest:016x}"
 
 
-def samsung_slot_position(slot: int, geometry: dict, facts, rows_per_block: int) -> dict:
+def samsung_slot_position(
+    slot: int, geometry: dict, facts, rows_per_block: int
+) -> dict:
     """Physical position of one REDUCE slot: pass, channel, PIM block, GRF_B entry."""
     C, P, G = geometry["channels"], facts.pim_blocks, rows_per_block
     return {
@@ -1478,8 +1542,12 @@ def samsung_slot_position(slot: int, geometry: dict, facts, rows_per_block: int)
     }
 
 
-def samsung_reduce_plan(program: SamsungProgram, geometry: dict, columns: int,
-                        weight_resident: bool | None = None) -> dict:
+def samsung_reduce_plan(
+    program: SamsungProgram,
+    geometry: dict,
+    columns: int,
+    weight_resident: bool | None = None,
+) -> dict:
     """Physical plan of a REDUCE program on the simulated geometry.
 
     Slot s is ((pass * channels + channel) * blocks + block) * rows_per_block
@@ -1536,13 +1604,17 @@ def samsung_eltwise_plan(program: SamsungProgram, geometry: dict) -> dict:
             f"{(n_inputs + 1) * rows_per_operand} DRAM rows; a bank has {geometry['rows']}"
         )
     input_rows = [k * rows_per_operand for k in range(n_inputs)]
-    lines = _plan_header("ELTWISE", facts, geometry) + [
-        f"tiles {tiles}",
-        f"inputs {n_inputs}",
-        "input_rows " + " ".join(str(r) for r in input_rows),
-        "input_swap_parity " + " ".join(str(int(s)) for s in program.swap_parity),
-        f"output_row {n_inputs * rows_per_operand}",
-    ] + _plan_binds(program)
+    lines = (
+        _plan_header("ELTWISE", facts, geometry)
+        + [
+            f"tiles {tiles}",
+            f"inputs {n_inputs}",
+            "input_rows " + " ".join(str(r) for r in input_rows),
+            "input_swap_parity " + " ".join(str(int(s)) for s in program.swap_parity),
+            f"output_row {n_inputs * rows_per_operand}",
+        ]
+        + _plan_binds(program)
+    )
     return {
         "text": "\n".join(lines) + "\n",
         "tiles": tiles,
@@ -1556,7 +1628,9 @@ def _invoke_conductor(root, argv, what):
             argv, capture_output=True, cwd=str(root), timeout=1800, check=False
         )
     except (subprocess.SubprocessError, OSError) as exc:
-        raise RuntimeError(f"Samsung pim_driver {what} invocation failed: {exc}") from exc
+        raise RuntimeError(
+            f"Samsung pim_driver {what} invocation failed: {exc}"
+        ) from exc
     combined = proc.stdout.decode("utf-8", "replace") + proc.stderr.decode(
         "utf-8", "replace"
     )
@@ -1569,10 +1643,15 @@ def _invoke_conductor(root, argv, what):
         r"PIM_CYCLES total=(\d+) preload=(\d+) exec=(\d+) readback=(\d+)", combined
     )
     if not m:
-        raise RuntimeError(f"Samsung pim_driver {what} reported no cycles: {combined[-600:]}")
+        raise RuntimeError(
+            f"Samsung pim_driver {what} reported no cycles: {combined[-600:]}"
+        )
     receipt = re.search(r"TENON_CONDUCTOR (.*)", combined)
     conductor = (
-        {k: (int(v) if v.isdigit() else v) for k, v in re.findall(r"(\w+)=(\S+)", receipt.group(1))}
+        {
+            k: (int(v) if v.isdigit() else v)
+            for k, v in re.findall(r"(\w+)=(\S+)", receipt.group(1))
+        }
         if receipt
         else {}
     )
@@ -1606,8 +1685,9 @@ _ELTWISE_TIMING_SCOPE = (
 )
 
 
-def _samsung_run_reduce(compiled, program, crf_words, root, geometry, matrix, vectors,
-                        weight_resident=None):
+def _samsung_run_reduce(
+    compiled, program, crf_words, root, geometry, matrix, vectors, weight_resident=None
+):
     """Execute one REDUCE program for `vectors` (N, K) and return the result
     rows (N, M), cycles, phases, plan and conductor receipt."""
     import numpy as np
@@ -1633,12 +1713,18 @@ def _samsung_run_reduce(compiled, program, crf_words, root, geometry, matrix, ve
         plan_path.write_text(plan["text"])
         argv = [
             str(Path(root) / "pim_driver"),
-            "--op", "GENERIC",
-            "--op-kind", "REDUCE",
-            "--plan", str(plan_path),
-            "--crf", str(crf_path),
-            "--inputs", f"{a_path},{b_path}",
-            "--out", str(out_path),
+            "--op",
+            "GENERIC",
+            "--op-kind",
+            "REDUCE",
+            "--plan",
+            str(plan_path),
+            "--crf",
+            str(crf_path),
+            "--inputs",
+            f"{a_path},{b_path}",
+            "--out",
+            str(out_path),
         ]
         cycles, phases, conductor, log = _invoke_conductor(root, argv, "REDUCE")
         bursts = _samsung_read_bursts(out_path, N * slots, "REDUCE", log)
@@ -1661,7 +1747,9 @@ def _samsung_run_reduce(compiled, program, crf_words, root, geometry, matrix, ve
         "map": program.row_map,
         "digest": plan["row_map_digest"],
         "placement": {
-            row: samsung_slot_position(slot_of[row], geometry, facts, program.rows_per_block)
+            row: samsung_slot_position(
+                slot_of[row], geometry, facts, program.rows_per_block
+            )
             for row in sorted({0, 1, 2, 31, 32, M // 2, M - 1} & set(range(M)))
         },
     }
@@ -1711,18 +1799,31 @@ def _samsung_run_temporal(program, crf_words, root, geometry, matrix, vectors, i
         crf_path.write_text(crf_text)
         argv = [
             str(Path(root) / "pim_driver"),
-            "--op", "GENERIC",
-            "--op-kind", "TEMPORAL_REDUCE",
-            "--cmds", str(crf_path),
-            "--inputs", f"{a_path},{b_path},{i_path}",
-            "--out-rows", str(M),
-            "--reduce-k", str(K),
-            "--out-cols", str(N),
-            "--temporal-audit", str(td / "audit"),
-            "--out", str(out_path),
+            "--op",
+            "GENERIC",
+            "--op-kind",
+            "TEMPORAL_REDUCE",
+            "--cmds",
+            str(crf_path),
+            "--inputs",
+            f"{a_path},{b_path},{i_path}",
+            "--out-rows",
+            str(M),
+            "--reduce-k",
+            str(K),
+            "--out-cols",
+            str(N),
+            "--temporal-audit",
+            str(td / "audit"),
+            "--out",
+            str(out_path),
         ]
-        cycles, phases, _conductor, log = _invoke_conductor(root, argv, "TEMPORAL_REDUCE")
-        bursts = _samsung_read_bursts(out_path, (M * N + 15) // 16, "TEMPORAL_REDUCE", log)
+        cycles, phases, _conductor, log = _invoke_conductor(
+            root, argv, "TEMPORAL_REDUCE"
+        )
+        bursts = _samsung_read_bursts(
+            out_path, (M * N + 15) // 16, "TEMPORAL_REDUCE", log
+        )
     receipt = re.search(r"PIM_TEMPORAL_REDUCE (.*)", log)
     if not receipt or "ordered_k=1" not in receipt.group(1):
         raise RuntimeError(
@@ -1784,7 +1885,9 @@ def _check_host_moves(compiled, program, inputs) -> None:
         value = inputs[role]
         is_matrix = value is inputs.get("A")
         is_vector = value is inputs.get("B")
-        if verb == "scatter" and not (is_matrix or (is_vector and program.vector_from_bank)):
+        if verb == "scatter" and not (
+            is_matrix or (is_vector and program.vector_from_bank)
+        ):
             raise ValueError(
                 f"Samsung host move scatter binds {role!r}, which the selected program "
                 "does not place in the banks"
@@ -1817,7 +1920,9 @@ def _run_samsung(compiled: "Compiled", **inputs) -> RunResult:
     one conductor invocation per launch (``_run_samsung_launches``); its
     operands arrive under the workload's parameter names.
     """
-    ctx_programs = list(getattr(getattr(compiled, "layout_ctx", None), "programs", ()) or ())
+    ctx_programs = list(
+        getattr(getattr(compiled, "layout_ctx", None), "programs", ()) or ()
+    )
     if len(ctx_programs) > 1:
         return _run_samsung_launches(compiled, inputs)
     reason = _samsung_unavailable_reason()
@@ -1836,7 +1941,7 @@ def _run_samsung_program(compiled, program, root, geometry, inputs) -> RunResult
     runtime-role operands ``inputs`` (``A``/``B``/``C`` or ``IN0..IN2``)."""
     import numpy as np
 
-    crf_words = list(compiled.cmds[program.start:program.end])
+    crf_words = list(compiled.cmds[program.start : program.end])
     supplied = sorted(k for k, v in inputs.items() if v is not None)
 
     if program.kind == "TEMPORAL_REDUCE":
@@ -1864,7 +1969,9 @@ def _run_samsung_program(compiled, program, root, geometry, inputs) -> RunResult
             vectors = B[: c.K, : c.N].T
         else:
             vectors = B[: c.N, : c.K]
-        res = _samsung_run_reduce(compiled, program, crf_words, root, geometry, matrix, vectors)
+        res = _samsung_run_reduce(
+            compiled, program, crf_words, root, geometry, matrix, vectors
+        )
         rows = res["rows"]
         outputs = {"y": rows[0]} if c.column_var is None else {"out": rows.T}
         extra = {
@@ -1926,19 +2033,32 @@ def _run_samsung_program(compiled, program, root, geometry, inputs) -> RunResult
         out_path = td / "out.bin"
         argv = [
             str(Path(root) / "pim_driver"),
-            "--op", "GENERIC",
-            "--op-kind", "ELTWISE",
-            "--plan", str(td / "plan.txt"),
-            "--crf", str(td / "crf.txt"),
-            "--inputs", ",".join(paths),
-            "--out", str(out_path),
+            "--op",
+            "GENERIC",
+            "--op-kind",
+            "ELTWISE",
+            "--plan",
+            str(td / "plan.txt"),
+            "--crf",
+            str(td / "crf.txt"),
+            "--inputs",
+            ",".join(paths),
+            "--out",
+            str(out_path),
         ]
         cycles, phases, conductor, log = _invoke_conductor(root, argv, "ELTWISE")
         flat = _samsung_read_bursts(out_path, padded // 16, "ELTWISE", log).reshape(-1)
+    result = flat[: el.n].astype(np.float32)
+    outputs = {"out": result}
+    # Accepted copies (C-24): the source writes the same elements into these
+    # buffers as well; realized on the host from the gathered result.
+    for sink in el.sink_memrefs:
+        outputs[sink] = result.copy()
     extra = {
         "kernel": "GENERIC_ELTWISE",
         "returncode": 0,
-        "outputs": {"out": flat[: el.n].astype(np.float32)},
+        "outputs": outputs,
+        "copies": list(el.sink_memrefs),
         "logical_shape": {"elements": el.n},
         "padded_shape": {"elements": padded},
         "padding_fraction": 1.0 - el.n / padded,
@@ -2005,7 +2125,7 @@ def _run_samsung_temporal(program, crf_words, root, geometry, inputs) -> RunResu
                 "array) was not supplied"
             )
         init = np.asarray(init, dtype=np.float16)
-        initial = (init.reshape(M, 1) if c.column_var is None else init.reshape(M, N))
+        initial = init.reshape(M, 1) if c.column_var is None else init.reshape(M, N)
     else:
         initial = np.zeros((M, N), dtype=np.float16)
     slots = None
@@ -2017,7 +2137,9 @@ def _run_samsung_temporal(program, crf_words, root, geometry, inputs) -> RunResu
         staged, staged_init = np.empty_like(matrix), np.empty_like(initial)
         staged[slots], staged_init[slots] = matrix, initial
         matrix, initial = staged, staged_init
-    res = _samsung_run_temporal(program, crf_words, root, geometry, matrix, vectors, initial)
+    res = _samsung_run_temporal(
+        program, crf_words, root, geometry, matrix, vectors, initial
+    )
     rows = res["rows"] if slots is None else res["rows"][slots]
     tile_rows = geometry["channels"] * program.facts.pim_blocks * program.facts.lanes
 
@@ -2102,11 +2224,15 @@ def _launch_buffers(compiled, program, names) -> dict:
 
     trace = compiled.trace
     refs = getattr(trace, "source_value_refs", None) or {}
-    name_of = {ref: names[int(o)] for o, ref in refs.items() if 0 <= int(o) < len(names)}
+    name_of = {
+        ref: names[int(o)] for o, ref in refs.items() if 0 <= int(o) < len(names)
+    }
     matches = [
         m for m in trace.matches if _matcher_work_scope(m).group_id == program.group_id
     ]
-    kernel = matches[0].func_name.rsplit("_", 1)[0] if matches else str(program.group_id)
+    kernel = (
+        matches[0].func_name.rsplit("_", 1)[0] if matches else str(program.group_id)
+    )
 
     def bind(what, value_refs):
         found = {name_of.get(ref) for ref in value_refs}
@@ -2155,7 +2281,10 @@ def _launch_buffers(compiled, program, names) -> dict:
             ]
             or [None],
         )
-    if program.kind in _CONTRACTION_KINDS and program.contraction.accumulator_init == "carried":
+    if (
+        program.kind in _CONTRACTION_KINDS
+        and program.contraction.accumulator_init == "carried"
+    ):
         roles["C"] = roles["out"]
     return roles
 
@@ -2217,7 +2346,9 @@ def samsung_launch_plan(compiled) -> dict:
     """
     from .spmw_plan import HostStep, LaunchStep
 
-    programs = list(getattr(getattr(compiled, "layout_ctx", None), "programs", ()) or ())
+    programs = list(
+        getattr(getattr(compiled, "layout_ctx", None), "programs", ()) or ()
+    )
     schedule = getattr(compiled, "launch_schedule", None)
     if schedule is None or not any(isinstance(s, LaunchStep) for s in schedule.steps):
         raise NotImplementedError(
@@ -2369,7 +2500,10 @@ def samsung_launch_plan(compiled) -> dict:
                         f"{text}, which its selected program takes by {need}; "
                         f"host step {host_index} declares {verb}"
                     )
-                host_steps[host_index]["realized_by"] = {"launch": index, "phase": phase}
+                host_steps[host_index]["realized_by"] = {
+                    "launch": index,
+                    "phase": phase,
+                }
                 consumed[buffer] = (host_index, index)
                 operands[role] = (buffer, host_index)
             produced[roles["out"]] = index
@@ -2448,29 +2582,53 @@ def _run_samsung_launches(compiled, inputs) -> RunResult:
             extra = res.extra
             record = {
                 key: launch[key]
-                for key in ("launch", "kernel", "group_id", "ordinal", "program", "output", "gathered_by")
+                for key in (
+                    "launch",
+                    "kernel",
+                    "group_id",
+                    "ordinal",
+                    "program",
+                    "output",
+                    "gathered_by",
+                )
             }
             record.update(
-                operands={role: buffer for role, (buffer, _h) in launch["operands"].items()},
-                staged_by={role: h for role, (_buffer, h) in launch["operands"].items()},
+                operands={
+                    role: buffer for role, (buffer, _h) in launch["operands"].items()
+                },
+                staged_by={
+                    role: h for role, (_buffer, h) in launch["operands"].items()
+                },
                 cycles=res.cycles,
                 **{
                     key: extra[key]
                     for key in (
-                        "timing_scope", "cycle_phases", "conductor",
-                        "crf", "plan", "levers", "logical_shape", "padded_shape",
-                        "padding_fraction", "row_map", "accumulation",
+                        "timing_scope",
+                        "cycle_phases",
+                        "conductor",
+                        "crf",
+                        "plan",
+                        "levers",
+                        "logical_shape",
+                        "padded_shape",
+                        "padding_fraction",
+                        "row_map",
+                        "accumulation",
                     )
                     if key in extra
                 },
             )
             record["kernel_route"] = extra.get("kernel")
             records.append(record)
-            logs.append(f"--- launch {launch['launch']}: {launch['kernel']} ---\n{res.stdout}")
+            logs.append(
+                f"--- launch {launch['launch']}: {launch['kernel']} ---\n{res.stdout}"
+            )
         else:
             _kind, _host_index, buffer = event
             destination = inputs.get(buffer)
-            dtype = destination.dtype if isinstance(destination, np.ndarray) else np.float16
+            dtype = (
+                destination.dtype if isinstance(destination, np.ndarray) else np.float16
+            )
             value = device[buffer]
             shape = plan["parameters"].get(buffer)
             if shape is not None and value.size == math.prod(shape):
@@ -2491,7 +2649,10 @@ def _run_samsung_launches(compiled, inputs) -> RunResult:
             "launches": records,
             "host_steps": plan["host_steps"],
             "timing_scope": _LAUNCHES_TIMING_SCOPE,
-            "cycle_phases": {"launches": launch_cycles, "modelled_host_steps": modelled_cycles},
+            "cycle_phases": {
+                "launches": launch_cycles,
+                "modelled_host_steps": modelled_cycles,
+            },
             "simulator_geometry": geometry,
             "cycles_source": "PIMSimulator, one Tenon conductor invocation per launch, "
             "plus the cost graph for host steps no invocation performs",
@@ -2509,7 +2670,9 @@ def _layout_stage_resident(layout) -> bool:
     return bool(getattr(layout, "extra", {}).get("stage_resident", False))
 
 
-def _run_samsung_batched(compiled: "Compiled", W, X, compare_native: bool = True) -> RunResult:
+def _run_samsung_batched(
+    compiled: "Compiled", W, X, compare_native: bool = True
+) -> RunResult:
     """Run the compiled GEMV for B input vectors X[B, K] against one matrix W.
 
     The same emitted CRF runs B column passes; the selected placement's
@@ -2530,7 +2693,7 @@ def _run_samsung_batched(compiled: "Compiled", W, X, compare_native: bool = True
     root = _pimsim_root()
     geometry = samsung_simulator_geometry(root)
     _check_geometry(program.facts, geometry)
-    crf_words = list(compiled.cmds[program.start:program.end])
+    crf_words = list(compiled.cmds[program.start : program.end])
     W = np.asarray(W, dtype=np.float16)
     X = np.asarray(X, dtype=np.float16)
     if X.ndim == 1:

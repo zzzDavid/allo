@@ -31,8 +31,17 @@ from allo.spmw_samsung import (
 )
 
 M, K, ROWS = 4096, 256, 32
-GEOMETRY = {"channels": 64, "pim_blocks": 8, "grf_a": 8, "grf_b": 8, "lanes": 16,
-            "crf_words": 32, "banks": 16, "cols_per_row": 32, "rows": 16384}
+GEOMETRY = {
+    "channels": 64,
+    "pim_blocks": 8,
+    "grf_a": 8,
+    "grf_b": 8,
+    "lanes": 16,
+    "crf_words": 32,
+    "banks": 16,
+    "cols_per_row": 32,
+    "rows": 16384,
+}
 
 
 def _workloads():
@@ -145,7 +154,11 @@ def _forced(workload, compiled, mode, residency, issue="shared"):
         ):
             n = compiled.placement_ranking.kernels[0].bucket_count
             return allo.compile(
-                workload, target, samsung_cost, layout=[candidate] * n, reduction_order="reassociate"
+                workload,
+                target,
+                samsung_cost,
+                layout=[candidate] * n,
+                reduction_order="reassociate",
             )
     raise KeyError((mode, residency, issue))
 
@@ -167,7 +180,11 @@ def test_vendor_layout_emits_the_vendor_gemv_program(vendor):
     assert _words(vendor) == VENDOR_K256
     (program,) = vendor.compiled.layout_ctx.programs
     assert program.kind == "REDUCE"
-    assert (program.k_tiles, program.tile_fiber, program.rows_per_block) == (2, (0, 1), 8)
+    assert (program.k_tiles, program.tile_fiber, program.rows_per_block) == (
+        2,
+        (0, 1),
+        8,
+    )
     assert program.vector_from_bank is False
     assert program.lever_record["grf_residency"] == {"local_x": "host"}
     assert program.lever_record["fibers"] == 2
@@ -192,9 +209,13 @@ def test_default_selection_follows_the_serialized_fiber_cost(paper):
 def test_k512_program_derives_trip_counts_from_tiles():
     workload, _M, _K = _workloads()["gemv_m4096_k512"]
     target = build_samsung_target()
-    default = allo.compile(workload, target, samsung_cost, reduction_order="reassociate")
+    default = allo.compile(
+        workload, target, samsung_cost, reduction_order="reassociate"
+    )
     compiled = allo.compile(
-        workload, target, samsung_cost,
+        workload,
+        target,
+        samsung_cost,
         layout=samsung_vendor_gemv_layout(target, default.trace),
         reduction_order="reassociate",
     )
@@ -207,7 +228,10 @@ def test_k512_program_derives_trip_counts_from_tiles():
 def test_operand_order_does_not_change_decisions(paper):
     _workload, compiled = paper
     swapped = allo.compile(
-        swapped_gemv, build_samsung_target(), samsung_cost, reduction_order="reassociate"
+        swapped_gemv,
+        build_samsung_target(),
+        samsung_cost,
+        reduction_order="reassociate",
     )
     assert _words(swapped) == _words(compiled)
     assert dict(swapped._source_binding.inputs) == {"A": "W", "B": "x"}
@@ -234,16 +258,31 @@ def test_bank_row_and_crf_fill_change_the_emitted_program(paper):
     ]
     crf_fill = _forced(workload, compiled, "dual_fiber", "crf")
     assert [w[0] for w in _words(crf_fill)] == [
-        "FILL", "MAC", "JUMP", "FILL", "MAC", "JUMP", "NOP", "EXIT"
+        "FILL",
+        "MAC",
+        "JUMP",
+        "FILL",
+        "MAC",
+        "JUMP",
+        "NOP",
+        "EXIT",
     ]
     (program,) = crf_fill.compiled.layout_ctx.programs
     assert program.vector_from_bank is True
-    assert [b[1] for b in program.binds] == ["vector", "matrix", "vector", "matrix", "drain"]
+    assert [b[1] for b in program.binds] == [
+        "vector",
+        "matrix",
+        "vector",
+        "matrix",
+        "drain",
+    ]
 
 
 def test_unrealizable_levers_are_rejected_at_materialization(paper):
     workload, compiled = paper
-    with pytest.raises(InfeasibleSchedule, match="grf_staged places the matrix in a GRF"):
+    with pytest.raises(
+        InfeasibleSchedule, match="grf_staged places the matrix in a GRF"
+    ):
         _forced(workload, compiled, "grf_staged", "host")
     with pytest.raises(InfeasibleSchedule, match="lockstep"):
         _forced(workload, compiled, "dual_fiber", "host", issue="per_workid")
@@ -263,7 +302,9 @@ def test_reduce_plan_places_tiles_by_selected_fibers(vendor):
 
 
 def test_ambiguous_operands_are_rejected():
-    with pytest.raises(NotImplementedError, match="cannot tell the matrix from the vector"):
+    with pytest.raises(
+        NotImplementedError, match="cannot tell the matrix from the vector"
+    ):
         allo.compile(dot, build_samsung_target(), samsung_cost)
 
 
@@ -273,7 +314,10 @@ def test_partial_row_coverage_is_an_error():
 
 
 def test_elementwise_needs_a_provable_element_index():
-    with pytest.raises(SamsungUnsupported, match="not indexed by the element loop"):
+    # Work item (0, 0) reads ``la[0 + i]`` over 1024 of 131072 elements; the
+    # others read ``la[base + i]``: either way the lowering cannot walk the
+    # whole extent with one item and says so (resolved coordinates, C-24).
+    with pytest.raises(SamsungUnsupported, match="walks the whole 1-D FP16 extent"):
         allo.compile(partitioned_add, build_samsung_target(), samsung_cost)
 
 
@@ -283,13 +327,23 @@ def test_elementwise_programs_use_declared_moves():
     movs = [c for c in words if c.type_ == "MOV"]
     assert len(movs) == 16 and all(c.isRelu_ for c in movs)
     assert [c.dstIdx_ for c in movs[:8]] == list(range(8))
-    assert {c.dst_ for c in movs[:8]} == {"GRF_A"} and {c.dst_ for c in movs[8:]} == {"GRF_B"}
+    assert {c.dst_ for c in movs[:8]} == {"GRF_A"} and {c.dst_ for c in movs[8:]} == {
+        "GRF_B"
+    }
 
     mad = allo.compile(flat_mad, build_samsung_target(), samsung_cost)
     (program,) = mad.compiled.layout_ctx.programs
     assert program.swap_parity == (False, False, True)
     assert [c.type_ for c in mad.compiled.cmds] == [
-        "FILL", "FILL", "MAD", "NOP", "FILL", "FILL", "MAD", "NOP", "EXIT"
+        "FILL",
+        "FILL",
+        "MAD",
+        "NOP",
+        "FILL",
+        "FILL",
+        "MAD",
+        "NOP",
+        "EXIT",
     ]
     assert dict(mad._source_binding.inputs) == {"IN0": "a", "IN1": "b", "IN2": "d"}
 
@@ -298,7 +352,12 @@ def test_target_facts_raise_instead_of_guessing():
     with pytest.raises(ValueError, match="lacks the Samsung declarations"):
         samsung_target_facts(SimpleNamespace(name="partial", _walk=lambda: []))
     facts = samsung_target_facts(build_samsung_target())
-    assert (facts.pim_blocks, facts.banks_per_pim, facts.grf_a_entries, facts.lanes) == (
+    assert (
+        facts.pim_blocks,
+        facts.banks_per_pim,
+        facts.grf_a_entries,
+        facts.lanes,
+    ) == (
         8,
         2,
         8,

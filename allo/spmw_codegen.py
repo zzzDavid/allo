@@ -426,20 +426,14 @@ def _bank_fiber_class(idx, stride: int | None = None) -> str | None:
 # --------------------------------------------------------------------- #
 
 
-
-
 # --------------------------------------------------------------------- #
 # GSI APU v1 (Gemini 1) backend
 # --------------------------------------------------------------------- #
 
 
-
-
 # --------------------------------------------------------------------- #
 # GSI APU v2 (Gemini 2, G2) backend
 # --------------------------------------------------------------------- #
-
-
 
 
 # --------------------------------------------------------------------- #
@@ -918,8 +912,6 @@ def simulator_unavailable_reason(target_name: str) -> str | None:
 # --------------------------------------------------------------------- #
 
 
-
-
 def _run_virtual(compiled: "Compiled", **inputs) -> RunResult:
     """Evaluate the already-lowered cost program; nothing executes.
 
@@ -954,8 +946,6 @@ def _run_virtual(compiled: "Compiled", **inputs) -> RunResult:
     )
 
 
-
-
 @dataclass(frozen=True)
 class SourceBackendBinding:
     """Workload-parameter names bound to backend runtime kwargs.
@@ -967,6 +957,10 @@ class SourceBackendBinding:
 
     inputs: "dict[str, str]" = field(default_factory=dict)
     output: "str | None" = None
+    # Every externally visible destination the backend writes, keyed by the
+    # runtime's output name (``"out"`` for the producer, a sink's memref name
+    # for a copy), mapped to the source parameter receiving it.
+    outputs: "dict[str, str]" = field(default_factory=dict)
 
 
 # Samsung runtime kwargs. A contraction binds by structure (release audit
@@ -1012,9 +1006,7 @@ def source_backend_binding(target, trace, parameter_names) -> SourceBackendBindi
             refs = set()
             for match, c in classified:
                 role = c.matrix_role if kind == "matrix" else c.vector_role
-                refs.update(
-                    op.value_ref for op in match.operands if op.role == role
-                )
+                refs.update(op.value_ref for op in match.operands if op.role == role)
             role_kwargs.append((kwarg, refs))
     elif len(ops) == 1 and ops <= SAMSUNG_ELEMENTWISE_OPS:
         for role, kwarg in _SAMSUNG_ELTWISE_ROLE_KWARGS:
@@ -1055,14 +1047,26 @@ def source_backend_binding(target, trace, parameter_names) -> SourceBackendBindi
         for ordinal, ref in sorted(source_value_refs.items())
         if 0 <= int(ordinal) < len(parameter_names) and ref not in operand_refs
     ]
+    # Every external destination: the producers' own buffers and the sinks
+    # of accepted copies (`external_effects`), by retained identity.
+    outputs = {}
+    stored = {m.result_value_ref for m in trace.matches}
+    if len(stored) == 1 and next(iter(stored)) in ordinal_by_ref:
+        outputs["out"] = parameter_names[ordinal_by_ref[next(iter(stored))]]
+    for match in trace.matches:
+        for (memref, _text), (ref, local) in zip(
+            match.extra.get("output_sinks", ()), match.extra.get("output_sink_refs", ())
+        ):
+            if not local and ref in ordinal_by_ref:
+                outputs[memref] = parameter_names[ordinal_by_ref[ref]]
     output = unreferenced[0] if len(unreferenced) == 1 else None
     if output is None:
         # In place (``a[i] = a[i] + b[i]``): the stored parameter is also an
         # operand, so only the matches' store destination names the output.
-        stored = {m.result_value_ref for m in trace.matches}
-        if len(stored) == 1 and next(iter(stored)) in ordinal_by_ref:
-            output = parameter_names[ordinal_by_ref[next(iter(stored))]]
-    return SourceBackendBinding(inputs=inputs, output=output)
+        output = outputs.get("out")
+    if output is None and len(outputs) == 1:
+        output = next(iter(outputs.values()))
+    return SourceBackendBinding(inputs=inputs, output=output, outputs=outputs)
 
 
 class Compiled:
@@ -1162,8 +1166,6 @@ class Compiled:
         from .spmw_samsung import _run_samsung_batched
 
         return _run_samsung_batched(self, W, X, compare_native=compare_native)
-
-
 
 
 # Backend contexts and runners live in per-backend modules, imported only
@@ -1562,9 +1564,7 @@ def compile_for_target(
     if launch_schedule is not None:
         from .spmw_plan import HostStep
 
-        n_host_steps = sum(
-            isinstance(step, HostStep) for step in launch_schedule.steps
-        )
+        n_host_steps = sum(isinstance(step, HostStep) for step in launch_schedule.steps)
         if n_host_steps != len(resolved_host_moves):
             raise ValueError(
                 f"launch schedule has {n_host_steps} host steps but "
@@ -1653,6 +1653,16 @@ def compile_for_target(
             f"{sorted(_BACKENDS)}"
         )
     ctx_cls = backend_context_class(target_name)
+
+    # Release gate G2 (C-24): every externally visible write of the source
+    # (matched stores and accepted copies into function arguments) must be
+    # realized by this backend, or compilation stops here.
+    from .spmw_match_engine import require_effects_realized
+
+    declare = getattr(ctx_cls, "realized_effects", None)
+    require_effects_realized(
+        target, checked_trace, declare(checked_trace) if declare is not None else None
+    )
 
     from .spmw_autoschedule import _bucket_for_autoschedule
 

@@ -111,7 +111,9 @@ def gemv_carried(W: fp16[M, K], x: fp16[K], y: fp16[M]):
 
 
 def _compile(workload):
-    return allo.compile(workload, build_samsung_target(), samsung_cost, backend="virtual")
+    return allo.compile(
+        workload, build_samsung_target(), samsung_cost, backend="virtual"
+    )
 
 
 def _paper_gemv():
@@ -142,9 +144,7 @@ def test_paper_gemv_zero_init_and_output_sink():
     assert trace.coverage.errors == []
     assert {match.target_op_name for match in trace.matches} == {"MAC"}
     assert {match.extra["accumulator_init"] for match in trace.matches} == {"zero"}
-    sinks = {
-        sink for match in trace.matches for sink in match.extra["output_sinks"]
-    }
+    sinks = {sink for match in trace.matches for sink in match.extra["output_sinks"]}
     assert {name for name, _index in sinks} == {"local_y"}
     # One distinct output row base per work item.
     assert len(sinks) == len(trace.matches) == 128
@@ -216,7 +216,9 @@ def test_carried_accumulator_selects_the_ordered_program_on_samsung():
     ordered TEMPORAL program, whose conductor loads the initial accumulator.
     The REDUCE programs (which zero GRF_B) are pruned for it."""
     target = build_samsung_target()
-    trace = match_workload(target, allo.customize(gemv_carried, enable_tensor=False).module)
+    trace = match_workload(
+        target, allo.customize(gemv_carried, enable_tensor=False).module
+    )
     assert trace.coverage.errors == []
     assert {match.extra["accumulator_init"] for match in trace.matches} == {"carried"}
     # The store itself is the output sink of a carried accumulation.
@@ -251,9 +253,7 @@ def test_compile_for_target_rechecks_an_unchecked_trace():
     trace = match_workload(target, module)
     trace.coverage = None
     with pytest.raises(UnsupportedWorkloadError, match="arith.divf"):
-        compile_for_target(
-            target, trace, backend="virtual", module=module
-        )
+        compile_for_target(target, trace, backend="virtual", module=module)
 
 
 # --------------------------------------------------------------------------- #
@@ -348,7 +348,8 @@ def test_exact_constant_initializer_still_matches():
     """The frontend spells ``acc: fp16 = 0`` as sitofp(0); the constant is
     representable, so the initializer is still recognized as zero."""
     trace = match_workload(
-        build_samsung_target(), allo.customize(_paper_gemv(), enable_tensor=False).module
+        build_samsung_target(),
+        allo.customize(_paper_gemv(), enable_tensor=False).module,
     )
     assert trace.coverage.errors == []
     assert {m.extra["accumulator_init"] for m in trace.matches} == {"zero"}
@@ -669,7 +670,9 @@ def test_identity_and_hoisted_row_coordinates_compile_alike():
     identity = _compile(gemv_identity_rows)
     hoisted = _compile(gemv_hoisted_rows)
     assert identity.estimate().cycles == hoisted.estimate().cycles
-    assert [str(c) for c in identity.compiled.cmds] == [str(c) for c in hoisted.compiled.cmds]
+    assert [str(c) for c in identity.compiled.cmds] == [
+        str(c) for c in hoisted.compiled.cmds
+    ]
 
 
 def test_output_rows_are_written_at_the_rows_read(samsung_sim_gate):
@@ -707,7 +710,11 @@ def test_aim_reversed_output_rows_are_rejected():
 
     with pytest.raises(Exception, match="output map is not the identity"):
         allo.compile(
-            aim_rev, build_aim_target(), aim_cost, backend="virtual", reduction_order="reassociate"
+            aim_rev,
+            build_aim_target(),
+            aim_cost,
+            backend="virtual",
+            reduction_order="reassociate",
         )
 
 
@@ -772,3 +779,182 @@ def test_unsigned_loads_use_the_unsigned_range():
     message = str(info.value)
     assert "[0, 130050]" in message
     assert "i17 cannot hold" in message
+
+
+# --------------------------------------------------------------------------- #
+# Elementwise destination maps and realized copies (release review, round 10)
+# --------------------------------------------------------------------------- #
+
+
+@_df_region()
+def ew_reverse_add(A: fp16[N_EW], B: fp16[N_EW], Y: fp16[N_EW]):
+    @allo.work(mapping=[1], args=[A, B, Y])
+    def calc(a: fp16[N_EW], b: fp16[N_EW], y: fp16[N_EW]):
+        for i in range(N_EW):
+            y[N_EW - 1 - i] = a[i] + b[i]
+
+
+@_df_region()
+def ew_shifted_add(A: fp16[N_EW], B: fp16[N_EW], Y: fp16[N_EW + 1]):
+    @allo.work(mapping=[1], args=[A, B, Y])
+    def calc(a: fp16[N_EW], b: fp16[N_EW], y: fp16[N_EW + 1]):
+        for i in range(N_EW):
+            y[i + 1] = a[i] + b[i]
+
+
+@_df_region()
+def ew_broadcast_add(A: fp16[N_EW], B: fp16[N_EW], Y: fp16[N_EW]):
+    @allo.work(mapping=[1], args=[A, B, Y])
+    def calc(a: fp16[N_EW], b: fp16[N_EW], y: fp16[N_EW]):
+        for i in range(N_EW):
+            y[0] = a[i] + b[i]
+
+
+@_df_region()
+def ew_shifted_input(A: fp16[N_EW + 1], B: fp16[N_EW], Y: fp16[N_EW]):
+    @allo.work(mapping=[1], args=[A, B, Y])
+    def calc(a: fp16[N_EW + 1], b: fp16[N_EW], y: fp16[N_EW]):
+        for i in range(N_EW):
+            y[i] = a[i + 1] * b[i]
+
+
+def test_elementwise_destination_must_be_the_element_read():
+    """The Samsung elementwise program writes element i of the output from
+    element i of the inputs (the reviewer's reversed destination returned
+    forward-order results).  Reversed, shifted and broadcast destinations and
+    a shifted input are refused with the resolved coordinates, for ADD and
+    MUL alike."""
+    for workload in (ew_reverse_add, ew_shifted_add, ew_broadcast_add):
+        with pytest.raises(Exception, match="not at the element loop index") as info:
+            _compile(workload)
+        assert "reversed, shifted or broadcast destination" in str(info.value)
+    with pytest.raises(Exception, match="not at the element loop"):
+        _compile(ew_shifted_input)
+
+
+@_df_region()
+def ew_copy_reversed(A: fp16[N_EW], B: fp16[N_EW], T: fp16[N_EW], Y: fp16[N_EW]):
+    @allo.work(mapping=[1], args=[A, B, T, Y])
+    def calc(a: fp16[N_EW], b: fp16[N_EW], t: fp16[N_EW], y: fp16[N_EW]):
+        for i in range(N_EW):
+            t[i] = a[i] + b[i]
+            y[N_EW - 1 - i] = t[i]
+
+
+@_df_region()
+def ew_copy_identity(A: fp16[N_EW], B: fp16[N_EW], T: fp16[N_EW], Y: fp16[N_EW]):
+    @allo.work(mapping=[1], args=[A, B, T, Y])
+    def calc(a: fp16[N_EW], b: fp16[N_EW], t: fp16[N_EW], y: fp16[N_EW]):
+        for i in range(N_EW):
+            t[i] = a[i] + b[i]
+            y[i] = t[i]
+
+
+@_df_region()
+def ew_copy_two_sinks(
+    A: fp16[N_EW], B: fp16[N_EW], T: fp16[N_EW], Y: fp16[N_EW], Z: fp16[N_EW]
+):
+    @allo.work(mapping=[1], args=[A, B, T, Y, Z])
+    def calc(a: fp16[N_EW], b: fp16[N_EW], t: fp16[N_EW], y: fp16[N_EW], z: fp16[N_EW]):
+        for i in range(N_EW):
+            t[i] = a[i] * b[i]
+            y[i] = t[i]
+            z[i] = t[i]
+
+
+def test_permuted_copy_of_an_array_result_is_rejected():
+    """``y[N-1-i] = t[i]`` copies the produced element to a different
+    element; a copy is realized element for element, so the matcher refuses
+    it before any backend (the reviewer's probe reported a simulator run and
+    left y untouched)."""
+    with pytest.raises(
+        UnsupportedWorkloadError, match="permuted or shifted copy"
+    ) as info:
+        _compile(ew_copy_reversed)
+    assert "copies the result produced at element" in str(info.value)
+
+
+def test_identity_copies_are_required_outputs():
+    """``t[i] = a[i] + b[i]; y[i] = t[i]`` has two external effects.  The
+    binding lists both destinations and the Samsung elementwise program
+    declares it writes both; a backend that realizes only the producer
+    (AiM's elementwise stream) is refused at compile time."""
+    compiled = _compile(ew_copy_identity)
+    binding = compiled._source_binding
+    assert binding.outputs == {"out": "T", "y": "Y"}
+    (match,) = compiled.trace.matches
+    assert [memref for memref, _ in match.extra["output_sinks"]] == ["y"]
+    assert compiled.compiled.layout_ctx.programs[0].elementwise.sink_memrefs == ("y",)
+
+    from allo.ir.types import bfloat16 as bf16t
+    from allo.pim.costs import aim_cost
+    from allo.pim.targets import build_aim_target
+
+    @_df_region()
+    def aim_copy(A: bf16t[N_EW], B: bf16t[N_EW], T: bf16t[N_EW], Y: bf16t[N_EW]):
+        @allo.work(mapping=[1], args=[A, B, T, Y])
+        def calc(a: bf16t[N_EW], b: bf16t[N_EW], t: bf16t[N_EW], y: bf16t[N_EW]):
+            for i in range(N_EW):
+                t[i] = a[i] * b[i]
+                y[i] = t[i]
+
+    with pytest.raises(NotImplementedError, match="does not realize the write") as info:
+        allo.compile(aim_copy, build_aim_target(), aim_cost, backend="virtual")
+    assert "'y' in function 'calc_0' (copy store)" in str(info.value)
+
+
+def test_identity_copies_execute_and_write_every_destination(samsung_sim_gate):
+    """Executed check (values): one producer and two copies, all external;
+    every destination holds the result, none keeps its initial value."""
+    rng = np.random.default_rng(7)
+    a = (rng.standard_normal(N_EW) * 0.5).astype(np.float16)
+    b = (rng.standard_normal(N_EW) * 0.5).astype(np.float16)
+    expected = (a.astype(np.float32) + b.astype(np.float32)).astype(np.float16)
+    compiled = allo.compile(ew_copy_identity, build_samsung_target(), samsung_cost)
+    t = np.full(N_EW, 98, np.float16)
+    y = np.full(N_EW, 99, np.float16)
+    result = compiled(a, b, t, y)
+    assert result.kind == "simulator"
+    assert result.extra["copies"] == ["y"]
+    np.testing.assert_array_equal(t, expected)
+    np.testing.assert_array_equal(y, expected)
+
+    expected = (a.astype(np.float32) * b.astype(np.float32)).astype(np.float16)
+    compiled = allo.compile(ew_copy_two_sinks, build_samsung_target(), samsung_cost)
+    t = np.full(N_EW, 98, np.float16)
+    y = np.full(N_EW, 99, np.float16)
+    z = np.full(N_EW, 97, np.float16)
+    result = compiled(a, b, t, y, z)
+    assert result.kind == "simulator"
+    for destination in (t, y, z):
+        np.testing.assert_array_equal(destination, expected)
+
+
+@_df_region()
+def ew_local_then_copy(A: fp16[N_EW], B: fp16[N_EW], Y: fp16[N_EW]):
+    @allo.work(mapping=[1], args=[A, B, Y])
+    def calc(a: fp16[N_EW], b: fp16[N_EW], y: fp16[N_EW]):
+        t: fp16[N_EW] = 0
+        for i in range(N_EW):
+            t[i] = a[i] + b[i]
+            y[i] = t[i]
+
+
+def test_local_intermediate_copied_to_an_external_output(samsung_sim_gate):
+    """A function-local intermediate is not an effect; its copy into the
+    argument ``y`` is the only required output, and it is written."""
+    compiled = allo.compile(ew_local_then_copy, build_samsung_target(), samsung_cost)
+    stores = {
+        (s.memref_name, s.category, s.local) for s in compiled.trace.coverage.stores
+    }
+    assert ("t", "matched", True) in stores and ("y", "copy", False) in stores
+    assert compiled._source_binding.outputs == {"y": "Y"}
+    rng = np.random.default_rng(11)
+    a = (rng.standard_normal(N_EW) * 0.5).astype(np.float16)
+    b = (rng.standard_normal(N_EW) * 0.5).astype(np.float16)
+    y = np.full(N_EW, 99, np.float16)
+    result = compiled(a, b, y)
+    assert result.kind == "simulator"
+    np.testing.assert_array_equal(
+        y, (a.astype(np.float32) + b.astype(np.float32)).astype(np.float16)
+    )

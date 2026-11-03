@@ -579,8 +579,14 @@ class CompiledCallable:
 
         binding = getattr(self, "_source_binding", None)
         required = list(gather_roles)
-        if not required and binding is not None and binding.output in arguments:
-            required.append(binding.output)
+        if not required and binding is not None:
+            # every external destination the lowering realizes
+            for name in dict.fromkeys(
+                list(getattr(binding, "outputs", {}).values())
+                + ([binding.output] if binding.output is not None else [])
+            ):
+                if name in arguments and name not in required:
+                    required.append(name)
         if not outputs:
             if required:
                 raise RuntimeError(
@@ -590,7 +596,20 @@ class CompiledCallable:
                 )
             return
 
+        bound_outputs = getattr(binding, "outputs", None) or {}
         if (
+            binding is not None
+            and len(outputs) > 1
+            and all(key in bound_outputs or key not in arguments for key in outputs)
+        ):
+            # Several external destinations (a result and its copies), keyed
+            # by the runtime's output names and mapped through the binding.
+            assignments = {
+                bound_outputs[key]: value
+                for key, value in outputs.items()
+                if key in bound_outputs and bound_outputs[key] in arguments
+            }
+        elif (
             binding is not None
             and (binding.inputs or binding.output is not None)
             and len(outputs) == 1
@@ -654,7 +673,9 @@ def _bind_carried_accumulator(binding, trace, parameter_names):
     (ref,) = refs
     ordinals = [
         int(ordinal)
-        for ordinal, source_ref in (getattr(trace, "source_value_refs", None) or {}).items()
+        for ordinal, source_ref in (
+            getattr(trace, "source_value_refs", None) or {}
+        ).items()
         if source_ref == ref and 0 <= int(ordinal) < len(parameter_names)
     ]
     if len(ordinals) != 1:

@@ -609,7 +609,11 @@ def _interval(term, loop_bounds) -> tuple[int, int] | None:
         return None if width is None else _load_range(width, term.signed)
     if isinstance(term, WBlockArg):
         bounds = loop_bounds.get(term.ssa_name)
-        return None if bounds is None or bounds[1] <= bounds[0] else (bounds[0], bounds[1] - 1)
+        return (
+            None
+            if bounds is None or bounds[1] <= bounds[0]
+            else (bounds[0], bounds[1] - 1)
+        )
     if isinstance(term, WSelect):
         a = _interval(term.a, loop_bounds)
         b = _interval(term.b, loop_bounds)
@@ -776,7 +780,9 @@ def _float_leaf_fits(term, dst: str, loop_bounds) -> bool:
         return magnitude <= bits
     if isinstance(term, WBlockArg):
         bounds = loop_bounds.get(term.ssa_name)
-        return bounds is not None and max(abs(bounds[0]), abs(bounds[1] - 1)) < (1 << bits)
+        return bounds is not None and max(abs(bounds[0]), abs(bounds[1] - 1)) < (
+            1 << bits
+        )
     if isinstance(term, WBinOp):
         return _float_leaf_fits(term.lhs, dst, loop_bounds) and _float_leaf_fits(
             term.rhs, dst, loop_bounds
@@ -784,7 +790,9 @@ def _float_leaf_fits(term, dst: str, loop_bounds) -> bool:
     if isinstance(term, WUnary):
         # math.* functions and negation of a fitting argument; a cast term
         # (``arith.*<..>``) is a conversion we could not prove and stays out.
-        return not term.fn.startswith("arith.") and _float_leaf_fits(term.arg, dst, loop_bounds)
+        return not term.fn.startswith("arith.") and _float_leaf_fits(
+            term.arg, dst, loop_bounds
+        )
     if isinstance(term, WSelect):
         return (
             _float_leaf_fits(term.cond, dst, loop_bounds)
@@ -812,9 +820,11 @@ def _single_float_operation(term) -> bool:
     if isinstance(term, WUnary):
         return term.fn == "neg" and _is_float_leaf(term.arg)
     if isinstance(term, WBinOp):
-        return term.op in ("add", "sub", "mul", "div", "min", "max") and _is_float_leaf(
-            term.lhs
-        ) and _is_float_leaf(term.rhs)
+        return (
+            term.op in ("add", "sub", "mul", "div", "min", "max")
+            and _is_float_leaf(term.lhs)
+            and _is_float_leaf(term.rhs)
+        )
     return False
 
 
@@ -1000,7 +1010,9 @@ def _build_function_scope(func, value_refs, *, state) -> _FunctionScope:
         else:
             block = path[:-1]
             before = sum(
-                1 for _w, wpath in writes if wpath[:-1] == block and wpath[-1] < path[-1]
+                1
+                for _w, wpath in writes
+                if wpath[:-1] == block and wpath[-1] < path[-1]
             )
             versions[result] = (block, before)
         # M3: one store into a scalar alloc, in this block or an enclosing one,
@@ -1017,7 +1029,9 @@ def _build_function_scope(func, value_refs, *, state) -> _FunctionScope:
     return _FunctionScope(versions, forward)
 
 
-def _build_load_term(load_op, value_refs, *, state, scope=None, defining_map=None) -> WLoad:
+def _build_load_term(
+    load_op, value_refs, *, state, scope=None, defining_map=None
+) -> WLoad:
     name = load_op.operation.name
     attrs = load_op.attributes
     memref_name = None
@@ -1089,7 +1103,11 @@ def _trace_value(
     if op_name in _LOAD_OPS:
         if scope is not None and ssa_name in scope.forward:
             return _trace_value(
-                scope.forward[ssa_name], defining_map, value_refs, state=state, scope=scope
+                scope.forward[ssa_name],
+                defining_map,
+                value_refs,
+                state=state,
+                scope=scope,
             )
         return _build_load_term(
             src, value_refs, state=state, scope=scope, defining_map=defining_map
@@ -1108,15 +1126,23 @@ def _trace_value(
         )
     if op_name in _MATH_UNARY:
         arg = _trace_value(
-            _operand_names(src, state=state)[0], defining_map, value_refs, state=state, scope=scope
+            _operand_names(src, state=state)[0],
+            defining_map,
+            value_refs,
+            state=state,
+            scope=scope,
         )
         return WUnary(_MATH_UNARY[op_name], arg, _result_names(src, state=state)[0])
     if op_name in {"arith.cmpf", "arith.cmpi"}:
         predicate = _compare_predicate(src)
         if predicate is not None:
             ops = _operand_names(src, state=state)
-            lhs = _trace_value(ops[0], defining_map, value_refs, state=state, scope=scope)
-            rhs = _trace_value(ops[1], defining_map, value_refs, state=state, scope=scope)
+            lhs = _trace_value(
+                ops[0], defining_map, value_refs, state=state, scope=scope
+            )
+            rhs = _trace_value(
+                ops[1], defining_map, value_refs, state=state, scope=scope
+            )
             return WCmp(
                 predicate[0], lhs, rhs, _result_names(src, state=state)[0], predicate[1]
             )
@@ -1124,7 +1150,8 @@ def _trace_value(
     if op_name == "arith.select":
         ops = _operand_names(src, state=state)
         cond, a, b = (
-            _trace_value(name, defining_map, value_refs, state=state, scope=scope) for name in ops
+            _trace_value(name, defining_map, value_refs, state=state, scope=scope)
+            for name in ops
         )
         return WSelect(cond, a, b, _result_names(src, state=state)[0])
     if op_name == "arith.constant":
@@ -1152,7 +1179,11 @@ def _trace_value(
     # any other negation as a real term so `-x` never traces as `x`.
     if op_name == "arith.negf" and len(src.operands) == 1 and src.results:
         inner = _trace_value(
-            _operand_names(src, state=state)[0], defining_map, value_refs, state=state, scope=scope
+            _operand_names(src, state=state)[0],
+            defining_map,
+            value_refs,
+            state=state,
+            scope=scope,
         )
         value = _const_value(inner)
         result = _result_names(src, state=state)[0]
@@ -1167,7 +1198,11 @@ def _trace_value(
     # no pattern silently absorbs it and coverage reports it.
     if op_name in _CAST_OPS and len(src.operands) == 1 and src.results:
         inner = _trace_value(
-            _operand_names(src, state=state)[0], defining_map, value_refs, state=state, scope=scope
+            _operand_names(src, state=state)[0],
+            defining_map,
+            value_refs,
+            state=state,
+            scope=scope,
         )
         dst = _scalar_type_text(src.results[0].type)
         if _cast_exact_op(src):
@@ -1182,15 +1217,25 @@ def _trace_value(
         ):
             # A constant proven representable in the destination type (the
             # frontend's `acc: f16 = 0` arrives as sitofp(0)).
-            return WConst(_cast_constant(_const_value(inner), op_name), _result_names(src, state=state)[0])
+            return WConst(
+                _cast_constant(_const_value(inner), op_name),
+                _result_names(src, state=state)[0],
+            )
         narrowed = None
-        if op_name in ("arith.trunci", "arith.index_cast") and _int_bits(dst) is not None:
-            narrowed = _narrow_integer(inner, _int_bits(dst), getattr(state, "loop_bounds", {}))
+        if (
+            op_name in ("arith.trunci", "arith.index_cast")
+            and _int_bits(dst) is not None
+        ):
+            narrowed = _narrow_integer(
+                inner, _int_bits(dst), getattr(state, "loop_bounds", {})
+            )
         elif op_name == "arith.truncf":
             narrowed = _narrow_float(
                 inner, _scalar_type_text(src.operands[0].type), dst, state
             )
-        elif op_name in ("arith.sitofp", "arith.uitofp") and isinstance(inner, WBlockArg):
+        elif op_name in ("arith.sitofp", "arith.uitofp") and isinstance(
+            inner, WBlockArg
+        ):
             bounds = getattr(state, "loop_bounds", {}).get(inner.ssa_name)
             bits = _FLOAT_SIGNIFICAND_BITS.get(dst)
             if (
@@ -1279,11 +1324,7 @@ def _param_kinds(op_obj, pattern) -> dict[str, str] | None:
         return None
     return {
         name: (
-            "const"
-            if name in const_params
-            else "iv"
-            if name in iv_params
-            else "load"
+            "const" if name in const_params else "iv" if name in iv_params else "load"
         )
         for name in pattern.param_names
     }
@@ -1434,11 +1475,7 @@ def _term_eq(a, b) -> bool:
     if isinstance(a, WCmp):
         return a.pred == b.pred and _term_eq(a.lhs, b.lhs) and _term_eq(a.rhs, b.rhs)
     if isinstance(a, WSelect):
-        return (
-            _term_eq(a.cond, b.cond)
-            and _term_eq(a.a, b.a)
-            and _term_eq(a.b, b.b)
-        )
+        return _term_eq(a.cond, b.cond) and _term_eq(a.a, b.a) and _term_eq(a.b, b.b)
     return False
 
 
@@ -1542,7 +1579,9 @@ def _walk_loops(
                 frames = guards
                 if name == "scf.if":
                     cond = _value_name(op.operands[0], state)
-                    frames = guards + ((("if", cond) if region_index == 0 else ("not", cond)),)
+                    frames = guards + (
+                        (("if", cond) if region_index == 0 else ("not", cond)),
+                    )
                 elif name == "affine.if":
                     condition = (
                         str(op.attributes["condition"])
@@ -1952,9 +1991,12 @@ def _try_match_at_store(
         store_data_dependent = _data_dependent(op_name, index_terms)
         guard_terms = tuple(
             (
-                (frame[0], _trace_value(
-                    frame[1], defining_map, value_refs, state=state, scope=scope
-                ))
+                (
+                    frame[0],
+                    _trace_value(
+                        frame[1], defining_map, value_refs, state=state, scope=scope
+                    ),
+                )
                 if frame[0] in ("if", "not")
                 else frame
             )
@@ -2363,7 +2405,8 @@ def _stamp_batch_dims(trace: MatchTrace) -> None:
             return None, "axis roles are unresolved"
         first = roles[0]
         if any(
-            (r["matrix"], r["vector"], r["trips"]) != (first["matrix"], first["vector"], first["trips"])
+            (r["matrix"], r["vector"], r["trips"])
+            != (first["matrix"], first["vector"], first["trips"])
             for r in roles
         ):
             return None, "work items differ in operand roles or loop extents"
@@ -2728,7 +2771,9 @@ def _eval_affine_expr(node, dims):
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         inner = _eval_affine_expr(node.operand, dims)
         return None if inner is None else _form_scale(inner, -1)
-    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+    if isinstance(node, ast.BinOp) and isinstance(
+        node.op, (ast.Add, ast.Sub, ast.Mult)
+    ):
         lhs = _eval_affine_expr(node.left, dims)
         rhs = _eval_affine_expr(node.right, dims)
         if lhs is None or rhs is None:
@@ -2817,9 +2862,7 @@ def _form_mentions(form, names) -> bool:
 
 
 def _render_form(form) -> str:
-    parts = [
-        (f"{coef}*{atom}" if coef != 1 else atom) for atom, coef in form[0]
-    ]
+    parts = [(f"{coef}*{atom}" if coef != 1 else atom) for atom, coef in form[0]]
     if form[1] or not parts:
         parts.append(str(form[1]))
     return " + ".join(parts).replace("+ -", "- ")
@@ -2849,11 +2892,22 @@ def output_map_problem(match) -> str | None:
     if not store and sink_coords:
         problems = [
             _output_map_problem_for(match, coords, f"sink {memref}")
-            for (memref, _text), coords in zip(match.extra.get("output_sinks", ()), sink_coords)
+            for (memref, _text), coords in zip(
+                match.extra.get("output_sinks", ()), sink_coords
+            )
         ]
         return next((p for p in problems if p is not None), None)
     if not store and match.extra.get("output_sinks"):
         return "the result sinks' coordinates were not resolved by the matcher"
+    if store and sink_coords:
+        for (memref, _text), coords in zip(
+            match.extra.get("output_sinks", ()), sink_coords
+        ):
+            if coords is None or tuple(coords) != tuple(store):
+                return (
+                    f"the result is copied into {memref!r} at a different element "
+                    "than it is produced at; copies are realized element for element"
+                )
     return _output_map_problem_for(match, store, "the store")
 
 
@@ -2869,10 +2923,14 @@ def _output_map_problem_for(match, store, what) -> str | None:
         if operand.is_loop_carried or operand.memref_name is None:
             continue
         if operand.coords is None:
-            return f"the coordinates of operand {operand.memref_name!r} were not resolved"
+            return (
+                f"the coordinates of operand {operand.memref_name!r} were not resolved"
+            )
         for coord in operand.coords:
             if coord is None:
-                return f"operand {operand.memref_name!r} has a data-dependent coordinate"
+                return (
+                    f"operand {operand.memref_name!r} has a data-dependent coordinate"
+                )
             if _form_mentions(coord, reduction):
                 continue
             if coord not in store_set:
@@ -2890,7 +2948,8 @@ def _render_guards(guards) -> str:
     if not guards:
         return "none"
     return ", ".join(
-        f"{frame[0]}({frame[1]})" if len(frame) > 1 else str(frame[0]) for frame in guards
+        f"{frame[0]}({frame[1]})" if len(frame) > 1 else str(frame[0])
+        for frame in guards
     )
 
 
@@ -3150,13 +3209,19 @@ class _FunctionCoverage:
             return None
         init = None
         for index in self.stores:
-            if index == producer or self._dest(index) != dest or index in self.site_matches:
+            if (
+                index == producer
+                or self._dest(index) != dest
+                or index in self.site_matches
+            ):
                 continue
             interval = _interval(self._term(index), loop_bounds)
             if interval is None:
                 return None
-            init = interval if init is None else (
-                min(init[0], interval[0]), max(init[1], interval[1])
+            init = (
+                interval
+                if init is None
+                else (min(init[0], interval[0]), max(init[1], interval[1]))
             )
         if init is None:
             return None
@@ -3170,7 +3235,7 @@ class _FunctionCoverage:
             if depth is None:
                 return None
             trips = 1
-            for loop in loops[min(depth, len(loops)):]:
+            for loop in loops[min(depth, len(loops)) :]:
                 lo = _AFFINE_CONST_RE.match(str(loop[1]).strip())
                 hi = _AFFINE_CONST_RE.match(str(loop[2]).strip())
                 if not lo or not hi or not loop[3]:
@@ -3186,7 +3251,9 @@ class _FunctionCoverage:
             width = _int_bits(str(self._op(producer).operands[1].type.element_type))
         except AttributeError:
             return None
-        if width is None or not (_int_fits(total[0], width) and _int_fits(total[1], width)):
+        if width is None or not (
+            _int_fits(total[0], width) and _int_fits(total[1], width)
+        ):
             return None
         return total
 
@@ -3207,7 +3274,11 @@ class _FunctionCoverage:
         """
 
         def source_name(load_op):
-            return _attr_str(load_op.attributes["from"]) if "from" in load_op.attributes else "?"
+            return (
+                _attr_str(load_op.attributes["from"])
+                if "from" in load_op.attributes
+                else "?"
+            )
 
         copy_guards = tuple(self.sites[index][2])
         copy_loops = [loop[0] for loop in self.sites[index][1]]
@@ -3262,6 +3333,27 @@ class _FunctionCoverage:
                     f"[{', '.join(_render_term(t) for t in source_terms)}] of the "
                     f"result, but its producer stores element "
                     f"[{', '.join(_render_term(t) for t in self._store_index_terms(j))}]"
+                )
+            # Destination relation (C-24): a backend realizes a copy of an
+            # array result as the same element of another buffer.  The copy's
+            # own coordinates must therefore equal the producer's (a scalar
+            # producer has none; its sinks are checked by `output_map_problem`).
+            produced = _coords_of_terms(self._store_index_terms(j), self._store_map(j))
+            written = _coords_of_terms(
+                self._store_index_terms(index), self._store_map(index)
+            )
+            if produced and (
+                written is None
+                or any(c is None for c in written)
+                or any(c is None for c in produced)
+                or written != produced
+            ):
+                return (
+                    "copies the result produced at element "
+                    f"[{', '.join(_render_form(c) if c else '?' for c in produced)}] to "
+                    f"element [{', '.join(_render_form(c) if c else '?' for c in (written or ()))}]"
+                    "; a copy is realized as the same element of another buffer, "
+                    "and no target lowering realizes a permuted or shifted copy"
                 )
         try:
             source_type = str(source.operands[0].type.element_type)
@@ -3361,15 +3453,27 @@ class _FunctionCoverage:
                     sink_coords = _coords_of_terms(
                         self._store_index_terms(index), self._store_map(index)
                     )
+                    sink_ref = self._ref(self._op(index).operands[1])
                     for j in producers:
                         for match in self.site_matches[j]:
                             sinks = match.extra.setdefault("output_sinks", [])
                             if sink not in sinks:
                                 sinks.append(sink)
-                                # Resolved sink coordinates, one entry per
-                                # sink (`output_map_problem`).
+                                # Resolved sink coordinates and destination
+                                # identities, one entry per sink
+                                # (`output_map_problem`, `external_effects`).
                                 match.extra.setdefault("output_sink_coords", []).append(
                                     sink_coords
+                                )
+                                match.extra.setdefault("output_sink_refs", []).append(
+                                    (
+                                        (
+                                            sink_ref
+                                            if isinstance(sink_ref, IRValueRef)
+                                            else None
+                                        ),
+                                        self._is_local(index),
+                                    )
                                 )
                     detail[index] = f"copy of {_render_term(self._term(index))}"
                     continue
@@ -3413,6 +3517,10 @@ class _FunctionCoverage:
 
         for index in self.stores:
             cat = category[index]
+            dest_ref = self._ref(self._op(index).operands[1])
+            local = self._is_local(index)
+            for match in self.site_matches.get(index, ()):
+                match.extra["result_is_local"] = local
             coverage.stores.append(
                 StoreCoverage(
                     func_name=self.func_name,
@@ -3421,6 +3529,8 @@ class _FunctionCoverage:
                     enclosing_loops=tuple(self.sites[index][1]),
                     category=cat,
                     detail=detail.get(index, ""),
+                    local=local,
+                    value_ref=dest_ref if isinstance(dest_ref, IRValueRef) else None,
                 )
             )
             if cat == STORE_UNMATCHED:
@@ -3457,7 +3567,9 @@ class _FunctionCoverage:
                         self._store_index_terms(store),
                     ):
                         continue
-                    names = ", ".join(m.target_op_name for m in self.site_matches[index])
+                    names = ", ".join(
+                        m.target_op_name for m in self.site_matches[index]
+                    )
                     read = _render_term(load)
                     written = f"{self._dest_name(store)}[{self._index_text(store)}]"
                     problems.setdefault(
@@ -3606,16 +3718,16 @@ class _FunctionCoverage:
         if not others:
             if dest in self.arg_refs:
                 return "carried", []
-            return "unsupported", [
-                "it is a local buffer that is never initialized"
-            ]
+            return "unsupported", ["it is a local buffer that is never initialized"]
         _op, match_loops, match_guards = self.sites[index]
         match_ivs = [loop[0] for loop in match_loops]
         found = []
         for other in others:
             other_loops, other_guards = self.sites[other][1], self.sites[other][2]
             other_ivs = [loop[0] for loop in other_loops]
-            at = f"store {self._handle(other)} at loop nest {_render_loops(other_loops)}"
+            at = (
+                f"store {self._handle(other)} at loop nest {_render_loops(other_loops)}"
+            )
             if other in self.site_matches:
                 found.append(
                     f"it is also written by matched op(s) "
@@ -3717,7 +3829,9 @@ def _format_coverage_problems(problems, exempt=frozenset()) -> list[str]:
         if count == 0:
             continue
         if count > 1:
-            message += f" (the same store occurs in {count - 1} more work-item function(s))"
+            message += (
+                f" (the same store occurs in {count - 1} more work-item function(s))"
+            )
         errors.append(message)
     return errors
 
@@ -3750,6 +3864,74 @@ def _host_executed_functions(target, trace: MatchTrace):
         if kernel.placement == "host":
             host.update(match.func_name for match in matches)
     return frozenset(host)
+
+
+def external_effects(trace: MatchTrace, target=None) -> list[tuple]:
+    """Externally observable writes a backend must realize: every matched or
+    copied store whose destination is not a function-local buffer, as
+    ``(function, memref name, destination ref, category)``.  Stores of
+    functions the backend runs verbatim on the host are excluded (their
+    effects are realized by that code).
+    """
+    coverage = getattr(trace, "coverage", None)
+    if coverage is None:
+        return []
+    exempt = (
+        _host_executed_functions(target, trace) if target is not None else frozenset()
+    )
+    effects = []
+    for record in coverage.stores:
+        if record.category not in (STORE_MATCHED, STORE_COPY) or record.local:
+            continue
+        if exempt and record.func_name in exempt:
+            continue
+        effects.append(
+            (record.func_name, record.memref_name, record.value_ref, record.category)
+        )
+    return effects
+
+
+def default_realized_effects(trace: MatchTrace) -> set:
+    """Destination refs a matcher backend realizes unless it says otherwise:
+    the matched stores' own destinations, and the sinks of a producer whose
+    own destination is local (a scalar accumulator copied to the output).  A
+    copy of an externally visible array result into another buffer is an
+    additional effect; a backend that realizes it declares so through
+    ``realized_effects``."""
+    realized = set()
+    for match in trace.matches:
+        if match.result_value_ref is not None:
+            realized.add(match.result_value_ref)
+        if match.extra.get("result_is_local"):
+            for ref, _local in match.extra.get("output_sink_refs", ()):
+                if ref is not None:
+                    realized.add(ref)
+    return realized
+
+
+def require_effects_realized(target, trace: MatchTrace, realized: set | None) -> None:
+    """Raise unless every external effect of ``trace`` is realized.
+
+    ``realized`` is the backend's declaration (destination refs it writes);
+    None selects `default_realized_effects`.  Release gate G2: a compiled
+    program must not report success while an observable write of the source
+    never happens.
+    """
+    if realized is None:
+        realized = default_realized_effects(trace)
+    missing = []
+    for func_name, memref, ref, category in external_effects(trace, target):
+        if ref is None or ref not in realized:
+            missing.append(f"'{memref}' in function '{func_name}' ({category} store)")
+    if missing:
+        name = getattr(target, "name", trace.target_name)
+        raise NotImplementedError(
+            f"target {name!r}: the lowering does not realize the write(s) to "
+            + ", ".join(dict.fromkeys(missing))
+            + "; the program would report success without performing them. "
+            "Store the result only where the backend writes it, or extend the "
+            "backend's realized effects."
+        )
 
 
 def require_match_coverage(

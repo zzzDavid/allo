@@ -198,6 +198,13 @@ class StoreCoverage:
     enclosing_loops: tuple
     category: str
     detail: str = ""
+    # True when the destination is a buffer local to the function (an
+    # ``alloc``): the write is not observable by the caller.  Externally
+    # visible writes (function arguments) are the effects a backend must
+    # realize (`spmw_match_engine.external_effects`).
+    local: bool = False
+    # Retained identity of the destination buffer (None outside a scope).
+    value_ref: IRValueRef | None = None
 
 
 @dataclass

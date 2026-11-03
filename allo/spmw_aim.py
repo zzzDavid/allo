@@ -85,13 +85,15 @@ class AimCtx(CodegenContext):
                 "lane_bank inputs"
             )
         out_index = layout.out_dims.index("bank")
-        fixed = {name: 0 for name in layout.bases if name not in ("work_bank", "lane_bank")}
+        fixed = {
+            name: 0 for name in layout.bases if name not in ("work_bank", "lane_bank")
+        }
         banks: list[int] = []
         for work_bank in range(layout.size_of("work_bank")):
             for lane_bank in range(layout.size_of("lane_bank")):
-                bank = layout.apply(
-                    **fixed, work_bank=work_bank, lane_bank=lane_bank
-                )[out_index]
+                bank = layout.apply(**fixed, work_bank=work_bank, lane_bank=lane_bank)[
+                    out_index
+                ]
                 if bank not in banks:
                     banks.append(bank)
         return tuple(banks)
@@ -182,10 +184,10 @@ class AimCtx(CodegenContext):
         return "ramulator2-preterminated-segments", runtime_segments
 
 
-
 # --------------------------------------------------------------------- #
 # Spec 002 A3-A5: AimOp derivation, row allocation, host-step lowering.
 # --------------------------------------------------------------------- #
+
 
 def _bank_slot_conventions(target):
     """EWMUL and bank-pair MAC bank slots declared by the target's ``banks``
@@ -260,7 +262,9 @@ def _contraction_row_map(target, group, matches, layouts):
     if all(m is None for m in movements):
         return None
     if any(m is None or m != movements[0] for m in movements):
-        raise InfeasibleSchedule(f"AiM {group.name}: work items carry different owner maps")
+        raise InfeasibleSchedule(
+            f"AiM {group.name}: work items carry different owner maps"
+        )
     try:
         derived = derive_layout_problem(target, matches)
         matrix = derived.movement_matrix(movements[0])
@@ -283,7 +287,9 @@ def _contraction_row_map(target, group, matches, layouts):
     if derived.owner_flag(matrix) != derived.owner_flag(program):
         reason = row_map_unrealizable_reason(derived, matrix)
         if reason is not None:
-            raise InfeasibleSchedule(f"AiM {group.name}: owner map not realizable: {reason}")
+            raise InfeasibleSchedule(
+                f"AiM {group.name}: owner map not realizable: {reason}"
+            )
     shapes = [contraction["shape"] for contraction in group.contractions]
     if (
         len(shapes) != 1
@@ -309,8 +315,10 @@ def _contraction_row_map(target, group, matches, layouts):
         )
     per_unit = outputs // count
     frontier = {u: list(range(u * per_unit, (u + 1) * per_unit)) for u in range(count)}
-    if own != frontier or sorted(units) != list(range(count)) or any(
-        len(rows) != per_unit for rows in units.values()
+    if (
+        own != frontier
+        or sorted(units) != list(range(count))
+        or any(len(rows) != per_unit for rows in units.values())
     ):
         raise InfeasibleSchedule(
             f"AiM {group.name}: owner map not realizable: the work items do not "
@@ -373,7 +381,8 @@ def _row_map_entry(entry, slots, record) -> dict:
     samples = sorted({0, 1, per_unit - 1, per_unit, rows - 1} & set(range(rows)))
     out["row_slots"] = list(slots)
     out["placement"] = {
-        row: {"slot": slots[row], **_frontier_position(entry, slots[row])} for row in samples
+        row: {"slot": slots[row], **_frontier_position(entry, slots[row])}
+        for row in samples
     }
     return out
 
@@ -383,7 +392,9 @@ class _Usage:
 
     __slots__ = ("kind", "stride", "slot", "copies", "store", "contraction")
 
-    def __init__(self, kind, *, stride=0, slot=0, copies=1, store=False, contraction=None):
+    def __init__(
+        self, kind, *, stride=0, slot=0, copies=1, store=False, contraction=None
+    ):
         self.kind = kind  # "slot" or "matrix"
         self.stride = stride
         self.slot = slot
@@ -394,9 +405,22 @@ class _Usage:
 
 class _Group:
     __slots__ = (
-        "group_id", "name", "functions", "matches", "properties", "kind",
-        "replicas", "partitions", "elements", "usages", "contractions",
-        "sbk_banks", "row", "reduction_partitions", "row_map", "split_replicas",
+        "group_id",
+        "name",
+        "functions",
+        "matches",
+        "properties",
+        "kind",
+        "replicas",
+        "partitions",
+        "elements",
+        "usages",
+        "contractions",
+        "sbk_banks",
+        "row",
+        "reduction_partitions",
+        "row_map",
+        "split_replicas",
     )
 
     def __init__(self, group_id, name):
@@ -434,7 +458,9 @@ class _AimProgramDerivation:
         ) = _bank_slot_conventions(target)
         self.layout_by_scope = {
             scope: layout
-            for (scope, _matches), layout in zip(_bucket_for_autoschedule(trace), layouts)
+            for (scope, _matches), layout in zip(
+                _bucket_for_autoschedule(trace), layouts
+            )
         }
         self._index_buffers()
         # id(AimContraction record) -> scalar MACs of its matched program.
@@ -473,7 +499,9 @@ class _AimProgramDerivation:
                 shape = _memref_shape(getattr(operand, "memref_type", None))
                 if shape and key not in self.shape_by_key:
                     self.shape_by_key[key] = shape
-                self.declaration.setdefault(key, len(parameters) + len(self.declaration))
+                self.declaration.setdefault(
+                    key, len(parameters) + len(self.declaration)
+                )
             key = self._key(match.result_value_ref, match.result_memref_name)
             self.declaration.setdefault(key, len(parameters) + len(self.declaration))
         self.resident = {
@@ -587,9 +615,20 @@ class _AimProgramDerivation:
                         f"got {len(matched)}"
                     )
                 match = matched[0]
+                from .spmw_match_engine import output_map_problem
+
+                problem = output_map_problem(match)
+                if problem is not None:
+                    # The EWMUL/EWADD stream writes element i of the result
+                    # from element i of the operands (C-24).
+                    raise NotImplementedError(
+                        f"AiM {group.name}: the output map is not the identity the "
+                        f"elementwise lowering realizes: {problem}"
+                    )
                 group.kind = kind.lower()
                 group.elements = math.prod(
-                    _parse_loop_bound(ub) for _var, _lb, ub, _step in match.enclosing_loops
+                    _parse_loop_bound(ub)
+                    for _var, _lb, ub, _step in match.enclosing_loops
                 )
                 self._spread_elementwise_grid(group, match, replicated)
                 if kind == "MUL":
@@ -701,7 +740,9 @@ class _AimProgramDerivation:
                 "reduction": contraction["shape"]["reduction"],
             }
         batch, outputs, reduction = (
-            extents["batch"], extents["output"], extents["reduction"]
+            extents["batch"],
+            extents["output"],
+            extents["reduction"],
         )
         cpr = group.partitions
         channels = group.replicas * cpr
@@ -719,9 +760,9 @@ class _AimProgramDerivation:
                 * _ceil(outputs, geometry.banks)
                 * _ceil(_ceil(reduction, parts), cols)
             )
-        return _ceil(outputs * batch * group.replicas, channels * geometry.banks) * _ceil(
-            reduction, cols
-        )
+        return _ceil(
+            outputs * batch * group.replicas, channels * geometry.banks
+        ) * _ceil(reduction, cols)
 
     def _allocate_rows(self):
         from .pim.schedule_search import InfeasibleSchedule
@@ -759,8 +800,10 @@ class _AimProgramDerivation:
         footprints: dict = {}
         for group in self.groups:
             for key, usage in group.usages.items():
-                if group.kind == "mul" and self._relocated(group, key) and any(
-                    k in self.resident for k in group.usages
+                if (
+                    group.kind == "mul"
+                    and self._relocated(group, key)
+                    and any(k in self.resident for k in group.usages)
                 ):
                     continue
                 root = find(key)
@@ -772,7 +815,9 @@ class _AimProgramDerivation:
             components.setdefault(find(key), []).append(key)
         ordered = sorted(
             components,
-            key=lambda root: min(self.declaration.get(k, 1 << 30) for k in components[root]),
+            key=lambda root: min(
+                self.declaration.get(k, 1 << 30) for k in components[root]
+            ),
         )
         rows = {}
         regions = []
@@ -832,7 +877,9 @@ class _AimProgramDerivation:
                     activation=contraction["activation"],
                     name=contraction["match"].func_name,
                 )
-                operation = replace(operation, row=self.row_of_key[contraction["matrix"]])
+                operation = replace(
+                    operation, row=self.row_of_key[contraction["matrix"]]
+                )
                 self.program_macs[id(operation)] = shape["program_scalar_macs"]
                 if group.row_map is not None:
                     self.row_maps[id(operation)] = group.row_map
@@ -982,7 +1029,9 @@ class _AimProgramDerivation:
     def _token_extent(self, key, index):
         shape = self.shape_by_key.get(key)
         if shape is None:
-            raise NotImplementedError(f"AiM host transfer of unknown-shape buffer {key}")
+            raise NotImplementedError(
+                f"AiM host transfer of unknown-shape buffer {key}"
+            )
         if index is None:
             return math.prod(shape)
         if len(index) != len(shape):
@@ -1005,7 +1054,9 @@ class _AimProgramDerivation:
         axes = contraction["axes"]
         shape = contraction["shape"]
         if index is None or len(index) != len(axes):
-            raise NotImplementedError(f"AiM {direction} {name}: expected a full-rank slice")
+            raise NotImplementedError(
+                f"AiM {direction} {name}: expected a full-rank slice"
+            )
         fixed = [role for item, role in zip(index, axes) if isinstance(item, int)]
         position = next((item for item in index if isinstance(item, int)), None)
         if any(isinstance(item, tuple) for item in index):
@@ -1041,7 +1092,11 @@ class _AimProgramDerivation:
                         )
                     )
             return records
-        if direction == "broadcast" and mapping == "channels" and fixed == ["reduction"]:
+        if (
+            direction == "broadcast"
+            and mapping == "channels"
+            and fixed == ["reduction"]
+        ):
             # Element `position` of a reduction split P ways lives in partition
             # position % P at local index position // P; only the channels of
             # that partition's accumulators (local channel c with c % P == p)
@@ -1370,7 +1425,9 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
             # not simulated: they are listed, never added to `cycles`.
             "host_steps": [
                 step.manifest()
-                for step in getattr(getattr(compiled, "layout_ctx", None), "host_steps", ())
+                for step in getattr(
+                    getattr(compiled, "layout_ctx", None), "host_steps", ()
+                )
             ],
             **_row_map_extra(compiled),
         },
