@@ -881,7 +881,8 @@ def test_identity_copies_are_required_outputs():
     (AiM's elementwise stream) is refused at compile time."""
     compiled = _compile(ew_copy_identity)
     binding = compiled._source_binding
-    assert binding.outputs == {"out": "T", "y": "Y"}
+    # Outputs are keyed by the destinations' own memref names (C-25).
+    assert binding.outputs == {"t": "T", "y": "Y"}
     (match,) = compiled.trace.matches
     assert [memref for memref, _ in match.extra["output_sinks"]] == ["y"]
     assert compiled.compiled.layout_ctx.programs[0].elementwise.sink_memrefs == ("y",)
@@ -957,4 +958,122 @@ def test_local_intermediate_copied_to_an_external_output(samsung_sim_gate):
     assert result.kind == "simulator"
     np.testing.assert_array_equal(
         y, (a.astype(np.float32) + b.astype(np.float32)).astype(np.float16)
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Destination identities and arithmetic precision (release review, round 11)
+# --------------------------------------------------------------------------- #
+
+
+@_df_region()
+def ew_copy_sink_named_out(A: fp16[N_EW], B: fp16[N_EW], T: fp16[N_EW], Y: fp16[N_EW]):
+    @allo.work(mapping=[1], args=[A, B, T, Y])
+    def calc(a: fp16[N_EW], b: fp16[N_EW], t: fp16[N_EW], out: fp16[N_EW]):
+        for i in range(N_EW):
+            t[i] = a[i] + b[i]
+            out[i] = t[i]
+
+
+def test_destination_names_never_collide_with_runtime_keys(samsung_sim_gate):
+    """A copy destination called ``out`` (the reviewer's rename) must not
+    displace the producer's output: outputs are keyed by the destinations'
+    own memref names and every external destination is required
+    independently of the binding.  Executed: both T and Y hold the sum."""
+    compiled = allo.compile(
+        ew_copy_sink_named_out, build_samsung_target(), samsung_cost
+    )
+    assert compiled._source_binding.outputs == {"t": "T", "out": "Y"}
+    rng = np.random.default_rng(13)
+    a = (rng.standard_normal(N_EW) * 0.5).astype(np.float16)
+    b = (rng.standard_normal(N_EW) * 0.5).astype(np.float16)
+    expected = (a.astype(np.float32) + b.astype(np.float32)).astype(np.float16)
+    t = np.full(N_EW, 98, np.float16)
+    y = np.full(N_EW, 99, np.float16)
+    result = compiled(a, b, t, y)
+    assert result.kind == "simulator" and set(result.outputs) == {"t", "out"}
+    np.testing.assert_array_equal(t, expected)
+    np.testing.assert_array_equal(y, expected)
+
+
+from allo.ir.types import float32 as fp32
+
+
+@_df_region()
+def ew_wide_sum(A: fp16[N_EW], B: fp16[N_EW], Y: fp32[N_EW]):
+    @allo.work(mapping=[1], args=[A, B, Y])
+    def calc(a: fp16[N_EW], b: fp16[N_EW], y: fp32[N_EW]):
+        for i in range(N_EW):
+            y[i] = float(a[i]) + float(b[i])
+
+
+@_df_region()
+def ew_wide_product(A: fp16[N_EW], B: fp16[N_EW], Y: fp32[N_EW]):
+    @allo.work(mapping=[1], args=[A, B, Y])
+    def calc(a: fp16[N_EW], b: fp16[N_EW], y: fp32[N_EW]):
+        for i in range(N_EW):
+            y[i] = float(a[i]) * float(b[i])
+
+
+@_df_region()
+def ew_narrow_then_widen(A: fp16[N_EW], B: fp16[N_EW], Y: fp32[N_EW]):
+    @allo.work(mapping=[1], args=[A, B, Y])
+    def calc(a: fp16[N_EW], b: fp16[N_EW], y: fp32[N_EW]):
+        for i in range(N_EW):
+            y[i] = a[i] * b[i]
+
+
+@_df_region()
+def ew_larger_output(A: fp16[N_EW], B: fp16[N_EW], Y: fp16[N_EW + 1]):
+    @allo.work(mapping=[1], args=[A, B, Y])
+    def calc(a: fp16[N_EW], b: fp16[N_EW], y: fp16[N_EW + 1]):
+        for i in range(N_EW):
+            y[i] = a[i] + b[i]
+
+
+def test_widened_arithmetic_stored_wide_is_not_the_fp16_operation():
+    """``float(a[i]) + float(b[i])`` stored to an f32 output is an f32 add on
+    f16 operands (32768 + 32768 = 65536 in the source, inf on an FP16
+    adder); the same for the product.  No Samsung op declares a wide
+    intermediate, so both are refused naming the precision."""
+    for workload in (ew_wide_sum, ew_wide_product):
+        with pytest.raises(UnsupportedWorkloadError) as info:
+            _compile(workload)
+        message = str(info.value)
+        assert "evaluates this operation in f32 on f16 operands" in message
+        assert "matches no target op" in message
+
+
+def test_fp16_operation_widened_at_the_store_executes(samsung_sim_gate):
+    """The control: ``y_f32[i] = a[i] * b[i]`` multiplies in FP16 and widens
+    the result exactly; the device result (inf for 256 * 256) is the
+    source's."""
+    compiled = allo.compile(ew_narrow_then_widen, build_samsung_target(), samsung_cost)
+    a = np.full(N_EW, 256, np.float16)
+    y = np.full(N_EW, -1, np.float32)
+    result = compiled(a, a.copy(), y)
+    assert result.kind == "simulator"
+    with np.errstate(over="ignore"):
+        expected = (a * a).astype(np.float32)
+    np.testing.assert_array_equal(y, expected)
+    assert np.all(np.isinf(y))
+
+
+def test_output_extent_is_checked_before_execution():
+    with pytest.raises(Exception, match="must be a 1-D FP16 .* buffer of that extent"):
+        _compile(ew_larger_output)
+
+
+def wide_int_sum(A: int32[16], B: int32[16], C: int64[16]):
+    for i in range(16):
+        C[i] = A[i] + B[i]
+
+
+def test_widened_integer_arithmetic_stored_wide_is_refused():
+    """``i32 + i32`` evaluated in i33 and stored to int64 keeps the wide sum;
+    an op computing in i32 would wrap."""
+    with pytest.raises(UnsupportedWorkloadError) as info:
+        require_match_coverage(_trace(wide_int_sum, "ADD"))
+    assert "evaluates this operation in i33 on operands of at most i32" in str(
+        info.value
     )

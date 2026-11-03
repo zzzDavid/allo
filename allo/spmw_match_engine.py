@@ -328,6 +328,9 @@ class WUnary:
     fn: str  # normalized name, see _MATH_UNARY; "neg" for arith.negf
     arg: Any
     ssa_name: str
+    # MLIR result type text when traced from the IR (the precision the
+    # source evaluates the function in); None for synthesized terms.
+    result_type: str | None = None
 
 
 @dataclass
@@ -715,6 +718,9 @@ def _narrow_integer(term, bits: int, loop_bounds):
     keeps the cast visible so matching fails closed.
     """
     if _fits_integer(term, bits, loop_bounds):
+        # The value fits: evaluating in ``bits`` bits gives the same value.
+        if isinstance(term, (WBinOp, WUnary)):
+            return dataclasses.replace(term, result_type=f"i{bits}")
         return term
     # Leaves are judged by bit width, not by the signed range: truncating a
     # ``bits``-bit (or narrower) load to ``bits`` bits is the identity on its
@@ -741,13 +747,13 @@ def _narrow_integer(term, bits: int, loop_bounds):
         rhs = _narrow_integer(term.rhs, bits, loop_bounds)
         if lhs is None or rhs is None:
             return None
-        return WBinOp(term.op, lhs, rhs, term.ssa_name)
+        return WBinOp(term.op, lhs, rhs, term.ssa_name, result_type=f"i{bits}")
     if isinstance(term, WBinOp) and term.op == "shl":
         # Low bits of a left shift depend only on the low bits of the value.
         lhs = _narrow_integer(term.lhs, bits, loop_bounds)
         if lhs is None or not _fits_integer(term.rhs, bits, loop_bounds):
             return None
-        return WBinOp(term.op, lhs, term.rhs, term.ssa_name)
+        return WBinOp(term.op, lhs, term.rhs, term.ssa_name, result_type=f"i{bits}")
     if isinstance(term, WSelect):
         a = _narrow_integer(term.a, bits, loop_bounds)
         b = _narrow_integer(term.b, bits, loop_bounds)
@@ -756,7 +762,11 @@ def _narrow_integer(term, bits: int, loop_bounds):
         return WSelect(term.cond, a, b, term.ssa_name)
     if isinstance(term, WUnary) and term.fn == "neg":
         arg = _narrow_integer(term.arg, bits, loop_bounds)
-        return None if arg is None else WUnary("neg", arg, term.ssa_name)
+        return (
+            None
+            if arg is None
+            else WUnary("neg", arg, term.ssa_name, result_type=f"i{bits}")
+        )
     return None
 
 
@@ -864,7 +874,88 @@ def _narrow_float(term, src: str, dst: str, state):
         return None
     if not _single_float_operation(term):
         return None
+    # The accepted operation *is* the dst-precision operation: retag it so
+    # the precision contract (`arithmetic_precision_problem`) sees dst.
+    if isinstance(term, (WBinOp, WUnary)):
+        return dataclasses.replace(term, result_type=dst)
     return term
+
+
+def _float_leaf_types(term, out: list) -> list:
+    """Element types of the float-typed loads under ``term``."""
+    for load in _term_loads(term, []):
+        elem = _memref_element_type(load.memref_type) or ""
+        if elem in _FLOAT_SIGNIFICAND_BITS:
+            out.append(elem)
+    return out
+
+
+def _int_leaf_widths(term, out: list) -> list:
+    for load in _term_loads(term, []):
+        width = _int_bits(_memref_element_type(load.memref_type) or "")
+        if width is not None:
+            out.append(width)
+    return out
+
+
+def arithmetic_precision_problem(term) -> str | None:
+    """Why a target op declared on its operands' element type cannot compute
+    ``term``: the source evaluates the root operation in a wider type than
+    its operands (exact widening casts are transparent to the matcher, so
+    ``float(a[i]) + float(b[i])`` on f16 arrays stored to f32 is ``add`` in
+    f32 over f16 leaves; a device f16 add overflows where the source does
+    not).  None when the root's result type is at most the operands' type,
+    or when the store narrowed it back and the narrowing proof retagged the
+    operation (`_narrow_float`, `_narrow_integer`).  A compound expression
+    whose root is wide is caught here as well; its inner operations are
+    covered by the store-side narrowing rules.
+    """
+    if not isinstance(term, (WBinOp, WUnary)):
+        return None
+    result = term.result_type
+    if result is None:
+        return None
+    if result in _FLOAT_SIGNIFICAND_BITS:
+        leaves = _float_leaf_types(term, [])
+        if not leaves:
+            return None
+        narrowest = min(leaves, key=lambda t: _FLOAT_SIGNIFICAND_BITS[t])
+        if _FLOAT_SIGNIFICAND_BITS[result] > _FLOAT_SIGNIFICAND_BITS[narrowest]:
+            return (
+                f"the source evaluates this operation in {result} on {narrowest} "
+                f"operands (a widened intermediate stored without narrowing back); a "
+                f"target op computes in its operands' type {narrowest}, which rounds "
+                "and overflows differently"
+            )
+        return None
+    width = _int_bits(result)
+    if width is None:
+        return None
+    leaves = _int_leaf_widths(term, [])
+    if leaves and width > max(leaves):
+        return (
+            f"the source evaluates this operation in {result} on operands of at most "
+            f"i{max(leaves)} (a widened intermediate stored without truncating back); "
+            f"a target op computes in its operands' width, which wraps where the "
+            "source does not"
+        )
+    return None
+
+
+def _op_computes_wide(op_obj, term) -> bool:
+    """True when ``op_obj`` declares an intermediate precision that covers
+    the type ``term`` is evaluated in: a float type of at least as many
+    significand bits, or an integer width of at least as many bits."""
+    declared = getattr(op_obj, "intermediate", None)
+    result = getattr(term, "result_type", None)
+    if declared is None or result is None:
+        return False
+    if result in _FLOAT_SIGNIFICAND_BITS:
+        return (
+            _FLOAT_SIGNIFICAND_BITS.get(declared, 0) >= _FLOAT_SIGNIFICAND_BITS[result]
+        )
+    width, declared_width = _int_bits(result), _int_bits(str(declared))
+    return width is not None and declared_width is not None and declared_width >= width
 
 
 def _attr_str(a) -> str | None:
@@ -1132,7 +1223,12 @@ def _trace_value(
             state=state,
             scope=scope,
         )
-        return WUnary(_MATH_UNARY[op_name], arg, _result_names(src, state=state)[0])
+        return WUnary(
+            _MATH_UNARY[op_name],
+            arg,
+            _result_names(src, state=state)[0],
+            result_type=_scalar_type_text(src.results[0].type) if src.results else None,
+        )
     if op_name in {"arith.cmpf", "arith.cmpi"}:
         predicate = _compare_predicate(src)
         if predicate is not None:
@@ -1189,7 +1285,12 @@ def _trace_value(
         result = _result_names(src, state=state)[0]
         if value is not None:
             return WConst(-value, result)
-        return WUnary("neg", inner, result)
+        return WUnary(
+            "neg",
+            inner,
+            result,
+            result_type=_scalar_type_text(src.results[0].type) if src.results else None,
+        )
     # Only value-preserving casts are traced through (`cast_is_exact`), so
     # that constants on the other side still appear as constants when the
     # pattern needs them.  A conversion that can change a value (narrowing,
@@ -2040,6 +2141,13 @@ def _try_match_at_store(
                     ):
                         continue
                     candidate = t.arg
+                # Precision contract (C-26): an operation the source evaluates
+                # in a wider type than its operands binds only to an op that
+                # declares it computes in that precision.
+                if arithmetic_precision_problem(
+                    candidate
+                ) is not None and not _op_computes_wide(op_obj, candidate):
+                    continue
                 pat = compile_op_pattern(op_obj)
                 bindings: dict[str, Any] = {}
                 kinds = _param_kinds(op_obj, pat)
@@ -2118,6 +2226,10 @@ def _try_match_at_store(
                     ):
                         continue
                 extra = {"store_indices": list(store_indices)}
+                if memref_ssa is not None and len(store_op.operands) > 1:
+                    # Shaped type of the destination (backends check the
+                    # output's extent and element type against the program).
+                    extra["result_memref_type"] = str(store_op.operands[1].type)
                 if index_terms is not None:
                     # Resolved store coordinates (`affine_form`); consumers
                     # compare them with the operands' ``coords`` instead of
@@ -3614,6 +3726,9 @@ class _FunctionCoverage:
             )
         else:
             what = f"computes {_render_term(term)} (root op {root}), which matches no target op"
+            precision = arithmetic_precision_problem(term)
+            if precision is not None:
+                what += f"; {precision}"
         return (
             f"{where}: {what}. Target ops considered: {self._target_ops()}. "
             "Compiling would silently drop this effect; express it with the "

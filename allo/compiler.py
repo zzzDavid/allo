@@ -579,14 +579,37 @@ class CompiledCallable:
 
         binding = getattr(self, "_source_binding", None)
         required = list(gather_roles)
-        if not required and binding is not None:
-            # every external destination the lowering realizes
-            for name in dict.fromkeys(
-                list(getattr(binding, "outputs", {}).values())
-                + ([binding.output] if binding.output is not None else [])
+        if not required:
+            # Every externally visible destination of the source program
+            # (matched stores and accepted copies into parameters), derived
+            # from the trace's effects by retained identity, independently of
+            # the binding; then the binding's own destinations.
+            from .spmw_match_engine import external_effects
+
+            names = list(arguments)
+            ordinal_by_ref = {
+                ref: int(ordinal)
+                for ordinal, ref in (
+                    getattr(self.trace, "source_value_refs", None) or {}
+                ).items()
+            }
+            for _func, _memref, ref, _category in external_effects(
+                self.trace, self.target
             ):
-                if name in arguments and name not in required:
-                    required.append(name)
+                ordinal = ordinal_by_ref.get(ref)
+                if (
+                    ordinal is not None
+                    and ordinal < len(names)
+                    and names[ordinal] not in required
+                ):
+                    required.append(names[ordinal])
+            if binding is not None:
+                for name in dict.fromkeys(
+                    list(getattr(binding, "outputs", {}).values())
+                    + ([binding.output] if binding.output is not None else [])
+                ):
+                    if name in arguments and name not in required:
+                        required.append(name)
         if not outputs:
             if required:
                 raise RuntimeError(

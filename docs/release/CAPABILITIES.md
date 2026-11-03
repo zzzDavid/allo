@@ -175,7 +175,12 @@ without coefficients.
   unless the target op declares `intermediate="f32"`, as the AiM `AF`
   lookup table does), and any other conversion (`int(acc)` on an FP16
   output, `fptosi`, an unproven `trunci`) matches no target op and is
-  rejected naming the conversion; an output copy must run under exactly its
+  rejected naming the conversion; an operation the source evaluates in a
+  wider type than its operands and stores wide (`y_f32[i] = float(a[i]) +
+  float(b[i])` on FP16 arrays, `i32 + i32` stored to int64) binds only to
+  an op declaring that `intermediate` precision, otherwise it is rejected
+  naming the precision (`arithmetic_precision_problem`), while an FP16
+  operation whose result is widened at the store is the FP16 operation; an output copy must run under exactly its
   producer's guards, exactly once per produced element (never inside the
   reduction loop), read the element its producer stored, and write a
   buffer of the producer's type, otherwise it is rejected

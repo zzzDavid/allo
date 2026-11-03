@@ -346,6 +346,27 @@ Lint: the full `scripts/lint/task_lint.sh` header check against
 architecture document, the historical `design/` notes, two source modules,
 two tests, a verifier probe and both simulator `apply.sh`).
 
+## Round 11 (2026-11-02): fourth independent rejection (f732b22) and the repairs
+
+- Destination identities (C-25 follow-up). The round 10 realization keyed
+  the producer's output by the fixed word `out`, in the binding and in the
+  Samsung runtime, so a source buffer named `out` displaced it. Repair:
+  outputs are keyed by the destinations' own memref names end to end, and
+  the runtime's required-destination check is derived from the trace's
+  external effects by retained identity, independent of the binding. No
+  source name is reserved. The classifier also checks the output's extent
+  and element type before execution.
+- Arithmetic precision (C-26). Erasing exact widening casts is value-exact
+  but loses *where the arithmetic happens*; the match then bound an f32 add
+  on f16 operands to the FP16 ADD. Repair: the term carries its evaluation
+  type, `arithmetic_precision_problem` states the contract, and a wide
+  operation binds only to an op declaring that intermediate precision; the
+  narrowing proofs retag accepted operations to the destination type so the
+  valid `trunc` cases remain. Review judgment on the control: `y_f32[i] =
+  a[i] * b[i]` multiplies in FP16 and widens the result exactly, so the
+  device's FP16 multiply (inf for 256 * 256) is the source's value; it
+  stays accepted and is executed as a regression.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -388,7 +409,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 | Gate | Judgment | Basis |
 |---|---|---|
 | G1 correspondence | **PASS (round 7 judgment, to be re-challenged under G9)** | every substantive mechanism of Sections III and IV has a maintained implementation reachable through `allo.compile` (CLAIMS.md); row 16 realized on Samsung, UPMEM and AiM; the remaining external items are evaluation scripts documented as such (E11, E14 DRAM half, E15, the AttAcc reference-best study and e2e composition); under the user's G9 framing the APU v1 vector route and the Gemini-II source route are release APIs but not the shared pipeline (X-01) |
-| G2 semantic preservation / explicit failure | **FAIL at 620a230; repaired in round 10, pending independent review** | the reviewer's elementwise destination-map and dropped-copy probes executed with wrong or missing results at 620a230 (C-24, C-25); both are refused or realized now, with the external-effect check in `compile_for_target` and value-checked simulator regressions; the round 8 and 9 probes still reject |
+| G2 semantic preservation / explicit failure | **FAIL at f732b22; repaired in round 11, pending independent review** | the reviewer's renamed-sink and wide-output probes executed with a lost write and wrong values at f732b22 (C-25 follow-up, C-26); outputs are now keyed by destination identity with the required set derived from the trace's effects, and the match enforces the operation's evaluation precision; the rounds 8 to 10 probes still behave; evidence at the new revision in `VALIDATION.md` round 11 |
 | G3 general mechanisms | **PASS (round 7 judgment, to be re-challenged)** | structural recognizers and template-derived legality on every backend; renamed and neighbouring programs compile to the same normalized decisions; open minor: M-14; round 8 added no case entries: the cast and copy contracts are proofs over the IR, not spellings |
 | G4 search/layout/selected-program integrity | **PARTIAL (reopened in rounds 9 and 10)** | the executed program dropped accepted copies until C-25; required outputs are now derived from the trace's complete external effects and checked against the backend's declaration before selection; re-judge after independent review; the APU routes' planners remain outside the shared selection stage until G9 |
 | G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1; open: C-18 evaluator anomaly, uniform movement weights |

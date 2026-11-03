@@ -557,6 +557,15 @@ def samsung_elementwise(matches) -> SamsungElementwise:
     problem = output_map_problem(m)
     if problem is not None:
         reject(f"the output map is not the identity the lowering realizes: {problem}")
+    out_dims, out_elt = _memref_dims(m.extra.get("result_memref_type"))
+    if out_dims != (n,) or out_elt not in ("f16", "f32"):
+        # f32: the FP16 result is widened exactly on readback (the source's
+        # ``y_f32[i] = a[i] * b[i]`` multiplies in FP16 and widens the result).
+        reject(
+            f"the output {m.result_memref_name!r} is a {out_elt} buffer of shape "
+            f"{out_dims} but the element loop writes {n} FP16 results; the output "
+            "must be a 1-D FP16 (or FP32, widened on readback) buffer of that extent"
+        )
     if len({o.memref_name for o in inputs}) != len(inputs):
         reject("one buffer bound to several inputs is not supported")
     # Copies the matcher accepted are element-for-element copies of the result
@@ -2049,9 +2058,10 @@ def _run_samsung_program(compiled, program, root, geometry, inputs) -> RunResult
         cycles, phases, conductor, log = _invoke_conductor(root, argv, "ELTWISE")
         flat = _samsung_read_bursts(out_path, padded // 16, "ELTWISE", log).reshape(-1)
     result = flat[: el.n].astype(np.float32)
-    outputs = {"out": result}
-    # Accepted copies (C-24): the source writes the same elements into these
-    # buffers as well; realized on the host from the gathered result.
+    # Outputs are keyed by the destinations' own memref names (the producer's
+    # and each accepted copy's), so no source name can collide with a fixed
+    # key (C-25); the binding maps each name to its caller parameter.
+    outputs = {el.output_memref: result}
     for sink in el.sink_memrefs:
         outputs[sink] = result.copy()
     extra = {

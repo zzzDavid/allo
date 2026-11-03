@@ -1498,12 +1498,19 @@ def build_apu_g2_contraction_patterns():
                     accumulates=True,
                     fn=lambda x, y, acc: acc + x * y,
                 )
+                # The epilogue is evaluated on the exact dot sums in typed
+                # VL64 lanes of up to 24 bits (``MUL_TYPED``/``ADD_TYPED``
+                # over the interleaved dots); the source route's width check
+                # (`_check_widths`) proves the combined result fits.  The
+                # frontend evaluates ``alpha * x + beta * y`` in the output's
+                # type, wider than the accumulators, which this declares.
                 allo.op(
                     "AXPBY",
                     src=(seg0, seg0),
                     dst=seg1,
                     fn=lambda x, y, alpha, beta: alpha * x + beta * y,
                     const_params=("alpha", "beta"),
+                    intermediate="i24",
                 )
 
     return patterns

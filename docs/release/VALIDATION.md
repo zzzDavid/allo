@@ -405,3 +405,17 @@ black and clang-format stages pass against both HEAD~1 and origin/main after
 the round 10 lint commit; the pylint stage exits with 365 pre-existing
 findings across the fork (P-23), so the complete command still fails at
 that last stage.
+
+## Round 11 (2026-11-02): fourth reviewer rejection (destination identities, arithmetic precision)
+
+Reviewer material: `/work/shared/users/phd/nz264/tenon-release-evidence/reviewer-r10/`
+(`tenon_review_r10_effects.py`, `tenon_review_r10_wide_output.py`, logs).
+Raw logs of this round: `/tmp/tenon-release/r9/{r11a,final11-pim,final11-perf,installed11,board-installed11}.log`,
+copied to `/work/shared/users/phd/nz264/tenon-release-evidence/r11/`.
+
+| Probe (reviewer's script, unchanged) | At f732b22 (reviewer) | Round 11 tree |
+|---|---|---|
+| `renamed_sink`: `t[i] = a[i] + b[i]; out[i] = t[i]` (T and Y external) | compiled, binding `{'out': 'Y'}`, Y written, T left at 98 | binding `{'t': 'T', 'out': 'Y'}`; simulator outputs `['t', 'out']`; T and Y both equal a + b |
+| `larger_output`: 4097-element output for a 4096-element loop | compiled; failed only at readback with a shape error | refused at compile time: "the output 'y' is a f16 buffer of shape (4097,) but the element loop writes 4096 FP16 results" |
+| `wide_sum` / `wide_product`: FP16 inputs, FP32 output, `float(a[i]) + float(b[i])` and `float(a[i]) * float(b[i])` (source 65536) | compiled, simulator returned inf | refused: "computes add(a, b) ... the source evaluates this operation in f32 on f16 operands ... a target op computes in its operands' type f16" |
+| `narrow_then_widen` control: `y_f32[i] = a[i] * b[i]` | inf (correct) | compiles and executes: inf, equal to the source |

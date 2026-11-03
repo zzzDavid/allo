@@ -3,7 +3,7 @@
 
 # Release status
 
-Updated: 2026-11-02 (round 10: third reviewer rejection at `620a230`; elementwise destination maps and dropped copies repaired; full lint passes). Read `TASK.md` in the containing repository,
+Updated: 2026-11-02 (round 11: fourth reviewer rejection at `f732b22`; destination identities and arithmetic precision repaired; lint: header, black and clang-format stages pass, pylint stage carries pre-existing findings, P-23). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -41,7 +41,9 @@ then this file, then `ISSUES.md` for the next action.
    copies), repaired in round 8 (plus C-21), and then found two more at
    `ee8f522` (C-22 float precision silently changed, C-23 output access
    maps lost), and two more at `620a230` (C-24 elementwise destination
-   maps, C-25 accepted copies dropped). Rounds 9 and 10 repair them with
+   maps, C-25 accepted copies dropped), and two more at `f732b22` (C-25's
+   fixed output key displaced by a destination named `out`, C-26 wide
+   arithmetic bound to the operands'-type op). Rounds 9 to 11 repair them with
    stated contracts, an external-effect realization check before selection
    and value-checked regressions; awaiting independent review.
 3. **G7/G8 evidence**: at `7bdb475` the installed artifact (wheel from the
@@ -53,6 +55,18 @@ then this file, then `ISSUES.md` for the next action.
    build path for a user without the patches is the open question the
    reviewer named.
 4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+
+## Round 11 (2026-11-02): what was done
+
+- Destination identities (C-25 follow-up): outputs keyed by memref name in
+  the Samsung runtime and `SourceBackendBinding.outputs`; required
+  destinations derived from `external_effects` in `_copy_outputs`; output
+  extent and element type checked in the Samsung elementwise classifier.
+- Arithmetic precision (C-26): `arithmetic_precision_problem` enforced at
+  match time; narrowing proofs retag the accepted operation; wide integer
+  and float operations refused unless the op declares `intermediate`.
+- STATUS line 6 corrected: the complete lint command still exits in the
+  pylint stage (P-23).
 
 ## Round 10 (2026-11-02): what was done
 

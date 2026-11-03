@@ -324,15 +324,25 @@ class Op:
         # (the default) means the device rounds after every operation, so
         # only single operations, where both roundings provably agree, are
         # matched through such a store.
+        # An integer width (``"i24"``, ``"i64"``) declares the same for
+        # integer expressions: every intermediate is held exactly in at least
+        # that many bits, so a source expression the frontend evaluated in a
+        # wider type than its operands binds when that type fits the width.
         if intermediate is not None and intermediate not in (
             "f16",
             "bf16",
             "f32",
             "f64",
         ):
-            raise ValueError(
-                "operation intermediate must be one of f16, bf16, f32, f64"
-            )
+            import re
+
+            if not (
+                isinstance(intermediate, str) and re.fullmatch(r"i\d+", intermediate)
+            ):
+                raise ValueError(
+                    "operation intermediate must be one of f16, bf16, f32, f64 or "
+                    "an integer width such as 'i24'"
+                )
         self.intermediate = intermediate
 
     def __repr__(self):
@@ -772,9 +782,10 @@ def op(
 ):
     """Attach an Op to the current unit; return the handle.
 
-    ``intermediate`` (``"f32"``/``"f64"``) declares that the device computes
-    the whole of ``fn`` with intermediates of at least that precision and
-    rounds once into the destination element type; see ``Op``.
+    ``intermediate`` (``"f32"``/``"f64"``, or an integer width ``"i24"``)
+    declares that the device computes the whole of ``fn`` with intermediates
+    of at least that precision and rounds once into the destination element
+    type; see ``Op``.
     """
     if not _target_stack:
         raise RuntimeError("allo.op must be called inside @allo.target/@allo.unit")

@@ -1049,10 +1049,16 @@ def source_backend_binding(target, trace, parameter_names) -> SourceBackendBindi
     ]
     # Every external destination: the producers' own buffers and the sinks
     # of accepted copies (`external_effects`), by retained identity.
+    # Keys are the destinations' own memref names (distinct within a
+    # function), never a fixed word a source buffer could also be called.
     outputs = {}
+    producer_output = None
     stored = {m.result_value_ref for m in trace.matches}
     if len(stored) == 1 and next(iter(stored)) in ordinal_by_ref:
-        outputs["out"] = parameter_names[ordinal_by_ref[next(iter(stored))]]
+        producer_output = parameter_names[ordinal_by_ref[next(iter(stored))]]
+        names = {m.result_memref_name for m in trace.matches if m.result_memref_name}
+        if len(names) == 1:
+            outputs[next(iter(names))] = producer_output
     for match in trace.matches:
         for (memref, _text), (ref, local) in zip(
             match.extra.get("output_sinks", ()), match.extra.get("output_sink_refs", ())
@@ -1063,7 +1069,7 @@ def source_backend_binding(target, trace, parameter_names) -> SourceBackendBindi
     if output is None:
         # In place (``a[i] = a[i] + b[i]``): the stored parameter is also an
         # operand, so only the matches' store destination names the output.
-        output = outputs.get("out")
+        output = producer_output
     if output is None and len(outputs) == 1:
         output = next(iter(outputs.values()))
     return SourceBackendBinding(inputs=inputs, output=output, outputs=outputs)
