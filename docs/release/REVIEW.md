@@ -709,6 +709,31 @@ Gate G9 remains **FAIL** until the remaining matcher backends are
 migrated and reviewed, the hybrid manifest reads the scalar ABI from the
 retained IR, and the slice 5 traces exist.
 
+## Round 20 (2026-11-03): independent review of 4fda263; carried reads, Samsung realization, search-time checks
+
+The reviewer accepted the ordered traversal and the Samsung slice's reach
+into shared validation and lowering, and found the Samsung contract
+incomplete in three ways:
+
+- Carried destinations (X-05, fixed). A destination whose incoming
+  contents seed the reduction was not a semantic read on any backend, so
+  removing its ingress passed. Judgment: the read is a property of the
+  program, so it belongs to the shared derivation; every backend's
+  declaration now includes it, its realization checks expect it, and
+  removal is refused before costing and at realization.
+- Storage and transfers (X-06, fixed). Declarations named an existing
+  storage the program did not use, routes were not checked, and the MAD
+  addend's fiber packing was absent. Judgment: the contract states backing
+  storage, transient registers, packing and the conductor's transfers in
+  the emitter's own terms and the realization check compares them with
+  the emitted program; routes are checked against declared storage, moves,
+  host steps and registered steps on every target.
+- Search-time realization (C-33, fixed). The realization check now runs at
+  the materialization boundary of the ranking; a mismatch is a recorded
+  feasibility rejection and another candidate is selected.
+
+AiM, UPMEM and AttAcc remain handle-only (X-01). Gate G9 remains **FAIL**.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -760,4 +785,4 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 | G8 backend execution | **evidence complete at 9255d29, pending independent review** | installed-artifact runs at the round 10 repair (VALIDATION.md round 10) and again at the round 15 commit: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock, 3 passed) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed through the shared pipeline); all reviewer probes of rounds 8 to 14 rejected or executed correctly through the installed wheel (VALIDATION.md round 15); AttAcc analytical by design; AiM timing-only as accepted |
 | G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-15: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, an enforced typed candidate contract (C-30), supplied placements rebound (C-28), orchestration and launch bindings validated before selection (C-29, C-29b), Gemini-II typed records and `APUv1Program` as frontends of the pipeline (ISSUES X-01; round 16 removed the last typed route, round 17 replaced the `APUv1Program` facade by the shared front stages with retained store effects, X-02), the launch chain, accumulator modes and every operation's extent enforced (C-30b); both hardware hosts and the installed wheel exercised at `9255d29`; open: review of round 17, matcher backends' effects and facts consumption, the hybrid manifest's text ABI, slice 5 traces of forced alternatives and cost perturbations on hardware |
 
-Verdict: **NOT READY**. Blockers: G9 (X-01 to X-04, C-32) is in progress (review of rounds 17-19: the `APUv1Program` frontend, retained effects and the Samsung slice; AiM, UPMEM and AttAcc effects; hybrid manifest ABI; slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.
+Verdict: **NOT READY**. Blockers: G9 (X-01 to X-06, C-32, C-33) is in progress (review of rounds 17-20; AiM, UPMEM and AttAcc effects; hybrid manifest ABI; slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.

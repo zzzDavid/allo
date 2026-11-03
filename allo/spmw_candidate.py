@@ -245,8 +245,14 @@ def _program_values(matches):
                 continue
             if operand.is_loop_carried:
                 # An accumulator seeded from a buffer other than the result
-                # destination (a record's ``accumulator`` input) is read.
+                # destination (a record's ``accumulator`` input) is read; so
+                # is the destination itself when the source carries its
+                # incoming contents into the reduction (``y[i] += ...``).
                 if operand.memref_name != match.result_memref_name:
+                    inputs.add(operand.memref_name)
+                elif match.extra.get("accumulator_init") == "carried" and not (
+                    match.extra.get("result_is_local")
+                ):
                     inputs.add(operand.memref_name)
                 continue
             inputs.add(operand.memref_name)
@@ -485,13 +491,52 @@ def _check_value_layouts(effects, matches, inputs, outputs, locals_, view) -> li
     return problems
 
 
-def _check_transfers(effects, inputs, outputs, locals_, parameters) -> list:
-    """Every input transferred in, every output transferred out; a physical
-    transfer names a declared parameter the program neither reads nor
-    writes and never stands in for a semantic one."""
+# Host-side steps a transfer route may name on any target.
+HOST_HOOKS = frozenset(
+    {
+        "host_copy",
+        "host_readback",
+        "host_scatter",
+        "host_broadcast",
+        "host_gather",
+        "host_pack",
+        "device_readback",
+    }
+)
+# target name -> further route steps a backend's runtime performs that are
+# neither a declared storage nor a declared move (registered by the backend).
+ROUTE_VOCABULARY: dict = {}
+
+
+def _route_step_declared(view, step) -> bool:
+    if step in HOST_HOOKS or step in ROUTE_VOCABULARY.get(
+        getattr(view, "name", None), ()
+    ):
+        return True
+    if _storage_declared(view, step):
+        return True
+    moves = set()
+    for unit in getattr(view, "_walk", lambda: ())():
+        moves.update(str(name).lower() for name in getattr(unit, "moves", {}) or ())
+    return str(step).lower() in moves
+
+
+def _check_transfers(effects, inputs, outputs, locals_, parameters, view) -> list:
+    """Every input transferred in, every output transferred out, over routes
+    whose every step is a declared storage, a declared move, a host hook or
+    a step the backend registered; a physical transfer names a declared
+    parameter the program neither reads nor writes and never stands in for
+    a semantic one."""
     problems = []
     moved_in, moved_out = set(), set()
     for transfer in effects.transfers:
+        for step in transfer.route:
+            if view is not None and not _route_step_declared(view, step):
+                problems.append(
+                    f"transfer of {transfer.value!r} names route step {step!r}, "
+                    "which is neither a declared storage nor a declared move of the "
+                    "target nor a host step"
+                )
         if transfer.physical:
             if transfer.value not in parameters:
                 problems.append(
@@ -670,7 +715,9 @@ def validate_candidate_effects(matches, placement, view=None) -> list[str]:
     problems.extend(
         _check_value_layouts(effects, matches, inputs, outputs, locals_, view)
     )
-    problems.extend(_check_transfers(effects, inputs, outputs, locals_, parameters))
+    problems.extend(
+        _check_transfers(effects, inputs, outputs, locals_, parameters, view)
+    )
 
     problems.extend(_check_launches(effects, matches, view))
 
@@ -867,6 +914,8 @@ def rebind_supplied_layouts(view, trace, supplied) -> list:
 __all__ = [
     "EFFECTS_DERIVERS",
     "EFFECTS_REQUIRED_TARGETS",
+    "HOST_HOOKS",
+    "ROUTE_VOCABULARY",
     "CandidateCoverage",
     "CandidateEffects",
     "CandidateLaunch",

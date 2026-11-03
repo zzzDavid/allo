@@ -1511,6 +1511,19 @@ def _materialize_matcher_codegen(
 
     ctx = ctx_cls(target)
     _walk_and_emit(target, trace, ctx, layouts)
+    # The realized program against the candidate's declared effects, at the
+    # materialization boundary: a mismatch is a feasibility rejection the
+    # ranking records, so another candidate can be selected.
+    check_realization = getattr(ctx, "check_realization", None)
+    if check_realization is not None:
+        from .pim.schedule_search import InfeasibleSchedule
+
+        try:
+            check_realization(layouts)
+        except RuntimeError as error:
+            raise InfeasibleSchedule(
+                f"realization differs from the candidate contract: {error}"
+            ) from error
     commands = tuple(_clone_matcher_command(command) for command in ctx.cmds)
     host_schedule = tuple(
         HostTrigger(trigger.work_id, trigger.tile_count)

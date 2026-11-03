@@ -3,7 +3,7 @@
 
 # Release status
 
-Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline; committed as `9255d29`, exercised from the installed wheel on the simulators, the APU v1 board and the Gemini-II card; round 16: the reviewer's three contract gaps closed (C-30b) and the last typed route removed; round 17: the `APUv1Program` facade replaced by the shared front stages on the phase's source with retained store effects (X-02); round 18: indirect loads, fill initializers and unused arguments retained or represented correctly (X-03), whole launches reserved for verbatim programs (C-32); round 19: effects in program order (X-04) and Samsung as the first matcher backend declaring effects from the shared facts). Read `TASK.md` in the containing repository,
+Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline; committed as `9255d29`, exercised from the installed wheel on the simulators, the APU v1 board and the Gemini-II card; round 16: the reviewer's three contract gaps closed (C-30b) and the last typed route removed; round 17: the `APUv1Program` facade replaced by the shared front stages on the phase's source with retained store effects (X-02); round 18: indirect loads, fill initializers and unused arguments retained or represented correctly (X-03), whole launches reserved for verbatim programs (C-32); round 19: effects in program order (X-04) and Samsung as the first matcher backend declaring effects from the shared facts; round 20: carried destinations are reads on every backend (X-05), Samsung storage, packing and transfers tied to the emitted program (X-06), realization checked at the materialization boundary (C-33)). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -72,6 +72,20 @@ then this file, then `ISSUES.md` for the next action.
    build path for a user without the patches is the open question the
    reviewer named.
 4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+
+## Round 20 (2026-11-03): what was done
+
+- Reviewer findings on `4fda263`: X-05 (carried destinations not semantic
+  reads) fixed in the shared derivation and in the Samsung, APU v1 vector
+  and Gemini-II declarations and realization checks; X-06 (Samsung storage
+  and transfers not tied to realization) fixed with backing storage,
+  transient registers, packing and conductor transfers declared in the
+  emitter's terms and compared with the emitted program, plus a route
+  vocabulary check on every target; C-33 (realization checked only after
+  selection) fixed by running the check at the materialization boundary as
+  a recorded feasibility rejection. Regressions in sections o and p of
+  `tests/pim/test_shared_semantics.py`; the reviewer's probes behave.
+- Evidence: VALIDATION.md round 20.
 
 ## Round 19 (2026-11-03): what was done
 
@@ -293,8 +307,8 @@ then this file, then `ISSUES.md` for the next action.
 
 ## Next concrete actions (in order)
 
-0. Independent review of rounds 17-19 (the `APUv1Program` frontend, the
-   retained effects, the Samsung slice).
+0. Independent review of rounds 17-20 (the `APUv1Program` frontend, the
+   retained effects, the Samsung slice and its realization contract).
 1. G9, matcher backends: AiM, UPMEM and AttAcc candidates declare
    `CandidateEffects` (coverage, value layouts on their handles, transfers,
    launches) and their enumerators consume `ProgramFacts` instead of

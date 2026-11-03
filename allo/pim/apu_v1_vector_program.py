@@ -519,11 +519,15 @@ class APUv1VectorCandidate:
             if any(axis.name == _UNIT_AXIS for axis in analysis.axes)
             else ()
         )
+        inputs = (analysis.lhs.value, analysis.rhs.value)
+        if analysis.output_initializer == "carried":
+            # The output's incoming contents seed the reduction: a read.
+            inputs = inputs + (output,)
         return CandidateEffects(
             coverage=CandidateCoverage(
                 function=analysis.function,
                 operations=("MAC",),
-                inputs=(analysis.lhs.value, analysis.rhs.value),
+                inputs=inputs,
                 outputs=(output,),
             ),
             value_layouts=tuple(
@@ -533,12 +537,14 @@ class APUv1VectorCandidate:
                 for layout in plan.value_layouts
             ),
             transfers=tuple(
-                CandidateTransfer(
-                    transfer.value,
-                    "inout" if transfer.value == output else "in",
-                    tuple(step.kind for step in transfer.route),
+                dict.fromkeys(
+                    CandidateTransfer(
+                        transfer.value,
+                        "inout" if transfer.value == output else "in",
+                        tuple(step.kind for step in transfer.route),
+                    )
+                    for transfer in plan.transfers
                 )
-                for transfer in plan.transfers
             ),
             launches=(
                 CandidateLaunch(
@@ -555,9 +561,7 @@ class APUv1VectorCandidate:
                     ),
                 ),
             ),
-            abi_inputs=tuple(
-                layout.value for layout in plan.value_layouts if layout.value != output
-            ),
+            abi_inputs=inputs,
             abi_outputs=(output,),
             device_scope="one APUC, whole problem, single launch",
             synthetic_axes=synthetic,
@@ -1028,3 +1032,18 @@ __all__ = [
     "apu_v1_plan_regroups",
     "apu_v1_vector_candidates",
 ]
+
+
+def _register_route_steps():
+    """Route steps the GVML realizations name: the plan transfer kinds of
+    `allo.pim.apu_v1_layout` (DMA, PIO and lookup steps between L4, L3, L1
+    and the VRs), which the realization check compares with the plan."""
+    from ..spmw_candidate import ROUTE_VOCABULARY
+    from .apu_v1_layout import _TRANSFER_ROUTE_KINDS
+
+    ROUTE_VOCABULARY.setdefault("apu_v1", set()).update(
+        {str(kind) for kind in _TRANSFER_ROUTE_KINDS}
+    )
+
+
+_register_route_steps()

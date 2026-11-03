@@ -214,6 +214,12 @@ class APUG2SourceCtx(CodegenContext):
             access.parameter
             for stream in contract.streams
             for access in (stream.lhs, stream.rhs)
+        } | {
+            # The runtime packs a carried accumulator's buffer as the first
+            # launch's accumulator input.
+            stream.output
+            for stream in contract.streams
+            if stream.accumulator == "carried" and stream.output is not None
         }
         if inputs != set(effects.abi_inputs):
             raise RuntimeError(

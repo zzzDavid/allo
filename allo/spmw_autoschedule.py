@@ -1907,6 +1907,34 @@ def _movement_entries(movement, policy):
     return entries, len(crossed)
 
 
+def _redeclare_effects(view, kernel_trace, placements) -> None:
+    """Re-derive the declared effects of each bucket's placement after the
+    movement stage attached its layer (the movement layout decides the
+    result's row packing and the decision key), and validate the refreshed
+    declaration; a problem is a feasibility rejection the ranking records.
+    Backends without a registered deriver keep their declarations."""
+    from .pim.schedule_search import InfeasibleSchedule
+    from .spmw_candidate import EFFECTS_DERIVERS, validate_candidate_effects
+
+    deriver = EFFECTS_DERIVERS.get(getattr(view, "name", None))
+    if deriver is None:
+        return
+    per_bucket = _bucket_for_autoschedule(kernel_trace)
+    if len(per_bucket) != len(placements):
+        return
+    for placement, (_scope, matches) in zip(placements, per_bucket):
+        effects = deriver(view, matches, placement)
+        if effects is None:
+            continue
+        placement.extra["effects"] = effects
+        problems = validate_candidate_effects(matches, placement, view)
+        if problems:
+            raise InfeasibleSchedule(
+                f"candidate {placement.mode!r} violates the candidate contract "
+                "after the movement stage: " + "; ".join(problems)
+            )
+
+
 def _with_movement(template, layout, label, cost):
     """Copy ``template`` carrying a movement layout and its label.
 
@@ -2024,6 +2052,7 @@ def rank_matcher_placements(
         _stamp_xkernel(kernel_trace, placements, liveness)
         if host_moves:
             _stamp_host_moves(placements, host_moves)
+        _redeclare_effects(matcher_target, kernel_trace, placements)
         return placements
 
     def probe(probe_trace, placements):

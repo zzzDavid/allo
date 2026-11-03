@@ -609,17 +609,55 @@ def _axes_of(access, labels) -> tuple:
     return tuple(axes)
 
 
+def _elementwise_register_plan(target):
+    """Which register each elementwise input is loaded into and whether the
+    MAD addend's fiber is the opposite one (the emitter's `_register_moves`
+    logic over the target's declared moves): ``(dest registers by fiber,
+    addend_swapped)``."""
+    ctx = SamsungCtx(target)
+    loads, drains = ctx._register_moves()
+    swapped = None
+    for fiber, (_st, dest) in sorted(drains.items()):
+        other = target.grf_b if dest is target.grf_a else target.grf_a
+        _name, o_fiber = loads.get(other.name, (None, None))
+        if o_fiber is not None:
+            swapped = (o_fiber != fiber) if swapped is None else swapped
+    return bool(swapped)
+
+
+def _output_row_packing(target, matches, placement) -> str:
+    """``row_slots:movement`` when the placement carries a movement layout
+    (the result rows occupy the slots that layout assigns, identity or a
+    permutation the group-level owner map decides), ``row_slots:identity``
+    when it carries none (rows in row order).  The realization check
+    confirms the program's row map was built from that layout."""
+    del target, matches
+    from .spmw_layout_problem import split_movement_layout
+
+    try:
+        _backend, movement = split_movement_layout(getattr(placement, "layout", None))
+    except Exception:  # pylint: disable=broad-exception-caught
+        movement = None
+    return "row_slots:movement" if movement is not None else "row_slots:identity"
+
+
 def samsung_candidate_effects(target, matches, placement):
     """`CandidateEffects` of one Samsung placement for one work item, derived
     from the shared semantic facts of its matches (`Contraction`/`Epilogue`:
     loop labels, trips, access coordinates, accumulator initialization,
-    sinks) and from the placement (handles and levers): coverage, value
-    layouts on ``grf_a``/``grf_b``/``banks`` over the source loops, the host
-    transfers the conductor performs (scatter to the banks, broadcast to
-    GRF_A, gather of the result), one CRF program per kernel group that
-    advances the work item's operation over all its result instances and
-    the whole reduction, and the ABI.  None when the matches carry no facts
-    (a trace assembled outside the shared front stages)."""
+    sinks) and from the placement (handles and levers).
+
+    Backing storage is where the conductor keeps a value between launches
+    (the DRAM ``banks`` for every matrix, every elementwise operand and
+    every result; ``grf_a`` for a host-broadcast vector); transient register
+    use is declared as allocations (the accumulator's ``grf_b``, the tile
+    registers of the elementwise program); packing names the bank image
+    (``row_slots:identity``/``row_slots:movement`` for results of the REDUCE
+    programs, ``all_bank`` / ``all_bank:swapped_fibers`` for elementwise
+    operands); transfers are the conductor's scatter, broadcast and gather
+    steps.  `SamsungCtx.check_realization` compares all of these with the
+    emitted program.  None when the matches carry no facts (a trace
+    assembled outside the shared front stages)."""
     from .spmw_candidate import (
         CandidateCoverage,
         CandidateEffects,
@@ -628,19 +666,21 @@ def samsung_candidate_effects(target, matches, placement):
         CandidateValueLayout,
     )
 
-    del target  # the placement's handles name the target's storage
     facts = [m.extra.get("semantic_facts") for m in matches]
     if not matches or any(f is None for f in facts):
         return None
     extra = placement.extra or {}
     residency = extra.get("grf_residency", {}) or {}
     ops = {m.target_op_name for m in matches}
-    inputs, outputs, layouts, transfers = [], [], {}, {}
+    contraction = ops == {"MAC"}
+    temporal = extra.get("reduction_program") == "temporal"
     labels = {}
-    instances = reduction = None
-    init = None
     for fact in facts:
         labels.update(fact.loop_labels)
+    inputs, outputs, layouts, transfers, allocations = [], [], {}, {}, []
+    instances = reduction = None
+    init = None
+    vector_memref = None
     for match, fact in zip(matches, facts):
         if hasattr(fact, "reduction_vars"):
             trips = fact.trips
@@ -654,13 +694,14 @@ def samsung_candidate_effects(target, matches, placement):
             reduction = red if reduction is None else reduction
             init = fact.accumulator_init
             accesses = [(a.memref_name, a) for a in fact.inputs]
+            if fact.vector is not None:
+                vector_memref = fact.vector.memref_name
             result_accesses = []
             if not fact.accumulator.local:
                 result_accesses.append((fact.accumulator.memref_name, fact.accumulator))
             for sink in fact.external_sinks:
                 result_accesses.append((sink.memref_name, sink))
         else:
-            trips = fact.trips if hasattr(fact, "trips") else {}
             extent = 1
             for loop in fact.loops:
                 extent *= int(loop.trip or 0)
@@ -672,65 +713,85 @@ def samsung_candidate_effects(target, matches, placement):
             for memref, _text in match.extra.get("output_sinks", ()):
                 if memref != fact.result.memref_name:
                     result_accesses.append((memref, fact.result))
-        for memref, access in accesses:
+        for position, (memref, access) in enumerate(accesses):
             if memref is None or memref in inputs:
                 continue
             inputs.append(memref)
-            handle = placement.placements.get(memref)
-            storage = _storage_name(handle)
-            if (
-                storage == "grf_a"
-                and residency.get(memref, "crf") != "host"
-                and extra.get("reduction_program") != "temporal"
-            ):
-                # GRF residency lever: the REDUCE programs scatter the
-                # vector to the banks and load it into GRF_A per reduction
-                # tile (LD_A); the ordered program broadcasts it to GRF_A.
-                storage = "banks"
-            layouts[memref] = CandidateValueLayout(
-                memref, _axes_of(access, labels), storage
-            )
-            transfers[memref] = CandidateTransfer(
-                memref,
-                "in",
-                (
-                    ("host_broadcast", "grf_a")
-                    if storage == "grf_a"
-                    else ("host_scatter", "banks")
-                ),
-            )
+            axes = _axes_of(access, labels)
+            if contraction:
+                handle = placement.placements.get(memref)
+                storage = _storage_name(handle)
+                if storage == "grf_a" and (
+                    residency.get(memref, "crf") != "host" and not temporal
+                ):
+                    # CRF fill: the vector is scattered to the banks and loaded
+                    # into GRF_A per reduction tile (LD_A).
+                    storage = "banks"
+                layouts[memref] = CandidateValueLayout(memref, axes, storage)
+                transfers[memref] = CandidateTransfer(
+                    memref,
+                    "in",
+                    (
+                        ("host_broadcast", "grf_a")
+                        if storage == "grf_a"
+                        else ("host_scatter", "banks")
+                    ),
+                )
+            else:
+                # Every elementwise operand is a flat all-bank image; the MAD
+                # addend is stored with the fibers exchanged when its register
+                # loads from the opposite fiber.
+                packing = "all_bank"
+                if match.target_op_name == "MAD" and position == 2:
+                    if _elementwise_register_plan(target):
+                        packing = "all_bank:swapped_fibers"
+                layouts[memref] = CandidateValueLayout(memref, axes, "banks", packing)
+                transfers[memref] = CandidateTransfer(
+                    memref, "in", ("host_scatter", "banks")
+                )
         for memref, access in result_accesses:
             if memref is None:
                 continue
             if memref not in outputs:
                 outputs.append(memref)
-            handle = placement.placements.get(memref)
-            storage = _storage_name(handle) or "grf_b"
-            layouts.setdefault(
-                memref, CandidateValueLayout(memref, _axes_of(access, labels), storage)
+            axes = _axes_of(access, labels)
+            carried = contraction and init == "carried"
+            if carried and memref not in inputs:
+                # The destination's incoming contents seed the reduction.
+                inputs.append(memref)
+            packing = (
+                _output_row_packing(target, matches, placement)
+                if contraction
+                else "all_bank"
             )
+            layouts[memref] = CandidateValueLayout(memref, axes, "banks", packing)
             transfers[memref] = CandidateTransfer(
                 memref,
-                "inout" if memref in inputs or init == "carried" else "out",
-                (storage, "banks", "host_gather"),
+                "inout" if carried or memref in inputs else "out",
+                (
+                    ("host_scatter", "banks", "host_gather")
+                    if (carried or memref in inputs)
+                    else ("banks", "host_gather")
+                ),
             )
-    if ops == {"MAC"}:
-        kind = (
-            "TEMPORAL_REDUCE"
-            if extra.get("reduction_program") == "temporal"
-            else "REDUCE"
-        )
+    if contraction:
+        kind = "TEMPORAL_REDUCE" if temporal else "REDUCE"
+        allocations = [("accumulator", 0, "grf_b"), ("vector_tile", 0, "grf_a")]
     else:
         kind = "ELTWISE"
+        allocations = [("tile", 0, "grf_a")]
+        if ops == {"MAD"}:
+            allocations.append(("addend_tile", 0, "grf_b"))
     launch = CandidateLaunch(
         index=0,
         kind=kind,
         operations=tuple(range(len(matches))),
         instances=(0, int(instances or 0)),
-        reduction=None if ops != {"MAC"} else (0, int(reduction or 0)),
-        accumulator=init if ops == {"MAC"} else None,
+        reduction=(0, int(reduction or 0)) if contraction else None,
+        accumulator=init if contraction else None,
         covers=(placement.mode,),
     )
+    del vector_memref
     return CandidateEffects(
         coverage=CandidateCoverage(
             matches[0].func_name, tuple(sorted(ops)), tuple(inputs), tuple(outputs)
@@ -741,13 +802,22 @@ def samsung_candidate_effects(target, matches, placement):
         abi_inputs=tuple(inputs),
         abi_outputs=tuple(outputs),
         device_scope="one CRF per kernel group, every PIM unit of a pseudo-channel in lockstep",
+        allocations=tuple(allocations),
     )
+
+
+def _derive_samsung_effects(view, matches, placement):
+    """Late-binding entry of the effects registry: resolves
+    `samsung_candidate_effects` at call time, so the enumerator, the
+    movement-stage re-declaration and a supplied-placement rebinding all
+    use the same (possibly instrumented) derivation."""
+    return samsung_candidate_effects(view, matches, placement)
 
 
 def _register_effects_deriver():
     from .spmw_candidate import EFFECTS_DERIVERS
 
-    EFFECTS_DERIVERS["samsung_hbm_pim"] = samsung_candidate_effects
+    EFFECTS_DERIVERS["samsung_hbm_pim"] = _derive_samsung_effects
 
 
 _register_effects_deriver()
@@ -1047,10 +1117,13 @@ class SamsungCtx(CodegenContext):
 
     def check_realization(self, layouts) -> None:
         """The lowered CRF programs against the selected candidates' declared
-        effects: per kernel group, the program kind, the reduction extent,
-        the result instances per work item, the accumulator initialization
-        and the vector's residency (banks versus GRF_A broadcast) must be
-        what the candidate declared."""
+        effects, per kernel group: the program kind; for a contraction the
+        reduction extent, the result instances per work item, the
+        accumulator initialization, the vector's residency, the result's row
+        packing and the carried destination's ingress; for an elementwise
+        program every operand's bank residency and fiber packing (the MAD
+        addend's swap parity); for both the conductor's transfers (scatter,
+        broadcast, gather) and the transient registers the program uses."""
         from .spmw_candidate import candidate_effects
 
         layouts = list(layouts) if isinstance(layouts, (list, tuple)) else [layouts]
@@ -1067,12 +1140,16 @@ class SamsungCtx(CodegenContext):
                     f"Samsung realization lowered no program for the candidate "
                     f"{layout.mode!r} that declares effects"
                 )
-            (launch,) = effects.launches if len(effects.launches) == 1 else (None,)
-            if launch is None or launch.kind != program.kind:
+            if len(effects.launches) != 1 or effects.launches[0].kind != program.kind:
                 raise RuntimeError(
                     f"Samsung realization is a {program.kind} program; the candidate "
                     f"declares launches {[l.kind for l in effects.launches]}"
                 )
+            (launch,) = effects.launches
+            layouts_by_value = {v.value: v for v in effects.value_layouts}
+            transfers_by_value = {t.value: t for t in effects.transfers}
+            allocated = {storage for _name, _size, storage in effects.allocations}
+            expected_transfers = {}
             if program.contraction is not None:
                 rep = program.contraction
                 declared = (
@@ -1091,25 +1168,146 @@ class SamsungCtx(CodegenContext):
                         f"contract: realized (instances, reduction, accumulator) "
                         f"{realized}, declared {declared}"
                     )
-                vector = next(
-                    (v for v in effects.value_layouts if v.value == rep.vector_memref),
-                    None,
-                )
-                if vector is not None and (vector.storage == "banks") != bool(
-                    program.vector_from_bank
-                ):
+                matrix = layouts_by_value.get(rep.matrix_memref)
+                if matrix is None or matrix.storage != "banks":
+                    raise RuntimeError(
+                        f"Samsung realization keeps the matrix {rep.matrix_memref!r} "
+                        f"in the banks; the candidate declared {matrix}"
+                    )
+                vector = layouts_by_value.get(rep.vector_memref)
+                vector_banks = bool(program.vector_from_bank)
+                if vector is None or (vector.storage == "banks") != vector_banks:
                     raise RuntimeError(
                         "Samsung realization loads the vector from "
-                        f"{'the banks' if program.vector_from_bank else 'a GRF_A broadcast'}; "
-                        f"the candidate declared storage {vector.storage!r}"
+                        f"{'the banks' if vector_banks else 'a GRF_A broadcast'}; "
+                        f"the candidate declared {vector}"
                     )
-            elif program.elementwise is not None:
-                if tuple(launch.instances) != (0, program.elementwise.n):
+                output = layouts_by_value.get(rep.output_memref)
+                from .spmw_layout_problem import split_movement_layout
+
+                _backend, movement = split_movement_layout(
+                    getattr(layout, "layout", None)
+                )
+                # The program's row map is derived from the placement's
+                # movement layout (`_row_slots`); without one the rows are in
+                # row order.
+                row_packing = (
+                    "row_slots:movement"
+                    if movement is not None
+                    else "row_slots:identity"
+                )
+                if movement is None and program.row_map != "identity":
                     raise RuntimeError(
-                        "Samsung elementwise realization covers "
-                        f"{program.elementwise.n} elements; the candidate declared "
-                        f"instances {launch.instances}"
+                        f"Samsung realization permutes the rows of {rep.output_memref!r} "
+                        "without a movement layout on the placement"
                     )
+                if (
+                    output is None
+                    or output.storage != "banks"
+                    or output.packing != (row_packing)
+                ):
+                    raise RuntimeError(
+                        f"Samsung realization writes {rep.output_memref!r} to the banks "
+                        f"with {row_packing} (row map {program.row_map}); the candidate "
+                        f"declared {output}"
+                    )
+                carried = rep.accumulator_init == "carried"
+                if carried and rep.output_memref not in effects.coverage.inputs:
+                    raise RuntimeError(
+                        f"Samsung realization uploads the carried destination "
+                        f"{rep.output_memref!r} before the reduction; the candidate "
+                        "does not declare it as an input"
+                    )
+                expected_transfers[rep.matrix_memref] = (
+                    "in",
+                    ("host_scatter", "banks"),
+                )
+                expected_transfers[rep.vector_memref] = (
+                    "in",
+                    (
+                        ("host_scatter", "banks")
+                        if vector_banks
+                        else ("host_broadcast", "grf_a")
+                    ),
+                )
+                expected_transfers[rep.output_memref] = (
+                    ("inout", ("host_scatter", "banks", "host_gather"))
+                    if carried
+                    else ("out", ("banks", "host_gather"))
+                )
+                expected_allocations = {"grf_b", "grf_a"}
+            else:
+                el = program.elementwise
+                if tuple(launch.instances) != (0, el.n):
+                    raise RuntimeError(
+                        f"Samsung elementwise realization covers {el.n} elements; "
+                        f"the candidate declared instances {launch.instances}"
+                    )
+                for position, memref in enumerate(el.input_memrefs):
+                    value = layouts_by_value.get(memref)
+                    swapped = bool(
+                        program.swap_parity[position]
+                        if position < len(program.swap_parity)
+                        else False
+                    )
+                    packing = "all_bank:swapped_fibers" if swapped else "all_bank"
+                    if (
+                        value is None
+                        or value.storage != "banks"
+                        or (value.packing != packing)
+                    ):
+                        raise RuntimeError(
+                            f"Samsung elementwise realization streams {memref!r} from "
+                            f"the banks as {packing}; the candidate declared {value}"
+                        )
+                    expected_transfers[memref] = ("in", ("host_scatter", "banks"))
+                # The op's own result is external only when the program
+                # declares it (a local intermediate copied to a sink is not).
+                written = [
+                    memref
+                    for memref in (el.output_memref, *el.sink_memrefs)
+                    if memref in effects.coverage.outputs
+                ]
+                if not written:
+                    raise RuntimeError(
+                        "Samsung elementwise realization writes "
+                        f"{[el.output_memref, *el.sink_memrefs]}; the candidate "
+                        f"declares outputs {list(effects.coverage.outputs)}"
+                    )
+                for memref in written:
+                    value = layouts_by_value.get(memref)
+                    if (
+                        value is None
+                        or value.storage != "banks"
+                        or (value.packing != "all_bank")
+                    ):
+                        raise RuntimeError(
+                            f"Samsung elementwise realization writes {memref!r} to the "
+                            f"banks as all_bank; the candidate declared {value}"
+                        )
+                    expected_transfers[memref] = (
+                        ("inout", ("host_scatter", "banks", "host_gather"))
+                        if memref in el.input_memrefs
+                        else ("out", ("banks", "host_gather"))
+                    )
+                expected_allocations = (
+                    {"grf_a", "grf_b"} if el.op == "MAD" else {"grf_a"}
+                )
+            declared_transfers = {
+                value: (t.direction, tuple(t.route))
+                for value, t in transfers_by_value.items()
+            }
+            if declared_transfers != expected_transfers:
+                raise RuntimeError(
+                    "Samsung realization moves "
+                    f"{sorted(expected_transfers.items())}; the candidate declared "
+                    f"{sorted(declared_transfers.items())}"
+                )
+            if allocated != expected_allocations:
+                raise RuntimeError(
+                    f"Samsung realization uses registers {sorted(expected_allocations)}; "
+                    f"the candidate declares {sorted(allocated)}"
+                )
 
     def _check_unrealized_levers(self, layout):
         extra = layout.extra or {}

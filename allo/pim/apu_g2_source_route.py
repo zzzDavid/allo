@@ -1489,9 +1489,17 @@ class APUG2SourceCandidate:
             labels.update(contraction.loop_labels)
         inputs = tuple(
             dict.fromkeys(
-                access.parameter
-                for stream in contract.streams
-                for access in (stream.lhs, stream.rhs)
+                [
+                    access.parameter
+                    for stream in contract.streams
+                    for access in (stream.lhs, stream.rhs)
+                ]
+                # A carried accumulator's buffer seeds the reduction: a read.
+                + [
+                    stream.output
+                    for stream in contract.streams
+                    if stream.accumulator == "carried" and stream.output is not None
+                ]
             )
         )
         operations = ["MAC"] * len(contract.streams)
@@ -1556,9 +1564,20 @@ class APUG2SourceCandidate:
             ),
             value_layouts=tuple(layouts.values()),
             transfers=tuple(
-                [CandidateTransfer(name, "in", ("host_pack", "l1")) for name in inputs]
+                [
+                    CandidateTransfer(name, "in", ("host_pack", "l1"))
+                    for name in inputs
+                    if name not in contract.outputs
+                ]
                 + [
-                    CandidateTransfer(name, "out", ("device_readback",))
+                    (
+                        # A carried accumulator is packed in and read back.
+                        CandidateTransfer(
+                            name, "inout", ("host_pack", "l1", "device_readback")
+                        )
+                        if name in inputs
+                        else CandidateTransfer(name, "out", ("device_readback",))
+                    )
                     for name in contract.outputs
                 ]
             ),
@@ -1650,3 +1669,14 @@ __all__ = [
     "rank_apu_g2_launch_plans",
     "rebuild_apu_g2_launch_plan",
 ]
+
+
+def _register_route_steps():
+    """Route steps the Gemini-II runtime names beyond the view's handles:
+    the card's L1 the packed carriers are loaded into."""
+    from ..spmw_candidate import ROUTE_VOCABULARY
+
+    ROUTE_VOCABULARY.setdefault("apu_v2", set()).update({"l1"})
+
+
+_register_route_steps()

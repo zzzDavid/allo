@@ -359,7 +359,7 @@ def test_apu_v1_plans_are_candidates_of_the_shared_ranking():
         assert extra["candidate_plan"] == placement.mode
         effects = extra["effects"]
         assert effects.coverage.outputs == ("result",)
-        assert effects.coverage.inputs == ("left", "right")
+        assert effects.coverage.inputs == ("left", "right", "result")
         assert effects.value_layouts and effects.transfers and effects.launches
         assert effects.abi_outputs == ("result",)
         assert extra["whole_device_launch"]
@@ -775,7 +775,8 @@ def test_declared_effects_match_the_realized_programs():
         reduction_order="reassociate",
     )
     effects = v1.compiled.layout.extra["effects"]
-    assert effects.coverage.inputs == ("left", "right")
+    # ``result`` is carried: its incoming contents are a read (round 20).
+    assert effects.coverage.inputs == ("left", "right", "result")
     assert {v.value for v in effects.value_layouts} == {"left", "right", "result"}
     assert all(v.storage == "vr" for v in effects.value_layouts)
     assert {t.direction for t in effects.transfers} == {"in", "inout"}
@@ -1132,13 +1133,16 @@ def test_elementwise_record_launch_must_cover_every_result_instance(monkeypatch)
     from allo.spmw_apu_g2 import APUG2SourceCtx
 
     def swapped_route(*args):
+        # A declarable route (the card's L1 is a registered step) that is
+        # not the one the record's runtime takes for its output.
         candidates = original(*args)
         for placement in candidates:
             effects = placement.extra["effects"]
             placement.extra["effects"] = replace(
                 effects,
                 transfers=tuple(
-                    replace(t, route=("elsewhere",)) for t in effects.transfers
+                    replace(t, route=("host_pack", "l1")) if t.value == "out" else t
+                    for t in effects.transfers
                 ),
             )
         return candidates
@@ -1573,7 +1577,10 @@ def test_samsung_candidates_declare_effects_from_the_shared_facts():
     assert effects.coverage.outputs == ("local_y",)
     layouts = {v.value: (v.axes, v.storage) for v in effects.value_layouts}
     assert layouts["local_W"] == (("i", "k"), "banks")
-    assert layouts["local_y"] == (("i",), "grf_b")
+    # The result's backing storage is the banks (its row image, identity
+    # row slots); GRF_B is the transient accumulator register.
+    assert layouts["local_y"] == (("i",), "banks")
+    assert {s for _n, _b, s in effects.allocations} == {"grf_a", "grf_b"}
     assert layouts["local_x"][0] == ("k",) and layouts["local_x"][1] in {
         "grf_a",
         "banks",
@@ -1662,3 +1669,308 @@ def test_samsung_selected_program_executes_under_the_declared_contract(
         rtol=1e-2,
         atol=1e-2,
     )
+
+
+# --------------------------------------------------------------------------- #
+# (o) Carried destinations are reads of the program (review round 19)
+# --------------------------------------------------------------------------- #
+
+CARRIED_M, CARRIED_K = 2048, 100
+
+
+@allo.dataflow.region()
+def samsung_carried(
+    weights: float16[CARRIED_M, CARRIED_K],
+    values: float16[CARRIED_K],
+    accum: float16[CARRIED_M],
+):
+    @allo.work(mapping=[16, 8], args=[weights, values, accum])
+    def worker(
+        matrix: float16[CARRIED_M, CARRIED_K],
+        vector: float16[CARRIED_K],
+        destination: float16[CARRIED_M],
+    ):
+        pc, unit = allo.get_wid()
+        first = (pc * 8 + unit) * 16
+        for row in range(16):
+            for depth in range(CARRIED_K):
+                destination[first + row] += matrix[first + row, depth] * vector[depth]
+
+
+def test_carried_destination_is_an_input_on_every_backend():
+    """A destination whose incoming contents seed the reduction is a read:
+    it is in the coverage inputs, the ABI inputs and moved in on Samsung,
+    APU v1 and Gemini-II alike."""
+    from allo.spmw_candidate import candidate_effects
+
+    samsung = allo.compile(
+        samsung_carried, build_samsung_target(), samsung_cost, backend="virtual"
+    )
+    facts = samsung.trace.function_facts["worker_0_0"]
+    assert facts.contractions[0].accumulator_init == "carried"
+    layout = samsung.compiled.layout
+    layout = layout[0] if isinstance(layout, list) else layout
+    effects = candidate_effects(layout)
+    assert effects.coverage.inputs == ("matrix", "vector", "destination")
+    assert effects.abi_inputs == effects.coverage.inputs
+    (destination,) = [t for t in effects.transfers if t.value == "destination"]
+    assert destination.direction == "inout"
+    assert destination.route == ("host_scatter", "banks", "host_gather")
+
+    apu = allo.compile(
+        gemm_n,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="virtual",
+        reduction_order="reassociate",
+    )
+    effects = apu.compiled.layout.extra["effects"]
+    assert effects.coverage.inputs == ("left", "right", "result")
+    assert [(t.value, t.direction) for t in effects.transfers] == [
+        ("left", "in"),
+        ("right", "in"),
+        ("result", "inout"),
+    ]
+
+    g2 = allo.compile(ig_carried, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    effects = g2.compiled.layout.extra["effects"]
+    assert effects.coverage.inputs == ("L", "R", "C")
+    (carried,) = [t for t in effects.transfers if t.value == "C"]
+    assert carried.direction == "inout" and carried.route[-1] == "device_readback"
+
+
+def ig_carried(L: int4[4, 4], R: int4[4, 4], C: int15[4, 4]):
+    for i, j in allo.grid(4, 4):
+        for k in range(4):
+            C[i, j] += L[i, k] * R[k, j]
+
+
+def test_removing_the_carried_ingress_is_refused(monkeypatch):
+    """Declaring a carried destination as write-only is refused by the shared
+    validator against the facts and, were it to pass, by the realization
+    check against the conductor's uploads."""
+    from allo import spmw_samsung
+    from allo.spmw_candidate import candidate_effects, validate_candidate_effects
+
+    compiled = allo.compile(
+        samsung_carried, build_samsung_target(), samsung_cost, backend="virtual"
+    )
+    layout = compiled.compiled.layout
+    layout = layout[0] if isinstance(layout, list) else layout
+    effects = candidate_effects(layout)
+    matches = [m for m in compiled.trace.matches if m.func_name == "worker_0_0"]
+    out_only = replace(
+        effects,
+        transfers=tuple(
+            (
+                replace(t, direction="out", route=("banks", "host_gather"))
+                if t.value == "destination"
+                else t
+            )
+            for t in effects.transfers
+        ),
+    )
+    layout.extra["effects"] = out_only
+    problems = validate_candidate_effects(matches, layout, build_samsung_target())
+    assert any("never transferred in" in p for p in problems)
+    with pytest.raises(RuntimeError, match="realization moves"):
+        compiled.compiled.layout_ctx.check_realization([layout])
+
+    original = spmw_samsung.samsung_candidate_effects
+
+    def no_ingress(target, matches, placement):
+        effects = original(target, matches, placement)
+        if effects is None:
+            return None
+        return replace(
+            effects,
+            coverage=replace(
+                effects.coverage,
+                inputs=tuple(n for n in effects.coverage.inputs if n != "destination"),
+            ),
+            abi_inputs=tuple(n for n in effects.abi_inputs if n != "destination"),
+            transfers=tuple(
+                (
+                    replace(t, direction="out", route=("banks", "host_gather"))
+                    if t.value == "destination"
+                    else t
+                )
+                for t in effects.transfers
+            ),
+        )
+
+    monkeypatch.setattr(spmw_samsung, "samsung_candidate_effects", no_ingress)
+    with pytest.raises(
+        ValueError, match="reads \\['matrix', 'vector'\\], the program reads"
+    ):
+        allo.compile(
+            samsung_carried, build_samsung_target(), samsung_cost, backend="virtual"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# (p) Samsung storage, packing and transfers are tied to the emitted program;
+#     realization is checked at the materialization boundary
+# --------------------------------------------------------------------------- #
+
+
+def flat_mad_source(
+    la: float16[4096], lb: float16[4096], ld: float16[4096], lc: float16[4096]
+):
+    for i in range(4096):
+        lc[i] = la[i] * lb[i] + ld[i]
+
+
+def test_samsung_elementwise_contract_describes_bank_images_and_fiber_packing():
+    from allo.spmw_candidate import candidate_effects
+
+    compiled = allo.compile(
+        flat_mad_source, build_samsung_target(), samsung_cost, backend="virtual"
+    )
+    layout = compiled.compiled.layout
+    layout = layout[0] if isinstance(layout, list) else layout
+    effects = candidate_effects(layout)
+    packing = {v.value: (v.storage, v.packing) for v in effects.value_layouts}
+    assert packing == {
+        "la": ("banks", "all_bank"),
+        "lb": ("banks", "all_bank"),
+        "ld": ("banks", "all_bank:swapped_fibers"),
+        "lc": ("banks", "all_bank"),
+    }
+    program = compiled.compiled.layout_ctx.programs[0]
+    assert program.kind == "ELTWISE" and program.swap_parity == (False, False, True)
+    assert {s for _n, _b, s in effects.allocations} == {"grf_a", "grf_b"}
+    assert {t.value: t.route for t in effects.transfers} == {
+        "la": ("host_scatter", "banks"),
+        "lb": ("host_scatter", "banks"),
+        "ld": ("host_scatter", "banks"),
+        "lc": ("banks", "host_gather"),
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation, reason",
+    [
+        (
+            lambda e: replace(
+                e,
+                value_layouts=tuple(replace(v, storage="srf") for v in e.value_layouts),
+            ),
+            "realization",
+        ),
+        (
+            lambda e: replace(
+                e,
+                transfers=tuple(
+                    replace(t, route=("imaginary_route",)) for t in e.transfers
+                ),
+            ),
+            "neither a declared storage nor a declared move",
+        ),
+        (
+            lambda e: replace(
+                e,
+                value_layouts=tuple(
+                    replace(v, packing="all_bank") if v.value == "ld" else v
+                    for v in e.value_layouts
+                ),
+            ),
+            "swapped_fibers",
+        ),
+        (
+            lambda e: replace(e, allocations=(("tile", 0, "grf_a"),)),
+            "uses registers",
+        ),
+    ],
+    ids=["srf_storage", "imaginary_route", "packing", "registers"],
+)
+def test_valid_looking_but_wrong_samsung_declarations_are_refused(
+    monkeypatch, mutation, reason
+):
+    """A declared storage that exists on the target but is not the one the
+    program uses, a transfer path the target does not declare, a packing the
+    emitter does not produce, or missing transient registers are refused:
+    by the validator before costing, or by the realization check at
+    materialization, which rejects the candidate during the search."""
+    from allo import spmw_samsung
+
+    original = spmw_samsung.samsung_candidate_effects
+
+    def corrupted(target, matches, placement):
+        effects = original(target, matches, placement)
+        return None if effects is None else mutation(effects)
+
+    monkeypatch.setattr(spmw_samsung, "samsung_candidate_effects", corrupted)
+    with pytest.raises((ValueError, RuntimeError)) as error:
+        allo.compile(
+            flat_mad_source, build_samsung_target(), samsung_cost, backend="virtual"
+        )
+    assert reason in str(error.value)
+
+
+def test_realization_mismatch_is_rejected_in_the_search_with_a_fallback(monkeypatch):
+    """A candidate whose declaration passes the validator but not the
+    realization check (the vector declared as a GRF_A broadcast while its
+    program loads it from the banks) is rejected at materialization and the
+    ranking selects another candidate."""
+    from allo import spmw_samsung
+    from allo.spmw_candidate import candidate_effects
+
+    baseline = allo.compile(
+        samsung_gemv,
+        build_samsung_target(),
+        samsung_cost,
+        backend="virtual",
+        reduction_order="reassociate",
+    )
+    (kernel,) = baseline.placement_ranking.kernels
+    assert len(kernel.scores) > 1
+    chosen = baseline.compiled.layout
+    chosen = chosen[0] if isinstance(chosen, list) else chosen
+    victim = chosen.mode  # the candidate the ranking selects when undisturbed
+    original = spmw_samsung.samsung_candidate_effects
+
+    def wrong_vector_storage(target, matches, placement):
+        # Flip the vector's declared residency (and its transfer to match):
+        # both forms are declarable, only one is what the program does.
+        effects = original(target, matches, placement)
+        if effects is None or placement.mode != victim:
+            return effects
+        (vector,) = [v for v in effects.value_layouts if v.value == "local_x"]
+        flipped = "banks" if vector.storage == "grf_a" else "grf_a"
+        route = (
+            ("host_scatter", "banks")
+            if flipped == "banks"
+            else ("host_broadcast", "grf_a")
+        )
+        return replace(
+            effects,
+            value_layouts=tuple(
+                replace(v, storage=flipped) if v.value == "local_x" else v
+                for v in effects.value_layouts
+            ),
+            transfers=tuple(
+                replace(t, route=route) if t.value == "local_x" else t
+                for t in effects.transfers
+            ),
+        )
+
+    monkeypatch.setattr(spmw_samsung, "samsung_candidate_effects", wrong_vector_storage)
+    compiled = allo.compile(
+        samsung_gemv,
+        build_samsung_target(),
+        samsung_cost,
+        backend="virtual",
+        reduction_order="reassociate",
+    )
+    layout = compiled.compiled.layout
+    layout = layout[0] if isinstance(layout, list) else layout
+    assert layout.mode != victim
+    (kernel,) = compiled.placement_ranking.kernels
+    reasons = [reason for _position, reason in kernel.rejections]
+    assert any(
+        "realization differs from the candidate contract" in str(reason)
+        and "loads the vector from" in str(reason)
+        for reason in reasons
+    ), reasons
+    assert candidate_effects(layout) is not None

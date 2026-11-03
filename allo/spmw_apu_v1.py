@@ -232,6 +232,11 @@ class APUv1Ctx(CodegenContext):
             n for n, intent in values.items() if intent in {"out", "inout"}
         }
         realized_inputs = {n for n, intent in values.items() if intent == "in"}
+        analysis = self.program.candidate.analysis
+        if analysis.output_initializer == "carried":
+            # The program reads the output's incoming contents as the
+            # accumulator seed: a realized input as well as an output.
+            realized_inputs.add(analysis.output.value)
         if realized_outputs != set(effects.abi_outputs) or realized_inputs != set(
             effects.abi_inputs
         ):

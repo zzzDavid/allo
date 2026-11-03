@@ -196,7 +196,19 @@ Not yet done (the remaining slices):
   (`apu_v1_hybrid.discover_apu_v1_hybrid_manifest`);
 - Samsung declares every candidate's effects from the retained facts
   (round 19, `spmw_samsung.samsung_candidate_effects`; facts are derived
-  for every matched dataflow work body); AiM, UPMEM and AttAcc still read
+  for every matched dataflow work body). Round 20 made that contract
+  checkable against the emitted program: backing storage (the banks for
+  matrices, elementwise operands and results; `grf_a` for a host-broadcast
+  vector), transient registers as allocations, packing
+  (`row_slots:identity`/`movement`, `all_bank`, `all_bank:swapped_fibers`
+  derived from the target's register moves as the emitter derives it) and
+  the conductor's scatter/broadcast/gather transfers; carried destinations
+  are semantic reads in the shared derivation and in every backend's
+  declaration; transfer routes on every target name declared storage,
+  declared moves, host steps or steps a backend registers
+  (`ROUTE_VOCABULARY`); and the realization check runs at the
+  materialization boundary of the ranking, so a mismatch is a recorded
+  feasibility rejection with a fallback. AiM, UPMEM and AttAcc still read
   `MatchedOp` directly and declare no `CandidateEffects`;
 - stage traces on the Gemini-II card and the installed artifact (slice 5);
   the APU v1 board and the three simulators ran through the round 13 tree
