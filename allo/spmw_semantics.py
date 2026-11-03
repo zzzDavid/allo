@@ -252,9 +252,13 @@ class Contraction:  # pylint: disable=too-many-instance-attributes
 
     @property
     def result_vars(self) -> tuple[str, ...]:
-        """Output and batch loops in loop-nest order."""
+        """Output and batch loops in loop-nest order; when the matcher left
+        the roles unresolved, every loop that is not a reduction loop (each
+        iteration of those writes one result instance)."""
 
         result = set(self.output_vars) | set(self.batch_vars)
+        if not result:
+            result = set(self.loop_vars) - set(self.reduction_vars)
         return tuple(var for var in self.loop_vars if var in result)
 
     @property
@@ -312,6 +316,14 @@ class Epilogue:
     @property
     def loop_vars(self) -> tuple[str, ...]:
         return tuple(loop.var for loop in self.loops)
+
+    @property
+    def trips(self) -> dict[str, int | None]:
+        return {loop.var: loop.trip for loop in self.loops}
+
+    @property
+    def loop_labels(self) -> dict[str, str]:
+        return {loop.var: loop.label for loop in self.loops}
 
 
 @dataclass(frozen=True)
@@ -813,6 +825,7 @@ def analyze_program(
     parameter_names=None,
     result_names=None,
     verbatim: bool = False,
+    parameter_names_by_ref=None,
 ) -> ProgramFacts:
     """Derive the shared semantic facts of one function from a match trace.
 
@@ -849,7 +862,11 @@ def analyze_program(
         shape, element_text = parsed
         ref = facts.argument_refs[memref_ordinal]
         memref_ordinal += 1
-        if parameter_names is not None and ordinal < len(parameter_names):
+        if parameter_names_by_ref is not None and ref in parameter_names_by_ref:
+            # A dataflow work body: its arguments are named by the buffers
+            # the matched operations bind them to (``local_W``).
+            name = str(parameter_names_by_ref[ref])
+        elif parameter_names is not None and ordinal < len(parameter_names):
             name = str(parameter_names[ordinal])
         else:
             name = f"arg{ordinal}"
@@ -1092,14 +1109,24 @@ def product_extent(values) -> int:
     return math.prod(int(v) for v in values)
 
 
-def stamp_program_facts(trace: MatchTrace, facts: ProgramFacts) -> None:
+def stamp_program_facts(
+    trace: MatchTrace, facts: ProgramFacts, *, primary: bool = True
+) -> None:
     """Attach the facts to the trace and to its matches so downstream stages
     (enumerators, backend contexts) read the semantic stage's result instead
-    of re-deriving it: ``trace.semantics``, ``match.extra["program_facts"]``
-    on every match of the analyzed function, and ``extra["semantic_facts"]``
-    (the `Contraction` or `Epilogue`) on the matches that are one."""
+    of re-deriving it: ``trace.semantics`` (the entry function's facts;
+    ``primary=False`` for a dataflow work body's facts, which join
+    ``trace.function_facts``), ``match.extra["program_facts"]`` on every
+    match of the analyzed function, and ``extra["semantic_facts"]`` (the
+    `Contraction` or `Epilogue`) on the matches that are one."""
 
-    trace.semantics = facts
+    if primary:
+        trace.semantics = facts
+    function_facts = getattr(trace, "function_facts", None)
+    if function_facts is None:
+        function_facts = {}
+        trace.function_facts = function_facts
+    function_facts[facts.function] = facts
     for match in trace.matches:
         if match.func_name == facts.function:
             match.extra["program_facts"] = facts

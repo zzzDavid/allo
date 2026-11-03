@@ -1481,3 +1481,184 @@ def test_whole_launches_are_reserved_for_verbatim_programs(monkeypatch):
     monkeypatch.setattr(records, "apu_g2_record_candidates", whole_launch)
     with pytest.raises(ValueError, match="declared whole-function"):
         allo.compile(add, target, apu_g2_cost, backend="virtual")
+
+
+def dependent_fill(
+    src: allo.ir.types.int32[8], out: allo.ir.types.int32[8]
+) -> allo.ir.types.int32[8]:
+    for i in range(8):
+        out[i] = src[i] + 2
+    seed: allo.ir.types.int32 = out[0]
+    result: allo.ir.types.int32[8] = seed
+    return result
+
+
+def test_retained_effects_keep_program_order_across_fills_and_stores():
+    """A fill that reads a value an earlier store defined is retained after
+    that store (one traversal in site order), so the effect set never places
+    a read before its defining write."""
+    compiled = _compile_record(dependent_fill, ("result",))
+    src = np.arange(8, dtype=np.int32)
+    out = np.full(8, 99, np.int32)
+    run = compiled(src, out)
+    np.testing.assert_array_equal(out, src + 2)
+    np.testing.assert_array_equal(run.extra["outputs"]["result"], np.full(8, 2))
+    effects = compiled.trace.semantics.effects
+    order = [
+        (e.destination.parameter or e.destination.memref_name, e.category)
+        for e in effects
+    ]
+    assert order == [("out", "unmatched"), ("seed", "unmatched"), ("result", "fill")]
+    assert [a.parameter for a in effects[1].reads] == ["out"]
+    # The fill's value is the seed, which the matcher follows to ``out[0]``:
+    # the fill depends on the store that defined it.
+    assert "out" in {a.parameter for a in effects[2].reads}
+
+
+# --------------------------------------------------------------------------- #
+# (n) The first matcher backend on the shared contract: Samsung HBM-PIM
+#     consumes the retained facts and declares its candidates' effects
+# --------------------------------------------------------------------------- #
+
+SAMSUNG_M, SAMSUNG_K, SAMSUNG_ROWS = 4096, 256, 32
+
+
+@allo.dataflow.region()
+def samsung_gemv(
+    W: float16[SAMSUNG_M, SAMSUNG_K], x: float16[SAMSUNG_K], y: float16[SAMSUNG_M]
+):
+    @allo.work(mapping=[16, 8], args=[W, x, y])
+    def body(
+        local_W: float16[SAMSUNG_M, SAMSUNG_K],
+        local_x: float16[SAMSUNG_K],
+        local_y: float16[SAMSUNG_M],
+    ):
+        pid, uid = allo.get_wid()
+        row0 = (pid * 8 + uid) * SAMSUNG_ROWS
+        for i in range(SAMSUNG_ROWS):
+            acc: float16 = 0
+            for k in range(SAMSUNG_K):
+                acc += local_W[row0 + i, k] * local_x[k]
+            local_y[row0 + i] = acc
+
+
+def test_samsung_candidates_declare_effects_from_the_shared_facts():
+    """Every Samsung candidate of a program with shared facts declares its
+    effects, derived from the work body's `Contraction` facts (source loop
+    labels, trips, access coordinates, accumulator initialization, sinks)
+    and the placement (handles, levers); the realized CRF program is
+    compared with the selected declaration."""
+    from allo.spmw_candidate import EFFECTS_REQUIRED_TARGETS, candidate_effects
+
+    assert "samsung_hbm_pim" in EFFECTS_REQUIRED_TARGETS
+    compiled = allo.compile(
+        samsung_gemv, build_samsung_target(), samsung_cost, backend="virtual"
+    )
+    facts = compiled.trace.function_facts["body_0_0"]
+    (contraction,) = facts.contractions
+    assert [p.name for p in facts.parameters] == ["local_W", "local_x", "local_y"]
+    assert contraction.loop_labels == {
+        contraction.loop_vars[0]: "i",
+        contraction.loop_vars[1]: "k",
+    }
+    (kernel,) = compiled.placement_ranking.kernels
+    candidates = [
+        entry[1] if isinstance(entry, tuple) else entry for entry in kernel.candidates
+    ]
+    assert candidates and all(candidate_effects(c) is not None for c in candidates)
+    layout = compiled.compiled.layout
+    layout = layout[0] if isinstance(layout, list) else layout
+    effects = candidate_effects(layout)
+    assert effects.coverage.inputs == ("local_W", "local_x")
+    assert effects.coverage.outputs == ("local_y",)
+    layouts = {v.value: (v.axes, v.storage) for v in effects.value_layouts}
+    assert layouts["local_W"] == (("i", "k"), "banks")
+    assert layouts["local_y"] == (("i",), "grf_b")
+    assert layouts["local_x"][0] == ("k",) and layouts["local_x"][1] in {
+        "grf_a",
+        "banks",
+    }
+    (launch,) = effects.launches
+    assert launch.kind in {"REDUCE", "TEMPORAL_REDUCE"}
+    assert launch.instances == (0, SAMSUNG_ROWS) and launch.reduction == (0, SAMSUNG_K)
+    assert launch.accumulator == "zero" and launch.covers == (layout.mode,)
+    assert {t.value: t.direction for t in effects.transfers} == {
+        "local_W": "in",
+        "local_x": "in",
+        "local_y": "out",
+    }
+    assert compiled.estimate().cycles > 0
+
+
+@pytest.mark.parametrize(
+    "mutation, reason",
+    [
+        (
+            lambda e: replace(e, coverage=replace(e.coverage, inputs=("local_W",))),
+            "reads",
+        ),
+        (
+            lambda e: replace(
+                e,
+                launches=tuple(replace(l, reduction=(0, 128)) for l in e.launches),
+            ),
+            "not an ordered partition",
+        ),
+        (
+            lambda e: replace(
+                e,
+                value_layouts=tuple(
+                    (
+                        replace(v, axes=("nonexistent_axis",))
+                        if v.value == "local_W"
+                        else v
+                    )
+                    for v in e.value_layouts
+                ),
+            ),
+            "not a loop of the program",
+        ),
+        (lambda e: None, "declares no effects"),
+    ],
+    ids=["inputs", "reduction", "axis", "missing"],
+)
+def test_corrupted_samsung_declarations_are_refused_before_costing(
+    monkeypatch, mutation, reason
+):
+    from allo import spmw_samsung
+
+    original = spmw_samsung.samsung_candidate_effects
+
+    def corrupted(target, matches, placement):
+        effects = original(target, matches, placement)
+        return None if effects is None else mutation(effects)
+
+    monkeypatch.setattr(spmw_samsung, "samsung_candidate_effects", corrupted)
+    with pytest.raises(ValueError, match="violates the candidate contract") as error:
+        allo.compile(
+            samsung_gemv, build_samsung_target(), samsung_cost, backend="virtual"
+        )
+    assert reason in str(error.value)
+
+
+def test_samsung_selected_program_executes_under_the_declared_contract(
+    samsung_sim_gate,
+):
+    """The selected candidate (declared, validated, realized and checked)
+    runs on the Samsung simulator and reproduces the GEMV."""
+    compiled = allo.compile(samsung_gemv, build_samsung_target(), samsung_cost)
+    layout = compiled.compiled.layout
+    layout = layout[0] if isinstance(layout, list) else layout
+    assert layout.extra["effects"].launches[0].reduction == (0, SAMSUNG_K)
+    rng = np.random.default_rng(0)
+    W = (rng.standard_normal((SAMSUNG_M, SAMSUNG_K)) * 0.1).astype(np.float16)
+    x = (rng.standard_normal(SAMSUNG_K) * 0.1).astype(np.float16)
+    y = np.zeros(SAMSUNG_M, np.float16)
+    run = compiled(W, x, y)
+    assert run.kind == "simulator" and run.cycles > 0
+    np.testing.assert_allclose(
+        y.astype(np.float32),
+        W.astype(np.float32) @ x.astype(np.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )

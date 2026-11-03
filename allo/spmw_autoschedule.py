@@ -717,8 +717,17 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
         )
 
     from .spmw_knobs import cross_with_knobs
+    from .spmw_samsung import samsung_candidate_effects
 
-    return cross_with_knobs(target, base_candidates, matches, role_to_memref)
+    candidates = cross_with_knobs(target, base_candidates, matches, role_to_memref)
+    # The common candidate contract (gate G9): every Samsung candidate of a
+    # program with shared facts declares its effects, derived from those
+    # facts and the placement (handles, levers).
+    for candidate in candidates:
+        effects = samsung_candidate_effects(target, matches, candidate)
+        if effects is not None:
+            candidate.extra["effects"] = effects
+    return candidates
 
 
 def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:

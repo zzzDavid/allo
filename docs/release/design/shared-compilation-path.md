@@ -194,10 +194,10 @@ Not yet done (the remaining slices):
 
 - the hybrid manifest still reads the scalar ABI from MLIR text
   (`apu_v1_hybrid.discover_apu_v1_hybrid_manifest`);
-- the matcher backends' enumerators read `MatchedOp` directly and declare
-  no `CandidateEffects`; the facts are available on every match
-  (`extra["program_facts"]`) but Samsung, AiM, UPMEM and AttAcc do not
-  consume them yet;
+- Samsung declares every candidate's effects from the retained facts
+  (round 19, `spmw_samsung.samsung_candidate_effects`; facts are derived
+  for every matched dataflow work body); AiM, UPMEM and AttAcc still read
+  `MatchedOp` directly and declare no `CandidateEffects`;
 - stage traces on the Gemini-II card and the installed artifact (slice 5);
   the APU v1 board and the three simulators ran through the round 13 tree
   (VALIDATION round 13).

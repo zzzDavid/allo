@@ -3,7 +3,7 @@
 
 # Release status
 
-Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline; committed as `9255d29`, exercised from the installed wheel on the simulators, the APU v1 board and the Gemini-II card; round 16: the reviewer's three contract gaps closed (C-30b) and the last typed route removed; round 17: the `APUv1Program` facade replaced by the shared front stages on the phase's source with retained store effects (X-02); round 18: indirect loads, fill initializers and unused arguments retained or represented correctly (X-03), whole launches reserved for verbatim programs (C-32)). Read `TASK.md` in the containing repository,
+Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline; committed as `9255d29`, exercised from the installed wheel on the simulators, the APU v1 board and the Gemini-II card; round 16: the reviewer's three contract gaps closed (C-30b) and the last typed route removed; round 17: the `APUv1Program` facade replaced by the shared front stages on the phase's source with retained store effects (X-02); round 18: indirect loads, fill initializers and unused arguments retained or represented correctly (X-03), whole launches reserved for verbatim programs (C-32); round 19: effects in program order (X-04) and Samsung as the first matcher backend declaring effects from the shared facts). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -72,6 +72,23 @@ then this file, then `ISSUES.md` for the next action.
    build path for a user without the patches is the open question the
    reviewer named.
 4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+
+## Round 19 (2026-11-03): what was done
+
+- Reviewer finding on `1a5ebf9` (X-04): fills and stores are retained in
+  one traversal in program order; the dependency-bearing case is a
+  regression and the reviewer's test passes.
+- G9, first matcher backend: the pipeline derives and stamps shared facts
+  for every matched dataflow work body (`trace.function_facts`); the
+  Samsung enumerator declares every candidate's effects from the retained
+  facts and the placement (`samsung_candidate_effects`); handle-only
+  Samsung candidates are refused for programs with shared facts
+  (`EFFECTS_REQUIRED_TARGETS`); corrupted declarations are refused before
+  costing; `SamsungCtx.check_realization` compares the lowered CRF program
+  with the selected declaration; the selected GEMV executes on the
+  simulator (section n of `tests/pim/test_shared_semantics.py`).
+- Evidence: VALIDATION.md round 19 (targeted; no full suites or hardware
+  reruns this round, as directed).
 
 ## Round 18 (2026-11-03): what was done
 
@@ -276,10 +293,9 @@ then this file, then `ISSUES.md` for the next action.
 
 ## Next concrete actions (in order)
 
-0. Independent review of the rounds 17-18 `APUv1Program` frontend (retained
-   store effects incl. fills and indirect loads, verbatim contract,
-   physical transfers, runtime-checked movement).
-1. G9, matcher backends: Samsung, AiM, UPMEM and AttAcc candidates declare
+0. Independent review of rounds 17-19 (the `APUv1Program` frontend, the
+   retained effects, the Samsung slice).
+1. G9, matcher backends: AiM, UPMEM and AttAcc candidates declare
    `CandidateEffects` (coverage, value layouts on their handles, transfers,
    launches) and their enumerators consume `ProgramFacts` instead of
    re-reading `MatchedOp` fields; the shared validator then applies to

@@ -3792,14 +3792,17 @@ class _FunctionCoverage:
         loop_names = tuple(
             sorted((getattr(self.state, "loop_names", {}) or {}).items())
         )
-        fills = [
+        fills = {
             index
             for index, (op, _loops, _guards) in enumerate(self.sites)
             if op.operation.name == "linalg.fill" and len(op.operands) >= 2
-        ]
-        for index in sorted(fills):
-            self._record_fill(index, coverage, loop_names)
-        for index in self.stores:
+        }
+        # One traversal in site (program) order: a fill that reads a value an
+        # earlier store defined is retained after that store.
+        for index in sorted(fills | set(self.stores)):
+            if index in fills:
+                self._record_fill(index, coverage, loop_names)
+                continue
             cat = category[index]
             dest_ref = self._ref(self._op(index).operands[1])
             local = self._is_local(index)

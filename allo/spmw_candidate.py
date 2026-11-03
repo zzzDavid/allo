@@ -602,6 +602,20 @@ def _check_launches(effects, matches, view) -> list:
     return problems
 
 
+# Targets whose enumerators declare `CandidateEffects` for every candidate of
+# a program that went through the shared front stages (its work items carry
+# ``extra["program_facts"]``).  A handle-only placement is a contract problem
+# there; the matcher backends still to migrate (AiM, UPMEM, AttAcc) are not
+# listed and keep their handle-only candidates (ISSUES X-01).
+EFFECTS_REQUIRED_TARGETS = frozenset({"apu_v1", "apu_v2", "samsung_hbm_pim"})
+
+
+def _effects_required(matches, view) -> bool:
+    if getattr(view, "name", None) not in EFFECTS_REQUIRED_TARGETS:
+        return False
+    return bool(matches) and matches[0].extra.get("program_facts") is not None
+
+
 def validate_candidate_effects(matches, placement, view=None) -> list[str]:
     """Problems of a candidate's declared effects against the semantic
     program of ``matches`` (and the storage declarations of ``view`` when
@@ -623,6 +637,12 @@ def validate_candidate_effects(matches, placement, view=None) -> list[str]:
 
     effects = candidate_effects(placement)
     if effects is None:
+        if _effects_required(matches, view):
+            return [
+                "declares no effects; every candidate of target "
+                f"{getattr(view, 'name', None)!r} for a program with shared facts "
+                "states its coverage, layouts, transfers, launches and ABI"
+            ]
         return []
     inputs, outputs, locals_, operations, parameters = _program_values(matches)
     functions = {match.func_name for match in matches}
@@ -707,6 +727,46 @@ def check_graph_consistency(placement, graph) -> None:
         )
 
 
+# target name -> ``fn(view, matches, placement) -> CandidateEffects | None``:
+# how a migrated matcher backend declares a placement's effects, used to
+# re-declare a caller-supplied handle-only placement for the work item it is
+# compiled for (the enumerator declares them for its own candidates).
+EFFECTS_DERIVERS: dict = {}
+
+
+def _redeclared(view, matches, placement):
+    deriver = EFFECTS_DERIVERS.get(getattr(view, "name", None))
+    if deriver is None:
+        return placement
+    effects = deriver(view, matches, placement)
+    if effects is None or candidate_effects(placement) == effects:
+        return placement
+    from .spmw_autoschedule import Placement
+
+    return Placement(
+        placements=dict(placement.placements),
+        mode=placement.mode,
+        extra={**(placement.extra or {}), "effects": effects},
+        layout=getattr(placement, "layout", None),
+    )
+
+
+def _with_current_effects(placement, current):
+    """``placement`` with the effects the current enumeration declared for
+    the same decision (per work item), the caller's other fields kept."""
+    effects = candidate_effects(current)
+    if effects is None or candidate_effects(placement) is effects:
+        return placement
+    from .spmw_autoschedule import Placement
+
+    return Placement(
+        placements=dict(placement.placements),
+        mode=placement.mode,
+        extra={**(placement.extra or {}), "effects": effects},
+        layout=getattr(placement, "layout", None),
+    )
+
+
 def rebind_supplied_layouts(view, trace, supplied) -> list:
     """Bind caller-supplied placements to candidates of the current program.
 
@@ -764,7 +824,10 @@ def rebind_supplied_layouts(view, trace, supplied) -> list:
                 # A handle-only placement with a current candidate's decision:
                 # the caller's placement (with the fields its own ranking
                 # derived) is the program; only its decision was re-checked.
-                rebound.append(placement)
+                # Its declared effects are this work item's (a placement
+                # supplied for every work item of a lockstep kernel carries
+                # the first body's declaration otherwise).
+                rebound.append(_with_current_effects(placement, same[0]))
                 continue
             chosen = same[0]
             chosen.extra = {**chosen.extra, "candidate_selection": "forced"}
@@ -794,11 +857,16 @@ def rebind_supplied_layouts(view, trace, supplied) -> list:
                 f"placement {placement.mode!r} was pruned by the reduction-order "
                 f"policy ({pruned[placement.mode]})"
             )
-        rebound.append(placement)
+        # The caller's placement for this work item, its effects declared by
+        # the backend for these matches (a supplied placement may carry the
+        # declaration of another body of a lockstep kernel).
+        rebound.append(_redeclared(view, matches, placement))
     return rebound
 
 
 __all__ = [
+    "EFFECTS_DERIVERS",
+    "EFFECTS_REQUIRED_TARGETS",
     "CandidateCoverage",
     "CandidateEffects",
     "CandidateLaunch",

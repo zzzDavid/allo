@@ -87,6 +87,43 @@ class SourceProgram:
                 parameter_names=self.parameter_names,
             )
             stamp_program_facts(self.trace, self.facts)
+            # A dataflow region's work bodies are functions of their own:
+            # each matched body gets its facts (its arguments named by the
+            # buffers the matches bind them to), stamped on its matches, so
+            # every work item's candidates can be derived from and checked
+            # against the shared facts.
+            bodies = dict.fromkeys(
+                m.func_name
+                for m in self.trace.matches
+                if m.func_name != self.entry_function
+            )
+            for body in bodies:
+                names_by_ref = {}
+                for match in self.trace.matches:
+                    if match.func_name != body:
+                        continue
+                    for operand in match.operands:
+                        if operand.value_ref is not None and operand.memref_name:
+                            names_by_ref.setdefault(
+                                operand.value_ref, operand.memref_name
+                            )
+                    if match.result_value_ref is not None and match.result_memref_name:
+                        names_by_ref.setdefault(
+                            match.result_value_ref, match.result_memref_name
+                        )
+                    sinks = match.extra.get("output_sinks", ())
+                    refs = match.extra.get("output_sink_refs", ())
+                    for (memref, _text), (ref, _local) in zip(sinks, refs):
+                        if ref is not None:
+                            names_by_ref.setdefault(ref, memref)
+                facts = analyze_program(
+                    self.match_target,
+                    self.schedule.module,
+                    self.trace,
+                    function=body,
+                    parameter_names_by_ref=names_by_ref,
+                )
+                stamp_program_facts(self.trace, facts, primary=False)
         return self.facts
 
 

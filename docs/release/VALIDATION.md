@@ -597,3 +597,17 @@ directory. Raw logs under `/tmp/g9/r18-*.log`, copied to
 | Gemini-II card from a wheel built on zhang-x4 from the round 18 sdist (`g2_installed_run18.sh`, `g2-installed-run.log`, `r18/g2/`; `-rA`; temporaries not kept) | host `en-ec-zhang-x4`, card `apu-00`; sdist of the round 18 tree (sha256 `04b8e485...`) built into wheel `000f91ae8d2ca86d...` with the host's gcc 11, clean venv of the `allo-dev` interpreter, run from `/tmp` under `flock /tmp/tenon-apu-g2.lock`, build temporaries not kept: `tests/pim/test_apu_g2_hardware.py` **15 passed in 146.50 s**; per-case output kept with `-rA` |
 | black on `allo` and `tests` (24.8.0); license headers; pylint on the changed modules | black clean (24.8.0); pylint: no findings in `apu_v1_record_frontend.py`, `spmw_candidate.py`, `spmw_semantics.py` (the pre-existing P-23 findings of `spmw_match.py` and `spmw_match_engine.py` are unchanged); license headers checked at commit |
 
+## Round 19 (2026-11-03): review finding X-04; Samsung on the shared contract
+
+Same interpreter and `LLVM_BUILD_DIR` as round 12; checkout as working
+directory. Targeted runs only this round, as the reviewer directed (no full
+suites, no hardware hosts). Raw logs under `/tmp/g9/r19-*.log`, copied to
+`/work/shared/users/phd/nz264/tenon-release-evidence/r19/`.
+
+| Check (round 19 tree) | Result |
+|---|---|
+| the reviewer's `test_effect_order.py` (`tenon-release-evidence/reviewer-r18/`, run unchanged) | 1 passed: the defining store, the seed store and the fill are retained in that order |
+| `tests/pim/test_shared_semantics.py` (52: sections a-m plus the ordering regression and (n) Samsung candidates declare effects from the facts, four corrupted declarations refused before costing, the selected GEMV executes on the simulator) | 52 passed (within `r19-a.log`); the Samsung simulator execution ran behind its gate |
+| Samsung-sensitive files (`r19-a.log`: shared semantics, the `samsung_hbm_pim` tests, GEMV on all targets except the board, match coverage, work grid, matcher ranking, layout and joint selection, host transfer dispatch, legality, G6 decisions) | 351 passed, 26 skipped, 2 deselected in 6477 s (1:47:56): shared semantics, the `samsung_hbm_pim` directory (conductor runs incl. the elementwise ops and the GEMM residency lever, lowering, owner maps, reduction order, GEMV and readback, layout swizzle), GEMV on all targets except the board, match coverage, work grid, matcher ranking, joint selection, legality, G6 decisions and semantics, paper golden rows, compile interface, run-result contract, layout selection search, Samsung performance, AiM and UPMEM matchers; an earlier run of the same files on the tree before the per-body re-declaration of supplied placements (`r19-a-prefix.log`) had the lockstep-kernel declarations mismatch that the fix removes. A second batch (`r19-b.log`: layout search, Samsung performance, AiM and UPMEM matchers, CENT AiM workloads): 29 passed, 13 skipped |
+| black on `allo` and `tests` (24.8.0); license headers; pylint on the changed modules | black clean (24.8.0); pylint: no findings in the new code of `spmw_samsung.py`, `spmw_candidate.py`, `spmw_pipeline.py`, `spmw_semantics.py` (pre-existing P-23 findings unchanged); license headers checked at commit |
+

@@ -678,6 +678,37 @@ matcher backends declare their effects and consume the facts, the hybrid
 manifest reads the scalar ABI from the retained IR, and the slice 5 traces
 exist.
 
+## Round 19 (2026-11-03): independent review of 1a5ebf9; effect order, first matcher backend
+
+The reviewer accepted the round 18 repairs and found one remaining
+shared-contract defect: retained effects did not preserve program order
+(every fill before every store), so a fill reading a value an earlier
+store defined was placed before its defining write (X-04). Judgment: the
+effect set is the function's program-ordered effect sequence; fills and
+stores are now retained in one traversal by site index, and the
+dependency-bearing case is a regression.
+
+As directed, the increment also started the matcher-backend migration
+with an ordinary-source vertical slice on Samsung HBM-PIM: the pipeline
+derives and stamps shared facts for every matched dataflow work body
+(their arguments named by the buffers the matches bind them to); the
+Samsung enumerator declares every candidate's effects from those facts
+and the placement; a handle-only Samsung candidate is a contract problem
+for any program with shared facts; the shared validator refuses corrupted
+declarations (coverage, reduction partition, layout axes, missing effects)
+before costing; the context compares the lowered CRF program with the
+selected declaration; the selected GEMV program executes on the simulator
+under that contract. Judgment on scope: the Samsung classification code
+(`samsung_contraction`, `samsung_elementwise`) still reads the matches'
+structural fields for its own domain checks; the candidate contract is
+derived from the facts, and the realization is checked against it, which
+is the invariant the gate asks for. AiM, UPMEM and AttAcc remain
+handle-only (X-01).
+
+Gate G9 remains **FAIL** until the remaining matcher backends are
+migrated and reviewed, the hybrid manifest reads the scalar ABI from the
+retained IR, and the slice 5 traces exist.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -729,4 +760,4 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 | G8 backend execution | **evidence complete at 9255d29, pending independent review** | installed-artifact runs at the round 10 repair (VALIDATION.md round 10) and again at the round 15 commit: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock, 3 passed) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed through the shared pipeline); all reviewer probes of rounds 8 to 14 rejected or executed correctly through the installed wheel (VALIDATION.md round 15); AttAcc analytical by design; AiM timing-only as accepted |
 | G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-15: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, an enforced typed candidate contract (C-30), supplied placements rebound (C-28), orchestration and launch bindings validated before selection (C-29, C-29b), Gemini-II typed records and `APUv1Program` as frontends of the pipeline (ISSUES X-01; round 16 removed the last typed route, round 17 replaced the `APUv1Program` facade by the shared front stages with retained store effects, X-02), the launch chain, accumulator modes and every operation's extent enforced (C-30b); both hardware hosts and the installed wheel exercised at `9255d29`; open: review of round 17, matcher backends' effects and facts consumption, the hybrid manifest's text ABI, slice 5 traces of forced alternatives and cost perturbations on hardware |
 
-Verdict: **NOT READY**. Blockers: G9 (X-01 to X-03, C-32) is in progress (review of the rounds 17-18 `APUv1Program` frontend and retained effects, matcher backends' effects, hybrid manifest ABI, slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.
+Verdict: **NOT READY**. Blockers: G9 (X-01 to X-04, C-32) is in progress (review of rounds 17-19: the `APUv1Program` frontend, retained effects and the Samsung slice; AiM, UPMEM and AttAcc effects; hybrid manifest ABI; slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.
