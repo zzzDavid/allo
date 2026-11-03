@@ -529,6 +529,22 @@ def _region_parameters(region) -> tuple:
     return tuple(parameters)
 
 
+def _candidate_execution_graph(target, trace, layout, bound_cost, **options):
+    """Delegate pricing to the backend context class of ``target`` when it
+    declares ``candidate_execution_graph`` (a classmethod returning an
+    ``ExecutionGraph`` for its own candidates, None otherwise)."""
+
+    from .spmw_codegen import _BACKENDS, backend_context_class
+
+    name = getattr(target, "name", None)
+    if name not in _BACKENDS:
+        return None
+    hook = getattr(backend_context_class(name), "candidate_execution_graph", None)
+    if hook is None:
+        return None
+    return hook(target, trace, layout, bound_cost, **options)
+
+
 def build_execution_graph(
     target,
     trace,
@@ -546,6 +562,21 @@ def build_execution_graph(
     transfers and launches run serially in its program order.
     """
     bound_cost = _bind_cost(cost_spec, target)
+    # A backend whose candidates carry their own realization (the APU vector
+    # plans, the Gemini-II launch plans) prices them through its context's
+    # ``candidate_execution_graph`` hook; the hook returns None for placements
+    # that are not its candidates, which take the generic lowering below.
+    hooked = _candidate_execution_graph(
+        target,
+        trace,
+        layout,
+        bound_cost,
+        host_moves=host_moves,
+        buffer_metrics=buffer_metrics,
+        launch_schedule=launch_schedule,
+    )
+    if hooked is not None:
+        return hooked
     buffer_manifest, trace_values = _coerce_buffer_metric_manifest(
         trace, host_moves, buffer_metrics
     )

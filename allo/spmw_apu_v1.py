@@ -40,6 +40,11 @@ class APUv1Ctx(CodegenContext):
         super().__init__(target)
         # Override the parent's PIMCmd list -- APU v1 emits plain C text.
         self.cmds: list[str] = []
+        # The realized vector program when the selected candidate is a GVML
+        # vector plan of a plain-function contraction
+        # (`allo.pim.apu_v1_vector_program.APUv1VectorProgram`); None on the
+        # grouped matcher program of a dataflow region.
+        self.program = None
         # Reverse-handle map populated by the autoscheduler before
         # walk_and_emit runs. Maps id(handle) -> C symbol. Also accepts
         # string keys (e.g. "mac_tmp") for scratch slots that aren't
@@ -48,6 +53,90 @@ class APUv1Ctx(CodegenContext):
         self._used_vr_names: list[str] = []
         self.group_size: int = 32768
         self.vector_batches: int = 1
+
+    # -- shared-pipeline candidate hooks (gate G9) ---------------------------
+
+    @staticmethod
+    def _vector_payloads(layouts):
+        from .pim.apu_v1_vector_program import APUv1VectorCandidate
+
+        layouts = layouts if isinstance(layouts, (list, tuple)) else [layouts]
+        payloads = [
+            (getattr(layout, "extra", None) or {}).get("payload") for layout in layouts
+        ]
+        if not any(isinstance(p, APUv1VectorCandidate) for p in payloads):
+            return None
+        if len(payloads) != 1 or not isinstance(payloads[0], APUv1VectorCandidate):
+            raise NotImplementedError(
+                "APU v1 vector plans realize one plain-function contraction per "
+                "program; a multi-kernel program mixes candidates"
+            )
+        return payloads[0]
+
+    @classmethod
+    def candidate_execution_graph(cls, target, _trace, layout, bound_cost, **_options):
+        """Price a vector-plan candidate from its materialized GVML inventory
+        (``apu_v1_cost`` over the realized operations); None for the grouped
+        matcher placements, which take the generic lowering."""
+
+        from .pim.apu_v1_vector_cost import estimate_apu_v1_realization
+        from .pim.schedule_search import InfeasibleSchedule
+
+        payload = cls._vector_payloads(layout)
+        if payload is None:
+            return None
+        if payload.realization is None:
+            raise InfeasibleSchedule(
+                payload.realization_error
+                or "APU v1 plan has no faithful GVML " "realization"
+            )
+        estimate = payload.estimate
+        if estimate is None or estimate.graph.metadata.get(
+            "cost_fingerprint"
+        ) != getattr(bound_cost, "fingerprint", None):
+            estimate = estimate_apu_v1_realization(
+                payload.realization, target, bound_cost
+            )
+            payload.estimate = estimate
+        return estimate.graph
+
+    def emit_program(
+        self, trace, layouts, *, schedule=None, host_moves=(), module=None
+    ) -> None:
+        """Materialize the selected candidate: a vector plan instantiates
+        the realized program (its GVML device source is the command stream);
+        a grouped placement of a dataflow region takes the per-bucket walk."""
+
+        from .pim.apu_v1_vector_program import APUv1VectorProgram
+        from .pim.schedule_search import InfeasibleSchedule
+
+        payload = self._vector_payloads(layouts)
+        if payload is None:
+            super().emit_program(
+                trace, layouts, schedule=schedule, host_moves=host_moves, module=module
+            )
+            return
+        if payload.realization is None:
+            raise InfeasibleSchedule(
+                payload.realization_error
+                or "APU v1 plan has no faithful GVML " "realization"
+            )
+        (placement,) = layouts if isinstance(layouts, (list, tuple)) else [layouts]
+        self.program = APUv1VectorProgram(self.target, payload, trace, placement)
+        self.cmds = list(payload.realization.device_source().splitlines())
+
+    def runtime_route(self, commands) -> tuple[str, tuple]:
+        if self.program is None:
+            return super().runtime_route(commands)
+        decision = self.program.candidate.decision()
+        return "apu-v1-vector-gvml-v1", (self.program.selected_plan.name, decision[-1])
+
+    def virtual_run_extra(self) -> dict:
+        return {} if self.program is None else self.program.virtual_extra()
+
+    def virtual_run_check(self, inputs) -> None:
+        if self.program is not None:
+            self.program.check_virtual_inputs(inputs)
 
     def _enabled(self) -> bool:
         """Emit one SPMD body; the host launches it on every APUC."""
@@ -405,7 +494,27 @@ def _apu_v1_prepare_io(compiled: "Compiled", inputs: dict):
 
 
 def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:
-    """Run a compiled APU v1 artifact against real GSI hardware.
+    """Run a compiled APU v1 artifact.
+
+    A vector-plan program (`APUv1Ctx.program`) runs through its own
+    realization: the GVML project on the board (``backend=None``) or the
+    host-side functional model (``backend="functional"``).  The grouped
+    matcher program of a dataflow region builds and launches the low-mode
+    project below.
+    """
+    program = getattr(getattr(compiled, "layout_ctx", None), "program", None)
+    if program is not None:
+        return program.run(compiled, inputs)
+    if compiled.backend not in (None, "device"):
+        raise ValueError(
+            "the APU v1 grouped matcher program supports backend=None (board) or "
+            f"'virtual'; got {compiled.backend!r}"
+        )
+    return _run_apu_v1_grouped(compiled, **inputs)
+
+
+def _run_apu_v1_grouped(compiled: "Compiled", **inputs) -> RunResult:
+    """Run a compiled grouped APU v1 artifact against real GSI hardware.
 
     Materializes a build directory via `gen_apu_v1_low_mode_project`,
     runs `make` with the ARC GNU toolchain, executes the resulting

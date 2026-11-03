@@ -145,6 +145,10 @@ _MATCHER_PHYSICAL_EXTRA_FIELDS = (
     "kc",
     "predicate_lowering",
     "attacc_tiling",
+    # Backend candidate plans (APU v1 vector recipes, Gemini-II launch plans):
+    # the plan's name and its name-free physical decision.
+    "candidate_plan",
+    "candidate_decision",
 )
 
 
@@ -1120,6 +1124,45 @@ def _upmem_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
 
 @register_enumerator("apu_v1")
 def _apu_v1_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
+    """APU v1 candidates: the GVML vector plans of a plain-function
+    contraction (`allo.pim.apu_v1_vector_program.apu_v1_vector_candidates`),
+    or the grouped-tree program of a dataflow region's work item
+    (`_apu_v1_grouped_enumerate`).  The reduction-order policy is consulted
+    here: regrouping vector plans are pruned under a strict float policy and
+    the grouped program, which always regroups, is refused."""
+    from .spmw_reduction_policy import (
+        APU_V1_GROUPED_ROUTE_REGROUPS,
+        may_regroup,
+        no_strict_program_error,
+    )
+
+    scope = _matcher_work_scope(matches[0])
+    if not scope.group_shape:
+        from .pim.apu_v1_vector_program import apu_v1_vector_candidates
+
+        return apu_v1_vector_candidates(target, matches)
+    if not may_regroup(matches):
+        raise no_strict_program_error("apu_v1", matches, APU_V1_GROUPED_ROUTE_REGROUPS)
+    carried = [m for m in matches if m.extra.get("accumulator_init") == "carried"]
+    if carried:
+        # The grouped program zeroes its accumulator VR before each reduction
+        # (release gate G2); only the vector plans carry an initial output.
+        from .spmw_codegen import carried_accumulator_message
+
+        raise NotImplementedError(carried_accumulator_message("apu_v1", carried[0]))
+    return _apu_v1_grouped_enumerate(target, matches)
+
+
+@register_enumerator("apu_v2")
+def _apu_g2_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
+    """Gemini-II candidates: the composed-dot launch plans of the matched
+    integer contraction family (`allo.pim.apu_g2_source_route`)."""
+    from .pim.apu_g2_source_route import apu_g2_source_candidates
+
+    return apu_g2_source_candidates(target, matches)
+
+
+def _apu_v1_grouped_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     """Build the group view used by a GVML reduction.
 
     ``lane_in_group`` is the padded reduction axis and ``group`` enumerates
@@ -1217,6 +1260,81 @@ def _attacc_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
 # --------------------------------------------------------------------- #
 
 
+def candidate_matches(placement: Placement, request) -> bool:
+    """Whether a candidate answers to a ``layout=`` request: its mode (the
+    candidate name), one of its declared ``extra["candidate_families"]``,
+    or, for a backend plan payload, the payload's own notion
+    (``payload.matches_request``)."""
+    if isinstance(request, Placement):
+        return placement is request
+    extra = getattr(placement, "extra", None) or {}
+    if isinstance(request, str):
+        if placement.mode == request or request in extra.get("candidate_families", ()):
+            return True
+    payload = extra.get("payload")
+    matcher = getattr(payload, "matches_request", None)
+    return bool(matcher(request)) if callable(matcher) else False
+
+
+def select_candidates(candidates, request, matches=()):
+    """Mark the candidates designating ``request`` as the selectable set.
+
+    Every candidate stays in the ranking (scored and inspectable); the ones
+    that do not designate the request carry ``extra["candidate_excluded"]``
+    and are never selected.  Raises ``ReductionOrderError`` when the request
+    names a plan the reduction-order policy pruned, else ``ValueError``
+    naming the available candidates, when none designates it.
+    """
+    selected = [c for c in candidates if candidate_matches(c, request)]
+    if selected:
+        for candidate in candidates:
+            if candidate in selected:
+                candidate.extra = {**candidate.extra, "candidate_selection": "forced"}
+            else:
+                candidate.extra = {**candidate.extra, "candidate_excluded": True}
+        return list(candidates)
+    pruned_names = {}
+    for candidate in candidates:
+        for name, reason in candidate.extra.get("reduction_policy_pruned", ()):
+            pruned_names.setdefault(name, reason)
+    if isinstance(request, str):
+        hits = [
+            name
+            for name in pruned_names
+            if name == request or name.startswith(request + "_k")
+        ]
+        if hits:
+            from .spmw_reduction_policy import ReductionOrderError
+
+            raise ReductionOrderError(
+                f"APU plan {request!r} regroups the reduction, which "
+                f"reduction_order='strict' forbids ({pruned_names[hits[0]]}); pass "
+                "reduction_order='reassociate' or choose one of: "
+                + ", ".join(c.mode for c in candidates)
+            )
+    names = []
+    for candidate in candidates:
+        for name in (candidate.mode, *candidate.extra.get("candidate_families", ())):
+            if name and name not in names:
+                names.append(name)
+    pruned = []
+    for candidate in candidates:
+        for name, _reason in candidate.extra.get("reduction_policy_pruned", ()):
+            if name not in pruned:
+                pruned.append(name)
+    func = matches[0].func_name if matches else "<kernel>"
+    message = (
+        f"layout={request!r} names no candidate of kernel {func!r}; candidates: "
+        + ", ".join(names)
+    )
+    if pruned:
+        message += (
+            "; pruned by reduction_order='strict' (pass "
+            "reduction_order='reassociate' to allow regrouping): " + ", ".join(pruned)
+        )
+    raise ValueError(message)
+
+
 def autoschedule(
     target,
     trace: MatchTrace,
@@ -1227,6 +1345,7 @@ def autoschedule(
     movement_policy=None,
     selection_policy=None,
     launch_schedule=None,
+    candidate_filter=None,
 ) -> list[Placement]:
     """Pick one `Placement` per `@allo.work` kernel in `trace`.
 
@@ -1244,8 +1363,17 @@ def autoschedule(
     ``movement_policy`` (a ``spmw_layout_problem.MovementSelectionPolicy``)
     configures the layout-construction stage; ``None`` uses the policy of
     ``spmw_layout_problem.movement_selection_policy`` or the default.
+    ``candidate_filter`` (a ``layout=`` request: a candidate name, a family
+    name or a backend plan object) keeps only the candidates designating it
+    (`candidate_matches`); the ranking then runs over that subset, so a
+    family name is still a cost-ranked decision.  Enumeration, legality and
+    the movement stage see the target's matcher view
+    (`spmw_pipeline.matcher_view`); costing sees the target.
     """
+    from .spmw_pipeline import matcher_view
+
     target_name = getattr(target, "name", None)
+    view = matcher_view(target)
     enumerator = _ENUMERATORS.get(target_name)
     if enumerator is None:
         raise NotImplementedError(
@@ -1287,6 +1415,8 @@ def autoschedule(
 
     def legal_enumerator(target_, matches):
         candidates = enumerator(target_, matches)
+        if candidate_filter is not None:
+            candidates = select_candidates(candidates, candidate_filter, matches)
         kept, verdicts = [], []
         for candidate in candidates:
             verdict = check_placement(target_, matches, candidate)
@@ -1321,6 +1451,7 @@ def autoschedule(
             movement_policy=movement_policy,
             selection_policy=selection_policy,
             launch_schedule=launch_schedule,
+            matcher_target=view,
         )
     finally:
         reset_active_liveness(_liveness_token)
@@ -1502,6 +1633,10 @@ class KernelRanking:
     # ``(mode, reason)`` of base placements an enumerator pruned before
     # ranking (``extra["reduction_policy_pruned"]`` of the first bucket).
     policy_pruned: tuple[tuple[str, str], ...] = ()
+    # ``(position, realized placement of the first bucket)`` for every scored
+    # candidate, in rank order: the inspectable choice set behind ``scores``
+    # (``docs/release/design/selection.md``; how to inspect a chosen program).
+    candidates: tuple[tuple[int, Any], ...] = ()
     per_group_position: int | None = None
     probe_count: int = 0
     materialized: tuple[int, ...] = ()
@@ -1756,6 +1891,7 @@ def rank_matcher_placements(
     movement_policy=None,
     selection_policy=None,
     launch_schedule=None,
+    matcher_target=None,
 ) -> MatcherScheduledPlacements:
     """Select one placement decision per `@allo.work` kernel group.
 
@@ -1815,6 +1951,10 @@ def rank_matcher_placements(
     policy = active_movement_policy(movement_policy)
     selection = active_selection_policy(selection_policy)
     rejection_types = candidate_rejection_types()
+    # Enumeration and the movement stage read the target's operation and
+    # storage declarations; a backend with a separate matcher view supplies
+    # it here (costing and code generation use ``target``).
+    matcher_target = target if matcher_target is None else matcher_target
     buckets = _bucket_for_autoschedule(trace)
     kernels: dict[int, list[int]] = {}
     for index, (_scope, matches) in enumerate(buckets):
@@ -1867,7 +2007,7 @@ def rank_matcher_placements(
         score_schedule = launch_schedule if single_group else None
         _stamp_group_replication(kernel_trace.matches)
         infos = [
-            _bucket_decision_map(target, trace, enumerator, buckets[index][1])
+            _bucket_decision_map(matcher_target, trace, enumerator, buckets[index][1])
             for index in bucket_indices
         ]
         choice_set = [
@@ -1876,7 +2016,7 @@ def rank_matcher_placements(
             if all(key in key_map for _t, _c, key_map in infos[1:])
         ]
         movement = analyze_kernel_movement(
-            target, kernel_trace.matches, bound_cost, policy
+            matcher_target, kernel_trace.matches, bound_cost, policy
         )
         policy_pruned = tuple(infos[0][1][0].extra.get("reduction_policy_pruned", ()))
 
@@ -2066,12 +2206,26 @@ def rank_matcher_placements(
                 )
                 realized[position] = placements
         scored.sort()
+        excluded = {
+            position
+            for position, placements in realized.items()
+            if placements[0].extra.get("candidate_excluded")
+        }
+        if excluded and all(position in excluded for _c, _k, position in scored):
+            raise RuntimeError(
+                f"the layout request of kernel group {group_id} names only "
+                "candidates the cost stage rejected"
+            )
 
         group = _GroupSelection(
             group_id=group_id,
             bucket_indices=bucket_indices,
             kernel_trace=kernel_trace,
-            order=[position for _cycles, _key, position in scored],
+            order=[
+                position
+                for _cycles, _key, position in scored
+                if position not in excluded
+            ],
             cycles={position: cycles for cycles, _key, position in scored},
             realized=realized,
             probes={},
@@ -2361,6 +2515,16 @@ def rank_matcher_placements(
         records.append(
             KernelRanking(
                 **group.record,
+                candidates=tuple(
+                    (p, group.realized[p][0])
+                    for p, _cycles, _mode in group.record.get("scores", ())
+                    if p in group.realized and group.realized[p]
+                )
+                or tuple(
+                    (p, group.realized[p][0])
+                    for p in group.order
+                    if p in group.realized and group.realized[p]
+                ),
                 rejections=tuple((p, str(reason)) for p, reason in group.rejections),
                 chosen_position=None if fallback else position,
                 per_group_position=None if fallback else group.winner,

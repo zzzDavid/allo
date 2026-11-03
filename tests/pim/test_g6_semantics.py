@@ -588,7 +588,16 @@ def test_apu_v1_device_route_stages_aliases_and_zero_fills(monkeypatch):
             name: np.shares_memory(value, arrays[compiled.analysis.output.value])
             for name, value in arrays.items()
         }
-        return RunResult(1, "recorded", "apu_v1", kind="device", extra={})
+        # The executed-run contract requires every external destination:
+        # the recorder returns the staged output unchanged.
+        output = compiled.analysis.output.value
+        return RunResult(
+            1,
+            "recorded",
+            "apu_v1",
+            kind="device",
+            extra={"outputs": {output: arrays[output]}},
+        )
 
     monkeypatch.setattr(runtime, "run_apu_v1_vector", record)
     rng = np.random.default_rng(605)
@@ -862,7 +871,7 @@ def test_apu_g2_fused_and_separate_bicg_plans_agree(emulated_card):
         q = np.full(256, 7, np.int16)
         s = np.full(256, 7, np.int16)
         result = compiled(A, p, r, q, s)
-        outputs[compiled.compiled.plan.name] = (q, s, result.extra["launches"])
+        outputs[compiled.plan.name] = (q, s, result.extra["launches"])
     fused, separate = outputs["fused/k1"], outputs["separate/k1"]
     np.testing.assert_array_equal(fused[0], A.astype(np.int64) @ p)
     np.testing.assert_array_equal(fused[1], r.astype(np.int64) @ A)

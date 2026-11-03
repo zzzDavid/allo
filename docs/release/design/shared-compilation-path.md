@@ -6,9 +6,9 @@
 Status: **required, in progress**. User scope addition on 2026-11-02.
 This is gate G9 of the containing repository's `TASK.md`; release cannot be
 declared ready without it. Slices 1 and 2 of the migration map below landed
-in round 12 (section "Implemented stage contracts"); slices 3 to 5 remain.
-This document is the migration map and the record of what is implemented,
-not a completion receipt.
+in round 12 and slice 3 in round 13 (section "Implemented stage contracts");
+slices 4 and 5 remain. This document is the migration map and the record of
+what is implemented, not a completion receipt.
 
 ## Implemented stage contracts (round 12)
 
@@ -22,7 +22,44 @@ through the same front stages (`allo/spmw_pipeline.py::normalize_source`):
 | semantic validation | dropped effects, unsupported accumulator initializers, unproven conversions, operand/result aliases, copy and precision contracts raise `UnsupportedWorkloadError` before any planner | `require_match_coverage(trace, target=view, defer_unknown=True)` |
 | semantic analysis | `ProgramFacts` (`allo/spmw_semantics.py`): parameters (ordinal, shape, element type with signedness from the frontend's `itypes` / `unsigned` attributes, retained identity); per contraction: loop nest with static trips and source labels, reduction/output/batch loops from the matcher's roles, inputs and accumulator as `BufferAccess` records with resolved coordinates and plain-dimension loop variables, accumulator initialization, output sinks (`OutputSink`), guards, product/accumulate operations, element types, reduction policy, alias facts; epilogues (`Epilogue`: operands, literal constants, result, store coordinates); matches outside those two shapes (`other_matches`); matches in other functions (`foreign_functions`) | `analyze_program(view, module, trace, parameter_names=...)`; derived once per compilation (`SourceProgram.program_facts()`), never from MLIR text |
 
-Backend planning after the shared stages:
+### Round 13: both APUs' plans are candidates of the common selection stage
+
+After the shared front stages every target, including both APUs, continues
+through the same driver (`allo/spmw_codegen.py::compile_for_target`):
+
+| Stage | Contract | APU v1 (plain-function contraction) | Gemini-II |
+|---|---|---|---|
+| candidate enumeration | `autoschedule` enumerator `(matcher view, bucket matches) -> [Placement]`; a placement's `extra` states `candidate_plan`, `candidate_decision` (name-free physical identity, part of the schedule-search key), `candidate_families`, `coverage`, `value_layouts`, `transfers`, `launch_order`, `abi`, `whole_device_launch`, `reduction_policy_pruned`; the backend's intrinsic recipe is the `payload` | `apu_v1_vector_program.apu_v1_vector_candidates`: the recipe catalog of the facts-derived `ContractionAnalysis`, regrouping plans pruned under a strict float policy (nothing left raises `ReductionOrderError`), each plan realized to GVML (`APUv1VectorCandidate`, unrealizable plans kept with their reason); operands placed on the VR classes the `MAC` declaration admits; a dataflow region's work items still enumerate the grouped program (`_apu_v1_grouped_enumerate`), which refuses a strict float policy and a carried accumulator | `apu_g2_source_route.apu_g2_source_candidates`: the contract from the shared facts, `enumerate_apu_g2_launch_plans` (fusion x reduction chunks x output tiles), one `APUG2SourceCandidate` per legal plan with the whole catalog and the rejected plans; operands placed on the view's `seg0`/`seg1` |
+| legality | `spmw_legality.check_placement(view, matches, candidate)` on every candidate (operand storage classes against the op declaration) | `MAC` src/dst `any_vr` | view `MAC` (`seg0`, `seg0` -> `seg1`), `AXPBY` (`seg1`, `seg1` -> `seg1`) |
+| movement stage | `analyze_kernel_movement(view, ...)`; a plain function retains no group shape, so the stage reports `not-analyzed` and the candidates keep their own layouts | not analyzed (recorded) | not analyzed (recorded) |
+| cost | `spmw_plan.build_execution_graph` delegates to the context's `candidate_execution_graph(target, trace, layout, bound_cost)` when the placements are its candidates (None otherwise: generic lowering) | `APUv1Ctx.candidate_execution_graph`: `estimate_apu_v1_realization` over the materialized GVML inventory; an unrealizable plan raises `InfeasibleSchedule` (a recorded rejection) | `APUG2SourceCtx.candidate_execution_graph`: `price_apu_g2_launch_plan` (every launch's issued recipe, back to back) |
+| selection | `rank_matcher_placements`: scores, ties, rejections, joint evaluation, `KernelRanking.candidates` (new: the realized placement per scored position); `layout=` is a `candidate_filter` (`select_candidates`: a candidate name, a declared family name or a backend plan object restricts the ranking; an unknown name raises naming the candidates and those the policy pruned) | `layout="temporal_svp"`, `layout="spatial_gemv_group_reduction"` (family, cost-ranked among tiles), `layout=<APUV1Plan>` | `layout="single/k2"` |
+| materialization | `ctx.emit_program(trace, layouts)` in cost order (probe); the context's `program` is the realized backend program; `runtime_route` names it | `APUv1Ctx.emit_program` -> `APUv1VectorProgram` (device source = the command stream; route `apu-v1-vector-gvml-v1`) | `APUG2SourceCtx.emit_program` -> `APUG2SourceProgram` (launch list = the command stream; route `apu-g2-composed-dot-v1`) |
+| work grid | `_check_work_grid(target, trace, layouts=...)`: a single item is accepted when every selected placement declares `whole_device_launch` | the plan decomposes the one item over the APUC | the launches cover the whole problem |
+| artifact and runner | `Compiled` (graph, cmds, ranking, runtime ABI) wrapped by `CompiledCallable`; `backend_program` is the context's program and its documented `INTROSPECTION` names are forwarded (`compiled.selected_plan`, `compiled.plan`) | `_run_apu_v1`: vector program on the board or the functional host model; grouped program through the low-mode project | `_run_apu_g2`: pack, launch, oracle check |
+
+Removed in round 13: the planner-hook registry `_SOURCE_PLANNERS` and
+`compile()`'s target-name branches; `APUv1VectorCallable`,
+`compile_apu_v1_vector_workload`, `search_apu_v1_vector_plans` and the
+route's own `grid_search`; `compile_apu_g2_source_workload` and
+`APUG2SourceProgram._select` (the program is the realized selected plan;
+`repetitions` rebuilds that plan's launches). `require_matcher_route_policy`
+treats `apu_v1` and `apu_v2` as policy-aware routes because their
+enumerators consult the policy.
+
+Function boundary (review round 12): `normalize_source` refuses ordinary
+source whose entry function calls plain helpers
+(`require_single_function_or_dataflow`), for every target, before matching:
+the matcher would otherwise analyze the helper's own argument order and one
+call site, so a reordered call computed `R @ L` and a repeated call planned
+one contraction. Dataflow regions (`df.kernel` callees) remain the
+supported interprocedural form. The facts are always derived for the entry
+function and stamped on the trace (`trace.semantics`,
+`match.extra["program_facts"]`, `extra["semantic_facts"]`) for the
+enumerators.
+
+Backend planning after the shared stages (round 12 state, superseded by the
+table above for the APUs):
 
 | Target | Planner | Consumes | Status |
 |---|---|---|---|
@@ -57,17 +94,15 @@ Consequences observed and tested (`tests/pim/test_shared_semantics.py`):
 
 Not yet done (the remaining slices):
 
-- the APU v1 recipes and the Gemini-II launch plans are still selected by
-  their own searches (`search_apu_v1_vector_plans` over `grid_search`;
-  `rank_apu_g2_launch_plans`) instead of being `Placement` candidates of
-  `rank_matcher_placements` (slice 3): the planner-hook registry
-  `_SOURCE_PLANNERS` in `allo/compiler.py` is the explicit seam where those
-  enumerators will plug in, not a substitute for them;
-- the typed program records do not normalize into the shared contracts
-  (slice 4); the hybrid typed route still uses the text parser;
-- the matcher backends' enumerators do not consume `ProgramFacts` (slice 3
-  makes the candidate contract common);
-- stage traces on simulators and both APU hosts, installed artifact (slice 5).
+- the typed program records (`APUv1Program`, `APUG2TypedProgram`,
+  `APUG2ComposedContractionProgram`) do not normalize into the shared
+  contracts (slice 4); the hybrid typed route still uses the text parser;
+- the matcher backends' enumerators read `MatchedOp` directly; the facts are
+  available on every match (`extra["program_facts"]`) but Samsung, AiM,
+  UPMEM and AttAcc do not consume them yet;
+- stage traces on the Gemini-II card and the installed artifact (slice 5);
+  the APU v1 board and the three simulators ran through the round 13 tree
+  (VALIDATION round 13).
 
 ## Current separation
 
@@ -177,14 +212,16 @@ Observations that fix the migration order:
    in front of it. The `NoContractionError` fall-through is now the
    planner's `applies` predicate (`_apu_v1_vector_applies`); it goes away
    when the recipes are enumerator candidates.
-3. **Plans as enumerator outputs.** Register the APU v1 recipes and the
-   Gemini-II launch plans as `autoschedule` enumerators producing
-   `Placement`s with target-specific payloads and explicit effects; price
-   them through the existing graph path; select in
-   `rank_matcher_placements`; materialize through `compile_for_target`
-   backend contexts.
-4. **Remove the bypasses.** Delete the `apu_v2` and `apu_v1` branches in
-   `compile()`; typed records normalize into slice 1/3 contracts.
+3. **Plans as enumerator outputs** (done, round 13): the APU v1 recipes and
+   the Gemini-II launch plans are `autoschedule` enumerators producing
+   `Placement`s with target-specific payloads and explicit effects; priced
+   through the graph path (`candidate_execution_graph`); selected in
+   `rank_matcher_placements`; materialized through `compile_for_target`
+   backend contexts. The `apu_v2` and `apu_v1` branches of `compile()` and
+   the planner hooks are gone.
+4. **Typed records.** Normalize `APUv1Program`, `APUG2TypedProgram` and
+   `APUG2ComposedContractionProgram` into the slice 1/3 contracts; remove
+   the hybrid route's MLIR-text parser.
 5. **Evidence.** Stage traces for one representative program per target,
    forced alternatives and cost perturbations reaching generated code and
    launches, simulator and both hardware hosts, installed artifact.

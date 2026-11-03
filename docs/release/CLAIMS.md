@@ -37,7 +37,7 @@ backend audits.
 | 15 | Each surviving complete assignment is evaluated as one program | III-F | M | `rank_matcher_placements`: joint evaluation through `pim/schedule_search.grid_search` over the whole-trace graph when the product of surviving candidate counts is within `SelectionPolicy.joint_budget` (256), labelled `joint_evaluation="complete"`; otherwise per-group ranking plus re-priced reconciliation labelled `"per-group heuristic"`; `program_cycles` equals `estimate().cycles` | bounded by the budget; the label states which route ran | implemented within the stated domain |
 | 16 | Ties in movement survive to final cost ranking | III-E | M | `spmw_layout_problem.py` + the movement stage in `rank_matcher_placements`; realization in the Samsung (`row_slots`), UPMEM (row-to-DPU blocks) and AiM (row-to-channel frontier slots) lowerings | movement ties reach the ranking on every analyzed kernel; Samsung, UPMEM and AiM execute every tie whose owner map keeps each output row's reduction in one unit (Samsung: 4 ties on the paper GEMV, identical cycles 4,435 / 26,807, correct outputs; UPMEM 1024x128 on 8 DPUs: 2 ties exact on uPIMulator, 595,371 vs 593,932 cycles on random data; AiM 2048x64 on 32 channels: 2 ties, identical traces, 507 cycles); identity maps are byte-identical to the work-grid programs; ties that split a row's reduction are rejected as reduction splits except the AiM `reduction_partitions` split, which is routed to that knob; APU v1 realizes only the work-grid map | implemented on three of four matcher backends |
 | 23 | Materialized program includes buffers, transfers, code, host ABI | III-F | M | `_materialize_matcher_codegen` manifest | | implemented (Samsung REDUCE runtime ignores it: S-01) |
-| 24 | Backend code generators and runtimes are target-specific | III-E | M | `spmw_codegen._BACKENDS`: samsung_hbm_pim, aim, apu_v1, upmem; typed routes for apu_v1 and apu_v2 | | implemented |
+| 24 | Backend code generators and runtimes are target-specific | III-E | M | `spmw_codegen._BACKENDS`: samsung_hbm_pim, aim, apu_v1 (grouped program and vector plans), apu_v2 (composed-dot launch plans), upmem, attacc; typed routes for apu_v1 and apu_v2 | | implemented |
 | 25 | Public surface | III | M | `allo/__init__.py` eager + lazy exports; `tests/pim/test_import_surface.py` | | implemented |
 
 ## Section IV: minimum-movement layouts
@@ -90,10 +90,11 @@ Ramulator2-AttAcc timing and DCC decode composition of E16.
 Required by gate G9 (user scope addition 2026-11-02, ISSUES X-01) and in
 progress: one shared orchestration with explicit stage contracts for every
 target. Since round 12 every ordinary source workload passes the same front
-stages (`allo/spmw_pipeline.py`: frontend, matcher, coverage/semantic
-contracts C-19 to C-26, shared facts `allo/spmw_semantics.py`) before any
-backend planner; the Gemini-II contract and the APU v1 vector analysis are
-derived from those facts (the APU v1 MLIR-text analysis is out of the public
-route). Not yet done: the APU plans are selected by their own searches rather
-than as `rank_matcher_placements` candidates; typed records do not normalize
-into the shared contracts (`design/shared-compilation-path.md`).
+stages (`allo/spmw_pipeline.py`: frontend, function-boundary check, matcher,
+coverage/semantic contracts C-19 to C-27, shared facts
+`allo/spmw_semantics.py`), and since round 13 the same candidate pipeline
+(`compile_for_target`: enumeration, legality, movement stage, cost, ranking,
+materialization), with the APU v1 vector plans and the Gemini-II launch plans
+as candidates of `rank_matcher_placements` (rows 24 and E9/E10 now go through
+it). Not yet done: typed records do not normalize into the shared contracts;
+card and installed-artifact stage traces (`design/shared-compilation-path.md`).

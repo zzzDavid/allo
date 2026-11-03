@@ -184,7 +184,7 @@ def test_typed_program_per_operation_on_card(apu_g2_card):
 
 
 def _source_args(compiled, rng):
-    contract = compiled.compiled.contract
+    contract = compiled.contract
     args = {}
     for name in contract.parameters:
         scalar = contract.parameter_type(name)
@@ -218,7 +218,7 @@ def _reference(name, args):
 def test_paper_source_kernel_on_card(apu_g2_card, name):
     rng = np.random.default_rng(SEED + sum(map(ord, name)))
     compiled = allo.compile(PAPER_KERNELS[name], build_apu_g2_target(), apu_g2_cost)
-    compiled.compiled.repetitions = REPETITIONS
+    compiled.repetitions = REPETITIONS
     args = _source_args(compiled, rng)
     expected = _reference(name, args)
     result = compiled(**args)
@@ -226,14 +226,14 @@ def test_paper_source_kernel_on_card(apu_g2_card, name):
     for output, value in expected.items():
         np.testing.assert_array_equal(args[output].astype(np.int64), value)
     (launch,) = result.extra["launches"]
-    (selected,) = compiled.compiled.plan.launches
+    (selected,) = compiled.plan.launches
     assert launch["layout_fingerprint"] == selected.layout_fingerprint
     _record(
         "source",
         name,
         result,
-        estimate=compiled.compiled.plan.estimate_cycles,
-        plan=compiled.compiled.plan.name,
+        estimate=compiled.plan.estimate_cycles,
+        plan=compiled.plan.name,
         layout_fingerprint=launch["layout_fingerprint"],
         program_fingerprint=launch["program_fingerprint"],
         device_library_sha256=launch["artifact_sha256"]["device_library"],
@@ -255,7 +255,7 @@ def test_nearby_gemm_beyond_one_carrier_on_card(apu_g2_card):
 
     rng = np.random.default_rng(SEED + 33)
     compiled = allo.compile(gemm_n33, build_apu_g2_target(), apu_g2_cost)
-    compiled.compiled.repetitions = REPETITIONS
+    compiled.repetitions = REPETITIONS
     args = _source_args(compiled, rng)
     expected = args["A"].astype(np.int64) @ args["B"]
     result = compiled(**args)
@@ -264,10 +264,10 @@ def test_nearby_gemm_beyond_one_carrier_on_card(apu_g2_card):
         "source",
         "gemm_64x128x33",
         result,
-        estimate=compiled.compiled.plan.estimate_cycles,
-        plan=compiled.compiled.plan.name,
-        estimate_validity=compiled.compiled.plan.estimate_validity,
-        ranking=compiled.compiled.placement_ranking,
+        estimate=compiled.plan.estimate_cycles,
+        plan=compiled.plan.name,
+        estimate_validity=compiled.plan.estimate_validity,
+        ranking=compiled.backend_program.placement_ranking,
         launch_cycles=[item["cycles"] for item in result.extra["launches"]],
     )
 
@@ -287,7 +287,7 @@ def test_wrong_oracle_is_reported_as_a_mismatch_on_card(apu_g2_card, monkeypatch
         lambda *args, **kwargs: original(*args, **kwargs) + 1,
     )
     compiled = allo.compile(PAPER_KERNELS["gemm"], build_apu_g2_target(), apu_g2_cost)
-    compiled.compiled.repetitions = REPETITIONS
+    compiled.repetitions = REPETITIONS
     args = _source_args(compiled, np.random.default_rng(SEED + 1))
     with pytest.raises(RuntimeError, match="differs from NumPy"):
         compiled(**args)
@@ -305,7 +305,7 @@ def test_echoed_fingerprint_mismatch_is_refused_on_card(apu_g2_card, monkeypatch
         runtime, "build_apu_g2_composed_host_command", wrong_fingerprint
     )
     compiled = allo.compile(PAPER_KERNELS["gemm"], build_apu_g2_target(), apu_g2_cost)
-    compiled.compiled.repetitions = REPETITIONS
+    compiled.repetitions = REPETITIONS
     args = _source_args(compiled, np.random.default_rng(SEED + 2))
     with pytest.raises(RuntimeError, match="layout_fingerprint"):
         compiled(**args)
@@ -320,7 +320,7 @@ def test_selected_fingerprint_mismatch_is_refused_before_launch(monkeypatch, tmp
     probed = []
     monkeypatch.setattr(runtime, "_require_hardware_stack", lambda: probed.append(1))
     compiled = allo.compile(PAPER_KERNELS["gemm"], build_apu_g2_target(), apu_g2_cost)
-    (launch,) = compiled.compiled.plan.launches
+    (launch,) = compiled.plan.launches
     operand = np.zeros(launch.program.dot_shape, dtype=np.int8)
     with pytest.raises(RuntimeError, match="fingerprint mismatch"):
         runtime.run_apu_g2_composed(
@@ -351,7 +351,7 @@ def test_call_aliases_read_pre_call_values_on_card(apu_g2_card):
     rng = np.random.default_rng(SEED + 61)
     target = build_apu_g2_target()
     gemm = allo.compile(g6_gemm_square, target, apu_g2_cost)
-    gemm.compiled.repetitions = REPETITIONS
+    gemm.repetitions = REPETITIONS
     A0 = rng.integers(-8, 8, size=(32, 32)).astype(np.int16)
     B0 = rng.integers(-8, 8, size=(32, 32)).astype(np.int16)
 
@@ -400,7 +400,7 @@ def test_extreme_operands_on_card(apu_g2_card):
     _record("g6_extreme", "mul_i8_i16", result)
 
     gemm = allo.compile(PAPER_KERNELS["gemm"], target, apu_g2_cost)
-    gemm.compiled.repetitions = REPETITIONS
+    gemm.repetitions = REPETITIONS
     A = np.full((64, 128), -8, np.int16)
     B = np.full((128, 31), -8, np.int16)
     B[:, 1::2] = 7
@@ -431,7 +431,7 @@ def test_zero_results_overwrite_a_sentinel_on_card(apu_g2_card):
     _record("g6_zero", "add_i16_a_minus_a", result)
 
     gemm = allo.compile(PAPER_KERNELS["gemm"], target, apu_g2_cost)
-    gemm.compiled.repetitions = REPETITIONS
+    gemm.repetitions = REPETITIONS
     B = rng.integers(-8, 8, size=(128, 31)).astype(np.int16)
     C = np.full((64, 31), 7, np.int16)
     result = gemm(np.zeros((64, 128), np.int16), B, C)
@@ -449,16 +449,16 @@ def test_fused_and_separate_bicg_plans_agree_on_card(apu_g2_card):
         compiled = allo.compile(
             PAPER_KERNELS["bicg"], build_apu_g2_target(), apu_g2_cost, layout=layout
         )
-        compiled.compiled.repetitions = REPETITIONS
+        compiled.repetitions = REPETITIONS
         q = np.full(256, 7, np.int16)
         s = np.full(256, 7, np.int16)
         result = compiled(A, p, r, q, s)
-        runs[compiled.compiled.plan.name] = (q, s, result)
+        runs[compiled.plan.name] = (q, s, result)
         _record(
             "g6_two_plans",
-            compiled.compiled.plan.name,
+            compiled.plan.name,
             result,
-            estimate=compiled.compiled.plan.estimate_cycles,
+            estimate=compiled.plan.estimate_cycles,
             launches=len(result.extra["launches"]),
         )
     (fq, fs, fused), (sq, ss, separate) = runs["fused/k1"], runs["separate/k1"]

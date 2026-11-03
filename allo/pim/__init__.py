@@ -54,8 +54,9 @@ from .apu_v1_vector_cost import (
     rank_apu_v1_plans,
 )
 from .apu_v1_vector_program import (
-    APUv1VectorCallable,
-    compile_apu_v1_vector_workload,
+    APUv1VectorCandidate,
+    APUv1VectorProgram,
+    apu_v1_vector_candidates,
 )
 from .apu_g2_layout import (
     APUG2_GROUPS,
@@ -240,8 +241,9 @@ __all__ = [
     "estimate_apu_v1_realization",
     "materialized_apu_v1_operation_inventory",
     "rank_apu_v1_plans",
-    "APUv1VectorCallable",
-    "compile_apu_v1_vector_workload",
+    "APUv1VectorCandidate",
+    "APUv1VectorProgram",
+    "apu_v1_vector_candidates",
     "APUG2_GROUPS",
     "APUG2_LANES_PER_GROUP",
     "APUG2_MMB_SETS",

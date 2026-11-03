@@ -18,7 +18,6 @@ import numpy as np
 from .ir.builder import _spmw_group_contract
 from .perf import BoundCostSpec, CostSpec
 from .pim.apu_v1_program import APUv1Program, compile_apu_v1_program
-from .pim.apu_v1_vector_program import compile_apu_v1_vector_workload
 from .pim.apu_g2_composed_program import (
     APUG2ComposedContractionProgram,
     compile_apu_g2_composed_program,
@@ -27,7 +26,6 @@ from .pim.apu_g2_typed_program import (
     APUG2TypedProgram,
     compile_apu_g2_typed_program,
 )
-from .pim.apu_g2_source_route import compile_apu_g2_source_workload
 from .spmw_autoschedule import MatcherWorkScope, _retain_matcher_work_scope
 from .spmw_codegen import RunResult, compile_for_target, source_backend_binding
 from .spmw_liveness import MatcherValueId, trace_liveness
@@ -492,6 +490,52 @@ class CompiledCallable:
             tuple(self.signature.parameters),
         )
         self.last_result: RunResult | None = None
+        # The realized backend program (a context's ``program``) may need the
+        # artifact it belongs to (ranking views, repricing) and the source
+        # workload (the APU v1 functional model executes it on the host).
+        try:
+            compiled.source_workload = workload
+        except AttributeError:
+            pass
+        program = self.backend_program
+        attach = getattr(program, "attach", None)
+        if callable(attach):
+            attach(compiled)
+
+    @property
+    def backend_program(self):
+        """The backend's realized program object for the selected candidate
+        (``Compiled.layout_ctx.program``), or None for backends whose
+        executable is the command stream itself."""
+        context = getattr(self.compiled, "layout_ctx", None)
+        return getattr(context, "program", None)
+
+    def __getattr__(self, name):
+        # Explicit forwarding of the realized backend program's documented
+        # introspection surface (``INTROSPECTION``): ``compiled.selected_plan``
+        # on APU v1, ``compiled.plan`` on Gemini-II.  Nothing else is
+        # forwarded; ordinary attribute errors stay attribute errors.
+        if name.startswith("_") or "compiled" not in self.__dict__:
+            raise AttributeError(name)
+        program = self.backend_program
+        if program is not None and name in getattr(type(program), "INTROSPECTION", ()):
+            return getattr(program, name)
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
+
+    def __setattr__(self, name, value):
+        # Writable introspection attributes of the backend program (Gemini-II
+        # ``repetitions``) are forwarded too, so an assignment never lands
+        # silently on the callable instead of the program.
+        if not name.startswith("_") and "compiled" in self.__dict__:
+            program = self.backend_program
+            if program is not None and name in getattr(
+                type(program), "INTROSPECTION", ()
+            ):
+                setattr(program, name, value)
+                return
+        object.__setattr__(self, name, value)
 
     def __call__(self, *args, **kwargs) -> RunResult:
         bound = self.signature.bind(*args, **kwargs)
@@ -533,13 +577,43 @@ class CompiledCallable:
     def execution_graph(self):
         return self.compiled.execution_graph
 
-    def estimate(self):
-        """Evaluate the retained candidate graph without invoking a backend."""
+    def estimate(self, candidate=None):
+        """Evaluate the retained candidate graph without invoking a backend.
+
+        ``candidate`` (a candidate name, family name or backend plan object)
+        evaluates another scored candidate of the single-kernel ranking
+        instead of the selected program; it must have been scored.
+        """
         if self.cost is None:
             raise RuntimeError("compiled workload has no executable cost spec")
-        if self.execution_graph is None:
-            raise RuntimeError("compiled workload has no retained execution graph")
-        return self.cost.evaluate(self.execution_graph)
+        if candidate is None:
+            if self.execution_graph is None:
+                raise RuntimeError("compiled workload has no retained execution graph")
+            return self.cost.evaluate(self.execution_graph)
+        from .spmw_autoschedule import candidate_matches
+        from .spmw_plan import build_execution_graph
+
+        ranking = self.placement_ranking
+        if ranking is None or len(ranking.kernels) != 1:
+            raise RuntimeError(
+                "estimate(candidate) needs the ranking of a single-kernel program"
+            )
+        for _position, placement in ranking.kernels[0].candidates:
+            if candidate_matches(placement, candidate):
+                graph = build_execution_graph(
+                    self.target,
+                    self.trace,
+                    placement,
+                    self.cost,
+                    host_moves=getattr(self.compiled, "host_moves", ()),
+                )
+                return self.cost.evaluate(graph)
+        names = [
+            placement.mode for _position, placement in ranking.kernels[0].candidates
+        ]
+        raise ValueError(
+            f"{candidate!r} names no scored candidate; scored candidates: {names}"
+        )
 
     @staticmethod
     def _bound_output_assignment(outputs, arguments, gather_roles, binding):
@@ -798,92 +872,6 @@ def _compile_program(
     return route.compile_fn(workload, target, cost=bound_cost, backend=backend)
 
 
-def _plan_apu_g2_source(
-    program, bound_cost, *, backend, host_moves, layout, reduction_order
-):
-    """Gemini-II planner over the shared facts: composed-dot launch plans."""
-
-    if bound_cost is None:
-        raise ValueError(
-            "Gemini-II source workloads need an executable cost program "
-            "(apu_g2_cost) to rank their launch plans"
-        )
-    schedule, trace, compiled = compile_apu_g2_source_workload(
-        program.workload,
-        program.target,
-        cost=bound_cost,
-        backend=backend,
-        host_moves=host_moves,
-        layout=layout,
-        program=program,
-    )
-    return CompiledCallable(
-        program.workload,
-        program.target,
-        schedule,
-        trace,
-        compiled,
-        cost=bound_cost,
-        reduction_order=reduction_order,
-    )
-
-
-def _plan_apu_v1_vector(
-    program, bound_cost, *, backend, host_moves, layout, reduction_order
-):
-    """APU v1 planner over the shared facts: the vector recipe catalog."""
-
-    if host_moves is not None:
-        raise ValueError(
-            "APU v1 vector plans derive their transfers; host_moves is not accepted"
-        )
-    return compile_apu_v1_vector_workload(
-        program.workload,
-        program.target,
-        program,
-        cost=bound_cost,
-        layout=layout,
-        backend=backend,
-        reduction_order=reduction_order,
-    )
-
-
-def _apu_v1_vector_applies(program) -> bool:
-    # Dataflow regions retain their matcher/group implementation through
-    # typed structural scope attributes stamped on retained IR kernel
-    # functions; they take the matcher route.  A plain function takes the
-    # vector planner when the shared facts hold a contraction; otherwise the
-    # matcher route reports what it can and cannot lower.
-    if _module_has_retained_matcher_scopes(program.schedule.module):
-        return False
-    return bool(program.program_facts().contractions)
-
-
-@dataclass(frozen=True)
-class _SourcePlanner:
-    """A backend planner over the shared semantic facts."""
-
-    applies: Callable  # (SourceProgram) -> bool
-    plan: Callable  # (SourceProgram, bound_cost, **options) -> CompiledWorkload
-
-
-# Backend planners that consume the shared semantic facts.  They are the
-# APU routes whose candidate plans are not yet matcher placements (gate G9
-# slice 3 folds them into `autoschedule` enumerators); every other target
-# plans through `compile_for_target`.
-_SOURCE_PLANNERS: dict[str, _SourcePlanner] = {
-    "apu_v2": _SourcePlanner(lambda program: True, _plan_apu_g2_source),
-    "apu_v1": _SourcePlanner(_apu_v1_vector_applies, _plan_apu_v1_vector),
-}
-
-
-def _source_planner(target, program):
-    entry = _SOURCE_PLANNERS.get(getattr(target, "name", None))
-    if entry is None or not entry.applies(program):
-        return None
-    return entry.plan
-
-
 def compile(
     workload,
     target,
@@ -913,16 +901,18 @@ def compile(
        coverage, accumulator-initialization, conversion, alias and copy
        contracts are enforced (``UnsupportedWorkloadError``), and the shared
        semantic facts are derived (:func:`allo.spmw_semantics.analyze_program`).
-    3. **Backend planning.** A backend whose candidate plans are not yet
-       matcher placements consumes the shared facts through a planner hook
-       (``_SOURCE_PLANNERS``): Gemini-II (``apu_v2``) derives its composed-dot
-       contract and ranks launch plans (``layout=`` names a plan; anything
-       outside the family raises ``APUG2SourceRouteError``); APU v1 plans a
-       matched contraction of a plain function with its vector recipes
-       (``allo.pim.apu_v1_vectorize``).  Every other target, and an APU v1
-       dataflow region or plain function without a contraction, continues
-       with the matcher route: the ranked autoscheduler picks placements
-       and backend codegen emits commands (``compile_for_target``).
+    3. **Common candidate pipeline** (``compile_for_target``): the target's
+       enumerator produces the candidate placements of every kernel (Samsung,
+       AiM, UPMEM and AttAcc placements; the APU v1 GVML vector plans of a
+       plain-function contraction or the grouped program of a dataflow
+       region; the Gemini-II composed-dot launch plans), the target-neutral
+       legality pass filters them, the movement stage crosses layouts, every
+       candidate is priced through its execution graph (a backend plan
+       through its context's ``candidate_execution_graph``), ranked and
+       materialized in cost order (`rank_matcher_placements`), and the
+       selected program is lowered by the backend context and run by its
+       runner.  ``layout=`` names a candidate, a candidate family or a
+       backend plan object and restricts the ranking to it.
 
     A source workload on UPMEM lowers each matched kernel group to a
     calibrated physical plan and runs it on the provenance uPIMulator; a run
@@ -990,17 +980,10 @@ def compile(
     # the semantic facts, identical for every target.
     program = normalize_source(workload, target, reduction_order=reduction_order)
     schedule, trace = program.schedule, program.trace
-
-    planner = _source_planner(target, program)
-    if planner is not None:
-        return planner(
-            program,
-            bound_cost,
-            backend=backend,
-            host_moves=host_moves,
-            layout=layout,
-            reduction_order=reduction_order,
-        )
+    if trace.matches:
+        # Derived once here and stamped on the trace: the backend enumerators
+        # and contexts read these facts, never the IR text.
+        program.program_facts()
 
     require_matcher_route_policy(target, trace)
     _stamp_matcher_work_scopes(target, schedule.module, trace)

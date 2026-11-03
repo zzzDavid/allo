@@ -157,17 +157,21 @@ evaluated jointly within a documented budget (Section 2.6 and
    contraction's loop nest, roles, accesses, accumulator initialization,
    output sinks, guards, operations, policy; epilogues) are derived from
    that trace on first use (`SourceProgram.program_facts()`).
-4. Backend planners over the shared facts (`_SOURCE_PLANNERS`, an explicit
-   seam until the APU plans become `autoschedule` candidates): `apu_v2` ->
-   `apu_g2_source_route.compile_apu_g2_source_workload(program=...)`
-   (Section 3.5); `apu_v1` on a plain function whose facts hold a
-   contraction -> `compile_apu_v1_vector_workload(program=...)` (Section
-   3.4). Dataflow regions and contraction-free functions on `apu_v1`
-   continue below.
-5. Matcher route: `require_matcher_route_policy`,
-   `_stamp_matcher_work_scopes`, then `spmw_codegen.compile_for_target`
-   (autoschedule enumerators, legality, movement stage, ranking, backend
-   context, runner).
+4. Common candidate pipeline: `require_matcher_route_policy`,
+   `_stamp_matcher_work_scopes`, then `spmw_codegen.compile_for_target`:
+   the target's enumerator (Samsung, AiM, UPMEM, AttAcc placements; APU v1
+   vector plans of a plain-function contraction or the grouped program of
+   a dataflow region; Gemini-II launch plans), legality against the
+   matcher view, the movement stage, cost through
+   `spmw_plan.build_execution_graph` (a backend plan through its context's
+   `candidate_execution_graph`), `rank_matcher_placements`, materialization
+   by the backend context and the runner.  ``layout=`` names a candidate,
+   a candidate family or a backend plan object and restricts the selection
+   (`spmw_autoschedule.select_candidates`); every candidate stays scored.
+   The realized backend program of the selected candidate (the context's
+   ``program``) is reachable as ``CompiledCallable.backend_program``; its
+   documented ``INTROSPECTION`` names are forwarded
+   (``compiled.selected_plan``, ``compiled.plan``).
 
 ### 2.1 Frontend (`allo/customize.py`, `allo/ir/`)
 
@@ -644,15 +648,20 @@ profile freshness by diffing the device log before and after the launch
   type, loop extents equal to buffer extents) and yields the
   `ContractionAnalysis`; the older MLIR-text parser remains only for the
   hybrid typed route. `generate_apu_v1_vectorization_candidates` builds a
-  finite recipe catalog
-  of `APUV1Plan`s (temporal SVP, DMA coalescing with accumulator depths,
-  spatial group reduction, ...); `_apply_reduction_policy` removes
-  regrouping plans under strict (`apu_v1_plan_regroups`);
-  `search_apu_v1_vector_plans` (over `schedule_search.grid_search`)
-  realizes every plan to GVML (`realize_apu_v1_plan`) and ranks the
-  materialized instructions with `apu_v1_cost`; `layout=<plan name>` forces
-  one. `APUv1VectorCallable` exposes `plans`, `candidate_estimates`,
-  `selected_plan`, `realization`, `plan_selection`, `reduction_policy_pruned`.
+  finite recipe catalog of `APUV1Plan`s (temporal SVP, DMA coalescing with
+  accumulator depths, spatial group reduction, ...); `apu_v1_vector_candidates`
+  (the ``autoschedule`` enumerator) prunes it under the reduction-order
+  policy (`apu_v1_plan_regroups`), realizes every plan to GVML
+  (`realize_apu_v1_plan`) and emits one ``Placement`` per plan with its
+  effects (coverage, value layouts, transfers, launch order, ABI) and a
+  name-free decision in the search key; `APUv1Ctx.candidate_execution_graph`
+  prices each from the materialized inventory with `apu_v1_cost` and the
+  shared `rank_matcher_placements` ranks them; `layout=<plan name>`, a
+  family name or an ``APUV1Plan`` restricts the selection.
+  `APUv1Ctx.emit_program` instantiates `APUv1VectorProgram` for the
+  selected plan (forwarded by the callable: `plans`, `candidates`,
+  `ranked_plans`, `candidate_estimates`, `selected_plan`, `realization`,
+  `plan_selection`, `tile_decision`, `device_source()`).
   Backends: `None` builds the GVML project with the ARC toolchain and runs on
   the board (`run_apu_v1_vector`, `kind="device"`, manifest v2 uploads the
   packed initial output for temporal plans; V1-02); `"virtual"` evaluates
@@ -732,14 +741,18 @@ G2-06).
   passes the shared front stages, matched against the target's declared
   view `build_apu_g2_contraction_patterns()` (`MAC`, `AXPBY`, the latter
   declaring `intermediate="i24"` for its wide epilogue);
-  `analyze_apu_g2_source(ProgramFacts)` derives the `APUG2SourceContract` (K, result
+  `analyze_apu_g2_source(ProgramFacts)` (called by the ``autoschedule``
+  enumerator `apu_g2_source_candidates`) derives the `APUG2SourceContract` (K, result
   coordinates, transposition, broadcast, epilogue, exact widths; rejects
   wrapping, non-power-of-two K, mixed signedness, K > 512),
   `enumerate_apu_g2_launch_plans` builds `single`/`fused`/`separate` x
-  `k1`/`k2` x output-tile plans (G2-05), `rank_apu_g2_launch_plans` orders
-  them by estimate, launches, catalog order; `APUG2SourceProgram` exposes
-  `plan`, `ranking`, `rejected`, `selection`, `placement_ranking`,
-  `manifest()`; `layout="<plan name>"` forces a plan. Results are checked
+  `k1`/`k2` x output-tile plans (G2-05), each a candidate ``Placement``
+  priced by `APUG2SourceCtx.candidate_execution_graph`
+  (`price_apu_g2_launch_plan`) and ranked by `rank_matcher_placements`
+  (`allo/spmw_apu_g2.py`); the context materializes `APUG2SourceProgram`,
+  which exposes `plan`, `ranking`, `rejected`, `selection`,
+  `placement_ranking`, `manifest()`, `pack()`; `layout="<plan name>"`
+  restricts the selection. Results are checked
   against an `einsum` oracle before `kind="device"` is returned (G2-02).
   The five paper kernels as source (`benchmarks/apu_g2/workloads.py`)
   reproduce the artifact's layout and program fingerprints.
@@ -931,10 +944,11 @@ Allo alone.
 | `allo/spmw_aim.py`, `allo/pim/aim_lowering.py` | AiM program derivation, ISR lowering, coverage invariant, runner |
 | `allo/spmw_upmem.py`, `allo/pim/upmem_physical.py`, `allo/pim/upmem_physical_search.py`, `allo/pim/upmem_irregular.py`, `allo/pim/upmem_analysis.py`, `allo/pim/upmem_calibration.py` | UPMEM families, templates, physical decision catalog and calibration, MLIR instruction summary, calibration tooling |
 | `allo/backend/c.py` | MLIR to portable C (UPMEM oracle and host groups, APU v1 scalar programs) |
-| `allo/spmw_apu_v1.py`, `allo/spmw_apu_v1_build.py` | APU v1 legacy matcher context and GVML project emission |
+| `allo/spmw_apu_v1.py`, `allo/spmw_apu_v1_build.py` | APU v1 backend context (vector-plan candidates and the grouped program), runner, GVML project emission |
+| `allo/spmw_apu_g2.py` | Gemini-II backend context (launch-plan candidates) and runner |
 | `allo/pim/apu_v1_*.py` | APU v1 vector plans, codegen, cost bridge, runtime, typed scalar programs, native recipes, hybrid manifest |
 | `allo/pim/apu_g2_*.py`, `allo/pim/templates/apu_g2/` | Gemini-II typed, composed and source routes, tick model, runtimes, project templates |
-| `allo/pim/schedule_search.py` | generic materialize-then-score grid search (APU v1 vector route) |
+| `allo/pim/schedule_search.py` | generic materialize-then-score grid search (joint evaluation of complete assignments) |
 | `benchmarks/cent_aim/`, `benchmarks/upmem/`, `benchmarks/apu_g2/` | paper workloads as source |
 
 ## 8. Open items and compatibility boundary

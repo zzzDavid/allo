@@ -221,15 +221,17 @@ without coefficients.
   (F-02 fixed).
 - `RunResult.kind` is set on every route and validated; non-executed kinds
   never write caller arrays (G2-07, S-02, V1-09, M-08 fixed).
-- One shared front end since round 12 (gate G9, ISSUES X-01, in progress):
-  every ordinary source workload on every target passes
-  `allo/spmw_pipeline.py::normalize_source` (frontend, matcher against the
-  target or its declared `spmw_match_view`, the coverage/semantic contracts
-  above, the shared facts `allo/spmw_semantics.py::ProgramFacts`). Samsung,
-  AiM, UPMEM and AttAcc continue with the matcher/legality/placement path;
-  Gemini-II and APU v1 derive their contraction contracts from the shared
-  facts and still select among their own candidate plans (planner hooks in
-  `allo/compiler.py`); the typed APU records are frontends to those routes.
-  Until the remaining slices land (plans as common candidates, typed
-  normalization), "supported" for the APUs means supported by those planners
-  within the shared semantic contract.
+- One shared pipeline for ordinary source since rounds 12-13 (gate G9,
+  ISSUES X-01, in progress): every target passes
+  `allo/spmw_pipeline.py::normalize_source` (frontend, function-boundary
+  check, matcher against the target or its declared `spmw_match_view`, the
+  coverage/semantic contracts above, the shared facts
+  `allo/spmw_semantics.py::ProgramFacts`) and then `compile_for_target`
+  (enumerator, legality, movement stage, cost, `rank_matcher_placements`,
+  materialization, runner). The APU v1 GVML vector plans and the Gemini-II
+  composed-dot launch plans are candidates of that ranking with their
+  effects stated in the placement contract; `layout=` names a candidate or
+  family on every target. Plain helper-function calls in ordinary source are
+  refused at the shared boundary (C-27); dataflow regions remain the
+  interprocedural form. The typed APU records are still separate frontends
+  (slice 4 open).

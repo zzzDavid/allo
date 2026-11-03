@@ -6,7 +6,7 @@ import inspect
 import allo
 import numpy as np
 from allo.ir.types import float16
-from allo.pim.apu_v1_vector_program import APUv1VectorCallable
+from allo.compiler import CompiledCallable
 from allo.pim.costs import apu_v1_cost
 from allo.pim.targets import build_apu_v1_target
 
@@ -31,7 +31,7 @@ def test_public_compile_generates_ranks_and_executes_four_apu_plans():
         backend="functional",
     )
 
-    assert isinstance(compiled, APUv1VectorCallable)
+    assert isinstance(compiled, CompiledCallable)
     assert inspect.signature(compiled) == inspect.signature(ordinary_contraction)
     assert [candidate.name for candidate in compiled.candidates] == [
         "baseline_spatial_reduction",

@@ -760,10 +760,11 @@ def test_public_compile_selects_matcher_adapter_from_retained_ir(monkeypatch):
     monkeypatch.setattr(
         compiler_api, "compile_for_target", lambda *args, **kwargs: fake
     )
+    vector = importlib.import_module("allo.pim.apu_v1_vector_program")
     monkeypatch.setattr(
-        compiler_api,
-        "compile_apu_v1_vector_workload",
-        lambda *args, **kwargs: pytest.fail("retained dataflow IR used vector adapter"),
+        vector,
+        "apu_v1_vector_candidates",
+        lambda *args, **kwargs: pytest.fail("retained dataflow IR used vector plans"),
     )
 
     original_metadata = _scope_order_original.mappings

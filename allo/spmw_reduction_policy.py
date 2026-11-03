@@ -170,8 +170,13 @@ def no_strict_program_error(target_name, matches, why) -> ReductionOrderError:
 
 
 # Matcher routes whose enumerators consult the policy themselves (they prune
-# regrouping candidates and raise when none remains).
-_POLICY_AWARE_MATCHER_ROUTES = frozenset({"samsung_hbm_pim", "upmem"})
+# regrouping candidates and raise when none remains).  APU v1's enumerator
+# prunes the regrouping vector plans of a plain-function contraction and
+# refuses the grouped-tree program of a dataflow region under a strict float
+# policy; Gemini-II lowers integer contractions only.
+_POLICY_AWARE_MATCHER_ROUTES = frozenset(
+    {"samsung_hbm_pim", "upmem", "apu_v1", "apu_v2"}
+)
 
 # Why the remaining matcher routes cannot honour a strict floating-point
 # reduction.  Every program they emit regroups the reduction.
@@ -181,12 +186,13 @@ _REGROUPING_MATCHER_ROUTES = {
         "the bank's adder tree before accumulating, so no AiM program adds the "
         "products one at a time in source order"
     ),
-    "apu_v1": (
-        "the APU v1 matcher route reduces each group with a GVML subgroup tree "
-        "(gvml_add_subgrps); source-order plans exist only on the vector "
-        "contraction route"
-    ),
 }
+
+APU_V1_GROUPED_ROUTE_REGROUPS = (
+    "the APU v1 grouped matcher program of a dataflow region reduces each group "
+    "with a GVML subgroup tree (gvml_add_subgrps); source-order plans exist only "
+    "for a plain-function contraction (the vector plans)"
+)
 
 
 def require_matcher_route_policy(target, trace) -> None:
@@ -215,6 +221,7 @@ __all__ = [
     "accumulator_element_type",
     "may_regroup",
     "no_strict_program_error",
+    "APU_V1_GROUPED_ROUTE_REGROUPS",
     "normalize_reduction_order",
     "reduction_policy",
     "require_matcher_route_policy",

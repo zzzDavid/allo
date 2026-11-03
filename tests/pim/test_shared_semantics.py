@@ -25,6 +25,7 @@ from allo.pim.targets import (
     build_aim_target,
     build_apu_g2_target,
     build_apu_v1_target,
+    build_apu_v2_target,
     build_samsung_target,
 )
 from allo.spmw_match import MatchTrace, UnsupportedWorkloadError
@@ -184,7 +185,7 @@ def test_apu_g2_planner_consumes_the_shared_facts():
     facts = program.program_facts()
     contract = analyze_apu_g2_source(facts)
     compiled = allo.compile(g2_gemm, target, apu_g2_cost)
-    assert compiled.compiled.contract.manifest() == contract.manifest()
+    assert compiled.contract.manifest() == contract.manifest()
     (stream,) = contract.streams
     assert stream.reduction_extent == 128 and stream.result_extents == (64, 31)
     assert stream.accumulator == "zero" and stream.output == "C"
@@ -257,3 +258,138 @@ def test_local_accumulator_gemm_executes_on_apu_v1_functional_backend():
         gemm, build_apu_v1_target(), apu_v1_cost, backend="functional"
     )
     assert carried.selected_plan.name == compiled.selected_plan.name
+
+
+# --------------------------------------------------------------------------- #
+# (e) Function boundary: the entry ABI and call multiplicity (review round 12)
+# --------------------------------------------------------------------------- #
+
+
+def square_leaf(L: float16[4, 4], R: float16[4, 4], C: float16[4, 4]):
+    for r, c in allo.grid(4, 4):
+        for d in range(4):
+            C[r, c] += L[r, d] * R[d, c]
+
+
+def square_helper(R: float16[4, 4], L: float16[4, 4], C: float16[4, 4]):
+    square_leaf(L, R, C)
+
+
+def twice(L: float16[4, 4], R: float16[4, 4], C: float16[4, 4]):
+    square_leaf(L, R, C)
+    square_leaf(L, R, C)
+
+
+def int_square_leaf(L: int4[4, 4], R: int4[4, 4], C: int15[4, 4]):
+    for r, c in allo.grid(4, 4):
+        acc: int15 = 0
+        for d in range(4):
+            acc += L[r, d] * R[d, c]
+        C[r, c] = acc
+
+
+def int_square_helper(R: int4[4, 4], L: int4[4, 4], C: int15[4, 4]):
+    int_square_leaf(L, R, C)
+
+
+@pytest.mark.parametrize(
+    "workload, build, cost, calls",
+    [
+        (square_helper, build_apu_v1_target, apu_v1_cost, "calls 'square_leaf'"),
+        (twice, build_apu_v1_target, apu_v1_cost, "calls 'square_leaf' 2 times"),
+        (
+            int_square_helper,
+            build_apu_g2_target,
+            apu_g2_cost,
+            "calls 'int_square_leaf'",
+        ),
+        (square_helper, build_samsung_target, samsung_cost, "calls 'square_leaf'"),
+    ],
+    ids=["apu_v1_reordered", "apu_v1_twice", "apu_g2_reordered", "samsung_reordered"],
+)
+def test_plain_helper_calls_are_refused_at_the_shared_boundary(
+    workload, build, cost, calls
+):
+    """A helper called with reordered arguments (the reviewer's probe: the
+    planned program computed R @ L instead of L @ R) or called twice (one
+    contraction planned for two) is refused before any planner, for every
+    target, naming the call; the entry ABI is never replaced by a helper's."""
+    with pytest.raises(UnsupportedWorkloadError, match=calls) as error:
+        allo.compile(workload, build(), cost, backend="virtual")
+    assert "Inline the helper" in str(error.value)
+
+
+def test_both_gemini_ii_builders_compile_the_same_source_program():
+    for build in (build_apu_g2_target, build_apu_v2_target):
+        compiled = allo.compile(g2_gemm, build(), apu_g2_cost, backend="virtual")
+        assert compiled.plan.name == "single/k1"
+        assert [p.name for p in compiled.ranking] == ["single/k1", "single/k2"]
+
+
+# --------------------------------------------------------------------------- #
+# (f) Slice 3: both APUs' plans are candidates of the common selection stage
+# --------------------------------------------------------------------------- #
+
+
+def test_apu_v1_plans_are_candidates_of_the_shared_ranking():
+    compiled = allo.compile(
+        gemm,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        reduction_order="reassociate",
+        backend="virtual",
+    )
+    (kernel,) = compiled.placement_ranking.kernels
+    scored = [mode for _position, _cycles, mode in kernel.scores]
+    assert set(scored) == {
+        "baseline_spatial_reduction",
+        "temporal_svp",
+        "temporal_dma_coalescing",
+        "temporal_dma_coalescing_broadcast_friendly",
+    }
+    assert scored[0] == compiled.selected_plan.name == kernel.scores[0][2]
+    # Every candidate carries its effects through the shared contract.
+    for _position, placement in kernel.candidates:
+        extra = placement.extra
+        assert extra["candidate_plan"] == placement.mode
+        assert extra["coverage"]["output"] == "result"
+        assert extra["value_layouts"] and extra["transfers"] and extra["abi"]
+        assert extra["whole_device_launch"]
+    # The selected program's graph is the one the estimate reports.
+    assert compiled.execution_graph.metadata["plan"] == compiled.selected_plan.name
+    assert compiled.estimate().cycles == kernel.scores[0][1]
+    # A forced alternative reaches the generated GVML source.
+    forced = allo.compile(
+        gemm,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        reduction_order="reassociate",
+        backend="virtual",
+        layout="temporal_svp",
+    )
+    assert forced.selected_plan.name == "temporal_svp"
+    assert forced.plan_selection == "explicit_layout"
+    assert forced.device_source() != compiled.device_source()
+    assert forced.compiled.cmds != compiled.compiled.cmds
+
+
+def test_apu_g2_plans_are_candidates_of_the_shared_ranking():
+    compiled = allo.compile(g2_gemm, build_apu_g2_target(), apu_g2_cost)
+    (kernel,) = compiled.placement_ranking.kernels
+    assert [mode for _p, _c, mode in kernel.scores] == ["single/k1", "single/k2"]
+    assert compiled.plan.name == "single/k1" and compiled.selection == "cost"
+    for _position, placement in kernel.candidates:
+        extra = placement.extra
+        assert extra["candidate_plan"] == placement.mode
+        assert extra["launch_order"] and extra["abi"]["outputs"] == ["C"]
+    forced = allo.compile(
+        g2_gemm, build_apu_g2_target(), apu_g2_cost, layout="single/k2"
+    )
+    assert forced.plan.name == "single/k2" and forced.selection == "forced"
+    # The forced alternative is a different launch program (two chained
+    # launches), visible in the runtime route and the command stream.
+    assert len(forced.plan.launches) == 2 and len(compiled.plan.launches) == 1
+    route = lambda c: c.compiled.layout_ctx.runtime_route(c.compiled.cmds)
+    assert route(forced) != route(compiled)
+    assert forced.compiled.cmds != compiled.compiled.cmds
+    assert forced.estimate().cycles == kernel.scores[1][1]

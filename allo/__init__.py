@@ -79,7 +79,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "materialise_handle": ("allo.spmw_linear_layout", "materialise_handle"),
     "compile": ("allo.compiler", "compile"),
     "CompiledCallable": ("allo.compiler", "CompiledCallable"),
-    "APUv1VectorCallable": ("allo.pim.apu_v1_vector_program", "APUv1VectorCallable"),
+    "APUv1VectorProgram": ("allo.pim.apu_v1_vector_program", "APUv1VectorProgram"),
     "APUv1Phase": ("allo.pim.apu_v1_program", "APUv1Phase"),
     "APUv1Program": ("allo.pim.apu_v1_program", "APUv1Program"),
     "APUG2ComposedContractionCallable": (

@@ -691,7 +691,8 @@ def analyze_program(
     if function is None:
         names = list(dict.fromkeys(m.func_name for m in matches))
         if not names:
-            for operation in module.body.operations:
+            body = getattr(module, "body", None)
+            for operation in getattr(body, "operations", ()):
                 if operation.operation.name == "func.func":
                     function = _attr_text(operation, "sym_name")
                     break
@@ -836,6 +837,21 @@ def product_extent(values) -> int:
     return math.prod(int(v) for v in values)
 
 
+def stamp_program_facts(trace: MatchTrace, facts: ProgramFacts) -> None:
+    """Attach the facts to the trace and to its matches so downstream stages
+    (enumerators, backend contexts) read the semantic stage's result instead
+    of re-deriving it: ``trace.semantics``, ``match.extra["program_facts"]``
+    on every match of the analyzed function, and ``extra["semantic_facts"]``
+    (the `Contraction` or `Epilogue`) on the matches that are one."""
+
+    trace.semantics = facts
+    for match in trace.matches:
+        if match.func_name == facts.function:
+            match.extra["program_facts"] = facts
+    for item in (*facts.contractions, *facts.epilogues):
+        item.match.extra["semantic_facts"] = item
+
+
 __all__ = [
     "BufferAccess",
     "Contraction",
@@ -848,4 +864,5 @@ __all__ = [
     "SemanticAnalysisError",
     "analyze_program",
     "parse_memref_type",
+    "stamp_program_facts",
 ]

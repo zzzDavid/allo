@@ -1,10 +1,29 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Public callable for MLIR-discovered APU v1 vector contractions.
+"""APU v1 vector contraction plans as candidates of the shared pipeline.
 
-This module is the narrow bridge between the public ``allo.compile`` facade
-and the three independent APU abstractions: MLIR-based contraction analysis,
-declarative layout plans, and executable target-bound costs.
+The GVML vector plans of a matched contraction enter ``allo.compile`` like
+every other backend's candidates (release gate G9):
+
+* :func:`apu_v1_vector_candidates` is the ``autoschedule`` enumerator for a
+  plain-function contraction on ``apu_v1``.  It applies the vector plans'
+  legality to the shared semantic facts
+  (:func:`allo.pim.apu_v1_vectorize.apu_v1_contraction_analysis`), builds the
+  recipe catalog, prunes the plans the reduction-order policy forbids,
+  realizes each plan to GVML (an unrealizable plan is kept as a candidate the
+  cost stage rejects with its reason) and returns one ``Placement`` per plan.
+  The placement's ``extra`` states the plan's semantic coverage, value
+  layouts, transfers, launch order and ABI; the ``payload``
+  (:class:`APUv1VectorCandidate`) carries the ``APUV1Plan`` and its
+  realization for the backend context.
+* The shared driver prices every candidate through the backend's
+  ``candidate_execution_graph`` hook (:mod:`allo.spmw_apu_v1`), which
+  evaluates the materialized operation inventory with ``apu_v1_cost``,
+  ranks them in ``rank_matcher_placements`` and materializes the winner
+  through the backend context, which instantiates
+  :class:`APUv1VectorProgram`, the realized program behind the public
+  callable.
+
 ``backend="virtual"`` evaluates the selected plan's retained cost graph only
 (``kind="virtual"``, nothing executed, caller arrays untouched).
 ``backend="functional"`` is a host-side NumPy model of the selected plan's
@@ -17,11 +36,10 @@ from __future__ import annotations
 
 import hashlib
 import importlib
-import inspect
 import json
 import warnings
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -29,7 +47,7 @@ from ..spmw_codegen import RunResult
 from ..spmw_reduction_policy import (
     ReductionOrderError,
     is_integer_type,
-    normalize_reduction_order,
+    reduction_policy,
 )
 from .apu_v1_layout import APUV1Plan
 from .apu_v1_vector_codegen import (
@@ -40,21 +58,13 @@ from .apu_v1_vector_codegen import (
     uint16_contraction_ops,
     xnor_popcount_ops,
 )
-from .apu_v1_vector_cost import (
-    estimate_apu_v1_plan,
-    estimate_apu_v1_realization,
-    rank_apu_v1_plans,
+from .apu_v1_vectorize import (
+    apu_v1_contraction_analysis,
+    generate_apu_v1_vectorization_candidates,
 )
-from .apu_v1_vectorize import generate_apu_v1_vectorization_candidates
-from .schedule_search import (
-    DecisionDomain,
-    InfeasibleSchedule,
-    ScheduleObjectiveDomain,
-    grid_search,
-)
-
 
 _HOST_BACKENDS = frozenset({"functional", "virtual"})
+
 _APU_V1_PHYSICAL_PLAN_FIELDS = (
     "iteration_layout",
     "value_layouts",
@@ -194,29 +204,6 @@ def _same_apu_v1_physical_plan(lhs, rhs):
     return _apu_v1_plan_decision(lhs) == _apu_v1_plan_decision(rhs)
 
 
-def _estimate_for_apu_v1_plan(estimates, plan):
-    return next(
-        (
-            estimate
-            for estimate in estimates
-            if _same_apu_v1_physical_plan(estimate.plan, plan)
-        ),
-        None,
-    )
-
-
-def _apu_v1_cycle_objective_domain(estimate):
-    return ScheduleObjectiveDomain.fingerprinted_target(
-        metric="cycles",
-        target=estimate.graph.metadata["target"],
-        model_fingerprint=estimate.estimate.model_fingerprint,
-        fidelity="analytical",
-        scope="region",
-        unit="cycles",
-        direction="minimize",
-    )
-
-
 # Reduction strategies that add each product into the accumulator once, in
 # source order: ``temporal_accumulate`` walks the reduction axis in time and
 # adds one product per step into the output (its ``partial`` flag means the
@@ -240,26 +227,16 @@ def _tile_family(candidate_or_plan):
     return decision.get("family")
 
 
-def _family_members(candidates, name):
-    """Tile variants a family name (e.g. ``spatial_gemv_group_reduction``)
-    stands for; empty when ``name`` is an exact plan name."""
+def _prune_by_reduction_policy(candidates, analysis, order):
+    """Split the recipe catalog by the reduction-order policy.
 
-    if any(candidate.name == name for candidate in candidates):
-        return ()
-    return tuple(
-        candidate for candidate in candidates if _tile_family(candidate) == name
-    )
-
-
-def _apply_reduction_policy(candidates, analysis, reduction_order, layout):
-    """Prune plans that regroup a strict floating-point reduction.
-
-    Returns the surviving candidates and the ``(plan name, reason)`` record of
-    the pruned ones.  Integer contractions wrap modulo 2^16 and keep every
-    plan.  A ``layout`` naming a pruned plan, or a policy that leaves no plan,
-    raises ReductionOrderError.
+    Returns the surviving candidates and the ``(plan name, reason)`` records
+    of the pruned ones.  Integer contractions wrap modulo 2^16 and keep every
+    plan.  The shared driver reports the pruned records on every surviving
+    candidate (``extra["reduction_policy_pruned"]``) and a ``layout=`` that
+    names a pruned plan finds no candidate.
     """
-    if reduction_order != "strict" or is_integer_type(analysis.numeric_type):
+    if order != "strict" or is_integer_type(analysis.numeric_type):
         return tuple(candidates), ()
     keep, pruned = [], []
     for candidate in candidates:
@@ -274,28 +251,6 @@ def _apply_reduction_policy(candidates, analysis, reduction_order, layout):
             )
         else:
             keep.append(candidate)
-    requested = layout.name if isinstance(layout, APUV1Plan) else layout
-    if isinstance(layout, APUV1Plan) and apu_v1_plan_regroups(layout):
-        pruned_names = {requested}
-    else:
-        pruned_names = {name for name, _reason in pruned}
-        pruned_families = {
-            _tile_family(candidate)
-            for candidate in candidates
-            if candidate.name in pruned_names and _tile_family(candidate)
-        }
-        pruned_names |= {
-            family
-            for family in pruned_families
-            if not any(_tile_family(candidate) == family for candidate in keep)
-        }
-    if isinstance(requested, str) and requested in pruned_names:
-        raise ReductionOrderError(
-            f"APU v1 plan {requested!r} regroups the {analysis.numeric_type} "
-            "reduction, which reduction_order='strict' forbids; pass "
-            "reduction_order='reassociate' or choose one of: "
-            + ", ".join(candidate.name for candidate in keep)
-        )
     if not keep:
         raise ReductionOrderError(
             "reduction_order='strict': no APU v1 plan keeps the source order of "
@@ -354,43 +309,6 @@ def _grouped_fp16_contraction(analysis, plan, arrays):
             )
         output = (output + chunk[..., 0]).astype(np.float16)
     return output
-
-
-def _candidate_by_name(candidates, name: str):
-    for candidate in candidates:
-        if candidate.name == name:
-            return candidate
-    available = ", ".join(candidate.name for candidate in candidates)
-    raise ValueError(f"unknown APU v1 vector plan {name!r}; choose one of: {available}")
-
-
-def _select_plan(candidates, ranked, layout):
-    if isinstance(layout, str):
-        members = _family_members(candidates, layout)
-        if members:
-            # A family name keeps the tile a cost-ranked decision.
-            names = {candidate.name for candidate in members}
-            for estimate in ranked:
-                if estimate.plan.name in names:
-                    return estimate.plan
-            raise ValueError(
-                f"APU v1 plan family {layout!r} has tile variants "
-                + ", ".join(sorted(names))
-                + "; pass a cost program to rank them or name one variant"
-            )
-        return _candidate_by_name(candidates, layout).plan
-    if isinstance(layout, APUV1Plan):
-        return layout
-    if layout is not None:
-        raise TypeError("APU v1 vector layout must be an APUV1Plan, plan name, or None")
-    if ranked:
-        return ranked[0].plan
-    raise ValueError(
-        "APU v1 vector plans are selected by cost ranking; pass an executable "
-        "cost program (e.g. allo.pim.costs.apu_v1_cost) or choose a plan with "
-        "layout=<name>; candidates: "
-        + ", ".join(candidate.name for candidate in candidates)
-    )
 
 
 def _numpy_dtype(dtype: str):
@@ -515,174 +433,318 @@ def _realize(analysis, plan):
         return None, str(error)
 
 
-def search_apu_v1_vector_plans(
-    analysis,
-    plans,
-    target,
-    cost,
-    *,
-    incumbent_plan=None,
-):
-    """Realize, score, and deterministically rank APU v1 vector plans."""
-
-    ordered_plans = tuple(plans)
-    incumbent_index = next(
-        (index for index, plan in enumerate(ordered_plans) if plan is incumbent_plan),
-        None,
-    )
-    if incumbent_index is None and incumbent_plan is not None:
-        raise ValueError("incumbent_plan must be one of the searched plan objects")
-    decision_to_plan = {}
-    for plan in ordered_plans:
-        decision_to_plan.setdefault(_apu_v1_plan_decision(plan), plan)
-    plan_decisions = tuple(decision_to_plan)
-
-    def materialize(plan):
-        realization, error = _realize(analysis, plan)
-        if realization is None:
-            raise InfeasibleSchedule(
-                error or "APU v1 plan has no faithful GVML realization"
-            )
-        if realization.plan is not plan:
-            raise InfeasibleSchedule(
-                "APU v1 materializer returned a different plan object"
-            )
-        return realization
-
-    return grid_search(
-        (DecisionDomain("plan", plan_decisions),),
-        build=lambda decisions: decision_to_plan[decisions["plan"]],
-        materialize=materialize,
-        score=lambda realization: estimate_apu_v1_realization(
-            realization, target, cost
-        ),
-        objective=lambda estimate: int(estimate.cycles),
-        objective_domain=_apu_v1_cycle_objective_domain,
-        incumbent=(
-            None
-            if incumbent_index is None
-            else {"plan": _apu_v1_plan_decision(ordered_plans[incumbent_index])}
-        ),
-    )
+# --------------------------------------------------------------------------- #
+# Candidates of the shared pipeline
+# --------------------------------------------------------------------------- #
 
 
-def _feasible_candidate_estimates(search_result):
-    return tuple(candidate.score for candidate in search_result.ranked)
+@dataclass
+class APUv1VectorCandidate:
+    """One vector plan of a matched contraction, realized to GVML.
 
+    The payload of the plan's ``Placement``.  ``realization`` is None when
+    the plan has no faithful GVML realization (``realization_error`` says
+    why); such a candidate is rejected by the cost stage, never selected.
+    ``estimate`` caches the materialized-inventory estimate the cost stage
+    computed.
+    """
 
-def _legacy_realizable_incumbent(analysis, plans, target, cost):
-    """Reproduce the pre-inventory best score among realizable plans."""
+    plan: APUV1Plan
+    analysis: Any
+    realization: Any
+    realization_error: str | None
+    estimate: Any = None
 
-    feasible = []
-    failures = []
-    for plan in plans:
-        realization, error = _realize(analysis, plan)
-        if realization is not None:
-            feasible.append(plan)
-        else:
-            failures.append(f"{plan.name}: {error}")
-    if not feasible:
-        raise InfeasibleSchedule(
-            "APU v1 legacy selection has no faithful realization: "
-            + "; ".join(failures)
+    @property
+    def name(self) -> str:
+        return self.plan.name
+
+    @property
+    def family(self) -> str | None:
+        return _tile_family(self.plan)
+
+    @property
+    def regroups(self) -> bool:
+        return apu_v1_plan_regroups(self.plan)
+
+    def decision(self) -> tuple:
+        """Name-free physical identity of the plan (schedule-search key)."""
+
+        decision = _apu_v1_plan_decision(self.plan)
+        return (
+            decision.temporal_strategy,
+            decision.reduction_kind,
+            decision.reduction_group_size,
+            decision.accumulator_block,
+            decision.physical_iteration_shape,
+            decision.output_tile_shape,
+            decision.reduction_tile_extent,
+            decision.transfer_routes,
+            decision.physical_fingerprint,
         )
-    return rank_apu_v1_plans(feasible, target, cost)[0].plan
+
+    def matches_request(self, request) -> bool:
+        """Whether ``layout=request`` (a plan name, a family name or an
+        ``APUV1Plan``) designates this candidate."""
+
+        if isinstance(request, str):
+            return request in (self.name, self.family)
+        if isinstance(request, APUV1Plan):
+            return _same_apu_v1_physical_plan(request, self.plan)
+        return False
+
+    def effects(self) -> dict[str, Any]:
+        """The plan's scheduling effects, visible through the shared
+        candidate contract (what the realization does, in words the driver
+        and a reviewer can read without the GVML payload)."""
+
+        plan = self.plan
+        analysis = self.analysis
+        return {
+            "coverage": {
+                "function": analysis.function,
+                "operation": f"{analysis.multiply_operation}/{analysis.combine_operation}",
+                "output": analysis.output.value,
+                "output_initializer": analysis.output_initializer,
+                "inputs": [analysis.lhs.value, analysis.rhs.value],
+            },
+            "value_layouts": [
+                {
+                    "value": layout.value,
+                    "axes": list(layout.axes),
+                    "storage": getattr(layout, "storage", None),
+                }
+                for layout in plan.value_layouts
+            ],
+            "transfers": [
+                {
+                    "value": transfer.value,
+                    "route": [step.kind for step in transfer.route],
+                }
+                for transfer in plan.transfers
+            ],
+            "launch_order": [
+                plan.temporal_strategy,
+                getattr(plan.reduction_strategy, "kind", "none"),
+            ],
+            "abi": [
+                {
+                    "value": layout.value,
+                    "intent": (
+                        "inout" if layout.value == analysis.output.value else "in"
+                    ),
+                }
+                for layout in plan.value_layouts
+            ],
+            "device_scope": "one APUC, whole problem (single launch)",
+        }
 
 
-class APUv1VectorCallable:
-    """NumPy-callable APU v1 contraction plus plans, costs, and GVML artifact."""
+def _candidate_placements(target, facts, candidates, pruned):
+    """One ``Placement`` per surviving recipe; the operand registers are the
+    VR classes the plan's values occupy (legality checks them against the
+    ``MAC`` declaration), the payload carries the plan and its realization."""
 
-    def __init__(
-        self,
-        workload,
-        target,
-        schedule,
-        candidates,
-        *,
-        cost=None,
-        layout=None,
-        backend=None,
-        reduction_order=None,
-    ):
-        self.workload = workload
+    from ..spmw_autoschedule import Placement
+
+    (contraction,) = facts.contractions
+    registers = {}
+    for access, register in zip(contraction.inputs, (target.vr0, target.vr1)):
+        if access.memref_name is not None:
+            registers[access.memref_name] = register
+    if contraction.accumulator.memref_name is not None:
+        registers[contraction.accumulator.memref_name] = target.vr2
+    placements = []
+    for candidate in candidates:
+        realization, error = _realize(candidate.analysis, candidate.plan)
+        payload = APUv1VectorCandidate(
+            candidate.plan, candidate.analysis, realization, error
+        )
+        extra = {
+            "candidate_plan": payload.name,
+            "candidate_decision": payload.decision(),
+            "candidate_families": (payload.family,) if payload.family else (),
+            "payload": payload,
+            "whole_device_launch": True,
+            "reduction_policy_pruned": tuple(pruned),
+            "regroups_reduction": payload.regroups,
+            **payload.effects(),
+        }
+        if "tile_decision" in candidate.plan.metadata:
+            extra["tile_decision"] = dict(candidate.plan.metadata["tile_decision"])
+        placements.append(
+            Placement(placements=dict(registers), mode=payload.name, extra=extra)
+        )
+    return placements
+
+
+def apu_v1_vector_candidates(target, matches) -> list:
+    """``autoschedule`` enumerator: the GVML vector plans of one matched
+    contraction of a plain function (shared semantic facts required)."""
+
+    facts = matches[0].extra.get("program_facts")
+    if facts is None:
+        raise NotImplementedError(
+            "APU v1 vector plans need the shared semantic facts of the matched "
+            "program (compile through allo.compile, which derives them)"
+        )
+    analysis = apu_v1_contraction_analysis(facts)
+    recipes = generate_apu_v1_vectorization_candidates(analysis)
+    policy = reduction_policy(facts.contractions[0].match)
+    order = "strict" if policy is None else policy.order
+    kept, pruned = _prune_by_reduction_policy(recipes, analysis, order)
+    return _candidate_placements(target, facts, kept, pruned)
+
+
+# --------------------------------------------------------------------------- #
+# The realized program behind the public callable
+# --------------------------------------------------------------------------- #
+
+
+class APUv1VectorProgram:
+    """The selected vector plan of one contraction, as the backend context
+    materialized it; executed by the ``apu_v1`` runner.
+
+    ``INTROSPECTION`` names the attributes :class:`allo.compiler.CompiledCallable`
+    forwards (``compiled.selected_plan`` and friends); ranking-derived views
+    (``candidates``, ``ranked_plans``, ``candidate_estimates``,
+    ``tile_decision``) read the shared ``PlacementRanking`` of the compiled
+    artifact.
+    """
+
+    INTROSPECTION = (
+        "selected_plan",
+        "plans",
+        "candidates",
+        "ranked_plans",
+        "candidate_estimates",
+        "realization",
+        "realization_error",
+        "analysis",
+        "program_facts",
+        "plan_selection",
+        "cost_validity",
+        "tile_decision",
+        "device_source",
+        "selected_estimate",
+    )
+
+    def __init__(self, target, candidate: APUv1VectorCandidate, trace, placement):
         self.target = target
-        self.schedule = schedule
-        self.module = schedule.module
-        self.analysis = candidates[0].analysis
-        self.reduction_order = normalize_reduction_order(reduction_order)
-        candidates, self.reduction_policy_pruned = _apply_reduction_policy(
-            candidates, self.analysis, self.reduction_order, layout
+        self.candidate = candidate
+        self.trace = trace
+        self.placement = placement
+        self.compiled = None  # attached by the driver (CompiledCallable)
+
+    # -- attachment to the compiled artifact ---------------------------------
+
+    def attach(self, compiled) -> None:
+        self.compiled = compiled
+
+    # -- the selected plan -----------------------------------------------------
+
+    @property
+    def selected_plan(self) -> APUV1Plan:
+        return self.candidate.plan
+
+    @property
+    def realization(self):
+        return self.candidate.realization
+
+    @property
+    def realization_error(self):
+        return self.candidate.realization_error
+
+    @property
+    def analysis(self):
+        return self.candidate.analysis
+
+    @property
+    def program_facts(self):
+        match = self.trace.matches[0] if self.trace.matches else None
+        return None if match is None else match.extra.get("program_facts")
+
+    @property
+    def plan_selection(self) -> str:
+        return (
+            "explicit_layout"
+            if self.placement.extra.get("candidate_selection") == "forced"
+            else "cost_ranked"
         )
-        self.candidates = tuple(candidates)
-        self.plans = tuple(candidate.plan for candidate in candidates)
-        self.cost = cost
-        self.schedule_search_result = None
-        if layout is None and cost is not None:
-            incumbent_plan = _legacy_realizable_incumbent(
-                self.analysis,
-                self.plans,
-                target,
-                cost,
-            )
-            self.schedule_search_result = search_apu_v1_vector_plans(
-                self.analysis,
-                self.plans,
-                target,
-                cost,
-                incumbent_plan=incumbent_plan,
-            )
-            selected = self.schedule_search_result.best
-            self.candidate_estimates = _feasible_candidate_estimates(
-                self.schedule_search_result
-            )
-            self.selected_plan = selected.payload
-            self.selected_estimate = selected.score
-            self.realization = selected.materialized
-            self.realization_error = None
-        else:
-            self.candidate_estimates = (
-                rank_apu_v1_plans(self.plans, target, cost) if cost is not None else ()
-            )
-            self.selected_plan = _select_plan(
-                self.candidates, self.candidate_estimates, layout
-            )
-            self.selected_estimate = (
-                _estimate_for_apu_v1_plan(self.candidate_estimates, self.selected_plan)
-                if cost is not None
-                else None
-            )
-            if self.selected_estimate is None and cost is not None:
-                self.selected_estimate = estimate_apu_v1_plan(
-                    self.selected_plan, target, cost
-                )
-            self.realization, self.realization_error = _realize(
-                self.analysis, self.selected_plan
-            )
-        self.plan_selection = "cost_ranked" if layout is None else "explicit_layout"
-        self.backend = "device" if backend is None else str(backend)
-        if self.backend not in _HOST_BACKENDS | {"device"}:
-            raise ValueError(
-                "APU v1 vector contractions support backend=None/'device', "
-                "'functional', or 'virtual'"
-            )
-        self.signature = inspect.signature(workload)
-        self.__signature__ = self.signature
-        self.__name__ = getattr(workload, "__name__", "apu_v1_vector_workload")
-        self.__doc__ = getattr(workload, "__doc__", None)
-        self.last_result = None
+
+    @property
+    def selected_estimate(self):
+        return self.candidate.estimate
 
     @property
     def execution_graph(self):
-        return self.selected_estimate.graph if self.selected_estimate else None
-
-    @property
-    def ranked_plans(self):
-        return tuple(estimate.plan for estimate in self.candidate_estimates)
+        if self.compiled is not None and self.compiled.execution_graph is not None:
+            return self.compiled.execution_graph
+        estimate = self.candidate.estimate
+        return None if estimate is None else estimate.graph
 
     @property
     def cost_validity(self):
         graph = self.execution_graph
         return None if graph is None else graph.metadata.get("cost_validity")
+
+    def device_source(self):
+        if self.realization is None:
+            raise RuntimeError(self.realization_error or "plan has no GVML realization")
+        return self.realization.device_source()
+
+    # -- ranking-derived views ---------------------------------------------------
+
+    def _ranking_candidates(self):
+        """``[(position, cycles, payload)]`` of the kernel's scored candidates
+        in cost order, from the shared ranking; the selected candidate alone
+        when no ranking was run (explicit placements)."""
+
+        ranking = getattr(self.compiled, "placement_ranking", None)
+        if ranking is None or not ranking.kernels:
+            return [(0, None, self.candidate)]
+        kernel = ranking.kernels[0]
+        by_position = {
+            position: placement.extra.get("payload")
+            for position, placement in kernel.candidates
+        }
+        out = []
+        for position, cycles, _mode in kernel.scores:
+            payload = by_position.get(position)
+            if isinstance(payload, APUv1VectorCandidate):
+                out.append((position, cycles, payload))
+        return out or [(0, None, self.candidate)]
+
+    @property
+    def candidates(self) -> tuple[APUv1VectorCandidate, ...]:
+        """Every enumerated candidate, in enumeration order."""
+
+        return tuple(
+            payload
+            for _position, _cycles, payload in sorted(
+                self._ranking_candidates(), key=lambda item: item[0]
+            )
+        )
+
+    @property
+    def plans(self) -> tuple[APUV1Plan, ...]:
+        return tuple(candidate.plan for candidate in self.candidates)
+
+    @property
+    def ranked_plans(self) -> tuple[APUV1Plan, ...]:
+        return tuple(payload.plan for _p, _c, payload in self._ranking_candidates())
+
+    @property
+    def candidate_estimates(self) -> tuple:
+        return tuple(
+            payload.estimate
+            for _p, _c, payload in self._ranking_candidates()
+            if payload.estimate is not None
+        )
+
+    @property
+    def reduction_policy_pruned(self) -> tuple:
+        return tuple(self.placement.extra.get("reduction_policy_pruned", ()))
 
     @property
     def tile_decision(self):
@@ -695,13 +757,12 @@ class APUv1VectorCallable:
             return None
         family = decision["family"]
         scored = {
-            estimate.plan.name: int(estimate.cycles)
-            for estimate in self.candidate_estimates
+            payload.name: int(cycles)
+            for _p, cycles, payload in self._ranking_candidates()
+            if cycles is not None
         }
         members = [
-            candidate
-            for candidate in self.candidates
-            if _tile_family(candidate) == family
+            candidate for candidate in self.candidates if candidate.family == family
         ]
         pruned = {name for name, _reason in self.reduction_policy_pruned}
         return {
@@ -724,53 +785,46 @@ class APUv1VectorCallable:
             ),
         }
 
-    def estimate(self, plan=None):
-        """Return the analytical estimate for the selected or named plan."""
+    def check_virtual_inputs(self, inputs) -> None:
+        """Price only inputs the plan can take: the executing routes reject a
+        nonzero initial output the plan resets; checked here, not written."""
+        arrays = {
+            name: value
+            for name, value in inputs.items()
+            if name in self.program_facts.parameter_names
+        }
+        for name, value in arrays.items():
+            if not isinstance(value, np.ndarray):
+                raise TypeError(
+                    f"APU v1 vector operand {name!r} must be a NumPy array, "
+                    f"got {type(value).__name__}"
+                )
+        if self.realization is not None and self.analysis.output_initializer != "zero":
+            self.realization.check_initial_outputs(arrays)
 
-        if self.cost is None:
-            raise RuntimeError("compiled APU v1 workload has no executable cost spec")
-        if plan is None:
-            return self.selected_estimate.estimate
-        selected = (
-            _candidate_by_name(self.candidates, plan).plan
-            if isinstance(plan, str)
-            else plan
-        )
-        if not isinstance(selected, APUV1Plan):
-            raise TypeError("estimate plan must be an APUV1Plan or candidate name")
-        estimate = _estimate_for_apu_v1_plan(self.candidate_estimates, selected)
-        if estimate is not None:
-            return estimate.estimate
-        if self.schedule_search_result is not None:
-            raise RuntimeError(
-                f"APU v1 plan {selected.name!r} was rejected before scoring"
-            )
-        return estimate_apu_v1_plan(selected, self.target, self.cost).estimate
+    def virtual_extra(self) -> dict:
+        return {
+            "plan": self.selected_plan.name,
+            "plan_selection": self.plan_selection,
+            "tile_decision": self.tile_decision,
+            "cost_validity": self.cost_validity,
+            "plan_regroups_reduction": self.candidate.regroups,
+        }
 
-    def device_source(self):
-        if self.realization is None:
-            raise RuntimeError(self.realization_error or "plan has no GVML realization")
-        return self.realization.device_source()
+    # -- execution -----------------------------------------------------------------
 
-    def __call__(self, *args, **kwargs):
-        bound = self.signature.bind(*args, **kwargs)
-        bound.apply_defaults()
-        return self.run_backend(**bound.arguments)
-
-    run = __call__
-
-    def run_backend(self, **inputs):
-        if self.backend == "virtual":
-            result = self._run_virtual(inputs)
-        elif self.backend == "functional":
-            result = self._run_functional(self._stage_output(inputs))
-        else:
+    def run(self, compiled, inputs: Mapping[str, object]) -> RunResult:
+        backend = compiled.backend
+        if backend == "functional":
+            result = self._run_functional(compiled, self._stage_output(inputs))
+        elif backend in {None, "device"}:
             result = self._run_device(self._stage_output(inputs))
-        result.extra["reduction_order"] = self.reduction_order
-        result.extra["plan_regroups_reduction"] = apu_v1_plan_regroups(
-            self.selected_plan
-        )
-        self.last_result = result
+        else:
+            raise ValueError(
+                "APU v1 vector contractions support backend=None/'device', "
+                f"'functional', or 'virtual'; got {backend!r}"
+            )
+        result.extra["plan_regroups_reduction"] = self.candidate.regroups
         return result
 
     def _stage_output(self, inputs: Mapping[str, object]) -> dict:
@@ -798,51 +852,7 @@ class APUv1VectorCallable:
             output[...] = 0
         return arguments
 
-    def _run_virtual(self, inputs: Mapping[str, object]):
-        """Evaluate the selected plan's retained cost graph; nothing executes.
-
-        ``kind="virtual"``: no outputs, caller arrays are not written.
-        """
-        for name, value in inputs.items():
-            if not isinstance(value, np.ndarray):
-                raise TypeError(
-                    f"APU v1 vector operand {name!r} must be a NumPy array, "
-                    f"got {type(value).__name__}"
-                )
-        if self.cost is None or self.execution_graph is None:
-            raise RuntimeError(
-                "APU v1 vector backend='virtual' needs an executable cost spec"
-            )
-        if (
-            self.realization is not None
-            and getattr(self.analysis, "output_initializer", "carried") != "zero"
-        ):
-            # Price only inputs the plan can take: the executing routes reject
-            # a nonzero initial output the plan resets; checked, not written.
-            self.realization.check_initial_outputs(inputs)
-        estimate = self.cost.evaluate(self.execution_graph)
-        spec = getattr(self.cost, "spec", self.cost)
-        return RunResult(
-            estimate.cycles,
-            "virtual APU v1 vector contraction cost evaluation; device not "
-            "launched, nothing executed, outputs not written",
-            "virtual",
-            kind="virtual",
-            extra={
-                "critical_path": list(estimate.critical_path),
-                "utilization": dict(estimate.utilization),
-                "bottlenecks": list(estimate.bottlenecks),
-                "model_fingerprint": estimate.model_fingerprint,
-                "cost_model": getattr(spec, "name", None),
-                "priced_target": self.target.name,
-                "cost_validity": self.cost_validity,
-                "plan": self.selected_plan.name,
-                "plan_selection": self.plan_selection,
-                "tile_decision": self.tile_decision,
-            },
-        )
-
-    def _run_functional(self, inputs: Mapping[str, object]):
+    def _run_functional(self, compiled, inputs: Mapping[str, object]):
         """Host-side NumPy model of the selected plan's arithmetic order.
 
         Not compiled device code: neither the GVML realization nor any
@@ -854,7 +864,11 @@ class APUv1VectorCallable:
         outputs are written to the caller's arrays and ``cycles`` is the
         selected plan's analytical estimate, not a measurement.
         """
-        arguments = dict(inputs)
+        arguments = {
+            name: value
+            for name, value in inputs.items()
+            if name in self.program_facts.parameter_names
+        }
         for name, value in arguments.items():
             if not isinstance(value, np.ndarray):
                 raise TypeError(
@@ -868,7 +882,7 @@ class APUv1VectorCallable:
         output_name = self.analysis.output.value
         returned = None
         if (
-            apu_v1_plan_regroups(self.selected_plan)
+            self.candidate.regroups
             and self.analysis.multiply_operation == "arith.mulf"
             and output_name in arguments
         ):
@@ -889,6 +903,12 @@ class APUv1VectorCallable:
                 "groups added to the output in ascending order"
             )
         else:
+            workload = getattr(compiled, "source_workload", None)
+            if workload is None:
+                raise RuntimeError(
+                    "the APU v1 functional model executes the source workload on "
+                    "the host; the compiled artifact carries no source workload"
+                )
             # ``allo.reduction(1-D)`` is represented by ``np.ndindex`` when an
             # Allo DSL function is executed directly, so its induction variable
             # is a one-element tuple.  NumPy currently accepts that
@@ -901,10 +921,10 @@ class APUv1VectorCallable:
                     message="Conversion of an array with ndim > 0 to a scalar",
                     category=DeprecationWarning,
                 )
-                returned = self.workload(**arguments)
+                returned = workload(**arguments)
             numerics = (
                 "source order"
-                if not apu_v1_plan_regroups(self.selected_plan)
+                if not self.candidate.regroups
                 else "source order (integer or bitwise reduction: every grouping "
                 "of the selected plan gives the same wrapped result)"
             )
@@ -913,11 +933,8 @@ class APUv1VectorCallable:
             outputs[output_name] = np.asarray(arguments[output_name]).copy()
         elif returned is not None:
             outputs[output_name] = np.asarray(returned)
-        cycles = (
-            int(self.selected_estimate.cycles)
-            if self.selected_estimate is not None
-            else None
-        )
+        estimate = self.candidate.estimate
+        cycles = int(estimate.cycles) if estimate is not None else None
         return RunResult(
             cycles,
             "host-side NumPy model of the selected APU v1 plan's arithmetic "
@@ -930,7 +947,7 @@ class APUv1VectorCallable:
                 "plan_selection": self.plan_selection,
                 "tile_decision": self.tile_decision,
                 "cost_validity": self.cost_validity,
-                "analytical": self.selected_estimate is not None,
+                "analytical": estimate is not None,
                 "functional": True,
                 "execution": "host NumPy model of the selected plan's arithmetic "
                 "order; not compiled device code",
@@ -950,7 +967,11 @@ class APUv1VectorCallable:
                 "backend='functional' or backend='virtual'"
             ) from error
         # A lifted 1-D contraction plans its values with a trailing unit axis.
-        arrays = dict(inputs)
+        arrays = {
+            name: value
+            for name, value in inputs.items()
+            if name in self.program_facts.parameter_names
+        }
         lifted = {}
         for value in self.realization.values:
             source = arrays.get(value.name)
@@ -972,50 +993,14 @@ class APUv1VectorCallable:
                     np.reshape(arrays[value.name], source.shape),
                     casting="same_kind",
                 )
+        result.extra.setdefault("plan", self.selected_plan.name)
+        result.extra.setdefault("plan_selection", self.plan_selection)
         return result
 
 
-def compile_apu_v1_vector_workload(
-    workload,
-    target,
-    program,
-    *,
-    cost=None,
-    layout=None,
-    backend=None,
-    reduction_order=None,
-):
-    """Plan one matched Allo contraction and return its public callable.
-
-    ``program`` is the :class:`allo.spmw_pipeline.SourceProgram` of the
-    shared front stages (frontend, matcher, coverage and semantic analysis
-    have already run); the vector plans are generated from its shared facts.
-    Under ``reduction_order="strict"`` (the default) a floating-point
-    contraction ranks only plans that keep the source accumulation order.
-    """
-
-    if getattr(target, "name", None) != "apu_v1":
-        raise ValueError("APU v1 vector workloads require the apu_v1 target")
-    facts = program.program_facts()
-    candidates = generate_apu_v1_vectorization_candidates(facts)
-    compiled = APUv1VectorCallable(
-        workload,
-        target,
-        program.schedule,
-        candidates,
-        cost=cost,
-        layout=layout,
-        backend=backend,
-        reduction_order=reduction_order,
-    )
-    compiled.trace = program.trace
-    compiled.program_facts = facts
-    return compiled
-
-
 __all__ = [
-    "APUv1VectorCallable",
+    "APUv1VectorCandidate",
+    "APUv1VectorProgram",
     "apu_v1_plan_regroups",
-    "compile_apu_v1_vector_workload",
-    "search_apu_v1_vector_plans",
+    "apu_v1_vector_candidates",
 ]

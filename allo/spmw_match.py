@@ -243,6 +243,10 @@ class MatchTrace:
     # Store coverage of the module this trace was matched from.  None for a
     # trace assembled by hand or sliced from another trace.
     coverage: MatchCoverage | None = None
+    # Shared semantic facts of the analyzed function
+    # (``allo.spmw_semantics.ProgramFacts``), stamped by the pipeline's
+    # semantic-analysis stage; None before that stage ran.
+    semantics: Any = None
 
     def by_target_op(self, name: str) -> list[MatchedOp]:
         return [m for m in self.matches if m.target_op_name == name]

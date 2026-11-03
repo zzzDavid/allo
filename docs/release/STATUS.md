@@ -3,7 +3,7 @@
 
 # Release status
 
-Updated: 2026-11-02 (round 12: gate G9 slices 1-2 implemented, shared front stages and semantic facts for every target, both APU contract derivations on them; the round 11 checkpoint reconciled and committed separately). Read `TASK.md` in the containing repository,
+Updated: 2026-11-02 (round 13: gate G9 slice 3 implemented, both APUs' plans are candidates of the common selection stage; reviewer findings C-27 and G2-13 fixed). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -36,10 +36,11 @@ then this file, then `ISSUES.md` for the next action.
 1. **G9 (X-01)**: the shared compilation pipeline for all targets including
    APU v1 and Gemini-II is required by the user (2026-11-02) and in
    progress: slices 1-2 landed in round 12 (shared front stages
-   `allo/spmw_pipeline.py`, semantic facts `allo/spmw_semantics.py`, both
-   APU contract derivations over them, the APU v1 MLIR-text analysis out of
-   the public route). Open: APU plans as common selection candidates
-   (slice 3), typed records (slice 4), hardware/installed stage traces
+   `allo/spmw_pipeline.py`, semantic facts `allo/spmw_semantics.py`) and
+   slice 3 in round 13 (the APU v1 vector plans and the Gemini-II launch
+   plans are `autoschedule` candidates priced, ranked, materialized and run
+   through `compile_for_target`; the planner seam is gone). Open: typed
+   records (slice 4), Gemini-II card and installed-artifact stage traces
    (slice 5). Map and status: `design/shared-compilation-path.md`.
 2. **G2**: the independent reviewer disproved the round 7 PASS with two
    executed wrong-code probes at `e41ebbd` (C-19 casts erased, C-20 guarded
@@ -60,6 +61,26 @@ then this file, then `ISSUES.md` for the next action.
    build path for a user without the patches is the open question the
    reviewer named.
 4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+
+## Round 13 (2026-11-02): what was done
+
+- Reviewer findings on `7bb372e`: C-27 (helper calls replaced the entry
+  ABI; refused at the shared boundary for every target, with executed
+  regressions for a reordered and a repeated call) and G2-13
+  (`build_apu_v2_target()` lacked the matcher view) fixed.
+- G9 slice 3: `apu_v1_vector_program.apu_v1_vector_candidates` and
+  `apu_g2_source_route.apu_g2_source_candidates` are the ``autoschedule``
+  enumerators of the two APUs; `candidate_execution_graph` on the backend
+  contexts prices their candidates; `select_candidates` turns ``layout=``
+  into a selection restriction over a fully scored ranking;
+  `KernelRanking.candidates` exposes the realized choice set; the APU v1
+  context materializes `APUv1VectorProgram`, the new `allo/spmw_apu_g2.py`
+  context materializes `APUG2SourceProgram`; `CompiledCallable` forwards
+  the programs' documented introspection. Removed: `_SOURCE_PLANNERS`,
+  `APUv1VectorCallable`, `compile_apu_v1_vector_workload`,
+  `compile_apu_g2_source_workload`, the Gemini-II program's own selection.
+- Tests: `tests/pim/test_shared_semantics.py` (boundary and slice 3
+  sections); Gemini-II and APU v1 tests moved to the forwarded surface.
 
 ## Round 12 (2026-11-02): what was done
 
@@ -154,13 +175,11 @@ then this file, then `ISSUES.md` for the next action.
    (VALIDATION.md round 10). Repeat after any later code commit.
 3. Lint: header, black and clang-format stages pass; the pylint stage
    carries pre-existing fork-wide findings (P-23).
-4. G9 slice 3: register the APU v1 recipes and the Gemini-II launch plans
-   as `autoschedule` enumerators producing `Placement`s with explicit
-   effects, priced through the graph path and selected in
-   `rank_matcher_placements`; then slice 4 (typed records normalize into
-   the shared contracts; remove `_SOURCE_PLANNERS` and the hybrid text
-   parser) and slice 5 (stage traces on simulators, APU v1 board,
-   Gemini-II card, installed artifact).
+4. G9 slice 4: typed records (`APUv1Program`, `APUG2TypedProgram`,
+   `APUG2ComposedContractionProgram`) normalize into the shared contracts;
+   remove the hybrid route's MLIR-text parser. Slice 5: stage traces on the
+   Gemini-II card (zhang-x4) and the installed artifact; refresh the full
+   suites.
 
 ## Round 6 (2026-11-02): what was done
 

@@ -1118,39 +1118,71 @@ def _scatter(contract, launch, gathered, results):
 
 
 class APUG2SourceProgram:
-    """The compiled backend object of one Gemini-II source workload."""
+    """The realized program of one selected Gemini-II launch plan.
 
-    def __init__(self, contract, target, cost, *, backend=None, layout=None):
+    Instantiated by the backend context (:mod:`allo.spmw_apu_g2`) for the
+    candidate the shared ranking selected; it packs the host carriers, runs
+    the launches on the card (or reports the virtual estimate) and checks
+    the device result against the source oracle.  ``candidates`` are the
+    priced launch plans the ranking chose among (for inspection:
+    ``ranking``, ``placement_ranking``); ``selection`` is ``"cost"`` or
+    ``"forced"`` (``layout=`` named the plan).
+    """
+
+    INTROSPECTION = (
+        "plan",
+        "contract",
+        "ranking",
+        "rejected",
+        "selection",
+        "candidates",
+        "repetitions",
+        "pack",
+        "manifest",
+    )
+
+    def __init__(
+        self,
+        contract,
+        target,
+        plan,
+        *,
+        candidates=(),
+        rejected=(),
+        selection="cost",
+        cost=None,
+        backend=None,
+    ):
         if backend not in (None, "device", "virtual"):
             raise ValueError("the Gemini-II source route supports device or virtual")
         self.contract = contract
         self.target = target
+        self.plan = plan
+        self.candidates = tuple(candidates) or (plan,)
+        self.rejected = tuple(rejected)
+        self.selection = selection
         self.cost = cost
         self.backend = "device" if backend is None else backend
         self.host_moves = ()
-        self._repetitions = 256
-        self._forced = layout
-        self._select()
+        self.compiled = None
+        self._repetitions = _plan_repetitions(plan)
 
-    def _select(self):
-        plans, rejected = enumerate_apu_g2_launch_plans(
-            self.contract, repetitions=self._repetitions
+    def attach(self, compiled) -> None:
+        self.compiled = compiled
+        if compiled.cost is not None:
+            self.cost = compiled.cost
+        self.backend = "device" if compiled.backend is None else compiled.backend
+
+    @property
+    def ranking(self):
+        """The priced candidates in estimate order (then fewer launches)."""
+        priced = [plan for plan in self.candidates if plan.estimate_cycles is not None]
+        return tuple(
+            sorted(
+                priced,
+                key=lambda plan: (plan.estimate_cycles, len(plan.launches)),
+            )
         )
-        ranking = rank_apu_g2_launch_plans(plans, self.target, self.cost)
-        self.rejected = tuple(rejected)
-        self.ranking = tuple(ranking)
-        if self._forced is None:
-            self.plan = ranking[0]
-            self.selection = "cost"
-        else:
-            chosen = [plan for plan in ranking if plan.name == self._forced]
-            if not chosen:
-                raise ValueError(
-                    f"layout={self._forced!r} names no legal plan; legal plans: "
-                    f"{[plan.name for plan in ranking]}"
-                )
-            self.plan = chosen[0]
-            self.selection = "forced"
 
     @property
     def repetitions(self) -> int:
@@ -1158,12 +1190,25 @@ class APUG2SourceProgram:
 
     @repetitions.setter
     def repetitions(self, value):
+        """Rebuild the selected plan's launches with another timed-loop
+        repetition count (the plan, its coordinates and chunks are unchanged;
+        the estimate is re-priced per call)."""
         if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
             raise TypeError("repetitions must be an integer")
         if not 1 <= int(value) <= np.iinfo(np.uint32).max:
             raise ValueError("repetitions must fit a nonzero uint32")
         self._repetitions = int(value)
-        self._select()
+        rebuilt = rebuild_apu_g2_launch_plan(
+            self.contract, self.plan, repetitions=self._repetitions
+        )
+        if self.cost is not None:
+            graph = price_apu_g2_launch_plan(rebuilt, self.target, self.cost)
+            rebuilt.execution_graph = graph
+            rebuilt.estimate_cycles = int(self.cost.evaluate(graph).cycles)
+            rebuilt.estimate_validity = graph.metadata["estimate_validity"]
+            if self.compiled is not None:
+                self.compiled.execution_graph = graph
+        self.plan = rebuilt
 
     @property
     def execution_graph(self):
@@ -1189,8 +1234,15 @@ class APUG2SourceProgram:
             "selected": self.plan.manifest(),
             "ranking": self.placement_ranking,
             "rejected": [list(item) for item in self.rejected],
-            "cost_model": self.cost.spec.name,
-            "cost_fingerprint": self.cost.fingerprint,
+            "cost_model": None if self.cost is None else self.cost.spec.name,
+            "cost_fingerprint": None if self.cost is None else self.cost.fingerprint,
+        }
+
+    def virtual_extra(self) -> dict[str, object]:
+        return {
+            "latency_unit": "device_ticks_per_call",
+            "estimate_validity": self.plan.estimate_validity,
+            "plan": self.manifest(),
         }
 
     def _validated_inputs(self, inputs):
@@ -1256,8 +1308,19 @@ class APUG2SourceProgram:
             )
         return packed
 
-    def run(self, **inputs) -> RunResult:
+    def run(self, compiled, inputs) -> RunResult:
+        """Execute the selected plan: ``backend=None`` on the card
+        (``kind="device"``); the virtual backend never reaches here."""
+        self.backend = "device" if compiled.backend is None else compiled.backend
+        if self.backend != "device":
+            raise ValueError(
+                "the Gemini-II source route supports backend=None (card) or "
+                f"'virtual'; got {self.backend!r}"
+            )
         contract = self.contract
+        inputs = {
+            name: value for name, value in inputs.items() if name in contract.parameters
+        }
         arrays, initial = self._validated_inputs(inputs)
         oracle = apu_g2_source_oracle(contract, arrays, initial)
         for name in oracle:
@@ -1273,23 +1336,6 @@ class APUG2SourceProgram:
                     f"output '{name}' container {container.dtype} cannot hold "
                     f"every {scalar.name} value"
                 )
-        if self.backend == "virtual":
-            return RunResult(
-                kind="virtual",
-                cycles=int(self.plan.estimate_cycles),
-                stdout=(
-                    f"virtual Gemini-II source route: plan {self.plan.name!r} "
-                    f"priced by {self.cost.spec.name!r}; nothing executed, "
-                    "outputs not written"
-                ),
-                backend="virtual",
-                extra={
-                    "cost_model": self.cost.spec.name,
-                    "latency_unit": "device_ticks_per_call",
-                    "estimate_validity": self.plan.estimate_validity,
-                    "plan": self.manifest(),
-                },
-            )
         return self._run_device(arrays, initial, oracle, inputs)
 
     def _run_device(self, arrays, initial, oracle, inputs):
@@ -1357,7 +1403,7 @@ class APUG2SourceProgram:
                 "launches": launches,
                 "plan": self.manifest(),
                 "estimate_cycles": self.plan.estimate_cycles,
-                "cost_model": self.cost.spec.name,
+                "cost_model": None if self.cost is None else self.cost.spec.name,
                 "repetitions": self._repetitions,
                 "cycles_scope": (
                     "sum over launches of round(device pipeline ticks / "
@@ -1367,43 +1413,148 @@ class APUG2SourceProgram:
         )
 
 
-def compile_apu_g2_source_workload(
-    workload,
-    target,
-    *,
-    cost,
-    backend=None,
-    host_moves=None,
-    layout=None,
-    program=None,
-):
-    """``allo.compile`` planner for ordinary source workloads on ``apu_v2``.
+def _plan_repetitions(plan) -> int:
+    for launch in plan.launches:
+        value = getattr(launch.program, "repetitions", None)
+        if value is not None:
+            return int(value)
+    return 256
 
-    ``program`` is the :class:`allo.spmw_pipeline.SourceProgram` produced by
-    the shared front stages (frontend, matcher, coverage, semantic analysis);
-    when omitted those stages run here, so the function is also usable on
-    its own.  The Gemini-II contract is derived from the shared facts and the
-    composed-dot launch plans are enumerated, priced and selected.
-    """
 
-    from ..spmw_pipeline import normalize_source
+def rebuild_apu_g2_launch_plan(contract, plan, *, repetitions):
+    """The same plan (fusion, chunks, tiles) with another repetition count."""
+    plans, _rejected = enumerate_apu_g2_launch_plans(contract, repetitions=repetitions)
+    for candidate in plans:
+        if candidate.name == plan.name:
+            return candidate
+    raise ValueError(f"plan {plan.name!r} is no longer legal at {repetitions} reps")
 
-    if host_moves is not None:
-        raise ValueError(
-            "the Gemini-II source route derives its host packing; host_moves "
-            "is not accepted"
+
+@dataclass
+class APUG2SourceCandidate:
+    """The payload of one launch-plan candidate: the contract, the plan and
+    the whole enumerated catalog (shared by every candidate of the kernel)."""
+
+    contract: APUG2SourceContract
+    plan: APUG2LaunchPlan
+    catalog: tuple
+    rejected: tuple
+
+    @property
+    def name(self) -> str:
+        return self.plan.name
+
+    def decision(self) -> tuple:
+        """Name-free physical identity: fusion, chunking and every launch's
+        stream set, coordinates, reduction range and accumulator mode."""
+        return (
+            self.plan.fusion,
+            int(self.plan.reduction_chunks),
+            tuple(
+                (
+                    tuple(launch.streams),
+                    tuple(launch.coordinates),
+                    tuple(launch.reduction),
+                    launch.accumulator,
+                    launch.program.structural_fingerprint,
+                )
+                for launch in self.plan.launches
+            ),
         )
-    if layout is not None and not isinstance(layout, str):
-        raise TypeError("layout= on Gemini-II names a launch plan (a string)")
-    if not isinstance(cost, BoundCostSpec) or cost.target is not target:
-        raise TypeError("the Gemini-II source route requires a target-bound cost")
-    if program is None:
-        program = normalize_source(workload, target)
-    contract = analyze_apu_g2_source(program.program_facts())
-    compiled = APUG2SourceProgram(
-        contract, target, cost, backend=backend, layout=layout
-    )
-    return program.schedule, program.trace, compiled
+
+    def matches_request(self, request) -> bool:
+        return isinstance(request, str) and request == self.plan.name
+
+    def effects(self) -> dict[str, object]:
+        """Scheduling effects visible through the shared candidate contract."""
+        contract = self.contract
+        return {
+            "coverage": {
+                "function": contract.function,
+                "streams": len(contract.streams),
+                "epilogue": "pair_affine" if contract.pair_affine else None,
+                "outputs": list(contract.outputs),
+            },
+            "value_layouts": [
+                {
+                    "stream": index,
+                    "packing": stream.packing_form,
+                    "result_extents": list(stream.result_extents),
+                    "reduction_extent": stream.reduction_extent,
+                }
+                for index, stream in enumerate(contract.streams)
+            ],
+            "transfers": [
+                "host packing of every launch's lhs/rhs carriers",
+                "device result readback per launch",
+            ],
+            "launch_order": [
+                (list(launch.streams), list(launch.coordinates), launch.accumulator)
+                for launch in self.plan.launches
+            ],
+            "abi": {
+                "inputs": [
+                    name for name in contract.parameters if name not in contract.outputs
+                ],
+                "outputs": list(contract.outputs),
+            },
+            "device_scope": "one Gemini-II card, launches back to back",
+        }
+
+
+def apu_g2_source_candidates(target, matches) -> list:
+    """``autoschedule`` enumerator for ``apu_v2``: the composed-dot launch
+    plans of the matched contraction family, derived from the shared
+    semantic facts (one ``Placement`` per structurally legal plan).
+
+    ``target`` is the matcher view; its ``mmb`` segments are the storage the
+    legality stage checks the operands against (inputs in ``seg0``,
+    accumulators in ``seg1``).
+    """
+    from ..spmw_autoschedule import Placement
+
+    facts = matches[0].extra.get("program_facts")
+    if facts is None:
+        # The facts are stamped on the entry function's matches only; a
+        # match without them lives in a dataflow kernel (or came from a
+        # hand-built trace).
+        raise APUG2SourceRouteError(
+            f"matched code lives in '{matches[0].func_name}', not the entry "
+            "function (dataflow regions and work grids are not lowered; the "
+            "shared semantic facts of the entry function are required)"
+        )
+    contract = analyze_apu_g2_source(facts)
+    plans, rejected = enumerate_apu_g2_launch_plans(contract)
+    catalog = tuple(plans)
+    seg0, seg1 = target.mmb["seg0"], target.mmb["seg1"]
+    registers = {}
+    for contraction in facts.contractions:
+        for access in contraction.inputs:
+            if access.memref_name is not None:
+                registers.setdefault(access.memref_name, seg0)
+        if contraction.accumulator.memref_name is not None:
+            registers[contraction.accumulator.memref_name] = seg1
+    for epilogue in facts.epilogues:
+        if epilogue.result.memref_name is not None:
+            registers[epilogue.result.memref_name] = seg1
+    placements = []
+    for plan in plans:
+        payload = APUG2SourceCandidate(contract, plan, catalog, tuple(rejected))
+        placements.append(
+            Placement(
+                placements=dict(registers),
+                mode=plan.name,
+                extra={
+                    "candidate_plan": plan.name,
+                    "candidate_decision": payload.decision(),
+                    "payload": payload,
+                    "whole_device_launch": True,
+                    "launch_count": len(plan.launches),
+                    **payload.effects(),
+                },
+            )
+        )
+    return placements
 
 
 __all__ = [
@@ -1416,11 +1567,13 @@ __all__ = [
     "APUG2SourceProgram",
     "APUG2SourceRouteError",
     "APUG2SourceStream",
+    "APUG2SourceCandidate",
     "analyze_apu_g2_source",
+    "apu_g2_source_candidates",
     "apu_g2_source_oracle",
     "apu_g2_stream_dots",
-    "compile_apu_g2_source_workload",
     "enumerate_apu_g2_launch_plans",
     "price_apu_g2_launch_plan",
     "rank_apu_g2_launch_plans",
+    "rebuild_apu_g2_launch_plan",
 ]

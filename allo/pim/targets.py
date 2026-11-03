@@ -1451,6 +1451,11 @@ def build_apu_v2_target():
                 verb=allo.move_only,
             )
 
+    # The hardware description declares only unmatchable typed primitives;
+    # ordinary source is matched against the source-idiom view, a declared
+    # property of the target the shared pipeline consults
+    # (`allo.spmw_pipeline.matcher_view`).
+    device.spmw_match_view = build_apu_g2_contraction_patterns()
     return device
 
 
@@ -1466,9 +1471,14 @@ def build_apu_g2_contraction_patterns():
     recipes:
 
     * ``MAC``: ``acc += x * y``, one integer dot-product reduction;
-    * ``AXPBY``: ``alpha * x + beta * y`` with literal coefficients, the
-      two-term epilogue realized by ``MUL_TYPED``,
-      ``COPY_ODD_TO_EVEN_VECTORS`` and ``ADD_TYPED`` over interleaved dots.
+    * ``AXPBY``: ``alpha * x + beta * y`` with literal coefficients over two
+      accumulators (``seg1`` operands), the two-term epilogue realized by
+      ``MUL_TYPED``, ``COPY_ODD_TO_EVEN_VECTORS`` and ``ADD_TYPED`` over
+      interleaved dots.
+
+    The view is also what the shared legality stage checks candidate
+    placements against: a ``MAC`` reads its inputs from ``seg0`` and
+    accumulates in ``seg1``.
 
     It carries no cost rules and is never executed; costs and execution use
     the hardware target.
@@ -1506,7 +1516,7 @@ def build_apu_g2_contraction_patterns():
                 # type, wider than the accumulators, which this declares.
                 allo.op(
                     "AXPBY",
-                    src=(seg0, seg0),
+                    src=(seg1, seg1),
                     dst=seg1,
                     fn=lambda x, y, alpha, beta: alpha * x + beta * y,
                     const_params=("alpha", "beta"),
@@ -1520,15 +1530,13 @@ def build_apu_g2_target():
     """Preferred hardware name for :func:`build_apu_v2_target`.
 
     ``target.name`` remains ``"apu_v2"`` so existing Tenon registries and
-    archived results keep a stable backend key.  The hardware description
-    declares only unmatchable typed primitives; ordinary source is matched
-    against the source-idiom view (`build_apu_g2_contraction_patterns`),
-    which the shared pipeline finds through ``spmw_match_view``.
+    archived results keep a stable backend key.  Both builders return a
+    target whose ``spmw_match_view`` is the source-idiom view
+    (`build_apu_g2_contraction_patterns`) the shared pipeline matches
+    ordinary source against.
     """
 
-    device = build_apu_v2_target()
-    device.spmw_match_view = build_apu_g2_contraction_patterns()
-    return device
+    return build_apu_v2_target()
 
 
 # --------------------------------------------------------------------- #

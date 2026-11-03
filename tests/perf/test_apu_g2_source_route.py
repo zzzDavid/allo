@@ -150,7 +150,7 @@ def paper():
 
 
 def _random_args(compiled, rng, *, carried_bits=None):
-    contract = compiled.compiled.contract
+    contract = compiled.contract
     args = {}
     outputs = set(contract.outputs)
     for name in contract.parameters:
@@ -179,8 +179,8 @@ def _random_args(compiled, rng, *, carried_bits=None):
 @pytest.mark.parametrize("name", sorted(PAPER_KERNELS))
 def test_paper_kernel_selects_the_artifact_program(paper, name):
     compiled = paper[name]
-    plan = compiled.compiled.plan
-    assert compiled.compiled.selection == "cost"
+    plan = compiled.plan
+    assert compiled.selection == "cost"
     assert len(plan.launches) == 1
     (launch,) = plan.launches
     _case, layout, program, recipe = ARTIFACT[name]
@@ -189,14 +189,16 @@ def test_paper_kernel_selects_the_artifact_program(paper, name):
     assert build_apu_g2_composed_recipe(launch.program).structural_fingerprint == recipe
     assert plan.estimate_validity == "calibrated"
     # The selected plan is the cheapest legal one; the others are kept.
-    estimates = [item["estimate_cycles"] for item in compiled.placement_ranking]
+    estimates = [
+        item["estimate_cycles"] for item in compiled.backend_program.placement_ranking
+    ]
     assert estimates == sorted(estimates)
-    assert compiled.placement_ranking[0]["plan"] == plan.name
+    assert compiled.backend_program.placement_ranking[0]["plan"] == plan.name
 
 
 def test_paper_kernel_derivations(paper):
     forms = {
-        name: [s.packing_form for s in compiled.compiled.contract.streams]
+        name: [s.packing_form for s in compiled.contract.streams]
         for name, compiled in paper.items()
     }
     assert forms == {
@@ -212,19 +214,21 @@ def test_paper_kernel_derivations(paper):
             "pack_apu_g2_matrix_vector_dots(transpose=True)",
         ],
     }
-    gesummv = paper["gesummv"].compiled
+    gesummv = paper["gesummv"]
     assert gesummv.contract.coefficients == (3, 2)
     assert gesummv.plan.name == "fused/k1"
-    assert [p["plan"] for p in gesummv.placement_ranking] == ["fused/k1"]
-    bicg = paper["bicg"].compiled
+    assert [p["plan"] for p in gesummv.backend_program.placement_ranking] == [
+        "fused/k1"
+    ]
+    bicg = paper["bicg"]
     assert [s.output for s in bicg.contract.streams] == ["q", "s"]
-    assert {p["plan"] for p in bicg.placement_ranking} == {
+    assert {p["plan"] for p in bicg.backend_program.placement_ranking} == {
         "fused/k1",
         "fused/k2",
         "separate/k1",
         "separate/k2",
     }
-    mvt = paper["mvt"].compiled
+    mvt = paper["mvt"]
     assert [s.accumulator for s in mvt.contract.streams] == ["carried"] * 2
     (launch,) = mvt.plan.launches
     assert launch.program.epilogue.accumulator_type == APUG2ScalarType(14, True)
@@ -253,8 +257,8 @@ def test_paper_kernel_packing_equals_host_helpers(paper, name):
     compiled = paper[name]
     rng = np.random.default_rng(11)
     args = _random_args(compiled, rng, carried_bits=14)
-    (packed,) = compiled.compiled.pack(**args)
-    (launch,) = compiled.compiled.plan.launches
+    (packed,) = compiled.pack(**args)
+    (launch,) = compiled.plan.launches
     lhs, rhs = _helper_dots(name, args)
     program = launch.program
     lhs = lhs.astype(program.input_types[0].numpy_dtype)
@@ -303,7 +307,7 @@ def test_paper_kernel_packing_is_byte_identical_to_the_campaign(paper, name):
     if not (ARTIFACT_ROOT / "inputs" / case).is_dir():
         pytest.skip(f"artifact {ARTIFACT_ROOT} is not present")
     compiled = paper[name]
-    contract = compiled.compiled.contract
+    contract = compiled.contract
     fixture = {key.lower(): value for key, value in _artifact_fixture(case).items()}
     args = {
         parameter: (
@@ -313,7 +317,7 @@ def test_paper_kernel_packing_is_byte_identical_to_the_campaign(paper, name):
         )
         for parameter in contract.parameters
     }
-    (packed,) = compiled.compiled.pack(**args)
+    (packed,) = compiled.pack(**args)
     digests = tuple(
         (
             None
@@ -323,7 +327,7 @@ def test_paper_kernel_packing_is_byte_identical_to_the_campaign(paper, name):
         for key in ("lhs", "rhs", "auxiliary")
     )
     assert digests == ARTIFACT_PACKED[name]
-    arrays, initial = compiled.compiled._validated_inputs(args)
+    arrays, initial = compiled.backend_program._validated_inputs(args)
     oracle = apu_g2_source_oracle(contract, arrays, initial)
     serialized = np.concatenate(
         [oracle[output].reshape(-1) for output in contract.outputs]
@@ -421,27 +425,25 @@ def gemm_transposed_lhs(A: int4[128, 64], B: int4[128, 32], C: int15[64, 32]):
 
 def test_rename_only_variant_compiles_to_the_same_program(paper):
     renamed = _compile(renamed_gesummv)
-    (launch,) = renamed.compiled.plan.launches
-    (original,) = paper["gesummv"].compiled.plan.launches
+    (launch,) = renamed.plan.launches
+    (original,) = paper["gesummv"].plan.launches
     assert (
         launch.program.structural_fingerprint == original.program.structural_fingerprint
     )
     assert launch.layout_fingerprint == original.layout_fingerprint
     in_place = _compile(gemm_accumulate_in_place)
-    (launch,) = in_place.compiled.plan.launches
+    (launch,) = in_place.plan.launches
     assert launch.program.structural_fingerprint == ARTIFACT["gemm"][2]
     wide = _compile(gemm_wide_containers)
-    (launch,) = wide.compiled.plan.launches
+    (launch,) = wide.plan.launches
     assert launch.program.structural_fingerprint == ARTIFACT["gemm"][2]
 
 
 def test_nearby_shapes_compile_and_tile_beyond_one_carrier():
     exact = _compile(gemm_n32)
-    assert [
-        len(p.launches) for p in exact.compiled.ranking if p.name == "single/k1"
-    ] == [1]
+    assert [len(p.launches) for p in exact.ranking if p.name == "single/k1"] == [1]
     beyond = _compile(gemm_n33)
-    plans = {plan.name: plan for plan in beyond.compiled.ranking}
+    plans = {plan.name: plan for plan in beyond.ranking}
     # 2112 dots exceed the 2048-dot K=128 carrier: output tiles 2048 + 64 ...
     assert [l.coordinates for l in plans["single/k1"].launches] == [
         (0, 2048),
@@ -449,18 +451,18 @@ def test_nearby_shapes_compile_and_tile_beyond_one_carrier():
     ]
     # ... or one 4096-dot K=64 carrier per reduction chunk, chained exactly.
     assert [l.accumulator for l in plans["single/k2"].launches] == ["none", "previous"]
-    assert beyond.compiled.plan.name == "single/k2"
-    assert beyond.compiled.plan.estimate_validity == "extrapolated"
+    assert beyond.plan.name == "single/k2"
+    assert beyond.plan.estimate_validity == "extrapolated"
     m512 = _compile(gesummv_m512)
-    assert m512.compiled.plan.launches[0].program.output_shape == (512,)
+    assert m512.plan.launches[0].program.output_shape == (512,)
     k512 = _compile(bicg_n512)
-    assert k512.compiled.plan.name == "fused/k2"
-    assert [l.program.reduction_extent for l in k512.compiled.plan.launches] == [
+    assert k512.plan.name == "fused/k2"
+    assert [l.program.reduction_extent for l in k512.plan.launches] == [
         256,
         256,
     ]
     transposed = _compile(gemm_transposed_lhs)
-    assert transposed.compiled.contract.streams[0].packing_form == "broadcast_gather"
+    assert transposed.contract.streams[0].packing_form == "broadcast_gather"
 
 
 def k96(A: int4[64, 96], x: int4[96], y: int15[64]):
@@ -582,12 +584,13 @@ def test_unsupported_forms_raise_a_finite_error(workload, reason, shared):
 
 def test_layout_forces_a_named_plan_and_rejects_unknown_names():
     forced = _compile(PAPER_KERNELS["bicg"], layout="separate/k1")
-    assert forced.compiled.selection == "forced"
-    assert len(forced.compiled.plan.launches) == 2
-    with pytest.raises(ValueError, match="names no legal plan"):
+    assert forced.selection == "forced"
+    assert len(forced.plan.launches) == 2
+    with pytest.raises(ValueError, match="names no candidate"):
         _compile(PAPER_KERNELS["bicg"], layout="fused/k3")
-    with pytest.raises(ValueError, match="host_moves"):
-        _compile(PAPER_KERNELS["bicg"], host_moves=[])
+    # An empty host-move list is "no explicit moves" on every target; the
+    # launch plans derive their own host packing.
+    assert _compile(PAPER_KERNELS["bicg"], host_moves=[]).plan.name == "fused/k1"
 
 
 def test_composed_record_beyond_one_carrier_names_the_capacity():
@@ -630,11 +633,7 @@ def test_virtual_run_is_labelled_and_leaves_outputs(paper):
     result = compiled(**args)
     assert result.kind == "virtual"
     assert result.backend == "virtual"
-    assert (
-        result.cycles
-        == compiled.compiled.plan.estimate_cycles
-        == compiled.estimate().cycles
-    )
+    assert result.cycles == compiled.plan.estimate_cycles == compiled.estimate().cycles
     assert result.extra["cost_model"] == "apu_g2_cost"
     assert result.extra["estimate_validity"] == "calibrated"
     np.testing.assert_array_equal(args["C"], before)
@@ -642,7 +641,7 @@ def test_virtual_run_is_labelled_and_leaves_outputs(paper):
 
 def test_estimates_depend_on_shape():
     def estimate(workload):
-        return _compile(workload).compiled.plan.estimate_cycles
+        return _compile(workload).plan.estimate_cycles
 
     def gemm_k64(A: int4[64, 64], B: int4[64, 31], C: int15[64, 31]):
         for i in range(64):
@@ -666,7 +665,7 @@ def test_estimates_depend_on_shape():
     # Within one carrier every VL64 call covers all 262,144 lanes, so the dot
     # count does not change device time; beyond it, launches add up.
     assert estimate(gemm_n32) == base
-    two_tiles = _compile(gemm_n33).compiled.ranking
+    two_tiles = _compile(gemm_n33).ranking
     assert {p.name: p.estimate_cycles for p in two_tiles}["single/k1"] == 2 * base
 
 
@@ -678,17 +677,17 @@ def test_cost_perturbation_changes_estimate_and_selection():
     assert perturbed.bind(target).fingerprint != apu_g2_cost.bind(target).fingerprint
     base = _compile(PAPER_KERNELS["gemm"])
     moved = _compile(PAPER_KERNELS["gemm"], cost=perturbed)
-    assert moved.compiled.plan.estimate_cycles > base.compiled.plan.estimate_cycles
+    assert moved.plan.estimate_cycles > base.plan.estimate_cycles
     # Same program either way: legality and lowering ignore the cost.
     assert (
-        moved.compiled.plan.launches[0].program.structural_fingerprint
-        == base.compiled.plan.launches[0].program.structural_fingerprint
+        moved.plan.launches[0].program.structural_fingerprint
+        == base.plan.launches[0].program.structural_fingerprint
     )
     # 64x128x33: the reduction split wins under the calibrated model; making
     # row sweeps (which the split's accumulate epilogue adds) 20x dearer flips
     # the selection to output tiling.
-    assert _compile(gemm_n33).compiled.plan.name == "single/k2"
-    assert _compile(gemm_n33, cost=perturbed).compiled.plan.name == "single/k1"
+    assert _compile(gemm_n33).plan.name == "single/k2"
+    assert _compile(gemm_n33, cost=perturbed).plan.name == "single/k1"
 
 
 # --------------------------------------------------------------------------- #
@@ -847,7 +846,7 @@ def _reference(name, args):
 def test_emulated_device_run_writes_exact_outputs(emulated_card, name):
     workload = gemm_n33 if name == "gemm_n33" else PAPER_KERNELS[name]
     compiled = _compile(workload)
-    compiled.compiled.repetitions = 20
+    compiled.repetitions = 20
     args = _random_args(compiled, np.random.default_rng(5), carried_bits=14)
     expected = _reference(name, args)
     result = compiled(**args)
@@ -855,9 +854,9 @@ def test_emulated_device_run_writes_exact_outputs(emulated_card, name):
     for output, value in expected.items():
         np.testing.assert_array_equal(args[output], value)
     launches = result.extra["launches"]
-    assert len(launches) == len(compiled.compiled.plan.launches)
+    assert len(launches) == len(compiled.plan.launches)
     assert result.cycles == 1000 * len(launches)
-    for record, launch in zip(launches, compiled.compiled.plan.launches):
+    for record, launch in zip(launches, compiled.plan.launches):
         assert record["layout_fingerprint"] == launch.layout_fingerprint
         assert (
             record["packing_attestation"]["layout_fingerprint"]
@@ -894,7 +893,7 @@ def test_fingerprint_mismatch_is_refused_before_launch(emulated_card):
     import allo.pim.apu_g2_composed_runtime as runtime
 
     compiled = _compile(PAPER_KERNELS["gemm"])
-    (launch,) = compiled.compiled.plan.launches
+    (launch,) = compiled.plan.launches
     lhs = np.zeros(launch.program.dot_shape, dtype=np.int8)
     with pytest.raises(RuntimeError, match="fingerprint mismatch"):
         runtime.run_apu_g2_composed(

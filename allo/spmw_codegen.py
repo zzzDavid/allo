@@ -920,6 +920,12 @@ def _run_virtual(compiled: "Compiled", **inputs) -> RunResult:
     """
     if compiled.cost is None or compiled.execution_graph is None:
         raise RuntimeError("virtual execution requires an executable CostSpec")
+    # A backend context may refuse inputs the selected program could not take
+    # on an executing route (an initial output a plan resets): checked, never
+    # written.
+    check = getattr(getattr(compiled, "layout_ctx", None), "virtual_run_check", None)
+    if callable(check):
+        check(inputs)
     estimate = compiled.cost.evaluate(compiled.execution_graph)
     extra = {
         "critical_path": list(estimate.critical_path),
@@ -1180,6 +1186,7 @@ _BACKENDS: dict[str, tuple[str, str, str | None]] = {
     "samsung_hbm_pim": ("allo.spmw_samsung", "SamsungCtx", "_run_samsung"),
     "aim": ("allo.spmw_aim", "AimCtx", "_run_aim"),
     "apu_v1": ("allo.spmw_apu_v1", "APUv1Ctx", "_run_apu_v1"),
+    "apu_v2": ("allo.spmw_apu_g2", "APUG2SourceCtx", "_run_apu_g2"),
     "upmem": ("allo.spmw_upmem", "UpmemCtx", "_run_upmem"),
     # Analytical-only: the runner raises (no device, no in-package simulator).
     "attacc": ("allo.spmw_attacc", "AttAccCtx", "_run_attacc"),
@@ -1266,8 +1273,11 @@ def __getattr__(name):
 #     (tests/pim/test_aim_axis_roles.py `gemv_single`).
 #   attacc: the `attacc_tiling` knob maps a single item over one device's
 #     channels and units (allo/pim/attacc_tiling.py).
-# apu_v1 is not listed: its scalar mapping is a coalesced VR partition axis,
-# accepted by its own branch below.
+# apu_v1 and apu_v2 are not listed: a dataflow region's scalar mapping on
+# apu_v1 is a coalesced VR partition axis, accepted by its own branch below;
+# a plain-function contraction on either APU is a single item only through a
+# candidate that declares ``extra["whole_device_launch"]`` (the vector plans
+# and the composed-dot launch plans decompose the one item over the device).
 _SINGLE_ITEM_LAUNCH_BACKENDS = frozenset({"samsung_hbm_pim", "upmem", "aim", "attacc"})
 # Backends that map a 1-D grid of n items (n <= the OUTERMOST extent) onto
 # disjoint groups of outermost units:
@@ -1281,7 +1291,7 @@ _SINGLE_ITEM_LAUNCH_BACKENDS = frozenset({"samsung_hbm_pim", "upmem", "aim", "at
 _OUTER_SUBSET_LAUNCH_BACKENDS = frozenset({"upmem", "aim"})
 
 
-def _check_work_grid(target, trace, *, auto_fill=False):
+def _check_work_grid(target, trace, *, auto_fill=False, layouts=None):
     """Check that every kernel's declared work grid maps onto the target's
     unit tree in a form the backend executes; raise ValueError otherwise.
     Returns the work-item count of a single-kernel trace (the derived
@@ -1309,6 +1319,9 @@ def _check_work_grid(target, trace, *, auto_fill=False):
     match no unit level) raises: no unit mapping exists for it, and the
     cost program's one-stream-per-unit graph would misprice it.  Nothing
     is auto-filled; `auto_fill` is accepted for compatibility and ignored.
+    ``layouts`` are the selected placements: a single item is also accepted
+    when every selected placement declares ``extra["whole_device_launch"]``
+    (a backend candidate plan that decomposes the one item over the device).
     Backend partition checks that need the workload (Samsung row coverage,
     `SamsungCtx._covered_contraction`) still apply on top of this one.
     """
@@ -1328,8 +1341,14 @@ def _check_work_grid(target, trace, *, auto_fill=False):
     for _scope, matches in buckets:
         groups.setdefault(_matcher_work_scope(matches[0]).group_id, []).append(matches)
     prefixes = [factors[:n] for n in range(1, len(factors) + 1)]
+    whole_device = bool(layouts) and all(
+        (getattr(layout, "extra", None) or {}).get("whole_device_launch")
+        for layout in layouts
+    )
     single_ok = (
-        target.name in _SINGLE_ITEM_LAUNCH_BACKENDS or target.name not in _BACKENDS
+        target.name in _SINGLE_ITEM_LAUNCH_BACKENDS
+        or target.name not in _BACKENDS
+        or whole_device
     )
     problems = []
     for group_id, group in groups.items():
@@ -1530,6 +1549,61 @@ def _materialize_matcher_codegen(
     )
 
 
+def _select_named_candidates(view, trace, request):
+    """Without a cost program, ``layout=request`` must designate exactly one
+    legal candidate of every kernel; those candidates are the program."""
+
+    from .spmw_autoschedule import (
+        _ENUMERATORS,
+        _bucket_for_autoschedule,
+        derive_layout_properties,
+        select_candidates,
+    )
+    from .spmw_legality import check_placement
+
+    enumerator = _ENUMERATORS.get(getattr(view, "name", None))
+    if enumerator is None:
+        raise NotImplementedError(
+            f"no autoscheduler enumerator registered for target "
+            f"{getattr(view, 'name', None)!r}"
+        )
+    layouts = []
+    for _scope, matches in _bucket_for_autoschedule(trace):
+        candidates = select_candidates(enumerator(view, matches), request, matches)
+        chosen = [
+            candidate
+            for candidate in candidates
+            if not candidate.extra.get("candidate_excluded")
+            and check_placement(view, matches, candidate).legal
+        ]
+        if len(chosen) != 1:
+            names = sorted(candidate.mode for candidate in chosen)
+            raise ValueError(
+                f"layout={request!r} designates {len(chosen)} legal candidates of "
+                f"kernel {matches[0].func_name!r} ({names}); pass a cost program to "
+                "rank them or name one candidate"
+            )
+        (placement,) = chosen
+        placement.extra = derive_layout_properties(view, placement)
+        layouts.append(placement)
+    return layouts
+
+
+def carried_accumulator_message(target_name: str, match) -> str:
+    """Why a backend that zeroes its accumulator cannot lower ``y[i] += ...``."""
+    return (
+        f"{target_name}: {match.target_op_name} in {match.func_name!r} "
+        f"accumulates into {match.result_memref_name!r}, a caller-provided "
+        "buffer the kernel never initializes (the `y[i] += ...` form, "
+        "accumulator_init='carried'). This device zeroes its accumulator "
+        "before each reduction, so the caller's initial value would be "
+        "lost. Initialize a local accumulator with literal 0 before the "
+        "reduction loop and store it to the output "
+        "(`acc = 0; for k: acc += ...; y[i] = acc`); lowering the carried "
+        "form with a host epilogue add is not implemented."
+    )
+
+
 def compile_for_target(
     target: Any,
     trace: MatchTrace,
@@ -1548,7 +1622,11 @@ def compile_for_target(
     placements. If ``layout`` is a single `Placement`, it is broadcast
     across every kernel (back-compat for single-layer tests). If
     ``layout`` is a list, its length must equal the number of
-    `@allo.work` kernels in the trace.
+    `@allo.work` kernels in the trace.  Any other ``layout`` (a candidate
+    name, a candidate family name or a backend plan object such as an
+    ``APUV1Plan``) selects among the autoscheduler's candidates
+    (`spmw_autoschedule.select_candidates`); the ranking runs over the
+    selected subset.
 
     ``backend="virtual"`` executes the supplied CostSpec without a simulator.
 
@@ -1588,7 +1666,9 @@ def compile_for_target(
     checked_trace = require_match_coverage(trace, target=target, module=module)
     # Samsung is not listed: its REDUCE candidates are pruned for a carried
     # accumulator and the ordered TEMPORAL program loads the initial value.
-    if target_name in ("aim", "apu_v1"):
+    # APU v1's grouped program of a dataflow region refuses a carried
+    # accumulator in its enumerator; its vector plans carry the output.
+    if target_name == "aim":
         carried = [
             match
             for match in checked_trace.matches
@@ -1596,24 +1676,28 @@ def compile_for_target(
         ]
         if carried:
             first = carried[0]
-            raise NotImplementedError(
-                f"{target_name}: {first.target_op_name} in {first.func_name!r} "
-                f"accumulates into {first.result_memref_name!r}, a caller-provided "
-                "buffer the kernel never initializes (the `y[i] += ...` form, "
-                "accumulator_init='carried'). This device zeroes its accumulator "
-                "before each reduction, so the caller's initial value would be "
-                "lost. Initialize a local accumulator with literal 0 before the "
-                "reduction loop and store it to the output "
-                "(`acc = 0; for k: acc += ...; y[i] = acc`); lowering the carried "
-                "form with a host epilogue add is not implemented."
-            )
+            raise NotImplementedError(carried_accumulator_message(target_name, first))
+
+    from .spmw_pipeline import matcher_view
+
+    # Legality reads the target's declarations through its matcher view (the
+    # target itself for every backend but Gemini-II).
+    view = matcher_view(target)
+    explicit_layout = layout is not None and (
+        isinstance(layout, Placement)
+        or (
+            isinstance(layout, (list, tuple))
+            and all(isinstance(item, Placement) for item in layout)
+        )
+    )
+    candidate_filter = None if layout is None or explicit_layout else layout
 
     # Placement legality (release audit C-01): a caller-supplied layout must
     # respect the target's access scopes, operand patterns and moves.
-    if layout is not None:
+    if explicit_layout:
         from .spmw_legality import check_layouts
 
-        check_layouts(target, trace, layout).raise_if_illegal("user-supplied layout")
+        check_layouts(view, trace, layout).raise_if_illegal("user-supplied layout")
 
     # A virtual-only target needs no code generator. Its executable cost spec
     # lowers the trace directly to the retained handle-based graph.
@@ -1675,7 +1759,18 @@ def compile_for_target(
     buckets = _bucket_for_autoschedule(trace)
     n_groups = len(buckets) or 1
 
-    if layout is None:
+    if not explicit_layout and cost is None:
+        # No cost program: a request that names exactly one candidate per
+        # kernel is materialized without ranking; anything else needs the
+        # ranking (and therefore a cost program).
+        if candidate_filter is None:
+            raise ValueError(
+                f"target {target_name!r}: candidates are selected by cost ranking; "
+                "pass an executable cost program (allo.pim.costs) or choose a "
+                "candidate with layout=<name>"
+            )
+        layouts = _select_named_candidates(view, trace, candidate_filter)
+    elif not explicit_layout:
         layouts = autoschedule(
             target,
             trace,
@@ -1683,6 +1778,7 @@ def compile_for_target(
             host_moves=resolved_host_moves,
             buffer_metrics=buffer_metrics,
             launch_schedule=launch_schedule,
+            candidate_filter=candidate_filter,
         )
     elif isinstance(layout, Placement):
         # Single layout: replicate across every kernel. Equivalent to
@@ -1696,18 +1792,18 @@ def compile_for_target(
             f"layout list has {len(layouts)} entries but trace has "
             f"{len(buckets)} @allo.work kernels"
         )
-    if layout is None:
+    if not explicit_layout:
         # The autoscheduler filtered its candidates; re-check what survived
         # the cross-kernel reconciliation.
         from .spmw_legality import check_layouts
 
-        check_layouts(target, trace, layouts).raise_if_illegal("autoscheduled layout")
+        check_layouts(view, trace, layouts).raise_if_illegal("autoscheduled layout")
 
     # The declared work grid must map onto the unit tree (release audit C-04).
     # Checked after selection so backend partition diagnostics raised while
     # materializing candidates (Samsung row coverage) report first.
     if hasattr(target, "work_grid"):
-        _check_work_grid(target, trace)
+        _check_work_grid(target, trace, layouts=layouts)
 
     ctx = ctx_cls(target)
     _walk_and_emit(
