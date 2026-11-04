@@ -79,11 +79,21 @@ Measured (`r33/access_stream_*.json`, `samsung_fiber_ab_trace_*.json`):
 | 4096x512 | dual_fiber (vendor) | 8,041 | 1,228 | 3 + 3 |
 | 4096x512 | bank_row | 7,947 | 1,248 | 7 |
 
-The fiber swizzle removes row changes and makes the bank-read phase
-faster (1.05x and 1.02x), the direction of the paper's mechanism; the full
-program is slower with it because the split fibers cost elsewhere (two
-MAC/JUMP loops, the odd-fiber staging), which the cost model prices and
-the default selection follows.
+What these numbers are and are not. The harness replay issues the
+stream's MAC and FILL addresses as ordinary reads with a barrier per
+group: no PIM mode, no PIM execution of the MAC, no host fills, drains,
+staging, CRF programming or mode changes. Its 1,188 against 1,248 is a
+diagnostic of the address sequence under the simulator's DRAM timing; it
+does not establish that the conductor's own bank-read phase is faster
+under `dual_fiber`, and it does not attribute the full-program difference
+(8,153 against 8,247) to any component. The "row changes" column counts
+address changes between successive MAC groups of one bank in the modelled
+stream; they are not measured row activations. Causal attribution of the
+full-program difference needs controlled simulator evidence (the
+conductor's per-phase cycle breakdown or its DRAM statistics under each
+placement), which this round did not produce; the cost model's
+`FIBER_TILE_CYCLES` surcharge for split fibers is an empirical term, not
+that attribution.
 
 ## The route for the paper row (not yet implemented)
 
