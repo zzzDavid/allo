@@ -448,6 +448,9 @@ class HostComputeStep:
     outputs: tuple = ()
     ordinal: int = 0
     function: object = None
+    # The semantic operation (``allo.spmw_target.HOST_OPERATIONS``): what
+    # the backends price and bind; ``name`` is a label.
+    operation: str = ""
 
     def volume(self, which: str) -> int:
         """Bytes of ``which`` ('inputs' or 'outputs')."""
@@ -491,6 +494,7 @@ class LaunchSchedule:
                     (
                         "host_compute",
                         step.name,
+                        step.operation,
                         tuple((n, tuple(sh or ()), int(b)) for n, sh, b in step.inputs),
                         tuple((n, tuple(sh or ()), int(b)) for n, sh, b in step.outputs),
                     )
@@ -649,6 +653,7 @@ def launch_schedule(host_program, trace, *, module=None) -> LaunchSchedule:
                     outputs,
                     sum(isinstance(step, HostComputeStep) for step in steps),
                     record.fn,
+                    record.operation,
                 )
             )
         else:
@@ -866,6 +871,7 @@ def build_execution_graph(
                 (),
                 {
                     "stage": step.name,
+                    "operation": step.operation,
                     "inputs": tuple((n, tuple(sh), int(b)) for n, sh, b in step.inputs),
                     "outputs": tuple((n, tuple(sh), int(b)) for n, sh, b in step.outputs),
                     "input_bytes": step.volume("inputs"),
@@ -873,7 +879,7 @@ def build_execution_graph(
                     "input_elements": step.elements("inputs"),
                     "output_elements": step.elements("outputs"),
                 },
-                {"phase": "host_compute", "stage": step.name},
+                {"phase": "host_compute", "stage": step.name, "operation": step.operation},
                 dependencies,
             )
         )

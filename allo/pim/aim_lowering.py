@@ -278,10 +278,16 @@ class AimHostStage(AimOp):
     outputs: tuple = ()
     name: str | None = None
     function: object = field(default=None, compare=False)
+    # The semantic operation (``allo.spmw_target.HOST_OPERATIONS``) the
+    # cost policy prices and the realization check binds; ``stage`` is the
+    # host program's label.
+    operation: str = ""
 
     def __post_init__(self):
         if not self.stage:
             raise ValueError("host stage needs a name")
+        if not self.operation:
+            raise ValueError(f"host stage {self.stage!r} declares no operation")
         if not self.inputs or not self.outputs:
             raise ValueError(f"host stage {self.stage!r} needs inputs and outputs")
         object.__setattr__(self, "inputs", tuple((n, tuple(sh), int(b)) for n, sh, b in self.inputs))
@@ -973,6 +979,7 @@ class _AimLowerer:
         return {
             "executes_on": "host",
             "stage": operation.stage,
+            "operation": operation.operation,
             "inputs": [list(item) for item in operation.inputs],
             "outputs": [list(item) for item in operation.outputs],
             # Read out of the GPR (the producers' RD_MAC entries) and written

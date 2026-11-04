@@ -1185,24 +1185,49 @@ class LaunchRecord:
 _launch_recorder_stack: list = []
 
 
+# The semantic operations a host stage may declare: the domain of the
+# backends' host-time policies.  ``name`` is a diagnostic label a host
+# program chooses freely; ``operation`` is what the stage computes and is
+# what every backend prices and binds.  A backend prices an operation it
+# supports (``allo.pim.costs.aim.HOST_OPERATION_PASSES``); an operation
+# outside this table is refused when the host program is recorded.
+HOST_OPERATIONS = {
+    "softmax": (
+        "row-wise softmax over the last axis of each input (an optional scalar "
+        "scale folded into the exponent), one output per input"
+    ),
+    "elementwise": "one pass of an elementwise function over each input",
+    "reduction": "a reduction over the last axis of each input",
+}
+
+
 class HostComputeRecord:
-    """One recorded ``allo.host_compute(name, fn, inputs, outputs)``: a host
-    computation between launches.  ``fn`` maps the input arrays (in the
-    order of ``inputs``) to the output arrays (in the order of ``outputs``);
-    ``inputs`` and ``outputs`` are whole-buffer ``BufferToken``s.  The step is
-    a declared stage of the program: the schedule orders it, the backend
-    represents and prices it (its readout and upload volumes and its host
-    time), the availability check requires its inputs to be produced before
-    it and lets its outputs reach a later launch through that launch's
-    declared host ingress, and the functional path executes ``fn``."""
+    """One recorded ``allo.host_compute(name, fn, inputs, outputs,
+    operation)``: a host computation between launches.  ``fn`` maps the
+    input arrays (in the order of ``inputs``) to the output arrays (in the
+    order of ``outputs``); ``inputs`` and ``outputs`` are whole-buffer
+    ``BufferToken``s; ``operation`` names the semantic operation from
+    :data:`HOST_OPERATIONS` (the backends' cost policies key on it, never on
+    ``name``).  The step is a declared stage of the program: the schedule
+    orders it, the backend represents and prices it (its readout and upload
+    volumes and its host time), the availability check requires its inputs
+    to be produced before it and lets its outputs reach a later launch
+    through that launch's declared host ingress, the realization check binds
+    the lowered stage to this record's computation and position, and the
+    functional path executes ``fn``."""
 
-    __slots__ = ("name", "fn", "inputs", "outputs")
+    __slots__ = ("name", "fn", "inputs", "outputs", "operation")
 
-    def __init__(self, name, fn, inputs, outputs):
+    def __init__(self, name, fn, inputs, outputs, operation):
         if not isinstance(name, str) or not name.isidentifier():
             raise ValueError(f"host_compute name must be an identifier, got {name!r}")
         if not callable(fn):
             raise TypeError("host_compute fn must be callable")
+        if operation not in HOST_OPERATIONS:
+            raise ValueError(
+                f"host_compute {name!r}: operation {operation!r} is not a declared "
+                f"host operation ({sorted(HOST_OPERATIONS)})"
+            )
         for role, tokens in (("inputs", inputs), ("outputs", outputs)):
             if not tokens:
                 raise ValueError(f"host_compute {name!r} declares no {role}")
@@ -1220,21 +1245,25 @@ class HostComputeRecord:
         self.fn = fn
         self.inputs = tuple(inputs)
         self.outputs = tuple(outputs)
+        self.operation = operation
 
     def __repr__(self):
         return (
-            f"HostComputeRecord({self.name!r}, inputs={[t.name for t in self.inputs]}, "
+            f"HostComputeRecord({self.name!r}, {self.operation}, "
+            f"inputs={[t.name for t in self.inputs]}, "
             f"outputs={[t.name for t in self.outputs]})"
         )
 
 
-def host_compute(name, fn, inputs=(), outputs=()):
+def host_compute(name, fn, inputs=(), outputs=(), *, operation):
     """Record a host computation inside a host program: ``fn(*inputs) ->
     outputs`` between launches (the global softmax between an attention's
-    QK and SV kernels).  Ordered with the surrounding launches and moves."""
+    QK and SV kernels).  ``operation`` is the semantic operation from
+    :data:`HOST_OPERATIONS`; ``name`` is a diagnostic label.  Ordered with
+    the surrounding launches and moves."""
     if not _launch_recorder_stack:
         raise RuntimeError("allo.host_compute(...) called outside a host_program scope")
-    rec = HostComputeRecord(name, fn, tuple(inputs), tuple(outputs))
+    rec = HostComputeRecord(name, fn, tuple(inputs), tuple(outputs), operation)
     _launch_recorder_stack[-1].append(rec)
     return rec
 

@@ -108,11 +108,14 @@ HOST_VECTOR_ADD_CYCLES = 1
 # plus host time: the inputs read out of the GPR and the outputs written
 # back cross the declared link (the readout and upload volumes), and the
 # host processes the inputs vector by vector (16 lanes) with a declared
-# number of vector passes per stage kind, each at HOST_VECTOR_ADD_CYCLES.
-# The softmax is four passes (row max, exp, row sum, divide).  The host time
-# is a declared model, not a measurement; the reproduction driver records
-# measured host samples beside it.
-HOST_STAGE_VECTOR_PASSES = {"softmax": 4}
+# number of vector passes per *semantic operation*
+# (``allo.spmw_target.HOST_OPERATIONS``; the stage's label never selects
+# the model), each at HOST_VECTOR_ADD_CYCLES.  The softmax is four passes
+# (row max, scaled exp, row sum, divide); an elementwise operation one; a
+# reduction one.  The host time is a declared model, not a measurement; the
+# reproduction driver records measured host samples beside it.
+HOST_OPERATION_PASSES = {"softmax": 4, "elementwise": 1, "reduction": 1}
+HOST_STAGE_VECTOR_PASSES = HOST_OPERATION_PASSES  # historical alias
 
 
 def _ceil_div(value, divisor):
@@ -206,24 +209,35 @@ def host_reduction_cycles(record, geometry):
     )
 
 
-def host_stage_cycles(record, geometry):
-    """Cycles of one ``AimHostStage`` under the declared link scenario and
-    host model: the readout and upload bytes over the link plus the host's
-    vector passes over the input elements.  A stage kind without a declared
-    pass count is refused rather than priced at zero."""
-    passes = HOST_STAGE_VECTOR_PASSES.get(record.stage)
+def host_stage_terms(record, geometry) -> dict:
+    """The two priced terms of one ``AimHostStage``, separately: the link
+    cycles of its readout and upload bytes under the declared link scenario,
+    and the host compute cycles of its declared operation's vector passes
+    over the input elements.  An operation without a declared pass count is
+    refused rather than priced at zero."""
+    passes = HOST_OPERATION_PASSES.get(record.operation)
     if passes is None:
         raise ValueError(
-            f"host stage {record.stage!r} has no declared host-time model "
-            f"(HOST_STAGE_VECTOR_PASSES declares {sorted(HOST_STAGE_VECTOR_PASSES)})"
+            f"host stage {record.stage!r} declares operation {record.operation!r}, "
+            f"which has no declared host-time model (HOST_OPERATION_PASSES "
+            f"declares {sorted(HOST_OPERATION_PASSES)})"
         )
     link_bytes = int(record.readout_bytes) + int(record.upload_bytes)
     vectors = _ceil_div(int(record.elements), geometry.lanes)
-    return (
-        HOST_LINK_FIXED_CYCLES
-        + _ceil_div(link_bytes, HOST_LINK_BYTES_PER_CYCLE)
-        + vectors * passes * HOST_VECTOR_ADD_CYCLES
-    )
+    return {
+        "link_cycles": HOST_LINK_FIXED_CYCLES + _ceil_div(link_bytes, HOST_LINK_BYTES_PER_CYCLE),
+        "compute_cycles": vectors * passes * HOST_VECTOR_ADD_CYCLES,
+        "link_bytes": link_bytes,
+        "vectors": vectors,
+        "passes": passes,
+    }
+
+
+def host_stage_cycles(record, geometry):
+    """Cycles of one ``AimHostStage``: its link term plus its compute term
+    (:func:`host_stage_terms`)."""
+    terms = host_stage_terms(record, geometry)
+    return terms["link_cycles"] + terms["compute_cycles"]
 
 
 def _slice_elements(shape, index):
@@ -313,8 +327,10 @@ def aim_cost(target):
             stage=str(metrics.get("stage")),
             inputs=tuple(metrics.get("inputs") or ()),
             outputs=tuple(metrics.get("outputs") or ()),
+            operation=str(metrics.get("operation") or ""),
         )
-        latency = host_stage_cycles(record, geometry)
+        terms = host_stage_terms(record, geometry)
+        latency = terms["link_cycles"] + terms["compute_cycles"]
         ctx.step(
             latency=latency,
             occupy=[ctx.use(host, cycles=latency)],

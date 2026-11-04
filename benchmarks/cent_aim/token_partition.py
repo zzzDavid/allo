@@ -85,7 +85,7 @@ from allo.pim.aim_lowering import (
     reference_partial_sums,
 )
 from allo.pim.costs import aim_cost
-from allo.pim.costs.aim import host_reduction_cycles, host_stage_cycles
+from allo.pim.costs.aim import host_reduction_cycles, host_stage_cycles, host_stage_terms
 from allo.pim.targets import build_aim_target
 from allo.spmw_autoschedule import (
     _aim_enumerate,
@@ -117,16 +117,42 @@ PAPER = {
 }
 
 
-def global_softmax(scores):
-    """The bridge's host computation: the global softmax over the token axis
-    of the QK scores, in FP32 on the host (row max subtracted, exp, row sum,
-    divide), rounded to BF16 for the upload to the SV kernel's GB vector.
-    The declared host-time model prices it as four vector passes
-    (``allo.pim.costs.aim.HOST_STAGE_VECTOR_PASSES``)."""
-    x = np.asarray(scores, dtype=np.float32)
-    x = x - x.max(axis=-1, keepdims=True)
-    e = np.exp(x)
-    return bf16_round(e / e.sum(axis=-1, keepdims=True))
+class ScaledSoftmax:
+    """The bridge's host computation: the scaled global softmax over the
+    token axis of the QK scores, ``softmax(scores / sqrt(head_dim))`` in
+    FP32 on the host (scale, row max subtracted, exp, row sum, divide),
+    rounded to BF16 for the upload to the SV kernel's GB vector.  The head
+    dimension is the actual one of the workload (the historical host
+    operation ``global_attention_softmax(scores, features)`` divided by
+    ``sqrt(features)``).  The declared host-time model prices the
+    ``softmax`` operation as four vector passes with the scale folded into
+    the exponent pass (``allo.pim.costs.aim.HOST_OPERATION_PASSES``).
+
+    One instance per workload: the recorded callable is the stage's
+    identity the realization check binds the lowered stage to.
+    """
+
+    operation = "softmax"
+
+    def __init__(self, head_dim):
+        if int(head_dim) <= 0:
+            raise ValueError("head_dim must be positive")
+        self.head_dim = int(head_dim)
+        self.scale = np.float32(1.0 / math.sqrt(self.head_dim))
+
+    def __call__(self, scores):
+        x = np.asarray(scores, dtype=np.float32) * self.scale
+        x = x - x.max(axis=-1, keepdims=True)
+        e = np.exp(x)
+        return bf16_round(e / e.sum(axis=-1, keepdims=True, dtype=np.float32))
+
+    def __repr__(self):
+        return f"ScaledSoftmax(head_dim={self.head_dim})"
+
+
+def global_softmax(scores, head_dim=HEAD_DIM):
+    """The scaled global softmax for ``head_dim`` (see :class:`ScaledSoftmax`)."""
+    return ScaledSoftmax(head_dim)(scores)
 
 
 def build_attention(heads, tokens, head_dim=HEAD_DIM, max_tokens=MAX_TOKENS, *, bridge=True):
@@ -177,9 +203,13 @@ def build_attention(heads, tokens, head_dim=HEAD_DIM, max_tokens=MAX_TOKENS, *, 
 
     if bridge:
 
+        softmax = ScaledSoftmax(Dh)
+
         def host(q, k_cache, scores, probs, v_cache, heads_out):
             allo.launch("attention_qk", q, k_cache, scores)
-            allo.host_compute("softmax", global_softmax, inputs=(scores,), outputs=(probs,))
+            allo.host_compute(
+                "softmax", softmax, inputs=(scores,), outputs=(probs,), operation="softmax"
+            )
             allo.launch("attention_sv", probs, v_cache, heads_out)
 
         program = allo.host_program(attention, resident=("q", "k_cache", "v_cache"))(host)
@@ -423,20 +453,31 @@ def functional_check(compiled, heads, tokens, *, seed=0, head_dim=HEAD_DIM):
     qk, sv = _entry(compiled, "attention_qk"), _entry(compiled, "attention_sv")
     stage = _stage(compiled)
     rng = np.random.default_rng(seed + 31 * heads + tokens)
-    scale = np.float32(0.1)
-    q = bf16_round(rng.standard_normal((heads, head_dim)).astype(np.float32) * scale)
-    K = bf16_round(rng.standard_normal((heads, tokens, head_dim)).astype(np.float32) * scale)
-    V = bf16_round(rng.standard_normal((heads, head_dim, tokens)).astype(np.float32) * scale)
+    # Unit-variance BF16 operands: the raw scores then have variance
+    # head_dim, so an unscaled softmax would saturate and the check would
+    # fail; the scale by 1/sqrt(head_dim) is exercised, not assumed.
+    q = bf16_round(rng.standard_normal((heads, head_dim)).astype(np.float32))
+    K = bf16_round(rng.standard_normal((heads, tokens, head_dim)).astype(np.float32))
+    V = bf16_round(rng.standard_normal((heads, head_dim, tokens)).astype(np.float32))
     replicas = int(qk["replicas"])
     scores = reference_outputs(qk, np.broadcast_to(K[None], (replicas, *K.shape)), np.broadcast_to(q[None], (replicas, *q.shape)))
     probs = stage.run(scores[0])[0]
     split = sv.get("reduction_partition") is not None
     out = reference_outputs(sv, np.broadcast_to(V[None], (int(sv["replicas"]), *V.shape)), np.broadcast_to(probs[None], (int(sv["replicas"]), *probs.shape)))
+    # The independent reference: scaled attention, softmax(q.K / sqrt(d)).V
+    # in float64, the scale from the workload's actual head dimension.
     reference_scores = np.einsum("hd,hld->hl", q.astype(np.float64), K.astype(np.float64))
-    reference_probs = np.exp(reference_scores - reference_scores.max(-1, keepdims=True))
+    scaled = reference_scores / math.sqrt(head_dim)
+    reference_probs = np.exp(scaled - scaled.max(-1, keepdims=True))
     reference_probs /= reference_probs.sum(-1, keepdims=True)
     reference = np.einsum("hl,hdl->hd", reference_probs, V.astype(np.float64))
     error = float(np.max(np.abs(out[0] - reference)) / np.max(np.abs(reference)))
+    # The same operands against an unscaled softmax: the discrepancy the
+    # inputs expose, recorded so the check is known to be sensitive.
+    unscaled_probs = np.exp(reference_scores - reference_scores.max(-1, keepdims=True))
+    unscaled_probs /= unscaled_probs.sum(-1, keepdims=True)
+    unscaled = np.einsum("hl,hdl->hd", unscaled_probs, V.astype(np.float64))
+    unscaled_error = float(np.max(np.abs(out[0] - unscaled)) / np.max(np.abs(reference)))
     tolerance = 2.0**-6
     if not error < tolerance:
         raise AssertionError(f"functional pipeline error {error} exceeds {tolerance}")
@@ -444,11 +485,27 @@ def functional_check(compiled, heads, tokens, *, seed=0, head_dim=HEAD_DIM):
         "evidence": "functional oracle, not the timing-only simulator",
         "pipeline": "reference_outputs(QK) -> stage.run -> " + ("reference_partial_sums(SV) + host merge" if split else "reference_outputs(SV)"),
         "stage": stage.stage,
+        "operation": stage.operation,
+        "head_dim": int(head_dim),
+        "reference": "softmax(q.K / sqrt(head_dim)).V in float64",
         "split": split,
         "max_rel_error": error,
+        "unscaled_reference_error": unscaled_error,
         "tolerance": tolerance,
         "seed": int(seed),
     }
+
+
+def measured_host_total(device_cycles, host_price, measured):
+    """Device cycles + the host reduction + the host stage's link term +
+    the measured median of the stage's computation (ns, 1 cycle = 1 ns):
+    the measured sample stands in for the modelled compute term only."""
+    return (
+        int(device_cycles)
+        + int(host_price["host_reduction_cycles"])
+        + int(host_price["host_stage_link_cycles"])
+        + int(measured["median_ns"])
+    )
 
 
 def host_stage_samples(compiled, heads, tokens, *, repeats=20, seed=0):
@@ -473,7 +530,7 @@ def host_stage_samples(compiled, heads, tokens, *, repeats=20, seed=0):
         "median_ns": samples[len(samples) // 2],
         "min_ns": samples[0],
         "samples_ns": samples,
-        "note": "1 simulated cycle = 1 ns at the simulator's declared rate; not in the priced graph",
+        "note": "stage.run only (the host computation); the stage's link term and the host reduction are modelled separately; 1 simulated cycle = 1 ns at the simulator's declared rate; not in the priced graph",
     }
 
 
@@ -707,16 +764,21 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
         stage = "host_price"
         host_steps = list(built.compiled.layout_ctx.host_steps)
         reduction_cycles = sum(host_reduction_cycles(s, geometry) for s in host_steps if isinstance(s, AimHostReduction))
-        stage_cycles = sum(host_stage_cycles(s, geometry) for s in host_steps if isinstance(s, AimHostStage))
+        stage_terms = [host_stage_terms(s, geometry) for s in host_steps if isinstance(s, AimHostStage)]
+        stage_link = sum(t["link_cycles"] for t in stage_terms)
+        stage_compute = sum(t["compute_cycles"] for t in stage_terms)
         record["host_price"] = {
             "unit": "cycles (1 cycle = 1 ns at the simulator's declared rate)",
             "host_reduction_cycles": reduction_cycles,
-            "host_stage_cycles": stage_cycles,
+            "host_stage_link_cycles": stage_link,
+            "host_stage_compute_cycles": stage_compute,
+            "host_stage_cycles": stage_link + stage_compute,
             "host_stages": [s.manifest() for s in host_steps if isinstance(s, AimHostStage)],
+            "host_stage_terms": stage_terms,
             "link_model": "32 B/cycle, zero fixed latency (allo.pim.costs.aim)",
             "no_double_counting": "readout = stage inputs, upload = stage outputs, partial readout = host reduction only",
         }
-        record["host_cycles"] = reduction_cycles + stage_cycles
+        record["host_cycles"] = reduction_cycles + stage_link + stage_compute
         record["completed"].append(stage)
         stage = "estimate"
         record["estimate_cycles"] = compile_program(
@@ -745,10 +807,11 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
                 raise RuntimeError(f"{label}: simulator reported cycles {result.cycles!r}")
             record["device_cycles"] = int(result.cycles)
             record["total_cycles"] = int(result.cycles) + record["host_cycles"]
-            record["total_cycles_measured_host_stage"] = (
-                int(result.cycles)
-                + record["host_price"]["host_reduction_cycles"]
-                + int(record["host_stage_measured"]["median_ns"])
+            # The measured-host total replaces only the modelled compute term
+            # with the measured median of stage.run; the stage's link term
+            # (readout + upload) and the host reduction are retained.
+            record["total_cycles_measured_host_stage"] = measured_host_total(
+                int(result.cycles), record["host_price"], record["host_stage_measured"]
             )
             record["execution"] = {
                 "kind": result.kind,
@@ -965,8 +1028,12 @@ def summarize(results):
         "failed_plans": sum(len(r.get("failed_plans") or {}) for r in results if "error" not in r),
         "comparable_with_paper": False,
         "not_comparable_because": (
-            "no scores-to-softmax-to-probs bridge, no host-stage time, no QK readout / "
-            "score upload / partial readout link volumes; see the module docstring"
+            "the bridge, the readout/upload/partial link volumes and the host stage are "
+            "priced and measured, but the host stage's compute price is a declared "
+            "per-vector model (measured samples recorded beside it) and the CENT control "
+            "available here is CENT's own attention program with its own boundary; the "
+            "historical host protocol also covers decode/staging and merge; see the "
+            "module docstring"
         ),
         "paper": PAPER,
     }

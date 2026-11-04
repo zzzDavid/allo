@@ -1453,6 +1453,28 @@ are kept. The study stays DIAGNOSTIC: the host stage's price is a declared
 per-vector model (measured samples beside it) and the CENT control's
 boundary is CENT's own. G9/G10 and the recorded blockers remain open.
 
+## Round 43 (2026-11-04): independent review of 3a40971; host-stage invariants, attention semantics, timing accounting
+
+The reviewer accepted the bridge's reach into scheduling, costing and
+lowering, reproduced the 1x128 row, and found five bounded gaps (M-17):
+the softmax lacked the 1/sqrt(head_dim) scale and so did its reference;
+the realization check read the declared schedule, not the realized
+sequence, and ignored the computation; the host-time model was chosen by
+the stage's label; the measured-host total dropped the stage's link term;
+and the realization refused host inputs the shared availability walk
+admits. Judgment: all accepted and repaired. The stage is the scaled
+softmax of the workload's head dimension, verified on operands that expose
+the scale; the lowered stage is bound to the recorded callable, the
+declared operation and buffers and its position among the realized launch
+occurrences, refused at materialization otherwise; the semantic operation
+is an explicit declared domain the policy keys on, carried through the
+schedule, graph, record and manifest; the price is stored as link and
+compute terms and the measured total replaces the compute term only; a
+stage may read a region input no launch writes or an earlier stage's
+output. The study is re-run on the repaired boundary and stays DIAGNOSTIC;
+the one-head misses are examined from the retained graphs (design doc).
+G9/G10 and the recorded blockers remain open.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1492,7 +1514,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 42 (2026-11-04) at the candidate `6e988e9`+ (this
+Refreshed in round 43 (2026-11-04) at the candidate `3a40971`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |

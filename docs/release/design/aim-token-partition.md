@@ -151,19 +151,37 @@ producing and consuming launches' declared transfers through the launch's
 positional binding and the retained identities.  Other backends refuse a
 host stage.
 
+**Semantics.**  The stage is the scaled global softmax of the workload's
+head dimension, `softmax(scores / sqrt(d))` in FP32 with BF16 at the
+upload (`ScaledSoftmax(head_dim)`), the historical host operation's
+semantics; its `operation` is `softmax` from the declared host-operation
+domain (`allo.spmw_target.HOST_OPERATIONS`), the only thing the pricing
+and the realization key on (the stage's name is a label).
+
 **Pricing, in the graph the normal selection ranks.**  The program graph
 emits the stage as the target's `HOST_COMPUTE` operation; the AiM rule
-prices it with `host_stage_cycles`: the readout of the inputs plus the
-upload of the outputs over the declared link (32 B/cycle, zero fixed
-latency) plus the host's vector passes (`HOST_STAGE_VECTOR_PASSES["softmax"]
-= 4`: row max, exp, row sum, divide, one `HOST_VECTOR_ADD_CYCLES` each per
-16-lane vector).  Units are simulator cycles (1 cycle = 1 ns at the
+prices it with `host_stage_terms`: a link term, the readout of the inputs
+plus the upload of the outputs over the declared link (32 B/cycle, zero
+fixed latency), and a compute term, the host's vector passes
+(`HOST_OPERATION_PASSES["softmax"] = 4`: row max, scaled exp, row sum,
+divide, one `HOST_VECTOR_ADD_CYCLES` each per 16-lane vector).  Units are simulator cycles (1 cycle = 1 ns at the
 declared rate).  The partial-result readout and the merge adds of a split
 SV remain in the host reduction, so nothing is counted twice.  For 1 head
 x 128 tokens the stage prices at 48 cycles (16 link + 32 host).  The host
 time is a declared model; the driver records measured host-stage samples
-beside it (`host_stage_measured`) and a second total that uses the
-measured median (`total_cycles_measured_host_stage`).
+beside it (`host_stage_measured`, `stage.run` only) and a second total in
+which the measured median replaces the compute term only, the stage's link
+term and the host reduction retained (`total_cycles_measured_host_stage`).
+
+**Realization.**  `AimCtx._check_host_stages` compares the realized
+sequence of launch occurrences and stages in the lowered records with the
+schedule (repeated launches counted by their primary records), requires
+the lowered stage's callable to be the one the host program recorded and
+its operation and buffers the declared ones, requires a launch-written
+input to be declared an output by an earlier launch (a region input no
+launch writes is host data; an earlier stage's output is accepted) and an
+output to reach a later launch's declared host ingress; a mismatch is a
+materialization failure before selection.
 
 **Functional evidence, separate from the simulator.**  `reference_outputs`
 (`allo/pim/aim_lowering.py`) is the functional oracle of a lowered
@@ -204,10 +222,30 @@ Six of nine minima, largest gap 1.04%; every plan's functional pipeline
 within 4.9e-3 of the float64 reference; the measured host-stage samples on
 this host (18 us to 530 us per call, NumPy on small arrays) are far above
 the declared price (48 to 49,152 cycles) and are recorded separately, not
-substituted.  The one-head misses remain: the ranked totals of the
-candidates lie within 1-10% of each other and the serial-issue estimate
-misorders them (section 3); the bridge adds the same stage price to every
-P of a workload and does not change the order.
+substituted.
+
+**The one-head misses, from the retained graphs (round 43,
+`r41/token_partition_bridged.artifacts/h1_*/P*/plan.json`).**  The
+bridge's stage term is identical for every P of a workload and the host
+reduction term is small (32 cycles per doubling of P), so the order is
+decided by the contraction profile (`mac_abk`, the serial-issue estimate
+of the lowered command stream), which the simulator does not confirm at
+the sub-percent level:
+
+| Workload | Plans | Estimate (device term) | Measured device | What decided it |
+|---|---|---:|---:|---|
+| 1 x 128 | P2 vs P4 | 1554 vs 1522 (totals 1634 = 1634) | 1141 vs 1105 | an exact tie of the totals, broken to the smaller P; measured P4 better by 0.33% |
+| 1 x 512 | P4 vs P8 | 2134 vs 2070 (totals 2390 = 2390) | 1570 vs 1498 | an exact tie of the totals, broken to the smaller P; measured P8 better by 0.44% |
+| 1 x 4096 | P1 vs P8 | 6911 vs 7334 | 5535 vs 5334 | the profile overprices the 8-way program (1.37x of the simulator) more than the flattened unsplit one (1.25x); measured P8 better by 1.04% |
+
+Two of the three misses are estimate ties resolved by the ordinary
+smaller-P preference, the third a 12% relative overprice of the 8-way
+command stream in the profile.  Neither is a bridge or accounting effect.
+A tie rule that prefers the larger split when the host reduction is the
+only difference would be a selection heuristic, not evidence; the profile's
+systematic overprice of the channel-batched split programs (1.37x against
+1.25x here, 1.25x to 1.59x across the study) is the cost-model item to
+calibrate from the lowered command streams, not from these winners.
 
 ## 4. Cost-route repairs (M-06, M-05, M-07)
 

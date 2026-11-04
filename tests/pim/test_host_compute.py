@@ -25,18 +25,19 @@ from allo.pim.aim_lowering import (
 from allo.pim.costs import aim_cost
 from allo.pim.costs.aim import (
     HOST_LINK_BYTES_PER_CYCLE,
-    HOST_STAGE_VECTOR_PASSES,
+    HOST_OPERATION_PASSES,
     HOST_VECTOR_ADD_CYCLES,
     host_stage_cycles,
+    host_stage_terms,
 )
 from allo.pim.targets import build_aim_target, build_samsung_target
 from allo.spmw_plan import HostComputeStep, LaunchStep
 from benchmarks.cent_aim.token_partition import (
     BUDGET,
     POLICY,
+    ScaledSoftmax,
     build_attention,
     functional_check,
-    global_softmax,
     kernel_choices,
     partitions_of,
 )
@@ -53,7 +54,8 @@ def test_host_compute_is_recorded_scheduled_and_declared():
         "LaunchRecord", "HostComputeRecord", "LaunchRecord"
     ]
     (stage,) = program.computes
-    assert stage.name == "softmax" and stage.fn is global_softmax
+    assert stage.name == "softmax" and stage.operation == "softmax"
+    assert isinstance(stage.fn, ScaledSoftmax) and stage.fn.head_dim == 128
     compiled = allo.compile(
         attention, build_aim_target(), aim_cost, backend="virtual", host_moves=program, **POLICY
     )
@@ -64,22 +66,28 @@ def test_host_compute_is_recorded_scheduled_and_declared():
     assert isinstance(step, HostComputeStep)
     assert step.inputs == (("scores", (1, 128), 16),) and step.outputs == (("probs", (1, 128), 16),)
     assert step.volume("inputs") == 256 and step.volume("outputs") == 256 and step.elements() == 128
-    assert step.function is global_softmax
+    assert step.function is stage.fn and step.operation == "softmax"
     manifest = compiled.compiled.launch_schedule.manifest()
-    assert ("host_compute", "softmax", (("scores", (1, 128), 16),), (("probs", (1, 128), 16),)) in manifest
+    assert ("host_compute", "softmax", "softmax", (("scores", (1, 128), 16),), (("probs", (1, 128), 16),)) in manifest
 
 
 def test_host_compute_rejects_bad_declarations():
     from allo.spmw_target import BufferToken, HostComputeRecord
 
+    fn = ScaledSoftmax(128)
     with pytest.raises(RuntimeError, match="outside a host_program"):
-        allo.host_compute("softmax", global_softmax, inputs=(BufferToken("a"),), outputs=(BufferToken("b"),))
+        allo.host_compute("softmax", fn, inputs=(BufferToken("a"),), outputs=(BufferToken("b"),), operation="softmax")
     with pytest.raises(ValueError, match="declares no outputs"):
-        HostComputeRecord("softmax", global_softmax, (BufferToken("a"),), ())
+        HostComputeRecord("softmax", fn, (BufferToken("a"),), (), "softmax")
     with pytest.raises(TypeError, match="whole workload buffers"):
-        HostComputeRecord("softmax", global_softmax, (BufferToken("a")[0],), (BufferToken("b"),))
+        HostComputeRecord("softmax", fn, (BufferToken("a")[0],), (BufferToken("b"),), "softmax")
     with pytest.raises(TypeError, match="callable"):
-        HostComputeRecord("softmax", None, (BufferToken("a"),), (BufferToken("b"),))
+        HostComputeRecord("softmax", None, (BufferToken("a"),), (BufferToken("b"),), "softmax")
+    # The semantic operation comes from the declared domain, never the label.
+    with pytest.raises(ValueError, match="not a declared host operation"):
+        HostComputeRecord("softmax", fn, (BufferToken("a"),), (BufferToken("b"),), "normalization")
+    with pytest.raises(TypeError):
+        HostComputeRecord("softmax", fn, (BufferToken("a"),), (BufferToken("b"),))
 
 
 def test_stage_must_read_what_an_earlier_launch_produced():
@@ -91,7 +99,7 @@ def test_stage_must_read_what_an_earlier_launch_produced():
     attention, _program = build_attention(1, 128)
 
     def early(q, k_cache, scores, probs, v_cache, heads_out):
-        allo.host_compute("softmax", global_softmax, inputs=(scores,), outputs=(probs,))
+        allo.host_compute("softmax", ScaledSoftmax(128), inputs=(scores,), outputs=(probs,), operation="softmax")
         allo.launch("attention_qk", q, k_cache, scores)
         allo.launch("attention_sv", probs, v_cache, heads_out)
 
@@ -115,7 +123,7 @@ def test_stage_is_priced_in_the_selection_graph_and_lowered():
     (stage_activity,) = [a for a in graph.activities if a.label == "host_stage:softmax"]
     # Readout 1 KiB + upload 1 KiB over the 32 B/cycle link, plus four
     # vector passes over 512 / 16 vectors.
-    expected = (2048 // HOST_LINK_BYTES_PER_CYCLE) + (512 // geometry.lanes) * HOST_STAGE_VECTOR_PASSES["softmax"] * HOST_VECTOR_ADD_CYCLES
+    expected = (2048 // HOST_LINK_BYTES_PER_CYCLE) + (512 // geometry.lanes) * HOST_OPERATION_PASSES["softmax"] * HOST_VECTOR_ADD_CYCLES
     assert stage_activity.latency_cycles == expected
     assert stage_activity.primitive.endswith("HOST_COMPUTE")
     assert [use.handle.name for use in stage_activity.occupancy] and "host" in stage_activity.occupancy[0].handle.name
@@ -139,10 +147,99 @@ def test_stage_is_priced_in_the_selection_graph_and_lowered():
     assert run.extra["resource_budget"] == BUDGET
 
 
-def test_an_unknown_stage_kind_is_not_priced_at_zero():
-    record = AimHostStage(stage="unknown", inputs=(("a", (4,), 16),), outputs=(("b", (4,), 16),))
+def test_an_unknown_operation_is_not_priced_at_zero_and_labels_do_not_select_the_model():
+    geometry = _target_geometry(build_aim_target())
+    record = AimHostStage(stage="softmax", operation="unknown", inputs=(("a", (4,), 16),), outputs=(("b", (4,), 16),))
     with pytest.raises(ValueError, match="no declared host-time model"):
-        host_stage_cycles(record, _target_geometry(build_aim_target()))
+        host_stage_cycles(record, geometry)
+    with pytest.raises(ValueError, match="declares no operation"):
+        AimHostStage(stage="softmax", inputs=(("a", (4,), 16),), outputs=(("b", (4,), 16),))
+    # The label is free; the operation prices.  Two labels, one operation,
+    # one price; one label, two operations, two prices.
+    a = AimHostStage(stage="softmax", operation="softmax", inputs=(("a", (64,), 16),), outputs=(("b", (64,), 16),))
+    b = AimHostStage(stage="normalization", operation="softmax", inputs=(("a", (64,), 16),), outputs=(("b", (64,), 16),))
+    c = AimHostStage(stage="softmax", operation="elementwise", inputs=(("a", (64,), 16),), outputs=(("b", (64,), 16),))
+    assert host_stage_cycles(a, geometry) == host_stage_cycles(b, geometry)
+    assert host_stage_cycles(c, geometry) < host_stage_cycles(a, geometry)
+    terms = host_stage_terms(a, geometry)
+    assert terms["link_cycles"] == 256 // 32 and terms["compute_cycles"] == 4 * 4 and terms["passes"] == 4
+
+
+def test_a_renamed_stage_with_the_same_operation_compiles_at_the_same_price():
+    attention, _program = build_attention(1, 128)
+    target = build_aim_target()
+    softmax = ScaledSoftmax(128)
+
+    def renamed(q, k_cache, scores, probs, v_cache, heads_out):
+        allo.launch("attention_qk", q, k_cache, scores)
+        allo.host_compute("normalization", softmax, inputs=(scores,), outputs=(probs,), operation="softmax")
+        allo.launch("attention_sv", probs, v_cache, heads_out)
+
+    program = allo.host_program(attention, resident=("q", "k_cache", "v_cache"))(renamed)
+    reference = allo.compile(*build_attention(1, 128)[:1], target, aim_cost, backend="virtual", host_moves=build_attention(1, 128)[1], resources=BUDGET, **POLICY)
+    compiled = allo.compile(attention, target, aim_cost, backend="virtual", host_moves=program, resources=BUDGET, **POLICY)
+    assert compiled.run_backend().cycles == reference.run_backend().cycles
+    (activity,) = [a for a in compiled.compiled.execution_graph.activities if a.label == "host_stage:normalization"]
+    (expected,) = [a for a in reference.compiled.execution_graph.activities if a.label == "host_stage:softmax"]
+    assert activity.latency_cycles == expected.latency_cycles
+    lowered = allo.compile(attention, target, aim_cost, host_moves=program, resources=BUDGET, **POLICY)
+    (stage,) = [s for s in lowered.compiled.layout_ctx.host_steps if isinstance(s, AimHostStage)]
+    assert (stage.stage, stage.operation) == ("normalization", "softmax")
+
+
+def test_a_stage_may_read_a_host_input_the_program_never_writes():
+    """The shared availability reasoning: a stage reading the region input
+    ``q`` (host data no launch writes) and producing ``probs`` is accepted by
+    both the schedule and the realization."""
+    attention, _program = build_attention(1, 128)
+    target = build_aim_target()
+
+    def from_host_input(q, k_cache, scores, probs, v_cache, heads_out):
+        allo.launch("attention_qk", q, k_cache, scores)
+        allo.host_compute("softmax", ScaledSoftmax(128), inputs=(q,), outputs=(probs,), operation="softmax")
+        allo.launch("attention_sv", probs, v_cache, heads_out)
+
+    program = allo.host_program(attention, resident=("q", "k_cache", "v_cache"))(from_host_input)
+    compiled = allo.compile(attention, target, aim_cost, host_moves=program, resources=BUDGET, **POLICY)
+    (stage,) = [s for s in compiled.compiled.layout_ctx.host_steps if isinstance(s, AimHostStage)]
+    assert stage.inputs == (("q", (1, 128), 16),)
+
+
+@pytest.mark.parametrize("mutation", ["early", "late", "function", "between_repeats"])
+def test_realization_binds_the_stage_position_and_computation(monkeypatch, mutation):
+    """Fault injection on the lowered record sequence: a stage moved before
+    its producer or after its consumer, or carrying a computation other than
+    the recorded one, is refused at materialization (before selection)."""
+    from dataclasses import replace
+
+    from allo import spmw_aim
+
+    attention, program = build_attention(1, 128)
+    target = build_aim_target()
+    original = spmw_aim._AimProgramDerivation.records
+
+    def mutated(self, host_moves, ctx):
+        records = original(self, host_moves, ctx)
+        stages = [r for r in records if isinstance(r[0], AimHostStage)]
+        rest = [r for r in records if not isinstance(r[0], AimHostStage)]
+        if mutation == "early":
+            return stages + rest
+        if mutation == "late":
+            return rest + stages
+        if mutation == "function":
+            return [
+                (replace(op, function=lambda x: np.zeros_like(x)), banks) if isinstance(op, AimHostStage) else (op, banks)
+                for op, banks in records
+            ]
+        # between_repeats: the stage between two copies of the SV launch
+        # records while the schedule has one SV launch after the stage.
+        sv = [r for r in rest if getattr(r[0], "name", "") and str(r[0].name).startswith("attention_sv")]
+        return rest + stages + sv
+
+    monkeypatch.setattr(spmw_aim._AimProgramDerivation, "records", mutated)
+    expected = "carries a computation other than" if mutation == "function" else "orders the host stages differently|primary record"
+    with pytest.raises(Exception, match=expected):
+        allo.compile(attention, target, aim_cost, host_moves=program, **POLICY)
 
 
 def test_realization_refuses_a_dropped_or_mismatched_stage(monkeypatch):
@@ -208,4 +305,24 @@ def test_functional_pipeline_for_split_and_unsplit_plans(heads, tokens, partitio
     check = functional_check(built, heads, tokens, seed=7)
     assert check["split"] == (partitions > 1)
     assert check["max_rel_error"] < check["tolerance"]
-    assert check["stage"] == "softmax" and check["evidence"] == "functional oracle, not the timing-only simulator"
+    assert check["stage"] == "softmax" and check["operation"] == "softmax"
+    assert check["evidence"] == "functional oracle, not the timing-only simulator"
+    # The inputs expose the scale: against an unscaled softmax the same
+    # pipeline is far off, so a stage without the 1/sqrt(head_dim) scale
+    # could not have passed.
+    assert check["head_dim"] == 128 and check["unscaled_reference_error"] > 10 * check["tolerance"]
+
+
+def test_the_stage_is_the_scaled_softmax():
+    """``softmax(scores / sqrt(head_dim))``, the historical host operation's
+    semantics, on scores whose range makes the scale visible."""
+    import math
+
+    softmax = ScaledSoftmax(128)
+    scores = bf16_round(np.linspace(-4, 4, 128, dtype=np.float32)[None])
+    out = softmax(scores)
+    scaled = scores / np.float32(math.sqrt(128))
+    reference = np.exp(scaled - scaled.max()); reference /= reference.sum()
+    assert np.allclose(out, bf16_round(reference.astype(np.float32)), atol=2.0**-9)
+    unscaled = np.exp(scores - scores.max()); unscaled /= unscaled.sum()
+    assert float(out.max()) < 0.02 < float(unscaled.max())

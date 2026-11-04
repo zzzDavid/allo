@@ -669,13 +669,25 @@ class AimCtx(CodegenContext):
             self.emit_eoc()
 
     def _check_host_stages(self, program, layouts, ops) -> None:  # noqa: C901
-        """Every declared host stage of the schedule is lowered once as an
-        `AimHostStage` with the declared buffers, reads buffers a launch
-        before it produces (declared ``out``/``inout`` transfers) and feeds
-        buffers a launch after it receives through its declared host ingress
-        (an ``in``/``inout`` transfer whose route starts on the host)."""
+        """The lowered host stages against the schedule's declared stages:
+
+        * one `AimHostStage` per declared stage, with the declared label,
+          operation, buffers and the very computation the host program
+          recorded (the same callable object), in the realized sequence at
+          the declared position among the launches (the sequence of launch
+          occurrences and stages in ``ops`` equals the schedule's, repeated
+          launches included; host transfers are not ordered here);
+        * each stage input is produced before the stage: by an earlier
+          launch whose candidate declares it as an output, by an earlier
+          stage, or it is a region input no launch of the program writes
+          (host data from the start, as the shared availability walk reads
+          it);
+        * each stage output reaches a later launch through that launch's
+          declared host ingress.
+        """
+        from .spmw_autoschedule import _matcher_work_scope
         from .spmw_candidate import candidate_effects
-        from .spmw_plan import HOST_INGRESS_STEPS, HostComputeStep, LaunchStep
+        from .spmw_plan import HostComputeStep, LaunchStep
 
         schedule = getattr(program, "schedule", None)
         steps = list(getattr(schedule, "steps", ()) or ())
@@ -688,72 +700,167 @@ class AimCtx(CodegenContext):
             )
         if not declared:
             return
+
+        # --- the realized sequence of launch occurrences and stages ---
+        group_of_function = {}
+        for group in program.groups:
+            for function in group.functions:
+                group_of_function[function] = group.group_id
+            group_of_function[group.name] = group.group_id
+
+        def group_of(op):
+            if isinstance(op, _HOST_TRANSFER_RECORDS):
+                return None
+            gid = getattr(op, "group_id", None)
+            if gid is not None:
+                return gid
+            for attr in ("source", "name"):
+                value = getattr(op, attr, None)
+                if not value:
+                    continue
+                text = str(value)
+                for candidate in (text, text.split(".", 1)[0]):
+                    if candidate in group_of_function:
+                        return group_of_function[candidate]
+            return None
+
+        primary = (AimContraction, AimElementwise)
+        launches = [s for s in steps if isinstance(s, LaunchStep)]
+        launches_of_group = {}
+        for step in launches:
+            launches_of_group[step.group_id] = launches_of_group.get(step.group_id, 0) + 1
+        primaries_of_group = {}
+        for op in ops:
+            if isinstance(op, primary):
+                gid = group_of(op)
+                primaries_of_group[gid] = primaries_of_group.get(gid, 0) + 1
+        per_launch = {}
+        for gid, count in launches_of_group.items():
+            total = primaries_of_group.get(gid, 0)
+            if total == 0 or total % count:
+                raise RuntimeError(
+                    f"AiM realization lowered {total} primary record(s) for group "
+                    f"{gid} launched {count} time(s)"
+                )
+            per_launch[gid] = total // count
+        realized = []  # ("launch", group_id) per occurrence | ("stage", index)
+        seen_primaries = {}
+        stage_index = 0
+        for op in ops:
+            if isinstance(op, AimHostStage):
+                realized.append(("stage", stage_index))
+                stage_index += 1
+                continue
+            gid = group_of(op)
+            if gid is None or gid not in per_launch:
+                continue
+            if isinstance(op, primary):
+                seen_primaries[gid] = seen_primaries.get(gid, 0) + 1
+                occurrence = (seen_primaries[gid] - 1) // per_launch[gid]
+                if not realized or realized[-1] != ("launch", gid, occurrence):
+                    realized.append(("launch", gid, occurrence))
+        realized = [
+            ("launch", item[1]) if item[0] == "launch" else item for item in realized
+        ]
+        expected = []
+        stage_index = 0
+        for step in steps:
+            if isinstance(step, LaunchStep):
+                expected.append(("launch", step.group_id))
+            elif isinstance(step, HostComputeStep):
+                expected.append(("stage", stage_index))
+                stage_index += 1
+        if realized != expected:
+            raise RuntimeError(
+                "AiM realization orders the host stages differently from the "
+                f"schedule: realized {realized}, declared {expected}"
+            )
+
+        # --- per stage: identity, computation, inputs and outputs ---
         effects_of = {}
         for layout in layouts:
             group_id = getattr(self, "_group_of_layout", {}).get(id(layout))
             effects = candidate_effects(layout)
             if group_id is not None and effects is not None:
                 effects_of[group_id] = effects
+
+        def local_names(launch, region_name):
+            # The candidate's transfers name the kernel's own buffers.  The
+            # launch binds the region's buffers to the kernel's parameters
+            # positionally (allo.launch(kernel, *operands) in the kernel's
+            # signature order, checked by launch_schedule); the retained
+            # value identities confirm it when present.
+            names = set()
+            matches = [
+                m for m in program.trace.matches
+                if _matcher_work_scope(m).group_id == launch.group_id
+            ]
+            for match in matches:
+                facts = match.extra.get("program_facts")
+                parameters = tuple(getattr(facts, "parameter_names", ()) or ())
+                for operand, local in zip(launch.operands, parameters):
+                    if operand == region_name:
+                        names.add(local)
+            key = program.key_by_name.get(region_name)
+            if key is not None:
+                for match in matches:
+                    for operand in match.operands:
+                        if operand.value_ref is not None and operand.value_ref == key:
+                            names.add(operand.memref_name)
+                    if match.result_value_ref is not None and match.result_value_ref == key:
+                        names.add(match.result_memref_name)
+            return names
+
+        def declares(launch_steps, region_name, directions, ingress=False):
+            for launch in launch_steps:
+                names = local_names(launch, region_name)
+                for t in getattr(effects_of.get(launch.group_id), "transfers", ()):
+                    if t.value not in names or t.direction not in directions:
+                        continue
+                    if ingress and not _host_ingress_route(t.route):
+                        continue
+                    return True
+            return False
+
+        def written_by_a_launch(region_name):
+            key = program.key_by_name.get(region_name)
+            if key is None:
+                return False
+            return any(
+                key in group.usages and group.usages[key].store for group in program.groups
+            )
+
+        produced_by_stages = set()
         for step, record in zip(declared, lowered):
-            if (record.stage, record.inputs, record.outputs) != (
-                step.name, tuple(step.inputs), tuple(step.outputs)
+            if (record.stage, record.operation, record.inputs, record.outputs) != (
+                step.name, step.operation, tuple(step.inputs), tuple(step.outputs)
             ):
                 raise RuntimeError(
                     f"AiM realization of host stage {step.name!r} differs from the "
-                    f"schedule: lowered {record.stage!r} {record.inputs} -> "
-                    f"{record.outputs}, declared {step.inputs} -> {step.outputs}"
+                    f"schedule: lowered {record.stage!r} ({record.operation}) "
+                    f"{record.inputs} -> {record.outputs}, declared ({step.operation}) "
+                    f"{step.inputs} -> {step.outputs}"
+                )
+            if record.function is not step.function:
+                raise RuntimeError(
+                    f"AiM realization of host stage {step.name!r} carries a computation "
+                    "other than the one the host program recorded"
                 )
             position = steps.index(step)
             before = [s for s in steps[:position] if isinstance(s, LaunchStep)]
             after = [s for s in steps[position + 1 :] if isinstance(s, LaunchStep)]
-
-            from .spmw_autoschedule import _matcher_work_scope
-
-            def local_names(launch, region_name):
-                # The candidate's transfers name the kernel's own buffers.
-                # The launch binds the region's buffers to the kernel's
-                # parameters positionally (allo.launch(kernel, *operands) in
-                # the kernel's signature order, checked by launch_schedule);
-                # the retained value identities confirm it when present.
-                names = set()
-                matches = [
-                    m for m in program.trace.matches
-                    if _matcher_work_scope(m).group_id == launch.group_id
-                ]
-                for match in matches:
-                    facts = match.extra.get("program_facts")
-                    parameters = tuple(getattr(facts, "parameter_names", ()) or ())
-                    for operand, local in zip(launch.operands, parameters):
-                        if operand == region_name:
-                            names.add(local)
-                key = program.key_by_name.get(region_name)
-                if key is not None:
-                    for match in matches:
-                        for operand in match.operands:
-                            if operand.value_ref is not None and operand.value_ref == key:
-                                names.add(operand.memref_name)
-                        if match.result_value_ref is not None and match.result_value_ref == key:
-                            names.add(match.result_memref_name)
-                return names
-
-            def declares(launches, region_name, directions, ingress=False):
-                for launch in launches:
-                    names = local_names(launch, region_name)
-                    for t in getattr(effects_of.get(launch.group_id), "transfers", ()):
-                        if t.value not in names or t.direction not in directions:
-                            continue
-                        if ingress and not _host_ingress_route(t.route):
-                            continue
-                        return True
-                return False
-
             for name, _shape, _bits in step.inputs:
-                if not declares(before, name, ("out", "inout")):
-                    raise RuntimeError(
-                        f"AiM realization: host stage {step.name!r} reads {name!r}, "
-                        "which no earlier launch of the program declares as an output"
-                    )
+                if name in produced_by_stages:
+                    continue
+                if written_by_a_launch(name):
+                    if not declares(before, name, ("out", "inout")):
+                        raise RuntimeError(
+                            f"AiM realization: host stage {step.name!r} reads {name!r} "
+                            "before the launch that produces it declares it as an output"
+                        )
+                # else: a region input no launch writes, host data from the start.
             for name, _shape, _bits in step.outputs:
+                produced_by_stages.add(name)
                 if not declares(after, name, ("in", "inout"), ingress=True):
                     raise RuntimeError(
                         f"AiM realization: host stage {step.name!r} produces {name!r}, "
@@ -2080,6 +2187,7 @@ class _AimProgramDerivation:
                             outputs=step.outputs,
                             name=f"host_compute.{step.name}",
                             function=step.function,
+                            operation=step.operation,
                         ),
                         None,
                     )

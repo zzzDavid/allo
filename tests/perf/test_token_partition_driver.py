@@ -268,3 +268,15 @@ def test_simulator_timeout_keeps_the_partial_streams(monkeypatch, tmp_path):
     assert evidence["segment"]["trace"][-1].strip() == "AiM EOC" and evidence["segment"]["trace_sha256"]
     assert evidence["executor"]["binary"] == str(binary) and evidence["executor"]["config"]["sha256"]
     assert evidence["command"][0] == str(binary)
+
+
+def test_measured_host_total_keeps_the_link_and_reduction_terms():
+    """The measured-host total replaces only the stage's modelled compute
+    term with the measured median: device + reduction + stage link + sample."""
+    price = {"host_reduction_cycles": 32, "host_stage_link_cycles": 16, "host_stage_compute_cycles": 32, "host_stage_cycles": 48}
+    assert tp.measured_host_total(1141, price, {"median_ns": 18112}) == 1141 + 32 + 16 + 18112
+    result = tp.run_workload(1, 128, simulate=False)
+    record = result.record["plans"]["default"]["host_price"]
+    assert record["host_stage_cycles"] == record["host_stage_link_cycles"] + record["host_stage_compute_cycles"]
+    assert record["host_stage_link_cycles"] == 16 and record["host_stage_compute_cycles"] == 32
+    assert result.record["plans"]["default"]["functional_check"]["head_dim"] == 128
