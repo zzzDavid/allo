@@ -760,6 +760,38 @@ handle-only (X-01).
 
 Gate G9 remains **FAIL**.
 
+## Round 22 (2026-11-03): independent review of cc2354f; scheduled materialization, AiM contract depth
+
+The reviewer found three defects in the round 21 work and a count error.
+(1) C-33 was not closed for scheduled programs: the materialization probe
+emitted every candidate without the launch schedule and the host moves, so
+the realization compared at materialization was a kernel-only program and a
+mismatch under the host program surfaced only after selection (the
+reviewer's `probe_final_only.py` printed FAILURE). Judgment: the ranking
+keeps the per-kernel probes as schedule-free preliminary filters and accepts
+a complete assignment, on the joint path and on the over-budget heuristic
+path, only after the whole program materializes under the real launch
+schedule and the resolved host moves (C-33b); the probe prints FALLBACK.
+(2) The AiM realization check ignored the declared batch mapping and the
+results' residency: a wrong-but-valid `channels` mapping and results
+declared in `gb` passed. Judgment: the declared request must be the
+record's (an unspecified one is the lowering's `auto`), an explicit one the
+realized mapping of every launch, the realized one the mapping the
+derivation laid the host transfers out for; results live in `gpr` and
+leave through it (X-07). (3) The host-transfer check matched the record's
+label text against function names and covered one record kind. Judgment:
+the derivation stamps every host record with the retained identities of the
+buffers it moves, their slices and the group whose layout it follows, and
+the check binds each record to the declared transfer of the work-body value
+with the same identity, comparing direction, slice extent and device
+endpoint; under a host program every declared input must be host-written,
+resident or produced on the device (X-08). The round 21 shared-semantics
+count is corrected to 68.
+
+Gate G9 remains **FAIL**: UPMEM and AttAcc effects, the hybrid scalar ABI
+from retained IR, the installed-artifact and both-hardware-host traces are
+open.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -811,4 +843,4 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 | G8 backend execution | **evidence complete at 9255d29, pending independent review** | installed-artifact runs at the round 10 repair (VALIDATION.md round 10) and again at the round 15 commit: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock, 3 passed) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed through the shared pipeline); all reviewer probes of rounds 8 to 14 rejected or executed correctly through the installed wheel (VALIDATION.md round 15); AttAcc analytical by design; AiM timing-only as accepted |
 | G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-15: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, an enforced typed candidate contract (C-30), supplied placements rebound (C-28), orchestration and launch bindings validated before selection (C-29, C-29b), Gemini-II typed records and `APUv1Program` as frontends of the pipeline (ISSUES X-01; round 16 removed the last typed route, round 17 replaced the `APUv1Program` facade by the shared front stages with retained store effects, X-02), the launch chain, accumulator modes and every operation's extent enforced (C-30b); both hardware hosts and the installed wheel exercised at `9255d29`; open: review of round 17, matcher backends' effects and facts consumption, the hybrid manifest's text ABI, slice 5 traces of forced alternatives and cost perturbations on hardware |
 
-Verdict: **NOT READY**. Blockers: G9 (X-01 to X-06, C-32, C-33) is in progress (review of rounds 17-21; UPMEM and AttAcc effects; hybrid manifest ABI; slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.
+Verdict: **NOT READY**. Blockers: G9 (X-01 to X-08, C-32, C-33, C-33b) is in progress (review of rounds 17-22; UPMEM and AttAcc effects; hybrid manifest ABI; slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.

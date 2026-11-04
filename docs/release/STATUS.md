@@ -3,7 +3,7 @@
 
 # Release status
 
-Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline; committed as `9255d29`, exercised from the installed wheel on the simulators, the APU v1 board and the Gemini-II card; round 16: the reviewer's three contract gaps closed (C-30b) and the last typed route removed; round 17: the `APUv1Program` facade replaced by the shared front stages on the phase's source with retained store effects (X-02); round 18: indirect loads, fill initializers and unused arguments retained or represented correctly (X-03), whole launches reserved for verbatim programs (C-32); round 19: effects in program order (X-04) and Samsung as the first matcher backend declaring effects from the shared facts; round 20: carried destinations are reads on every backend (X-05), Samsung storage, packing and transfers tied to the emitted program (X-06), realization checked at the materialization boundary (C-33); round 21: distinct input/output images and exact vector residency complete X-06, AiM is the second matcher backend declaring effects from the shared facts). Read `TASK.md` in the containing repository,
+Updated: 2026-11-03 (round 15: launch operand bindings validated (C-29b), the candidate contract enforced field by field (C-30), Gemini-II typed records migrated into the shared pipeline; committed as `9255d29`, exercised from the installed wheel on the simulators, the APU v1 board and the Gemini-II card; round 16: the reviewer's three contract gaps closed (C-30b) and the last typed route removed; round 17: the `APUv1Program` facade replaced by the shared front stages on the phase's source with retained store effects (X-02); round 18: indirect loads, fill initializers and unused arguments retained or represented correctly (X-03), whole launches reserved for verbatim programs (C-32); round 19: effects in program order (X-04) and Samsung as the first matcher backend declaring effects from the shared facts; round 20: carried destinations are reads on every backend (X-05), Samsung storage, packing and transfers tied to the emitted program (X-06), realization checked at the materialization boundary (C-33); round 21: distinct input/output images and exact vector residency complete X-06, AiM is the second matcher backend declaring effects from the shared facts; round 22: complete assignments materialize under the real launch schedule and host moves before acceptance (C-33b), the AiM check covers the batch mapping, the GPR readout of results (X-07) and host transfers bound by retained buffer identity (X-08)). Read `TASK.md` in the containing repository,
 then this file, then `ISSUES.md` for the next action.
 
 ## Identity
@@ -47,8 +47,11 @@ then this file, then `ISSUES.md` for the next action.
    and removed the typed route, but its `APUv1Program` migration was a
    facade (X-02); round 17 runs the shared front stages on the phase's
    source and derives the record's contract from retained store effects
-   (guards, carried reads, preserved output regions). Open: independent
-   review of round 17, the matcher backends' effects declarations and facts
+   (guards, carried reads, preserved output regions); rounds 19-22 put
+   Samsung and AiM on the enforced contract (effects from the shared facts,
+   realization compared at the materialization boundary under the real
+   launch schedule and host moves, C-33b, X-05 to X-08). Open: independent
+   review of round 22, UPMEM and AttAcc effects declarations and facts
    consumption, the hybrid manifest's scalar ABI from retained IR, and the
    slice 5 traces of forced alternatives and cost perturbations on both
    hardware hosts. Map and status: `design/shared-compilation-path.md`.

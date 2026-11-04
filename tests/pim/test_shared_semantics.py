@@ -2258,3 +2258,280 @@ def test_aim_selected_program_runs_timing_only_under_the_declared_contract(
     run = compiled(W, x, y)
     assert run.kind == "simulator-timing-only" and run.cycles > 0
     np.testing.assert_array_equal(y, np.full(AIM_N, 5.0, np.float32))
+
+
+# --------------------------------------------------------------------------- #
+# (s) Materialization under the real orchestration; the AiM batch mapping,
+#     result residency and identity-bound host transfers (review round 21)
+# --------------------------------------------------------------------------- #
+
+
+def _aim_gemv_resident_host():
+    def host(W, x, y):
+        allo.launch("mv", W, x, y)
+
+    return allo.host_program(aim_gemv_region, resident=("W", "x"))(host)
+
+
+def _chosen(compiled):
+    layout = compiled.compiled.layout
+    return layout[0] if isinstance(layout, list) else layout
+
+
+def test_scheduled_realization_failure_is_rejected_before_acceptance(monkeypatch):
+    """A complete assignment is accepted only once the whole program
+    materializes under the real launch schedule and host moves, the way the
+    selected program is emitted (C-33): a realization mismatch that shows only
+    under the schedule rejects the candidate in the ranking, which records it,
+    and the selection falls back.  The per-kernel probes stay schedule-free
+    preliminary filters."""
+    from allo import spmw_aim
+
+    host = _aim_gemv_resident_host()
+    victim = _chosen(_compile_aim(backend="virtual", host_moves=host)).mode
+    original = spmw_aim.AimCtx.check_realization
+    counts = {"scheduled": 0, "kernel": 0}
+
+    def faulty(self, layouts):
+        scheduled = self._program.schedule is not None
+        counts["scheduled" if scheduled else "kernel"] += 1
+        original(self, layouts)
+        items = layouts if isinstance(layouts, (list, tuple)) else [layouts]
+        if scheduled and any(item.mode == victim for item in items):
+            raise RuntimeError("scheduled realization differs for the winning mode")
+
+    monkeypatch.setattr(spmw_aim.AimCtx, "check_realization", faulty)
+    compiled = _compile_aim(backend="virtual", host_moves=host)
+    assert _chosen(compiled).mode != victim
+    # The victim was probed under the schedule (and rejected), the fallback
+    # under the schedule (accepted) and the final emission ran under it too.
+    assert counts["scheduled"] >= 3 and counts["kernel"] >= 2, counts
+    joint = compiled.placement_ranking.joint
+    assert joint is not None
+    assert any(
+        "scheduled realization differs" in reason
+        for _assignment, reason in joint.probe_rejections
+    ), joint.probe_rejections
+    (kernel,) = compiled.placement_ranking.kernels
+    # The kernel probe did not reject the victim: the filter is preliminary.
+    assert all("scheduled" not in str(r) for _p, r in kernel.rejections)
+
+
+def _aim_fallback_with_reason(monkeypatch, mutate, needle):
+    from allo import spmw_aim
+
+    baseline = _compile_aim(backend="virtual")
+    victim = _chosen(baseline).mode
+    realized = baseline.compiled.layout_ctx.lowering_manifest[0]["batch_mapping"]
+    original = spmw_aim.aim_candidate_effects
+
+    def corrupted(target, matches, placement):
+        effects = original(target, matches, placement)
+        if effects is None or placement.mode != victim:
+            return effects
+        return mutate(effects, realized)
+
+    monkeypatch.setattr(spmw_aim, "aim_candidate_effects", corrupted)
+    compiled = _compile_aim(backend="virtual")
+    assert _chosen(compiled).mode != victim
+    (kernel,) = compiled.placement_ranking.kernels
+    reasons = [str(reason) for _position, reason in kernel.rejections]
+    assert any(
+        "realization differs from the candidate contract" in reason and needle in reason
+        for reason in reasons
+    ), reasons
+    return compiled
+
+
+def test_aim_wrong_batch_mapping_declaration_is_rejected_with_a_fallback(
+    monkeypatch,
+):
+    """A valid but wrong batch mapping in the launch's ``covers`` (one the
+    lowering can realize, but not the one this candidate's program realizes)
+    is a realization mismatch, rejected at materialization."""
+
+    def wrong_mapping(effects, realized):
+        wrong = "channels" if realized != "channels" else "flattened"
+        return replace(
+            effects,
+            launches=tuple(
+                replace(launch, covers=(*launch.covers[:3], wrong))
+                for launch in effects.launches
+            ),
+        )
+
+    compiled = _aim_fallback_with_reason(monkeypatch, wrong_mapping, "maps batches")
+    chosen = _chosen(compiled)
+    declared = chosen.extra["effects"].launches[0].covers[3]
+    manifest = compiled.compiled.layout_ctx.lowering_manifest[0]
+    assert declared in ("auto", "none", manifest["batch_mapping"])
+    if declared not in ("auto", "none"):
+        assert declared == manifest["batch_mapping"]
+
+
+def test_aim_wrong_result_residency_declaration_is_rejected_with_a_fallback(
+    monkeypatch,
+):
+    """Declaring the MAC results in the global buffer (a declarable storage
+    the readout does not use: results come back through the GPR) is
+    rejected at materialization."""
+
+    def results_in_gb(effects, _realized):
+        return replace(
+            effects,
+            value_layouts=tuple(
+                replace(v, storage="gb") if v.value == "local_y" else v
+                for v in effects.value_layouts
+            ),
+            transfers=tuple(
+                replace(t, route=("gb", "host_gather")) if t.value == "local_y" else t
+                for t in effects.transfers
+            ),
+        )
+
+    _aim_fallback_with_reason(monkeypatch, results_in_gb, "back from gpr")
+
+
+AIM_D = 128
+
+
+@allo.dataflow.region()
+def aim_pointwise_region(
+    A: allo.ir.types.bfloat16[AIM_D],
+    B: allo.ir.types.bfloat16[AIM_D],
+    C: allo.ir.types.bfloat16[AIM_D],
+):
+    @allo.work(mapping=[1], args=[A, B, C])
+    def multiply(
+        left: allo.ir.types.bfloat16[AIM_D],
+        right: allo.ir.types.bfloat16[AIM_D],
+        dest: allo.ir.types.bfloat16[AIM_D],
+    ):
+        for i in range(AIM_D):
+            dest[i] = left[i] * right[i]
+
+
+def _compile_aim_pointwise_with_host():
+    def host(A, B, C):
+        hx = allo.host_xfer
+        hx.scatter(A, hx.banks)
+        hx.scatter(B, hx.banks)
+        allo.launch("multiply", A, B, C)
+        hx.gather(C, hx.banks)
+
+    program = allo.host_program(aim_pointwise_region)(host)
+    return allo.compile(
+        aim_pointwise_region,
+        build_aim_target(),
+        aim_cost,
+        backend="virtual",
+        host_moves=program,
+    )
+
+
+def test_aim_host_transfers_carry_retained_buffer_identities():
+    """Every host transfer the AiM derivation lowers names the retained
+    identity of the buffer it moves, the slice and the group whose layout it
+    follows; these bind it to the candidate's declared transfers."""
+    from allo.pim.aim_lowering import AimDistributedHostTransfer
+
+    compiled = _compile_aim_pointwise_with_host()
+    ctx = compiled.compiled.layout_ctx
+    transfers = [
+        op
+        for op in ctx.lowered_operations
+        if isinstance(op, AimDistributedHostTransfer)
+    ]
+    assert transfers, [type(op).__name__ for op in ctx.lowered_operations]
+    program = ctx._program
+    refs = {program.key_by_name[name] for name in ("A", "B", "C")}
+    moved = set()
+    for op in transfers:
+        assert op.buffer_refs and len(op.buffer_refs) == len(op.buffer_slices)
+        assert op.group_id == program.groups[0].group_id
+        moved.update(op.buffer_refs)
+    assert moved == refs
+    directions = {ref: op.direction for op in transfers for ref in op.buffer_refs}
+    assert directions[program.key_by_name["C"]] == "read"
+    assert directions[program.key_by_name["A"]] == "write"
+    ctx.check_realization(compiled.compiled.layout)
+
+
+@pytest.mark.parametrize(
+    "mutation, needle",
+    [
+        (
+            lambda op, program: replace(
+                op, direction="read" if op.direction == "write" else "write"
+            ),
+            "the candidate declares it",
+        ),
+        (lambda op, program: replace(op, elements=op.elements * 4), "element(s) of"),
+        (
+            lambda op, program: replace(
+                op, buffer_refs=tuple(("memref", "undeclared") for _ in op.buffer_refs)
+            ),
+            "declares transfers of",
+        ),
+        (lambda op, program: replace(op, buffer_refs=()), "retained buffer identity"),
+    ],
+    ids=["direction", "extent", "identity", "unbound"],
+)
+def test_aim_host_transfer_records_are_checked_by_identity(mutation, needle):
+    """A lowered host transfer whose direction, extent or bound buffer differs
+    from the candidate's declared transfer is a realization mismatch; the
+    binding is through the retained identity, not the record's label."""
+    from allo.pim.aim_lowering import AimDistributedHostTransfer
+
+    compiled = _compile_aim_pointwise_with_host()
+    ctx = compiled.compiled.layout_ctx
+    program = ctx._program
+    ctx.lowered_operations = tuple(
+        mutation(op, program) if isinstance(op, AimDistributedHostTransfer) else op
+        for op in ctx.lowered_operations
+    )
+    with pytest.raises(RuntimeError, match="AiM realization") as error:
+        ctx.check_realization(compiled.compiled.layout)
+    assert needle in str(error.value)
+
+
+def test_aim_host_transfer_labels_are_not_the_binding():
+    """Relabelling a record changes nothing the check reads: the transfer is
+    still bound to its declared counterpart by identity (no name matching)."""
+    from allo.pim.aim_lowering import AimDistributedHostTransfer
+
+    compiled = _compile_aim_pointwise_with_host()
+    ctx = compiled.compiled.layout_ctx
+    ctx.lowered_operations = tuple(
+        (
+            replace(op, name="relabelled")
+            if isinstance(op, AimDistributedHostTransfer)
+            else op
+        )
+        for op in ctx.lowered_operations
+    )
+    ctx.check_realization(compiled.compiled.layout)
+
+
+def test_aim_declared_input_the_host_program_never_supplies_is_rejected():
+    """Under a host program every declared input must reach the device: a
+    program that launches the kernel without writing an operand (and without
+    residency) is refused at materialization, not run on stale banks."""
+    from allo.pim.schedule_search import InfeasibleSchedule
+
+    def host(A, B, C):
+        hx = allo.host_xfer
+        hx.scatter(A, hx.banks)
+        allo.launch("multiply", A, B, C)
+        hx.gather(C, hx.banks)
+
+    program = allo.host_program(aim_pointwise_region)(host)
+    with pytest.raises((RuntimeError, InfeasibleSchedule, ValueError)) as error:
+        allo.compile(
+            aim_pointwise_region,
+            build_aim_target(),
+            aim_cost,
+            backend="virtual",
+            host_moves=program,
+        )
+    assert "never brings" in str(error.value) or "right" in str(error.value)

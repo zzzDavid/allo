@@ -346,6 +346,15 @@ class AimHostTransfer(AimOp):
     row: int
     bursts: int = 1
     name: str | None = None
+    # Retained identities of the host-program buffers the transfer moves
+    # (the program derivation's buffer keys, one per coalesced transfer),
+    # the normalized slice of each (None for the whole buffer) and the kernel
+    # group whose layout the transfer follows.  Set by the program
+    # derivation; `AimCtx.check_realization` binds the transfer to the
+    # candidate's declared transfers through them, never through ``name``.
+    buffer_refs: tuple = ()
+    buffer_slices: tuple = ()
+    group_id: int | None = None
 
     def __post_init__(self):
         direction = str(self.direction).lower()
@@ -425,6 +434,15 @@ class AimAllBankWrite(AimOp):
     channels: tuple[int, ...] | None = None
     gpr_addr: int = 0
     name: str | None = None
+    # Retained identities of the host-program buffers the transfer moves
+    # (the program derivation's buffer keys, one per coalesced transfer),
+    # the normalized slice of each (None for the whole buffer) and the kernel
+    # group whose layout the transfer follows.  Set by the program
+    # derivation; `AimCtx.check_realization` binds the transfer to the
+    # candidate's declared transfers through them, never through ``name``.
+    buffer_refs: tuple = ()
+    buffer_slices: tuple = ()
+    group_id: int | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "row", _nonnegative("row", self.row))
@@ -444,7 +462,7 @@ class AimAllBankWrite(AimOp):
 
 
 @dataclass(frozen=True)
-class AimDistributedHostTransfer(AimOp):
+class AimDistributedHostTransfer(AimOp):  # pylint: disable=too-many-instance-attributes
     """Regular linear-layout host traffic expanded into raw MEM bursts.
 
     Each replica occupies ``channels_per_replica`` disjoint channels.  Banks
@@ -463,6 +481,15 @@ class AimDistributedHostTransfer(AimOp):
     bank_offset: int = 0
     copies: int = 1
     name: str | None = None
+    # Retained identities of the host-program buffers the transfer moves
+    # (the program derivation's buffer keys, one per coalesced transfer),
+    # the normalized slice of each (None for the whole buffer) and the kernel
+    # group whose layout the transfer follows.  Set by the program
+    # derivation; `AimCtx.check_realization` binds the transfer to the
+    # candidate's declared transfers through them, never through ``name``.
+    buffer_refs: tuple = ()
+    buffer_slices: tuple = ()
+    group_id: int | None = None
 
     def __post_init__(self):
         direction = str(self.direction).lower()

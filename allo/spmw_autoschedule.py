@@ -2066,10 +2066,28 @@ def rank_matcher_placements(
         return placements
 
     def probe(probe_trace, placements):
-        """Materialize one candidate: None, or the rejection reason."""
+        """Materialize one candidate's kernels alone (the preliminary
+        per-kernel filter): None, or the rejection reason."""
         try:
             _materialize_matcher_codegen(
                 target, probe_trace, placements, host_moves=host_moves
+            )
+        except rejection_types as error:
+            return _Rejected(error)
+        return None
+
+    def scheduled_probe(placements):
+        """Materialize one complete assignment under the real orchestration
+        (launch schedule and resolved host moves), as ``compile_for_target``
+        emits the selected program: None, or the rejection reason."""
+        try:
+            _materialize_matcher_codegen(
+                target,
+                trace,
+                placements,
+                host_moves=host_moves,
+                schedule=launch_schedule,
+                orchestrated=True,
             )
         except rejection_types as error:
             return _Rejected(error)
@@ -2408,12 +2426,28 @@ def rank_matcher_placements(
         return value
 
     def assignment_probe(assignment):
-        """Code generation of one complete assignment: None, or the reason."""
+        """Code generation of one complete assignment under the real
+        orchestration: None, or the reason.  The per-kernel probe is the
+        preliminary filter; a complete assignment is accepted only when the
+        whole program materializes with the launch schedule and the host
+        moves the selected program is emitted with (C-33)."""
         if single_group:
-            return groups[0].probe(probe, assignment[0])
+            reason = groups[0].probe(probe, assignment[0])
+            if reason is not None:
+                return reason
         if assignment not in whole_probes:
-            placements, _reverted = assemble(assignment)
-            whole_probes[assignment] = probe(trace, placements)
+            placements, reverted = assemble(assignment)
+            if (
+                single_group
+                and launch_schedule is None
+                and not host_moves
+                and not reverted
+            ):
+                # One kernel, no host program: the kernel probe emitted this
+                # exact program already.
+                whole_probes[assignment] = None
+            else:
+                whole_probes[assignment] = scheduled_probe(placements)
         return whole_probes[assignment]
 
     def bucket_reverts(reverted):
@@ -2601,6 +2635,49 @@ def rank_matcher_placements(
                 f"budget ({joint_assignments} > {selection.joint_budget})"
             )
         label = "per-group heuristic"
+        # The heuristic pick is accepted only once it materializes under the
+        # real orchestration; otherwise each group's ranked alternatives are
+        # tried in turn (one group at a time, cheapest feasible first).
+        heuristic_rejections = []
+
+        def record_rejection(assignment_, group_index, reason):
+            heuristic_rejections.append((assignment_, reason))
+            groups[group_index].rejections.append((assignment_[group_index], reason))
+
+        reason = assignment_probe(selected)
+        if reason is not None:
+            record_rejection(selected, 0, reason)
+            for group_index, group in enumerate(groups):
+                trials = []
+                for position in group.domain():
+                    if position == selected[group_index]:
+                        continue
+                    trial = (
+                        selected[:group_index]
+                        + (position,)
+                        + selected[group_index + 1 :]
+                    )
+                    try:
+                        trials.append((whole_cycles(trial), position, trial))
+                    except InfeasibleSchedule:
+                        continue
+                trials.sort(key=lambda item: item[:2])
+                for cycles, _position, trial in trials:
+                    reason = assignment_probe(trial)
+                    if reason is None:
+                        selected = trial
+                        selection_cycles = cycles
+                        break
+                    record_rejection(trial, group_index, reason)
+                if reason is None:
+                    break
+            if reason is not None:
+                _raise_unmaterialized(
+                    f"no complete assignment materialized under the launch "
+                    f"schedule on target {getattr(target, 'name', None)!r}; "
+                    f"rejections: {[(a, str(r)) for a, r in heuristic_rejections]}",
+                    [reason for _assignment, reason in heuristic_rejections],
+                )
 
     placements, _reverted = assemble(selected)
     records = []

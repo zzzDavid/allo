@@ -259,6 +259,173 @@ def _register_effects_deriver():
 _register_effects_deriver()
 
 
+_HOST_TRANSFER_RECORDS = (AimDistributedHostTransfer, AimHostTransfer, AimAllBankWrite)
+
+
+def _check_host_transfer_extent(op, group, geometry, shape, value, index, expected):
+    """One distributed transfer or all-bank broadcast against the element
+    extent of the slice it was lowered for."""
+    if isinstance(op, AimDistributedHostTransfer):
+        replicas = op.replicas if group.split_replicas else 1
+        realized = op.elements * replicas
+        if not expected <= realized < expected + replicas:
+            raise RuntimeError(
+                f"AiM realization moves {realized} element(s) of {value!r}; the "
+                f"slice {index} holds {expected}"
+            )
+        return
+    if shape is None:
+        raise RuntimeError(
+            f"AiM realization broadcasts {value!r} into a group without a "
+            "contraction"
+        )
+    parts = group.reduction_partitions
+    accumulators = shape["outputs"] * shape["batches"]
+    if (
+        expected != accumulators
+        or op.rows != _ceil(shape["outputs"], geometry.banks)
+        or op.copies != _ceil(shape["batches"] * parts, group.partitions)
+    ):
+        raise RuntimeError(
+            f"AiM realization broadcasts {value!r} to {op.rows} row(s) x "
+            f"{op.copies} copies; the slice {index} feeds {accumulators} "
+            f"accumulator(s) ({expected} elements)"
+        )
+
+
+def _check_host_transfers(program, group, effects, ops, storage_of) -> None:
+    """The host transfers lowered for ``group`` against its candidate's
+    declared transfers, bound by retained buffer identity.
+
+    Every host record the derivation lowered for the group carries the
+    buffer keys it moves (`buffer_refs`), their slices and the group; each is
+    matched to the declared transfer of the work-body value with the same
+    retained identity (the body's operands and results, never a name), and
+    its direction (host write: ``in``/``inout``; host read: ``out``/``inout``),
+    the extent of the slice it moves and its device endpoint (the banks the
+    group's layout holds the buffer in) are compared with the declaration.
+    Under a host program every declared input must reach the device: a host
+    write of it, residency, or a store by another group of the program.
+    """
+    records = [
+        op
+        for op in ops
+        if isinstance(op, _HOST_TRANSFER_RECORDS) and op.group_id == group.group_id
+    ]
+    if not records and program.schedule is None:
+        return
+    ref_of_name: dict = {}
+    for match in group.matches:
+        for operand in match.operands:
+            if operand.memref_name is not None:
+                ref_of_name.setdefault(
+                    operand.memref_name,
+                    program._key(operand.value_ref, operand.memref_name),
+                )
+        if match.result_memref_name is not None:
+            ref_of_name.setdefault(
+                match.result_memref_name,
+                program._key(match.result_value_ref, match.result_memref_name),
+            )
+    declared_by_ref: dict = {}
+    for transfer in effects.transfers:
+        ref = ref_of_name.get(transfer.value)
+        if ref is not None:
+            declared_by_ref.setdefault(ref, transfer)
+    label = program.name_by_key.get
+    geometry = program.geometry
+    shape = group.contractions[0]["shape"] if group.contractions else None
+    written: set = set()
+    bursts: dict = {}
+    for op in records:
+        if not op.buffer_refs or len(op.buffer_refs) != len(op.buffer_slices):
+            raise RuntimeError(
+                f"AiM realization lowered the host transfer {op.name!r} without a "
+                "retained buffer identity"
+            )
+        direction = "write" if isinstance(op, AimAllBankWrite) else op.direction
+        for ref, index in zip(op.buffer_refs, op.buffer_slices):
+            transfer = declared_by_ref.get(ref)
+            if transfer is None:
+                raise RuntimeError(
+                    f"AiM realization moves {label(ref, ref)!r} between host and "
+                    f"the device for group {group.name!r}; the candidate declares "
+                    f"transfers of {sorted(t.value for t in effects.transfers)}"
+                )
+            allowed = {"in", "inout"} if direction == "write" else {"out", "inout"}
+            if transfer.direction not in allowed:
+                raise RuntimeError(
+                    f"AiM realization {direction}s {label(ref, ref)!r} "
+                    f"({transfer.value!r}); the candidate declares it {transfer.direction!r}"
+                )
+            side = "in" if direction == "write" else "out"
+            landing = storage_of(transfer.value, side)
+            if (
+                landing is None
+                or landing.storage != "banks"
+                or "banks" not in tuple(transfer.route)
+            ):
+                raise RuntimeError(
+                    f"AiM realization moves {transfer.value!r} through the banks; "
+                    f"the candidate declared {landing} with route {transfer.route}"
+                )
+            expected = program._token_extent(ref, index)
+            if isinstance(op, AimHostTransfer):
+                bursts.setdefault((ref, index, transfer.value), [0, expected])
+                bursts[(ref, index, transfer.value)][0] += op.bursts
+            else:
+                _check_host_transfer_extent(
+                    op, group, geometry, shape, transfer.value, index, expected
+                )
+            if direction == "write":
+                written.add(ref)
+    for (ref, index, value), (total, expected) in bursts.items():
+        per_replica = total * geometry.lanes // max(group.replicas, 1)
+        batches = shape["batches"] if shape else 1
+        if not expected <= per_replica <= expected + batches * (geometry.lanes - 1):
+            raise RuntimeError(
+                f"AiM realization writes {per_replica} element(s) of {value!r} "
+                f"per replica; the slice {index} holds {expected}"
+            )
+    if program.schedule is None:
+        return
+    # Inputs the group reads from the banks reach them by a host write (for
+    # any group's layout: one scatter serves every reader of the buffer), by
+    # residency, or as the result of another group of the program.  GPR
+    # operands (EWADD) have no lowered ingress: the AiM trace starts with the
+    # GPR host-written, as the lowering's manifest states, so they are not
+    # checked here.
+    host_written = {
+        ref
+        for op in ops
+        if isinstance(op, _HOST_TRANSFER_RECORDS)
+        and (isinstance(op, AimAllBankWrite) or op.direction == "write")
+        for ref in op.buffer_refs
+    }
+    produced = {
+        program._key(match.result_value_ref, match.result_memref_name)
+        for other in program.groups
+        if other is not group
+        for match in other.matches
+    }
+    for transfer in effects.transfers:
+        if transfer.direction not in {"in", "inout"} or transfer.physical:
+            continue
+        landing = storage_of(transfer.value, "in")
+        if landing is None or landing.storage != "banks":
+            continue
+        ref = ref_of_name.get(transfer.value)
+        if ref is None or ref in written or ref in host_written:
+            continue
+        if ref in program.resident or ref in produced:
+            continue
+        raise RuntimeError(
+            f"AiM realization never brings {transfer.value!r} to the device: the "
+            "host program neither writes it nor keeps it resident, and no other "
+            "group of the program produces it"
+        )
+
+
 class AimCtx(CodegenContext):
     """Codegen ctx for AiM: emits the ramulator2 text trace.
 
@@ -398,9 +565,14 @@ class AimCtx(CodegenContext):
         reduction extent (per work item, or aggregated over a partitioned
         group), its bank scope, reduction partitions (with the host reduction
         that merges them), the vector's residency (GB broadcast or bank
-        pair) and the matrix's bank residency; an elementwise record's
-        element count and home; and, when a host program was lowered, that
-        every host transfer names a declared transfer."""
+        pair), the matrix's bank residency, the batch mapping it requests
+        and the one the lowering realizes, and the GPR readout of its results;
+        an elementwise record's element count and home; and every host
+        transfer the host program lowered for the group, bound to the
+        candidate's declared transfers through the retained buffer identities
+        the records carry (direction, slice extent and device endpoint), with
+        every declared input written by the host, resident or produced on the
+        device."""
         from .spmw_candidate import candidate_effects
 
         layouts = list(layouts) if isinstance(layouts, (list, tuple)) else [layouts]
@@ -409,10 +581,13 @@ class AimCtx(CodegenContext):
             return
         groups = {group.group_id: group for group in program.groups}
         ops = list(getattr(self, "lowered_operations", ()))
-        host_names = set()
-        for op in ops:
-            if isinstance(op, AimDistributedHostTransfer) and op.name:
-                host_names.update(part.split("[")[0] for part in op.name.split("+"))
+        manifest = list(getattr(self, "lowering_manifest", ()))
+        if len(manifest) != len(ops):
+            raise RuntimeError(
+                f"AiM realization lowered {len(ops)} records but {len(manifest)} "
+                "manifest entries"
+            )
+        manifest_of = {id(op): entry for op, entry in zip(ops, manifest)}
         for layout in layouts:
             effects = candidate_effects(layout)
             if effects is None:
@@ -531,6 +706,50 @@ class AimCtx(CodegenContext):
                         "AiM realization accumulates in mac_reg; the candidate "
                         f"declares {list(effects.allocations)}"
                     )
+                # Batch mapping: the declared request is the record's request
+                # (an unspecified one is the lowering's ``auto`` rule) and an
+                # explicit one is the mapping realized; the lowering's choice
+                # is the one the derivation laid the host transfers out for.
+                requested = str(launch.covers[3]) if len(launch.covers) > 3 else "auto"
+                requested = "auto" if requested in {"", "none"} else requested
+                realized_mappings = {
+                    manifest_of[id(r)].get("batch_mapping") for r in records
+                }
+                expected_realized = (
+                    contraction_entry["mapping"] if contraction_entry else None
+                )
+                if (
+                    requested != record.batch_mapping
+                    or (requested != "auto" and realized_mappings != {requested})
+                    or (
+                        expected_realized is not None
+                        and realized_mappings != {expected_realized}
+                    )
+                ):
+                    raise RuntimeError(
+                        f"AiM realization maps batches {sorted(realized_mappings)} "
+                        f"(request {record.batch_mapping!r}); the candidate declares "
+                        f"the batch mapping {requested!r}"
+                    )
+                # Results: the MAC accumulators are read back into the GPR
+                # (RD_MAC) and gathered from there; a declared result that
+                # lives elsewhere, or leaves by another route, is not this
+                # program.
+                for name in effects.coverage.outputs:
+                    result = storage_of(name, "out")
+                    transfer = {t.value: t for t in effects.transfers}.get(name)
+                    route = tuple(transfer.route) if transfer is not None else ()
+                    if (
+                        result is None
+                        or result.storage != "gpr"
+                        or "gpr" not in route
+                        or route[-1] != "host_gather"
+                    ):
+                        raise RuntimeError(
+                            f"AiM realization reads the results of {name!r} back "
+                            "from gpr to the host; the candidate declared "
+                            f"{result} with transfer {transfer}"
+                        )
             else:
                 records = [
                     op
@@ -568,18 +787,7 @@ class AimCtx(CodegenContext):
                             f"AiM realization keeps {v.value!r} in {home}; the "
                             f"candidate declared {v}"
                         )
-            declared_values = {t.value for t in effects.transfers}
-            missing = {name for name in host_names if name in group.functions} - (
-                declared_values
-            )
-            if host_names and any(
-                n not in declared_values and n in names for n in missing
-            ):
-                raise RuntimeError(
-                    f"AiM realization moves {sorted(host_names)} between host and "
-                    f"device; the candidate declares transfers of "
-                    f"{sorted(declared_values)}"
-                )
+            _check_host_transfers(program, group, effects, ops, storage_of)
 
     # Host-move emit lambdas reach these; the derivation consumes the
     # recorded direction instead, so they only validate the device endpoint.
@@ -1463,8 +1671,13 @@ class _AimProgramDerivation:
                 extent *= item[1] - item[0]
         return extent
 
-    def _matrix_records(self, direction, group, usage, index, name):
+    def _matrix_records(self, direction, group, usage, index, name, key=None):
         """Cache-append transfers into a contraction matrix layout (A5)."""
+        identity = {
+            "buffer_refs": (key,),
+            "buffer_slices": (index,),
+            "group_id": group.group_id,
+        }
         geometry = self.geometry
         contraction = usage.contraction
         axes = contraction["axes"]
@@ -1503,6 +1716,7 @@ class _AimProgramDerivation:
                                 row=row,
                                 bursts=packed * aligned // geometry.lanes,
                                 name=f"{name}.group{batch_group}.r{replica}",
+                                **identity,
                             ),
                             None,
                         )
@@ -1547,6 +1761,7 @@ class _AimProgramDerivation:
                         copy_row_stride=output_tiles * storage_rows,
                         channels=channels,
                         name=name,
+                        **identity,
                     ),
                     None,
                 )
@@ -1604,7 +1819,9 @@ class _AimProgramDerivation:
                 flush()
             if usage.kind == "matrix":
                 flush()
-                records.extend(self._matrix_records(verb, group, usage, index, text))
+                records.extend(
+                    self._matrix_records(verb, group, usage, index, text, key)
+                )
                 continue
             if verb == "broadcast":
                 raise NotImplementedError(f"AiM broadcast of {text} into a slot layout")
@@ -1626,6 +1843,9 @@ class _AimProgramDerivation:
                 bank_offset=usage.slot,
                 copies=usage.copies,
                 name=text,
+                buffer_refs=(key,),
+                buffer_slices=(index,),
+                group_id=group.group_id,
             )
             last = pending[-1] if pending else None
             if (
@@ -1639,12 +1859,16 @@ class _AimProgramDerivation:
                         "channels_per_replica",
                         "row",
                         "bank_stride",
+                        "group_id",
                     )
                 )
                 and last["bank_offset"] + last["copies"] == transfer["bank_offset"]
             ):
-                last["copies"] += transfer["copies"]
-                last["name"] = f"{last['name']}+{text}"
+                merged = pending[-1]
+                merged["copies"] += transfer["copies"]
+                merged["name"] = f"{merged['name']}+{text}"
+                merged["buffer_refs"] += (key,)
+                merged["buffer_slices"] += (index,)
             else:
                 for earlier in pending:
                     records.append((AimDistributedHostTransfer(**earlier), None))

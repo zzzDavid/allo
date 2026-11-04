@@ -1501,8 +1501,19 @@ def _materialize_matcher_codegen(
     layouts,
     *,
     host_moves=(),
+    schedule=None,
+    orchestrated=False,
 ) -> MatcherCodegenArtifact:
-    """Emit and freeze the exact executable side of one scored candidate."""
+    """Emit and freeze the exact executable side of one scored candidate.
+
+    With ``orchestrated`` the program is emitted the way ``compile_for_target``
+    emits the selected one: under ``schedule`` (the host program's launch
+    schedule, None without one) and the resolved ``host_moves``.  The ranking
+    materializes every complete assignment this way before accepting a
+    winner, so the realization the candidate contract is checked against is
+    the final emission's.  Without it the kernels are emitted alone (no
+    schedule, no host steps): the per-kernel preliminary filter.
+    """
 
     target_name = getattr(target, "name", None)
     if target_name not in _BACKENDS:
@@ -1510,7 +1521,12 @@ def _materialize_matcher_codegen(
     ctx_cls = backend_context_class(target_name)
 
     ctx = ctx_cls(target)
-    _walk_and_emit(target, trace, ctx, layouts)
+    if orchestrated:
+        _walk_and_emit(
+            target, trace, ctx, layouts, schedule=schedule, host_moves=host_moves
+        )
+    else:
+        _walk_and_emit(target, trace, ctx, layouts)
     # The realized program against the candidate's declared effects, at the
     # materialization boundary: a mismatch is a feasibility rejection the
     # ranking records, so another candidate can be selected.
