@@ -196,6 +196,12 @@ class TenonLane:
         expected = len(self.compiled.plan.launches)
         batch = [(launch.get("raw_ticks") or {}).get("pipeline") for launch in launches]
         timing_problem = timing_evidence_problem(batch, expected)
+        if timing_problem is None:
+            # The records must be the selected plan's launches (index order,
+            # the plan's layout fingerprint per launch), not just a tick count.
+            from .selection_traces import launch_evidence_problem
+
+            timing_problem = launch_evidence_problem(launches, self.compiled.plan)
         amortized = (
             sum(float(t) / REPETITIONS for t in batch) if timing_problem is None else None
         )

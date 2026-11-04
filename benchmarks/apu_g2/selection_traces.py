@@ -120,15 +120,20 @@ def launch_evidence_problem(records, plan) -> str | None:
         return f"{len(records)} launch record(s) for a plan of {len(expected)} launch(es)"
     for position, (record, launch) in enumerate(zip(records, expected)):
         index = record.get("index")
-        if index is not None and index != position:
+        if index is None:
+            return f"launch record {position} carries no launch index"
+        if index != position:
             return f"launch record {position} carries index {index!r}"
         declared = getattr(launch, "layout_fingerprint", None)
         recorded = record.get("layout_fingerprint")
-        if declared is not None and recorded is not None and declared != recorded:
-            return (
-                f"launch {position}: layout fingerprint {recorded[:12]} is not the "
-                f"plan's {declared[:12]}"
-            )
+        if declared is not None:
+            if not recorded:
+                return f"launch {position}: no layout fingerprint recorded"
+            if declared != recorded:
+                return (
+                    f"launch {position}: layout fingerprint {recorded[:12]} is not the "
+                    f"plan's {declared[:12]}"
+                )
         ticks = (record.get("raw_ticks") or {}).get("pipeline")
         if (
             ticks is None

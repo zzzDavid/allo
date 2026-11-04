@@ -427,3 +427,51 @@ def test_apu_v1_archived_lane_accepts_a_relative_scratch_directory(monkeypatch, 
     kept = (tmp_path / "relative_scratch" / "expert-launch-002")
     assert kept.is_absolute() and (kept / "error.txt").exists()
     assert (kept / "counts.bin").read_bytes() == b"partial"
+
+
+def test_apu_g2_launch_evidence_requires_index_and_declared_fingerprint():
+    problem = selection_traces.launch_evidence_problem
+    plan = _Plan("two", ("expected-a", "expected-b"))
+    ticks = [{"raw_ticks": {"pipeline": 100}}, {"raw_ticks": {"pipeline": 90}}]
+    assert problem(ticks, plan) == "launch record 0 carries no launch index"
+    indexed = [dict(r, index=i) for i, r in enumerate(ticks)]
+    assert problem(indexed, plan) == "launch 0: no layout fingerprint recorded"
+    assert problem([dict(indexed[0], layout_fingerprint=None), indexed[1]], plan) == (
+        "launch 0: no layout fingerprint recorded"
+    )
+    swapped = [
+        dict(indexed[0], layout_fingerprint="expected-b"),
+        dict(indexed[1], layout_fingerprint="expected-a"),
+    ]
+    assert "is not the plan's" in problem(swapped, plan)
+    complete = [
+        dict(indexed[0], layout_fingerprint="expected-a"),
+        dict(indexed[1], layout_fingerprint="expected-b"),
+    ]
+    assert problem(complete, plan) is None
+    # A plan that declares no fingerprint only needs the index and ticks.
+    assert problem(indexed, _Plan("two", (None, None))) is None
+
+
+def test_apu_g2_paper_rows_lane_applies_the_plan_correspondence(monkeypatch):
+    import numpy as np
+
+    lane = object.__new__(g2_paper_rows.TenonLane)
+    lane.name = "gemm"
+    lane.fixture = type("F", (), {"oracle": np.zeros((1,), dtype=np.int64)})()
+    lane.arguments = {"C": np.zeros((1,), dtype=np.int16)}
+    monkeypatch.setitem(g2_paper_rows.ORACLE_OUTPUTS, "gemm", ("C",))
+    records = [{"raw_ticks": {"pipeline": 100}}, {"raw_ticks": {"pipeline": 90}}]
+    lane.compiled = type(
+        "Compiled",
+        (),
+        {
+            "plan": _Plan("two", ("expected-a", "expected-b")),
+            "__call__": lambda self, **a: type(
+                "R", (), {"kind": "device", "cycles": 10, "extra": {"launches": records}}
+            )(),
+        },
+    )()
+    launch = lane.launch()
+    assert launch["amortized_ticks_per_pipeline"] is None
+    assert launch["timing_evidence_problem"] == "launch record 0 carries no launch index"
