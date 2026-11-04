@@ -185,3 +185,54 @@ def test_discovery_reads_the_ir_not_its_text():
     assert patterns == [apu_v1_hybrid._DTYPE_RE]
     for name in ("_function_regions", "_type_parts", "_FUNC", "_FORMAL", "_CALL"):
         assert not hasattr(apu_v1_hybrid, name)
+
+
+def seed_and_accumulate(x: int32[8]) -> int32[8]:
+    local: int32[8] = 7
+    for i in range(8):
+        local[i] += x[i]
+    return local
+
+
+def zero_and_accumulate(values: int32[8]) -> int32[8]:
+    acc: int32[8] = 0
+    for i in range(8):
+        acc[i] += values[i]
+    return acc
+
+
+def test_public_route_returned_buffer_identity_and_nonzero_initializer():
+    """Through ``allo.compile``: the returned local is one value under the
+    result name (no second buffer joined by spelling), and a nonzero
+    initializer is not zero initialization; the result's values are the
+    seeded accumulation."""
+    import numpy as np
+
+    from allo.pim.costs import apu_v1_cost
+
+    program = allo.APUv1Program(
+        (allo.APUv1Phase(seed_and_accumulate, result_names=("answer",)),)
+    )
+    compiled = allo.compile(
+        program, build_apu_v1_target(), apu_v1_cost, backend="functional"
+    )
+    values = _values(compiled.hybrid_manifest)
+    assert set(values) == {"x", "answer"}
+    assert values["answer"].program_output and not values["answer"].intermediate
+    assert not values["answer"].zero_initialized
+    (phase,) = compiled.hybrid_manifest.phases
+    assert phase.outputs == ("answer",) and phase.intermediates == ()
+    x = np.arange(8, dtype=np.int32)
+    np.testing.assert_array_equal(compiled(x).extra["outputs"]["answer"], x + 7)
+
+    zero = allo.compile(
+        allo.APUv1Program(
+            (allo.APUv1Phase(zero_and_accumulate, result_names=("total",)),)
+        ),
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="functional",
+    )
+    values = _values(zero.hybrid_manifest)
+    assert set(values) == {"values", "total"}
+    assert values["total"].zero_initialized and values["total"].program_output

@@ -96,6 +96,23 @@ def _formal_number(function, value) -> int | None:
     return argument.arg_number
 
 
+def _is_zero_constant(value) -> bool:
+    """Is ``value`` an ``arith.constant`` equal to zero (integer or float)?"""
+    ir = _ir()
+    if not ir.OpResult.isinstance(value):
+        return False
+    owner = ir.OpResult(value).owner
+    if owner.operation.name != "arith.constant" or "value" not in owner.attributes:
+        return False
+    attribute = owner.attributes["value"]
+    for kind in (ir.IntegerAttr, ir.FloatAttr):
+        try:
+            return kind(attribute).value == 0
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _formal_accesses(function) -> tuple[set, set]:
     """``(read formals, written formals)`` by position: the formals the
     function's loads read and its stores write (nested loops included)."""
@@ -432,12 +449,28 @@ def discover_apu_v1_hybrid_manifest(
             program_output=abi.mode in {"out", "both"},
         )
     top_ops = _walk(_entry_block(top_function), [])
+    # Zero initialization is a property of the fill's value: only a
+    # ``linalg.fill`` whose filled constant is zero initializes to zero.
     filled = {
         names(operation.operands[-1])
         for operation in top_ops
-        if operation.operation.name == "linalg.fill" and len(operation.operands) >= 2
+        if operation.operation.name == "linalg.fill"
+        and len(operation.operands) >= 2
+        and _is_zero_constant(operation.operands[0])
     }
     explicit_zero = set(getattr(phase, "zero_initialize", ()))
+    # A returned buffer is the allocation the top function returns: one
+    # value under the phase's result name, never a second buffer joined to
+    # the allocation by spelling.
+    returns = [op for op in top_ops if op.operation.name == "func.return"]
+    if len(returns) != 1:
+        raise ValueError(
+            f"hybrid manifest expects one return in {top!r}, found {len(returns)}"
+        )
+    returned_ssa = tuple(names(operand) for operand in returns[0].operands)
+    if len(returned_ssa) != len(result_abi):
+        raise ValueError("hybrid manifest returned memrefs do not match the ABI")
+    result_name_of_ssa = dict(zip(returned_ssa, phase.result_names))
     for operation in top_ops:
         if (
             operation.operation.name != "memref.alloc"
@@ -455,24 +488,32 @@ def discover_apu_v1_hybrid_manifest(
             dtype = "u" + dtype
         name = _attr_text(operation.attributes["name"])
         ssa = names(result)
+        returned = ssa in result_name_of_ssa
+        if returned:
+            name = result_name_of_ssa[ssa]
         value_of_ssa[ssa] = name
         values[name] = APUv1ValueManifest(
             name,
             shape,
             dtype,
-            intermediate=True,
+            program_output=returned,
+            intermediate=not returned,
             zero_initialized=(ssa in filled or name in explicit_zero),
         )
-    for name, abi in zip(phase.result_names, result_abi):
-        shape, dtype = tuple(abi.shape), abi.dtype
-        old = values.get(name)
+    for ssa, name, abi in zip(returned_ssa, phase.result_names, result_abi):
+        if ssa not in value_of_ssa:
+            raise ValueError(
+                f"hybrid manifest result {name!r} is not a named allocation of {top!r}"
+            )
+        old = values[value_of_ssa[ssa]]
+        # The ABI's dtype is authoritative for signless integer results.
         values[name] = APUv1ValueManifest(
             name,
-            shape,
-            dtype,
+            tuple(abi.shape),
+            abi.dtype,
             program_output=True,
             intermediate=False,
-            zero_initialized=bool(old and old.zero_initialized),
+            zero_initialized=old.zero_initialized,
         )
 
     calls = []

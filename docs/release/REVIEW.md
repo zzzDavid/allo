@@ -996,6 +996,17 @@ text-derived ones, and a renamed neighbour yields the same structure.
 
 Gates G9 and G10 remain **FAIL**; the gate table above was refreshed.
 
+## Round 29 (2026-11-04): independent review of 90c6cbd accepted; manifest fidelity (X-21)
+
+The reviewer accepted the parser replacement and found that the manifest
+still called every fill a zero initialization and joined a returned local
+to its result name by spelling. Judgment: both are facts of the retained
+IR (the fill's constant; the operands of `func.return`), so they are read
+from it, and the public-route regression uses different allocation and
+result names with a nonzero initializer so spelling cannot carry the
+test. The remaining increment of this round is the hardware session the
+reviewer asked for (G9 slice 5 with the G10 APU rows).
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
