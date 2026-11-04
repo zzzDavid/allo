@@ -1162,10 +1162,10 @@ directories and arguments are built, and a relative scratch with a
 successful and a failed launch leaves the archive byte-identical.
 
 The round then went to the missing route rather than to the ledger. Reading
-the production lowering and the conductor showed why no ordinary program
-reaches the paper's micro-experiment: every reduction tile is staged at DRAM
-row 0 and tiles are separated by column, so the only layout lever is the
-bank fiber per tile and row conflicts cannot occur. The fiber-swizzle lever
+the production lowering and the conductor, it concluded that every
+reduction tile is staged at DRAM row 0 (corrected in round 33: the address
+generator carries columns into rows and a tile spans two rows; what the
+stream lacks is two rows of one bank inside one barrier group). The fiber-swizzle lever
 was measured on the real conductor through `allo.compile`: the vendor
 `dual_fiber` placement 8,247 cycles (the paper's vendor row), `bank_row`
 with the same levers 8,153. Judgment: the paper's mechanism exists in the
@@ -1176,6 +1176,46 @@ through the program and the conductor plan, a program-derived
 `bank_access_trace()` artifact) is specified in
 `design/samsung-bank-row-swizzle-route.md` and is the next G10
 implementation item for this row. The row stays UNVERIFIED.
+
+## Round 33 (2026-11-04): independent review of e357628; the row-0 diagnosis corrected with the conductor's own trace; the first production slice
+
+The reviewer showed the round 32 diagnosis wrong: `addrGenSafe` carries
+column overflow into the row, so with 32 burst columns per row each
+64-column tile spans two physical rows, and the measured A/B did not
+establish an absence of row changes. Judgment: accepted in full; the
+conductor overlay now dumps its normalized stream on request, the dump of
+both placements of the 8192x256 GEMV (and of the 4096x512 neighbour)
+confirms the reviewer's arithmetic (bank_row: bank 0 rows 0-3 and 4-7,
+seven same-bank row changes; dual_fiber: banks 0 and 1 rows 0-3, three
+each), and every copy of the wrong statement was corrected (design,
+ISSUES S-13, inventory, STATUS, VALIDATION, this file, handoff).
+
+What the stream does establish is narrower than round 32 claimed and is
+now evidenced rather than asserted: every barrier group is eight
+consecutive columns of one row of one bank, so the within-round two-row
+conflict the paper's four-request probe measures never occurs in the
+production program; the layout-dependent cost it has is the row change
+between successive groups. The multiplicity, ordering and timing boundary
+of the probe therefore cannot be obtained by compressing the GEMV stream,
+and the design now says so instead of proposing a one-request-per-tile
+trace; its cost proposal no longer calibrates against 148/116.
+
+The production slice: `samsung_access_stream` derives the executable
+pass-phase stream from the lowered program and the geometry; it is
+byte-identical to the conductor's dump for both placements of two GEMVs
+(a gated test runs the conductor with the trace enabled; a unit test pins
+the counts, rows and row changes); the layout-trace harness was made able
+to replay a program-length stream, and the replay isolates the
+layout-dependent bank-read cost (dual_fiber faster: 1,188 vs 1,248 and
+1,228 vs 1,248 harness cycles) while the full programs run the other way
+(8,247 vs 8,153 and 8,041 vs 7,947), both through `allo.compile` with
+explicit placements. Judgment: this is shared-pipeline evidence of the
+mechanism on real programs, with an independent neighbouring workload; it
+is not the paper row, which stays UNVERIFIED.
+
+Also this round: the Gemini-II drivers require a launch index and the
+plan's layout fingerprint on every record (reviewer's provenance probe);
+CLAIMS E4 reports 10 exact AiM rows and four OPEN (X-19).
 
 ## Rejected shortcuts
 
@@ -1216,7 +1256,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 32 (2026-11-04) at the candidate `257b91d`+ (this
+Refreshed in round 33 (2026-11-04) at the candidate `e357628`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |
@@ -1230,7 +1270,7 @@ commit). Earlier judgments are kept in the round sections above.
 | G7 install/interfaces/maintainability | **PARTIAL** | installed-artifact runs at `7bdb475`, `e60973f`, `9255d29`; architecture docs follow the pipeline (`design/shared-compilation-path.md`); open: a fresh install at the candidate, the Samsung patches (P-04), P-23 lint, the public-payload review |
 | G8 backend execution | **PARTIAL** | installed-artifact evidence on the simulators at `69773fc` (Samsung, AiM, UPMEM probes, no checkout module loaded) and on the APU v1 board and the Gemini-II card at `69773fc`/`28cc922` (round 30: the archived paired protocols with the baselines re-run, exact outputs, device locks, launch provenance on every route); `tests/perf` at `69773fc` (545 passed, the one failure an NFS-tmpdir artifact fixed in `d2e3fda`), `tests/pim` at `69773fc` 564 passed with 20 Docker-backed simulator tests failing on the host's full `/var` (containerd ENOSPC, an administrator matter; the same rows passed from the installed wheel earlier in the round); open: the 20 simulator tests re-run when the host has space, the suites and installed-wheel checks at the final round 30 candidate, the ledag scratch fix (X-24) exercised only through its unit test and the sessions 3 and later |
 | G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | shared front stages and facts (rounds 12-18); both APUs' plans and typed records as candidates of the common pipeline with an enforced contract (rounds 13-17); Samsung, AiM, UPMEM and AttAcc declare effects from the facts and are checked at materialization (rounds 19-27, X-04 to X-20); shared transfer availability (X-09, X-17, X-18); the `APUv1Program` manifest from the retained IR (round 28); slice 5 traces at `653b059` from installed wheels (round 29); round 30: the paper rows measured through default selection from installed wheels under the archived protocols with launch provenance on every route; open: independent review of rounds 28-30, the full suites and installed-artifact runs at the final candidate, the remaining minor items |
-| G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), Gemini-II 5/5 REPRODUCED under the archived paired protocol with the GTML baseline re-run in the same rounds (round 30), Gemini-I under the archived paired protocol with the expert binaries re-run: 2/5 REPRODUCED (matrix multiply, histogram), kmeans and linear regression OPEN (nominal) on the pooled round 30 sessions (X-23; the single-session closure of kmeans was withdrawn in round 31), word count attributed to the generated program's loop-counter width and repaired (X-22, `dc41df7`): the repaired program at parity with the paper's own binary in the same rounds and 0.19% above the paper's archived median, OPEN (nominal); the Gemini-I vector GEMM layout row faster than the paper (round 31); the Samsung XOR row UNVERIFIED with its probe diagnostic only and its shared-pipeline route specified (round 32, S-13, `design/samsung-bank-row-swizzle-route.md`); the 500-instance selector equivalence as a diagnostic; UNVERIFIED: portability GEMV, token partitioning, UPMEM scaling, packing/selection/DCC studies, AttAcc Ramulator2 timings and decode, calibration, the virtual study, compile cost |
+| G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), Gemini-II 5/5 REPRODUCED under the archived paired protocol with the GTML baseline re-run in the same rounds (round 30), Gemini-I under the archived paired protocol with the expert binaries re-run: 2/5 REPRODUCED (matrix multiply, histogram), kmeans and linear regression OPEN (nominal) on the pooled round 30 sessions (X-23; the single-session closure of kmeans was withdrawn in round 31), word count attributed to the generated program's loop-counter width and repaired (X-22, `dc41df7`): the repaired program at parity with the paper's own binary in the same rounds and 0.19% above the paper's archived median, OPEN (nominal); the Gemini-I vector GEMM layout row faster than the paper (round 31); the Samsung XOR row UNVERIFIED with its probe diagnostic only; the program-derived executable access stream verified against the conductor and replayed on the harness for two GEMVs (round 33, S-13, `design/samsung-bank-row-swizzle-route.md`); the 500-instance selector equivalence as a diagnostic; UNVERIFIED: portability GEMV, token partitioning, UPMEM scaling, packing/selection/DCC studies, AttAcc Ramulator2 timings and decode, calibration, the virtual study, compile cost |
 
 Verdict: **NOT READY**. Blockers: G9 (independent review of rounds 28-30,
 the suites at the final candidate), G10 (the remaining studies, the four
