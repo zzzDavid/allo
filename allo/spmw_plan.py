@@ -431,6 +431,45 @@ class LaunchStep:
 
 
 @dataclass(frozen=True)
+class HostComputeStep:
+    """One declared host computation of the program, in schedule order.
+
+    ``inputs`` and ``outputs`` are ``(buffer name, shape, element bits)``
+    triples: the whole buffers the stage reads and produces, with the
+    volumes the backend prices (readout of the inputs from the device's
+    host-visible memory, upload of the outputs to the consumer's ingress).
+    ``function`` is the stage's computation (``fn(*inputs) -> outputs``),
+    executed on the functional path and by functional checks; it is not part
+    of the manifest.
+    """
+
+    name: str
+    inputs: tuple = ()
+    outputs: tuple = ()
+    ordinal: int = 0
+    function: object = None
+
+    def volume(self, which: str) -> int:
+        """Bytes of ``which`` ('inputs' or 'outputs')."""
+        total = 0
+        for _name, shape, bits in getattr(self, which):
+            elements = 1
+            for extent in shape or ():
+                elements *= int(extent)
+            total += (elements * int(bits) + 7) // 8
+        return total
+
+    def elements(self, which: str = "inputs") -> int:
+        total = 0
+        for _name, shape, _bits in getattr(self, which):
+            elements = 1
+            for extent in shape or ():
+                elements *= int(extent)
+            total += elements
+        return total
+
+
+@dataclass(frozen=True)
 class LaunchSchedule:
     """Host transfers and kernel launches in recorded host-program order.
 
@@ -449,11 +488,20 @@ class LaunchSchedule:
                 ("host", step.host_index)
                 if isinstance(step, HostStep)
                 else (
-                    "launch",
-                    step.kernel,
-                    step.group_id,
-                    step.ordinal,
-                    tuple(step.operands),
+                    (
+                        "host_compute",
+                        step.name,
+                        tuple((n, tuple(sh or ()), int(b)) for n, sh, b in step.inputs),
+                        tuple((n, tuple(sh or ()), int(b)) for n, sh, b in step.outputs),
+                    )
+                    if isinstance(step, HostComputeStep)
+                    else (
+                        "launch",
+                        step.kernel,
+                        step.group_id,
+                        step.ordinal,
+                        tuple(step.operands),
+                    )
                 )
             )
             for step in self.steps
@@ -520,9 +568,15 @@ def launch_schedule(host_program, trace, *, module=None) -> LaunchSchedule:
     because no backend lowers a rebinding of a kernel's ABI.
     """
     from .spmw_match_engine import _parse_work_id
-    from .spmw_target import HostMoveRecord, LaunchRecord
+    from .spmw_target import HostComputeRecord, HostMoveRecord, LaunchRecord
 
     parameters = _region_parameters(getattr(host_program, "region", None))
+    shape_of = dict(parameters)
+    # Element widths from the region's own annotations (the typed view of
+    # its buffers), completed by the matched kernels' operand types.
+    bits_of = _region_element_bits(getattr(host_program, "region", None))
+    for name, bits in _parameter_element_bits(trace).items():
+        bits_of.setdefault(name, bits)
     entry = _parse_work_id(trace.matches[0].func_name)[0] if trace.matches else None
     declared = (
         _kernel_abi_names(module, parameters, entry) if module is not None else {}
@@ -563,6 +617,40 @@ def launch_schedule(host_program, trace, *, module=None) -> LaunchSchedule:
             ordinals[group_id] = ordinal + 1
             operands = _check_launch_binding(record, declared.get(record.kernel))
             steps.append(LaunchStep(record.kernel, group_id, ordinal, operands))
+        elif isinstance(record, HostComputeRecord):
+            def binding(tokens):
+                out = []
+                for token in tokens:
+                    if token.name not in shape_of:
+                        raise ValueError(
+                            f"host_compute {record.name!r} names {token.name!r}, not a "
+                            f"parameter of the region ({list(shape_of)})"
+                        )
+                    shape = shape_of[token.name]
+                    if shape is None:
+                        raise ValueError(
+                            f"host_compute {record.name!r}: the region declares no "
+                            f"shape for {token.name!r}"
+                        )
+                    out.append((token.name, tuple(shape), int(bits_of.get(token.name, 0))))
+                return tuple(out)
+
+            inputs, outputs = binding(record.inputs), binding(record.outputs)
+            for name, _shape, bits in inputs + outputs:
+                if bits <= 0:
+                    raise ValueError(
+                        f"host_compute {record.name!r}: no element type is retained for "
+                        f"{name!r} (it must be read or written by a matched kernel)"
+                    )
+            steps.append(
+                HostComputeStep(
+                    record.name,
+                    inputs,
+                    outputs,
+                    sum(isinstance(step, HostComputeStep) for step in steps),
+                    record.fn,
+                )
+            )
         else:
             raise ValueError(f"unknown host program step {record!r}")
 
@@ -576,6 +664,60 @@ def launch_schedule(host_program, trace, *, module=None) -> LaunchSchedule:
         frozenset(getattr(host_program, "resident", ()) or ()),
         parameters,
     )
+
+
+_ELEMENT_BITS = {
+    "bf16": 16, "f16": 16, "f32": 32, "f64": 64,
+    "i1": 1, "i8": 8, "i16": 16, "i32": 32, "i64": 64,
+    "ui8": 8, "ui16": 16, "ui32": 32, "ui64": 64,
+}
+
+
+def _memref_element_bits(memref_type) -> int:
+    text = str(memref_type or "")
+    inner = text[text.find("<") + 1 : text.rfind(">")] if "<" in text else ""
+    element = inner.split("x")[-1].strip() if inner else ""
+    if element in _ELEMENT_BITS:
+        return _ELEMENT_BITS[element]
+    digits = "".join(ch for ch in element if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def _parameter_element_bits(trace) -> dict:
+    """``{buffer name: element bits}`` from the retained operand and result
+    types of the matched kernels (the only typed view of the buffers)."""
+    bits = {}
+    for match in getattr(trace, "matches", ()) or ():
+        for operand in getattr(match, "operands", ()):
+            value = _memref_element_bits(getattr(operand, "memref_type", None))
+            if operand.memref_name and value:
+                bits.setdefault(operand.memref_name, value)
+        name = getattr(match, "result_memref_name", None)
+        value = _memref_element_bits(getattr(match, "result_memref_type", None))
+        if name and value:
+            bits.setdefault(name, value)
+    return bits
+
+
+def _region_element_bits(region) -> dict:
+    """``{parameter: element bits}`` from the region's type annotations."""
+    import inspect
+
+    if region is None:
+        return {}
+    try:
+        annotations = inspect.get_annotations(region, eval_str=True)
+    except (NameError, TypeError):
+        annotations = getattr(region, "__annotations__", {}) or {}
+    bits = {}
+    for name, annotation in annotations.items():
+        dtype = getattr(annotation, "dtype", None)
+        value = getattr(dtype, "bits", None)
+        if value is None:
+            value = _memref_element_bits(str(dtype)) if dtype is not None else 0
+        if value:
+            bits[name] = int(value)
+    return bits
 
 
 def _region_parameters(region) -> tuple:
@@ -699,6 +841,39 @@ def build_execution_graph(
                     ).manifest(),
                     "phase": f"host_{direction}",
                 },
+                dependencies,
+            )
+        )
+
+    def _emit_host_compute(step, dependencies):
+        """The declared host stage as one priced event of the target's
+        ``HOST_COMPUTE`` operation: its metrics are the stage name and the
+        declared input (readout) and output (upload) volumes and elements;
+        the cost program prices the link traffic and the host time."""
+        try:
+            primitive = target.op("HOST_COMPUTE")
+        except KeyError as error:
+            raise NotImplementedError(
+                f"target {getattr(target, 'name', None)!r} declares no HOST_COMPUTE "
+                f"operation; the host stage {step.name!r} cannot be priced"
+            ) from error
+        return tuple(
+            _emit_event(
+                bound_cost,
+                graph,
+                primitive,
+                f"host:compute:{step.ordinal}:{step.name}",
+                (),
+                {
+                    "stage": step.name,
+                    "inputs": tuple((n, tuple(sh), int(b)) for n, sh, b in step.inputs),
+                    "outputs": tuple((n, tuple(sh), int(b)) for n, sh, b in step.outputs),
+                    "input_bytes": step.volume("inputs"),
+                    "output_bytes": step.volume("outputs"),
+                    "input_elements": step.elements("inputs"),
+                    "output_elements": step.elements("outputs"),
+                },
+                {"phase": "host_compute", "stage": step.name},
                 dependencies,
             )
         )
@@ -889,6 +1064,8 @@ def build_execution_graph(
                     else f"group{step.group_id}#{step.ordinal}"
                 )
                 frontier = _emit_group(step.group_id, frontier, label_prefix)
+            elif isinstance(step, HostComputeStep):
+                frontier = _emit_host_compute(step, frontier)
             else:
                 raise TypeError(f"unknown launch schedule step {step!r}")
         return graph
@@ -1293,6 +1470,18 @@ def check_transfer_availability(trace, launch_schedule, host_moves, placements):
         if key is not None and shape is not None:
             available.setdefault(key, []).append(tuple((0, d) for d in shape))
 
+    # Buffers some launch of the program writes: a host stage may read one
+    # only after that launch; any other buffer is host data from the start.
+    produced_keys = set()
+    for group in groups.values():
+        if group["effects"] is None:
+            continue
+        written = {
+            t.value for t in group["effects"].transfers if t.direction in ("out", "inout")
+        }
+        for key in regions(group, written, "writes"):
+            produced_keys.add(key)
+    # Keys written by a launch are available only once that launch ran.
     moves = list(host_moves or ())
     for position, step in enumerate(launch_schedule.steps):
         if isinstance(step, HostStep):
@@ -1329,6 +1518,29 @@ def check_transfer_availability(trace, launch_schedule, host_moves, placements):
             else:
                 box = region  # a Cartesian box: exactly the elements it names
             available.setdefault(key, []).append(box)
+            continue
+        if isinstance(step, HostComputeStep):
+            # A host stage reads whole buffers the program has on the host:
+            # produced by an earlier launch (read out of the device) or a
+            # region input no launch produces; it produces whole buffers that
+            # a later launch receives through its own declared host ingress.
+            for name, shape, _bits in step.inputs:
+                key = key_by_name.get(name)
+                if key is None:
+                    continue
+                box = tuple((0, int(d)) for d in shape)
+                if _covered(box, available.get(key, [])) or key not in produced_keys:
+                    continue
+                raise InfeasibleSchedule(
+                    f"host stage {step.name!r} (step {position}) reads {name!r} over "
+                    f"{list(box)} before the launch that produces it"
+                )
+            for name, shape, _bits in step.outputs:
+                key = key_by_name.get(name)
+                if key is None:
+                    continue
+                available.setdefault(key, []).append(tuple((0, int(d)) for d in shape))
+                produced_keys.add(key)
             continue
         if not isinstance(step, LaunchStep):
             continue

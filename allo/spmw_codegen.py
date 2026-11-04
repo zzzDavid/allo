@@ -1729,8 +1729,15 @@ def compile_for_target(
     target_name = getattr(target, "name", None)
     resolved_host_moves = _resolve_host_moves(target, host_moves)
     if launch_schedule is not None:
-        from .spmw_plan import HostStep
+        from .spmw_plan import HostComputeStep, HostStep
 
+        stages = [s for s in launch_schedule.steps if isinstance(s, HostComputeStep)]
+        if stages and not getattr(backend_context_class(target_name), "supports_host_compute", False):
+            raise NotImplementedError(
+                f"target {target_name!r} does not represent declared host stages "
+                f"(allo.host_compute {[s.name for s in stages]}); its program "
+                "derivation, pricing and realization check do not bind them"
+            )
         n_host_steps = sum(isinstance(step, HostStep) for step in launch_schedule.steps)
         if n_host_steps != len(resolved_host_moves):
             raise ValueError(

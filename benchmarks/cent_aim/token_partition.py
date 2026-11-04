@@ -4,51 +4,61 @@
 as a maintained reproduction driver (release gate G10, inventory row
 ``token_partitioning_nine_workloads``).
 
-What it measures today is a **diagnostic** of the partition decision, not
-the frozen paper's comparable boundary:
+Nine resident-input decode-attention workloads (1/8/32 heads x
+128/512/4096 tokens, head dim 128) compiled through ``allo.compile`` on the
+AiM target under the paper's eight-channel device budget expressed as the
+compiler's resource policy (``resources={"channel": 8}``).  Since round 42
+the program is the bridged attention: QK scores -> global softmax on the
+host -> probabilities -> SV, with the softmax a declared host stage of the
+host program (``allo.host_compute``) that the schedule orders, the
+availability check binds (the scores produced by QK before it, the
+probabilities reaching SV's GB preload), the AiM program lowers as a host
+step and the cost program prices in the graph the normal selection ranks
+(``host_stage:softmax``: the readout of the scores and the upload of the
+probabilities over the declared 32 B/cycle link, plus the declared host
+vector passes).  The partial-result readout of a split SV is priced by the
+host reduction, so nothing is counted twice.
 
-* Nine resident-input decode-attention workloads (1/8/32 heads x
-  128/512/4096 tokens, head dim 128) compiled through ``allo.compile`` on
-  the AiM target under the paper's eight-channel device budget expressed
-  as the compiler's resource policy (``resources={"channel": 8}``,
-  ``allo.spmw_resources``): the enumerators bound the replica and token
-  partition domains by it and the shared ranking selects the complete
-  program (QK and SV).  That **normal selection** is the headline plan
-  (``default``); its P is the study's "selected" partition count.
-* Forced alternatives for the ablation: the budgeted ranking's cheapest SV
+* The **normal selection** under the budget is the headline plan
+  (``default``); its P is the study's "selected" partition count.  The
+  forced alternatives are the ablation: the budgeted ranking's cheapest SV
   plan per P in {1, 2, 4, 8} and the head-only control (one head per
-  channel, no split), each compiled as an explicit layout under the same
-  budget (the supplied placement is rebound and its declaration validated
-  by the shared boundary).  The simulator decides which is fastest.
+  channel, no split), compiled as explicit layouts under the same budget.
+  Aliases are decided before anything runs and never replace a failure.
 * Per plan: the estimate from the virtual backend, the device cycles from
   the AiM simulator (timing-only ramulator2; ``kind == "simulator-timing-only"``
-  is asserted), the host merge priced by the declared 32 GB/s link model,
-  and, for split plans only, the merge's numerics on integer and BF16
-  operands (an unsplit plan has no merge; its record says so).  Every
-  plan's artifacts (placements with their declared effects, the complete
-  lowering manifest, the execution graph's activities, the exact segment
-  traces, the simulator's output, the executor's binary/library/config
-  digests, the compiler revision) are written before the next plan runs,
-  and a failed plan is recorded without discarding the completed ones.
+  asserted; no values exist and none are attributed to it), the priced host
+  cycles (stage + reduction, with the breakdown), **independent functional
+  evidence** (the lowered QK program's oracle -> the compiled stage's own
+  function -> the lowered SV program's oracle, against a float64 reference;
+  ``functional_check``), the integer-exact merge check of a split plan,
+  measured host-stage samples (``host_stage_measured``, recorded beside
+  the modelled price and never substituted for it), and complete
+  provenance and artifacts written before the next plan runs; a failed
+  plan is retained with its evidence.
+* Controls: the head-only plan; the CENT-derived attention program of the
+  same token length (``benchmarks.cent_aim`` ``attention_l<L>``, CENT's
+  layout and command stream, available for the 32-head workloads, its
+  boundary stated); the unbudgeted default selection, recorded only.
+* Totals: ``total_cycles`` = device + priced host; also
+  ``total_cycles_measured_host_stage`` with the measured stage median in
+  place of the modelled stage (1 cycle = 1 ns at the simulator's declared
+  rate).  A minima comparison needs the normal selection and all four
+  partition plans; otherwise it is reported incomplete.
 
-What the frozen evaluation includes and this driver does not yet: the
-scores-to-global-softmax-to-probabilities bridge between the two kernels
-(here ``probs`` is a resident input), the host stages' time and the link
-volumes of the QK readout, score upload and partial readout.  Those common
-costs change percentage gaps and ratios, so the figures reported here
-(minima reached, gaps, head-only ratio) are comparable only with each other,
-not with the paper's row, until the bridge and the full accounting are
-implemented under the original arithmetic, residency and link assumptions
-with independent functional evidence.  The unbudgeted default selection on
-the simulated 32-channel device is recorded for transparency only.
+The study stays DIAGNOSTIC in the inventory until its boundary is judged
+comparable with the frozen paper's row (M-15): the host stage's price is a
+declared model beside measured samples, and the CENT control's boundary is
+CENT's own.
 
 Usage::
 
     python -m benchmarks.cent_aim.token_partition --out tp.json [--no-sim]
-        [--shapes 1x128,8x512] [--artifacts DIR]
+        [--shapes 1x128,8x512] [--artifacts DIR] [--neighbor 2x256|none]
 
 The workloads are defined here (eager region annotations); the tests in
-``tests/pim/test_aim_token_partition.py`` import them.
+``tests/pim/test_aim_token_partition.py`` and ``tests/pim/test_host_compute.py``
+import them.
 """
 
 import argparse
@@ -67,12 +77,15 @@ import allo
 from allo.dataflow import region
 from allo.ir.types import bfloat16
 from allo.pim.aim_lowering import (
+    AimHostReduction,
+    AimHostStage,
     _target_geometry,
     bf16_round,
+    reference_outputs,
     reference_partial_sums,
 )
 from allo.pim.costs import aim_cost
-from allo.pim.costs.aim import host_reduction_cycles
+from allo.pim.costs.aim import host_reduction_cycles, host_stage_cycles
 from allo.pim.targets import build_aim_target
 from allo.spmw_autoschedule import (
     _aim_enumerate,
@@ -104,11 +117,30 @@ PAPER = {
 }
 
 
-def build_attention(heads, tokens, head_dim=HEAD_DIM, max_tokens=MAX_TOKENS):
-    """Resident-input decode attention: scores = q.K, heads_out = probs.V.
+def global_softmax(scores):
+    """The bridge's host computation: the global softmax over the token axis
+    of the QK scores, in FP32 on the host (row max subtracted, exp, row sum,
+    divide), rounded to BF16 for the upload to the SV kernel's GB vector.
+    The declared host-time model prices it as four vector passes
+    (``allo.pim.costs.aim.HOST_STAGE_VECTOR_PASSES``)."""
+    x = np.asarray(scores, dtype=np.float32)
+    x = x - x.max(axis=-1, keepdims=True)
+    e = np.exp(x)
+    return bf16_round(e / e.sum(axis=-1, keepdims=True))
 
-    The host softmax between the kernels is identical for every partition
-    choice and is not a compiler-priced stage; ``probs`` is resident.
+
+def build_attention(heads, tokens, head_dim=HEAD_DIM, max_tokens=MAX_TOKENS, *, bridge=True):
+    """Resident-input decode attention: scores = q.K, probs = softmax(scores)
+    on the host, heads_out = probs.V.
+
+    With ``bridge`` (the default) the host program declares the global
+    softmax between the two launches (``allo.host_compute``): the compiler
+    orders it, prices its readout of the scores, its upload of the
+    probabilities and its host time, checks that the scores are produced
+    before it and that the probabilities reach SV's GB preload, and the
+    functional path executes it.  ``bridge=False`` is the pre-round-42
+    diagnostic program with ``probs`` resident (no bridge), kept for
+    comparison only.
     """
     H, L, Dh, M = heads, tokens, head_dim, max_tokens
 
@@ -143,13 +175,23 @@ def build_attention(heads, tokens, head_dim=HEAD_DIM, max_tokens=MAX_TOKENS):
                         acc += pr[h, s] * vc[h, d, s]
                     o[h, d] = acc
 
-    def host(q, k_cache, scores, probs, v_cache, heads_out):
+    if bridge:
+
+        def host(q, k_cache, scores, probs, v_cache, heads_out):
+            allo.launch("attention_qk", q, k_cache, scores)
+            allo.host_compute("softmax", global_softmax, inputs=(scores,), outputs=(probs,))
+            allo.launch("attention_sv", probs, v_cache, heads_out)
+
+        program = allo.host_program(attention, resident=("q", "k_cache", "v_cache"))(host)
+        return attention, program
+
+    def host_resident(q, k_cache, scores, probs, v_cache, heads_out):
         allo.launch("attention_qk", q, k_cache, scores)
         allo.launch("attention_sv", probs, v_cache, heads_out)
 
     program = allo.host_program(
         attention, resident=("q", "k_cache", "probs", "v_cache")
-    )(host)
+    )(host_resident)
     return attention, program
 
 
@@ -323,7 +365,7 @@ def check_merge_numerics(compiled, heads, tokens, seed=0):
     host = next(
         step
         for step in compiled.compiled.layout_ctx.host_steps
-        if step.source == entry["name"]
+        if isinstance(step, AimHostReduction) and step.source == entry["name"]
     )
     rng = np.random.default_rng(seed + heads + tokens)
     # Integer operands: exact partials and exact merge.
@@ -352,6 +394,124 @@ def check_merge_numerics(compiled, heads, tokens, seed=0):
 # --------------------------------------------------------------------- #
 # The nine-workload experiment
 # --------------------------------------------------------------------- #
+
+
+def _entry(compiled, kernel):
+    return next(
+        e
+        for e in compiled.compiled.layout_ctx.lowering_manifest
+        if e.get("kind") == "contraction" and str(e["name"]).startswith(kernel)
+    )
+
+
+def _stage(compiled, name="softmax"):
+    return next(
+        s for s in compiled.compiled.layout_ctx.host_steps
+        if isinstance(s, AimHostStage) and s.stage == name
+    )
+
+
+def functional_check(compiled, heads, tokens, *, seed=0, head_dim=HEAD_DIM):
+    """Independent functional evidence for one compiled bridged program:
+    random BF16 operands through the lowered QK program's oracle
+    (``reference_outputs``: the lowering's ownership and coverage), the
+    compiled host stage's own function, and the lowered SV program's oracle
+    (``reference_partial_sums`` + the host merge for a split SV,
+    ``reference_outputs`` otherwise), against a float64 reference of
+    softmax(q.K).V.  No simulator is involved: the timing-only ramulator2
+    produces no values and none are attributed to it."""
+    qk, sv = _entry(compiled, "attention_qk"), _entry(compiled, "attention_sv")
+    stage = _stage(compiled)
+    rng = np.random.default_rng(seed + 31 * heads + tokens)
+    scale = np.float32(0.1)
+    q = bf16_round(rng.standard_normal((heads, head_dim)).astype(np.float32) * scale)
+    K = bf16_round(rng.standard_normal((heads, tokens, head_dim)).astype(np.float32) * scale)
+    V = bf16_round(rng.standard_normal((heads, head_dim, tokens)).astype(np.float32) * scale)
+    replicas = int(qk["replicas"])
+    scores = reference_outputs(qk, np.broadcast_to(K[None], (replicas, *K.shape)), np.broadcast_to(q[None], (replicas, *q.shape)))
+    probs = stage.run(scores[0])[0]
+    split = sv.get("reduction_partition") is not None
+    out = reference_outputs(sv, np.broadcast_to(V[None], (int(sv["replicas"]), *V.shape)), np.broadcast_to(probs[None], (int(sv["replicas"]), *probs.shape)))
+    reference_scores = np.einsum("hd,hld->hl", q.astype(np.float64), K.astype(np.float64))
+    reference_probs = np.exp(reference_scores - reference_scores.max(-1, keepdims=True))
+    reference_probs /= reference_probs.sum(-1, keepdims=True)
+    reference = np.einsum("hl,hdl->hd", reference_probs, V.astype(np.float64))
+    error = float(np.max(np.abs(out[0] - reference)) / np.max(np.abs(reference)))
+    tolerance = 2.0**-6
+    if not error < tolerance:
+        raise AssertionError(f"functional pipeline error {error} exceeds {tolerance}")
+    return {
+        "evidence": "functional oracle, not the timing-only simulator",
+        "pipeline": "reference_outputs(QK) -> stage.run -> " + ("reference_partial_sums(SV) + host merge" if split else "reference_outputs(SV)"),
+        "stage": stage.stage,
+        "split": split,
+        "max_rel_error": error,
+        "tolerance": tolerance,
+        "seed": int(seed),
+    }
+
+
+def host_stage_samples(compiled, heads, tokens, *, repeats=20, seed=0):
+    """Measured host time of the compiled program's stage on representative
+    BF16 scores (nanoseconds per call, ``repeats`` samples after one warm-up),
+    recorded beside the modelled price and never substituted for it."""
+    import time
+
+    stage = _stage(compiled)
+    rng = np.random.default_rng(seed)
+    scores = bf16_round(rng.standard_normal((heads, tokens)).astype(np.float32))
+    stage.run(scores)
+    samples = []
+    for _ in range(repeats):
+        started = time.perf_counter_ns()
+        stage.run(scores)
+        samples.append(time.perf_counter_ns() - started)
+    samples.sort()
+    return {
+        "unit": "ns per call",
+        "repeats": repeats,
+        "median_ns": samples[len(samples) // 2],
+        "min_ns": samples[0],
+        "samples_ns": samples,
+        "note": "1 simulated cycle = 1 ns at the simulator's declared rate; not in the priced graph",
+    }
+
+
+def cent_control(heads, tokens, *, simulate, budget=None):
+    """The CENT-derived attention program for the same token length, as the
+    control the paper's study compared against: ``benchmarks.cent_aim``'s
+    ``attention_l<L>`` case (CENT's layout and command stream, K/V cache
+    append + QK + SV, softmax outside the device program) compiled through
+    the shared pipeline and simulated.  CENT fixes 32 heads and 32 channels
+    (4 replicas x 8), so the control exists for the 32-head workloads only
+    and its boundary (cache append included, no host stage, whole device) is
+    stated, not aligned, with the study's."""
+    from benchmarks.cent_aim.workloads import DEFAULT_DECODE_SPEC, build_case
+
+    record = {
+        "program": f"cent_aim attention_l{tokens}",
+        "boundary": "CENT K/V cache append + QK + SV on 32 channels (4 replicas x 8), softmax outside; not the study's boundary",
+    }
+    if heads != DEFAULT_DECODE_SPEC.H or tokens not in (128, 512, 4096):
+        record["available"] = False
+        record["reason"] = f"CENT fixes {DEFAULT_DECODE_SPEC.H} heads and L in (128, 512, 4096)"
+        return record
+    case = build_case(f"attention_l{tokens}")
+    built = allo.compile(case.region, build_aim_target(), aim_cost, host_moves=case.host_program, **POLICY)
+    record["available"] = True
+    record["modes"] = [p.mode for p in _placements(built)]
+    record["command_count"] = len(built.compiled.cmds)
+    if simulate:
+        result = built.run_backend()
+        if result.kind != "simulator-timing-only":
+            raise RuntimeError(f"CENT control: expected a simulator-timing-only run, got {result.kind!r}")
+        record["device_cycles"] = int(result.cycles)
+        record["execution"] = {
+            "kind": result.kind,
+            "simulator": result.extra.get("simulator"),
+            "segments": [{k: v for k, v in seg.items() if k not in ("trace", "stdout")} for seg in result.extra.get("segment_records") or ()],
+        }
+    return record
 
 
 def _json_ready(value, depth=0):
@@ -530,6 +690,10 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
         "device_cycles": None,
         "total_cycles": None,
         "merge_check": {"applicable": None, "bf16_error": None, "integer_exact": None},
+        "functional_check": None,
+        "host_price": None,
+        "host_stage_measured": None,
+        "total_cycles_measured_host_stage": None,
         "execution": None,
         "provenance": None,
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -541,9 +705,18 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
         record["provenance"] = _plan_provenance(built)
         record["completed"].append(stage)
         stage = "host_price"
-        record["host_cycles"] = sum(
-            host_reduction_cycles(step, geometry) for step in built.compiled.layout_ctx.host_steps
-        )
+        host_steps = list(built.compiled.layout_ctx.host_steps)
+        reduction_cycles = sum(host_reduction_cycles(s, geometry) for s in host_steps if isinstance(s, AimHostReduction))
+        stage_cycles = sum(host_stage_cycles(s, geometry) for s in host_steps if isinstance(s, AimHostStage))
+        record["host_price"] = {
+            "unit": "cycles (1 cycle = 1 ns at the simulator's declared rate)",
+            "host_reduction_cycles": reduction_cycles,
+            "host_stage_cycles": stage_cycles,
+            "host_stages": [s.manifest() for s in host_steps if isinstance(s, AimHostStage)],
+            "link_model": "32 B/cycle, zero fixed latency (allo.pim.costs.aim)",
+            "no_double_counting": "readout = stage inputs, upload = stage outputs, partial readout = host reduction only",
+        }
+        record["host_cycles"] = reduction_cycles + stage_cycles
         record["completed"].append(stage)
         stage = "estimate"
         record["estimate_cycles"] = compile_program(
@@ -557,6 +730,12 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
             record["merge_check"]["bf16_error"] = check_merge_numerics(built, heads, tokens)
             record["merge_check"]["integer_exact"] = True
         record["completed"].append(stage)
+        stage = "functional_check"
+        record["functional_check"] = functional_check(built, heads, tokens, seed=heads * 1000 + tokens)
+        record["completed"].append(stage)
+        stage = "host_samples"
+        record["host_stage_measured"] = host_stage_samples(built, heads, tokens)
+        record["completed"].append(stage)
         if simulate:
             stage = "simulate"
             result = built.run_backend()
@@ -566,6 +745,11 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
                 raise RuntimeError(f"{label}: simulator reported cycles {result.cycles!r}")
             record["device_cycles"] = int(result.cycles)
             record["total_cycles"] = int(result.cycles) + record["host_cycles"]
+            record["total_cycles_measured_host_stage"] = (
+                int(result.cycles)
+                + record["host_price"]["host_reduction_cycles"]
+                + int(record["host_stage_measured"]["median_ns"])
+            )
             record["execution"] = {
                 "kind": result.kind,
                 "simulator": result.extra.get("simulator"),
@@ -586,7 +770,7 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
     return record
 
 
-def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET):
+def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET, neighbor=False):
     """Compile, measure and record every plan of one workload: the normal
     selection under the budget and the forced alternatives.
 
@@ -642,6 +826,12 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET)
         if choice is not None:
             record["ranked_cycles"] = choice[0]
         records[label] = record
+    try:
+        control = cent_control(heads, tokens, simulate=simulate)
+    except Exception as error:  # the control's failure is evidence too
+        control = {"available": False, "failure": _failure_entry("cent_control", error)}
+    if control.get("failure"):
+        failures["cent-attention"] = control["failure"]
     rows = {
         label: SimpleNamespace(
             mode=r["sv_mode"], modes=r["modes"], partitions=r["partitions"],
@@ -691,6 +881,14 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET)
         "gap": gap,
         "head_only_over_selected": head_only_ratio,
         "plans": records,
+        "controls": {"cent_attention": control},
+        "neighbor": bool(neighbor),
+        "boundary": {
+            "device": "AiM ramulator2 memory-system cycles of the complete program (QK, SV)",
+            "host": "priced host stage (readout + upload link bytes, declared vector passes) and host reduction (partial readout + adds)",
+            "bridge": "scores -> global softmax (host) -> probabilities, declared in the schedule and priced in the selection graph",
+            "measured_host": "host-stage samples recorded separately (total_cycles_measured_host_stage)",
+        },
         "aliases": aliases,
         "failed_plans": failures,
         "distinct_plans": len({tuple(r["modes"]) for r in records.values() if r.get("modes")}),
@@ -733,6 +931,7 @@ def assert_complete(result) -> None:
 def summarize(results):
     """The study's figures over the completed workloads (diagnostic; see
     the module docstring for what the paper's boundary adds)."""
+    results = [r for r in results if not r.get("neighbor")]
     complete = [
         r for r in results
         if r.get("gap") is not None and (r.get("comparison") or {}).get("complete", True)
@@ -787,8 +986,10 @@ def main(argv=None) -> int:
     parser.add_argument("--no-sim", action="store_true", help="estimates only")
     parser.add_argument("--shapes", default=None, help="subset, e.g. 1x128,8x512 (default: all nine)")
     parser.add_argument("--artifacts", default=None, help="per-plan artifacts directory (default: <out>.artifacts)")
+    parser.add_argument("--neighbor", default="2x256", help="a neighbouring supported workload run beside the nine (none to skip)")
     args = parser.parse_args(argv)
     shapes = _parse_shapes(args.shapes) if args.shapes else SHAPES
+    neighbors = () if args.neighbor in ("", "none") else _parse_shapes(args.neighbor)
     simulate = not args.no_sim
     artifacts = args.artifacts or (args.out + ".artifacts")
     session = {
@@ -800,6 +1001,7 @@ def main(argv=None) -> int:
         "simulate": simulate,
         "artifacts": artifacts,
         "shapes": [list(s) for s in shapes],
+        "neighbors": [list(s) for s in neighbors],
         "workloads": [],
     }
     failures = 0
@@ -808,10 +1010,11 @@ def main(argv=None) -> int:
         "selected P | best P | gap | merge bf16 err | failed plans",
         flush=True,
     )
-    for heads, tokens in shapes:
+    for heads, tokens in tuple(shapes) + tuple(neighbors):
+        is_neighbor = (heads, tokens) in neighbors and (heads, tokens) not in shapes
         started = time.perf_counter()
         try:
-            result = run_workload(heads, tokens, simulate=simulate, artifacts=artifacts)
+            result = run_workload(heads, tokens, simulate=simulate, artifacts=artifacts, neighbor=is_neighbor)
             record = result.record
             rows = result.rows
             failures += len(result.failures)

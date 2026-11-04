@@ -40,6 +40,7 @@ from .spmw_target import (
     BackendHandle,
     HandleToken,
     HostMoveRecord,
+    host_compute,
     host_program,
     launch,
     BufferToken,

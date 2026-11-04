@@ -48,6 +48,21 @@ Terms used below:
   an undeclared unit is refused before enumeration, never accepted and
   ignored. It is a search policy, not a device description: target and
   simulator geometry are unchanged.
+- **Declared host stages.** `allo.host_compute(name, fn, inputs, outputs)`
+  inside a host program declares a host computation between launches (the
+  global softmax between an attention's QK and SV kernels). The launch
+  schedule orders it with its declared buffer volumes; the availability
+  check requires its inputs to be produced by an earlier launch (or be
+  region inputs) and lets its outputs reach a later launch through that
+  launch's declared host ingress; the program graph the normal selection
+  ranks prices it as the target's `HOST_COMPUTE` operation (AiM: readout
+  and upload bytes over the declared 32 B/cycle link plus declared host
+  vector passes per stage kind, `allo.pim.costs.aim.host_stage_cycles`); the
+  AiM program lowers it as a host step (`AimHostStage`, no commands, in the
+  manifest and the run's host steps) and the realization check binds it to
+  the producing and consuming launches' declared transfers; `fn` runs on the
+  functional path and in functional checks. Backends that do not represent
+  host stages refuse them (`NotImplementedError`). Today: AiM.
 - **Evidence status.** *Verified* means run at the round 3 tree on the
   authors' hosts through the public API and recorded in `VALIDATION.md`;
   **UNVERIFIED** means no run at the candidate revision, whatever older

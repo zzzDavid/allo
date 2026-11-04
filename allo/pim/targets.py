@@ -278,6 +278,18 @@ def build_aim_target():
                 width=256,
                 name="gpr",
             )
+            # A declared host computation between launches
+            # (``allo.host_compute``): the host reads its inputs out of the
+            # GPR and writes its outputs back into it.  Never matched from
+            # source; priced by the cost program's HOST_COMPUTE rule from the
+            # stage's declared volumes.
+            allo.op(
+                "HOST_COMPUTE",
+                src=(gpr,),
+                dst=gpr,
+                fn=lambda x: x,
+                matchable=False,
+            )
 
             @allo.unit(mapping={"channel": 32})
             def channel():

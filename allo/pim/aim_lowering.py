@@ -17,7 +17,7 @@ simulator-backed numerical correctness.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import math
 from typing import Literal
 
@@ -256,6 +256,71 @@ class AimHostReduction(AimOp):
             )
         dtype = np.int64 if np.issubdtype(values.dtype, np.integer) else np.float32
         return np.sum(values.astype(dtype), axis=-2, dtype=dtype)
+
+
+@dataclass(frozen=True)
+class AimHostStage(AimOp):
+    """A declared host computation between launches (``allo.host_compute``).
+
+    The host reads the stage's inputs out of the host-visible GPR (where the
+    producing contraction's ``RD_MAC`` left them), computes ``function`` and
+    writes the outputs into the GPR for the consumer's ingress (``WR_GB`` /
+    ``WR_ABK`` in the consumer's own command stream).  ``inputs`` and
+    ``outputs`` are ``(buffer, shape, element bits)`` triples.  The record
+    lowers to no simulator command; it is priced by
+    :func:`allo.pim.costs.aim.host_stage_cycles` (link volumes under the
+    declared host link, host time under the declared per-vector model) and
+    executed numerically by :meth:`run`.
+    """
+
+    stage: str
+    inputs: tuple = ()
+    outputs: tuple = ()
+    name: str | None = None
+    function: object = field(default=None, compare=False)
+
+    def __post_init__(self):
+        if not self.stage:
+            raise ValueError("host stage needs a name")
+        if not self.inputs or not self.outputs:
+            raise ValueError(f"host stage {self.stage!r} needs inputs and outputs")
+        object.__setattr__(self, "inputs", tuple((n, tuple(sh), int(b)) for n, sh, b in self.inputs))
+        object.__setattr__(self, "outputs", tuple((n, tuple(sh), int(b)) for n, sh, b in self.outputs))
+
+    @staticmethod
+    def _bytes(triples) -> int:
+        return sum((math.prod(sh) * b + 7) // 8 for _n, sh, b in triples)
+
+    @staticmethod
+    def _elements(triples) -> int:
+        return sum(math.prod(sh) for _n, sh, _b in triples)
+
+    @property
+    def readout_bytes(self) -> int:
+        return self._bytes(self.inputs)
+
+    @property
+    def upload_bytes(self) -> int:
+        return self._bytes(self.outputs)
+
+    @property
+    def elements(self) -> int:
+        return self._elements(self.inputs)
+
+    def manifest(self) -> dict:
+        data = {k: v for k, v in asdict(self).items() if k != "function"}
+        data["kind"] = self.kind
+        data["readout_bytes"] = self.readout_bytes
+        data["upload_bytes"] = self.upload_bytes
+        data["elements"] = self.elements
+        return data
+
+    def run(self, *arrays):
+        """Execute the stage's computation on host arrays (functional path)."""
+        if self.function is None:
+            raise RuntimeError(f"host stage {self.stage!r} carries no function")
+        out = self.function(*arrays)
+        return out if isinstance(out, tuple) else (out,)
 
 
 @dataclass(frozen=True)
@@ -770,6 +835,8 @@ class _AimLowerer:
             details = {"barrier": "device"}
         elif isinstance(operation, AimHostReduction):
             details = self._host_reduction(operation)
+        elif isinstance(operation, AimHostStage):
+            details = self._host_stage(operation)
         else:
             raise TypeError(f"unsupported AiM operation {type(operation).__name__}")
         end = len(self.commands)
@@ -900,6 +967,23 @@ class _AimLowerer:
             "merge": "host ADD over the partition axis (AimHostReduction)",
         }
         return details
+
+    def _host_stage(self, operation: AimHostStage) -> dict:
+        entry_bytes = self.geometry.vector_bits // 8
+        return {
+            "executes_on": "host",
+            "stage": operation.stage,
+            "inputs": [list(item) for item in operation.inputs],
+            "outputs": [list(item) for item in operation.outputs],
+            # Read out of the GPR (the producers' RD_MAC entries) and written
+            # back into it for the consumers' ingress; whole GPR entries.
+            "readout_bytes": operation.readout_bytes,
+            "upload_bytes": operation.upload_bytes,
+            "readout_gpr_entries": math.ceil(operation.readout_bytes / entry_bytes),
+            "upload_gpr_entries": math.ceil(operation.upload_bytes / entry_bytes),
+            "elements": operation.elements,
+            "host_vectors": math.ceil(operation.elements / self.geometry.lanes),
+        }
 
     def _host_reduction(self, operation: AimHostReduction) -> dict:
         geometry = self.geometry
@@ -2493,6 +2577,65 @@ def reference_partial_sums(details: dict, matrix, vector, *, arithmetic="bf16"):
             "exactly once"
         )
     return partials
+
+
+def reference_outputs(details: dict, matrix, vector, *, arithmetic="bf16"):
+    """Functional oracle of one lowered contraction's results, separate from
+    the timing-only simulator.
+
+    A reduction-partitioned entry delegates to :func:`reference_partial_sums`
+    and sums the partials as the host merge does.  An unsplit entry owns the
+    whole reduction of every output in one accumulator chain: the lowering's
+    coverage fields are asserted first (every logical scalar MAC issued,
+    none missing) and the result is the BF16 x BF16 products summed in FP32
+    and rounded to BF16 at the readout (``arithmetic="exact"``: integer
+    operands summed in int64).  ``matrix`` has shape ``(replicas, batches,
+    outputs, reduction)`` and ``vector`` ``(replicas, batches, reduction)``
+    (the replica axis may be omitted); returns ``(replicas, batches,
+    outputs)``.
+    """
+    import numpy as np
+
+    if details.get("reduction_partition"):
+        partials = reference_partial_sums(details, matrix, vector, arithmetic=arithmetic)
+        dtype = np.int64 if arithmetic == "exact" else np.float32
+        merged = np.sum(partials.astype(dtype), axis=-2, dtype=dtype)
+        return merged if arithmetic == "exact" else bf16_round(merged)
+    exact = arithmetic == "exact"
+    if arithmetic not in ("bf16", "exact"):
+        raise ValueError("arithmetic must be 'bf16' or 'exact'")
+    issued = details.get("issued_scalar_macs")
+    logical = details.get("logical_scalar_macs")
+    if issued is None or logical is None or int(issued) < int(logical):
+        raise ValueError(
+            f"lowered contraction {details.get('name')!r} does not issue every "
+            f"logical scalar MAC ({issued} of {logical})"
+        )
+    if details.get("coverage_missing"):
+        raise ValueError(f"lowered contraction {details.get('name')!r} leaves MACs uncovered")
+    dtype = np.int64 if exact else np.float32
+    weights = np.asarray(matrix)
+    inputs = np.asarray(vector)
+    if weights.ndim == 3:
+        weights, inputs = weights[None], inputs[None]
+    replicas, batches, outputs, reduction = weights.shape
+    if inputs.shape != (replicas, batches, reduction):
+        raise ValueError("vector shape does not match the matrix")
+    if (
+        replicas != details["replicas"]
+        or batches != details["batches"]
+        or outputs != details["outputs_per_instance"]
+        or reduction != details["reduction"]
+    ):
+        raise ValueError("operands do not match the lowered contraction shape")
+    if exact and not (
+        np.issubdtype(weights.dtype, np.integer) and np.issubdtype(inputs.dtype, np.integer)
+    ):
+        raise ValueError("exact arithmetic needs integer operands")
+    rounding = (lambda values: values) if exact else bf16_round
+    weights, inputs = rounding(weights.astype(dtype)), rounding(inputs.astype(dtype))
+    result = np.einsum("rbok,rbk->rbo", weights, inputs, dtype=dtype)
+    return result if exact else bf16_round(result)
 
 
 TOKEN_PARTITION_DIM = "token_partition"

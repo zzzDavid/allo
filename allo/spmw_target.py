@@ -1185,6 +1185,60 @@ class LaunchRecord:
 _launch_recorder_stack: list = []
 
 
+class HostComputeRecord:
+    """One recorded ``allo.host_compute(name, fn, inputs, outputs)``: a host
+    computation between launches.  ``fn`` maps the input arrays (in the
+    order of ``inputs``) to the output arrays (in the order of ``outputs``);
+    ``inputs`` and ``outputs`` are whole-buffer ``BufferToken``s.  The step is
+    a declared stage of the program: the schedule orders it, the backend
+    represents and prices it (its readout and upload volumes and its host
+    time), the availability check requires its inputs to be produced before
+    it and lets its outputs reach a later launch through that launch's
+    declared host ingress, and the functional path executes ``fn``."""
+
+    __slots__ = ("name", "fn", "inputs", "outputs")
+
+    def __init__(self, name, fn, inputs, outputs):
+        if not isinstance(name, str) or not name.isidentifier():
+            raise ValueError(f"host_compute name must be an identifier, got {name!r}")
+        if not callable(fn):
+            raise TypeError("host_compute fn must be callable")
+        for role, tokens in (("inputs", inputs), ("outputs", outputs)):
+            if not tokens:
+                raise ValueError(f"host_compute {name!r} declares no {role}")
+            for token in tokens:
+                if (
+                    not isinstance(token, BufferToken)
+                    or token.index is not None
+                    or token.name != token.base
+                ):
+                    raise TypeError(
+                        f"host_compute {name!r} {role} must be whole workload buffers, "
+                        f"got {token!r}"
+                    )
+        self.name = name
+        self.fn = fn
+        self.inputs = tuple(inputs)
+        self.outputs = tuple(outputs)
+
+    def __repr__(self):
+        return (
+            f"HostComputeRecord({self.name!r}, inputs={[t.name for t in self.inputs]}, "
+            f"outputs={[t.name for t in self.outputs]})"
+        )
+
+
+def host_compute(name, fn, inputs=(), outputs=()):
+    """Record a host computation inside a host program: ``fn(*inputs) ->
+    outputs`` between launches (the global softmax between an attention's
+    QK and SV kernels).  Ordered with the surrounding launches and moves."""
+    if not _launch_recorder_stack:
+        raise RuntimeError("allo.host_compute(...) called outside a host_program scope")
+    rec = HostComputeRecord(name, fn, tuple(inputs), tuple(outputs))
+    _launch_recorder_stack[-1].append(rec)
+    return rec
+
+
 def launch(kernel, *operands):
     """Record a kernel invocation inside a host program (the host-xcel launch).
 
@@ -1211,7 +1265,7 @@ class HostProgram:
     host` works.
     """
 
-    __slots__ = ("region", "moves", "launches", "steps", "subset", "resident")
+    __slots__ = ("region", "moves", "launches", "computes", "steps", "subset", "resident")
 
     def __init__(self, region, fn, *, subset=False, resident=()):
         import inspect
@@ -1234,6 +1288,7 @@ class HostProgram:
 
         moves = [s for s in steps if isinstance(s, HostMoveRecord)]
         launches = [s for s in steps if isinstance(s, LaunchRecord)]
+        computes = [s for s in steps if isinstance(s, HostComputeRecord)]
 
         # Validate launch targets against the region's declared kernels.
         known = set(getattr(region, "mappings", {}) or {})
@@ -1247,6 +1302,7 @@ class HostProgram:
         self.region = region
         self.moves = moves
         self.launches = launches
+        self.computes = computes
         self.steps = steps
         # `subset`: the program may leave matched kernels unlaunched.
         # `resident`: buffers loaded before the measured region.

@@ -34,6 +34,7 @@ from .pim.aim_lowering import (
     AimDistributedHostTransfer,
     AimElementwise,
     AimHostReduction,
+    AimHostStage,
     AimHostTransfer,
     AimSync,
     _AimLowerer,
@@ -532,6 +533,9 @@ def _check_host_transfers(program, group, effects, ops, storage_of) -> None:
 
 
 class AimCtx(CodegenContext):
+    # The AiM program represents, prices and binds declared host stages
+    # (``allo.host_compute``); ``compile_for_target`` refuses them elsewhere.
+    supports_host_compute = True
     """Codegen ctx for AiM: emits the ramulator2 text trace.
 
     ``self.cmds`` is a list of trace lines (not ``PIMCmd`` records).  Every
@@ -637,7 +641,7 @@ class AimCtx(CodegenContext):
             entry = lowerer.operations[-1]
             entry["command_span"] = [begin, len(lines)]
             entry["command_count"] = len(lines) - begin
-            if isinstance(operation, AimHostReduction):
+            if isinstance(operation, (AimHostReduction, AimHostStage)):
                 # Runs on the host after the device commands before it.
                 entry["after_command"] = len(lines)
                 self.host_steps.append(operation)
@@ -663,6 +667,98 @@ class AimCtx(CodegenContext):
         self.cmds.extend(lines)
         if program.groups:
             self.emit_eoc()
+
+    def _check_host_stages(self, program, layouts, ops) -> None:  # noqa: C901
+        """Every declared host stage of the schedule is lowered once as an
+        `AimHostStage` with the declared buffers, reads buffers a launch
+        before it produces (declared ``out``/``inout`` transfers) and feeds
+        buffers a launch after it receives through its declared host ingress
+        (an ``in``/``inout`` transfer whose route starts on the host)."""
+        from .spmw_candidate import candidate_effects
+        from .spmw_plan import HOST_INGRESS_STEPS, HostComputeStep, LaunchStep
+
+        schedule = getattr(program, "schedule", None)
+        steps = list(getattr(schedule, "steps", ()) or ())
+        declared = [s for s in steps if isinstance(s, HostComputeStep)]
+        lowered = [op for op in ops if isinstance(op, AimHostStage)]
+        if len(lowered) != len(declared):
+            raise RuntimeError(
+                f"AiM realization lowered {len(lowered)} host stage(s) for "
+                f"{len(declared)} declared"
+            )
+        if not declared:
+            return
+        effects_of = {}
+        for layout in layouts:
+            group_id = getattr(self, "_group_of_layout", {}).get(id(layout))
+            effects = candidate_effects(layout)
+            if group_id is not None and effects is not None:
+                effects_of[group_id] = effects
+        for step, record in zip(declared, lowered):
+            if (record.stage, record.inputs, record.outputs) != (
+                step.name, tuple(step.inputs), tuple(step.outputs)
+            ):
+                raise RuntimeError(
+                    f"AiM realization of host stage {step.name!r} differs from the "
+                    f"schedule: lowered {record.stage!r} {record.inputs} -> "
+                    f"{record.outputs}, declared {step.inputs} -> {step.outputs}"
+                )
+            position = steps.index(step)
+            before = [s for s in steps[:position] if isinstance(s, LaunchStep)]
+            after = [s for s in steps[position + 1 :] if isinstance(s, LaunchStep)]
+
+            from .spmw_autoschedule import _matcher_work_scope
+
+            def local_names(launch, region_name):
+                # The candidate's transfers name the kernel's own buffers.
+                # The launch binds the region's buffers to the kernel's
+                # parameters positionally (allo.launch(kernel, *operands) in
+                # the kernel's signature order, checked by launch_schedule);
+                # the retained value identities confirm it when present.
+                names = set()
+                matches = [
+                    m for m in program.trace.matches
+                    if _matcher_work_scope(m).group_id == launch.group_id
+                ]
+                for match in matches:
+                    facts = match.extra.get("program_facts")
+                    parameters = tuple(getattr(facts, "parameter_names", ()) or ())
+                    for operand, local in zip(launch.operands, parameters):
+                        if operand == region_name:
+                            names.add(local)
+                key = program.key_by_name.get(region_name)
+                if key is not None:
+                    for match in matches:
+                        for operand in match.operands:
+                            if operand.value_ref is not None and operand.value_ref == key:
+                                names.add(operand.memref_name)
+                        if match.result_value_ref is not None and match.result_value_ref == key:
+                            names.add(match.result_memref_name)
+                return names
+
+            def declares(launches, region_name, directions, ingress=False):
+                for launch in launches:
+                    names = local_names(launch, region_name)
+                    for t in getattr(effects_of.get(launch.group_id), "transfers", ()):
+                        if t.value not in names or t.direction not in directions:
+                            continue
+                        if ingress and not _host_ingress_route(t.route):
+                            continue
+                        return True
+                return False
+
+            for name, _shape, _bits in step.inputs:
+                if not declares(before, name, ("out", "inout")):
+                    raise RuntimeError(
+                        f"AiM realization: host stage {step.name!r} reads {name!r}, "
+                        "which no earlier launch of the program declares as an output"
+                    )
+            for name, _shape, _bits in step.outputs:
+                if not declares(after, name, ("in", "inout"), ingress=True):
+                    raise RuntimeError(
+                        f"AiM realization: host stage {step.name!r} produces {name!r}, "
+                        "which no later launch receives through a declared host ingress"
+                    )
 
     def check_realization(self, layouts) -> None:
         """The lowered AiM records against the selected candidates' declared
@@ -710,6 +806,7 @@ class AimCtx(CodegenContext):
                     )
         every_launched = getattr(self, "_every_group_launched", True)
         launched = getattr(self, "_launched_groups", set())
+        self._check_host_stages(program, layouts, ops)
         for op in ops:
             if isinstance(op, _HOST_TRANSFER_RECORDS) and (
                 op.group_id not in groups
@@ -1962,12 +2059,31 @@ class _AimProgramDerivation:
                 records.append((AimSync(name="host_gather_split"), None))
             gather_run = False
 
+        from .spmw_plan import HostComputeStep
+
         for position, step in enumerate(steps):
             if isinstance(step, LaunchStep):
                 flush()
                 group = self.by_id[step.group_id]
                 records.extend(self._launch_records(group))
                 records.extend(self._relocations(group, position, steps))
+                continue
+            if isinstance(step, HostComputeStep):
+                # The declared host stage, in program order: no commands; its
+                # volumes are the stage's declared buffers.
+                flush()
+                records.append(
+                    (
+                        AimHostStage(
+                            stage=step.name,
+                            inputs=step.inputs,
+                            outputs=step.outputs,
+                            name=f"host_compute.{step.name}",
+                            function=step.function,
+                        ),
+                        None,
+                    )
+                )
                 continue
             resolved = host_moves[step.host_index]
             verb, _handle = resolved.move.emit(ctx)
@@ -2145,6 +2261,14 @@ def _check_simulator_geometry(target, yaml_cfg: Path) -> None:
         )
 
 
+def _host_ingress_route(route) -> bool:
+    """A declared transfer route that starts on the host: the consumer
+    receives the value from the host (``host_scatter``/``host_broadcast``
+    into the banks, or the ``host_gpr_preload`` of a GB-fed vector)."""
+    route = tuple(route or ())
+    return bool(route) and str(route[0]).startswith("host")
+
+
 class AimSimulatorFailure(RuntimeError):
     """A ramulator2 invocation that produced no cycles.  ``evidence`` keeps
     what the run was: the executor (binary / library / config identity),
@@ -2306,10 +2430,23 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
                     command, capture_output=True, timeout=600, check=False, **run
                 )
             except (subprocess.SubprocessError, OSError) as exc:
+                # A timeout (or another subprocess error) may carry the
+                # partial streams the process wrote before it was killed:
+                # keep them, decoded, beside the trace and executor identity.
+                def _text(stream):
+                    if stream is None:
+                        return None
+                    if isinstance(stream, bytes):
+                        return stream.decode("utf-8", errors="replace")
+                    return str(stream)
+
                 raise failure(
                     f"AiM ramulator2 invocation failed: {exc}",
                     label=label, repeat=repeat, lines=lines, command=command, cwd=cwd,
-                    returncode=None, stdout=None, stderr=None, error=exc,
+                    returncode=None,
+                    stdout=_text(getattr(exc, "stdout", None) or getattr(exc, "output", None)),
+                    stderr=_text(getattr(exc, "stderr", None)),
+                    error=exc,
                 ) from exc
         stdout = proc.stdout.decode("utf-8", errors="replace")
         stderr = proc.stderr.decode("utf-8", errors="replace")

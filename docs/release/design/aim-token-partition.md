@@ -132,6 +132,83 @@ because the compiler's own program (masked WR_GB/RD_MAC per channel group,
 no separate per-channel readout) and cost model replace the harness's
 explicit-binding traces and measured host stages.
 
+## 3a. The host bridge (round 42, M-15)
+
+The study's program is the bridged attention: QK scores -> global softmax
+on the host -> probabilities -> SV.  The softmax is a declared host stage
+of the host program (`allo.host_compute("softmax", fn, inputs=(scores,),
+outputs=(probs,))`, `allo/spmw_target.py`), ordered by the launch schedule
+as a `HostComputeStep` carrying the stage's buffers with their shapes and
+element widths (`allo/spmw_plan.py`).  The availability walk requires the
+stage's inputs to be produced by an earlier launch (QK's declared `out`
+transfer of the scores to the GPR) and makes its outputs available to a
+later launch through that launch's declared host ingress (SV's
+`host_gpr_preload` of its GB vector).  The AiM program lowers the stage as
+`AimHostStage` (no commands; `after_command`; manifest kind `hoststage`
+with readout and upload bytes and GPR entries; in the run's `host_steps`),
+and `AimCtx._check_host_stages` binds it to the schedule and to the
+producing and consuming launches' declared transfers through the launch's
+positional binding and the retained identities.  Other backends refuse a
+host stage.
+
+**Pricing, in the graph the normal selection ranks.**  The program graph
+emits the stage as the target's `HOST_COMPUTE` operation; the AiM rule
+prices it with `host_stage_cycles`: the readout of the inputs plus the
+upload of the outputs over the declared link (32 B/cycle, zero fixed
+latency) plus the host's vector passes (`HOST_STAGE_VECTOR_PASSES["softmax"]
+= 4`: row max, exp, row sum, divide, one `HOST_VECTOR_ADD_CYCLES` each per
+16-lane vector).  Units are simulator cycles (1 cycle = 1 ns at the
+declared rate).  The partial-result readout and the merge adds of a split
+SV remain in the host reduction, so nothing is counted twice.  For 1 head
+x 128 tokens the stage prices at 48 cycles (16 link + 32 host).  The host
+time is a declared model; the driver records measured host-stage samples
+beside it (`host_stage_measured`) and a second total that uses the
+measured median (`total_cycles_measured_host_stage`).
+
+**Functional evidence, separate from the simulator.**  `reference_outputs`
+(`allo/pim/aim_lowering.py`) is the functional oracle of a lowered
+contraction: an unsplit entry after its coverage fields are asserted, a
+split entry through `reference_partial_sums` and the host merge.  The
+driver's `functional_check` runs random BF16 operands through the lowered
+QK oracle, the compiled stage's own function and the lowered SV oracle
+and compares with a float64 reference of softmax(q.K).V (tolerance 2^-6),
+for every plan, split and unsplit, and for the neighbouring 2 heads x 256
+tokens workload.  The timing-only simulator produces no values and none
+are attributed to it.
+
+**Controls.**  The head-only plan (forced), the CENT-derived attention
+program of the same token length (`benchmarks.cent_aim` `attention_l<L>`,
+CENT's layout and command stream, 32 heads on 32 channels, cache append
+included, softmax outside; its boundary stated, available for the 32-head
+workloads only) and the unbudgeted default selection (recorded only).
+
+**Bridged run (2026-11-04, round 42, `tenon-release-evidence/r41/token_partition_bridged.json`).**
+Cells: measured total = device + priced host (stage + reduction), with the
+estimate in parentheses; the normal budgeted selection equals the forced
+plan of its P on every workload.
+
+| Heads | Tokens | P1 | P2 | P4 | P8 | Head-only | Selected P | Best P | Gap | CENT control |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 128 | 1261 (1666) | 1221 (1634) | 1217 (1634) | 1263 (1682) | 1261 | 2 | 4 | 0.33% | n/a |
+| 1 | 512 | 2194 (2710) | 1938 (2486) | 1826 (2390) | 1818 (2390) | 2194 | 4 | 8 | 0.44% | n/a |
+| 1 | 4096 | 7071 (8447) | 9509 (11753) | 7510 (9446) | 6998 (8998) | 13539 | 1 | 8 | 1.04% | n/a |
+| 8 | 128 | 1856 (2590) | 2991 (4161) | 5005 (7047) | 9033 (12819) | 1856 | 1 | 1 | 0 | n/a |
+| 8 | 512 | 4787 (6607) | 5922 (8178) | 7936 (11064) | 11964 (16836) | 4787 | 1 | 1 | 0 | n/a |
+| 8 | 4096 | 34780 (48044) | 35036 (48300) | 35292 (48556) | 39320 (54328) | 34780 | 1 | 1 | 0 | n/a |
+| 32 | 128 | 7424 (10552) | 11964 (16836) | 20020 (28380) | 36132 (51468) | 7424 | 1 | 1 | 0 | 11010 |
+| 32 | 512 | 19148 (26620) | 23688 (32904) | 31744 (44448) | 47856 (67536) | 19148 | 1 | 1 | 0 | 18126 |
+| 32 | 4096 | 139120 (192368) | 140144 (193392) | 141168 (194416) | 157280 (217504) | 139120 | 1 | 1 | 0 | 95090 |
+| 2 (neighbour) | 256 | 1813 (2345) | 1733 (2281) | 1725 (2281) | 2732 (3724) | 1813 | 2 | 4 | 0.46% | n/a |
+
+Six of nine minima, largest gap 1.04%; every plan's functional pipeline
+within 4.9e-3 of the float64 reference; the measured host-stage samples on
+this host (18 us to 530 us per call, NumPy on small arrays) are far above
+the declared price (48 to 49,152 cycles) and are recorded separately, not
+substituted.  The one-head misses remain: the ranked totals of the
+candidates lie within 1-10% of each other and the serial-issue estimate
+misorders them (section 3); the bridge adds the same stage price to every
+P of a workload and does not change the order.
+
 ## 4. Cost-route repairs (M-06, M-05, M-07)
 
 * One route (M-06): every contraction placement, enumerated or passed as

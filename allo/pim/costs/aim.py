@@ -103,6 +103,16 @@ HOST_LINK_BYTES_PER_CYCLE = 32
 HOST_LINK_FIXED_CYCLES = 0
 # One 256-bit host SIMD add per merged GPR vector (analytical, uncalibrated).
 HOST_VECTOR_ADD_CYCLES = 1
+# A declared host stage (``allo.host_compute``, e.g. the global softmax
+# between an attention's QK and SV kernels) is priced as its link traffic
+# plus host time: the inputs read out of the GPR and the outputs written
+# back cross the declared link (the readout and upload volumes), and the
+# host processes the inputs vector by vector (16 lanes) with a declared
+# number of vector passes per stage kind, each at HOST_VECTOR_ADD_CYCLES.
+# The softmax is four passes (row max, exp, row sum, divide).  The host time
+# is a declared model, not a measurement; the reproduction driver records
+# measured host samples beside it.
+HOST_STAGE_VECTOR_PASSES = {"softmax": 4}
 
 
 def _ceil_div(value, divisor):
@@ -196,6 +206,26 @@ def host_reduction_cycles(record, geometry):
     )
 
 
+def host_stage_cycles(record, geometry):
+    """Cycles of one ``AimHostStage`` under the declared link scenario and
+    host model: the readout and upload bytes over the link plus the host's
+    vector passes over the input elements.  A stage kind without a declared
+    pass count is refused rather than priced at zero."""
+    passes = HOST_STAGE_VECTOR_PASSES.get(record.stage)
+    if passes is None:
+        raise ValueError(
+            f"host stage {record.stage!r} has no declared host-time model "
+            f"(HOST_STAGE_VECTOR_PASSES declares {sorted(HOST_STAGE_VECTOR_PASSES)})"
+        )
+    link_bytes = int(record.readout_bytes) + int(record.upload_bytes)
+    vectors = _ceil_div(int(record.elements), geometry.lanes)
+    return (
+        HOST_LINK_FIXED_CYCLES
+        + _ceil_div(link_bytes, HOST_LINK_BYTES_PER_CYCLE)
+        + vectors * passes * HOST_VECTOR_ADD_CYCLES
+    )
+
+
 def _slice_elements(shape, index):
     """Elements of a normalized host slice (ints, None for ``:``, (a, b))."""
     index = tuple(index)
@@ -273,6 +303,23 @@ def aim_cost(target):
                 occupy=[ctx.use(host, cycles=host_latency)],
                 name="host_reduction",
             )
+
+    @rule(target.op("HOST_COMPUTE"))
+    def host_compute(event, ctx):
+        """A declared host stage: link traffic (readout + upload) and host
+        time from the stage's declared volumes (spmw_plan HostComputeStep)."""
+        metrics = event.metrics
+        record = aim_lowering.AimHostStage(
+            stage=str(metrics.get("stage")),
+            inputs=tuple(metrics.get("inputs") or ()),
+            outputs=tuple(metrics.get("outputs") or ()),
+        )
+        latency = host_stage_cycles(record, geometry)
+        ctx.step(
+            latency=latency,
+            occupy=[ctx.use(host, cycles=latency)],
+            name=f"host_stage:{record.stage}",
+        )
 
     @rule(target.op("MAC"))
     def single_bank_mac(event, ctx):

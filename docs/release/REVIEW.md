@@ -1427,6 +1427,32 @@ steps and the failure appended, and the runner raises structured evidence
 with the exact trace, identity, command, return code and output. The M-15
 bridge follows these fixes; the study stays DIAGNOSTIC.
 
+## Round 42 (2026-11-04): independent review of 6e988e9; the M-15 bridge as the main deliverable
+
+The reviewer accepted the round 41 repairs, reproduced the 1x128 row
+natively, found one bounded provenance defect (a simulator timeout's
+partial streams were dropped; fixed, with a regression) and required the
+M-15 bridge through the shared plan. Judgment: implemented as a vertical
+slice. `allo.host_compute` declares the global softmax between QK and SV
+in the host program; the launch schedule orders it with its declared
+volumes; the availability walk binds its inputs to the producing launch
+and its outputs to the consumer's host ingress; the AiM program lowers it
+as a host step and the realization check binds it; the program graph the
+normal selection ranks prices it as the target's `HOST_COMPUTE` operation
+(readout and upload over the declared link plus declared host vector
+passes; the partial readout stays in the host reduction, nothing counted
+twice); other backends refuse it. The driver compiles the bridged program,
+records independent functional evidence per plan (the lowered QK and SV
+programs' oracles around the compiled stage's own function, against a
+float64 reference; the timing-only simulator produces no values and none
+are attributed to it), measured host-stage samples beside the modelled
+price, the CENT attention program as the control for the 32-head workloads
+with its boundary stated, and a neighbouring 2x256 workload; every plan's
+provenance, traces and executor identity are retained and failed plans
+are kept. The study stays DIAGNOSTIC: the host stage's price is a declared
+per-vector model (measured samples beside it) and the CENT control's
+boundary is CENT's own. G9/G10 and the recorded blockers remain open.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1466,7 +1492,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 41 (2026-11-04) at the candidate `0694791`+ (this
+Refreshed in round 42 (2026-11-04) at the candidate `6e988e9`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |

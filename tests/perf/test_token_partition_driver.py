@@ -37,6 +37,10 @@ def test_shapes_and_summary_figures():
     assert summary["comparable_with_paper"] is False and summary["paper"] == tp.PAPER
 
 
+def record_of(result, label):
+    return result.record["plans"][result.record["aliases"].get(label, label)]
+
+
 def test_estimates_only_run_keeps_every_plan_and_its_provenance(tmp_path):
     result = tp.run_workload(1, 128, simulate=False, artifacts=str(tmp_path))
     rows = result.rows
@@ -53,10 +57,16 @@ def test_estimates_only_run_keeps_every_plan_and_its_provenance(tmp_path):
         assert row.provenance["resource_budget"] == tp.BUDGET
         assert row.provenance["lowering_manifest"] and row.provenance["sv_lowering"]["kind"] == "contraction"
         assert row.provenance["command_count"] > 0
+        # Every plan prices the bridge's host stage; a split plan adds the
+        # host reduction of its partials.
+        price = record_of(result, label)["host_price"]
+        assert price["host_stage_cycles"] > 0 and row.host == price["host_stage_cycles"] + price["host_reduction_cycles"]
+        assert record_of(result, label)["functional_check"]["max_rel_error"] < 2.0**-6
+        assert record_of(result, label)["host_stage_measured"]["median_ns"] > 0
         if row.partitions > 1:
-            assert row.host > 0 and row.bf16_error is not None and row.provenance["host_steps"]
+            assert price["host_reduction_cycles"] > 0 and row.bf16_error is not None
         else:
-            assert row.host == 0 and row.bf16_error is None
+            assert price["host_reduction_cycles"] == 0 and row.bf16_error is None
     record = result.record
     # The normal selection's P is the selected one; the forced plan with the
     # same P is the ranking's cheapest for it, and the two agree.
@@ -113,7 +123,9 @@ def test_a_failed_forced_alternative_keeps_its_record_and_voids_the_comparison(m
     kept = result.record["plans"]["P2"]
     assert kept["modes"] and kept["provenance"]["placements"] and kept["provenance"]["lowering_manifest"]
     assert kept["provenance"]["graph"]["activities"] and kept["estimate_cycles"] > 0
-    assert kept["completed"] == ["provenance", "host_price", "estimate", "merge_check"]
+    assert kept["completed"] == [
+        "provenance", "host_price", "estimate", "merge_check", "functional_check", "host_samples"
+    ]
     on_disk = json.load(open(os.path.join(str(tmp_path), "h1_l128", "P2", "plan.json")))
     assert on_disk["modes"] == kept["modes"] and on_disk["failure"]["stage"] == "simulate"
     assert on_disk["provenance"]["placements"][0]["effects"]["value_layouts"]
@@ -220,3 +232,39 @@ def test_simulator_failure_evidence_is_structured_and_retained(monkeypatch, tmp_
     assert on_disk["provenance"]["lowering_manifest"]
     # No timing was reported for any plan.
     assert all(r.get("device_cycles") is None for r in result.record["plans"].values())
+
+
+def test_simulator_timeout_keeps_the_partial_streams(monkeypatch, tmp_path):
+    """A ramulator2 invocation that times out raises with the partial stdout
+    and stderr the process had written, the trace and the executor identity,
+    and no cycles."""
+    import subprocess
+
+    import allo
+    from allo import spmw_aim
+    from allo.pim.costs import aim_cost
+    from allo.pim.targets import build_aim_target
+
+    binary = tmp_path / "ramulator2"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("TENON_AIM_RAMULATOR2", str(binary))
+
+    def fake_run(command, **kwargs):
+        if command[0] == str(binary):
+            raise subprocess.TimeoutExpired(
+                command, 600, output=b"partial stdout\n", stderr=b"partial stderr\n"
+            )
+        return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(spmw_aim.subprocess, "run", fake_run)
+    attention, program = tp.build_attention(1, 128)
+    built = tp.compile_program(attention, program, build_aim_target())
+    with pytest.raises(spmw_aim.AimSimulatorFailure, match="invocation failed") as error:
+        built.run_backend()
+    evidence = error.value.evidence
+    assert evidence["stdout"] == "partial stdout\n" and evidence["stderr"] == "partial stderr\n"
+    assert evidence["returncode"] is None and "TimeoutExpired" in evidence["exception"]
+    assert evidence["segment"]["trace"][-1].strip() == "AiM EOC" and evidence["segment"]["trace_sha256"]
+    assert evidence["executor"]["binary"] == str(binary) and evidence["executor"]["config"]["sha256"]
+    assert evidence["command"][0] == str(binary)
