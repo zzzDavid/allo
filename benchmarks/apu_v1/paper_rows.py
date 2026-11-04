@@ -54,6 +54,8 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import shutil
+import tempfile
 import os
 import platform
 import statistics
@@ -323,12 +325,18 @@ class ExpertLane:
     ``lane_dir="tenon"`` is the paper-era Tenon binary (the historical
     program as built and measured for the paper, a control for X-22)."""
 
-    def __init__(self, case, root, *, lane_dir="expert", name="expert"):
+    def __init__(self, case, root, *, lane_dir="expert", name="expert", scratch=None):
         import numpy as np
 
         self.case = case
         self.name = name
         self.dir = root / "apuv1" / lane_dir / case
+        # Outputs are written per launch under a scratch directory outside
+        # the archive; the archived io is read-only evidence.
+        self.scratch = Path(scratch) if scratch else Path(
+            tempfile.mkdtemp(prefix=f"tenon-apu-v1-{case}-{name}-")
+        )
+        self.count = 0
         manifest_path = self.dir / "run-manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError(f"no {name} lane for {case!r} at {manifest_path}")
@@ -389,24 +397,50 @@ class ExpertLane:
             read_output_image,
         )
 
-        for _role, path, _dtype, _shape in self.outputs:
-            if path.exists():
-                path.unlink()
+        self.count = getattr(self, "count", 0) + 1
+        name = getattr(self, "name", "archived")
+        scratch = getattr(self, "scratch", None)
+        if scratch is None:
+            scratch = self.scratch = Path(
+                tempfile.mkdtemp(
+                    prefix=f"tenon-apu-v1-{getattr(self, 'case', 'case')}-{name}-"
+                )
+            )
+        launch_dir = scratch / f"{name}-launch-{self.count:03d}"
+        launch_dir.mkdir(parents=True, exist_ok=False)
+        outputs = [
+            (role, launch_dir / Path(path).name, dtype, shape)
+            for role, path, dtype, shape in self.outputs
+        ]
+        archive = self.dir.resolve()
+        for _role, path, _dtype, _shape in outputs:
+            if archive in path.resolve().parents:
+                raise MeasurementError(f"output path inside the archive: {path}")
         argv = [str(self.binary)]
         argv.extend(str(path) for _role, path in self.inputs)
-        argv.extend(str(path) for _role, path, _d, _s in self.outputs)
-        text, profile, cycles = launch_on_board(
-            argv, self.dir, expected_records=1, timeout=900
-        )
+        argv.extend(str(path) for _role, path, _d, _s in outputs)
+        try:
+            text, profile, cycles = launch_on_board(
+                argv, launch_dir, expected_records=1, timeout=900
+            )
+        except Exception as error:
+            # The failed launch's diagnostics stay beside whatever it wrote.
+            (launch_dir / "error.txt").write_text(f"{type(error).__name__}: {error}\n")
+            (launch_dir / "argv.json").write_text(json.dumps(argv, indent=1))
+            raise
         produced = [
             read_output_image(path, role, dtype, shape).reshape(-1)
-            for role, path, dtype, shape in self.outputs
+            for role, path, dtype, shape in outputs
         ]
         exact = all(
             p.size == self.oracle.size
             and np.array_equal(p.astype(self.oracle.dtype), self.oracle)
             for p in produced
         )
+        if exact:
+            shutil.rmtree(launch_dir, ignore_errors=True)
+        else:
+            (launch_dir / "device.log").write_text(text or "")
         return {
             "crun": cycles[0],
             "counters": profile_counters(profile),
@@ -414,6 +448,7 @@ class ExpertLane:
             "binary_sha256": self.binary_sha256,
             "profile_text": profile,
             "device_log": text,
+            "launch_dir": None if exact else str(launch_dir),
         }
 
 
@@ -457,9 +492,16 @@ def measure_case(
     label,
     control_sources=(),
     historical_binary=False,
+    scratch=None,
 ):
     import allo  # noqa: F401  (the lanes import the pipeline)
     from allo.pim.apu_v1_program import apu_v1_board_lock
+
+    if measured <= 0:
+        raise MeasurementError(f"measured launches must be positive, got {measured}")
+    scratch = Path(scratch) if scratch else Path(
+        tempfile.mkdtemp(prefix=f"tenon-apu-v1-session-{case}-")
+    )
 
     record = {
         "case": case,
@@ -499,14 +541,24 @@ def measure_case(
         record["lanes"][name] = description
         lanes[name] = control
     if historical_binary:
-        historical = ExpertLane(case, root, lane_dir="tenon", name="historical_binary")
+        historical = ExpertLane(
+            case, root, lane_dir="tenon", name="historical_binary", scratch=scratch
+        )
         record["lanes"]["historical_binary"] = historical.describe()
         lanes["historical_binary"] = historical
     if expert:
-        expert_lane = ExpertLane(case, root)
+        expert_lane = ExpertLane(case, root, scratch=scratch)
         record["lanes"]["expert"] = expert_lane.describe()
         lanes["expert"] = expert_lane
     record["protocol"]["lanes"] = list(lanes)
+    record["scratch"] = str(scratch)
+    for lane_name, lane in lanes.items():
+        # An archived baseline whose binary is not the archived one is not
+        # the comparison the paper made; the case is invalid as evidence.
+        if getattr(lane, "binary_matches_archive", True) is False:
+            record["problems"].append(
+                f"{lane_name}: binary {lane.binary_sha256[:16]} does not match the archive"
+            )
     if backend != "device":
         return record
 
@@ -562,11 +614,13 @@ def measure_case(
                 key: statistics.median(c[key] for c in counters if key in c)
                 for key in sorted({k for c in counters for k in c})
             }
+    for lane_name in lanes:
+        samples = (record["lanes"][lane_name].get("statistics") or {}).get("samples", 0)
+        if samples < measured:
+            record["problems"].append(
+                f"{lane_name}: {samples} valid measured launches of {measured}"
+            )
     tenon_stats = record["lanes"]["tenon"].get("statistics") or {}
-    if tenon_stats.get("samples", 0) < measured:
-        record["problems"].append(
-            f"tenon: {tenon_stats.get('samples', 0)} valid measured launches of {measured}"
-        )
     if tenon_stats.get("median") is not None:
         median = tenon_stats["median"]
         record["comparison"] = {
@@ -638,8 +692,20 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--label")
     parser.add_argument("--perturb", help="CONST=FACTOR on allo.pim.costs.apu_v1")
+    parser.add_argument(
+        "--scratch",
+        help="directory for per-launch outputs and failed-launch diagnostics "
+        "(default: a new temporary directory outside the archive)",
+    )
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
+    if not args.cases:
+        parser.error("--cases must name at least one case")
+    if args.measured <= 0:
+        parser.error("--measured must be positive")
+    unknown = [case for case in args.cases if case not in CASES]
+    if unknown:
+        parser.error(f"unknown cases: {unknown}; known: {list(CASES)}")
     import allo
 
     session = {
@@ -675,6 +741,7 @@ def main(argv=None) -> int:
                 label=args.label,
                 control_sources=args.control_source,
                 historical_binary=args.historical_binary,
+                scratch=args.scratch,
             )
         except Exception as error:  # a failed case is evidence too
             record = {

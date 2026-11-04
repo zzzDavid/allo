@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import platform
 import sys
 import time
@@ -84,13 +85,33 @@ def amortized_ticks(result, repetitions) -> float | None:
     every launch (``raw_ticks["pipeline"]``, ``repetitions`` bodies) divided
     by the repetitions and summed over launches; fractional ticks are kept
     (``result.cycles`` rounds per launch)."""
+    launches = list(result.extra.get("launches", ()) or ())
+    if not launches:
+        return None  # no launch records is not a zero-tick program
     total = 0.0
-    for launch in result.extra.get("launches", ()):
+    for launch in launches:
         ticks = (launch.get("raw_ticks") or {}).get("pipeline")
-        if ticks is None:
+        if (
+            ticks is None
+            or isinstance(ticks, bool)
+            or not isinstance(ticks, (int, float))
+            or not math.isfinite(ticks)
+            or ticks <= 0
+        ):
             return None
         total += float(ticks) / repetitions
     return total
+
+
+def _timing_problems(runs) -> list:
+    """A run without complete positive device ticks is not timing evidence."""
+
+    return [
+        f"{label}: no complete device tick evidence "
+        f"({len(run.get('launches') or [])} launch record(s))"
+        for label, run in runs.items()
+        if run.get("amortized_ticks_per_pipeline") is None
+    ]
 
 
 def _run(compiled, args):
@@ -149,6 +170,7 @@ def perturbation(seed: int) -> dict:
         for label, run in out["runs"].items()
         if not run["outputs_exact"]
     ]
+    problems.extend(_timing_problems(out["runs"]))
     if not out["selection_changed"]:
         problems.append("the perturbation did not change the selected plan")
     if {l["layout_fingerprint"] for l in stock["launches"]} == {
@@ -185,6 +207,7 @@ def forced_alternative(seed: int) -> dict:
         for label, run in out["runs"].items()
         if not run["outputs_exact"]
     ]
+    problems.extend(_timing_problems(out["runs"]))
     default, forced = out["runs"]["default"], out["runs"]["forced_separate_k1"]
     if default["plan"] == forced["plan"]:
         problems.append("the forced layout did not change the plan")

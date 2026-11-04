@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import shutil
@@ -191,15 +192,17 @@ class TenonLane:
             [args[name].reshape(-1) for name in ORACLE_OUTPUTS[self.name]]
         ).reshape(self.fixture.oracle.shape)
         exact = bool(np.array_equal(produced.astype(np.int64), self.fixture.oracle))
-        launches = result.extra.get("launches", ())
+        launches = list(result.extra.get("launches", ()) or ())
+        expected = len(self.compiled.plan.launches)
         batch = [(launch.get("raw_ticks") or {}).get("pipeline") for launch in launches]
+        timing_problem = timing_evidence_problem(batch, expected)
         amortized = (
-            sum(float(t) / REPETITIONS for t in batch)
-            if all(t is not None for t in batch)
-            else None
+            sum(float(t) / REPETITIONS for t in batch) if timing_problem is None else None
         )
         return {
             "amortized_ticks_per_pipeline": amortized,
+            "timing_evidence_problem": timing_problem,
+            "expected_launches": expected,
             "repeated_batch_ticks": batch,
             "cycles_rounded": result.cycles,
             "outputs_exact": exact,
@@ -217,6 +220,29 @@ class TenonLane:
             ],
             "device_lock": result.extra.get("device_lock"),
         }
+
+
+def timing_evidence_problem(batch_ticks, expected_launches) -> str | None:
+    """Why a launch's device ticks cannot serve as a measurement, or ``None``.
+
+    A measurement needs one launch record per launch of the selected plan,
+    each with a finite positive raw tick count for the repeated batch; an
+    empty launch list is not a zero-tick program.
+    """
+
+    if expected_launches <= 0:
+        return "the selected plan declares no launches"
+    if len(batch_ticks) != expected_launches:
+        return (
+            f"{len(batch_ticks)} launch record(s) for a plan of "
+            f"{expected_launches} launch(es)"
+        )
+    for index, ticks in enumerate(batch_ticks):
+        if isinstance(ticks, bool) or not isinstance(ticks, (int, float)):
+            return f"launch {index}: no raw device ticks"
+        if not math.isfinite(ticks) or ticks <= 0:
+            return f"launch {index}: raw device ticks {ticks!r} are not a positive finite count"
+    return None
 
 
 def loaded_device_library(benchmark: dict, expected_sha256: str) -> dict:
@@ -332,10 +358,12 @@ class VendorLane:
         )
         ticks = benchmark.get("repeated_ticks_total")
         loaded = loaded_device_library(benchmark, self.arc_sha256)
+        timing_problem = timing_evidence_problem([ticks], 1)
         record = {
             "amortized_ticks_per_pipeline": (
-                float(ticks) / REPETITIONS if isinstance(ticks, int) else None
+                float(ticks) / REPETITIONS if timing_problem is None else None
             ),
+            "timing_evidence_problem": timing_problem,
             "repeated_batch_ticks": [ticks],
             "final_pipeline_ticks": benchmark.get("independent_final_ticks"),
             "outputs_exact": bool(exact),
@@ -406,7 +434,8 @@ def run_session(names, root, *, rounds, vendor):
             )
         elif launch.get("amortized_ticks_per_pipeline") is None:
             session["problems"].append(
-                f"{name} {lane_name} {kind} {round_index}: no device ticks"
+                f"{name} {lane_name} {kind} {round_index}: "
+                + (launch.get("timing_evidence_problem") or "no device ticks")
             )
 
     order = list(names)
@@ -489,6 +518,13 @@ def main(argv=None) -> int:
     parser.add_argument("--no-vendor", action="store_true")
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
+    if not args.cases:
+        parser.error("--cases must name at least one case")
+    if args.rounds <= 0:
+        parser.error("--rounds must be positive")
+    unknown = [case for case in args.cases if case not in CASES]
+    if unknown:
+        parser.error(f"unknown cases: {unknown}; known: {list(CASES)}")
     import allo
 
     session = {

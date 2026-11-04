@@ -191,3 +191,90 @@ def test_ledag_drain_removes_the_tool_scratch_it_created(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="exited with 255"):
         program._ledag_drain()
     assert not (tmp_path / "online_log_2026_11_04_04_23_48").exists()
+
+
+def test_apu_v1_archived_lane_never_writes_into_the_archive(monkeypatch, tmp_path):
+    import numpy as np
+
+    from allo.pim import apu_v1_program as runtime
+
+    archive = tmp_path / "archive" / "expert" / "case"
+    (archive / "io").mkdir(parents=True)
+    original = archive / "io" / "counts.uint16.bin"
+    original.write_bytes(b"original archive evidence")
+    before = original.read_bytes()
+    scratch = tmp_path / "scratch"
+
+    lane = object.__new__(paper_rows.ExpertLane)
+    lane.case, lane.name, lane.dir, lane.count = "case", "expert", archive, 0
+    lane.scratch = scratch
+    lane.binary = archive / "binary"
+    lane.binary_sha256 = "0" * 64
+    lane.inputs = []
+    lane.outputs = [("counts", original, "uint16", (4,))]
+    lane.oracle = np.arange(4, dtype=np.uint16)
+
+    def successful(argv, cwd, **kwargs):
+        out = Path(argv[-1])
+        assert archive not in out.resolve().parents and out.parent == Path(cwd)
+        lane.oracle.astype("<u2").tofile(out)
+        return "log", "total crun: 5 hits: 1", [5]
+
+    monkeypatch.setattr(runtime, "launch_on_board", successful)
+    launch = lane.launch()
+    assert launch["crun"] == 5 and launch["outputs_match_oracle"]
+    assert original.read_bytes() == before
+
+    def failing(argv, cwd, **kwargs):
+        Path(argv[-1]).write_bytes(b"partial")
+        raise RuntimeError("simulated failed launch")
+
+    monkeypatch.setattr(runtime, "launch_on_board", failing)
+    with pytest.raises(RuntimeError, match="simulated failed launch"):
+        lane.launch()
+    assert original.read_bytes() == before
+    kept = scratch / "expert-launch-002"
+    assert (kept / "error.txt").read_text().startswith("RuntimeError")
+    assert (kept / "counts.uint16.bin").read_bytes() == b"partial"
+
+
+def test_apu_v1_driver_rejects_empty_cases_and_nonpositive_counts(tmp_path):
+    out = tmp_path / "rows.json"
+    with pytest.raises(SystemExit):
+        paper_rows.main(["--cases", "--out", str(out)])
+    with pytest.raises(SystemExit):
+        paper_rows.main(["--measured", "0", "--out", str(out)])
+    with pytest.raises(SystemExit):
+        paper_rows.main(["--cases", "not_a_case", "--out", str(out)])
+
+
+def test_apu_g2_timing_evidence_requires_complete_positive_ticks():
+    problem = g2_paper_rows.timing_evidence_problem
+    assert problem([], 1) == "0 launch record(s) for a plan of 1 launch(es)"
+    assert problem([34245], 1) is None
+    assert problem([34245, None], 2) == "launch 1: no raw device ticks"
+    assert "not a positive finite count" in problem([0], 1)
+    assert "not a positive finite count" in problem([float("nan")], 1)
+    assert problem([1, 2], 1).startswith("2 launch record(s)")
+    assert problem([1], 0) == "the selected plan declares no launches"
+
+    class Empty:
+        extra = {"launches": []}
+
+    assert selection_traces.amortized_ticks(Empty(), 20) is None
+
+    class Zero:
+        extra = {"launches": [{"raw_ticks": {"pipeline": 0}}]}
+
+    assert selection_traces.amortized_ticks(Zero(), 20) is None
+    assert selection_traces._timing_problems(
+        {"stock": {"amortized_ticks_per_pipeline": None, "launches": []}}
+    ) == ["stock: no complete device tick evidence (0 launch record(s))"]
+
+
+def test_apu_g2_driver_rejects_empty_cases_and_nonpositive_rounds(tmp_path):
+    out = tmp_path / "rows.json"
+    with pytest.raises(SystemExit):
+        g2_paper_rows.main(["--cases", "--out", str(out), "--no-vendor"])
+    with pytest.raises(SystemExit):
+        g2_paper_rows.main(["--rounds", "0", "--out", str(out), "--no-vendor"])
