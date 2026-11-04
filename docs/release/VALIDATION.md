@@ -736,3 +736,27 @@ under `/work/shared/users/phd/nz264/tenon-release-evidence/r28/`.
 | `tests/perf/test_apu_v1_hybrid_manifest.py` (6 tests) | 6 passed |
 | APU v1 batch (`r28/pytest_r28_apu_v1.log`: `test_apu_v1_scalar_surface.py`, `test_apu_v1_recognizers.py`, `test_apu_v1_native_reductions.py`, `test_apu_v1_cost_provenance.py`, `test_apu_v1_distance_argmin.py`, `test_compile_interface.py`, `test_run_result_contract.py`, the non-backend sections of `test_shared_semantics.py`) | 171 passed in 380 s |
 | `grep` of `allo/pim/apu_v1_hybrid.py` for text analysis (`str(schedule.module)`, `re.search`, the deleted regex names) | none left; the one remaining pattern validates scalar element-type spellings |
+
+## Round 29 (2026-11-04): X-21; installed-artifact hardware sessions on the APU v1 board and the Gemini-II card (G9 slice 5, G10 hardware rows)
+
+Candidate revision `653b059`. Local sdist sha256 `705b7598...16b6` built
+from the committed tree; local wheel sha256 `6abf554c...1819` (LLVM 22
+clang, clean venv `r29/pkg/venv`); zhang-x4 wheel sha256 `713ba6c6...63af`
+built from the same sdist with the host's gcc 11 (clean venv
+`r29/g2/venv`). Every run below executed from the installed wheel with the
+checkout off `sys.path` (`PYTHONSAFEPATH=1`, only a copy of `benchmarks/`
+on `PYTHONPATH`), under the device-host locks
+(`/tmp/tenon-apu-v1-0000:41:00.0.lock`, `/tmp/tenon-apu-g2-apu-00.lock`).
+Predictions were written before the runs (`r29/apu_v1_prediction.txt`,
+`r29/g2_prediction.txt`). Logs and JSON records under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r29/`.
+
+| Check | Result |
+|---|---|
+| `tests/perf/test_apu_v1_hybrid_manifest.py` after X-21 (7 tests, public route with a nonzero initializer and different allocation/result names) | 7 passed; the reviewer's `probe_manifest.py` now reports one buffer `answer` with `zero_initialized=False` and values `x + 7` (`r29/probe_manifest.log`) |
+| APU v1 paper rows, default shared selection, 5 launches each, outputs against the archived oracles (`r29/apu_v1-installed-default.log`, `apu_v1_default_rows.json`) | matrix_multiply (plan `temporal_dma_coalescing_broadcast_friendly_acc8`, the paper's forced plan, selected by cost) median 8,757,824 vs paper 8,764,900 (0.9992); kmeans 624,488 vs 624,677 (0.9997); histogram 166,636 vs 166,783 (0.9991); linear_regression 94,328 vs 94,618.5 (0.9969); word_count 174,620 vs 171,988 (**1.0153, open regression X-22**); every launch's outputs equal the oracle |
+| APU v1 forced alternative (`apu_v1-installed-alternative.log`) | `layout=temporal_dma_coalescing_broadcast_friendly_acc4`: different device source (sha `68fa795e...`), median 13,534,246 cycles (predicted slower than acc8: confirmed), outputs equal the oracle |
+| APU v1 cost perturbation (`apu_v1-installed-perturbed.log`): `MICRO_DMA_L4_L1_32K` x0.01 | cost fingerprint `3345fcb9...` vs stock `0c6e5955...`; the selection moves to `temporal_dma_coalescing` (perturbed estimate 4,849,168 vs acc8 10,682,747); different device source (sha `066bf67b...`); launched: median 359,246,921 cycles, outputs equal the oracle; the stock model's pick is 41x faster (its own estimate for the perturbed pick was 366,292,768, within 2% of the measurement), as predicted |
+| Gemini-II paper rows, default shared selection, 5 card sessions (`g2-installed-run.log`, `g2-paper-repeat{2,3,4,5}.log`, `g2_paper_rows_sessions.json`), exact int64 outputs enforced in the runtime and re-checked | medians of ticks per pipeline body (repetitions 20): gemm 1,725 vs paper 1,733.225 (0.9953); batched_gemm 1,736 vs 1,739.15 (0.9982); gesummv 1,806 vs 1,860.075 (0.9709); bicg 2,540 vs 2,548.825 (0.9965); mvt 2,733 vs 2,766.625 (0.9878); spreads at most 43 ticks; one device library `ca39fc23...` for every session |
+| Gemini-II card tests from the installed wheel (`g2-installed-run.log`) | `tests/pim/test_apu_g2_hardware.py`: 15 passed in 147 s |
+| Gemini-II selection traces (`benchmarks/apu_g2/selection_traces.py`, `g2-selection-traces.log`, `g2_selection_traces.json`) | cost perturbation (rows x20): the 64x128x33 GEMM moves from `single/k2` to `single/k1` (fingerprints `1539818...` vs `0ac887c7...`), distinct layout fingerprints per launch, both exact; stock 2,712 ticks vs perturbed 3,462 (prediction "stock not slower": confirmed). Forced alternative: BiCG `fused/k1` (one launch) 2,520 ticks vs forced `separate/k1` (two launches) 5,074, both exact |

@@ -1004,8 +1004,22 @@ to its result name by spelling. Judgment: both are facts of the retained
 IR (the fill's constant; the operands of `func.return`), so they are read
 from it, and the public-route regression uses different allocation and
 result names with a nonzero initializer so spelling cannot carry the
-test. The remaining increment of this round is the hardware session the
-reviewer asked for (G9 slice 5 with the G10 APU rows).
+test.
+
+The hardware sessions then ran from installed wheels at `653b059` on both
+hosts (VALIDATION round 29). G9 slice 5: on the APU v1 board a forced
+alternative plan and a cost perturbation each changed the selected plan,
+the generated device source and the launched program, with exact outputs
+and the stock model's pick faster as predicted; on the Gemini-II card the
+rows-x20 perturbation moved the GEMM's plan and layout fingerprints and
+the forced BiCG alternative doubled the launches, all exact, the stock
+pick faster as predicted. G10: the five Gemini-II paper kernels are at or
+below the paper's values over five sessions; four of the five Gemini-I
+kernels are at or below, word count is 1.5% slower (X-22, open; the
+expert baseline is still beaten). Judgment: the shared selection, not a
+forced historical plan, produced these programs; the matrix multiply's
+default selection is the paper's plan by cost, so no separate forced row
+was needed, and the forced rows are labelled as such.
 
 ## Rejected shortcuts
 
@@ -1058,11 +1072,12 @@ commit). Earlier judgments are kept in the round sections above.
 | G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1 in earlier rounds; open: C-18, uniform movement weights, the perturbation traces at the current candidate on both hardware hosts |
 | G6 evidence beyond examples | **PARTIAL** | EVIDENCE.md plus the reviewer-driven probes of rounds 8-27 (renamings, operation changes, shape and slice neighbours, wrong declarations, reversed arithmetic); open: hardware-only confirmations, the probe list re-run at the candidate |
 | G7 install/interfaces/maintainability | **PARTIAL** | installed-artifact runs at `7bdb475`, `e60973f`, `9255d29`; architecture docs follow the pipeline (`design/shared-compilation-path.md`); open: a fresh install at the candidate, the Samsung patches (P-04), P-23 lint, the public-payload review |
-| G8 backend execution | **PARTIAL** | installed-artifact evidence on the simulators, the APU v1 board and the Gemini-II card at `9255d29`; the UPMEM, AiM and Samsung paper rows re-run through the simulators at `da041af` (G10); open: both hardware hosts at the current candidate |
-| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | shared front stages and facts (rounds 12-18); both APUs' plans and typed records as candidates of the common pipeline with an enforced contract (rounds 13-17); Samsung, AiM, UPMEM and AttAcc declare effects from the facts and are checked at materialization (rounds 19-27, X-04 to X-20); shared transfer availability (X-09, X-17, X-18); the `APUv1Program` manifest from the retained IR (round 28); open: slice 5 traces of forced alternatives and cost perturbations reaching generated code and launches on the APU v1 board and the Gemini-II card at one revision, with installed artifacts |
-| G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), the 500-instance selector equivalence as a diagnostic; UNVERIFIED: both hardware tables, token partitioning, UPMEM scaling, packing/selection/DCC studies, AttAcc Ramulator2 timings and decode, calibration, the virtual study, compile cost |
+| G8 backend execution | **PARTIAL** | installed-artifact evidence on the simulators at `da041af` (the UPMEM, AiM and Samsung paper rows) and on the APU v1 board and the Gemini-II card at `653b059` (round 29: paper rows, forced alternatives, cost perturbations, exact outputs, device locks); open: the simulators from the installed wheel at the current candidate, the full suites at one revision |
+| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | shared front stages and facts (rounds 12-18); both APUs' plans and typed records as candidates of the common pipeline with an enforced contract (rounds 13-17); Samsung, AiM, UPMEM and AttAcc declare effects from the facts and are checked at materialization (rounds 19-27, X-04 to X-20); shared transfer availability (X-09, X-17, X-18); the `APUv1Program` manifest from the retained IR (round 28); slice 5 traces at `653b059` from installed wheels: forced alternatives and cost perturbations reach the selected plan, the generated source, the packing/launches and the measured device time on the APU v1 board and the Gemini-II card (round 29); open: independent review of rounds 28-29, the full suites and installed-artifact runs on the simulators at one revision, the remaining minor items |
+| G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), Gemini-II 5/5 at or below the paper over five card sessions, Gemini-I 4/5 at or below the paper with word count an OPEN 1.5% regression (X-22), the 500-instance selector equivalence as a diagnostic; UNVERIFIED: token partitioning, UPMEM scaling, packing/selection/DCC studies, AttAcc Ramulator2 timings and decode, calibration, the virtual study, compile cost |
 
-Verdict: **NOT READY**. Blockers: G9 (slice 5 hardware traces at the
-candidate), G10 (hardware rows, the remaining studies, the four AiM
-regressions), the independent re-challenge of G1-G8 at the candidate, P-04
-and P-23 (deferred), the open minor items in ISSUES.md.
+Verdict: **NOT READY**. Blockers: G9 (independent review of the completed
+migration and slice 5 evidence), G10 (the remaining studies, the four AiM
+regressions, the word-count regression), the independent re-challenge of
+G1-G8 at the candidate, P-04 and P-23 (deferred), the open minor items in
+ISSUES.md.
