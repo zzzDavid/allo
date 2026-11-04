@@ -191,19 +191,25 @@ def test_vendor_layout_emits_the_vendor_gemv_program(vendor):
     assert dict(vendor._source_binding.inputs) == {"A": "W", "B": "x"}
 
 
-def test_default_selection_follows_the_serialized_fiber_cost(paper):
-    # Both fibers share the channel bus (allo/pim/costs/samsung.py): the
-    # cost-selected program keeps every tile on the even bank.
+def test_default_selection_splits_each_tiles_rows_across_the_fibers(paper):
+    # The estimate includes each work item's share of the matrix staging
+    # (allo/pim/costs/samsung.py, S-16): the cost-selected program places a
+    # tile's second row in the odd fiber (`split_rows`, the measured fastest
+    # placement on the paper GEMVs), so each tile is two MACs, one per bank,
+    # and the loop runs over half the tile count.
     _workload, compiled = paper
     assert [w[:4] + (w[5],) for w in _words(compiled)] == [
         ("MAC", "GRF_B", "GRF_A", "EVEN_BANK", 0),
-        ("JUMP", "A_OUT", "A_OUT", "A_OUT", 15),
+        ("MAC", "GRF_B", "GRF_A", "ODD_BANK", 0),
+        ("JUMP", "A_OUT", "A_OUT", "A_OUT", 7),
         ("NOP", "A_OUT", "A_OUT", "A_OUT", 7),
         ("EXIT", "A_OUT", "A_OUT", "A_OUT", 0),
     ]
     (program,) = compiled.compiled.layout_ctx.programs
     assert program.lever_record["grf_residency"] == {"local_x": "host"}
-    assert program.lever_record["fibers"] == 1
+    assert program.lever_record["fibers"] == 2
+    assert program.lever_record["tile_rows"] == "split_fibers"
+    assert program.lever_record["mode"].split("+")[0] == "split_rows"
 
 
 def test_k512_program_derives_trip_counts_from_tiles():

@@ -65,10 +65,14 @@ def _ties_by_name(compiled):
 
 
 def _with_tie(placements, tie):
+    """The vendor placements with the tie's movement layout: an edited
+    decision supplied without a declaration (the vendor declaration names
+    the identity row packing; the boundary derives the edited decision's
+    own declaration and would refuse a stale one)."""
     out = []
     for placement in placements:
         clone = copy.copy(placement)
-        clone.extra = dict(placement.extra)
+        clone.extra = {k: v for k, v in placement.extra.items() if k != "effects"}
         clone.layout = split_movement_layout(placement.layout)[0].product(tie.layout)
         out.append(clone)
     return out

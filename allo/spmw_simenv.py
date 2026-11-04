@@ -23,6 +23,11 @@ Variables (meaning; default when unset):
     Default: ``$TENON_SIMULATORS_DIR/aim_simulator``.
 ``TENON_AIM_SIM_IMAGE``
     Docker image that runs ``ramulator2``. Default: ``aim-simulator-build``.
+``TENON_AIM_RAMULATOR2``
+    A natively built ``ramulator2`` binary to run instead of the Docker
+    image (its directory is added to ``LD_LIBRARY_PATH`` for a shared
+    ``libramulator``); the run records the binary's SHA-256.  Default:
+    unset (Docker).
 ``UPIMULATOR_ROOT``
     uPIMulator Go project root (``benchmark/``, ``sdk/``). Default: the
     provenance snapshot staged under ``$TENON_UPMEM_SCRATCH``.
@@ -160,6 +165,24 @@ def aim_root() -> Path | None:
 def aim_sim_image() -> str:
     """Docker image whose ``/work`` mount runs ``./build/ramulator2``."""
     return os.environ.get("TENON_AIM_SIM_IMAGE", _DEFAULT_AIM_SIM_IMAGE)
+
+
+def aim_ramulator2_binary() -> Path | None:
+    """A natively built ``ramulator2`` (``TENON_AIM_RAMULATOR2``), or None
+    when the Docker image is the executor."""
+    value = os.environ.get("TENON_AIM_RAMULATOR2")
+    return Path(value).expanduser() if value else None
+
+
+def aim_native_unavailable_reason(binary: Path) -> str | None:
+    """None when the native ``ramulator2`` binary exists and is executable
+    (a binary that cannot load here fails its first run with the loader's
+    message; the run reports no cycles)."""
+    if not binary.is_file():
+        return f"TENON_AIM_RAMULATOR2 binary not found at {binary}"
+    if not os.access(binary, os.X_OK):
+        return f"TENON_AIM_RAMULATOR2 binary at {binary} is not executable"
+    return None
 
 
 def tenon_artifacts_root() -> Path:
@@ -473,7 +496,12 @@ def samsung_unavailable_reason() -> str | None:
 
 
 def aim_unavailable_reason() -> str | None:
-    reason = docker_image_unavailable_reason(aim_sim_image())
+    binary = aim_ramulator2_binary()
+    reason = (
+        aim_native_unavailable_reason(binary)
+        if binary is not None
+        else docker_image_unavailable_reason(aim_sim_image())
+    )
     if reason is not None:
         return reason
     root = aim_root()

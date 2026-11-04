@@ -1358,6 +1358,31 @@ measured fastest wherever measured. S-16 is repaired with its remaining
 scope stated (declared-device absolutes; the ordered program's preload 16%
 under its measurement). The XOR paper row stays OPEN (probe metric).
 
+## Round 39 (2026-11-04): independent review of 0a4b543; the supplied-declaration boundary and the next inventory study
+
+The reviewer accepted the staging repair (its own 23x81x2 contraction
+selects `split_rows` and executes exactly at 3,241 cycles) and found the
+declaration fix incomplete: the compile boundary compared three fields and
+then replaced the whole supplied record before validation, so an edited
+image, buffer identity, launch domain or allocation set passed
+`allo.compile(..., layout=...)` while failing direct validation.
+Judgment: accepted (C-34). A supplied declaration is now a claim about the
+program: normalized onto its work item by structure (function and value
+bindings by operand role, which is what lets one body's declaration serve
+every body of a lockstep kernel), validated in full, and compared field by
+field with the current candidate's declaration for the same decision; any
+difference refuses the compilation before anything is replaced, in every
+rebinding branch. Reuse is preserved structurally, not by names: a bare
+decision and another program's plan (a declaration covering a function
+outside the program) supply their decision and get the re-derived
+declaration, recorded in the placement. The derivation check itself now
+compares the whole record. The reviewer asked next for an inventory study
+through actual shared selection and simulator execution; Docker is out of
+disk on this host, so the AiM simulator was built natively from the same
+tree and validated on the exact golden rows before the token-partitioning
+study ran through the maintained driver (`benchmarks/cent_aim/
+token_partition.py`); it reproduces in kind (6 of 9 simulated minima, largest gap 1.34%, against the paper's 7 of 9 and 2.63%), with every compared plan's declared effects, lowering entry, estimate, device cycles and executor recorded, and the row is OPEN (measured), not REPRODUCED: one fewer minimum, and the 1-head head-only ratio is not comparable because the ranking finds an in-budget plan outside the paper's candidate set.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1397,7 +1422,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 38 (2026-11-04) at the candidate `c29287d`+ (this
+Refreshed in round 39 (2026-11-04) at the candidate `0a4b543`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |

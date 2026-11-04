@@ -23,7 +23,17 @@ effects, it does not merely display them:
   reduction-order policy.  A placement that designates no candidate of the
   current program is refused; a plan the policy pruned raises
   ``ReductionOrderError``.  The payload of a supplied placement is never
-  executed as such.
+  executed as such.  A supplied placement's *declared effects* are a claim
+  about the program: a declaration covering a function of the compiled
+  program is normalized onto the work item it is supplied for (function and
+  value bindings by operand role, so one body's declaration serves every
+  body of a lockstep kernel), validated in full and compared field by field
+  with the current candidate's declaration for the same decision; a
+  disagreement refuses the compilation before anything is replaced.  A
+  declaration covering a function outside the program is another program's
+  plan: its decision is reused and its declaration re-derived (recorded in
+  the placement's ``candidate_selection``).  A placement without a
+  declaration supplies its decision only.
 * After materialization the backend context's ``check_realization``
   compares the realized program (its ABI, launches) with the effects the
   selected candidate declared.
@@ -950,73 +960,226 @@ def _derivation_problems(view, matches, placement, effects) -> list:
                 f"declares transfer {transfer.value!r} {transfer.direction} as "
                 f"{tuple(declared.route)}; the derivation gives {tuple(transfer.route)}"
             )
+    # Every other field of the record (images, launches, allocations, the
+    # declared synthetic axes, scope): a declaration is the derivation for
+    # its decision, in full.
+    if not problems:
+        problems.extend(
+            _declaration_differences(effects, derived, against="the derivation")
+        )
     return problems
 
 
-def _declaration_disagreements(declared, current) -> list:
-    """How a supplied declaration differs from the current candidate's for
-    the same decision, in the fields the lowering realizes: each value
-    layout's storage and packing (by position: a placement supplied for
-    every body of a lockstep kernel names another body's values) and each
-    transfer's route."""
+def _declaration_differences(declared, current, *, against) -> list:
+    """How ``declared`` differs from ``current`` (both declarations of the
+    same work item, in its names), field by field: value layouts by value
+    and image, transfers by value and direction, launches in order,
+    allocations, synthetic axes, ABI, scope.  Empty iff the records agree."""
     problems = []
-    if len(declared.value_layouts) != len(current.value_layouts):
+
+    def layouts(record):
+        return {(l.value, l.image): l for l in record.value_layouts}
+
+    mine, theirs = layouts(declared), layouts(current)
+    for key in sorted(set(mine) | set(theirs)):
+        value, image = key
+        if key not in theirs:
+            problems.append(
+                f"declares a layout of {value!r} (image {image!r}) that {against} "
+                "does not give"
+            )
+        elif key not in mine:
+            problems.append(
+                f"declares no layout of {value!r} (image {image!r}); {against} gives "
+                f"storage {theirs[key].storage!r} packing {theirs[key].packing!r}"
+            )
+        elif mine[key] != theirs[key]:
+            problems.append(
+                f"declares {value!r} (image {image!r}) laid out over "
+                f"{tuple(mine[key].axes)} in storage {mine[key].storage!r} packing "
+                f"{mine[key].packing!r}; {against} gives {tuple(theirs[key].axes)} in "
+                f"{theirs[key].storage!r} packing {theirs[key].packing!r}"
+            )
+
+    def transfers(record):
+        return {(t.value, t.direction): t for t in record.transfers}
+
+    mine, theirs = transfers(declared), transfers(current)
+    for key in sorted(set(mine) | set(theirs)):
+        value, direction = key
+        if key not in theirs or key not in mine:
+            problems.append(
+                f"declares transfers {sorted(transfers(declared))}; {against} gives "
+                f"{sorted(transfers(current))}"
+            )
+            break
+        if mine[key] != theirs[key]:
+            problems.append(
+                f"declares transfer {value!r} {direction} as {tuple(mine[key].route)}"
+                f"{' (physical)' if mine[key].physical else ''}; {against} gives "
+                f"{tuple(theirs[key].route)}"
+                f"{' (physical)' if theirs[key].physical else ''}"
+            )
+    if tuple(declared.launches) != tuple(current.launches):
         problems.append(
-            f"declares {len(declared.value_layouts)} value layouts, the current "
-            f"candidate {len(current.value_layouts)}"
+            "declares launches "
+            + "; ".join(
+                f"{l.index}:{l.kind} ops {tuple(l.operations)} instances "
+                f"{tuple(l.instances)} reduction {l.reduction} {l.accumulator}"
+                for l in declared.launches
+            )
+            + f"; {against} gives "
+            + "; ".join(
+                f"{l.index}:{l.kind} ops {tuple(l.operations)} instances "
+                f"{tuple(l.instances)} reduction {l.reduction} {l.accumulator}"
+                for l in current.launches
+            )
         )
-    for mine, theirs in zip(declared.value_layouts, current.value_layouts):
-        if (mine.storage, mine.packing) != (theirs.storage, theirs.packing):
-            problems.append(
-                f"declares {mine.value!r} in storage {mine.storage!r} packing "
-                f"{mine.packing!r}; the current candidate with the same decision "
-                f"declares {theirs.storage!r} packing {theirs.packing!r}"
-            )
-        # The semantic axes a value is laid out over are the program's loop
-        # labels, the same in every body of a lockstep kernel.
-        if tuple(mine.axes) != tuple(theirs.axes):
-            problems.append(
-                f"declares {mine.value!r} laid out over axes {tuple(mine.axes)}; the "
-                f"current candidate with the same decision declares {tuple(theirs.axes)}"
-            )
-    if len(declared.transfers) != len(current.transfers):
+    if tuple(declared.allocations) != tuple(current.allocations):
         problems.append(
-            f"declares {len(declared.transfers)} transfers, the current candidate "
-            f"{len(current.transfers)}"
+            f"declares allocations {list(declared.allocations)}; {against} gives "
+            f"{list(current.allocations)}"
         )
-    for mine, theirs in zip(declared.transfers, current.transfers):
-        if (mine.direction, tuple(mine.route)) != (theirs.direction, tuple(theirs.route)):
-            problems.append(
-                f"declares transfer {mine.value!r} {mine.direction} as "
-                f"{tuple(mine.route)}; the current candidate declares "
-                f"{theirs.direction} {tuple(theirs.route)}"
-            )
+    if tuple(declared.synthetic_axes) != tuple(current.synthetic_axes):
+        problems.append(
+            f"declares synthetic axes {list(declared.synthetic_axes)}; {against} "
+            f"gives {list(current.synthetic_axes)}"
+        )
+    if (set(declared.abi_inputs), set(declared.abi_outputs)) != (
+        set(current.abi_inputs),
+        set(current.abi_outputs),
+    ):
+        problems.append(
+            f"declares ABI {sorted(declared.abi_inputs)} -> "
+            f"{sorted(declared.abi_outputs)}; {against} gives "
+            f"{sorted(current.abi_inputs)} -> {sorted(current.abi_outputs)}"
+        )
+    if (declared.device_scope, declared.host_function) != (
+        current.device_scope,
+        current.host_function,
+    ):
+        problems.append(
+            f"declares scope {declared.device_scope!r} (host function "
+            f"{declared.host_function}); {against} gives {current.device_scope!r} "
+            f"(host function {current.host_function})"
+        )
     return problems
 
 
-def _with_current_effects(placement, current):
+def _rebound_declaration(declared, current):
+    """``declared`` with its bindings carried onto the work item ``current``
+    declares for, by structure: the function is the work item's; the n-th
+    input and the n-th output of the declared coverage (the operand roles
+    in derivation order) name the n-th input and output of ``current``.  A
+    placement supplied for every body of a lockstep kernel thus carries one
+    body's declaration onto the others.  Returns ``(record, problems)``:
+    the record is None when the bindings do not carry (a different operand
+    count, one declared value bound to two of the work item's or two to one).
+    """
+    from dataclasses import replace
+
+    mine = (tuple(declared.coverage.inputs), tuple(declared.coverage.outputs))
+    theirs = (tuple(current.coverage.inputs), tuple(current.coverage.outputs))
+    if tuple(map(len, mine)) != tuple(map(len, theirs)):
+        return None, [
+            f"covers {len(mine[0])} input(s) and {len(mine[1])} output(s); the work "
+            f"item has {len(theirs[0])} and {len(theirs[1])}"
+        ]
+    renaming, problems = {}, []
+    for source, target in zip(mine[0] + mine[1], theirs[0] + theirs[1]):
+        if renaming.setdefault(source, target) != target:
+            problems.append(
+                f"binds declared value {source!r} to both {renaming[source]!r} and "
+                f"{target!r} of the work item"
+            )
+    bound = {}
+    for source, target in renaming.items():
+        if bound.setdefault(target, source) != source:
+            problems.append(
+                f"binds declared values {bound[target]!r} and {source!r} to one "
+                f"value {target!r} of the work item"
+            )
+    if problems:
+        return None, problems
+
+    def name(value):
+        return renaming.get(value, value)
+
+    record = replace(
+        declared,
+        coverage=replace(
+            declared.coverage,
+            function=current.coverage.function,
+            inputs=tuple(name(v) for v in declared.coverage.inputs),
+            outputs=tuple(name(v) for v in declared.coverage.outputs),
+        ),
+        value_layouts=tuple(
+            replace(l, value=name(l.value)) for l in declared.value_layouts
+        ),
+        transfers=tuple(replace(t, value=name(t.value)) for t in declared.transfers),
+        abi_inputs=tuple(name(v) for v in declared.abi_inputs),
+        abi_outputs=tuple(name(v) for v in declared.abi_outputs),
+    )
+    return record, []
+
+
+def _with_current_effects(placement, current, matches, view, functions):
     """``placement`` with the effects the current enumeration declared for
-    the same decision (per work item), the caller's other fields kept.  A
-    supplied declaration that disagrees with the current candidate's on a
-    realized field (storage, packing, transfer route) is a contract
-    violation, refused here rather than silently replaced."""
+    the same decision (per work item), the caller's other fields kept.
+
+    A supplied placement's declared effects are a claim about the program:
+    when the declaration covers a function of the program being compiled
+    (this work item or another body of its kernel) it is normalized onto
+    this work item (:func:`_rebound_declaration`), validated against the
+    work item's semantic program in full (:func:`validate_candidate_effects`,
+    derivation included) and compared field by field with the current
+    candidate's declaration for the same decision; any problem refuses the
+    compilation before anything is replaced.  A declaration covering a
+    function outside the program is another program's plan: its decision is
+    reused and its declaration is re-derived (recorded in the placement's
+    ``candidate_selection``).  A placement without a declaration supplies
+    its decision only.
+    """
+    from .spmw_autoschedule import Placement
+
     effects = candidate_effects(current)
     if effects is None or candidate_effects(placement) is effects:
         return placement
     declared = candidate_effects(placement)
-    if declared is not None:
-        problems = _declaration_disagreements(declared, effects)
+    selection = None
+    if declared is not None and declared.coverage.function in functions:
+        rebound, problems = _rebound_declaration(declared, effects)
+        if not problems:
+            normalized = Placement(
+                placements=dict(placement.placements),
+                mode=placement.mode,
+                extra={**(placement.extra or {}), "effects": rebound},
+                layout=getattr(placement, "layout", None),
+            )
+            problems = validate_candidate_effects(matches, normalized, view)
+            if not problems:
+                problems = _declaration_differences(
+                    rebound, effects, against="the current candidate with the same decision"
+                )
         if problems:
             raise ValueError(
                 f"supplied placement {placement.mode!r} violates the candidate "
-                "contract: " + "; ".join(problems)
+                "contract: " + "; ".join(problems) + " (to reuse the decision "
+                "alone, supply the placement without its declared effects or "
+                "layout=<name>)"
             )
-    from .spmw_autoschedule import Placement
-
+    elif declared is not None:
+        selection = (
+            f"decision of {declared.coverage.function!r} rebound; declaration "
+            "re-derived for this program"
+        )
+    extra = {**(placement.extra or {}), "effects": effects}
+    if selection is not None:
+        extra["candidate_selection"] = selection
     return Placement(
         placements=dict(placement.placements),
         mode=placement.mode,
-        extra={**(placement.extra or {}), "effects": effects},
+        extra=extra,
         layout=getattr(placement, "layout", None),
     )
 
@@ -1039,6 +1202,7 @@ def rebind_supplied_layouts(view, trace, supplied) -> list:
 
     from .spmw_autoschedule import (
         _ENUMERATORS,
+        Placement,
         _bucket_for_autoschedule,
         _matcher_operand_roles,
         _matcher_placement_decision,
@@ -1060,6 +1224,7 @@ def rebind_supplied_layouts(view, trace, supplied) -> list:
         groups.setdefault(_matcher_work_scope(matches[0]).group_id, []).extend(matches)
     for group_matches in groups.values():
         _stamp_group_replication(group_matches)
+    functions = {match.func_name for match in trace.matches}
     rebound = []
     for placement, (_scope, matches) in zip(supplied, buckets):
         candidates = enumerator(view, matches)
@@ -1081,9 +1246,16 @@ def rebind_supplied_layouts(view, trace, supplied) -> list:
                 # Its declared effects are this work item's (a placement
                 # supplied for every work item of a lockstep kernel carries
                 # the first body's declaration otherwise).
-                rebound.append(_with_current_effects(placement, same[0]))
+                rebound.append(
+                    _with_current_effects(placement, same[0], matches, view, functions)
+                )
                 continue
+            # A backend plan with a current candidate's decision: the current
+            # candidate (its payload bound to this program) is compiled; the
+            # supplied plan's declaration, when it claims this program, must
+            # be the current candidate's.
             chosen = same[0]
+            _with_current_effects(placement, chosen, matches, view, functions)
             chosen.extra = {**chosen.extra, "candidate_selection": "forced"}
             rebound.append(chosen)
             continue
@@ -1100,6 +1272,7 @@ def rebind_supplied_layouts(view, trace, supplied) -> list:
                     f"layout placement {placement.mode!r} designates "
                     f"{len(named)} candidates of kernel {matches[0].func_name!r}"
                 )
+            _with_current_effects(placement, named[0], matches, view, functions)
             rebound.append(named[0])
             continue
         pruned = {}
@@ -1112,9 +1285,21 @@ def rebind_supplied_layouts(view, trace, supplied) -> list:
                 f"policy ({pruned[placement.mode]})"
             )
         # The caller's placement for this work item, its effects declared by
-        # the backend for these matches (a supplied placement may carry the
-        # declaration of another body of a lockstep kernel).
-        rebound.append(_redeclared(view, matches, placement))
+        # the backend for these matches; a declaration it carries (one of
+        # another body of a lockstep kernel, or an edited one) is normalized
+        # onto this work item and must be that derivation.
+        bare = Placement(
+            placements=dict(placement.placements),
+            mode=placement.mode,
+            extra={
+                k: v for k, v in (placement.extra or {}).items() if k != "effects"
+            },
+            layout=getattr(placement, "layout", None),
+        )
+        derived = _redeclared(view, matches, bare)
+        rebound.append(
+            _with_current_effects(placement, derived, matches, view, functions)
+        )
     return rebound
 
 

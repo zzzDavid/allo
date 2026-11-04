@@ -7,6 +7,7 @@ from __future__ import annotations
 import functools
 
 import math
+import os
 import re
 import subprocess
 import tempfile
@@ -2125,15 +2126,18 @@ def _check_simulator_geometry(target, yaml_cfg: Path) -> None:
 
 
 def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
-    """Run a compiled AiM artifact through ramulator2 in Docker.
+    """Run a compiled AiM artifact through ramulator2.
 
     `compiled.cmds` is a list of already-terminated text trace lines. We
     serialize those exact candidate-owned segments and invoke the ramulator2
-    binary inside the `aim-simulator-build` Docker image (`TENON_AIM_SIM_IMAGE`).
-    Each trace is written to a private temp directory mounted read-only at
-    `/trace`, so the simulator checkout is never written. The simulator's
-    YAML stdout carries per-channel `memory_system_cycles`; we parse
-    out the max across channels as the headline cycle count.
+    binary inside the `aim-simulator-build` Docker image (`TENON_AIM_SIM_IMAGE`)
+    or, when `TENON_AIM_RAMULATOR2` names a natively built binary, that
+    binary from the simulator tree (the executor and the binary's SHA-256
+    are recorded in ``extra["simulator"]``).  Each trace is written to a
+    private temp directory (mounted read-only at `/trace` under Docker), so
+    the simulator checkout is never written. The simulator's YAML stdout
+    carries per-channel `memory_system_cycles`; we parse out the max across
+    channels as the headline cycle count.
 
     ramulator2 is a timing simulator: it replays the command trace and
     computes no data. The result is ``kind="simulator-timing-only"`` with no
@@ -2148,31 +2152,52 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
 
     cfg_rel = yaml_cfg.relative_to(root)
 
-    image = _aim_sim_image()
+    from .spmw_simenv import aim_ramulator2_binary
+
+    native = aim_ramulator2_binary()
+    if native is not None:
+        import hashlib
+
+        native = native.resolve()
+        executor = {
+            "kind": "native",
+            "binary": str(native),
+            "sha256": hashlib.sha256(native.read_bytes()).hexdigest(),
+            "config": str(yaml_cfg),
+        }
+    else:
+        executor = {"kind": "docker", "image": _aim_sim_image(), "config": str(cfg_rel)}
 
     def run_segment(lines: list[str]) -> tuple[int, str, int]:
         with tempfile.TemporaryDirectory(prefix="tenon-aim-") as trace_dir:
             trace_path = Path(trace_dir) / "segment.trace"
             trace_path.write_text("".join(str(line) + "\n" for line in lines))
+            if native is not None:
+                env = dict(os.environ)
+                env["LD_LIBRARY_PATH"] = os.pathsep.join(
+                    p for p in (str(native.parent), env.get("LD_LIBRARY_PATH")) if p
+                )
+                command = [str(native), "-f", str(cfg_rel), "-t", str(trace_path)]
+                run = dict(cwd=str(root), env=env)
+            else:
+                command = [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "-v",
+                    f"{root}:/work",
+                    "-v",
+                    f"{trace_dir}:/trace:ro",
+                    executor["image"],
+                    "bash",
+                    "-c",
+                    f"cd /work && ./build/ramulator2 -f {cfg_rel} "
+                    f"-t /trace/{trace_path.name}",
+                ]
+                run = {}
             try:
                 proc = subprocess.run(
-                    [
-                        "docker",
-                        "run",
-                        "--rm",
-                        "-v",
-                        f"{root}:/work",
-                        "-v",
-                        f"{trace_dir}:/trace:ro",
-                        image,
-                        "bash",
-                        "-c",
-                        f"cd /work && ./build/ramulator2 -f {cfg_rel} "
-                        f"-t /trace/{trace_path.name}",
-                    ],
-                    capture_output=True,
-                    timeout=600,
-                    check=False,
+                    command, capture_output=True, timeout=600, check=False, **run
                 )
             except (subprocess.SubprocessError, OSError) as exc:
                 raise RuntimeError(f"AiM ramulator2 invocation failed: {exc}") from exc
@@ -2232,6 +2257,7 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
             "returncode": max(returncodes, default=0),
             "segments": len(segments),
             "unique_segments": len(cache),
+            "simulator": executor,
             # Host steps of the program (e.g. a reduction-partition merge) are
             # not simulated: they are listed, never added to `cycles`.
             "host_steps": [

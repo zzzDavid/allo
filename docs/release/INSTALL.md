@@ -144,6 +144,7 @@ reason without running anything.
 | `PIMSIMULATOR_ROOT` | Samsung PIMSimulator tree containing `pim_driver` | `$TENON_SIMULATORS_DIR/PIMSimulator` |
 | `AIM_SIMULATOR_ROOT` | aim_simulator tree (`build/ramulator2`, `test/example.yaml`) | `$TENON_SIMULATORS_DIR/aim_simulator` |
 | `TENON_AIM_SIM_IMAGE` | Docker image that runs `ramulator2` | `aim-simulator-build` |
+| `TENON_AIM_RAMULATOR2` | a natively built `ramulator2` binary to run instead of the Docker image (its SHA-256 is recorded with every run) | unset (Docker) |
 | `UPIMULATOR_ROOT` | uPIMulator Go project root (`benchmark/`, `sdk/`) | the archived source snapshot, staged under `$TENON_UPMEM_SCRATCH` |
 | `UPIMULATOR_BIN` | uPIMulator binary | `$TENON_UPMEM_PROVENANCE_DIR/uPIMulator` |
 | `TENON_UPMEM_SDK_IMAGE` | Docker image holding the UPMEM DPU SDK | `bongjoonhyun/upimulator` (a local build that reuses the upstream image name; see `simulators.md`) |

@@ -1658,6 +1658,6 @@ def test_sdist_tree_compiles_samsung_gemv_outside_the_checkout(tmp_path, no_arch
     )
     assert run.returncode == 0, (run.stdout + run.stderr)[-3000:]
     lines = dict(line.split(" ", 1) for line in run.stdout.splitlines() if " " in line)
-    assert lines["MODE"].startswith("bank_row"), run.stdout
+    assert lines["MODE"].startswith("split_rows"), run.stdout
     assert int(lines["CYCLES"]) > 0
     assert lines.get("LEAKED", "") == "", lines.get("LEAKED")

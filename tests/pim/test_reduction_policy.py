@@ -159,7 +159,14 @@ def test_match_workload_stamps_accumulating_matches():
 def test_samsung_strict_prunes_regrouping_placements(samsung_strict):
     assert _modes(samsung_strict) == {"temporal"}
     pruned = dict(samsung_strict.reduction_policy_pruned)
-    assert set(pruned) == {"bank_row", "grf_staged", "dual_fiber"}
+    assert set(pruned) == {
+        "bank_row",
+        "grf_staged",
+        "dual_fiber",
+        "bank_row_rowpair",
+        "split_rows",
+        "split_rows_rowpair",
+    }
     assert all("lane partial sums in FP32" in reason for reason in pruned.values())
     assert "2 bank fibers" in pruned["dual_fiber"]
     # Pruned before ranking: no regrouping key was scored or rejected (the
@@ -195,6 +202,9 @@ def test_samsung_reassociate_ranks_both_families(samsung_reassociate):
         "bank_row",
         "grf_staged",
         "dual_fiber",
+        "bank_row_rowpair",
+        "split_rows",
+        "split_rows_rowpair",
         "temporal",
     }
     assert samsung_reassociate.reduction_policy_pruned == ()
@@ -202,8 +212,14 @@ def test_samsung_reassociate_ranks_both_families(samsung_reassociate):
     chosen = dict((p, m) for p, _c, m in kernel.scores)[kernel.chosen_position]
     assert not chosen.startswith("temporal")
     scores = {m.split("+")[0]: c for _p, c, m in kernel.scores}
-    # The ordered program issues one reduction element per step.
-    assert scores["temporal"] > 10 * scores["bank_row"]
+    # The ordered program issues one reduction element per step: with the
+    # matrix staging share in every estimate (S-16) it still prices above
+    # the per-tile families, as the conductor measures (the paired-rows
+    # family carries the measured 2,845-cycle pair term and may not).
+    assert all(
+        scores["temporal"] > scores[family]
+        for family in ("bank_row", "dual_fiber", "split_rows")
+    ), scores
 
 
 def test_samsung_forced_regrouping_layout_fails_under_strict(samsung_reassociate):

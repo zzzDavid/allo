@@ -162,6 +162,30 @@ in `<repo>`.
   the authors' image `aim-simulator-build` (id `sha256:215d37b48f08...`,
   built 2026-04-18 from the same Dockerfile); `tests/pim/test_paper_golden.py
   -k aim` 3 passed (default CENT rows), 11 `paper_full` rows skipped, 52 s.
+- **Native build (verified 2026-11-04, when Docker cannot run):** the same
+  tree builds out of tree with a C++20 toolchain (conda-forge `gxx_linux-64=12`
+  into a private prefix); the dependency sources the Docker configure fetched
+  into `ext/` are reused offline:
+
+  ```bash
+  mamba create -p $TOOLCHAIN -c conda-forge --override-channels gxx_linux-64=12 gcc_linux-64=12 cmake ninja
+  cmake -S aim_simulator -B $BUILD -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DFETCHCONTENT_FULLY_DISCONNECTED=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      -DCMAKE_C_COMPILER=$TOOLCHAIN/bin/x86_64-conda-linux-gnu-gcc \
+      -DCMAKE_CXX_COMPILER=$TOOLCHAIN/bin/x86_64-conda-linux-gnu-g++
+  cmake --build $BUILD -j 16
+  export TENON_AIM_RAMULATOR2=$BUILD/ramulator2     # AIM_SIMULATOR_ROOT still names the tree
+  ```
+
+  The upstream `CMakeLists.txt` writes `libramulator.so` into the *source*
+  tree (`LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}`), so a native build
+  replaces the shared library the Docker-built `build/ramulator2` loads;
+  both binaries come from one source revision and compiler major (g++ 12),
+  and the Docker route must be re-smoked (689 cycles) after a native build.
+  The native binary reproduced the smoke test (689 memory-system cycles),
+  the AiM GEMV (222 cycles) and every exact CENT golden row
+  (`tests/pim/test_paper_golden.py -k aim`, incl. the `paper_full` rows);
+  each run records `{"kind": "native", "binary", "sha256", "config"}`.
 - **Model scope:** timing only (no data path); `test/example.yaml` fixes 32
   channels, and Tenon rejects targets whose geometry differs from it.
 - **License:** MIT. Redistribution is allowed with the notice; Tenon vendors
