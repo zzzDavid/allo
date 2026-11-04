@@ -460,6 +460,45 @@ def _ledag_available_reason() -> str | None:
     return None
 
 
+# ``ledag-ssh`` leaves a copy of every log it prints (``online_log_<time>``,
+# about 5 MB each) and its own session log (``ledag_ssh_<user>_<pid>_log.txt``)
+# in this directory; a measurement session of a few hundred launches fills a
+# small /tmp and then every later read fails with ENOSPC.
+_LEDAG_SCRATCH = Path("/tmp")
+_LEDAG_SCRATCH_PATTERNS = ("online_log_*", "ledag_ssh_*_log.txt")
+
+
+def _ledag_scratch_files() -> set:
+    files = set()
+    for pattern in _LEDAG_SCRATCH_PATTERNS:
+        try:
+            files.update(_LEDAG_SCRATCH.glob(pattern))
+        except OSError:
+            pass
+    return files
+
+
+def _remove_ledag_scratch(before: set) -> list:
+    """Remove the scratch files one ``ledag-ssh`` session left behind.
+
+    Only files that did not exist before the session, match the tool's
+    names and belong to this user are removed; the device log itself has
+    already been captured from the session's stdout.
+    """
+
+    removed = []
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    for path in sorted(_ledag_scratch_files() - before):
+        try:
+            if uid is not None and path.stat().st_uid != uid:
+                continue
+            path.unlink()
+            removed.append(path)
+        except OSError:
+            continue
+    return removed
+
+
 def _ledag_drain() -> str:
     """Read the device log through one ``ledag-ssh`` session.
 
@@ -468,6 +507,7 @@ def _ledag_drain() -> str:
     appended between them.
     """
 
+    before = _ledag_scratch_files()
     try:
         process = subprocess.run(
             ["ledag-ssh", "-o", "localhost"],
@@ -478,6 +518,8 @@ def _ledag_drain() -> str:
         )
     except (subprocess.SubprocessError, OSError) as error:
         raise RuntimeError(f"ledag-ssh failed while reading the device log: {error}")
+    finally:
+        _remove_ledag_scratch(before)
     if process.returncode:
         raise RuntimeError(
             f"ledag-ssh exited with {process.returncode} while reading the device log"

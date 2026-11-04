@@ -139,3 +139,55 @@ def test_apu_g2_vendor_lane_checks_the_loaded_device_library(tmp_path):
     assert "not a file" in missing["problem"]
     silent = g2_paper_rows.loaded_device_library({}, expected)
     assert "did not report" in silent["problem"]
+
+
+def test_apu_v1_paired_ratios_use_same_round_valid_launches_only():
+    launches = [
+        {"lane": "tenon", "kind": "warmup", "round": 0, "crun": 999, "outputs_match_oracle": True},
+        {"lane": "tenon", "kind": "measured", "round": 1, "crun": 100, "outputs_match_oracle": True},
+        {"lane": "control:paper", "kind": "measured", "round": 1, "crun": 90, "outputs_match_oracle": True},
+        {"lane": "expert", "kind": "measured", "round": 1, "crun": 110, "outputs_match_oracle": True},
+        {"lane": "tenon", "kind": "measured", "round": 2, "crun": 200, "outputs_match_oracle": True},
+        {"lane": "control:paper", "kind": "measured", "round": 2, "crun": 100, "outputs_match_oracle": False},
+        {"lane": "expert", "kind": "measured", "round": 2, "crun": 220, "error": "boom"},
+        {"lane": "tenon", "kind": "measured", "round": 3, "crun": 0, "outputs_match_oracle": True},
+        {"lane": "expert", "kind": "measured", "round": 3, "crun": 300, "outputs_match_oracle": True},
+    ]
+    assert paper_rows._paired_ratios(launches, "control:paper") == [0.9]
+    assert paper_rows._paired_ratios(launches, "expert") == [1.1]
+    assert paper_rows._control_lane_name("/x/word_count_narrow_counters_device.c") == (
+        "control:word_count_narrow_counters_device"
+    )
+
+
+def test_ledag_drain_removes_the_tool_scratch_it_created(monkeypatch, tmp_path):
+    import subprocess
+
+    from allo.pim import apu_v1_program as program
+
+    monkeypatch.setattr(program, "_LEDAG_SCRATCH", tmp_path)
+    older = tmp_path / "online_log_2026_11_04_00_00_00"
+    older.write_bytes(b"kept: existed before the read")
+    unrelated = tmp_path / "notes.txt"
+    unrelated.write_text("kept: not the tool's")
+
+    def fake_run(argv, **kwargs):
+        (tmp_path / "online_log_2026_11_04_04_23_40").write_bytes(b"x" * 64)
+        (tmp_path / "ledag_ssh_nz264_1_log.txt").write_text("session log")
+        return subprocess.CompletedProcess(argv, 0, stdout=b"total crun: 7 hits: 1\n")
+
+    monkeypatch.setattr(program.subprocess, "run", fake_run)
+    assert "crun: 7" in program._ledag_drain()
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "notes.txt",
+        "online_log_2026_11_04_00_00_00",
+    ]
+
+    def failing_run(argv, **kwargs):
+        (tmp_path / "online_log_2026_11_04_04_23_48").write_bytes(b"")
+        return subprocess.CompletedProcess(argv, 255, stdout=b"", stderr=b"ENOSPC")
+
+    monkeypatch.setattr(program.subprocess, "run", failing_run)
+    with pytest.raises(RuntimeError, match="exited with 255"):
+        program._ledag_drain()
+    assert not (tmp_path / "online_log_2026_11_04_04_23_48").exists()

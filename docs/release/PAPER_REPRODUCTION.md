@@ -105,6 +105,29 @@ vendor traces and golden checksums are comparison evidence only; a case
 whose paper program is found inconsistent is reported as such, with the
 corrected program's measurement, never by changing the paper.
 
+Hardware rows (round 30 onward) follow the archived campaigns' protocols
+with their baselines re-run in the same rounds: Gemini-I, one warm-up and
+ten measured launches per lane and case, the Tenon default selection
+interleaved launch by launch with the archived corrected expert Phoenix
+binary (`benchmarks/apu_v1/paper_rows.py --expert`); Gemini-II, one warm-up
+per lane and twenty interleaved paired rounds against the archived
+public-GTML VectorPack host, repetitions 20, raw batch ticks divided by the
+repetitions (`benchmarks/apu_g2/paper_rows.py`). Each row records the
+session median with quartiles, IQR and MAD, the re-measured baseline, the
+same-round baseline/Tenon ratios and the paper's ratio. `REPRODUCED` for a
+hardware row means the session median is at or below the paper's value
+under that protocol with every output exact. A row whose median is above
+the paper's value stays `OPEN` with the word "nominal" when the paper's
+value lies inside the session's interquartile range, and parity is
+established only by further sessions (medians on both sides of the paper's
+value, the paper's value inside their IQRs, the paired baseline ratio at or
+above the paper's); no tolerance closes a row, and X-19 and X-22 are not
+nominal. The Gemini-II vendor host has its device library location compiled
+in; a byte copy of the archived `device.update.bin` (sha256 `c46f7f08...`)
+was placed at that location on the shared filesystem for the re-run
+(`ORIGIN.txt` beside it), and the driver hashes the file the host reports
+having loaded and fails the launch unless it equals the archived library.
+
 ### Results so far (revision 0e48d81, evidence `tenon-release-evidence/r25/`)
 
 | Family | Rows | Result |
@@ -115,4 +138,5 @@ corrected program's measurement, never by changing the paper.
 | AttAcc selection (500) | analytical selector through `allo.compile` | Diagnostic only: `benchmarks/attacc/scripts/verify_paper_selection.py --out r25/g10_attacc_selection_500.json` shows the shared-pipeline selection equals the paper's archived selection on 500 of 500 instances (668,575 candidates, 1912 s). The published quality result (398 of 500 instances at the best reference simulator timing) is a different metric and stays UNVERIFIED until the external Ramulator2-AttAcc timings of the selected and reference tilings are produced; the golden test that calls the selector directly establishes neither |
 | Gemini-I kernels (5), round 29 | local board, installed wheel, 5 launches each, archived inputs and oracles | default shared selection medians: matrix_multiply 8,757,824 (paper 8,764,900; the selected plan is the paper's forced plan, chosen by cost), kmeans 624,488 (624,677), histogram 166,636 (166,783), linear_regression 94,328 (94,618.5), word_count 174,620 (171,988: **1.5% slower, X-22 open**); every output equals the oracle (`r29/apu_v1_default_rows.json`). Forced alternative and cost perturbation rows are labelled separately (`apu_v1_matmul_forced_acc4.json`, `apu_v1_matmul_perturbed.json`) |
 | Gemini-II kernels (5), round 29 | zhang-x4 card, installed wheel, 5 sessions of 20 pipeline bodies, exact int64 outputs | medians: gemm 1,725 (paper 1,733.225), batched_gemm 1,736 (1,739.15), gesummv 1,806 (1,860.075), bicg 2,540 (2,548.825), mvt 2,733 (2,766.625); all at or below the paper's Tenon column and below GTML (`r29/g2_paper_rows_sessions.json`); the GTML baseline itself is the paper's measurement, not re-run |
+| Gemini-II kernels (5), round 30 paired protocol | zhang-x4 card, installed wheel at 69773fc, 20 interleaved paired rounds against the archived GTML host, exact outputs in all 210 launches | Tenon medians (q1-q3): gemm 1,722.05 (1,717.0-1,733.4) vs paper 1,733.225; batched_gemm 1,731.55 (1,719.9-1,744.4) vs 1,739.15; gesummv 1,839.30 (1,829.1-1,844.5) vs 1,860.075; bicg 2,530.05 (2,525.9-2,547.5) vs 2,548.825; mvt 2,755.03 (2,750.5-2,770.6) vs 2,766.625: all REPRODUCED. GTML re-run in the same rounds 1,914.4 / 1,916.1 / 3,099.5 / 2,734.8 / 3,090.6 (within 0.6% of the paper's column); paired GTML/Tenon medians 1.109 / 1.105 / 1.687 / 1.079 / 1.122 (paper 1.098 / 1.096 / 1.662 / 1.070 / 1.117) (`r30/g2_paired_rows_run2.json`). The first run of the session reported the vendor lane's library-load failure and exited 1 (`r30/g2_paired_rows.json`) |
 | layout rows (Samsung XOR, Gemini-I vector GEMM), token partitioning, scaling, packing, DCC, calibration, virtual study, compile cost | | UNVERIFIED this round; next in the order of the inventory |

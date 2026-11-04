@@ -27,8 +27,13 @@ Options force a plan (``--layout``), perturb one cost constant
 (``--perturb NAME=FACTOR`` on ``allo.pim.costs.apu_v1``) or substitute a
 historical generated device source for the Tenon lane (``--device-source
 FILE``: a labelled control for attributing a difference, never the shared
-selection).  The paper's own values are comparison data; nothing here is
-read by the compiler.
+selection).  For attribution in one session, ``--control-source FILE``
+(repeatable) adds a lane per generated source interleaved in the same
+rounds as the default selection (lane ``control:<file stem>``), and
+``--historical-binary`` adds the archived paper-era Tenon binary of
+``apuv1/tenon/<case>`` as a lane; every non-Tenon lane reports its
+same-round ratios over the default selection.  The paper's own values are
+comparison data; nothing here is read by the compiler.
 
 Exit status: 0 only when every requested case executed, every launch's
 outputs equal the oracle and the experiment's invariants hold; otherwise 1,
@@ -39,6 +44,7 @@ Usage::
     python -m benchmarks.apu_v1.paper_rows --out rows.json [--cases ...]
         [--measured 10] [--expert] [--backend device|virtual]
         [--layout PLAN] [--perturb CONST=FACTOR] [--device-source FILE]
+        [--control-source FILE ...] [--historical-binary]
 """
 
 from __future__ import annotations
@@ -264,6 +270,12 @@ class TenonLane:
             "estimate_cycles": self.estimate_cycles,
             "device_source_sha256": self.device_source_sha256,
             "substituted_source": self.substituted_source,
+            # The source actually built and launched by this lane.
+            "launched_source_sha256": (
+                self.substituted_source["sha256"]
+                if self.substituted_source
+                else self.device_source_sha256
+            ),
             "inputs_sha256": self.input_sha256,
             "oracle_sha256": self.oracle_sha256,
             "outputs": list(self.returned) + self.in_place_outputs,
@@ -305,28 +317,37 @@ class TenonLane:
 
 
 class ExpertLane:
-    """The corrected expert Phoenix program of the archived comparison: the
-    archived release binary launched with the archived io through the
-    production launcher (same lock, same profiler freshness proof)."""
+    """An archived release binary of the campaign launched with its archived
+    io through the production launcher (same lock, same profiler freshness
+    proof).  ``lane_dir="expert"`` is the corrected expert Phoenix program;
+    ``lane_dir="tenon"`` is the paper-era Tenon binary (the historical
+    program as built and measured for the paper, a control for X-22)."""
 
-    def __init__(self, case, root):
+    def __init__(self, case, root, *, lane_dir="expert", name="expert"):
         import numpy as np
 
         self.case = case
-        self.dir = root / "apuv1" / "expert" / case
+        self.name = name
+        self.dir = root / "apuv1" / lane_dir / case
         manifest_path = self.dir / "run-manifest.json"
         if not manifest_path.is_file():
-            raise FileNotFoundError(f"no expert lane for {case!r} at {manifest_path}")
+            raise FileNotFoundError(f"no {name} lane for {case!r} at {manifest_path}")
         self.manifest = json.loads(manifest_path.read_text())
         binary = self.dir / self.manifest["build"]["binary"]
         if not binary.is_file():
             candidates = sorted((self.dir / "build-evidence").glob("*.release.bin"))
             if not candidates:
-                raise FileNotFoundError(f"no expert binary for {case!r}")
+                raise FileNotFoundError(f"no {name} binary for {case!r}")
             binary = candidates[0]
         self.binary = binary
         self.binary_sha256 = _sha256_file(binary)
         archived = self.manifest.get("provenance", {}).get("built_binary_sha256")
+        if archived is None:
+            evidence = self.dir / "build-evidence" / "build.json"
+            if evidence.is_file():
+                archived = (
+                    json.loads(evidence.read_text()).get("binary", {}).get("sha256")
+                )
         self.binary_matches_archive = archived == self.binary_sha256
         argv = self.manifest["argv"]
         self.inputs = [
@@ -344,7 +365,7 @@ class ExpertLane:
 
     def describe(self):
         return {
-            "lane": "expert",
+            "lane": self.name,
             "binary": str(self.binary),
             "binary_sha256": self.binary_sha256,
             "binary_matches_archive": self.binary_matches_archive,
@@ -401,8 +422,41 @@ class ExpertLane:
 # ----------------------------------------------------------------------- #
 
 
+def _control_lane_name(path) -> str:
+    return "control:" + Path(path).stem
+
+
+def _paired_ratios(launches, lane, reference="tenon"):
+    """Same-round ``lane / reference`` ratios over valid measured launches."""
+
+    pairs = {}
+    for l in launches:
+        if (
+            l.get("kind") == "measured"
+            and not l.get("error")
+            and l.get("outputs_match_oracle")
+            and l.get("crun")
+        ):
+            pairs.setdefault(l["round"], {})[l["lane"]] = l["crun"]
+    return [
+        p[lane] / p[reference]
+        for _round, p in sorted(pairs.items())
+        if lane in p and reference in p
+    ]
+
+
 def measure_case(
-    case, root, *, backend, measured, expert, layout, device_source, label
+    case,
+    root,
+    *,
+    backend,
+    measured,
+    expert,
+    layout,
+    device_source,
+    label,
+    control_sources=(),
+    historical_binary=False,
 ):
     import allo  # noqa: F401  (the lanes import the pipeline)
     from allo.pim.apu_v1_program import apu_v1_board_lock
@@ -423,6 +477,7 @@ def measure_case(
             "measured_per_lane": measured,
             "interleaved_with_expert": bool(expert),
             "statistic": "median crun of the profiler total record (one APUC)",
+            "order": "lanes in listed order on odd rounds, reversed on even rounds",
         },
         "lanes": {},
         "launches": [],
@@ -433,10 +488,25 @@ def measure_case(
     )
     record["lanes"]["tenon"] = tenon.describe()
     lanes = {"tenon": tenon}
+    for path in control_sources:
+        # A labelled control in the same rounds: the shared selection's
+        # program with a different generated device source (a historical
+        # or candidate program), never reported as the default selection.
+        name = _control_lane_name(path)
+        control = TenonLane(case, root, backend=backend, device_source=path)
+        description = control.describe()
+        description["lane"] = name
+        record["lanes"][name] = description
+        lanes[name] = control
+    if historical_binary:
+        historical = ExpertLane(case, root, lane_dir="tenon", name="historical_binary")
+        record["lanes"]["historical_binary"] = historical.describe()
+        lanes["historical_binary"] = historical
     if expert:
         expert_lane = ExpertLane(case, root)
         record["lanes"]["expert"] = expert_lane.describe()
         lanes["expert"] = expert_lane
+    record["protocol"]["lanes"] = list(lanes)
     if backend != "device":
         return record
 
@@ -509,21 +579,26 @@ def measure_case(
                 "valid" if not record["problems"] else "invalid (see problems)"
             ),
         }
-        if expert and record["lanes"]["expert"].get("statistics", {}).get("median"):
-            expert_median = record["lanes"]["expert"]["statistics"]["median"]
-            pairs = {}
-            for l in record["launches"]:
-                if (
-                    l["kind"] == "measured"
-                    and not l.get("error")
-                    and l.get("outputs_match_oracle")
-                ):
-                    pairs.setdefault(l["round"], {})[l["lane"]] = l["crun"]
-            ratios = [
-                p["expert"] / p["tenon"]
-                for p in pairs.values()
-                if "expert" in p and "tenon" in p
-            ]
+        comparisons = {}
+        for lane_name in lanes:
+            if lane_name == "tenon":
+                continue
+            lane_median = record["lanes"][lane_name].get("statistics", {}).get("median")
+            if not lane_median:
+                continue
+            ratios = _paired_ratios(record["launches"], lane_name)
+            comparisons[lane_name] = {
+                "median_crun": lane_median,
+                "over_tenon_medians": lane_median / median,
+                "paired_round_ratios_over_tenon": ratios,
+                "paired_ratio_statistics": _statistics(ratios),
+                "ratio_to_paper_tenon": lane_median / PAPER[case][1],
+            }
+        if comparisons:
+            record["comparison"]["lanes"] = comparisons
+        if "expert" in comparisons:
+            expert_median = comparisons["expert"]["median_crun"]
+            ratios = comparisons["expert"]["paired_round_ratios_over_tenon"]
             record["comparison"].update(
                 {
                     "expert_median_crun": expert_median,
@@ -548,6 +623,18 @@ def main(argv=None) -> int:
     parser.add_argument("--layout", help="force a plan (matrix_multiply)")
     parser.add_argument(
         "--device-source", help="launch this generated source instead (control)"
+    )
+    parser.add_argument(
+        "--control-source",
+        action="append",
+        default=[],
+        help="add an interleaved control lane launching this generated source "
+        "(repeatable; lane name control:<file stem>)",
+    )
+    parser.add_argument(
+        "--historical-binary",
+        action="store_true",
+        help="add an interleaved lane launching the archived paper-era Tenon binary",
     )
     parser.add_argument("--label")
     parser.add_argument("--perturb", help="CONST=FACTOR on allo.pim.costs.apu_v1")
@@ -586,6 +673,8 @@ def main(argv=None) -> int:
                 layout=args.layout,
                 device_source=args.device_source,
                 label=args.label,
+                control_sources=args.control_source,
+                historical_binary=args.historical_binary,
             )
         except Exception as error:  # a failed case is evidence too
             record = {

@@ -1021,6 +1021,69 @@ forced historical plan, produced these programs; the matrix multiply's
 default selection is the paper's plan by cost, so no separate forced row
 was needed, and the forced rows are labelled as such.
 
+## Round 30 (2026-11-04): independent review of 657fa95; measurement validity, the archived protocols with their baselines, launch provenance, X-22 attribution
+
+The reviewer accepted the round 29 hardware sessions as measurements but
+not as the G10 comparison: the drivers exited 0 on failed launches and
+wrong outputs, the sessions used five launches without the archived
+protocols or their baselines, the Gemini-II statistic rounded ticks, and
+launch provenance (binary hashes, profile counters, generated source,
+SDK/device identity) was discarded with the temporary projects. Judgment:
+all four are defects of the evidence, not of the compiler, and were
+repaired in `69773fc`/`d2e3fda` before any new measurement was taken:
+both drivers return 1 on a failed execution, a wrong output, a missing
+round or a violated invariant and keep the failed record; statistics are
+computed over valid launches only; the APU v1 driver runs the archived
+comparison's protocol (one warm-up, ten measured launches per lane,
+interleaved launch by launch with the archived corrected expert Phoenix
+binary, counters per launch) and the Gemini-II driver the archived
+campaign's (one warm-up per lane, twenty interleaved paired rounds against
+the archived public-GTML host, raw batch ticks divided by the repetitions);
+every APU v1 launch route records the binary hash and size, the parsed
+profile counters and the profile text; the Gemini-II runtime already
+recorded the layout and program fingerprints, packing attestation and
+artifact hashes per launch.
+
+Two things the new drivers caught on their first runs are kept as
+evidence. The Gemini-II vendor lane failed every launch of run 1 because
+the archived host loads its device library from a compiled-in path that
+no longer existed; the session exited 1 and reported no comparison. The
+path was restored with a byte copy of the archived library (documented in
+place), the driver now hashes the library at the location the host reports
+and fails the launch unless it is the archived one, and run 2 completed
+with every output exact: the five Tenon medians are below the paper's
+Tenon column and the re-run GTML baseline is within 0.6% of the paper's
+GTML column, so the paired GTML/Tenon ratios are at or above the paper's
+(VALIDATION round 30). Judgment: the five Gemini-II rows are REPRODUCED
+under the archived protocol with the baseline re-measured; the paper's
+value lies inside the session's interquartile range for gemm,
+batched_gemm and mvt, which the inventory states.
+
+The APU v1 session reproduced matrix_multiply and histogram below the
+paper's medians with the expert lane re-measured within 0.3% of its
+archived values; kmeans and linear_regression came out 0.1% and 1.0%
+above the paper's medians with the paper's values inside or just below the
+session's interquartile ranges (round 29 had both below the paper), and
+word_count came out 3.0% above (round 29: 1.5%). The same-session control
+that rebuilt the paper-era generated source through today's template
+measured 172,416 against the paper's 171,988 with a quarter of the current
+program's dispersion, which places X-22 in the generated program rather
+than in the board or firmware. A second paired session from a wheel at
+`d2e3fda` and a five-lane attribution session (current program, paper-era
+source, the current source with the paper-era loop-counter widths, the
+archived paper-era binary, the expert binary, all in the same rounds) were
+pre-registered and run next; their outcome and the status of the Gemini-I
+rows are in the addendum below and in ISSUES X-22/X-23.
+
+The suites at one revision: `tests/perf` at `69773fc` passed except the
+device-lock test, whose failure is an artifact of an NFS tmpdir (the probe
+takes `flock` on a read-only descriptor), fixed by keeping the test's lock
+file on a local filesystem; `tests/pim` at `69773fc` is recorded in the
+addendum. Installed-wheel simulator checks at `69773fc` passed with no
+checkout module loaded. CLAIMS.md rows 24 and E13 no longer describe typed
+or separate routes (removed in rounds 13-17), and E9/E13 cite the round 30
+protocols.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
