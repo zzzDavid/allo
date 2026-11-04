@@ -103,14 +103,55 @@ def amortized_ticks(result, repetitions) -> float | None:
     return total
 
 
+def launch_evidence_problem(records, plan) -> str | None:
+    """Why the launch records are not the selected plan's launches, or ``None``.
+
+    The plan declares its launches; the runtime must have recorded exactly
+    one record per launch, indexed ``0..n-1`` in order, each carrying the
+    plan's layout fingerprint for that launch (when the plan states one)
+    and a finite positive raw tick count.  Omitted work (a missing launch)
+    or extra work is not timing evidence for the plan.
+    """
+
+    expected = list(getattr(plan, "launches", ()) or ())
+    if not expected:
+        return "the selected plan declares no launches"
+    if len(records) != len(expected):
+        return f"{len(records)} launch record(s) for a plan of {len(expected)} launch(es)"
+    for position, (record, launch) in enumerate(zip(records, expected)):
+        index = record.get("index")
+        if index is not None and index != position:
+            return f"launch record {position} carries index {index!r}"
+        declared = getattr(launch, "layout_fingerprint", None)
+        recorded = record.get("layout_fingerprint")
+        if declared is not None and recorded is not None and declared != recorded:
+            return (
+                f"launch {position}: layout fingerprint {recorded[:12]} is not the "
+                f"plan's {declared[:12]}"
+            )
+        ticks = (record.get("raw_ticks") or {}).get("pipeline")
+        if (
+            ticks is None
+            or isinstance(ticks, bool)
+            or not isinstance(ticks, (int, float))
+            or not math.isfinite(ticks)
+            or ticks <= 0
+        ):
+            return f"launch {position}: raw device ticks {ticks!r} are not a positive finite count"
+    return None
+
+
 def _timing_problems(runs) -> list:
-    """A run without complete positive device ticks is not timing evidence."""
+    """A run without the selected plan's complete device ticks is not timing
+    evidence; the record is kept and the problem names what is missing."""
 
     return [
-        f"{label}: no complete device tick evidence "
-        f"({len(run.get('launches') or [])} launch record(s))"
+        f"{label}: {run.get('timing_evidence_problem') or 'no complete device tick evidence'} "
+        f"({len(run.get('launches') or [])} launch record(s) for "
+        f"{run.get('expected_launches')} expected)"
         for label, run in runs.items()
         if run.get("amortized_ticks_per_pipeline") is None
+        or run.get("timing_evidence_problem")
     ]
 
 
@@ -119,16 +160,22 @@ def _run(compiled, args):
     result = compiled(**args)
     if result.kind != "device":
         raise RuntimeError(f"expected a device run, got kind {result.kind!r}")
+    records = _launch_records(result)
+    problem = launch_evidence_problem(records, compiled.plan)
     return {
         "plan": compiled.plan.name,
         "estimate_cycles": compiled.plan.estimate_cycles,
+        "expected_launches": len(getattr(compiled.plan, "launches", ()) or ()),
         "cycles": result.cycles,
-        "amortized_ticks_per_pipeline": amortized_ticks(result, REPETITIONS),
+        "amortized_ticks_per_pipeline": (
+            amortized_ticks(result, REPETITIONS) if problem is None else None
+        ),
+        "timing_evidence_problem": problem,
         "run_kind": result.kind,
         "final_pipeline_ticks": result.extra.get("final_pipeline_ticks"),
         "device_lock": result.extra.get("device_lock"),
         "cycles_scope": result.extra.get("cycles_scope"),
-        "launches": _launch_records(result),
+        "launches": records,
     }
 
 

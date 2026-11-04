@@ -333,8 +333,13 @@ class ExpertLane:
         self.dir = root / "apuv1" / lane_dir / case
         # Outputs are written per launch under a scratch directory outside
         # the archive; the archived io is read-only evidence.
-        self.scratch = Path(scratch) if scratch else Path(
-            tempfile.mkdtemp(prefix=f"tenon-apu-v1-{case}-{name}-")
+        # Absolute: the launcher runs the binary with the launch directory
+        # as its working directory, so relative output paths would be
+        # resolved against themselves.
+        self.scratch = (
+            Path(scratch).resolve()
+            if scratch
+            else Path(tempfile.mkdtemp(prefix=f"tenon-apu-v1-{case}-{name}-"))
         )
         self.count = 0
         manifest_path = self.dir / "run-manifest.json"
@@ -401,23 +406,24 @@ class ExpertLane:
         name = getattr(self, "name", "archived")
         scratch = getattr(self, "scratch", None)
         if scratch is None:
-            scratch = self.scratch = Path(
+            scratch = Path(
                 tempfile.mkdtemp(
                     prefix=f"tenon-apu-v1-{getattr(self, 'case', 'case')}-{name}-"
                 )
             )
+        scratch = self.scratch = Path(scratch).resolve()
         launch_dir = scratch / f"{name}-launch-{self.count:03d}"
         launch_dir.mkdir(parents=True, exist_ok=False)
         outputs = [
-            (role, launch_dir / Path(path).name, dtype, shape)
+            (role, (launch_dir / Path(path).name).resolve(), dtype, shape)
             for role, path, dtype, shape in self.outputs
         ]
-        archive = self.dir.resolve()
+        archive = Path(self.dir).resolve()
         for _role, path, _dtype, _shape in outputs:
-            if archive in path.resolve().parents:
+            if path == archive or archive in path.parents:
                 raise MeasurementError(f"output path inside the archive: {path}")
-        argv = [str(self.binary)]
-        argv.extend(str(path) for _role, path in self.inputs)
+        argv = [str(Path(self.binary).resolve())]
+        argv.extend(str(Path(path).resolve()) for _role, path in self.inputs)
         argv.extend(str(path) for _role, path, _d, _s in outputs)
         try:
             text, profile, cycles = launch_on_board(
@@ -499,8 +505,10 @@ def measure_case(
 
     if measured <= 0:
         raise MeasurementError(f"measured launches must be positive, got {measured}")
-    scratch = Path(scratch) if scratch else Path(
-        tempfile.mkdtemp(prefix=f"tenon-apu-v1-session-{case}-")
+    scratch = (
+        Path(scratch).resolve()
+        if scratch
+        else Path(tempfile.mkdtemp(prefix=f"tenon-apu-v1-session-{case}-"))
     )
 
     record = {
