@@ -3,9 +3,18 @@
 
 # Paper reproduction through the shared pipeline
 
-Status: **required, not yet measured by this campaign**. User priority addition
-2026-11-03, gate G10 of the containing repository's TASK.md. This is an initial
-map from the frozen source, not evidence that any result has been reproduced.
+Status (2026-11-04, round 28): **in progress, G10 FAIL**. User priority
+addition 2026-11-03, gate G10 of the containing repository's TASK.md. The
+machine-readable inventory (`paper_reproduction/inventory.csv`, 83 rows) is
+the authoritative per-case status; "Results so far" below summarizes it.
+Measured through the shared pipeline's default selection so far: Samsung's
+three GEMVs (faster than the paper, outputs checked), UPMEM's sixteen kernels
+(exact), ten of fourteen AiM CENT rows (exact, timing-only) with the four
+RoPE rows an OPEN 32-cycle regression against the paper (X-19), and the
+500-instance AttAcc selector equivalence as a diagnostic. UNVERIFIED: both
+hardware tables, token partitioning, UPMEM scaling, the packing, shared
+selection and DCC studies, AttAcc Ramulator2 timings and decode composition,
+calibration, the virtual-backend study and the compile-cost rows.
 The paper is zzzDavid/tenon-hpca27 main at
 30b6f49e64583b5d301d2a5e8b902498f5578e4e; its local mirror and hash lock are
 paper/latex and paper/SUBMITTED_VERSION.json in the containing repository.

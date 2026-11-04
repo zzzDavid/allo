@@ -255,6 +255,7 @@ Not yet done (the remaining slices):
   coverage's retained loads). `EFFECTS_REQUIRED_TARGETS` now lists every
   released backend: a handle-only candidate is a contract problem
   everywhere;
+- (done, round 28) the `APUv1Program` scalar manifest from the retained IR: `apu_v1_hybrid.discover_apu_v1_hybrid_manifest` walks the module through the IR bindings and the MLIR-text regexes are gone;
 - stage traces on the Gemini-II card and the installed artifact (slice 5);
   the APU v1 board and the three simulators ran through the round 13 tree
   (VALIDATION round 13).

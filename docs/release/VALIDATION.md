@@ -724,3 +724,15 @@ under `/work/shared/users/phd/nz264/tenon-release-evidence/r27/`.
 |---|---|
 | the reviewer's `probe_attention.py` (`reviewer-r26/`, unchanged; `r27/probe_attention.log`) | ordinary attention 465 cycles; `total / s[h, t]` refused ("the division is not (exponentiated score) / (softmax sum): the operands are 'total' / 's'"); the context-loop renaming and the softmax-row-loop renaming accepted with the same 465 cycles and the same command digest as the ordinary program |
 | `tests/pim/test_attacc_virtual.py` (without the 500-instance row) and the whole `tests/pim/test_shared_semantics.py` (sections a-x, 123 tests) (`r27/pytest_r27_batch.log`) | 167 passed in 710 s |
+
+## Round 28 (2026-11-04): the APUv1Program manifest from the retained IR
+
+Same interpreter and `LLVM_BUILD_DIR`; checkout as working directory. Logs
+under `/work/shared/users/phd/nz264/tenon-release-evidence/r28/`.
+
+| Check (round 28 tree) | Result |
+|---|---|
+| manifests of four representative scalar programs (returned local buffer with scratch, nested calls through two callees, in/out argument, unsigned returned local) dumped before and after the rewrite (`r28/dump_manifests.py`, `r28/apu_v1_manifest_kernels.py`, `r28/manifests_{before,after}.json`) | byte-identical JSON (`diff` empty): values, ABI roles, call order, access directions, zero initialization, intermediates, dependencies and barriers unchanged |
+| `tests/perf/test_apu_v1_hybrid_manifest.py` (6 tests) | 6 passed |
+| APU v1 batch (`r28/pytest_r28_apu_v1.log`: `test_apu_v1_scalar_surface.py`, `test_apu_v1_recognizers.py`, `test_apu_v1_native_reductions.py`, `test_apu_v1_cost_provenance.py`, `test_apu_v1_distance_argmin.py`, `test_compile_interface.py`, `test_run_result_contract.py`, the non-backend sections of `test_shared_semantics.py`) | 171 passed in 380 s |
+| `grep` of `allo/pim/apu_v1_hybrid.py` for text analysis (`str(schedule.module)`, `re.search`, the deleted regex names) | none left; the one remaining pattern validates scalar element-type spellings |

@@ -46,9 +46,13 @@ what was accepted and why.
    with rejections recorded (C-03); the reconciled whole program is
    re-priced and bounded joint evaluation is labelled (C-05). Invariant: the
    selected placement is legal, materialized, and priced from the graph of
-   the program that is emitted. This holds for the matcher backends; the
-   APU v1 vector route and the Gemini-II source route have their own
-   planners (G9, X-01).
+   the program that is emitted. Since rounds 12-17 this holds for every
+   target: the APU v1 vector plans, the Gemini-II launch plans and the
+   typed records are candidates of the same pipeline (G9, X-01); since
+   rounds 19-24 every backend declares `CandidateEffects` from the shared
+   facts and is compared with them at materialization; since round 23 the
+   host program's transfer availability is a shared stage; since round 28
+   the `APUv1Program` manifest is read from the retained IR.
 4. **Codegen to runtime.** `RunResult.kind` states what a result evidences
    (`device`, `simulator`, `simulator-timing-only`, `functional`, `virtual`).
    Executed kinds must carry `extra["outputs"]` for every gathered role;
@@ -974,6 +978,24 @@ rejections.
 
 Gates G9 and G10 remain **FAIL**.
 
+## Round 28 (2026-11-04): independent review of 4056f67 accepted; the APUv1Program manifest from the retained IR
+
+The reviewer accepted the X-20 repair and asked for the hybrid scalar-ABI
+migration as production code. `discover_apu_v1_hybrid_manifest` now walks
+the retained module through the IR bindings (function symbols and formal
+types, named allocations and their `linalg.fill` initializers, `func.call`
+operations in program order, each callee's loads and stores on its
+formals) and the regex analysis of the printed module is deleted.
+Judgment: the manifest's facts (ABI identities, call order, access
+directions, initialization, intermediate lifetimes and barriers) are
+properties of the retained IR, so they are read from it; the dead
+vector-region branches (analysis, conversions) were removed with the text
+parser instead of being carried along. The manifests of returned-local,
+nested-call, in/out and unsigned-local programs are byte-identical to the
+text-derived ones, and a renamed neighbour yields the same structure.
+
+Gates G9 and G10 remain **FAIL**; the gate table above was refreshed.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1013,16 +1035,23 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
+Refreshed in round 28 (2026-11-04) at the candidate `4056f67`+ (this
+commit). Earlier judgments are kept in the round sections above.
+
 | Gate | Judgment | Basis |
 |---|---|---|
-| G1 correspondence | **PASS (round 7 judgment, to be re-challenged under G9)** | every substantive mechanism of Sections III and IV has a maintained implementation reachable through `allo.compile` (CLAIMS.md); row 16 realized on Samsung, UPMEM and AiM; the remaining external items are evaluation scripts documented as such (E11, E14 DRAM half, E15, the AttAcc reference-best study and e2e composition); under the user's G9 framing the APU v1 vector route and the Gemini-II source route are release APIs but not the shared pipeline (X-01) |
-| G2 semantic preservation / explicit failure | **FAIL at f732b22; repaired in round 11, pending independent review** | the reviewer's renamed-sink and wide-output probes executed with a lost write and wrong values at f732b22 (C-25 follow-up, C-26); outputs are now keyed by destination identity with the required set derived from the trace's effects, and the match enforces the operation's evaluation precision; the rounds 8 to 10 probes still behave; evidence at the new revision in `VALIDATION.md` round 11 |
-| G3 general mechanisms | **PASS (round 7 judgment, to be re-challenged)** | structural recognizers and template-derived legality on every backend; renamed and neighbouring programs compile to the same normalized decisions; open minor: M-14; round 8 added no case entries: the cast and copy contracts are proofs over the IR, not spellings |
-| G4 search/layout/selected-program integrity | **PARTIAL (reopened in rounds 9 and 10)** | the executed program dropped accepted copies until C-25; required outputs are now derived from the trace's complete external effects and checked against the backend's declaration before selection; re-judge after independent review; the APU routes' planners remain outside the shared selection stage until G9 |
-| G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1; open: C-18 evaluator anomaly, uniform movement weights |
-| G6 evidence beyond examples | **PARTIAL (reopened in round 8)** | EVIDENCE.md tables plus the round 6 probe files; remaining gaps are hardware-only confirmations listed in VALIDATION.md; the independent reviewer's probes varied the output conversion and a store guard, which the round 6 campaign had not, and found two silent defects; the campaign is kept as regression evidence, not as proof of generality; new probes must target the shared semantic contracts on every route |
-| G7 install/interfaces/maintainability | **PARTIAL** | fresh-venv install at ffb4a78 (needs repeating at the candidate, INSTALL.md section 6); AiM and UPMEM simulator recipes now ship in `simulators/` and were rebuilt from the release copies; Samsung's route is not buildable from the release repository without Samsung's permission for the five patches (P-04, documented, `apply.sh` refuses); architecture doc update for the shared pipeline pending (G9); P-17 documented proprietary SDK |
-| G8 backend execution | **evidence complete at 9255d29, pending independent review** | installed-artifact runs at the round 10 repair (VALIDATION.md round 10) and again at the round 15 commit: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock, 3 passed) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed through the shared pipeline); all reviewer probes of rounds 8 to 14 rejected or executed correctly through the installed wheel (VALIDATION.md round 15); AttAcc analytical by design; AiM timing-only as accepted |
-| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-15: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, an enforced typed candidate contract (C-30), supplied placements rebound (C-28), orchestration and launch bindings validated before selection (C-29, C-29b), Gemini-II typed records and `APUv1Program` as frontends of the pipeline (ISSUES X-01; round 16 removed the last typed route, round 17 replaced the `APUv1Program` facade by the shared front stages with retained store effects, X-02), the launch chain, accumulator modes and every operation's extent enforced (C-30b); both hardware hosts and the installed wheel exercised at `9255d29`; open: review of round 17, matcher backends' effects and facts consumption, the hybrid manifest's text ABI, slice 5 traces of forced alternatives and cost perturbations on hardware |
+| G1 correspondence | **PARTIAL** | every substantive mechanism of Sections III and IV has a maintained implementation reachable through `allo.compile` (CLAIMS.md), now including both APUs through the shared pipeline; the claim matrix must be re-read against the G9 pipeline and the G10 inventory (same-or-better performance is part of G1 since the 2026-11-03 scope addition) |
+| G2 semantic preservation / explicit failure | **PARTIAL** | the rounds 8-11 repairs (C-19 to C-26) and the shared contract rounds (X-02 to X-14, X-17 to X-20) are implemented with regressions; the shared semantic checks run before every backend's selection; open: the deferred arithmetic findings (ISSUES), independent re-challenge of the whole domain on every runner |
+| G3 general mechanisms | **PARTIAL** | structural recognizers and template-derived legality on every backend; the AttAcc attention template is proven structurally (X-20); renamed and neighbouring programs compile to the same normalized decisions in the round 24-28 regressions; open: M-14, the constants inventory re-read against the current tree |
+| G4 search/layout/selected-program integrity | **PARTIAL** | complete assignments materialize under the real orchestration before acceptance (C-33b); every backend's realization is compared with its declaration (X-05 to X-16); transfer availability and physical addressing are checked (X-09 to X-11, X-17, X-18); open: the slice 5 forced-alternative traces through packing and launches on both hardware hosts |
+| G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1 in earlier rounds; open: C-18, uniform movement weights, the perturbation traces at the current candidate on both hardware hosts |
+| G6 evidence beyond examples | **PARTIAL** | EVIDENCE.md plus the reviewer-driven probes of rounds 8-27 (renamings, operation changes, shape and slice neighbours, wrong declarations, reversed arithmetic); open: hardware-only confirmations, the probe list re-run at the candidate |
+| G7 install/interfaces/maintainability | **PARTIAL** | installed-artifact runs at `7bdb475`, `e60973f`, `9255d29`; architecture docs follow the pipeline (`design/shared-compilation-path.md`); open: a fresh install at the candidate, the Samsung patches (P-04), P-23 lint, the public-payload review |
+| G8 backend execution | **PARTIAL** | installed-artifact evidence on the simulators, the APU v1 board and the Gemini-II card at `9255d29`; the UPMEM, AiM and Samsung paper rows re-run through the simulators at `da041af` (G10); open: both hardware hosts at the current candidate |
+| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | shared front stages and facts (rounds 12-18); both APUs' plans and typed records as candidates of the common pipeline with an enforced contract (rounds 13-17); Samsung, AiM, UPMEM and AttAcc declare effects from the facts and are checked at materialization (rounds 19-27, X-04 to X-20); shared transfer availability (X-09, X-17, X-18); the `APUv1Program` manifest from the retained IR (round 28); open: slice 5 traces of forced alternatives and cost perturbations reaching generated code and launches on the APU v1 board and the Gemini-II card at one revision, with installed artifacts |
+| G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), the 500-instance selector equivalence as a diagnostic; UNVERIFIED: both hardware tables, token partitioning, UPMEM scaling, packing/selection/DCC studies, AttAcc Ramulator2 timings and decode, calibration, the virtual study, compile cost |
 
-Verdict: **NOT READY**. Blockers: G9 (X-01 to X-11, C-32, C-33, C-33b) is in progress (review of rounds 17-23; UPMEM and AttAcc effects; hybrid manifest ABI; slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.
+Verdict: **NOT READY**. Blockers: G9 (slice 5 hardware traces at the
+candidate), G10 (hardware rows, the remaining studies, the four AiM
+regressions), the independent re-challenge of G1-G8 at the candidate, P-04
+and P-23 (deferred), the open minor items in ISSUES.md.

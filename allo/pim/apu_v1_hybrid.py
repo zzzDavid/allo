@@ -1,10 +1,15 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Retained-MLIR discovery and immutable planning for hybrid APU v1 programs.
+"""Retained-IR discovery and immutable planning for APU v1 scalar programs.
 
-This module stops at the logical execution manifest.  Physical GVML/ARC
-source generation consumes the manifest elsewhere; discovery never rewrites
-Python source and never silently turns a selected vector region into ARC C.
+The manifest of an ``APUv1Program`` phase (its values, the scalar regions its
+top function calls, their operand access directions, the data dependencies
+between them) is read from the retained MLIR module through the IR bindings:
+function signatures and argument types, named allocations and their
+``linalg.fill`` initializers, ``func.call`` operations in program order and
+the loads and stores of each callee on its formals.  No MLIR text is parsed.
+This module stops at the logical execution manifest; physical GVML/ARC source
+generation consumes the manifest elsewhere.
 """
 
 from __future__ import annotations
@@ -12,63 +17,100 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import inspect
 import re
-from types import MappingProxyType
 from typing import Mapping
 
 from .apu_v1_vectorize import ContractionAnalysis
 
 
 _DTYPE = r"bf16|f16|f32|f64|i\d+|ui\d+"
-_MEMREF = re.compile(rf"memref<(?P<shape>(?:\d+x)*)(?P<dtype>{_DTYPE})>")
-_FUNC = re.compile(r"\bfunc\.func\s+@(?P<name>[-\w.$]+)\s*\((?P<args>[^)]*)\)")
-_FORMAL = re.compile(r"(?P<ssa>%[-\w.$]+)\s*:\s*(?P<type>memref<[^>]+>)")
-_ALLOC = re.compile(
-    rf"(?P<ssa>%[-\w.$]+)\s*=\s*memref\.alloc\(\)\s*"
-    rf'\{{[^}}]*name\s*=\s*"(?P<name>[^"]+)"[^}}]*\}}\s*:\s*'
-    rf"(?P<type>memref<[^>]+>)"
-)
-_FILL = re.compile(r"\blinalg\.fill\b.*\bouts\((?P<ssa>%[-\w.$]+)\s*:")
-_CALL = re.compile(r"\bcall\s+@(?P<function>[-\w.$]+)\s*\((?P<args>[^)]*)\)")
-_LOAD_ARG = re.compile(r"(?:affine|memref)\.load\s+(?P<arg>%arg\d+)\[")
-_STORE_ARG = re.compile(
-    r"(?:affine|memref)\.store\s+%[-\w.$]+\s*,\s*(?P<arg>%arg\d+)\["
-)
-_VALUE_ATTR = re.compile(r'(?:from|to)\s*=\s*"(?P<name>[^"]+)"')
+_DTYPE_RE = re.compile(_DTYPE)
 
 
-def _type_parts(text: str) -> tuple[tuple[int, ...], str]:
-    match = _MEMREF.search(text)
-    if match is None:
-        raise ValueError(f"hybrid APU manifest requires a ranked memref, got {text!r}")
-    shape = tuple(
-        int(item) for item in match.group("shape").rstrip("x").split("x") if item
-    )
-    return shape, match.group("dtype")
+def _ir():
+    from .._mlir import ir
+
+    return ir
 
 
-def _function_regions(text: str) -> Mapping[str, tuple[str, ...]]:
-    lines = text.splitlines()
-    regions = {}
-    index = 0
-    while index < len(lines):
-        start = _FUNC.search(lines[index])
-        if start is None:
-            index += 1
+def _attr_text(attribute) -> str:
+    ir = _ir()
+    for kind in (ir.StringAttr, ir.FlatSymbolRefAttr):
+        try:
+            return kind(attribute).value
+        except (TypeError, ValueError):
             continue
-        begin = index
-        depth = 0
-        opened = False
-        while index < len(lines):
-            depth += lines[index].count("{") - lines[index].count("}")
-            opened = opened or "{" in lines[index]
-            index += 1
-            if opened and depth == 0:
-                break
-        name = start.group("name")
-        if name in regions:
+    return str(attribute).strip('"').lstrip("@")
+
+
+def _module_functions(module) -> Mapping[str, object]:
+    """``{symbol name: func.func operation}`` of the retained module."""
+    functions = {}
+    for operation in module.body.operations:
+        if operation.operation.name != "func.func":
+            continue
+        name = _attr_text(operation.attributes["sym_name"])
+        if name in functions:
             raise ValueError(f"duplicate MLIR function {name!r}")
-        regions[name] = tuple(lines[begin:index])
-    return MappingProxyType(regions)
+        functions[name] = operation
+    return functions
+
+
+def _walk(block, out):
+    for operation in block.operations:
+        out.append(operation)
+        for region in operation.regions:
+            for nested in region.blocks:
+                _walk(nested, out)
+    return out
+
+
+def _memref_parts(mlir_type) -> tuple[tuple[int, ...], str]:
+    """``(shape, element dtype text)`` of a ranked memref type; a type that
+    is not a ranked memref of a scalar element is refused."""
+    ir = _ir()
+    if not ir.MemRefType.isinstance(mlir_type):
+        raise ValueError(
+            f"hybrid APU manifest requires a ranked memref, got {mlir_type}"
+        )
+    memref = ir.MemRefType(mlir_type)
+    dtype = str(memref.element_type)
+    if not _DTYPE_RE.fullmatch(dtype):
+        raise ValueError(
+            f"hybrid APU manifest requires a scalar element type, got {dtype}"
+        )
+    return tuple(int(d) for d in memref.shape), dtype
+
+
+def _entry_block(function):
+    return function.regions[0].blocks[0]
+
+
+def _formal_number(function, value) -> int | None:
+    """The position of ``value`` among ``function``'s formals, else None."""
+    ir = _ir()
+    if not ir.BlockArgument.isinstance(value):
+        return None
+    argument = ir.BlockArgument(value)
+    if argument.owner != _entry_block(function):
+        return None
+    return argument.arg_number
+
+
+def _formal_accesses(function) -> tuple[set, set]:
+    """``(read formals, written formals)`` by position: the formals the
+    function's loads read and its stores write (nested loops included)."""
+    reads, writes = set(), set()
+    for operation in _walk(_entry_block(function), []):
+        name = operation.operation.name
+        if name in ("affine.load", "memref.load"):
+            position = _formal_number(function, operation.operands[0])
+            if position is not None:
+                reads.add(position)
+        elif name in ("affine.store", "memref.store"):
+            position = _formal_number(function, operation.operands[1])
+            if position is not None:
+                writes.add(position)
+    return reads, writes
 
 
 @dataclass(frozen=True)
@@ -313,22 +355,6 @@ class APUv1HybridManifest:
         }
 
 
-def _formal_accesses(lines):
-    reads, writes, semantic = set(), set(), {}
-    for line in lines:
-        load = _LOAD_ARG.search(line)
-        store = _STORE_ARG.search(line)
-        match = load or store
-        if match is None:
-            continue
-        formal = match.group("arg")
-        (reads if load else writes).add(formal)
-        attr = _VALUE_ATTR.search(line)
-        if attr is not None:
-            semantic.setdefault(attr.group("name"), formal)
-    return reads, writes, semantic
-
-
 def discover_apu_v1_hybrid_manifest(
     phase,
     schedule,
@@ -338,10 +364,23 @@ def discover_apu_v1_hybrid_manifest(
     cost=None,
     program_name=None,
 ):
-    """Discover ordered vector/scalar regions from one canonical MLIR phase."""
+    """Discover the ordered scalar regions of one phase from its retained IR.
 
-    text = str(schedule.module)
-    functions = _function_regions(text)
+    Values are the top function's formals (the phase's source arguments, in
+    signature order, typed by the artifact's ABI), its named allocations
+    (intermediates; zero-initialized when a ``linalg.fill`` initializes them)
+    and the returned buffers (``phase.result_names``).  Regions are the top
+    function's ``func.call`` operations in program order, each callee's
+    formals bound to the call's actual values with the access direction the
+    callee's loads and stores give them; a top function without calls is
+    one scalar region over the program's inputs and outputs.  Dependencies
+    follow the last writer of every value a region reads or writes.
+    """
+    del cost, target
+    ir = _ir()
+    from ..spmw_match_engine import ValueNames
+
+    functions = _module_functions(schedule.module)
     top = schedule.top_func_name
     if top not in functions:
         raise ValueError(f"retained MLIR has no top function {top!r}")
@@ -370,20 +409,21 @@ def discover_apu_v1_hybrid_manifest(
     if len(phase.result_names) != len(result_abi):
         raise ValueError("hybrid manifest result_names do not match returned memrefs")
 
-    top_match = _FUNC.search(functions[top][0])
-    formal_top = tuple(_FORMAL.finditer(top_match.group("args")))
+    top_function = functions[top]
+    names = ValueNames(top_function, ir.AsmState(top_function))
+    formal_top = tuple(_entry_block(top_function).arguments)
     if len(formal_top) != len(source_names):
         raise ValueError("hybrid manifest top-level MLIR argument mismatch")
-    ssa_values = {}
+    value_of_ssa = {}
     values = {}
     bindings = dict(getattr(phase, "bindings", {}))
     for formal, source_name, abi in zip(formal_top, source_names, source_abi):
         name = bindings.get(source_name, source_name)
-        shape, _signless_dtype = _type_parts(formal.group("type"))
+        shape, _signless_dtype = _memref_parts(formal.type)
         # CArgument decodes the function-level itypes string, which is the
         # authoritative signedness for signless MLIR integer formals.
         dtype = abi.dtype
-        ssa_values[formal.group("ssa")] = name
+        value_of_ssa[names(formal)] = name
         values[name] = APUv1ValueManifest(
             name,
             shape,
@@ -391,35 +431,37 @@ def discover_apu_v1_hybrid_manifest(
             program_input=abi.mode in {"in", "both"},
             program_output=abi.mode in {"out", "both"},
         )
-    filled_allocations = {
-        match.group("ssa")
-        for line in functions[top]
-        for match in [_FILL.search(line)]
-        if match is not None
+    top_ops = _walk(_entry_block(top_function), [])
+    filled = {
+        names(operation.operands[-1])
+        for operation in top_ops
+        if operation.operation.name == "linalg.fill" and len(operation.operands) >= 2
     }
     explicit_zero = set(getattr(phase, "zero_initialize", ()))
-    for line in functions[top]:
-        alloc = _ALLOC.search(line)
-        if alloc is None:
+    for operation in top_ops:
+        if (
+            operation.operation.name != "memref.alloc"
+            or "name" not in operation.attributes
+        ):
             continue
-        # MLIR lowering also introduces scalar index slots.  They are an ARC
-        # implementation detail, not persistent tensor values in the hybrid
-        # manifest.
-        if _MEMREF.search(alloc.group("type")) is None:
+        result = operation.results[0]
+        try:
+            shape, dtype = _memref_parts(result.type)
+        except ValueError:
+            # MLIR lowering also introduces scalar index slots.  They are an
+            # ARC implementation detail, not persistent tensor values.
             continue
-        shape, dtype = _type_parts(alloc.group("type"))
-        if dtype.startswith("i") and re.search(r"\bunsigned\b", line):
+        if dtype.startswith("i") and "unsigned" in operation.attributes:
             dtype = "u" + dtype
-        name = alloc.group("name")
-        ssa_values[alloc.group("ssa")] = name
+        name = _attr_text(operation.attributes["name"])
+        ssa = names(result)
+        value_of_ssa[ssa] = name
         values[name] = APUv1ValueManifest(
             name,
             shape,
             dtype,
             intermediate=True,
-            zero_initialized=(
-                alloc.group("ssa") in filled_allocations or name in explicit_zero
-            ),
+            zero_initialized=(ssa in filled or name in explicit_zero),
         )
     for name, abi in zip(phase.result_names, result_abi):
         shape, dtype = tuple(abi.shape), abi.dtype
@@ -434,18 +476,17 @@ def discover_apu_v1_hybrid_manifest(
         )
 
     calls = []
-    for line in functions[top]:
-        call = _CALL.search(line)
-        if call is None:
+    for operation in top_ops:
+        if operation.operation.name != "func.call":
             continue
-        actual_ssa = tuple(item.strip() for item in call.group("args").split(","))
-        try:
-            actual_values = tuple(ssa_values[item] for item in actual_ssa)
-        except KeyError as error:
-            raise ValueError(
-                f"call uses unknown top-level SSA value {error.args[0]}"
-            ) from error
-        calls.append((call.group("function"), actual_values))
+        callee = _attr_text(operation.attributes["callee"])
+        actual_values = []
+        for operand in operation.operands:
+            ssa = names(operand)
+            if ssa not in value_of_ssa:
+                raise ValueError(f"call uses unknown top-level SSA value {ssa}")
+            actual_values.append(value_of_ssa[ssa])
+        calls.append((callee, tuple(actual_values)))
 
     if not calls:
         # The other PolyBench kernels remain one explicit scalar region.
@@ -496,34 +537,23 @@ def discover_apu_v1_hybrid_manifest(
 
     last_writer = {}
     regions = []
-    for ordinal, (function, actual_values) in enumerate(calls):
-        if function not in functions:
-            raise ValueError(f"top-level call references unknown function {function!r}")
-        signature = _FUNC.search(functions[function][0])
-        formals = tuple(_FORMAL.finditer(signature.group("args")))
+    intermediate_names = {name for name, value in values.items() if value.intermediate}
+    for ordinal, (function_name, actual_values) in enumerate(calls):
+        if function_name not in functions:
+            raise ValueError(
+                f"top-level call references unknown function {function_name!r}"
+            )
+        function = functions[function_name]
+        formals = tuple(_entry_block(function).arguments)
         if len(formals) != len(actual_values):
-            raise ValueError(f"call ABI mismatch for region function {function!r}")
-        read_formals, write_formals, semantic = _formal_accesses(functions[function])
+            raise ValueError(f"call ABI mismatch for region function {function_name!r}")
+        read_formals, write_formals = _formal_accesses(function)
         # Every region is a scalar ARC region (vector regions were removed).
-        analysis = None
-        selected = False
-        compute_analysis = None
-        plans = ()
-        selected_plan = selected_estimate = None
-        kind = "vector" if selected else "scalar"
-        role_formals = {}
-        if analysis is not None:
-            role_formals = {
-                semantic.get(analysis.lhs.value): "lhs",
-                semantic.get(analysis.rhs.value): "rhs",
-                semantic.get(analysis.output.value): "output",
-            }
         operands = []
         reads, writes = [], []
-        for position, (formal, value_name) in enumerate(zip(formals, actual_values)):
-            formal_name = formal.group("ssa")
-            is_read = formal_name in read_formals
-            is_write = formal_name in write_formals
+        for position, value_name in enumerate(actual_values):
+            is_read = position in read_formals
+            is_write = position in write_formals
             access = (
                 "readwrite" if is_read and is_write else "read" if is_read else "write"
             )
@@ -534,10 +564,7 @@ def discover_apu_v1_hybrid_manifest(
             if is_write:
                 writes.append(value_name)
             value = values[value_name]
-            role = role_formals.get(formal_name) or (
-                "output" if is_write else f"input{position}"
-            )
-            compute_dtype = compute_analysis.numeric_type if selected else value.dtype
+            role = "output" if is_write else f"input{position}"
             operands.append(
                 APUv1RegionOperand(
                     position,
@@ -545,7 +572,7 @@ def discover_apu_v1_hybrid_manifest(
                     value_name,
                     value.shape,
                     value.dtype,
-                    compute_dtype,
+                    value.dtype,
                     access,
                 )
             )
@@ -557,14 +584,11 @@ def discover_apu_v1_hybrid_manifest(
                 )
         dependencies = tuple(dependency_values)
         region_id = f"region{ordinal}"
-        intermediate_names = {
-            name for name, value in values.items() if value.intermediate
-        }
         region = APUv1RegionManifest(
             region_id,
-            function,
+            function_name,
             ordinal,
-            kind,
+            "scalar",
             tuple(operands),
             tuple(dict.fromkeys(reads)),
             tuple(dict.fromkeys(writes)),
@@ -575,12 +599,6 @@ def discover_apu_v1_hybrid_manifest(
                 if name in intermediate_names and name in last_writer
             ),
             dependencies,
-            storage_analysis=analysis,
-            compute_analysis=compute_analysis if selected else None,
-            plans=plans,
-            selected_plan=selected_plan,
-            selected_estimate=selected_estimate,
-            physical_plan_verified=selected,
         )
         regions.append(region)
         for value_name in writes:
@@ -615,72 +633,12 @@ def discover_apu_v1_hybrid_manifest(
         barriers.append(barrier)
         regions[region.ordinal] = replace(region, barrier=barrier.id)
 
-    conversions = []
-    for region in regions:
-        if region.kind != "vector":
-            continue
-        compute_dtype = region.compute_analysis.numeric_type
-        for operand in region.operands:
-            if operand.access not in {"read", "readwrite"}:
-                continue
-            producer = next(
-                (
-                    item
-                    for item in regions
-                    if item.id in region.dependencies and operand.value in item.writes
-                ),
-                None,
-            )
-            if producer is not None and producer.kind == "vector":
-                continue
-            value_manifest = values[operand.value]
-            if (
-                producer is None
-                and operand.role == "output"
-                and value_manifest.zero_initialized
-            ):
-                continue
-            if operand.storage_dtype != compute_dtype:
-                conversions.append(
-                    APUv1ConversionManifest(
-                        f"convert{len(conversions)}",
-                        operand.value,
-                        operand.shape,
-                        operand.storage_dtype,
-                        compute_dtype,
-                        before_region=region.id,
-                        reason="program_or_scalar_to_vector",
-                    )
-                )
-        for operand in region.operands:
-            if operand.access not in {"write", "readwrite"}:
-                continue
-            consumers = [
-                item
-                for item in regions
-                if region.id in item.dependencies and operand.value in item.reads
-            ]
-            value = values[operand.value]
-            if value.program_output or any(item.kind == "scalar" for item in consumers):
-                if operand.storage_dtype != compute_dtype:
-                    conversions.append(
-                        APUv1ConversionManifest(
-                            f"convert{len(conversions)}",
-                            operand.value,
-                            operand.shape,
-                            compute_dtype,
-                            operand.storage_dtype,
-                            after_region=region.id,
-                            reason="vector_to_scalar_or_program",
-                        )
-                    )
-
     phase_manifest = APUv1PhaseManifest(
         phase.phase_name,
         top,
         tuple(regions),
         tuple(barriers),
-        tuple(conversions),
+        (),
         tuple(value.name for value in values.values() if value.program_input),
         tuple(value.name for value in values.values() if value.program_output),
         tuple(value.name for value in values.values() if value.intermediate),
