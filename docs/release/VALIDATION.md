@@ -714,3 +714,13 @@ under `/work/shared/users/phd/nz264/tenon-release-evidence/r26/`.
 | `tests/pim/test_shared_semantics.py`, whole file on the final tree (`r26/pytest_shared_semantics_r26.log`; sections a-w, 119 tests) | 119 passed in 697 s |
 | regression batch (`r26/pytest_r26_batch.log`: `test_attacc_virtual.py` without the 500-instance row, the shared semantics, `test_aim_token_partition.py`, `test_cent_aim_workloads.py`, `test_upmem_matcher.py`) | 173 passed, 14 skipped, 3 failed in 812 s; the three failures were the first form of the section w tests (a wrong whole-row expectation for `W[0:4]`, and a Python variable captured inside a kernel body, which the frontend refuses), corrected before the whole-file run above |
 | pylint on `spmw_plan.py` and `attacc_tiling.py` (`r26/pylint_r26.log`) | no new findings beyond two docstrings (added) and the size notes on `_prove_attention_dataflow` recorded under P-23 |
+
+## Round 27 (2026-11-04): review finding X-20 reopened (operand order, loop renaming)
+
+Same interpreter and `LLVM_BUILD_DIR`; checkout as working directory. Logs
+under `/work/shared/users/phd/nz264/tenon-release-evidence/r27/`.
+
+| Check (round 27 tree) | Result |
+|---|---|
+| the reviewer's `probe_attention.py` (`reviewer-r26/`, unchanged; `r27/probe_attention.log`) | ordinary attention 465 cycles; `total / s[h, t]` refused ("the division is not (exponentiated score) / (softmax sum): the operands are 'total' / 's'"); the context-loop renaming and the softmax-row-loop renaming accepted with the same 465 cycles and the same command digest as the ordinary program |
+| `tests/pim/test_attacc_virtual.py` (without the 500-instance row) and the whole `tests/pim/test_shared_semantics.py` (sections a-x, 123 tests) (`r27/pytest_r27_batch.log`) | 167 passed in 710 s |

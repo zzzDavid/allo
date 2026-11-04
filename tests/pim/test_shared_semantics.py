@@ -14,6 +14,8 @@ output) now compiles and executes through the shared path.
 from __future__ import annotations
 
 import inspect
+import pathlib
+import sys
 
 import numpy as np
 import pytest
@@ -3674,3 +3676,103 @@ def test_attacc_ordinary_attention_still_lowers():
 
     compiled = _compile_attacc_with(attention_region(2, 16, 32))
     assert compiled.estimate().cycles == 465
+
+
+# --------------------------------------------------------------------------- #
+# x. Review round 26: the attention proof is structural (X-20 reopened): the
+#    division's operand order is checked, equivalent loop renamings pass
+# --------------------------------------------------------------------------- #
+
+
+def _attention_source(*, divide="s[h, t] / total", context_loop="t", row_loop="h"):
+    """The paper's attention region with one of its loops or its division
+    rewritten; the semantics are unchanged by a renaming and changed by the
+    reversed division."""
+    from allo.dataflow import region
+    from allo.spmw_match import exp
+
+    r = row_loop
+    z = context_loop
+    src = f"""
+@region()
+def attention_variant(q: float16[2, 16], kc: float16[2, 32, 16], vc: float16[2, 32, 16], o: float16[2, 16]):
+    @allo.work(mapping=[1], args=[q, kc, vc, o])
+    def attention(lq: float16[2, 16], lk: float16[2, 32, 16], lv: float16[2, 32, 16], lo: float16[2, 16]):
+        s: float16[2, 32] = 0.0
+        for h in range(2):
+            for t in range(32):
+                acc: float16 = 0.0
+                for d in range(16):
+                    acc += lq[h, d] * lk[h, t, d]
+                s[h, t] = acc
+        for {r} in range(2):
+            total: float16 = 0.0
+            for t in range(32):
+                s[{r}, t] = exp(s[{r}, t])
+            for t in range(32):
+                total += s[{r}, t]
+            for t in range(32):
+                s[{r}, t] = {divide.replace("s[h, t]", f"s[{r}, t]")}
+        for h in range(2):
+            for d in range(16):
+                acc2: float16 = 0.0
+                for {z} in range(32):
+                    acc2 += s[h, {z}] * lv[h, {z}, d]
+                lo[h, d] = acc2
+"""
+    # The frontend reads the kernel's source with ``inspect``: the variant is
+    # a real module file.
+    import hashlib
+    import importlib.util
+    import tempfile
+
+    del region, exp
+    header = (
+        "import allo\nfrom allo.dataflow import region\n"
+        "from allo.ir.types import float16\nfrom allo.spmw_match import exp\n"
+    )
+    digest = hashlib.sha256(src.encode()).hexdigest()[:12]
+    path = pathlib.Path(tempfile.gettempdir()) / f"attention_variant_{digest}.py"
+    path.write_text(header + src)
+    name = f"attention_variant_{digest}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module.attention_variant
+
+
+def _attacc_digest(compiled):
+    import hashlib
+
+    return hashlib.sha256(repr(list(compiled.compiled.cmds)).encode()).hexdigest()
+
+
+def test_attacc_attention_rejects_the_reversed_division():
+    """``total / s[h, t]`` is not the softmax: the facts retain the operand
+    order and the proof checks numerator and denominator roles."""
+    from allo.pim.attacc_tiling import AttAccDomainError
+
+    with pytest.raises(AttAccDomainError, match="operands are 'total' / 's'"):
+        _compile_attacc_with(_attention_source(divide="total / s[h, t]"))
+
+
+@pytest.mark.parametrize(
+    "rename",
+    [
+        {"context_loop": "z"},
+        {"row_loop": "row"},
+        {"context_loop": "z", "row_loop": "row"},
+    ],
+    ids=["context_loop", "softmax_row_loop", "both"],
+)
+def test_attacc_attention_accepts_alpha_renamed_loops(rename):
+    """Renaming a loop (the context reduction, or the softmax row loop that
+    is scoped independently of the MAC's row loop) does not change the
+    program: the same inventory and the same cycles are selected.  Axis
+    correspondence is by score-buffer dimension, loop scope by retained
+    loop identity, never by source spelling."""
+    reference = _compile_attacc_with(_attention_source())
+    renamed = _compile_attacc_with(_attention_source(**rename))
+    assert renamed.estimate().cycles == reference.estimate().cycles == 465
+    assert _attacc_digest(renamed) == _attacc_digest(reference)

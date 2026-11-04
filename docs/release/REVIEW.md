@@ -953,6 +953,27 @@ rows are an OPEN 32-cycle regression against the paper, not parity.
 
 Gates G9 and G10 remain **FAIL**.
 
+## Round 27 (2026-11-04): independent review of f3ef033; X-20 reopened
+
+The reviewer accepted X-18 and the G10 reporting corrections and reopened
+X-20 with two demonstrated defects: the division's operands were compared
+as a set (the reversed division selected the fused inventory), and axis
+correspondence used source loop labels (alpha-renamed loops were refused).
+The round 26 ledger's "no source-name checks" was wrong about that
+correspondence and is corrected. Judgment: a structural proof names axes
+by buffer dimension and loops by retained identity; operand roles are
+ordered facts. The proof now derives the length axis from the dimension
+of the score buffer the context MAC reduces over, proves own-element
+access relations per softmax op, checks numerator and denominator roles,
+and compares initializer and consumer scope by retained loop variables.
+The AttAcc declaration gained the local score buffer's layout so the
+shared iteration-coverage rule does not require the softmax loops to share
+the MAC's spelling. Regressions cover the reversed division and three
+renamings alongside the retained disconnected and global-normalization
+rejections.
+
+Gates G9 and G10 remain **FAIL**.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead

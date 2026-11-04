@@ -278,35 +278,55 @@ def attacc_kernel_from_matches(matches) -> AttAccKernel:
     )
 
 
-def _coord_labels(access, labels) -> tuple | None:
-    """The loop labels an access's coordinates range over, one per
-    coordinate, when every coordinate is one loop variable with unit
-    coefficient and no offset (``s[h, t]``); None otherwise."""
+def _own_element_vars(access, loops) -> tuple | None:
+    """The loop variable indexing each dimension of ``access`` when the access
+    is the iteration's own element of the whole buffer: every coordinate is
+    one loop variable of ``loops`` with unit coefficient and no offset, the
+    variables are distinct and each loop's trip count equals the dimension
+    extent.  None otherwise.  Loop identity is the retained variable, never
+    a source spelling."""
+    shape = getattr(access, "shape", None)
+    coords = getattr(access, "coords", None) or ()
+    if not shape or len(coords) != len(shape):
+        return None
+    trips = {loop.var: loop.trip for loop in loops}
     out = []
-    for coord in getattr(access, "coords", None) or ():
+    for coord, extent in zip(coords, shape):
         if coord is None:
             return None
         atoms, const = coord
         if int(const) != 0 or len(atoms) != 1 or int(atoms[0][1]) != 1:
             return None
-        label = labels.get(atoms[0][0])
-        if label is None:
+        var = atoms[0][0]
+        if var not in trips or trips[var] != int(extent) or var in out:
             return None
-        out.append(label)
+        out.append(var)
     return tuple(out)
 
 
 def _prove_attention_dataflow(matches) -> None:
     """Prove, from the shared semantic facts, that the five matches are one
-    attention kernel the fused AttAcc inventory realizes: the score MAC's
-    sink feeds the exponential, the sum and the division, which feed the
-    context MAC's vector (retained value identities, not names); every
-    softmax access reads and writes the score element ``[row, length]`` of
-    its own iteration; the sum's accumulator is initialized under the row
-    loop and the division reads it inside the same row iteration (per-row
-    normalization); and the context MAC reduces over the length axis.
-    Programs with another dataflow (a softmax over a different buffer, a
-    normalization across rows) are refused with the difference named."""
+    attention kernel the fused AttAcc inventory realizes.  The proof is
+    structural: buffers are followed by retained value identity, axes by
+    the dimensions of the score buffer, loops by their retained variables.
+
+    * the score MAC writes one local score buffer ``S`` with the iteration's
+      own element (one loop per dimension); the dimension of ``S`` the
+      context MAC's vector access indexes with the context's reduction loop
+      is the length axis, the others are the row axes; the extents agree
+      with the kernel's (rows, d_head, length);
+    * the exponential reads and writes ``S``, the sum reads ``S``, the
+      division writes ``S`` as ``S / total`` (numerator ``S``, denominator
+      the sum's accumulator; the reverse form is refused), and the context
+      MAC's vector is ``S``: each as the iteration's own element;
+    * per-row normalization: the sum's accumulator initializer (the retained
+      ``accumulator_init`` store effect) sits under exactly the loops that
+      index the row dimensions in the sum, and the division indexes the row
+      dimensions with those same loops (the row's total is consumed inside
+      its row iteration).
+
+    Any other dataflow is an `AttAccDomainError` naming the difference.
+    """
     facts = [match.extra.get("semantic_facts") for match in matches]
     program = matches[0].extra.get("program_facts") if matches else None
     if any(fact is None for fact in facts) or program is None:
@@ -321,78 +341,92 @@ def _prove_attention_dataflow(matches) -> None:
     (exp,) = by_op["SFM_EXP"]
     (total,) = by_op["SFM_SUM"]
     (div,) = by_op["SFM_DIV"]
-    labels = {}
-    for fact in facts:
-        labels.update(fact.loop_labels)
 
     def fail(what):
         raise AttAccDomainError(f"AttAcc attention: {what}")
 
-    # Axes: the score's result loops are (rows..., length); the length is the
-    # axis the context MAC reduces over.
-    score_result = tuple(labels[v] for v in score.result_vars)
-    context_reduction = tuple(labels[v] for v in context.reduction_vars)
-    if len(context_reduction) != 1 or context_reduction[0] not in score_result:
-        fail(
-            f"the context MAC reduces over {context_reduction}, not over an axis "
-            f"of the score result {score_result}"
-        )
-    length = context_reduction[0]
-    row_labels = tuple(label for label in score_result if label != length)
-    if not row_labels or score_result[-1] != length:
-        fail(
-            f"the score result axes are {score_result}; expected (rows..., "
-            f"length={length})"
-        )
-    # Dataflow by retained identity.
+    # The score buffer and its dimensions.
     sinks = [sink for sink in score.sinks if sink.value_ref is not None]
-    if len(sinks) != 1:
-        fail(f"the score MAC writes {len(sinks)} buffers, not one score buffer")
-    scores_ref = sinks[0].value_ref
-    if _coord_labels(sinks[0], labels) != score_result:
-        fail("the score buffer is not indexed by the score result axes")
-    (exp_in,) = exp.operands
-    if exp_in.value_ref != scores_ref or exp.result.value_ref != scores_ref:
+    if len(sinks) != 1 or not sinks[0].local:
+        fail(f"the score MAC writes {len(sinks)} buffers, not one local score buffer")
+    scores = sinks[0]
+    scores_ref = scores.value_ref
+    score_vars = _own_element_vars(scores, score.loops)
+    if score_vars is None or set(score_vars) != set(score.result_vars):
         fail(
-            f"the exponential reads {exp_in.memref_name!r} and writes "
-            f"{exp.result.memref_name!r}, not the score buffer "
-            f"{sinks[0].memref_name!r} the first MAC writes"
+            "the score buffer is not written as the iteration's own element over the score MAC's result loops"
         )
-    (sum_in,) = total.inputs
-    if sum_in.value_ref != scores_ref:
-        fail(f"the softmax sum reads {sum_in.memref_name!r}, not the score buffer")
-    total_ref = total.accumulator.value_ref
-    div_refs = {operand.value_ref for operand in div.operands}
-    if div_refs != {scores_ref, total_ref} or div.result.value_ref != scores_ref:
-        fail(
-            "the division does not divide the exponentiated scores by the "
-            "softmax sum in place"
-        )
+    shape = tuple(int(d) for d in scores.shape)
+    # The length axis: the dimension the context MAC reduces over.
     if context.vector is None or context.vector.value_ref != scores_ref:
-        fail("the context MAC's vector is not the normalized score buffer")
-    # Access relations: every softmax access is the iteration's own element.
-    for name, accesses in (
-        ("SFM_EXP", (exp_in, exp.result)),
-        ("SFM_SUM", (sum_in,)),
-        (
-            "SFM_DIV",
-            (*[o for o in div.operands if o.value_ref == scores_ref], div.result),
-        ),
-    ):
-        for access in accesses:
-            if _coord_labels(access, labels) != score_result:
-                fail(
-                    f"{name} accesses the score buffer over "
-                    f"{_coord_labels(access, labels)}, not [{', '.join(score_result)}]"
-                )
-    # Per-row normalization: the sum's accumulator starts under the row
-    # loop(s) and the division reads it inside the same row iteration.
-    row_vars = tuple(v for v in total.loop_vars if labels[v] in row_labels)
-    if tuple(labels[v] for v in total.loop_vars) != row_labels + (length,):
+        fail("the context MAC's vector is not the score buffer the first MAC writes")
+    context_vars = _own_element_vars(context.vector, context.loops)
+    if context_vars is None:
         fail(
-            f"the softmax sum iterates {[labels[v] for v in total.loop_vars]}, "
-            f"not the rows {row_labels} then the length {length}"
+            "the context MAC does not read the score buffer as its iteration's own element"
         )
+    length_dims = [
+        dim for dim, var in enumerate(context_vars) if var in context.reduction_vars
+    ]
+    if len(length_dims) != 1 or any(
+        var not in context.result_vars
+        for dim, var in enumerate(context_vars)
+        if dim != length_dims[0]
+    ):
+        fail(
+            "the context MAC must reduce over exactly one dimension of the score "
+            "buffer and keep the others as result axes"
+        )
+    length_dim = length_dims[0]
+    row_dims = tuple(dim for dim in range(len(shape)) if dim != length_dim)
+    if score_vars[length_dim] in score.reduction_vars:
+        fail("the length axis is a reduction axis of the score MAC")
+    rows = math.prod(shape[dim] for dim in row_dims)
+    extents = _contraction_extents_from_facts(score)
+    if extents is not None and (rows, shape[length_dim]) != (extents[0], extents[2]):
+        fail(
+            f"the score buffer {shape} does not match the score MAC's rows and "
+            f"length {extents[0]} x {extents[2]}"
+        )
+
+    # Dataflow and access relations of the softmax, by retained identity.
+    def own(name, access):
+        if access.value_ref != scores_ref:
+            fail(
+                f"{name} uses {access.memref_name!r}, not the score buffer "
+                f"{scores.memref_name!r} the first MAC writes"
+            )
+        variables = _own_element_vars(access, by_fact[name].loops)
+        if variables is None:
+            fail(
+                f"{name} does not access the score buffer as its iteration's own element"
+            )
+        return variables
+
+    by_fact = {"SFM_EXP": exp, "SFM_SUM": total, "SFM_DIV": div}
+    (exp_in,) = exp.operands
+    own("SFM_EXP", exp_in)
+    own("SFM_EXP", exp.result)
+    (sum_in,) = total.inputs
+    sum_vars = own("SFM_SUM", sum_in)
+    total_ref = total.accumulator.value_ref
+    if not total.accumulator.local or total.accumulator.coords not in ((), None):
+        fail("the softmax sum does not accumulate into a local scalar")
+    if len(div.operands) != 2:
+        fail("the division does not have two operands")
+    numerator, denominator = div.operands
+    if numerator.value_ref != scores_ref or denominator.value_ref != total_ref:
+        fail(
+            "the division is not (exponentiated score) / (softmax sum): the "
+            f"operands are {numerator.memref_name!r} / {denominator.memref_name!r}"
+        )
+    div_vars = own("SFM_DIV", numerator)
+    if own("SFM_DIV", div.result) != div_vars:
+        fail("the division does not write the element it reads")
+
+    # Per-row normalization: initializer scope and consumer scope by loop
+    # identity (the retained variables), rows by buffer dimension.
+    sum_rows = tuple(sum_vars[dim] for dim in row_dims)
     inits = [
         effect
         for effect in program.effects
@@ -400,20 +434,29 @@ def _prove_attention_dataflow(matches) -> None:
         and effect.destination.value_ref == total_ref
     ]
     if not inits or any(
-        tuple(loop.var for loop in effect.loops) != row_vars for effect in inits
+        tuple(loop.var for loop in effect.loops) != sum_rows for effect in inits
     ):
         fail(
             "the softmax sum is not re-initialized per row: its initializer sits "
             f"under loops {[[loop.var for loop in e.loops] for e in inits]}, the "
-            f"rows are {list(row_vars)} (a normalization across rows is not the "
-            "AttAcc softmax)"
+            f"row loops are {list(sum_rows)} (a normalization across rows is not "
+            "the AttAcc softmax)"
         )
-    div_rows = tuple(v for v in div.loop_vars if labels[v] in row_labels)
-    if div_rows != row_vars:
+    if tuple(div_vars[dim] for dim in row_dims) != sum_rows:
         fail(
             "the division runs in another row loop than the sum; the row's total "
             "is consumed outside its iteration"
         )
+
+
+def _contraction_extents_from_facts(fact) -> tuple | None:
+    """``(rows, reduction, outputs)`` from the match's structural axis roles,
+    None when the roles are unresolved (the caller's extents already failed
+    in that case)."""
+    try:
+        return _contraction_extents(fact.match)
+    except AttAccDomainError:
+        return None
 
 
 # --------------------------------------------------------------------- #

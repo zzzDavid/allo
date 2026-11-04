@@ -152,7 +152,7 @@ def attacc_candidate_effects(target, matches, placement):
                 else:
                     storage = "gemv_buffer"
                     route = ("host_scatter", "banks", "WR_GB", "gemv_buffer")
-                layouts[memref] = CandidateValueLayout(
+                layouts[(memref, "value")] = CandidateValueLayout(
                     memref, value_axes(access, labels), storage
                 )
                 transfers[memref] = CandidateTransfer(memref, "in", route)
@@ -165,16 +165,26 @@ def attacc_candidate_effects(target, matches, placement):
                     continue
                 if memref not in outputs:
                     outputs.append(memref)
-                layouts[memref] = CandidateValueLayout(
+                layouts[(memref, "value")] = CandidateValueLayout(
                     memref, value_axes(access, labels), "acc"
                 )
                 transfers[memref] = CandidateTransfer(
                     memref, "out", ("acc", "host_readback")
                 )
         elif any(a.local for a in fact.operands) or fact.result.local:
-            # Softmax over the local score rows: softmax-unit scratch.
+            # Softmax over the local score rows: softmax-unit scratch, and the
+            # score buffer's own layout over the softmax loops (the kernel's
+            # iteration axes that index only this local value).
             if ("scores", 0, "softmax_buffer") not in allocations:
                 allocations.append(("scores", 0, "softmax_buffer"))
+            for access in (*fact.operands, fact.result):
+                memref = access.memref_name
+                if memref is None or not access.local or access.coords in ((), None):
+                    continue
+                if (memref, "value") not in layouts:
+                    layouts[(memref, "value")] = CandidateValueLayout(
+                        memref, value_axes(access, labels), "softmax_buffer"
+                    )
         instances, reduction, init = _launch_extents(fact)
         launches.append(
             CandidateLaunch(
