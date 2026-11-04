@@ -140,21 +140,41 @@ class ProvenanceError(RuntimeError):
     """A required provenance value could not be serialized structurally."""
 
 
-def _json_ready(value, depth=0, *, path="value"):
+_MAX_PROVENANCE_DEPTH = 64
+
+
+def _json_ready(value, depth=0, *, path="value", _active=None):
     """Structural JSON form of a provenance value.  Mappings (including
     ``mappingproxy`` and other ``Mapping`` views), sequences, sets, arrays,
-    NumPy scalars and objects with a ``manifest()`` are rendered
-    structurally; anything else is rendered as ``repr`` text, and never
-    truncated.  Nesting deeper than 12 levels is a provenance error, not a
-    silent cut."""
-    if depth > 12:
-        raise ProvenanceError(f"{path}: provenance nests deeper than 12 levels")
+    NumPy scalars, dataclasses and objects with a ``manifest()`` are
+    rendered structurally; anything else is rendered as ``repr`` text, and
+    never truncated.  A reference cycle or nesting deeper than 64 levels is
+    a provenance error, not a silent cut."""
+    if depth > _MAX_PROVENANCE_DEPTH:
+        raise ProvenanceError(
+            f"{path}: provenance nests deeper than {_MAX_PROVENANCE_DEPTH} levels"
+        )
+    active = _active if _active is not None else set()
+    if isinstance(value, (Mapping, list, tuple, set, frozenset)) or hasattr(
+        value, "__dataclass_fields__"
+    ):
+        if id(value) in active:
+            raise ProvenanceError(f"{path}: provenance contains a reference cycle")
+        active = active | {id(value)}
     if isinstance(value, Mapping):
-        return {str(k): _json_ready(v, depth + 1, path=f"{path}.{k}") for k, v in value.items()}
+        return {
+            str(k): _json_ready(v, depth + 1, path=f"{path}.{k}", _active=active)
+            for k, v in value.items()
+        }
     if isinstance(value, (list, tuple)):
-        return [_json_ready(v, depth + 1, path=f"{path}[{i}]") for i, v in enumerate(value)]
+        return [
+            _json_ready(v, depth + 1, path=f"{path}[{i}]", _active=active)
+            for i, v in enumerate(value)
+        ]
     if isinstance(value, (set, frozenset)):
-        return sorted((_json_ready(v, depth + 1, path=path) for v in value), key=repr)
+        return sorted(
+            (_json_ready(v, depth + 1, path=path, _active=active) for v in value), key=repr
+        )
     if isinstance(value, np.ndarray):
         return {"ndarray": list(value.shape), "dtype": str(value.dtype), "sha256": _sha256(value)}
     if isinstance(value, (np.integer,)):
@@ -165,10 +185,10 @@ def _json_ready(value, depth=0, *, path="value"):
         return value
     manifest = getattr(value, "manifest", None)
     if callable(manifest):
-        return _json_ready(manifest(), depth + 1, path=f"{path}.manifest()")
+        return _json_ready(manifest(), depth + 1, path=f"{path}.manifest()", _active=active)
     if hasattr(value, "__dataclass_fields__"):
         return {
-            name: _json_ready(getattr(value, name), depth + 1, path=f"{path}.{name}")
+            name: _json_ready(getattr(value, name), depth + 1, path=f"{path}.{name}", _active=active)
             for name in value.__dataclass_fields__
         }
     return repr(value)

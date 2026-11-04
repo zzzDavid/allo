@@ -195,13 +195,25 @@ def test_plan_provenance_is_structural_not_truncated():
 
     proxy = types.MappingProxyType({"a": 1, "nested": {"b": (1, 2)}})
     assert driver._json_ready(proxy) == {"a": 1, "nested": {"b": [1, 2]}}
-    with pytest.raises(driver.ProvenanceError):
+    with pytest.raises(driver.ProvenanceError, match="deeper"):
         deep = {}
         cur = deep
-        for _ in range(14):
+        for _ in range(driver._MAX_PROVENANCE_DEPTH + 2):
             cur["x"] = {}
             cur = cur["x"]
         driver._json_ready(deep)
+    loop = {}
+    loop["self"] = loop
+    with pytest.raises(driver.ProvenanceError, match="cycle"):
+        driver._json_ready(loop)
+    # The real plan's effects manifest nests past 12 levels; it must come
+    # through whole (a dry run of round 36 failed on the old 12-level cap).
+    deep_but_fine = {}
+    cur = deep_but_fine
+    for _ in range(20):
+        cur["x"] = {}
+        cur = cur["x"]
+    assert driver._json_ready(deep_but_fine) is not None
 
     compiled = allo.compile(driver.gemv_source(), build_apu_v1_target(), apu_v1_cost, backend="virtual")
     plan = compiled.selected_plan
