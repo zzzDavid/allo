@@ -1001,10 +1001,40 @@ def parse_buffer_role(text):
     return base, tuple(index)
 
 
-def slice_region(shape, index) -> tuple:
-    """The box ``((lo, hi), ...)`` of ``index`` (see `parse_buffer_role`) in
-    a buffer of ``shape``; the whole buffer for ``None``.  A single bounded
-    range over a multi-dimensional buffer indexes its flattened extent."""
+@dataclass(frozen=True)
+class FlatRange:
+    """``[start, stop)`` of the row-major flattening of a buffer: the region a
+    single bounded range names over a multi-dimensional buffer
+    (``W[0:2640]`` over ``W[3, 33, 80]``).  Distinct from a Cartesian box,
+    whose every dimension is bounded (``W[0:4, 0, 0]`` is the box
+    ``((0, 4), (0, 1), (0, 1))`` and covers four scattered elements)."""
+
+    start: int
+    stop: int
+
+    @property
+    def count(self) -> int:
+        """Number of flattened elements in the range."""
+        return self.stop - self.start
+
+    def rows(self, shape) -> tuple:
+        """The Cartesian box of whole leading-dimension rows this range
+        covers, or ``None`` when it is not whole rows."""
+        inner = 1
+        for d in shape[1:]:
+            inner *= int(d)
+        if self.start % inner or self.stop % inner:
+            return None
+        return ((self.start // inner, self.stop // inner),) + tuple(
+            (0, int(d)) for d in shape[1:]
+        )
+
+
+def slice_region(shape, index):
+    """The region ``index`` (see `parse_buffer_role`) names in a buffer of
+    ``shape``: a Cartesian box ``((lo, hi), ...)`` with one bound per
+    dimension (the whole buffer for ``None``), or a `FlatRange` for a single
+    bounded range over a multi-dimensional buffer (its flattened extent)."""
     shape = tuple(int(d) for d in shape)
     if index is None:
         return tuple((0, d) for d in shape)
@@ -1015,7 +1045,7 @@ def slice_region(shape, index) -> tuple:
             total *= d
         if not 0 <= start <= stop <= total:
             raise ValueError(f"slice {index} does not fit a buffer of {shape}")
-        return ((start, stop),) + tuple((0, 1) for _ in shape[1:])  # flat form
+        return FlatRange(int(start), int(stop))
     if len(index) != len(shape):
         raise ValueError(f"index {index} does not fit a buffer of {shape}")
     box = []
@@ -1034,18 +1064,15 @@ def slice_region(shape, index) -> tuple:
     return tuple(box)
 
 
-def flat_range(shape, box) -> tuple | None:
-    """``(first, count)`` when ``box`` is one contiguous range of the
-    row-major flattening of a buffer of ``shape``, else None."""
+def flat_range(shape, region) -> tuple | None:
+    """``(first, count)`` of ``region`` in the row-major flattening of a
+    buffer of ``shape``: a `FlatRange` as such; a Cartesian box when it is
+    one contiguous range (a scalar's offset is its row-major position), else
+    None."""
     shape = tuple(int(d) for d in shape)
-    if (
-        len(box) == len(shape)
-        and all(hi == 1 for _lo, hi in box[1:])
-        and (len(shape) > 1 and box[1:] == tuple((0, 1) for _ in shape[1:]))
-    ):
-        # The flat form `slice_region` produces for a single bounded range.
-        lo, hi = box[0]
-        return int(lo), int(hi - lo)
+    if isinstance(region, FlatRange):
+        return region.start, region.count
+    box = region
     if len(box) != len(shape):
         return None
     strides = []
@@ -1283,30 +1310,24 @@ def check_transfer_availability(trace, launch_schedule, host_moves, placements):
             if key is None or shape is None:
                 continue
             try:
-                box = slice_region(shape, index)
+                region = slice_region(shape, index)
             except ValueError as error:
                 raise InfeasibleSchedule(f"host {verb} of {role}: {error}") from error
-            if (
-                len(box) == len(shape)
-                and len(shape) > 1
-                and box[1:] == tuple((0, 1) for _ in shape[1:])
-            ):
-                # A flat range ``[start, stop)`` over a multi-dimensional
-                # buffer (the form `slice_region` returns for one bounded
-                # range): the whole rows of the leading dimension it covers.
-                start, stop = box[0]
-                inner = 1
-                for d in shape[1:]:
-                    inner *= d
-                if start % inner or stop % inner:
+            if isinstance(region, FlatRange):
+                # A flat range over a multi-dimensional buffer covers whole
+                # rows of the leading dimension, or it is refused.
+                box = region.rows(shape)
+                if box is None:
+                    inner = 1
+                    for d in shape[1:]:
+                        inner *= d
                     raise InfeasibleSchedule(
-                        f"host {verb} of {role}: the flat range [{start}, {stop}) "
-                        f"over a buffer of {shape} must cover whole rows of "
-                        f"{inner} elements"
+                        f"host {verb} of {role}: the flat range [{region.start}, "
+                        f"{region.stop}) over a buffer of {shape} must cover whole "
+                        f"rows of {inner} elements"
                     )
-                box = ((start // inner, stop // inner),) + tuple(
-                    (0, d) for d in shape[1:]
-                )
+            else:
+                box = region  # a Cartesian box: exactly the elements it names
             available.setdefault(key, []).append(box)
             continue
         if not isinstance(step, LaunchStep):

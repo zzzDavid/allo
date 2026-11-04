@@ -3480,3 +3480,197 @@ def test_aim_host_rewrite_of_a_produced_value_after_its_launch_is_a_reupload():
     )
     with pytest.raises(RuntimeError, match="declares it 'out'"):
         ctx.check_realization(compiled.compiled.layout)
+
+
+# --------------------------------------------------------------------------- #
+# w. Review round 25: flat ranges are a distinct region type (X-18 reopened);
+#    AttAcc attention proves its dataflow and per-row normalization (X-20)
+# --------------------------------------------------------------------------- #
+
+
+def test_flat_ranges_and_cartesian_boxes_are_distinct_regions():
+    """``W[0:4]`` over a (4, 2, 2) buffer is a flat range of its flattening;
+    ``W[0:4, 0, 0]`` is the Cartesian box of four scattered elements and is
+    not contiguous; a scalar's flat offset is its row-major position."""
+    from allo.spmw_plan import FlatRange, flat_range, slice_region
+
+    shape = (4, 2, 2)
+    flat = slice_region(shape, ((0, 4),))
+    assert flat == FlatRange(0, 4) and flat_range(shape, flat) == (0, 4)
+    # Four flat elements are whole row 0; six are not whole rows.
+    assert flat.rows(shape) == ((0, 1), (0, 2), (0, 2))
+    assert FlatRange(0, 6).rows(shape) is None
+    assert FlatRange(0, 8).rows(shape) == ((0, 2), (0, 2), (0, 2))
+    box = slice_region(shape, ((0, 4), 0, 0))
+    assert box == ((0, 4), (0, 1), (0, 1)) and flat_range(shape, box) is None
+    assert flat_range(shape, slice_region(shape, (1, 0, 0))) == (4, 1)
+    assert flat_range(shape, slice_region(shape, ((0, 4), None, None))) == (0, 16)
+
+
+def test_cartesian_scatter_of_scattered_elements_does_not_supply_a_matrix():
+    """A GEMV reading ``W[0, :, :]`` is supplied by the flat prefix
+    ``W[0:4]`` or the box ``W[0, :, :]``, not by ``W[0:4, 0, 0]`` (four
+    scattered elements, one of which lies in the matrix)."""
+    from types import SimpleNamespace
+
+    from allo.dataflow import region
+    from allo.pim.schedule_search import InfeasibleSchedule
+    from allo.spmw_plan import HostStep, LaunchStep, check_transfer_availability
+
+    @region()
+    def prefix(W: float16[4, 2, 2], x: float16[4, 2], y: float16[4, 2]):
+        @allo.work(mapping=[1], args=[W, x, y])
+        def gemv(lW: float16[4, 2, 2], lx: float16[4, 2], ly: float16[4, 2]):
+            for h in range(1):
+                for n in range(2):
+                    acc: float16 = 0
+                    for k in range(2):
+                        acc += lW[h, n, k] * lx[h, k]
+                    ly[h, n] = acc
+
+    compiled = _compile_attacc_with(
+        prefix, host_moves=allo.host_program(prefix, resident=("W", "x"))(_attacc_once)
+    )
+    schedule = compiled.compiled.launch_schedule
+    launch = next(s for s in schedule.steps if isinstance(s, LaunchStep))
+
+    def check(role):
+        moves = [
+            SimpleNamespace(verb=SimpleNamespace(name="scatter"), buffer_role=role)
+        ]
+        check_transfer_availability(
+            compiled.trace,
+            replace(schedule, steps=(HostStep(0), launch), resident=frozenset(("x",))),
+            moves,
+            compiled.compiled.layout,
+        )
+
+    with pytest.raises(
+        InfeasibleSchedule, match=r"has not brought \[\(0, 1\), \(0, 1\), \(1, 2\)\]"
+    ):
+        check("W[0:4, 0, 0]")
+    check("W[0:4]")
+    check("W[0, :, :]")
+
+
+def _attention_disconnected():
+    """Scores in ``s``; the softmax and the context MAC use a separate
+    zero-filled ``p`` (the softmax never reads the scores)."""
+    from allo.dataflow import region
+    from allo.spmw_match import exp
+
+    @region()
+    def attention_variant(
+        q: float16[2, 16],
+        kc: float16[2, 32, 16],
+        vc: float16[2, 32, 16],
+        o: float16[2, 16],
+    ):
+        @allo.work(mapping=[1], args=[q, kc, vc, o])
+        def attention(
+            lq: float16[2, 16],
+            lk: float16[2, 32, 16],
+            lv: float16[2, 32, 16],
+            lo: float16[2, 16],
+        ):
+            s: float16[2, 32] = 0.0
+            p: float16[2, 32] = 0.0
+            for h in range(2):
+                for t in range(32):
+                    acc: float16 = 0.0
+                    for d in range(16):
+                        acc += lq[h, d] * lk[h, t, d]
+                    s[h, t] = acc
+            for h in range(2):
+                total: float16 = 0.0
+                for t in range(32):
+                    p[h, t] = exp(p[h, t])
+                for t in range(32):
+                    total += p[h, t]
+                for t in range(32):
+                    p[h, t] = p[h, t] / total
+            for h in range(2):
+                for d in range(16):
+                    acc2: float16 = 0.0
+                    for t in range(32):
+                        acc2 += p[h, t] * lv[h, t, d]
+                    lo[h, d] = acc2
+
+    return attention_variant
+
+
+def _attention_global():
+    """The softmax sum runs over both heads (one normalization across rows)."""
+    from allo.dataflow import region
+    from allo.spmw_match import exp
+
+    @region()
+    def attention_variant(
+        q: float16[2, 16],
+        kc: float16[2, 32, 16],
+        vc: float16[2, 32, 16],
+        o: float16[2, 16],
+    ):
+        @allo.work(mapping=[1], args=[q, kc, vc, o])
+        def attention(
+            lq: float16[2, 16],
+            lk: float16[2, 32, 16],
+            lv: float16[2, 32, 16],
+            lo: float16[2, 16],
+        ):
+            s: float16[2, 32] = 0.0
+            for h in range(2):
+                for t in range(32):
+                    acc: float16 = 0.0
+                    for d in range(16):
+                        acc += lq[h, d] * lk[h, t, d]
+                    s[h, t] = acc
+            for h in range(2):
+                for t in range(32):
+                    s[h, t] = exp(s[h, t])
+            total: float16 = 0.0
+            for h in range(2):
+                for t in range(32):
+                    total += s[h, t]
+            for h in range(2):
+                for t in range(32):
+                    s[h, t] = s[h, t] / total
+            for h in range(2):
+                for d in range(16):
+                    acc2: float16 = 0.0
+                    for t in range(32):
+                        acc2 += s[h, t] * lv[h, t, d]
+                    lo[h, d] = acc2
+
+    return attention_variant
+
+
+_ATTENTION_VARIANTS = {
+    "disconnected": _attention_disconnected,
+    "global": _attention_global,
+}
+
+
+@pytest.mark.parametrize(
+    "kind, reason",
+    [
+        ("disconnected", "not the score buffer"),
+        ("global", "not re-initialized per row"),
+    ],
+)
+def test_attacc_attention_requires_the_fused_dataflow(kind, reason):
+    """The fused attention inventory is selected only when the shared facts
+    prove score -> exp -> sum -> div -> context over one score buffer with a
+    per-row sum; a softmax over another buffer, or one normalized across
+    rows, is refused with the difference named (no source-name checks)."""
+    from allo.pim.attacc_tiling import AttAccDomainError
+
+    with pytest.raises(AttAccDomainError, match=reason):
+        _compile_attacc_with(_ATTENTION_VARIANTS[kind]())
+
+
+def test_attacc_ordinary_attention_still_lowers():
+    from benchmarks.attacc.workloads import attention_region
+
+    compiled = _compile_attacc_with(attention_region(2, 16, 32))
+    assert compiled.estimate().cycles == 465

@@ -701,3 +701,16 @@ under `/work/shared/users/phd/nz264/tenon-release-evidence/r25/`.
 | `tests/pim/test_shared_semantics.py` section v with the AttAcc, availability, residency and scatter rows (`r25/section_v.log`) | 15 passed |
 | regression batch on the round 25 tree (`r25/pytest_r25_batch.log`: `test_attacc_virtual.py` without the 500-instance row, `test_cent_aim_workloads.py`, `test_aim_token_partition.py`, `test_upmem_matcher.py`, the whole `test_shared_semantics.py`) | 170 passed, 14 skipped in 819 s |
 | G10 first measurements through `allo.compile` default shared selection (`r25/g10_*.log`, `r25/probe_rope_case_*.log`) | Samsung GEMV rows: default 4389 / 7947 / 8153 cycles, forced vendor layout 4435 / 8041 / 8247 (= paper), outputs within rtol 1e-2 of the fp32 reference; UPMEM: 16 of 16 rows exact (default and `paper_full`), NumPy-exact outputs; AiM: 10 of 14 rows exact (timing-only), the 4 RoPE rows corrected (X-19): qkvo_rope_l128 129637, full_block_l128 421191, full_block_l512 446835, full_block_l4096 697348 cycles against the paper's 129605, 421159, 446803, 697316; AttAcc: 500 of 500 instances select the paper's tiling through `allo.compile` (668,575 candidates, 1912 s); AiM regression after the re-upload modelling (`r25/pytest_aim_reupload.log`): 53 passed, 12 skipped |
+
+## Round 26 (2026-11-04): review findings X-18 (reopened) and X-20
+
+Same interpreter and `LLVM_BUILD_DIR`; checkout as working directory. Logs
+under `/work/shared/users/phd/nz264/tenon-release-evidence/r26/`.
+
+| Check (round 26 tree) | Result |
+|---|---|
+| the reviewer's `probe_slice_identity.py` (`reviewer-r25/`, unchanged; `r26/probe_slice_identity.log`) | `W[0:4]` is `FlatRange(0, 4)`; `W[0:4, 0, 0]` is the box `((0, 4), (0, 1), (0, 1))` with no flat range; the scalar `(1, 0, 0)` has flat offset 4; availability rejects `W[0:4, 0, 0]` naming the missing `[(0, 1), (0, 1), (1, 2)]` and accepts `W[0:4]` and `W[0, :, :]` |
+| the reviewer's `probe_attacc_dataflow.py` and `probe_attacc_global.py` (`r26/probe_attacc_*.log`) | the ordinary attention lowers to the 465-cycle inventory; the disconnected softmax is refused ("the exponential reads 'p' and writes 'p', not the score buffer 's' the first MAC writes"); the global normalization is refused ("the softmax sum is not re-initialized per row ... a normalization across rows is not the AttAcc softmax") |
+| `tests/pim/test_shared_semantics.py`, whole file on the final tree (`r26/pytest_shared_semantics_r26.log`; sections a-w, 119 tests) | 119 passed in 697 s |
+| regression batch (`r26/pytest_r26_batch.log`: `test_attacc_virtual.py` without the 500-instance row, the shared semantics, `test_aim_token_partition.py`, `test_cent_aim_workloads.py`, `test_upmem_matcher.py`) | 173 passed, 14 skipped, 3 failed in 812 s; the three failures were the first form of the section w tests (a wrong whole-row expectation for `W[0:4]`, and a Python variable captured inside a kernel body, which the frontend refuses), corrected before the whole-file run above |
+| pylint on `spmw_plan.py` and `attacc_tiling.py` (`r26/pylint_r26.log`) | no new findings beyond two docstrings (added) and the size notes on `_prove_attention_dataflow` recorded under P-23 |

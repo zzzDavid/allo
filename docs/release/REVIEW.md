@@ -927,6 +927,32 @@ values while naming the deviation. The direct selector call in the 500
 instance golden test does not establish shared selection; the measured
 route is `benchmarks/attacc/scripts/verify_paper_selection.py`.
 
+## Round 26 (2026-11-04): independent review of da041af; flat-range encoding, attention dataflow
+
+The reviewer accepted the G9 progress and the first G10 measurements and
+found two contract defects (`reviewer-r25/`). (1) The round 25 flat-slice
+repair had kept an ambiguous encoding (a flat range as a Cartesian box
+ending in unit dimensions), so a genuine Cartesian scatter of four scattered
+elements was taken as the flat prefix supplying a whole matrix. Judgment: a
+region is either a Cartesian box or a flat range, by type, never by shape
+(`spmw_plan.FlatRange`); every consumer was moved to the typed form and
+X-18 was reopened rather than left closed. (2) AttAcc recognized fused
+attention from operation names and extents only: a softmax over another
+buffer and a normalization across heads both lowered to the same inventory.
+Judgment: the fused template is selected only after a structural proof from
+the shared facts (value identities along score to exp to sum to div to
+context, own-element access relations, the sum's initializer scope under
+exactly the row loops, the division in the same row iteration); the proof
+reads the retained `accumulator_init` store effect, which is why the
+initializer scope is a shared fact and not a backend parser (X-20).
+
+G10 reporting corrected as the reviewer asked: the 500-instance selector
+equivalence is a diagnostic row; the published 398/500 timing-quality result
+stays UNVERIFIED without Ramulator2-AttAcc timings; the four corrected AiM
+rows are an OPEN 32-cycle regression against the paper, not parity.
+
+Gates G9 and G10 remain **FAIL**.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
