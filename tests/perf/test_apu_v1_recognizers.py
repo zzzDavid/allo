@@ -414,6 +414,22 @@ def _word_count(make_kernel, cross=False, **overrides):
     return make_kernel(source, fields["f"]), (fields["c"],)
 
 
+def test_record_frequency_loop_counters_are_the_papers_width(make_kernel):
+    # Release issue X-22: the 32-bit ARC loop counters introduced on
+    # 2026-11-02 cost 2.4% of the word count's device cycles for the same
+    # instruction count; the paper's program counted in 16 bits.
+    from allo.pim.apu_v1_record_frequency import loop_counter_type
+
+    assert loop_counter_type(128) == "uint16_t"
+    assert loop_counter_type(0xFFFF) == "uint16_t"
+    assert loop_counter_type(0x10000) == "uint32_t"
+    source = _compile(*_word_count(make_kernel)).device_source
+    assert "    uint16_t query = 0;" in source
+    assert source.count("for (uint16_t chunk = 0; chunk < FREQ_CHUNKS; ++chunk)") == 3
+    assert "for (uint16_t index = 0; index < FREQ_QUERIES; ++index)" in source
+    assert "uint32_t query" not in source and "uint32_t index" not in source
+
+
 def test_record_frequency_paper_and_renamed_kernels_emit_identical_gvml(make_kernel):
     paper = _compile(*_word_count(make_kernel))
     lowering = paper.native_vector_lowering

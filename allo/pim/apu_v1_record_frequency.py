@@ -72,6 +72,18 @@ def _query_image_values(queries: int, chunks: int) -> int:
     return math.ceil(queries * chunks / 256) * 256
 
 
+def loop_counter_type(queries: int) -> str:
+    """The C type of the ARC loop counters of the record-frequency kernel.
+
+    The store loop's counter reaches ``FREQ_QUERIES``, so 16-bit counters
+    are correct up to 65,535 queries; the chunk loops are bounded by the
+    vector-register file.  The width matters on the board: see
+    :meth:`emit_device_source`.
+    """
+
+    return "uint16_t" if 0 < queries <= 0xFFFF else "uint32_t"
+
+
 @dataclass(frozen=True)
 class APUv1RecordFrequencyAnalysis:
     """A proven nested-equality fixed-record frequency computation."""
@@ -420,6 +432,17 @@ class APUv1RecordFrequencyLowering:
     def emit_device_source(self) -> str:
         analysis = self.analysis
         count_tmp_vr = analysis.chunks
+        # The ARC loop counters are as narrow as the extents allow.  The
+        # paper's program counted queries and chunks in ``uint16_t``; the
+        # ``uint32_t`` counters introduced with the structural recognizer
+        # (2026-11-02) cost 2.4% on the board for the same instruction
+        # count (release issue X-22: in one session the current program
+        # measured 176,042 cycles, the same source with 16-bit counters
+        # 172,178, the paper-era source 171,984).  The counter reaches
+        # ``FREQ_QUERIES`` in the store loop, so 16 bits need
+        # ``FREQ_QUERIES <= 65535``; the chunk loops are bounded by the
+        # vector-register file (``FREQ_CHUNKS < 15``).
+        counter_t = loop_counter_type(analysis.queries)
         return f"""#include <stdint.h>
 
 #include <gsi/libsys/assert.h>
@@ -494,9 +517,9 @@ static int record_frequency(struct program_data *data)
             (enum gvml_vm_reg)chunk);
     }}
 
-    uint32_t query = 0;
+    {counter_t} query = 0;
     for (; query + 1 < FREQ_QUERIES; query += 2) {{
-        for (uint32_t chunk = 0; chunk < FREQ_CHUNKS; ++chunk) {{
+        for ({counter_t} chunk = 0; chunk < FREQ_CHUNKS; ++chunk) {{
             enum gvml_vr16 record_vr =
                 (enum gvml_vr16)(GVML_VR16_0 + chunk);
             gvml_eq_imm_16(
@@ -525,7 +548,7 @@ static int record_frequency(struct program_data *data)
         counts_l3[query + 1] = (uint16_t)second_count;
     }}
     if (query < FREQ_QUERIES) {{
-        for (uint32_t chunk = 0; chunk < FREQ_CHUNKS; ++chunk) {{
+        for ({counter_t} chunk = 0; chunk < FREQ_CHUNKS; ++chunk) {{
             enum gvml_vr16 record_vr =
                 (enum gvml_vr16)(GVML_VR16_0 + chunk);
             gvml_eq_imm_16(
@@ -540,7 +563,7 @@ static int record_frequency(struct program_data *data)
         counts_l3[query] = (uint16_t)count;
     }}
 
-    for (uint32_t index = 0; index < FREQ_QUERIES; ++index)
+    for ({counter_t} index = 0; index < FREQ_QUERIES; ++index)
         counts_l4[index] = counts_l3[index];
 
     PROF_END(total);
