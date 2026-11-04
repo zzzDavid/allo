@@ -3,13 +3,12 @@
 
 # Samsung bank/row swizzle: what the production program does and the route the paper row needs
 
-Status (round 33, 2026-11-04): diagnosis corrected and backed by the
-conductor's own address trace; the first production slice (a program-
-derived executable access stream, verified against the conductor and
-replayable on the harness) landed; the paper row
-`layout_samsung_xor_identity_vs_synthesized` (identity packing 148 cycles,
-synthesized XOR 116, PIMSimulator, two rounds of four requests replicated
-over 64 channels) stays UNVERIFIED for G10.
+Status (round 36, 2026-11-04): the tile-row levers are implemented through
+the shared pipeline and measured on the conductor (section "Round 36"
+below); the paper row `layout_samsung_xor_identity_vs_synthesized`
+(identity packing 148 cycles, synthesized XOR 116, PIMSimulator, two rounds
+of four requests replicated over 64 channels) is OPEN (measured with a
+program-level metric), not REPRODUCED.
 
 ## Correction of the round 32 diagnosis
 
@@ -95,7 +94,72 @@ placement), which this round did not produce; the cost model's
 `FIBER_TILE_CYCLES` surcharge for split fibers is an empirical term, not
 that attribution.
 
-## The route for the paper row (not yet implemented)
+## Round 36: the tile-row levers implemented through the shared pipeline
+
+The row pairing the paper's experiment needs cannot pair two *k-tiles*
+(two tiles need two vector slices in one GRF_A, which has one), so the
+production realization pairs the two physical rows of **one** tile: same
+vector slice, distinct GRF_B entries (`PIMRank::getGrfIdxHigh` selects the
+entry from the row's parity), accumulation order per entry unchanged, so
+the results are bit identical to `bank_row`. Three placements were added
+to `_samsung_enumerate` (every stage of the shared pipeline: candidate,
+the shared contract, legality at lowering, the plan the conductor
+executes, `check_realization` of the levers, the access-stream model):
+
+| placement | rows of a tile | barrier | lowering | conductor |
+|---|---|---|---|---|
+| `bank_row_rowpair` | both in the even fiber | one per pair (g, g+G/2) | vendor CRF, conductor issues the pair | `issue_order 1` |
+| `split_rows` | first in the even fiber, second in the odd fiber at the same column (the F2 `half -> bank` swizzle `optimal_swizzle` chooses) | one per group (vendor) | loop body `MAC even; MAC odd; JUMP` | `split_rows 1` |
+| `split_rows_rowpair` | split, one barrier per pair | refused at lowering (below) | | `issue_order 1 split_rows 1` |
+
+Measured on the real conductor through `allo.compile` with `layout=` and
+the vendor levers (host GRF_A fill, shared CRF), `tenon-release-evidence/
+r36/run2/rowpair_*.json`, outputs within 2.3e-4 of the FP32 product, the
+derived access stream byte-identical to the conductor's dump in every
+case, `pim_driver` sha256 `82db787a...`:
+
+| GEMV | placement | cycles | preload / exec / readback | results |
+|---|---|---|---|---|
+| 8192x256 | bank_row (identity rows, per-group barriers) | 8,153 | 5,628 / 2,216 / 309 | reference |
+| 8192x256 | dual_fiber (tiles alternate fibers) | 8,247 | 5,628 / 2,310 / 309 | |
+| 8192x256 | bank_row_rowpair (identity rows, one barrier per pair) | 53,634 | 5,628 / 47,697 / 309 | bit identical to bank_row |
+| 8192x256 | split_rows (XOR rows, per-group barriers) | 7,255 | 4,595 / 2,351 / 309 | bit identical to bank_row |
+| 4096x512 | bank_row | 7,947 | 5,628 / 2,138 / 181 | reference |
+| 4096x512 | dual_fiber | 8,041 | 5,628 / 2,232 / 181 | |
+| 4096x512 | bank_row_rowpair | 53,506 | 5,628 / 47,697 / 181 | bit identical |
+| 4096x512 | split_rows | 7,057 | 4,595 / 2,281 / 181 | bit identical |
+
+Findings. (1) Two rows of one bank inside one barrier group (the identity
+packing's conflict) cost 45,481 and 45,559 execution cycles for 16 pairs
+on the two shapes, about 2,845 per pair, far beyond tRP + tRCDRD: the
+barrier group waits on the row conflict across the fabric. (2) The XOR
+packing with the vendor's barrier structure (`split_rows`) is the fastest
+program on both shapes, 1.124x and 1.126x over `bank_row`, with the gain
+in the staging phase (4,595 against 5,628) and a small execution loss
+(2,351 against 2,216). (3) `split_rows_rowpair` executed but produced
+wrong results (max error 0.14 and 0.18 against 1.4e-4): with two banks
+inside one barrier group the memory controller may reorder the two banks'
+column commands while the PIM's lockstep CRF executes fixed-bank MAC
+instructions (`PIMOpdType::EVEN_BANK`/`ODD_BANK`; the simulator's
+"CRF bank coding and bank id from packet are inconsistent" warning is
+compiled out of the release build, so the cause is inferred from the ISA
+and the symptom, not logged). The ISA has no bank-agnostic operand, so
+that placement is enumerated and refused at lowering with this reason.
+(4) The cost model prices `split_rows` above `bank_row` (301 against 253
+for 8192x256) because the staging saving is outside the MAC rule; the
+default selection therefore still picks `bank_row` (S-14).
+
+What this means for the paper row. The paper's four-request probe
+measures within-round bank conflicts on plain reads (148 against 116,
+1.28x). The production program cannot issue two banks inside one barrier
+group, so that exact mechanism is unreachable; what the shared pipeline
+does reach is the same layout choice (identity rows in one bank against
+XOR rows across the fibers) under the PIM's barrier discipline, where the
+XOR packing is 1.12-1.13x faster on the whole program. The inventory row
+is therefore OPEN (measured through the shared pipeline with a different,
+program-level metric), not REPRODUCED.
+
+## The route for the paper row as first specified (superseded above)
 
 The paper's experiment needs two rows of one bank inside one barrier
 group, which the REDUCE lowering never issues. Making it an ordinary-
