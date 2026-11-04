@@ -908,18 +908,35 @@ def samsung_half_fibers(placement) -> tuple:
     layout = extra.get("half_bank_map")
     if layout is None:
         return (0, 0)
+    if tuple(layout.out_dims) != ("bank",) or tuple(layout.out_sizes) != (2,):
+        raise ValueError(
+            f"half_bank_map must map into the two fibers (bank,) of size 2, got "
+            f"{tuple(layout.out_dims)} {tuple(layout.out_sizes)}"
+        )
+    if sorted(layout.bases) != ["bank", "half"] or layout.size_of("half") != 2:
+        raise ValueError("half_bank_map takes the inputs {bank, half} with two halves")
+    bank_index = layout.out_dims.index("bank")
+    # The lowering realizes only the half -> fiber choice: a tile's base
+    # fiber is the bank input itself (the bank basis must be the identity;
+    # a map that permutes or collapses the bank input describes something
+    # the lowering does not do and is refused).
+    for bank in range(layout.size_of("bank")):
+        if int(layout.apply(bank=bank, half=0)[bank_index]) != bank:
+            raise ValueError(
+                "half_bank_map must keep the bank input as the tile's base fiber "
+                f"(bank {bank}, half 0 maps to fiber "
+                f"{int(layout.apply(bank=bank, half=0)[bank_index])})"
+            )
     halves = []
     for half in (0, 1):
         try:
             physical = layout.apply(bank=0, half=half)
         except Exception as error:
             raise ValueError(f"half_bank_map cannot place half {half}: {error}")
-        bank = int(physical[layout.out_dims.index("bank")])
+        bank = int(physical[bank_index])
         if bank not in (0, 1):
             raise ValueError(f"half_bank_map places half {half} in bank {bank}, not a fiber")
         halves.append(bank)
-    if halves[0] != 0:
-        raise ValueError("half_bank_map must keep a tile's first row in its base (even) fiber")
     return tuple(halves)
 
 

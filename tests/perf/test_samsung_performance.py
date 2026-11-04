@@ -97,8 +97,9 @@ def test_virtual_graph_includes_shape_aware_host_transfers():
 
     # The accumulator lives in GRF_B, so the plan materializes its load and
     # drain around the MAC; the host moves bracket the device program.  Since
-    # round 37 the MAC rule adds the first matrix staging as a second step of
-    # the MAC event (``mac_stage``, the conductor's staging schedule).
+    # round 37 the MAC event also carries this work item's share of the first
+    # matrix staging (``mac_stage``), which precedes the MAC as the conductor
+    # stages before it executes (round 38).
     assert [activity.primitive for activity in graph.activities] == [
         "samsung_hbm_pim/host/SCATTER_BANKS",
         "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/LD_B",
@@ -107,7 +108,9 @@ def test_virtual_graph_includes_shape_aware_host_transfers():
         "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/ST_B",
         "samsung_hbm_pim/host/GATHER_BANKS",
     ]
-    assert [activity.label for activity in graph.activities][2:4] == ["mac", "mac_stage"]
+    assert [activity.label for activity in graph.activities][2:4] == ["mac_stage", "mac"]
+    stage, mac = graph.activities[2], graph.activities[3]
+    assert stage.id in mac.depends_on
     # Host moves are priced from their buffer bytes (64 B scatter -> 4 cycles,
     # 32 B gather -> 3 cycles) and serialize with the device program.
     device_only = bound.evaluate(
@@ -251,3 +254,64 @@ def test_reduce_run_zero_pads_into_physical_slots(monkeypatch, tmp_path):
     assert "k_tiles 11" in captured["plan"]
     assert result["padding_fraction"] == pytest.approx(1 - 1024 / 4096)
     assert result["rows"].shape == (1, 1024)
+
+
+def test_staging_shares_partition_the_conductors_staging():
+    """Round 38 (reviewer): a work item is charged its own rows' share of the
+    first staging, the shares of a kernel's work items partition the
+    conductor's staging exactly, equal work gives equal cost, rows scale it,
+    and the staging precedes the MAC; the same scope prices the ordered
+    program."""
+    from allo.perf import CostEvent, ExecutionGraph
+    from allo.pim.costs.samsung import (
+        STAGE_ROW_CHANGE_CYCLES,
+        STAGE_WRITE_CYCLES,
+        samsung_staging_cycles,
+        samsung_staging_schedule,
+        samsung_staging_share,
+    )
+
+    target = build_samsung_target()
+    bound = samsung_cost.bind(target)
+
+    def staged(rows, k, candidate=None):
+        graph = ExecutionGraph()
+        event = CostEvent.create(
+            "mac", target.op("MAC"), work_id=(0, 0),
+            metrics={"loop_extents": (rows, k), "reduction_extent": k, "lanes": 16,
+                     "n_fibers": 1, "candidate": candidate or {}},
+        )
+        bound.emit(graph, event)
+        labels = [a.label for a in graph.activities]
+        assert labels[:2] == ["mac_stage", "mac"], labels
+        assert graph.activities[0].id in graph.activities[1].depends_on
+        return graph.activities[0].latency_cycles
+
+    # Equal padded bursts (1,024), equal cost; rows scale a bus-bound share
+    # linearly; a share too small to fill its bank's row occupancy (8 rows,
+    # 64 writes) sits on that floor rather than scaling below it.
+    assert staged(64, 256) == staged(32, 512) == staged(128, 128)
+    assert staged(1024, 128) == 8 * staged(128, 128)
+    G, E = int(target.grf_b.slots), int(target.grf_a.slots)
+    small = samsung_staging_share(8, 128, G=G, E=E, lanes=16)
+    assert staged(8, 128) == small["latency"] == max(small["bus_cycles"], small["bank_cycles"])
+    assert small["bank_cycles"] > small["bus_cycles"] and small["writes"] == 64
+    # The paper GEMV (8192 x 256) as its 128 work items of 64 rows: the shares
+    # sum to the conductor's staging (64 channels x 2,048 writes per channel,
+    # 32 exposed row changes per channel for the vendor rows, none when the
+    # second rows sit in the odd fiber), i.e. to the whole-pass schedule.
+    for split in (False, True):
+        share = samsung_staging_share(64, 256, G=G, E=E, lanes=16, split_rows=split)
+        total_writes = 128 * share["writes"]
+        total_exposed = 128 * share["exposed_row_changes"]
+        schedule = samsung_staging_schedule(2, 2, 1, (0, 1) if split else (0, 0), G, E, 32, 8)
+        whole = samsung_staging_cycles(schedule)
+        assert total_writes == 64 * whole["writes"] == 64 * 2048
+        assert total_exposed == 64 * whole["exposed_row_changes"] == (0 if split else 64 * 32)
+        assert share["bus_cycles"] == share["writes"] * STAGE_WRITE_CYCLES + share["exposed_row_changes"] * STAGE_ROW_CHANGE_CYCLES
+    # The split rows remove the exposed changes: a cheaper share, the
+    # ranking the conductor confirms (VALIDATION rounds 37-38).
+    assert staged(64, 256, {"tile_rows": "split_fibers"}) < staged(64, 256)
+    # The ordered program carries the same scope (its own preload pattern).
+    temporal = staged(64, 256, {"reduction_program": "temporal"})
+    assert temporal == samsung_staging_share(64, 256, G=G, E=E, lanes=16, temporal=True)["latency"] > 0

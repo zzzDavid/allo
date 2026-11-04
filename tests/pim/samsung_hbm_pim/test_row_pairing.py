@@ -269,3 +269,46 @@ def test_the_selected_map_is_the_contract_not_a_label(monkeypatch):
     compiled = allo.compile(fn, target, samsung_cost, reduction_order="reassociate", backend="virtual",
                             layout=[split] * len(buckets))
     assert compiled.compiled.layout_ctx.programs[0].half_fibers == (0, 1)
+
+
+def test_supplied_declarations_must_match_axes_and_a_valid_map():
+    """Reviewer round 37: a supplied declaration whose matrix axes were
+    emptied (coverage still complete through the other values) is rejected
+    at validation and at the compile boundary, and a map that does not keep
+    the bank input as the tile's base fiber is refused."""
+    from dataclasses import replace
+
+    from allo.spmw_candidate import validate_candidate_effects
+    from allo.spmw_linear_layout import LinearLayout
+    from allo.spmw_samsung import samsung_half_fibers
+
+    fn, _m, _k = _WORKLOAD.CASES["gemv_m8192_k256"]
+    target, buckets, candidates = _candidates(fn)
+    matches = buckets[0][1]
+    split = _vendor_levers(candidates, buckets, "split_rows")[0]
+    effects = split.extra["effects"]
+    matrix = next(v for v in effects.value_layouts if v.storage == "banks" and v.value in effects.coverage.inputs)
+    split.extra["effects"] = replace(
+        effects,
+        value_layouts=tuple(replace(v, axes=()) if v is matrix else v for v in effects.value_layouts),
+    )
+    try:
+        problems = validate_candidate_effects(matches, split, target)
+        assert any("laid out over axes ()" in p for p in problems), problems
+        with pytest.raises(Exception, match="laid out over axes"):
+            allo.compile(fn, target, samsung_cost, reduction_order="reassociate", backend="virtual",
+                         layout=[split] * len(buckets))
+    finally:
+        split.extra["effects"] = effects
+    original_map = split.extra["half_bank_map"]
+    split.extra["half_bank_map"] = LinearLayout({"bank": [(0,)], "half": [(1,)]}, ("bank",), (2,))
+    try:
+        with pytest.raises(ValueError, match="base fiber"):
+            samsung_half_fibers(split)
+        problems = validate_candidate_effects(matches, split, target)
+        assert any("selected map is invalid" in p or "base fiber" in p for p in problems), problems
+        with pytest.raises(Exception, match="base fiber|contract"):
+            allo.compile(fn, target, samsung_cost, reduction_order="reassociate", backend="virtual",
+                         layout=[split] * len(buckets))
+    finally:
+        split.extra["half_bank_map"] = original_map

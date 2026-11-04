@@ -104,26 +104,40 @@ TEMPORAL_PASS_CYCLES = 681
 # every tile's second row in the odd fiber and pays the odd-fiber row-open
 # cost per tile (FIBER_TILE_CYCLES, the empirical odd-fiber term above).
 ROW_PAIR_SAME_BANK_CYCLES = 2845
-# First matrix staging (added in round 37, scope change: the estimate now
-# includes the first staging of the bank-resident matrix, the phase the
-# conductor reports as "preload").  The staging schedule is the conductor's
-# (`stage_matrix` in TenonConductor.inc; `samsung_staging_schedule` below
-# reproduces its channel-0 bank/row sequence and is checked against the
-# conductor's address dump): per pass, tile and PIM block, G*E = 64
+# First matrix staging (rounds 37-38, scope change: the estimate includes
+# the first staging of the bank-resident matrix, the phase the conductor
+# reports as "preload", for every family).  The staging schedule is the
+# conductor's (`stage_matrix` in TenonConductor.inc; `samsung_staging_schedule`
+# below reproduces its channel-0 bank/row sequence and is checked against
+# the conductor's address dump): per pass, tile and PIM block, G*E = 64
 # consecutive column writes to the tile's fiber, so the two physical rows
 # of a tile are written back to back in one bank unless the selected half
-# -> bank map places the second row in the partner fiber.  Priced from the
-# device ini (HBM2_samsung_2M_16B_x64.ini): a column write every tCCDS = 2
-# memory clocks on the channel (writes alternate banks between blocks), and
-# an exposed in-run row change in one bank costing the write recovery, the
-# precharge and the activate less the spacing it replaces,
-# tWR + tRP + tRCDWR - tCCDL = 16 + 14 + 10 - 4 = 36.  Measured preload of
-# the 8192x256 and 4096x512 GEMVs: 5,628 (both rows in one bank: 32 exposed
-# changes) against 4,595 (second row in the odd fiber: none); the model
-# gives 5,248 against 4,096, the right order and a gap of 1,152 against the
-# measured 1,033 (VALIDATION round 37).  No constant is fitted.
+# -> bank map places the second row in the partner fiber.  Each work item
+# is charged its own rows' share (`samsung_staging_share`; the shares of a
+# kernel's work items partition the staging, checked in the tests), and
+# the staging precedes the MAC.  Priced from the device ini
+# (HBM2_samsung_2M_16B_x64.ini): a column write every tCCDS = 2 memory
+# clocks on the channel (writes alternate banks between blocks), an exposed
+# in-run row change in one bank stalling the bus for the write recovery,
+# the precharge and the activate less the spacing it replaces,
+# tWR + tRP + tRCDWR - tCCDL = 16 + 14 + 10 - 4 = 36, and each bank, in
+# parallel with the others, occupied tWR + tRP + tRCDWR = 40 per row it is
+# written in.  Measured preload of the 8192x256 and 4096x512 GEMVs: 5,628
+# (both rows in one bank: 32 exposed changes per channel) against 4,595
+# (second row in the odd fiber: none); the model gives 5,248 against 4,096,
+# the right order and a gap of 1,152 against the measured 1,033.  No
+# constant is fitted.
 STAGE_WRITE_CYCLES = 2  # tCCDS
 STAGE_ROW_CHANGE_CYCLES = 16 + 14 + 10 - 4  # tWR + tRP + tRCDWR - tCCDL
+# A bank's occupancy per row it is written in: write recovery, precharge and
+# activate (tWR + tRP + tRCDWR = 40); banks work in parallel, so this is a
+# latency, not channel time.  The ordered program's preload writes one burst
+# per PIM block per reduction element, each at a new row of the even bank
+# (TemporalReduce.inc): its staging is bank-bound (K=256: modelled 10,794
+# per row tile and column against the measured 12,851, 16% low) while the
+# REDUCE programs' is bus-bound (modelled 5,248 / 4,096 against 5,628 /
+# 4,595).  Same scope for every family: the first staging of the matrix.
+STAGE_ROW_VISIT_CYCLES = 16 + 14 + 10  # tWR + tRP + tRCDWR
 
 
 def samsung_staging_schedule(passes, tiles, fibers, half_fibers, G, E, cols_per_row, blocks):
@@ -157,20 +171,84 @@ def samsung_staging_schedule(passes, tiles, fibers, half_fibers, G, E, cols_per_
 
 
 def samsung_staging_cycles(sequence) -> dict:
-    """Price a staging sequence: one write every STAGE_WRITE_CYCLES on the
-    channel, plus STAGE_ROW_CHANGE_CYCLES for every row change between
-    consecutive writes to the same bank (a row change hidden behind writes
-    to other banks is not charged)."""
+    """Price a staging sequence (channel 0): the channel bus takes every
+    write (STAGE_WRITE_CYCLES) and stalls for a row change between
+    consecutive writes to the same bank (STAGE_ROW_CHANGE_CYCLES); each
+    bank, in parallel with the others, is occupied STAGE_ROW_VISIT_CYCLES
+    per row it is written in plus its writes.  The staging takes the longer
+    of the bus and the busiest bank."""
     exposed = 0
     previous = None
+    visits = {}
+    writes_per_bank = {}
+    last_row = {}
     for bank, row in sequence:
         if previous is not None and previous[0] == bank and previous[1] != row:
             exposed += 1
         previous = (bank, row)
+        writes_per_bank[bank] = writes_per_bank.get(bank, 0) + 1
+        if last_row.get(bank) != row:
+            visits[bank] = visits.get(bank, 0) + 1
+            last_row[bank] = row
+    bus = len(sequence) * STAGE_WRITE_CYCLES + exposed * STAGE_ROW_CHANGE_CYCLES
+    bank = max(
+        (visits[b] * STAGE_ROW_VISIT_CYCLES + writes_per_bank[b] * STAGE_WRITE_CYCLES
+         for b in visits),
+        default=0,
+    )
     return {
         "writes": len(sequence),
         "exposed_row_changes": exposed,
-        "cycles": len(sequence) * STAGE_WRITE_CYCLES + exposed * STAGE_ROW_CHANGE_CYCLES,
+        "bus_cycles": bus,
+        "bank_cycles": bank,
+        "cycles": max(bus, bank),
+    }
+
+
+def samsung_staging_share(
+    rows, reduction, *, G, E, lanes, cols_per_row=32, split_rows=False,
+    temporal=False, columns=1,
+) -> dict:
+    """One work item's share of the program's first matrix staging, so that
+    the shares of a kernel's work items partition the conductor's staging
+    without duplication (checked against the staging dump in the tests).
+
+    REDUCE: the item's rows occupy ceil(rows / G) PIM-block row groups; each
+    group receives, per reduction tile, one run of G*E consecutive column
+    writes in the tile's fiber (64 columns = two physical rows), so the run
+    has one exposed row change unless the selected map splits the rows over
+    the two fibers (then two runs of G*E/2 in two banks, no exposed change).
+    Ordered program: ceil(rows / lanes) blocks receive one write per
+    reduction element (and the initial accumulator), each at a new row of
+    the even bank, per column.  Returns the bus time (channel occupancy),
+    the bank time (a latency, banks in parallel) and the item's latency.
+    """
+    if temporal:
+        blocks = _ceil_div(rows, lanes)
+        writes = blocks * (reduction + 1) * columns
+        exposed = 0
+        bank = (reduction + 1) * columns * (STAGE_ROW_VISIT_CYCLES + STAGE_WRITE_CYCLES)
+    else:
+        tile = E * lanes
+        tiles = max(1, _ceil_div(reduction, tile))
+        groups = _ceil_div(rows, G)
+        run = G * E
+        writes = groups * tiles * run
+        if split_rows:
+            exposed = 0
+            # per group, each of the two banks: `tiles` visits of run/2 writes
+            bank = tiles * (STAGE_ROW_VISIT_CYCLES + (run // 2) * STAGE_WRITE_CYCLES)
+        else:
+            exposed = groups * tiles
+            # per group, one bank: `tiles` runs of two rows each
+            bank = tiles * (2 * STAGE_ROW_VISIT_CYCLES + run * STAGE_WRITE_CYCLES)
+    bus = writes * STAGE_WRITE_CYCLES + exposed * STAGE_ROW_CHANGE_CYCLES
+    return {
+        "writes": writes,
+        "exposed_row_changes": exposed,
+        "bus_cycles": bus,
+        "bank_cycles": bank,
+        "latency": max(bus, bank),
     }
 
 
@@ -198,6 +276,16 @@ def samsung_cost(target):
             name=event.primitive.name.lower(),
         )
 
+    def stage(event, ctx, share):
+        # The first matrix staging (the conductor's preload phase): the bus
+        # part occupies the channel, the bank part is latency only (banks in
+        # parallel); it precedes the MAC, as the conductor stages first.
+        ctx.step(
+            latency=share["latency"],
+            occupy=[ctx.use(channel, cycles=share["bus_cycles"])],
+            name="mac_stage",
+        )
+
     def temporal_mac(event, ctx):
         # One output row per FP16 lane; the reduction is issued element by
         # element, so each pass costs K steps whatever the fiber layout.
@@ -206,6 +294,13 @@ def samsung_cost(target):
         rows = int(extents[0]) if len(extents) > 1 else 1
         columns = int(extents[1]) if len(extents) == 3 else 1
         lanes16 = int(target.grf_b.width) // 16
+        stage(
+            event, ctx,
+            samsung_staging_share(
+                rows, reduction, G=int(target.grf_b.slots), E=int(target.grf_a.slots),
+                lanes=lanes16, temporal=True, columns=columns,
+            ),
+        )
         passes = _ceil_div(rows, lanes16) * columns
         latency = passes * (reduction * TEMPORAL_STEP_CYCLES + TEMPORAL_PASS_CYCLES)
         occupy_compute(event, ctx, latency, MAC_CYCLES)
@@ -242,37 +337,19 @@ def samsung_cost(target):
         if candidate.get("issue_order") == "row_pair" and not split_rows:
             groups_per_tile = int(target.grf_b.slots)
             latency += tiles * (groups_per_tile // 2) * ROW_PAIR_SAME_BANK_CYCLES
+        # This work item's share of the first matrix staging (its own rows'
+        # bursts; the shares of a kernel's work items partition the
+        # conductor's staging), before the MAC.
+        extents_stage = tuple(event.metrics.get("loop_extents", ()) or ())
+        rows_stage = int(extents_stage[0]) if len(extents_stage) > 1 else 1
+        stage(
+            event, ctx,
+            samsung_staging_share(
+                rows_stage, reduction, G=int(target.grf_b.slots),
+                E=int(target.grf_a.slots), lanes=lanes, split_rows=split_rows,
+            ),
+        )
         occupy_compute(event, ctx, latency, MAC_CYCLES)
-        # First matrix staging (scope: the conductor's preload phase of the
-        # bank-resident matrix), from the staging schedule of this placement.
-        if not candidate.get("reduction_program") == "temporal":
-            from ...spmw_samsung import samsung_target_facts
-
-            facts = samsung_target_facts(target)
-            extents = tuple(event.metrics.get("loop_extents", ()) or ())
-            rows = int(extents[0]) if len(extents) > 1 else 1
-            G = int(target.grf_b.slots)
-            E = int(target.grf_a.slots)
-            blocks = int(facts.pim_blocks)
-            # One work item's rows are staged as passes of the declared device
-            # (its pseudo-channel count, like every other term of this graph:
-            # the declared 16 x 8 grid maps each work item's rows onto one
-            # channel's PIM blocks, so a work item of P*G rows is one pass of
-            # its channel).  Absolute values follow the declared device, the
-            # conductor's 64-channel system differs by the channel count; the
-            # ranking is what the model is judged on (module docstring).
-            channels = int(facts.channels)
-            passes = _ceil_div(rows, channels * blocks * G)
-            half_fibers = (0, 1) if split_rows else (0, 0)
-            schedule = samsung_staging_schedule(
-                passes, tiles, fibers, half_fibers, G, E, 32, blocks
-            )
-            staging = samsung_staging_cycles(schedule)
-            ctx.step(
-                latency=staging["cycles"],
-                occupy=[ctx.use(channel, cycles=staging["cycles"])],
-                name="mac_stage",
-            )
         # Several reduction columns (GEMM N, batched GEMV) with a restaged
         # matrix: each extra column rewrites this work item's matrix rows
         # (rows x K/16 bursts) over its pseudo-channel before its pass;

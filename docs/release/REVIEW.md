@@ -1336,6 +1336,28 @@ declared device and are compared by ranking only, as the module states.
 The XOR paper row stays OPEN (program-level metric); the cost-model issue
 is S-16 (the earlier S-14 label collided with the output-binding issue).
 
+## Round 38 (2026-11-04): independent review of c29287d; the staging accounting and the declaration axes
+
+The reviewer accepted the map-to-packing-to-conductor repair and found
+two gaps: the staging term charged every work-item event a whole-fabric
+pass divided by the fabric (equal work priced differently, rows not
+scaling, the temporal family outside the scope, the staging after the MAC),
+and the declaration checks compared storage and packing but not the
+semantic axes, so an emptied matrix layout passed through coverage.
+Judgment: both accepted. Each work item is now charged its own rows' share
+of the realized staging (bus time on the channel, the bank's row occupancy
+as latency with banks in parallel), the shares partition the conductor's
+staging exactly (checked against the dump counts for the paper GEMV), the
+staging precedes the MAC, and the ordered program carries the same scope
+from its own preload pattern; the declaration checks compare axes, a
+supplied declaration that disagrees on any realized field is refused rather
+than replaced, and the map must keep the bank input as the base fiber.
+With the repaired accounting the default still selects the swizzled rows on
+both paper GEMVs, the held-out 37x129x2 and the reviewer's 19x65x3, the
+measured fastest wherever measured. S-16 is repaired with its remaining
+scope stated (declared-device absolutes; the ordered program's preload 16%
+under its measurement). The XOR paper row stays OPEN (probe metric).
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1375,7 +1397,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 37 (2026-11-04) at the candidate `4378bf7`+ (this
+Refreshed in round 38 (2026-11-04) at the candidate `c29287d`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |
@@ -1384,7 +1406,7 @@ commit). Earlier judgments are kept in the round sections above.
 | G2 semantic preservation / explicit failure | **PARTIAL** | the rounds 8-11 repairs (C-19 to C-26) and the shared contract rounds (X-02 to X-14, X-17 to X-20) are implemented with regressions; the shared semantic checks run before every backend's selection; open: the deferred arithmetic findings (ISSUES), independent re-challenge of the whole domain on every runner |
 | G3 general mechanisms | **PARTIAL** | structural recognizers and template-derived legality on every backend; the AttAcc attention template is proven structurally (X-20); renamed and neighbouring programs compile to the same normalized decisions in the round 24-28 regressions; open: M-14, the constants inventory re-read against the current tree |
 | G4 search/layout/selected-program integrity | **PARTIAL** | complete assignments materialize under the real orchestration before acceptance (C-33b); every backend's realization is compared with its declaration (X-05 to X-16); transfer availability and physical addressing are checked (X-09 to X-11, X-17, X-18); open: the slice 5 forced-alternative traces through packing and launches on both hardware hosts |
-| G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1 in earlier rounds; the Samsung estimate includes the first matrix staging from the conductor's schedule and ranks the swizzled-rows placement first on both paper GEMVs and a held-out shape, as the conductor measures (round 37, S-16 repaired); open: C-18, uniform movement weights, the perturbation traces at the current candidate on both hardware hosts |
+| G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1 in earlier rounds; the Samsung estimate includes each work item's share of the first matrix staging (partitioning the conductor's staging exactly, staging before the MAC, the same scope for the ordered program) and ranks the swizzled-rows placement first on both paper GEMVs, a held-out and a neighbouring shape, as the conductor measures (rounds 37-38, S-16 repaired); open: C-18, uniform movement weights, the perturbation traces at the current candidate on both hardware hosts |
 | G6 evidence beyond examples | **PARTIAL** | EVIDENCE.md plus the reviewer-driven probes of rounds 8-27 (renamings, operation changes, shape and slice neighbours, wrong declarations, reversed arithmetic); open: hardware-only confirmations, the probe list re-run at the candidate |
 | G7 install/interfaces/maintainability | **PARTIAL** | installed-artifact runs at `7bdb475`, `e60973f`, `9255d29`; architecture docs follow the pipeline (`design/shared-compilation-path.md`); open: a fresh install at the candidate, the Samsung patches (P-04), P-23 lint, the public-payload review |
 | G8 backend execution | **PARTIAL** | installed-artifact evidence on the simulators at `69773fc` (Samsung, AiM, UPMEM probes, no checkout module loaded) and on the APU v1 board and the Gemini-II card at `69773fc`/`28cc922` (round 30: the archived paired protocols with the baselines re-run, exact outputs, device locks, launch provenance on every route); `tests/perf` at `69773fc` (545 passed, the one failure an NFS-tmpdir artifact fixed in `d2e3fda`), `tests/pim` at `69773fc` 564 passed with 20 Docker-backed simulator tests failing on the host's full `/var` (containerd ENOSPC, an administrator matter; the same rows passed from the installed wheel earlier in the round); open: the 20 simulator tests re-run when the host has space, the suites and installed-wheel checks at the final round 30 candidate, the ledag scratch fix (X-24) exercised only through its unit test and the sessions 3 and later |

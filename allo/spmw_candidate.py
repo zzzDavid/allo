@@ -931,6 +931,12 @@ def _derivation_problems(view, matches, placement, effects) -> list:
                 f"derivation from the placement's selected map and handles gives "
                 f"{derived_layout.storage!r} packing {derived_layout.packing!r}"
             )
+        if tuple(declared_layout.axes) != tuple(derived_layout.axes):
+            problems.append(
+                f"declares {derived_layout.value!r} laid out over axes "
+                f"{tuple(declared_layout.axes)}; the derivation from the program's "
+                f"facts gives {tuple(derived_layout.axes)}"
+            )
         if str(derived_layout.packing or "").startswith("invalid:"):
             problems.append(
                 f"the placement's selected map is invalid for {derived_layout.value!r}: "
@@ -965,6 +971,13 @@ def _declaration_disagreements(declared, current) -> list:
                 f"declares {mine.value!r} in storage {mine.storage!r} packing "
                 f"{mine.packing!r}; the current candidate with the same decision "
                 f"declares {theirs.storage!r} packing {theirs.packing!r}"
+            )
+        # The semantic axes a value is laid out over are the program's loop
+        # labels, the same in every body of a lockstep kernel.
+        if tuple(mine.axes) != tuple(theirs.axes):
+            problems.append(
+                f"declares {mine.value!r} laid out over axes {tuple(mine.axes)}; the "
+                f"current candidate with the same decision declares {tuple(theirs.axes)}"
             )
     if len(declared.transfers) != len(current.transfers):
         problems.append(
