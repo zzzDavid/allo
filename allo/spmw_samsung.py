@@ -15,6 +15,7 @@ microcode.  Contract: ``docs/release/design/samsung-execution.md``.
 from __future__ import annotations
 
 import math
+from collections import Counter
 import re
 import subprocess
 import tempfile
@@ -2008,6 +2009,231 @@ def _row_map_digest(values) -> str:
         digest ^= int(value)
         digest = (digest * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return f"{digest:016x}"
+
+
+# --------------------------------------------------------------------- #
+# Executable access stream of a lowered REDUCE program
+# --------------------------------------------------------------------- #
+
+# Samsung HBM-PIM geometry the conductor reports (`pim_driver --describe`);
+# used when the simulator is not installed.  cols_per_row is NUM_COLS / BL.
+SAMSUNG_DEFAULT_GEOMETRY = {
+    "channels": 64,
+    "ranks": 1,
+    "pim_blocks": 8,
+    "banks": 16,
+    "bank_groups": 4,
+    "cols_per_row": 32,
+    "rows": 16384,
+}
+
+
+@dataclass(frozen=True)
+class SamsungAccess:
+    """One normalized DRAM transaction of channel 0 (the other channels
+    receive the same address): bank within the PIM unit's pair for the
+    all-bank PIM commands, physical row after the column-to-row carry of
+    ``PIMAddrManager::addrGenSafe``, burst column."""
+
+    write: bool
+    bank: int
+    row: int
+    column: int
+
+
+@dataclass(frozen=True)
+class SamsungAccessRound:
+    """Transactions issued together and closed by one barrier on every
+    channel, in the conductor's order.  ``kind`` is MAC (a matrix tile's
+    auto-MAC group, E columns), FILL (a CRF-issued GRF_A fill from the even
+    bank), HOST_FILL (the host's GRF_A broadcast, no bank transaction) or
+    DRAIN (the GRF_B writeback, G columns to the odd bank)."""
+
+    index: int
+    column_index: int  # vector n
+    pass_index: int  # output tile j
+    kind: str
+    fiber: int | None
+    tile: int | None
+    group: int | None
+    accesses: tuple
+
+    @property
+    def rows(self) -> tuple:
+        return tuple(sorted({a.row for a in self.accesses}))
+
+
+def _normalized(cols_per_row: int, column: int) -> tuple:
+    return divmod(int(column), int(cols_per_row))
+
+
+def samsung_reduce_access_stream(
+    program: SamsungProgram, geometry: dict, columns: int = 1, weight_resident=None
+) -> list:
+    """The transaction stream the conductor issues for ``program`` during its
+    passes, derived from the lowered program (``binds``, ``tile_fiber``,
+    ``k_tiles``, ``rows_per_block``, ``vector_from_bank``) and the simulated
+    geometry, in the order ``TenonConductor.inc`` ``run_pass`` executes the
+    CRF: one round per barrier.
+
+    Columns follow the conductor: a matrix tile occupies ``G*E`` consecutive
+    columns of its fiber at ``(pass * tiles_on_fiber + local) * G*E``; the
+    vectors sit after the matrix in the even bank and the drained results
+    after the matrix in the odd bank; ``addrGenSafe`` carries column
+    overflow into the row (``cols_per_row`` burst columns per row), so a
+    tile of 64 columns spans two physical rows.  Matrix staging, CRF
+    programming, mode changes and readback are not part of the stream.
+    """
+
+    facts = program.facts
+    if program.kind != "REDUCE":
+        raise ValueError(f"access stream of a {program.kind} program is not modelled")
+    G, E, T = program.rows_per_block, facts.grf_a_entries, program.k_tiles
+    C, P = int(geometry["channels"]), int(geometry.get("pim_blocks", facts.pim_blocks))
+    cols_per_row = int(geometry["cols_per_row"])
+    J = math.ceil(program.rows / (C * P * G))
+    tile_cols = G * E
+    fiber_tiles = {
+        f: [t for t in range(T) if program.tile_fiber[t] == f] for f in (0, 1)
+    }
+    local = {t: fiber_tiles[program.tile_fiber[t]].index(t) for t in range(T)}
+    vector_base = J * len(fiber_tiles[0]) * tile_cols
+    result_base = J * len(fiber_tiles[1]) * tile_cols
+    N = int(columns)
+    rounds = []
+
+    def add(kind, n, j, fiber, tile, group, write, bank, first_col, count):
+        accesses = []
+        for k in range(count):
+            row, col = _normalized(cols_per_row, first_col + k)
+            accesses.append(SamsungAccess(write, bank, row, col))
+        rounds.append(
+            SamsungAccessRound(
+                len(rounds), n, j, kind, fiber, tile, group, tuple(accesses)
+            )
+        )
+
+    for n in range(N):
+        for j in range(J):
+            groups = {0: 0, 1: 0}
+            filled = None
+            for _pc, kind, fiber, _operand, _offset in program.binds:
+                if kind == "matrix":
+                    f = int(fiber)
+                    tiles = fiber_tiles[f]
+                    count = G if program.vector_from_bank else G * len(tiles)
+                    for _ in range(count):
+                        e = groups[f]
+                        groups[f] += 1
+                        loc, grp = divmod(e, G)
+                        tile = tiles[loc]
+                        if not program.vector_from_bank and grp == 0:
+                            rounds.append(
+                                SamsungAccessRound(
+                                    len(rounds), n, j, "HOST_FILL", None, tile, 0, ()
+                                )
+                            )
+                        col = (j * len(tiles) + loc) * tile_cols + grp * E
+                        add("MAC", n, j, f, tile, grp, False, f, col, E)
+                elif kind == "vector":
+                    # The fill provides the tile of the next MAC group on the
+                    # fiber the next matrix bind names.
+                    nxt = next(
+                        (int(b[2]) for b in program.binds if b[1] == "matrix" and b[0] > _pc),
+                        None,
+                    )
+                    if nxt is None:
+                        raise ValueError("a vector fill without a following MAC group")
+                    tile = fiber_tiles[nxt][groups[nxt] // G]
+                    col = vector_base + (n * T + tile) * E
+                    add("FILL", n, j, 0, tile, None, False, 0, col, E)
+                    filled = tile
+                elif kind == "drain":
+                    col = result_base + (n * J + j) * G
+                    add("DRAIN", n, j, 1, None, None, True, 1, col, G)
+            del filled
+    return rounds
+
+
+def samsung_access_stream(compiled, columns: int = 1, geometry: dict | None = None) -> list:
+    """The executable access stream of a compiled single-kernel Samsung
+    REDUCE program (an ``allo.compile`` result or its backend artifact)."""
+
+    artifact = getattr(compiled, "compiled", compiled)
+    program = _program_of(artifact)
+    if geometry is None:
+        try:
+            geometry = samsung_simulator_geometry(_pimsim_root())
+        except Exception:
+            geometry = dict(SAMSUNG_DEFAULT_GEOMETRY)
+    return samsung_reduce_access_stream(program, geometry, columns)
+
+
+def samsung_access_stream_summary(rounds) -> dict:
+    """Counts the comparison of two placements rests on: rounds by kind,
+    rows each bank touches and the same-bank row transitions between
+    successive rounds (each a row activation after a barrier)."""
+
+    by_kind = Counter(r.kind for r in rounds)
+    rows = {}
+    transitions = {}
+    last = {}
+    for r in rounds:
+        for a in r.accesses:
+            rows.setdefault(a.bank, set()).add(a.row)
+        if r.kind != "MAC" or not r.accesses:
+            continue
+        bank, row = r.accesses[0].bank, r.accesses[0].row
+        if bank in last and last[bank] != row:
+            transitions[bank] = transitions.get(bank, 0) + 1
+        last[bank] = row
+    return {
+        "rounds": len(rounds),
+        "rounds_by_kind": dict(sorted(by_kind.items())),
+        "transactions": sum(len(r.accesses) for r in rounds),
+        "rows_by_bank": {b: sorted(v) for b, v in sorted(rows.items())},
+        "mac_same_bank_row_transitions": dict(sorted(transitions.items())),
+    }
+
+
+def samsung_access_trace_text(rounds, kinds=("MAC", "FILL")) -> str:
+    """The stream as the layout-trace harness consumes it (``round bank row
+    col``, one line per read transaction of channel 0, which the harness
+    replicates over the 64 channels and closes with a barrier per round),
+    restricted to the read rounds of ``kinds``: a replay of the pass-phase
+    bank reads without PIM execution, writes, staging or mode changes."""
+
+    lines = []
+    index = 0
+    for r in rounds:
+        if r.kind not in kinds or not r.accesses:
+            continue
+        for a in r.accesses:
+            lines.append(f"{index} {a.bank} {a.row} {a.column}")
+        index += 1
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def samsung_conductor_trace_text(rounds) -> str:
+    """The stream in the conductor's own trace format
+    (``TENON_CONDUCTOR_ADDRESS_TRACE``: ``PASS n j``, ``<tag> 0 bank row
+    col``, ``BARRIER``), for byte comparison with a captured dump."""
+
+    lines = []
+    current = None
+    for r in rounds:
+        key = (r.column_index, r.pass_index)
+        if key != current:
+            lines.append(f"PASS {r.column_index} {r.pass_index}")
+            current = key
+        if r.kind == "HOST_FILL":
+            lines.append(f"Whost_fill_grf_a x{r.accesses and len(r.accesses) or 8}")
+        else:
+            tag = {"MAC": "MAC", "FILL": "FILL", "DRAIN": "WDRAIN"}[r.kind]
+            for a in r.accesses:
+                lines.append(f"{tag} 0 {a.bank} {a.row} {a.column}")
+        lines.append("BARRIER")
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def samsung_slot_position(

@@ -180,14 +180,31 @@ Options parse_options(int argc, char **argv) {
   return options;
 }
 
+// The simulator's per-channel transaction queue is finite; a long trace
+// (an executable program stream rather than a four-request probe) must let
+// the memory system advance while requests are queued.  A request or
+// barrier that the queue refuses is retried after clock updates, bounded
+// so a stuck queue is an error instead of a hang.
+constexpr unsigned kMaxQueueRetries = 1u << 20;
+
+template <typename Enqueue>
+void enqueue_or_advance(const std::shared_ptr<MultiChannelMemorySystem> &memory,
+                        Enqueue enqueue, const std::string &what) {
+  for (unsigned attempt = 0; attempt < kMaxQueueRetries; ++attempt) {
+    if (enqueue())
+      return;
+    memory->update();
+  }
+  throw std::runtime_error("simulator queue never accepted " + what);
+}
+
 void add_full_channel_barrier(
     const std::shared_ptr<MultiChannelMemorySystem> &memory,
     unsigned active_channels) {
   for (unsigned channel = 0; channel < active_channels; ++channel) {
-    if (!memory->addBarrier(channel)) {
-      throw std::runtime_error("failed to add round barrier on channel " +
-                               std::to_string(channel));
-    }
+    enqueue_or_advance(
+        memory, [&]() { return memory->addBarrier(channel); },
+        "round barrier on channel " + std::to_string(channel));
   }
 }
 
@@ -245,10 +262,13 @@ int main(int argc, char **argv) {
       for (unsigned channel = 0; channel < active_channels; ++channel) {
         const uint64_t address = addresses.addrGen(
             channel, 0, bank_group, bank_in_group, request.row, request.col);
-        if (!memory->addTransaction(false, address, "TENON_LAYOUT_TRACE",
-                                    &read_sink)) {
-          throw std::runtime_error("simulator rejected a trace request");
-        }
+        enqueue_or_advance(
+            memory,
+            [&]() {
+              return memory->addTransaction(false, address,
+                                            "TENON_LAYOUT_TRACE", &read_sink);
+            },
+            "a trace request");
         ++physical_requests;
       }
     }
