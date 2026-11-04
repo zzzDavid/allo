@@ -73,34 +73,150 @@ def test_estimates_only_run_keeps_every_plan_and_its_provenance(tmp_path):
         assert os.path.isfile(os.path.join(folder, "plan.json")), label
 
 
-def test_a_failed_plan_is_recorded_and_the_others_kept(monkeypatch, tmp_path):
+def _stub_run(kind="simulator-timing-only", cycles=100):
     from types import SimpleNamespace
 
+    return lambda: SimpleNamespace(
+        kind=kind, cycles=cycles,
+        extra={"simulator": {"kind": "stub"}, "segment_records": [], "invocations": []},
+        stdout="stub",
+    )
+
+
+def _inject(monkeypatch, failing):
+    """Compile through the real pipeline; stub the simulator so that the plan
+    ``failing(modes, layouts)`` says returns a run of the wrong kind and
+    every other plan returns a positive cycle count that grows with P."""
     original = tp.compile_program
 
-    def wrong_kind_for_P2(attention, program, target, *, layouts=None, budget=tp.BUDGET, virtual=False):
+    def compile_program(attention, program, target, *, layouts=None, budget=tp.BUDGET, virtual=False):
         built = original(attention, program, target, layouts=layouts, budget=budget, virtual=virtual)
-        if not virtual and layouts is not None:
-            modes = [p.mode for p in (layouts if isinstance(layouts, (list, tuple)) else [layouts])]
-            if any(tp.partitions_of(m) == 2 for m in modes):
-                built.run_backend = lambda: SimpleNamespace(kind="virtual", cycles=1, extra={}, stdout="")
-            else:
-                built.run_backend = lambda m=modes: SimpleNamespace(
-                    kind="simulator-timing-only", cycles=100 + 10 * max(tp.partitions_of(x) for x in m),
-                    extra={"simulator": {"kind": "stub"}, "segment_records": [], "invocations": []}, stdout="stub",
-                )
-        elif not virtual:
-            built.run_backend = lambda: SimpleNamespace(
-                kind="simulator-timing-only", cycles=100,
-                extra={"simulator": {"kind": "stub"}, "segment_records": [], "invocations": []}, stdout="stub",
-            )
+        if virtual:
+            return built
+        modes = [p.mode for p in tp._placements(built)]
+        if failing(modes, layouts):
+            built.run_backend = _stub_run(kind="virtual", cycles=1)
+        else:
+            built.run_backend = _stub_run(cycles=100 + 10 * max(tp.partitions_of(m) for m in modes))
         return built
 
-    monkeypatch.setattr(tp, "compile_program", wrong_kind_for_P2)
+    monkeypatch.setattr(tp, "compile_program", compile_program)
+
+
+def test_a_failed_forced_alternative_keeps_its_record_and_voids_the_comparison(monkeypatch, tmp_path):
+    _inject(monkeypatch, lambda modes, layouts: layouts is not None and any(tp.partitions_of(m) == 2 for m in modes))
     result = tp.run_workload(1, 128, simulate=True, artifacts=str(tmp_path))
     assert set(result.failures) == {"P2"}
-    assert "simulator-timing-only" in result.failures["P2"]["error"]
+    failure = result.failures["P2"]
+    assert failure["stage"] == "simulate" and "simulator-timing-only" in failure["error"]
+    # The failed plan's record is retained in full, in memory and on disk.
+    kept = result.record["plans"]["P2"]
+    assert kept["modes"] and kept["provenance"]["placements"] and kept["provenance"]["lowering_manifest"]
+    assert kept["provenance"]["graph"]["activities"] and kept["estimate_cycles"] > 0
+    assert kept["completed"] == ["provenance", "host_price", "estimate", "merge_check"]
+    on_disk = json.load(open(os.path.join(str(tmp_path), "h1_l128", "P2", "plan.json")))
+    assert on_disk["modes"] == kept["modes"] and on_disk["failure"]["stage"] == "simulate"
+    assert on_disk["provenance"]["placements"][0]["effects"]["value_layouts"]
+    # The minima comparison is not made from a partial set.
     assert "P2" not in result.rows and {"default", "P1", "P4", "P8"} <= set(result.rows)
-    assert result.gap is not None and result.best is not None
-    assert os.path.isfile(os.path.join(str(tmp_path), "h1_l128", "P2", "plan.json"))
-    assert os.path.isfile(os.path.join(str(tmp_path), "h1_l128", "P1", "stdout.txt"))
+    assert result.gap is None and result.best is None and not result.comparison_complete
+    assert result.record["comparison"] == {
+        "complete": False, "required": ["default", "P1", "P2", "P4", "P8"], "missing": ["P2"],
+        "controls_complete": True,
+    }
+    with pytest.raises(AssertionError, match="P2 failed at simulate.*incomplete"):
+        tp.assert_complete(result)
+    # The graph record carries what the cost accounting needs.
+    activity = kept["provenance"]["graph"]["activities"][0]
+    assert {"primitive", "occupancy", "metadata", "latency_cycles", "depends_on"} <= set(activity)
+
+
+def test_a_failed_distinct_control_is_never_replaced_by_an_alias(monkeypatch, tmp_path):
+    """1 head x 4096 tokens: the head-only control (one head per channel,
+    unsplit) is a different plan from P1 (the flattened mapping); when it
+    fails, no alias stands in for it and the head-only ratio is absent,
+    while the complete partition comparison still stands."""
+    _inject(
+        monkeypatch,
+        lambda modes, layouts: layouts is not None
+        and tp.knob(modes[-1], "batch_mapping") == "channels"
+        and tp.partitions_of(modes[-1]) == 1,
+    )
+    result = tp.run_workload(1, 4096, simulate=True, artifacts=str(tmp_path))
+    assert "head-only" in result.expected and set(result.failures) == {"head-only"}
+    assert "head-only" not in result.record["aliases"] and "head-only" not in result.rows
+    assert result.record["head_only_over_selected"] is None
+    assert result.comparison_complete and result.gap is not None
+    assert not result.controls_complete
+    with pytest.raises(AssertionError, match="head-only"):
+        tp.assert_complete(result)
+    # The alias that exists was decided before execution, from the plans.
+    assert result.record["aliases"] == {"fixed-8": "P8"}
+
+
+def test_aliases_are_decided_before_execution():
+    result = tp.run_workload(1, 128, simulate=False)
+    # 1 x 128: the ranking's cheapest unsplit plan is the head-only mapping,
+    # so the control is P1 by construction, not by a missing row.
+    assert result.record["aliases"] == {"fixed-8": "P8", "head-only": "P1"}
+    assert "head-only" not in result.expected
+
+
+def test_summary_counts_only_complete_comparisons():
+    records = [
+        {"heads": 1, "tokens": 4096, "selected_partitions": 1, "best_partitions": 8, "gap": 0.0134,
+         "head_only_over_selected": 2.17, "distinct_plans": 5, "split_plans_checked": 3, "failed_plans": {},
+         "comparison": {"complete": True, "missing": [], "controls_complete": True}},
+        {"heads": 1, "tokens": 128, "selected_partitions": 2, "best_partitions": None, "gap": None,
+         "head_only_over_selected": None, "distinct_plans": 4, "split_plans_checked": 3,
+         "failed_plans": {"P2": {"error": "x"}},
+         "comparison": {"complete": False, "missing": ["P2"], "controls_complete": True}},
+        {"heads": 32, "tokens": 128, "error": "RuntimeError: simulator"},
+    ]
+    summary = tp.summarize(records)
+    assert summary["workloads_completed"] == 1 and summary["minima_reached"] == 0
+    assert [(w["heads"], w["tokens"], w["missing"], w["failed_plans"]) for w in summary["incomplete_workloads"]] == [
+        (1, 128, ["P2"], ["P2"]), (32, 128, None, []),
+    ]
+    assert summary["failed_plans"] == 1
+    # A control that did not complete gives no head-only ratio.
+    records[0]["comparison"]["controls_complete"] = False
+    assert tp.summarize(records)["head_only_over_selected_1x4096"] is None
+
+
+def test_simulator_failure_evidence_is_structured_and_retained(monkeypatch, tmp_path):
+    """A ramulator2 invocation that exits nonzero raises with the exact
+    segment trace, executor identity, command, return code and output; the
+    driver keeps that evidence in the plan's retained record."""
+    import subprocess
+
+    from allo import spmw_aim
+
+    binary = tmp_path / "ramulator2"
+    binary.write_text("#!/bin/sh\nexit 7\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("TENON_AIM_RAMULATOR2", str(binary))
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(list(command))
+        return subprocess.CompletedProcess(command, 7, stdout=b"partial stats\n", stderr=b"segmentation fault\n")
+
+    monkeypatch.setattr(spmw_aim.subprocess, "run", fake_run)
+    result = tp.run_workload(1, 128, simulate=True, artifacts=str(tmp_path / "artifacts"))
+    assert set(result.failures) == set(result.expected)
+    failure = result.record["plans"]["default"]["failure"]
+    assert failure["stage"] == "simulate" and "status 7" in failure["error"]
+    evidence = failure["evidence"]
+    assert evidence["returncode"] == 7 and evidence["stderr"].startswith("segmentation fault")
+    assert evidence["stdout"].startswith("partial stats")
+    assert evidence["executor"]["kind"] == "native" and evidence["executor"]["binary"] == str(binary)
+    assert evidence["executor"]["config"]["sha256"] and evidence["executor"]["sha256"]
+    assert evidence["segment"]["lines"] > 0 and evidence["segment"]["trace"][-1].strip() == "AiM EOC"
+    assert evidence["segment"]["trace_sha256"] and evidence["command"][0] == str(binary)
+    assert evidence["completed_segments"] == []
+    on_disk = json.load(open(tmp_path / "artifacts" / "h1_l128" / "default" / "plan.json"))
+    assert on_disk["failure"]["evidence"]["segment"]["trace"] == evidence["segment"]["trace"]
+    assert on_disk["provenance"]["lowering_manifest"]
+    # No timing was reported for any plan.
+    assert all(r.get("device_cycles") is None for r in result.record["plans"].values())

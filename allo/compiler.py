@@ -913,9 +913,12 @@ def compile(
         units (``resources={"channel": 8}``): the enumerators bound their
         partition domains by it, the shared ranking selects among the
         candidates that fit, the realization is checked against it and it
-        is recorded on every result (``extra["resource_budget"]``).  A cap
-        above the device's unit count or an undeclared unit is refused
-        (``allo.spmw_resources``).
+        is recorded on every result (``extra["resource_budget"]``).  The
+        contract is bounded to the (target, unit) pairs a backend enforces
+        end to end (``allo.spmw_resources.BUDGET_UNITS``; today AiM
+        ``channel``): a budget on any other pair, a cap above the device's
+        unit count or an undeclared unit is refused before enumeration,
+        never accepted and ignored.
     """
     workload = _materialize_workload(workload)
     target = _materialize_target(target)

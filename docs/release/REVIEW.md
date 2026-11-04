@@ -1409,6 +1409,24 @@ invocations; the driver keeps every plan's artifacts and raw result before
 advancing, failed plans included, with the compiler revision. S-17 and the
 earlier blockers stay open; G9 and G10 remain FAIL.
 
+## Round 41 (2026-11-04): independent review of 0694791; study failure handling, the budget contract, failure provenance
+
+The reviewer accepted the duplicate-declaration repair, reproduced the
+1-head/128-token row natively with matching provenance, and found three
+bounded gaps. (1) The study could misreport: a failed distinct control was
+aliased to P1, partial alternative sets were compared for minima, and the
+`paper_full` test passed with a failed plan. Judgment: accepted (M-16);
+aliases are decided before execution and never substitute for a failure,
+a comparison is complete or not made, and the test gate requires every
+expected plan. (2) The resource budget accepted units it ignored.
+Judgment: accepted (C-35); the contract is bounded to the enforced pairs
+(AiM channel) and refuses the rest before enumeration. (3) Failed-plan
+provenance was overwritten and a simulator failure kept nothing.
+Judgment: accepted (M-16); the record is established before fallible
+steps and the failure appended, and the runner raises structured evidence
+with the exact trace, identity, command, return code and output. The M-15
+bridge follows these fixes; the study stays DIAGNOSTIC.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1448,7 +1466,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 40 (2026-11-04) at the candidate `128aef8`+ (this
+Refreshed in round 41 (2026-11-04) at the candidate `0694791`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |

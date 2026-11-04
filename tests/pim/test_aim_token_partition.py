@@ -37,6 +37,7 @@ from benchmarks.cent_aim.token_partition import (
     knob as _knob,
     partitions_of as _partitions,
     ranked as _ranked,
+    assert_complete,
     run_workload,
     sv_entry as _sv_entry,
     within_budget as _within_budget,
@@ -197,10 +198,15 @@ def test_cache_append_into_partitioned_layout():
 def test_nine_workload_selection(aim_sim_gate):
     results = [run_workload(heads, tokens) for heads, tokens in SHAPES]
     for result in results:
-        for row in result.rows.values():
-            assert row.device > 0
+        # Every expected plan (the normal selection, the four partition plans
+        # and the head-only control) completed on the simulator; a failed or
+        # missing plan fails the test, it is never a partial comparison.
+        assert_complete(result)
         # The selection never loses to the controls by more than the gap
         # it reports; the count of reached minima is reported, not forced.
         assert result.gap >= 0.0
     reached = sum(result.selected == result.best for result in results)
-    print(f"cost-selected P reaches {reached} of {len(results)} simulated minima")
+    print(
+        f"cost-selected P reaches {reached} of {len(results)} simulated minima "
+        "(diagnostic boundary, M-15)"
+    )

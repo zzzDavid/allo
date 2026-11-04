@@ -270,6 +270,11 @@ def _register_effects_deriver():
     from .spmw_candidate import EFFECTS_DERIVERS, ROUTE_VOCABULARY
 
     EFFECTS_DERIVERS["aim"] = _derive_aim_effects
+    # The channel budget: the replica and token partition domains
+    # (`spmw_knobs._budgeted_channels`) and `AimCtx.check_realization`.
+    from .spmw_resources import register_budget_unit
+
+    register_budget_unit("aim", "channel")
     # The GPR preload the host performs before the traced program.
     ROUTE_VOCABULARY.setdefault("aim", set()).add("host_gpr_preload")
 
@@ -2140,6 +2145,18 @@ def _check_simulator_geometry(target, yaml_cfg: Path) -> None:
         )
 
 
+class AimSimulatorFailure(RuntimeError):
+    """A ramulator2 invocation that produced no cycles.  ``evidence`` keeps
+    what the run was: the executor (binary / library / config identity),
+    the exact segment trace and its digest, the command and working
+    directory, the return code, the complete stdout and stderr, and the
+    segments completed before it; no timing is reported."""
+
+    def __init__(self, message: str, evidence: dict):
+        super().__init__(message)
+        self.evidence = evidence
+
+
 def _resolved_shared_library(binary: Path, stem: str, library_path: str) -> dict:
     """The shared library ``stem`` the dynamic loader resolves for
     ``binary`` (via ``ldd`` under the run's ``LD_LIBRARY_PATH``), with its
@@ -2228,8 +2245,36 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
         }
 
     invocations: list[dict] = []
+    segment_records: list[dict] = []
 
-    def run_segment(lines: list[str]) -> tuple[int, str, int]:
+    def failure(message, *, label, repeat, lines, command, cwd, returncode, stdout, stderr, error=None):
+        text = "".join(str(line) + "\n" for line in lines)
+        return AimSimulatorFailure(
+            message,
+            {
+                "executor": executor,
+                "segment": {
+                    "label": label,
+                    "repeat": int(repeat),
+                    "lines": len(lines),
+                    "trace_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "trace": list(map(str, lines)),
+                },
+                "command": list(command),
+                "cwd": cwd,
+                "returncode": returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "exception": None if error is None else f"{type(error).__name__}: {error}",
+                "completed_segments": [
+                    {k: v for k, v in record.items() if k != "trace"}
+                    for record in segment_records
+                ],
+                "invocations": list(invocations),
+            },
+        )
+
+    def run_segment(lines: list[str], label: str = "program", repeat: int = 1) -> tuple[int, str, int]:
         with tempfile.TemporaryDirectory(prefix="tenon-aim-") as trace_dir:
             trace_path = Path(trace_dir) / "segment.trace"
             trace_path.write_text("".join(str(line) + "\n" for line in lines))
@@ -2254,30 +2299,39 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
                     f"-t /trace/{trace_path.name}",
                 ]
                 run = {}
-            invocations.append({"command": list(command), **{k: v for k, v in run.items() if k == "cwd"}})
+            cwd = run.get("cwd")
+            invocations.append({"command": list(command), **({"cwd": cwd} if cwd else {})})
             try:
                 proc = subprocess.run(
                     command, capture_output=True, timeout=600, check=False, **run
                 )
             except (subprocess.SubprocessError, OSError) as exc:
-                raise RuntimeError(f"AiM ramulator2 invocation failed: {exc}") from exc
+                raise failure(
+                    f"AiM ramulator2 invocation failed: {exc}",
+                    label=label, repeat=repeat, lines=lines, command=command, cwd=cwd,
+                    returncode=None, stdout=None, stderr=None, error=exc,
+                ) from exc
         stdout = proc.stdout.decode("utf-8", errors="replace")
         stderr = proc.stderr.decode("utf-8", errors="replace")
         combined = stdout + ("\n" + stderr if stderr else "")
         if proc.returncode != 0:
             # A failed run may still print partial statistics; never report
             # cycles from it.
-            raise RuntimeError(
+            raise failure(
                 f"AiM ramulator2 exited with status {proc.returncode}; no cycles "
-                "are reported from a failed run; tail: " + combined[-400:]
+                "are reported from a failed run; tail: " + combined[-400:],
+                label=label, repeat=repeat, lines=lines, command=command, cwd=cwd,
+                returncode=proc.returncode, stdout=stdout, stderr=stderr,
             )
         values = [
             int(m) for m in re.findall(r"memory_system_cycles:\s*(\d+)", combined)
         ]
         if not values:
-            raise RuntimeError(
+            raise failure(
                 "AiM ramulator2 returned but stdout missing "
-                "'memory_system_cycles: ...' line; tail: " + combined[-400:]
+                "'memory_system_cycles: ...' line; tail: " + combined[-400:],
+                label=label, repeat=repeat, lines=lines, command=command, cwd=cwd,
+                returncode=proc.returncode, stdout=stdout, stderr=stderr,
             )
         return max(values), combined, proc.returncode
 
@@ -2296,12 +2350,11 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
     # their digest, the repeat count, the measured and composed cycles, the
     # simulator's own output and whether the run was shared with an
     # identical earlier segment.
-    segment_records: list[dict] = []
     for label, repeat, lines in segments:
         key = tuple(lines)
         cached = key in cache
         if not cached:
-            cache[key] = run_segment(lines)
+            cache[key] = run_segment(lines, label, repeat)
         raw_cycles, log, returncode = cache[key]
         total_cycles += raw_cycles * repeat
         returncodes.append(returncode)

@@ -402,6 +402,9 @@ def compiler_revision():
 
 
 def _graph_activities(compiled):
+    """The priced graph in full: every activity's primitive, latency,
+    occupancies (handle, cycles, amount), dependencies and metadata, with
+    the graph's own name and metadata, for reproducible cost accounting."""
     graph = getattr(compiled.compiled, "execution_graph", None)
     if graph is None:
         return None
@@ -411,11 +414,25 @@ def _graph_activities(compiled):
             {
                 "id": getattr(activity, "id", None),
                 "label": getattr(activity, "label", None),
+                "primitive": getattr(activity, "primitive", None),
                 "latency_cycles": getattr(activity, "latency_cycles", None),
+                "occupancy": [
+                    {
+                        "handle": getattr(getattr(use, "handle", None), "name", repr(getattr(use, "handle", None))),
+                        "cycles": getattr(use, "cycles", None),
+                        "amount": getattr(use, "amount", None),
+                    }
+                    for use in getattr(activity, "occupancy", ()) or ()
+                ],
                 "depends_on": list(getattr(activity, "depends_on", ()) or ()),
+                "metadata": _json_ready(dict(getattr(activity, "metadata", {}) or {})),
             }
         )
-    return {"activities": activities, "metadata": _json_ready(getattr(graph, "metadata", {}) or {})}
+    return {
+        "name": getattr(graph, "name", None),
+        "activities": activities,
+        "metadata": _json_ready(getattr(graph, "metadata", {}) or {}),
+    }
 
 
 def _plan_provenance(compiled):
@@ -463,10 +480,39 @@ def _write_artifacts(directory, label, record, result):
     return folder
 
 
+class PlanFailure(Exception):
+    """A plan that could not be measured; ``record`` is its retained record
+    (modes, provenance, what was completed) with a ``failure`` entry."""
+
+    def __init__(self, record):
+        super().__init__(record["failure"]["error"])
+        self.record = record
+
+
+def _failure_entry(stage, error):
+    import traceback
+
+    entry = {
+        "stage": stage,
+        "error": f"{type(error).__name__}: {error}",
+        "traceback": traceback.format_exc(),
+    }
+    evidence = getattr(error, "evidence", None)
+    if evidence is not None:
+        entry["evidence"] = _json_ready(evidence)
+    return entry
+
+
 def measure_plan(label, built, attention, program, target, heads, tokens, *, simulate, budget, artifacts, sv_index=None):
-    """Estimate, simulate and check one compiled plan; the record is written
-    to ``artifacts`` before returning.  Raises on a failed run; the caller
-    records the failure with the artifacts written so far."""
+    """Estimate, simulate and check one compiled plan.
+
+    The plan's record (its modes and complete provenance) is established
+    before any fallible step; a failure during the estimate, the merge
+    check or the simulation is appended to that record as ``failure``
+    (with the simulator's structured evidence when it has it), the record
+    is written to ``artifacts``, and :class:`PlanFailure` carrying it is
+    raised.  A successful plan's record is written too.
+    """
     import time
 
     geometry = _target_geometry(target)
@@ -474,38 +520,52 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
     # The SV placement is the one compiled for the SV work item (the bucket
     # index the ranking reported); a single-kernel program has only it.
     sv_mode = modes[sv_index] if sv_index is not None and sv_index < len(modes) else modes[-1]
-    host = sum(host_reduction_cycles(step, geometry) for step in built.compiled.layout_ctx.host_steps)
-    estimate = compile_program(
-        attention, program, target, layouts=built.compiled.layout, budget=budget, virtual=True
-    ).run_backend().cycles
-    split = sv_entry(built).get("reduction_partition") is not None
     record = {
         "label": label,
         "modes": modes,
         "sv_mode": sv_mode,
         "partitions": partitions_of(sv_mode),
-        "estimate_cycles": estimate,
-        "host_cycles": host,
+        "estimate_cycles": None,
+        "host_cycles": None,
         "device_cycles": None,
         "total_cycles": None,
-        "merge_check": {"applicable": split, "bf16_error": None, "integer_exact": None},
+        "merge_check": {"applicable": None, "bf16_error": None, "integer_exact": None},
         "execution": None,
-        "provenance": _plan_provenance(built),
+        "provenance": None,
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "completed": [],
     }
-    if split:
-        record["merge_check"]["bf16_error"] = check_merge_numerics(built, heads, tokens)
-        record["merge_check"]["integer_exact"] = True
     result = None
+    stage = "provenance"
     try:
+        record["provenance"] = _plan_provenance(built)
+        record["completed"].append(stage)
+        stage = "host_price"
+        record["host_cycles"] = sum(
+            host_reduction_cycles(step, geometry) for step in built.compiled.layout_ctx.host_steps
+        )
+        record["completed"].append(stage)
+        stage = "estimate"
+        record["estimate_cycles"] = compile_program(
+            attention, program, target, layouts=built.compiled.layout, budget=budget, virtual=True
+        ).run_backend().cycles
+        record["completed"].append(stage)
+        stage = "merge_check"
+        split = sv_entry(built).get("reduction_partition") is not None
+        record["merge_check"]["applicable"] = split
+        if split:
+            record["merge_check"]["bf16_error"] = check_merge_numerics(built, heads, tokens)
+            record["merge_check"]["integer_exact"] = True
+        record["completed"].append(stage)
         if simulate:
+            stage = "simulate"
             result = built.run_backend()
             if result.kind != "simulator-timing-only":
                 raise RuntimeError(f"{label}: expected a simulator-timing-only run, got {result.kind!r}")
             if not isinstance(result.cycles, int) or result.cycles <= 0:
                 raise RuntimeError(f"{label}: simulator reported cycles {result.cycles!r}")
             record["device_cycles"] = int(result.cycles)
-            record["total_cycles"] = int(result.cycles) + host
+            record["total_cycles"] = int(result.cycles) + record["host_cycles"]
             record["execution"] = {
                 "kind": result.kind,
                 "simulator": result.extra.get("simulator"),
@@ -517,8 +577,12 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
                 "returncode": result.extra.get("returncode"),
                 "resource_budget": result.extra.get("resource_budget"),
             }
-    finally:
+            record["completed"].append(stage)
+    except Exception as error:
+        record["failure"] = _failure_entry(stage, error)
         record["artifacts"] = _write_artifacts(artifacts, label, record, result)
+        raise PlanFailure(record) from error
+    record["artifacts"] = _write_artifacts(artifacts, label, record, result)
     return record
 
 
@@ -526,14 +590,16 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET)
     """Compile, measure and record every plan of one workload: the normal
     selection under the budget and the forced alternatives.
 
-    Returns a namespace with ``rows`` (label -> row namespace), ``selected``
-    (the normal selection's P), ``best`` (the simulated fastest P among the
-    forced partition plans and the normal selection), ``gap``, the failed
-    plans and a JSON-ready ``record``.  A plan that fails is recorded under
-    its label with the error; the other plans are kept.
+    Returns a namespace with ``rows`` (label -> row namespace of the plans
+    that completed), ``selected`` (the normal selection's P), ``best`` and
+    ``gap`` (only when every partition plan and the normal selection
+    completed: a partial set is not a minima comparison), the failed plans
+    (their records retained) and a JSON-ready ``record``.  Aliases are
+    decided before anything runs (the head-only control that is the same
+    placement as P1; the fixed eight-way control that is P8 by definition)
+    and never stand in for a plan that failed.
     """
     import os
-    import traceback
 
     target, attention, program, ranking = ranked(heads, tokens, budget=budget)
     variants = budget_variants(target, ranking)
@@ -541,8 +607,15 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET)
     folder = None if artifacts is None else os.path.join(artifacts, f"h{heads}_l{tokens}")
     plans = [("default", None)]
     plans += [(f"P{p}", choice) for p, choice in sorted(variants.per_partition.items())]
-    if variants.head_only[1] != variants.per_partition[1][1]:
+    # Established before execution: the head-only control is the P1 plan
+    # itself when the ranking's cheapest unsplit plan is the one-head-per-
+    # channel mapping; the fixed eight-way control is the P8 plan.
+    aliases = {"fixed-8": "P8"}
+    if variants.head_only[1] == variants.per_partition[1][1]:
+        aliases["head-only"] = "P1"
+    else:
         plans.append(("head-only", variants.head_only))
+    expected = [label for label, _choice in plans]
     records, failures = {}, {}
     for label, choice in plans:
         try:
@@ -551,15 +624,24 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET)
                 if choice is None
                 else compile_variant(attention, program, target, variants, choice, budget=budget)
             )
-            records[label] = measure_plan(
+        except Exception as error:  # the plan did not compile: no record beyond the failure
+            record = {"label": label, "modes": None, "failure": _failure_entry("compile", error)}
+            record["artifacts"] = _write_artifacts(folder, label, record, None)
+            records[label] = record
+            failures[label] = record["failure"]
+            continue
+        try:
+            record = measure_plan(
                 label, built, attention, program, target, heads, tokens,
                 simulate=simulate, budget=budget, artifacts=folder, sv_index=variants.sv_index,
             )
-            if choice is not None:
-                records[label]["ranked_cycles"] = choice[0]
-        except Exception as error:  # a failed plan is evidence too
-            failures[label] = {"error": f"{type(error).__name__}: {error}", "traceback": traceback.format_exc()}
-            _write_artifacts(folder, label, {"label": label, **failures[label]}, None)
+        except PlanFailure as error:
+            records[label] = error.record
+            failures[label] = error.record["failure"]
+            continue
+        if choice is not None:
+            record["ranked_cycles"] = choice[0]
+        records[label] = record
     rows = {
         label: SimpleNamespace(
             mode=r["sv_mode"], modes=r["modes"], partitions=r["partitions"],
@@ -568,24 +650,25 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET)
             bf16_error=r["merge_check"]["bf16_error"], execution=r["execution"], provenance=r["provenance"],
         )
         for label, r in records.items()
+        if "failure" not in r
     }
-    aliases = {}
-    if "head-only" not in rows and "P1" in rows:
-        rows["head-only"] = rows["P1"]; aliases["head-only"] = "P1"
-    if "P8" in rows:
-        rows["fixed-8"] = rows["P8"]; aliases["fixed-8"] = "P8"
+    for alias, source in aliases.items():
+        if source in rows:
+            rows[alias] = rows[source]
     default = rows.get("default")
     selected = default.partitions if default is not None else None
-    measured = [rows[f"P{p}"] for p in PARTITIONS if f"P{p}" in rows and rows[f"P{p}"].total is not None]
-    if default is not None and default.total is not None:
-        measured.append(default)
-    best = min(measured, key=lambda r: r.total, default=None) if simulate else None
-    gap = None
-    if simulate and default is not None and default.total is not None and best is not None:
+    required = ["default"] + [f"P{p}" for p in PARTITIONS]
+    missing = [label for label in required if label not in rows or (simulate and rows[label].total is None)]
+    comparison_complete = not missing
+    best = gap = None
+    if simulate and comparison_complete:
+        measured = [rows[label] for label in required]
+        best = min(measured, key=lambda r: r.total)
         gap = default.total / best.total - 1.0
+    controls_complete = "head-only" in rows and (not simulate or rows["head-only"].total is not None)
     head_only_ratio = (
         rows["head-only"].total / default.total
-        if simulate and default is not None and default.total and "head-only" in rows and rows["head-only"].total
+        if simulate and controls_complete and default is not None and default.total
         else None
     )
     forced = variants.per_partition.get(selected) if selected is not None else None
@@ -595,37 +678,89 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET)
         "resource_budget": budget,
         "compiler": compiler_revision(),
         "default_selection_unrestricted": [p.mode for p in _placements(unrestricted)],
+        "expected_plans": expected,
         "selected_partitions": selected,
         "default_equals_forced_choice": None if default is None or forced is None else default.mode == forced[1],
+        "comparison": {
+            "complete": comparison_complete,
+            "required": required,
+            "missing": missing,
+            "controls_complete": controls_complete,
+        },
         "best_partitions": None if best is None else best.partitions,
         "gap": gap,
         "head_only_over_selected": head_only_ratio,
-        "plans": {label: records[label] for label in records},
+        "plans": records,
         "aliases": aliases,
         "failed_plans": failures,
-        "distinct_plans": len({tuple(r["modes"]) for r in records.values()}),
-        "split_plans_checked": sum(1 for r in records.values() if r["merge_check"]["applicable"]),
+        "distinct_plans": len({tuple(r["modes"]) for r in records.values() if r.get("modes")}),
+        "split_plans_checked": sum(1 for r in records.values() if r.get("merge_check", {}).get("applicable")),
         "artifacts": folder,
     }
     return SimpleNamespace(
         heads=heads, tokens=tokens, rows=rows, selected=selected,
         best=None if best is None else best.partitions, gap=gap,
-        default=record["default_selection_unrestricted"], failures=failures, record=record,
+        comparison_complete=comparison_complete, controls_complete=controls_complete,
+        expected=expected, default=record["default_selection_unrestricted"],
+        failures=failures, record=record,
     )
+
+
+def assert_complete(result) -> None:
+    """Raise unless every expected plan of ``result`` completed with a
+    positive simulated device cycle count, the minima comparison is
+    complete and the controls completed; the paper_full test's gate."""
+    problems = []
+    for label, failure in sorted(result.failures.items()):
+        problems.append(f"{label} failed at {failure.get('stage')}: {failure.get('error')}")
+    for label in result.expected:
+        row = result.rows.get(label)
+        if row is None:
+            if label not in result.failures:
+                problems.append(f"{label} has no record")
+        elif not (isinstance(row.device, int) and row.device > 0):
+            problems.append(f"{label} has no simulated device cycles ({row.device!r})")
+    if not result.comparison_complete:
+        problems.append(f"the minima comparison is incomplete: missing {result.record['comparison']['missing']}")
+    if not result.controls_complete:
+        problems.append("the head-only control did not complete")
+    if problems:
+        raise AssertionError(
+            f"{result.heads} heads x {result.tokens} tokens: " + "; ".join(problems)
+        )
 
 
 def summarize(results):
     """The study's figures over the completed workloads (diagnostic; see
     the module docstring for what the paper's boundary adds)."""
-    complete = [r for r in results if r.get("gap") is not None]
+    complete = [
+        r for r in results
+        if r.get("gap") is not None and (r.get("comparison") or {}).get("complete", True)
+    ]
+    incomplete = [
+        {
+            "heads": r.get("heads"),
+            "tokens": r.get("tokens"),
+            "missing": (r.get("comparison") or {}).get("missing"),
+            "failed_plans": sorted(r.get("failed_plans") or {}),
+            "error": r.get("error"),
+        }
+        for r in results
+        if r not in complete
+    ]
     reached = sum(r["selected_partitions"] == r["best_partitions"] for r in complete)
     gaps = [r["gap"] for r in complete]
     one_4096 = next((r for r in complete if (r["heads"], r["tokens"]) == (1, 4096)), None)
     return {
         "workloads_completed": len(complete),
+        "incomplete_workloads": incomplete,
         "minima_reached": reached,
         "max_gap": max(gaps) if gaps else None,
-        "head_only_over_selected_1x4096": (one_4096["head_only_over_selected"] if one_4096 else None),
+        "head_only_over_selected_1x4096": (
+            one_4096["head_only_over_selected"]
+            if one_4096 and (one_4096.get("comparison") or {}).get("controls_complete", True)
+            else None
+        ),
         "distinct_plans": sum(int(r.get("distinct_plans") or 0) for r in results if "error" not in r),
         "split_plans_checked": sum(int(r.get("split_plans_checked") or 0) for r in results if "error" not in r),
         "failed_plans": sum(len(r.get("failed_plans") or {}) for r in results if "error" not in r),
@@ -716,7 +851,8 @@ def main(argv=None) -> int:
     summary = session["summary"]
     print(
         f"normal budgeted selection reaches {summary['minima_reached']} of "
-        f"{summary['workloads_completed']} simulated minima"
+        f"{summary['workloads_completed']} complete simulated comparisons"
+        + (f" ({len(summary['incomplete_workloads'])} incomplete)" if summary["incomplete_workloads"] else "")
         + (f"; max gap {summary['max_gap'] * 100:.2f}%" if summary["max_gap"] is not None else "")
         + f"; {summary['distinct_plans']} distinct plans, {summary['split_plans_checked']} split plans "
         f"numerically checked (diagnostic; paper: {PAPER['minima_reached']} of {PAPER['workloads']}, "

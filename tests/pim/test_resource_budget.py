@@ -40,6 +40,21 @@ def test_budget_is_validated_against_the_target():
     target = build_aim_target()
     assert normalize_resource_budget(None) is None
     assert normalize_resource_budget({"channel": 8}, target) == {"channel": 8}
+    # The contract is bounded to the pairs a backend enforces end to end:
+    # a declared unit no enumerator or realization check reads is refused,
+    # not accepted and ignored.
+    from allo.pim.targets import build_samsung_target
+    from allo.spmw_resources import supported_budget_units
+
+    assert supported_budget_units(target) == {"channel"}
+    for other, unit in ((target, "bank"), (target, "bank_group"), (build_samsung_target(), "pseudo_channel")):
+        with pytest.raises(ValueError, match="enforces no budget"):
+            normalize_resource_budget({unit: 1}, other)
+    with pytest.raises(ValueError, match="enforces no budget"):
+        allo.compile(
+            *build_attention(1, 128)[:1], target, aim_cost, backend="virtual",
+            host_moves=build_attention(1, 128)[1], resources={"bank": 1}, **POLICY,
+        )
     for bad, reason in (
         ({"channel": 64}, "exceeds the 32 channel"),
         ({"nope": 1}, "does not declare"),

@@ -41,9 +41,13 @@ Terms used below:
   fit, a supplied placement outside the budgeted enumeration is refused, the
   realization check compares the lowered program's unit use with the cap
   (a feasibility rejection the ranking records), and the budget is on every
-  result (`extra["resource_budget"]`). A cap above the device's count or an
-  undeclared unit is refused. It is a search policy, not a device
-  description: target and simulator geometry are unchanged.
+  result (`extra["resource_budget"]`). The contract is bounded to the
+  (target, unit) pairs a backend enforces end to end
+  (`allo.spmw_resources.BUDGET_UNITS`, registered by the backend; today AiM
+  `channel`): a budget on any other pair, a cap above the device's count or
+  an undeclared unit is refused before enumeration, never accepted and
+  ignored. It is a search policy, not a device description: target and
+  simulator geometry are unchanged.
 - **Evidence status.** *Verified* means run at the round 3 tree on the
   authors' hosts through the public API and recorded in `VALIDATION.md`;
   **UNVERIFIED** means no run at the candidate revision, whatever older
