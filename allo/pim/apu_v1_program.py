@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass, replace
 import fcntl
+import hashlib
 import inspect
 import math
 import os
@@ -552,6 +553,24 @@ def parse_fresh_profile(
     return tuple(cycles)
 
 
+_COUNTER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(hits|seu|crun|iall|icm|dcm)\s*[:=]\s*([0-9]+)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+
+
+def profile_counters(profile: str) -> dict:
+    """The counters (``hits``, ``seu``, ``crun``, ``iall``, ``icm``, ``dcm``)
+    of the last ``total`` PROF_PRINT record in ``profile``; empty when the
+    record carries none."""
+    records = [
+        match.group(0) for match in _TOTAL_RECORD.finditer(profile)
+    ] or [profile]
+    return {
+        key.lower(): int(value) for key, value in _COUNTER_RE.findall(records[-1])
+    }
+
+
 def launch_on_board(argv, cwd, *, expected_records, timeout, attempts=3):
     """Run one built APU v1 binary under the board lock with a fresh profile.
 
@@ -968,10 +987,12 @@ class CompiledAPUv1Program:
             argv = [str(binary)]
             argv.extend(str(input_paths[name]) for name in sorted(input_paths))
             argv.extend(str(output_paths[name]) for name in sorted(output_paths))
+            binary_sha256 = hashlib.sha256(Path(binary).read_bytes()).hexdigest()
             text, profile, cycles = launch_on_board(
                 argv, project, expected_records=1, timeout=900
             )
             log = text + "\n" + profile
+            counters = profile_counters(profile)
             outputs = {}
             for argument in self.outputs:
                 role = output_roles[argument.name]
@@ -1002,6 +1023,21 @@ class CompiledAPUv1Program:
                     "device_source": self.device_source,
                     "board_lock": str(apu_v1_lock_path()),
                     "profile_records": 1,
+                    # Launch provenance: the binary that ran, the fresh
+                    # profiler record's counters and the argument roles.
+                    "binary_sha256": binary_sha256,
+                    "binary_bytes": Path(binary).stat().st_size,
+                    "profile_counters": counters,
+                    "profile_text": profile,
+                    "launch_roles": {
+                        "inputs": sorted(input_paths),
+                        "outputs": sorted(output_paths),
+                    },
+                    "project_dir": (
+                        str(project)
+                        if os.environ.get("TENON_APU_V1_KEEP_TMP") == "1"
+                        else None
+                    ),
                 },
             )
         finally:

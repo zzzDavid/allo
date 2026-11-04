@@ -5,23 +5,40 @@
 For each kernel of ``tables/eval-apuv1.tex`` the workload of the evaluation
 assets (``$TENON_ARTIFACTS/apuv1/tenon/<case>/workload.py``, an
 evaluation-only tree distributed separately from the release package) is
-compiled with ``allo.compile`` under the default shared selection, its
+compiled with ``allo.compile`` under the default shared selection; its
 selected plan or native route, candidate estimates and generated device
-source are recorded, and the program is launched on the board ``--repeats``
-times under the shared board lock with the archived inputs
-(``inputs/<case>/<name>.uint16.bin``); every output is compared with the
-archived oracle before any timing is reported.  Options force a plan
-(``--layout``), the paper's own forced plan being labelled separately from
-the default selection, or perturb one cost constant (``--perturb
-NAME=FACTOR`` on ``allo.pim.costs.apu_v1``) so the perturbation's effect on
-selection, generated source and launch is traced.  Results are a JSON
-record per case (``--out``); nothing here is read by the compiler.
+source are recorded; and the program is launched on the board under the
+shared board lock with the archived inputs (``inputs/<case>/<name>.uint16.
+bin``), every output compared with the archived oracle.
+
+Protocol (the archived comparison's, ``apuv1/TENON_COMPARISON.md``): one
+warm-up launch and ``--measured`` (default 10) measured launches per lane
+and case; with ``--expert`` the corrected expert Phoenix lane of the same
+assets (``apuv1/expert/<case>``: archived release binary, manifest and io)
+is interleaved launch by launch with the Tenon lane (round r runs Tenon
+then expert for even r, expert then Tenon for odd r), and paired ratios are
+reported with the median, quartiles, IQR and MAD of every lane.  The
+statistic is the median ``crun`` of the profiler's ``total`` record (one
+APUC, the paper's boundary); the counters ``seu``/``iall``/``icm``/``dcm``
+of every launch are retained for attribution, with the binary hash, the
+generated source, the device log and the profiler text.
+
+Options force a plan (``--layout``), perturb one cost constant
+(``--perturb NAME=FACTOR`` on ``allo.pim.costs.apu_v1``) or substitute a
+historical generated device source for the Tenon lane (``--device-source
+FILE``: a labelled control for attributing a difference, never the shared
+selection).  The paper's own values are comparison data; nothing here is
+read by the compiler.
+
+Exit status: 0 only when every requested case executed, every launch's
+outputs equal the oracle and the experiment's invariants hold; otherwise 1,
+with the failed records preserved in ``--out``.
 
 Usage::
 
     python -m benchmarks.apu_v1.paper_rows --out rows.json [--cases ...]
-        [--repeats 5] [--backend device|virtual|functional]
-        [--layout PLAN] [--perturb CONST=FACTOR]
+        [--measured 10] [--expert] [--backend device|virtual]
+        [--layout PLAN] [--perturb CONST=FACTOR] [--device-source FILE]
 """
 
 from __future__ import annotations
@@ -29,6 +46,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import platform
@@ -40,8 +58,7 @@ from pathlib import Path
 CASES = ("matrix_multiply", "kmeans", "histogram", "linear_regression", "word_count")
 
 # Paper table rows (tables/eval-apuv1.tex): expert Phoenix cycles and the
-# paper's reported Tenon median device cycles.  Comparison data, never
-# compiler inputs.
+# paper's reported Tenon median device cycles.  Comparison data only.
 PAPER = {
     "matrix_multiply": (8_784_431, 8_764_900),
     "kmeans": (641_471, 624_677),
@@ -49,6 +66,10 @@ PAPER = {
     "linear_regression": (95_785, 94_618.5),
     "word_count": (175_397.5, 171_988),
 }
+
+
+class MeasurementError(RuntimeError):
+    """A launch that did not produce a valid measurement."""
 
 
 def _artifacts_root(argument):
@@ -64,6 +85,8 @@ def _artifacts_root(argument):
 
 def _load_workload(root: Path, case: str):
     path = root / "apuv1" / "tenon" / case / "workload.py"
+    if not path.is_file():
+        raise FileNotFoundError(f"no workload for {case!r} at {path}")
     spec = importlib.util.spec_from_file_location(f"paper_apu_v1_{case}", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -71,8 +94,12 @@ def _load_workload(root: Path, case: str):
     return module.build()
 
 
-def _sha256(text: str) -> str:
+def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _perturb(spec_text):
@@ -82,137 +109,430 @@ def _perturb(spec_text):
 
     name, factor = spec_text.split("=")
     old = getattr(apu_v1_costs, name)
-    new = type(old)(old * float(factor)) if isinstance(old, (int, float)) else old
+    if not isinstance(old, (int, float)):
+        raise ValueError(f"{name} is not a numeric cost constant")
+    new = type(old)(old * float(factor))
     setattr(apu_v1_costs, name, new)
     return name, old, new
 
 
-def measure_case(case, root, *, backend, repeats, layout=None, label=None):
-    import numpy as np
-
-    import allo
-    from allo.pim.costs import apu_v1_cost
-    from allo.pim.targets import build_apu_v1_target
-
-    workload = _load_workload(root, case)
-    target = build_apu_v1_target()
-    kwargs = {}
-    if layout is not None:
-        kwargs["layout"] = layout
-    started = time.perf_counter()
-    compiled = allo.compile(
-        workload,
-        target,
-        apu_v1_cost,
-        backend=None if backend == "device" else backend,
-        **kwargs,
+def _statistics(values):
+    """Median, quartiles (linear interpolation), IQR and MAD of a sample."""
+    if not values:
+        return {}
+    ordered = sorted(values)
+    median = statistics.median(ordered)
+    quartiles = (
+        statistics.quantiles(ordered, n=4, method="inclusive")
+        if len(ordered) > 1
+        else [ordered[0]] * 3
     )
-    compile_seconds = time.perf_counter() - started
-    record = {
-        "case": case,
-        "label": label or ("forced:" + layout if layout else "default_selection"),
-        "backend": backend,
-        "compile_seconds": round(compile_seconds, 2),
-        "paper_expert_cycles": PAPER[case][0],
-        "paper_tenon_cycles": PAPER[case][1],
-        "cost_fingerprint": apu_v1_cost.bind(target).fingerprint,
+    mad = statistics.median(abs(v - median) for v in ordered)
+    return {
+        "samples": len(ordered),
+        "median": median,
+        "min": ordered[0],
+        "max": ordered[-1],
+        "q1": quartiles[0],
+        "q3": quartiles[2],
+        "iqr": quartiles[2] - quartiles[0],
+        "mad": mad,
     }
-    plan = getattr(compiled, "selected_plan", None)
-    if plan is not None:
-        record["selected_plan"] = plan.name
-        record["candidate_estimates"] = {
-            e.plan.name: int(e.cycles) for e in compiled.candidate_estimates
-        }
-        decision = getattr(compiled, "tile_decision", None)
-        record["plan_selection"] = (
-            decision.get("plan_selection") if isinstance(decision, dict) else None
+
+
+# ----------------------------------------------------------------------- #
+# Lanes
+# ----------------------------------------------------------------------- #
+
+
+class TenonLane:
+    """The shared pipeline's program for one case: compiled once, launched
+    through the public callable."""
+
+    def __init__(self, case, root, *, backend, layout=None, device_source=None):
+        import allo
+        from allo.pim.costs import apu_v1_cost
+        from allo.pim.targets import build_apu_v1_target
+
+        self.case = case
+        self.root = root
+        self.backend = backend
+        workload = _load_workload(root, case)
+        target = build_apu_v1_target()
+        kwargs = {"layout": layout} if layout is not None else {}
+        started = time.perf_counter()
+        self.compiled = allo.compile(
+            workload,
+            target,
+            apu_v1_cost,
+            backend=None if backend == "device" else backend,
+            **kwargs,
         )
-        realization = getattr(compiled, "realization", None)
-        source = realization.device_source() if realization is not None else None
-    else:
-        route = getattr(compiled, "route", None)
-        record["native_vector_route"] = route
-        source = getattr(compiled, "device_source", None)
-    record["device_source_sha256"] = _sha256(source) if source else None
-    estimate = compiled.estimate() if hasattr(compiled, "estimate") else None
-    record["estimate_cycles"] = (
-        int(estimate.cycles) if estimate is not None and estimate.cycles else None
-    )
-
-    inputs_dir = root / "apuv1" / "inputs" / case
-    manifest = json.loads((inputs_dir / "manifest.json").read_text())
-    arrays = manifest["arrays"]
-    oracle_spec = arrays["oracle"]
-    oracle = np.fromfile(inputs_dir / oracle_spec["file"], dtype=oracle_spec["dtype"])
-    import inspect
-
-    kernel = getattr(workload, "phases", None)
-    if kernel is not None:
-        parameters = list(inspect.signature(kernel[0].kernel).parameters)
-        returned = tuple(kernel[0].result_names)
-    else:
-        parameters = list(inspect.signature(workload).parameters)
-        returned = ()
-    # Inputs come from the archived arrays by parameter name; an in/out
-    # parameter without an archive (the matrix multiply's result) starts as
-    # zeros of the oracle's shape and is read back in place.
-    arguments, in_place_outputs = {}, []
-    for name in parameters:
-        if name in arrays:
-            spec = arrays[name]
-            arguments[name] = np.fromfile(
-                inputs_dir / spec["file"], dtype=spec["dtype"]
-            ).reshape(spec["shape"])
+        self.compile_seconds = round(time.perf_counter() - started, 2)
+        self.cost_fingerprint = apu_v1_cost.bind(target).fingerprint
+        plan = getattr(self.compiled, "selected_plan", None)
+        self.selection = {}
+        if plan is not None:
+            self.selection["selected_plan"] = plan.name
+            self.selection["candidate_estimates"] = {
+                e.plan.name: int(e.cycles) for e in self.compiled.candidate_estimates
+            }
+            decision = getattr(self.compiled, "tile_decision", None)
+            self.selection["plan_selection"] = (
+                decision.get("plan_selection") if isinstance(decision, dict) else None
+            )
+            realization = getattr(self.compiled, "realization", None)
+            source = realization.device_source() if realization is not None else None
+            self._program = getattr(self.compiled, "compiled", None)
         else:
-            arguments[name] = np.zeros(oracle_spec["shape"], dtype=oracle_spec["dtype"])
-            in_place_outputs.append(name)
-    record["inputs"] = {
-        name: hashlib.sha256(value.tobytes()).hexdigest()[:16]
-        for name, value in arguments.items()
-        if name not in in_place_outputs
-    }
-    record["outputs"] = list(returned) + in_place_outputs
-    if backend == "virtual":
-        record["cycles"] = []
-        return record
+            self.selection["native_vector_route"] = getattr(
+                self.compiled, "route", None
+            )
+            source = getattr(self.compiled, "device_source", None)
+            self._program = getattr(self.compiled, "lowered", None) or getattr(
+                self.compiled, "compiled", None
+            )
+        self.device_source_sha256 = _sha256_text(source) if source else None
+        self.device_source = source
+        self.substituted_source = None
+        if device_source is not None:
+            # A labelled control: launch a historical generated program in
+            # place of the selected one.  Not the shared selection.
+            text = Path(device_source).read_text()
+            holder = self._program if self._program is not None else self.compiled
+            if not hasattr(holder, "device_source"):
+                raise MeasurementError(
+                    "this route holds no device source to substitute"
+                )
+            holder.device_source = text
+            self.substituted_source = {
+                "path": str(device_source),
+                "sha256": _sha256_text(text),
+            }
+        estimate = (
+            self.compiled.estimate() if hasattr(self.compiled, "estimate") else None
+        )
+        self.estimate_cycles = (
+            int(estimate.cycles) if estimate is not None and estimate.cycles else None
+        )
+        self._bind_inputs()
 
+    def _bind_inputs(self):
+        import numpy as np
+
+        inputs_dir = self.root / "apuv1" / "inputs" / self.case
+        manifest = json.loads((inputs_dir / "manifest.json").read_text())
+        arrays = manifest["arrays"]
+        oracle_spec = arrays["oracle"]
+        self.oracle = np.fromfile(
+            inputs_dir / oracle_spec["file"], dtype=oracle_spec["dtype"]
+        )
+        self.oracle_sha256 = _sha256_file(inputs_dir / oracle_spec["file"])
+        workload = _load_workload(self.root, self.case)
+        phases = getattr(workload, "phases", None)
+        if phases is not None:
+            self.parameters = list(inspect.signature(phases[0].kernel).parameters)
+            self.returned = tuple(phases[0].result_names)
+            self.keyword_call = True
+        else:
+            self.parameters = list(inspect.signature(workload).parameters)
+            self.returned = ()
+            self.keyword_call = False
+        self.arguments, self.in_place_outputs, self.input_sha256 = {}, [], {}
+        for name in self.parameters:
+            if name in arrays:
+                spec = arrays[name]
+                path = inputs_dir / spec["file"]
+                self.arguments[name] = np.fromfile(path, dtype=spec["dtype"]).reshape(
+                    spec["shape"]
+                )
+                self.input_sha256[name] = _sha256_file(path)
+            else:
+                # An in/out parameter without an archive (the matrix
+                # multiply's result) starts as zeros of the oracle's shape.
+                self.arguments[name] = np.zeros(
+                    oracle_spec["shape"], dtype=oracle_spec["dtype"]
+                )
+                self.in_place_outputs.append(name)
+
+    def describe(self):
+        return {
+            "lane": "tenon",
+            "compile_seconds": self.compile_seconds,
+            "cost_fingerprint": self.cost_fingerprint,
+            **self.selection,
+            "estimate_cycles": self.estimate_cycles,
+            "device_source_sha256": self.device_source_sha256,
+            "substituted_source": self.substituted_source,
+            "inputs_sha256": self.input_sha256,
+            "oracle_sha256": self.oracle_sha256,
+            "outputs": list(self.returned) + self.in_place_outputs,
+        }
+
+    def launch(self):
+        import numpy as np
+
+        fresh = {name: value.copy() for name, value in self.arguments.items()}
+        if self.keyword_call:
+            result = self.compiled(**fresh)
+        else:
+            result = self.compiled(*(fresh[name] for name in self.parameters))
+        if result.kind != "device":
+            raise MeasurementError(f"expected a device run, got {result.kind!r}")
+        outputs = dict(result.extra.get("outputs", {}) or {})
+        for name in self.in_place_outputs:
+            outputs.setdefault(name, fresh[name])
+        produced = [np.asarray(v).reshape(-1) for v in outputs.values()]
+        exact = bool(produced) and all(
+            p.size == self.oracle.size
+            and np.array_equal(p.astype(self.oracle.dtype), self.oracle)
+            for p in produced
+        )
+        extra = result.extra
+        return {
+            "crun": result.cycles,
+            "counters": extra.get("profile_counters"),
+            "outputs_match_oracle": exact,
+            "binary_sha256": extra.get("binary_sha256"),
+            "binary_bytes": extra.get("binary_bytes"),
+            "build_mode": extra.get("build_mode"),
+            "board_lock": extra.get("board_lock"),
+            "profile_text": extra.get("profile_text"),
+            "device_log": result.stdout if hasattr(result, "stdout") else None,
+            "route": extra.get("native_vector_route"),
+            "scalar_arc": extra.get("scalar_arc"),
+        }
+
+
+class ExpertLane:
+    """The corrected expert Phoenix program of the archived comparison: the
+    archived release binary launched with the archived io through the
+    production launcher (same lock, same profiler freshness proof)."""
+
+    def __init__(self, case, root):
+        import numpy as np
+
+        self.case = case
+        self.dir = root / "apuv1" / "expert" / case
+        manifest_path = self.dir / "run-manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"no expert lane for {case!r} at {manifest_path}")
+        self.manifest = json.loads(manifest_path.read_text())
+        binary = self.dir / self.manifest["build"]["binary"]
+        if not binary.is_file():
+            candidates = sorted((self.dir / "build-evidence").glob("*.release.bin"))
+            if not candidates:
+                raise FileNotFoundError(f"no expert binary for {case!r}")
+            binary = candidates[0]
+        self.binary = binary
+        self.binary_sha256 = _sha256_file(binary)
+        archived = self.manifest.get("provenance", {}).get("built_binary_sha256")
+        self.binary_matches_archive = archived == self.binary_sha256
+        argv = self.manifest["argv"]
+        self.inputs = [
+            (item["role"], self.dir / item["path"]) for item in argv["inputs"]
+        ]
+        self.outputs = [
+            (item["role"], self.dir / item["path"], item["dtype"], tuple(item["shape"]))
+            for item in argv["outputs"]
+        ]
+        correctness = self.manifest["correctness"]
+        oracle = (self.dir / correctness["oracle"]).resolve()
+        self.oracle = np.fromfile(oracle, dtype=correctness["dtype"])
+        self.oracle_sha256 = _sha256_file(oracle)
+        self.input_sha256 = {role: _sha256_file(path) for role, path in self.inputs}
+
+    def describe(self):
+        return {
+            "lane": "expert",
+            "binary": str(self.binary),
+            "binary_sha256": self.binary_sha256,
+            "binary_matches_archive": self.binary_matches_archive,
+            "device_source_sha256": self.manifest.get("expert", {}).get(
+                "device_source_sha256"
+            ),
+            "phoenix_reference": self.manifest.get("provenance", {}).get(
+                "phoenix_reference_commit"
+            ),
+            "inputs_sha256": self.input_sha256,
+            "oracle_sha256": self.oracle_sha256,
+            "timing_boundary": self.manifest.get("timing_boundary"),
+        }
+
+    def launch(self):
+        import numpy as np
+
+        from allo.pim.apu_v1_program import (
+            launch_on_board,
+            profile_counters,
+            read_output_image,
+        )
+
+        for _role, path, _dtype, _shape in self.outputs:
+            if path.exists():
+                path.unlink()
+        argv = [str(self.binary)]
+        argv.extend(str(path) for _role, path in self.inputs)
+        argv.extend(str(path) for _role, path, _d, _s in self.outputs)
+        text, profile, cycles = launch_on_board(
+            argv, self.dir, expected_records=1, timeout=900
+        )
+        produced = [
+            read_output_image(path, role, dtype, shape).reshape(-1)
+            for role, path, dtype, shape in self.outputs
+        ]
+        exact = all(
+            p.size == self.oracle.size
+            and np.array_equal(p.astype(self.oracle.dtype), self.oracle)
+            for p in produced
+        )
+        return {
+            "crun": cycles[0],
+            "counters": profile_counters(profile),
+            "outputs_match_oracle": exact,
+            "binary_sha256": self.binary_sha256,
+            "profile_text": profile,
+            "device_log": text,
+        }
+
+
+# ----------------------------------------------------------------------- #
+# Protocol
+# ----------------------------------------------------------------------- #
+
+
+def measure_case(
+    case, root, *, backend, measured, expert, layout, device_source, label
+):
+    import allo  # noqa: F401  (the lanes import the pipeline)
     from allo.pim.apu_v1_program import apu_v1_board_lock
 
-    cycles, outputs_match, kinds = [], [], set()
+    record = {
+        "case": case,
+        "label": label
+        or (
+            "historical_program"
+            if device_source
+            else ("forced:" + layout if layout else "default_selection")
+        ),
+        "backend": backend,
+        "paper_expert_cycles": PAPER[case][0],
+        "paper_tenon_cycles": PAPER[case][1],
+        "protocol": {
+            "warmups_per_lane": 1,
+            "measured_per_lane": measured,
+            "interleaved_with_expert": bool(expert),
+            "statistic": "median crun of the profiler total record (one APUC)",
+        },
+        "lanes": {},
+        "launches": [],
+        "problems": [],
+    }
+    tenon = TenonLane(
+        case, root, backend=backend, layout=layout, device_source=device_source
+    )
+    record["lanes"]["tenon"] = tenon.describe()
+    lanes = {"tenon": tenon}
+    if expert:
+        expert_lane = ExpertLane(case, root)
+        record["lanes"]["expert"] = expert_lane.describe()
+        lanes["expert"] = expert_lane
+    if backend != "device":
+        return record
+
+    def run(lane_name, kind, round_index):
+        lane = lanes[lane_name]
+        try:
+            launch = lane.launch()
+        except Exception as error:  # the failed launch is evidence
+            launch = {"error": f"{type(error).__name__}: {error}"}
+        launch.update(lane=lane_name, kind=kind, round=round_index)
+        record["launches"].append(launch)
+        if launch.get("error"):
+            record["problems"].append(
+                f"{lane_name} {kind} {round_index}: {launch['error']}"
+            )
+        elif not launch.get("outputs_match_oracle"):
+            record["problems"].append(
+                f"{lane_name} {kind} {round_index}: outputs differ from the oracle"
+            )
+        return launch
+
+    order = list(lanes)
     with apu_v1_board_lock() as lock_path:
         record["board_lock"] = str(lock_path)
-        for _ in range(repeats):
-            fresh = {name: value.copy() for name, value in arguments.items()}
-            if kernel is not None:
-                result = compiled(**fresh)
-            else:
-                result = compiled(*(fresh[name] for name in parameters))
-            kinds.add(result.kind)
-            outputs = dict(result.extra.get("outputs", {}) or {})
-            for name in in_place_outputs:
-                outputs.setdefault(name, fresh[name])
-            produced = [np.asarray(v).reshape(-1) for v in outputs.values()]
-            match = bool(produced) and all(
-                p.size == oracle.size and np.array_equal(p.astype(oracle.dtype), oracle)
-                for p in produced
-            )
-            outputs_match.append(match)
-            cycles.append(result.cycles)
-            record.setdefault("run_extra", {}).update(
+        for lane_name in order:
+            run(lane_name, "warmup", 0)
+        for round_index in range(1, measured + 1):
+            sequence = order if round_index % 2 == 1 else list(reversed(order))
+            for lane_name in sequence:
+                run(lane_name, "measured", round_index)
+
+    # Statistics over valid measured launches only (an invalid launch is
+    # recorded but never contributes a cycle count).
+    for lane_name in lanes:
+        valid = [
+            l["crun"]
+            for l in record["launches"]
+            if l["lane"] == lane_name
+            and l["kind"] == "measured"
+            and not l.get("error")
+            and l.get("outputs_match_oracle")
+            and l.get("crun")
+        ]
+        record["lanes"][lane_name]["measured_crun"] = valid
+        record["lanes"][lane_name]["statistics"] = _statistics(valid)
+        counters = [
+            l["counters"]
+            for l in record["launches"]
+            if l["lane"] == lane_name and l["kind"] == "measured" and l.get("counters")
+        ]
+        if counters:
+            record["lanes"][lane_name]["counter_medians"] = {
+                key: statistics.median(c[key] for c in counters if key in c)
+                for key in sorted({k for c in counters for k in c})
+            }
+    tenon_stats = record["lanes"]["tenon"].get("statistics") or {}
+    if tenon_stats.get("samples", 0) < measured:
+        record["problems"].append(
+            f"tenon: {tenon_stats.get('samples', 0)} valid measured launches of {measured}"
+        )
+    if tenon_stats.get("median") is not None:
+        median = tenon_stats["median"]
+        record["comparison"] = {
+            "tenon_median_crun": median,
+            "paper_tenon_cycles": PAPER[case][1],
+            "ratio_to_paper_tenon": median / PAPER[case][1],
+            "paper_expert_cycles": PAPER[case][0],
+            "ratio_to_paper_expert": median / PAPER[case][0],
+            "performance_evidence": (
+                "valid" if not record["problems"] else "invalid (see problems)"
+            ),
+        }
+        if expert and record["lanes"]["expert"].get("statistics", {}).get("median"):
+            expert_median = record["lanes"]["expert"]["statistics"]["median"]
+            pairs = {}
+            for l in record["launches"]:
+                if (
+                    l["kind"] == "measured"
+                    and not l.get("error")
+                    and l.get("outputs_match_oracle")
+                ):
+                    pairs.setdefault(l["round"], {})[l["lane"]] = l["crun"]
+            ratios = [
+                p["expert"] / p["tenon"]
+                for p in pairs.values()
+                if "expert" in p and "tenon" in p
+            ]
+            record["comparison"].update(
                 {
-                    k: v
-                    for k, v in result.extra.items()
-                    if k in ("build_mode", "native_vector_route", "scalar_arc", "plan")
+                    "expert_median_crun": expert_median,
+                    "expert_over_tenon_medians": expert_median / median,
+                    "paired_round_ratios_expert_over_tenon": ratios,
+                    "paired_ratio_statistics": _statistics(ratios),
+                    "paper_expert_over_tenon": PAPER[case][0] / PAPER[case][1],
                 }
             )
-    record["result_kind"] = sorted(kinds)
-    record["cycles"] = cycles
-    record["outputs_match_oracle"] = outputs_match
-    if cycles and all(c is not None for c in cycles):
-        record["median_cycles"] = statistics.median(cycles)
-        record["min_cycles"], record["max_cycles"] = min(cycles), max(cycles)
-        record["ratio_to_paper_tenon"] = record["median_cycles"] / PAPER[case][1]
-        record["ratio_to_paper_expert"] = record["median_cycles"] / PAPER[case][0]
     return record
 
 
@@ -220,46 +540,90 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--artifacts")
     parser.add_argument("--cases", nargs="*", default=list(CASES))
-    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--measured", type=int, default=10)
     parser.add_argument(
-        "--backend", default="device", choices=("device", "virtual", "functional")
+        "--expert", action="store_true", help="interleave the expert lane"
     )
+    parser.add_argument("--backend", default="device", choices=("device", "virtual"))
     parser.add_argument("--layout", help="force a plan (matrix_multiply)")
-    parser.add_argument("--label", help="label for the record (default from --layout)")
+    parser.add_argument(
+        "--device-source", help="launch this generated source instead (control)"
+    )
+    parser.add_argument("--label")
     parser.add_argument("--perturb", help="CONST=FACTOR on allo.pim.costs.apu_v1")
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     import allo
 
-    root = _artifacts_root(args.artifacts)
     session = {
         "host": platform.node(),
         "date": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "python": sys.executable,
         "allo": allo.__file__,
-        "artifacts": str(root),
         "perturbation": None,
         "records": [],
     }
-    if args.perturb:
-        name, old, new = _perturb(args.perturb)
-        session["perturbation"] = {"constant": name, "stock": old, "perturbed": new}
+    failures = 0
+    try:
+        root = _artifacts_root(args.artifacts)
+        if args.perturb:
+            name, old, new = _perturb(args.perturb)
+            session["perturbation"] = {"constant": name, "stock": old, "perturbed": new}
+    except Exception as error:
+        session["error"] = f"{type(error).__name__}: {error}"
+        Path(args.out).write_text(json.dumps(session, indent=1, default=str))
+        print(session["error"], file=sys.stderr)
+        return 1
+    session["artifacts"] = str(root)
     for case in args.cases:
         try:
             record = measure_case(
                 case,
                 root,
                 backend=args.backend,
-                repeats=args.repeats,
+                measured=args.measured,
+                expert=args.expert,
                 layout=args.layout,
+                device_source=args.device_source,
                 label=args.label,
             )
         except Exception as error:  # a failed case is evidence too
-            record = {"case": case, "error": f"{type(error).__name__}: {error}"}
+            record = {
+                "case": case,
+                "error": f"{type(error).__name__}: {error}",
+                "problems": [],
+            }
+        if record.get("error") or record.get("problems"):
+            failures += 1
         session["records"].append(record)
-        print(json.dumps(record, default=str), flush=True)
+        summary = {
+            k: record.get(k)
+            for k in ("case", "label", "error", "problems", "comparison")
+            if k in record
+        }
+        summary["lanes"] = {
+            name: {
+                k: v
+                for k, v in lane.items()
+                if k
+                in (
+                    "selected_plan",
+                    "native_vector_route",
+                    "statistics",
+                    "counter_medians",
+                    "device_source_sha256",
+                    "binary_sha256",
+                )
+            }
+            for name, lane in (record.get("lanes") or {}).items()
+        }
+        print(json.dumps(summary, default=str), flush=True)
+    session["status"] = "pass" if not failures else f"fail ({failures} case(s))"
     Path(args.out).write_text(json.dumps(session, indent=1, default=str))
-    return 0
+    print(session["status"], flush=True)
+    # A failed execution, a wrong output or a violated invariant is a
+    # nonzero exit; every record is preserved in --out.
+    return 0 if not failures else 1
 
 
 if __name__ == "__main__":

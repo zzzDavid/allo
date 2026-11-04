@@ -14,8 +14,9 @@ Finding IDs (S-xx, M-xx, U-xx, V1-xx, G2-xx, C-xx, P-xx, F-xx) refer to
 Terms used below:
 
 - **Input kind.** *Source*: an ordinary `@allo` workload (usually an
-  `allo.dataflow.region` with `@allo.work(mapping=...)`; a plain function on
-  the APU v1 vector route and the Gemini-II source route) passed to
+  `allo.dataflow.region` with `@allo.work(mapping=...)`; a plain function
+  with a matched contraction on APU v1 and Gemini-II, whose vector plans and
+  launch plans are candidates of the same shared pipeline) passed to
   `allo.compile(workload, target, cost)`. *Typed*: a typed program object
   (`APUv1Program`, `APUG2TypedProgram`, `APUG2ComposedContractionProgram`)
   passed to `allo.compile`; they have no source for the matcher and enter

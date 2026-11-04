@@ -17,9 +17,12 @@ Two controlled experiments on ``zhang-x4``'s card, both through
   exact outputs, per-plan ticks recorded.
 
 Each record carries the plan name, the estimate, the measured ticks per
-pipeline body (``repetitions`` bodies), the layout and program fingerprints
-and the device library hash of every launch.  Results are evidence; nothing
-here is read by the compiler.
+pipeline body (``repetitions`` bodies; the reproduction statistic is the
+raw repeated-batch ticks divided by the repetitions, fractions kept), the
+layout and program fingerprints, the packing attestation, every artifact
+hash and the host timings of every launch.  A failed launch, an inexact
+output or a violated invariant exits nonzero with the record preserved.
+Results are evidence; nothing here is read by the compiler.
 
 Usage::
 
@@ -57,29 +60,53 @@ def gemm_n33(A: int4[64, 128], B: int4[128, 33], C: int15[64, 33]):
 
 
 def _launch_records(result):
+    """Every launch's provenance as the runtime exposes it: fingerprints,
+    the packing attestation, every artifact hash, raw tick counters and
+    host timings."""
     return [
         {
+            "index": launch.get("index"),
             "layout_fingerprint": launch.get("layout_fingerprint"),
             "program_fingerprint": launch.get("program_fingerprint"),
-            "device_library_sha256": (launch.get("artifact_sha256") or {}).get(
-                "device_library"
-            ),
+            "packing_attestation": launch.get("packing_attestation"),
+            "artifact_sha256": launch.get("artifact_sha256"),
             "raw_ticks": launch.get("raw_ticks"),
+            "final_pipeline_ticks": launch.get("final_pipeline_ticks"),
+            "host_timings_us": launch.get("host_timings_us"),
+            "cycles": launch.get("cycles"),
         }
         for launch in result.extra.get("launches", ())
     ]
 
 
+def amortized_ticks(result, repetitions) -> float | None:
+    """The reproduction statistic: the repeated batch's raw device ticks of
+    every launch (``raw_ticks["pipeline"]``, ``repetitions`` bodies) divided
+    by the repetitions and summed over launches; fractional ticks are kept
+    (``result.cycles`` rounds per launch)."""
+    total = 0.0
+    for launch in result.extra.get("launches", ()):
+        ticks = (launch.get("raw_ticks") or {}).get("pipeline")
+        if ticks is None:
+            return None
+        total += float(ticks) / repetitions
+    return total
+
+
 def _run(compiled, args):
     compiled.repetitions = REPETITIONS
     result = compiled(**args)
+    if result.kind != "device":
+        raise RuntimeError(f"expected a device run, got kind {result.kind!r}")
     return {
         "plan": compiled.plan.name,
         "estimate_cycles": compiled.plan.estimate_cycles,
         "cycles": result.cycles,
+        "amortized_ticks_per_pipeline": amortized_ticks(result, REPETITIONS),
         "run_kind": result.kind,
         "final_pipeline_ticks": result.extra.get("final_pipeline_ticks"),
         "device_lock": result.extra.get("device_lock"),
+        "cycles_scope": result.extra.get("cycles_scope"),
         "launches": _launch_records(result),
     }
 
@@ -114,6 +141,21 @@ def perturbation(seed: int) -> dict:
         and moved["cycles"] is not None
         and stock["cycles"] <= moved["cycles"]
     )
+    # Invariants of the experiment: both exact, the selection moved and the
+    # two programs launched different layouts.  A violated invariant fails
+    # the command; the record is kept.
+    problems = [
+        f"{label}: outputs differ from the int64 reference"
+        for label, run in out["runs"].items()
+        if not run["outputs_exact"]
+    ]
+    if not out["selection_changed"]:
+        problems.append("the perturbation did not change the selected plan")
+    if {l["layout_fingerprint"] for l in stock["launches"]} == {
+        l["layout_fingerprint"] for l in moved["launches"]
+    }:
+        problems.append("the two selections launched the same layouts")
+    out["invariant_problems"] = problems
     return out
 
 
@@ -138,6 +180,17 @@ def forced_alternative(seed: int) -> dict:
             and np.array_equal(s.astype(np.int64), r.astype(np.int64) @ A)
         )
         out["runs"][label] = record
+    problems = [
+        f"{label}: outputs differ from the int64 reference"
+        for label, run in out["runs"].items()
+        if not run["outputs_exact"]
+    ]
+    default, forced = out["runs"]["default"], out["runs"]["forced_separate_k1"]
+    if default["plan"] == forced["plan"]:
+        problems.append("the forced layout did not change the plan")
+    if (len(default["launches"]), len(forced["launches"])) != (1, 2):
+        problems.append("fused/separate launch counts are not (1, 2)")
+    out["invariant_problems"] = problems
     return out
 
 
@@ -155,6 +208,7 @@ def main(argv=None) -> int:
         "repetitions": REPETITIONS,
         "experiments": [],
     }
+    failures = 0
     for experiment in (perturbation, forced_alternative):
         try:
             record = experiment(args.seed)
@@ -163,11 +217,17 @@ def main(argv=None) -> int:
                 "experiment": experiment.__name__,
                 "error": f"{type(error).__name__}: {error}",
             }
+        if record.get("error") or record.get("invariant_problems"):
+            failures += 1
         session["experiments"].append(record)
         print(json.dumps(record, default=str), flush=True)
+    session["status"] = "pass" if not failures else f"fail ({failures} experiment(s))"
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(session, handle, indent=1, default=str)
-    return 0
+    print(session["status"], flush=True)
+    # A failed execution or a violated invariant is a nonzero exit; the
+    # records are preserved either way.
+    return 0 if not failures else 1
 
 
 if __name__ == "__main__":
