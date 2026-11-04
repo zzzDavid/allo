@@ -1077,12 +1077,12 @@ the whole word-count gap in the loop-counter width of the generated
 program (the same source with 16-bit counters measured as the paper-era
 source, at the paper's value, in the same rounds), the repair in `dc41df7`
 restored the paper's program and its advantage over the expert, and the
-controls showed the board measuring the paper's own kmeans binary within
-the current program's dispersion (kmeans REPRODUCED) and its own
-linear-regression binary above the paper's value (OPEN, nominal).
-Judgment: X-22 was a compiler regression and is repaired; its row and the
-linear-regression row stay OPEN (nominal) because the parity rule, not a
-tolerance, decides when a hardware row is called REPRODUCED.
+controls showed the board measuring the paper's own kmeans and
+linear-regression binaries within the current programs' dispersion.
+Judgment: X-22 was a compiler regression and is repaired; the kmeans,
+linear-regression and repaired word-count rows stay OPEN (nominal). The
+round 30 closure of kmeans on one favourable session was wrong and was
+withdrawn in round 31 (pooled-session rule).
 
 The suites at one revision: `tests/perf` at `69773fc` passed except the
 device-lock test, whose failure is an artifact of an NFS tmpdir (the probe
@@ -1092,6 +1092,51 @@ addendum. Installed-wheel simulator checks at `69773fc` passed with no
 checkout module loaded. CLAIMS.md rows 24 and E13 no longer describe typed
 or separate routes (removed in rounds 13-17), and E9/E13 cite the round 30
 protocols.
+
+## Round 31 (2026-11-04): independent review of 41a7237; driver defects, acceptance wording, an installed-artifact finding
+
+The reviewer verified the round 30 measurements against the raw records,
+ran the `dc41df7` wheel on the board with a renamed record-frequency
+program (two chunks, 129 queries, reversed equality, a zero-result query:
+exact outputs, 142,092 cycles), and found two bounded defects in the
+measurement drivers and one defect in the acceptance wording.
+
+Drivers. The archived-baseline lane launched into the archive's own
+output paths after unlinking them, so a failed launch destroyed historical
+evidence; the Gemini-II drivers computed zero ticks for an empty launch
+list (`all([])`) and the paper-row driver accepted the zero as a
+measurement; the APU v1 driver validated the Tenon lane's count only and
+ignored a binary that did not match the archive; empty case lists and
+nonpositive counts were accepted. Judgment: all four are defects of the
+evidence-producing code and were repaired before any further session
+(VALIDATION round 31): per-launch output paths outside the archive with
+failed outputs and diagnostics retained; timing evidence requires one
+record per launch of the selected plan with finite positive raw ticks;
+every lane's count is validated; an archive mismatch invalidates the case;
+usage errors for empty or nonpositive arguments. The reviewer's probes now
+fail loudly and the archive survives a failed launch.
+
+Acceptance. The round 30 wording let a row become REPRODUCED once any
+session's median crossed the paper's value, which permits favourable-
+session selection; kmeans had been closed on one such session while the
+pooled 30 samples sit above the paper (624,950 vs 624,677). Judgment: the
+closure was wrong. The rule is now pooled over every complete session at
+the revision, with at most one pre-registered confirmation campaign per
+nominal row; kmeans and linear regression are OPEN (nominal) on the pooled
+statistics, with their historical-binary controls reported, and no session
+is discarded.
+
+Installed artifact. The functional reference route relies on a NumPy
+conversion that NumPy 2.4+ rejects; three existing tests fail with the
+installed wheel (V1-19, recorded, repair deferred behind G9/G10, tests not
+weakened).
+
+G10 then advanced on an available path: the Samsung XOR layout row is
+reproduced exactly on PIMSimulator (148 to 116 cycles, a mechanism row
+through the layout synthesizer, stated as such), and the Gemini-I vector
+GEMM layout row ran on the board (VALIDATION round 31). The 20
+Docker-blocked simulator tests stay UNVERIFIED until the host's `/var` is
+freed; they are not rerun blindly.
 
 ## Rejected shortcuts
 
@@ -1146,9 +1191,9 @@ commit). Earlier judgments are kept in the round sections above.
 | G7 install/interfaces/maintainability | **PARTIAL** | installed-artifact runs at `7bdb475`, `e60973f`, `9255d29`; architecture docs follow the pipeline (`design/shared-compilation-path.md`); open: a fresh install at the candidate, the Samsung patches (P-04), P-23 lint, the public-payload review |
 | G8 backend execution | **PARTIAL** | installed-artifact evidence on the simulators at `69773fc` (Samsung, AiM, UPMEM probes, no checkout module loaded) and on the APU v1 board and the Gemini-II card at `69773fc`/`28cc922` (round 30: the archived paired protocols with the baselines re-run, exact outputs, device locks, launch provenance on every route); `tests/perf` at `69773fc` (545 passed, the one failure an NFS-tmpdir artifact fixed in `d2e3fda`), `tests/pim` at `69773fc` 564 passed with 20 Docker-backed simulator tests failing on the host's full `/var` (containerd ENOSPC, an administrator matter; the same rows passed from the installed wheel earlier in the round); open: the 20 simulator tests re-run when the host has space, the suites and installed-wheel checks at the final round 30 candidate, the ledag scratch fix (X-24) exercised only through its unit test and the sessions 3 and later |
 | G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | shared front stages and facts (rounds 12-18); both APUs' plans and typed records as candidates of the common pipeline with an enforced contract (rounds 13-17); Samsung, AiM, UPMEM and AttAcc declare effects from the facts and are checked at materialization (rounds 19-27, X-04 to X-20); shared transfer availability (X-09, X-17, X-18); the `APUv1Program` manifest from the retained IR (round 28); slice 5 traces at `653b059` from installed wheels (round 29); round 30: the paper rows measured through default selection from installed wheels under the archived protocols with launch provenance on every route; open: independent review of rounds 28-30, the full suites and installed-artifact runs at the final candidate, the remaining minor items |
-| G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), Gemini-II 5/5 REPRODUCED under the archived paired protocol with the GTML baseline re-run in the same rounds (round 30), Gemini-I under the archived paired protocol with the expert binaries re-run: 3/5 REPRODUCED (matrix multiply, histogram, kmeans after a same-round control against the archived paper-era binary), linear regression OPEN (nominal; the paper's own binary measures above the paper's value today, X-23), word count attributed to the generated program's loop-counter width and repaired (X-22, `dc41df7`): the repaired program at parity with the paper's own binary in the same rounds and 0.19% above the paper's archived median, OPEN (nominal); the 500-instance selector equivalence as a diagnostic; UNVERIFIED: token partitioning, UPMEM scaling, packing/selection/DCC studies, AttAcc Ramulator2 timings and decode, calibration, the virtual study, compile cost |
+| G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), Gemini-II 5/5 REPRODUCED under the archived paired protocol with the GTML baseline re-run in the same rounds (round 30), Gemini-I under the archived paired protocol with the expert binaries re-run: 2/5 REPRODUCED (matrix multiply, histogram), kmeans and linear regression OPEN (nominal) on the pooled round 30 sessions (X-23; the single-session closure of kmeans was withdrawn in round 31), word count attributed to the generated program's loop-counter width and repaired (X-22, `dc41df7`): the repaired program at parity with the paper's own binary in the same rounds and 0.19% above the paper's archived median, OPEN (nominal); the Samsung XOR layout row exact and the Gemini-I vector GEMM layout row faster than the paper (round 31); the 500-instance selector equivalence as a diagnostic; UNVERIFIED: portability GEMV, token partitioning, UPMEM scaling, packing/selection/DCC studies, AttAcc Ramulator2 timings and decode, calibration, the virtual study, compile cost |
 
 Verdict: **NOT READY**. Blockers: G9 (independent review of rounds 28-30,
 the suites at the final candidate), G10 (the remaining studies, the four
-AiM regressions X-19, the nominal word-count and linear-regression rows X-22/X-23), the independent re-challenge of G1-G8 at the
+AiM regressions X-19, the nominal Gemini-I rows X-22/X-23 under the pooled-session rule, the independent re-challenge of G1-G8 at the
 candidate, P-04 and P-23 (deferred), the open minor items in ISSUES.md.

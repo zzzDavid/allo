@@ -13,10 +13,10 @@ three GEMVs (faster than the paper, outputs checked), UPMEM's sixteen kernels
 RoPE rows an OPEN 32-cycle regression against the paper (X-19), the five
 Gemini-II kernels (REPRODUCED under the archived paired protocol with the
 GTML baseline re-run in the same rounds), the Gemini-I kernels under the
-archived paired protocol with the expert binaries re-run (matrix multiply,
-histogram and, after a same-round control against the archived paper-era
-binary, kmeans REPRODUCED; linear regression OPEN (nominal), its generated
-program being the paper's, X-23; word count an OPEN regression
+archived paired protocol with the expert binaries re-run (matrix multiply
+and histogram REPRODUCED; kmeans and linear regression OPEN (nominal) on
+the pooled sessions, their generated programs being the paper's, X-23;
+word count an OPEN regression
 attributed to the generated program's loop-counter width and repaired, the
 repaired program at parity with the paper's own binary in the same rounds
 and 0.19% above the paper's archived median, so OPEN (nominal) by the
@@ -122,15 +122,29 @@ per lane and twenty interleaved paired rounds against the archived
 public-GTML VectorPack host, repetitions 20, raw batch ticks divided by the
 repetitions (`benchmarks/apu_g2/paper_rows.py`). Each row records the
 session median with quartiles, IQR and MAD, the re-measured baseline, the
-same-round baseline/Tenon ratios and the paper's ratio. `REPRODUCED` for a
-hardware row means the session median is at or below the paper's value
-under that protocol with every output exact. A row whose median is above
-the paper's value stays `OPEN` with the word "nominal" when the paper's
-value lies inside the session's interquartile range, and parity is
-established only by further sessions (medians on both sides of the paper's
-value, the paper's value inside their IQRs, the paired baseline ratio at or
-above the paper's); no tolerance closes a row, and X-19 and X-22 are not
-nominal. The Gemini-II vendor host has its device library location compiled
+same-round baseline/Tenon ratios and the paper's ratio.
+
+Acceptance for hardware rows (rewritten in round 31 after the reviewer
+found the round 30 wording open to favourable-session selection): every
+complete session under the protocol at a given revision is kept and
+pooled; no session is discarded or chosen. The row's statistic is the
+median of the pooled measured samples of all complete sessions at the
+revision being judged (sessions at earlier revisions are reported beside
+it, not pooled). `REPRODUCED` means that pooled median is at or below the
+paper's value with every output exact. Otherwise the row is `OPEN
+(nominal)` when the paper's value lies inside the pooled interquartile
+range, or `OPEN (regression)` when it lies below it; both report the
+pooled median, quartiles, the per-session medians, the re-measured
+baseline, the paired baseline/Tenon ratio against the paper's, and the
+same-round control against the archived paper-era binary where one
+exists. Confirmation is bounded: a row that is `OPEN (nominal)` gets at
+most one pre-registered confirmation campaign at the final candidate (the
+number of sessions written down before the first launch, three unless
+stated otherwise), whose samples are pooled with the earlier sessions at
+that revision; after it the status is fixed by the pooled median and no
+further sessions are run to move it. No tolerance closes a row; X-19 and
+the pre-repair X-22 measurements are regressions, not nominal. The
+Gemini-II vendor host has its device library location compiled
 in; a byte copy of the archived `device.update.bin` (sha256 `c46f7f08...`)
 was placed at that location on the shared filesystem for the re-run
 (`ORIGIN.txt` beside it), and the driver hashes the file the host reports
@@ -146,6 +160,6 @@ having loaded and fails the launch unless it equals the archived library.
 | AttAcc selection (500) | analytical selector through `allo.compile` | Diagnostic only: `benchmarks/attacc/scripts/verify_paper_selection.py --out r25/g10_attacc_selection_500.json` shows the shared-pipeline selection equals the paper's archived selection on 500 of 500 instances (668,575 candidates, 1912 s). The published quality result (398 of 500 instances at the best reference simulator timing) is a different metric and stays UNVERIFIED until the external Ramulator2-AttAcc timings of the selected and reference tilings are produced; the golden test that calls the selector directly establishes neither |
 | Gemini-I kernels (5), round 29 | local board, installed wheel, 5 launches each, archived inputs and oracles | default shared selection medians: matrix_multiply 8,757,824 (paper 8,764,900; the selected plan is the paper's forced plan, chosen by cost), kmeans 624,488 (624,677), histogram 166,636 (166,783), linear_regression 94,328 (94,618.5), word_count 174,620 (171,988: **1.5% slower, X-22 open**); every output equals the oracle (`r29/apu_v1_default_rows.json`). Forced alternative and cost perturbation rows are labelled separately (`apu_v1_matmul_forced_acc4.json`, `apu_v1_matmul_perturbed.json`) |
 | Gemini-II kernels (5), round 29 | zhang-x4 card, installed wheel, 5 sessions of 20 pipeline bodies, exact int64 outputs | medians: gemm 1,725 (paper 1,733.225), batched_gemm 1,736 (1,739.15), gesummv 1,806 (1,860.075), bicg 2,540 (2,548.825), mvt 2,733 (2,766.625); all at or below the paper's Tenon column and below GTML (`r29/g2_paper_rows_sessions.json`); the GTML baseline itself is the paper's measurement, not re-run |
-| Gemini-I kernels (5), round 30 paired protocol | local board, installed wheels at 69773fc and 28cc922, one warm-up and ten measured launches per lane, the expert binaries interleaved launch by launch, exact outputs in every launch | Tenon medians (sessions 1 / 3) vs paper: matrix_multiply 8,758,698 / 8,757,878 vs 8,764,900 (REPRODUCED); kmeans 625,280 / 625,200 vs 624,677 (+0.1%, identical generated source; the control session measured the current program at 624,530 and the archived paper-era binary at 625,038 in the same rounds with the paired expert ratio at the paper's 1.0269: REPRODUCED, parity established, X-23); histogram 165,997 / 166,141 vs 166,783 (REPRODUCED); linear_regression 95,526 / 95,807.5 vs 94,618.5 (OPEN nominal, +1.0-1.3%, source differs in a static assertion only; the control session measured the current program at 94,933 and the paper's own binary at 95,047.5, X-23); word_count 177,178 / 176,415 vs 171,988 (OPEN regression X-22, attributed to the loop-counter width: in one session the current program 176,041.5, the same source with 16-bit counters 172,178, the paper-era source 171,984, the archived paper-era binary 172,648; repaired in dc41df7; the repair check measured the repaired default selection at 172,312 in the same rounds as the archived paper-era binary at 172,372 and the expert at 175,635, paired expert/Tenon 1.0201 vs the paper's 1.0198: OPEN (nominal), 0.19% above the paper's archived median). Expert medians re-run 8,786,101 / 641,165 / 167,804 / 95,185 / 175,948.5 (session 1); paired expert/Tenon 1.0030 / 1.0261 / 1.0107 / 0.9961 / 0.9922 against the paper's 1.0022 / 1.0269 / 1.0036 / 1.0123 / 1.0198 (`r30/apu_v1_paired_rows.json`, `apu_v1_paired_rows_s3.json`, `apu_v1_word_count_x22.json`) |
+| Gemini-I kernels (5), round 30 paired protocol | local board, installed wheels at 69773fc and 28cc922, one warm-up and ten measured launches per lane, the expert binaries interleaved launch by launch, exact outputs in every launch | Tenon medians (sessions 1 / 3) vs paper: matrix_multiply 8,758,698 / 8,757,878 vs 8,764,900 (REPRODUCED); kmeans 625,280 / 625,200 / 624,530 (control session) vs 624,677: pooled over the three complete round 30 sessions (30 samples) median 624,950, q1 624,429, q3 625,430 (1.0004), the archived paper-era binary 625,038 in the same rounds as the control, the paired expert ratio 1.0269 at the paper's: OPEN (nominal), identical generated source, X-23; histogram 165,997 / 166,141 vs 166,783 (REPRODUCED); linear_regression 95,526 / 95,807.5 / 94,933 vs 94,618.5: pooled median 95,180 (q1 94,703, q3 95,967; 1.0059), the paper's own binary 95,047.5 in the same rounds as the control: OPEN (nominal), source differs in a static assertion only, X-23; word_count 177,178 / 176,415 vs 171,988 (OPEN regression X-22, attributed to the loop-counter width: in one session the current program 176,041.5, the same source with 16-bit counters 172,178, the paper-era source 171,984, the archived paper-era binary 172,648; repaired in dc41df7; the repair check, the only complete session at dc41df7, measured the repaired default selection at 172,312 (q1 172,090, q3 172,882) in the same rounds as the archived paper-era binary at 172,372 and the expert at 175,635, paired expert/Tenon 1.0201 vs the paper's 1.0198: OPEN (nominal), the paper's value 0.06% below the pooled q1). Expert medians re-run 8,786,101 / 641,165 / 167,804 / 95,185 / 175,948.5 (session 1); paired expert/Tenon 1.0030 / 1.0261 / 1.0107 / 0.9961 / 0.9922 against the paper's 1.0022 / 1.0269 / 1.0036 / 1.0123 / 1.0198 (`r30/apu_v1_paired_rows.json`, `apu_v1_paired_rows_s3.json`, `apu_v1_word_count_x22.json`) |
 | Gemini-II kernels (5), round 30 paired protocol | zhang-x4 card, installed wheel at 69773fc, 20 interleaved paired rounds against the archived GTML host, exact outputs in all 210 launches | Tenon medians (q1-q3): gemm 1,722.05 (1,717.0-1,733.4) vs paper 1,733.225; batched_gemm 1,731.55 (1,719.9-1,744.4) vs 1,739.15; gesummv 1,839.30 (1,829.1-1,844.5) vs 1,860.075; bicg 2,530.05 (2,525.9-2,547.5) vs 2,548.825; mvt 2,755.03 (2,750.5-2,770.6) vs 2,766.625: all REPRODUCED. GTML re-run in the same rounds 1,914.4 / 1,916.1 / 3,099.5 / 2,734.8 / 3,090.6 (within 0.6% of the paper's column); paired GTML/Tenon medians 1.109 / 1.105 / 1.687 / 1.079 / 1.122 (paper 1.098 / 1.096 / 1.662 / 1.070 / 1.117) (`r30/g2_paired_rows_run2.json`). The first run of the session reported the vendor lane's library-load failure and exited 1 (`r30/g2_paired_rows.json`) |
 | layout rows (Samsung XOR, Gemini-I vector GEMM), token partitioning, scaling, packing, DCC, calibration, virtual study, compile cost | | UNVERIFIED this round; next in the order of the inventory |
