@@ -1072,8 +1072,17 @@ than in the board or firmware. A second paired session from a wheel at
 `d2e3fda` and a five-lane attribution session (current program, paper-era
 source, the current source with the paper-era loop-counter widths, the
 archived paper-era binary, the expert binary, all in the same rounds) were
-pre-registered and run next; their outcome and the status of the Gemini-I
-rows are in the addendum below and in ISSUES X-22/X-23.
+pre-registered and run next (VALIDATION round 30): the five-lane session put
+the whole word-count gap in the loop-counter width of the generated
+program (the same source with 16-bit counters measured as the paper-era
+source, at the paper's value, in the same rounds), the repair in `dc41df7`
+restored the paper's program and its advantage over the expert, and the
+controls showed the board measuring the paper's own kmeans binary within
+the current program's dispersion (kmeans REPRODUCED) and its own
+linear-regression binary above the paper's value (OPEN, nominal).
+Judgment: X-22 was a compiler regression and is repaired; its row and the
+linear-regression row stay OPEN (nominal) because the parity rule, not a
+tolerance, decides when a hardware row is called REPRODUCED.
 
 The suites at one revision: `tests/perf` at `69773fc` passed except the
 device-lock test, whose failure is an artifact of an NFS tmpdir (the probe
@@ -1123,7 +1132,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 28 (2026-11-04) at the candidate `4056f67`+ (this
+Refreshed in round 30 (2026-11-04) at the candidate `dc41df7`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |
@@ -1135,12 +1144,11 @@ commit). Earlier judgments are kept in the round sections above.
 | G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1 in earlier rounds; open: C-18, uniform movement weights, the perturbation traces at the current candidate on both hardware hosts |
 | G6 evidence beyond examples | **PARTIAL** | EVIDENCE.md plus the reviewer-driven probes of rounds 8-27 (renamings, operation changes, shape and slice neighbours, wrong declarations, reversed arithmetic); open: hardware-only confirmations, the probe list re-run at the candidate |
 | G7 install/interfaces/maintainability | **PARTIAL** | installed-artifact runs at `7bdb475`, `e60973f`, `9255d29`; architecture docs follow the pipeline (`design/shared-compilation-path.md`); open: a fresh install at the candidate, the Samsung patches (P-04), P-23 lint, the public-payload review |
-| G8 backend execution | **PARTIAL** | installed-artifact evidence on the simulators at `da041af` (the UPMEM, AiM and Samsung paper rows) and on the APU v1 board and the Gemini-II card at `653b059` (round 29: paper rows, forced alternatives, cost perturbations, exact outputs, device locks); open: the simulators from the installed wheel at the current candidate, the full suites at one revision |
-| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | shared front stages and facts (rounds 12-18); both APUs' plans and typed records as candidates of the common pipeline with an enforced contract (rounds 13-17); Samsung, AiM, UPMEM and AttAcc declare effects from the facts and are checked at materialization (rounds 19-27, X-04 to X-20); shared transfer availability (X-09, X-17, X-18); the `APUv1Program` manifest from the retained IR (round 28); slice 5 traces at `653b059` from installed wheels: forced alternatives and cost perturbations reach the selected plan, the generated source, the packing/launches and the measured device time on the APU v1 board and the Gemini-II card (round 29); open: independent review of rounds 28-29, the full suites and installed-artifact runs on the simulators at one revision, the remaining minor items |
-| G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), Gemini-II 5/5 at or below the paper over five card sessions, Gemini-I 4/5 at or below the paper with word count an OPEN 1.5% regression (X-22), the 500-instance selector equivalence as a diagnostic; UNVERIFIED: token partitioning, UPMEM scaling, packing/selection/DCC studies, AttAcc Ramulator2 timings and decode, calibration, the virtual study, compile cost |
+| G8 backend execution | **PARTIAL** | installed-artifact evidence on the simulators at `69773fc` (Samsung, AiM, UPMEM probes, no checkout module loaded) and on the APU v1 board and the Gemini-II card at `69773fc`/`28cc922` (round 30: the archived paired protocols with the baselines re-run, exact outputs, device locks, launch provenance on every route); `tests/perf` at `69773fc` (545 passed, the one failure an NFS-tmpdir artifact fixed in `d2e3fda`), `tests/pim` at `69773fc` 564 passed with 20 Docker-backed simulator tests failing on the host's full `/var` (containerd ENOSPC, an administrator matter; the same rows passed from the installed wheel earlier in the round); open: the 20 simulator tests re-run when the host has space, the suites and installed-wheel checks at the final round 30 candidate, the ledag scratch fix (X-24) exercised only through its unit test and the sessions 3 and later |
+| G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | shared front stages and facts (rounds 12-18); both APUs' plans and typed records as candidates of the common pipeline with an enforced contract (rounds 13-17); Samsung, AiM, UPMEM and AttAcc declare effects from the facts and are checked at materialization (rounds 19-27, X-04 to X-20); shared transfer availability (X-09, X-17, X-18); the `APUv1Program` manifest from the retained IR (round 28); slice 5 traces at `653b059` from installed wheels (round 29); round 30: the paper rows measured through default selection from installed wheels under the archived protocols with launch provenance on every route; open: independent review of rounds 28-30, the full suites and installed-artifact runs at the final candidate, the remaining minor items |
+| G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), Gemini-II 5/5 REPRODUCED under the archived paired protocol with the GTML baseline re-run in the same rounds (round 30), Gemini-I under the archived paired protocol with the expert binaries re-run: 3/5 REPRODUCED (matrix multiply, histogram, kmeans after a same-round control against the archived paper-era binary), linear regression OPEN (nominal; the paper's own binary measures above the paper's value today, X-23), word count attributed to the generated program's loop-counter width and repaired (X-22, `dc41df7`): the repaired program at parity with the paper's own binary in the same rounds and 0.19% above the paper's archived median, OPEN (nominal); the 500-instance selector equivalence as a diagnostic; UNVERIFIED: token partitioning, UPMEM scaling, packing/selection/DCC studies, AttAcc Ramulator2 timings and decode, calibration, the virtual study, compile cost |
 
-Verdict: **NOT READY**. Blockers: G9 (independent review of the completed
-migration and slice 5 evidence), G10 (the remaining studies, the four AiM
-regressions, the word-count regression), the independent re-challenge of
-G1-G8 at the candidate, P-04 and P-23 (deferred), the open minor items in
-ISSUES.md.
+Verdict: **NOT READY**. Blockers: G9 (independent review of rounds 28-30,
+the suites at the final candidate), G10 (the remaining studies, the four
+AiM regressions X-19, the nominal word-count and linear-regression rows X-22/X-23), the independent re-challenge of G1-G8 at the
+candidate, P-04 and P-23 (deferred), the open minor items in ISSUES.md.
