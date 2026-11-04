@@ -70,10 +70,13 @@ struct TenonReducePlan
     // meet inside one barrier group (the same GRF_A vector slice, distinct
     // GRF_B entries).
     int issue_order = 0;
-    // split_rows 1: the second row of every tile is staged in the partner
-    // (odd) bank fiber at the same column position (the F2 half -> bank
-    // swizzle), with or without row pairing.  tile_fiber then names each
-    // tile's base (first-row) fiber, which must be the even fiber.
+    // half_fiber[h]: the bank fiber holding half h (physical row h) of every
+    // tile whose base fiber is the even fiber, the plan's rendering of the
+    // selected F2 half -> bank map.  {0, 0} keeps both rows in the tile's
+    // fiber (the vendor layout); {0, 1} stages the second row in the odd
+    // fiber at the same column position (the swizzled layout).  split_rows
+    // is derived: half_fiber[0] != half_fiber[1].
+    int half_fiber[2] = {0, 0};
     int split_rows = 0;
 };
 

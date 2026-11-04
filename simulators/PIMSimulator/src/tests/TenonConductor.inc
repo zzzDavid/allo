@@ -293,21 +293,33 @@ TenonReducePlan tenonParseReducePlan(const std::string& text)
     if (it == fields.end())
         tenonFail("plan requires 'tile_fiber'");
     for (long fiber : it->second) plan.tile_fiber.push_back((int)fiber);
-    for (const char* name : {"issue_order", "split_rows"})
+    auto order = fields.find("issue_order");
+    if (order != fields.end())
     {
-        auto field = fields.find(name);
-        if (field == fields.end())
-            continue;
-        if (field->second.size() != 1 || (field->second[0] != 0 && field->second[0] != 1))
-            tenonFail(std::string(name) + " must be 0 or 1");
-        (std::string(name) == "issue_order" ? plan.issue_order : plan.split_rows) =
-            (int)field->second[0];
+        if (order->second.size() != 1 || (order->second[0] != 0 && order->second[0] != 1))
+            tenonFail("issue_order must be 0 or 1");
+        plan.issue_order = (int)order->second[0];
     }
+    auto halves = fields.find("half_fiber");
+    if (halves != fields.end())
+    {
+        if (halves->second.size() != 2)
+            tenonFail("half_fiber names the fiber of each of a tile's two rows");
+        for (int h = 0; h < 2; ++h)
+        {
+            if (halves->second[h] != 0 && halves->second[h] != 1)
+                tenonFail("half_fiber values must be 0 (even) or 1 (odd)");
+            plan.half_fiber[h] = (int)halves->second[h];
+        }
+        if (plan.half_fiber[0] != 0)
+            tenonFail("half_fiber[0] must be the even fiber (the tile's base fiber)");
+    }
+    plan.split_rows = plan.half_fiber[0] != plan.half_fiber[1];
     if (plan.split_rows)
     {
         for (int f : plan.tile_fiber)
             if (f != 0)
-                tenonFail("split_rows stages every tile's first row in the even fiber");
+                tenonFail("a split half -> bank map stages every tile's first row in the even fiber");
     }
     return plan;
 }
@@ -612,10 +624,10 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
                     {
                         long slot = ((long)j * C * P + block) * G + g;
                         long row = slot_row[slot];
-                        // split_rows: the tile's second row (its upper half
-                        // of columns) lives in the partner fiber at the same
-                        // column position.
-                        int fiber = (plan.split_rows && g * E >= cols_per_row) ? 1 : f;
+                        // The selected half -> bank map: half h (physical row
+                        // h of the tile) lives in fiber plan.half_fiber[h] at
+                        // the same column position.
+                        int fiber = plan.split_rows ? plan.half_fiber[(g * E) / cols_per_row] : f;
                         for (int a = 0; a < E; ++a)
                             mem_->addTransaction(
                                 true, address(block / P, block % P, fiber, tile_col + g * E + a),

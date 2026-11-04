@@ -122,6 +122,7 @@ _MATCHER_PHYSICAL_EXTRA_FIELDS = (
     "crf_issue",
     "issue_order",
     "tile_rows",
+    "half_bank_map",
     "stage_resident",
     "group_size",
     "groups_per_vr",

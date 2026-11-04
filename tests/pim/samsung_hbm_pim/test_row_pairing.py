@@ -97,6 +97,10 @@ def test_row_pair_candidates_are_enumerated_with_the_shared_contract():
             assert half.describes_conflict_free(
                 bank_dims=("bank",), varying_inputs=("half",)
             ) == conflict_free
+            # The declared matrix packing is the map's rendering.
+            effects = c.extra["effects"]
+            matrix = next(v for v in effects.value_layouts if v.storage == "banks" and v.value in effects.coverage.inputs)
+            assert matrix.packing == ("half_bank:0,1" if conflict_free else "half_bank:0,0")
 
 
 def test_row_pair_lowering_and_plan():
@@ -120,11 +124,12 @@ def test_row_pair_lowering_and_plan():
     assert (split.issue_order, split.tile_rows) == ("tile_major", "split_fibers")
     geometry = dict(SAMSUNG_DEFAULT_GEOMETRY)
     lines = samsung_reduce_plan(split, geometry, 1)["text"].splitlines()
-    assert "issue_order 0" in lines and "split_rows 1" in lines
+    assert "issue_order 0" in lines and "half_fiber 0 1" in lines
     lines = samsung_reduce_plan(same, geometry, 1)["text"].splitlines()
-    assert "issue_order 1" in lines and "split_rows 0" in lines
+    assert "issue_order 1" in lines and "half_fiber 0 0" in lines
     lines = samsung_reduce_plan(programs["bank_row"][1], geometry, 1)["text"].splitlines()
-    assert "issue_order 0" in lines and "split_rows 0" in lines
+    assert "issue_order 0" in lines and "half_fiber 0 0" in lines
+    assert split.half_fibers == (0, 1) and same.half_fibers == (0, 0)
     # Streams.  The identity pairing: a pair is one round of 16 transactions,
     # both rows in bank 0.  The split layout: 32 rounds of 8, each tile's
     # first row in bank 0 and second row in bank 1.
@@ -142,11 +147,17 @@ def test_row_pair_lowering_and_plan():
     # (second row), each group under its own barrier.
     macs = [r for r in stream if r.kind == "MAC"][:8]
     assert [(r.accesses[0].bank, r.accesses[0].row) for r in macs] == [(0, 0), (1, 1)] * 4
-    # Cost: the measured same-bank pair cost keeps the identity pairing above
-    # every other placement; the split layout pays the odd-fiber term.
+    # Cost (round 37): the estimate includes the first staging from the
+    # conductor's schedule, so the split layout, whose staging has no exposed
+    # row change, is priced below bank_row and dual_fiber, and the default
+    # selection picks it; the measured same-bank pair cost keeps the identity
+    # pairing last.  The conductor agrees on both paper GEMVs and on a
+    # held-out 37x129x2 contraction (VALIDATION round 37).
     estimates = {f: programs[f][0].estimate().cycles for f in programs}
     assert estimates["bank_row_rowpair"] > max(estimates["bank_row"], estimates["dual_fiber"], estimates["split_rows"])
-    assert estimates["split_rows"] > estimates["bank_row"]
+    assert estimates["split_rows"] < estimates["bank_row"] < estimates["dual_fiber"]
+    default = allo.compile(fn, target, samsung_cost, reduction_order="reassociate", backend="virtual")
+    assert default.compiled.layout_ctx.programs[0].lever_record["mode"].split("+")[0] == "split_rows"
 
 
 def test_split_rows_rejects_a_crf_filled_vector_and_the_paired_split():
@@ -198,3 +209,63 @@ def test_row_pair_streams_equal_the_conductor_and_results_are_bit_identical(
         assert text[start:end] == samsung_conductor_trace_text(samsung_access_stream(compiled)), family
     for family in ("bank_row_rowpair", "split_rows"):
         assert np.array_equal(outputs[family].view(np.uint16), outputs["bank_row"].view(np.uint16)), family
+
+
+def test_the_selected_map_is_the_contract_not_a_label(monkeypatch):
+    """Reviewer round 36: the half -> bank map must decide the packing and
+    the addressing, be part of the decision identity, and an edited map or
+    packing declaration must be rejected before selection."""
+    from dataclasses import replace
+
+    from allo.spmw_autoschedule import _matcher_placement_decision
+    from allo.spmw_candidate import validate_candidate_effects
+    from allo.spmw_samsung import samsung_half_fibers, samsung_matrix_packing
+
+    fn, _m, _k = _WORKLOAD.CASES["gemv_m8192_k256"]
+    target, buckets, candidates = _candidates(fn)
+    default = allo.compile(fn, target, samsung_cost, reduction_order="reassociate", backend="virtual")
+    matches = buckets[0][1]
+    split = _vendor_levers(candidates, buckets, "split_rows")[0]
+    identity_map = next(c.extra["half_bank_map"] for c in candidates if c.mode.split("+")[0] == "bank_row_rowpair")
+    assert samsung_half_fibers(split) == (0, 1) and samsung_matrix_packing(split) == "half_bank:0,1"
+
+    # 1. The map is part of the decision identity.
+    before = _matcher_placement_decision(default.trace, split)
+    edited = replace(split) if hasattr(split, "__dataclass_fields__") else split
+    original_map = split.extra["half_bank_map"]
+    split.extra["half_bank_map"] = identity_map
+    try:
+        after = _matcher_placement_decision(default.trace, split)
+        assert before != after, "changing the selected map must change the search decision"
+        # 2. An edited map disagrees with the declared packing: rejected
+        # before costing by the shared validation, and by the lowering.
+        problems = validate_candidate_effects(matches, split, target)
+        assert any("half_bank:0,1" in p and "half_bank:0,0" in p for p in problems), problems
+        with pytest.raises(Exception, match="map places them|declared packing|contract"):
+            allo.compile(fn, target, samsung_cost, reduction_order="reassociate", backend="virtual",
+                         layout=[split] * len(buckets))
+    finally:
+        split.extra["half_bank_map"] = original_map
+    # 3. A bogus matrix packing declaration is rejected before selection.
+    effects = split.extra["effects"]
+    bogus = replace(
+        effects,
+        value_layouts=tuple(
+            replace(v, packing="bogus-unrealized-packing")
+            if v.storage == "banks" and v.value in effects.coverage.inputs else v
+            for v in effects.value_layouts
+        ),
+    )
+    split.extra["effects"] = bogus
+    try:
+        problems = validate_candidate_effects(matches, split, target)
+        assert any("bogus-unrealized-packing" in p for p in problems), problems
+        with pytest.raises(Exception, match="bogus-unrealized-packing|contract"):
+            allo.compile(fn, target, samsung_cost, reduction_order="reassociate", backend="virtual",
+                         layout=[split] * len(buckets))
+    finally:
+        split.extra["effects"] = effects
+    # 4. A consistent candidate still compiles and realizes its map.
+    compiled = allo.compile(fn, target, samsung_cost, reduction_order="reassociate", backend="virtual",
+                            layout=[split] * len(buckets))
+    assert compiled.compiled.layout_ctx.programs[0].half_fibers == (0, 1)

@@ -733,7 +733,17 @@ def samsung_candidate_effects(target, matches, placement):
                     # CRF fill: the vector is scattered to the banks and loaded
                     # into GRF_A per reduction tile (LD_A).
                     storage = "banks"
-                layouts[(memref, "value")] = CandidateValueLayout(memref, axes, storage)
+                packing = None
+                if contraction and memref == getattr(fact.matrix, "memref_name", None) and not temporal:
+                    # The matrix's row packing in the banks is the selected
+                    # half -> bank map (vendor: both rows in the tile's fiber).
+                    try:
+                        packing = samsung_matrix_packing(placement)
+                    except ValueError as error:
+                        packing = f"invalid:{error}"
+                layouts[(memref, "value")] = CandidateValueLayout(
+                    memref, axes, storage, packing
+                )
                 transfers[memref] = CandidateTransfer(
                     memref,
                     "in",
@@ -873,14 +883,53 @@ class SamsungProgram:
     # default, one barrier per group) or "row_pair" (group g and g + G/2 of
     # one tile, its two physical rows, under one barrier).
     issue_order: str = "tile_major"
-    # With row_pair: the second row of every tile staged in the partner
-    # (odd) fiber at the same column position ("split_fibers") or kept in
-    # the tile's own fiber ("same_bank").
+    # The fiber of each of a tile's two physical rows, from the selected
+    # half -> bank map: (0, 0) "same_bank", (0, 1) "split_fibers".
+    half_fibers: tuple = (0, 0)
     tile_rows: str = "same_bank"
 
 
 ISSUE_ORDERS = ("tile_major", "row_pair")
 TILE_ROW_PLACEMENTS = ("same_bank", "split_fibers")
+
+
+def samsung_half_fibers(placement) -> tuple:
+    """The bank fiber of each of a tile's two physical rows, read from the
+    placement's selected ``half_bank_map`` (a ``LinearLayout`` over
+    ``{bank, half}`` into ``(bank,)``): ``(0, 0)`` keeps both rows in the
+    tile's fiber, ``(0, 1)`` stages the second row in the odd fiber.  A
+    placement without a map is the vendor layout ``(0, 0)``.  The map is
+    the production source of this choice: the packing the candidate
+    declares, the program the lowering emits and the plan the conductor
+    executes all derive from it, and the realization check compares them.
+    """
+
+    extra = getattr(placement, "extra", None) or {}
+    layout = extra.get("half_bank_map")
+    if layout is None:
+        return (0, 0)
+    halves = []
+    for half in (0, 1):
+        try:
+            physical = layout.apply(bank=0, half=half)
+        except Exception as error:
+            raise ValueError(f"half_bank_map cannot place half {half}: {error}")
+        bank = int(physical[layout.out_dims.index("bank")])
+        if bank not in (0, 1):
+            raise ValueError(f"half_bank_map places half {half} in bank {bank}, not a fiber")
+        halves.append(bank)
+    if halves[0] != 0:
+        raise ValueError("half_bank_map must keep a tile's first row in its base (even) fiber")
+    return tuple(halves)
+
+
+def samsung_matrix_packing(placement) -> str:
+    """The matrix packing a candidate declares, named from its half -> bank
+    map: ``half_bank:0,0`` (both rows in the tile's fiber) or
+    ``half_bank:0,1`` (second row in the odd fiber)."""
+
+    h0, h1 = samsung_half_fibers(placement)
+    return f"half_bank:{h0},{h1}"
 
 
 def _infeasible(message):
@@ -1142,21 +1191,35 @@ class SamsungCtx(CodegenContext):
                     )
 
     def _check_lever_realization(self, layout, program) -> None:
-        """The emitted program's issue order and row placement must be the
-        levers the candidate declared."""
+        """The emitted program's issue order must be the lever the candidate
+        declared, and its tile-row placement (the fiber of each physical
+        row) must be the matrix packing the candidate's shared contract
+        declares from its half -> bank map."""
+        from .spmw_candidate import candidate_effects
+
+        if program.kind != "REDUCE":
+            return
         extra = layout.extra or {}
-        declared = (
-            extra.get("issue_order", "tile_major"),
-            extra.get("tile_rows", "same_bank"),
-        )
-        realized = (
-            getattr(program, "issue_order", "tile_major"),
-            getattr(program, "tile_rows", "same_bank"),
-        )
-        if program.kind == "REDUCE" and declared != realized:
+        declared_order = extra.get("issue_order", "tile_major")
+        if declared_order != getattr(program, "issue_order", "tile_major"):
             raise RuntimeError(
                 "Samsung realization issues the MAC groups as "
-                f"{realized} but the candidate declared {declared}"
+                f"{program.issue_order!r} but the candidate declared {declared_order!r}"
+            )
+        effects = candidate_effects(layout)
+        rep = program.contraction
+        if effects is None or rep is None:
+            return
+        declared = None
+        for value_layout in effects.value_layouts:
+            if value_layout.value == rep.matrix_memref and value_layout.storage == "banks":
+                declared = value_layout.packing
+                break
+        realized = "half_bank:{},{}".format(*(program.half_fibers or (0, 0)))
+        if declared != realized:
+            raise RuntimeError(
+                f"Samsung realization stages the matrix rows as {realized!r}; the "
+                f"candidate declared packing {declared!r}"
             )
 
     def check_realization(self, layouts) -> None:
@@ -1586,11 +1649,19 @@ class SamsungCtx(CodegenContext):
         mac = target.op("MAC")
         extra = layout.extra or {}
         issue_order = extra.get("issue_order", "tile_major")
-        tile_rows = extra.get("tile_rows", "same_bank")
-        if issue_order not in ISSUE_ORDERS or tile_rows not in TILE_ROW_PLACEMENTS:
+        try:
+            half_fibers = samsung_half_fibers(layout)
+        except ValueError as error:
+            raise _infeasible(str(error))
+        tile_rows = "split_fibers" if half_fibers[1] != half_fibers[0] else "same_bank"
+        declared_rows = extra.get("tile_rows")
+        if declared_rows is not None and declared_rows != tile_rows:
             raise _infeasible(
-                f"unknown issue_order/tile_rows levers {issue_order!r}/{tile_rows!r}"
+                f"the candidate labels its tile rows {declared_rows!r} but its "
+                f"half -> bank map places them {half_fibers} ({tile_rows})"
             )
+        if issue_order not in ISSUE_ORDERS:
+            raise _infeasible(f"unknown issue_order lever {issue_order!r}")
         if issue_order == "row_pair" or tile_rows == "split_fibers":
             # A tile's G*E columns must be exactly two physical rows of
             # cols_per_row burst columns (the pair, or the split, is the
@@ -1699,6 +1770,7 @@ class SamsungCtx(CodegenContext):
             row_slots=row_slots,
             row_map=row_map,
             issue_order=issue_order,
+            half_fibers=tuple(half_fibers),
             tile_rows=tile_rows,
         )
 
@@ -2230,7 +2302,7 @@ def samsung_reduce_access_stream(
     local = {t: fiber_tiles[program.tile_fiber[t]].index(t) for t in range(T)}
     vector_base = J * len(fiber_tiles[0]) * tile_cols
     result_base = J * len(fiber_tiles[1]) * tile_cols
-    if getattr(program, "tile_rows", "same_bank") == "split_fibers":
+    if tuple(getattr(program, "half_fibers", (0, 0)) or (0, 0)) == (0, 1):
         result_base = J * len(fiber_tiles[0]) * tile_cols
     N = int(columns)
     rounds = []
@@ -2247,7 +2319,8 @@ def samsung_reduce_access_stream(
         )
 
     row_pair = getattr(program, "issue_order", "tile_major") == "row_pair"
-    split = getattr(program, "tile_rows", "same_bank") == "split_fibers"
+    halves = tuple(getattr(program, "half_fibers", (0, 0)) or (0, 0))
+    split = halves[1] != halves[0]
     if split:
         # The odd fiber serves the second row of every even-fiber tile.
         fiber_tiles = {0: list(fiber_tiles[0]), 1: list(fiber_tiles[0])}
@@ -2483,7 +2556,7 @@ def samsung_reduce_plan(
         f"columns {columns}",
         f"weight_resident {int(bool(resident))}",
         f"issue_order {int(program.issue_order == 'row_pair')}",
-        f"split_rows {int(program.tile_rows == 'split_fibers')}",
+        "half_fiber " + " ".join(str(f) for f in (program.half_fibers or (0, 0))),
     ]
     slots = passes * C * P * G
     table = None

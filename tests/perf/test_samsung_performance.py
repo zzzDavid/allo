@@ -96,14 +96,18 @@ def test_virtual_graph_includes_shape_aware_host_transfers():
     estimate = bound.evaluate(graph)
 
     # The accumulator lives in GRF_B, so the plan materializes its load and
-    # drain around the MAC; the host moves bracket the device program.
+    # drain around the MAC; the host moves bracket the device program.  Since
+    # round 37 the MAC rule adds the first matrix staging as a second step of
+    # the MAC event (``mac_stage``, the conductor's staging schedule).
     assert [activity.primitive for activity in graph.activities] == [
         "samsung_hbm_pim/host/SCATTER_BANKS",
         "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/LD_B",
         "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/MAC",
+        "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/MAC",
         "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/ST_B",
         "samsung_hbm_pim/host/GATHER_BANKS",
     ]
+    assert [activity.label for activity in graph.activities][2:4] == ["mac", "mac_stage"]
     # Host moves are priced from their buffer bytes (64 B scatter -> 4 cycles,
     # 32 B gather -> 3 cycles) and serialize with the device program.
     device_only = bound.evaluate(
@@ -138,9 +142,14 @@ def test_autoscheduler_and_virtual_backend_share_cost_program(monkeypatch):
     result = compiled.run()
 
     # Both bank fibers share the channel bus (costs/samsung.py MAC rule), so
-    # the selected placement keeps the reduction on one fiber.
-    assert chosen.mode.startswith("bank_row")
-    assert chosen.extra.get("n_fibers", 1) == 1
+    # the reduction tiles stay on one fiber; since round 37 the estimate
+    # includes the first matrix staging from the conductor's schedule, and
+    # the placement that stages every tile's second row in the odd fiber
+    # (`split_rows`, no exposed row change in its staging) is the cheapest
+    # one, as the conductor measures on the paper GEMVs and a held-out shape.
+    assert chosen.mode.startswith("split_rows")
+    assert chosen.extra.get("tile_rows") == "split_fibers"
+    assert chosen.extra.get("issue_order") == "tile_major"
     assert result.cycles == direct.cycles
     assert result.extra["critical_path"] == list(direct.critical_path)
     assert result.extra["model_fingerprint"] == bound.fingerprint

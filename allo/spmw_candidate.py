@@ -832,6 +832,7 @@ def validate_candidate_effects(matches, placement, view=None) -> list[str]:
             f"{sorted((set(effects.abi_inputs) | set(effects.abi_outputs)) - parameters)}"
             " are not parameters of the program"
         )
+    problems.extend(_derivation_problems(view, matches, placement, effects))
     return problems
 
 
@@ -874,11 +875,16 @@ EFFECTS_DERIVERS: dict = {}
 
 
 def _redeclared(view, matches, placement):
+    """Attach the deriver's effects to a placement that declares none (a
+    caller-supplied handle-only placement).  A placement that already
+    declares effects keeps them: a declaration that differs from the
+    derivation is a contract violation for ``validate_candidate_effects``
+    to report, not something to overwrite silently."""
     deriver = EFFECTS_DERIVERS.get(getattr(view, "name", None))
-    if deriver is None:
+    if deriver is None or candidate_effects(placement) is not None:
         return placement
     effects = deriver(view, matches, placement)
-    if effects is None or candidate_effects(placement) == effects:
+    if effects is None:
         return placement
     from .spmw_autoschedule import Placement
 
@@ -890,12 +896,108 @@ def _redeclared(view, matches, placement):
     )
 
 
+def _derivation_problems(view, matches, placement, effects) -> list:
+    """The declared value layouts (storage and packing) and transfers must be
+    the ones the target's deriver states for this placement: a declaration
+    edited after enumeration (a different packing, a different map) is
+    rejected before costing and selection."""
+    deriver = EFFECTS_DERIVERS.get(getattr(view, "name", None))
+    if deriver is None:
+        return []
+    try:
+        derived = deriver(view, matches, placement)
+    except Exception as error:  # the deriver's own rejection is a problem too
+        return [f"the target's effects derivation rejects the placement: {error}"]
+    if derived is None:
+        return []
+    problems = []
+    def key(layout):
+        return (layout.value, getattr(layout, "image", "value"))
+    declared_layouts = {key(l): l for l in effects.value_layouts}
+    for derived_layout in derived.value_layouts:
+        declared_layout = declared_layouts.get(key(derived_layout))
+        if declared_layout is None:
+            problems.append(
+                f"declares no layout for {derived_layout.value!r}; the derivation "
+                f"places it in {derived_layout.storage!r}"
+            )
+            continue
+        if (declared_layout.storage, declared_layout.packing) != (
+            derived_layout.storage, derived_layout.packing
+        ):
+            problems.append(
+                f"declares {derived_layout.value!r} in storage "
+                f"{declared_layout.storage!r} packing {declared_layout.packing!r}; the "
+                f"derivation from the placement's selected map and handles gives "
+                f"{derived_layout.storage!r} packing {derived_layout.packing!r}"
+            )
+        if str(derived_layout.packing or "").startswith("invalid:"):
+            problems.append(
+                f"the placement's selected map is invalid for {derived_layout.value!r}: "
+                f"{derived_layout.packing[len('invalid:'):]}"
+            )
+    declared_transfers = {(t.value, t.direction): t for t in effects.transfers}
+    for transfer in derived.transfers:
+        declared = declared_transfers.get((transfer.value, transfer.direction))
+        if declared is not None and tuple(declared.route) != tuple(transfer.route):
+            problems.append(
+                f"declares transfer {transfer.value!r} {transfer.direction} as "
+                f"{tuple(declared.route)}; the derivation gives {tuple(transfer.route)}"
+            )
+    return problems
+
+
+def _declaration_disagreements(declared, current) -> list:
+    """How a supplied declaration differs from the current candidate's for
+    the same decision, in the fields the lowering realizes: each value
+    layout's storage and packing (by position: a placement supplied for
+    every body of a lockstep kernel names another body's values) and each
+    transfer's route."""
+    problems = []
+    if len(declared.value_layouts) != len(current.value_layouts):
+        problems.append(
+            f"declares {len(declared.value_layouts)} value layouts, the current "
+            f"candidate {len(current.value_layouts)}"
+        )
+    for mine, theirs in zip(declared.value_layouts, current.value_layouts):
+        if (mine.storage, mine.packing) != (theirs.storage, theirs.packing):
+            problems.append(
+                f"declares {mine.value!r} in storage {mine.storage!r} packing "
+                f"{mine.packing!r}; the current candidate with the same decision "
+                f"declares {theirs.storage!r} packing {theirs.packing!r}"
+            )
+    if len(declared.transfers) != len(current.transfers):
+        problems.append(
+            f"declares {len(declared.transfers)} transfers, the current candidate "
+            f"{len(current.transfers)}"
+        )
+    for mine, theirs in zip(declared.transfers, current.transfers):
+        if (mine.direction, tuple(mine.route)) != (theirs.direction, tuple(theirs.route)):
+            problems.append(
+                f"declares transfer {mine.value!r} {mine.direction} as "
+                f"{tuple(mine.route)}; the current candidate declares "
+                f"{theirs.direction} {tuple(theirs.route)}"
+            )
+    return problems
+
+
 def _with_current_effects(placement, current):
     """``placement`` with the effects the current enumeration declared for
-    the same decision (per work item), the caller's other fields kept."""
+    the same decision (per work item), the caller's other fields kept.  A
+    supplied declaration that disagrees with the current candidate's on a
+    realized field (storage, packing, transfer route) is a contract
+    violation, refused here rather than silently replaced."""
     effects = candidate_effects(current)
     if effects is None or candidate_effects(placement) is effects:
         return placement
+    declared = candidate_effects(placement)
+    if declared is not None:
+        problems = _declaration_disagreements(declared, effects)
+        if problems:
+            raise ValueError(
+                f"supplied placement {placement.mode!r} violates the candidate "
+                "contract: " + "; ".join(problems)
+            )
     from .spmw_autoschedule import Placement
 
     return Placement(
