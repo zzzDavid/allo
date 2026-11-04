@@ -11,6 +11,8 @@ machine without the proprietary SDK.
 
 from __future__ import annotations
 
+import hashlib
+
 import math
 import os
 from pathlib import Path
@@ -30,6 +32,7 @@ from .apu_v1_program import (
     _ledag_available_reason,
     apu_v1_lock_path,
     launch_on_board,
+    profile_counters,
     read_output_image,
 )
 from .apu_v1_vector_codegen import PointerOffsetRef, PointerRef, VR_LANES
@@ -388,6 +391,7 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
         argv.extend(str(input_paths[name]) for name in sorted(input_paths))
         argv.extend(str(output_paths[name]) for name in sorted(output_paths))
         argv.extend(str(initial_paths[name]) for name in sorted(initial_paths))
+        binary_sha256 = hashlib.sha256(Path(binary).read_bytes()).hexdigest()
         text, profile, cycles = launch_on_board(
             argv, project, expected_records=1, timeout=900
         )
@@ -426,6 +430,16 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
                 "initial_outputs_transferred": sorted(initial_paths),
                 "board_lock": str(apu_v1_lock_path()),
                 "profile_records": 1,
+                # Launch provenance (as the scalar route records it).
+                "binary_sha256": binary_sha256,
+                "binary_bytes": Path(binary).stat().st_size,
+                "profile_counters": profile_counters(profile),
+                "profile_text": profile,
+                "launch_roles": {
+                    "inputs": sorted(input_paths),
+                    "outputs": sorted(output_paths),
+                    "initial": sorted(initial_paths),
+                },
             },
         )
     finally:

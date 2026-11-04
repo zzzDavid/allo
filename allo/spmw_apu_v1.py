@@ -803,12 +803,16 @@ def _run_apu_v1_grouped(compiled: "Compiled", **inputs) -> RunResult:
 
         import numpy as np
 
+        import hashlib
+
         from .pim.apu_v1_program import (
             apu_v1_lock_path,
             launch_on_board,
+            profile_counters,
             read_output_image,
         )
 
+        binary_sha256 = hashlib.sha256(Path(bin_path).read_bytes()).hexdigest()
         # The board lock is held across launch and the pre/post device-log
         # drains, so the parsed totals belong to this launch only.
         binary_output, ledag_text, apuc_cycles = launch_on_board(
@@ -859,6 +863,11 @@ def _run_apu_v1_grouped(compiled: "Compiled", **inputs) -> RunResult:
                 "returncode": 0,
                 "board_lock": str(apu_v1_lock_path()),
                 "profile_records": _APU_V1_MATCHER_APUCS,
+                "binary_sha256": binary_sha256,
+                "binary_bytes": Path(bin_path).stat().st_size,
+                "profile_counters": profile_counters(ledag_text),
+                "profile_text": ledag_text,
+                "apuc_cycles": list(apuc_cycles),
             },
         )
     finally:

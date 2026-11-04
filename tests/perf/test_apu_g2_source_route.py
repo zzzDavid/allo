@@ -935,23 +935,34 @@ def test_device_lock_is_exclusive_and_reentrant(monkeypatch, tmp_path):
     monkeypatch.delenv("TENON_APU_G2_LOCK", raising=False)
     monkeypatch.setenv("TENON_APU_G2_DEVICE", "apu-00")
     assert apu_g2_lock_path() == Path("/tmp/tenon-apu-g2-apu-00.lock")
-    path = tmp_path / "g2.lock"
-    monkeypatch.setenv("TENON_APU_G2_LOCK", str(path))
-    with apu_g2_device_lock() as held:
-        assert held == path
-        with apu_g2_device_lock():
-            pass
+    # The real lock lives under /tmp (a local filesystem); the probe below
+    # takes ``flock`` on a read-only descriptor, which NFS-backed temp
+    # directories reject with EBADF, so keep the test lock local as well.
+    import tempfile
+
+    import shutil
+
+    local = Path(tempfile.mkdtemp(prefix="tenon-g2-lock-", dir="/tmp"))
+    try:
+        path = local / "g2.lock"
+        monkeypatch.setenv("TENON_APU_G2_LOCK", str(path))
+        with apu_g2_device_lock() as held:
+            assert held == path
+            with apu_g2_device_lock():
+                pass
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
         fd = os.open(path, os.O_RDONLY)
         try:
-            with pytest.raises(BlockingIOError):
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
             os.close(fd)
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     finally:
-        os.close(fd)
+        shutil.rmtree(local, ignore_errors=True)
 
 
 def test_cmake_arguments_follow_the_resolved_sdk_and_device(monkeypatch):

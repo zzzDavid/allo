@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from benchmarks.apu_g2 import paper_rows as g2_paper_rows
 from benchmarks.apu_g2 import selection_traces
 from benchmarks.apu_v1 import paper_rows
 
@@ -115,3 +116,26 @@ def test_apu_g2_amortized_ticks_keep_fractions():
         extra = {"launches": [{"raw_ticks": {}}]}
 
     assert selection_traces.amortized_ticks(Missing(), 20) is None
+
+
+def test_apu_g2_vendor_lane_checks_the_loaded_device_library(tmp_path):
+    import hashlib
+
+    archived = tmp_path / "device.update.bin"
+    archived.write_bytes(b"archived library")
+    expected = hashlib.sha256(archived.read_bytes()).hexdigest()
+    same = tmp_path / "compiled-in.bin"
+    same.write_bytes(b"archived library")
+    other = tmp_path / "other.bin"
+    other.write_bytes(b"another library")
+
+    ok = g2_paper_rows.loaded_device_library({"device_library": str(same)}, expected)
+    assert ok["problem"] is None and ok["loaded_device_library_sha256"] == expected
+    wrong = g2_paper_rows.loaded_device_library({"device_library": str(other)}, expected)
+    assert "other than the archived one" in wrong["problem"]
+    missing = g2_paper_rows.loaded_device_library(
+        {"device_library": str(tmp_path / "gone.bin")}, expected
+    )
+    assert "not a file" in missing["problem"]
+    silent = g2_paper_rows.loaded_device_library({}, expected)
+    assert "did not report" in silent["problem"]
