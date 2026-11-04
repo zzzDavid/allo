@@ -208,8 +208,13 @@ Not yet done (the remaining slices):
   declared moves, host steps or steps a backend registers
   (`ROUTE_VOCABULARY`); and the realization check runs at the
   materialization boundary of the ranking, so a mismatch is a recorded
-  feasibility rejection with a fallback. AiM, UPMEM and AttAcc still read
-  `MatchedOp` directly and declare no `CandidateEffects`;
+  feasibility rejection with a fallback. Round 21: one semantic buffer may
+  have distinct input and output images (`CandidateValueLayout.image`),
+  the vector residency check is exact, and AiM is the second matcher
+  backend on the contract (`spmw_aim.aim_candidate_effects`,
+  `AimCtx.check_realization`: records compared at materialization). UPMEM
+  and AttAcc still read `MatchedOp` directly and declare no
+  `CandidateEffects`;
 - stage traces on the Gemini-II card and the installed artifact (slice 5);
   the APU v1 board and the three simulators ran through the round 13 tree
   (VALIDATION round 13).

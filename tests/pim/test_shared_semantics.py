@@ -1974,3 +1974,287 @@ def test_realization_mismatch_is_rejected_in_the_search_with_a_fallback(monkeypa
         for reason in reasons
     ), reasons
     assert candidate_effects(layout) is not None
+
+
+# --------------------------------------------------------------------------- #
+# (q) Distinct images of one buffer; exact vector residency (review round 20)
+# --------------------------------------------------------------------------- #
+
+COPYBACK_N = 4113
+
+
+def update_addend(
+    a: float16[COPYBACK_N], b: float16[COPYBACK_N], c: float16[COPYBACK_N]
+):
+    temp: float16[COPYBACK_N]
+    for i in range(COPYBACK_N):
+        temp[i] = a[i] * b[i] + c[i]
+        c[i] = temp[i]
+
+
+def test_operand_that_is_also_a_sink_has_distinct_input_and_output_images(
+    samsung_sim_gate,
+):
+    """The MAD addend ``c`` is read with the fibers exchanged and written back
+    as the result's copy sink: the contract holds both images, the emitter's
+    swap parity matches the input image, and the program executes exactly."""
+    from allo.spmw_candidate import candidate_effects
+
+    compiled = allo.compile(update_addend, build_samsung_target(), samsung_cost)
+    layout = compiled.compiled.layout
+    layout = layout[0] if isinstance(layout, list) else layout
+    effects = candidate_effects(layout)
+    images = {(v.value, v.image): v.packing for v in effects.value_layouts}
+    assert images[("c", "in")] == "all_bank:swapped_fibers"
+    assert images[("c", "out")] == "all_bank"
+    assert images[("a", "in")] == images[("b", "in")] == "all_bank"
+    assert effects.coverage.inputs == ("a", "b", "c")
+    assert effects.coverage.outputs == ("c",)
+    (transfer,) = [t for t in effects.transfers if t.value == "c"]
+    assert transfer.direction == "inout"
+    program = compiled.compiled.layout_ctx.programs[0]
+    assert program.kind == "ELTWISE" and program.swap_parity == (False, False, True)
+    a = (np.arange(COPYBACK_N) % 4 + 1).astype(np.float16)
+    b = (np.arange(COPYBACK_N) % 5 - 2).astype(np.float16)
+    c = (np.arange(COPYBACK_N) % 3 - 1).astype(np.float16)
+    expected = (a * b + c).astype(np.float16)
+    run = compiled(a, b, c)
+    assert run.kind == "simulator"
+    np.testing.assert_array_equal(c, expected)
+
+
+def test_vector_residency_must_be_the_exact_realized_storage(monkeypatch):
+    """Declaring the host-broadcast vector in another existing storage (the
+    SRF) or with a transfer that ends elsewhere is refused at realization,
+    during the search, for every candidate."""
+    from allo import spmw_samsung
+
+    original = spmw_samsung.samsung_candidate_effects
+
+    def vector_in_srf(target, matches, placement):
+        effects = original(target, matches, placement)
+        if effects is None:
+            return None
+        return replace(
+            effects,
+            value_layouts=tuple(
+                replace(v, storage="srf") if v.value == "local_x" else v
+                for v in effects.value_layouts
+            ),
+        )
+
+    monkeypatch.setattr(spmw_samsung, "samsung_candidate_effects", vector_in_srf)
+    with pytest.raises(RuntimeError, match="no feasible placement") as error:
+        allo.compile(
+            samsung_gemv, build_samsung_target(), samsung_cost, backend="virtual"
+        )
+    assert "loads the vector from" in str(error.value)
+
+    def vector_transfer_elsewhere(target, matches, placement):
+        effects = original(target, matches, placement)
+        if effects is None:
+            return None
+        return replace(
+            effects,
+            transfers=tuple(
+                (
+                    replace(t, route=("host_scatter", "banks"))
+                    if t.value == "local_x"
+                    else t
+                )
+                for t in effects.transfers
+            ),
+        )
+
+    monkeypatch.setattr(
+        spmw_samsung, "samsung_candidate_effects", vector_transfer_elsewhere
+    )
+    with pytest.raises(RuntimeError, match="no feasible placement") as error:
+        allo.compile(
+            samsung_gemv,
+            build_samsung_target(),
+            samsung_cost,
+            backend="virtual",
+            layout="temporal+crf_shared",
+        )
+    assert "moves the vector into" in str(error.value) or "loads the vector" in str(
+        error.value
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (r) The second matcher backend on the shared contract: SK hynix AiM
+# --------------------------------------------------------------------------- #
+
+AIM_N = 256
+AIM_MAPPING = [32]
+AIM_ROWS_PER_CHANNEL = AIM_N // AIM_MAPPING[0]
+
+
+@allo.dataflow.region()
+def aim_gemv_region(
+    W: allo.ir.types.bfloat16[AIM_N, AIM_N],
+    x: allo.ir.types.bfloat16[AIM_N],
+    y: allo.ir.types.bfloat16[AIM_N],
+):
+    @allo.work(mapping=AIM_MAPPING, args=[W, x, y])
+    def mv(
+        local_W: allo.ir.types.bfloat16[AIM_N, AIM_N],
+        local_x: allo.ir.types.bfloat16[AIM_N],
+        local_y: allo.ir.types.bfloat16[AIM_N],
+    ):
+        (channel,) = allo.get_wid()
+        row0 = channel * AIM_ROWS_PER_CHANNEL
+        for i in range(AIM_ROWS_PER_CHANNEL):
+            acc: allo.ir.types.bfloat16 = 0
+            for j in range(AIM_N):
+                acc += local_W[row0 + i, j] * local_x[j]
+            local_y[row0 + i] = acc
+
+
+def _compile_aim(**kwargs):
+    kwargs.setdefault("reduction_order", "reassociate")
+    return allo.compile(aim_gemv_region, build_aim_target(), aim_cost, **kwargs)
+
+
+def test_aim_candidates_declare_effects_from_the_shared_facts():
+    """Every AiM candidate of a program with shared facts declares its
+    effects from the work body's `Contraction` facts and the placement
+    (handles, knobs); the lowered records are compared with the selected
+    declaration at materialization."""
+    from allo.spmw_candidate import EFFECTS_REQUIRED_TARGETS, candidate_effects
+
+    assert "aim" in EFFECTS_REQUIRED_TARGETS
+    compiled = _compile_aim(backend="virtual")
+    facts = compiled.trace.function_facts["mv_0"]
+    (contraction,) = facts.contractions
+    assert contraction.matrix.memref_name == "local_W"
+    assert contraction.vector.memref_name == "local_x"
+    (kernel,) = compiled.placement_ranking.kernels
+    candidates = [e[1] if isinstance(e, tuple) else e for e in kernel.candidates]
+    assert candidates and all(candidate_effects(c) is not None for c in candidates)
+    assert kernel.rejections == ()
+    layout = compiled.compiled.layout
+    layout = layout[0] if isinstance(layout, list) else layout
+    effects = candidate_effects(layout)
+    assert effects.coverage.inputs == ("local_W", "local_x")
+    assert effects.coverage.outputs == ("local_y",)
+    storages = {v.value: (v.axes, v.storage) for v in effects.value_layouts}
+    assert storages["local_W"] == (("i", "j"), "banks")
+    assert storages["local_x"] == (("j",), "gb")
+    assert storages["local_y"] == (("i",), "gpr")
+    (launch,) = effects.launches
+    assert launch.kind in {"MAC", "MAC_ABK"}
+    assert launch.instances == (0, AIM_ROWS_PER_CHANNEL)
+    assert launch.reduction == (0, AIM_N) and launch.accumulator == "zero"
+    scope = compiled.compiled.layout_ctx.lowering_manifest[0]["bank_scope"]
+    assert launch.covers[1] == scope
+    assert launch.kind == ("MAC_ABK" if scope == "abk" else "MAC")
+    assert {t.value: t.direction for t in effects.transfers} == {
+        "local_W": "in",
+        "local_x": "in",
+        "local_y": "out",
+    }
+    assert {s for _n, _b, s in effects.allocations} == {"mac_reg"}
+    assert compiled.estimate().cycles > 0
+
+
+@pytest.mark.parametrize(
+    "mutation, reason",
+    [
+        (
+            lambda e: replace(e, coverage=replace(e.coverage, inputs=("local_W",))),
+            "reads",
+        ),
+        (
+            lambda e: replace(
+                e,
+                launches=tuple(replace(l, reduction=(0, 128)) for l in e.launches),
+            ),
+            "not an ordered partition",
+        ),
+        (lambda e: None, "declares no effects"),
+    ],
+    ids=["inputs", "reduction", "missing"],
+)
+def test_corrupted_aim_declarations_are_refused_before_costing(
+    monkeypatch, mutation, reason
+):
+    from allo import spmw_aim
+
+    original = spmw_aim.aim_candidate_effects
+
+    def corrupted(target, matches, placement):
+        effects = original(target, matches, placement)
+        return None if effects is None else mutation(effects)
+
+    monkeypatch.setattr(spmw_aim, "aim_candidate_effects", corrupted)
+    with pytest.raises(ValueError, match="violates the candidate contract") as error:
+        _compile_aim(backend="virtual")
+    assert reason in str(error.value)
+
+
+def test_aim_realization_mismatch_is_rejected_in_the_search_with_a_fallback(
+    monkeypatch,
+):
+    """Declaring the broadcast vector in the banks (a declarable residency the
+    lowering does not realize for the GB broadcast candidates) is rejected at
+    materialization for those candidates, which the ranking records; the
+    selection falls back to a candidate whose declaration holds."""
+    from allo import spmw_aim
+    from allo.spmw_candidate import candidate_effects
+
+    baseline = _compile_aim(backend="virtual")
+    chosen = baseline.compiled.layout
+    chosen = chosen[0] if isinstance(chosen, list) else chosen
+    victim = chosen.mode
+    original = spmw_aim.aim_candidate_effects
+
+    def vector_in_banks(target, matches, placement):
+        effects = original(target, matches, placement)
+        if effects is None or placement.mode != victim:
+            return effects
+        return replace(
+            effects,
+            value_layouts=tuple(
+                replace(v, storage="banks") if v.value == "local_x" else v
+                for v in effects.value_layouts
+            ),
+            transfers=tuple(
+                (
+                    replace(t, route=("host_scatter", "banks"))
+                    if t.value == "local_x"
+                    else t
+                )
+                for t in effects.transfers
+            ),
+        )
+
+    monkeypatch.setattr(spmw_aim, "aim_candidate_effects", vector_in_banks)
+    compiled = _compile_aim(backend="virtual")
+    layout = compiled.compiled.layout
+    layout = layout[0] if isinstance(layout, list) else layout
+    assert layout.mode != victim
+    (kernel,) = compiled.placement_ranking.kernels
+    reasons = [str(reason) for _position, reason in kernel.rejections]
+    assert any(
+        "realization differs from the candidate contract" in reason
+        and "reads the vector" in reason
+        for reason in reasons
+    ), reasons
+    assert candidate_effects(layout) is not None
+
+
+def test_aim_selected_program_runs_timing_only_under_the_declared_contract(
+    aim_sim_gate,
+):
+    compiled = _compile_aim()
+    layout = compiled.compiled.layout
+    layout = layout[0] if isinstance(layout, list) else layout
+    assert layout.extra["effects"].launches[0].reduction == (0, AIM_N)
+    W = np.zeros((AIM_N, AIM_N), np.float32)
+    x = np.zeros(AIM_N, np.float32)
+    y = np.full(AIM_N, 5.0, np.float32)
+    run = compiled(W, x, y)
+    assert run.kind == "simulator-timing-only" and run.cycles > 0
+    np.testing.assert_array_equal(y, np.full(AIM_N, 5.0, np.float32))

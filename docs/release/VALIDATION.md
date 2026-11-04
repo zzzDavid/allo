@@ -626,3 +626,18 @@ directory. Targeted runs only this round, as directed. Raw logs under
 | Samsung-sensitive batch (`r20-a.log`, the round 19 file set) | 428 passed, 40 skipped, 2 deselected, 1 failed in 6616 s (1:50:16): the round 19 file set plus the APU v1 vector, reduction-policy and tile-selection files, the Gemini-II source, typed, composed and card-emulation files and the native reductions. The one failure (`test_match_coverage.py::test_local_intermediate_copied_to_an_external_output`) was the elementwise realization check demanding a bank image for the op's *local* result, which the declaration correctly omits; the check now covers the declared outputs and sinks only. Rerun on the final tree (`r20-b.log`: match coverage, shared semantics, the Samsung conductor runs, G6 semantics without the APU rows): 107 passed, 34 deselected in 1609 s |
 | black on `allo` and `tests` (24.8.0); license headers; pylint on the changed modules | black clean (24.8.0); pylint: no findings in the new code of `spmw_candidate.py`, `spmw_autoschedule.py`, `spmw_samsung.py`, `spmw_codegen.py`, the APU declarations (pre-existing P-23 findings unchanged); license headers checked at commit |
 
+## Round 21 (2026-11-03): X-06 completion; AiM on the shared contract
+
+Same interpreter and `LLVM_BUILD_DIR` as round 12; checkout as working
+directory. Targeted runs only this round, as directed. Raw logs under
+`/tmp/g9/r21-*.log`, copied to
+`/work/shared/users/phd/nz264/tenon-release-evidence/r21/`.
+
+| Check (round 21 tree) | Result |
+|---|---|
+| the reviewer's `probe_copyback.py` (`tenon-release-evidence/reviewer-r20/`, run unchanged through `runpy` from the checkout; `r21/probe_copyback-after.log`) | compiles; the 4113-element `temp[i] = a[i]*b[i] + c[i]; c[i] = temp[i]` executes on PIMSimulator and equals the NumPy oracle (1910 cycles, as at the parent) |
+| the reviewer's `probe_vector_storage.py` (`r21/probe_vector_storage-after.log`) | the vector-only SRF declaration is refused: every candidate is rejected at materialization ("loads the vector from a GRF_A broadcast (grf_a); the candidate declared ... srf") |
+| `tests/pim/test_shared_semantics.py` (70: sections a-p plus (q) distinct images and exact residency, (r) AiM declares effects from the facts, corrupted declarations refused, a realization mismatch rejected in the search with a fallback, the timing-only simulator run) | 70 passed (within `r21-a.log` and `r21-b.log`); the Samsung and AiM simulator executions ran behind their gates |
+| targeted batch (`r21-a.log`: the round 20 file set plus the AiM files `test_aim_matcher`, `test_aim_axis_roles`, `test_aim_cost_routes`, `test_aim_owner_maps`, `test_aim_program`, `test_aim_token_partition`, `test_aim_virtual_study`, `test_cent_aim_workloads`) | first run (`r21-a.log`): 479 passed, 52 skipped, 2 deselected, 10 failed in 7796 s (2:09:56); the ten failures were all the new AiM realization check on the CENT multi-kernel programs: a group the case's host program never launches lowers no record (now skipped as not realized by that program), and a group launched twice lowers two matching records (now every record is compared with the declaration). Rerun of the AiM files, GEMV on all targets and the shared semantics on the fixed tree (`r21-b.log`): 130 passed, 23 skipped in 1301 s; the CENT workloads and the AiM shared-semantics rows on the final tree (after the last lint edit): 12 passed |
+| black on `allo` and `tests` (24.8.0); license headers; pylint on the changed modules | black clean (24.8.0); pylint: no findings in the new code of `spmw_aim.py`, `spmw_candidate.py`, `spmw_samsung.py` (pre-existing P-23 findings, including `AimCtx`'s abstract-method notes, unchanged); license headers checked at commit |
+

@@ -727,7 +727,7 @@ def samsung_candidate_effects(target, matches, placement):
                     # CRF fill: the vector is scattered to the banks and loaded
                     # into GRF_A per reduction tile (LD_A).
                     storage = "banks"
-                layouts[memref] = CandidateValueLayout(memref, axes, storage)
+                layouts[(memref, "value")] = CandidateValueLayout(memref, axes, storage)
                 transfers[memref] = CandidateTransfer(
                     memref,
                     "in",
@@ -745,7 +745,9 @@ def samsung_candidate_effects(target, matches, placement):
                 if match.target_op_name == "MAD" and position == 2:
                     if _elementwise_register_plan(target):
                         packing = "all_bank:swapped_fibers"
-                layouts[memref] = CandidateValueLayout(memref, axes, "banks", packing)
+                layouts[(memref, "in")] = CandidateValueLayout(
+                    memref, axes, "banks", packing, image="in"
+                )
                 transfers[memref] = CandidateTransfer(
                     memref, "in", ("host_scatter", "banks")
                 )
@@ -764,7 +766,13 @@ def samsung_candidate_effects(target, matches, placement):
                 if contraction
                 else "all_bank"
             )
-            layouts[memref] = CandidateValueLayout(memref, axes, "banks", packing)
+            # An elementwise operand that is also written (a copy sink of the
+            # result) has a distinct output image: its input image keeps its
+            # own packing (the MAD addend's swapped fibers).
+            image = "out" if (not contraction and memref in inputs) else "value"
+            layouts[(memref, image)] = CandidateValueLayout(
+                memref, axes, "banks", packing, image=image
+            )
             transfers[memref] = CandidateTransfer(
                 memref,
                 "inout" if carried or memref in inputs else "out",
@@ -1146,7 +1154,16 @@ class SamsungCtx(CodegenContext):
                     f"declares launches {[l.kind for l in effects.launches]}"
                 )
             (launch,) = effects.launches
-            layouts_by_value = {v.value: v for v in effects.value_layouts}
+            images = {}
+            for v in effects.value_layouts:
+                images.setdefault(v.value, {})[v.image] = v
+
+            def layout_of(value, side):
+                """The layout of ``value``'s ``side`` (``in``/``out``) image:
+                the side's own image when declared, else the single image."""
+                candidates = images.get(value, {})
+                return candidates.get(side) or candidates.get("value")
+
             transfers_by_value = {t.value: t for t in effects.transfers}
             allocated = {storage for _name, _size, storage in effects.allocations}
             expected_transfers = {}
@@ -1168,21 +1185,31 @@ class SamsungCtx(CodegenContext):
                         f"contract: realized (instances, reduction, accumulator) "
                         f"{realized}, declared {declared}"
                     )
-                matrix = layouts_by_value.get(rep.matrix_memref)
+                matrix = layout_of(rep.matrix_memref, "in")
                 if matrix is None or matrix.storage != "banks":
                     raise RuntimeError(
                         f"Samsung realization keeps the matrix {rep.matrix_memref!r} "
                         f"in the banks; the candidate declared {matrix}"
                     )
-                vector = layouts_by_value.get(rep.vector_memref)
+                vector = layout_of(rep.vector_memref, "in")
                 vector_banks = bool(program.vector_from_bank)
-                if vector is None or (vector.storage == "banks") != vector_banks:
+                vector_storage = "banks" if vector_banks else "grf_a"
+                vector_transfer = transfers_by_value.get(rep.vector_memref)
+                if vector is None or vector.storage != vector_storage:
                     raise RuntimeError(
                         "Samsung realization loads the vector from "
-                        f"{'the banks' if vector_banks else 'a GRF_A broadcast'}; "
-                        f"the candidate declared {vector}"
+                        f"{'the banks' if vector_banks else 'a GRF_A broadcast'} "
+                        f"({vector_storage}); the candidate declared {vector}"
                     )
-                output = layouts_by_value.get(rep.output_memref)
+                if vector_transfer is None or (
+                    tuple(vector_transfer.route)[-1] != vector_storage
+                ):
+                    raise RuntimeError(
+                        f"Samsung realization moves the vector into {vector_storage}; "
+                        f"the candidate's transfer ends at "
+                        f"{vector_transfer and vector_transfer.route}"
+                    )
+                output = layout_of(rep.output_memref, "out")
                 from .spmw_layout_problem import split_movement_layout
 
                 _backend, movement = split_movement_layout(
@@ -1244,7 +1271,7 @@ class SamsungCtx(CodegenContext):
                         f"the candidate declared instances {launch.instances}"
                     )
                 for position, memref in enumerate(el.input_memrefs):
-                    value = layouts_by_value.get(memref)
+                    value = layout_of(memref, "in")
                     swapped = bool(
                         program.swap_parity[position]
                         if position < len(program.swap_parity)
@@ -1275,7 +1302,7 @@ class SamsungCtx(CodegenContext):
                         f"declares outputs {list(effects.coverage.outputs)}"
                     )
                 for memref in written:
-                    value = layouts_by_value.get(memref)
+                    value = layout_of(memref, "out")
                     if (
                         value is None
                         or value.storage != "banks"

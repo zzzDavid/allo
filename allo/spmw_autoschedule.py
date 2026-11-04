@@ -1006,7 +1006,17 @@ def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             "aim enumerator: kernel has no MAC, MUL or ADD match; "
             f"got {sorted(names)}"
         )
-    return cross_with_knobs(target, bases, matches, role_to_memref)
+    from .spmw_aim import aim_candidate_effects
+
+    candidates = cross_with_knobs(target, bases, matches, role_to_memref)
+    # The common candidate contract (gate G9): every AiM candidate of a
+    # program with shared facts declares its effects from those facts and
+    # the placement (handles, knobs).
+    for candidate in candidates:
+        effects = aim_candidate_effects(target, matches, candidate)
+        if effects is not None:
+            candidate.extra["effects"] = effects
+    return candidates
 
 
 def _trace_reduction_trip(matches: list[MatchedOp]) -> int | None:

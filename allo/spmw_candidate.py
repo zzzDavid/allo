@@ -64,6 +64,11 @@ class CandidateValueLayout:
     axes: tuple[str, ...]
     storage: str | None = None
     packing: str | None = None
+    # Which image of the value this layout describes when one semantic buffer
+    # has distinct images in the program: ``"value"`` (the only one),
+    # ``"in"`` (the contents the program reads) or ``"out"`` (the contents it
+    # writes; an operand that is also a copy sink has both).
+    image: str = "value"
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,7 @@ class CandidateEffects:
                     "axes": list(v.axes),
                     "storage": v.storage,
                     "packing": v.packing,
+                    "image": v.image,
                 }
                 for v in self.value_layouts
             ],
@@ -458,6 +464,8 @@ def _check_value_layouts(effects, matches, inputs, outputs, locals_, view) -> li
         if layout.value not in inputs | outputs | locals_:
             problems.append(f"lays out {layout.value!r}, not a program buffer")
             continue
+        if layout.image not in {"value", "in", "out"}:
+            problems.append(f"layout of {layout.value!r} names image {layout.image!r}")
         laid_out.add(layout.value)
         if len(set(layout.axes)) != len(layout.axes):
             problems.append(f"layout of {layout.value!r} repeats an axis")
@@ -652,7 +660,7 @@ def _check_launches(effects, matches, view) -> list:
 # ``extra["program_facts"]``).  A handle-only placement is a contract problem
 # there; the matcher backends still to migrate (AiM, UPMEM, AttAcc) are not
 # listed and keep their handle-only candidates (ISSUES X-01).
-EFFECTS_REQUIRED_TARGETS = frozenset({"apu_v1", "apu_v2", "samsung_hbm_pim"})
+EFFECTS_REQUIRED_TARGETS = frozenset({"apu_v1", "apu_v2", "samsung_hbm_pim", "aim"})
 
 
 def _effects_required(matches, view) -> bool:

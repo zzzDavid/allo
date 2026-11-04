@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import math
 import re
 import subprocess
@@ -27,6 +29,7 @@ from .spmw_simenv import aim_unavailable_reason as _aim_unavailable_reason
 from .pim.aim_lowering import (
     AimAllBankWrite,
     AimBankCopy,
+    AimContraction,
     AimDistributedHostTransfer,
     AimElementwise,
     AimHostReduction,
@@ -46,6 +49,214 @@ from .pim.aim_lowering import (
     matrix_axes,
     resolve_batch_mapping,
 )
+
+
+def _aim_storage_name(handle) -> str | None:
+    home = getattr(handle, "home_handle", handle)
+    memory = getattr(home, "memory", None)
+    if memory is not None:
+        return getattr(memory, "name", None)
+    return getattr(home, "name", None)
+
+
+def _layout_image(images, value, side):
+    """The layout of ``value``'s ``side`` (``in``/``out``) image from a
+    value -> image -> layout map: the side's own image when declared, else
+    the single image."""
+    candidates = images.get(value, {})
+    return candidates.get(side) or candidates.get("value")
+
+
+def _aim_axes(access, labels) -> tuple:
+    axes = []
+    for coord in getattr(access, "coords", None) or ():
+        if coord is None:
+            continue
+        for atom, _coefficient in coord[0]:
+            label = labels.get(atom)
+            if label is not None and label not in axes:
+                axes.append(label)
+    return tuple(axes)
+
+
+def aim_candidate_effects(target, matches, placement):
+    """`CandidateEffects` of one AiM placement for one work item, derived from
+    the shared semantic facts of its matches (`Contraction`/`Epilogue`: loop
+    labels, trips, access coordinates, matrix and vector roles, accumulator
+    initialization, sinks) and from the placement (handles and knobs).
+
+    Backing storage: the matrix in the ``banks``; the vector in the global
+    buffer ``gb`` (broadcast) or, when it shares the matrix's buffer, in the
+    banks; results in the host-visible ``gpr`` the MAC results are read back
+    into; elementwise MUL operands in the banks and ADD operands in the GPR.
+    The accumulator register file ``mac_reg`` is a transient allocation.
+    The one launch of a contraction advances the work item's result
+    instances over the whole reduction; its ``covers`` name the placement
+    and the knobs the lowering realizes (bank scope, reduction partitions,
+    batch mapping), which `AimCtx.check_realization` compares with the
+    lowered records.  None when the matches carry no facts."""
+    from .spmw_candidate import (
+        CandidateCoverage,
+        CandidateEffects,
+        CandidateLaunch,
+        CandidateTransfer,
+        CandidateValueLayout,
+    )
+
+    del target
+    facts = [m.extra.get("semantic_facts") for m in matches]
+    if not matches or any(f is None for f in facts):
+        return None
+    extra = placement.extra or {}
+    ops = {m.target_op_name for m in matches}
+    labels = {}
+    for fact in facts:
+        labels.update(fact.loop_labels)
+    inputs, outputs, layouts, transfers = [], [], {}, {}
+    instances = reduction = None
+    init = None
+    contraction = "MAC" in ops
+    for match, fact in zip(matches, facts):
+        if hasattr(fact, "reduction_vars"):
+            trips = fact.trips
+            extent = 1
+            for var in fact.result_vars:
+                extent *= int(trips.get(var) or 0)
+            red = 1
+            for var in fact.reduction_vars:
+                red *= int(trips.get(var) or 0)
+            instances = extent if instances is None else instances
+            reduction = red if reduction is None else reduction
+            init = fact.accumulator_init
+            matrix = fact.matrix.memref_name if fact.matrix is not None else None
+            vector = fact.vector.memref_name if fact.vector is not None else None
+            for access in fact.inputs:
+                memref = access.memref_name
+                if memref is None or memref in inputs:
+                    continue
+                inputs.append(memref)
+                handle = placement.placements.get(memref)
+                storage = _aim_storage_name(handle) or (
+                    "banks" if memref == matrix else "gb"
+                )
+                if memref == vector and vector != matrix and storage != "gb":
+                    storage = "banks"
+                layouts[memref] = CandidateValueLayout(
+                    memref, _aim_axes(access, labels), storage
+                )
+                transfers[memref] = CandidateTransfer(
+                    memref,
+                    "in",
+                    (
+                        ("host_broadcast", "gb")
+                        if storage == "gb"
+                        else ("host_scatter", "banks")
+                    ),
+                )
+            result_accesses = []
+            if not fact.accumulator.local:
+                result_accesses.append((fact.accumulator.memref_name, fact.accumulator))
+            for sink in fact.external_sinks:
+                result_accesses.append((sink.memref_name, sink))
+        else:
+            extent = 1
+            for loop in fact.loops:
+                extent *= int(loop.trip or 0)
+            instances = extent if instances is None else instances
+            home = "gpr" if match.target_op_name == "ADD" else "banks"
+            for access in fact.operands:
+                memref = access.memref_name
+                if memref is None or access.local or memref in inputs:
+                    continue
+                inputs.append(memref)
+                storage = _aim_storage_name(placement.placements.get(memref)) or home
+                layouts[memref] = CandidateValueLayout(
+                    memref, _aim_axes(access, labels), storage
+                )
+                transfers[memref] = CandidateTransfer(
+                    memref, "in", ("host_scatter", storage)
+                )
+            result_accesses = (
+                [] if fact.result.local else [(fact.result.memref_name, fact.result)]
+            )
+            for memref, _text in match.extra.get("output_sinks", ()):
+                if memref != fact.result.memref_name:
+                    result_accesses.append((memref, fact.result))
+        for memref, access in result_accesses:
+            if memref is None:
+                continue
+            if memref not in outputs:
+                outputs.append(memref)
+            carried = contraction and init == "carried"
+            if carried and memref not in inputs:
+                inputs.append(memref)
+            storage = "gpr" if contraction or match.target_op_name == "ADD" else "banks"
+            layouts.setdefault(
+                (memref, "out") if memref in inputs else memref,
+                CandidateValueLayout(
+                    memref,
+                    _aim_axes(access, labels),
+                    storage,
+                    image="out" if memref in inputs else "value",
+                ),
+            )
+            transfers[memref] = CandidateTransfer(
+                memref,
+                "inout" if memref in inputs else "out",
+                (
+                    ("host_scatter", storage, "host_gather")
+                    if memref in inputs
+                    else (storage, "host_gather")
+                ),
+            )
+    if contraction:
+        kind = str(extra.get("operation_name") or "MAC")
+        covers = (
+            placement.mode,
+            str(extra.get("bank_scope") or ("abk" if kind == "MAC_ABK" else "sbk")),
+            int(extra.get("reduction_partitions", 1) or 1),
+            str(extra.get("batch_mapping") or "none"),
+        )
+        allocations = (("accumulator", 0, "mac_reg"),)
+    else:
+        kind = "MUL" if "MUL" in ops else "ADD"
+        covers = (placement.mode,)
+        allocations = ()
+    launch = CandidateLaunch(
+        index=0,
+        kind=kind,
+        operations=tuple(range(len(matches))),
+        instances=(0, int(instances or 0)),
+        reduction=(0, int(reduction or 0)) if contraction else None,
+        accumulator=init if contraction else None,
+        covers=covers,
+    )
+    return CandidateEffects(
+        coverage=CandidateCoverage(
+            matches[0].func_name, tuple(sorted(ops)), tuple(inputs), tuple(outputs)
+        ),
+        value_layouts=tuple(layouts.values()),
+        transfers=tuple(transfers.values()),
+        launches=(launch,),
+        abi_inputs=tuple(inputs),
+        abi_outputs=tuple(outputs),
+        device_scope="one channel-masked command stream, every channel of the device",
+        allocations=allocations,
+    )
+
+
+def _derive_aim_effects(view, matches, placement):
+    """Late-binding registry entry (see `aim_candidate_effects`)."""
+    return aim_candidate_effects(view, matches, placement)
+
+
+def _register_effects_deriver():
+    from .spmw_candidate import EFFECTS_DERIVERS
+
+    EFFECTS_DERIVERS["aim"] = _derive_aim_effects
+
+
+_register_effects_deriver()
 
 
 class AimCtx(CodegenContext):
@@ -110,6 +321,22 @@ class AimCtx(CodegenContext):
         """
         program = _AimProgramDerivation(self.target, trace, layouts, schedule)
         records = program.records(host_moves, self)
+        # id(layout) -> kernel group, for `check_realization`.
+        from .spmw_autoschedule import _bucket_for_autoschedule
+
+        self._group_of_layout = {}
+        for (_scope, bucket), layout in zip(_bucket_for_autoschedule(trace), layouts):
+            self._group_of_layout[id(layout)] = _matcher_work_scope(bucket[0]).group_id
+        self._program = program
+        # Groups the host program launches (every group without a schedule):
+        # a group the given host program never launches lowers no record,
+        # so its candidate's declaration is not realized by this program.
+        self._every_group_launched = schedule is None
+        self._launched_groups = set(
+            step.group_id
+            for step in (schedule.steps if schedule is not None else ())
+            if isinstance(step, LaunchStep)
+        )
 
         lowerer = _AimLowerer(self.target)
         lines: list[str] = []
@@ -164,6 +391,195 @@ class AimCtx(CodegenContext):
         self.cmds.extend(lines)
         if program.groups:
             self.emit_eoc()
+
+    def check_realization(self, layouts) -> None:
+        """The lowered AiM records against the selected candidates' declared
+        effects, per kernel group: the contraction's result instances and
+        reduction extent (per work item, or aggregated over a partitioned
+        group), its bank scope, reduction partitions (with the host reduction
+        that merges them), the vector's residency (GB broadcast or bank
+        pair) and the matrix's bank residency; an elementwise record's
+        element count and home; and, when a host program was lowered, that
+        every host transfer names a declared transfer."""
+        from .spmw_candidate import candidate_effects
+
+        layouts = list(layouts) if isinstance(layouts, (list, tuple)) else [layouts]
+        program = getattr(self, "_program", None)
+        if program is None:
+            return
+        groups = {group.group_id: group for group in program.groups}
+        ops = list(getattr(self, "lowered_operations", ()))
+        host_names = set()
+        for op in ops:
+            if isinstance(op, AimDistributedHostTransfer) and op.name:
+                host_names.update(part.split("[")[0] for part in op.name.split("+"))
+        for layout in layouts:
+            effects = candidate_effects(layout)
+            if effects is None:
+                continue
+            group = groups.get(getattr(self, "_group_of_layout", {}).get(id(layout)))
+            if group is None:
+                raise RuntimeError(
+                    f"AiM realization lowered no group for the candidate "
+                    f"{layout.mode!r} that declares effects"
+                )
+            if not getattr(self, "_every_group_launched", True) and (
+                group.group_id not in getattr(self, "_launched_groups", set())
+            ):
+                continue
+            names = set(group.functions) | {group.name}
+            (launch,) = effects.launches if len(effects.launches) == 1 else (None,)
+            if launch is None:
+                raise RuntimeError("AiM realization is one record per kernel group")
+            images = {}
+            for v in effects.value_layouts:
+                images.setdefault(v.value, {})[v.image] = v
+            storage_of = functools.partial(_layout_image, images)
+            items = len(group.functions)
+            if group.kind == "contraction":
+                records = [
+                    op
+                    for op in ops
+                    if isinstance(op, AimContraction) and op.name in names
+                ]
+                if not records:
+                    raise RuntimeError(
+                        f"AiM realization lowered no contraction record for group "
+                        f"{group.name!r}"
+                    )
+                # A host program may launch the group more than once; every
+                # launch lowers the same contraction, checked below.
+                record = records[0]
+                if any(
+                    (r.outputs, r.batches, r.reduction, r.reduction_partitions)
+                    != (
+                        record.outputs,
+                        record.batches,
+                        record.reduction,
+                        record.reduction_partitions,
+                    )
+                    or r.input_source != record.input_source
+                    for r in records[1:]
+                ):
+                    raise RuntimeError(
+                        f"AiM realization lowered differing contraction records for "
+                        f"the launches of group {group.name!r}"
+                    )
+                declared = (tuple(launch.instances), tuple(launch.reduction or ()))
+                per_item = (0, record.outputs * record.batches)
+                aggregate = (0, record.outputs * record.batches // max(items, 1))
+                if declared[1] != (0, record.reduction) or declared[0] not in (
+                    per_item,
+                    aggregate,
+                ):
+                    raise RuntimeError(
+                        "AiM realization launch differs from the candidate contract: "
+                        f"realized outputs {record.outputs} x batches {record.batches} "
+                        f"over {items} work item(s), reduction {record.reduction}; "
+                        f"declared {declared}"
+                    )
+                scope = "abk" if group.sbk_banks is None else "sbk"
+                kind = "MAC_ABK" if scope == "abk" else "MAC"
+                partitions = int(record.reduction_partitions)
+                merges = [
+                    op
+                    for op in ops
+                    if isinstance(op, AimHostReduction) and op.source == record.name
+                ]
+                if (
+                    launch.kind != kind
+                    or len(launch.covers) < 3
+                    or launch.covers[1] != scope
+                    or int(launch.covers[2]) != partitions
+                    or (partitions > 1) != bool(merges)
+                ):
+                    raise RuntimeError(
+                        f"AiM realization issues {kind} ({scope}, {partitions} reduction "
+                        f"partition(s){', host-merged' if merges else ''}); the "
+                        f"candidate declares {launch.kind} {launch.covers}"
+                    )
+                (contraction_entry,) = [
+                    c for c in group.contractions if c["match"].func_name == record.name
+                ] or [None]
+                shape = contraction_entry["shape"] if contraction_entry else {}
+                matrix = storage_of(shape.get("matrix"), "in")
+                vector = storage_of(shape.get("vector"), "in")
+                vector_storage = "banks" if record.input_source == "banks" else "gb"
+                if matrix is None or matrix.storage != "banks":
+                    raise RuntimeError(
+                        f"AiM realization keeps the matrix {shape.get('matrix')!r} in "
+                        f"the banks; the candidate declared {matrix}"
+                    )
+                if vector is None or vector.storage != vector_storage:
+                    raise RuntimeError(
+                        f"AiM realization reads the vector {shape.get('vector')!r} from "
+                        f"{vector_storage}; the candidate declared {vector}"
+                    )
+                vector_transfer = {t.value: t for t in effects.transfers}.get(
+                    shape.get("vector")
+                )
+                if vector_transfer is None or (
+                    tuple(vector_transfer.route)[-1] != vector_storage
+                ):
+                    raise RuntimeError(
+                        f"AiM realization moves the vector into {vector_storage}; the "
+                        f"candidate's transfer ends at "
+                        f"{vector_transfer and vector_transfer.route}"
+                    )
+                if {s for _n, _b, s in effects.allocations} != {"mac_reg"}:
+                    raise RuntimeError(
+                        "AiM realization accumulates in mac_reg; the candidate "
+                        f"declares {list(effects.allocations)}"
+                    )
+            else:
+                records = [
+                    op
+                    for op in ops
+                    if isinstance(op, AimElementwise) and op.name in names
+                ]
+                if not records:
+                    raise RuntimeError(
+                        f"AiM realization lowered no elementwise record for group "
+                        f"{group.name!r}"
+                    )
+                record = records[0]
+                if any(
+                    (r.operation, r.elements) != (record.operation, record.elements)
+                    for r in records[1:]
+                ):
+                    raise RuntimeError(
+                        f"AiM realization lowered differing elementwise records for "
+                        f"the launches of group {group.name!r}"
+                    )
+                per_item = (0, record.elements)
+                aggregate = (0, record.elements // max(items, 1))
+                if launch.kind != record.operation.upper() or tuple(
+                    launch.instances
+                ) not in (per_item, aggregate):
+                    raise RuntimeError(
+                        f"AiM realization is {record.operation.upper()} over "
+                        f"{record.elements} elements ({items} work item(s)); the "
+                        f"candidate declares {launch.kind} {launch.instances}"
+                    )
+                home = "banks" if record.operation == "mul" else "gpr"
+                for v in effects.value_layouts:
+                    if v.storage != home:
+                        raise RuntimeError(
+                            f"AiM realization keeps {v.value!r} in {home}; the "
+                            f"candidate declared {v}"
+                        )
+            declared_values = {t.value for t in effects.transfers}
+            missing = {name for name in host_names if name in group.functions} - (
+                declared_values
+            )
+            if host_names and any(
+                n not in declared_values and n in names for n in missing
+            ):
+                raise RuntimeError(
+                    f"AiM realization moves {sorted(host_names)} between host and "
+                    f"device; the candidate declares transfers of "
+                    f"{sorted(declared_values)}"
+                )
 
     # Host-move emit lambdas reach these; the derivation consumes the
     # recorded direction instead, so they only validate the device endpoint.
