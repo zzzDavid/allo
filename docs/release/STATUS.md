@@ -82,7 +82,14 @@ then this file, then `ISSUES.md` for the next action.
    without Samsung's permission for the five patches (P-04); the compatible
    build path for a user without the patches is the open question the
    reviewer named.
-4. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
+4. **G10 (user addition, 2026-11-03)**: reproduce the frozen paper's
+   results through the shared pipeline at matching or better comparable
+   performance. Not started beyond the user's source-based starting map
+   (`PAPER_REPRODUCTION.md`, untracked at the end of round 24); the next
+   increment builds the machine-readable inventory and begins
+   reproductions on the migrated paths (Samsung, AiM timing, UPMEM,
+   AttAcc), alongside the remaining G9 work.
+5. Open minor/boundary items: V1-16, C-18, S-13, P-17, APU v1 owner maps.
 
 ## Round 21 (2026-11-03): what was done
 
