@@ -961,3 +961,371 @@ def estimate_candidate(target, trace, layout, cost_spec):
     bound = _bind_cost(cost_spec, target)
     graph = build_execution_graph(target, trace, layout, bound)
     return graph, bound.evaluate(graph)
+
+
+# --------------------------------------------------------------------- #
+# Transfer availability: what the host program brings to the device, in
+# schedule order, against what every launch reads (release gate G9).
+# --------------------------------------------------------------------- #
+
+# The ``host_xfer`` verbs that bring a buffer region onto the device; a
+# candidate transfer whose route starts with one of these is host-supplied
+# and must be available before the launch that reads it.
+HOST_INGRESS_STEPS = frozenset({"host_scatter", "host_broadcast"})
+
+
+def parse_buffer_role(text):
+    """``name`` or ``name[i, :, a:b]`` -> (name, normalized index or None).
+
+    The index is a tuple with one item per indexed dimension: an ``int`` for
+    a fixed coordinate, ``(start, stop)`` for a bounded range, ``None`` for a
+    whole dimension.  Text that is not an index returns the whole text.
+    """
+    if "[" not in text:
+        return text, None
+    base, rest = text.split("[", 1)
+    body = rest.rstrip("]")
+    index = []
+    for item in body.split(","):
+        item = item.strip()
+        if item == ":":
+            index.append(None)
+        elif ":" in item:
+            start, stop = item.split(":")
+            index.append((int(start or 0), int(stop)))
+        else:
+            try:
+                index.append(int(item))
+            except ValueError:
+                return text, None
+    return base, tuple(index)
+
+
+def slice_region(shape, index) -> tuple:
+    """The box ``((lo, hi), ...)`` of ``index`` (see `parse_buffer_role`) in
+    a buffer of ``shape``; the whole buffer for ``None``.  A single bounded
+    range over a multi-dimensional buffer indexes its flattened extent."""
+    shape = tuple(int(d) for d in shape)
+    if index is None:
+        return tuple((0, d) for d in shape)
+    if len(index) == 1 and len(shape) > 1 and isinstance(index[0], tuple):
+        start, stop = index[0]
+        total = 1
+        for d in shape:
+            total *= d
+        if not 0 <= start <= stop <= total:
+            raise ValueError(f"slice {index} does not fit a buffer of {shape}")
+        return ((start, stop),) + tuple((0, 1) for _ in shape[1:])  # flat form
+    if len(index) != len(shape):
+        raise ValueError(f"index {index} does not fit a buffer of {shape}")
+    box = []
+    for item, d in zip(index, shape):
+        if item is None:
+            box.append((0, d))
+        elif isinstance(item, tuple):
+            start, stop = item
+            if not 0 <= start <= stop <= d:
+                raise ValueError(f"slice {index} does not fit a buffer of {shape}")
+            box.append((start, stop))
+        else:
+            if not 0 <= int(item) < d:
+                raise ValueError(f"index {index} does not fit a buffer of {shape}")
+            box.append((int(item), int(item) + 1))
+    return tuple(box)
+
+
+def flat_range(shape, box) -> tuple | None:
+    """``(first, count)`` when ``box`` is one contiguous range of the
+    row-major flattening of a buffer of ``shape``, else None."""
+    shape = tuple(int(d) for d in shape)
+    if (
+        len(box) == len(shape)
+        and all(hi == 1 for _lo, hi in box[1:])
+        and (len(shape) > 1 and box[1:] == tuple((0, 1) for _ in shape[1:]))
+    ):
+        # The flat form `slice_region` produces for a single bounded range.
+        lo, hi = box[0]
+        return int(lo), int(hi - lo)
+    if len(box) != len(shape):
+        return None
+    strides = []
+    stride = 1
+    for d in reversed(shape):
+        strides.append(stride)
+        stride *= d
+    strides.reverse()
+    first = sum(int(lo) * s for (lo, _hi), s in zip(box, strides))
+    count = 1
+    seen_partial = False
+    for (lo, hi), d in reversed(list(zip(box, shape))):
+        extent = int(hi) - int(lo)
+        if extent <= 0:
+            return 0, 0
+        if seen_partial and extent != 1:
+            return None
+        count *= extent
+        if extent != d:
+            seen_partial = True
+    return first, count
+
+
+def access_region(access, loops) -> tuple | None:
+    """The box an access covers over its buffer, from its resolved affine
+    coordinates and the enclosing loops (`spmw_semantics.LoopAxis`), or
+    None when the buffer shape is unknown.
+
+    A coordinate over loop variables spans their trip ranges; a coordinate
+    over any other atom (a work-id derived offset, loaded data) spans the
+    whole dimension: the region is never smaller than what the body may
+    read.  Guards are not applied (an over-approximation).
+    """
+    shape = getattr(access, "shape", None)
+    if not shape:
+        return None
+    shape = tuple(int(d) for d in shape)
+    bounds = {}
+    for loop in loops or ():
+        trip = loop.trip
+        if trip is None or trip <= 0:
+            continue
+        bounds[loop.var] = (loop.lower, loop.lower + (trip - 1) * loop.step)
+    coords = getattr(access, "coords", None) or ()
+    box = []
+    for d, extent in enumerate(shape):
+        coord = coords[d] if d < len(coords) else None
+        if coord is None:
+            box.append((0, extent))
+            continue
+        atoms, const = coord
+        lo = hi = int(const)
+        whole = False
+        for atom, coefficient in atoms:
+            span = bounds.get(atom)
+            if span is None:
+                whole = True
+                break
+            a, b = int(coefficient) * span[0], int(coefficient) * span[1]
+            lo += min(a, b)
+            hi += max(a, b)
+        if whole:
+            box.append((0, extent))
+        else:
+            box.append((max(0, lo), min(extent, hi + 1)))
+    return tuple(box)
+
+
+def _covered(box, boxes) -> bool:
+    """Is every point of ``box`` inside some box of ``boxes``?"""
+    if any(hi <= lo for lo, hi in box):
+        return True
+    inside = [
+        b
+        for b in boxes
+        if all(blo < hi and bhi > lo for (lo, hi), (blo, bhi) in zip(box, b))
+    ]
+    if not inside:
+        return False
+    cuts = []
+    for d, (lo, hi) in enumerate(box):
+        points = {lo, hi}
+        for b in inside:
+            points.update(p for p in b[d] if lo < p < hi)
+        cuts.append(sorted(points))
+    import itertools
+
+    for cell in itertools.product(*(zip(c, c[1:]) for c in cuts)):
+        if not any(
+            all(blo <= clo and chi <= bhi for (clo, chi), (blo, bhi) in zip(cell, b))
+            for b in inside
+        ):
+            return False
+    return True
+
+
+def _missing_region(box, boxes) -> tuple:
+    """One cell of ``box`` no box of ``boxes`` contains (for diagnostics)."""
+    cuts = []
+    for d, (lo, hi) in enumerate(box):
+        points = {lo, hi}
+        for b in boxes:
+            points.update(p for p in b[d] if lo < p < hi)
+        cuts.append(sorted(points))
+    import itertools
+
+    for cell in itertools.product(*(zip(c, c[1:]) for c in cuts)):
+        if not any(
+            all(blo <= clo and chi <= bhi for (clo, chi), (blo, bhi) in zip(cell, b))
+            for b in boxes
+        ):
+            return cell
+    return box
+
+
+def _facts_accesses(facts):
+    """(reads, writes) of one match's retained facts: `BufferAccess`-like
+    objects with ``memref_name``, ``value_ref``, ``shape``, ``coords``."""
+    reads, writes = [], []
+    if facts is None:
+        return reads, writes
+    if hasattr(facts, "reduction_vars"):
+        reads.extend(facts.inputs)
+        if not facts.accumulator.local:
+            writes.append(facts.accumulator)
+            if facts.accumulator_init == "carried":
+                reads.append(facts.accumulator)
+        writes.extend(facts.sinks)
+    elif hasattr(facts, "loop_vars"):
+        reads.extend(a for a in facts.operands if not a.local)
+        if not facts.result.local:
+            writes.append(facts.result)
+    return reads, writes
+
+
+def _value_key(ref, name):
+    return ref if ref is not None else ("memref", name)
+
+
+def check_transfer_availability(trace, launch_schedule, host_moves, placements):
+    """Every launch of the host program finds, on the device, the region its
+    work body reads of every host-supplied input: brought by an earlier
+    ``scatter``/``broadcast`` (the slice it names), declared ``resident``, or
+    written by an earlier launch of this program.  Walked in schedule order
+    for every launch (repeated launches included) against the retained
+    accesses of the body; a missing region is an `InfeasibleSchedule` naming
+    the launch, the buffer and the region.  Buffers are followed by retained
+    identity (`trace.source_value_refs`, the accesses' ``value_ref``), never
+    by name.  Host-supplied means the candidate's declared transfer route
+    starts with a step of `HOST_INGRESS_STEPS`; a candidate without declared
+    effects is not checked.
+    """
+    if launch_schedule is None or not trace.matches:
+        return
+    from .pim.schedule_search import InfeasibleSchedule
+    from .spmw_autoschedule import _bucket_for_autoschedule
+    from .spmw_candidate import candidate_effects
+
+    refs = getattr(trace, "source_value_refs", None) or {}
+    parameters = tuple(getattr(launch_schedule, "parameters", ()) or ())
+    key_by_name, shape_by_key, name_by_key = {}, {}, {}
+    for ordinal, (name, shape) in enumerate(parameters):
+        ref = refs.get(ordinal)
+        if ref is None:
+            continue
+        key_by_name[name] = ref
+        name_by_key[ref] = name
+        if shape is not None:
+            shape_by_key[ref] = tuple(int(d) for d in shape)
+
+    placements = (
+        list(placements) if isinstance(placements, (list, tuple)) else [placements]
+    )
+    groups: dict = {}
+    for (_scope, bucket), placement in zip(_bucket_for_autoschedule(trace), placements):
+        group_id = _matcher_work_scope(bucket[0]).group_id
+        entry = groups.setdefault(group_id, {"matches": [], "effects": None})
+        entry["matches"].extend(bucket)
+        if entry["effects"] is None:
+            entry["effects"] = candidate_effects(placement)
+
+    def regions(group, names, which):
+        """{key: (display name, [boxes])} of ``which`` ('reads'/'writes')
+        accesses of the group's bodies to the values ``names``."""
+        out: dict = {}
+        for match in group["matches"]:
+            facts = match.extra.get("semantic_facts")
+            reads, writes = _facts_accesses(facts)
+            for access in reads if which == "reads" else writes:
+                if access.memref_name not in names:
+                    continue
+                key = _value_key(access.value_ref, access.memref_name)
+                box = access_region(access, getattr(facts, "loops", ()))
+                if box is None:
+                    shape = shape_by_key.get(key)
+                    if shape is None:
+                        continue
+                    box = tuple((0, d) for d in shape)
+                shape_by_key.setdefault(key, tuple(hi for _lo, hi in box))
+                out.setdefault(key, (access.memref_name, []))[1].append(box)
+        return out
+
+    available: dict = {}
+    for name in getattr(launch_schedule, "resident", ()) or ():
+        key = key_by_name.get(name)
+        shape = shape_by_key.get(key)
+        if key is not None and shape is not None:
+            available.setdefault(key, []).append(tuple((0, d) for d in shape))
+
+    moves = list(host_moves or ())
+    for position, step in enumerate(launch_schedule.steps):
+        if isinstance(step, HostStep):
+            resolved = moves[step.host_index]
+            verb = getattr(getattr(resolved, "verb", None), "name", None)
+            if verb not in ("scatter", "broadcast"):
+                continue
+            role = getattr(resolved, "buffer_role", None)
+            base = getattr(role, "base", None) if not isinstance(role, str) else None
+            index = getattr(role, "index", None) if base is not None else None
+            if base is None:
+                base, index = parse_buffer_role(str(role))
+            key = key_by_name.get(base)
+            shape = shape_by_key.get(key)
+            if key is None or shape is None:
+                continue
+            try:
+                box = slice_region(shape, index)
+            except ValueError as error:
+                raise InfeasibleSchedule(f"host {verb} of {role}: {error}") from error
+            if (
+                len(box) == len(shape)
+                and len(shape) > 1
+                and box[1:] == tuple((0, 1) for _ in shape[1:])
+            ):
+                # A flat range over a multi-dimensional buffer: expand to the
+                # boxes it covers only when it is whole rows.
+                first, count = box[0]
+                inner = 1
+                for d in shape[1:]:
+                    inner *= d
+                if first % inner or count % inner:
+                    raise InfeasibleSchedule(
+                        f"host {verb} of {role}: a flat range over a "
+                        f"{len(shape)}-dimensional buffer must cover whole rows"
+                    )
+                box = ((first // inner, (first + count) // inner),) + tuple(
+                    (0, d) for d in shape[1:]
+                )
+            available.setdefault(key, []).append(box)
+            continue
+        if not isinstance(step, LaunchStep):
+            continue
+        group = groups.get(step.group_id)
+        if group is None or group["effects"] is None:
+            continue
+        effects = group["effects"]
+        supplied = {
+            t.value
+            for t in effects.transfers
+            if t.direction in ("in", "inout")
+            and not t.physical
+            and tuple(t.route)[:1]
+            and tuple(t.route)[0] in HOST_INGRESS_STEPS
+        }
+        for key, (name, boxes) in regions(group, supplied, "reads").items():
+            have = available.get(key, [])
+            for box in boxes:
+                if _covered(box, have):
+                    continue
+                missing = _missing_region(box, have)
+                label = name_by_key.get(key, name)
+                raise InfeasibleSchedule(
+                    f"launch {step.ordinal} of {step.kernel!r} (step {position}) "
+                    f"reads {label!r} ({name!r}) over {list(box)} but the host "
+                    f"program has not brought {list(missing)} to the device: no "
+                    "earlier scatter/broadcast of that region, not declared "
+                    "resident, not produced by an earlier launch"
+                )
+        produced = {
+            t.value for t in effects.transfers if t.direction in ("out", "inout")
+        }
+        for key, (_name, boxes) in regions(group, produced, "writes").items():
+            available.setdefault(key, []).extend(boxes)

@@ -490,6 +490,13 @@ class AimDistributedHostTransfer(AimOp):  # pylint: disable=too-many-instance-at
     buffer_refs: tuple = ()
     buffer_slices: tuple = ()
     group_id: int | None = None
+    # The transfer moves ``elements`` consecutive elements starting at
+    # ``first_element`` of a logical vector of ``vector_elements`` elements
+    # laid out over the partitions (the kernel's vector); the bursts emitted
+    # are those of the layout the slice touches.  ``None`` means the whole
+    # vector (``first_element`` 0, ``vector_elements`` = ``elements``).
+    first_element: int = 0
+    vector_elements: int | None = None
 
     def __post_init__(self):
         direction = str(self.direction).lower()
@@ -1774,13 +1781,27 @@ class _AimLowerer:
                 "distributed host-transfer replicas exceed target channels"
             )
         partitions = operation.channels_per_replica * banks_per_channel
-        span = math.ceil(operation.elements / partitions)
+        total = (
+            operation.elements
+            if operation.vector_elements is None
+            else int(operation.vector_elements)
+        )
+        first = int(operation.first_element)
+        if first < 0 or first + operation.elements > total:
+            raise ValueError(
+                f"distributed host transfer of [{first}, {first + operation.elements})"
+                f" exceeds its {total}-element vector"
+            )
+        last = first + operation.elements
+        span = math.ceil(total / partitions)
         rows = math.ceil(span / geometry.row_elements)
         self._check_rows(operation.row, rows)
         prefix = "R" if operation.direction == "read" else "W"
         emitted = 0
 
-        # Row/burst/partition/replica/copy is an intentional stable ABI.
+        # Row/burst/partition/replica/copy is an intentional stable ABI: the
+        # vector's layout is walked once and only the bursts holding
+        # elements of [first, last) are issued.
         for row_offset in range(rows):
             row_start = row_offset * geometry.row_elements
             max_row_elements = min(geometry.row_elements, span - row_start)
@@ -1788,8 +1809,15 @@ class _AimLowerer:
             for burst in range(max_bursts):
                 for partition in range(partitions):
                     partition_start = partition * span
-                    partition_elements = min(span, operation.elements - partition_start)
-                    if partition_elements <= row_start + burst * geometry.lanes:
+                    partition_elements = min(span, total - partition_start)
+                    local = row_start + burst * geometry.lanes
+                    if partition_elements <= local:
+                        continue
+                    burst_first = partition_start + local
+                    burst_last = partition_start + min(
+                        partition_elements, local + geometry.lanes
+                    )
+                    if burst_last <= first or burst_first >= last:
                         continue
                     local_channel = partition // banks_per_channel
                     bank_slot = partition % banks_per_channel
@@ -1811,6 +1839,8 @@ class _AimLowerer:
         return {
             "direction": operation.direction,
             "elements_per_replica": operation.elements,
+            "first_element": first,
+            "vector_elements": total,
             "replicas": operation.replicas,
             "channels_per_replica": operation.channels_per_replica,
             "partitions_per_replica": partitions,

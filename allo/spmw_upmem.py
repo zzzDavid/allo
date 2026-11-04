@@ -1783,6 +1783,303 @@ def upmem_base_placements(target, matches) -> list[Placement]:
     ]
 
 
+# --------------------------------------------------------------------- #
+# Candidate effects (the shared candidate contract, release gate G9)
+# --------------------------------------------------------------------- #
+
+# Residencies under which the template keeps the operand in WRAM for the
+# whole launch (a transient allocation); the others stream it from MRAM or
+# fuse it into the matrix rows' DMA packets.
+_WRAM_RESIDENCIES = frozenset(
+    {
+        UPMEMOperandResidency.SHARED_WRAM.value,
+        UPMEMOperandResidency.TASKLET_PRIVATE_WRAM.value,
+    }
+)
+# The role the family's residency decision applies to.
+_RESIDENT_ROLE = {"matrix_vector": "vector", "gemm": "rhs"}
+# The role a carried accumulator (``accumulator_init == "carried"``) lives
+# in: the output, except the selection count (carried by the host
+# compaction step, never loaded by the template).
+_CARRIED_ROLE = {"selection": "count"}
+
+
+def upmem_family_extents(kernel: UpmemKernel, geometry=None) -> tuple:
+    """``(result instances, reduction extent)`` the family template computes
+    for ``geometry`` (the kernel's by default): what one launch of the
+    template advances, in the shared contract's terms (a contraction's
+    result trips and reduction trips; an accumulating elementwise op's
+    iterations, no reduction).  The realization check compares these with
+    the selected candidate's declared launch."""
+    g = dict(kernel.geometry if geometry is None else geometry)
+    family = kernel.family
+    if family in ("pointwise", "reduction", "selection"):
+        return int(g["elements"]), None
+    if family == "matrix_vector":
+        return int(g["batches"]) * int(g["rows"]), int(g["columns"])
+    if family == "gemm":
+        return int(g["rows"]) * int(g["columns"]), int(g["reduction"])
+    if family == "histogram":
+        return int(g["elements"]), None
+    if family == "kmeans_distances":
+        return int(g["points"]) * int(g["clusters"]), int(g["dimension"])
+    if family == "feature_gradient":
+        return int(g["features"]), int(g["samples"])
+    raise NotImplementedError(
+        f"UPMEM family {family!r} states no launch extents for the realization check"
+    )
+
+
+def upmem_candidate_effects(target, matches, placement):
+    """`CandidateEffects` of one UPMEM placement for one work item, derived
+    from the shared semantic facts of its matches (`Contraction`/`Epilogue`:
+    loop labels, trips, access coordinates, accumulator initialization,
+    sinks) and from the placement's physical decision (data layout, WRAM
+    residency) and family.
+
+    A DPU group: every value's backing storage is the DPU's ``mram`` heap
+    image the runtime packs from the caller's arrays (``host_pack``) and
+    decodes the outputs from (``host_readback``); the input images carry the
+    decision's data layout as their packing (``separate`` or
+    ``fused_replicated``, the resident operand also its residency); the
+    template's WRAM use is a transient allocation (its DMA buffers, and the
+    resident operand under a WRAM residency).  A carried accumulator
+    (``accumulator_init == "carried"``) makes the output ``inout``: the
+    template loads the initial output.  One launch advances the work item's
+    result instances over the whole reduction (the family's template; the
+    DPUs of a group run in lockstep, one work item each).
+
+    A host group (``placement == "host"``, the paper's k-means update
+    partition) executes the work item's whole function on the host from its
+    retained IR: ``host_function`` effects with a whole-function launch over
+    the function's retained store effects and values in ``host_dram``.
+
+    `UpmemCtx.check_realization` compares the realized plan, decision,
+    segment kind, role windows and host steps with the declaration.  None
+    when the matches carry no facts (a trace assembled outside the shared
+    front stages).
+    """
+    from .spmw_candidate import (
+        CandidateCoverage,
+        CandidateEffects,
+        CandidateLaunch,
+        CandidateTransfer,
+        CandidateValueLayout,
+        indirect_reads,
+        value_axes,
+        verbatim_values,
+    )
+
+    if not matches:
+        return None
+    program = matches[0].extra.get("program_facts")
+    facts = [m.extra.get("semantic_facts") for m in matches]
+    if program is None:
+        return None
+    extra = placement.extra or {}
+    family = extra.get("upmem_family")
+    if family is None:
+        return None
+    function = matches[0].func_name
+    operations = tuple(sorted({m.target_op_name for m in matches}))
+    if extra.get("upmem_placement") == "host":
+        if not getattr(program, "effects", ()):
+            return None
+        inputs, outputs, _locals = verbatim_values(program)
+        layouts = tuple(
+            CandidateValueLayout(name, (), "host_dram")
+            for name in dict.fromkeys((*inputs, *outputs))
+        )
+        transfers = []
+        for name in dict.fromkeys((*inputs, *outputs)):
+            if name in inputs and name in outputs:
+                transfers.append(
+                    CandidateTransfer(
+                        name, "inout", ("host_copy", "host_dram", "host_copy")
+                    )
+                )
+            elif name in inputs:
+                transfers.append(
+                    CandidateTransfer(name, "in", ("host_copy", "host_dram"))
+                )
+            else:
+                transfers.append(
+                    CandidateTransfer(name, "out", ("host_dram", "host_copy"))
+                )
+        launch = CandidateLaunch(
+            index=0,
+            kind=f"upmem_host:{family}",
+            operations=tuple(range(len(program.effects))),
+            instances=(0, 1),
+            whole=True,
+            covers=(placement.mode, family, "host"),
+        )
+        return CandidateEffects(
+            coverage=CandidateCoverage(function, operations, inputs, outputs),
+            value_layouts=layouts,
+            transfers=tuple(transfers),
+            launches=(launch,),
+            abi_inputs=inputs,
+            abi_outputs=outputs,
+            device_scope=(
+                "host partition: the work item's function, lowered to C from its "
+                "retained IR, runs on the host (UPMEM paper partition)"
+            ),
+            host_function=True,
+        )
+    if any(f is None for f in facts):
+        return None
+    data_layout = str(extra.get("data_layout") or "")
+    residency = str(extra.get("wram_residency") or "not_applicable")
+    resident_role = _RESIDENT_ROLE.get(family)
+    resident_value = None
+    if resident_role is not None:
+        kernel = classify_upmem_kernel(target, matches)
+        resident_value = dict(kernel.roles).get(resident_role)
+    labels = {}
+    for fact in facts:
+        labels.update(fact.loop_labels)
+    inputs, outputs, layouts, transfers = [], [], {}, {}
+    instances = reduction = init = None
+    for match, fact in zip(matches, facts):
+        if hasattr(fact, "reduction_vars"):
+            trips = fact.trips
+            extent = red = 1
+            for var in fact.result_vars:
+                extent *= int(trips.get(var) or 0)
+            for var in fact.reduction_vars:
+                red *= int(trips.get(var) or 0)
+            if instances is None:
+                instances, init = extent, fact.accumulator_init
+                # An accumulate without a reduction loop (a histogram's
+                # ``H[bin] += 1`` per sample) sums nothing per instance.
+                reduction = red if fact.reduction_vars else None
+            accesses = [a for a in fact.inputs if not a.local]
+            results = []
+            if not fact.accumulator.local:
+                results.append(fact.accumulator)
+            results.extend(fact.external_sinks)
+            carried = fact.accumulator_init == "carried"
+        else:
+            extent = 1
+            for loop in fact.loops:
+                extent *= int(loop.trip or 0)
+            if instances is None:
+                instances = extent
+            own = match.extra.get("accumulator_init")
+            # An operand reading the element it writes: an input only when
+            # the source carries the incoming contents (the shared rule).
+            accesses = [
+                a
+                for a in fact.operands
+                if not a.local
+                and not (a.memref_name == fact.result.memref_name and own == "zero")
+            ]
+            results = [] if fact.result.local else [fact.result]
+            for memref, _text in match.extra.get("output_sinks", ()):
+                if memref != fact.result.memref_name:
+                    results.append(fact.result)
+            carried = own == "carried"
+        for access in accesses:
+            memref = access.memref_name
+            if memref is None or memref in inputs:
+                continue
+            inputs.append(memref)
+            packing = data_layout or None
+            if memref == resident_value:
+                packing = f"{data_layout}:{residency}"
+            layouts[(memref, "in")] = CandidateValueLayout(
+                memref, value_axes(access, labels), "mram", packing, image="in"
+            )
+            transfers[memref] = CandidateTransfer(memref, "in", ("host_pack", "mram"))
+        for access in results:
+            memref = access.memref_name
+            if memref is None:
+                continue
+            if memref not in outputs:
+                outputs.append(memref)
+            if carried and memref not in inputs:
+                inputs.append(memref)
+            both = memref in inputs
+            if both and (memref, "in") not in layouts:
+                # A carried accumulator: the template loads the caller's
+                # output from the same MRAM window it writes back to.
+                layouts[(memref, "in")] = CandidateValueLayout(
+                    memref,
+                    value_axes(access, labels),
+                    "mram",
+                    data_layout or None,
+                    image="in",
+                )
+            layouts[(memref, "out" if both else "value")] = CandidateValueLayout(
+                memref,
+                value_axes(access, labels),
+                "mram",
+                data_layout or None,
+                image="out" if both else "value",
+            )
+            transfers[memref] = CandidateTransfer(
+                memref,
+                "inout" if both else "out",
+                (
+                    ("host_pack", "mram", "host_readback")
+                    if both
+                    else ("mram", "host_readback")
+                ),
+            )
+    # Inputs read only through a computed index or a guard (the histogram's
+    # samples): packed like every other input.
+    for memref, access in indirect_reads(matches).items():
+        if memref in inputs:
+            continue
+        inputs.append(memref)
+        layouts[(memref, "in")] = CandidateValueLayout(
+            memref, value_axes(access, labels), "mram", data_layout or None, image="in"
+        )
+        transfers[memref] = CandidateTransfer(memref, "in", ("host_pack", "mram"))
+    allocations = [("dma_buffers", 0, "wram")]
+    if resident_value is not None and residency in _WRAM_RESIDENCIES:
+        allocations.append((f"{resident_role}_wram", 0, "wram"))
+    launch = CandidateLaunch(
+        index=0,
+        kind=f"upmem:{family}",
+        operations=tuple(range(len(matches))),
+        instances=(0, int(instances or 0)),
+        reduction=None if reduction is None else (0, int(reduction)),
+        accumulator=init,
+        covers=(placement.mode, family, data_layout, residency),
+    )
+    return CandidateEffects(
+        coverage=CandidateCoverage(function, operations, tuple(inputs), tuple(outputs)),
+        value_layouts=tuple(layouts.values()),
+        transfers=tuple(transfers.values()),
+        launches=(launch,),
+        abi_inputs=tuple(inputs),
+        abi_outputs=tuple(outputs),
+        device_scope=(
+            "one work item per DPU, the family template's tasklets sharing the "
+            "DPU; the group's DPUs run the same binary in lockstep"
+        ),
+        allocations=tuple(allocations),
+    )
+
+
+def _derive_upmem_effects(view, matches, placement):
+    """Late-binding entry of the effects registry (the enumerator, the
+    movement-stage re-declaration and a supplied-placement rebinding use
+    the same derivation)."""
+    return upmem_candidate_effects(view, matches, placement)
+
+
+def _register_effects_deriver():
+    from .spmw_candidate import EFFECTS_DERIVERS
+
+    EFFECTS_DERIVERS["upmem"] = _derive_upmem_effects
+
+
+_register_effects_deriver()
+
+
 # Knob names in registration (cross) order, spec 001 D5.  ``tasklets`` only
 # ever takes 12 (every catalog decision and template is a 12-tasklet plan: a
 # schedule policy, not a hardware limit; the target declares 24); it stays a
@@ -3021,6 +3318,11 @@ class UpmemCtx(CodegenContext):
         self.segments: tuple = ()
         self.groups: dict = {}
         self.arity: int | None = None
+        # id(placement) -> (group id, work-item index) of the program emitted
+        # for it (realization check); group id -> the work bodies' argument
+        # names (from the shared facts).
+        self._group_of_layout: dict = {}
+        self._parameters_of_group: dict = {}
 
     def emit_program(
         self, trace, layouts, *, schedule=None, host_moves=(), module=None
@@ -3100,6 +3402,20 @@ class UpmemCtx(CodegenContext):
                 {m.func_name: _matcher_work_scope(m).work_id for m in matches}.items(),
                 key=lambda item: item[1],
             )
+            for position, work in enumerate(work_ids):
+                scope = scope_by_work[work]
+                if scope in layout_by_scope:
+                    self._group_of_layout[id(layout_by_scope[scope])] = (
+                        group_id,
+                        position,
+                    )
+            self._parameters_of_group[group_id] = {
+                name
+                for match in matches
+                for name in getattr(
+                    match.extra.get("program_facts"), "parameter_names", ()
+                )
+            }
             groups[group_id] = _GroupProgram(
                 kernel,
                 decision,
@@ -3183,6 +3499,173 @@ class UpmemCtx(CodegenContext):
             layout = layout_by_scope[scope].layout
             if layout is not None:
                 _check_tasklet_ownership(plan, layout)
+
+    def check_realization(self, layouts) -> None:
+        """The realized UPMEM program against the selected candidates'
+        declared effects, per work item: the group's placement (DPU template
+        or host partition) and family; the launch extents against the family
+        template's geometry for that work item (`upmem_family_extents`); the
+        accumulator chain (carried outputs load the initial output and are
+        ``inout``); the decision's data layout and WRAM residency against the
+        declared packings and allocations; the kernel's roles against the
+        declared values (at the final compile, the proven role windows); and
+        the host steps (every output is gathered)."""
+        from .spmw_candidate import candidate_effects
+
+        layouts = list(layouts) if isinstance(layouts, (list, tuple)) else [layouts]
+        for layout in layouts:
+            effects = candidate_effects(layout)
+            if effects is None:
+                continue
+            located = self._group_of_layout.get(id(layout))
+            program = self.groups.get(located[0]) if located is not None else None
+            if program is None:
+                raise RuntimeError(
+                    "UPMEM realization lowered no program for the candidate "
+                    f"{layout.mode!r} that declares effects"
+                )
+            kernel, decision = program.kernel, program.decision
+            if len(effects.launches) != 1:
+                raise RuntimeError(
+                    "UPMEM realization is one template launch per work item; the "
+                    f"candidate declares {len(effects.launches)} launches"
+                )
+            (launch,) = effects.launches
+            host = kernel.placement == "host"
+            expected_kind = (
+                f"upmem_host:{kernel.family}" if host else f"upmem:{kernel.family}"
+            )
+            if launch.kind != expected_kind or effects.host_function != host:
+                raise RuntimeError(
+                    f"UPMEM realization runs {kernel.family!r} "
+                    f"{'on the host' if host else 'on the DPUs'}; the candidate "
+                    f"declares launch {launch.kind!r} (host_function="
+                    f"{effects.host_function})"
+                )
+            roles = dict(kernel.roles)
+            declared = set(effects.coverage.inputs) | set(effects.coverage.outputs)
+            if host:
+                # The host partition's roles may name function locals (the
+                # k-means sums); every role that is an argument is declared.
+                parameters = self._parameters_of_group.get(located[0], set())
+                undeclared = (set(roles.values()) & parameters) - declared
+            else:
+                undeclared = set(roles.values()) ^ declared
+            if undeclared:
+                raise RuntimeError(
+                    f"UPMEM realization binds the roles {roles}; the candidate "
+                    f"declares the values {sorted(declared)} ({sorted(undeclared)} "
+                    "differ)"
+                )
+            if host:
+                if program.plan is not None or not launch.whole:
+                    raise RuntimeError(
+                        "UPMEM host partition runs the function verbatim without a "
+                        f"template; the candidate declares plan {program.plan!r}, "
+                        f"whole={launch.whole}"
+                    )
+                if self.arity is not None and not program.oracles:
+                    raise RuntimeError(
+                        f"UPMEM host partition {kernel.family!r} compiled no host "
+                        "function for its group"
+                    )
+                continue
+            instances, reduction = upmem_family_extents(
+                kernel, kernel.stream_geometry(located[1])
+            )
+            realized = ((0, instances), None if reduction is None else (0, reduction))
+            if (tuple(launch.instances), launch.reduction) != realized:
+                raise RuntimeError(
+                    f"UPMEM {kernel.family} template advances (instances, reduction) "
+                    f"{realized} for work item {located[1]}; the candidate declares "
+                    f"{(tuple(launch.instances), launch.reduction)}"
+                )
+            if launch.accumulator is not None and (
+                launch.accumulator != kernel.accumulator_init
+            ):
+                raise RuntimeError(
+                    f"UPMEM template starts the accumulator as "
+                    f"{kernel.accumulator_init!r}; the candidate declares "
+                    f"{launch.accumulator!r}"
+                )
+            carried = kernel.accumulator_init == "carried"
+            loads_initial = carried and kernel.family != "selection"
+            plan_carried = getattr(program.plan, "carried_output", loads_initial)
+            if bool(plan_carried) != loads_initial:
+                raise RuntimeError(
+                    f"UPMEM plan carried_output={plan_carried!r} disagrees with the "
+                    f"kernel's accumulator_init={kernel.accumulator_init!r}"
+                )
+            transfers = {t.value: t for t in effects.transfers}
+            carried_role = _CARRIED_ROLE.get(kernel.family, "out")
+            for role, value in roles.items():
+                if value not in effects.coverage.outputs:
+                    continue
+                expected = "inout" if carried and role == carried_role else "out"
+                direction = transfers[value].direction if value in transfers else None
+                if direction != expected:
+                    raise RuntimeError(
+                        f"UPMEM template {'loads' if expected == 'inout' else 'does not load'} "
+                        f"the initial output {value!r} ({role}); the candidate transfers "
+                        f"it {direction!r}"
+                    )
+                if tuple(transfers[value].route)[-1] != "host_readback":
+                    raise RuntimeError(
+                        f"UPMEM gathers {value!r} from the MRAM output window; the "
+                        f"candidate's route is {transfers[value].route}"
+                    )
+            fields = decision_fields(decision)
+            images = {}
+            for value in effects.value_layouts:
+                images.setdefault(value.value, {})[value.image] = value
+            for name in effects.coverage.inputs:
+                image = images.get(name, {}).get("in") or images.get(name, {}).get(
+                    "value"
+                )
+                if image is None or image.storage != "mram":
+                    raise RuntimeError(
+                        f"UPMEM packs {name!r} into the MRAM heap image; the candidate "
+                        f"declared {image}"
+                    )
+                packing = str(image.packing or "")
+                if packing.split(":", maxsplit=1)[0] != fields["data_layout"]:
+                    raise RuntimeError(
+                        f"UPMEM lays {name!r} out as {fields['data_layout']!r}; the "
+                        f"candidate declared packing {image.packing!r}"
+                    )
+            resident_role = _RESIDENT_ROLE.get(kernel.family)
+            resident = roles.get(resident_role) if resident_role else None
+            if resident is not None:
+                image = images.get(resident, {}).get("in") or images.get(
+                    resident, {}
+                ).get("value")
+                packing = str(getattr(image, "packing", "") or "")
+                if packing.rsplit(":", maxsplit=1)[-1] != fields["wram_residency"]:
+                    raise RuntimeError(
+                        f"UPMEM keeps {resident!r} as {fields['wram_residency']!r}; "
+                        f"the candidate declared packing {packing!r}"
+                    )
+                wram = {
+                    name
+                    for name, _b, storage in effects.allocations
+                    if storage == "wram"
+                }
+                if (f"{resident_role}_wram" in wram) != (
+                    fields["wram_residency"] in _WRAM_RESIDENCIES
+                ):
+                    raise RuntimeError(
+                        f"UPMEM residency {fields['wram_residency']!r} of {resident!r} "
+                        f"disagrees with the candidate's WRAM allocations {sorted(wram)}"
+                    )
+            function = program.functions[located[1]]
+            windows = program.windows.get(function)
+            if windows is not None:
+                bound = {roles[role] for role in windows if role in roles}
+                if not bound <= declared:
+                    raise RuntimeError(
+                        f"UPMEM binds windows for {sorted(bound)} in {function}; the "
+                        f"candidate declares {sorted(declared)}"
+                    )
 
     def _bind_module(self, module, by_group, groups) -> None:
         from ._mlir.ir import AsmState

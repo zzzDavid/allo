@@ -18,8 +18,25 @@ import allo
 from allo.dataflow import region
 from allo.ir.types import bfloat16
 
-# Buffers loaded once before the measured decode step (CENT --only-trace).
-RESIDENT = ("g_x", "g_sa", "cs_q", "cs_k", "wq", "wk", "wv", "wo", "w1", "w3", "w2")
+# Buffers loaded once before the measured decode step (CENT --only-trace),
+# and the KV cache of the earlier tokens: the measured step appends token
+# L-1 and the attention kernels read tokens [0, L).  Residency is declared,
+# never assumed, so the host program's availability check can see it.
+RESIDENT = (
+    "g_x",
+    "g_sa",
+    "cs_q",
+    "cs_k",
+    "wq",
+    "wk",
+    "wv",
+    "wo",
+    "w1",
+    "w3",
+    "w2",
+    "k_cache",
+    "v_cache",
+)
 
 
 class CentCase(NamedTuple):

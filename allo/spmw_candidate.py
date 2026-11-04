@@ -125,6 +125,13 @@ class CandidateEffects:
     # Device allocations the program needs beyond its values:
     # ``(name, bytes, storage)`` (a scalar program's local-array scratch).
     allocations: tuple[tuple[str, int, str], ...] = ()
+    # A declared host partition: the backend executes the work item's whole
+    # function verbatim on the host from its retained IR (UPMEM's paper
+    # partition of the k-means update).  Its launches are whole-function
+    # launches checked against the function's retained store effects, the
+    # way a verbatim device program's are; its value layouts name host
+    # storage.  Never a device program's shortcut around tiling.
+    host_function: bool = False
 
     def manifest(self) -> dict[str, Any]:
         return {
@@ -170,6 +177,7 @@ class CandidateEffects:
             "synthetic_axes": [list(item) for item in self.synthetic_axes],
             "allocations": [list(item) for item in self.allocations],
             "device_scope": self.device_scope,
+            "host_function": self.host_function,
         }
 
 
@@ -179,11 +187,34 @@ def candidate_effects(placement) -> CandidateEffects | None:
     return effects if isinstance(effects, CandidateEffects) else None
 
 
-def _verbatim_facts(matches):
+def _verbatim_facts(matches, host_function: bool = False):
     """The `ProgramFacts` of a work item whose program executes the
-    function verbatim (``facts.verbatim``), else None."""
+    function verbatim (``facts.verbatim``, or a candidate's declared host
+    partition ``host_function`` over facts with retained store effects),
+    else None."""
     facts = matches[0].extra.get("program_facts") if matches else None
-    return facts if getattr(facts, "verbatim", False) else None
+    if facts is None:
+        return None
+    if getattr(facts, "verbatim", False):
+        return facts
+    if host_function and getattr(facts, "effects", ()):
+        return facts
+    return None
+
+
+def value_axes(access, labels) -> tuple:
+    """Source loop labels the access coordinates range over, in coordinate
+    order (an affine coordinate ``row0 + i`` ranges over ``i``); the shared
+    derivation of a `CandidateValueLayout`'s axes from a retained access."""
+    axes = []
+    for coord in getattr(access, "coords", None) or ():
+        if coord is None:
+            continue
+        for atom, _coefficient in coord[0]:
+            label = labels.get(atom)
+            if label is not None and label not in axes:
+                axes.append(label)
+    return tuple(axes)
 
 
 def verbatim_values(facts):
@@ -236,30 +267,72 @@ def _verbatim_values(facts, matches):
     )
 
 
-def _program_values(matches):
-    """The buffers of one work item's matches: inputs, external
-    destinations, local destinations, operations, parameter names."""
+def indirect_reads(matches) -> dict:
+    """Buffers the work item's matched stores read outside their operands:
+    through a computed index (a histogram's bin ``H[(x * m) >> k]`` reads
+    ``x``) or a guard, as the retained store effects record them
+    (`ProgramFacts.effects`, category ``matched``).  ``{memref name:
+    BufferAccess}`` for the external buffers that are no match's operand or
+    result; the semantic inputs the operand view misses.
+    """
+    facts = matches[0].extra.get("program_facts") if matches else None
+    if facts is None or not getattr(facts, "effects", ()):
+        return {}
+    functions = {match.func_name for match in matches}
+    known = set()
+    for match in matches:
+        known.update(o.memref_name for o in match.operands if o.memref_name)
+        if match.result_memref_name:
+            known.add(match.result_memref_name)
+    out = {}
+    for effect in facts.effects:
+        if effect.category != "matched" or effect.function not in functions:
+            continue
+        for access in effect.reads:
+            name = access.memref_name
+            if name is None or access.local or name in known or name in out:
+                continue
+            out[name] = access
+    return out
 
-    facts = _verbatim_facts(matches)
+
+def _program_values(matches, host_function: bool = False):
+    """The buffers of one work item's matches: inputs, external
+    destinations, local destinations, operations, parameter names.
+
+    A destination the match accumulates into is an input only when the
+    source carries its incoming contents (``accumulator_init == "carried"``):
+    with a proven zero initializer (``"zero"``: the matcher found every
+    other store into it a constant 0 before the match, on the same element
+    or a whole-buffer fill) the caller's contents are dead, whether the
+    accumulating operand is the pattern's loop-carried parameter (``MAC``)
+    or an elementwise operand reading its own element (``P[d] += A[i]``
+    matched as ``ADD``).
+    """
+
+    facts = _verbatim_facts(matches, host_function)
     if facts is not None:
         return _verbatim_values(facts, matches)
     inputs, outputs, locals_, operations = set(), set(), set(), set()
     for match in matches:
         operations.add(match.target_op_name)
+        init = match.extra.get("accumulator_init")
         for operand in match.operands:
             if operand.memref_name is None:
                 continue
+            if operand.memref_name == match.result_memref_name and (
+                operand.is_loop_carried or init == "zero"
+            ):
+                # The destination itself: read only when the source carries
+                # its incoming contents into the reduction (``y[i] += ...``
+                # without an initializer).
+                if init == "carried" and not match.extra.get("result_is_local"):
+                    inputs.add(operand.memref_name)
+                continue
             if operand.is_loop_carried:
                 # An accumulator seeded from a buffer other than the result
-                # destination (a record's ``accumulator`` input) is read; so
-                # is the destination itself when the source carries its
-                # incoming contents into the reduction (``y[i] += ...``).
-                if operand.memref_name != match.result_memref_name:
-                    inputs.add(operand.memref_name)
-                elif match.extra.get("accumulator_init") == "carried" and not (
-                    match.extra.get("result_is_local")
-                ):
-                    inputs.add(operand.memref_name)
+                # destination (a record's ``accumulator`` input) is read.
+                inputs.add(operand.memref_name)
                 continue
             inputs.add(operand.memref_name)
         if match.result_memref_name is not None:
@@ -279,6 +352,8 @@ def _program_values(matches):
                 outputs.add(memref)
     facts = matches[0].extra.get("program_facts") if matches else None
     parameters = set(getattr(facts, "parameter_names", ()) or ())
+    # Buffers read only through computed indices or guards are inputs too.
+    inputs.update(indirect_reads(matches))
     # Accumulator buffers that are outputs (carried accumulators) are also
     # read; the loop-carried operand is not an input of the program.
     inputs -= locals_
@@ -332,7 +407,7 @@ def _product(values) -> int | None:
     return total
 
 
-def _operation_extents(matches) -> dict:
+def _operation_extents(matches, host_function: bool = False) -> dict:
     """Per matched operation (original match index): ``(instances,
     reduction_extent, accumulator_init)``.  A contraction's instances are
     its result (output and batch) trips and its reduction extent the
@@ -342,7 +417,7 @@ def _operation_extents(matches) -> dict:
     when the extent is unknown (the launches cannot be checked, which is a
     contract problem)."""
     out = {}
-    verbatim = _verbatim_facts(matches)
+    verbatim = _verbatim_facts(matches, host_function)
     if verbatim is not None:
         for index, effect in enumerate(verbatim.effects):
             out[index] = (effect.instances, effect.reduction_extent, None)
@@ -487,7 +562,7 @@ def _check_value_layouts(effects, matches, inputs, outputs, locals_, view) -> li
     if (
         loop_labels
         and not loop_labels <= covered_axes
-        and _verbatim_facts(matches) is None
+        and _verbatim_facts(matches, effects.host_function) is None
     ):
         # A verbatim program keeps its buffers whole in device memory and
         # runs the function's loops itself; distributed layouts over the
@@ -583,8 +658,13 @@ def _check_launches(effects, matches, view) -> list:
     previous launch; a verbatim program launches whole functions.  Declared
     allocations name declared storage."""
     problems = []
-    verbatim = _verbatim_facts(matches)
+    verbatim = _verbatim_facts(matches, effects.host_function)
     operation_count = len(verbatim.effects) if verbatim is not None else len(matches)
+    if effects.host_function and verbatim is None:
+        problems.append(
+            "declares a host partition (host_function) for a work item without "
+            "retained store effects to check its whole-function launches against"
+        )
     if not effects.launches:
         problems.append("declares no launch")
     for position, launch in enumerate(effects.launches):
@@ -625,7 +705,7 @@ def _check_launches(effects, matches, view) -> list:
         for op in launch.operations:
             if 0 <= op < operation_count:
                 by_operation.setdefault(op, []).append(launch)
-    extents = _operation_extents(matches)
+    extents = _operation_extents(matches, effects.host_function)
     for op, launches in by_operation.items():
         if all(launch.whole for launch in launches):
             if len(launches) != 1:
@@ -658,9 +738,11 @@ def _check_launches(effects, matches, view) -> list:
 # Targets whose enumerators declare `CandidateEffects` for every candidate of
 # a program that went through the shared front stages (its work items carry
 # ``extra["program_facts"]``).  A handle-only placement is a contract problem
-# there; the matcher backends still to migrate (AiM, UPMEM, AttAcc) are not
-# listed and keep their handle-only candidates (ISSUES X-01).
-EFFECTS_REQUIRED_TARGETS = frozenset({"apu_v1", "apu_v2", "samsung_hbm_pim", "aim"})
+# there.  Every released backend is listed: a new backend joins the list
+# with its effects deriver (`EFFECTS_DERIVERS`) and realization check.
+EFFECTS_REQUIRED_TARGETS = frozenset(
+    {"apu_v1", "apu_v2", "samsung_hbm_pim", "aim", "upmem", "attacc"}
+)
 
 
 def _effects_required(matches, view) -> bool:
@@ -697,7 +779,9 @@ def validate_candidate_effects(matches, placement, view=None) -> list[str]:
                 "states its coverage, layouts, transfers, launches and ABI"
             ]
         return []
-    inputs, outputs, locals_, operations, parameters = _program_values(matches)
+    inputs, outputs, locals_, operations, parameters = _program_values(
+        matches, effects.host_function
+    )
     functions = {match.func_name for match in matches}
     problems = []
     coverage = effects.coverage
@@ -931,8 +1015,10 @@ __all__ = [
     "CandidateValueLayout",
     "candidate_effects",
     "check_graph_consistency",
+    "indirect_reads",
     "rebind_supplied_layouts",
     "require_candidate_effects",
     "validate_candidate_effects",
+    "value_axes",
     "verbatim_values",
 ]

@@ -1522,6 +1522,11 @@ def _materialize_matcher_codegen(
 
     ctx = ctx_cls(target)
     if orchestrated:
+        # The host program must bring what every launch reads before the
+        # backend lowers it (shared contract, every target).
+        from .spmw_plan import check_transfer_availability
+
+        check_transfer_availability(trace, schedule, host_moves, layouts)
         _walk_and_emit(
             target, trace, ctx, layouts, schedule=schedule, host_moves=host_moves
         )
@@ -1908,6 +1913,9 @@ def compile_for_target(
     # The backend the artifact will run on: a context may refuse a backend
     # its selected program cannot serve at materialization time.
     ctx.backend = backend
+    from .spmw_plan import check_transfer_availability
+
+    check_transfer_availability(trace, launch_schedule, resolved_host_moves, layouts)
     _walk_and_emit(
         target,
         trace,

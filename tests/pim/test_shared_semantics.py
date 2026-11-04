@@ -2466,7 +2466,7 @@ def test_aim_host_transfers_carry_retained_buffer_identities():
             ),
             "the candidate declares it",
         ),
-        (lambda op, program: replace(op, elements=op.elements * 4), "element(s) of"),
+        (lambda op, program: replace(op, elements=op.elements * 4), "moves elements"),
         (
             lambda op, program: replace(
                 op, buffer_refs=tuple(("memref", "undeclared") for _ in op.buffer_refs)
@@ -2534,4 +2534,741 @@ def test_aim_declared_input_the_host_program_never_supplies_is_rejected():
             backend="virtual",
             host_moves=program,
         )
-    assert "never brings" in str(error.value) or "right" in str(error.value)
+    assert "has not brought" in str(error.value) and "right" in str(error.value)
+
+
+# --------------------------------------------------------------------------- #
+# (t) Transfer availability in schedule order; slice-faithful AiM transfers;
+#     host records checked against the kernel's physical layout (review
+#     round 22)
+# --------------------------------------------------------------------------- #
+
+
+def _compile_aim_pointwise(host, region=None):
+    region = aim_pointwise_region if region is None else region
+    return allo.compile(
+        region,
+        build_aim_target(),
+        aim_cost,
+        backend="virtual",
+        host_moves=allo.host_program(region)(host),
+    )
+
+
+def _rejected(host, region=None):
+    from allo.pim.schedule_search import InfeasibleSchedule
+
+    with pytest.raises((RuntimeError, InfeasibleSchedule)) as error:
+        _compile_aim_pointwise(host, region)
+    return str(error.value)
+
+
+def test_partial_scatter_does_not_make_the_kernel_input_available():
+    """The launch reads the whole operand; a scatter of its first half is
+    not availability of the rest (shared check, schedule order)."""
+
+    def host(A, B, C):
+        hx = allo.host_xfer
+        hx.scatter(A[:64], hx.banks)
+        hx.scatter(B, hx.banks)
+        allo.launch("multiply", A, B, C)
+        hx.gather(C, hx.banks)
+
+    message = _rejected(host)
+    assert "has not brought" in message and "[(64, 128)]" in message, message
+
+
+def test_a_scatter_after_the_launch_does_not_serve_that_launch():
+    """Availability is in schedule order: the first launch reads B before the
+    only scatter of B; a later write cannot serve an earlier launch, and the
+    repeated launch after it is fine."""
+
+    def host(A, B, C):
+        hx = allo.host_xfer
+        hx.scatter(A, hx.banks)
+        allo.launch("multiply", A, B, C)
+        hx.scatter(B, hx.banks)
+        allo.launch("multiply", A, B, C)
+        hx.gather(C, hx.banks)
+
+    message = _rejected(host)
+    assert "launch 0 of 'multiply'" in message and "'B'" in message, message
+
+    def ordered(A, B, C):
+        hx = allo.host_xfer
+        hx.scatter(A, hx.banks)
+        hx.scatter(B, hx.banks)
+        allo.launch("multiply", A, B, C)
+        allo.launch("multiply", A, B, C)
+        hx.gather(C, hx.banks)
+
+    compiled = _compile_aim_pointwise(ordered)
+    from allo.pim.aim_lowering import AimElementwise
+
+    launches = [
+        op
+        for op in compiled.compiled.layout_ctx.lowered_operations
+        if isinstance(op, AimElementwise)
+    ]
+    assert len(launches) == 2
+
+
+def _addresses(ctx, entry):
+    begin, end = ctx.lowering_manifest[entry]["command_span"]
+    return [tuple(line.split()[2:5]) for line in ctx.cmds[begin:end]]
+
+
+def test_split_scatters_cover_the_vector_once_at_their_own_addresses():
+    """Two half scatters move the halves of the kernel's vector: their bursts
+    are disjoint, address the layout the kernel reads, and together equal
+    the whole-vector scatter; the records carry the slice frame."""
+    from allo.pim.aim_lowering import AimDistributedHostTransfer
+
+    def split(A, B, C):
+        hx = allo.host_xfer
+        hx.scatter(A[:64], hx.banks)
+        hx.scatter(A[64:128], hx.banks)
+        hx.scatter(B, hx.banks)
+        allo.launch("multiply", A, B, C)
+        hx.gather(C, hx.banks)
+
+    def whole(A, B, C):
+        hx = allo.host_xfer
+        hx.scatter(A, hx.banks)
+        hx.scatter(B, hx.banks)
+        allo.launch("multiply", A, B, C)
+        hx.gather(C, hx.banks)
+
+    split_compiled = _compile_aim_pointwise(split)
+    split_ctx = split_compiled.compiled.layout_ctx
+    whole_ctx = _compile_aim_pointwise(whole).compiled.layout_ctx
+    halves = [
+        op
+        for op in split_ctx.lowered_operations
+        if isinstance(op, AimDistributedHostTransfer) and op.direction == "write"
+    ][:2]
+    assert [(op.first_element, op.elements, op.vector_elements) for op in halves] == [
+        (0, 64, AIM_D),
+        (64, 64, AIM_D),
+    ]
+    first, second = _addresses(split_ctx, 0), _addresses(split_ctx, 1)
+    assert first and second and not set(first) & set(second)
+    # The whole program coalesces A and B into one record (two bank slots);
+    # A's bursts are those of its own slot.
+    (coalesced,) = [
+        op
+        for op in whole_ctx.lowered_operations
+        if isinstance(op, AimDistributedHostTransfer) and op.direction == "write"
+    ]
+    assert coalesced.copies == 2 and coalesced.first_element == 0
+    slot_of_a = coalesced.bank_offset
+    whole_a = [
+        address
+        for address in _addresses(whole_ctx, 0)
+        if int(address[1]) % coalesced.bank_stride == slot_of_a
+    ]
+    assert len(whole_a) * 2 == len(_addresses(whole_ctx, 0))
+    assert sorted(first + second) == sorted(whole_a)
+    split_ctx.check_realization(split_compiled.compiled.layout)
+
+
+AIM_PREFIX_BUFFER = 256
+AIM_PREFIX_READ = 128
+
+
+@allo.dataflow.region()
+def aim_prefix_region(
+    A: allo.ir.types.bfloat16[AIM_PREFIX_BUFFER],
+    B: allo.ir.types.bfloat16[AIM_PREFIX_BUFFER],
+    C: allo.ir.types.bfloat16[AIM_PREFIX_BUFFER],
+):
+    @allo.work(mapping=[1], args=[A, B, C])
+    def multiply(
+        left: allo.ir.types.bfloat16[AIM_PREFIX_BUFFER],
+        right: allo.ir.types.bfloat16[AIM_PREFIX_BUFFER],
+        dest: allo.ir.types.bfloat16[AIM_PREFIX_BUFFER],
+    ):
+        for i in range(AIM_PREFIX_READ):
+            dest[i] = left[i] * right[i]
+
+
+def test_the_slice_frame_is_the_region_the_kernel_reads():
+    """A kernel that reads a prefix of its buffers lays out that prefix; a
+    scatter of exactly the prefix is the whole vector (the CENT softmax
+    form), a scatter of the whole larger buffer is refused rather than
+    spread over the layout, and the prefix is what must be available."""
+    from allo.pim.aim_lowering import AimDistributedHostTransfer
+
+    def prefix(A, B, C):
+        hx = allo.host_xfer
+        hx.scatter(A[0:AIM_PREFIX_READ], hx.banks)
+        hx.scatter(B[0:AIM_PREFIX_READ], hx.banks)
+        allo.launch("multiply", A, B, C)
+        hx.gather(C[0:AIM_PREFIX_READ], hx.banks)
+
+    compiled = _compile_aim_pointwise(prefix, aim_prefix_region)
+    writes = [
+        op
+        for op in compiled.compiled.layout_ctx.lowered_operations
+        if isinstance(op, AimDistributedHostTransfer)
+    ]
+    assert {(op.first_element, op.elements, op.vector_elements) for op in writes} == {
+        (0, AIM_PREFIX_READ, AIM_PREFIX_READ)
+    }
+
+    def whole(A, B, C):
+        hx = allo.host_xfer
+        hx.scatter(A, hx.banks)
+        hx.scatter(B, hx.banks)
+        allo.launch("multiply", A, B, C)
+        hx.gather(C, hx.banks)
+
+    message = _rejected(whole, aim_prefix_region)
+    assert "outside the region" in message, message
+
+
+@pytest.mark.parametrize(
+    "mutation, needle",
+    [
+        (lambda op: replace(op, row=op.row + 37), "addresses"),
+        (lambda op: replace(op, bank_offset=op.bank_offset + 1), "addresses"),
+        (
+            lambda op: replace(op, channels_per_replica=op.channels_per_replica * 2),
+            "addresses",
+        ),
+        (lambda op: replace(op, first_element=1), "moves elements"),
+        (lambda op: replace(op, group_id=100000), "no launched kernel group"),
+    ],
+    ids=["row", "bank_slot", "channels", "slice_frame", "owner"],
+)
+def test_aim_host_records_are_checked_against_the_kernel_layout(mutation, needle):
+    """A host record whose rows, bank slot, channels, slice frame or owner
+    differ from the layout the launched kernel record addresses is a
+    realization mismatch."""
+    from allo.pim.aim_lowering import AimDistributedHostTransfer
+
+    compiled = _compile_aim_pointwise_with_host()
+    ctx = compiled.compiled.layout_ctx
+    ctx.lowered_operations = tuple(
+        mutation(op) if isinstance(op, AimDistributedHostTransfer) else op
+        for op in ctx.lowered_operations
+    )
+    with pytest.raises(RuntimeError, match="AiM realization") as error:
+        ctx.check_realization(compiled.compiled.layout)
+    assert needle in str(error.value), str(error.value)
+
+
+def test_aim_host_records_redirected_before_emission_are_refused(monkeypatch):
+    """Records redirected to other rows before command emission (a
+    self-consistent but wrong manifest) fail the realization check against
+    the kernel record at materialization: no candidate is accepted."""
+    from allo import spmw_aim
+    from allo.pim.aim_lowering import AimDistributedHostTransfer
+
+    original = spmw_aim._AimProgramDerivation.records
+
+    def redirected(self, *args):
+        return [
+            (
+                (
+                    replace(op, row=op.row + 37)
+                    if isinstance(op, AimDistributedHostTransfer)
+                    else op
+                ),
+                banks,
+            )
+            for op, banks in original(self, *args)
+        ]
+
+    monkeypatch.setattr(spmw_aim._AimProgramDerivation, "records", redirected)
+    with pytest.raises(RuntimeError) as error:
+        _compile_aim_pointwise_with_host()
+    assert "addresses" in str(error.value), str(error.value)
+
+
+def test_resident_inputs_and_produced_intermediates_are_available():
+    """Residency is explicit availability; a launch's declared outputs are
+    available to the launches after it (the GEMV with resident operands and
+    the chained pointwise program compile)."""
+    compiled = _compile_aim(backend="virtual", host_moves=_aim_gemv_resident_host())
+    assert compiled.compiled.layout_ctx.lowered_operations
+
+
+# --------------------------------------------------------------------------- #
+# u. UPMEM and AttAcc declare their candidates' effects from the shared facts
+#    (G9: every released matcher backend is on the enforced candidate contract)
+# --------------------------------------------------------------------------- #
+
+UPMEM_M, UPMEM_K = 256, 128
+
+
+def _upmem_gemv_region(dpus=2, *, alpha=None):
+    import sys
+
+    sys.path.insert(0, "benchmarks/upmem")
+    from workloads import gemv_workload
+
+    return gemv_workload(UPMEM_M, UPMEM_K, dpus, alpha=alpha)
+
+
+def _compile_upmem(region, **kw):
+    from allo.pim.costs import upmem_cost
+    from allo.pim.targets import build_upmem_target
+
+    return allo.compile(
+        region, build_upmem_target(), upmem_cost, backend="virtual", **kw
+    )
+
+
+def _selected_layouts(compiled):
+    layout = compiled.compiled.layout
+    return layout if isinstance(layout, list) else [layout]
+
+
+def _all_rejections(compiled) -> str:
+    """Every recorded rejection of the ranking: the per-kernel probes and the
+    joint materialization under the real orchestration."""
+    ranking = compiled.placement_ranking
+    reasons = [str(r) for kernel in ranking.kernels for r in kernel.rejections]
+    joint = getattr(ranking, "joint", None)
+    if joint is not None:
+        reasons.extend(str(r) for _a, r in joint.probe_rejections)
+    return " | ".join(reasons)
+
+
+def test_upmem_candidates_declare_effects_from_the_shared_facts():
+    """Every UPMEM candidate of a program with shared facts declares its
+    effects from the work body's `Contraction` facts (loop labels, trips,
+    accesses, accumulator initialization) and its physical decision: MRAM
+    backing storage with the decision's data layout as packing, the vector's
+    residency, WRAM as a transient allocation, pack/readback transfers and
+    one template launch per work item; the realized plan is compared with
+    the selected declaration."""
+    from allo.spmw_candidate import EFFECTS_REQUIRED_TARGETS, candidate_effects
+
+    assert {"upmem", "attacc"} <= EFFECTS_REQUIRED_TARGETS
+    compiled = _compile_upmem(_upmem_gemv_region(2))
+    for kernel in compiled.placement_ranking.kernels:
+        candidates = [
+            entry[1] if isinstance(entry, tuple) else entry
+            for entry in kernel.candidates
+        ]
+        assert candidates and all(candidate_effects(c) is not None for c in candidates)
+    layouts = _selected_layouts(compiled)
+    assert len(layouts) == 2  # one work item per DPU
+    for layout in layouts:
+        effects = candidate_effects(layout)
+        assert effects.coverage.inputs == ("lA", "lx")
+        assert effects.coverage.outputs == ("ly",)
+        images = {(v.value, v.image): v for v in effects.value_layouts}
+        matrix = images[("lA", "in")]
+        assert matrix.axes == ("i", "j") and matrix.storage == "mram"
+        assert matrix.packing == layout.extra["data_layout"]
+        vector = images[("lx", "in")]
+        assert vector.axes == ("j",) and vector.storage == "mram"
+        assert vector.packing == (
+            f"{layout.extra['data_layout']}:{layout.extra['wram_residency']}"
+        )
+        assert images[("ly", "value")].axes == ("i",)
+        assert {s for _n, _b, s in effects.allocations} == {"wram"}
+        (launch,) = effects.launches
+        assert launch.kind == "upmem:matrix_vector"
+        assert launch.instances == (0, UPMEM_M // 2)
+        assert launch.reduction == (0, UPMEM_K)
+        assert launch.accumulator == "zero"
+        assert launch.covers[0] == layout.mode
+        assert {t.value: (t.direction, t.route) for t in effects.transfers} == {
+            "lA": ("in", ("host_pack", "mram")),
+            "lx": ("in", ("host_pack", "mram")),
+            "ly": ("out", ("mram", "host_readback")),
+        }
+    assert compiled.estimate().cycles > 0
+
+
+def test_upmem_scaled_gemv_declares_both_operations_in_one_launch():
+    """``y = alpha * (A x)``: the MAC with a local accumulator and the SCALE
+    epilogue are one template launch over the same result instances."""
+    from allo.spmw_candidate import candidate_effects
+
+    compiled = _compile_upmem(_upmem_gemv_region(1, alpha=3))
+    (layout,) = _selected_layouts(compiled)
+    effects = candidate_effects(layout)
+    assert effects.coverage.operations == ("MAC", "SCALE")
+    (launch,) = effects.launches
+    assert launch.operations == (0, 1)
+    assert launch.instances == (0, UPMEM_M) and launch.reduction == (0, UPMEM_K)
+
+
+def test_upmem_zero_initialized_partial_is_an_output_not_an_input():
+    """``P[d] = 0; for i: P[d] += A[...]`` (the reduction family, matched as
+    an accumulating ADD): the partial's incoming contents are dead, so it is
+    an output only (the template zero-initializes and the runtime does not
+    pack it); a carried partial (no initializer) is ``inout`` and the
+    template loads the initial output."""
+    import sys
+
+    sys.path.insert(0, "benchmarks/upmem")
+    from workloads import reduction_workload
+    from allo.spmw_candidate import candidate_effects
+
+    compiled = _compile_upmem(reduction_workload(4096, 2))
+    for layout in _selected_layouts(compiled):
+        effects = candidate_effects(layout)
+        assert effects.coverage.inputs == ("lA",)
+        assert effects.coverage.outputs == ("lP",)
+        assert {t.value: t.direction for t in effects.transfers} == {
+            "lA": "in",
+            "lP": "out",
+        }
+        (launch,) = effects.launches
+        assert launch.kind == "upmem:reduction" and launch.instances == (0, 2048)
+    import runpy
+
+    generality = runpy.run_path("tests/pim/test_upmem_generality.py")
+    carried = _compile_upmem(generality["reduction_region"](4096, carried=True))
+    (layout,) = _selected_layouts(carried)
+    effects = candidate_effects(layout)
+    assert "lP" in effects.coverage.inputs and effects.coverage.outputs == ("lP",)
+    (transfer,) = [t for t in effects.transfers if t.value == "lP"]
+    assert transfer.direction == "inout"
+    assert transfer.route == ("host_pack", "mram", "host_readback")
+    assert {(v.value, v.image) for v in effects.value_layouts} >= {
+        ("lP", "in"),
+        ("lP", "out"),
+    }
+
+
+def test_upmem_indirect_reads_are_inputs():
+    """A histogram reads its samples only inside the bin index and the
+    guards: the retained store effect records those reads, so the samples
+    are a program input with a layout over the sample loop and a packed
+    transfer, and the template's ``input`` role is the declared value."""
+    import runpy
+
+    from allo.spmw_candidate import candidate_effects
+
+    generality = runpy.run_path("tests/pim/test_upmem_generality.py")
+    compiled = _compile_upmem(generality["histogram_region"](1536, 64, 12))
+    (layout,) = _selected_layouts(compiled)
+    effects = candidate_effects(layout)
+    assert effects.coverage.inputs == ("lA",) and effects.coverage.outputs == ("lH",)
+    (samples,) = [v for v in effects.value_layouts if v.value == "lA"]
+    assert samples.axes == ("i",) and samples.storage == "mram"
+    (launch,) = effects.launches
+    assert launch.kind == "upmem:histogram"
+
+
+def test_upmem_host_partition_is_a_declared_whole_function_launch():
+    """The k-means update group runs its whole function on the host (the
+    paper partition): its candidate declares ``host_function`` with one
+    whole-function launch over the function's retained store effects, values
+    in ``host_dram`` and host copies; the distances group stays a DPU
+    template launch."""
+    from benchmarks.upmem.workloads import kmeans_host, kmeans_region
+    from allo.spmw_candidate import candidate_effects
+
+    compiled = _compile_upmem(kmeans_region, host_moves=kmeans_host)
+    by_kind = {}
+    for layout in _selected_layouts(compiled):
+        effects = candidate_effects(layout)
+        (launch,) = effects.launches
+        by_kind[launch.kind] = (effects, launch)
+    assert set(by_kind) == {"upmem:kmeans_distances", "upmem_host:kmeans_update"}
+    effects, launch = by_kind["upmem_host:kmeans_update"]
+    assert effects.host_function and launch.whole
+    assert launch.instances == (0, 1) and launch.reduction is None
+    assert {v.storage for v in effects.value_layouts} == {"host_dram"}
+    assert all("host_dram" in t.route for t in effects.transfers)
+    effects, launch = by_kind["upmem:kmeans_distances"]
+    assert not effects.host_function and not launch.whole
+    assert launch.reduction is not None
+    ctx = compiled.compiled.layout_ctx
+    assert [s.kind for s in ctx.segments].count("host") == 1
+
+
+@pytest.mark.parametrize(
+    "mutation, reason",
+    [
+        (
+            lambda e: replace(e, coverage=replace(e.coverage, inputs=("lA",))),
+            "reads",
+        ),
+        (
+            lambda e: replace(
+                e,
+                launches=tuple(replace(l, reduction=(0, 64)) for l in e.launches),
+            ),
+            "not an ordered partition",
+        ),
+        (
+            lambda e: replace(
+                e,
+                value_layouts=tuple(
+                    replace(v, storage="scratchpad") if v.value == "lx" else v
+                    for v in e.value_layouts
+                ),
+            ),
+            "does not declare",
+        ),
+        (lambda e: None, "declares no effects"),
+    ],
+    ids=["inputs", "reduction", "storage", "missing"],
+)
+def test_corrupted_upmem_declarations_are_refused_before_costing(
+    monkeypatch, mutation, reason
+):
+    from allo import spmw_upmem
+
+    original = spmw_upmem.upmem_candidate_effects
+
+    def corrupted(target, matches, placement):
+        effects = original(target, matches, placement)
+        return mutation(effects) if effects is not None else None
+
+    monkeypatch.setattr(spmw_upmem, "upmem_candidate_effects", corrupted)
+    with pytest.raises(ValueError) as error:
+        _compile_upmem(_upmem_gemv_region(1))
+    assert "candidate contract" in str(error.value)
+    assert reason in str(error.value), str(error.value)
+
+
+@pytest.mark.parametrize(
+    "mutation, needle",
+    [
+        (
+            lambda e: replace(
+                e,
+                value_layouts=tuple(
+                    (
+                        replace(v, packing="fused_replicated:streamed_mram")
+                        if v.value == "lx"
+                        else v
+                    )
+                    for v in e.value_layouts
+                ),
+            ),
+            "keeps 'lx'",
+        ),
+        (
+            lambda e: replace(
+                e,
+                value_layouts=tuple(
+                    replace(v, packing="other_layout") if v.value == "lA" else v
+                    for v in e.value_layouts
+                ),
+            ),
+            "lays 'lA' out as",
+        ),
+        (
+            lambda e: replace(
+                e,
+                value_layouts=tuple(
+                    replace(v, storage="iram") if v.value == "lx" else v
+                    for v in e.value_layouts
+                ),
+            ),
+            "packs 'lx' into the MRAM heap image",
+        ),
+    ],
+    ids=["residency", "data_layout", "storage"],
+)
+def test_upmem_realization_is_compared_with_the_declaration(
+    monkeypatch, mutation, needle
+):
+    """A declaration the contract accepts but the template does not realize
+    (a residency the decision does not take, another data layout than the
+    decision's, a declared storage the template does not use) is a
+    realization mismatch at materialization: the candidate is rejected with
+    the difference named and the selection falls back to a faithful one."""
+    from allo import spmw_upmem
+
+    baseline = _compile_upmem(_upmem_gemv_region(1))
+    (chosen,) = _selected_layouts(baseline)
+    victim = chosen.mode  # the candidate the ranking selects when undisturbed
+    original = spmw_upmem.upmem_candidate_effects
+
+    def corrupted(target, matches, placement):
+        effects = original(target, matches, placement)
+        if effects is None or placement.mode != victim:
+            return effects
+        return mutation(effects)
+
+    monkeypatch.setattr(spmw_upmem, "upmem_candidate_effects", corrupted)
+    compiled = _compile_upmem(_upmem_gemv_region(1))
+    # The corrupted winner was rejected at materialization; another won.
+    (layout,) = _selected_layouts(compiled)
+    assert layout.mode != victim
+    rejections = _all_rejections(compiled)
+    assert needle in rejections, rejections
+
+
+def test_upmem_realization_check_refuses_a_foreign_plan(monkeypatch):
+    """The final check compares the emitted plan with the declaration: a
+    plan whose accumulator chain differs from the kernel's is refused."""
+    compiled = _compile_upmem(_upmem_gemv_region(1))
+    ctx = compiled.compiled.layout_ctx
+    (program,) = ctx.groups.values()
+    monkeypatch.setattr(
+        program.plan.__class__, "carried_output", property(lambda self: True)
+    )
+    with pytest.raises(RuntimeError, match="carried_output"):
+        ctx.check_realization(compiled.compiled.layout)
+
+
+ATTACC_ROWS, ATTACC_K, ATTACC_N = 8, 5120, 384
+
+
+def _compile_attacc(region):
+    from allo.pim.costs import attacc_cost
+    from allo.pim.targets import build_attacc_target
+
+    return allo.compile(
+        region,
+        build_attacc_target(),
+        attacc_cost,
+        backend="virtual",
+        reduction_order="reassociate",
+    )
+
+
+def _attacc_regions():
+    import runpy
+
+    return runpy.run_path("tests/pim/test_attacc_virtual.py")
+
+
+def test_attacc_candidates_declare_effects_from_the_shared_facts():
+    """Every AttAcc tiling candidate declares its effects from the MAC's
+    facts: the matrix in the banks, the vector in the GEMV buffer (through
+    the banks and WR_GB), the result in the accumulator, one launch over
+    rows x outputs instances and the reduction, started from zero, naming
+    the tiling; the emitted command inventory is compared with it."""
+    from allo.spmw_candidate import candidate_effects
+
+    regions = _attacc_regions()
+    compiled = _compile_attacc(regions["gemv_region"](ATTACC_ROWS, ATTACC_K, ATTACC_N))
+    (kernel,) = compiled.placement_ranking.kernels
+    candidates = [
+        entry[1] if isinstance(entry, tuple) else entry for entry in kernel.candidates
+    ]
+    assert candidates and all(candidate_effects(c) is not None for c in candidates)
+    (layout,) = _selected_layouts(compiled)
+    effects = candidate_effects(layout)
+    assert effects.coverage.inputs == ("lW", "lx")
+    assert effects.coverage.outputs == ("ly",)
+    storage = {v.value: (v.axes, v.storage) for v in effects.value_layouts}
+    assert storage == {
+        "lW": (("h", "n", "k"), "banks"),
+        "lx": (("h", "k"), "gemv_buffer"),
+        "ly": (("h", "n"), "acc"),
+    }
+    assert {t.value: t.route for t in effects.transfers} == {
+        "lW": ("host_scatter", "banks"),
+        "lx": ("host_scatter", "banks", "WR_GB", "gemv_buffer"),
+        "ly": ("acc", "host_readback"),
+    }
+    (launch,) = effects.launches
+    assert launch.kind == "attacc_gemv"
+    assert launch.instances == (0, ATTACC_ROWS * ATTACC_N)
+    assert launch.reduction == (0, ATTACC_K) and launch.accumulator == "zero"
+    assert launch.covers == (
+        layout.mode,
+        str(layout.extra["attacc_tiling"]),
+        "MAC",
+    )
+    assert compiled.estimate().cycles == 7040
+
+
+def test_attacc_attention_declares_its_five_phases():
+    """QK^T, the softmax and PV are five launches in match order; the two
+    MAC phases cover rows x length over d_head and rows x d_head over the
+    length, both from zero; the score rows are a softmax-buffer allocation."""
+    from allo.spmw_candidate import candidate_effects
+
+    regions = _attacc_regions()
+    compiled = _compile_attacc(regions["attention_region"](8, 128, 256))
+    (layout,) = _selected_layouts(compiled)
+    effects = candidate_effects(layout)
+    assert effects.coverage.inputs == ("lq", "lk", "lv")
+    assert effects.coverage.outputs == ("lo",)
+    phases = [(l.covers[-1], l.instances, l.reduction) for l in effects.launches]
+    assert phases == [
+        ("MAC", (0, 8 * 256), (0, 128)),
+        ("SFM_EXP", (0, 8 * 256), None),
+        ("SFM_SUM", (0, 8 * 256), None),
+        ("SFM_DIV", (0, 8 * 256), None),
+        ("MAC", (0, 8 * 128), (0, 256)),
+    ]
+    assert ("scores", 0, "softmax_buffer") in effects.allocations
+
+
+@pytest.mark.parametrize(
+    "mutation, reason",
+    [
+        (
+            lambda e: replace(e, coverage=replace(e.coverage, outputs=())),
+            "writes",
+        ),
+        (
+            lambda e: replace(
+                e,
+                launches=tuple(replace(l, accumulator="carried") for l in e.launches),
+            ),
+            "starts its accumulator",
+        ),
+        (lambda e: None, "declares no effects"),
+    ],
+    ids=["outputs", "accumulator", "missing"],
+)
+def test_corrupted_attacc_declarations_are_refused_before_costing(
+    monkeypatch, mutation, reason
+):
+    from allo import spmw_attacc
+
+    original = spmw_attacc.attacc_candidate_effects
+
+    def corrupted(target, matches, placement):
+        effects = original(target, matches, placement)
+        return mutation(effects) if effects is not None else None
+
+    monkeypatch.setattr(spmw_attacc, "attacc_candidate_effects", corrupted)
+    regions = _attacc_regions()
+    with pytest.raises(ValueError) as error:
+        _compile_attacc(regions["gemv_region"](ATTACC_ROWS, ATTACC_K, ATTACC_N))
+    assert "candidate contract" in str(error.value)
+    assert reason in str(error.value), str(error.value)
+
+
+def test_attacc_realization_is_compared_with_the_declaration(monkeypatch):
+    """A declaration naming another tiling than the one the program is
+    emitted for is a realization mismatch: the candidate is rejected at
+    materialization and the selection falls back to a faithful one."""
+    from allo import spmw_attacc
+
+    original = spmw_attacc.attacc_candidate_effects
+    regions = _attacc_regions()
+    reference = _compile_attacc(regions["gemv_region"](ATTACC_ROWS, ATTACC_K, ATTACC_N))
+    (best,) = _selected_layouts(reference)
+    best_tiling = str(best.extra["attacc_tiling"])
+
+    def corrupted(target, matches, placement):
+        effects = original(target, matches, placement)
+        if effects is None or str(placement.extra.get("attacc_tiling")) != best_tiling:
+            return effects
+        return replace(
+            effects,
+            launches=tuple(
+                replace(
+                    l, covers=(l.covers[0], "[[1,1,1],[1,1,1],[1,1,1]]", l.covers[2])
+                )
+                for l in effects.launches
+            ),
+        )
+
+    monkeypatch.setattr(spmw_attacc, "attacc_candidate_effects", corrupted)
+    compiled = _compile_attacc(regions["gemv_region"](ATTACC_ROWS, ATTACC_K, ATTACC_N))
+    (layout,) = _selected_layouts(compiled)
+    assert str(layout.extra["attacc_tiling"]) != best_tiling
+    rejections = _all_rejections(compiled)
+    assert "uses tiling" in rejections, rejections
+    assert compiled.estimate().cycles >= reference.estimate().cycles

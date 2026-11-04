@@ -1131,14 +1131,25 @@ def _upmem_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             matches,
             "UPMEM programs combine tasklet and nc/kc partial sums",
         )
+    from .spmw_upmem import upmem_candidate_effects
+
     # UPMEM knobs never read roles; a scaled GEMV binds role "x" to both the
     # matrix (MAC) and the accumulator (SCALE), which the role map rejects.
-    return cross_with_knobs(
+    candidates = cross_with_knobs(
         target,
         bases,
         matches,
         {},
     )
+    # Every candidate of a program with shared facts declares its effects
+    # from those facts and its physical decision (the family template's
+    # storage, residency, transfers and launch); `UpmemCtx.check_realization`
+    # compares the realized plan with the selected declaration.
+    for candidate in candidates:
+        effects = upmem_candidate_effects(target, matches, candidate)
+        if effects is not None:
+            candidate.extra["effects"] = effects
+    return candidates
 
 
 @register_enumerator("apu_v1")
@@ -1278,12 +1289,20 @@ def _attacc_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     record; the knob fans out every legal tiling of it
     (``allo/pim/attacc_tiling.py``).
     """
-    from .spmw_attacc import attacc_base_placement
+    from .spmw_attacc import attacc_base_placement, attacc_candidate_effects
     from .spmw_knobs import cross_with_knobs
 
-    return cross_with_knobs(
+    candidates = cross_with_knobs(
         target, [attacc_base_placement(target, matches)], matches, {}
     )
+    # Every candidate of a program with shared facts declares its effects
+    # from those facts and its tiling; `AttAccCtx.check_realization` compares
+    # the emitted command inventory's kernel and tiling with the declaration.
+    for candidate in candidates:
+        effects = attacc_candidate_effects(target, matches, candidate)
+        if effects is not None:
+            candidate.extra["effects"] = effects
+    return candidates
 
 
 # --------------------------------------------------------------------- #

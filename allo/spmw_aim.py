@@ -68,15 +68,10 @@ def _layout_image(images, value, side):
 
 
 def _aim_axes(access, labels) -> tuple:
-    axes = []
-    for coord in getattr(access, "coords", None) or ():
-        if coord is None:
-            continue
-        for atom, _coefficient in coord[0]:
-            label = labels.get(atom)
-            if label is not None and label not in axes:
-                axes.append(label)
-    return tuple(axes)
+    """The shared `spmw_candidate.value_axes`."""
+    from .spmw_candidate import value_axes
+
+    return value_axes(access, labels)
 
 
 def aim_candidate_effects(target, matches, placement):
@@ -144,11 +139,16 @@ def aim_candidate_effects(target, matches, placement):
                 layouts[memref] = CandidateValueLayout(
                     memref, _aim_axes(access, labels), storage
                 )
+                # A GB-resident vector is supplied by the launch itself: the
+                # lowering copies it into the GB (``WR_GB``) from a GPR the
+                # host loads before the traced program (the manifest states
+                # it), not by a ``host_xfer`` step of the host program.  A
+                # bank-resident vector is scattered by the host program.
                 transfers[memref] = CandidateTransfer(
                     memref,
                     "in",
                     (
-                        ("host_broadcast", "gb")
+                        ("host_gpr_preload", "gpr", "WR_GB", "gb")
                         if storage == "gb"
                         else ("host_scatter", "banks")
                     ),
@@ -168,13 +168,28 @@ def aim_candidate_effects(target, matches, placement):
                 memref = access.memref_name
                 if memref is None or access.local or memref in inputs:
                     continue
+                if (
+                    memref == fact.result.memref_name
+                    and match.extra.get("accumulator_init") == "zero"
+                ):
+                    # Reads the element it writes after a proven zero
+                    # initializer: dead incoming contents, not an input.
+                    continue
                 inputs.append(memref)
                 storage = _aim_storage_name(placement.placements.get(memref)) or home
                 layouts[memref] = CandidateValueLayout(
                     memref, _aim_axes(access, labels), storage
                 )
+                # EWADD operands live in the GPR the host loads before the
+                # traced program (no lowered ingress): declared as such.
                 transfers[memref] = CandidateTransfer(
-                    memref, "in", ("host_scatter", storage)
+                    memref,
+                    "in",
+                    (
+                        ("host_gpr_preload", storage)
+                        if storage == "gpr"
+                        else ("host_scatter", storage)
+                    ),
                 )
             result_accesses = (
                 [] if fact.result.local else [(fact.result.memref_name, fact.result)]
@@ -251,9 +266,11 @@ def _derive_aim_effects(view, matches, placement):
 
 
 def _register_effects_deriver():
-    from .spmw_candidate import EFFECTS_DERIVERS
+    from .spmw_candidate import EFFECTS_DERIVERS, ROUTE_VOCABULARY
 
     EFFECTS_DERIVERS["aim"] = _derive_aim_effects
+    # The GPR preload the host performs before the traced program.
+    ROUTE_VOCABULARY.setdefault("aim", set()).add("host_gpr_preload")
 
 
 _register_effects_deriver()
@@ -262,57 +279,150 @@ _register_effects_deriver()
 _HOST_TRANSFER_RECORDS = (AimDistributedHostTransfer, AimHostTransfer, AimAllBankWrite)
 
 
-def _check_host_transfer_extent(op, group, geometry, shape, value, index, expected):
-    """One distributed transfer or all-bank broadcast against the element
-    extent of the slice it was lowered for."""
+def _kernel_record(ops, group):
+    """The launch record of ``group`` (its EWMUL/EWADD or MAC record)."""
+    names = set(group.functions) | {group.name}
+    return next(
+        (
+            op
+            for op in ops
+            if isinstance(op, (AimElementwise, AimContraction)) and op.name in names
+        ),
+        None,
+    )
+
+
+def _check_host_record_physical(op, group, program, ref, index, kernel, value, slot):
+    """One host record against the physical layout the launched kernel
+    record addresses: its rows, channels, replicas, bank slot, stride and
+    copies, and the slice frame of the logical vector it moves.  ``slot`` is
+    the bank slot the record's next constituent occupies (a coalesced record
+    moves consecutive slots); returns the slot after this constituent."""
+    from .spmw_plan import flat_range, slice_region
+
+    geometry = program.geometry
+    usage = group.usages.get(ref)
+    if usage is None or kernel is None:
+        raise RuntimeError(
+            f"AiM realization moves {value!r} for group {group.name!r}, whose "
+            "launch holds it in no bank layout"
+        )
+    channels = group.replicas * group.partitions
+    kernel_channels = (
+        kernel.channels_per_replica
+        if kernel.channels_per_replica is not None
+        else group.partitions
+    )
     if isinstance(op, AimDistributedHostTransfer):
-        replicas = op.replicas if group.split_replicas else 1
-        realized = op.elements * replicas
-        if not expected <= realized < expected + replicas:
-            raise RuntimeError(
-                f"AiM realization moves {realized} element(s) of {value!r}; the "
-                f"slice {index} holds {expected}"
+        region_first, region_total = program._slot_frame(group, ref)
+        if group.split_replicas:
+            expected = (0, _ceil(region_total, group.replicas), None)
+        else:
+            shape = program.shape_by_key.get(ref)
+            flat = (
+                flat_range(shape, slice_region(shape, index))
+                if shape is not None
+                else None
             )
-        return
-    if shape is None:
-        raise RuntimeError(
-            f"AiM realization broadcasts {value!r} into a group without a "
-            "contraction"
+            if flat is None:
+                raise RuntimeError(
+                    f"AiM realization moves a slice {index} of {value!r} that is "
+                    "not one contiguous range of the kernel's vector"
+                )
+            start, count = flat
+            expected = (start - region_first, count, region_total)
+        realized = (
+            op.first_element,
+            op.elements,
+            op.vector_elements if op.vector_elements is not None else op.elements,
         )
-    parts = group.reduction_partitions
-    accumulators = shape["outputs"] * shape["batches"]
-    if (
-        expected != accumulators
-        or op.rows != _ceil(shape["outputs"], geometry.banks)
-        or op.copies != _ceil(shape["batches"] * parts, group.partitions)
-    ):
-        raise RuntimeError(
-            f"AiM realization broadcasts {value!r} to {op.rows} row(s) x "
-            f"{op.copies} copies; the slice {index} feeds {accumulators} "
-            f"accumulator(s) ({expected} elements)"
+        frame = (expected[0], expected[1], expected[2] or expected[1])
+        if realized != frame:
+            raise RuntimeError(
+                f"AiM realization moves elements [{realized[0]}, "
+                f"{realized[0] + realized[1]}) of a {realized[2]}-element vector "
+                f"for {value!r}; the slice {index} is [{frame[0]}, "
+                f"{frame[0] + frame[1]}) of the {frame[2]}-element region the "
+                "kernel's layout holds"
+            )
+        physical = (
+            op.row,
+            op.replicas,
+            op.channels_per_replica,
+            op.bank_stride,
+            slot,
         )
+        layout = (
+            kernel.row,
+            kernel.replicas,
+            kernel_channels,
+            usage.stride,
+            usage.slot,
+        )
+        if physical != layout or slot + usage.copies > op.bank_offset + op.copies:
+            raise RuntimeError(
+                f"AiM realization addresses {value!r} at (row, replicas, "
+                f"channels per replica, bank stride, bank slot) {physical} with "
+                f"{op.copies} slot(s) from {op.bank_offset}; the launched kernel "
+                f"{kernel.name!r} holds it at {layout} in {usage.copies} slot(s)"
+            )
+        return slot + usage.copies
+    # Matrix row writes and all-bank broadcasts land in the matrix's rows.
+    base = program.row_of_key.get(ref)
+    rows = program._footprint(group, ref, usage)
+    if base is None or kernel.row != base:
+        raise RuntimeError(
+            f"AiM realization writes {value!r} into rows from {base}; the launched "
+            f"kernel {kernel.name!r} reads its matrix from row {kernel.row}"
+        )
+    if isinstance(op, AimHostTransfer):
+        if not base <= op.row < base + rows or op.channel >= channels:
+            raise RuntimeError(
+                f"AiM realization writes {value!r} at channel {op.channel} row "
+                f"{op.row}; the kernel's matrix occupies rows [{base}, {base + rows}) "
+                f"on {channels} channel(s)"
+            )
+        return slot
+    touched = (
+        op.rows * op.row_stride * op.copies
+        if op.copy_row_stride is None
+        else (op.row_stride * (op.rows - 1) + op.copy_row_stride * (op.copies - 1) + 1)
+    )
+    if not base <= op.row < base + rows or op.row + touched > base + rows:
+        raise RuntimeError(
+            f"AiM realization broadcasts {value!r} into rows [{op.row}, "
+            f"{op.row + touched}); the kernel's matrix occupies rows "
+            f"[{base}, {base + rows})"
+        )
+    if op.channels is not None and not set(op.channels) <= set(range(channels)):
+        raise RuntimeError(
+            f"AiM realization broadcasts {value!r} to channels {list(op.channels)}; "
+            f"the kernel runs on {channels} channel(s)"
+        )
+    return slot
 
 
 def _check_host_transfers(program, group, effects, ops, storage_of) -> None:
     """The host transfers lowered for ``group`` against its candidate's
-    declared transfers, bound by retained buffer identity.
+    declared transfers and the physical layout its launched kernel addresses.
 
     Every host record the derivation lowered for the group carries the
     buffer keys it moves (`buffer_refs`), their slices and the group; each is
     matched to the declared transfer of the work-body value with the same
-    retained identity (the body's operands and results, never a name), and
-    its direction (host write: ``in``/``inout``; host read: ``out``/``inout``),
-    the extent of the slice it moves and its device endpoint (the banks the
-    group's layout holds the buffer in) are compared with the declaration.
-    Under a host program every declared input must reach the device: a host
-    write of it, residency, or a store by another group of the program.
+    retained identity (the body's operands and results, never a name): its
+    direction (host write: ``in``/``inout``; host read: ``out``/``inout``)
+    and declared landing (the banks) are compared with the declaration, and
+    its rows, channels, replicas, bank slot, stride, copies and slice frame
+    with the kernel record the launch emits and the target's slot
+    conventions (`_check_host_record_physical`).  Availability of what each
+    launch reads is the shared `spmw_plan.check_transfer_availability`.
     """
     records = [
         op
         for op in ops
         if isinstance(op, _HOST_TRANSFER_RECORDS) and op.group_id == group.group_id
     ]
-    if not records and program.schedule is None:
+    if not records:
         return
     ref_of_name: dict = {}
     for match in group.matches:
@@ -335,7 +445,7 @@ def _check_host_transfers(program, group, effects, ops, storage_of) -> None:
     label = program.name_by_key.get
     geometry = program.geometry
     shape = group.contractions[0]["shape"] if group.contractions else None
-    written: set = set()
+    kernel = _kernel_record(ops, group)
     bursts: dict = {}
     for op in records:
         if not op.buffer_refs or len(op.buffer_refs) != len(op.buffer_slices):
@@ -344,6 +454,7 @@ def _check_host_transfers(program, group, effects, ops, storage_of) -> None:
                 "retained buffer identity"
             )
         direction = "write" if isinstance(op, AimAllBankWrite) else op.direction
+        slot = getattr(op, "bank_offset", 0)
         for ref, index in zip(op.buffer_refs, op.buffer_slices):
             transfer = declared_by_ref.get(ref)
             if transfer is None:
@@ -369,16 +480,35 @@ def _check_host_transfers(program, group, effects, ops, storage_of) -> None:
                     f"AiM realization moves {transfer.value!r} through the banks; "
                     f"the candidate declared {landing} with route {transfer.route}"
                 )
-            expected = program._token_extent(ref, index)
+            slot = _check_host_record_physical(
+                op, group, program, ref, index, kernel, transfer.value, slot
+            )
             if isinstance(op, AimHostTransfer):
+                expected = program._token_extent(ref, index)
                 bursts.setdefault((ref, index, transfer.value), [0, expected])
                 bursts[(ref, index, transfer.value)][0] += op.bursts
-            else:
-                _check_host_transfer_extent(
-                    op, group, geometry, shape, transfer.value, index, expected
-                )
-            if direction == "write":
-                written.add(ref)
+            elif isinstance(op, AimAllBankWrite):
+                parts = group.reduction_partitions
+                accumulators = shape["outputs"] * shape["batches"] if shape else None
+                expected = program._token_extent(ref, index)
+                if shape is None or (
+                    expected != accumulators
+                    or op.rows != _ceil(shape["outputs"], geometry.banks)
+                    or op.copies != _ceil(shape["batches"] * parts, group.partitions)
+                ):
+                    raise RuntimeError(
+                        f"AiM realization broadcasts {transfer.value!r} to "
+                        f"{op.rows} row(s) x {op.copies} copies; the slice {index} "
+                        f"feeds {accumulators} accumulator(s) ({expected} elements)"
+                    )
+        if isinstance(op, AimDistributedHostTransfer) and (
+            slot != op.bank_offset + op.copies
+        ):
+            raise RuntimeError(
+                f"AiM realization moves {op.copies} bank slot(s) from "
+                f"{op.bank_offset} in {op.name!r}; its buffers occupy slots up to "
+                f"{slot}"
+            )
     for (ref, index, value), (total, expected) in bursts.items():
         per_replica = total * geometry.lanes // max(group.replicas, 1)
         batches = shape["batches"] if shape else 1
@@ -387,43 +517,6 @@ def _check_host_transfers(program, group, effects, ops, storage_of) -> None:
                 f"AiM realization writes {per_replica} element(s) of {value!r} "
                 f"per replica; the slice {index} holds {expected}"
             )
-    if program.schedule is None:
-        return
-    # Inputs the group reads from the banks reach them by a host write (for
-    # any group's layout: one scatter serves every reader of the buffer), by
-    # residency, or as the result of another group of the program.  GPR
-    # operands (EWADD) have no lowered ingress: the AiM trace starts with the
-    # GPR host-written, as the lowering's manifest states, so they are not
-    # checked here.
-    host_written = {
-        ref
-        for op in ops
-        if isinstance(op, _HOST_TRANSFER_RECORDS)
-        and (isinstance(op, AimAllBankWrite) or op.direction == "write")
-        for ref in op.buffer_refs
-    }
-    produced = {
-        program._key(match.result_value_ref, match.result_memref_name)
-        for other in program.groups
-        if other is not group
-        for match in other.matches
-    }
-    for transfer in effects.transfers:
-        if transfer.direction not in {"in", "inout"} or transfer.physical:
-            continue
-        landing = storage_of(transfer.value, "in")
-        if landing is None or landing.storage != "banks":
-            continue
-        ref = ref_of_name.get(transfer.value)
-        if ref is None or ref in written or ref in host_written:
-            continue
-        if ref in program.resident or ref in produced:
-            continue
-        raise RuntimeError(
-            f"AiM realization never brings {transfer.value!r} to the device: the "
-            "host program neither writes it nor keeps it resident, and no other "
-            "group of the program produces it"
-        )
 
 
 class AimCtx(CodegenContext):
@@ -588,6 +681,17 @@ class AimCtx(CodegenContext):
                 "manifest entries"
             )
         manifest_of = {id(op): entry for op, entry in zip(ops, manifest)}
+        every_launched = getattr(self, "_every_group_launched", True)
+        launched = getattr(self, "_launched_groups", set())
+        for op in ops:
+            if isinstance(op, _HOST_TRANSFER_RECORDS) and (
+                op.group_id not in groups
+                or (not every_launched and op.group_id not in launched)
+            ):
+                raise RuntimeError(
+                    f"AiM realization lowered the host transfer {op.name!r} for no "
+                    f"launched kernel group ({op.group_id!r})"
+                )
         for layout in layouts:
             effects = candidate_effects(layout)
             if effects is None:
@@ -1650,6 +1754,43 @@ class _AimProgramDerivation:
             "kernel layout to follow"
         )
 
+    def _slot_frame(self, group, key):
+        """(first flat element, element count) of the region the group's work
+        bodies access of buffer ``key``: the logical vector its slot layout
+        holds (the kernel's vector, which may be a prefix of the host buffer).
+        A partitioned grid holds the whole buffer, 1/replicas per replica."""
+        from .spmw_plan import _facts_accesses, access_region, flat_range
+
+        shape = self.shape_by_key.get(key)
+        if group.split_replicas:
+            return 0, self._elements(key, group.elements * group.replicas)
+        boxes = []
+        for match in group.matches:
+            facts = match.extra.get("semantic_facts")
+            reads, writes = _facts_accesses(facts)
+            for access in reads + writes:
+                if self._key(access.value_ref, access.memref_name) != key:
+                    continue
+                box = access_region(access, getattr(facts, "loops", ()))
+                if box is not None:
+                    boxes.append(box)
+        if not boxes:
+            return 0, self._elements(key, group.elements)
+        box = boxes[0]
+        name = self.name_by_key.get(key, key)
+        if any(other != box for other in boxes[1:]):
+            raise NotImplementedError(
+                f"AiM {group.name}: {name} is accessed over different regions "
+                f"{boxes}"
+            )
+        frame = flat_range(shape or tuple(hi for _lo, hi in box), box)
+        if frame is None:
+            raise NotImplementedError(
+                f"AiM {group.name}: the region {list(box)} of {name} is not one "
+                "contiguous range of the buffer"
+            )
+        return frame
+
     def _token_extent(self, key, index):
         shape = self.shape_by_key.get(key)
         if shape is None:
@@ -1825,17 +1966,48 @@ class _AimProgramDerivation:
                 continue
             if verb == "broadcast":
                 raise NotImplementedError(f"AiM broadcast of {text} into a slot layout")
-            elements = self._token_extent(key, index)
+            region_first, region_total = self._slot_frame(group, key)
             if group.split_replicas:
                 if index is not None:
                     raise NotImplementedError(
                         f"AiM host {verb} of {text}: a sliced transfer into a "
                         "work-item-split elementwise layout"
                     )
-                elements = _ceil(elements, group.replicas)
+                elements, first, vector = _ceil(region_total, group.replicas), 0, None
+            else:
+                # The slice's coordinates in the kernel's vector: the layout
+                # is the vector's, and only the bursts of the slice move.
+                from .spmw_plan import flat_range, slice_region
+
+                shape = self.shape_by_key.get(key)
+                if shape is None:
+                    raise NotImplementedError(
+                        f"AiM host {verb} of unknown-shape buffer {text}"
+                    )
+                try:
+                    flat = flat_range(shape, slice_region(shape, index))
+                except ValueError as error:
+                    raise NotImplementedError(
+                        f"AiM host {verb} of {text}: {error}"
+                    ) from error
+                if flat is None:
+                    raise NotImplementedError(
+                        f"AiM host {verb} of {text}: the slice is not one contiguous "
+                        "range of the buffer"
+                    )
+                start, elements = flat
+                first, vector = start - region_first, region_total
+                if first < 0 or first + elements > region_total:
+                    raise NotImplementedError(
+                        f"AiM host {verb} of {text}: elements [{start}, "
+                        f"{start + elements}) lie outside the region [{region_first}, "
+                        f"{region_first + region_total}) the kernel's layout holds"
+                    )
             transfer = dict(
                 direction="read" if verb == "gather" else "write",
                 elements=elements,
+                first_element=first,
+                vector_elements=vector,
                 replicas=group.replicas,
                 channels_per_replica=group.partitions,
                 row=group.row if group.kind != "contraction" else self.row_of_key[key],
@@ -1860,6 +2032,8 @@ class _AimProgramDerivation:
                         "row",
                         "bank_stride",
                         "group_id",
+                        "first_element",
+                        "vector_elements",
                     )
                 )
                 and last["bank_offset"] + last["copies"] == transfer["bank_offset"]
@@ -1880,25 +2054,10 @@ class _AimProgramDerivation:
 
 
 def _parse_buffer_role(text):
-    """``name`` or ``name[i, :, a:b]`` -> (name, normalized index or None)."""
-    if "[" not in text:
-        return text, None
-    base, rest = text.split("[", 1)
-    body = rest.rstrip("]")
-    index = []
-    for item in body.split(","):
-        item = item.strip()
-        if item == ":":
-            index.append(None)
-        elif ":" in item:
-            start, stop = item.split(":")
-            index.append((int(start or 0), int(stop)))
-        else:
-            try:
-                index.append(int(item))
-            except ValueError:
-                return text, None
-    return base, tuple(index)
+    """Shared with the plan: `spmw_plan.parse_buffer_role`."""
+    from .spmw_plan import parse_buffer_role
+
+    return parse_buffer_role(text)
 
 
 def _aim_runtime_segments(commands) -> tuple[tuple[str, int, tuple[str, ...]], ...]:

@@ -132,7 +132,10 @@ def build_sv(heads, tokens, head_dim=HEAD_DIM, max_tokens=MAX_TOKENS, append=Fal
             hx.broadcast(v_cache[:, :, L - 1], hx.banks)
         allo.launch("attention_sv", probs, v_cache, heads_out)
 
-    resident = ("probs",) if append else ("probs", "v_cache")
+    # The cache before this decode step is on the device in both forms: the
+    # append writes token L-1 into a resident cache the kernel then reads
+    # over [0, L) (availability is explicit, review round 22).
+    resident = ("probs", "v_cache")
     return attention, allo.host_program(attention, resident=resident)(host)
 
 

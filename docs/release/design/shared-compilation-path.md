@@ -161,7 +161,7 @@ table above for the APUs):
 
 | Target | Planner | Consumes | Status |
 |---|---|---|---|
-| Samsung, AiM, UPMEM, AttAcc | matcher route (`compile_for_target`: `autoschedule` enumerators, legality, movement stage, `rank_matcher_placements`, backend ctx) | the trace (the facts are available through `SourceProgram.program_facts()` but these enumerators still read `MatchedOp` directly) | unchanged |
+| Samsung, AiM, UPMEM, AttAcc | matcher route (`compile_for_target`: `autoschedule` enumerators, legality, movement stage, `rank_matcher_placements`, backend ctx) | the trace for structural recognition (families, roles, knobs) and the shared facts for every candidate's declared effects (`samsung_candidate_effects`, `aim_candidate_effects`, `upmem_candidate_effects`, `attacc_candidate_effects`: coverage, value layouts, transfers, launches derived from `Contraction`/`Epilogue` facts and the retained store effects); each backend context's `check_realization` compares the emitted program with the declaration at materialization | all four on the enforced contract (rounds 19-24) |
 | Gemini-II (`apu_v2`) | `allo/compiler.py::_plan_apu_g2_source` -> `apu_g2_source_route.compile_apu_g2_source_workload(program=...)` -> `analyze_apu_g2_source(ProgramFacts)` -> `APUG2SourceContract` -> launch-plan enumeration, pricing, ranking -> `APUG2SourceProgram` | the shared facts only. Removed: the route's own `_FunctionFacts` module walk (argument `itypes`, local `unsigned`, identity-store check), its `_map_dims` access-map parser, `_memref_shape_and_bits` and `_loop_trips`; the contract's domain rules (integer lanes 2..24 bits, power-of-two reductions, at most two products, result covers the output, `_check_widths`) remain as target legality over the facts | slice 1 done |
 | APU v1 (`apu_v1`), plain function with a matched contraction | `allo/compiler.py::_plan_apu_v1_vector` -> `apu_v1_vector_program.compile_apu_v1_vector_workload(program=...)` -> `apu_v1_vectorize.apu_v1_contraction_analysis(ProgramFacts)` -> `ContractionAnalysis` -> recipe catalog -> `grid_search` over realized plans -> `APUv1VectorCallable` (`.trace`, `.program_facts` retained) | the shared facts only. Removed from the public route: `analyze_apu_v1_contractions`, the regex MLIR-text parser (it remains, marked, for the typed hybrid route `apu_v1_hybrid.discover_apu_v1_hybrid_manifest`, slice 4). The vector plans' restrictions are applied as legality over the facts (`contraction_analysis_from_facts`): one unguarded `range(N)` nest, one reduction loop indexing both inputs, plain loop-variable subscripts, two distinct input buffers, accumulator a function argument (carried or zero-filled) or a local scalar copied once to an argument (new: the `acc = 0; ...; C[i, j] = acc` form compiles and executes), one 16-bit element type, loop extents equal to buffer extents (new explicit rejection of partial coverage) | slice 2 done |
 | APU v1 dataflow region (`@allo.work` scopes) or plain function without a contraction | matcher route (`spmw_apu_v1.APUv1Ctx`, grouped FP16 MAC) | the trace | unchanged |
@@ -218,8 +218,43 @@ Not yet done (the remaining slices):
   probes stay preliminary filters, C-33b); the AiM check covers the batch
   mapping and the GPR readout of results (X-07) and binds every lowered host
   transfer to a declared one through the retained buffer identities the
-  records carry (X-08). UPMEM and AttAcc still read `MatchedOp` directly
-  and declare no `CandidateEffects`;
+  records carry (X-08). Round 23: transfer availability is a shared stage
+  contract (`spmw_plan.check_transfer_availability`, run by the orchestrated
+  probe and the final compile on every target): in schedule order, every
+  launch finds the regions its body reads of each host-supplied input on
+  the device, from host slices, explicit residency and earlier launches'
+  written regions (X-09); AiM slot-layout transfers are slices of the
+  kernel's vector, lowered from the whole vector's layout (X-10), and every
+  host record is compared with the launched kernel record's physical
+  addressing and must belong to a launched group (X-11). Round 24: UPMEM
+  and AttAcc are the last matcher backends on the contract.
+  `spmw_upmem.upmem_candidate_effects` derives every candidate's effects
+  from the work body's facts and the placement's physical decision (MRAM
+  backing storage with the decision's data layout as packing, the resident
+  operand's WRAM residency, WRAM as a transient allocation, pack/readback
+  transfers, one template launch per work item; a carried accumulator is
+  `inout`); a host-placed group (the k-means update, the paper's host
+  partition) is a declared `host_function` with one whole-function launch
+  over the function's retained store effects and values in `host_dram`;
+  `UpmemCtx.check_realization` compares the realized plan and decision
+  (family extents from the template geometry per work item,
+  `upmem_family_extents`; accumulator chain and carried role; data layout
+  and residency; template roles against the declared values and, at the
+  final compile, the proven role windows; host steps). `spmw_attacc.
+  attacc_candidate_effects` derives the AttAcc effects from the MAC facts
+  (matrices in the banks, vectors in the GEMV buffer through `WR_GB`,
+  results in the accumulator; one launch per matched operation naming the
+  command phase and the tiling); `AttAccCtx.check_realization` compares
+  the emitted inventory's kernel extents, MAC phases and tiling. Two shared
+  rules were completed on the way: a destination an operation accumulates
+  into after a proven zero initializer is not a program input, whether the
+  accumulating operand is loop-carried or an elementwise operand reading
+  its own element (`_program_values`), and buffers read only through
+  computed indices or guards are inputs (`indirect_reads`, from the
+  retained store effects; the per-body facts name such arguments from the
+  coverage's retained loads). `EFFECTS_REQUIRED_TARGETS` now lists every
+  released backend: a handle-only candidate is a contract problem
+  everywhere;
 - stage traces on the Gemini-II card and the installed artifact (slice 5);
   the APU v1 board and the three simulators ran through the round 13 tree
   (VALIDATION round 13).

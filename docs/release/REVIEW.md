@@ -792,6 +792,103 @@ Gate G9 remains **FAIL**: UPMEM and AttAcc effects, the hybrid scalar ABI
 from retained IR, the installed-artifact and both-hardware-host traces are
 open.
 
+## Round 23 (2026-11-03): independent review of 29b477b; X-08 reopened
+
+The reviewer accepted the scheduled materialization (the scheduled-failure
+probe also fell back with `joint_budget=0`) and found X-08 not closed, with
+three probes outside the checkout (`reviewer-r22/`). (1) Input availability
+ignored launch order and access coverage: a 128-element multiply compiled
+after a scatter of `A[:64]`, and a first launch before the only scatter of
+`B` compiled. Judgment: availability is a property of the host program and
+the candidate's declared transfers, not of one backend, so it is the shared
+`spmw_plan.check_transfer_availability`, walked in schedule order for every
+launch against the regions the retained accesses read, with host slices,
+explicit residency and earlier launches' written regions as the only
+sources (X-09). Programs that relied on an implicit KV cache now declare it
+resident. (2) Sliced transfers lost their coordinates: two half scatters of
+a 524288-element vector emitted identical streams over rows 0 and 1 while
+the kernel read rows 0 to 3. Judgment: a transfer is a slice of the kernel's
+vector; the record carries the slice frame and the lowering issues the
+bursts of the whole vector's layout that the slice touches; unsupported
+slice forms are refused (X-10). (3) The endpoint check compared the storage
+name only and skipped unknown owners. Judgment: every host record is
+compared with the launched kernel record's addressing (row, replicas,
+channels, stride, slot per coalesced constituent, slice frame; matrix rows
+for row writes and broadcasts) and must belong to a launched group (X-11).
+The round 22 "fixed" claim on X-08 is corrected in ISSUES.md.
+
+Gate G9 remains **FAIL**.
+
+## Round 24 (2026-11-03): round 23 verified; UPMEM and AttAcc on the shared contract
+
+Round 23 had ended without verification (the launcher lost its shell when
+/tmp filled). This round first ran its last edits: the reviewer's three
+probes (`reviewer-r22/probe_transfer_contract.py`, `probe_large_slices.py`)
+now reject the partial and the late scatter in schedule order, emit distinct
+command streams for the two half scatters of the 524288-element vector
+(rows 0 to 3, as the multiply reads), and refuse every physical mutation
+(row, bank slot, channels, unknown owner, and the pre-emission row
+redirection, which now fails selection and the final compile). Two of its
+tests needed correction, not the mechanism: the "extent" corruption is now
+caught by the slice-frame message rather than the round 22 wording, and the
+split-scatter test compared the halves with a whole-program record that
+coalesces A and B into two bank slots (A's own slot's bursts are the
+comparison).
+
+Then the last two matcher backends joined the contract. Judgments:
+
+- *UPMEM effects are derived from the facts, the physical decision names the
+  realization.* The family classifier (`classify_upmem_kernel`) remains the
+  structural recognition that chooses the template; it is consulted by the
+  deriver only to name the operand the residency decision applies to. Every
+  value's backing storage is the DPU MRAM heap image the runtime packs
+  (`host_pack`) and decodes (`host_readback`); WRAM is a transient
+  allocation; the packing carries the decision's data layout and the
+  resident operand's residency so `check_realization` can compare them with
+  `decision_fields`. Launch extents are compared with the family template's
+  geometry per work item (`upmem_family_extents`), the accumulator chain
+  with the kernel's `accumulator_init` and the plan's `carried_output`, and
+  the carried role is the output except the selection count (the host
+  compaction step carries it, the template never loads it).
+- *A host partition is declared, not hidden.* The k-means update group runs
+  its whole function on the host from its retained IR (the paper's
+  partition). The contract gains `CandidateEffects.host_function`: a
+  whole-function launch over the function's retained store effects (the
+  same check a verbatim device program gets) with values in `host_dram`.
+  A device backend cannot use it to hide tiling: the realization check
+  requires the group's placement to be the host, no template plan, and the
+  compiled host function at the final compile.
+- *AttAcc's inventory is one program with phases.* One launch per matched
+  operation, in match order, names the command phase and the tiling; the
+  realization check compares the emitted inventory's kernel kind, the MAC
+  phases' extents (rows x outputs over the reduction, then rows x d_head
+  over the length for attention), zero-started accumulators, the tiling and
+  the fixed datapath homes.
+- *Two shared rules were incomplete and are now stated once.* A destination
+  an operation accumulates into after a proven zero initializer is not an
+  input (the operand view had exempted only the pattern's loop-carried
+  parameter), and buffers read only through computed indices or guards are
+  inputs (`indirect_reads`, from the retained store effects; the per-body
+  facts name such arguments from the coverage's loads). Both came out of
+  faithful UPMEM declarations the previous rule would have forced to lie
+  (X-12, X-13); they apply to every backend.
+
+- *The availability check found a misdeclared AiM ingress.* The CENT
+  attention and projection kernels never broadcast their MAC vector; the
+  lowering writes the GB with `WR_GB` from a host-loaded GPR. The round 21
+  declaration `("host_broadcast", "gb")` had described a host step that
+  does not exist, which only the schedule-ordered availability check could
+  expose. The declaration now names the realized route
+  (`host_gpr_preload`, `gpr`, `WR_GB`, `gb`), the same form round 23 gave
+  EWADD's GPR operands (X-14). This is the intended effect of the shared
+  stage: a declaration that is not what the backend does cannot survive
+  the host program.
+
+`EFFECTS_REQUIRED_TARGETS` lists every released backend; a handle-only
+candidate is a contract problem everywhere. Open for G9: the hybrid
+manifest's scalar ABI from retained IR, the slice 5 hardware traces, and
+independent review of rounds 23-24. Gate G9 remains **FAIL**.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -843,4 +940,4 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 | G8 backend execution | **evidence complete at 9255d29, pending independent review** | installed-artifact runs at the round 10 repair (VALIDATION.md round 10) and again at the round 15 commit: Samsung virtual and simulator, AiM timing-only, UPMEM simulator, APU v1 board (local lock, 3 passed) and Gemini-II card (wheel built on zhang-x4, clean venv, shared lock, 15 passed through the shared pipeline); all reviewer probes of rounds 8 to 14 rejected or executed correctly through the installed wheel (VALIDATION.md round 15); AttAcc analytical by design; AiM timing-only as accepted |
 | G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | rounds 12-15: shared front stages, semantic facts, common candidate pipeline with both APUs' plans as ranked candidates, an enforced typed candidate contract (C-30), supplied placements rebound (C-28), orchestration and launch bindings validated before selection (C-29, C-29b), Gemini-II typed records and `APUv1Program` as frontends of the pipeline (ISSUES X-01; round 16 removed the last typed route, round 17 replaced the `APUv1Program` facade by the shared front stages with retained store effects, X-02), the launch chain, accumulator modes and every operation's extent enforced (C-30b); both hardware hosts and the installed wheel exercised at `9255d29`; open: review of round 17, matcher backends' effects and facts consumption, the hybrid manifest's text ABI, slice 5 traces of forced alternatives and cost perturbations on hardware |
 
-Verdict: **NOT READY**. Blockers: G9 (X-01 to X-08, C-32, C-33, C-33b) is in progress (review of rounds 17-22; UPMEM and AttAcc effects; hybrid manifest ABI; slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.
+Verdict: **NOT READY**. Blockers: G9 (X-01 to X-11, C-32, C-33, C-33b) is in progress (review of rounds 17-23; UPMEM and AttAcc effects; hybrid manifest ABI; slice 5 traces); G2's round 8 repair awaits independent review and execution evidence from the installed artifact on the simulators and both hardware hosts at the candidate revision; G7's Samsung simulator route depends on Samsung's permission (P-04); G5 keeps C-18 and the uniform movement weights open.

@@ -657,3 +657,35 @@ directory. Targeted runs only this round, as directed. Raw logs under
 | ranking-sensitive batch (`r22/ranking_batch.log`: shared semantics, G6 decisions and semantics, GEMV on all targets except the board, match coverage, the UPMEM matcher, work grid) | 206 passed, 2 skipped in 2754 s (45:53); the per-kernel probe is unchanged for programs without a host program and the whole-program probe adds one emission per accepted assignment |
 | AiM host-program files before the final edits (`r22/aim_host_tests.log`: token partition, AiM program, host transfer codegen and dispatch, host program analysis) | 53 passed, 1 skipped in 51 s |
 | black on the changed files (24.8.0); pylint on the changed modules (`r22/pylint.log` is the first pass; the new code's own findings, a tuple membership test, a `dict` call, a 12-attribute record and a 28-branch function, were removed; the remaining findings in these modules pre-date this round, P-23); license headers | clean |
+
+## Round 23 (2026-11-03): X-09, X-10, X-11 (verified in round 24)
+
+Round 23's actor lost its shell before verification; the edits were
+verified at the start of round 24 on the same tree (same interpreter and
+`LLVM_BUILD_DIR` as round 12; logs under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r23/`).
+
+| Check (round 23 tree) | Result |
+|---|---|
+| the reviewer's `probe_transfer_contract.py` (`reviewer-r22/`, unchanged; `r23/probe_transfer_contract.log`) | `partial` and `late` are rejected before selection ("launch 0 of 'multiply' ... reads 'A' over [(0, 128)] but the host program has not brought [(64, 128)] to the device"; "reads 'B' ... has not brought [(0, 128)]"); `split` compiles with distinct command streams for the two halves; the row, bank slot, channel and group-id mutations are refused by `check_realization`; the pre-emission row redirection fails selection and the final compile ("addresses 'left' at (row, ...) (37, ...)") |
+| the reviewer's `probe_large_slices.py` (`r23/probe_large_slices.log`) | the 524288-element program compiles; the two half scatters emit different commands over rows 0 to 3 |
+| `tests/pim/test_shared_semantics.py` with `test_aim_token_partition.py` (`r23/pytest_shared_semantics_r23.log`) | 93 passed, 1 skipped, 1 failed in 660 s; the failure (`test_split_scatters_cover_the_vector_once_at_their_own_addresses`) was the test comparing the halves with the whole program's coalesced `A+B` record; it now compares with A's own bank slot. The "extent" case of `test_aim_host_transfer_records_are_checked_by_identity` was matched to the round 23 slice-frame message before this run |
+
+## Round 24 (2026-11-03): UPMEM and AttAcc on the shared contract (G9); X-12, X-13
+
+Same interpreter and `LLVM_BUILD_DIR`; checkout as working directory.
+Targeted runs. Logs under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r23/` (the round 24
+files are named by their content).
+
+| Check (round 24 tree) | Result |
+|---|---|
+| every UPMEM family through `allo.compile` with the new deriver (`r23/probe_upmem_families.py`: pointwise, matrix-vector carried, MMTV, GEMM, histogram plain and carried, reduction carried, selection plain and carried, k-means distances, logistic regression, the k-means program with its host-partitioned update) | every program compiles; every selected candidate declares effects that pass the contract and the realization check (the k-means update as a `host_function` whole-function launch) |
+| AttAcc GEMV, attention, the renamed GEMV (`r23/probe_attacc_effects.py`) | effects declared and realized as documented; the paper GEMV estimate is unchanged (7040) and the renamed program keeps the same tiling |
+| `tests/pim/test_shared_semantics.py` section u (19 tests: UPMEM declarations from the facts, the scaled GEMV's two operations in one launch, the zero-initialized partial as an output and the carried one as `inout`, indirect reads as inputs, the host partition, four corrupted UPMEM declarations refused, three accepted-but-unrealized declarations rejected at materialization with a fallback, a foreign plan refused by the final check; AttAcc declarations, the attention's five phases, three corrupted declarations refused, a wrong tiling rejected with a fallback) with the UPMEM carried/zero-init rows of `test_upmem_generality.py` (`r23/section_u_and_carried.log`) | 86 passed, 1 skipped in 494 s |
+| `tests/pim/test_attacc_virtual.py` (without the 500-instance paper selector row), `test_upmem_matcher.py`, `test_upmem_owner_maps.py` (`r23/pytest_attacc_upmem_a.log`) | 53 passed, 2 skipped in 402 s |
+| `tests/pim/test_upmem_generality.py`, `test_upmem_dtypes.py`, `test_g6_semantics.py`, `test_g6_decisions.py` on the tree before the last two deriver fixes (`r23/pytest_upmem_b.log`) | 139 passed, 1 skipped, 4 failed in 2127 s: the histogram's launch declared a reduction range of 1 for an accumulate without a reduction loop (now `None`, as the shared extents allow) and the selection family's carried *count* was checked as if it were the output (now `_CARRIED_ROLE`); the non-simulator rows rerun on the fixed tree (`r23/pytest_upmem_b2.log`, before the carried-role fix): 74 passed, 1 failed (the selection row, fixed next); the carried rows and section u after both fixes: see the row above |
+| cross-backend batch on the tree before the X-14 fix (`r23/pytest_cross_c.log`: GEMV on all targets, layout selection, reduction policy, the AiM matcher, program, axis-role and CENT files, the Samsung directory) | 96 passed, 11 skipped, 2 failed in 3442 s; both failures were the CENT attention case rejected by the round 23 availability check because the AiM GB vector declared a host broadcast nothing performs (X-14). After the route fix (`r23/pytest_aim_gb_route.log`: the CENT file, the AiM/availability/scatter rows of the shared semantics, `test_aim_program.py`, `test_aim_token_partition.py`): 52 passed, 12 skipped in 211 s |
+| `tests/pim/test_shared_semantics.py`, whole file on the round 24 tree before the X-14 route fix (`r23/pytest_shared_semantics_final.log`) | 108 passed in 680 s (sections a-u) |
+| the UPMEM simulator rows for the carried histogram, the carried reduction and the selection with a carried count (`r23/pytest_upmem_sim_final.log`, uPIMulator through its gate) | 3 passed |
+| black (24.8.0) on the changed files; pylint on `spmw_candidate.py`, `spmw_upmem.py`, `spmw_attacc.py`, `spmw_pipeline.py` (`r23/pylint_r24.log`) | black clean; pylint: the new derivers and realization checks carry the same size notes as the Samsung and AiM ones (too-many-locals/branches/statements, imports inside the function to avoid the import cycle with `spmw_candidate`), recorded under P-23; the two `use-maxsplit-arg` notes were fixed; no other new findings |

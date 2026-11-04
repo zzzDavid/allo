@@ -116,6 +116,22 @@ class SourceProgram:
                     for (memref, _text), (ref, _local) in zip(sinks, refs):
                         if ref is not None:
                             names_by_ref.setdefault(ref, memref)
+                # Buffers the body's stores read only through computed indices
+                # or guards (a histogram's samples) bind no match operand; the
+                # coverage's retained loads name them.
+                coverage = getattr(self.trace, "coverage", None)
+                for store in getattr(coverage, "stores", ()) or ():
+                    if store.func_name != body:
+                        continue
+                    for load in (
+                        *store.loads,
+                        *store.guard_loads,
+                        *store.index_loads,
+                    ):
+                        ref = getattr(load, "value_ref", None)
+                        name = getattr(load, "memref_name", None)
+                        if ref is not None and name:
+                            names_by_ref.setdefault(ref, name)
                 facts = analyze_program(
                     self.match_target,
                     self.schedule.module,

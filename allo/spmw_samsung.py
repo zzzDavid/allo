@@ -596,17 +596,11 @@ def _storage_name(handle) -> str | None:
 
 
 def _axes_of(access, labels) -> tuple:
-    """Source loop labels the access coordinates range over, in coordinate
-    order (an affine coordinate ``row0 + i`` ranges over ``i``)."""
-    axes = []
-    for coord in getattr(access, "coords", None) or ():
-        if coord is None:
-            continue
-        for atom, _coefficient in coord[0]:
-            label = labels.get(atom)
-            if label is not None and label not in axes:
-                axes.append(label)
-    return tuple(axes)
+    """Source loop labels the access coordinates range over (the shared
+    `spmw_candidate.value_axes`)."""
+    from .spmw_candidate import value_axes
+
+    return value_axes(access, labels)
 
 
 def _elementwise_register_plan(target):
@@ -706,7 +700,18 @@ def samsung_candidate_effects(target, matches, placement):
             for loop in fact.loops:
                 extent *= int(loop.trip or 0)
             instances = extent if instances is None else instances
-            accesses = [(a.memref_name, a) for a in fact.operands if not a.local]
+            # An operand reading the element it writes with a proven zero
+            # initializer (``accumulator_init == "zero"``) has dead incoming
+            # contents: not an input (the shared coverage rule).
+            accesses = [
+                (a.memref_name, a)
+                for a in fact.operands
+                if not a.local
+                and not (
+                    a.memref_name == fact.result.memref_name
+                    and match.extra.get("accumulator_init") == "zero"
+                )
+            ]
             result_accesses = (
                 [] if fact.result.local else [(fact.result.memref_name, fact.result)]
             )
