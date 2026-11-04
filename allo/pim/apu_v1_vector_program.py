@@ -433,6 +433,44 @@ def _realize(analysis, plan):
         return None, str(error)
 
 
+# Directions of a vector plan's transfers that move a value off the device
+# (``apu_v1_layout.Transfer.direction``); every other direction brings it in.
+_OUTBOUND_TRANSFER_DIRECTIONS = frozenset({"out", "store", "vr_to_l4", "l4_to_host"})
+
+
+def _candidate_transfers(plan, output):
+    """The plan's transfers as contract records.  An input is moved in by
+    each of its routes.  The output is moved in (its carried contents) and
+    out: a route the plan uses in both directions (the baseline's ``direct``
+    result transfer) is one ``inout`` record; distinct inbound and outbound
+    routes (the DMA plans' result: loaded through L1 and the VRs, stored
+    back by a VR-to-L4 DMA) are one ``in`` and one ``out`` record.  Never
+    two records of one value and direction."""
+    from ..spmw_candidate import CandidateTransfer
+
+    records = []
+    inbound, outbound = [], []
+    for transfer in plan.transfers:
+        route = tuple(step.kind for step in transfer.route)
+        if transfer.value != output:
+            records.append(CandidateTransfer(transfer.value, "in", route))
+        elif transfer.direction in _OUTBOUND_TRANSFER_DIRECTIONS:
+            outbound.append(route)
+        else:
+            inbound.append(route)
+    if plan.transfers and not (inbound or outbound):
+        return records
+    for route in dict.fromkeys(inbound + outbound):
+        if route in inbound and route in outbound:
+            direction = "inout"
+        elif route in inbound:
+            direction = "in" if outbound else "inout"
+        else:
+            direction = "out" if inbound else "inout"
+        records.append(CandidateTransfer(output, direction, route))
+    return records
+
+
 # --------------------------------------------------------------------------- #
 # Candidates of the shared pipeline
 # --------------------------------------------------------------------------- #
@@ -536,16 +574,7 @@ class APUv1VectorCandidate:
                 )
                 for layout in plan.value_layouts
             ),
-            transfers=tuple(
-                dict.fromkeys(
-                    CandidateTransfer(
-                        transfer.value,
-                        "inout" if transfer.value == output else "in",
-                        tuple(step.kind for step in transfer.route),
-                    )
-                    for transfer in plan.transfers
-                )
-            ),
+            transfers=tuple(dict.fromkeys(_candidate_transfers(plan, output))),
             launches=(
                 CandidateLaunch(
                     index=0,

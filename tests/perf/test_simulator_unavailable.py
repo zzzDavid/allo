@@ -32,6 +32,9 @@ def test_samsung_run_raises_when_pim_driver_is_missing(monkeypatch, tmp_path):
 
 
 def test_docker_timeout_is_reported_separately_from_missing_image(monkeypatch):
+    # These are the Docker executor's tests: a native binary configured in
+    # the environment (TENON_AIM_RAMULATOR2) would bypass it.
+    monkeypatch.delenv("TENON_AIM_RAMULATOR2", raising=False)
     monkeypatch.setattr(spmw_simenv, "docker_available", lambda: True)
 
     def timeout(*_args, **_kwargs):

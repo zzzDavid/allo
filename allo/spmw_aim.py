@@ -688,6 +688,21 @@ class AimCtx(CodegenContext):
                 "manifest entries"
             )
         manifest_of = {id(op): entry for op, entry in zip(ops, manifest)}
+        # The lowered program against the compile's resource budget: no
+        # record may occupy more channels than the cap.
+        cap = (getattr(self, "resource_budget", None) or {}).get("channel")
+        if cap is not None:
+            for entry in manifest:
+                if not isinstance(entry, dict):
+                    continue
+                used = entry.get("active_channel_count")
+                if used is None and entry.get("active_channels"):
+                    used = len(entry["active_channels"])
+                if used is not None and int(used) > int(cap):
+                    raise RuntimeError(
+                        f"AiM realization of {entry.get('name')!r} occupies {used} "
+                        f"channels; the compile's resource budget allows {cap}"
+                    )
         every_launched = getattr(self, "_every_group_launched", True)
         launched = getattr(self, "_launched_groups", set())
         for op in ops:
@@ -2125,6 +2140,33 @@ def _check_simulator_geometry(target, yaml_cfg: Path) -> None:
         )
 
 
+def _resolved_shared_library(binary: Path, stem: str, library_path: str) -> dict:
+    """The shared library ``stem`` the dynamic loader resolves for
+    ``binary`` (via ``ldd`` under the run's ``LD_LIBRARY_PATH``), with its
+    content digest; the loader's answer when it cannot be resolved."""
+    import hashlib
+
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = library_path
+    try:
+        out = subprocess.run(
+            ["ldd", str(binary)], capture_output=True, timeout=30, env=env, check=False
+        ).stdout.decode("utf-8", errors="replace")
+    except (subprocess.SubprocessError, OSError) as error:
+        return {"path": None, "sha256": None, "error": str(error)}
+    for line in out.splitlines():
+        if stem in line and "=>" in line:
+            path = line.split("=>", 1)[1].split("(")[0].strip()
+            if path and Path(path).is_file():
+                resolved = Path(path).resolve()
+                return {
+                    "path": str(resolved),
+                    "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+                }
+            return {"path": path or None, "sha256": None, "ldd": line.strip()}
+    return {"path": None, "sha256": None, "ldd": out[-300:]}
+
+
 def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
     """Run a compiled AiM artifact through ramulator2.
 
@@ -2154,19 +2196,38 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
 
     from .spmw_simenv import aim_ramulator2_binary
 
+    import hashlib
+
+    config = {
+        "path": str(yaml_cfg),
+        "sha256": hashlib.sha256(yaml_cfg.read_bytes()).hexdigest(),
+    }
     native = aim_ramulator2_binary()
     if native is not None:
-        import hashlib
-
         native = native.resolve()
+        library_path = os.pathsep.join(
+            p for p in (str(native.parent), os.environ.get("LD_LIBRARY_PATH")) if p
+        )
         executor = {
             "kind": "native",
             "binary": str(native),
             "sha256": hashlib.sha256(native.read_bytes()).hexdigest(),
-            "config": str(yaml_cfg),
+            # The shared library the executable resolves at run time (the
+            # upstream build keeps libramulator.so in the source tree).
+            "library": _resolved_shared_library(native, "libramulator", library_path),
+            "config": config,
+            "cwd": str(root),
+            "ld_library_path": library_path,
         }
     else:
-        executor = {"kind": "docker", "image": _aim_sim_image(), "config": str(cfg_rel)}
+        executor = {
+            "kind": "docker",
+            "image": _aim_sim_image(),
+            "config": {**config, "mounted_as": str(cfg_rel)},
+            "mount": str(root),
+        }
+
+    invocations: list[dict] = []
 
     def run_segment(lines: list[str]) -> tuple[int, str, int]:
         with tempfile.TemporaryDirectory(prefix="tenon-aim-") as trace_dir:
@@ -2174,9 +2235,7 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
             trace_path.write_text("".join(str(line) + "\n" for line in lines))
             if native is not None:
                 env = dict(os.environ)
-                env["LD_LIBRARY_PATH"] = os.pathsep.join(
-                    p for p in (str(native.parent), env.get("LD_LIBRARY_PATH")) if p
-                )
+                env["LD_LIBRARY_PATH"] = executor["ld_library_path"]
                 command = [str(native), "-f", str(cfg_rel), "-t", str(trace_path)]
                 run = dict(cwd=str(root), env=env)
             else:
@@ -2195,6 +2254,7 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
                     f"-t /trace/{trace_path.name}",
                 ]
                 run = {}
+            invocations.append({"command": list(command), **{k: v for k, v in run.items() if k == "cwd"}})
             try:
                 proc = subprocess.run(
                     command, capture_output=True, timeout=600, check=False, **run
@@ -2232,9 +2292,15 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
     logs: list[str] = []
     returncodes: list[int] = []
     cache: dict[tuple[str, ...], tuple[int, str, int]] = {}
+    # One record per segment: the exact trace lines the simulator consumed,
+    # their digest, the repeat count, the measured and composed cycles, the
+    # simulator's own output and whether the run was shared with an
+    # identical earlier segment.
+    segment_records: list[dict] = []
     for label, repeat, lines in segments:
         key = tuple(lines)
-        if key not in cache:
+        cached = key in cache
+        if not cached:
             cache[key] = run_segment(lines)
         raw_cycles, log, returncode = cache[key]
         total_cycles += raw_cycles * repeat
@@ -2242,6 +2308,21 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
         logs.append(
             f"=== {label}; repeat={repeat}; raw_cycles={raw_cycles}; "
             f"composed_cycles={raw_cycles * repeat} ===\n{log}"
+        )
+        text = "".join(str(line) + "\n" for line in lines)
+        segment_records.append(
+            {
+                "label": label,
+                "repeat": int(repeat),
+                "raw_cycles": int(raw_cycles),
+                "composed_cycles": int(raw_cycles * repeat),
+                "lines": len(lines),
+                "trace_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "trace": list(map(str, lines)),
+                "stdout": log,
+                "returncode": int(returncode),
+                "shared_run": cached,
+            }
         )
     cycles = total_cycles
     combined = "\n".join(logs)
@@ -2258,6 +2339,8 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
             "segments": len(segments),
             "unique_segments": len(cache),
             "simulator": executor,
+            "segment_records": segment_records,
+            "invocations": invocations,
             # Host steps of the program (e.g. a reduction-partition merge) are
             # not simulated: they are listed, never added to `cycles`.
             "host_steps": [

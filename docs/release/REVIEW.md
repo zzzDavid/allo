@@ -1383,6 +1383,32 @@ tree and validated on the exact golden rows before the token-partitioning
 study ran through the maintained driver (`benchmarks/cent_aim/
 token_partition.py`); it reproduces in kind (6 of 9 simulated minima, largest gap 1.34%, against the paper's 7 of 9 and 2.63%), with every compared plan's declared effects, lowering entry, estimate, device cycles and executor recorded, and the row is OPEN (measured), not REPRODUCED: one fewer minimum, and the 1-head head-only ratio is not comparable because the ranking finds an in-budget plan outside the paper's candidate set.
 
+## Round 40 (2026-11-04): independent review of 128aef8; duplicates, the comparable boundary, compiler-owned budget, provenance
+
+The reviewer verified the round 39 tests and the native executor on the
+default golden rows, reproduced the 1-head/128-token row, and found four
+gaps. (1) C-34 incomplete: the comparisons collapsed layouts and transfers
+into dictionaries, so a contradicting duplicate record passed validation
+and was replaced. Judgment: accepted; duplicate (value, image) and (value,
+direction) keys are refused by the validator and by both comparisons, in
+either order, with regressions at both boundaries. (2) The token study does
+not measure the frozen paper's boundary (no softmax bridge, no host-stage
+time, no readout/upload link volumes; 37 distinct plans, merge checks only
+on split plans). Judgment: accepted; the inventory row is DIAGNOSTIC, the
+driver, the design doc and the ledger say what the measured boundary is and
+is not, and M-15 holds the bridge and full accounting as the next
+increment; the bridge is not implemented in this round. (3) The eight-channel
+selection lived in the benchmark. Judgment: accepted; the budget is now a
+general compiler search policy (`resources={"channel": 8}`) read by the
+enumerators, the ranking, the rebinding boundary and the realization check,
+and the headline plan is the normal shared selection under it; the forced
+plans remain as ablations. (4) Provenance. Judgment: accepted; every AiM run
+records the executor with the resolved shared library and configuration
+digests, the exact segment traces, repeats and simulator output and the
+invocations; the driver keeps every plan's artifacts and raw result before
+advancing, failed plans included, with the compiler revision. S-17 and the
+earlier blockers stay open; G9 and G10 remain FAIL.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1422,7 +1448,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 39 (2026-11-04) at the candidate `0a4b543`+ (this
+Refreshed in round 40 (2026-11-04) at the candidate `128aef8`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |

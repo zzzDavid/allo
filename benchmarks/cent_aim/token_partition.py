@@ -4,37 +4,48 @@
 as a maintained reproduction driver (release gate G10, inventory row
 ``token_partitioning_nine_workloads``).
 
-Nine resident-input decode-attention workloads (1/8/32 heads x 128/512/4096
-tokens, head dim 128) compiled through ``allo.compile`` on the AiM target.
-For each workload the shared ranking (the cost program over the enumerated
-candidates) is read once; the paper's device had eight channels, so the
-compared plans are the ranking's best SV placement per reduction split
-P in {1, 2, 4, 8} among the candidates that use at most eight channel
-replicas (``CHANNEL_BUDGET``), plus the head-only control (one head per
-channel, no split).  The paper's selection is the cheapest of the four by
-the cost program; the simulator decides which is fastest.  Every compared
-plan is compiled as an explicit layout (the supplied placement is rebound
-and its declaration validated by the shared boundary), its estimate read
-from the virtual backend, its device cycles from the AiM simulator
-(timing-only ramulator2; ``kind == "simulator-timing-only"`` is asserted)
-and its host merge priced by the declared 32 GB/s link model; the merge's
-numerics are checked on integer and BF16 operands.
+What it measures today is a **diagnostic** of the partition decision, not
+the frozen paper's comparable boundary:
 
-Comparison boundaries (the inventory's): scoring + global softmax + value
-sum + host stages/reductions with inputs resident; the cache append and the
-projections are outside.  Reported: per workload the total (device + host)
-cycles of every plan, the selected P, the simulated best P and the gap;
-over the nine, the minima reached and the largest gap; for 1 head x 4096
-tokens the head-only / selected ratio.  The unrestricted default selection
-of the shared pipeline on the simulated 32-channel device is recorded for
-transparency and is not the paper's metric.  A failed compile or run, an
-inexact merge or an execution of the wrong kind is recorded and exits
-nonzero; nothing here is read by the compiler.
+* Nine resident-input decode-attention workloads (1/8/32 heads x
+  128/512/4096 tokens, head dim 128) compiled through ``allo.compile`` on
+  the AiM target under the paper's eight-channel device budget expressed
+  as the compiler's resource policy (``resources={"channel": 8}``,
+  ``allo.spmw_resources``): the enumerators bound the replica and token
+  partition domains by it and the shared ranking selects the complete
+  program (QK and SV).  That **normal selection** is the headline plan
+  (``default``); its P is the study's "selected" partition count.
+* Forced alternatives for the ablation: the budgeted ranking's cheapest SV
+  plan per P in {1, 2, 4, 8} and the head-only control (one head per
+  channel, no split), each compiled as an explicit layout under the same
+  budget (the supplied placement is rebound and its declaration validated
+  by the shared boundary).  The simulator decides which is fastest.
+* Per plan: the estimate from the virtual backend, the device cycles from
+  the AiM simulator (timing-only ramulator2; ``kind == "simulator-timing-only"``
+  is asserted), the host merge priced by the declared 32 GB/s link model,
+  and, for split plans only, the merge's numerics on integer and BF16
+  operands (an unsplit plan has no merge; its record says so).  Every
+  plan's artifacts (placements with their declared effects, the complete
+  lowering manifest, the execution graph's activities, the exact segment
+  traces, the simulator's output, the executor's binary/library/config
+  digests, the compiler revision) are written before the next plan runs,
+  and a failed plan is recorded without discarding the completed ones.
+
+What the frozen evaluation includes and this driver does not yet: the
+scores-to-global-softmax-to-probabilities bridge between the two kernels
+(here ``probs`` is a resident input), the host stages' time and the link
+volumes of the QK readout, score upload and partial readout.  Those common
+costs change percentage gaps and ratios, so the figures reported here
+(minima reached, gaps, head-only ratio) are comparable only with each other,
+not with the paper's row, until the bridge and the full accounting are
+implemented under the original arithmetic, residency and link assumptions
+with independent functional evidence.  The unbudgeted default selection on
+the simulated 32-channel device is recorded for transparency only.
 
 Usage::
 
     python -m benchmarks.cent_aim.token_partition --out tp.json [--no-sim]
-        [--shapes 1x128,8x512]
+        [--shapes 1x128,8x512] [--artifacts DIR]
 
 The workloads are defined here (eager region annotations); the tests in
 ``tests/pim/test_aim_token_partition.py`` import them.
@@ -80,6 +91,7 @@ POLICY = (
 HEAD_DIM = 128
 MAX_TOKENS = 4096
 CHANNEL_BUDGET = 8  # the paper's eight simulated channels
+BUDGET = {"channel": CHANNEL_BUDGET}  # the compiler's resource policy for it
 PARTITIONS = (1, 2, 4, 8)
 SHAPES = tuple((heads, tokens) for heads in (1, 8, 32) for tokens in (128, 512, 4096))
 
@@ -194,17 +206,29 @@ def within_budget(mode, budget=CHANNEL_BUDGET):
     return int(knob(mode, "replica_partitions", 1)) <= budget
 
 
-def ranked(heads, tokens, *, qk=True):
-    """The shared ranking of one workload: ``(target, region, host program,
-    compiled)``, the compiled object carrying the placement ranking."""
+def compile_program(attention, program, target, *, layouts=None, budget=BUDGET, virtual=False):
+    """One compile of a workload under the budget: the normal selection
+    (``layouts`` None) or an explicit layout; ``virtual`` for the estimate."""
+    kwargs = dict(host_moves=program, **POLICY)
+    if budget is not None:
+        kwargs["resources"] = budget
+    if layouts is not None:
+        kwargs["layout"] = layouts
+    if virtual:
+        kwargs["backend"] = "virtual"
+    return allo.compile(attention, target, aim_cost, **kwargs)
+
+
+def ranked(heads, tokens, *, qk=True, budget=BUDGET):
+    """The shared ranking of one workload under the budget: ``(target,
+    region, host program, compiled)``, the compiled object carrying the
+    placement ranking."""
     if qk:
         attention, program = build_attention(heads, tokens)
     else:
         attention, program = build_sv(heads, tokens)
     target = build_aim_target()
-    compiled = allo.compile(
-        attention, target, aim_cost, backend="virtual", host_moves=program, **POLICY
-    )
+    compiled = compile_program(attention, program, target, budget=budget, virtual=True)
     return target, attention, program, compiled
 
 
@@ -229,13 +253,18 @@ def kernel_choices(target, compiled):
 
 
 def budget_variants(target, compiled, budget=CHANNEL_BUDGET):
-    """The cost program's best placement per decision inside the channel
-    budget: the QK choice, the SV choice for each P, and the two controls."""
+    """The forced alternatives of the ablation from a ranking compiled under
+    the budget: the cheapest QK plan, the cheapest SV plan per P and the
+    head-only control.  Every scored plan is checked against the budget
+    (the compiler's policy already bounded the domains)."""
     choices = kernel_choices(target, compiled)
     qk_index, qk_scores = choices.get("attention_qk", (None, []))
     sv_index, sv_scores = choices["attention_sv"]
-    qk = min((s for s in qk_scores if within_budget(s[1], budget)), default=None)
-    sv = [s for s in sv_scores if within_budget(s[1], budget)]
+    outside = [m for scores in (qk_scores, sv_scores) for _c, m, _p in scores if not within_budget(m, budget)]
+    if outside:
+        raise RuntimeError(f"ranking scored plans outside the budget: {outside[:3]}")
+    qk = min(qk_scores, default=None)
+    sv = list(sv_scores)
     per_partition = {}
     for cycles, mode, placement in sv:
         partitions = partitions_of(mode)
@@ -263,15 +292,13 @@ def budget_variants(target, compiled, budget=CHANNEL_BUDGET):
     )
 
 
-def compile_variant(attention, program, target, variants, sv_choice):
+def compile_variant(attention, program, target, variants, sv_choice, budget=BUDGET):
     layouts = [None, None]
     layouts[variants.sv_index] = sv_choice[2]
     if variants.qk is not None:
         layouts[variants.qk_index] = variants.qk[2]
     layouts = [layout for layout in layouts if layout is not None]
-    return allo.compile(
-        attention, target, aim_cost, host_moves=program, layout=layouts, **POLICY
-    )
+    return compile_program(attention, program, target, layouts=layouts, budget=budget)
 
 
 def sv_entry(compiled):
@@ -348,10 +375,53 @@ def _placements(compiled):
     return list(stored) if isinstance(stored, (list, tuple)) else [stored]
 
 
+def compiler_revision():
+    """The compiler the plans were compiled with: the package path and the
+    checkout's revision and cleanliness (None outside a checkout)."""
+    import os
+    import subprocess
+
+    package = os.path.dirname(os.path.abspath(allo.__file__))
+    record = {"allo": allo.__file__, "git_revision": None, "git_dirty": None}
+    try:
+        rev = subprocess.run(
+            ["git", "-C", package, "rev-parse", "HEAD"], capture_output=True, timeout=20, check=False
+        )
+        if rev.returncode == 0:
+            record["git_revision"] = rev.stdout.decode().strip()
+            status = subprocess.run(
+                ["git", "-C", package, "status", "--porcelain", "--untracked-files=no"],
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            record["git_dirty"] = bool(status.stdout.strip())
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return record
+
+
+def _graph_activities(compiled):
+    graph = getattr(compiled.compiled, "execution_graph", None)
+    if graph is None:
+        return None
+    activities = []
+    for activity in getattr(graph, "activities", ()) or ():
+        activities.append(
+            {
+                "id": getattr(activity, "id", None),
+                "label": getattr(activity, "label", None),
+                "latency_cycles": getattr(activity, "latency_cycles", None),
+                "depends_on": list(getattr(activity, "depends_on", ()) or ()),
+            }
+        )
+    return {"activities": activities, "metadata": _json_ready(getattr(graph, "metadata", {}) or {})}
+
+
 def _plan_provenance(compiled):
-    """What was compiled: every placement's mode and declared effects, the
-    SV lowering entry (partition ownership, channel groups) and the host
-    steps."""
+    """What was compiled: every placement's mode, declared effects and
+    rebinding note, the complete lowering manifest (every QK/SV record and
+    host step the lowering produced), the host steps and the priced graph."""
     ctx = compiled.compiled.layout_ctx
     return {
         "placements": [
@@ -362,138 +432,207 @@ def _plan_provenance(compiled):
             }
             for p in _placements(compiled)
         ],
+        "lowering_manifest": _json_ready(list(getattr(ctx, "lowering_manifest", ()) or ())),
         "sv_lowering": _json_ready(sv_entry(compiled)),
         "host_steps": [_json_ready(step) for step in getattr(ctx, "host_steps", ())],
+        "resource_budget": getattr(ctx, "resource_budget", None),
+        "command_count": len(getattr(compiled.compiled, "cmds", ()) or ()),
+        "graph": _graph_activities(compiled),
     }
 
 
-def run_workload(heads, tokens, *, simulate=True):
-    """Compile and (optionally) simulate every compared plan of one workload.
+def _write_artifacts(directory, label, record, result):
+    """Write a plan's record, segment traces and simulator output under
+    ``directory/label`` before the next plan runs."""
+    import json
+    import os
 
-    Returns a namespace with ``rows`` (label -> row), ``selected`` and
-    ``best`` P, ``gap``, the unrestricted default selection and a JSON-ready
-    ``record``.  A failed plan raises; the caller records it.
-    """
-    target, attention, program, ranking = ranked(heads, tokens)
-    variants = budget_variants(target, ranking)
+    if directory is None:
+        return None
+    folder = os.path.join(directory, label)
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "plan.json"), "w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=1, default=str)
+    if result is not None:
+        with open(os.path.join(folder, "stdout.txt"), "w", encoding="utf-8") as handle:
+            handle.write(result.stdout or "")
+        for index, segment in enumerate(result.extra.get("segment_records") or ()):
+            path = os.path.join(folder, f"segment-{index}-{segment['label']}.trace")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("".join(line + "\n" for line in segment["trace"]))
+    return folder
+
+
+def measure_plan(label, built, attention, program, target, heads, tokens, *, simulate, budget, artifacts, sv_index=None):
+    """Estimate, simulate and check one compiled plan; the record is written
+    to ``artifacts`` before returning.  Raises on a failed run; the caller
+    records the failure with the artifacts written so far."""
+    import time
+
     geometry = _target_geometry(target)
-    default = [p.mode for p in _placements(ranking)]
-    rows = {}
-    labelled = [
-        (f"P{p}", choice) for p, choice in sorted(variants.per_partition.items())
-    ]
-    if variants.head_only[1] != variants.per_partition[1][1]:
-        labelled.append(("head-only", variants.head_only))
-    for label, choice in labelled:
-        built = compile_variant(attention, program, target, variants, choice)
-        host = sum(
-            host_reduction_cycles(step, geometry)
-            for step in built.compiled.layout_ctx.host_steps
-        )
-        estimate = (
-            allo.compile(
-                attention,
-                target,
-                aim_cost,
-                backend="virtual",
-                host_moves=program,
-                layout=built.compiled.layout,
-                **POLICY,
-            )
-            .run_backend()
-            .cycles
-        )
-        execution = None
-        device = None
+    modes = [p.mode for p in _placements(built)]
+    # The SV placement is the one compiled for the SV work item (the bucket
+    # index the ranking reported); a single-kernel program has only it.
+    sv_mode = modes[sv_index] if sv_index is not None and sv_index < len(modes) else modes[-1]
+    host = sum(host_reduction_cycles(step, geometry) for step in built.compiled.layout_ctx.host_steps)
+    estimate = compile_program(
+        attention, program, target, layouts=built.compiled.layout, budget=budget, virtual=True
+    ).run_backend().cycles
+    split = sv_entry(built).get("reduction_partition") is not None
+    record = {
+        "label": label,
+        "modes": modes,
+        "sv_mode": sv_mode,
+        "partitions": partitions_of(sv_mode),
+        "estimate_cycles": estimate,
+        "host_cycles": host,
+        "device_cycles": None,
+        "total_cycles": None,
+        "merge_check": {"applicable": split, "bf16_error": None, "integer_exact": None},
+        "execution": None,
+        "provenance": _plan_provenance(built),
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    if split:
+        record["merge_check"]["bf16_error"] = check_merge_numerics(built, heads, tokens)
+        record["merge_check"]["integer_exact"] = True
+    result = None
+    try:
         if simulate:
             result = built.run_backend()
             if result.kind != "simulator-timing-only":
-                raise RuntimeError(
-                    f"{label}: expected a simulator-timing-only run, got {result.kind!r}"
-                )
+                raise RuntimeError(f"{label}: expected a simulator-timing-only run, got {result.kind!r}")
             if not isinstance(result.cycles, int) or result.cycles <= 0:
                 raise RuntimeError(f"{label}: simulator reported cycles {result.cycles!r}")
-            device = int(result.cycles)
-            execution = {
+            record["device_cycles"] = int(result.cycles)
+            record["total_cycles"] = int(result.cycles) + host
+            record["execution"] = {
                 "kind": result.kind,
                 "simulator": result.extra.get("simulator"),
-                "segments": result.extra.get("segments"),
-                "unique_segments": result.extra.get("unique_segments"),
+                "segments": [
+                    {k: v for k, v in segment.items() if k not in ("trace", "stdout")}
+                    for segment in result.extra.get("segment_records") or ()
+                ],
+                "invocations": result.extra.get("invocations"),
                 "returncode": result.extra.get("returncode"),
+                "resource_budget": result.extra.get("resource_budget"),
             }
-        rows[label] = SimpleNamespace(
-            mode=choice[1],
-            ranked_cycles=choice[0],
-            partitions=partitions_of(choice[1]),
-            estimate=estimate,
-            device=device,
-            host=host,
-            total=None if device is None else device + host,
-            bf16_error=check_merge_numerics(built, heads, tokens),
-            execution=execution,
-            provenance=_plan_provenance(built),
+    finally:
+        record["artifacts"] = _write_artifacts(artifacts, label, record, result)
+    return record
+
+
+def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET):
+    """Compile, measure and record every plan of one workload: the normal
+    selection under the budget and the forced alternatives.
+
+    Returns a namespace with ``rows`` (label -> row namespace), ``selected``
+    (the normal selection's P), ``best`` (the simulated fastest P among the
+    forced partition plans and the normal selection), ``gap``, the failed
+    plans and a JSON-ready ``record``.  A plan that fails is recorded under
+    its label with the error; the other plans are kept.
+    """
+    import os
+    import traceback
+
+    target, attention, program, ranking = ranked(heads, tokens, budget=budget)
+    variants = budget_variants(target, ranking)
+    unrestricted = ranked(heads, tokens, budget=None)[3]
+    folder = None if artifacts is None else os.path.join(artifacts, f"h{heads}_l{tokens}")
+    plans = [("default", None)]
+    plans += [(f"P{p}", choice) for p, choice in sorted(variants.per_partition.items())]
+    if variants.head_only[1] != variants.per_partition[1][1]:
+        plans.append(("head-only", variants.head_only))
+    records, failures = {}, {}
+    for label, choice in plans:
+        try:
+            built = (
+                compile_program(attention, program, target, budget=budget)
+                if choice is None
+                else compile_variant(attention, program, target, variants, choice, budget=budget)
+            )
+            records[label] = measure_plan(
+                label, built, attention, program, target, heads, tokens,
+                simulate=simulate, budget=budget, artifacts=folder, sv_index=variants.sv_index,
+            )
+            if choice is not None:
+                records[label]["ranked_cycles"] = choice[0]
+        except Exception as error:  # a failed plan is evidence too
+            failures[label] = {"error": f"{type(error).__name__}: {error}", "traceback": traceback.format_exc()}
+            _write_artifacts(folder, label, {"label": label, **failures[label]}, None)
+    rows = {
+        label: SimpleNamespace(
+            mode=r["sv_mode"], modes=r["modes"], partitions=r["partitions"],
+            ranked_cycles=r.get("ranked_cycles"), estimate=r["estimate_cycles"],
+            device=r["device_cycles"], host=r["host_cycles"], total=r["total_cycles"],
+            bf16_error=r["merge_check"]["bf16_error"], execution=r["execution"], provenance=r["provenance"],
         )
-    if "head-only" not in rows:
-        rows["head-only"] = rows["P1"]
-    rows["fixed-8"] = rows["P8"]
-    best = min((rows[f"P{p}"] for p in PARTITIONS), key=lambda r: r.total or r.estimate)
-    chosen = rows[f"P{variants.selected_partitions}"]
-    gap = (chosen.total / best.total - 1.0) if simulate else None
+        for label, r in records.items()
+    }
+    aliases = {}
+    if "head-only" not in rows and "P1" in rows:
+        rows["head-only"] = rows["P1"]; aliases["head-only"] = "P1"
+    if "P8" in rows:
+        rows["fixed-8"] = rows["P8"]; aliases["fixed-8"] = "P8"
+    default = rows.get("default")
+    selected = default.partitions if default is not None else None
+    measured = [rows[f"P{p}"] for p in PARTITIONS if f"P{p}" in rows and rows[f"P{p}"].total is not None]
+    if default is not None and default.total is not None:
+        measured.append(default)
+    best = min(measured, key=lambda r: r.total, default=None) if simulate else None
+    gap = None
+    if simulate and default is not None and default.total is not None and best is not None:
+        gap = default.total / best.total - 1.0
     head_only_ratio = (
-        rows["head-only"].total / chosen.total if simulate else None
+        rows["head-only"].total / default.total
+        if simulate and default is not None and default.total and "head-only" in rows and rows["head-only"].total
+        else None
     )
+    forced = variants.per_partition.get(selected) if selected is not None else None
     record = {
         "heads": heads,
         "tokens": tokens,
-        "channel_budget": CHANNEL_BUDGET,
-        "default_selection_unrestricted": default,
-        "default_within_budget": all(within_budget(m) for m in default),
-        "selected_partitions": variants.selected_partitions,
-        "best_partitions": best.partitions,
+        "resource_budget": budget,
+        "compiler": compiler_revision(),
+        "default_selection_unrestricted": [p.mode for p in _placements(unrestricted)],
+        "selected_partitions": selected,
+        "default_equals_forced_choice": None if default is None or forced is None else default.mode == forced[1],
+        "best_partitions": None if best is None else best.partitions,
         "gap": gap,
         "head_only_over_selected": head_only_ratio,
-        "plans": {
-            label: {
-                "mode": row.mode,
-                "partitions": row.partitions,
-                "ranked_cycles": row.ranked_cycles,
-                "estimate_cycles": row.estimate,
-                "device_cycles": row.device,
-                "host_cycles": row.host,
-                "total_cycles": row.total,
-                "bf16_merge_error": row.bf16_error,
-                "execution": row.execution,
-                "provenance": row.provenance,
-            }
-            for label, row in rows.items()
-        },
+        "plans": {label: records[label] for label in records},
+        "aliases": aliases,
+        "failed_plans": failures,
+        "distinct_plans": len({tuple(r["modes"]) for r in records.values()}),
+        "split_plans_checked": sum(1 for r in records.values() if r["merge_check"]["applicable"]),
+        "artifacts": folder,
     }
     return SimpleNamespace(
-        heads=heads,
-        tokens=tokens,
-        rows=rows,
-        selected=variants.selected_partitions,
-        best=best.partitions,
-        gap=gap,
-        default=default,
-        record=record,
+        heads=heads, tokens=tokens, rows=rows, selected=selected,
+        best=None if best is None else best.partitions, gap=gap,
+        default=record["default_selection_unrestricted"], failures=failures, record=record,
     )
 
 
 def summarize(results):
-    """The study's figures over the completed workloads."""
+    """The study's figures over the completed workloads (diagnostic; see
+    the module docstring for what the paper's boundary adds)."""
     complete = [r for r in results if r.get("gap") is not None]
     reached = sum(r["selected_partitions"] == r["best_partitions"] for r in complete)
     gaps = [r["gap"] for r in complete]
-    one_4096 = next(
-        (r for r in complete if (r["heads"], r["tokens"]) == (1, 4096)), None
-    )
+    one_4096 = next((r for r in complete if (r["heads"], r["tokens"]) == (1, 4096)), None)
     return {
         "workloads_completed": len(complete),
         "minima_reached": reached,
         "max_gap": max(gaps) if gaps else None,
-        "head_only_over_selected_1x4096": (
-            one_4096["head_only_over_selected"] if one_4096 else None
+        "head_only_over_selected_1x4096": (one_4096["head_only_over_selected"] if one_4096 else None),
+        "distinct_plans": sum(int(r.get("distinct_plans") or 0) for r in results if "error" not in r),
+        "split_plans_checked": sum(int(r.get("split_plans_checked") or 0) for r in results if "error" not in r),
+        "failed_plans": sum(len(r.get("failed_plans") or {}) for r in results if "error" not in r),
+        "comparable_with_paper": False,
+        "not_comparable_because": (
+            "no scores-to-softmax-to-probs bridge, no host-stage time, no QK readout / "
+            "score upload / partial readout link volumes; see the module docstring"
         ),
         "paper": PAPER,
     }
@@ -511,44 +650,50 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", required=True)
     parser.add_argument("--no-sim", action="store_true", help="estimates only")
-    parser.add_argument(
-        "--shapes", default=None, help="subset, e.g. 1x128,8x512 (default: all nine)"
-    )
+    parser.add_argument("--shapes", default=None, help="subset, e.g. 1x128,8x512 (default: all nine)")
+    parser.add_argument("--artifacts", default=None, help="per-plan artifacts directory (default: <out>.artifacts)")
     args = parser.parse_args(argv)
     shapes = _parse_shapes(args.shapes) if args.shapes else SHAPES
     simulate = not args.no_sim
+    artifacts = args.artifacts or (args.out + ".artifacts")
     session = {
         "host": platform.node(),
         "date": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "python": sys.executable,
-        "allo": allo.__file__,
+        "compiler": compiler_revision(),
+        "resource_budget": BUDGET,
         "simulate": simulate,
+        "artifacts": artifacts,
         "shapes": [list(s) for s in shapes],
         "workloads": [],
     }
     failures = 0
     print(
-        "heads tokens | P1 P2 P4 P8 total(estimate) | head-only | selected P | "
-        "best P | gap | merge bf16 err | default (unrestricted)",
+        "heads tokens | default total(estimate) P | P1 P2 P4 P8 total(estimate) | head-only | "
+        "selected P | best P | gap | merge bf16 err | failed plans",
         flush=True,
     )
     for heads, tokens in shapes:
         started = time.perf_counter()
         try:
-            result = run_workload(heads, tokens, simulate=simulate)
+            result = run_workload(heads, tokens, simulate=simulate, artifacts=artifacts)
             record = result.record
             rows = result.rows
-            totals = " ".join(
-                f"{rows[f'P{p}'].total if simulate else rows[f'P{p}'].estimate}"
-                f"({rows[f'P{p}'].estimate})"
-                for p in PARTITIONS
-            )
-            errors = max((r.bf16_error or 0.0) for r in rows.values())
+            failures += len(result.failures)
+
+            def cell(row):
+                if row is None:
+                    return "-"
+                return f"{row.total if simulate else row.estimate}({row.estimate})"
+
+            totals = " ".join(cell(rows.get(f"P{p}")) for p in PARTITIONS)
+            errors = max((r.bf16_error or 0.0) for r in rows.values()) if rows else 0.0
+            default = rows.get("default")
             print(
-                f"{heads:5d} {tokens:6d} | {totals} | "
-                f"{rows['head-only'].total if simulate else rows['head-only'].estimate} | "
-                f"{result.selected} | {result.best} | "
-                f"{(result.gap or 0.0) * 100:.2f}% | {errors:.2e} | {result.default}",
+                f"{heads:5d} {tokens:6d} | {cell(default)} P{result.selected} | {totals} | "
+                f"{cell(rows.get('head-only'))} | {result.selected} | {result.best} | "
+                f"{'-' if result.gap is None else f'{result.gap * 100:.2f}%'} | {errors:.2e} | "
+                f"{sorted(result.failures) or '-'}",
                 flush=True,
             )
         except Exception as error:  # a failed workload is evidence too
@@ -565,20 +710,17 @@ def main(argv=None) -> int:
         with open(args.out, "w", encoding="utf-8") as handle:
             json.dump(session, handle, indent=1, default=str)
     session["summary"] = summarize(session["workloads"])
-    session["status"] = "pass" if not failures else f"fail ({failures} workload(s))"
+    session["status"] = "pass" if not failures else f"fail ({failures} plan(s)/workload(s))"
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(session, handle, indent=1, default=str)
     summary = session["summary"]
     print(
-        f"selection reaches {summary['minima_reached']} of "
+        f"normal budgeted selection reaches {summary['minima_reached']} of "
         f"{summary['workloads_completed']} simulated minima"
-        + (
-            f"; max gap {summary['max_gap'] * 100:.2f}%"
-            if summary["max_gap"] is not None
-            else ""
-        )
-        + f" (paper: {PAPER['minima_reached']} of {PAPER['workloads']}, "
-        f"{PAPER['max_gap'] * 100:.2f}%)",
+        + (f"; max gap {summary['max_gap'] * 100:.2f}%" if summary["max_gap"] is not None else "")
+        + f"; {summary['distinct_plans']} distinct plans, {summary['split_plans_checked']} split plans "
+        f"numerically checked (diagnostic; paper: {PAPER['minima_reached']} of {PAPER['workloads']}, "
+        f"{PAPER['max_gap'] * 100:.2f}%, not comparable yet)",
         flush=True,
     )
     print(session["status"], flush=True)

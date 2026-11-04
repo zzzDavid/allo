@@ -7,7 +7,8 @@ the work item it is supplied for (function and value bindings by operand
 role), validated in full, and must be the current candidate's declaration
 for the same decision; otherwise ``allo.compile`` refuses it (reviewer
 round 38 reproducer: an edited image, buffer identity, launch domain,
-allocation or axis set).  Legitimate reuse is preserved: one body's
+allocation or axis set; round 39: a second, contradicting layout of one
+value and image or transfer of one value and direction, in either order).  Legitimate reuse is preserved: one body's
 declaration serves every body of a lockstep kernel, a bare decision (no
 declaration) is rebound, and another program's plan supplies its decision.
 """
@@ -96,10 +97,34 @@ def _edit(effects, what):
     if what == "axes":
         layouts = tuple(replace(l, axes=()) if l is matrix else l for l in effects.value_layouts)
         return replace(effects, value_layouts=layouts)
+    if what.startswith("duplicate_layout_"):
+        # A second layout of the same value and image, contradicting the
+        # first, placed before or after it: never a quieter alternative.
+        twin = replace(matrix, packing="unrealized_packing")
+        layouts = (twin,) + effects.value_layouts if what.endswith("first") else effects.value_layouts + (twin,)
+        return replace(effects, value_layouts=layouts)
+    if what.startswith("duplicate_transfer_"):
+        first = next(t for t in effects.transfers if t.value == "left")
+        twin = replace(first, route=("host_copy",))
+        transfers = (twin,) + effects.transfers if what.endswith("first") else effects.transfers + (twin,)
+        return replace(effects, transfers=transfers)
     raise AssertionError(what)
 
 
-@pytest.mark.parametrize("what", ["image", "buffer_identity", "launch_domain", "allocation", "axes"])
+@pytest.mark.parametrize(
+    "what",
+    [
+        "image",
+        "buffer_identity",
+        "launch_domain",
+        "allocation",
+        "axes",
+        "duplicate_layout_first",
+        "duplicate_layout_last",
+        "duplicate_transfer_first",
+        "duplicate_transfer_last",
+    ],
+)
 def test_an_edited_declaration_is_refused_at_both_boundaries(what):
     target, buckets, candidates = _enumerate(contraction)
     chosen = _split_rows(candidates)
@@ -108,6 +133,9 @@ def test_an_edited_declaration_is_refused_at_both_boundaries(what):
     try:
         problems = validate_candidate_effects(buckets[0][1], chosen, target)
         assert problems, what
+        if what.startswith("duplicate_"):
+            kind = "layouts" if "layout" in what else "transfers"
+            assert any(f"two {kind}" in problem for problem in problems), problems
         with pytest.raises(ValueError, match="violates the candidate contract") as error:
             allo.compile(contraction, target, samsung_cost, layout=[chosen] * len(buckets), **REASSOCIATE)
     finally:

@@ -165,6 +165,9 @@ def test_unconfigured_simulator_location_names_the_variable(monkeypatch, tmp_pat
 
 
 def test_aim_image_override(monkeypatch):
+    # These are the Docker executor's tests: a native binary configured in
+    # the environment (TENON_AIM_RAMULATOR2) would bypass it.
+    monkeypatch.delenv("TENON_AIM_RAMULATOR2", raising=False)
     monkeypatch.delenv("TENON_AIM_SIM_IMAGE", raising=False)
     assert spmw_simenv.aim_sim_image() == "aim-simulator-build"
     monkeypatch.setenv("TENON_AIM_SIM_IMAGE", "my-aim")
@@ -179,6 +182,9 @@ def test_aim_image_override(monkeypatch):
 
 
 def test_aim_run_never_writes_into_the_simulator_checkout(monkeypatch, tmp_path):
+    # These are the Docker executor's tests: a native binary configured in
+    # the environment (TENON_AIM_RAMULATOR2) would bypass it.
+    monkeypatch.delenv("TENON_AIM_RAMULATOR2", raising=False)
     root = tmp_path / "aim_simulator"
     (root / "test").mkdir(parents=True)
     (root / "test" / "example.yaml").write_text("")

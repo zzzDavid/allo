@@ -34,6 +34,16 @@ Terms used below:
   by default (source accumulation order and rounding for floating-point
   accumulators; integer accumulators may always be split) or
   `"reassociate"`. Rows below say which programs each policy admits.
+- **Resource budget.** `allo.compile(..., resources={"channel": 8})` caps
+  the structural units one program may occupy (`allo.spmw_resources`): the
+  enumerators bound their partition domains by it (AiM replica and token
+  partition counts), the shared ranking selects among the candidates that
+  fit, a supplied placement outside the budgeted enumeration is refused, the
+  realization check compares the lowered program's unit use with the cap
+  (a feasibility rejection the ranking records), and the budget is on every
+  result (`extra["resource_budget"]`). A cap above the device's count or an
+  undeclared unit is refused. It is a search policy, not a device
+  description: target and simulator geometry are unchanged.
 - **Evidence status.** *Verified* means run at the round 3 tree on the
   authors' hosts through the public API and recorded in `VALIDATION.md`;
   **UNVERIFIED** means no run at the candidate revision, whatever older
@@ -79,7 +89,7 @@ discovery variables in `INSTALL.md` section 3.
 | Input | Source GEMV and attention-style batched MAC (`acc += W*x`), elementwise `MUL`/`ADD` and `AF` through target ops; mapping a prefix of `[32, 4, 4]` or an outer subset. Output, reduction, batch and work axes are derived structurally (`axis_roles`, M-01 fixed); undecidable forms (split-K grids, uneven per-item extents, `y[row0+i] += ...`) raise; issued MACs are checked against the program (`AimCoverageError`). Carried accumulators are rejected (M-09/C-14). |
 | Compile-only | `compiled.compiled.cmds` is the exact Ramulator2 trace text (`AiM WR_GB ...`, `MAC_ABK ...`, `EOC`); `compiled.compiled.layout_ctx.host_steps` lists host reductions. |
 | Analytical | `aim_cost`: one route prices the exact lowered record (M-06 fixed; GEMV 256x256 ABK 223 vs 222 simulated, SBK 1,528 vs 1,527); host transfers priced by the moved slice and residency (M-05 fixed; `attention_l128` 10,108 estimated vs 11,010 simulated). Long streams remain 1.25x to 1.59x high (token-partition study). |
-| Simulator | Ramulator2 timing simulator in Docker (`TENON_AIM_SIM_IMAGE`, default `aim-simulator-build`) or a natively built binary (`TENON_AIM_RAMULATOR2`; the executor and the binary's SHA-256 are recorded in `extra["simulator"]`); `kind="simulator-timing-only"`, no `extra["outputs"]`, caller arrays untouched; a nonzero simulator exit raises (M-08 fixed). Trace files go to a private temp directory (P-21 fixed). |
+| Simulator | Ramulator2 timing simulator in Docker (`TENON_AIM_SIM_IMAGE`, default `aim-simulator-build`) or a natively built binary (`TENON_AIM_RAMULATOR2`); every run records the executor (image id, or the binary's SHA-256 with the shared library it resolves and its SHA-256), the configuration file's SHA-256, each segment's exact trace lines, digest, repeat count, cycles and simulator output, and the invocations (`extra["simulator"]`, `extra["segment_records"]`, `extra["invocations"]`); `kind="simulator-timing-only"`, no `extra["outputs"]`, caller arrays untouched; a nonzero simulator exit raises (M-08 fixed). Trace files go to a private temp directory (P-21 fixed). |
 | Numerical scope | **None in the simulator** (no data path). Under `"strict"` every BF16 reduction is refused before scheduling with `ReductionOrderError` (each MAC regroups 16 products through the bank adder tree); use `reduction_order="reassociate"` or integer accumulators. The token-partition merge (`reduction_partitions` knob, `AimHostReduction`) is checked numerically by `aim_lowering.reference_partial_sums` (exact on integers, within 3.7e-3 on BF16). |
 | What cycles mean | Max over channels of Ramulator2 `memory_system_cycles` per distinct trace segment, times the compile-time repeat count, summed. Host steps are listed in `extra["host_steps"]` and never added. Simulator geometry is fixed at the 32-channel preset; other targets are rejected (M-10). |
 | Hardware | none. |

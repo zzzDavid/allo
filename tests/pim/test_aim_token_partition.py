@@ -48,7 +48,7 @@ from benchmarks.cent_aim.token_partition import (
 
 
 def test_knob_domain_and_reduction_policy():
-    target, _attention, _program, compiled = _ranked(1, 512, qk=False)
+    target, _attention, _program, compiled = _ranked(1, 512, qk=False, budget=None)
     choices = _kernel_choices(target, compiled)
     modes = [mode for _c, mode, _p in choices["attention_sv"][1]]
     found = {_partitions(mode) for mode in modes}

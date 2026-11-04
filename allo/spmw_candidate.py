@@ -545,7 +545,20 @@ def _check_value_layouts(effects, matches, inputs, outputs, locals_, view) -> li
             problems.append(f"synthetic axis {name!r} is not a fresh positive axis")
     laid_out = set()
     covered_axes = set()
+    # One layout per value and image: a second record for the same key is a
+    # contradiction (or a duplicate), never a quieter alternative.
+    seen_layouts = {}
     for layout in effects.value_layouts:
+        key = (layout.value, layout.image)
+        if key in seen_layouts:
+            problems.append(
+                f"declares two layouts of {layout.value!r} (image {layout.image!r}): "
+                f"storage {seen_layouts[key].storage!r} packing "
+                f"{seen_layouts[key].packing!r} and storage {layout.storage!r} packing "
+                f"{layout.packing!r}"
+            )
+            continue
+        seen_layouts[key] = layout
         if layout.value not in inputs | outputs | locals_:
             problems.append(f"lays out {layout.value!r}, not a program buffer")
             continue
@@ -622,7 +635,18 @@ def _check_transfers(effects, inputs, outputs, locals_, parameters, view) -> lis
     a semantic one."""
     problems = []
     moved_in, moved_out = set(), set()
+    # One transfer per value and direction: a second record for the same key
+    # is a contradiction (or a duplicate).
+    seen_transfers = {}
     for transfer in effects.transfers:
+        key = (transfer.value, transfer.direction)
+        if key in seen_transfers:
+            problems.append(
+                f"declares two transfers of {transfer.value!r} {transfer.direction}: "
+                f"{tuple(seen_transfers[key].route)} and {tuple(transfer.route)}"
+            )
+            continue
+        seen_transfers[key] = transfer
         for step in transfer.route:
             if view is not None and not _route_step_declared(view, step):
                 problems.append(
@@ -921,9 +945,21 @@ def _derivation_problems(view, matches, placement, effects) -> list:
     if derived is None:
         return []
     problems = []
+
     def key(layout):
         return (layout.value, getattr(layout, "image", "value"))
-    declared_layouts = {key(l): l for l in effects.value_layouts}
+
+    declared_layouts = {}
+    for layout in effects.value_layouts:
+        if key(layout) in declared_layouts:
+            problems.append(
+                f"declares two layouts of {layout.value!r} (image {layout.image!r})"
+            )
+        declared_layouts.setdefault(key(layout), layout)
+    if len({(t.value, t.direction) for t in effects.transfers}) != len(effects.transfers):
+        problems.append("declares two transfers of one value and direction")
+    if problems:
+        return problems
     for derived_layout in derived.value_layouts:
         declared_layout = declared_layouts.get(key(derived_layout))
         if declared_layout is None:
@@ -980,6 +1016,21 @@ def _declaration_differences(declared, current, *, against) -> list:
     def layouts(record):
         return {(l.value, l.image): l for l in record.value_layouts}
 
+    def duplicates(items, key):
+        seen, extra = set(), []
+        for item in items:
+            k = key(item)
+            if k in seen:
+                extra.append(k)
+            seen.add(k)
+        return extra
+
+    for key_ in duplicates(declared.value_layouts, lambda l: (l.value, l.image)):
+        problems.append(f"declares two layouts of {key_[0]!r} (image {key_[1]!r})")
+    for key_ in duplicates(declared.transfers, lambda t: (t.value, t.direction)):
+        problems.append(f"declares two transfers of {key_[0]!r} {key_[1]}")
+    if problems:
+        return problems
     mine, theirs = layouts(declared), layouts(current)
     for key in sorted(set(mine) | set(theirs)):
         value, image = key
@@ -1283,6 +1334,18 @@ def rebind_supplied_layouts(view, trace, supplied) -> list:
             raise ReductionOrderError(
                 f"placement {placement.mode!r} was pruned by the reduction-order "
                 f"policy ({pruned[placement.mode]})"
+            )
+        # Under a resource budget the enumeration is the set of programs that
+        # fit; a placement designating none of its candidates is not compiled
+        # on the strength of its own legality.
+        from .spmw_resources import budget_of
+
+        budget = budget_of(matches)
+        if budget is not None and candidates:
+            raise ValueError(
+                f"placement {placement.mode!r} designates no candidate of kernel "
+                f"{matches[0].func_name!r} enumerated under the resource budget "
+                f"{budget}; it is not compiled on its own legality"
             )
         # The caller's placement for this work item, its effects declared by
         # the backend for these matches; a declaration it carries (one of

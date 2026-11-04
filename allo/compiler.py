@@ -29,6 +29,7 @@ from .spmw_reduction_policy import (
     normalize_reduction_order,
     require_matcher_route_policy,
 )
+from .spmw_resources import normalize_resource_budget, stamp_resource_budget
 from .spmw_target import HostProgram
 
 
@@ -461,6 +462,7 @@ class CompiledCallable:
         compiled,
         cost=None,
         reduction_order=None,
+        resources=None,
     ):
         self.workload = workload
         self.target = target
@@ -469,6 +471,9 @@ class CompiledCallable:
         self.compiled = compiled
         self.cost = cost
         self.reduction_order = normalize_reduction_order(reduction_order)
+        # The resource budget the program was selected under (a search cap,
+        # ``spmw_resources``), recorded on every result.
+        self.resources = normalize_resource_budget(resources)
         # Candidates the enumerators pruned under the reduction-order policy:
         # ``(mode, reason)`` pairs recorded on the selected placements.
         self.reduction_policy_pruned = _reduction_policy_pruned(compiled)
@@ -560,6 +565,9 @@ class CompiledCallable:
             )
         result.validate()
         _stamp_reduction_order(result, self.reduction_order, self.trace)
+        result.extra["resource_budget"] = (
+            None if self.resources is None else dict(self.resources)
+        )
         self._copy_outputs(result, inputs)
         self.last_result = result
         return result
@@ -823,6 +831,7 @@ def compile(
     host_moves=None,
     layout=None,
     reduction_order=None,
+    resources=None,
 ) -> CompiledWorkload:
     """Compile ``workload`` for ``target`` and return a NumPy-callable object.
 
@@ -899,6 +908,14 @@ def compile(
         and on every result (``RunResult.extra["reduction_order"]``).
         Typed program records fix their own grouping and reject this
         argument. See ``docs/release/design/reduction-policy.md``.
+    resources : mapping or None
+        A resource budget, ``{unit name: cap}`` over the target's structural
+        units (``resources={"channel": 8}``): the enumerators bound their
+        partition domains by it, the shared ranking selects among the
+        candidates that fit, the realization is checked against it and it
+        is recorded on every result (``extra["resource_budget"]``).  A cap
+        above the device's unit count or an undeclared unit is refused
+        (``allo.spmw_resources``).
     """
     workload = _materialize_workload(workload)
     target = _materialize_target(target)
@@ -937,6 +954,11 @@ def compile(
     require_matcher_route_policy(target, trace)
     if module is not None:
         _stamp_matcher_work_scopes(target, module, trace)
+    # The resource budget (``resources={"channel": 8}``): a cap on the units
+    # a program may occupy, stamped before enumeration so the partition
+    # domains, the ranking and the realization check all read it.
+    budget = normalize_resource_budget(resources, target)
+    stamp_resource_budget(trace, budget)
     launch_order = None
     if isinstance(host_moves, HostProgram):
         if host_moves.launches:
@@ -963,4 +985,5 @@ def compile(
         compiled,
         cost=bound_cost,
         reduction_order=reduction_order,
+        resources=budget,
     )

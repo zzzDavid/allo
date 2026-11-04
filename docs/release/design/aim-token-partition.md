@@ -71,25 +71,43 @@ merge) with `perf_counter_ns`; those are not compiler quantities and the
 softmax is common to every P. The compiler prices only the merge and its
 transfers.
 
-## 3. The nine-workload experiment
+## 3. The nine-workload experiment (a diagnostic; see M-15)
 
-`tests/pim/test_aim_token_partition.py` (`test_nine_workload_selection`,
-`-m paper_full`; table: `python -m tests.pim.test_aim_token_partition`).
-Workloads: 1/8/32 heads x 128/512/4096 tokens, head dim 128, K/V caches
-reserved for 4096 tokens, inputs resident, QK and SV in one program
-(`mapping=[1]`). Budget: eight channels (the paper's eight simulated
-channels) = candidates with `replica_partitions <= 8` on the 32-channel
-simulator preset (the harness also emitted 8-channel masks on that preset).
-For each P in {1, 2, 4, 8} the cost program's best candidate with that P is
-compiled through `layout=` and simulated; P1 is the best unsplit candidate
-of any mapping. Controls: head-only = best P = 1 candidate on the `channels`
-mapping (one head per channel); fixed eight-way = the P = 8 variant.
-Measured total = simulated device cycles + modelled host reduction. Every
-split variant passes the exact-integer merge check and the BF16 check
-(max relative error 3.7e-3, tolerance 2^-6).
+Driver: `benchmarks/cent_aim/token_partition.py` (`python -m
+benchmarks.cent_aim.token_partition --out tp.json`; the test
+`tests/pim/test_aim_token_partition.py::test_nine_workload_selection`,
+`-m paper_full`, calls it).  Workloads: 1/8/32 heads x 128/512/4096 tokens,
+head dim 128, K/V caches reserved for 4096 tokens, inputs resident, QK and
+SV in one program (`mapping=[1]`).  Budget: the paper's eight simulated
+channels, expressed since round 40 as the compiler's resource policy
+(`resources={"channel": 8}`, `allo.spmw_resources`): the replica and token
+partition domains are bounded by it and the shared ranking selects the
+complete program (QK and SV) within it; that **normal selection** is the
+headline plan and its P the "selected" partition count.  The forced plans
+are the ablation: the budgeted ranking's cheapest SV plan per P in
+{1, 2, 4, 8} and the head-only control (one head per channel, no split),
+compiled as explicit layouts under the same budget.  Measured total =
+simulated device cycles + modelled host reduction (32 GB/s link).  Every
+split plan passes the exact-integer merge check and the BF16 check (max
+relative error 3.7e-3, tolerance 2^-6); an unsplit plan has no merge and
+its record says so.  Every plan's artifacts are written before the next
+plan runs (declared effects, lowering manifest, graph, segment traces,
+simulator output, executor/library/config digests, compiler revision),
+and a failed plan is recorded without discarding the others.
+
+**What this is not:** the frozen paper's boundary includes the
+scores-to-global-softmax-to-probabilities bridge between the kernels, the
+host stages' time and the QK readout / score upload / partial readout link
+volumes; this driver has `probs` resident and prices only the merge, so its
+minima, gaps and head-only ratios are comparable with each other, not with
+the paper's row (inventory status DIAGNOSTIC; M-15 holds the plan).
 
 Run 2026-11-02, isolated snapshot HEAD `6efaca5` + this change, simulator
-`0f28a07`, image `aim-simulator-build`. Cells: measured total (estimate).
+`0f28a07`, image `aim-simulator-build`; re-run 2026-11-04 (rounds 39-40,
+native ramulator2 from the same tree, the budget as the compiler's policy)
+with the same cells, the normal budgeted selection equal to the forced
+plan of its P on every workload (`tenon-release-evidence/r40/
+token_partition_nine.json`). Cells: measured total (estimate).
 
 | Heads | Tokens | P1 | P2 | P4 | P8 = fixed 8-way | Head-only | Selected P | Best P | Gap |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|

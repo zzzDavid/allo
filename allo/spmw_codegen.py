@@ -1913,6 +1913,11 @@ def compile_for_target(
     # The backend the artifact will run on: a context may refuse a backend
     # its selected program cannot serve at materialization time.
     ctx.backend = backend
+    # The resource budget the program was selected under, for the
+    # realization check (``spmw_resources``).
+    from .spmw_resources import budget_of
+
+    ctx.resource_budget = budget_of(trace.matches)
     from .spmw_plan import check_transfer_availability
 
     check_transfer_availability(trace, launch_schedule, resolved_host_moves, layouts)

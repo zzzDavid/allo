@@ -401,6 +401,17 @@ def _aim_reuse_group_candidates(ctx: KnobCtx) -> list:
     return list(_default_reuse_candidates(slots // (2 if shape["activation"] else 1)))
 
 
+def _budgeted_channels(ctx: KnobCtx) -> int:
+    """The channels a program may occupy: the device's count, capped by the
+    compile's resource budget (``spmw_resources``) when one is stamped."""
+    from .pim.aim_lowering import _target_geometry
+    from .spmw_resources import resource_cap
+
+    channels = _target_geometry(ctx.target).channels
+    cap = resource_cap(ctx.matches, "channel")
+    return channels if cap is None else min(channels, int(cap))
+
+
 def _aim_replica_partitions_candidates(ctx: KnobCtx) -> list:
     import math
 
@@ -411,7 +422,7 @@ def _aim_replica_partitions_candidates(ctx: KnobCtx) -> list:
     from .pim.aim_lowering import _target_geometry
 
     geometry = _target_geometry(ctx.target)
-    channels = geometry.channels
+    channels = _budgeted_channels(ctx)
     shape = _aim_shape(ctx)
     if shape is not None:
         replicas = int(shape["replicas"])
@@ -448,8 +459,9 @@ def _aim_reduction_partitions_candidates(ctx: KnobCtx) -> list:
     P > 1 splits the reduction over P channel groups, each accumulating a
     partial output that a host ADD merges (PIMphony token partitioning when
     the reduction is the attention token axis).  Domain: powers of two
-    P <= channels / replicas that divide the reduction, on the ``channels``
-    batch mapping with a GB-fed vector.  Splitting reassociates the reduction:
+    P <= channels / replicas that divide the reduction (the channels capped by
+    the compile's resource budget), on the ``channels`` batch mapping with a
+    GB-fed vector.  Splitting reassociates the reduction:
     when any accumulating match's reduction-order policy forbids regrouping
     (``spmw_reduction_policy.reduction_policy``; an unstamped floating-point
     match reads as the strict default) only P = 1 remains.
@@ -469,7 +481,7 @@ def _aim_reduction_partitions_candidates(ctx: KnobCtx) -> list:
         policy = reduction_policy(match)
         if policy is not None and not policy.may_regroup:
             return [1]
-    limit = _target_geometry(ctx.target).channels // max(1, int(shape["replicas"]))
+    limit = _budgeted_channels(ctx) // max(1, int(shape["replicas"]))
     values = [1]
     parts = 2
     while parts <= limit and shape["reduction"] % parts == 0:
