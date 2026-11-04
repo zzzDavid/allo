@@ -2067,14 +2067,43 @@ def _normalized(cols_per_row: int, column: int) -> tuple:
     return divmod(int(column), int(cols_per_row))
 
 
+@dataclass(frozen=True)
+class SamsungAccessStream:
+    """The executable pass-phase stream of one lowered REDUCE program.
+
+    ``geometry_source`` says where the simulated geometry came from: the
+    installed conductor (``pim_driver --describe``) or the explicitly
+    requested offline default; an offline stream is a model of the
+    conductor's addressing, not the installed simulator's stream.
+    """
+
+    rounds: tuple
+    columns: int
+    geometry: dict
+    geometry_source: str
+
+    def __iter__(self):
+        return iter(self.rounds)
+
+    def __len__(self):
+        return len(self.rounds)
+
+
+GEOMETRY_SOURCE_INSTALLED = "installed pim_driver --describe"
+GEOMETRY_SOURCE_DEFAULT = "SAMSUNG_DEFAULT_GEOMETRY (offline model, no installed simulator queried)"
+
+
 def samsung_reduce_access_stream(
-    program: SamsungProgram, geometry: dict, columns: int = 1, weight_resident=None
+    program: SamsungProgram, geometry: dict, columns: int | None = None, weight_resident=None
 ) -> list:
     """The transaction stream the conductor issues for ``program`` during its
     passes, derived from the lowered program (``binds``, ``tile_fiber``,
     ``k_tiles``, ``rows_per_block``, ``vector_from_bank``) and the simulated
     geometry, in the order ``TenonConductor.inc`` ``run_pass`` executes the
-    CRF: one round per barrier.
+    CRF: one round per barrier.  ``columns`` is the program's result column
+    count (``contraction.N``, the complete program); passing another count
+    is an error, so a stream is never a silent subset or repetition of the
+    program.
 
     Columns follow the conductor: a matrix tile occupies ``G*E`` consecutive
     columns of its fiber at ``(pass * tiles_on_fiber + local) * G*E``; the
@@ -2088,6 +2117,19 @@ def samsung_reduce_access_stream(
     facts = program.facts
     if program.kind != "REDUCE":
         raise ValueError(f"access stream of a {program.kind} program is not modelled")
+    program_columns = int(program.contraction.N) if program.contraction is not None else 1
+    if columns is None:
+        columns = program_columns
+    elif isinstance(columns, bool) or not isinstance(columns, int) or columns <= 0:
+        raise ValueError(f"columns must be a positive integer, got {columns!r}")
+    elif int(columns) != program_columns:
+        raise ValueError(
+            f"the program computes {program_columns} result column(s); a stream of "
+            f"{columns} is not the program's stream (pass columns=None)"
+        )
+    for key in ("channels", "cols_per_row"):
+        if key not in geometry:
+            raise ValueError(f"geometry lacks {key!r}: {sorted(geometry)}")
     G, E, T = program.rows_per_block, facts.grf_a_entries, program.k_tiles
     C, P = int(geometry["channels"]), int(geometry.get("pim_blocks", facts.pim_blocks))
     cols_per_row = int(geometry["cols_per_row"])
@@ -2155,18 +2197,31 @@ def samsung_reduce_access_stream(
     return rounds
 
 
-def samsung_access_stream(compiled, columns: int = 1, geometry: dict | None = None) -> list:
+def samsung_access_stream(
+    compiled, columns: int | None = None, geometry: dict | None = None
+) -> SamsungAccessStream:
     """The executable access stream of a compiled single-kernel Samsung
-    REDUCE program (an ``allo.compile`` result or its backend artifact)."""
+    REDUCE program (an ``allo.compile`` result or its backend artifact).
+
+    With ``geometry=None`` the installed conductor is asked for its geometry
+    and any discovery or configuration error propagates (an installed
+    simulator that cannot describe itself yields no stream).  Offline
+    modelling passes ``geometry=SAMSUNG_DEFAULT_GEOMETRY`` (or another
+    explicit geometry) and the result is labelled as such.
+    """
 
     artifact = getattr(compiled, "compiled", compiled)
     program = _program_of(artifact)
     if geometry is None:
-        try:
-            geometry = samsung_simulator_geometry(_pimsim_root())
-        except Exception:
-            geometry = dict(SAMSUNG_DEFAULT_GEOMETRY)
-    return samsung_reduce_access_stream(program, geometry, columns)
+        geometry = samsung_simulator_geometry(_pimsim_root())
+        source = GEOMETRY_SOURCE_INSTALLED
+    elif geometry is SAMSUNG_DEFAULT_GEOMETRY or geometry == SAMSUNG_DEFAULT_GEOMETRY:
+        source = GEOMETRY_SOURCE_DEFAULT
+    else:
+        source = "explicit geometry"
+    rounds = samsung_reduce_access_stream(program, geometry, columns)
+    resolved = int(program.contraction.N) if program.contraction is not None else 1
+    return SamsungAccessStream(tuple(rounds), resolved, dict(geometry), source)
 
 
 def samsung_access_stream_summary(rounds) -> dict:
@@ -2174,6 +2229,8 @@ def samsung_access_stream_summary(rounds) -> dict:
     rows each bank touches and the same-bank row transitions between
     successive rounds (each a row activation after a barrier)."""
 
+    label = getattr(rounds, "geometry_source", None)
+    rounds = list(rounds)
     by_kind = Counter(r.kind for r in rounds)
     rows = {}
     transitions = {}
@@ -2192,7 +2249,10 @@ def samsung_access_stream_summary(rounds) -> dict:
         "rounds_by_kind": dict(sorted(by_kind.items())),
         "transactions": sum(len(r.accesses) for r in rounds),
         "rows_by_bank": {b: sorted(v) for b, v in sorted(rows.items())},
+        # Address changes between successive MAC groups of one bank in the
+        # modelled stream; not measured row activations of the simulator.
         "mac_same_bank_row_transitions": dict(sorted(transitions.items())),
+        "geometry_source": label,
     }
 
 

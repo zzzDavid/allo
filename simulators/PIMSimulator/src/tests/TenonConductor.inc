@@ -8,6 +8,8 @@
 // CRF, places operands, and issues the column commands the CRF consumes.
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -20,6 +22,34 @@ namespace
 [[noreturn]] void tenonFail(const std::string& message)
 {
     throw std::runtime_error(message);
+}
+
+// Optional normalized-address trace of every transaction the Tenon conductor
+// issues, for the release evidence (TENON_CONDUCTOR_ADDRESS_TRACE=<path>):
+// one line per DRAM transaction of channel 0 ("<tag> ch bank row col"
+// after PIMAddrManager::addrGenSafe's column-to-row carry; "W" prefix for
+// writes), "BARRIER" when a barrier is attached, "PASS n j" at each pass.
+struct TenonAddressTrace
+{
+    std::FILE* file = nullptr;
+    TenonAddressTrace()
+    {
+        const char* path = std::getenv("TENON_CONDUCTOR_ADDRESS_TRACE");
+        if (path && *path) file = std::fopen(path, "w");
+    }
+    ~TenonAddressTrace()
+    {
+        if (file) std::fclose(file);
+    }
+    void line(const std::string& text)
+    {
+        if (file) std::fprintf(file, "%s\n", text.c_str());
+    }
+};
+TenonAddressTrace& tenonTrace()
+{
+    static TenonAddressTrace trace;
+    return trace;
 }
 
 const char* tenonOpdName(PIMOpdType opd)
@@ -491,14 +521,35 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
     const long vector_base = (long)J * T0 * tile_cols;  // even bank, after the matrix
     const long result_base = (long)J * T1 * tile_cols;  // odd bank, after the matrix
     auto fiber_tiles_count = [&](int f) { return f == 0 ? T0 : T1; };
+    const char* trace_tag = "stage";
     auto address = [&](int ch, int pb, int parity, long col) {
         int global_bank = 2 * pb + parity;
         unsigned row = 0, column = (unsigned)col;
-        return pim_addr_mgr_->addrGenSafe(ch, 0, global_bank / banks_per_group,
-                                          global_bank % banks_per_group, row, column);
+        uint64_t addr = pim_addr_mgr_->addrGenSafe(ch, 0, global_bank / banks_per_group,
+                                                   global_bank % banks_per_group, row, column);
+        if (ch == 0 && tenonTrace().file)
+            tenonTrace().line(std::string(trace_tag) + " 0 " + std::to_string(global_bank) + " " +
+                              std::to_string(row) + " " + std::to_string(column));
+        return addr;
+    };
+    // Normalized addresses of an all-bank PIM column command sequence
+    // (PIMKernel::addTransactionAll with bank group 0): channel 0 only, the
+    // other channels receive the same addresses.
+    auto trace_all = [&](const char* tag, int bank, long col, int count, bool barrier) {
+        if (!tenonTrace().file) return;
+        unsigned row = 0, column = (unsigned)col;
+        for (int i = 0; i < count; ++i)
+        {
+            pim_addr_mgr_->addrGenSafe(0, 0, 0, bank, row, column);
+            tenonTrace().line(std::string(tag) + " 0 " + std::to_string(bank) + " " +
+                              std::to_string(row) + " " + std::to_string(column));
+            column++;
+        }
+        if (barrier) tenonTrace().line("BARRIER");
     };
 
     auto stage_matrix = [&]() {
+        trace_tag = "Wstage_matrix";
         // Same order as the vendor preloadGemv: pass, tile, block, row group, burst.
         for (int j = 0; j < J; ++j)
             for (int t = 0; t < T; ++t)
@@ -519,6 +570,7 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
         audit.matrix_preloads++;
     };
     auto stage_vector = [&](int n) {
+        trace_tag = "Wstage_vector";
         for (int t = 0; t < T; ++t)
             for (int block = 0; block < C * P; ++block)
                 for (int a = 0; a < E; ++a)
@@ -527,6 +579,7 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
                         &vectors.bData[((long)n * T + t) * E + a]);
     };
     auto run_pass = [&](int n, int j) {
+        tenonTrace().line("PASS " + std::to_string(n) + " " + std::to_string(j));
         changePIMMode(dramMode::HAB, dramMode::HAB_PIM);  // PC reset, GRF_B zeroed
         audit.passes++;
         for (const auto& issue : issues)
@@ -546,10 +599,13 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
                                     &vectors.bData[((long)n * T + issue.tile) * E + a]);
                         mem_->addBarrier(ch);
                     }
+                    tenonTrace().line("Whost_fill_grf_a x" + std::to_string(E));
+                    tenonTrace().line("BARRIER");
                     audit.host_vector_writes += E;
                 }
                 long col = ((long)j * fiber_tiles_count(issue.fiber) + issue.local) * tile_cols +
                            issue.group * E;
+                trace_all("MAC", issue.fiber, col, E, true);
                 addTransactionAll(false, 0, issue.fiber, 0, (int)col, "MAC_", &null_bst_, true, E);
                 audit.mac_groups[issue.fiber]++;
                 audit.column_commands += E;
@@ -557,6 +613,7 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
             else if (issue.kind == 'F')
             {
                 long col = vector_base + ((long)n * T + issue.tile) * E;
+                trace_all("FILL", 0, col, E, true);
                 addTransactionAll(false, 0, 0, 0, (int)col, "FILL_GRF_A_", &null_bst_, true, E);
                 audit.fills++;
                 audit.column_commands += E;
@@ -564,6 +621,7 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
             else
             {
                 long col = result_base + ((long)n * J + j) * G;
+                trace_all("WDRAIN", 1, col, G, true);
                 addTransactionAll(true, 0, 1, 0, (int)col, "GRFB_TO_BANK_", &null_bst_, true, G);
                 audit.drains++;
                 audit.column_commands += G;
@@ -616,6 +674,7 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
 
     // Readback in vendor readResult order: column, pass, block, row group;
     // each drained slot lands at its row's position (row order).
+    trace_tag = "readback";
     result.assign((size_t)N * slots, BurstType());
     for (int n = 0; n < N; ++n)
         for (int j = 0; j < J; ++j)

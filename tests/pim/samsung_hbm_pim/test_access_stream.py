@@ -83,7 +83,9 @@ def test_access_stream_follows_the_fiber_placement_with_the_row_carry():
     streams = {}
     for name, layout in layouts.items():
         compiled = _compile(fn, target, layout, "virtual")
-        rounds = samsung_access_stream(compiled, 1, SAMSUNG_DEFAULT_GEOMETRY)
+        rounds = samsung_access_stream(compiled, geometry=SAMSUNG_DEFAULT_GEOMETRY)
+        assert rounds.geometry_source.startswith("SAMSUNG_DEFAULT_GEOMETRY")
+        assert rounds.columns == 1
         streams[name] = (rounds, samsung_access_stream_summary(rounds))
     for name, (rounds, summary) in streams.items():
         # Two passes of 16 MAC groups (8 columns each), a host fill per tile
@@ -139,10 +141,70 @@ def test_derived_stream_equals_the_conductors_dump(
             W.astype(np.float32) @ x.astype(np.float32),
             atol=2e-2,
         )
-        text = dump.read_text()
-        if "PASS 0 0" not in text:
-            pytest.skip("the installed pim_driver predates the address trace; rebuild it")
+        text = dump.read_text() if dump.is_file() else ""
+        assert "PASS 0 0" in text, (
+            "the installed pim_driver wrote no address trace: it predates the "
+            "TENON_CONDUCTOR_ADDRESS_TRACE switch of the release overlay; rebuild "
+            "it with `bash simulators/PIMSimulator/apply.sh <PIMSimulator checkout>` "
+            "(experiments/simulators/setup/PIMSimulator/apply.sh in the research "
+            "tree), which installs TenonConductor.inc and runs scons pim_driver"
+        )
         start = text.index("PASS 0 0")
         end = text.index("readback", start)
-        derived = samsung_conductor_trace_text(samsung_access_stream(compiled, 1))
-        assert text[start:end] == derived, name
+        stream = samsung_access_stream(compiled)  # the installed geometry, no default
+        assert stream.geometry_source == "installed pim_driver --describe"
+        assert stream.columns == 1
+        assert text[start:end] == samsung_conductor_trace_text(stream), name
+
+
+def test_access_stream_is_the_whole_program_and_never_a_silent_default():
+    """Reviewer round 33: the column count comes from the retained program
+    (a two-column GEMM has two columns' worth of passes), another count is
+    rejected, and a failing geometry query propagates instead of being
+    replaced by the offline default."""
+    from allo.dataflow import region
+    from allo.ir.types import float16 as fp16
+    from allo import spmw_samsung
+
+    M, K, N, ROWS = 4096, 128, 2, 32
+
+    @region()
+    def product(W: fp16[M, K], X: fp16[K, N], Y: fp16[M, N]):
+        @allo.work(mapping=[16, 8], args=[W, X, Y])
+        def body(a: fp16[M, K], b: fp16[K, N], c: fp16[M, N]):
+            p, u = allo.get_wid()
+            row0 = (p * 8 + u) * ROWS
+            for i in range(ROWS):
+                for j in range(N):
+                    acc: fp16 = 0
+                    for k in range(K):
+                        acc += a[row0 + i, k] * b[k, j]
+                    c[row0 + i, j] = acc
+
+    compiled = allo.compile(
+        product, build_samsung_target(), samsung_cost,
+        reduction_order="reassociate", backend="virtual",
+    )
+    program = compiled.compiled.layout_ctx.programs[0]
+    assert program.kind == "REDUCE" and program.contraction.N == 2
+    stream = samsung_access_stream(compiled, geometry=SAMSUNG_DEFAULT_GEOMETRY)
+    assert stream.columns == 2
+    assert {r.column_index for r in stream} == {0, 1}
+    assert samsung_access_stream(compiled, columns=2, geometry=SAMSUNG_DEFAULT_GEOMETRY).columns == 2
+    with pytest.raises(ValueError, match="not the program's stream"):
+        samsung_access_stream(compiled, columns=1, geometry=SAMSUNG_DEFAULT_GEOMETRY)
+    with pytest.raises(ValueError, match="positive integer"):
+        samsung_access_stream(compiled, columns=0, geometry=SAMSUNG_DEFAULT_GEOMETRY)
+    with pytest.raises(ValueError, match="geometry lacks"):
+        samsung_access_stream(compiled, geometry={"channels": 64})
+
+    def broken(root):
+        raise RuntimeError("installed driver has broken describe")
+
+    original = spmw_samsung.samsung_simulator_geometry
+    spmw_samsung.samsung_simulator_geometry = broken
+    try:
+        with pytest.raises(RuntimeError, match="broken describe"):
+            samsung_access_stream(compiled)
+    finally:
+        spmw_samsung.samsung_simulator_geometry = original
