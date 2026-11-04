@@ -464,10 +464,16 @@ def _check_host_transfers(program, group, effects, ops, storage_of) -> None:
                     f"transfers of {sorted(t.value for t in effects.transfers)}"
                 )
             allowed = {"in", "inout"} if direction == "write" else {"out", "inout"}
+            reupload = direction == "write" and getattr(op, "reupload", False)
+            if reupload:
+                # The host rewrites a produced value's device copy after the
+                # launch: it binds to the declared output (its device home).
+                allowed = {"out", "inout"}
             if transfer.direction not in allowed:
                 raise RuntimeError(
                     f"AiM realization {direction}s {label(ref, ref)!r} "
-                    f"({transfer.value!r}); the candidate declares it {transfer.direction!r}"
+                    f"({transfer.value!r}){' after its launch' if reupload else ''}; "
+                    f"the candidate declares it {transfer.direction!r}"
                 )
             side = "in" if direction == "write" else "out"
             landing = storage_of(transfer.value, side)
@@ -2018,6 +2024,11 @@ class _AimProgramDerivation:
                 buffer_refs=(key,),
                 buffer_slices=(index,),
                 group_id=group.group_id,
+                # A write into a layout the group *stores* to: the host
+                # rewrites a value the kernel produced, after its launch
+                # (`_host_usage` binds a scatter with no later reader to the
+                # producer's output slot).
+                reupload=bool(usage.store and verb != "gather"),
             )
             last = pending[-1] if pending else None
             if (
@@ -2034,6 +2045,7 @@ class _AimProgramDerivation:
                         "group_id",
                         "first_element",
                         "vector_elements",
+                        "reupload",
                     )
                 )
                 and last["bank_offset"] + last["copies"] == transfer["bank_offset"]

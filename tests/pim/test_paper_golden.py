@@ -186,6 +186,19 @@ _LEAF_CHECKED = {
 _AIM_DEFAULT_CASES = frozenset(
     {"norm_residual_l128", "attention_l128", "softmax_pim_l128"}
 )
+# Paper rows whose program was corrected after publication (ISSUES X-19,
+# round 25): the decode region's RoPE kernels covered D of the D2 elements
+# the host scatters (a strided half of each partition's data).  The rows keep
+# the paper's values; the live check pins the corrected program's cycles
+# exactly and reports the deviation.  Every value here is above the paper's by
+# the two wider EWMULs (32 cycles) and below CENT's (`docs/release/
+# paper_reproduction/inventory.csv`).
+AIM_CORRECTED_PROGRAMS = {
+    "qkvo_rope_l128": 129637,
+    "full_block_l128": 421191,
+    "full_block_l512": 446835,
+    "full_block_l4096": 697348,
+}
 _APU_V1_BOARD_CASES = frozenset({"histogram"})
 _SAMSUNG_COMPILE_BUDGET_S = 120.0
 _AIM_COMPILE_BUDGET_S = 120.0
@@ -340,6 +353,14 @@ def test_aim_cent_paper_cycles(row, aim_sim_gate):
     # The trace carries no data; the region's buffers are not runtime inputs.
     result = compiled.run_backend()
 
+    corrected = AIM_CORRECTED_PROGRAMS.get(row.case_id)
+    if corrected is not None:
+        print(
+            f"AIM_GOLDEN {row.case_id} paper={row.expected} corrected_program="
+            f"{corrected} measured={result.cycles} (ISSUES X-19)"
+        )
+        assert result.cycles == corrected, (row, corrected, result.cycles)
+        return
     assert _within(result.cycles, row), (row, result.cycles)
 
 

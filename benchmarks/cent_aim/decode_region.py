@@ -220,12 +220,15 @@ def build_decode_region(spec, banks_per_channel: int = 16):
         # ---------------- RoPE device multiply ---------------- #
         @allo.work(mapping=[R], args=[cs_q, m_q, r_q])
         def rope_q(cs: bfloat16[D2], ms: bfloat16[D2], rs: bfloat16[D2]):
-            for i in range(D):
+            # The PIM portion of RoPE multiplies the concatenated
+            # [q; rotate_half(q)] (2D elements) by [cos; sin]; the host adds
+            # the halves.  The kernel covers every element the host scatters.
+            for i in range(D2):
                 rs[i] = cs[i] * ms[i]
 
         @allo.work(mapping=[R], args=[cs_k, m_k, r_k])
         def rope_k(cs: bfloat16[D2], ms: bfloat16[D2], rs: bfloat16[D2]):
-            for i in range(D):
+            for i in range(D2):
                 rs[i] = cs[i] * ms[i]
 
         # ---------------- attention ---------------- #

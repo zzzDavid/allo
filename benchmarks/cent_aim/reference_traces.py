@@ -58,4 +58,39 @@ TYPED_TRACE_LINES = MappingProxyType(
     }
 )
 
-__all__ = ["TYPED_TRACE_PROVENANCE", "TYPED_TRACE_SHA256", "TYPED_TRACE_LINES"]
+# Round 25 (2026-11-04, release gate G10): the RoPE kernels of the decode
+# region now cover the D2-element vector the host scatters (the typed-route
+# program iterated D elements, a strided half of each partition's data; the
+# round 23 transfer frame check refused it).  The four affected traces differ
+# from the typed-route pins only in the two EWMUL op sizes (16 instead of 8
+# columns per row); their opcode inventories still equal CENT's.  Generated
+# by the matcher path (`allo.compile(case.region, build_aim_target(), aim_cost,
+# host_moves=case.host_program, reduction_order="reassociate")`) at the
+# revision that introduced the correction; line counts unchanged.
+CORRECTED_TRACE_PROVENANCE = "matcher path @ tenon round 25, 2026-11-04 (RoPE D2)"
+
+CORRECTED_TRACE_SHA256 = MappingProxyType(
+    {
+        "qkvo_rope_l128": "c25203892997d24def2f536a3fd416aca5bd4bade11f4e4da0869bab14e68ffe",
+        "full_block_l128": "05101b9337b0dd8b33741f093fffb4c9dfcb57d3943027587ff110f56edf659a",
+        "full_block_l512": "3603565dc1031f897cf85bba392d1de25e774dd80b60e411e81a174eb4c22f93",
+        "full_block_l4096": "8abfcb04091bc78412938a3844b85d69524b687e5770ac821bf649e76fc48172",
+    }
+)
+
+
+def reference_trace_sha256(case_id: str) -> str:
+    """The pinned trace hash the matcher path must reproduce for ``case_id``:
+    the corrected pin where the benchmark program was corrected, else the
+    typed-route pin."""
+    return CORRECTED_TRACE_SHA256.get(case_id, TYPED_TRACE_SHA256[case_id])
+
+
+__all__ = [
+    "CORRECTED_TRACE_PROVENANCE",
+    "CORRECTED_TRACE_SHA256",
+    "TYPED_TRACE_PROVENANCE",
+    "TYPED_TRACE_SHA256",
+    "TYPED_TRACE_LINES",
+    "reference_trace_sha256",
+]

@@ -497,6 +497,11 @@ class AimDistributedHostTransfer(AimOp):  # pylint: disable=too-many-instance-at
     # vector (``first_element`` 0, ``vector_elements`` = ``elements``).
     first_element: int = 0
     vector_elements: int | None = None
+    # A host write of a value the launched kernel produced, issued after that
+    # launch in the host program (the host rewrites the device copy, as
+    # CENT's store helper does after the host side of RoPE); the record
+    # follows the producer's output layout.  Never an ingress of the kernel.
+    reupload: bool = False
 
     def __post_init__(self):
         direction = str(self.direction).lower()
@@ -1841,6 +1846,7 @@ class _AimLowerer:
             "elements_per_replica": operation.elements,
             "first_element": first,
             "vector_elements": total,
+            "reupload": bool(operation.reupload),
             "replicas": operation.replicas,
             "channels_per_replica": operation.channels_per_replica,
             "partitions_per_replica": partitions,

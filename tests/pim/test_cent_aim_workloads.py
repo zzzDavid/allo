@@ -73,8 +73,11 @@ def test_matcher_trace_is_typed_trace_and_vendor_inventory(case, spec, cent):
     manifest = semantic_manifest(case.case_id, spec, compiled)
     commands = [str(line) for line in compiled.compiled.cmds]
 
-    # Byte identity with the pinned typed-route trace.
-    assert manifest["compiled_trace"]["sha256"] == TYPED_TRACE_SHA256[case.case_id]
+    # Byte identity with the pinned trace (the typed-route trace, or the
+    # corrected program's trace where the benchmark program was corrected).
+    from benchmarks.cent_aim.reference_traces import reference_trace_sha256
+
+    assert manifest["compiled_trace"]["sha256"] == reference_trace_sha256(case.case_id)
 
     # Vendor opcode inventory, except the complete V-cache append.
     expected = dict(VENDOR_TRACE_CONTRACTS[case.case_id].opcode_counts)

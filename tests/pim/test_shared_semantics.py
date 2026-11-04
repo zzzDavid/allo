@@ -3443,3 +3443,40 @@ def test_flat_slices_of_a_matrix_cover_whole_rows_exactly():
     check(("W[0:5280]", "W[5280:7920]"))
     with pytest.raises(InfeasibleSchedule, match="whole rows"):
         check(("W[0:2000]", "W[2000:7920]"))
+
+
+def test_aim_host_rewrite_of_a_produced_value_after_its_launch_is_a_reupload():
+    """A host scatter of a kernel output after the kernel ran (CENT's store
+    helper after the host side of RoPE) is a re-upload of a produced value:
+    the record follows the producer's output slot, is marked ``reupload``
+    and binds to the declared output; the same scatter before the launch
+    would be an ingress the candidate does not declare."""
+    from allo.pim.aim_lowering import AimDistributedHostTransfer
+
+    def rewrite_after(A, B, C):
+        hx = allo.host_xfer
+        hx.scatter(A, hx.banks)
+        hx.scatter(B, hx.banks)
+        allo.launch("multiply", A, B, C)
+        hx.scatter(C, hx.banks)
+        hx.gather(C, hx.banks)
+
+    compiled = _compile_aim_pointwise(rewrite_after)
+    ctx = compiled.compiled.layout_ctx
+    writes = [
+        op
+        for op in ctx.lowered_operations
+        if isinstance(op, AimDistributedHostTransfer) and op.direction == "write"
+    ]
+    names = {op.name: op.reupload for op in writes}
+    assert names.get("C") is True, names
+    assert all(not flag for name, flag in names.items() if name != "C"), names
+    ctx.check_realization(compiled.compiled.layout)
+    # Relabelled as an ordinary ingress, the same record is refused: C is
+    # declared out.
+    ctx.lowered_operations = tuple(
+        replace(op, reupload=False) if getattr(op, "name", None) == "C" else op
+        for op in ctx.lowered_operations
+    )
+    with pytest.raises(RuntimeError, match="declares it 'out'"):
+        ctx.check_realization(compiled.compiled.layout)

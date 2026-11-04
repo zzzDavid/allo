@@ -910,6 +910,23 @@ and X-18 the stage is checked on multi-dimensional buffers too.
 Gate G9 remains **FAIL** (hybrid scalar ABI, slice 5 hardware traces);
 G10 is open.
 
+### G10 start (round 25)
+
+The inventory (`paper_reproduction/inventory.csv`, 82 rows) was measured
+first where the shared pipeline is usable locally: Samsung's three GEMVs
+(default selection faster than the paper, outputs checked), UPMEM's sixteen
+kernels (exact, NumPy-exact outputs), ten of fourteen AiM CENT rows (exact,
+timing-only) and the 500 AttAcc instances (shared selection equals the
+paper's selection on all 500 through `allo.compile`). The four
+RoPE-containing AiM rows did not compile: the round 23 frame check exposed
+that the paper's program multiplied a strided half of the scattered RoPE
+data (X-19). Judgment: the paper's digits for those rows are not a target to
+force; the kernel is corrected to the work CENT performs, the measurement is
+reported against both the paper and CENT, and the golden rows keep the paper
+values while naming the deviation. The direct selector call in the 500
+instance golden test does not establish shared selection; the measured
+route is `benchmarks/attacc/scripts/verify_paper_selection.py`.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
