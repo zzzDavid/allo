@@ -889,6 +889,27 @@ candidate is a contract problem everywhere. Open for G9: the hybrid
 manifest's scalar ABI from retained IR, the slice 5 hardware traces, and
 independent review of rounds 23-24. Gate G9 remains **FAIL**.
 
+## Round 25 (2026-11-04): independent review of 9d13666; AttAcc orchestration and datapath fidelity, availability shapes
+
+The reviewer accepted the UPMEM/AttAcc migration as real progress and found
+four G9 gaps, all reproduced by `reviewer-r24/probe_attacc_contract.py`.
+Judgments: (1) an analytical backend is still bound by the retained
+schedule: AttAcc now emits one inventory per launch in schedule order, so
+the artifact, the realization check and the priced graph describe the same
+program (X-15); (2) a realization check that accepts "either home" checks
+nothing: the AttAcc check binds every external MAC value to the datapath
+role its facts give it, with the exact route, and checks the phase order and
+the softmax scratch (X-16); (3) the full allocation shape is a fact of the
+normalized program, not of a factory's annotations: the availability stage
+reads it from the entry facts by retained identity before residency (X-17);
+(4) the flat-slice conversion was a plain bug, fixed and pinned by a test
+whose rejected case names the missing row (X-18). The round 23 one-dimensional
+transfer probes therefore did not establish complete X-09 closure; with X-17
+and X-18 the stage is checked on multi-dimensional buffers too.
+
+Gate G9 remains **FAIL** (hybrid scalar ABI, slice 5 hardware traces);
+G10 is open.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead

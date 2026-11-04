@@ -1215,6 +1215,18 @@ def check_transfer_availability(trace, launch_schedule, host_moves, placements):
         name_by_key[ref] = name
         if shape is not None:
             shape_by_key[ref] = tuple(int(d) for d in shape)
+    # The full allocation shape of every parameter comes from the normalized
+    # program's facts (the entry function's IR types), keyed by retained
+    # identity: a factory whose annotations name closure dimensions gives
+    # the schedule no shape, and an accessed region is never the allocation.
+    semantics = getattr(trace, "semantics", None)
+    for parameter in getattr(semantics, "parameters", ()) or ():
+        ref = refs.get(parameter.ordinal, parameter.value_ref)
+        if ref is None or not parameter.shape:
+            continue
+        shape_by_key[ref] = tuple(int(d) for d in parameter.shape)
+        key_by_name.setdefault(parameter.name, ref)
+        name_by_key.setdefault(ref, parameter.name)
 
     placements = (
         list(placements) if isinstance(placements, (list, tuple)) else [placements]
@@ -1244,7 +1256,6 @@ def check_transfer_availability(trace, launch_schedule, host_moves, placements):
                     if shape is None:
                         continue
                     box = tuple((0, d) for d in shape)
-                shape_by_key.setdefault(key, tuple(hi for _lo, hi in box))
                 out.setdefault(key, (access.memref_name, []))[1].append(box)
         return out
 
@@ -1280,18 +1291,20 @@ def check_transfer_availability(trace, launch_schedule, host_moves, placements):
                 and len(shape) > 1
                 and box[1:] == tuple((0, 1) for _ in shape[1:])
             ):
-                # A flat range over a multi-dimensional buffer: expand to the
-                # boxes it covers only when it is whole rows.
-                first, count = box[0]
+                # A flat range ``[start, stop)`` over a multi-dimensional
+                # buffer (the form `slice_region` returns for one bounded
+                # range): the whole rows of the leading dimension it covers.
+                start, stop = box[0]
                 inner = 1
                 for d in shape[1:]:
                     inner *= d
-                if first % inner or count % inner:
+                if start % inner or stop % inner:
                     raise InfeasibleSchedule(
-                        f"host {verb} of {role}: a flat range over a "
-                        f"{len(shape)}-dimensional buffer must cover whole rows"
+                        f"host {verb} of {role}: the flat range [{start}, {stop}) "
+                        f"over a buffer of {shape} must cover whole rows of "
+                        f"{inner} elements"
                     )
-                box = ((first // inner, (first + count) // inner),) + tuple(
+                box = ((start // inner, stop // inner),) + tuple(
                     (0, d) for d in shape[1:]
                 )
             available.setdefault(key, []).append(box)

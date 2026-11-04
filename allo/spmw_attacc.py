@@ -255,8 +255,12 @@ class AttAccCtx(CodegenContext):
         super().__init__(target)
         self.geometry = attacc_geometry(target)
         self.programs = []
-        # id(placement) -> the program emitted for it (realization check).
+        # id(placement) -> the program emitted for it, the number of launches
+        # the retained schedule issues of it, and the datapath roles of its
+        # matches (matrix, vector, result values) for the realization check.
         self._program_of_layout: dict = {}
+        self._launches_of_layout: dict = {}
+        self._roles_of_layout: dict = {}
 
     def cmd(self, name, **fields):
         raise NotImplementedError(
@@ -269,12 +273,25 @@ class AttAccCtx(CodegenContext):
     def emit_program(
         self, trace, layouts, *, schedule=None, host_moves=(), module=None
     ):
+        """One command inventory per launch of the retained schedule, in its
+        order and multiplicity (a kernel launched twice is two programs and
+        twice the commands; a kernel the host program never launches emits
+        nothing); without a schedule, one inventory per matched kernel.
+        Host transfer steps emit no commands here: the AttAcc model times
+        kernels with their operands resident in the banks, and its cost
+        program refuses to price host ingress."""
         from .pim.schedule_search import InfeasibleSchedule
-        from .spmw_autoschedule import Placement, _bucket_for_autoschedule
+        from .spmw_autoschedule import (
+            Placement,
+            _bucket_for_autoschedule,
+            _matcher_work_scope,
+        )
 
+        del host_moves, module
         buckets = _bucket_for_autoschedule(trace)
         if isinstance(layouts, Placement):
             layouts = [layouts] * len(buckets)
+        built = []
         for (_scope, matches), placement in zip(buckets, layouts):
             kernel = attacc_kernel_from_matches(matches)
             extra = getattr(placement, "extra", {}) or {}
@@ -293,17 +310,44 @@ class AttAccCtx(CodegenContext):
                 program = attacc_program(kernel, tiling, self.geometry)
             except (AttAccDomainError, ValueError) as error:
                 raise InfeasibleSchedule(str(error)) from error
-            self.programs.append(program)
             self._program_of_layout[id(placement)] = program
+            self._roles_of_layout[id(placement)] = _datapath_roles(matches)
+            self._launches_of_layout[id(placement)] = 0
+            built.append((_matcher_work_scope(matches[0]).group_id, placement, program))
+        if schedule is None:
+            order = [(placement, program) for _g, placement, program in built]
+        else:
+            from .spmw_plan import LaunchStep
+
+            by_group: dict = {}
+            for group_id, placement, program in built:
+                by_group.setdefault(group_id, []).append((placement, program))
+            order = []
+            for step in schedule.steps:
+                if not isinstance(step, LaunchStep):
+                    continue
+                if step.group_id not in by_group:
+                    raise InfeasibleSchedule(
+                        f"AttAcc schedule launches unknown kernel group {step.group_id}"
+                    )
+                order.extend(by_group[step.group_id])
+        for placement, program in order:
+            self.programs.append(program)
+            self._launches_of_layout[id(placement)] += 1
             self.cmds.extend(program.command_lines())
 
     def check_realization(self, layouts) -> None:
         """The emitted command inventory against the selected candidates'
-        declared effects: the kernel family and tiling every launch names,
-        the score/context extents the launches advance (the kernel's rows,
-        reduction and outputs), zero-started accumulators, and the fixed
-        AttAcc homes (matrices in the banks, vectors in the GEMV buffer,
-        results in the accumulator)."""
+        declared effects: the kernel family and tiling every launch names;
+        the command phases in the kernel's order (one MAC for a GEMV; QK^T,
+        the three softmax steps and PV for attention, with the score rows
+        declared as softmax-unit scratch); the score/context extents the MAC
+        phases advance (the kernel's rows, reduction and outputs) from zero;
+        per retained role of the MAC facts, the datapath home and route the
+        inventory models (the matrix scattered to the ``banks``, an external
+        vector written from the banks into the ``gemv_buffer`` by ``WR_GB``,
+        every result read back from the accumulator ``acc``); and one emitted
+        inventory per launch the schedule issues of the candidate."""
         from .spmw_candidate import candidate_effects
 
         layouts = list(layouts) if isinstance(layouts, (list, tuple)) else [layouts]
@@ -330,17 +374,32 @@ class AttAccCtx(CodegenContext):
                         f"AttAcc realization uses tiling {tiling}; launch "
                         f"{launch.index} of the candidate declares {launch.covers}"
                     )
+            phases = [
+                launch.covers[-1] if launch.covers else None
+                for launch in effects.launches
+            ]
+            expected_phases = {
+                "gemv": ["MAC"],
+                "attention": ["MAC", "SFM_EXP", "SFM_SUM", "SFM_DIV", "MAC"],
+            }[kernel.kind]
+            if phases != expected_phases:
+                raise RuntimeError(
+                    f"AttAcc {kernel.kind} issues the phases {expected_phases} in "
+                    f"order; the candidate declares {phases}"
+                )
+            scratch = {storage for _n, _b, storage in effects.allocations}
+            if ("softmax_buffer" in scratch) != (kernel.kind == "attention"):
+                raise RuntimeError(
+                    f"AttAcc {kernel.kind} "
+                    f"{'moves' if kernel.kind == 'attention' else 'has no'} score "
+                    "rows through the softmax unit; the candidate's allocations are "
+                    f"{sorted(scratch)}"
+                )
             macs = [
                 launch
                 for launch in effects.launches
                 if launch.covers and launch.covers[-1] == "MAC"
             ]
-            phases = {"gemv": 1, "attention": 2}[kernel.kind]
-            if len(macs) != phases:
-                raise RuntimeError(
-                    f"AttAcc {kernel.kind} issues {phases} MAC phase(s); the candidate "
-                    f"declares {len(macs)}"
-                )
             # (instances, reduction) of each MAC phase from the kernel extents:
             # a GEMV computes rows x outputs over the reduction; attention
             # scores rows x outputs(length) over reduction(d_head), then the
@@ -361,21 +420,39 @@ class AttAccCtx(CodegenContext):
                         "AttAcc command streams start every accumulator from zero; "
                         f"launch {launch.index} declares {launch.accumulator!r}"
                     )
-            homes = {"banks", "gemv_buffer"}
-            for value in effects.value_layouts:
-                if (
-                    value.value in effects.coverage.inputs
-                    and value.storage not in homes
-                ):
+            roles = self._roles_of_layout.get(id(layout), {})
+            storage = {v.value: v.storage for v in effects.value_layouts}
+            routes = {t.value: tuple(t.route) for t in effects.transfers}
+            expected = {}
+            for name in roles.get("matrix", ()):
+                expected[name] = ("banks", ("host_scatter", "banks"))
+            for name in roles.get("vector", ()):
+                expected.setdefault(
+                    name,
+                    ("gemv_buffer", ("host_scatter", "banks", "WR_GB", "gemv_buffer")),
+                )
+            for name in roles.get("result", ()):
+                expected[name] = ("acc", ("acc", "host_readback"))
+            for name, (home, route) in expected.items():
+                if storage.get(name) != home or routes.get(name) != route:
                     raise RuntimeError(
-                        f"AttAcc realization reads {value.value!r} from the banks or "
-                        f"the GEMV buffer; the candidate declared {value.storage!r}"
+                        f"AttAcc realization keeps {name!r} in {home!r} through "
+                        f"{route}; the candidate declared {storage.get(name)!r} "
+                        f"through {routes.get(name)}"
                     )
-                if value.value in effects.coverage.outputs and value.storage != "acc":
-                    raise RuntimeError(
-                        f"AttAcc realization accumulates {value.value!r} in the PIM "
-                        f"accumulator; the candidate declared {value.storage!r}"
-                    )
+            undeclared = set(effects.coverage.inputs) - set(expected)
+            undeclared |= set(effects.coverage.outputs) - set(expected)
+            if undeclared:
+                raise RuntimeError(
+                    f"AttAcc realization has no datapath role for {sorted(undeclared)}"
+                )
+            launched = self._launches_of_layout.get(id(layout), 0)
+            emitted = sum(1 for p in self.programs if p is program)
+            if emitted != launched:
+                raise RuntimeError(
+                    f"AttAcc realization emitted {emitted} inventories of "
+                    f"{layout.mode!r} for {launched} launch(es)"
+                )
 
     def runtime_route(self, commands):
         return ("attacc-analytical", ())
@@ -401,6 +478,32 @@ class AttAccCtx(CodegenContext):
             extra["attacc_kernel"] = programs[0]["kernel"]
             extra["attacc_counts"] = programs[0]["counts"]
         return extra
+
+
+def _datapath_roles(matches) -> dict:
+    """``{"matrix": [...], "vector": [...], "result": [...]}``: the external
+    values of the work item's MAC facts by the role the AttAcc datapath gives
+    them (bank-resident matrix, GEMV-buffer vector, accumulator result).  A
+    local vector (attention's probabilities) and local accumulators are
+    internal to the inventory."""
+    roles: dict = {"matrix": [], "vector": [], "result": []}
+    for match in matches:
+        fact = match.extra.get("semantic_facts")
+        if fact is None or not hasattr(fact, "reduction_vars"):
+            continue
+        matrix = fact.matrix.memref_name if fact.matrix is not None else None
+        for access in fact.inputs:
+            if access.local or access.memref_name is None:
+                continue
+            bucket = "matrix" if access.memref_name == matrix else "vector"
+            if access.memref_name not in roles[bucket]:
+                roles[bucket].append(access.memref_name)
+        results = [] if fact.accumulator.local else [fact.accumulator]
+        results.extend(fact.external_sinks)
+        for access in results:
+            if access.memref_name and access.memref_name not in roles["result"]:
+                roles["result"].append(access.memref_name)
+    return roles
 
 
 def _run_attacc(compiled, **inputs):

@@ -3272,3 +3272,174 @@ def test_attacc_realization_is_compared_with_the_declaration(monkeypatch):
     rejections = _all_rejections(compiled)
     assert "uses tiling" in rejections, rejections
     assert compiled.estimate().cycles >= reference.estimate().cycles
+
+
+# --------------------------------------------------------------------------- #
+# v. Review round 24: AttAcc honours the launch schedule and binds its datapath
+#    roles; the shared availability check uses the IR's allocation shapes and
+#    converts flat multi-dimensional slices correctly (X-15 to X-18)
+# --------------------------------------------------------------------------- #
+
+
+def _attacc_factory_region():
+    from benchmarks.attacc.workloads import gemv_region
+
+    return gemv_region(3, 80, 33)
+
+
+def _attacc_once(W, x, y):
+    allo.launch("gemv", W, x, y)
+
+
+def _attacc_twice(W, x, y):
+    allo.launch("gemv", W, x, y)
+    allo.launch("gemv", W, x, y)
+
+
+def test_attacc_resident_inputs_of_a_deferred_annotation_factory_are_available():
+    """A benchmark factory whose annotations name closure dimensions gives the
+    schedule no parameter shapes; the availability check takes the full
+    allocation shapes from the normalized program's facts, so resident
+    inputs are available (X-17)."""
+    region = _attacc_factory_region()
+    host = allo.host_program(region, resident=("W", "x"))(_attacc_once)
+    compiled = _compile_attacc_with(region, host_moves=host)
+    assert compiled.estimate().cycles == 320
+    assert [s for s in compiled.compiled.launch_schedule.parameters] == [
+        ("W", None),
+        ("x", None),
+        ("y", None),
+    ]
+
+
+def _compile_attacc_with(region, **kw):
+    from allo.pim.costs import attacc_cost
+    from allo.pim.targets import build_attacc_target
+
+    return allo.compile(
+        region,
+        build_attacc_target(),
+        attacc_cost,
+        backend="virtual",
+        reduction_order="reassociate",
+        **kw,
+    )
+
+
+def test_attacc_materializes_one_inventory_per_launch():
+    """The analytical artifact follows the retained schedule: two launches of
+    the GEMV are two program records and twice the commands, and the priced
+    graph agrees (X-15)."""
+    region = _attacc_factory_region()
+    once = _compile_attacc_with(
+        region, host_moves=allo.host_program(region, resident=("W", "x"))(_attacc_once)
+    )
+    twice = _compile_attacc_with(
+        region,
+        host_moves=allo.host_program(region, resident=("W", "x"))(_attacc_twice),
+    )
+    assert len(once.compiled.layout_ctx.programs) == 1
+    assert len(twice.compiled.layout_ctx.programs) == 2
+    assert list(twice.compiled.cmds) == list(once.compiled.cmds) * 2
+    assert twice.estimate().cycles == 2 * once.estimate().cycles == 640
+    manifest = twice.compiled.layout_ctx.virtual_run_extra()
+    assert len(manifest["attacc_programs"]) == 2
+
+
+def test_attacc_swapped_datapath_declaration_is_refused_at_materialization():
+    """A declaration that passes the shared validator but swaps the matrix
+    and vector homes (and their routes) does not describe the inventory the
+    AttAcc model emits: every such candidate is rejected at materialization
+    with the role named (X-16)."""
+    from allo import spmw_attacc
+
+    original = spmw_attacc.attacc_candidate_effects
+    swap = {"banks": "gemv_buffer", "gemv_buffer": "banks"}
+
+    def swapped(target, matches, placement):
+        effects = original(target, matches, placement)
+        if effects is None:
+            return effects
+        return replace(
+            effects,
+            value_layouts=tuple(
+                replace(v, storage=swap.get(v.storage, v.storage))
+                for v in effects.value_layouts
+            ),
+            transfers=tuple(
+                replace(t, route=tuple(swap.get(s, s) for s in t.route))
+                for t in effects.transfers
+            ),
+        )
+
+    spmw_attacc.attacc_candidate_effects = swapped
+    try:
+        with pytest.raises(RuntimeError) as error:
+            _compile_attacc_with(_attacc_factory_region())
+    finally:
+        spmw_attacc.attacc_candidate_effects = original
+    message = str(error.value)
+    assert "keeps 'lW' in 'banks'" in message, message
+
+
+def test_attacc_attention_phase_order_is_checked(monkeypatch):
+    """The attention inventory issues QK^T, exp, sum, div, PV in that order;
+    a declaration with the phases reordered is refused."""
+    from allo import spmw_attacc
+
+    regions = _attacc_regions()
+    original = spmw_attacc.attacc_candidate_effects
+
+    def reordered(target, matches, placement):
+        effects = original(target, matches, placement)
+        if effects is None:
+            return effects
+        launches = list(effects.launches)
+        launches[0], launches[1] = (
+            replace(launches[1], index=0),
+            replace(launches[0], index=1),
+        )
+        return replace(effects, launches=tuple(launches))
+
+    monkeypatch.setattr(spmw_attacc, "attacc_candidate_effects", reordered)
+    with pytest.raises(RuntimeError, match="phases"):
+        _compile_attacc(regions["attention_region"](8, 128, 256))
+
+
+def test_flat_slices_of_a_matrix_cover_whole_rows_exactly():
+    """Flat ranges over a 3x33x80 matrix: two scatters covering rows 0 and 1
+    leave row 2 missing (rejected); three covering every row are complete
+    (accepted); a range that is not whole rows is refused (X-18).  Checked
+    through the shared stage directly: the AttAcc cost refuses to price host
+    ingress, so the compile stops before the stage on that target."""
+    from types import SimpleNamespace
+
+    from allo.pim.schedule_search import InfeasibleSchedule
+    from allo.spmw_plan import HostStep, LaunchStep, check_transfer_availability
+
+    region = _attacc_factory_region()
+    compiled = _compile_attacc_with(
+        region, host_moves=allo.host_program(region, resident=("W", "x"))(_attacc_once)
+    )
+    schedule = compiled.compiled.launch_schedule
+    launch = next(s for s in schedule.steps if isinstance(s, LaunchStep))
+
+    def check(slices):
+        steps = tuple(HostStep(i) for i in range(len(slices))) + (launch,)
+        moves = [
+            SimpleNamespace(verb=SimpleNamespace(name="scatter"), buffer_role=s)
+            for s in slices
+        ]
+        check_transfer_availability(
+            compiled.trace,
+            replace(schedule, steps=steps, resident=frozenset(("x",))),
+            moves,
+            compiled.compiled.layout,
+        )
+
+    with pytest.raises(InfeasibleSchedule, match=r"has not brought \[\(2, 3\)"):
+        check(("W[0:2640]", "W[2640:5280]"))
+    check(("W[0:2640]", "W[2640:5280]", "W[5280:7920]"))
+    check(("W[0:5280]", "W[5280:7920]"))
+    with pytest.raises(InfeasibleSchedule, match="whole rows"):
+        check(("W[0:2000]", "W[2000:7920]"))

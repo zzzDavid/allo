@@ -689,3 +689,14 @@ files are named by their content).
 | `tests/pim/test_shared_semantics.py`, whole file on the round 24 tree before the X-14 route fix (`r23/pytest_shared_semantics_final.log`) | 108 passed in 680 s (sections a-u) |
 | the UPMEM simulator rows for the carried histogram, the carried reduction and the selection with a carried count (`r23/pytest_upmem_sim_final.log`, uPIMulator through its gate) | 3 passed |
 | black (24.8.0) on the changed files; pylint on `spmw_candidate.py`, `spmw_upmem.py`, `spmw_attacc.py`, `spmw_pipeline.py` (`r23/pylint_r24.log`) | black clean; pylint: the new derivers and realization checks carry the same size notes as the Samsung and AiM ones (too-many-locals/branches/statements, imports inside the function to avoid the import cycle with `spmw_candidate`), recorded under P-23; the two `use-maxsplit-arg` notes were fixed; no other new findings |
+
+## Round 25 (2026-11-04): review findings X-15 to X-18
+
+Same interpreter and `LLVM_BUILD_DIR`; checkout as working directory. Logs
+under `/work/shared/users/phd/nz264/tenon-release-evidence/r25/`.
+
+| Check (round 25 tree) | Result |
+|---|---|
+| the reviewer's `probe_attacc_contract.py` (`reviewer-r24/`, unchanged; `r25/probe_attacc_contract.log`) | stops at its first case with the intended outcome: every swapped-home candidate is rejected at materialization ("keeps 'lW' in 'banks' through ('host_scatter', 'banks'); the candidate declared 'gemv_buffer' ...") and the compile fails with no feasible placement; the probe's later cases are the section v tests |
+| `tests/pim/test_shared_semantics.py` section v with the AttAcc, availability, residency and scatter rows (`r25/section_v.log`) | 15 passed |
+| regression batch on the round 25 tree (`r25/pytest_r25_batch.log`: `test_attacc_virtual.py` without the 500-instance row, `test_cent_aim_workloads.py`, `test_aim_token_partition.py`, `test_upmem_matcher.py`, the whole `test_shared_semantics.py`) | 170 passed, 14 skipped in 819 s |
