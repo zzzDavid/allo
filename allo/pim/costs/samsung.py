@@ -88,6 +88,17 @@ FIBER_TILE_CYCLES = 47
 # Ordered program (module docstring): per reduction element and per pass.
 TEMPORAL_STEP_CYCLES = 51
 TEMPORAL_PASS_CYCLES = 681
+# Tile rows (release S-13).  issue_order=row_pair with tile_rows=same_bank
+# issues a tile's two rows of one bank under one barrier; measured on the
+# conductor the execution phase grows by 45,481 cycles for 16 pairs on the
+# 8192x256 GEMV and by 45,559 for 16 pairs on the 4096x512 GEMV (VALIDATION
+# round 36), 2,843 and 2,847 per pair, far above the device's tRP + tRCDRD
+# (14 + 14) because the barrier group waits on the row conflict across the
+# whole fabric.  The constant is that measurement (two shapes, one value),
+# not a fit to the paper's probe.  tile_rows=split_fibers stages every
+# tile's second row in the odd fiber and pays the odd-fiber row-open cost
+# per tile (FIBER_TILE_CYCLES, the empirical odd-fiber term above).
+ROW_PAIR_SAME_BANK_CYCLES = 2845
 
 
 def _ceil_div(value, divisor):
@@ -151,6 +162,14 @@ def samsung_cost(target):
             + fibers * JUMP_CYCLES
             + later_fiber_tiles * FIBER_TILE_CYCLES
         )
+        if candidate.get("issue_order") == "row_pair":
+            groups_per_tile = int(target.grf_b.slots)
+            pairs = tiles * (groups_per_tile // 2)
+            if candidate.get("tile_rows") == "split_fibers":
+                # Every tile's second row lives in the odd fiber.
+                latency += tiles * FIBER_TILE_CYCLES
+            else:
+                latency += pairs * ROW_PAIR_SAME_BANK_CYCLES
         occupy_compute(event, ctx, latency, MAC_CYCLES)
         # Several reduction columns (GEMM N, batched GEMV) with a restaged
         # matrix: each extra column rewrites this work item's matrix rows

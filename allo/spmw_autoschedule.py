@@ -120,6 +120,8 @@ _MATCHER_PHYSICAL_EXTRA_FIELDS = (
     "n_fibers",
     "grf_residency",
     "crf_issue",
+    "issue_order",
+    "tile_rows",
     "stage_resident",
     "group_size",
     "groups_per_vr",
@@ -661,8 +663,76 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             "grf_staged": lane_split,
             "dual_fiber": lane_split
             + f" after splitting the reduction tiles over {n_fibers} bank fibers",
+            "bank_row_rowpair": lane_split,
+            "split_rows": lane_split
+            + " after staging every tile's second row in the odd bank fiber",
+            "split_rows_rowpair": lane_split
+            + " after staging every tile's second row in the odd bank fiber",
         }
-        base_candidates = [bank_row, grf_staged, dual_fiber, temporal]
+        # Tile rows (release S-13, design/samsung-bank-row-swizzle-route.md).
+        # A tile's G*E columns are two physical rows.  ``bank_row_rowpair``
+        # issues the two rows of one bank under one barrier (the identity
+        # packing's within-group conflict); ``split_rows`` stages every
+        # tile's second row in the odd fiber at the same column position,
+        # the F2 map half -> bank that `optimal_swizzle` chooses for a
+        # {half} segment over the two fibers (the XOR packing), with the
+        # vendor's barrier per group; ``split_rows_rowpair`` is the XOR
+        # packing under one barrier, which the lowering refuses (lockstep
+        # CRF hazard, measured).  All are REDUCE programs (they regroup).
+        half_base = LinearLayout.identity(
+            {"bank": banks_per_pim, "half": 2}, out_dims=("bank",), allow_zero=True
+        )
+        half_swizzled = LinearLayout.optimal_swizzle(
+            half_base, vec_dims=(), bank_dims=("bank",), segment_dims=("half",)
+        )
+        bank_row_rowpair = Placement(
+            placements={vector: target.grf_a, matrix: y_even, acc: target.grf_b},
+            mode="bank_row_rowpair",
+            extra={
+                "fiber_axis": "tile",
+                "issue_order": "row_pair",
+                "tile_rows": "same_bank",
+                "half_bank_map": half_base,
+            },
+            layout=swizzled,
+        )
+        split_rows = Placement(
+            placements={vector: target.grf_a, matrix: y_even, acc: target.grf_b},
+            mode="split_rows",
+            extra={
+                "fibers": list(fibers),
+                "fiber_axis": "tile",
+                "n_fibers": n_fibers,
+                "issue_order": "tile_major",
+                "tile_rows": "split_fibers",
+                "half_bank_map": half_swizzled,
+            },
+            layout=swizzled,
+        )
+        # Enumerated so the ranking records why it is rejected: the lowering
+        # refuses two banks inside one barrier group (lockstep CRF hazard).
+        split_rows_rowpair = Placement(
+            placements={vector: target.grf_a, matrix: y_even, acc: target.grf_b},
+            mode="split_rows_rowpair",
+            extra={
+                "fibers": list(fibers),
+                "fiber_axis": "tile",
+                "n_fibers": n_fibers,
+                "issue_order": "row_pair",
+                "tile_rows": "split_fibers",
+                "half_bank_map": half_swizzled,
+            },
+            layout=swizzled,
+        )
+        base_candidates = [
+            bank_row,
+            grf_staged,
+            dual_fiber,
+            temporal,
+            bank_row_rowpair,
+            split_rows,
+            split_rows_rowpair,
+        ]
         pruned = []
         if roles.accumulator_init == "carried":
             # Only the ordered program loads an initial accumulator (its first

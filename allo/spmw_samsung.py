@@ -869,6 +869,18 @@ class SamsungProgram:
     # the row-order packing; None means rows occupy slots in row order.
     row_slots: tuple | None = None
     row_map: str = "identity"
+    # Issue order of a tile's MAC groups: "tile_major" (the conductor's
+    # default, one barrier per group) or "row_pair" (group g and g + G/2 of
+    # one tile, its two physical rows, under one barrier).
+    issue_order: str = "tile_major"
+    # With row_pair: the second row of every tile staged in the partner
+    # (odd) fiber at the same column position ("split_fibers") or kept in
+    # the tile's own fiber ("same_bank").
+    tile_rows: str = "same_bank"
+
+
+ISSUE_ORDERS = ("tile_major", "row_pair")
+TILE_ROW_PLACEMENTS = ("same_bank", "split_fibers")
 
 
 def _infeasible(message):
@@ -1129,6 +1141,24 @@ class SamsungCtx(CodegenContext):
                         )
                     )
 
+    def _check_lever_realization(self, layout, program) -> None:
+        """The emitted program's issue order and row placement must be the
+        levers the candidate declared."""
+        extra = layout.extra or {}
+        declared = (
+            extra.get("issue_order", "tile_major"),
+            extra.get("tile_rows", "same_bank"),
+        )
+        realized = (
+            getattr(program, "issue_order", "tile_major"),
+            getattr(program, "tile_rows", "same_bank"),
+        )
+        if program.kind == "REDUCE" and declared != realized:
+            raise RuntimeError(
+                "Samsung realization issues the MAC groups as "
+                f"{realized} but the candidate declared {declared}"
+            )
+
     def check_realization(self, layouts) -> None:
         """The lowered CRF programs against the selected candidates' declared
         effects, per kernel group: the program kind; for a contraction the
@@ -1154,6 +1184,7 @@ class SamsungCtx(CodegenContext):
                     f"Samsung realization lowered no program for the candidate "
                     f"{layout.mode!r} that declares effects"
                 )
+            self._check_lever_realization(layout, program)
             if len(effects.launches) != 1 or effects.launches[0].kind != program.kind:
                 raise RuntimeError(
                     f"Samsung realization is a {program.kind} program; the candidate "
@@ -1550,30 +1581,85 @@ class SamsungCtx(CodegenContext):
         fibers = self._fiber_handles(layout, matrix_h)
         E, L, G = facts.grf_a_entries, facts.lanes, facts.grf_b_entries
         T = math.ceil(rep.K / (E * L))
-        tile_fiber = tuple(fibers[t % len(fibers)][0] for t in range(T))
         residency = (layout.extra or {}).get("grf_residency", {}) or {}
         vector_from_bank = residency.get(rep.vector_memref, "crf") != "host"
         mac = target.op("MAC")
+        extra = layout.extra or {}
+        issue_order = extra.get("issue_order", "tile_major")
+        tile_rows = extra.get("tile_rows", "same_bank")
+        if issue_order not in ISSUE_ORDERS or tile_rows not in TILE_ROW_PLACEMENTS:
+            raise _infeasible(
+                f"unknown issue_order/tile_rows levers {issue_order!r}/{tile_rows!r}"
+            )
+        if issue_order == "row_pair" or tile_rows == "split_fibers":
+            # A tile's G*E columns must be exactly two physical rows of
+            # cols_per_row burst columns (the pair, or the split, is the
+            # tile's two rows), and the GRF_B entry of a group follows the
+            # row parity.
+            if G % 2 or G * E != 2 * SAMSUNG_DEFAULT_GEOMETRY["cols_per_row"]:
+                raise _infeasible(
+                    "row_pair/split_fibers need a tile of exactly two physical rows "
+                    f"(G*E = {G * E}, cols_per_row = {SAMSUNG_DEFAULT_GEOMETRY['cols_per_row']})"
+                )
+        if issue_order == "row_pair" and tile_rows == "split_fibers":
+            # Measured on the conductor (VALIDATION round 36): with the two
+            # rows in two banks under one barrier, the memory controller may
+            # reorder the two banks' column commands, and the PIM's lockstep
+            # CRF executes whatever instruction is current with a fixed bank
+            # operand (EVEN_BANK/ODD_BANK), so a command for one bank can
+            # run the other bank's MAC and the results are wrong.  The ISA
+            # has no bank-agnostic operand; two banks need a barrier between
+            # them, which is the tile_major split_fibers candidate.
+            raise _infeasible(
+                "row_pair with split_fibers is unsound under the lockstep CRF: two "
+                "banks' column commands inside one barrier group may be reordered "
+                "against the fixed-bank MAC instructions (results differ; measured)"
+            )
+        if tile_rows == "split_fibers":
+            if vector_from_bank:
+                raise _infeasible(
+                    "split_fibers has no CRF-filled GRF_A variant (the odd fiber holds "
+                    "the tiles' second rows, not the vector)"
+                )
+            if [f for f, _h in fibers] != [0, 1]:
+                raise _infeasible(
+                    "split_fibers needs the even fiber (first rows) and the odd fiber "
+                    "(second rows) of each PIM unit"
+                )
+            tile_fiber = tuple(0 for _ in range(T))
+        else:
+            tile_fiber = tuple(fibers[t % len(fibers)][0] for t in range(T))
 
         start = len(self.cmds)
         binds = []
-        for fiber_index, (fiber, handle) in enumerate(fibers):
-            tiles = [t for t in range(T) if t % len(fibers) == fiber_index]
-            if not tiles:
-                continue
-            if vector_from_bank:
-                # One JUMP register: loops cannot nest, so each tile gets its
-                # own FILL + MAC row loop.
-                for _tile in tiles:
-                    binds.append((len(self.cmds) - start, "vector", 0, -1, 0))
-                    self._emit_move("LD_A")
+        if tile_rows == "split_fibers":
+            # One loop body of two auto MACs: the even fiber serves the first
+            # row of a tile (groups 0..G/2-1), the odd fiber its second row;
+            # the conductor issues one barrier per group.
+            (even_fiber, even_h), (odd_fiber, odd_h) = fibers
+            binds.append((len(self.cmds) - start, "matrix", even_fiber, -1, 0))
+            mac.emit(vector_h, even_h, acc_h, self)
+            binds.append((len(self.cmds) - start, "matrix", odd_fiber, -1, 0))
+            mac.emit(vector_h, odd_h, acc_h, self)
+            self._emit_jump(T * (G // 2) - 1, 3)
+        else:
+            for fiber_index, (fiber, handle) in enumerate(fibers):
+                tiles = [t for t in range(T) if t % len(fibers) == fiber_index]
+                if not tiles:
+                    continue
+                if vector_from_bank:
+                    # One JUMP register: loops cannot nest, so each tile gets its
+                    # own FILL + MAC row loop.
+                    for _tile in tiles:
+                        binds.append((len(self.cmds) - start, "vector", 0, -1, 0))
+                        self._emit_move("LD_A")
+                        binds.append((len(self.cmds) - start, "matrix", fiber, -1, 0))
+                        mac.emit(vector_h, handle, acc_h, self)
+                        self._emit_jump(G - 1, 2)
+                else:
                     binds.append((len(self.cmds) - start, "matrix", fiber, -1, 0))
                     mac.emit(vector_h, handle, acc_h, self)
-                    self._emit_jump(G - 1, 2)
-            else:
-                binds.append((len(self.cmds) - start, "matrix", fiber, -1, 0))
-                mac.emit(vector_h, handle, acc_h, self)
-                self._emit_jump(G * len(tiles) - 1, 2)
+                    self._emit_jump(G * len(tiles) - 1, 2)
         binds.append((len(self.cmds) - start, "drain", 1, -1, 0))
         self._emit_move("ST_B")
         self.cmds.append(PIMCmd(type_="EXIT"))
@@ -1583,7 +1669,6 @@ class SamsungCtx(CodegenContext):
                 f"the per-pass program needs {words} CRF words; the CRF holds "
                 f"{facts.crf_words}"
             )
-        extra = layout.extra or {}
         return SamsungProgram(
             kind="REDUCE",
             group_id=group_id,
@@ -1608,9 +1693,13 @@ class SamsungCtx(CodegenContext):
                 "stage_resident": bool(extra.get("stage_resident", False)),
                 "residency": extra.get("residency"),
                 "row_map": row_map,
+                "issue_order": issue_order,
+                "tile_rows": tile_rows,
             },
             row_slots=row_slots,
             row_map=row_map,
+            issue_order=issue_order,
+            tile_rows=tile_rows,
         )
 
     def _emit_temporal(self, group_id, buckets, layout, issue):
@@ -2141,6 +2230,8 @@ def samsung_reduce_access_stream(
     local = {t: fiber_tiles[program.tile_fiber[t]].index(t) for t in range(T)}
     vector_base = J * len(fiber_tiles[0]) * tile_cols
     result_base = J * len(fiber_tiles[1]) * tile_cols
+    if getattr(program, "tile_rows", "same_bank") == "split_fibers":
+        result_base = J * len(fiber_tiles[0]) * tile_cols
     N = int(columns)
     rounds = []
 
@@ -2155,33 +2246,84 @@ def samsung_reduce_access_stream(
             )
         )
 
+    row_pair = getattr(program, "issue_order", "tile_major") == "row_pair"
+    split = getattr(program, "tile_rows", "same_bank") == "split_fibers"
+    if split:
+        # The odd fiber serves the second row of every even-fiber tile.
+        fiber_tiles = {0: list(fiber_tiles[0]), 1: list(fiber_tiles[0])}
     for n in range(N):
         for j in range(J):
             groups = {0: 0, 1: 0}
+            pair_issued = {}
             filled = None
-            for _pc, kind, fiber, _operand, _offset in program.binds:
+            binds = list(program.binds)
+            matrix_binds = [b for b in binds if b[1] == "matrix"]
+            if split:
+                # One loop body of (even MAC, odd MAC) repeated T*G/2 times.
+                executions = []
+                for _ in range(len(fiber_tiles[0]) * (G // 2)):
+                    executions.extend(int(b[2]) for b in matrix_binds)
+                sequence = [("matrix", f) for f in executions]
+                sequence.append(("drain", 1))
+            else:
+                sequence = []
+                for _pc, kind, fiber, _operand, _offset in binds:
+                    if kind == "matrix":
+                        f = int(fiber)
+                        count = G if program.vector_from_bank else G * len(fiber_tiles[f])
+                        sequence.extend([("matrix", f)] * count)
+                    elif kind == "vector":
+                        sequence.append(("vector", _pc))
+                    elif kind == "drain":
+                        sequence.append(("drain", 1))
+            for kind, fiber in sequence:
                 if kind == "matrix":
                     f = int(fiber)
                     tiles = fiber_tiles[f]
-                    count = G if program.vector_from_bank else G * len(tiles)
-                    for _ in range(count):
-                        e = groups[f]
-                        groups[f] += 1
+                    e = groups[f]
+                    groups[f] += 1
+                    if split:
+                        loc = e // (G // 2)
+                        grp = e % (G // 2) + (G // 2 if f else 0)
+                    elif row_pair:
+                        loc, q = divmod(e, G)
+                        grp = q // 2 if q % 2 == 0 else q // 2 + G // 2
+                    else:
                         loc, grp = divmod(e, G)
-                        tile = tiles[loc]
-                        if not program.vector_from_bank and grp == 0:
+                    tile = tiles[loc]
+                    first_group_of_tile = (grp == 0) if not split else (f == 0 and grp == 0)
+                    if not program.vector_from_bank and first_group_of_tile:
+                        rounds.append(
+                            SamsungAccessRound(
+                                len(rounds), n, j, "HOST_FILL", None, tile, 0, ()
+                            )
+                        )
+                    col = (j * len(tiles) + loc) * tile_cols + grp * E
+                    add("MAC", n, j, f, tile, grp, False, f, col, E)
+                    if row_pair:
+                        key = (loc, grp % (G // 2))
+                        pair_issued[key] = pair_issued.get(key, 0) + 1
+                        if pair_issued[key] < 2:
+                            # the first half of a pair: no barrier yet; merge
+                            # into one round with the second half
+                            first = rounds.pop()
+                            pending = first
+                            continue
+                        if "pending" in locals() and pending is not None:
+                            second = rounds.pop()
                             rounds.append(
                                 SamsungAccessRound(
-                                    len(rounds), n, j, "HOST_FILL", None, tile, 0, ()
+                                    len(rounds), n, j, "MAC", None, tile, grp,
+                                    tuple(pending.accesses) + tuple(second.accesses),
                                 )
                             )
-                        col = (j * len(tiles) + loc) * tile_cols + grp * E
-                        add("MAC", n, j, f, tile, grp, False, f, col, E)
+                            pending = None
                 elif kind == "vector":
                     # The fill provides the tile of the next MAC group on the
                     # fiber the next matrix bind names.
+                    pc = fiber
                     nxt = next(
-                        (int(b[2]) for b in program.binds if b[1] == "matrix" and b[0] > _pc),
+                        (int(b[2]) for b in binds if b[1] == "matrix" and b[0] > pc),
                         None,
                     )
                     if nxt is None:
@@ -2340,6 +2482,8 @@ def samsung_reduce_plan(
         f"vector_from_bank {int(program.vector_from_bank)}",
         f"columns {columns}",
         f"weight_resident {int(bool(resident))}",
+        f"issue_order {int(program.issue_order == 'row_pair')}",
+        f"split_rows {int(program.tile_rows == 'split_fibers')}",
     ]
     slots = passes * C * P * G
     table = None

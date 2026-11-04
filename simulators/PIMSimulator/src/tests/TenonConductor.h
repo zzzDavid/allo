@@ -60,6 +60,21 @@ struct TenonReducePlan
     bool vector_from_bank = false; // CRF fills GRF_A from the even bank (else host)
     int columns = 1;               // N: reduction columns (GEMM N, batch B)
     bool weight_resident = true;   // preload the matrix once for all columns
+    // Row pairing of the MAC groups of one tile.  A tile's G*E columns span
+    // two physical rows (cols_per_row columns each): groups 0..G/2-1 read
+    // the first row, G/2..G-1 the second, and the GRF_B entry of a group is
+    // selected by the row's parity and the column (PIMRank::getGrfIdxHigh).
+    // issue_order 0 (tile_major): groups in order, one barrier each.
+    // issue_order 1 (row_pair): group g and group g+G/2 of the same tile
+    // are issued back to back under one barrier, so the tile's two rows
+    // meet inside one barrier group (the same GRF_A vector slice, distinct
+    // GRF_B entries).
+    int issue_order = 0;
+    // split_rows 1: the second row of every tile is staged in the partner
+    // (odd) bank fiber at the same column position (the F2 half -> bank
+    // swizzle), with or without row pairing.  tile_fiber then names each
+    // tile's base (first-row) fiber, which must be the even fiber.
+    int split_rows = 0;
 };
 
 // ELTWISE plan.  Every operand is laid out flat (preloadNoReplacement order)

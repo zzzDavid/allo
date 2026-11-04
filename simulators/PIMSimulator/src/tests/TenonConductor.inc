@@ -293,6 +293,22 @@ TenonReducePlan tenonParseReducePlan(const std::string& text)
     if (it == fields.end())
         tenonFail("plan requires 'tile_fiber'");
     for (long fiber : it->second) plan.tile_fiber.push_back((int)fiber);
+    for (const char* name : {"issue_order", "split_rows"})
+    {
+        auto field = fields.find(name);
+        if (field == fields.end())
+            continue;
+        if (field->second.size() != 1 || (field->second[0] != 0 && field->second[0] != 1))
+            tenonFail(std::string(name) + " must be 0 or 1");
+        (std::string(name) == "issue_order" ? plan.issue_order : plan.split_rows) =
+            (int)field->second[0];
+    }
+    if (plan.split_rows)
+    {
+        for (int f : plan.tile_fiber)
+            if (f != 0)
+                tenonFail("split_rows stages every tile's first row in the even fiber");
+    }
     return plan;
 }
 
@@ -444,6 +460,9 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
         if (bind.kind == "matrix")
         {
             int f = bind.bank;
+            // split_rows: the odd-fiber MAC reads the second rows of the
+            // even fiber's tiles, so it is accounted on fiber 0's tiles.
+            const int tile_source = plan.split_rows ? 0 : f;
             bool operands = cmd.dst_ == PIMOpdType::GRF_B &&
                             ((cmd.src0_ == PIMOpdType::GRF_A && cmd.src1_ == tenonBankOpd(f)) ||
                              (cmd.src1_ == PIMOpdType::GRF_A && cmd.src0_ == tenonBankOpd(f)));
@@ -452,12 +471,35 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
                           " matrix MAC but is not an auto MAC GRF_B <- GRF_A * " +
                           tenonOpdName(tenonBankOpd(f)));
             long e = groups[f]++;
-            int local = (int)(e / G), group = (int)(e % G);
-            if (local >= (int)fiber_tiles[f].size())
+            int local, group;
+            if (plan.split_rows)
+            {
+                // Each fiber's MAC covers half of every tile's groups: the
+                // even fiber the first row (groups 0..G/2-1), the odd fiber
+                // the second row (groups G/2..G-1).
+                local = (int)(e / (G / 2));
+                group = (int)(e % (G / 2)) + (f ? G / 2 : 0);
+            }
+            else if (plan.issue_order)
+            {
+                // row_pair on one fiber: the CRF repeats one MAC G times per
+                // tile; execution q of a tile serves group q/2 of the first
+                // row when q is even and group q/2 + G/2 of the second row
+                // when q is odd, so the pair (g, g+G/2) is adjacent.
+                local = (int)(e / G);
+                int q = (int)(e % G);
+                group = (q % 2 == 0) ? q / 2 : q / 2 + G / 2;
+            }
+            else
+            {
+                local = (int)(e / G);
+                group = (int)(e % G);
+            }
+            if (local >= (int)fiber_tiles[tile_source].size())
                 tenonFail(tenonWord(crf, step.pc) + " issues more MAC groups on fiber " +
                           std::to_string(f) + " than the plan places tiles there (" +
-                          std::to_string(fiber_tiles[f].size() * G) + " groups)");
-            int tile = fiber_tiles[f][local];
+                          std::to_string(fiber_tiles[tile_source].size() * G) + " groups)");
+            int tile = fiber_tiles[tile_source][local];
             if (plan.vector_from_bank && group == 0 && filled_tile != tile)
                 tenonFail(tenonWord(crf, step.pc) + " starts tile " + std::to_string(tile) +
                           " but the CRF did not fill GRF_A with that tile");
@@ -501,6 +543,8 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
             if (f_next < 0)
                 tenonFail(tenonWord(crf, step.pc) + " fills GRF_A but no MAC group follows");
             long e = groups[f_next];
+            if (plan.split_rows)
+                tenonFail("split_rows has no CRF-filled GRF_A variant");
             if (e % G != 0 || e / G >= (long)fiber_tiles[f_next].size())
                 tenonFail(tenonWord(crf, step.pc) + " refills GRF_A inside a tile");
             filled_tile = fiber_tiles[f_next][e / G];
@@ -508,18 +552,25 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
         }
     }
     for (int f = 0; f < 2; ++f)
-        if (groups[f] != (long)fiber_tiles[f].size() * G)
+    {
+        long expected = plan.split_rows ? (long)fiber_tiles[0].size() * (G / 2)
+                                        : (long)fiber_tiles[f].size() * G;
+        if (groups[f] != expected)
             tenonFail("CRF performs " + std::to_string(groups[f]) + " MAC groups on fiber " +
-                      std::to_string(f) + "; the plan places " +
-                      std::to_string(fiber_tiles[f].size()) + " tiles x " + std::to_string(G) +
-                      " rows there");
+                      std::to_string(f) + "; the plan expects " + std::to_string(expected));
+    }
     if (drains != 1)
         tenonFail("CRF must drain GRF_B exactly once per pass, found " + std::to_string(drains));
 
     const int T0 = (int)fiber_tiles[0].size(), T1 = (int)fiber_tiles[1].size();
     const int tile_cols = G * E;                      // one tile per block per fiber
+    const int cols_per_row = pim_addr_mgr_->num_cols_per_bl_;
+    if ((plan.issue_order || plan.split_rows) && (G % 2 != 0 || tile_cols != 2 * cols_per_row))
+        tenonFail("row_pair/split_rows need a tile of exactly two physical rows (G*E == 2*cols_per_row)");
     const long vector_base = (long)J * T0 * tile_cols;  // even bank, after the matrix
-    const long result_base = (long)J * T1 * tile_cols;  // odd bank, after the matrix
+    // Odd bank: after the matrix tiles it holds (split_rows: the second row
+    // of every even-fiber tile sits at the same column position).
+    const long result_base = (long)J * (plan.split_rows ? T0 : T1) * tile_cols;
     auto fiber_tiles_count = [&](int f) { return f == 0 ? T0 : T1; };
     const char* trace_tag = "stage";
     auto address = [&](int ch, int pb, int parity, long col) {
@@ -561,9 +612,13 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
                     {
                         long slot = ((long)j * C * P + block) * G + g;
                         long row = slot_row[slot];
+                        // split_rows: the tile's second row (its upper half
+                        // of columns) lives in the partner fiber at the same
+                        // column position.
+                        int fiber = (plan.split_rows && g * E >= cols_per_row) ? 1 : f;
                         for (int a = 0; a < E; ++a)
                             mem_->addTransaction(
-                                true, address(block / P, block % P, f, tile_col + g * E + a),
+                                true, address(block / P, block % P, fiber, tile_col + g * E + a),
                                 &weight.bData[row * T * E + t * E + a]);
                     }
             }
@@ -582,6 +637,9 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
         tenonTrace().line("PASS " + std::to_string(n) + " " + std::to_string(j));
         changePIMMode(dramMode::HAB, dramMode::HAB_PIM);  // PC reset, GRF_B zeroed
         audit.passes++;
+        // row_pair: one barrier closes the pair (g, g + G/2) of a tile, so
+        // its two rows meet inside one barrier group.
+        std::vector<int> pair_issued((size_t)T * (G / 2 > 0 ? G / 2 : 1), 0);
         for (const auto& issue : issues)
         {
             if (issue.kind == 'M')
@@ -603,10 +661,17 @@ void PIMKernel::tenonRunReduce(const TenonReducePlan& plan, const std::string& p
                     tenonTrace().line("BARRIER");
                     audit.host_vector_writes += E;
                 }
-                long col = ((long)j * fiber_tiles_count(issue.fiber) + issue.local) * tile_cols +
+                const int source_fiber = plan.split_rows ? 0 : issue.fiber;
+                long col = ((long)j * fiber_tiles_count(source_fiber) + issue.local) * tile_cols +
                            issue.group * E;
-                trace_all("MAC", issue.fiber, col, E, true);
-                addTransactionAll(false, 0, issue.fiber, 0, (int)col, "MAC_", &null_bst_, true, E);
+                bool barrier = true;
+                if (plan.issue_order)
+                {
+                    size_t pair = (size_t)issue.local * (G / 2) + (issue.group % (G / 2));
+                    barrier = (++pair_issued[pair] == 2);
+                }
+                trace_all("MAC", issue.fiber, col, E, barrier);
+                addTransactionAll(false, 0, issue.fiber, 0, (int)col, "MAC_", &null_bst_, barrier, E);
                 audit.mac_groups[issue.fiber]++;
                 audit.column_commands += E;
             }
