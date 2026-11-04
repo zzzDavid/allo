@@ -1299,10 +1299,42 @@ rows in one bank, is now an ordinary-source choice executed by the
 conductor with comparable timing and exact outputs; the paper's probe
 metric (within-round conflicts on plain reads) is unreachable by the
 production program, so the row is OPEN (measured), not REPRODUCED, and the
-default selection does not yet earn the faster packing (S-14, the staging
+default selection does not yet earn the faster packing (S-16, the staging
 saving is outside the MAC rule). The measured per-pair constant prices the
 identity pairing; the split layout's rank is an open cost-model item, not
 a fitted one.
+
+## Round 37 (2026-11-04): independent review of 4378bf7; the selected map made the contract; the staging term; the default earns the swizzled rows
+
+The reviewer accepted the tile-row levers as substantive and found that
+the selected half -> bank map was a diagnostic attachment: the lowering
+followed a label, the conductor hardcoded the upper-half bank, the shared
+matrix layout omitted its packing, the map was outside the decision
+identity, and an edited map with a bogus packing compiled unchanged.
+Judgment: accepted in full. The map now names the packing the candidate
+declares, the lowering derives the row placement from it and rejects a
+disagreeing label, the plan carries the map's rendering and the conductor
+addresses both halves from it, the realization check compares the
+program's row fibers with the declared packing, the map is a physical
+decision field, and the shared validation compares every declared value
+layout and transfer with the target's derivation before costing while a
+caller-supplied declaration is no longer overwritten. The reviewer's probe
+now reports a changed decision and a rejection before selection.
+
+The reviewer also required the ranking repair without a fitted discount.
+Judgment: the estimate's scope now includes the first matrix staging,
+derived from the conductor's staging schedule (verified equal to the
+staging dump for every placement on three workloads) and priced from the
+device ini; the split-rows accounting applies for any issue order; the
+row-pair constant states its validity domain. With that term the default
+selection picks `split_rows` on both paper GEMVs and on the reviewer's
+held-out 37x129x2 contraction, and the conductor confirms it is the
+fastest placement on all three (7,255 / 7,057 / 8,163 against bank_row
+8,153 / 7,947 / 8,724), bit identical. Judgment: the ranking is validated
+on a shape the model was not built on; absolute estimates remain on the
+declared device and are compared by ranking only, as the module states.
+The XOR paper row stays OPEN (program-level metric); the cost-model issue
+is S-16 (the earlier S-14 label collided with the output-binding issue).
 
 ## Rejected shortcuts
 
@@ -1343,7 +1375,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 36 (2026-11-04) at the candidate `e6f54f0`+ (this
+Refreshed in round 37 (2026-11-04) at the candidate `4378bf7`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |
@@ -1352,12 +1384,12 @@ commit). Earlier judgments are kept in the round sections above.
 | G2 semantic preservation / explicit failure | **PARTIAL** | the rounds 8-11 repairs (C-19 to C-26) and the shared contract rounds (X-02 to X-14, X-17 to X-20) are implemented with regressions; the shared semantic checks run before every backend's selection; open: the deferred arithmetic findings (ISSUES), independent re-challenge of the whole domain on every runner |
 | G3 general mechanisms | **PARTIAL** | structural recognizers and template-derived legality on every backend; the AttAcc attention template is proven structurally (X-20); renamed and neighbouring programs compile to the same normalized decisions in the round 24-28 regressions; open: M-14, the constants inventory re-read against the current tree |
 | G4 search/layout/selected-program integrity | **PARTIAL** | complete assignments materialize under the real orchestration before acceptance (C-33b); every backend's realization is compared with its declaration (X-05 to X-16); transfer availability and physical addressing are checked (X-09 to X-11, X-17, X-18); open: the slice 5 forced-alternative traces through packing and launches on both hardware hosts |
-| G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1 in earlier rounds; open: C-18, uniform movement weights, the perturbation traces at the current candidate on both hardware hosts, S-14 (the Samsung model does not rank the faster `split_rows` packing) |
+| G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1 in earlier rounds; the Samsung estimate includes the first matrix staging from the conductor's schedule and ranks the swizzled-rows placement first on both paper GEMVs and a held-out shape, as the conductor measures (round 37, S-16 repaired); open: C-18, uniform movement weights, the perturbation traces at the current candidate on both hardware hosts |
 | G6 evidence beyond examples | **PARTIAL** | EVIDENCE.md plus the reviewer-driven probes of rounds 8-27 (renamings, operation changes, shape and slice neighbours, wrong declarations, reversed arithmetic); open: hardware-only confirmations, the probe list re-run at the candidate |
 | G7 install/interfaces/maintainability | **PARTIAL** | installed-artifact runs at `7bdb475`, `e60973f`, `9255d29`; architecture docs follow the pipeline (`design/shared-compilation-path.md`); open: a fresh install at the candidate, the Samsung patches (P-04), P-23 lint, the public-payload review |
 | G8 backend execution | **PARTIAL** | installed-artifact evidence on the simulators at `69773fc` (Samsung, AiM, UPMEM probes, no checkout module loaded) and on the APU v1 board and the Gemini-II card at `69773fc`/`28cc922` (round 30: the archived paired protocols with the baselines re-run, exact outputs, device locks, launch provenance on every route); `tests/perf` at `69773fc` (545 passed, the one failure an NFS-tmpdir artifact fixed in `d2e3fda`), `tests/pim` at `69773fc` 564 passed with 20 Docker-backed simulator tests failing on the host's full `/var` (containerd ENOSPC, an administrator matter; the same rows passed from the installed wheel earlier in the round); open: the 20 simulator tests re-run when the host has space, the suites and installed-wheel checks at the final round 30 candidate, the ledag scratch fix (X-24) exercised only through its unit test and the sessions 3 and later |
 | G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | shared front stages and facts (rounds 12-18); both APUs' plans and typed records as candidates of the common pipeline with an enforced contract (rounds 13-17); Samsung, AiM, UPMEM and AttAcc declare effects from the facts and are checked at materialization (rounds 19-27, X-04 to X-20); shared transfer availability (X-09, X-17, X-18); the `APUv1Program` manifest from the retained IR (round 28); slice 5 traces at `653b059` from installed wheels (round 29); round 30: the paper rows measured through default selection from installed wheels under the archived protocols with launch provenance on every route; open: independent review of rounds 28-30, the full suites and installed-artifact runs at the final candidate, the remaining minor items |
-| G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), Gemini-II 5/5 REPRODUCED under the archived paired protocol with the GTML baseline re-run in the same rounds (round 30), Gemini-I under the archived paired protocol with the expert binaries re-run: 2/5 REPRODUCED (matrix multiply, histogram), kmeans and linear regression OPEN (nominal) on the pooled round 30 sessions (X-23; the single-session closure of kmeans was withdrawn in round 31), word count attributed to the generated program's loop-counter width and repaired (X-22, `dc41df7`): the repaired program at parity with the paper's own binary in the same rounds and 0.19% above the paper's archived median, OPEN (nominal); the Gemini-I vector GEMM layout row faster than the paper (round 31); the portability row REPRODUCED on both targets with the paper's inputs through the maintained in-repo driver (rounds 34-35, checkout evidence); the Samsung XOR row OPEN (measured): the identity-rows and F2-swizzled-rows placements are ordinary-source candidates executed by the conductor, the XOR packing 1.12-1.13x faster and bit identical on two GEMVs, the paper's within-round probe metric unreachable by the production program (round 36, S-13 narrowed, S-14 opened); the 500-instance selector equivalence as a diagnostic; UNVERIFIED: token partitioning, UPMEM scaling, packing/selection/DCC studies, AttAcc Ramulator2 timings and decode, calibration, the virtual study, compile cost |
+| G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), Gemini-II 5/5 REPRODUCED under the archived paired protocol with the GTML baseline re-run in the same rounds (round 30), Gemini-I under the archived paired protocol with the expert binaries re-run: 2/5 REPRODUCED (matrix multiply, histogram), kmeans and linear regression OPEN (nominal) on the pooled round 30 sessions (X-23; the single-session closure of kmeans was withdrawn in round 31), word count attributed to the generated program's loop-counter width and repaired (X-22, `dc41df7`): the repaired program at parity with the paper's own binary in the same rounds and 0.19% above the paper's archived median, OPEN (nominal); the Gemini-I vector GEMM layout row faster than the paper (round 31); the portability row REPRODUCED on both targets with the paper's inputs through the maintained in-repo driver (rounds 34-35, checkout evidence); the Samsung XOR row OPEN (measured): the identity-rows and F2-swizzled-rows placements are ordinary-source candidates executed by the conductor, the XOR packing 1.12-1.13x faster and bit identical on two GEMVs, the paper's within-round probe metric unreachable by the production program (round 36); the selected map made the contract and the default selection earning the swizzled rows on the paper shapes and a held-out shape (round 37); the 500-instance selector equivalence as a diagnostic; UNVERIFIED: token partitioning, UPMEM scaling, packing/selection/DCC studies, AttAcc Ramulator2 timings and decode, calibration, the virtual study, compile cost |
 
 Verdict: **NOT READY**. Blockers: G9 (independent review of rounds 28-30,
 the suites at the final candidate), G10 (the remaining studies, the four

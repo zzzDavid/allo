@@ -3,9 +3,10 @@
 
 # Samsung bank/row swizzle: what the production program does and the route the paper row needs
 
-Status (round 36, 2026-11-04): the tile-row levers are implemented through
-the shared pipeline and measured on the conductor (section "Round 36"
-below); the paper row `layout_samsung_xor_identity_vs_synthesized`
+Status (round 37, 2026-11-04): the tile-row levers are implemented through
+the shared pipeline with the selected map as the contract, the estimate
+includes the staging and the default selection earns the swizzled rows
+(sections "Round 36" and finding (4) below); the paper row `layout_samsung_xor_identity_vs_synthesized`
 (identity packing 148 cycles, synthesized XOR 116, PIMSimulator, two rounds
 of four requests replicated over 64 channels) is OPEN (measured with a
 program-level metric), not REPRODUCED.
@@ -145,9 +146,17 @@ instructions (`PIMOpdType::EVEN_BANK`/`ODD_BANK`; the simulator's
 compiled out of the release build, so the cause is inferred from the ISA
 and the symptom, not logged). The ISA has no bank-agnostic operand, so
 that placement is enumerated and refused at lowering with this reason.
-(4) The cost model prices `split_rows` above `bank_row` (301 against 253
-for 8192x256) because the staging saving is outside the MAC rule; the
-default selection therefore still picks `bank_row` (S-14).
+(4) In round 36 the cost model priced `split_rows` above `bank_row` (301
+against 253 for 8192x256) because the staging saving was outside the MAC
+rule; round 37 added the first staging to the estimate from the
+conductor's staging schedule priced with the device ini, and the default
+selection now picks `split_rows` on both paper GEMVs and on a held-out
+37x129x2 contraction, the measured fastest on all three (S-16 repaired).
+Round 37 also made the selected half -> bank map the contract: it names the
+declared matrix packing, drives the lowering and the conductor's
+addressing (`half_fiber` in the plan), sits in the decision identity and
+is compared at realization; an edited map or packing is rejected before
+selection.
 
 What this means for the paper row. The paper's four-request probe
 measures within-round bank conflicts on plain reads (148 against 116,
