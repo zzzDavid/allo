@@ -136,3 +136,86 @@ def test_driver_records_a_failed_run_before_exiting(monkeypatch, tmp_path):
     assert report["runs"][0]["run_error"].startswith("RuntimeError: board unavailable")
     assert (tmp_path / "ev" / "apu_v1_strict.output.npy").is_file()
     assert report["problems"] == ["apu_v1_strict: did not execute"]
+
+
+def test_failed_or_misplaced_control_fails_the_command(monkeypatch, tmp_path):
+    """Reviewer round 35: a requested reassociation control that fails or
+    runs elsewhere than the paper executed fails the command, while a control
+    that executes may differ from the strict oracle."""
+    A, B = driver.historical_inputs()
+    oracle = driver.source_order_fp16(A, B)
+    different = oracle.copy()
+    different[3, 0] = np.float16(2.0)
+
+    def scenario(control):
+        calls = {"n": 0}
+
+        def fake_compile(workload, target, cost, **kwargs):
+            calls["n"] += 1
+            if kwargs.get("reduction_order") == "reassociate":
+                return control()
+            return _fake_compiled(_Result("device", oracle))
+
+        monkeypatch.setattr(driver.allo, "compile", fake_compile)
+        monkeypatch.setattr(driver, "_target", lambda name: (name, None))
+        monkeypatch.setattr(driver, "_board_lock", lambda name: __import__("contextlib").nullcontext())
+        out = tmp_path / f"ev-{calls['n']}-{id(control)}"
+        status = driver.main(["--out", str(out), "--targets", "apu_v1", "--reassociate"])
+        return status, json.loads((out / "report.json").read_text())
+
+    class Failing:
+        selected_plan = None
+        compiled = type("A", (), {"layout": None, "layout_ctx": None, "cmds": ()})()
+        schedule = type("S", (), {"module": "m"})()
+
+        def __call__(self, A, B, out):
+            raise RuntimeError("control launch failed")
+
+    status, report = scenario(lambda: Failing())
+    assert status == 1 and report["problems"] == ["apu_v1_reassociate: did not execute"]
+    assert report["runs"][1]["run_error"].startswith("RuntimeError: control launch failed")
+
+    status, report = scenario(lambda: _fake_compiled(_Result("virtual", different)))
+    assert status == 1 and "apu_v1_reassociate: executed as 'virtual'" in report["problems"][0]
+
+    status, report = scenario(lambda: _fake_compiled(_Result("device", different)))
+    assert status == 0 and report["problems"] == []
+    assert report["runs"][1]["mismatching_outputs"] == 1  # allowed for the control
+
+
+def test_plan_provenance_is_structural_not_truncated():
+    """Reviewer round 35: APUV1Plan.metadata is a mappingproxy; it and the
+    plan's manifest must be retained structurally (a real compiled plan,
+    virtual backend, no hardware)."""
+    import types
+
+    import allo
+    from allo.pim.costs import apu_v1_cost
+    from allo.pim.targets import build_apu_v1_target
+
+    proxy = types.MappingProxyType({"a": 1, "nested": {"b": (1, 2)}})
+    assert driver._json_ready(proxy) == {"a": 1, "nested": {"b": [1, 2]}}
+    with pytest.raises(driver.ProvenanceError):
+        deep = {}
+        cur = deep
+        for _ in range(14):
+            cur["x"] = {}
+            cur = cur["x"]
+        driver._json_ready(deep)
+
+    compiled = allo.compile(driver.gemv_source(), build_apu_v1_target(), apu_v1_cost, backend="virtual")
+    plan = compiled.selected_plan
+    assert isinstance(plan.metadata, types.MappingProxyType)
+    metadata = driver._json_ready(plan.metadata)
+    assert isinstance(metadata, dict)
+    for key in ("operation_counts", "transfer_facts", "accumulator_persistence", "accesses"):
+        assert key in metadata and isinstance(metadata[key], (dict, list)), key
+    manifest = driver._json_ready(plan.manifest())
+    assert {"name", "iteration_layout", "value_layouts", "transfers", "reduction_strategy", "operations"} <= set(manifest)
+    assert manifest["name"] == plan.name
+    effects = (getattr(compiled.compiled.layout, "extra", None) or {}).get("effects")
+    assert effects is not None, "the selected placement carries the shared candidate effects"
+    effects_manifest = driver._json_ready(effects)
+    assert isinstance(effects_manifest, dict) and effects_manifest
+    text = json.dumps({"m": metadata, "p": manifest, "e": effects_manifest})
+    assert "mappingproxy" not in text and "..." not in text[:0]

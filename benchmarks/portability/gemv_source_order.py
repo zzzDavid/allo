@@ -36,8 +36,9 @@ generated device source and binary hash, launch roles and profile text on
 Gemini-I; the CRF words, plan text, conductor receipt and ``pim_driver``
 identity on Samsung), the complete ``RunResult.extra``, and the
 environment (interpreter, NumPy, allo location and revision, host, date).
-A failed compile or run is recorded in the same files before the command
-exits 1.
+A failed compile or run of any requested run, the controls included, is
+recorded in the same files before the command exits 1; a control that
+executes is allowed to differ from the oracle.
 
 Usage::
 
@@ -50,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from collections.abc import Mapping
 import json
 import os
 import platform
@@ -134,13 +136,25 @@ def _sha256(array) -> str:
     return hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
 
 
-def _json_ready(value, depth=0):
-    if depth > 6:
-        return str(value)[:200]
-    if isinstance(value, dict):
-        return {str(k): _json_ready(v, depth + 1) for k, v in value.items()}
+class ProvenanceError(RuntimeError):
+    """A required provenance value could not be serialized structurally."""
+
+
+def _json_ready(value, depth=0, *, path="value"):
+    """Structural JSON form of a provenance value.  Mappings (including
+    ``mappingproxy`` and other ``Mapping`` views), sequences, sets, arrays,
+    NumPy scalars and objects with a ``manifest()`` are rendered
+    structurally; anything else is rendered as ``repr`` text, and never
+    truncated.  Nesting deeper than 12 levels is a provenance error, not a
+    silent cut."""
+    if depth > 12:
+        raise ProvenanceError(f"{path}: provenance nests deeper than 12 levels")
+    if isinstance(value, Mapping):
+        return {str(k): _json_ready(v, depth + 1, path=f"{path}.{k}") for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_json_ready(v, depth + 1) for v in value]
+        return [_json_ready(v, depth + 1, path=f"{path}[{i}]") for i, v in enumerate(value)]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_json_ready(v, depth + 1, path=path) for v in value), key=repr)
     if isinstance(value, np.ndarray):
         return {"ndarray": list(value.shape), "dtype": str(value.dtype), "sha256": _sha256(value)}
     if isinstance(value, (np.integer,)):
@@ -151,11 +165,13 @@ def _json_ready(value, depth=0):
         return value
     manifest = getattr(value, "manifest", None)
     if callable(manifest):
-        try:
-            return _json_ready(manifest(), depth + 1)
-        except Exception:  # pragma: no cover - best effort
-            pass
-    return str(value)[:400]
+        return _json_ready(manifest(), depth + 1, path=f"{path}.manifest()")
+    if hasattr(value, "__dataclass_fields__"):
+        return {
+            name: _json_ready(getattr(value, name), depth + 1, path=f"{path}.{name}")
+            for name in value.__dataclass_fields__
+        }
+    return repr(value)
 
 
 def environment(out_dir: Path) -> dict:
@@ -246,8 +262,20 @@ def run_target(name, A, B, oracle, out_dir: Path, *, backend, reduction_order=No
     record["selected_plan"] = getattr(plan, "name", None)
     record["selected_plan_metadata"] = _json_ready(getattr(plan, "metadata", None))
     record["reduction_strategy"] = _json_ready(getattr(plan, "reduction_strategy", None))
+    if plan is not None and callable(getattr(plan, "manifest", None)):
+        # The plan's own manifest: iteration and value layouts, transfers,
+        # temporal and reduction strategies, operations, VR allocations.
+        record["selected_plan_manifest"] = _json_ready(plan.manifest())
     artifact = compiled.compiled
-    record["layout_mode"] = getattr(getattr(artifact, "layout", None), "mode", None)
+    layout = getattr(artifact, "layout", None)
+    record["layout_mode"] = getattr(layout, "mode", None)
+    effects = (getattr(layout, "extra", None) or {}).get("effects")
+    if effects is not None:
+        # The shared candidate contract the selection was checked against.
+        record["candidate_effects_manifest"] = _json_ready(effects)
+    record["layout_extra"] = _json_ready(
+        {k: v for k, v in (getattr(layout, "extra", None) or {}).items() if k != "effects"}
+    )
     programs = list(getattr(getattr(artifact, "layout_ctx", None), "programs", ()) or ())
     if programs:
         record["samsung_programs"] = [
@@ -374,8 +402,9 @@ def main(argv=None) -> int:
             print(json.dumps({k: v for k, v in record.items()
                               if k not in ("run_extra", "selected_plan_metadata")},
                              default=str), flush=True)
-            if order is not None:
-                continue  # the regrouping control is informational
+            # Every requested run must have executed where the paper executed;
+            # only the strict runs are held to the source-order oracle (the
+            # regrouping control is expected to differ from it).
             if record.get("compile_error") or record.get("run_error") or record.get("error"):
                 report["problems"].append(f"{record['label']}: did not execute")
             elif record.get("dry_run"):
@@ -383,7 +412,7 @@ def main(argv=None) -> int:
                     f"{record['label']}: executed as {record['execution_kind']!r}, not "
                     f"{EXPECTED_EXECUTION[name]!r} where the paper executed it (dry run)"
                 )
-            elif record.get("mismatching_outputs"):
+            elif order is None and record.get("mismatching_outputs"):
                 report["problems"].append(
                     f"{record['label']}: {record['mismatching_outputs']} of {M * N} outputs "
                     "differ from the source-order FP16 oracle"
