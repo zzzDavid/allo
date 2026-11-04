@@ -2225,9 +2225,11 @@ def samsung_access_stream(
 
 
 def samsung_access_stream_summary(rounds) -> dict:
-    """Counts the comparison of two placements rests on: rounds by kind,
-    rows each bank touches and the same-bank row transitions between
-    successive rounds (each a row activation after a barrier)."""
+    """Counts of the modelled stream: rounds by kind, the rows each bank
+    touches and the address changes between successive MAC rounds of one
+    bank.  These are properties of the derived address sequence, not
+    measured row activations or simulator timing; what the simulator does
+    with the sequence is only known from running it."""
 
     label = getattr(rounds, "geometry_source", None)
     rounds = list(rounds)
