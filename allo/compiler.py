@@ -493,6 +493,10 @@ class CompiledCallable:
         # workload (the APU v1 functional model executes it on the host).
         try:
             compiled.source_workload = workload
+            # The caller's parameter names by ordinal: backend runtimes bind
+            # the program's buffers to them by retained identity
+            # (`trace.source_value_refs`), never by spelling.
+            compiled.source_parameters = tuple(self.signature.parameters)
         except AttributeError:
             pass
         program = self.backend_program

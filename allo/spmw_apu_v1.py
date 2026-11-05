@@ -53,6 +53,14 @@ class APUv1Ctx(CodegenContext):
         self._used_vr_names: list[str] = []
         self.group_size: int = 32768
         self.vector_batches: int = 1
+        # What the grouped emission did, as the emitters did it (work id,
+        # event): the loads and stores by role and register, every grouped
+        # MAC with its group size, every other operation.
+        # `check_realization` compares these with the candidate's declared
+        # effects (ISSUES X-28); the per-bucket layouts and role maps the
+        # walk received are kept beside them.
+        self.realized: list[tuple] = []
+        self._grouped_buckets: list[tuple] | None = None
 
     # -- shared-pipeline candidate hooks (gate G9) ---------------------------
 
@@ -137,6 +145,30 @@ class APUv1Ctx(CodegenContext):
 
         payload = self._vector_payloads(layouts)
         if payload is None:
+            from .spmw_autoschedule import (
+                _bucket_for_autoschedule,
+                _matcher_work_scope,
+                _trace_memrefs_by_role,
+            )
+
+            layout_list = layouts if isinstance(layouts, (list, tuple)) else [layouts]
+            self._grouped_buckets = []
+            for (_scope, matches), layout in zip(
+                _bucket_for_autoschedule(trace), layout_list
+            ):
+                try:
+                    roles = _trace_memrefs_by_role(matches)
+                except NotImplementedError:
+                    roles = {}
+                self._grouped_buckets.append(
+                    (
+                        _matcher_work_scope(matches[0]).work_id,
+                        list(matches),
+                        layout,
+                        roles,
+                    )
+                )
+            self.realized = []
             super().emit_program(
                 trace, layouts, schedule=schedule, host_moves=host_moves, module=module
             )
@@ -174,6 +206,7 @@ class APUv1Ctx(CodegenContext):
         from .spmw_candidate import candidate_effects
 
         if self.program is None:
+            self._check_grouped_realization(layouts)
             return
         (placement,) = layouts if isinstance(layouts, (list, tuple)) else [layouts]
         effects = candidate_effects(placement)
@@ -299,6 +332,225 @@ class APUv1Ctx(CodegenContext):
                 f"declared {declared}"
             )
 
+    def _check_grouped_realization(self, layouts) -> None:
+        """The grouped program of a dataflow region against every work
+        item's declared effects (ISSUES X-28).
+
+        The emission is one SPMD body per kernel group (the walk emits the
+        body of the group's work item 0; every APUC runs it).  Per declared
+        work item: the launch is one `LAUNCH_KIND` launch whose group
+        geometry partitions the VR, whose reduction fits the group and
+        whose accumulator starts at zero (the group sums overwrite the
+        accumulator register, so a carried destination is unrealizable);
+        the body loads each declared input, by its role, into the register
+        the declaration places it in and that its transfer ends in; the
+        body's grouped MACs are one per declared operation, over exactly
+        the declared group size, on those registers; the register whose
+        group heads are stored back is the declared output's; the batch
+        loop count is the declared one; the L4 images the body reads are
+        exactly the declared ABI inputs.  A trace without shared facts (no
+        declaration anywhere) is the legacy handle-only route and is not
+        checked."""
+        from .pim.apu_v1_grouped_route import APUCS, LAUNCH_KIND, declared_launch
+        from .spmw_candidate import candidate_effects
+
+        buckets = self._grouped_buckets
+        if buckets is None:
+            layout_list = layouts if isinstance(layouts, (list, tuple)) else [layouts]
+            buckets = [((), [], layout, {}) for layout in layout_list]
+        declared = [
+            (work_id, layout, roles, candidate_effects(layout))
+            for work_id, _matches, layout, roles in buckets
+        ]
+        if all(effects is None for *_rest, effects in declared):
+            return
+        lanes = int(self.target.vr0.axes["lane"])
+        bodies: dict = {}
+        for work_id, *event in self.realized:
+            bodies.setdefault(tuple(work_id), []).append(tuple(event))
+        if not bodies:
+            raise RuntimeError("APU v1 grouped realization emitted no program")
+
+        def fail(what, work_id, layout):
+            raise RuntimeError(
+                f"APU v1 grouped realization of work item {tuple(work_id)} "
+                f"(candidate {getattr(layout, 'mode', None)!r}) {what}"
+            )
+
+        for work_id, layout, roles, effects in declared:
+            if effects is None:
+                fail("declares no effects", work_id, layout)
+            launch = declared_launch(effects)
+            if launch is None:
+                fail(
+                    "is one grouped MAC program; the candidate declares launches "
+                    f"{[(l.kind, l.covers) for l in effects.launches]}, not one "
+                    f"{LAUNCH_KIND}",
+                    work_id,
+                    layout,
+                )
+            group_size, groups, apucs, batches, _kind = launch
+            if group_size * groups != lanes or apucs != APUCS:
+                fail(
+                    f"partitions {lanes} lanes over {APUCS} APUCs; the candidate "
+                    f"declares {groups} groups of {group_size} on {apucs} APUCs",
+                    work_id,
+                    layout,
+                )
+            (declared_launch_record,) = effects.launches
+            reduction = declared_launch_record.reduction
+            if reduction is None or int(reduction[1]) - int(reduction[0]) > group_size:
+                fail(
+                    f"reduces at most {group_size} lanes per group; the candidate "
+                    f"declares the reduction range {reduction}",
+                    work_id,
+                    layout,
+                )
+            if declared_launch_record.accumulator != "zero":
+                fail(
+                    "overwrites its accumulator register with the group sums (a "
+                    "zero-initialized accumulator); the candidate declares "
+                    f"accumulator {declared_launch_record.accumulator!r}",
+                    work_id,
+                    layout,
+                )
+            body_id = tuple(0 for _ in work_id)
+            events = bodies.get(body_id)
+            if events is None:
+                fail(
+                    f"has no emitted SPMD body (work item {body_id} of its group "
+                    f"emitted nothing; bodies: {sorted(bodies)})",
+                    work_id,
+                    layout,
+                )
+            # A grouped MAC is a full-VR multiply into the scratch register
+            # followed by the group-sum tree of that scratch into the
+            # accumulator; anything else in the body is uncovered.
+            loads, stores, macs, others = {}, {}, [], []
+            pending = None
+            for event in events:
+                if event[0] == "load":
+                    loads[event[1]] = event[2]
+                elif event[0] == "store":
+                    stores[event[1]] = event[2]
+                elif event[0] == "mul" and pending is None:
+                    pending = event
+                elif (
+                    event[0] == "group_reduce"
+                    and pending is not None
+                    and event[2] == self._name("mac_tmp")
+                ):
+                    macs.append(("mac", event[1], pending[1], pending[2], event[3]))
+                    pending = None
+                else:
+                    others.append(event)
+            if pending is not None:
+                others.append(pending)
+            if others:
+                fail(
+                    f"emits {sorted({e[1] for e in others})}, which the grouped MAC "
+                    "declaration does not cover",
+                    work_id,
+                    layout,
+                )
+            if len(macs) != len(declared_launch_record.operations):
+                fail(
+                    f"emits {len(macs)} grouped MAC(s); the candidate declares "
+                    f"{len(declared_launch_record.operations)} operation(s)",
+                    work_id,
+                    layout,
+                )
+            realized_groups = sorted({int(mac[4]) for mac in macs})
+            if realized_groups != [group_size]:
+                fail(
+                    f"reduces groups of {realized_groups} lanes; the candidate "
+                    f"declares {group_size}",
+                    work_id,
+                    layout,
+                )
+            if int(self.vector_batches) != batches:
+                fail(
+                    f"loops over {self.vector_batches} batch(es); the candidate "
+                    f"declares {batches}",
+                    work_id,
+                    layout,
+                )
+            memref_role = {memref: role for role, memref in roles.items()}
+            by_value = {v.value: v for v in effects.value_layouts}
+            transfers = {(t.value, t.direction): t for t in effects.transfers}
+            for memref in effects.abi_inputs:
+                role = memref_role.get(memref)
+                register = loads.get(role)
+                decl = by_value.get(memref)
+                if register is None or decl is None or decl.storage != register:
+                    fail(
+                        f"loads {memref!r} (role {role!r}) into {register!r}; the "
+                        f"candidate declares it in {decl and decl.storage!r}",
+                        work_id,
+                        layout,
+                    )
+                transfer = transfers.get((memref, "in")) or transfers.get(
+                    (memref, "inout")
+                )
+                if transfer is None or register not in transfer.route:
+                    fail(
+                        f"brings {memref!r} into {register!r}; the candidate's "
+                        f"transfer is {transfer and tuple(transfer.route)}",
+                        work_id,
+                        layout,
+                    )
+            accumulator = stores.get("acc")
+            if accumulator is None:
+                fail("stores no accumulator register back to L4", work_id, layout)
+            for memref in effects.abi_outputs:
+                decl = by_value.get(memref)
+                if decl is None or decl.storage != accumulator:
+                    fail(
+                        f"writes the group heads of {accumulator!r} to L4 as the "
+                        f"output; the candidate declares {memref!r} in "
+                        f"{decl and decl.storage!r}",
+                        work_id,
+                        layout,
+                    )
+                transfer = transfers.get((memref, "out")) or transfers.get(
+                    (memref, "inout")
+                )
+                if (
+                    transfer is None
+                    or accumulator not in transfer.route
+                    or transfer.route[-1] != "host_gather"
+                ):
+                    fail(
+                        f"returns {memref!r} from {accumulator!r} through L4 to the "
+                        f"host; the candidate's transfer is "
+                        f"{transfer and tuple(transfer.route)}",
+                        work_id,
+                        layout,
+                    )
+            operand_registers = {loads.get("x"), loads.get("y")}
+            for _kind, acc_name, x_name, y_name, _group in macs:
+                if acc_name != accumulator or {x_name, y_name} != operand_registers:
+                    fail(
+                        f"multiplies {x_name!r} by {y_name!r} into {acc_name!r}; the "
+                        f"loads bind {sorted(loads.items())} and the store "
+                        f"{accumulator!r}",
+                        work_id,
+                        layout,
+                    )
+            # The L4 images the body reads: the x and y operands (the load
+            # of the accumulator's L4 image is dead under zero
+            # initialization); the declared ABI inputs are exactly those.
+            realized_inputs = {
+                roles[r] for r in ("x", "y") if r in roles and r in loads
+            }
+            if set(effects.abi_inputs) != realized_inputs:
+                fail(
+                    f"reads {sorted(realized_inputs)} from L4; the candidate "
+                    f"declares the ABI inputs {sorted(effects.abi_inputs)}",
+                    work_id,
+                    layout,
+                )
+
     def runtime_route(self, commands) -> tuple[str, tuple]:
         if self.program is None:
             return super().runtime_route(commands)
@@ -330,6 +582,12 @@ class APUv1Ctx(CodegenContext):
     def _append(self, line: str) -> None:
         if self._enabled():
             self.cmds.append(line)
+
+    def _record(self, *event) -> None:
+        """Record one emitted event of the SPMD body (see ``realized``)."""
+        if self._enabled():
+            work_id = tuple(getattr(self, "_active_work_id", ()) or ())
+            self.realized.append((work_id, *event))
 
     def bind_handle(self, handle, c_name: str) -> None:
         """Teach the ctx that `handle` lowers to the C identifier
@@ -384,6 +642,7 @@ class APUv1Ctx(CodegenContext):
             operands.append(self._name(src1, "src1"))
         for k, v in kwargs.items():
             operands.append(f"/* {k}= */ {v!r}")
+        self._record("op", name, tuple(operands))
         self._append(name + "(" + ", ".join(operands) + ");")
 
     @staticmethod
@@ -398,6 +657,7 @@ class APUv1Ctx(CodegenContext):
         if self.vector_batches > 1:
             pointer = f"({pointer} + batch * 32768)"
         vr_name = self._name(vr, role)
+        self._record("load", role, vr_name, int(vm_index))
         self._append(f"direct_dma_l4_to_l1_32k(GVML_VM_{vm_index}, {pointer});")
         self._append(f"gvml_load_16({vr_name}, GVML_VM_{vm_index});")
 
@@ -406,6 +666,7 @@ class APUv1Ctx(CodegenContext):
         if self.vector_batches > 1:
             pointer = f"({pointer} + batch * 32768)"
         vr_name = self._name(vr, role)
+        self._record("store", role, vr_name, int(vm_index))
         self._append(f"gvml_store_16(GVML_VM_{vm_index}, {vr_name});")
         self._append(f"direct_dma_l1_to_l4_32k({pointer}, GVML_VM_{vm_index});")
 
@@ -413,6 +674,8 @@ class APUv1Ctx(CodegenContext):
         dst_name = self._name(dst, "acc")
         src_name = self._name(src, "x")
         group = self._group_enum(self.group_size)
+        # Recorded here, from the group enum actually emitted.
+        self._record("group_reduce", dst_name, src_name, int(self.group_size))
         self._append(
             "gvml_add_subgrps_f16_grp("
             f"{dst_name}, {src_name}, {group}, GVML_P2_1, 0, "
@@ -420,9 +683,9 @@ class APUv1Ctx(CodegenContext):
         )
 
     def emit_grouped_f16_mac(self, acc, x, y) -> None:
-        self._append(
-            f"gvml_mul_f16(mac_tmp_vr, {self._name(x, 'x')}, " f"{self._name(y, 'y')});"
-        )
+        x_name, y_name = self._name(x, "x"), self._name(y, "y")
+        self._record("mul", x_name, y_name)
+        self._append(f"gvml_mul_f16(mac_tmp_vr, {x_name}, {y_name});")
         self.emit_group_reduce_f16(acc, "mac_tmp")
 
     def append(self, line: str) -> None:
@@ -583,6 +846,13 @@ def _apu_v1_prepare_io(compiled: "Compiled", inputs: dict):
     layout = getattr(compiled, "layout", None)
     if isinstance(layout, list):
         layout = layout[0] if layout else None
+    from .spmw_candidate import candidate_effects
+
+    effects = candidate_effects(layout)
+    if effects is not None:
+        # A candidate of the shared contract: the packing and the ABI
+        # binding come from the retained facts and the declaration.
+        return _apu_v1_prepare_grouped_io(compiled, layout, effects, normalized)
     extra = getattr(layout, "extra", {}) or {}
     group_size = int(extra.get("group_size", 0) or 0)
     batches = max(1, int(extra.get("n_out_tiles", 1)))
@@ -675,6 +945,122 @@ def _apu_v1_prepare_io(compiled: "Compiled", inputs: dict):
 
     output_specs = _apu_v1_output_specs(compiled, normalized)
     return normalized, output_specs, None
+
+
+def _apu_v1_prepare_grouped_io(compiled: "Compiled", layout, effects, inputs: dict):
+    """Pack the caller's arrays for the declared grouped program.
+
+    The packing (`grouped_device_packing`) and the binding of the work
+    body's buffers to the caller's parameters (`grouped_runtime_binding`,
+    by retained identity) are re-derived from the retained facts and
+    compared with the declaration the artifact carries: the group geometry
+    and the batch count the device program loops over must be the
+    declared ones, and a program without a device packing is refused with
+    the reason (``backend="virtual"`` gives its estimate).
+    """
+    import numpy as np
+
+    from .pim.apu_v1_grouped_route import (
+        APUCS,
+        contraction_facts,
+        declared_launch,
+        grouped_device_packing,
+        grouped_geometry,
+        grouped_runtime_binding,
+    )
+
+    launch = declared_launch(effects)
+    if launch is None:
+        raise RuntimeError(
+            "APU v1 grouped runtime: the selected candidate declares no grouped launch"
+        )
+    group_size, groups_per_vr, apucs, batches, declared_kind = launch
+    facts = contraction_facts(getattr(compiled.trace, "matches", ()))
+    if facts is None:
+        raise RuntimeError(
+            "APU v1 grouped runtime: the artifact declares effects but its trace "
+            "carries no shared facts"
+        )
+    geometry = grouped_geometry(compiled.target, layout)
+    if (geometry.group_size, geometry.groups_per_vr) != (group_size, groups_per_vr):
+        raise RuntimeError(
+            f"APU v1 grouped runtime: the placement partitions the VR into "
+            f"{geometry.groups_per_vr} groups of {geometry.group_size}; the candidate "
+            f"declares {groups_per_vr} of {group_size}"
+        )
+    packing = grouped_device_packing(facts[0], geometry)
+    if packing.kind != "gemm" or declared_kind != "gemm":
+        raise NotImplementedError(
+            "APU v1 grouped matcher program: device execution is not implemented "
+            f"for this program: {packing.reason or declared_kind}; backend='virtual' "
+            "gives its estimate"
+        )
+    if int(packing.batches) != int(batches):
+        raise RuntimeError(
+            f"APU v1 grouped runtime: the device program loops over {batches} "
+            f"batch(es) but the packing needs {packing.batches}"
+        )
+    parameters = getattr(compiled, "source_parameters", None)
+    binding = grouped_runtime_binding(compiled.trace, parameters) if parameters else {}
+
+    def caller_name(memref):
+        name = binding.get(memref, memref)
+        if name not in inputs:
+            raise ValueError(
+                f"APU v1 run: no argument for the work body's {memref!r} (caller "
+                f"parameter {name!r}); got {sorted(inputs)}"
+            )
+        return name
+
+    lhs_name = caller_name(packing.lhs)
+    rhs_name = caller_name(packing.rhs)
+    output_name = caller_name(packing.output)
+    lhs, rhs = inputs[lhs_name], inputs[rhs_name]
+    rows, columns, reduction = packing.rows, packing.columns, packing.reduction
+    if tuple(lhs.shape) != (rows, reduction) or tuple(rhs.shape) != (
+        reduction,
+        columns,
+    ):
+        raise ValueError(
+            f"APU v1 run: {lhs_name!r} is {tuple(lhs.shape)} and {rhs_name!r} is "
+            f"{tuple(rhs.shape)}; the program declares [{rows}, {reduction}] x "
+            f"[{reduction}, {columns}]"
+        )
+    if lhs.dtype != np.float16 or rhs.dtype != np.float16:
+        raise ValueError(
+            "APU v1 grouped contractions require float16 inputs; "
+            f"got {lhs.dtype} and {rhs.dtype}"
+        )
+    lanes = geometry.lanes
+    rows_per_core = int(packing.rows_per_apuc)
+    packed_lhs = np.zeros((APUCS, batches, lanes), dtype=lhs.dtype)
+    packed_rhs = np.zeros((APUCS, batches, lanes), dtype=rhs.dtype)
+    for core in range(APUCS):
+        row0 = core * rows_per_core
+        pairs = [
+            (row, col)
+            for row in range(row0, min(rows, row0 + rows_per_core))
+            for col in range(columns)
+        ]
+        for output_index, (row, col) in enumerate(pairs):
+            batch, group = divmod(output_index, groups_per_vr)
+            base = group * group_size
+            packed_lhs[core, batch, base : base + reduction] = lhs[row, :]
+            packed_rhs[core, batch, base : base + reduction] = rhs[:, col]
+    normalized = {lhs_name: packed_lhs.reshape(-1), rhs_name: packed_rhs.reshape(-1)}
+    output_specs = {output_name: ((APUCS, batches, lanes), np.dtype(lhs.dtype))}
+    return (
+        normalized,
+        output_specs,
+        {
+            "kind": "gemm",
+            "output": output_name,
+            "logical_shape": (rows, columns),
+            "rows_per_core": rows_per_core,
+            "group_size": group_size,
+            "groups_per_vr": groups_per_vr,
+        },
+    )
 
 
 def _run_apu_v1(compiled: "Compiled", **inputs) -> RunResult:

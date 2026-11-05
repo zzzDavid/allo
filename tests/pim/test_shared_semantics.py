@@ -4127,3 +4127,271 @@ def test_repetitions_update_runs_the_shared_graph_check_before_installing(monkey
     assert compiled.repetitions == 19 and compiled.plan is not plan
     assert compiled.execution_graph is compiled.plan.execution_graph and compiled.execution_graph.metadata["launch_count"] == 2
     assert [l.program.repetitions for l in compiled.plan.launches] == [19, 19]
+
+
+# --------------------------------------------------------------------------- #
+# (u) The APU v1 grouped route of a dataflow region on the contract (review
+# round 60, ISSUES X-28): candidates declare their effects from the shared
+# facts, the emission is checked against them, the runtime binds by identity
+# --------------------------------------------------------------------------- #
+
+
+@allo.dataflow.region()
+def grouped_gemv_region(a: float16[4, 8], b: float16[8], c: float16[4]):
+    """The reviewer's round 60 source: four work items, one FP16 row dot
+    product each, a zero local accumulator; the work parameters are named
+    differently from the region's arguments."""
+
+    @allo.work(mapping=[4], args=[a, b, c])
+    def reduce_row(mat: float16[4, 8], vec: float16[8], dst: float16[4]):
+        row = allo.get_wid()
+        acc: float16 = 0
+        for k in allo.reduction(8):
+            acc += mat[row, k] * vec[k]
+        dst[row] = acc
+
+
+@allo.dataflow.region()
+def grouped_gemv_region_renamed(lhs_in: float16[4, 8], rhs_in: float16[8], out: float16[4]):
+    @allo.work(mapping=[4], args=[lhs_in, rhs_in, out])
+    def one_row(A: float16[4, 8], x: float16[8], y: float16[4]):
+        r = allo.get_wid()
+        total: float16 = 0
+        for j in allo.reduction(8):
+            total += A[r, j] * x[j]
+        y[r] = total
+
+
+G_M, G_K, G_N = 16, 32, 8
+
+
+@allo.dataflow.region()
+def grouped_gemm_region(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+    """A nearby supported program: each of the four work items owns a block of
+    four rows of a dense FP16 GEMM (the runtime's device packing)."""
+
+    @allo.work(mapping=[4], args=[p, q, r_out])
+    def row_block(A: float16[G_M, G_K], B: float16[G_K, G_N], C: float16[G_M, G_N]):
+        core = allo.get_wid()
+        for i in allo.grid(G_M // 4):
+            for j in allo.grid(G_N):
+                acc: float16 = 0
+                for k in allo.reduction(G_K):
+                    acc += A[core * (G_M // 4) + i, k] * B[k, j]
+                C[core * (G_M // 4) + i, j] = acc
+
+
+@allo.dataflow.region()
+def grouped_gemv_carried(a: float16[4, 8], b: float16[8], c: float16[4]):
+    @allo.work(mapping=[4], args=[a, b, c])
+    def reduce_row(mat: float16[4, 8], vec: float16[8], dst: float16[4]):
+        row = allo.get_wid()
+        for k in allo.reduction(8):
+            dst[row] += mat[row, k] * vec[k]
+
+
+@allo.dataflow.region()
+def grouped_add_region(a: float16[4, 8], b: float16[4, 8], c: float16[4, 8]):
+    @allo.work(mapping=[4], args=[a, b, c])
+    def add_row(x: float16[4, 8], y: float16[4, 8], z: float16[4, 8]):
+        row = allo.get_wid()
+        for k in allo.grid(8):
+            z[row, k] = x[row, k] + y[row, k]
+
+
+def _compile_grouped(region, **kwargs):
+    kwargs.setdefault("reduction_order", "reassociate")
+    kwargs.setdefault("backend", "virtual")
+    return allo.compile(region, build_apu_v1_target(), apu_v1_cost, **kwargs)
+
+
+def test_apu_v1_grouped_candidates_declare_effects_from_the_shared_facts():
+    """The reviewer's source compiles through public ``allo.compile``; every
+    selected grouped placement declares coverage, layouts, transfers, the
+    launch and the ABI derived from the work body's facts and the group
+    layout, and the emitted body was checked against them."""
+    from allo.spmw_candidate import EFFECTS_DERIVERS, EFFECTS_REQUIRED_TARGETS, candidate_effects
+
+    assert "apu_v1" in EFFECTS_REQUIRED_TARGETS
+    compiled = _compile_grouped(grouped_gemv_region)
+    assert "apu_v1" in EFFECTS_DERIVERS  # registered by the route module
+    assert compiled.estimate().cycles > 0
+    inner = compiled.compiled
+    assert len(inner.layout) == 4 and all(l.mode == "grouped_f16" for l in inner.layout)
+    for placement in inner.layout:
+        effects = candidate_effects(placement)
+        assert effects is not None
+        assert effects.coverage.operations == ("MAC",)
+        assert effects.coverage.inputs == ("mat", "vec") and effects.coverage.outputs == ("dst",)
+        assert effects.abi_inputs == ("mat", "vec") and effects.abi_outputs == ("dst",)
+        layouts = {v.value: v for v in effects.value_layouts}
+        assert (layouts["mat"].storage, layouts["mat"].axes, layouts["mat"].packing) == ("vr0", ("k",), "group_lanes:8192")
+        assert (layouts["vec"].storage, layouts["vec"].axes) == ("vr1", ("k",))
+        assert (layouts["dst"].storage, layouts["dst"].packing) == ("vr2", "group_head:8192")
+        routes = {(t.value, t.direction): tuple(t.route) for t in effects.transfers}
+        assert routes[("mat", "in")] == ("host_pack", "l4", "vmrs", "vr0")
+        assert routes[("dst", "out")] == ("vr2", "vmrs", "l4", "host_gather")
+        (launch,) = effects.launches
+        assert launch.kind == "gvml_grouped_mac" and launch.operations == (0,)
+        assert launch.instances == (0, 1) and launch.reduction == (0, 8)
+        assert launch.accumulator == "zero"
+        assert launch.covers == ("grouped_f16", 8192, 4, 4, 1, "virtual_only")
+        assert {a[2] for a in effects.allocations} == {"vr", "vmrs"}
+    # The realization the check compared: one SPMD body (work item 0) with the
+    # declared loads, one multiply and one 8192-lane group sum, one store.
+    realized = inner.layout_ctx.realized
+    assert [e[1:] for e in realized] == [
+        ("load", "x", "vr0", 0),
+        ("load", "y", "vr1", 1),
+        ("load", "acc", "vr2", 2),
+        ("mul", "vr0", "vr1"),
+        ("group_reduce", "vr2", "mac_tmp_vr", 8192),
+        ("store", "acc", "vr2", 2),
+    ]
+    assert all(e[0] == (0,) for e in realized)
+    assert "GVML_P2_8K" in "\n".join(inner.cmds)
+
+
+def test_apu_v1_grouped_renamed_program_gets_the_same_decision():
+    """A program differing only in spelling (region arguments and work
+    parameters) gets the same placement, declaration (up to names) and
+    estimate."""
+    from allo.spmw_candidate import candidate_effects
+
+    first = _compile_grouped(grouped_gemv_region)
+    renamed = _compile_grouped(grouped_gemv_region_renamed)
+    assert renamed.estimate().cycles == first.estimate().cycles
+    a = candidate_effects(first.compiled.layout[0]).manifest()
+    b = candidate_effects(renamed.compiled.layout[0]).manifest()
+    assert a["launches"] == b["launches"]
+    # Axes are the source's loop labels (``k`` there, ``j`` here): compared
+    # by count; storage and packing are the decision.
+    assert [(v["storage"], v["packing"], len(v["axes"])) for v in a["value_layouts"]] == [
+        (v["storage"], v["packing"], len(v["axes"])) for v in b["value_layouts"]
+    ]
+    assert b["coverage"]["inputs"] == ["A", "x"] and b["coverage"]["outputs"] == ["y"]
+    assert renamed.compiled.cmds == first.compiled.cmds
+
+
+def test_apu_v1_grouped_gemm_declares_the_runtime_packing_and_batches():
+    """A dense FP16 GEMM region has a device packing: the declaration's batch
+    count is the packing's (rows split over four APUCs, one dot product per
+    group), and the emitted body loops over exactly that many batches."""
+    from allo.spmw_candidate import candidate_effects
+
+    compiled = _compile_grouped(grouped_gemm_region)
+    inner = compiled.compiled
+    placement = inner.layout[0]
+    effects = candidate_effects(placement)
+    (launch,) = effects.launches
+    # 16 rows over 4 APUCs = 4 rows x 8 columns = 32 dot products per APUC,
+    # 4 groups of 8192 lanes per VR -> 8 batches.
+    assert launch.covers == ("grouped_f16", 8192, 4, 4, 8, "gemm")
+    assert launch.instances == (0, 32) and launch.reduction == (0, 32)
+    assert placement.extra["n_out_tiles"] == 8 and inner.layout_ctx.vector_batches == 8
+    layouts = {v.value: v for v in effects.value_layouts}
+    assert layouts["A"].axes == ("i", "k") and layouts["B"].axes == ("k", "j")
+    assert layouts["C"].axes == ("i", "j") and layouts["C"].packing == "group_head:8192"
+
+
+def test_apu_v1_grouped_runtime_binds_the_callers_arrays_by_identity():
+    """The grouped runtime packs the caller's arrays for the declared program:
+    the work body's buffers are bound to the region's parameters by retained
+    identity (``A`` is ``p``, ``B`` is ``q``, ``C`` is ``r_out``), each dot
+    product occupies one group, the batch count is the declared one; a
+    program without a device packing (the GEMV) is refused with the reason."""
+    from allo.spmw_apu_v1 import _apu_v1_prepare_io
+
+    compiled = _compile_grouped(grouped_gemm_region)
+    inner = compiled.compiled
+    assert inner.source_parameters == ("p", "q", "r_out")
+    rng = np.random.default_rng(3)
+    A = rng.standard_normal((G_M, G_K)).astype(np.float16)
+    B = rng.standard_normal((G_K, G_N)).astype(np.float16)
+    C = np.zeros((G_M, G_N), np.float16)
+    normalized, specs, packing = _apu_v1_prepare_io(inner, {"p": A, "q": B, "r_out": C})
+    assert sorted(normalized) == ["p", "q"]
+    assert specs == {"r_out": ((4, 8, 32768), np.dtype(np.float16))}
+    assert packing["logical_shape"] == (G_M, G_N) and packing["rows_per_core"] == 4
+    lhs = normalized["p"].reshape(4, 8, 32768)
+    rhs = normalized["q"].reshape(4, 8, 32768)
+    # core 1, batch 0, group 2: output (row 4, column 2)
+    assert np.array_equal(lhs[1, 0, 2 * 8192 : 2 * 8192 + G_K], A[4])
+    assert np.array_equal(rhs[1, 0, 2 * 8192 : 2 * 8192 + G_K], B[:, 2])
+    assert not lhs[1, 0, 2 * 8192 + G_K : 3 * 8192].any()
+    with pytest.raises(ValueError, match="no argument for the work body's 'A'"):
+        _apu_v1_prepare_io(inner, {"A": A, "B": B, "C": C})
+    gemv = _compile_grouped(grouped_gemv_region).compiled
+    with pytest.raises(NotImplementedError, match="dense FP16 GEMM") as error:
+        _apu_v1_prepare_io(gemv, {"a": np.zeros((4, 8), np.float16), "b": np.zeros(8, np.float16), "c": np.zeros(4, np.float16)})
+    assert "mat[4, 8] x vec[8]" in str(error.value)
+
+
+def test_apu_v1_grouped_restrictions_are_explicit():
+    """Strict FP16 reduction (the route regroups), a carried destination (the
+    route zeroes its accumulator) and a non-MAC work body are refused by
+    name, before enumeration reaches the contract."""
+    with pytest.raises(ReductionOrderError, match="gvml_add_subgrps"):
+        _compile_grouped(grouped_gemv_region, reduction_order="strict")
+    with pytest.raises(NotImplementedError, match="accumulator_init='carried'"):
+        _compile_grouped(grouped_gemv_carried)
+    with pytest.raises(NotImplementedError, match="declares no program for the operations \\['ADD'\\]"):
+        _compile_grouped(grouped_add_region)
+
+
+def test_apu_v1_grouped_emission_is_checked_against_the_declaration(monkeypatch):
+    """Fault injection into the emission: a group-sum tree over half the
+    declared group makes the emitted body differ from the declaration, and
+    materialization refuses every candidate (the shared feasibility
+    rejection) instead of installing it."""
+    from allo.spmw_apu_v1 import APUv1Ctx
+
+    original = APUv1Ctx.emit_group_reduce_f16
+
+    def halved(self, dst, src):
+        saved = self.group_size
+        self.group_size = saved // 2
+        try:
+            original(self, dst, src)
+        finally:
+            self.group_size = saved
+
+    monkeypatch.setattr(APUv1Ctx, "emit_group_reduce_f16", halved)
+    with pytest.raises(Exception, match="reduces groups of \\[4096\\] lanes; the candidate declares 8192"):
+        _compile_grouped(grouped_gemv_region)
+
+
+def test_apu_v1_grouped_supplied_declaration_must_be_the_derivation():
+    """A supplied placement whose declaration was edited (the matrix in
+    another register) is refused by the contract before costing."""
+    from allo.spmw_autoschedule import Placement
+    from allo.spmw_candidate import candidate_effects
+
+    compiled = _compile_grouped(grouped_gemv_region)
+    placement = compiled.compiled.layout[0]
+    effects = candidate_effects(placement)
+    edited = replace(
+        effects,
+        value_layouts=tuple(
+            replace(v, storage="vr5") if v.value == "mat" else v for v in effects.value_layouts
+        ),
+    )
+    tampered = Placement(
+        placements=dict(placement.placements),
+        mode=placement.mode,
+        extra={**placement.extra, "effects": edited},
+        layout=placement.layout,
+    )
+    with pytest.raises(ValueError, match="declares 'mat' in storage 'vr5'"):
+        _compile_grouped(grouped_gemv_region, layout=[tampered] * 4)
+    # The same placement supplied without its declaration is re-declared
+    # from the facts and compiles to the same program.
+    handle_only = Placement(
+        placements=dict(placement.placements),
+        mode=placement.mode,
+        extra={k: v for k, v in placement.extra.items() if k != "effects"},
+        layout=placement.layout,
+    )
+    again = _compile_grouped(grouped_gemv_region, layout=[handle_only] * 4)
+    assert again.compiled.cmds == compiled.compiled.cmds
+    assert candidate_effects(again.compiled.layout[0]).manifest() == effects.manifest()

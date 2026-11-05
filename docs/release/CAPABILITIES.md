@@ -166,10 +166,26 @@ by diffing the device log before and after the launch (V1-07 fixed).
 | What cycles mean | ARC core cycles (`crun`) of the profiled `total` section printed by the device build (`PROF_PRINT`), exactly one fresh record per launch | same | same |
 | Evidence | Verified at round 3 on this server: `test_gemv_apu_v1` and two `tests/pim/apu_v1/vector_gemm` plans passed on the board (4 device tests, 197 s). Paper numbers (E9-E12) came from an external locked runner (`CLAIMS.md`); open: V1-05 (fitted count rule absent, native estimates 19-56% off without a validity flag), V1-06 (fixed tile heuristic; 12.71x row plans reachable by `layout=`, golden drift 2.9%); V1-08 fixed (only the eight GSI SDK files the build reads are copied from `TENON_APU_V1_TEMPLATE_DIR`, origins in the project's `THIRD_PARTY.txt`; an ARC build of a generated project succeeded on this server 2026-11-02, not launched) | virtual/functional covered by `tests/perf/test_run_result_contract.py`; hardware **UNVERIFIED** at round 3 | histogram golden median row passed on the board at round 3; other recipes compile-only at round 3 (`test_paper_golden.py`) |
 
-A legacy matcher route (`spmw_apu_v1.APUv1Ctx`, grouped FP16 MAC over four
-APUCs with `gvml_add_subgrps`) is reachable for dataflow regions only; it
-refuses float accumulators under `"strict"`, reads output shapes from the
-compiled ABI and raises on missing output files (V1-09 fixed).
+The grouped matcher route (`spmw_apu_v1.APUv1Ctx`, one full-VR FP16
+multiply and a `gvml_add_subgrps` tree per group, four APUCs in SPMD) is
+reachable for dataflow regions only (`@allo.work` scopes whose body is one
+FP16 MAC contraction with a zero accumulator). Since round 61 (X-28) it is
+on the shared candidate contract: every grouped candidate declares its
+coverage, value layouts (operands packed `group_lanes:<group>` in their
+VRs, the result at the group heads), transfers, one `gvml_grouped_mac`
+launch and ABI from the work body's retained facts
+(`allo/pim/apu_v1_grouped_route.py`), the emitted body is compared with the
+declaration at materialization, and the runtime binds the caller's arrays
+to the work body's buffers by retained identity. Restrictions, refused by
+name: a `"strict"` FP16 reduction (the tree regroups), a carried destination
+(the route zeroes its accumulator), a non-MAC work body. Device execution
+packs a dense FP16 GEMM (two rank-2 operands sharing the reduction extent,
+the result the whole output) one dot product per group with the batch count
+derived from the facts; any other shape (a region GEMV) compiles for its
+estimate (`backend="virtual"`) and is refused on the board with the reason.
+At most four work items are priced (V1-20). Not board-verified since the
+migration (the host's `/tmp`; V1-09 fixed earlier: output shapes from the
+compiled ABI, missing output files raise).
 
 ## GSI APU v2 (Gemini-II)
 

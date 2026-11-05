@@ -332,21 +332,43 @@ def _operand_pointer_fields(compiled: "Compiled") -> dict[str, str]:
     Deriving this bridge from ``OperandBinding.role`` avoids guessing from a
     parameter's spelling or alphabetical position.
     """
+    from .pim.apu_v1_grouped_route import grouped_runtime_binding
+
     role_to_pointer = {
         "x": "inp_L4ptr",
         "y": "wgt_L4ptr",
         "acc": "out_L4ptr",
     }
+    trace = getattr(compiled, "trace", None)
+    # The caller's names for the work body's buffers, by retained identity
+    # (a region whose work parameters are spelled differently from its
+    # arguments); a buffer without a binding keeps its own name.
+    parameters = getattr(compiled, "source_parameters", None)
+    binding = grouped_runtime_binding(trace, parameters) if parameters else {}
+
+    def field(memref):
+        name = _canonical_memref_name(memref)
+        return None if name is None else f"mem_hndl_{binding.get(name, name)}"
+
     fields: dict[str, str] = {}
-    for match in getattr(getattr(compiled, "trace", None), "matches", ()):
+    for match in getattr(trace, "matches", ()):
+        local_result = bool(match.extra.get("result_is_local"))
         for operand in match.operands:
             pointer = role_to_pointer.get(operand.role)
-            name = _canonical_memref_name(operand.memref_name)
-            if pointer is not None and name is not None:
-                fields.setdefault(pointer, f"mem_hndl_{name}")
-        result = _canonical_memref_name(match.result_memref_name)
-        if result is not None:
-            fields.setdefault("out_L4ptr", f"mem_hndl_{result}")
+            if pointer is None or operand.memref_name is None:
+                continue
+            if local_result and operand.memref_name == match.result_memref_name:
+                # A local accumulator has no L4 image of its own: the output
+                # pointer is the sink's (below).
+                continue
+            fields.setdefault(pointer, field(operand.memref_name))
+        sink_refs = match.extra.get("output_sink_refs", ())
+        for position, (memref, _text) in enumerate(match.extra.get("output_sinks", ())):
+            local = sink_refs[position][1] if position < len(sink_refs) else False
+            if not local and memref is not None:
+                fields.setdefault("out_L4ptr", field(memref))
+        if not local_result and match.result_memref_name is not None:
+            fields.setdefault("out_L4ptr", field(match.result_memref_name))
     return fields
 
 

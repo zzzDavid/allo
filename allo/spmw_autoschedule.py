@@ -1282,6 +1282,20 @@ def _apu_v1_grouped_enumerate(target, matches: list[MatchedOp]) -> list[Placemen
     independent outputs. Both map contiguously onto the target-declared 32K
     VR lane axis. A single GVML call processes every group concurrently.
     """
+    from .pim.apu_v1_grouped_route import (
+        apu_v1_grouped_candidate_effects,
+        contraction_facts,
+        grouped_device_packing,
+        grouped_geometry,
+        require_grouped_operations,
+    )
+
+    # A work body that went through the shared front stages: the route
+    # realizes one MAC contraction; anything else is refused by name here
+    # (ISSUES X-28), before a handle-only placement could reach the contract.
+    facts = contraction_facts(matches)
+    if facts is not None:
+        require_grouped_operations(matches, facts)
     role_to_memref = _trace_memrefs_by_role(matches)
     x_mref = role_to_memref.get("x")
     y_mref = role_to_memref.get("y")
@@ -1338,18 +1352,30 @@ def _apu_v1_grouped_enumerate(target, matches: list[MatchedOp]) -> list[Placemen
     )
     n_out_tiles, n_weight_tiles, n_boundaries = _apu_v1_vr_tiling(target, trace)
 
-    return [
-        Placement(
-            placements=placements,
-            mode="grouped_f16",
-            extra={
-                "n_out_tiles": n_out_tiles,
-                "n_weight_tiles": n_weight_tiles,
-                "n_stage_boundaries": n_boundaries,
-            },
-            layout=layout,
+    placement = Placement(
+        placements=placements,
+        mode="grouped_f16",
+        extra={
+            "n_out_tiles": n_out_tiles,
+            "n_weight_tiles": n_weight_tiles,
+            "n_stage_boundaries": n_boundaries,
+        },
+        layout=layout,
+    )
+    if facts is not None:
+        # The candidate's declared effects (coverage, layouts, transfers,
+        # launch, ABI) from the shared facts and this placement; the batch
+        # count the device program loops over is the runtime packing's, so
+        # the emitted loop and the host's packing agree (`APUv1Ctx.
+        # check_realization` compares the emission with the declaration).
+        packing = grouped_device_packing(facts[0], grouped_geometry(target, placement))
+        if packing.kind == "gemm":
+            placement.extra["n_out_tiles"] = int(packing.batches)
+        placement.extra["device_packing"] = packing.kind
+        placement.extra["effects"] = apu_v1_grouped_candidate_effects(
+            target, matches, placement
         )
-    ]
+    return [placement]
 
 
 @register_enumerator("attacc")
