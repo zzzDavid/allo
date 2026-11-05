@@ -1219,6 +1219,45 @@ Candidate `54cbb08` (clean tree). Evidence under
 | Installed-wheel `tests/pim/test_shared_semantics.py` (`installed.log`) | 131 passed, 1 failed: `test_local_accumulator_gemm_executes_on_apu_v1_functional_backend`, the recorded NumPy 2.4+ functional-route failure V1-19 (the venv installs numpy 2.5.4; the checkout environment has 2.3.5 where it passes); `installed-apu_v1-functional-rerun.log` |
 | zhang-x4 wheel from the same sdist (`g2_build_wheel.sh`, `g2/`) | wheel `ba7bedab...`, clean venv; card `apu-00` Available, FW `GSI_G2_Infrastructure_V1.24.1` |
 | Gemini-II card tests from the installed wheel (`g2-card-tests.log`) | 15 passed in 124 s (a first attempt failed when my kept temporaries from earlier rounds filled the host's /tmp; 139 of them removed, the run repeated without `TENON_APU_G2_KEEP_TMP`) |
-| Gemini-II paper rows at the candidate (`g2_paired_rows.json`, `g2_paired_rows_s{2,3,4}.json`, `g2_pooled.json`; four paired sessions of 20 rounds, 80 samples per row, GTML interleaved, every output exact) | pooled medians vs paper: gemm 1729.63 / 1733.225 (0.9979), batched_gemm 1743.33 / 1739.15 (1.0024, paper inside the pooled IQR), gesummv 1840.45 / 1860.075 (0.9894), bicg 2538.63 / 2548.825 (0.9960), mvt 2764.48 / 2766.625 (0.9992); GTML pooled medians within 0.5% of the paper's column; batched_gemm OPEN (nominal) after its pre-registered campaign (X-26), the other four REPRODUCED at the candidate |
+| Gemini-II paper rows at the candidate (`g2_paired_rows.json`, `g2_paired_rows_s{2,3,4}.json`, `g2_pooled.json`; four paired sessions of 20 rounds, 80 samples per row, GTML interleaved, every output exact) | pooled medians vs paper: gemm 1729.63 / 1733.225 (0.9979), batched_gemm 1743.33 / 1739.15 (1.0024, paper inside the pooled IQR), gesummv 1840.45 / 1860.075 (0.9894), bicg 2538.63 / 2548.825 (0.9960), mvt 2764.48 / 2766.625 (0.9992); GTML pooled medians against the paper's column: gemm 1915.38 / 1903.85 (+0.61%), batched_gemm 1912.93 / 1906.4 (+0.34%), gesummv 3093.93 / 3090.975 (+0.10%), bicg 2728.68 / 2726.5 (+0.08%), mvt 3084.35 / 3089.65 (-0.17%); batched_gemm OPEN (nominal) after its pre-registered campaign (X-26), the other four REPRODUCED at the candidate |
 | Gemini-I pre-registered campaign (X-22 / X-23) | not completed at this revision: attempt 1 launched nothing (the driver's `--artifacts` flag is the assets root; misuse mine), attempt 2 lost linear-regression launches 6 to 10 to `ledag-ssh` exit 255 with the host's shared `/tmp` at 100% (consumers not ours; the vendor tool needs about 5 MB of scratch per device-log read); both under `aborted/`, no sample pooled; `campaign_watcher.sh` launches the campaign when `/tmp` has 3 GB free |
-| Required G10 set at the candidate | 47 REPRODUCED, 8 OPEN (X-19 x4, X-22 / X-23 x3, X-26 x1), 0 UNVERIFIED |
+| Required G10 set: historical coverage against candidate validation | Historical (at the recorded revisions of the inventory): 47 REPRODUCED, 8 OPEN (X-19 x4, X-22 / X-23 x3, X-26 x1), 0 UNVERIFIED. Executed at the candidate `54cbb08` from installed artifacts in this round: the five Gemini-II rows (4 REPRODUCED, 1 OPEN) and the three default AiM golden rows (installed-wheel subset); not executed at the candidate: the sixteen UPMEM rows (recorded at `0e48d81`; the candidate's UPMEM probe failed on the host's Docker data root), the three Samsung rows and the eleven `paper_full` AiM rows (recorded at `0e48d81` and rounds 25-39), the twelve AttAcc results (rounds 51-52 working trees), the five Gemini-I rows (69773fc / 28cc922) |
+
+## Round 57 (2026-11-05): required AiM and Samsung rows executed at the integration candidate from the installed wheel
+
+Wheel `860c82a8...` of `54cbb08` in the clean venv (`r55/pkg`), tests and
+benchmarks copied out of the checkout, `PYTHONSAFEPATH`, the native
+timing-only ramulator2 (`r57/run_golden_installed.sh`, `r57/run_aim_provenance.sh`).
+
+| Check | Result |
+|---|---|
+| `tests/pim/test_paper_golden.py -k aim_cent_paper_cycles` (`golden-aim-default.log`) | 3 passed, 11 skipped (the default rows) |
+| the same with `-m paper_full` (`golden-aim-paper-full.log`) | 11 passed: the paper_full rows selected explicitly; the four RoPE rows print their corrected-program pins and measured cycles (`AIM_GOLDEN ... (ISSUES X-19)`) |
+| `r57/aim_rows_provenance.json` (every AiM row from the installed wheel: the selection of each kernel group with candidate counts and ties, the lowering manifest, the trace digest, line and opcode counts, the simulated cycles, the executor binary / library / config digests) | see the table below; 10 rows equal the paper's cycles exactly, the 4 RoPE rows are the corrected programs 32 cycles above (OPEN, X-19) |
+| `tests/pim/test_paper_golden.py -k samsung_gemv_paper_cycles` (`golden-samsung-default.log`, PIMSimulator) | 3 passed: the vendor-equivalent program at the paper's values (4435 / 8041 / 8247), the default selection faster (4108 / 7057 / 7255, `split_rows+crf_shared`), outputs within the float32 reference; no Samsung row is marked paper_full |
+| UPMEM at the candidate | not executed: the host's Docker data root is full (containerd ENOSPC), the UPMEM rows stay at `0e48d81` |
+
+AiM rows at the candidate (timing only; cycles are `memory_system_cycles`):
+
+| Row | Measured | Paper | Difference | Trace sha256 | Lines |
+|---|---:|---:|---|---|---:|
+| norm_residual_l128 | 11750 | 11750 | exact | `f846600a17b0` | 10271 |
+| qkvo_rope_l128 | 129637 | 129605 | +32 (corrected RoPE program, X-19) | `c25203892997` | 9747 |
+| attention_l128 | 11010 | 11010 | exact | `29f3190aad66` | 2249 |
+| attention_l512 | 18126 | 18126 | exact | `112c7bad9914` | 2549 |
+| attention_l4096 | 95090 | 95090 | exact | `103edc8376c5` | 5649 |
+| softmax_pim_l128 | 6307 | 6307 | exact | `5bbf4172209a` | 6149 |
+| softmax_pim_l512 | 24835 | 24835 | exact | `a6f1c35d91e2` | 24581 |
+| softmax_pim_l4096 | 198416 | 198416 | exact | `f40acc441db3` | 196619 |
+| ffn_fc_l128 | 250433 | 250433 | exact | `833f14bacd24` | 3312 |
+| ffn_activation_l128 | 11775 | 11775 | exact | `e30bbfbe179c` | 11276 |
+| ffn_complete_l128 | 262269 | 262269 | exact | `73af1bad404b` | 14587 |
+| full_block_l128 | 421191 | 421159 | +32 (corrected RoPE program, X-19) | `05101b9337b0` | 42999 |
+| full_block_l512 | 446835 | 446803 | +32 (corrected RoPE program, X-19) | `3603565dc103` | 61731 |
+| full_block_l4096 | 697348 | 697316 | +32 (corrected RoPE program, X-19) | `8abfcb04091b` | 236869 |
+
+Executed at the candidate after this round: the five Gemini-II rows (round
+56), the fourteen AiM rows and the three Samsung rows; not yet: the sixteen
+UPMEM rows (Docker), the twelve AttAcc results (rounds 51-52 working trees),
+the five Gemini-I rows (the pre-registered campaign pending on the host's
+temporary space).
