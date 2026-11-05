@@ -4154,7 +4154,6 @@ def _run_upmem(compiled, **inputs) -> RunResult:
         if "UPIMULATOR_ROOT" not in os.environ
         else None
     )
-    image = spmw_simenv.upmem_sdk_image()
     slot = spmw_simenv.upmem_benchmark_slot()
     runs_root = spmw_simenv.upmem_scratch_dir() / "runs"
     program_by_kernel = {p.kernel: p for p in ctx.groups.values()}
@@ -4205,22 +4204,13 @@ def _run_upmem(compiled, **inputs) -> RunResult:
         bin_dir.mkdir(parents=True)
         tasklets = segment.decision.tasklets
         dpus = segment.kernel.dpus
-        build = [
-            "docker",
-            "run",
-            "--rm",
-            "-v",
-            f"{root}:/root/uPIMulator",
-            image,
-            "python3",
-            "/root/uPIMulator/benchmark/build.py",
-            "--num_dpus",
-            "1",
-            "--num_tasklets",
-            str(tasklets),
-            "--benchmark",
-            slot,
-        ]
+        # The DPU SDK executor: the Docker image, or the host-installed SDK
+        # through a user-namespace bind at the image's path
+        # (`spmw_simenv.upmem_sdk_build_command`); recorded per run.
+        build = spmw_simenv.upmem_sdk_build_command(
+            root,
+            ["--num_dpus", "1", "--num_tasklets", str(tasklets), "--benchmark", slot],
+        )
         simulate = [
             str(binary),
             "--benchmark",
@@ -4363,6 +4353,7 @@ def _run_upmem(compiled, **inputs) -> RunResult:
                 "snapshot_sha256": snapshot_sha,
                 "sdk_build_sha256": sdk_sha,
                 "sdk_build": sdk_build,
+                "sdk_executor": spmw_simenv.upmem_sdk_executor_label(),
                 "commands": {"compile": build, "simulate": simulate},
                 "num_dpus": dpus,
                 "num_tasklets": tasklets,

@@ -361,6 +361,27 @@ no data path).
   3,135,600; 2mm 6,271,190; 3mm 9,406,780; conv 2,956,792 (501 s for all 16,
   GEMV 9 s). `tests/pim/test_gemv_all_targets.py -k upmem` (768x128 int32
   GEMV) 1 passed in 60 s on the same build.
+- **Native SDK executor (no Docker; round 67):** with
+  `TENON_UPMEM_SDK_HOME=<dir holding bin/dpu-upmem-dpurte-clang>` (SDK
+  2023.1.0 unpacked on the host) the DPU build runs the same
+  `benchmark/build.py` natively: `unshare -Urm` enters an unprivileged user
+  and mount namespace, mounts a tmpfs over `/root` there (the host's `/root`
+  is untouched), binds the uPIMulator root at `/root/uPIMulator` (the path
+  the Docker route mounts it at, so the compiler sees identical source
+  paths and the build tree is written into the root as the user, not as
+  root), and runs `python3 /root/uPIMulator/benchmark/build.py ...` with the
+  SDK's `bin` first on `PATH` and its `lib` and Python package visible, as
+  the image's environment sets them. Needs `cmake`, `ninja`, `unshare` and
+  `python3` on the host `PATH` and unprivileged user namespaces
+  (`spmw_simenv.upmem_sdk_native_unavailable_reason` names the missing
+  piece). The pinned-campaign manifest check and the user-build route are
+  unchanged; every DPU run record names its executor
+  (`sdk_executor`: `docker:<image>` or `native-sdk:<home>`) and the exact
+  build command (`commands.compile`). The SDK compiler is a clang 12 build
+  (`dpu-upmem-dpurte`) that runs on this host's glibc 2.31 unchanged. The
+  executor was added when the host's Docker data root was full (ENOSPC on
+  every container start); the UPMEM golden rows run through it are recorded
+  in `VALIDATION.md` round 67.
 - **Docker image naming:** the authors' local SDK image is tagged
   `bongjoonhyun/upimulator` (id `sha256:57dc7591...`, 2026-07-21), the same
   name as the upstream author's Docker Hub image, which does not contain the

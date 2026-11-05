@@ -148,6 +148,7 @@ reason without running anything.
 | `UPIMULATOR_ROOT` | uPIMulator Go project root (`benchmark/`, `sdk/`) | the archived source snapshot, staged under `$TENON_UPMEM_SCRATCH` |
 | `UPIMULATOR_BIN` | uPIMulator binary | `$TENON_UPMEM_PROVENANCE_DIR/uPIMulator` |
 | `TENON_UPMEM_SDK_IMAGE` | Docker image holding the UPMEM DPU SDK | `bongjoonhyun/upimulator` (a local build that reuses the upstream image name; see `simulators.md`) |
+| `TENON_UPMEM_SDK_HOME` | A host-installed UPMEM DPU SDK (`bin/dpu-upmem-dpurte-clang`): the DPU build runs natively through a user-namespace bind at the image's path instead of the Docker image (needs cmake, ninja, unshare, user namespaces; `simulators.md`) | unset (the Docker image) |
 | `TENON_UPMEM_BENCHMARK_SLOT` | `benchmark/<slot>` that receives the generated `task.c` | `GENERIC` |
 | `TENON_UPMEM_SCRATCH` | staged roots, per-run directories, `root.lock`, `run.lock` | `<tmpdir>/tenon-upmem` |
 | `TENON_UPMEM_PROVENANCE_DIR` | archived campaign uPIMulator binary and `source-snapshot.tar` | `$TENON_ARTIFACTS/upmem/provenance/upimulator` |
@@ -236,6 +237,8 @@ tar czf $UPIMULATOR_ROOT/docker/upmem-sdk.tar.gz -C <upmem-sdk> upmem-2023.1.0-L
 docker build -f $ALLO/simulators/uPIMulator/Dockerfile \
     -t tenon-upimulator-sdk:2023.1.0 $UPIMULATOR_ROOT/docker/            # ~36 s
 export TENON_UPMEM_SDK_IMAGE=tenon-upimulator-sdk:2023.1.0
+# or, without Docker: the SDK unpacked on the host (needs cmake, ninja, unshare, user namespaces)
+# export TENON_UPMEM_SDK_HOME=<upmem-sdk>/upmem-2023.1.0-Linux-x86_64
 docker run --rm -v $UPIMULATOR_ROOT:/root/uPIMulator $TENON_UPMEM_SDK_IMAGE \
     python3 /root/uPIMulator/sdk/build.py --num_tasklets 12
 #   paper GEMV (96x128): 359,026 cycles, sdk_build "user-build:d45e285c34b5"

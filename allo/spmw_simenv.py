@@ -36,6 +36,15 @@ Variables (meaning; default when unset):
 ``TENON_UPMEM_SDK_IMAGE``
     Docker image holding the UPMEM DPU SDK. Default: ``bongjoonhyun/upimulator``
     (a locally built image; see ``docs/release/simulators.md``).
+``TENON_UPMEM_SDK_HOME``
+    A UPMEM DPU SDK installed on this host (the directory holding
+    ``bin/dpu-upmem-dpurte-clang``, SDK 2023.1.0).  When set, the DPU build
+    runs natively instead of in the Docker image: ``unshare -Urm`` binds the
+    uPIMulator root at the image's ``/root/uPIMulator`` path in an
+    unprivileged user and mount namespace and runs the same
+    ``benchmark/build.py`` with the SDK on ``PATH``, so the compiler, the
+    source paths and the build tree are the ones the Docker route uses.  The
+    run records label the executor (``sdk_executor``).
 ``TENON_UPMEM_BENCHMARK_SLOT``
     ``benchmark/<slot>`` directory Tenon writes ``task.c`` into.
     Default: ``GENERIC``.
@@ -338,6 +347,103 @@ def upmem_sdk_image() -> str:
     return os.environ.get("TENON_UPMEM_SDK_IMAGE", _DEFAULT_UPMEM_SDK_IMAGE)
 
 
+UPMEM_SDK_COMPILER = "dpu-upmem-dpurte-clang"
+# The path the Docker route mounts the uPIMulator root at; the native route
+# binds it at the same path so the compiler sees identical source paths.
+UPMEM_CONTAINER_ROOT = "/root/uPIMulator"
+
+
+def upmem_sdk_native_home() -> Path | None:
+    """The host-installed UPMEM SDK (``TENON_UPMEM_SDK_HOME``), or None when
+    the DPU build runs in the Docker image."""
+    value = os.environ.get("TENON_UPMEM_SDK_HOME")
+    return Path(value) if value else None
+
+
+def upmem_sdk_native_unavailable_reason(home: Path) -> str | None:
+    """None when the native SDK executor can run: the SDK compiler is present,
+    ``cmake`` and ``ninja`` are on ``PATH``, and an unprivileged user and
+    mount namespace can be entered (``unshare -Urm``)."""
+    compiler = Path(home) / "bin" / UPMEM_SDK_COMPILER
+    if not compiler.is_file():
+        return f"UPMEM SDK compiler not found at {compiler}"
+    if not os.access(compiler, os.X_OK):
+        return f"UPMEM SDK compiler at {compiler} is not executable"
+    for tool in ("cmake", "ninja", "unshare", "python3"):
+        if shutil.which(tool) is None:
+            return f"{tool} is not on PATH (the native UPMEM SDK build needs it)"
+    try:
+        probe = subprocess.run(
+            ["unshare", "-Urm", "true"],
+            capture_output=True,
+            text=True,
+            timeout=_DOCKER_PROBE_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError) as error:
+        return f"unshare probe failed: {error}"
+    if probe.returncode != 0:
+        return (
+            "unprivileged user namespaces are not available "
+            f"(unshare -Urm: {probe.stderr.strip() or probe.returncode})"
+        )
+    return None
+
+
+def upmem_sdk_executor_label() -> str:
+    """The run-record label of the DPU SDK executor: ``docker:<image>`` or
+    ``native-sdk:<home>``."""
+    home = upmem_sdk_native_home()
+    return f"native-sdk:{home}" if home is not None else f"docker:{upmem_sdk_image()}"
+
+
+def upmem_sdk_build_command(root: Path, arguments) -> list[str]:
+    """The command that runs ``benchmark/build.py`` of the uPIMulator root
+    ``root`` with the DPU SDK, with ``arguments`` after the script.
+
+    Docker route: ``docker run --rm -v <root>:/root/uPIMulator <image> python3
+    /root/uPIMulator/benchmark/build.py ...``.  Native route
+    (``TENON_UPMEM_SDK_HOME``): the same script at the same path, the root
+    bound there inside ``unshare -Urm`` (a tmpfs over ``/root`` in the private
+    mount namespace, the host's ``/root`` untouched), the SDK's ``bin`` first
+    on ``PATH`` and its libraries and Python package visible, as the image's
+    environment sets them.
+    """
+    arguments = [str(a) for a in arguments]
+    home = upmem_sdk_native_home()
+    if home is None:
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{root}:{UPMEM_CONTAINER_ROOT}",
+            upmem_sdk_image(),
+            "python3",
+            f"{UPMEM_CONTAINER_ROOT}/benchmark/build.py",
+            *arguments,
+        ]
+    script = (
+        "set -e; "
+        "mount -t tmpfs none /root && "
+        f'mkdir -p {UPMEM_CONTAINER_ROOT} && mount --bind "$1" {UPMEM_CONTAINER_ROOT} && '
+        f"cd {UPMEM_CONTAINER_ROOT} && "
+        'exec env UPMEM_HOME="$2" PATH="$2/bin:$PATH" LD_LIBRARY_PATH="$2/lib" '
+        'PYTHONPATH="$2/lib/python3/dist-packages" '
+        f'python3 {UPMEM_CONTAINER_ROOT}/benchmark/build.py "${{@:3}}"'
+    )
+    return [
+        "unshare",
+        "-Urm",
+        "bash",
+        "-c",
+        script,
+        "tenon-upmem-sdk",
+        str(root),
+        str(home),
+        *arguments,
+    ]
+
+
 def upmem_benchmark_slot() -> str:
     """Directory name under ``benchmark/`` that Tenon writes DPU programs into."""
     return os.environ.get("TENON_UPMEM_BENCHMARK_SLOT", _DEFAULT_UPMEM_BENCHMARK_SLOT)
@@ -526,9 +632,15 @@ def upmem_unavailable_reason() -> str | None:
         )
     if not os.access(binary, os.X_OK):
         return f"uPIMulator binary at {binary} is not executable (set UPIMULATOR_BIN)"
-    reason = docker_image_unavailable_reason(upmem_sdk_image())
-    if reason is not None:
-        return f"{reason} (set TENON_UPMEM_SDK_IMAGE)"
+    home = upmem_sdk_native_home()
+    if home is not None:
+        reason = upmem_sdk_native_unavailable_reason(home)
+        if reason is not None:
+            return f"{reason} (TENON_UPMEM_SDK_HOME)"
+    else:
+        reason = docker_image_unavailable_reason(upmem_sdk_image())
+        if reason is not None:
+            return f"{reason} (set TENON_UPMEM_SDK_IMAGE, or TENON_UPMEM_SDK_HOME for a native SDK)"
     if "UPIMULATOR_ROOT" not in os.environ:
         snapshot = upimulator_snapshot()
         if not snapshot.is_file():
