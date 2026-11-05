@@ -1174,7 +1174,7 @@ Working tree on top of `a4802c2`; evidence under
 | Candidate domain of every kernel group (`r53/probe_rope_case.py`) | projections: 48 candidates each, 12 tied at the minimum with identical command streams (reuse groups do not apply: one MAC register per bank, a 1,024-element global buffer, CENT's per-chunk partial readout); elementwise: 4 replica partitions, the cheapest selected (4,272 against 4,288 / 4,320 / ...); no enumerated alternative is cheaper or lowers to a shorter multiply |
 | Device lower bound of the multiply | op size = ceil(2D / (channels_per_replica x bank_groups x lanes)) = ceil(8192 / (8 x 4 x 16)) = 16 columns (one bank pair per bank group per channel); the paper's 8 columns cover half the vector |
 | Neighbouring program (`r53/rope_neighbor_d2048.json`: D = 2048, H = 16, F = 5504) | the same structure with 8-column multiplies (4 WR_GB + 128 MAC per projection as the counts predict), 35,341 simulated cycles, the two multiplies 215 (equal to the 8-column reference above) |
-| `tests/pim/test_cent_aim_workloads.py::test_rope_ewmul_width_is_the_device_minimum_for_the_full_vector` (paper D and the neighbour; 2 passed) | two EWMULs per program at the geometric minimum width, every scattered element covered (`physical_element_slots >= logical_elements`), each kernel group's selection the cost minimum of its ranking |
+| `tests/pim/test_cent_aim_workloads.py::test_rope_ewmul_width_is_the_device_minimum_for_the_full_vector` (paper D and the neighbour; 2 passed) | two EWMULs per program at the geometric minimum width, the declared slot capacity at least the logical element count (`physical_element_slots >= logical_elements`: capacity, not address-level coverage of every scattered element), each kernel group's chosen candidate at the minimum estimated cost of its ranking |
 | Gemini-I X-22 / X-23 | confirmation campaign pre-registered (ISSUES): three paired sessions per row at the final candidate under the round 30 protocol; not launched at this revision |
 
 Status: the four rows stay OPEN; the attribution and the search by
@@ -1194,3 +1194,14 @@ Working tree on top of `13698c8`; evidence under
 | `tests/pim/test_shared_semantics.py` section q (6 passed) | the unmodified transposed int3 x int3 -> int12[7,12] program selects `single/k1` at 892 cycles (K 32, 11-bit output, final) and packs; the damaged cheapest candidate is rejected with the recorded reason (`reduction_extent realized 16 vs derived 32`, `output_type`) and the intact alternative selected and packed; forcing the damaged candidate fails at compilation; a flattened output geometry and a final launch declared partial are refused; a chained first chunk is refused earlier by the shared candidate contract |
 | Suites at this revision | `tests/pim/test_shared_semantics.py` + `tests/pim/test_apu_g2_hardware.py` + `tests/perf/test_compile_interface.py`: 150 passed, 14 skipped, 1 failed (`r54/pytest_shared.log`); the failure is the AiM timing-only run through the Docker route (containerd ENOSPC, the host's full `/var`), which passes with the native executor configured (`r54/pytest_aim_native_rerun.log`, 1 passed); the Gemini-II card tests are skipped on this host |
 | Not changed | the APU v1 path; no new compiler route; the AiM, Samsung, UPMEM and AttAcc realization checks |
+
+## Round 55 (2026-11-05): pair-affine coefficients bound to the stream identities (X-25)
+
+Working tree on top of `369e265`; evidence under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r55/`.
+
+| Check | Result |
+|---|---|
+| The reviewer's reproducer (`reviewer-r54/g2_stream_order.py`) after the repair | compilation fails: "no feasible placement ... Gemini-II launch 0 (streams (1, 0) ...) carries a recipe the contract does not imply ... epilogue" (the only legal plan is refused at materialization); before, it packed a program computing 128 for a source requiring 112 |
+| `tests/pim/test_shared_semantics.py` (3 new, 15 Gemini-II tests passed) | the ordinary pair selects `fused/k1` with streams (0, 1) and coefficients (3, 2), and the recipe's epilogue on the packed operands equals the source result (112 per output); reversed streams with unchanged coefficients are refused; reversed streams carrying the coefficients in their own order ((2, 3)) are accepted and compute 112 |
+| Suites at this revision | `tests/pim/test_shared_semantics.py` + `tests/pim/test_apu_g2_hardware.py` + `tests/perf/test_compile_interface.py` with the native AiM executor: 154 passed, 14 skipped, 0 failed (`r55/pytest_shared.log`; the Gemini-II card tests skip on this host) |

@@ -1727,6 +1727,24 @@ STATUS's required counts refreshed (48 / 7 / 0).  Next: name an integration
 candidate, validate its installed artifact and backend paths, and run the
 pre-registered Gemini-I campaign.
 
+## Round 55 (2026-11-05): pair-affine coefficients bound to the stream identities (X-25 completed)
+
+The reviewer's second fault injection reversed a pair-affine launch's
+streams through the enumerator; the round 54 check re-derived the same
+contract-order coefficients and accepted a recipe that would compute
+3 (b x) + 2 (a x) for a source requiring 3 (a x) + 2 (b x).  Repaired in
+the single derivation: the coefficients follow the stream identities into
+the launch's order, and a pair-affine contract's streams must share one
+launch.  The reversed-stream recipe with unchanged coefficients is now
+refused at materialization (the compilation fails: it was the only legal
+plan), the same launch carrying its coefficients in its own order is
+accepted and computes the source result, and the ordinary pair is
+unchanged (fused/k1, coefficients (3, 2), 112 per output).  Also corrected:
+the VALIDATION wording on slot capacity versus coverage and the stale
+statement in `spmw_candidate.py` that matcher backends declare no effects.
+Next: the integration candidate, its installed artifact and backend paths,
+then the pre-registered Gemini-I campaign.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1766,7 +1784,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 54 (2026-11-05) at the candidate `13698c8`+ (this
+Refreshed in round 55 (2026-11-05) at the candidate `369e265`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |

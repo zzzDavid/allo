@@ -786,14 +786,23 @@ def launch_program_for(contract, group, coordinates, reduction, *, repetitions):
     contract: the enumerator builds every launch with it and
     ``APUG2SourceCtx.check_realization`` re-derives each realized launch's
     recipe from its partition and refuses a launch whose recipe differs
-    (reduction extent, operand and output types, output geometry, epilogue,
-    accumulator chaining or final-result routing).  Returns
+    (reduction extent, operand and output types, output geometry, epilogue
+    with its coefficients in the launch's stream order, accumulator
+    chaining or final-result routing).  Returns
     ``(program, accumulator, final)``; raises ``ValueError`` when the
     partition is not one the contract admits."""
 
     streams = [contract.streams[index] for index in group]
     if not streams:
         raise ValueError("a launch must realize at least one stream")
+    if len(set(group)) != len(group) or any(
+        not 0 <= int(index) < len(contract.streams) for index in group
+    ):
+        raise ValueError(f"streams {tuple(group)} are not distinct streams of the contract")
+    if contract.pair_affine and sorted(group) != list(range(len(contract.streams))):
+        raise ValueError(
+            f"a pair-affine epilogue needs both streams in one launch, got {tuple(group)}"
+        )
     first = streams[0]
     for stream in streams[1:]:
         if (
@@ -839,7 +848,13 @@ def launch_program_for(contract, group, coordinates, reduction, *, repetitions):
         shape = (*shape, 2)
     dot_bits = lhs_type.bits + rhs_type.bits + _log2(chunk)
     if pair:
-        epilogue = APUG2DotEpilogue(coefficients=contract.coefficients)
+        # The epilogue applies coefficient j to interleaved term j, and the
+        # packing interleaves the operands in the launch's stream order, so
+        # the coefficients are bound to the stream identities: the
+        # contract's coefficient of stream s travels with s wherever the
+        # launch places it.
+        coefficients = tuple(contract.coefficients[int(index)] for index in group)
+        epilogue = APUG2DotEpilogue(coefficients=coefficients)
         coefficient = epilogue.coefficient_type(signed=lhs_type.signed)
         out_bits = dot_bits + coefficient.bits + 1
         accumulator = "none"

@@ -39,9 +39,11 @@ effects, it does not merely display them:
   selected candidate declared.
 
 The matcher backends (Samsung, AiM, UPMEM, AttAcc) express their candidates
-as storage handles checked by ``spmw_legality``; they declare no effects
-yet, so the effects validation is a no-op for them (recorded in ISSUES
-X-01 as remaining migration work).
+as storage handles checked by ``spmw_legality`` and, since release rounds
+19-27, declare their effects from the shared facts through
+``EFFECTS_DERIVERS`` (coverage, value layouts, transfers, launches, ABI),
+so the effects validation and the realization comparison apply to them as
+to the APU routes (ISSUES X-04 to X-20).
 """
 
 from __future__ import annotations

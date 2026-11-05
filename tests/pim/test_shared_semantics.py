@@ -3877,3 +3877,88 @@ def test_other_recipe_inconsistencies_are_rejected(monkeypatch, name, mutate, ex
     assert compiled.plan.name == "single/k2"
     (kernel,) = compiled.placement_ranking.kernels
     assert any(any(text in reason for text in expected) for _p, reason in kernel.rejections), (name, kernel.rejections)
+
+
+def nearby_pair_g2(a: int3[5, 16], b: int3[5, 16], x: int3[16], z: int15[5]):
+    for i in range(5):
+        t: int12 = 0
+        u: int12 = 0
+        for k in range(16):
+            t += a[i, k] * x[k]
+            u += b[i, k] * x[k]
+        z[i] = 3 * t + 2 * u
+
+
+_PAIR_ARGS = dict(a=np.ones((5, 16), np.int8), b=np.full((5, 16), 2, np.int8), x=np.ones(16, np.int8), z=np.zeros(5, np.int16))
+
+
+def _recipe_result(compiled):
+    """The launch recipe's epilogue applied to the operands the public
+    packing interleaves (the device's arithmetic, on the host)."""
+    from allo.pim import apu_g2_source_route as route
+
+    (launch,) = compiled.plan.launches
+    dots = [route.apu_g2_stream_dots(s, _PAIR_ARGS) for s in compiled.contract.streams]
+    lhs, rhs, _acc = route._launch_operands(compiled.contract, launch, dots, {})
+    individual = np.sum(lhs.astype(np.int64) * rhs.astype(np.int64), axis=1)
+    coefficients = np.array(launch.program.epilogue.coefficients, dtype=np.int64)
+    return (individual.reshape(-1, 2) * coefficients).sum(axis=1)
+
+
+def _reorder_streams(monkeypatch, swap_coefficients):
+    from allo.pim import apu_g2_source_route as route
+    from allo.pim.apu_g2_composed_contraction import APUG2DotEpilogue
+
+    original = route.enumerate_apu_g2_launch_plans
+
+    def reversed_streams(contract, **kwargs):
+        plans, rejected = original(contract, **kwargs)
+        for plan in plans:
+            launches = []
+            for launch in plan.launches:
+                program = launch.program
+                if swap_coefficients:
+                    program = replace(program, epilogue=APUG2DotEpilogue(coefficients=tuple(reversed(program.epilogue.coefficients))))
+                launches.append(replace(launch, streams=tuple(reversed(launch.streams)), program=program))
+            plan.launches = tuple(launches)
+        return plans, rejected
+
+    monkeypatch.setattr(route, "enumerate_apu_g2_launch_plans", reversed_streams)
+
+
+def test_pair_affine_coefficients_follow_the_stream_identities():
+    """The ordinary pair ``z = 3 (a x) + 2 (b x)``: one fused launch with
+    the streams in contract order and coefficients (3, 2); the recipe's
+    epilogue on the packed operands equals the source result."""
+    compiled = allo.compile(nearby_pair_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    compiled.pack(**_PAIR_ARGS)
+    (launch,) = compiled.plan.launches
+    assert compiled.plan.name == "fused/k1" and tuple(launch.streams) == (0, 1)
+    assert launch.program.epilogue.coefficients == (3, 2)
+    expected = 3 * (_PAIR_ARGS["a"].astype(np.int64) @ _PAIR_ARGS["x"]) + 2 * (_PAIR_ARGS["b"].astype(np.int64) @ _PAIR_ARGS["x"])
+    np.testing.assert_array_equal(_recipe_result(compiled), expected)
+    assert expected.tolist() == [112] * 5
+
+
+def test_reversed_streams_with_unchanged_coefficients_are_rejected(monkeypatch):
+    """The reviewer's probe: the launch's streams reversed through the
+    enumerator while the recipe keeps coefficients (3, 2) would compute
+    3 (b x) + 2 (a x) = 128 instead of 112.  The re-derived recipe binds
+    the coefficients to the stream identities ((2, 3) in that order), so
+    the only legal plan is refused at materialization and the compilation
+    fails instead of packing a wrong program."""
+    _reorder_streams(monkeypatch, swap_coefficients=False)
+    with pytest.raises(Exception, match="recipe the contract does not imply.*epilogue"):
+        allo.compile(nearby_pair_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+
+
+def test_reversed_streams_with_matching_coefficients_are_accepted(monkeypatch):
+    """A launch that places stream 1 first with the coefficients in that
+    order ((2, 3)) is a correct realization: accepted, packs, and the
+    recipe on the packed operands equals the source result."""
+    _reorder_streams(monkeypatch, swap_coefficients=True)
+    compiled = allo.compile(nearby_pair_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    compiled.pack(**_PAIR_ARGS)
+    (launch,) = compiled.plan.launches
+    assert tuple(launch.streams) == (1, 0) and launch.program.epilogue.coefficients == (2, 3)
+    np.testing.assert_array_equal(_recipe_result(compiled), [112] * 5)
