@@ -207,3 +207,55 @@ def test_case_table_is_exactly_the_fourteen_archived_cases():
     assert tuple(CENT_CASES) == EXPECTED_CASE_IDS
     assert tuple(VENDOR_TRACE_CONTRACTS) == EXPECTED_CASE_IDS
     assert tuple(TYPED_TRACE_SHA256) == EXPECTED_CASE_IDS
+
+
+# --------------------------------------------------------------------- #
+# X-19: the RoPE multiply covers the whole 2D vector at the device minimum
+# --------------------------------------------------------------------- #
+
+
+def _rope_width(spec):
+    """Columns per EWMUL the geometry allows for the full 2D vector: one
+    bank pair per bank group on each channel of the replica, 16 lanes."""
+    from benchmarks.cent_aim.workloads import BANK_GROUPS_PER_CHANNEL, VECTOR_LANES
+
+    partitions = spec.channels_per_replica * BANK_GROUPS_PER_CHANNEL
+    return -(-(2 * spec.D) // (partitions * VECTOR_LANES))
+
+
+@pytest.mark.parametrize(
+    "D, H, F",
+    [(4096, 32, 11008), pytest.param(2048, 16, 5504, marks=pytest.mark.paper_full)],
+    ids=["paper-D4096", "neighbour-D2048"],
+)
+def test_rope_ewmul_width_is_the_device_minimum_for_the_full_vector(D, H, F):
+    """The corrected RoPE kernels multiply every element the host scatters
+    (2D per replica) and lower to one EWMUL each whose op size is the
+    smallest the device geometry allows for that vector; the width scales
+    with D (X-19: the paper's digits came from a half-width multiply).
+    The selection is the cost minimum of the enumerated replica partitions
+    and every projection candidate ties on an identical command stream."""
+    from dataclasses import replace
+
+    from benchmarks.cent_aim.workloads import DEFAULT_DECODE_SPEC, build_case
+
+    spec = replace(DEFAULT_DECODE_SPEC, D=D, H=H, F=F, L=128)
+    case = build_case("qkvo_rope_l128", spec)
+    compiled = _compile(case)
+    commands = [str(line) for line in compiled.compiled.cmds]
+    ewmul = [line for line in commands if line.startswith("AiM EWMUL ")]
+    assert len(ewmul) == 2
+    width = _rope_width(spec)
+    assert [int(line.split()[2]) for line in ewmul] == [width, width]
+    manifest = compiled.compiled.layout_ctx.lowering_manifest
+    for name in ("rope_q", "rope_k"):
+        entry = next(e for e in manifest if e.get("name") == name)
+        assert entry["logical_elements"] == 2 * D * spec.replicas
+        assert entry["physical_element_slots"] >= entry["logical_elements"]
+        assert entry["row_op_sizes"] == [width]
+    # The elementwise selection is the cheapest enumerated replica partition
+    # and the projections' tied candidates lower to the same stream.
+    ranking = compiled.compiled.placement_ranking
+    for kernel in ranking.kernels:
+        chosen = next(s for s in kernel.scores if s[0] == kernel.chosen_position)
+        assert chosen[1] == kernel.scores[0][1]

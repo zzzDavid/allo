@@ -1161,3 +1161,21 @@ Working tree on top of `eb34f62`; evidence under
 Not evidence of: numerical execution (the simulator is timing-only), a
 measured decode step (the composition is analytical), or DCC's selector
 re-run (its recorded per-shape selections are the comparison baseline).
+
+## Round 53 (2026-11-05): X-19 attributed; the Gemini-I confirmation campaign pre-registered
+
+Working tree on top of `a4802c2`; evidence under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r53/`.
+
+| Check | Result |
+|---|---|
+| Per-stage prefix simulation of the corrected `qkvo_rope_l128` (`r53/rope_attribution.{py,json}`, native ramulator2, EOC baseline 2) | q / k / v / o projections 30298 / 30300 / 30300 / 30324 cycles; host scatters m_q / m_k / r_q / r_k 2055 / 2048 / 2015 / 2048; multiplies rope_q / rope_k 121 / 126; whole 129,637 (the golden pin) |
+| Controlled reference: the same trace with the two EWMULs at the paper's half op size (8 columns) | 129,605 cycles, the paper's digit exactly; the two multiplies 215 against 247 cycles after the same prefix: the 32-cycle difference is the execution of the omitted half of the data |
+| Candidate domain of every kernel group (`r53/probe_rope_case.py`) | projections: 48 candidates each, 12 tied at the minimum with identical command streams (reuse groups do not apply: one MAC register per bank, a 1,024-element global buffer, CENT's per-chunk partial readout); elementwise: 4 replica partitions, the cheapest selected (4,272 against 4,288 / 4,320 / ...); no enumerated alternative is cheaper or lowers to a shorter multiply |
+| Device lower bound of the multiply | op size = ceil(2D / (channels_per_replica x bank_groups x lanes)) = ceil(8192 / (8 x 4 x 16)) = 16 columns (one bank pair per bank group per channel); the paper's 8 columns cover half the vector |
+| Neighbouring program (`r53/rope_neighbor_d2048.json`: D = 2048, H = 16, F = 5504) | the same structure with 8-column multiplies (4 WR_GB + 128 MAC per projection as the counts predict), 35,341 simulated cycles, the two multiplies 215 (equal to the 8-column reference above) |
+| `tests/pim/test_cent_aim_workloads.py::test_rope_ewmul_width_is_the_device_minimum_for_the_full_vector` (paper D and the neighbour; 2 passed) | two EWMULs per program at the geometric minimum width, every scattered element covered (`physical_element_slots >= logical_elements`), each kernel group's selection the cost minimum of its ranking |
+| Gemini-I X-22 / X-23 | confirmation campaign pre-registered (ISSUES): three paired sessions per row at the final candidate under the round 30 protocol; not launched at this revision |
+
+Status: the four rows stay OPEN (explained). No expected value changed, no
+timing repinned, the omitted work not restored.

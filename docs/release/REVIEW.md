@@ -1675,6 +1675,29 @@ fixed variant's placement).  Required G10 set: 48 of 55 REPRODUCED, 7
 OPEN (X-19, X-22 / X-23), 0 UNVERIFIED.  Next: the four AiM RoPE rows
 (X-19), then the three nominal Gemini-I rows.
 
+## Round 53 (2026-11-05): X-19 investigated to its mechanism; the Gemini-I campaign pre-registered
+
+The reviewer asked for the four AiM RoPE regressions to be investigated
+and repaired without restoring the omitted work, changing the paper's
+values or repinning timings.  Investigated: per-stage prefix simulation
+attributes the corrected program; the paper's digit (129,605) is reproduced
+exactly by the same trace with the two multiplies at the paper's half op
+size, so the whole 32-cycle difference is the execution of the omitted half
+of the RoPE data; every kernel group's selection is the cost minimum of its
+enumerated candidates (the projections' candidates tie on one command
+stream for a structural reason: one MAC register per bank and a 1,024-element
+global buffer); the multiply's op size is the device's geometric minimum for
+the full vector; a neighbouring hidden size lowers and simulates
+consistently; a regression test pins the width and the coverage.  There is
+no faster faithful program in the pipeline's domain and the rows stay OPEN
+(explained) for the reviewer's judgment; nothing was repinned.  The
+Gemini-I confirmation campaign (X-22 / X-23) is pre-registered with its
+protocol, session count and decision rule and deliberately not launched:
+the protocol binds it to the final candidate and sessions at an earlier
+revision would not pool.  Next: the remaining candidate-wide gates (G9
+independent review, installed-artifact and backend validation at a
+declared final candidate, at which point the campaign runs).
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1714,7 +1737,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 52 (2026-11-05) at the candidate `eb34f62`+ (this
+Refreshed in round 53 (2026-11-05) at the candidate `a4802c2`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |
@@ -1734,9 +1757,11 @@ Verdict: **NOT READY**. Blockers: G9 (independent review of rounds 28-30,
 the suites at the final candidate), G10 on its narrowed required scope
 (user, 2026-11-04: the Samsung, AiM, UPMEM, Gemini-I and Gemini-II kernel
 comparisons and the AttAcc kernel-tiling and decode figures; the inventory's
-`release_scope` column): the four AiM RoPE regressions X-19, the three
-nominal Gemini-I rows X-22/X-23 under the pooled-session rule (the twelve
-AttAcc results were reproduced in rounds 51-52); the independent re-challenge of G1-G8 at the candidate; P-04
+`release_scope` column): the four AiM RoPE rows X-19 (OPEN, explained in
+round 53: the paper's digits are the inconsistent program's; the reviewer
+decides whether the explanation closes them), the three nominal Gemini-I
+rows X-22/X-23 awaiting their pre-registered confirmation campaign at the
+final candidate (the twelve AttAcc results were reproduced in rounds 51-52); the independent re-challenge of G1-G8 at the candidate; P-04
 and P-23 (deferred); the open minor items in ISSUES.md.  The optional
 supporting studies (scaling, layouts, packing, DCC, token partitioning,
 calibration, virtual sweeps, compile cost, LoC) keep their recorded

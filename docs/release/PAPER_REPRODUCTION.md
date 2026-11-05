@@ -49,7 +49,7 @@ the authoritative per-case status; "Results so far" below summarizes it.
 Measured through the shared pipeline's default selection so far: Samsung's
 three GEMVs (faster than the paper, outputs checked), UPMEM's sixteen kernels
 (exact), ten of fourteen AiM CENT rows (exact, timing-only) with the four
-RoPE rows an OPEN 32-cycle regression against the paper (X-19), the five
+RoPE rows an OPEN 32-cycle regression against the paper (X-19; round 53: the difference is exactly the omitted half of the RoPE multiply, the paper's digit is reproduced by the inconsistent program's command stream and no faster faithful program exists in the pipeline's domain), the five
 Gemini-II kernels (REPRODUCED under the archived paired protocol with the
 GTML baseline re-run in the same rounds), the Gemini-I kernels under the
 archived paired protocol with the expert binaries re-run (matrix multiply
@@ -208,7 +208,7 @@ most one pre-registered confirmation campaign at the final candidate (the
 number of sessions written down before the first launch, three unless
 stated otherwise), whose samples are pooled with the earlier sessions at
 that revision; after it the status is fixed by the pooled median and no
-further sessions are run to move it. No tolerance closes a row; X-19 and
+further sessions are run to move it. The Gemini-I campaign for kmeans, linear regression and word count is pre-registered in ISSUES X-22 / X-23 (round 53: three paired sessions each at the final candidate, the round 30 protocol, pooled median) and has not been launched because the candidate is not final. No tolerance closes a row; X-19 and
 the pre-repair X-22 measurements are regressions, not nominal. The
 Gemini-II vendor host has its device library location compiled
 in; a byte copy of the archived `device.update.bin` (sha256 `c46f7f08...`)
