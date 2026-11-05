@@ -85,7 +85,12 @@ from allo.pim.aim_lowering import (
     reference_partial_sums,
 )
 from allo.pim.costs import aim_cost
-from allo.pim.costs.aim import host_reduction_cycles, host_stage_cycles, host_stage_terms
+from allo.pim.costs.aim import (
+    host_reduction_cycles,
+    host_reduction_terms,
+    host_stage_cycles,
+    host_stage_terms,
+)
 from allo.pim.targets import build_aim_target
 from allo.spmw_autoschedule import (
     _aim_enumerate,
@@ -508,6 +513,80 @@ def measured_host_total(device_cycles, host_price, measured):
     )
 
 
+def host_protocol_samples(compiled, heads, tokens, *, repeats=20, seed=0):
+    """Measured host time of the historical bridge protocol on the compiled
+    program's shapes, each step separately (nanoseconds per call, median of
+    ``repeats`` after one warm-up): the decode of the QK readout entries
+    (BF16 words -> FP32), the compiled stage's own computation (the scaled
+    softmax), the staging of the probabilities for the upload (FP32 -> BF16
+    words) and, for a split SV, the merge of the partials by the compiled
+    host reduction.  Recorded beside the modelled prices and never
+    substituted for them; the link terms are modelled separately."""
+    import time
+
+    stage = _stage(compiled)
+    rng = np.random.default_rng(seed)
+    # The QK readout as the host sees it: one BF16 word per score.
+    words = rng.integers(0, 1 << 16, size=(heads, tokens), dtype=np.uint16)
+    words = (words & np.uint16(0x7F7F)) | np.uint16(0x3C00)  # finite, moderate magnitudes
+
+    def decode(w):
+        return (w.astype(np.uint32) << 16).view(np.float32)
+
+    def staging(p):
+        bits = np.asarray(p, dtype=np.float32).view(np.uint32)
+        return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).astype(np.uint16)
+
+    merge = None
+    partials = None
+    sv = sv_entry(compiled)
+    if sv.get("reduction_partition") is not None:
+        merge = next(
+            h for h in compiled.compiled.layout_ctx.host_steps
+            if isinstance(h, AimHostReduction) and h.source == sv["name"]
+        )
+        partials = rng.standard_normal((merge.replicas, merge.batches, merge.partitions, merge.outputs)).astype(np.float32)
+
+    def timed(fn, *args):
+        fn(*args)
+        samples = []
+        for _ in range(repeats):
+            started = time.perf_counter_ns()
+            fn(*args)
+            samples.append(time.perf_counter_ns() - started)
+        samples.sort()
+        return {"median_ns": samples[len(samples) // 2], "min_ns": samples[0], "samples_ns": samples}
+
+    scores = decode(words)
+    probs = stage.run(scores)[0]
+    record = {
+        "unit": "ns per call",
+        "repeats": repeats,
+        "decode": timed(decode, words),
+        "softmax": timed(stage.run, scores),
+        "staging": timed(staging, probs),
+        "merge": timed(merge.merge, partials) if merge is not None else None,
+        "note": "historical bridge protocol (decode of the QK readout, scaled softmax, staging for the upload) and merge, measured on this host; link terms modelled; 1 simulated cycle = 1 ns",
+    }
+    record["total_median_ns"] = sum(
+        record[k]["median_ns"] for k in ("decode", "softmax", "staging", "merge") if record[k] is not None
+    )
+    return record
+
+
+def measured_host_protocol_total(device_cycles, host_price, protocol):
+    """Device cycles + the stage's link term + the reduction's link term +
+    the measured median of the whole host protocol (decode, softmax,
+    staging, merge): the measured samples stand in for every modelled host
+    compute term, the link terms are retained."""
+    return (
+        int(device_cycles)
+        + int(host_price["host_stage_link_cycles"])
+        + int(host_price["host_reduction_link_cycles"])
+        + int(protocol["total_median_ns"])
+    )
+
+
 def host_stage_samples(compiled, heads, tokens, *, repeats=20, seed=0):
     """Measured host time of the compiled program's stage on representative
     BF16 scores (nanoseconds per call, ``repeats`` samples after one warm-up),
@@ -534,41 +613,61 @@ def host_stage_samples(compiled, heads, tokens, *, repeats=20, seed=0):
     }
 
 
-def cent_control(heads, tokens, *, simulate, budget=None):
-    """The CENT-derived attention program for the same token length, as the
-    control the paper's study compared against: ``benchmarks.cent_aim``'s
-    ``attention_l<L>`` case (CENT's layout and command stream, K/V cache
-    append + QK + SV, softmax outside the device program) compiled through
-    the shared pipeline and simulated.  CENT fixes 32 heads and 32 channels
-    (4 replicas x 8), so the control exists for the 32-head workloads only
-    and its boundary (cache append included, no host stage, whole device) is
-    stated, not aligned, with the study's."""
-    from benchmarks.cent_aim.workloads import DEFAULT_DECODE_SPEC, build_case
+# CENT's attention mapping policy, read from the shared pipeline's selection
+# on the CENT golden attention cases (32 heads, 128 / 512 / 4096 tokens,
+# exact against CENT's vendor traces): the QK scores row-packed over the
+# channel group with the 16-slot reuse window, the SV channel-batched (one
+# head per channel of the group, head groups in sequence), unsplit, with the
+# same reuse window.  The CENT-derived control of a study workload is the
+# plan of the budgeted enumeration whose decision carries exactly this
+# policy on the study's device budget: the channel group is the budget's
+# eight channels for QK, and for SV the heads up to eight (one per channel).
+CENT_POLICY = {
+    "attention_qk": {"bank_scope": "abk", "batch_mapping": "row_packed", "reuse_group": "16", "reduction_partitions": "1"},
+    "attention_sv": {"bank_scope": "abk", "batch_mapping": "channels", "reuse_group": "16", "reduction_partitions": "1"},
+}
 
-    record = {
-        "program": f"cent_aim attention_l{tokens}",
-        "boundary": "CENT K/V cache append + QK + SV on 32 channels (4 replicas x 8), softmax outside; not the study's boundary",
-    }
-    if heads != DEFAULT_DECODE_SPEC.H or tokens not in (128, 512, 4096):
-        record["available"] = False
-        record["reason"] = f"CENT fixes {DEFAULT_DECODE_SPEC.H} heads and L in (128, 512, 4096)"
-        return record
-    case = build_case(f"attention_l{tokens}")
-    built = allo.compile(case.region, build_aim_target(), aim_cost, host_moves=case.host_program, **POLICY)
-    record["available"] = True
-    record["modes"] = [p.mode for p in _placements(built)]
-    record["command_count"] = len(built.compiled.cmds)
-    if simulate:
-        result = built.run_backend()
-        if result.kind != "simulator-timing-only":
-            raise RuntimeError(f"CENT control: expected a simulator-timing-only run, got {result.kind!r}")
-        record["device_cycles"] = int(result.cycles)
-        record["execution"] = {
-            "kind": result.kind,
-            "simulator": result.extra.get("simulator"),
-            "segments": [{k: v for k, v in seg.items() if k not in ("trace", "stdout")} for seg in result.extra.get("segment_records") or ()],
-        }
-    return record
+
+def _knobs(mode):
+    head, *rest = mode.split("+")
+    knobs = {"family": head}
+    for item in rest:
+        if "=" in item:
+            key, value = item.split("=", 1)
+            knobs[key] = value
+    return knobs
+
+
+def cent_derived_layouts(target, ranking, heads, budget=CHANNEL_BUDGET):
+    """The CENT-derived control as explicit layouts of the current program:
+    for each kernel, the candidate of the budgeted ranking whose decision is
+    CENT's mapping policy (`CENT_POLICY`) with the channel group of the
+    budget (QK) and one head per channel up to the budget (SV).  Returns
+    ``(layouts, description)``; raises when the enumeration has no such
+    candidate (recorded as the control's failure, never substituted)."""
+    choices = kernel_choices(target, ranking)
+    layouts = [None] * len(choices)
+    description = {}
+    for kernel, policy in CENT_POLICY.items():
+        index, scores = choices[kernel]
+        replicas = budget if kernel == "attention_qk" else min(int(heads), budget)
+        wanted = dict(policy, replica_partitions=str(replicas))
+        matches = [
+            (cycles, mode, placement)
+            for cycles, mode, placement in scores
+            if all(_knobs(mode).get(k, "1" if k == "reduction_partitions" else None) == v for k, v in wanted.items())
+        ]
+        if not matches:
+            raise LookupError(
+                f"no candidate of {kernel!r} carries CENT's policy {wanted} under the "
+                f"budget; scored modes: {sorted({m for _c, m, _p in scores})[:6]}..."
+            )
+        if len(matches) > 1:
+            raise LookupError(f"{len(matches)} candidates of {kernel!r} carry CENT's policy {wanted}")
+        cycles, mode, placement = matches[0]
+        layouts[index] = placement
+        description[kernel] = {"mode": mode, "ranked_cycles": cycles, "policy": wanted}
+    return layouts, description
 
 
 def _json_ready(value, depth=0):
@@ -751,6 +850,8 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
         "host_price": None,
         "host_stage_measured": None,
         "total_cycles_measured_host_stage": None,
+        "host_protocol_measured": None,
+        "total_cycles_measured_host_protocol": None,
         "execution": None,
         "provenance": None,
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -763,13 +864,16 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
         record["completed"].append(stage)
         stage = "host_price"
         host_steps = list(built.compiled.layout_ctx.host_steps)
-        reduction_cycles = sum(host_reduction_cycles(s, geometry) for s in host_steps if isinstance(s, AimHostReduction))
+        reduction_terms = [host_reduction_terms(s, geometry) for s in host_steps if isinstance(s, AimHostReduction)]
+        reduction_cycles = sum(t["link_cycles"] + t["compute_cycles"] for t in reduction_terms)
         stage_terms = [host_stage_terms(s, geometry) for s in host_steps if isinstance(s, AimHostStage)]
         stage_link = sum(t["link_cycles"] for t in stage_terms)
         stage_compute = sum(t["compute_cycles"] for t in stage_terms)
         record["host_price"] = {
             "unit": "cycles (1 cycle = 1 ns at the simulator's declared rate)",
             "host_reduction_cycles": reduction_cycles,
+            "host_reduction_link_cycles": sum(t["link_cycles"] for t in reduction_terms),
+            "host_reduction_compute_cycles": sum(t["compute_cycles"] for t in reduction_terms),
             "host_stage_link_cycles": stage_link,
             "host_stage_compute_cycles": stage_compute,
             "host_stage_cycles": stage_link + stage_compute,
@@ -797,6 +901,7 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
         record["completed"].append(stage)
         stage = "host_samples"
         record["host_stage_measured"] = host_stage_samples(built, heads, tokens)
+        record["host_protocol_measured"] = host_protocol_samples(built, heads, tokens)
         record["completed"].append(stage)
         if simulate:
             stage = "simulate"
@@ -812,6 +917,9 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
             # (readout + upload) and the host reduction are retained.
             record["total_cycles_measured_host_stage"] = measured_host_total(
                 int(result.cycles), record["host_price"], record["host_stage_measured"]
+            )
+            record["total_cycles_measured_host_protocol"] = measured_host_protocol_total(
+                int(result.cycles), record["host_price"], record["host_protocol_measured"]
             )
             record["execution"] = {
                 "kind": result.kind,
@@ -853,6 +961,11 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
     unrestricted = ranked(heads, tokens, budget=None)[3]
     folder = None if artifacts is None else os.path.join(artifacts, f"h{heads}_l{tokens}")
     plans = [("default", None)]
+    try:
+        cent_layouts, cent_description = cent_derived_layouts(target, ranking, heads, budget=CHANNEL_BUDGET)
+        cent_failure = None
+    except Exception as error:  # the control's absence is evidence, never substituted
+        cent_layouts, cent_description, cent_failure = None, None, _failure_entry("cent_derived", error)
     plans += [(f"P{p}", choice) for p, choice in sorted(variants.per_partition.items())]
     # Established before execution: the head-only control is the P1 plan
     # itself when the ranking's cheapest unsplit plan is the one-head-per-
@@ -862,15 +975,21 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
         aliases["head-only"] = "P1"
     else:
         plans.append(("head-only", variants.head_only))
+    if cent_layouts is not None:
+        plans.append(("cent-derived", ("cent", cent_layouts)))
     expected = [label for label, _choice in plans]
     records, failures = {}, {}
+    if cent_failure is not None:
+        failures["cent-derived"] = cent_failure
+        records["cent-derived"] = {"label": "cent-derived", "modes": None, "failure": cent_failure}
     for label, choice in plans:
         try:
-            built = (
-                compile_program(attention, program, target, budget=budget)
-                if choice is None
-                else compile_variant(attention, program, target, variants, choice, budget=budget)
-            )
+            if choice is None:
+                built = compile_program(attention, program, target, budget=budget)
+            elif isinstance(choice, tuple) and choice and choice[0] == "cent":
+                built = compile_program(attention, program, target, layouts=choice[1], budget=budget)
+            else:
+                built = compile_variant(attention, program, target, variants, choice, budget=budget)
         except Exception as error:  # the plan did not compile: no record beyond the failure
             record = {"label": label, "modes": None, "failure": _failure_entry("compile", error)}
             record["artifacts"] = _write_artifacts(folder, label, record, None)
@@ -886,15 +1005,16 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
             records[label] = error.record
             failures[label] = error.record["failure"]
             continue
-        if choice is not None:
+        if choice is not None and not (isinstance(choice, tuple) and choice and choice[0] == "cent"):
             record["ranked_cycles"] = choice[0]
         records[label] = record
-    try:
-        control = cent_control(heads, tokens, simulate=simulate)
-    except Exception as error:  # the control's failure is evidence too
-        control = {"available": False, "failure": _failure_entry("cent_control", error)}
-    if control.get("failure"):
-        failures["cent-attention"] = control["failure"]
+    control = {
+        "policy": CENT_POLICY,
+        "derived_from": "the shared pipeline's selection on the CENT golden attention cases (32 heads x 128/512/4096 tokens, exact against CENT's vendor traces)",
+        "boundary": "the study's own: resident inputs, no cache append, the same bridge, budget and accounting",
+        "layouts": cent_description,
+        "failure": cent_failure,
+    }
     rows = {
         label: SimpleNamespace(
             mode=r["sv_mode"], modes=r["modes"], partitions=r["partitions"],
@@ -918,7 +1038,15 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
         measured = [rows[label] for label in required]
         best = min(measured, key=lambda r: r.total)
         gap = default.total / best.total - 1.0
-    controls_complete = "head-only" in rows and (not simulate or rows["head-only"].total is not None)
+    controls_complete = (
+        "head-only" in rows and (not simulate or rows["head-only"].total is not None)
+        and "cent-derived" in rows and (not simulate or rows["cent-derived"].total is not None)
+    )
+    cent_over_selected = (
+        rows["cent-derived"].total / default.total
+        if simulate and "cent-derived" in rows and default is not None and default.total and rows["cent-derived"].total
+        else None
+    )
     head_only_ratio = (
         rows["head-only"].total / default.total
         if simulate and controls_complete and default is not None and default.total
@@ -943,8 +1071,9 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
         "best_partitions": None if best is None else best.partitions,
         "gap": gap,
         "head_only_over_selected": head_only_ratio,
+        "cent_derived_over_selected": cent_over_selected,
         "plans": records,
-        "controls": {"cent_attention": control},
+        "controls": {"cent_derived": control},
         "neighbor": bool(neighbor),
         "boundary": {
             "device": "AiM ramulator2 memory-system cycles of the complete program (QK, SV)",
@@ -984,7 +1113,7 @@ def assert_complete(result) -> None:
     if not result.comparison_complete:
         problems.append(f"the minima comparison is incomplete: missing {result.record['comparison']['missing']}")
     if not result.controls_complete:
-        problems.append("the head-only control did not complete")
+        problems.append("a control (head-only or cent-derived) did not complete")
     if problems:
         raise AssertionError(
             f"{result.heads} heads x {result.tokens} tokens: " + "; ".join(problems)
@@ -1018,6 +1147,9 @@ def summarize(results):
         "incomplete_workloads": incomplete,
         "minima_reached": reached,
         "max_gap": max(gaps) if gaps else None,
+        "cent_derived_over_selected": {
+            f"{r['heads']}x{r['tokens']}": r.get("cent_derived_over_selected") for r in complete
+        },
         "head_only_over_selected_1x4096": (
             one_4096["head_only_over_selected"]
             if one_4096 and (one_4096.get("comparison") or {}).get("controls_complete", True)

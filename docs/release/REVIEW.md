@@ -1570,6 +1570,26 @@ with their derived payloads. Relocation bank copies, syncs and host
 transfer records remain outside the whole comparison, as M-18 says.
 G9/G10 and the recorded blockers remain open; the study stays DIAGNOSTIC.
 
+## Round 49 (2026-11-04): M-15 advanced; the CENT-derived eight-channel control, the host protocol, the calibration of the misses
+
+The reviewer accepted the bank-payload repair and asked for the M-15
+workstream. Delivered: the CENT-derived control is now structurally
+derived (CENT's mapping policy, read from the shared pipeline's exact
+selection on the CENT golden attention cases, matched by decision knobs in
+each workload's budgeted enumeration and compiled under the study's own
+budget, bridge and accounting), replacing the incomparable 32-channel
+case; the historical host protocol (decode of the readout, scaled softmax,
+staging, merge) is measured step by step on every compiled program and
+composed with the modelled link terms, beside the priced total; the nine
+workloads and the neighbour are re-measured with every variant and control
+accounted for; and the one-head misses are investigated with an
+independent command-level calibration driver (prefix simulation), which
+attributes them to the contraction profile's register I/O, WR_GB and MAC
+charges (M-19), not to the bridge or the accounting. The study stays
+DIAGNOSTIC: the priced host compute is a declared model and the profile's
+charges await recalibration from command classes; 6 of 9 minima does not
+establish the paper's 7 of 9. G9/G10 and the recorded blockers remain open.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1609,7 +1629,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 48 (2026-11-04) at the candidate `35b6351`+ (this
+Refreshed in round 49 (2026-11-04) at the candidate `586f575`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |

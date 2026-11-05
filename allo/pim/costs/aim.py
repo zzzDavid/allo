@@ -200,13 +200,25 @@ def host_reduction_cycles(record, geometry):
     vectors = (
         _ceil_div(record.outputs, geometry.lanes) * record.batches * record.replicas
     )
+    terms = host_reduction_terms(record, geometry)
+    return terms["link_cycles"] + terms["compute_cycles"]
+
+
+def host_reduction_terms(record, geometry) -> dict:
+    """The two priced terms of one ``AimHostReduction``, separately: the link
+    cycles of the (P + 1) GPR entries per merged vector (the partial readout
+    and the merged write-back) and the host compute cycles of the adds."""
+    vectors = (
+        _ceil_div(record.outputs, geometry.lanes) * record.batches * record.replicas
+    )
     entry_bytes = geometry.vector_bits // 8
     link_bytes = vectors * (record.partitions + 1) * entry_bytes
-    return (
-        HOST_LINK_FIXED_CYCLES
-        + _ceil_div(link_bytes, HOST_LINK_BYTES_PER_CYCLE)
-        + vectors * (record.partitions - 1) * HOST_VECTOR_ADD_CYCLES
-    )
+    return {
+        "link_cycles": HOST_LINK_FIXED_CYCLES + _ceil_div(link_bytes, HOST_LINK_BYTES_PER_CYCLE),
+        "compute_cycles": vectors * (record.partitions - 1) * HOST_VECTOR_ADD_CYCLES,
+        "link_bytes": link_bytes,
+        "vectors": vectors,
+    }
 
 
 def host_stage_terms(record, geometry) -> dict:

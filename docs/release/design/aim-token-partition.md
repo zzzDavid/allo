@@ -194,11 +194,58 @@ for every plan, split and unsplit, and for the neighbouring 2 heads x 256
 tokens workload.  The timing-only simulator produces no values and none
 are attributed to it.
 
-**Controls.**  The head-only plan (forced), the CENT-derived attention
-program of the same token length (`benchmarks.cent_aim` `attention_l<L>`,
-CENT's layout and command stream, 32 heads on 32 channels, cache append
-included, softmax outside; its boundary stated, available for the 32-head
-workloads only) and the unbudgeted default selection (recorded only).
+**Controls (round 49).**  The head-only plan (forced); the CENT-derived
+control: CENT's mapping policy, read from the shared pipeline's exact
+selection on the CENT golden attention cases (QK row-packed over the
+channel group with the 16-slot reuse window; SV channel-batched, one head
+per channel, unsplit, same window), matched by its decision knobs in each
+workload's budgeted enumeration (QK over the budget's eight channels, SV
+over the heads up to eight) and compiled as an explicit layout under the
+study's own budget, bridge and accounting (`cent_derived_layouts`); and
+the unbudgeted default selection (recorded only).  On every 8- and 32-head
+workload the CENT-derived control is the normal selection's own plan
+(ratio 1.00); on the 1-head workloads it is 1.03x (128 tokens), 1.32x
+(512) and 2.23x (4096) slower than the selection, and 1.05x on the 2x256
+neighbour.
+
+**Host protocol (round 49).**  Beside the priced host terms, the historical
+bridge protocol is measured step by step on each compiled program: the
+decode of the QK readout words (BF16 -> FP32), the compiled scaled softmax,
+the staging of the probabilities for the upload (FP32 -> BF16 words) and,
+for a split SV, the compiled merge (`host_protocol_measured`); their median
+sum replaces every modelled host compute term in
+`total_cycles_measured_host_protocol`, the stage's and the reduction's link
+terms retained.  On this host the protocol takes 31 us (1x128) to 899 us
+(32x4096) per call, NumPy on small arrays, far above the declared price;
+the paper's host is not this one, which is one reason the row stays
+DIAGNOSTIC.
+
+**The one-head misses, calibrated command by command (round 49,
+`benchmarks/cent_aim/command_calibration.py`).**  The k-th command's
+increment on the simulator (cycles of the first k commands minus those of
+the first k-1) is aggregated by class and set beside the profile's charges
+for the same class, independently of any selection outcome:
+
+| Class | Simulated increment per command | Profile charge |
+|---|---:|---:|
+| WR_BIAS | 2 | 35 (N_MODCH + CMD_WR_GB) |
+| RD_MAC | 4 to 7 | 34 (N_MODCH + CMD_RD_REG) |
+| WR_GB | 51 (one 128-element vector) to 131 (a flattened 4096-token write) | 35, constant |
+| first MAC_ABK of a reuse group | 101 to 245 | 56 (first-row activation) |
+| consecutive MAC_ABK, row-packed QK at 4096 tokens | 3,534 over 31 commands | 480 columns + 2,728 row switches |
+
+At 1 head x 4096 tokens the SV spans are 1,656 simulated against 1,372
+modelled for the flattened unsplit plan and 1,455 against 1,795 for the
+eight-way plan: the register I/O charges inflate the channel-batched split
+programs and the constant WR_GB and activation charges deflate the
+flattened one, inverting their order.  At 128 and 512 tokens the SV spans
+of the tied plans differ by 36 and 72 simulated cycles (951 against 915;
+1,023 against 951) while the model's difference (32 and 64) is cancelled
+exactly by the host reduction's 32 cycles per doubling, hence the ties.
+Neither is a bridge or accounting effect.  The repair is a recalibration of
+the register I/O, WR_GB and MAC charges from command classes measured this
+way across the CENT golden cases and the study's kernels, never from the
+study's winners (M-19).
 
 **Bridged run (2026-11-04, round 42, `tenon-release-evidence/r41/token_partition_bridged.json`).**
 Cells: measured total = device + priced host (stage + reduction), with the

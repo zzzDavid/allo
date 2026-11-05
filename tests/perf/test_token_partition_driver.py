@@ -155,7 +155,11 @@ def test_a_failed_distinct_control_is_never_replaced_by_an_alias(monkeypatch, tm
         and tp.partitions_of(modes[-1]) == 1,
     )
     result = tp.run_workload(1, 4096, simulate=True, artifacts=str(tmp_path))
-    assert "head-only" in result.expected and set(result.failures) == {"head-only"}
+    # The injection fails every forced channel-batched unsplit plan: the
+    # head-only control and, when its SV shares that mapping, the
+    # CENT-derived control; neither is aliased or substituted.
+    assert "head-only" in result.expected and "head-only" in result.failures
+    assert set(result.failures) <= {"head-only", "cent-derived"}
     assert "head-only" not in result.record["aliases"] and "head-only" not in result.rows
     assert result.record["head_only_over_selected"] is None
     assert result.comparison_complete and result.gap is not None
@@ -280,3 +284,41 @@ def test_measured_host_total_keeps_the_link_and_reduction_terms():
     assert record["host_stage_cycles"] == record["host_stage_link_cycles"] + record["host_stage_compute_cycles"]
     assert record["host_stage_link_cycles"] == 16 and record["host_stage_compute_cycles"] == 32
     assert result.record["plans"]["default"]["functional_check"]["head_dim"] == 128
+
+
+@pytest.mark.parametrize("heads,sv_replicas", [(1, 1), (8, 8), (32, 8)])
+def test_cent_derived_control_is_the_structural_policy_under_the_budget(heads, sv_replicas):
+    """The CENT-derived control is the budgeted candidate carrying CENT's
+    mapping policy: QK row-packed over the budget's eight channels, SV
+    channel-batched with one head per channel up to the budget, unsplit,
+    16-slot reuse; found for 1, 8 and 32 heads, never cost-selected."""
+    import allo
+    from allo.pim.costs import aim_cost
+    from allo.pim.targets import build_aim_target
+
+    target = build_aim_target()
+    attention, program = tp.build_attention(heads, 128)
+    ranking = allo.compile(attention, target, aim_cost, backend="virtual", host_moves=program, resources=tp.BUDGET, **tp.POLICY)
+    layouts, description = tp.cent_derived_layouts(target, ranking, heads)
+    assert all(layout is not None for layout in layouts)
+    qk, sv = description["attention_qk"], description["attention_sv"]
+    assert tp._knobs(qk["mode"])["batch_mapping"] == "row_packed" and tp._knobs(qk["mode"])["replica_partitions"] == "8"
+    assert tp._knobs(sv["mode"])["batch_mapping"] == "channels" and tp._knobs(sv["mode"])["replica_partitions"] == str(sv_replicas)
+    assert tp.partitions_of(sv["mode"]) == 1 and tp._knobs(sv["mode"])["reuse_group"] == "16"
+    built = allo.compile(attention, target, aim_cost, host_moves=program, resources=tp.BUDGET, layout=layouts, **tp.POLICY)
+    assert [p.mode for p in tp._placements(built)] == [l.mode for l in layouts]
+
+
+def test_measured_host_protocol_total_keeps_both_link_terms():
+    price = {"host_stage_link_cycles": 16, "host_reduction_link_cycles": 24, "host_stage_compute_cycles": 32, "host_reduction_compute_cycles": 8}
+    protocol = {"total_median_ns": 1000}
+    assert tp.measured_host_protocol_total(1141, price, protocol) == 1141 + 16 + 24 + 1000
+    result = tp.run_workload(1, 128, simulate=False)
+    record = result.record["plans"]["default"]
+    measured = record["host_protocol_measured"]
+    assert measured["decode"]["median_ns"] > 0 and measured["softmax"]["median_ns"] > 0 and measured["staging"]["median_ns"] > 0
+    assert (measured["merge"] is not None) == (record["partitions"] > 1)
+    assert measured["total_median_ns"] == sum(measured[k]["median_ns"] for k in ("decode", "softmax", "staging", "merge") if measured[k] is not None)
+    assert record["host_price"]["host_reduction_cycles"] == record["host_price"]["host_reduction_link_cycles"] + record["host_price"]["host_reduction_compute_cycles"]
+    assert "cent-derived" in result.record["plans"] and not result.failures
+    assert result.record["controls"]["cent_derived"]["failure"] is None
