@@ -210,6 +210,7 @@ class APUG2SourceCtx(CodegenContext):
                 "Gemini-II realization launches differ from the candidate contract: "
                 f"realized {realized}, declared {declared}"
             )
+        _check_launch_recipes(contract, plan)
         inputs = {
             access.parameter
             for stream in contract.streams
@@ -253,6 +254,84 @@ class APUG2SourceCtx(CodegenContext):
 
     def resolve_spill_moves(self, tier, home_handle, *, n_entries=1):
         raise NotImplementedError("Gemini-II launch plans do not spill")
+
+
+def _check_launch_recipes(contract, plan) -> None:
+    """Bind every launch's intrinsic recipe to the retained contract and its
+    own partition (streams, coordinate tile, reduction range): the recipe
+    the contract implies for that partition is derived again
+    (``launch_program_for``) and must equal the launch's in reduction
+    extent, operand and output types, output geometry, epilogue and
+    structural fingerprint; the accumulator mode and the final flag must be
+    the derived ones; and the final launches of every stream must tile its
+    result coordinates exactly once, each preceded by the partial launches
+    of its tile in reduction order.  A recipe that does not match is a
+    realization that costing and selection must not accept."""
+    from .pim.apu_g2_source_route import launch_program_for
+
+    finals: dict = {}
+    chains: dict = {}
+    for index, launch in enumerate(plan.launches):
+        try:
+            expected, accumulator, final = launch_program_for(
+                contract,
+                tuple(launch.streams),
+                tuple(launch.coordinates),
+                tuple(launch.reduction),
+                repetitions=getattr(launch.program, "repetitions", 256),
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                f"Gemini-II launch {index} partition is not one the contract admits: {error}"
+            ) from error
+        program = launch.program
+        fields = {
+            "reduction_extent": (program.reduction_extent, expected.reduction_extent),
+            "input_types": (tuple(program.input_types), tuple(expected.input_types)),
+            "output_type": (program.output_type, expected.output_type),
+            "output_shape": (tuple(program.output_shape), tuple(expected.output_shape)),
+            "epilogue": (program.epilogue, expected.epilogue),
+            "structural_fingerprint": (program.structural_fingerprint, expected.structural_fingerprint),
+            "accumulator": (launch.accumulator, accumulator),
+            "final": (bool(launch.final), bool(final)),
+        }
+        wrong = {name: pair for name, pair in fields.items() if pair[0] != pair[1]}
+        if wrong:
+            raise RuntimeError(
+                f"Gemini-II launch {index} (streams {tuple(launch.streams)}, coordinates "
+                f"{tuple(launch.coordinates)}, reduction {tuple(launch.reduction)}) carries "
+                "a recipe the contract does not imply for that partition: "
+                + "; ".join(f"{name} realized {a!r} vs derived {b!r}" for name, (a, b) in wrong.items())
+            )
+        key = (tuple(launch.streams), tuple(launch.coordinates))
+        chains.setdefault(key, []).append(tuple(launch.reduction))
+        if launch.final:
+            for stream in launch.streams:
+                finals.setdefault(int(stream), []).append(tuple(launch.coordinates))
+    for key, ranges in chains.items():
+        expected_ranges = sorted(ranges)
+        if ranges != expected_ranges or any(
+            ranges[i][1] != ranges[i + 1][0] for i in range(len(ranges) - 1)
+        ) or ranges[0][0] != 0 or ranges[-1][1] != contract.streams[key[0][0]].reduction_extent:
+            raise RuntimeError(
+                f"Gemini-II launches of tile {key} do not chain the reduction in order "
+                f"from 0 to the contract's extent: {ranges}"
+            )
+    for index, stream in enumerate(contract.streams):
+        tiles = sorted(finals.get(index, []))
+        covered = 0
+        for begin, end in tiles:
+            if begin != covered:
+                raise RuntimeError(
+                    f"Gemini-II final launches of stream {index} do not tile its result "
+                    f"coordinates exactly once: {tiles}"
+                )
+            covered = end
+        if covered != stream.coordinate_count:
+            raise RuntimeError(
+                f"Gemini-II final launches of stream {index} cover coordinates "
+                f"[0, {covered}) of {stream.coordinate_count}: {tiles}"
+            )
 
 
 def _run_apu_g2(compiled, **inputs) -> RunResult:

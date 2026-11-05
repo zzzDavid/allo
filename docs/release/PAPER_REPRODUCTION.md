@@ -49,7 +49,7 @@ the authoritative per-case status; "Results so far" below summarizes it.
 Measured through the shared pipeline's default selection so far: Samsung's
 three GEMVs (faster than the paper, outputs checked), UPMEM's sixteen kernels
 (exact), ten of fourteen AiM CENT rows (exact, timing-only) with the four
-RoPE rows an OPEN 32-cycle regression against the paper (X-19; round 53: the difference is exactly the omitted half of the RoPE multiply, the paper's digit is reproduced by the inconsistent program's command stream and no faster faithful program exists in the pipeline's domain), the five
+RoPE rows an OPEN 32-cycle regression against the paper (X-19; round 53: the difference is exactly the omitted half of the RoPE multiply, the paper's digit is reproduced by the inconsistent program's command stream; the enumerated candidates were searched by estimated cost and the multiply width is the device minimum, which does not establish that no faithful complete program is faster), the five
 Gemini-II kernels (REPRODUCED under the archived paired protocol with the
 GTML baseline re-run in the same rounds), the Gemini-I kernels under the
 archived paired protocol with the expert binaries re-run (matrix multiply

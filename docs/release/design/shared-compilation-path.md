@@ -50,8 +50,13 @@ through the same driver (`allo/spmw_codegen.py::compile_for_target`):
   `autoschedule` before costing (a violation is a recorded rejection) and
   in `compile_for_target` on the selected placements; the context's
   `check_realization` compares the realized program (APU v1 realization
-  ABI; Gemini-II contract outputs and launch count) with the declared
-  effects after materialization.
+  ABI; Gemini-II contract outputs, launch partition and, since round 54,
+  every launch's intrinsic recipe re-derived from the retained contract and
+  the launch's own partition: reduction extent, operand and output types,
+  output geometry, epilogue, accumulator chaining and final-result routing,
+  `apu_g2_source_route.launch_program_for`) with the declared effects after
+  materialization; a mismatch is a feasibility rejection and the ranking
+  takes the next candidate.
 - `rebind_supplied_layouts`: a caller-supplied placement is a decision.
   The current enumeration (legality, current reduction-order policy) is
   searched for the same physical decision; a backend plan without one is

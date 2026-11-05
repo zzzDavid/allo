@@ -1177,5 +1177,20 @@ Working tree on top of `a4802c2`; evidence under
 | `tests/pim/test_cent_aim_workloads.py::test_rope_ewmul_width_is_the_device_minimum_for_the_full_vector` (paper D and the neighbour; 2 passed) | two EWMULs per program at the geometric minimum width, every scattered element covered (`physical_element_slots >= logical_elements`), each kernel group's selection the cost minimum of its ranking |
 | Gemini-I X-22 / X-23 | confirmation campaign pre-registered (ISSUES): three paired sessions per row at the final candidate under the round 30 protocol; not launched at this revision |
 
-Status: the four rows stay OPEN (explained). No expected value changed, no
-timing repinned, the omitted work not restored.
+Status: the four rows stay OPEN; the attribution and the search by
+estimated cost over the enumerated candidates do not establish the minimum
+simulated time of a faithful complete program and do not satisfy the
+same-or-better rule. No expected value changed, no timing repinned, the
+omitted work not restored.
+
+## Round 54 (2026-11-05): Gemini-II launch recipes bound to the contract (X-25)
+
+Working tree on top of `13698c8`; evidence under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r54/`.
+
+| Check | Result |
+|---|---|
+| The reviewer's reproducer (`reviewer-r53/g2_realization.py`, `PYTHONPATH=$PWD`, spmw interpreter) after the repair | the damaged `single/k1` (recipe K 16, 10-bit output, declared reduction (0, 32)) is refused at materialization; `single/k2` is selected at 1,494 cycles with recipe K 16 per launch under declared ranges (0, 16) and (16, 32); the artifact packs, so the script's "expected packing failure" assertion fails as intended |
+| `tests/pim/test_shared_semantics.py` section q (6 passed) | the unmodified transposed int3 x int3 -> int12[7,12] program selects `single/k1` at 892 cycles (K 32, 11-bit output, final) and packs; the damaged cheapest candidate is rejected with the recorded reason (`reduction_extent realized 16 vs derived 32`, `output_type`) and the intact alternative selected and packed; forcing the damaged candidate fails at compilation; a flattened output geometry and a final launch declared partial are refused; a chained first chunk is refused earlier by the shared candidate contract |
+| Suites at this revision | `tests/pim/test_shared_semantics.py` + `tests/pim/test_apu_g2_hardware.py` + `tests/perf/test_compile_interface.py`: 150 passed, 14 skipped, 1 failed (`r54/pytest_shared.log`); the failure is the AiM timing-only run through the Docker route (containerd ENOSPC, the host's full `/var`), which passes with the native executor configured (`r54/pytest_aim_native_rerun.log`, 1 passed); the Gemini-II card tests are skipped on this host |
+| Not changed | the APU v1 path; no new compiler route; the AiM, Samsung, UPMEM and AttAcc realization checks |

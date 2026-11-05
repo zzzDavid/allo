@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 
 import allo
-from allo.ir.types import float16, int4, int15, uint16
+from allo.ir.types import float16, int3, int4, int12, int15, uint16
 from allo.pim.apu_g2_source_route import analyze_apu_g2_source
 from allo.pim.apu_v1_vectorize import IllegalContractionError
 from allo.pim.costs import aim_cost, apu_g2_cost, apu_v1_cost, samsung_cost
@@ -3776,3 +3776,104 @@ def test_attacc_attention_accepts_alpha_renamed_loops(rename):
     renamed = _compile_attacc_with(_attention_source(**rename))
     assert renamed.estimate().cycles == reference.estimate().cycles == 465
     assert _attacc_digest(renamed) == _attacc_digest(reference)
+
+
+# --------------------------------------------------------------------------- #
+# (q) Gemini-II launch recipes are bound to the contract and the partition
+#     (review round 53: an internally inconsistent recipe passed costing,
+#     selection and materialization until public packing failed)
+# --------------------------------------------------------------------------- #
+
+
+def transposed_dot_g2(a: int3[12, 32], b: int3[32, 7], z: int12[7, 12]):
+    for m, n in allo.grid(12, 7):
+        acc: int12 = 0
+        for k in allo.reduction(32):
+            acc += a[m, k] * b[k, n]
+        z[n, m] = acc
+
+
+def _damage_single_k1(monkeypatch, mutate):
+    """Replace ``single/k1``'s launches through the enumerator (the fault the
+    reviewer injected): ``mutate(launch) -> launch``."""
+    from allo.pim import apu_g2_source_route as route
+
+    original = route.enumerate_apu_g2_launch_plans
+
+    def damaged(contract, **kwargs):
+        plans, rejected = original(contract, **kwargs)
+        for plan in plans:
+            if plan.name == "single/k1":
+                plan.launches = tuple(mutate(launch) for launch in plan.launches)
+        return plans, rejected
+
+    monkeypatch.setattr(route, "enumerate_apu_g2_launch_plans", damaged)
+
+
+def _halve_recipe(launch):
+    """A legal K = 16 recipe with its 10-bit output under a launch that still
+    declares the reduction range (0, 32)."""
+    return replace(
+        launch,
+        program=replace(
+            launch.program,
+            reduction_extent=launch.program.reduction_extent // 2,
+            output_type=replace(launch.program.output_type, bits=launch.program.output_type.bits - 1),
+        ),
+    )
+
+
+def test_transposed_gemini_ii_program_is_supported_unmodified():
+    compiled = allo.compile(transposed_dot_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    assert compiled.plan.name == "single/k1" and compiled.estimate().cycles == 892
+    (launch,) = compiled.plan.launches
+    assert launch.program.reduction_extent == 32 and tuple(launch.reduction) == (0, 32)
+    assert launch.final and launch.program.output_type.bits == 11
+    compiled.pack(a=np.ones((12, 32), np.int8), b=np.ones((32, 7), np.int8), z=np.zeros((7, 12), np.int16))
+
+
+def test_damaged_cheapest_recipe_is_rejected_and_the_intact_alternative_selected(monkeypatch):
+    """The reviewer's probe: ``single/k1``'s recipe halved (K 16, 10-bit
+    output) under an unchanged declared reduction (0, 32).  It is the
+    cheapest estimate (700 against 1,494) and must be refused at
+    materialization as a feasibility rejection, so the shared selection
+    takes the intact ``single/k2``, whose artifact packs."""
+    _damage_single_k1(monkeypatch, _halve_recipe)
+    compiled = allo.compile(transposed_dot_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    assert compiled.plan.name == "single/k2" and compiled.estimate().cycles == 1494
+    assert [launch.program.reduction_extent for launch in compiled.plan.launches] == [16, 16]
+    assert [tuple(launch.reduction) for launch in compiled.plan.launches] == [(0, 16), (16, 32)]
+    (kernel,) = compiled.placement_ranking.kernels
+    assert [mode for _p, _c, mode in kernel.scores] == ["single/k1", "single/k2"]
+    reasons = [reason for _position, reason in kernel.rejections]
+    assert any("recipe the contract does not imply" in reason and "reduction_extent realized 16 vs derived 32" in reason for reason in reasons), reasons
+    assert any("output_type" in reason for reason in reasons)
+    compiled.pack(a=np.ones((12, 32), np.int8), b=np.ones((32, 7), np.int8), z=np.zeros((7, 12), np.int16))
+
+
+def test_forcing_the_damaged_recipe_fails_at_compilation(monkeypatch):
+    _damage_single_k1(monkeypatch, _halve_recipe)
+    with pytest.raises(Exception, match="recipe the contract does not imply"):
+        allo.compile(transposed_dot_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual", layout="single/k1")
+
+
+@pytest.mark.parametrize(
+    "name, mutate, expected",
+    [
+        ("output geometry", lambda l: replace(l, program=replace(l.program, output_shape=(84,))), ("output_shape realized (84,) vs derived (7, 12)",)),
+        ("final routing", lambda l: replace(l, final=False), ("final realized False vs derived True",)),
+        # A first chunk declared chained is already refused by the shared
+        # candidate contract (accumulator initialization), before realization.
+        ("accumulator mode", lambda l: replace(l, accumulator="previous"), ("accumulator realized 'previous' vs derived 'none'", "starts its accumulator as 'previous'")),
+    ],
+)
+def test_other_recipe_inconsistencies_are_rejected(monkeypatch, name, mutate, expected):
+    """A flattened output geometry the contract does not imply, a final
+    launch declared partial, or a first chunk declared chained are refused
+    (the recipe record itself refuses an output width inconsistent with its
+    own reduction extent, so that case cannot be constructed)."""
+    _damage_single_k1(monkeypatch, mutate)
+    compiled = allo.compile(transposed_dot_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    assert compiled.plan.name == "single/k2"
+    (kernel,) = compiled.placement_ranking.kernels
+    assert any(any(text in reason for text in expected) for _p, reason in kernel.rejections), (name, kernel.rejections)

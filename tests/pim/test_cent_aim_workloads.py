@@ -233,8 +233,11 @@ def test_rope_ewmul_width_is_the_device_minimum_for_the_full_vector(D, H, F):
     (2D per replica) and lower to one EWMUL each whose op size is the
     smallest the device geometry allows for that vector; the width scales
     with D (X-19: the paper's digits came from a half-width multiply).
-    The selection is the cost minimum of the enumerated replica partitions
-    and every projection candidate ties on an identical command stream."""
+    Also checked: the manifest's declared slot capacity covers the logical
+    elements and each kernel group's chosen candidate has the minimum
+    estimated cost of its ranking.  Not checked here: address-level
+    coverage of the scattered elements or the command streams of the other
+    projection candidates (they are not lowered by this test)."""
     from dataclasses import replace
 
     from benchmarks.cent_aim.workloads import DEFAULT_DECODE_SPEC, build_case
@@ -253,8 +256,8 @@ def test_rope_ewmul_width_is_the_device_minimum_for_the_full_vector(D, H, F):
         assert entry["logical_elements"] == 2 * D * spec.replicas
         assert entry["physical_element_slots"] >= entry["logical_elements"]
         assert entry["row_op_sizes"] == [width]
-    # The elementwise selection is the cheapest enumerated replica partition
-    # and the projections' tied candidates lower to the same stream.
+    # Each kernel group's chosen candidate has the minimum estimated cost
+    # of its ranking (ties included); an estimate ranking, not a simulation.
     ranking = compiled.compiled.placement_ranking
     for kernel in ranking.kernels:
         chosen = next(s for s in kernel.scores if s[0] == kernel.chosen_position)

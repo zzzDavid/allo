@@ -776,70 +776,127 @@ class APUG2LaunchPlan:
         }
 
 
+def launch_program_for(contract, group, coordinates, reduction, *, repetitions):
+    """The device recipe, accumulator mode and finality that the retained
+    contract implies for one launch partition: the streams ``group`` (stream
+    indices), the result-coordinate tile ``coordinates`` (begin, end) and the
+    reduction range ``reduction`` (begin, end).
+
+    This is the single derivation of a launch's intrinsic recipe from the
+    contract: the enumerator builds every launch with it and
+    ``APUG2SourceCtx.check_realization`` re-derives each realized launch's
+    recipe from its partition and refuses a launch whose recipe differs
+    (reduction extent, operand and output types, output geometry, epilogue,
+    accumulator chaining or final-result routing).  Returns
+    ``(program, accumulator, final)``; raises ``ValueError`` when the
+    partition is not one the contract admits."""
+
+    streams = [contract.streams[index] for index in group]
+    if not streams:
+        raise ValueError("a launch must realize at least one stream")
+    first = streams[0]
+    for stream in streams[1:]:
+        if (
+            (stream.lhs.scalar_type, stream.rhs.scalar_type)
+            != (first.lhs.scalar_type, first.rhs.scalar_type)
+            or stream.reduction_extent != first.reduction_extent
+            or stream.result_extents != first.result_extents
+            or stream.accumulator != first.accumulator
+        ):
+            raise ValueError(f"streams {tuple(group)} cannot share one launch")
+    lhs_type, rhs_type = first.lhs.scalar_type, first.rhs.scalar_type
+    extent = first.reduction_extent
+    begin_k, end_k = (int(v) for v in reduction)
+    chunk = end_k - begin_k
+    if chunk <= 0 or extent % chunk or begin_k % chunk or end_k > extent:
+        raise ValueError(
+            f"reduction range {tuple(reduction)} is not a chunk of the "
+            f"contract's reduction extent {extent}"
+        )
+    chunks = extent // chunk
+    index = begin_k // chunk
+    terms = len(group)
+    pair = contract.pair_affine
+    carried = first.accumulator == "carried"
+    tiling = APUG2DotTiling(first.coordinate_count * terms, chunk)
+    if tiling.reduction_tile_count != 1:
+        raise ValueError(f"reduction chunk {chunk} exceeds one launch")
+    begin, end = (int(v) for v in coordinates)
+    tiles = {
+        (row_begin // terms, row_end // terms)
+        for row_begin, row_end in (tiling.tile_bounds(t) for t in range(tiling.tile_count))
+    }
+    if (begin, end) not in tiles:
+        raise ValueError(
+            f"coordinates {(begin, end)} are not a result tile of the contract "
+            f"({sorted(tiles)})"
+        )
+    if tiling.tile_count == 1:
+        shape = first.result_extents
+    else:
+        shape = (end - begin,)
+    if terms == 2 and not pair:
+        shape = (*shape, 2)
+    dot_bits = lhs_type.bits + rhs_type.bits + _log2(chunk)
+    if pair:
+        epilogue = APUG2DotEpilogue(coefficients=contract.coefficients)
+        coefficient = epilogue.coefficient_type(signed=lhs_type.signed)
+        out_bits = dot_bits + coefficient.bits + 1
+        accumulator = "none"
+    elif carried:
+        epilogue = APUG2DotEpilogue(
+            accumulator_type=APUG2ScalarType(dot_bits, lhs_type.signed)
+        )
+        out_bits = dot_bits + 1
+        accumulator = "carried"
+    elif index == 0:
+        epilogue = APUG2DotEpilogue()
+        out_bits = dot_bits
+        accumulator = "none"
+    else:
+        epilogue = APUG2DotEpilogue(
+            accumulator_type=APUG2ScalarType(dot_bits, lhs_type.signed)
+        )
+        out_bits = dot_bits + 1
+        accumulator = "previous"
+    program = APUG2ComposedContractionProgram(
+        (lhs_type, rhs_type),
+        APUG2ScalarType(out_bits, lhs_type.signed),
+        shape,
+        chunk,
+        epilogue,
+        repetitions=repetitions,
+    )
+    return program, accumulator, index == chunks - 1
+
+
 def _launch_programs(contract, group, chunks, repetitions):
     """Launches realizing ``group`` (stream indices) with ``chunks`` K chunks."""
 
-    streams = [contract.streams[index] for index in group]
-    first = streams[0]
-    lhs_type, rhs_type = first.lhs.scalar_type, first.rhs.scalar_type
+    first = contract.streams[group[0]]
     extent = first.reduction_extent
     chunk = extent // chunks
     terms = len(group)
-    coordinates = first.coordinate_count
-    pair = contract.pair_affine
-    carried = first.accumulator == "carried"
-    tiling = APUG2DotTiling(coordinates * terms, chunk)
+    tiling = APUG2DotTiling(first.coordinate_count * terms, chunk)
     if tiling.reduction_tile_count != 1:
         raise ValueError(f"reduction chunk {chunk} exceeds one launch")
     launches = []
     for tile in range(tiling.tile_count):
         row_begin, row_end = tiling.tile_bounds(tile)
-        begin, end = row_begin // terms, row_end // terms
-        if tiling.tile_count == 1:
-            shape = first.result_extents
-        else:
-            shape = (end - begin,)
-        if terms == 2 and not pair:
-            shape = (*shape, 2)
+        coordinates = (row_begin // terms, row_end // terms)
         for index in range(chunks):
-            dot_bits = lhs_type.bits + rhs_type.bits + _log2(chunk)
-            if pair:
-                epilogue = APUG2DotEpilogue(coefficients=contract.coefficients)
-                coefficient = epilogue.coefficient_type(signed=lhs_type.signed)
-                out_bits = dot_bits + coefficient.bits + 1
-                accumulator = "none"
-            elif carried:
-                epilogue = APUG2DotEpilogue(
-                    accumulator_type=APUG2ScalarType(dot_bits, lhs_type.signed)
-                )
-                out_bits = dot_bits + 1
-                accumulator = "carried"
-            elif index == 0:
-                epilogue = APUG2DotEpilogue()
-                out_bits = dot_bits
-                accumulator = "none"
-            else:
-                epilogue = APUG2DotEpilogue(
-                    accumulator_type=APUG2ScalarType(dot_bits, lhs_type.signed)
-                )
-                out_bits = dot_bits + 1
-                accumulator = "previous"
-            program = APUG2ComposedContractionProgram(
-                (lhs_type, rhs_type),
-                APUG2ScalarType(out_bits, lhs_type.signed),
-                shape,
-                chunk,
-                epilogue,
-                repetitions=repetitions,
+            reduction = (index * chunk, (index + 1) * chunk)
+            program, accumulator, final = launch_program_for(
+                contract, group, coordinates, reduction, repetitions=repetitions
             )
             launches.append(
                 APUG2Launch(
                     program=program,
                     streams=tuple(group),
-                    coordinates=(begin, end),
-                    reduction=(index * chunk, (index + 1) * chunk),
+                    coordinates=coordinates,
+                    reduction=reduction,
                     accumulator=accumulator,
-                    final=index == chunks - 1,
+                    final=final,
                 )
             )
     return launches
