@@ -1510,8 +1510,30 @@ is itself checked against the candidate's declared launch; the manifest
 price follows from those fields and equals the priced graph's, verified
 for the single and the repeated program. The reviewer's three mutations,
 on the first and on a later repeated launch, are refused at
-materialization. M-17 is closed on this evidence. The study stays
-DIAGNOSTIC; G9/G10 and the recorded blockers remain open.
+materialization. (Correction, round 46: the producer itself was still
+validated by the product outputs x batches, so a coordinated change of the
+contraction and its merge to outputs 256 x batches 1 passed; round 46
+binds each contraction occurrence's outputs, batches, replicas, reduction
+and vector source to the retained semantic shape under the selected
+candidate.) The study stays DIAGNOSTIC; G9/G10 and the recorded blockers
+remain open.
+
+## Round 46 (2026-11-04): independent review of 152095e; the producer's own dimensions
+
+The reviewer accepted the merge-to-producer binding and showed the
+producer still validated by the product outputs x batches: changing the SV
+contraction and its merge together from outputs 128 x batches 2 to
+outputs 256 x batches 1 was accepted (57 commands and 2,066 simulated
+cycles against 33 and 1,178, the merge still priced 64), the functional
+check alone refusing it. Judgment: accepted. Every launch's contraction
+record is now bound dimension by dimension (outputs, batches, replicas,
+reduction, vector source) to the retained semantic shape of its
+contraction under the selected candidate, grouped realizations included;
+the coordinated mutation and the replica and reduction variants are
+refused on the single and the repeated program, and the unmodified
+programs and the reviewer's neighbouring 4 heads x 256 tokens x head
+dimension 64 workload pass with the merge priced as the graph prices it.
+The study stays DIAGNOSTIC; G9/G10 and the recorded blockers remain open.
 
 ## Rejected shortcuts
 
@@ -1552,7 +1574,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 45 (2026-11-04) at the candidate `25c482d`+ (this
+Refreshed in round 46 (2026-11-04) at the candidate `152095e`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |

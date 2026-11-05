@@ -1104,6 +1104,45 @@ class AimCtx(CodegenContext):
                         f"AiM realization lowered differing contraction records for "
                         f"the launches of group {group.name!r}"
                     )
+                # Every launch's record realizes the retained semantic shape of
+                # its contraction under the selected candidate, dimension by
+                # dimension (outputs, batches, replicas, reduction and the
+                # vector's source), never only the product of outputs and
+                # batches: equal flattened work does not give equal batch and
+                # output addressing.  A grouped (aggregate) realization is the
+                # shape the derivation retained for the group, so it binds
+                # the same way.
+                for realized in records:
+                    (entry,) = [
+                        c for c in group.contractions
+                        if c["match"].func_name == realized.name
+                    ] or [None]
+                    if entry is None:
+                        raise RuntimeError(
+                            f"AiM realization lowered a contraction {realized.name!r} "
+                            f"that group {group.name!r} does not derive"
+                        )
+                    shape = entry["shape"]
+                    expected_fields = {
+                        "outputs": int(shape["outputs"]),
+                        "batches": int(shape["batches"]),
+                        "replicas": int(shape["replicas"]),
+                        "reduction": int(shape["reduction"]),
+                        "input_source": shape["input_source"],
+                    }
+                    realized_fields = {
+                        "outputs": int(realized.outputs),
+                        "batches": int(realized.batches),
+                        "replicas": int(realized.replicas),
+                        "reduction": int(realized.reduction),
+                        "input_source": realized.input_source,
+                    }
+                    if realized_fields != expected_fields:
+                        raise RuntimeError(
+                            f"AiM realization of {realized.name!r} realizes "
+                            f"{realized_fields}; the retained program under the selected "
+                            f"candidate gives {expected_fields}"
+                        )
                 declared = (tuple(launch.instances), tuple(launch.reduction or ()))
                 per_item = (0, record.outputs * record.batches)
                 aggregate = (0, record.outputs * record.batches // max(items, 1))

@@ -479,3 +479,64 @@ def test_lowered_merge_cost_equals_the_priced_graph():
         lowered = [host_reduction_cycles(op, geometry) for op in built.compiled.layout_ctx.lowered_operations if isinstance(op, AimHostReduction)]
         priced = [a.latency_cycles for a in virtual.compiled.execution_graph.activities if a.label == "host_reduction"]
         assert lowered and lowered == priced == [64] * len(lowered)
+
+
+@pytest.mark.parametrize("occurrence", ["single", "repeated"])
+@pytest.mark.parametrize("change", [{"outputs": 256, "batches": 1}, {"replicas": 2}, {"reduction": 64}])
+def test_contraction_dimensions_are_bound_to_the_retained_shape(monkeypatch, occurrence, change):
+    """A coordinated mutation of the SV contraction and its merge (2 heads x
+    128 tokens, P = 2): outputs 256 x batches 1 keeps the flattened work
+    equal to outputs 128 x batches 2 but not the batch and output
+    addressing; it is refused dimension by dimension against the retained
+    semantic shape under the selected candidate, on the single and on the
+    repeated program (the program's MAC metadata is carried over, so the
+    coverage check is not what refuses it)."""
+    from dataclasses import replace
+
+    from allo import spmw_aim
+    from allo.pim.aim_lowering import AimContraction, AimHostReduction
+
+    attention, program = build_attention(2, 128)
+    target = build_aim_target()
+    if occurrence == "repeated":
+        program = _repeated_program(attention)
+    layouts = _split_sv_layout(target, attention, program, partitions=2)
+    original = spmw_aim._AimProgramDerivation.records
+
+    def mutated(self, host_moves, ctx):
+        result = []
+        for op, banks in original(self, host_moves, ctx):
+            if (isinstance(op, AimContraction) and op.reduction_partitions > 1) or isinstance(op, AimHostReduction):
+                fields = {k: v for k, v in change.items() if hasattr(op, k)}
+                old = op
+                op = replace(op, **fields)
+                if id(old) in self.program_macs:
+                    self.program_macs[id(op)] = self.program_macs[id(old)]
+                if id(old) in self.row_maps:
+                    self.row_maps[id(op)] = self.row_maps[id(old)]
+            result.append((op, banks))
+        return result
+
+    monkeypatch.setattr(spmw_aim._AimProgramDerivation, "records", mutated)
+    with pytest.raises(Exception, match="the retained program under the selected candidate gives|not realizable|logical scalar MACs"):
+        allo.compile(attention, target, aim_cost, host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
+
+
+@pytest.mark.parametrize("partitions", [1, 2])
+def test_neighbouring_head_dimension_workload_passes(partitions):
+    """4 heads x 256 tokens with head dimension 64: unmodified, accepted,
+    functionally checked, its merge priced as the graph prices it."""
+    from allo.pim.aim_lowering import AimHostReduction
+    from allo.pim.costs.aim import host_reduction_cycles
+
+    target = build_aim_target()
+    attention, program = build_attention(4, 256, head_dim=64)
+    layouts = _split_sv_layout(target, attention, program, partitions=partitions)
+    built = allo.compile(attention, target, aim_cost, host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
+    check = functional_check(built, 4, 256, seed=3, head_dim=64)
+    assert check["max_rel_error"] < check["tolerance"] and check["head_dim"] == 64
+    assert check["split"] == (partitions > 1)
+    lowered = [host_reduction_cycles(op, _target_geometry(target)) for op in built.compiled.layout_ctx.lowered_operations if isinstance(op, AimHostReduction)]
+    virtual = allo.compile(attention, target, aim_cost, backend="virtual", host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
+    priced = [a.latency_cycles for a in virtual.compiled.execution_graph.activities if a.label == "host_reduction"]
+    assert lowered == priced
