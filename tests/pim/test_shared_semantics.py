@@ -4083,3 +4083,47 @@ def test_repetitions_update_of_a_forced_nondefault_plan_is_valid():
     manifest = compiled.manifest()
     assert manifest["selected"]["name"] == "single/k2"
     assert all(l["program"]["repetitions"] == 17 for l in manifest["selected"]["launches"])
+
+
+def test_repetitions_update_runs_the_shared_graph_check_before_installing(monkeypatch):
+    """The reviewer's probe: a priced graph claiming one launch more than
+    the forced two-launch plan declares.  The shared graph consistency check
+    runs on the attached artifact's layout before anything is installed:
+    the update is refused and the previous plan object, both retained graph
+    references, the repetition count and the estimate stay as they were;
+    on a valid update the check is invoked and passes."""
+    from allo import spmw_candidate
+    from allo.pim import apu_g2_source_route as route
+
+    compiled = allo.compile(_reps_probe, build_apu_g2_target(), apu_g2_cost, backend="virtual", layout="single/k2")
+    plan, graph, estimate = compiled.plan, compiled.execution_graph, compiled.estimate().cycles
+    assert graph is compiled.plan.execution_graph and graph.metadata["launch_count"] == 2
+    calls = []
+    original_check = spmw_candidate.check_graph_consistency
+    original_price = route.price_apu_g2_launch_plan
+
+    def spy(placement, priced):
+        calls.append(priced.metadata.get("launch_count"))
+        return original_check(placement, priced)
+
+    def inconsistent_price(*args, **kwargs):
+        priced = original_price(*args, **kwargs)
+        priced.metadata["launch_count"] += 1
+        return priced
+
+    monkeypatch.setattr(spmw_candidate, "check_graph_consistency", spy)
+    monkeypatch.setattr(route, "price_apu_g2_launch_plan", inconsistent_price)
+    with pytest.raises(ValueError, match="prices 3 launch"):
+        compiled.repetitions = 19
+    assert calls == [3]
+    assert compiled.plan is plan and compiled.execution_graph is graph and compiled.plan.execution_graph is graph
+    assert compiled.repetitions == 256 and compiled.estimate().cycles == estimate
+    assert [l.program.repetitions for l in compiled.plan.launches] == [256, 256]
+    compiled.pack(**_REPS_ARGS)
+    # A valid update runs the same check and installs the consistent graph.
+    monkeypatch.setattr(route, "price_apu_g2_launch_plan", original_price)
+    compiled.repetitions = 19
+    assert calls == [3, 2]
+    assert compiled.repetitions == 19 and compiled.plan is not plan
+    assert compiled.execution_graph is compiled.plan.execution_graph and compiled.execution_graph.metadata["launch_count"] == 2
+    assert [l.program.repetitions for l in compiled.plan.launches] == [19, 19]

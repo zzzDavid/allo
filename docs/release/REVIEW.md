@@ -1791,6 +1791,23 @@ assertion: the update no longer admits the corruption.  Hardware and
 UPMEM candidate execution remain blocked by the hosts' full `/tmp` and
 Docker data root; X-19 and X-26 stay OPEN; no session was added.
 
+## Round 59 (2026-11-05): the graph check of the repetitions update actually runs (X-27 correction)
+
+The reviewer showed that the round 58 setter never invoked the shared graph
+consistency check on the public route: it looked for the layout under a
+nested attribute the attached artifact does not have, so an injected
+priced graph claiming three launches for the two-launch plan was
+installed.  Corrected: the setter reads the attached artifact's own layout
+and runs `check_graph_consistency` on every placement before installing
+anything.  The regression injects the inconsistent graph on the forced
+`single/k2` plan (refused; the previous plan object, both graph references,
+the count and the estimate retained; the artifact still packs) and then
+performs a valid update (the check is invoked and passes, the consistent
+graph installed).  The round 58 claim that the check ran before
+installation was false for that commit and is corrected in ISSUES,
+VALIDATION and the handoff.  The installed-artifact candidate `54cbb08`
+predates X-25's completion and X-27; the next candidate must include them.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1830,8 +1847,8 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 58 (2026-11-05); the integration candidate `54cbb08` plus
-the X-27 repair (this commit). Earlier judgments are kept in the round sections above.
+Refreshed in round 59 (2026-11-05); the integration candidate `54cbb08` plus
+the X-27 repair and its correction (this commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |
 |---|---|---|

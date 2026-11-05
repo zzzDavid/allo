@@ -1283,7 +1283,11 @@ class APUG2SourceProgram:
             rebuilt.execution_graph = graph
             rebuilt.estimate_cycles = int(self.cost.evaluate(graph).cycles)
             rebuilt.estimate_validity = graph.metadata["estimate_validity"]
-            layout = getattr(getattr(self.compiled, "compiled", None), "layout", None)
+            # ``attach`` receives the codegen artifact itself (its ``layout`` is
+            # the selected placement, or a list of them); the priced graph
+            # must describe that placement's declared launches before it
+            # can replace the installed one.
+            layout = getattr(self.compiled, "layout", None)
             if layout is not None:
                 from ..spmw_candidate import check_graph_consistency
 

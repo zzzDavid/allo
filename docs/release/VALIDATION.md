@@ -1275,3 +1275,15 @@ evidence under `/work/shared/users/phd/nz264/tenon-release-evidence/r58/`.
 | `tests/pim/test_shared_semantics.py` section r (5 new; 20 Gemini-II tests passed) | a corrupted enumeration is not consulted by an update (the enumerator is not called); a derivation drifting in reduction extent or output geometry, and a pair derivation with reordered coefficients, are refused with the previous plan, graph and count retained and the artifact packing the source result (112 per output); a valid update of the forced `single/k2` plan keeps both launches' partitions, carries 17 into every recipe and the manifest, re-prices and packs |
 | Suites at this revision | `tests/pim/test_shared_semantics.py` + `tests/pim/test_apu_g2_hardware.py` + `tests/perf/test_compile_interface.py` with the native AiM executor: 159 passed, 14 skipped, 0 failed (`r58/pytest_shared.log`; the card tests skip on this host) |
 | Not changed | the enumerator and the selection; no production change outside the Gemini-II source route and its context |
+
+## Round 59 (2026-11-05): the repetitions update's graph check runs on the public route (X-27 correction)
+
+Working tree on top of `c39af38`; evidence under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r59/`.
+
+| Check | Result |
+|---|---|
+| The reviewer's reproducer (`reviewer-r58/graph_update.py`) after the correction (`r59/reviewer_r58_reproducer_after.log`) | `repetitions = 19` with the injected three-launch graph raises "the cost graph prices 3 launch(es) but the candidate declares 2" from the shared check; nothing is installed |
+| `tests/pim/test_shared_semantics.py::test_repetitions_update_runs_the_shared_graph_check_before_installing` (21 Gemini-II tests passed) | the inconsistent graph is refused with the previous plan object, both graph references (`execution_graph` and `plan.execution_graph`), the repetition count (256) and the estimate retained and the artifact packing; a valid update invokes the check (spied: launch counts 3 then 2), installs the consistent graph and the new count in every recipe |
+| Correction of round 58's claim | the round 58 setter looked up the layout under a nested attribute the attached codegen artifact does not have, so its graph check never ran on the public route; the claim in round 58's entry that it ran before installation was false for `c39af38` |
+| Suites at this revision | `tests/pim/test_shared_semantics.py` + `tests/pim/test_apu_g2_hardware.py` + `tests/perf/test_compile_interface.py` with the native AiM executor: 160 passed, 14 skipped, 0 failed (`r59/pytest_shared.log`) |
