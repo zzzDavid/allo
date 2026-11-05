@@ -1256,8 +1256,10 @@ AiM rows at the candidate (timing only; cycles are `memory_system_cycles`):
 | full_block_l512 | 446835 | 446803 | +32 (corrected RoPE program, X-19) | `3603565dc103` | 61731 |
 | full_block_l4096 | 697348 | 697316 | +32 (corrected RoPE program, X-19) | `8abfcb04091b` | 236869 |
 
+| The twelve AttAcc results from the installed wheel (`r57/run_attacc_installed.sh`, `attacc_{qkv,proj}_b{1,4}.json` with fixed-form baselines, `attacc_score_b{1,4}.json`, `attacc_e2e.json`) | 504 of 504 selected and baseline timings equal the round 51 values (same tilings, same cycles), every one of the 500 shared-pipeline traces equal to its program command by command, no failure; the six decode configurations equal round 52 to the microsecond (Tenon full 6.50 / 6.95 / 7.40 / 3.09 / 3.48 / 3.87x, base 1.47 / 1.56 / 1.66 / 1.34 / 1.50 / 1.65x; DCC and fixed variants as recorded) |
+
 Executed at the candidate after this round: the five Gemini-II rows (round
-56), the fourteen AiM rows and the three Samsung rows; not yet: the sixteen
-UPMEM rows (Docker), the twelve AttAcc results (rounds 51-52 working trees),
+56), the fourteen AiM rows, the three Samsung rows and the twelve AttAcc
+results; not yet: the sixteen UPMEM rows (the host's Docker data root) and
 the five Gemini-I rows (the pre-registered campaign pending on the host's
 temporary space).

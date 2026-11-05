@@ -7,7 +7,7 @@
 Samsung/AiM/UPMEM/Gemini-I/Gemini-II performance comparisons and the AttAcc
 kernel/decode figures. All supporting studies are optional. The inventory's
 `release_scope` column is authoritative: currently 55 required performance
-entries (historical coverage at the recorded revisions: 47 reproduced, 8 open, 0 unverified; executed at the integration candidate 54cbb08 itself as of round 57: the five Gemini-II rows, the fourteen AiM rows (10 exact, 4 corrected RoPE programs) and the three Samsung rows; UPMEM, AttAcc and Gemini-I rows not yet re-executed there) and 28 optional supporting
+entries (historical coverage at the recorded revisions: 47 reproduced, 8 open, 0 unverified; executed at the integration candidate 54cbb08 itself as of round 57: the five Gemini-II rows, the fourteen AiM rows (10 exact, 4 corrected RoPE programs), the three Samsung rows and the twelve AttAcc results (equal to rounds 51-52); UPMEM (Docker) and Gemini-I (campaign pending) rows not yet re-executed there) and 28 optional supporting
 entries. These are evidence at the recorded revisions, not an assertion of
 current-candidate readiness. Optional reproduction gaps do not block release;
 actual production defects and G9 still need their appropriate assessment.
