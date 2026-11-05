@@ -1270,18 +1270,29 @@ class APUG2SourceProgram:
             raise TypeError("repetitions must be an integer")
         if not 1 <= int(value) <= np.iinfo(np.uint32).max:
             raise ValueError("repetitions must fit a nonzero uint32")
-        self._repetitions = int(value)
-        rebuilt = rebuild_apu_g2_launch_plan(
-            self.contract, self.plan, repetitions=self._repetitions
-        )
+        repetitions = int(value)
+        if repetitions == self._repetitions:
+            return
+        # Derive, validate and price first; install only when everything
+        # succeeded, so a failure leaves the previous plan, graph and
+        # repetition count in place (the validated artifact).
+        rebuilt = rebuild_apu_g2_launch_plan(self.contract, self.plan, repetitions=repetitions)
+        graph = None
         if self.cost is not None:
             graph = price_apu_g2_launch_plan(rebuilt, self.target, self.cost)
             rebuilt.execution_graph = graph
             rebuilt.estimate_cycles = int(self.cost.evaluate(graph).cycles)
             rebuilt.estimate_validity = graph.metadata["estimate_validity"]
-            if self.compiled is not None:
-                self.compiled.execution_graph = graph
+            layout = getattr(getattr(self.compiled, "compiled", None), "layout", None)
+            if layout is not None:
+                from ..spmw_candidate import check_graph_consistency
+
+                for placement in layout if isinstance(layout, (list, tuple)) else [layout]:
+                    check_graph_consistency(placement, graph)
+        self._repetitions = repetitions
         self.plan = rebuilt
+        if graph is not None and self.compiled is not None:
+            self.compiled.execution_graph = graph
 
     @property
     def execution_graph(self):
@@ -1494,13 +1505,139 @@ def _plan_repetitions(plan) -> int:
     return 256
 
 
+def check_launch_recipes(contract, plan) -> None:
+    """Bind every launch's intrinsic recipe to the retained contract and its
+    own partition (streams, coordinate tile, reduction range): the recipe
+    the contract implies for that partition is derived again
+    (``launch_program_for``) and must equal the launch's in reduction
+    extent, operand and output types, output geometry, epilogue and
+    structural fingerprint; the accumulator mode and the final flag must be
+    the derived ones; and the final launches of every stream must tile its
+    result coordinates exactly once, each preceded by the partial launches
+    of its tile in reduction order.  A recipe that does not match is a
+    realization that costing and selection must not accept."""
+    finals: dict = {}
+    chains: dict = {}
+    for index, launch in enumerate(plan.launches):
+        try:
+            expected, accumulator, final = launch_program_for(
+                contract,
+                tuple(launch.streams),
+                tuple(launch.coordinates),
+                tuple(launch.reduction),
+                repetitions=getattr(launch.program, "repetitions", 256),
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                f"Gemini-II launch {index} partition is not one the contract admits: {error}"
+            ) from error
+        program = launch.program
+        fields = {
+            "reduction_extent": (program.reduction_extent, expected.reduction_extent),
+            "input_types": (tuple(program.input_types), tuple(expected.input_types)),
+            "output_type": (program.output_type, expected.output_type),
+            "output_shape": (tuple(program.output_shape), tuple(expected.output_shape)),
+            "epilogue": (program.epilogue, expected.epilogue),
+            "structural_fingerprint": (program.structural_fingerprint, expected.structural_fingerprint),
+            "accumulator": (launch.accumulator, accumulator),
+            "final": (bool(launch.final), bool(final)),
+        }
+        wrong = {name: pair for name, pair in fields.items() if pair[0] != pair[1]}
+        if wrong:
+            raise RuntimeError(
+                f"Gemini-II launch {index} (streams {tuple(launch.streams)}, coordinates "
+                f"{tuple(launch.coordinates)}, reduction {tuple(launch.reduction)}) carries "
+                "a recipe the contract does not imply for that partition: "
+                + "; ".join(f"{name} realized {a!r} vs derived {b!r}" for name, (a, b) in wrong.items())
+            )
+        key = (tuple(launch.streams), tuple(launch.coordinates))
+        chains.setdefault(key, []).append(tuple(launch.reduction))
+        if launch.final:
+            for stream in launch.streams:
+                finals.setdefault(int(stream), []).append(tuple(launch.coordinates))
+    for key, ranges in chains.items():
+        expected_ranges = sorted(ranges)
+        if ranges != expected_ranges or any(
+            ranges[i][1] != ranges[i + 1][0] for i in range(len(ranges) - 1)
+        ) or ranges[0][0] != 0 or ranges[-1][1] != contract.streams[key[0][0]].reduction_extent:
+            raise RuntimeError(
+                f"Gemini-II launches of tile {key} do not chain the reduction in order "
+                f"from 0 to the contract's extent: {ranges}"
+            )
+    for index, stream in enumerate(contract.streams):
+        tiles = sorted(finals.get(index, []))
+        covered = 0
+        for begin, end in tiles:
+            if begin != covered:
+                raise RuntimeError(
+                    f"Gemini-II final launches of stream {index} do not tile its result "
+                    f"coordinates exactly once: {tiles}"
+                )
+            covered = end
+        if covered != stream.coordinate_count:
+            raise RuntimeError(
+                f"Gemini-II final launches of stream {index} cover coordinates "
+                f"[0, {covered}) of {stream.coordinate_count}: {tiles}"
+            )
+
+
+
+
+_RECIPE_FIELDS = ("reduction_extent", "input_types", "output_type", "output_shape", "epilogue")
+
+
 def rebuild_apu_g2_launch_plan(contract, plan, *, repetitions):
-    """The same plan (fusion, chunks, tiles) with another repetition count."""
-    plans, _rejected = enumerate_apu_g2_launch_plans(contract, repetitions=repetitions)
-    for candidate in plans:
-        if candidate.name == plan.name:
-            return candidate
-    raise ValueError(f"plan {plan.name!r} is no longer legal at {repetitions} reps")
+    """The same selected plan with another profiling repetition count.
+
+    Each launch's recipe is derived again from the retained contract and the
+    launch's own partition (``launch_program_for``: streams, coordinate tile,
+    reduction range) at the new repetition count; the enumerator is not
+    consulted and no plan is looked up by name.  The rebuilt launch must
+    equal the validated one in everything but ``repetitions`` (streams,
+    coordinates, reduction, accumulator, final flag, reduction extent,
+    operand and output types, output geometry, epilogue), and the rebuilt
+    plan passes ``check_launch_recipes`` again; otherwise ``ValueError`` is
+    raised and nothing is installed."""
+    launches = []
+    for index, launch in enumerate(plan.launches):
+        program, accumulator, final = launch_program_for(
+            contract,
+            tuple(launch.streams),
+            tuple(launch.coordinates),
+            tuple(launch.reduction),
+            repetitions=repetitions,
+        )
+        drift = {
+            name: (getattr(launch.program, name), getattr(program, name))
+            for name in _RECIPE_FIELDS
+            if getattr(launch.program, name) != getattr(program, name)
+        }
+        if accumulator != launch.accumulator:
+            drift["accumulator"] = (launch.accumulator, accumulator)
+        if bool(final) != bool(launch.final):
+            drift["final"] = (launch.final, final)
+        if drift:
+            raise ValueError(
+                f"repetitions update would change launch {index} of plan {plan.name!r} "
+                "beyond its repetition count: "
+                + "; ".join(f"{k} {a!r} -> {b!r}" for k, (a, b) in drift.items())
+            )
+        launches.append(
+            APUG2Launch(
+                program=program,
+                streams=tuple(launch.streams),
+                coordinates=tuple(launch.coordinates),
+                reduction=tuple(launch.reduction),
+                accumulator=launch.accumulator,
+                final=launch.final,
+            )
+        )
+    rebuilt = APUG2LaunchPlan(plan.name, plan.fusion, plan.reduction_chunks, tuple(launches))
+    try:
+        check_launch_recipes(contract, rebuilt)
+    except RuntimeError as error:
+        raise ValueError(f"repetitions update rejected: {error}") from error
+    return rebuilt
 
 
 @dataclass

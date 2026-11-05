@@ -1263,3 +1263,15 @@ Executed at the candidate after this round: the five Gemini-II rows (round
 results; not yet: the sixteen UPMEM rows (the host's Docker data root) and
 the five Gemini-I rows (the pre-registered campaign pending on the host's
 temporary space).
+
+## Round 58 (2026-11-05): the Gemini-II repetitions update bound to the validated plan (X-27)
+
+Working tree on top of `f1df711` (the candidate `54cbb08` plus this repair);
+evidence under `/work/shared/users/phd/nz264/tenon-release-evidence/r58/`.
+
+| Check | Result |
+|---|---|
+| The reviewer's reproducer (`reviewer-r57/g2_repetitions.py`) after the repair (`r58/reviewer_r57_reproducer_after.log`) | the corrupted enumeration no longer reaches the artifact: after `repetitions = 17` the launch still declares reduction (0, 32) with recipe K = 32, the explicit recipe check passes and the script stops at its own "expected recipe mismatch" assertion |
+| `tests/pim/test_shared_semantics.py` section r (5 new; 20 Gemini-II tests passed) | a corrupted enumeration is not consulted by an update (the enumerator is not called); a derivation drifting in reduction extent or output geometry, and a pair derivation with reordered coefficients, are refused with the previous plan, graph and count retained and the artifact packing the source result (112 per output); a valid update of the forced `single/k2` plan keeps both launches' partitions, carries 17 into every recipe and the manifest, re-prices and packs |
+| Suites at this revision | `tests/pim/test_shared_semantics.py` + `tests/pim/test_apu_g2_hardware.py` + `tests/perf/test_compile_interface.py` with the native AiM executor: 159 passed, 14 skipped, 0 failed (`r58/pytest_shared.log`; the card tests skip on this host) |
+| Not changed | the enumerator and the selection; no production change outside the Gemini-II source route and its context |

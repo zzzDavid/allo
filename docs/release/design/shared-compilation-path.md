@@ -146,7 +146,7 @@ Removed in round 13: the planner-hook registry `_SOURCE_PLANNERS` and
 `compile_apu_v1_vector_workload`, `search_apu_v1_vector_plans` and the
 route's own `grid_search`; `compile_apu_g2_source_workload` and
 `APUG2SourceProgram._select` (the program is the realized selected plan;
-`repetitions` rebuilds that plan's launches). `require_matcher_route_policy`
+`repetitions` re-derives the selected plan's launches from their own partitions at the new count, refuses any other change and installs the result atomically; round 58, X-27). `require_matcher_route_policy`
 treats `apu_v1` and `apu_v2` as policy-aware routes because their
 enumerators consult the policy.
 

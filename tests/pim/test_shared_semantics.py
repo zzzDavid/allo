@@ -3962,3 +3962,124 @@ def test_reversed_streams_with_matching_coefficients_are_accepted(monkeypatch):
     (launch,) = compiled.plan.launches
     assert tuple(launch.streams) == (1, 0) and launch.program.epilogue.coefficients == (2, 3)
     np.testing.assert_array_equal(_recipe_result(compiled), [112] * 5)
+
+
+# --------------------------------------------------------------------------- #
+# (r) A Gemini-II repetitions update keeps the validated plan (review round 57:
+#     the setter re-enumerated plans and took a replacement by name without
+#     the shared checks)
+# --------------------------------------------------------------------------- #
+
+
+def _reps_probe(a: int3[3, 32], b: int3[32, 5], z: int12[5, 3]):
+    for m, n in allo.grid(3, 5):
+        acc: int12 = 0
+        for k in allo.reduction(32):
+            acc += a[m, k] * b[k, n]
+        z[n, m] = acc
+
+
+_REPS_ARGS = dict(a=np.ones((3, 32), np.int8), b=np.ones((32, 5), np.int8), z=np.zeros((5, 3), np.int16))
+
+
+def _partition(plan):
+    return [(tuple(l.streams), tuple(l.coordinates), tuple(l.reduction), l.accumulator, l.final) for l in plan.launches]
+
+
+def test_repetitions_update_does_not_consult_the_enumerator(monkeypatch):
+    """The reviewer's probe: a corrupted enumeration (K halved, narrower
+    output) during a repetitions update.  The update derives the launches
+    from the validated plan's own partitions, so the corruption cannot
+    reach the artifact: the recipe keeps K = 32, only the repetition count
+    changes, the artifact packs, and the enumerator is not called."""
+    from allo.pim import apu_g2_source_route as route
+
+    compiled = allo.compile(_reps_probe, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    before = _partition(compiled.plan); estimate = compiled.estimate().cycles
+    calls = []
+
+    def broken(contract, **kwargs):
+        calls.append(1)
+        raise AssertionError("the enumerator must not be consulted by a repetitions update")
+
+    monkeypatch.setattr(route, "enumerate_apu_g2_launch_plans", broken)
+    compiled.repetitions = 17
+    assert not calls and compiled.repetitions == 17
+    assert _partition(compiled.plan) == before
+    (launch,) = compiled.plan.launches
+    assert launch.program.reduction_extent == 32 and launch.program.repetitions == 17
+    # The per-call estimate is independent of the profiling repetitions; the
+    # plan is re-priced and the graph re-attached.
+    assert compiled.estimate().cycles == estimate == compiled.plan.estimate_cycles
+    assert compiled.execution_graph is compiled.plan.execution_graph
+    compiled.pack(**_REPS_ARGS)
+    assert all(l["program"]["repetitions"] == 17 for l in compiled.manifest()["selected"]["launches"])
+
+
+@pytest.mark.parametrize("name, mutate", [
+    ("halved reduction", lambda p: replace(p, reduction_extent=p.reduction_extent // 2, output_type=replace(p.output_type, bits=p.output_type.bits - 1))),
+    ("flattened output geometry", lambda p: replace(p, output_shape=(15,))),
+])
+def test_repetitions_update_rejects_a_drifted_recipe_and_keeps_the_valid_plan(monkeypatch, name, mutate):
+    """If the derivation itself returned a recipe differing from the
+    validated launch in anything but repetitions, the update is refused and
+    the previous plan, graph and repetition count stay installed."""
+    from allo.pim import apu_g2_source_route as route
+
+    compiled = allo.compile(_reps_probe, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    before = _partition(compiled.plan); graph = compiled.execution_graph; estimate = compiled.estimate().cycles
+    original = route.launch_program_for
+
+    def drifted(contract, group, coordinates, reduction, *, repetitions):
+        program, accumulator, final = original(contract, group, coordinates, reduction, repetitions=repetitions)
+        return mutate(program), accumulator, final
+
+    monkeypatch.setattr(route, "launch_program_for", drifted)
+    with pytest.raises(ValueError, match="beyond its repetition count"):
+        compiled.repetitions = 17
+    assert compiled.repetitions == 256 and _partition(compiled.plan) == before
+    assert compiled.execution_graph is graph and compiled.estimate().cycles == estimate
+    assert compiled.plan.launches[0].program.repetitions == 256
+    compiled.pack(**_REPS_ARGS)
+
+
+def test_repetitions_update_rejects_reordered_pair_streams(monkeypatch):
+    """A pair-affine plan whose derivation returned the coefficients in the
+    wrong order during the update is refused (the validated launch keeps
+    (3, 2)); the artifact's recipe still computes the source result."""
+    from allo.pim import apu_g2_source_route as route
+    from allo.pim.apu_g2_composed_contraction import APUG2DotEpilogue
+
+    compiled = allo.compile(nearby_pair_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    original = route.launch_program_for
+
+    def swapped(contract, group, coordinates, reduction, *, repetitions):
+        program, accumulator, final = original(contract, group, coordinates, reduction, repetitions=repetitions)
+        return replace(program, epilogue=APUG2DotEpilogue(coefficients=tuple(reversed(program.epilogue.coefficients)))), accumulator, final
+
+    monkeypatch.setattr(route, "launch_program_for", swapped)
+    with pytest.raises(ValueError, match="epilogue"):
+        compiled.repetitions = 17
+    (launch,) = compiled.plan.launches
+    assert launch.program.epilogue.coefficients == (3, 2) and compiled.repetitions == 256
+    compiled.pack(**_PAIR_ARGS)
+    np.testing.assert_array_equal(_recipe_result(compiled), [112] * 5)
+
+
+def test_repetitions_update_of_a_forced_nondefault_plan_is_valid():
+    """A valid update of the forced two-launch plan: both launches keep
+    their partition, each recipe carries the new count, the plan is
+    re-priced, packing and provenance agree."""
+    compiled = allo.compile(_reps_probe, build_apu_g2_target(), apu_g2_cost, backend="virtual", layout="single/k2")
+    assert compiled.plan.name == "single/k2" and len(compiled.plan.launches) == 2 and compiled.selection == "forced"
+    before = _partition(compiled.plan); estimate = compiled.estimate().cycles
+    compiled.repetitions = 17
+    assert compiled.plan.name == "single/k2" and _partition(compiled.plan) == before
+    assert [l.program.repetitions for l in compiled.plan.launches] == [17, 17]
+    assert [l.program.reduction_extent for l in compiled.plan.launches] == [16, 16]
+    assert compiled.estimate().cycles == estimate == compiled.plan.estimate_cycles
+    assert compiled.execution_graph is compiled.plan.execution_graph
+    compiled.pack(**_REPS_ARGS)
+    manifest = compiled.manifest()
+    assert manifest["selected"]["name"] == "single/k2"
+    assert all(l["program"]["repetitions"] == 17 for l in manifest["selected"]["launches"])
