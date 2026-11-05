@@ -743,7 +743,53 @@ class AimCtx(CodegenContext):
             # name -> the primary record of this occurrence: a host reduction
             # is bound to its producing contraction's whole work domain.
             "primary_records": {},
+            # The launch-owned records of the open occurrence, in order.
+            "occurrence_records": [],
         }
+
+        def differing_fields(realized, expected):
+            from dataclasses import fields as dataclass_fields
+
+            names = []
+            for field in dataclass_fields(expected):
+                if getattr(realized, field.name, None) != getattr(expected, field.name, None):
+                    names.append(
+                        f"{field.name}: realized {getattr(realized, field.name, None)!r}, "
+                        f"expected {getattr(expected, field.name, None)!r}"
+                    )
+            return names
+
+        def compare_with_derivation(token, realized_records):
+            """The occurrence's launch-owned records (contractions, their host
+            reductions, elementwise records) must equal, record by record,
+            the records the retained program and the selected decision
+            derive for one launch of the group (``_launch_records``, computed
+            here afresh from the group's facts, never from the records under
+            check): activation, reuse scheduling, GPR addressing, channels,
+            rows, partitions and every other emitted field included."""
+            group = groups[token[1]]
+            expected = [op for op, _banks in program._launch_records(group)]
+            if len(realized_records) != len(expected):
+                raise RuntimeError(
+                    f"AiM realization of {describe(token)} lowers {len(realized_records)} "
+                    f"launch record(s) {[type(r).__name__ for r in realized_records]}; the "
+                    f"retained program derives {len(expected)} "
+                    f"{[type(e).__name__ for e in expected]}"
+                )
+            for realized, derived in zip(realized_records, expected):
+                if type(realized) is not type(derived):
+                    raise RuntimeError(
+                        f"AiM realization of {describe(token)} lowers a "
+                        f"{type(realized).__name__} where the retained program derives a "
+                        f"{type(derived).__name__}"
+                    )
+                if realized != derived:
+                    raise RuntimeError(
+                        f"AiM realization of {describe(token)} lowers "
+                        f"{getattr(realized, 'name', type(realized).__name__)!r} with "
+                        + "; ".join(differing_fields(realized, derived))
+                        + "; the retained program under the selected decision derives otherwise"
+                    )
 
         def describe(token):
             return (
@@ -761,6 +807,9 @@ class AimCtx(CodegenContext):
                     f"step: missing primary records {state['pending_primaries']} and host "
                     f"reductions {sorted(state['pending_merges'])}"
                 )
+            if token[0] == "launch":
+                compare_with_derivation(token, list(state["occurrence_records"]))
+            state["occurrence_records"] = []
 
         def open_next(kind, gid=None, what=""):
             close_current()
@@ -816,6 +865,7 @@ class AimCtx(CodegenContext):
                 state["pending_primaries"].remove(name)
                 state["done_primaries"].add(name)
                 state["primary_records"][name] = op
+                state["occurrence_records"].append(op)
                 continue
             if isinstance(op, AimHostReduction):
                 source = str(op.source)
@@ -867,6 +917,7 @@ class AimCtx(CodegenContext):
                         f"AiM realization merges (outputs, batches, replicas, partitions) "
                         f"{realized} of {source!r}; its contraction produces {produced}"
                     )
+                state["occurrence_records"].append(op)
                 continue
             # Host transfers, bank copies and syncs are owned by other steps.
         close_current()

@@ -1535,6 +1535,25 @@ programs and the reviewer's neighbouring 4 heads x 256 tokens x head
 dimension 64 workload pass with the merge priced as the graph prices it.
 The study stays DIAGNOSTIC; G9/G10 and the recorded blockers remain open.
 
+## Round 47 (2026-11-04): independent review of 65750db; realization fidelity beyond dimensions
+
+The reviewer accepted the dimensional repair and showed that the emitted
+activation, reuse scheduling and GPR addressing of a contraction record
+were still unbound: an added activation, another reuse group or another
+result GPR address on the QK record was accepted under the unchanged
+selected plan and estimate, with more commands and more simulated cycles.
+Judgment: accepted (M-18). Rather than another field patch, each launch
+occurrence's realized launch-owned records are now compared record by
+record with the records the retained program and the selected decision
+derive afresh for one launch of the group, every emitted field included;
+a difference names the fields and fails materialization before selection.
+The reviewer's three mutations and two more (input GPR, channel set) are
+refused on the single and the repeated program; the unmodified programs
+and the 3 heads x 192 tokens x head dimension 64 neighbour pass. Relocation
+bank copies, syncs and host transfer records are not yet under this
+comparison (M-18 says so); the round 46 closure stays dimensional. G9/G10
+and the recorded blockers remain open; the study stays DIAGNOSTIC.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1574,7 +1593,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 46 (2026-11-04) at the candidate `152095e`+ (this
+Refreshed in round 47 (2026-11-04) at the candidate `65750db`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |

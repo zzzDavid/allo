@@ -518,7 +518,7 @@ def test_contraction_dimensions_are_bound_to_the_retained_shape(monkeypatch, occ
         return result
 
     monkeypatch.setattr(spmw_aim._AimProgramDerivation, "records", mutated)
-    with pytest.raises(Exception, match="the retained program under the selected candidate gives|not realizable|logical scalar MACs"):
+    with pytest.raises(Exception, match="the retained program under the selected candidate gives|the retained program under the selected decision derives otherwise|not realizable|logical scalar MACs"):
         allo.compile(attention, target, aim_cost, host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
 
 
@@ -540,3 +540,57 @@ def test_neighbouring_head_dimension_workload_passes(partitions):
     virtual = allo.compile(attention, target, aim_cost, backend="virtual", host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
     priced = [a.latency_cycles for a in virtual.compiled.execution_graph.activities if a.label == "host_reduction"]
     assert lowered == priced
+
+
+@pytest.mark.parametrize("occurrence", ["single", "repeated"])
+@pytest.mark.parametrize("change", [{"activation": True}, {"reuse_group_size": 1}, {"result_gpr": 7}, {"input_gpr": 3}, {"channels": (0, 1, 2, 3, 4, 5, 6, 8)}])
+def test_every_emitted_contraction_field_is_bound_to_the_derivation(monkeypatch, occurrence, change):
+    """The realized records of each launch occurrence must equal, record by
+    record, what the retained program and the selected decision derive for
+    one launch of the group: an added activation (AF/RD_AF commands), another
+    reuse group (command order), another result or input GPR address or
+    another channel set on the QK record is refused at materialization,
+    with the differing fields named, on the single and the repeated program."""
+    from dataclasses import replace
+
+    from allo import spmw_aim
+    from allo.pim.aim_lowering import AimContraction
+
+    attention, program = build_attention(2, 128)
+    target = build_aim_target()
+    if occurrence == "repeated":
+        program = _repeated_program(attention)
+    layouts = _split_sv_layout(target, attention, program, partitions=2)
+    original = spmw_aim._AimProgramDerivation.records
+
+    def mutated(self, host_moves, ctx):
+        result = []
+        for op, banks in original(self, host_moves, ctx):
+            if isinstance(op, AimContraction) and "qk" in op.name:
+                old = op
+                op = replace(op, **change)
+                for metadata in (self.program_macs, self.row_maps):
+                    if id(old) in metadata:
+                        metadata[id(op)] = metadata[id(old)]
+            result.append((op, banks))
+        return result
+
+    monkeypatch.setattr(spmw_aim._AimProgramDerivation, "records", mutated)
+    field = next(iter(change))
+    with pytest.raises(Exception, match=f"{field}: realized|not realizable|logical scalar MACs|the retained program under the selected"):
+        allo.compile(attention, target, aim_cost, host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
+
+
+def test_unmodified_programs_match_their_derivation_record_by_record():
+    """The whole-record comparison accepts the unmodified single, repeated and
+    neighbouring (3 heads x 192 tokens x head dimension 64) programs, and the
+    neighbour's functional pipeline passes."""
+    target = build_aim_target()
+    attention, program = build_attention(2, 128)
+    for prog in (program, _repeated_program(attention)):
+        layouts = _split_sv_layout(target, attention, prog, partitions=2)
+        allo.compile(attention, target, aim_cost, host_moves=prog, resources=BUDGET, layout=layouts, **POLICY)
+    neighbour, neighbour_program = build_attention(3, 192, head_dim=64)
+    built = allo.compile(neighbour, target, aim_cost, host_moves=neighbour_program, resources=BUDGET, **POLICY)
+    check = functional_check(built, 3, 192, seed=19, head_dim=64)
+    assert check["max_rel_error"] < check["tolerance"] and check["head_dim"] == 64
