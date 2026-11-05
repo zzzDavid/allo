@@ -1485,11 +1485,33 @@ stage before the producing launch's merge, or that merge dropped while a
 repeated launch kept its own, passed). Judgment: accepted. The expected
 inventory now comes from the retained facts and the selected candidates,
 per scheduled launch occurrence, and the lowered records are walked
-against it; a duplicated, missing, displaced or mis-parameterized record
-fails materialization before selection, and the unmodified repeated-launch
-program is accepted. M-17 is closed on that evidence; the study's label
-stays DIAGNOSTIC and 6 of 9 minima does not establish the paper's 7 of 9.
-G9/G10 and the recorded blockers remain open.
+against it; a duplicated, missing or displaced record, or a host reduction
+with another partition count, fails materialization before selection, and
+the unmodified repeated-launch program is accepted. (Correction, round 45:
+that round bound only the reduction's partition count; its outputs,
+batches and replicas were not bound to the producing contraction, so a
+mis-parameterized reduction still materialized with a manifest price that
+disagreed with the priced graph. Round 45 binds the whole work domain.)
+The study's label stays DIAGNOSTIC and 6 of 9 minima does not establish
+the paper's 7 of 9. G9/G10 and the recorded blockers remain open.
+
+## Round 45 (2026-11-04): independent review of 25c482d; the reduction's work domain
+
+The reviewer accepted the occurrence and count repairs and showed the
+closure overstated: a host reduction's outputs, batches and replicas were
+not bound to its producing contraction, so a reduction with outputs 1,
+batches 1 or replicas 2 (2 heads x 128 tokens, P = 2) materialized with a
+manifest price of 8, 32 or 128 cycles while the selection graph kept 64,
+and only the functional merge later failed on a shape mismatch. Judgment:
+accepted. The inventory walk now binds each reduction occurrence to the
+contraction record of the same occurrence that produces its partials
+(outputs, batches, replicas and the contraction's partition count), which
+is itself checked against the candidate's declared launch; the manifest
+price follows from those fields and equals the priced graph's, verified
+for the single and the repeated program. The reviewer's three mutations,
+on the first and on a later repeated launch, are refused at
+materialization. M-17 is closed on this evidence. The study stays
+DIAGNOSTIC; G9/G10 and the recorded blockers remain open.
 
 ## Rejected shortcuts
 
@@ -1530,7 +1552,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 44 (2026-11-04) at the candidate `b0c667b`+ (this
+Refreshed in round 45 (2026-11-04) at the candidate `25c482d`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |

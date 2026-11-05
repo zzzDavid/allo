@@ -735,7 +735,15 @@ class AimCtx(CodegenContext):
             else:
                 primary_group[group.name] = group.group_id
 
-        state = {"index": -1, "pending_primaries": [], "pending_merges": {}, "done_primaries": set()}
+        state = {
+            "index": -1,
+            "pending_primaries": [],
+            "pending_merges": {},
+            "done_primaries": set(),
+            # name -> the primary record of this occurrence: a host reduction
+            # is bound to its producing contraction's whole work domain.
+            "primary_records": {},
+        }
 
         def describe(token):
             return (
@@ -773,9 +781,11 @@ class AimCtx(CodegenContext):
                 state["pending_primaries"] = list(expected["primaries"])
                 state["pending_merges"] = dict(expected["merges"])
                 state["done_primaries"] = set()
+                state["primary_records"] = {}
             else:
                 state["pending_primaries"], state["pending_merges"] = [], {}
                 state["done_primaries"] = set()
+                state["primary_records"] = {}
 
         def current_launch(gid):
             return (
@@ -805,6 +815,7 @@ class AimCtx(CodegenContext):
                         )
                 state["pending_primaries"].remove(name)
                 state["done_primaries"].add(name)
+                state["primary_records"][name] = op
                 continue
             if isinstance(op, AimHostReduction):
                 source = str(op.source)
@@ -829,6 +840,32 @@ class AimCtx(CodegenContext):
                     raise RuntimeError(
                         f"AiM realization merges {op.partitions} partials of {source!r}; the "
                         f"candidate declares {expected}"
+                    )
+                # The reduction's whole work domain is its producing
+                # contraction's, in this occurrence: outputs, batches and
+                # replicas (the host reads P x batches x replicas partial
+                # vectors of `outputs` elements) and the contraction's own
+                # partition count.  The contraction record is itself checked
+                # against the candidate's declared launch; the merge's price
+                # (`host_reduction_cycles`) follows from these fields, so the
+                # lowered host cost equals the priced graph's.
+                producer = state["primary_records"].get(source)
+                if not isinstance(producer, AimContraction):
+                    raise RuntimeError(
+                        f"AiM realization lowered the host reduction of {source!r} "
+                        "without the contraction that produces its partials"
+                    )
+                realized = (int(op.outputs), int(op.batches), int(op.replicas), int(op.partitions))
+                produced = (
+                    int(producer.outputs),
+                    int(producer.batches),
+                    int(producer.replicas),
+                    int(producer.reduction_partitions),
+                )
+                if realized != produced:
+                    raise RuntimeError(
+                        f"AiM realization merges (outputs, batches, replicas, partitions) "
+                        f"{realized} of {source!r}; its contraction produces {produced}"
                     )
                 continue
             # Host transfers, bank copies and syncs are owned by other steps.

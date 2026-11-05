@@ -428,3 +428,54 @@ def test_realization_binds_each_launch_occurrence_and_its_completion(monkeypatch
     }[mutation]
     with pytest.raises(Exception, match=expected):
         allo.compile(attention, target, aim_cost, host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
+
+
+@pytest.mark.parametrize("field,value", [("outputs", 1), ("batches", 1), ("replicas", 2)])
+@pytest.mark.parametrize("occurrence", ["first", "later"])
+def test_reduction_work_domain_is_bound_to_its_producing_contraction(monkeypatch, field, value, occurrence):
+    """A host reduction whose outputs, batches or replicas differ from its
+    producing contraction's is refused at materialization, whether it
+    belongs to the first SV launch or to the repeated one (2 heads x 128
+    tokens, P = 2); its manifest price would otherwise disagree with the
+    priced graph (64 cycles here: 8, 32 or 128 with the mutation)."""
+    from dataclasses import replace
+
+    from allo import spmw_aim
+    from allo.pim.aim_lowering import AimHostReduction
+
+    attention, program = build_attention(2, 128)
+    target = build_aim_target()
+    if occurrence == "later":
+        program = _repeated_program(attention)
+    layouts = _split_sv_layout(target, attention, program, partitions=2)
+    original = spmw_aim._AimProgramDerivation.records
+
+    def mutated(self, host_moves, ctx):
+        records = list(original(self, host_moves, ctx))
+        merges = [i for i, r in enumerate(records) if isinstance(r[0], AimHostReduction)]
+        target_index = merges[0] if occurrence == "first" else merges[-1]
+        op, banks = records[target_index]
+        records[target_index] = (replace(op, **{field: value}), banks)
+        return records
+
+    monkeypatch.setattr(spmw_aim._AimProgramDerivation, "records", mutated)
+    with pytest.raises(Exception, match="its contraction produces"):
+        allo.compile(attention, target, aim_cost, host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
+
+
+def test_lowered_merge_cost_equals_the_priced_graph():
+    """For the unmodified programs (single and repeated launch) the lowered
+    host reductions price exactly what the selection graph priced."""
+    from allo.pim.aim_lowering import AimHostReduction
+    from allo.pim.costs.aim import host_reduction_cycles
+
+    target = build_aim_target()
+    geometry = _target_geometry(target)
+    attention, single = build_attention(2, 128)
+    for program in (single, _repeated_program(attention)):
+        layouts = _split_sv_layout(target, attention, program, partitions=2)
+        built = allo.compile(attention, target, aim_cost, host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
+        virtual = allo.compile(attention, target, aim_cost, backend="virtual", host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
+        lowered = [host_reduction_cycles(op, geometry) for op in built.compiled.layout_ctx.lowered_operations if isinstance(op, AimHostReduction)]
+        priced = [a.latency_cycles for a in virtual.compiled.execution_graph.activities if a.label == "host_reduction"]
+        assert lowered and lowered == priced == [64] * len(lowered)
