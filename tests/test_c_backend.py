@@ -313,3 +313,25 @@ def test_wide_integer_abi_is_rejected():
 
     with pytest.raises(WideIntegerError, match="96-bit integer through the ABI"):
         _wide(kernel)
+
+
+def test_wide_index_cast_of_an_address_temporary_is_exact():
+    """An ``int64`` address temporary added to a loop index is typed i65 by
+    the frontend and cast to ``index`` for the access (the hoisted row base
+    of ISSUES U-16); the cast to ``index`` truncates to the low 64 bits and
+    the cast from ``index`` extends a 64-bit value, so both are exact under
+    ``wrap_wide_integers`` and the kernel lowers and runs."""
+
+    def kernel(A: int64[16], C: int64[16]):
+        row0: int64 = 8
+        for i in range(8):
+            C[row0 + i] = A[row0 + i] * 3
+
+    artifact = _wide(kernel)
+    assert (
+        "arith.index_cast" in artifact.lowered_mlir and "i65" in artifact.lowered_mlir
+    )
+    a = np.arange(16, dtype=np.int64)
+    out = np.zeros(16, np.int64)
+    artifact.compile()(a.copy(), out)
+    assert out.tolist() == [0] * 8 + [3 * v for v in range(8, 16)]

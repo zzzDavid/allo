@@ -470,6 +470,47 @@ _POINTWISE_BETA_SIGN = {"AXMBY": -1}
 _POINTWISE_OPERAND_ROLES = {"scale": ("x",)}
 
 
+def _coordinate_vars(operand) -> list:
+    """The loop variable each coordinate of ``operand`` ranges over, from the
+    matcher's resolved affine forms (``coords``): a coordinate that is one
+    loop variable plus a constant (the per-work-item base ``dpu * ROWS + i``,
+    inline or hoisted into an address-only temporary, ISSUES U-16) names
+    that variable; any other coordinate keeps its raw index name (a constant,
+    a data-dependent index), which no loop variable equals.  Falls back to
+    the raw indices when no resolved form was retained.  Family recognition
+    reads coordinates through this so nearby spellings classify alike."""
+    indices = list(getattr(operand, "indices", ()) or ())
+    coords = getattr(operand, "coords", None)
+    if not coords or len(coords) != len(indices):
+        return indices
+    return [_coordinate_var(coord, raw) for coord, raw in zip(coords, indices)]
+
+
+def _coordinate_var(coord, raw):
+    try:
+        terms, _constant = coord
+        terms = [
+            (str(var), int(coefficient))
+            for var, coefficient in terms
+            if int(coefficient) != 0
+        ]
+    except (TypeError, ValueError):
+        return raw
+    if len(terms) == 1 and terms[0][1] == 1:
+        return terms[0][0]
+    return raw
+
+
+def _store_vars(match) -> list:
+    """The loop variables of the match's store coordinates (``store_coords``
+    resolved like `_coordinate_vars`; the raw ``store_indices`` otherwise)."""
+    indices = list(match.extra.get("store_indices") or ())
+    coords = match.extra.get("store_coords")
+    if not coords or len(coords) != len(indices):
+        return indices
+    return [_coordinate_var(coord, raw) for coord, raw in zip(coords, indices)]
+
+
 def _data_operands(match) -> dict:
     """Operands bound to memref loads, by role (constant parameters excluded)."""
     return {
@@ -503,11 +544,11 @@ def _recognize_pointwise(target, stream):
     inputs = [operands[name] for name in names]
     if any(op.is_loop_carried for op in inputs):
         return None
-    if any(_memref_rank(op) != 1 or list(op.indices) != [iv] for op in inputs):
+    if any(_memref_rank(op) != 1 or _coordinate_vars(op) != [iv] for op in inputs):
         return None
     if match.result_memref_name in (None, *(op.memref_name for op in inputs)):
         return None
-    if match.extra.get("store_indices") != [iv]:
+    if _store_vars(match) != [iv]:
         return None
     for role, operand in zip(("lhs", "rhs"), inputs):
         _require_element_type("pointwise", role, operand)
@@ -607,9 +648,9 @@ def _recognize_reduction(target, stream):
     if len(cells) != 1 or len(values) != 1:
         return None
     (cell,), (value,) = cells, values
-    if iv in cell.indices or match.extra.get("store_indices") != list(cell.indices):
+    if iv in _coordinate_vars(cell) or _store_vars(match) != _coordinate_vars(cell):
         return None
-    if _memref_rank(value) != 1 or list(value.indices) != [iv]:
+    if _memref_rank(value) != 1 or _coordinate_vars(value) != [iv]:
         return None
     _require_element_type("reduction", "input", value)
     _require_element_type("reduction", "out", cell)
@@ -673,15 +714,17 @@ def _recognize_matrix_vector(target, stream):
     inputs = [operands.get("x"), operands.get("y")]
     if acc is None or not acc.is_loop_carried or None in inputs:
         return None
-    matrix = next((op for op in inputs if list(op.indices) == outer + [red_iv]), None)
+    matrix = next(
+        (op for op in inputs if _coordinate_vars(op) == outer + [red_iv]), None
+    )
     vector = next((op for op in inputs if op is not matrix), None)
     if matrix is None or vector is None or _memref_rank(matrix) != len(ivs):
         return None
-    if list(vector.indices) == [red_iv]:
+    if _coordinate_vars(vector) == [red_iv]:
         batches, rows = 1, 1
         for extent in extents[:-1]:
             rows *= extent
-    elif len(outer) == 2 and list(vector.indices) == [outer[0], red_iv]:
+    elif len(outer) == 2 and _coordinate_vars(vector) == [outer[0], red_iv]:
         batches, rows = extents[0], extents[1]
     else:
         return None
@@ -693,7 +736,7 @@ def _recognize_matrix_vector(target, stream):
             _memref_rank(acc) != 0
             or scaled is None
             or scaled.memref_name != acc.memref_name
-            or scale.extra.get("store_indices") != outer
+            or _store_vars(scale) != outer
             or [loop[0] for loop in scale.enclosing_loops] != outer
         ):
             return None
@@ -703,7 +746,10 @@ def _recognize_matrix_vector(target, stream):
             _require_int32_constant("matrix_vector", name, value)
         _require_element_type("matrix_vector", "acc", acc)
     else:
-        if list(acc.indices) != outer or acc.memref_name != match.result_memref_name:
+        if (
+            _coordinate_vars(acc) != outer
+            or acc.memref_name != match.result_memref_name
+        ):
             return None
         out = acc.memref_name
         _require_element_type("matrix_vector", "out", acc)
@@ -810,10 +856,10 @@ def _recognize_gemm(target, stream):
     inputs = [operands.get("x"), operands.get("y")]
     if acc is None or not acc.is_loop_carried or None in inputs:
         return None
-    if list(acc.indices) != [i, j] or acc.memref_name != match.result_memref_name:
+    if _coordinate_vars(acc) != [i, j] or acc.memref_name != match.result_memref_name:
         return None
-    lhs = next((op for op in inputs if list(op.indices) == [i, k]), None)
-    rhs = next((op for op in inputs if list(op.indices) == [k, j]), None)
+    lhs = next((op for op in inputs if _coordinate_vars(op) == [i, k]), None)
+    rhs = next((op for op in inputs if _coordinate_vars(op) == [k, j]), None)
     if lhs is None or rhs is None or lhs is rhs:
         return None
     _require_element_type("gemm", "lhs", lhs)
@@ -960,7 +1006,7 @@ def _load_is(term, operand) -> bool:
     return (
         isinstance(term, E.WLoad)
         and term.memref_name == operand.memref_name
-        and list(term.indices) == list(operand.indices)
+        and _coordinate_vars(term) == _coordinate_vars(operand)
     )
 
 
@@ -1044,7 +1090,7 @@ def _recognize_histogram(target, stream):
         return None
     x, bins, depth = parts
     (iv,) = (loop[0] for loop in match.enclosing_loops)
-    if list(x.indices) != [iv]:
+    if _coordinate_vars(x) != [iv]:
         return None
     (acc,) = [op for op in match.operands if op.is_loop_carried]
     _require_element_type("histogram", "input", x)
@@ -1153,7 +1199,7 @@ def _recognize_selection(target, stream):
             return None
         (iv,) = (loop[0] for loop in match.enclosing_loops)
         x = _data_operands(match).get("x")
-        if x is None or list(x.indices) != [iv]:
+        if x is None or _coordinate_vars(x) != [iv]:
             return None
         _require_element_type("selection", "input", x)
         return {
@@ -1171,7 +1217,7 @@ def _recognize_selection(target, stream):
         return None
     (iv,) = (loop[0] for loop in compact.enclosing_loops)
     value = _data_operands(compact).get("x")
-    if value is None or list(value.indices) != [iv]:
+    if value is None or _coordinate_vars(value) != [iv]:
         return None
     _require_element_type("selection", "input", value)
     guards = _guards(compact)
@@ -1307,9 +1353,9 @@ def _recognize_kmeans_distances(target, stream):
     if None in (x, y, acc):
         return None
     if (
-        list(x.indices) != [p, d]
-        or list(y.indices) != [c, d]
-        or list(acc.indices) != [p, c]
+        _coordinate_vars(x) != [p, d]
+        or _coordinate_vars(y) != [c, d]
+        or _coordinate_vars(acc) != [p, c]
     ):
         return None
     _require_element_type("kmeans_distances", "points", x)
@@ -1409,7 +1455,7 @@ def _recognize_kmeans_update(target, stream):
     if (
         extents is None
         or len(loops) != 2
-        or list(distances.indices) != loops
+        or _coordinate_vars(distances) != loops
         or _memref_shape(distances) != tuple(extents)
     ):
         reject("the argmin is not over D[p, c] for every point and cluster")
@@ -1501,12 +1547,16 @@ def _recognize_feature_gradient(target, stream):
     loops = {loop[0]: extent for loop, extent in zip(match.enclosing_loops, extents)}
     operands = _data_operands(match)
     x, y, acc = operands.get("x"), operands.get("y"), operands.get("acc")
-    if None in (x, y, acc) or len(acc.indices) != 1 or len(x.indices) != 2:
-        return None
-    s_iv, f_iv = x.indices
     if (
-        acc.indices[0] != f_iv
-        or list(y.indices) != [s_iv]
+        None in (x, y, acc)
+        or len(_coordinate_vars(acc)) != 1
+        or len(_coordinate_vars(x)) != 2
+    ):
+        return None
+    s_iv, f_iv = _coordinate_vars(x)
+    if (
+        _coordinate_vars(acc)[0] != f_iv
+        or _coordinate_vars(y) != [s_iv]
         or set(loops) != {s_iv, f_iv}
     ):
         return None

@@ -146,6 +146,13 @@ def _wide_op_is_exact(operation) -> bool:
         # conversion itself; extension from a wider type changes only bits at
         # or above the source width (> 64), so the low 64 bits are unchanged.
         return True
+    if name in ("arith.index_cast", "arith.index_castui"):
+        # ``index`` is 64 bits in the emitted C: a cast from a wider integer
+        # to ``index`` is a truncation to the low 64 bits, a cast from
+        # ``index`` to a wider integer an extension of a 64-bit value; both
+        # are exact under the low-64-bit representation (an address
+        # temporary ``row0 = dpu * ROWS`` added to an index, ISSUES U-16).
+        return True
     if name == "arith.shli":
         amount = _constant_int(operation.operands[1])
         return amount is not None and 0 <= amount < 64

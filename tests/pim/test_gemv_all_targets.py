@@ -288,6 +288,17 @@ def test_gemv_upmem():
 
     assert address_only(upmem_gemv_row0, "row0")
     assert not address_only(upmem_gemv_data_temp, "t")
+    # ISSUES U-16 (fixed round 68): the hoisted row base classifies like the
+    # inline spelling (the recognizers read the matcher's resolved affine
+    # coordinates, not raw index names) and compiles to the same plan, the
+    # same device source and the same estimate; the host oracle lowers the
+    # 65-bit ``row0 + i`` through its index cast (a truncation to 64 bits).
+    hoisted = _compile_within(120.0, upmem_gemv_row0, build_upmem_target(), upmem_cost)
+    (hoisted_segment,) = hoisted.compiled.layout_ctx.segments
+    assert hoisted_segment.kernel.family == "matrix_vector"
+    assert dict(hoisted_segment.kernel.geometry) == dict(segment.kernel.geometry)
+    assert hoisted_segment.device_source == segment.device_source
+    assert hoisted.estimate().cycles == compiled.estimate().cycles
     # The matcher's coverage analysis now rejects it first: the accumulator's
     # initializer is the non-constant data temporary ``t``.
     from allo.spmw_match import UnsupportedWorkloadError
