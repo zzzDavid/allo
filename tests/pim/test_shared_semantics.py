@@ -4673,3 +4673,104 @@ def test_apu_v1_grouped_search_rejects_an_under_batched_candidate(monkeypatch):
     assert compiled.estimate().cycles == _compile_grouped(grouped_gemm_region, backend=None).estimate().cycles
     rejections = [reason for kernel in compiled.placement_ranking.kernels for _position, reason in kernel.rejections]
     assert any("loops over 1 batch(es); the candidate declares 8" in reason for reason in rejections), rejections
+
+
+# The placement's selected map must be the map the grouped executable
+# realizes (review round 65, ISSUES X-31): the GVML group tree and the host
+# packing address contiguous groups, so an interleaved or collapsed map with
+# the same group cardinalities is refused per candidate.
+
+
+def _grouped_map_variants():
+    from allo.spmw_linear_layout import LinearLayout
+
+    interleaved = LinearLayout(
+        bases={"group": [(1,), (2,)], "lane_in_group": [(1 << b,) for b in range(2, 15)]},
+        out_dims=("vr_lane",),
+        out_sizes=(32768,),
+    )
+    collapsed = LinearLayout(
+        bases={"group": [(8192,), (16384,)], "lane_in_group": [(1,)] * 13},
+        out_dims=("vr_lane",),
+        out_sizes=(32768,),
+    )
+    return {"interleaved": interleaved, "collapsed": collapsed}
+
+
+def _with_map(compiled, layout, keep_effects=False):
+    from allo.spmw_autoschedule import Placement
+
+    return [
+        Placement(
+            placements=dict(p.placements),
+            mode=p.mode,
+            layout=layout,
+            extra={k: v for k, v in p.extra.items() if keep_effects or k != "effects"},
+        )
+        for p in compiled.compiled.layout
+    ]
+
+
+@pytest.mark.parametrize("variant", ["interleaved", "collapsed"])
+def test_apu_v1_grouped_non_contiguous_map_is_refused_when_supplied(variant):
+    """Supplied placements carrying an interleaved (group bits in the low
+    physical lanes) or a collapsed (thirteen lane bits on one physical bit)
+    map with the canonical cardinalities are refused by the contract before
+    costing, with the executable's contiguous map named; the canonical map
+    (with its movement annotations) still compiles."""
+    from allo.pim.apu_v1_grouped_route import grouped_geometry, grouped_map_problem
+
+    base = _compile_grouped(grouped_gemm_region, backend=None)
+    canonical = base.compiled.layout[0]
+    assert grouped_map_problem(canonical.layout, grouped_geometry(base.compiled.target, canonical)) is None
+    layout = _grouped_map_variants()[variant]
+    with pytest.raises(ValueError, match="the placement's selected map is invalid") as error:
+        _compile_grouped(grouped_gemm_region, backend=None, layout=_with_map(base, layout))
+    assert "contiguous groups" in str(error.value)
+    # the same map with the canonical declaration copied onto it: the
+    # derivation disagrees with the declaration
+    with pytest.raises(ValueError, match="violates the candidate contract"):
+        _compile_grouped(grouped_gemm_region, backend=None, layout=_with_map(base, layout, keep_effects=True))
+    again = _compile_grouped(grouped_gemm_region, backend=None, layout=_with_map(base, canonical.layout))
+    assert again.compiled.cmds == base.compiled.cmds
+
+
+def test_apu_v1_grouped_search_rejects_non_contiguous_maps(monkeypatch):
+    """Fault injection into normal search: the enumerator offers the
+    interleaved and collapsed clones of every intact candidate, each
+    declared by the production deriver.  Their packings are declared
+    invalid, the contract filters them per candidate and the intact
+    (canonical) candidate is selected and emitted."""
+    from allo import spmw_autoschedule as sa
+    from allo.pim.apu_v1_grouped_route import apu_v1_grouped_candidate_effects, grouped_map_problem, grouped_geometry
+    from allo.spmw_autoschedule import Placement
+    from allo.spmw_candidate import candidate_effects
+
+    original = sa._ENUMERATORS["apu_v1"]
+    variants = _grouped_map_variants()
+
+    def injected(target, matches):
+        intact = original(target, matches)
+        clones = []
+        for placement in intact:
+            for layout in variants.values():
+                clone = Placement(
+                    placements=dict(placement.placements),
+                    mode=placement.mode,
+                    layout=layout,
+                    extra={k: v for k, v in placement.extra.items() if k != "effects"},
+                )
+                clone.extra["effects"] = apu_v1_grouped_candidate_effects(target, matches, clone)
+                assert all(v.packing.startswith("invalid:") for v in clone.extra["effects"].value_layouts)
+                clones.append(clone)
+        return clones + intact
+
+    monkeypatch.setitem(sa._ENUMERATORS, "apu_v1", injected)
+    compiled = _compile_grouped(grouped_gemm_region, backend=None)
+    selected = compiled.compiled.layout[0]
+    assert grouped_map_problem(selected.layout, grouped_geometry(compiled.compiled.target, selected)) is None
+    assert [v[0] for v in selected.layout.bases["lane_in_group"]][:3] == [1, 2, 4]
+    assert all(v.packing.startswith(("group_lanes", "group_head")) for v in candidate_effects(selected).value_layouts)
+    reference = _compile_grouped(grouped_gemm_region, backend=None)
+    assert compiled.compiled.cmds == reference.compiled.cmds
+    assert compiled.estimate().cycles == reference.estimate().cycles

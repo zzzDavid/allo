@@ -390,6 +390,19 @@ class APUv1Ctx(CodegenContext):
                     layout,
                 )
             group_size, groups, apucs, batches, _kind = launch
+            # The placement's selected map must be the one the emitted group
+            # tree and the host packing realize (contiguous groups, X-31).
+            from .pim.apu_v1_grouped_route import grouped_geometry, grouped_map_problem
+
+            try:
+                map_problem = grouped_map_problem(
+                    getattr(layout, "layout", None),
+                    grouped_geometry(self.target, layout),
+                )
+            except ValueError as error:
+                map_problem = str(error)
+            if map_problem:
+                fail(f"realizes contiguous groups; {map_problem}", work_id, layout)
             if group_size * groups != lanes or apucs != APUCS:
                 fail(
                     f"partitions {lanes} lanes over {APUCS} APUCs; the candidate "

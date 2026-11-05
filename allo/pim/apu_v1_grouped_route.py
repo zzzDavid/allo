@@ -140,7 +140,9 @@ def _product(values) -> int:
 def grouped_geometry(target, placement) -> GroupedGeometry:
     """Group size and group count of a grouped placement from its carried
     layout (the ``group`` / ``lane_in_group`` bases), the same derivation
-    the emission walk applies (`derive_layout_properties`)."""
+    the emission walk applies (`derive_layout_properties`).  Cardinalities
+    only; `grouped_map_problem` states whether the map is the one the
+    executable realizes."""
     from ..spmw_autoschedule import derive_layout_properties
 
     properties = derive_layout_properties(target, placement)
@@ -153,6 +155,54 @@ def grouped_geometry(target, placement) -> GroupedGeometry:
             f"group_size {group_size} x groups_per_vr {groups} != {lanes} lanes"
         )
     return GroupedGeometry(lanes, group_size, groups)
+
+
+def grouped_map_problem(layout, geometry: GroupedGeometry) -> str | None:
+    """Why the placement's selected map is not the map the grouped
+    executable realizes, or None when it is (ISSUES X-31).
+
+    The GVML group tree (``gvml_add_subgrps_f16_grp`` with ``GVML_P2_<group
+    size>``) and the host packing address contiguous groups: physical lane
+    = group x group_size + lane_in_group, the reduction's elements in the
+    first lanes of a group.  A carried `LinearLayout` must therefore send
+    ``lane_in_group`` bit b to physical lane bit b and ``group`` bit b to
+    physical lane bit b + log2(group_size), with no other output dimension
+    moved by those bases.  An interleaved or non-injective map (the same
+    cardinalities, other physical lanes) is not realized by the emitted
+    program and is refused per candidate.  A placement without a linear
+    layout (a hand-built handle-only placement) is taken as the contiguous
+    map (its group size comes from ``extra``)."""
+    from ..spmw_linear_layout import LinearLayout
+
+    if not isinstance(layout, LinearLayout):
+        return None
+    if "vr_lane" not in layout.out_dims:
+        return "the layout has no vr_lane output dimension"
+    column = layout.out_dims.index("vr_lane")
+    lane_bits = (geometry.group_size - 1).bit_length()
+    expected = {
+        "lane_in_group": [1 << bit for bit in range(lane_bits)],
+        "group": [
+            geometry.group_size << bit
+            for bit in range((geometry.groups_per_vr - 1).bit_length())
+        ],
+    }
+    for name, wanted in expected.items():
+        vectors = list(layout.bases.get(name, ()))
+        physical = [int(vector[column]) for vector in vectors]
+        if physical != wanted:
+            return (
+                f"the executable addresses contiguous groups (physical lane = group x "
+                f"{geometry.group_size} + lane_in_group); the placement's map sends the "
+                f"{name} bits to physical lanes {physical}, not {wanted}"
+            )
+        for vector in vectors:
+            if any(int(v) for index, v in enumerate(vector) if index != column):
+                return (
+                    f"the placement's {name} bases move output dimensions other than "
+                    f"vr_lane ({vector}); the executable's groups are lanes of one VR"
+                )
+    return None
 
 
 def contraction_facts(matches):
@@ -581,6 +631,11 @@ def apu_v1_grouped_candidate_effects(target, matches, placement):
         return None
     require_grouped_operations(matches, facts)
     geometry = grouped_geometry(target, placement)
+    # A map the executable does not realize invalidates every operand's and
+    # result's packing: the contract reports it per candidate before
+    # costing (`_derivation_problems`), the realization check refuses it at
+    # materialization.
+    map_problem = grouped_map_problem(getattr(placement, "layout", None), geometry)
     labels: dict = {}
     for fact in facts:
         labels.update(fact.loop_labels)
@@ -625,7 +680,10 @@ def apu_v1_grouped_candidate_effects(target, matches, placement):
                 )
             inputs.append(memref)
             layouts[memref] = CandidateValueLayout(
-                memref, value_axes(access, labels), storage, f"group_lanes:{group}"
+                memref,
+                value_axes(access, labels),
+                storage,
+                f"invalid:{map_problem}" if map_problem else f"group_lanes:{group}",
             )
             transfers[memref] = CandidateTransfer(
                 memref, "in", ("host_pack", "l4", "vmrs", storage)
@@ -651,7 +709,7 @@ def apu_v1_grouped_candidate_effects(target, matches, placement):
                 memref,
                 value_axes(access, labels),
                 accumulator_storage,
-                f"group_head:{group}",
+                f"invalid:{map_problem}" if map_problem else f"group_head:{group}",
             )
             transfers[memref] = CandidateTransfer(
                 memref,
@@ -775,6 +833,7 @@ __all__ = [
     "group_contractions_of_trace",
     "grouped_device_packing",
     "grouped_geometry",
+    "grouped_map_problem",
     "grouped_runtime_binding",
     "prove_dense_gemm_template",
     "reduction_extent",
