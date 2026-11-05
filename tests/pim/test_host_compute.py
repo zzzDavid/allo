@@ -594,3 +594,56 @@ def test_unmodified_programs_match_their_derivation_record_by_record():
     built = allo.compile(neighbour, target, aim_cost, host_moves=neighbour_program, resources=BUDGET, **POLICY)
     check = functional_check(built, 3, 192, seed=19, head_dim=64)
     assert check["max_rel_error"] < check["tolerance"] and check["head_dim"] == 64
+
+
+@pytest.mark.parametrize("payload", [tuple(range(16)), (0,) * 16, (0, 1, 2, 3)])
+def test_the_emitted_bank_payload_is_bound_to_the_derivation(monkeypatch, payload):
+    """The emission input is the record and its bank payload: an all-bank QK
+    record whose returned payload is replaced by sixteen banks (MAC_SBK
+    expansion), by bank 0 sixteen times or by four banks is refused at
+    materialization against the derived payload; the declared scope and
+    estimate would otherwise stay those of the all-bank plan."""
+    from allo import spmw_aim
+    from allo.pim.aim_lowering import AimContraction
+
+    attention, program = build_attention(2, 128)
+    target = build_aim_target()
+    layouts = _split_sv_layout(target, attention, program, partitions=2)
+    original = spmw_aim._AimProgramDerivation.records
+
+    def mutated(self, host_moves, ctx):
+        return [
+            (op, payload if isinstance(op, AimContraction) and "qk" in op.name else banks)
+            for op, banks in original(self, host_moves, ctx)
+        ]
+
+    monkeypatch.setattr(spmw_aim._AimProgramDerivation, "records", mutated)
+    with pytest.raises(Exception, match="expands 'attention_qk_0' over banks|scalar MACs"):
+        allo.compile(attention, target, aim_cost, host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
+
+
+def test_genuine_single_bank_and_all_bank_candidates_are_accepted():
+    """An enumerated single-bank QK candidate lowers with its derived bank
+    payload (MAC_SBK over distinct banks, manifest scope sbk) and an all-bank
+    one without (scope abk); both pass the whole emission-input comparison."""
+    target = build_aim_target()
+    attention, program = build_attention(2, 128)
+    ranking = allo.compile(attention, target, aim_cost, backend="virtual", host_moves=program, resources=BUDGET, **POLICY)
+    choices = kernel_choices(target, ranking)
+    qk_index, qk_scores = choices["attention_qk"]
+    sv_index, sv_scores = choices["attention_sv"]
+    sv = min((s for s in sv_scores if partitions_of(s[1]) == 2 and "bank_scope=abk" in s[1]), key=lambda s: s[0])[2]
+    for scope in ("sbk", "abk"):
+        qk = min((s for s in qk_scores if f"bank_scope={scope}" in s[1]), key=lambda s: s[0])[2]
+        layouts = [None, None]
+        layouts[qk_index], layouts[sv_index] = qk, sv
+        built = allo.compile(attention, target, aim_cost, host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
+        entry = next(e for e in built.compiled.layout_ctx.lowering_manifest if e.get("kind") == "contraction" and e["name"].startswith("attention_qk"))
+        assert entry["bank_scope"] == scope
+        qk_lines = [line for line in built.compiled.cmds if "MAC_" in line][: 4 if scope == "abk" else 32]
+        if scope == "sbk":
+            banks = entry["sbk_banks"]
+            assert len(banks) == len(set(banks)) and all(0 <= b < 16 for b in banks)
+            assert any(line.startswith("AiM MAC_SBK") for line in qk_lines)
+        else:
+            assert "sbk_banks" not in entry and all(not line.startswith("AiM MAC_SBK") for line in qk_lines)

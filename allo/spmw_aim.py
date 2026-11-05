@@ -662,6 +662,10 @@ class AimCtx(CodegenContext):
                         )
                     )
         self.lowered_operations = tuple(operations)
+        # The complete emission input, retained for the realization check:
+        # each record with the bank payload the emission expanded it with
+        # (``None`` for an all-bank launch, the banks of a single-bank one).
+        self._lowered_records = tuple((op, banks) for op, banks in records)
         self.lowering_manifest = lowerer.operations
         self.row_regions = program.regions
         self.cmds.extend(lines)
@@ -690,6 +694,9 @@ class AimCtx(CodegenContext):
         schedule = getattr(program, "schedule", None)
         steps = list(getattr(schedule, "steps", ()) or ())
         groups = {group.group_id: group for group in program.groups}
+        emitted_payload = {
+            id(op): banks for op, banks in getattr(self, "_lowered_records", ())
+        }
 
         # Declared partitions per group: the selected candidate's launch
         # record (``covers[2]``), else the group's own derived knob.
@@ -768,15 +775,15 @@ class AimCtx(CodegenContext):
             check): activation, reuse scheduling, GPR addressing, channels,
             rows, partitions and every other emitted field included."""
             group = groups[token[1]]
-            expected = [op for op, _banks in program._launch_records(group)]
+            expected = list(program._launch_records(group))
             if len(realized_records) != len(expected):
                 raise RuntimeError(
                     f"AiM realization of {describe(token)} lowers {len(realized_records)} "
                     f"launch record(s) {[type(r).__name__ for r in realized_records]}; the "
                     f"retained program derives {len(expected)} "
-                    f"{[type(e).__name__ for e in expected]}"
+                    f"{[type(e).__name__ for e, _b in expected]}"
                 )
-            for realized, derived in zip(realized_records, expected):
+            for realized, (derived, derived_banks) in zip(realized_records, expected):
                 if type(realized) is not type(derived):
                     raise RuntimeError(
                         f"AiM realization of {describe(token)} lowers a "
@@ -789,6 +796,35 @@ class AimCtx(CodegenContext):
                         f"{getattr(realized, 'name', type(realized).__name__)!r} with "
                         + "; ".join(differing_fields(realized, derived))
                         + "; the retained program under the selected decision derives otherwise"
+                    )
+                # The emission input is the record *and* its bank payload: the
+                # banks the emission expanded MAC_ABK into MAC_SBK with.  The
+                # payload the emission actually used is compared with the
+                # derived one, and must itself be a set of distinct banks of
+                # the device.
+                if id(realized) not in emitted_payload:
+                    raise RuntimeError(
+                        f"AiM realization of {describe(token)}: the emission input of "
+                        f"{getattr(realized, 'name', type(realized).__name__)!r} was not retained"
+                    )
+                realized_banks = emitted_payload[id(realized)]
+                normalized = None if realized_banks is None else tuple(int(b) for b in realized_banks)
+                expected_banks = None if derived_banks is None else tuple(int(b) for b in derived_banks)
+                if normalized != expected_banks:
+                    raise RuntimeError(
+                        f"AiM realization of {describe(token)} expands "
+                        f"{getattr(realized, 'name', type(realized).__name__)!r} over banks "
+                        f"{normalized}; the retained program under the selected decision "
+                        f"derives {expected_banks}"
+                    )
+                if normalized is not None and (
+                    len(set(normalized)) != len(normalized)
+                    or any(b < 0 or b >= program.geometry.banks for b in normalized)
+                ):
+                    raise RuntimeError(
+                        f"AiM realization of {describe(token)} expands "
+                        f"{getattr(realized, 'name', type(realized).__name__)!r} over banks "
+                        f"{normalized}, not distinct banks of the device"
                     )
 
         def describe(token):
@@ -1207,7 +1243,23 @@ class AimCtx(CodegenContext):
                         f"over {items} work item(s), reduction {record.reduction}; "
                         f"declared {declared}"
                     )
-                scope = "abk" if group.sbk_banks is None else "sbk"
+                # The scope the emission realized, from the payload it expanded
+                # the record with (not the group's expectation).
+                emitted = {
+                    id(op): banks for op, banks in getattr(self, "_lowered_records", ())
+                }
+                if any(id(r) not in emitted for r in records):
+                    raise RuntimeError(
+                        f"AiM realization of group {group.name!r}: an emission input was "
+                        "not retained"
+                    )
+                payloads = {emitted[id(r)] is None for r in records}
+                if len(payloads) != 1:
+                    raise RuntimeError(
+                        f"AiM realization of group {group.name!r} expands its launches with "
+                        "differing bank scopes"
+                    )
+                scope = "abk" if emitted[id(record)] is None else "sbk"
                 kind = "MAC_ABK" if scope == "abk" else "MAC"
                 partitions = int(record.reduction_partitions)
                 merges = [

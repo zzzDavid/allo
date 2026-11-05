@@ -1554,6 +1554,22 @@ bank copies, syncs and host transfer records are not yet under this
 comparison (M-18 says so); the round 46 closure stays dimensional. G9/G10
 and the recorded blockers remain open; the study stays DIAGNOSTIC.
 
+## Round 48 (2026-11-04): independent review of 35b6351; the emission's bank payload
+
+The reviewer accepted the record-by-record comparison and showed it
+discarded half of the emission input: the bank payload the emission
+expands MAC_ABK into MAC_SBK with. An all-bank QK record whose payload was
+replaced by sixteen banks, or by bank 0 sixteen times, was accepted with
+the all-bank plan's scope and estimate, the scope check reading the
+group's expectation. Judgment: accepted (M-18 extended). The emission
+input is retained in full, each record's emitted payload is compared with
+the derived one and must be distinct banks of the device, and the scope
+check reads what was emitted; the two payload mutations and a four-bank
+one are refused, and genuine single-bank and all-bank candidates lower
+with their derived payloads. Relocation bank copies, syncs and host
+transfer records remain outside the whole comparison, as M-18 says.
+G9/G10 and the recorded blockers remain open; the study stays DIAGNOSTIC.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1593,7 +1609,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 47 (2026-11-04) at the candidate `65750db`+ (this
+Refreshed in round 48 (2026-11-04) at the candidate `35b6351`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |
