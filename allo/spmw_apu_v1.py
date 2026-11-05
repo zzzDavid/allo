@@ -359,10 +359,10 @@ class APUv1Ctx(CodegenContext):
             layout_list = layouts if isinstance(layouts, (list, tuple)) else [layouts]
             buckets = [((), [], layout, {}) for layout in layout_list]
         declared = [
-            (work_id, layout, roles, candidate_effects(layout))
-            for work_id, _matches, layout, roles in buckets
+            (work_id, layout, roles, candidate_effects(layout), matches)
+            for work_id, matches, layout, roles in buckets
         ]
-        if all(effects is None for *_rest, effects in declared):
+        if all(effects is None for _w, _l, _r, effects, _m in declared):
             return
         lanes = int(self.target.vr0.axes["lane"])
         bodies: dict = {}
@@ -377,7 +377,7 @@ class APUv1Ctx(CodegenContext):
                 f"(candidate {getattr(layout, 'mode', None)!r}) {what}"
             )
 
-        for work_id, layout, roles, effects in declared:
+        for work_id, layout, roles, effects, matches in declared:
             if effects is None:
                 fail("declares no effects", work_id, layout)
             launch = declared_launch(effects)
@@ -475,6 +475,30 @@ class APUv1Ctx(CodegenContext):
                     work_id,
                     layout,
                 )
+            # Independently of the declaration: the packing the runtime will
+            # perform for this kernel group, re-derived from the facts, must
+            # need exactly the batches the body loops over (X-30).
+            if _kind == "gemm" and matches:
+                from .pim.apu_v1_grouped_route import (
+                    group_contractions,
+                    grouped_device_packing,
+                    grouped_geometry,
+                )
+
+                packing = grouped_device_packing(
+                    group_contractions(matches), grouped_geometry(self.target, layout)
+                )
+                if packing.kind != "gemm" or int(packing.batches) != int(
+                    self.vector_batches
+                ):
+                    fail(
+                        f"loops over {self.vector_batches} batch(es); the packing the "
+                        f"runtime performs for this kernel group needs "
+                        f"{packing.batches if packing.kind == 'gemm' else 'no device packing'}"
+                        f" ({packing.reason or 'dense GEMM'})",
+                        work_id,
+                        layout,
+                    )
             memref_role = {memref: role for role, memref in roles.items()}
             by_value = {v.value: v for v in effects.value_layouts}
             transfers = {(t.value, t.direction): t for t in effects.transfers}

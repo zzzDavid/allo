@@ -600,7 +600,15 @@ def apu_v1_grouped_candidate_effects(target, matches, placement):
         )
     init = first.accumulator_init
     packing = grouped_device_packing(group_contractions(matches), geometry)
-    batches = max(1, int(extra.get("n_out_tiles", 1) or 1))
+    # The batch count the device program must loop over: the proven
+    # packing's for an executable GEMM (never the placement's own field, so
+    # a placement whose body loops over fewer batches than the packing
+    # needs declares the true count and is refused at materialization,
+    # ISSUES X-30); the placement's tile count for an estimate-only program.
+    if packing.kind == "gemm":
+        batches = int(packing.batches)
+    else:
+        batches = max(1, int(extra.get("n_out_tiles", 1) or 1))
     group = geometry.group_size
     inputs: list = []
     layouts: dict = {}

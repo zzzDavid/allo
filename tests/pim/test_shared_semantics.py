@@ -4590,3 +4590,86 @@ def test_apu_v1_grouped_template_is_proven_over_the_whole_kernel_group():
         grouped_gemm_region, build_apu_v1_target(), None, layout="grouped_f16", backend="virtual", reduction_order="reassociate"
     )
     assert candidate_effects(named.compiled.layout[0]).launches[0].covers[-1] == "gemm"
+
+
+# The batch count the device program loops over is validated against the
+# proven packing at the shared boundary (review round 63, ISSUES X-30): a
+# grouped candidate whose body loops over fewer batches than the packing
+# needs is a feasibility rejection, never the selected program.
+
+
+def _one_batch_clones(compiled, keep_effects=False):
+    """The compiled region's grouped placements with the device loop cut to
+    one batch; without their declarations (re-derived by the shared stage)
+    unless ``keep_effects``."""
+    from allo.spmw_autoschedule import Placement
+
+    clones = []
+    for original in compiled.compiled.layout:
+        extra = {k: v for k, v in original.extra.items() if keep_effects or k != "effects"}
+        extra["n_out_tiles"] = 1
+        clones.append(
+            Placement(placements=dict(original.placements), mode=original.mode, layout=original.layout, extra=extra)
+        )
+    return clones
+
+
+def test_apu_v1_grouped_supplied_placement_with_too_few_batches_is_refused():
+    """The dense 16 x 32 x 8 region needs eight batches per APUC.  Supplied
+    placements with a one-batch device loop and no declaration are
+    re-declared from the facts with the proven eight batches and refused at
+    materialization: the body loops over one batch, the packing needs eight.
+    Supplied with their original declaration edited to one batch they are
+    refused by the contract before costing."""
+    from allo.spmw_candidate import candidate_effects
+
+    base = _compile_grouped(grouped_gemm_region, backend=None)
+    assert base.compiled.layout[0].extra["n_out_tiles"] == 8
+    with pytest.raises(Exception, match="loops over 1 batch\\(es\\); the candidate declares 8"):
+        _compile_grouped(grouped_gemm_region, backend=None, layout=_one_batch_clones(base))
+    edited = _one_batch_clones(base, keep_effects=True)
+    for placement in edited:
+        effects = candidate_effects(placement)
+        (launch,) = effects.launches
+        placement.extra["effects"] = replace(
+            effects, launches=(replace(launch, covers=launch.covers[:4] + (1,) + launch.covers[5:]),)
+        )
+    with pytest.raises(ValueError, match="violates the candidate contract"):
+        _compile_grouped(grouped_gemm_region, backend=None, layout=edited)
+
+
+def test_apu_v1_grouped_search_rejects_an_under_batched_candidate(monkeypatch):
+    """Fault injection into normal search: the enumerator offers a cheaper
+    one-batch clone of every intact candidate, declared by the production
+    deriver.  The clone's declaration carries the proven eight batches, its
+    body loops over one, so materialization records a per-candidate
+    feasibility rejection and the intact candidate is selected."""
+    from allo import spmw_autoschedule as sa
+    from allo.pim.apu_v1_grouped_route import apu_v1_grouped_candidate_effects
+    from allo.spmw_autoschedule import Placement
+    from allo.spmw_candidate import candidate_effects
+
+    original = sa._ENUMERATORS["apu_v1"]
+
+    def injected(target, matches):
+        intact = original(target, matches)
+        clones = []
+        for placement in intact:
+            clone = Placement(
+                placements=dict(placement.placements),
+                mode=placement.mode,
+                layout=placement.layout,
+                extra={**placement.extra, "n_out_tiles": 1},
+            )
+            clone.extra["effects"] = apu_v1_grouped_candidate_effects(target, matches, clone)
+            clones.append(clone)
+        return clones + intact
+
+    monkeypatch.setitem(sa._ENUMERATORS, "apu_v1", injected)
+    compiled = _compile_grouped(grouped_gemm_region, backend=None)
+    assert compiled.compiled.layout[0].extra["n_out_tiles"] == 8
+    assert compiled.compiled.layout_ctx.vector_batches == 8
+    assert candidate_effects(compiled.compiled.layout[0]).launches[0].covers[4] == 8
+    assert compiled.estimate().cycles == _compile_grouped(grouped_gemm_region, backend=None).estimate().cycles
+    rejections = [reason for kernel in compiled.placement_ranking.kernels for _position, reason in kernel.rejections]
+    assert any("loops over 1 batch(es); the candidate declares 8" in reason for reason in rejections), rejections

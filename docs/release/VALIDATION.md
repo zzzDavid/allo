@@ -1364,3 +1364,18 @@ Evidence under `/work/shared/users/phd/nz264/tenon-release-evidence/r62/`
 | Gemini-I pre-registered campaign | not run (the same `/tmp` blocker); the scripts re-pointed at the `8795e8f` wheel (`r62/apu_v1_campaign.sh`, `r62/campaign_watcher.sh`); the r59 watcher stopped without having launched a session |
 | UPMEM at the candidate | not executed: the host's Docker data root is full; the sixteen rows stay at `0e48d81` |
 | Required G10 set | historical coverage: 46 REPRODUCED, 9 OPEN (X-19 x4, X-22 / X-23 x3, X-26, mvt at `cd744bb`), 0 UNVERIFIED. Executed at `8795e8f` from installed artifacts: the fourteen AiM rows, the three Samsung rows, the twelve AttAcc results; Gemini-II at `cd744bb` (plans and fingerprints equal at `8795e8f`); not: the sixteen UPMEM rows and the five Gemini-I rows |
+
+## Round 64 (2026-11-05): the grouped route's batch count validated against the proven packing (X-30)
+
+Working tree on top of `e4ec027` (the candidate `8795e8f` plus this
+repair); evidence under `/work/shared/users/phd/nz264/tenon-release-evidence/r63/`
+(the reviewer's under `reviewer-r63/`).
+
+| Check | Result |
+|---|---|
+| The reviewer's reproducer (`reviewer-r63/batch_probe.py`) against the repaired checkout (`r63/reviewer_batch_probe_after.log`) | the intact region: 974475 cycles, eight batches; the supplied one-batch placements without declarations: compilation refused, "APU v1 grouped realization of work item (0,) (candidate 'grouped_f16') loops over 1 batch(es); the candidate declares 8" (before the repair they compiled at 185295 and failed in the runtime's packing); the injected search (a one-batch clone declared by the production deriver beside every intact candidate): the intact candidate selected (974475, eight batches) and its packing accepted |
+| `test_apu_v1_grouped_supplied_placement_with_too_few_batches_is_refused` | supplied one-batch placements without declarations are re-declared with the proven eight batches and refused at materialization; supplied with their declaration edited to one batch they are refused by the contract before costing |
+| `test_apu_v1_grouped_search_rejects_an_under_batched_candidate` | with the enumerator monkeypatched to offer the one-batch clones first, the compiled program is the intact candidate (`n_out_tiles` 8, the context looping over 8, the declaration's covers 8, the same estimate as the unpatched compile) and the ranking records the clone's rejection ("loops over 1 batch(es); the candidate declares 8") |
+| The materialization check's independent leg | besides the declaration, `check_realization` re-derives the kernel group's packing from the stamped facts and requires the body's loop count to be the batches that packing needs ("the packing the runtime performs for this kernel group needs 8") |
+| Suites at this revision (native AiM executor) | `tests/pim/test_shared_semantics.py` + `tests/perf/test_compile_interface.py` + `tests/pim/test_apu_g2_hardware.py`: 176 passed, 14 skipped, 0 failed (`r63/pytest_shared.log`); the APU v1 perf and unit sets (not board): 28 passed (`r63/pytest_apu_v1_perf.log`); section u: 16 passed |
+| Not changed | the enumerator's own candidates (they already loop over the packing's batches); the runtime guard; the paper rows; other backends. No board launched (the host's `/tmp` still full; both watchers waiting) |
