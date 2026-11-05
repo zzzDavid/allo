@@ -42,7 +42,7 @@ the AttAcc performance figures, followed by release-candidate validation.
 Report required and optional progress separately; the total number of
 unverified entries in the broad inventory is not a release criterion.
 
-Status (2026-11-05, round 51): **in progress, G10 FAIL** (required set: 42 of 55 REPRODUCED, 7 OPEN, 6 UNVERIFIED, the AttAcc decode configurations). User priority
+Status (2026-11-05, round 52): **in progress, G10 FAIL** (required set: 48 of 55 REPRODUCED, 7 OPEN (the four AiM RoPE rows X-19, the three nominal Gemini-I rows X-22/X-23), 0 UNVERIFIED). User priority
 addition 2026-11-03, gate G10 of the containing repository's TASK.md. The
 machine-readable inventory (`paper_reproduction/inventory.csv`, 83 rows) is
 the authoritative per-case status; "Results so far" below summarizes it.
@@ -75,10 +75,17 @@ the two score rows at the figure's speedups (1.00x and 1.13x over fixed)
 with every selection equal to the paper's selection file and the text's
 500-instance tally against DCC reproduced exactly (123 wins, 316 ties, 61
 losses, median loss 7.1%).
-UNVERIFIED: the six AttAcc decode configurations (analytical composition,
-next), the layout rows, UPMEM scaling, the packing, shared selection and
-DCC studies, calibration, the virtual-backend study and the compile-cost
-rows.
+REPRODUCED (round 52, analytical composition): the six AttAcc decode
+configurations from the fresh shared-pipeline kernel times through DCC's
+decode model: Tenon full 6.50 / 6.95 / 7.40 / 3.09 / 3.48 / 3.87x and base
+1.47 / 1.56 / 1.66 / 1.34 / 1.50 / 1.65x over the GPU roofline (the frozen
+figure and table ranges), DCC re-run 6.50 / 6.95 / 7.40 / 3.05 / 3.44 / 3.82x,
+the fixed baseline 2.55 / 2.73 / 2.91 / 2.29 / 2.58 / 2.87x; batch 4 Tenon
+1.27% faster than DCC, QKV 1.2799 to 1.2332 ms of 3.9933 to 3.9431 ms at
+128 / 2048 (the frozen text).
+UNVERIFIED (optional): the layout rows, UPMEM scaling, the packing, shared
+selection and DCC studies, calibration, the virtual-backend study and the
+compile-cost rows.
 The paper is zzzDavid/tenon-hpca27 main at
 30b6f49e64583b5d301d2a5e8b902498f5578e4e; its local mirror and hash lock are
 paper/latex and paper/SUBMITTED_VERSION.json in the containing repository.
@@ -227,4 +234,5 @@ having loaded and fails the launch unless it equals the archived library.
 | AiM token partitioning, round 49, CENT-derived control and host protocol | the eight-channel CENT control derived structurally (CENT's mapping policy from the shared pipeline's exact selection on the CENT golden cases, matched in each workload's budgeted enumeration and compiled under the study's budget, bridge and accounting), the historical host protocol measured step by step beside the price, every variant and control accounted for, the one-head misses calibrated command by command against the simulator | DIAGNOSTIC (M-15, M-19): same device cells, 6 of 9 minima, largest gap 1.04%; the CENT-derived control equals the selection on the 8- and 32-head workloads and is 1.03x-2.23x slower on the 1-head ones; the misses are the contraction profile's register I/O, WR_GB and MAC charges (recalibration pending), not the bridge or the accounting (`r49/token_partition_bridged.json`, `r49/calibration_*.json`) |
 | AiM token partitioning, round 50, historical control, host protocol, recalibrated profile | the frozen study's `cent-repaired` control restored through the shared pipeline (padded heads, reuse 1, eight channels; producer provenance and command inventories recorded), the round 49 control kept as the `cent-policy` ablation; the host protocol measured on the attention's own BF16 scores, encoded once, with the historical methodology; the contraction profile recalibrated per command class from controlled single-factor simulator measurements and validated on the standalone probe and held-out programs before the nine workloads | DIAGNOSTIC (M-15; M-19 repaired, awaiting review): same device cells; the normal selection reaches 9 of 9 simulated minima, every gap 0, estimates within 0.1-0.3% of the measured totals (rounds 42-49: 6 of 9, misses 0.33% / 0.44% / 1.04%; paper 7 of 9, 2.63%, on its own boundary); cent-repaired 2.22x / 3.85x / 7.27x over the selection on the 1-head workloads and 1.45x-1.46x on the 8- and 32-head ones; the measured whole protocol 32-623 us per call on this host (`r50/token_partition_nine.json`, `r50/controlled_variations.json`, `r50/heldout_validation.json`) |
 | AttAcc kernel tiling (6 required results), round 51 | Ramulator2-AttAcc built natively from the MIT sources (`build_ramulator_attacc.sh`; Docker out of disk), `run_ramulator.py` rewritten to keep the compiled artifact and record the selection's provenance, check the DCC generator's trace against the selected program (totals, ordering, address mapping; `trace_check.py`) and retain trace, configuration, digests and raw output per run; every shape compiled through `allo.compile`; the fixed-form baseline re-run for the four GEMV rows (DCC's rule: the minimum over the fixed-form candidates) | REPRODUCED: QKV batch 1 / 4 and projection batch 1 / 4 selected programs 0.00881 / 0.03364 / 0.00265 / 0.01024 ms (the paper's values; fixed baselines 0.02807 / 0.17239 / 0.00265 / 0.01030, the paper's); score batch 1 / 4 over 248 shapes each: mean 0.00193 / 0.00678 ms, speedup over the fixed tiling 1.00x / 1.13x (mean of per-shape ratios, the figure's 1.00x / 1.13x; DCC's archived per-shape results give 1.01x / 1.12x, the figure's); every selection equals `paper_selection.csv`; the fresh Tenon times against DCC's archived per-shape times give 123 wins, 316 ties, 61 losses with a median loss of 7.07% on the 500 instances (text: 123 / 316 / 61, 7.1%); 506 retained traces re-checked, ordering and mapping as declared (`r51/attacc_*.json`, `r51/attacc_kernel_summary.json`, `r51/attacc_trace_recheck.json`) |
+| AttAcc full-model decode (6 required configurations), round 52 | `compose_e2e.py` rewritten: shared-pipeline kernel records only (conflicts rejected, references ignored), every GPT-13B PIM row measured or NaN (no baseline substitution), DCC's decode model (`inference/system.py`, A100 roofline, prefill excluded) run for the GPU roofline and for the Tenon, DCC-selection and fixed variants (the fixed variant with DCC's own placement: attention on PIM, QKV and projection on the GPU), per-stage times recorded; `tests/pim/test_attacc_compose.py` | REPRODUCED (analytical composition): Tenon full 6.50 / 6.95 / 7.40 / 3.09 / 3.48 / 3.87x, base 1.47 / 1.56 / 1.66 / 1.34 / 1.50 / 1.65x (the inventory's paper values and the table ranges 3.09-7.40 / 1.34-1.66); DCC re-run full 6.50 / 6.95 / 7.40 / 3.05 / 3.44 / 3.82x, base 1.47 / 1.56 / 1.66 / 1.34 / 1.49 / 1.64x; fixed full 2.55 / 2.73 / 2.91 / 2.29 / 2.58 / 2.87x, base 1.09 / 1.16 / 1.23 / 1.16 / 1.30 / 1.43x (the table's 2.29-2.91 / 1.09-1.43); batch 1 equal to two decimals with Tenon 0.0001 ms slower at 128 / 2048 (the text's one small loss), batch 4 Tenon 1.27% faster (text 1.2-1.3%), QKV 1.2799 to 1.2332 ms of 3.9933 to 3.9431 ms (`r52/attacc_e2e.json`) |
 | layout rows (Samsung XOR, Gemini-I vector GEMM), scaling, packing, DCC, calibration, virtual study, compile cost | | UNVERIFIED this round; next in the order of the inventory |

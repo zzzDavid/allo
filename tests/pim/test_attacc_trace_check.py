@@ -1,12 +1,19 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The AttAcc trace structure check (``benchmarks/attacc/trace_check.py``):
-ordering and address mapping of a trace against the selected program, not
-just opcode totals.  The DCC-free tests build traces from the generator's
-documented structure; the last test runs DCC's own generator when a
-checkout is available (``ATTACC_DCC_ROOT``)."""
+"""The AttAcc trace check (``benchmarks/attacc/trace_check.py``): the
+complete command stream a selected program implies, opcode and address of
+every command, derived from the program and the target geometry and
+compared with a trace command by command.  Corruptions that keep opcode
+totals and distinct-address counts (zeroed store, drain and barrier
+addresses; every address shifted by one channel; the matrix base shifted
+by one column; two commands swapped) must fail for GEMV and attention
+traces.  The last tests run DCC's own generator when a checkout is
+available (``ATTACC_DCC_ROOT``) and require an exact match."""
 
+import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -14,7 +21,6 @@ import pytest
 from allo.pim.attacc_tiling import (
     AttAccKernel,
     AttAccTiling,
-    attacc_command_counts,
     attacc_geometry,
     attacc_program,
 )
@@ -29,172 +35,206 @@ def geometry():
 
 
 QKV_NH8 = [[1, 8, 1], [8, 8, 80], [2, 1, 192]]
+SCORE_480 = [[8, 1, 1], [2, 4, 16], [1, 16, 30]]
 
 
-def _synthetic_trace(path, program, geometry, *, mutate=None):
-    """A trace with the generator's ordering and address mapping, written
-    from the program's counts (the structure the checker expects)."""
+def _program(geometry, kind, dims, tiling):
+    return attacc_program(AttAccKernel(kind, *dims), AttAccTiling.coerce(tiling), geometry)
+
+
+def _mutations(lines, g):
+    def split(line):
+        op, addr = line.split()
+        return op, int(addr, 16)
+
+    yield "zero_st_drain_and_barrier_addresses", [f"{op} 0x00000000" if op in ("ST", "PIM_MV_SB", "PIM_BARRIER") else line for line in lines for op, _ in [split(line)]]
+    yield "shift_all_addresses_one_channel", [f"{op} 0x{addr + g['ch']:08x}" for line in lines for op, addr in [split(line)]]
+    yield "shift_mac_matrix_base_one_column", [f"{op} 0x{addr + g['col']:08x}" if op == "PIM_MAC_AB" else line for line in lines for op, addr in [split(line)]]
+    swapped = list(lines)
+    i = next(k for k, l in enumerate(swapped) if l.startswith("PIM_MAC_AB"))
+    swapped[i], swapped[i + 16] = swapped[i + 16], swapped[i]
+    yield "swap_two_mac_commands", swapped
+    yield "drop_last_result_store", lines[:-1]
+    moved = list(lines)
+    j = next(k for k, l in enumerate(moved) if l.startswith("PIM_WR_GB"))
+    moved.append(moved.pop(j))
+    yield "move_one_gb_write_to_the_end", moved
+    yield "zero_softmax_and_context_moves", [f"{op} 0x00000000" if op in ("PIM_SFM", "PIM_MV_GB") else line for line in lines for op, _ in [split(line)]]
+
+
+@pytest.mark.parametrize("kind, dims, tiling", [("gemv", (8, 5120, 384), QKV_NH8), ("attention", (8, 128, 480), SCORE_480)])
+def test_derived_stream_matches_itself_and_its_counts(tmp_path, geometry, kind, dims, tiling):
+    program = _program(geometry, kind, dims, tiling)
+    trace = trace_check.write_expected_trace(program, tmp_path / "ok.trace")
+    report = trace_check.check_trace(trace, program)
+    assert report["match"] and report["totals_match"] and report["first_difference"] is None
+    assert report["totals"] == dict(program.counts.commands())
+    assert report["summary"]["out_of_device_commands"] == 0
+    assert report["regions"]["fits_bank"]
+
+
+@pytest.mark.parametrize("kind, dims, tiling", [("gemv", (8, 5120, 384), QKV_NH8), ("attention", (8, 128, 480), SCORE_480)])
+def test_corruptions_that_keep_totals_fail(tmp_path, geometry, kind, dims, tiling):
+    program = _program(geometry, kind, dims, tiling)
+    lines = trace_check.write_expected_trace(program, tmp_path / "ok.trace").read_text().splitlines()
     g = trace_check.granules(geometry)
-    counts = program.counts
-    n, it = counts.iterations, counts.rows_per_iteration
-    ch, ba = counts.channels_used, counts.units_used
-    s1, s2 = counts.serial_reduction, counts.serial_outputs
-    lanes, bpg = geometry.lanes, geometry.banks_per_group
-    lines = []
-
-    def barrier():
-        lines.extend(f"PIM_BARRIER 0x{c * g['ch']:08x}" for c in range(geometry.channels))
-
-    for _itr in range(n):
-        for pos in range(-(-it * s1 // lanes)):
-            for b in range(ba):
-                for c in range(ch):
-                    lines.append(f"ST 0x{c * g['ch'] + b * g['ba'] + pos * g['col']:08x}")
-        barrier()
-        mac = []
-        for pos2 in range(s2):
-            for pos1 in range(-(-s1 // lanes)):
-                for c in range(ch):
-                    mac.append(f"PIM_MAC_AB 0x{c * g['ch'] + (pos1 * s2 + pos2) * g['col']:08x}")
-            if pos2 % lanes == lanes - 1 or pos2 == s2 - 1:
-                for bg in range(-(-ba // bpg)):
-                    for c in range(ch):
-                        mac.append(f"PIM_MV_SB 0x{c * g['ch'] + bg * bpg * g['ba']:08x}")
-        for j in range(it):
-            first = -(-(j * s1) // lanes) * lanes
-            for pos in range(first, (j + 1) * s1, lanes):
-                for b in range(ba):
-                    for c in range(ch):
-                        lines.append(f"PIM_WR_GB 0x{c * g['ch'] + b * g['ba'] + pos:08x}")
-            barrier()
-            lines.extend(mac)
-            barrier()
-        barrier()
-        for pos in range(-(-it * s2 // lanes)):
-            for b in range(ba):
-                for c in range(ch):
-                    lines.append(f"ST 0x{c * g['ch'] + b * g['ba'] + pos * g['col']:08x}")
-    if mutate:
-        lines = mutate(lines)
-    Path(path).write_text("\n".join(lines))
-    return path
+    for name, mutated in _mutations(lines, g):
+        if kind == "gemv" and name == "zero_softmax_and_context_moves":
+            continue  # no such commands in a GEMV trace
+        path = tmp_path / f"{name}.trace"
+        path.write_text("\n".join(mutated))
+        report = trace_check.check_trace(path, program)
+        assert not report["match"], name
+        assert report["first_difference"] is not None, name
+        if name == "shift_all_addresses_one_channel":
+            assert report["summary"]["out_of_device_commands"] > 0
+        if name != "drop_last_result_store":
+            assert report["totals_match"], name  # the corruption is invisible to totals
 
 
-def test_synthetic_trace_in_the_generator_structure_passes(tmp_path, geometry):
-    program = attacc_program(AttAccKernel("gemv", 8, 5120, 384), AttAccTiling.coerce(QKV_NH8), geometry)
-    trace = _synthetic_trace(tmp_path / "ok.trace", program, geometry)
-    report = trace_check.check_trace(trace, program)
-    assert report["totals_match"] and report["ordering_checked"] and report["ordering_match"]
-    assert report["mapping_match"], report["mapping"]
-    assert report["commands"] == sum(dict(program.counts.commands()).values())
-    assert report["mapping"]["channels_addressed"] == 16 and report["mapping"]["units_addressed"] == 64
-    assert report["mapping"]["mac_columns_per_channel"] == [192 * 5]
+def test_regions_are_the_generators_placement(geometry):
+    """Vector at 0, matrix at the matrix size, result after the vector size
+    (inside the matrix's address range), the block fitting the bank."""
+    program = _program(geometry, "gemv", (8, 5120, 384), QKV_NH8)
+    regions = trace_check.regions(program)
+    assert regions["vector"] == (0, 160) and regions["matrix"] == (30720, 30720) and regions["result"] == (30880, 384)
+    assert regions["fits_bank"] and regions["result_inside_matrix_range"]
+    stream = trace_check.expected_trace(program)
+    assert stream[0] == ("ST", 0)
+    first_mac = next(addr for op, addr in stream if op == "PIM_MAC_AB")
+    assert first_mac == 30720
+    barrier = [addr for op, addr in stream if op == "PIM_BARRIER"][:16]
+    assert barrier == [c * trace_check.granules(geometry)["ch"] for c in range(16)]
 
 
-def test_reordered_commands_fail_the_ordering_check_with_equal_totals(tmp_path, geometry):
-    """Moving one WR_GB after the MACs keeps every opcode total and fails."""
-    program = attacc_program(AttAccKernel("gemv", 8, 5120, 384), AttAccTiling.coerce(QKV_NH8), geometry)
-
-    def swap(lines):
-        i = next(k for k, l in enumerate(lines) if l.startswith("PIM_WR_GB"))
-        j = next(k for k, l in enumerate(lines) if l.startswith("PIM_MAC_AB"))
-        lines[i], lines[j] = lines[j], lines[i]
-        return lines
-
-    trace = _synthetic_trace(tmp_path / "swapped.trace", program, geometry, mutate=swap)
-    report = trace_check.check_trace(trace, program)
-    assert report["totals_match"] and not report["ordering_match"]
-    assert report["first_difference"]["expected"] == "PIM_WR_GB" and report["first_difference"]["actual"] == "PIM_MAC_AB"
-
-
-def test_wrong_channel_mapping_fails_with_equal_totals_and_order(tmp_path, geometry):
-    """Addressing every MAC at channel 0 keeps totals and order and fails
-    the mapping check (one channel addressed, sixteen declared)."""
-    program = attacc_program(AttAccKernel("gemv", 8, 5120, 384), AttAccTiling.coerce(QKV_NH8), geometry)
-    g = trace_check.granules(geometry)
-
-    def collapse(lines):
-        return [f"PIM_MAC_AB 0x{int(l.split()[1], 16) % g['ch']:08x}" if l.startswith("PIM_MAC_AB") else l for l in lines]
-
-    trace = _synthetic_trace(tmp_path / "onechannel.trace", program, geometry, mutate=collapse)
-    report = trace_check.check_trace(trace, program)
-    assert report["totals_match"] and report["ordering_match"] and not report["mapping_match"]
-    assert report["mapping"]["channels_addressed"] == 1 and report["mapping"]["channels_declared"] == 16
-
-
-def test_partial_barrier_group_is_an_error(tmp_path, geometry):
-    program = attacc_program(AttAccKernel("gemv", 8, 5120, 384), AttAccTiling.coerce(QKV_NH8), geometry)
-    trace = _synthetic_trace(tmp_path / "barrier.trace", program, geometry, mutate=lambda lines: lines[:-1] if False else [l for k, l in enumerate(lines) if not (l.startswith("PIM_BARRIER") and k == next(i for i, x in enumerate(lines) if x.startswith("PIM_BARRIER")))])
-    with pytest.raises(ValueError, match="barrier group"):
-        trace_check.check_trace(trace, program)
-
-
-def _attention_rle(program, geometry):
-    seq = trace_check.expected_attention_sequence(program.counts, geometry)
-    rle = []
-    for op in seq:
-        if rle and rle[-1][0] == op:
-            rle[-1][1] += 1
-        else:
-            rle.append([op, 1])
-    return [tuple(x) for x in rle]
-
-
-def test_attention_sequence_has_the_generator_structure(geometry):
-    """One row block of the paper's worst-loss shape: vector stores, barrier,
-    the GB writes, the score MACs, the context MACs with their drains, the
-    softmax, the context vector loads, barrier, result stores; totals equal
-    the counts."""
-    program = attacc_program(AttAccKernel("attention", 8, 128, 480), AttAccTiling.coerce([[8, 1, 1], [2, 4, 16], [1, 16, 30]]), geometry)
-    rle = _attention_rle(program, geometry)
-    assert rle == [("ST", 1024), ("B", 1), ("PIM_WR_GB", 1024), ("PIM_MAC_AB", 992), ("PIM_MV_SB", 256), ("PIM_SFM", 16), ("PIM_MV_GB", 1024), ("B", 1), ("ST", 1024)]
-    import collections
-    totals = collections.Counter(op for op in trace_check.expected_attention_sequence(program.counts, geometry) if op != "B")
-    assert dict(totals) == dict(program.counts.commands())
-
-
-def test_attention_sequence_pairs_two_row_blocks(geometry):
-    """A program with two row blocks: the generator interleaves the pair
-    (both vector loads, one barrier, block 0's rows, block 1's GB writes,
-    barrier, block 1's MAC streams, block 0's softmax and loads, barrier,
-    block 1's softmax, barrier, block 1's loads, barrier, both result
-    stores); totals still equal the counts."""
-    from allo.pim.attacc_tiling import attacc_command_counts, AttAccCounts
-
-    kernel = AttAccKernel("attention", 32, 128, 4096)
-    tiling = AttAccTiling.coerce([[1, 1, 32], [1, 4, 32], [16, 16, 16]])
-    counts = attacc_command_counts(kernel, tiling, geometry)
-    if counts.iterations < 2:
-        pytest.skip("this tiling fits one row block in the bank")
-    import collections
-    seq = trace_check.expected_attention_sequence(counts, geometry)
-    assert seq.count("B") == 5 * (counts.iterations // 2) + 2 * (counts.iterations % 2)
-    totals = collections.Counter(op for op in seq if op != "B")
-    assert dict(totals) == dict(counts.commands())
+def test_wrong_program_for_a_trace_fails(tmp_path, geometry):
+    """A trace of one tiling checked against the program of another."""
+    a = _program(geometry, "gemv", (8, 5120, 384), QKV_NH8)
+    b = _program(geometry, "gemv", (8, 5120, 384), [[1, 8, 1], [14, 8, 46], [1, 1, 384]])
+    trace = trace_check.write_expected_trace(a, tmp_path / "a.trace")
+    assert not trace_check.check_trace(trace, b)["match"]
 
 
 @pytest.mark.skipif(not os.environ.get("ATTACC_DCC_ROOT"), reason="needs a DCC checkout (ATTACC_DCC_ROOT)")
-def test_dcc_generator_trace_matches_the_selected_qkv_program(tmp_path, geometry):
-    """DCC's own GEMV trace for the paper's QKV batch-1 selection has the
-    ordering and mapping the compiled program declares."""
+@pytest.mark.parametrize("kind, dims, tiling", [
+    ("gemv", (8, 5120, 384), QKV_NH8),
+    ("gemv", (32, 128, 5120), [[1, 32, 1], [2, 2, 32], [8, 1, 640]]),
+    ("gemv", (8, 5120, 384), [[8, 1, 1], [1, 4, 1280], [2, 16, 12]]),
+    ("attention", (8, 128, 480), SCORE_480),
+    ("attention", (32, 128, 4096), [[1, 32, 1], [1, 2, 64], [16, 1, 256]]),
+    ("attention", (8, 128, 144), [[8, 1, 1], [2, 4, 16], [1, 16, 9]]),
+])
+def test_dcc_generator_trace_equals_the_derived_stream(tmp_path, geometry, kind, dims, tiling):
+    """DCC's own generator output equals the stream derived from the
+    program, command by command (selected programs, a fixed-form baseline
+    candidate, the worst-loss, a golden and the shortest attention shape)."""
     from benchmarks.attacc.scripts.run_ramulator import _dcc_root, write_trace
 
-    program = attacc_program(AttAccKernel("gemv", 8, 5120, 384), AttAccTiling.coerce(QKV_NH8), geometry)
-    trace = write_trace(_dcc_root(), "gemv", program.tiling.dcc_tiling(), tmp_path)
+    program = _program(geometry, kind, dims, tiling)
+    trace = write_trace(_dcc_root(), kind, program.tiling.dcc_tiling(), tmp_path)
     report = trace_check.check_trace(trace, program)
-    assert report["totals_match"] and report["ordering_match"] and report["mapping_match"], report
-    assert dict(program.counts.commands()) == {"PIM_WR_GB": 5120, "PIM_MAC_AB": 15360, "PIM_MV_SB": 3072, "ST": 17408}
+    assert report["match"], report["first_difference"]
 
 
-@pytest.mark.skipif(not os.environ.get("ATTACC_DCC_ROOT"), reason="needs a DCC checkout (ATTACC_DCC_ROOT)")
-@pytest.mark.parametrize("dims, tiling", [((8, 128, 480), [[8, 1, 1], [2, 4, 16], [1, 16, 30]]), ((32, 128, 4096), [[1, 32, 1], [1, 2, 64], [16, 1, 256]]), ((8, 128, 144), [[8, 1, 1], [2, 4, 16], [1, 16, 9]])])
-def test_dcc_generator_attention_trace_matches_the_program(tmp_path, geometry, dims, tiling):
-    """DCC's own attention traces have the ordering and mapping the compiled
-    program declares (the paper's worst-loss shape, a 32-head golden shape
-    and the shortest length)."""
-    from benchmarks.attacc.scripts.run_ramulator import _dcc_root, write_trace
+# --------------------------------------------------------------------- #
+# Failure-path retention of the timing driver
+# --------------------------------------------------------------------- #
 
-    program = attacc_program(AttAccKernel("attention", *dims), AttAccTiling.coerce(tiling), geometry)
-    trace = write_trace(_dcc_root(), "attention", program.tiling.dcc_tiling(), tmp_path)
-    report = trace_check.check_trace(trace, program)
-    assert report["totals_match"] and report["ordering_match"] and report["mapping_match"], report
+
+def _fake_generator(program):
+    def write_trace(dcc_root, family, tiling, workdir):
+        trace = trace_check.write_expected_trace(program, workdir / "kernel.trace")
+        (workdir / "kernel.yaml").write_text("Frontend: {path: %s}\n" % trace)
+        return trace
+    return write_trace
+
+
+def test_failed_simulation_retains_inputs_and_output(tmp_path, geometry, monkeypatch):
+    """A simulator that exits nonzero: the trace, the configuration, the
+    complete stdout and stderr and a structured failure record are retained
+    under the artifacts directory, the work directory is removed, and the
+    error propagates (the driver exits nonzero)."""
+    from benchmarks.attacc.scripts import run_ramulator as driver
+
+    program = _program(geometry, "gemv", (8, 5120, 384), QKV_NH8)
+    monkeypatch.setattr(driver, "write_trace", _fake_generator(program))
+    fake = tmp_path / "ramulator2"
+    fake.write_text("#!/bin/sh\necho 'partial output line'\necho 'injected simulator failure' >&2\nexit 3\n")
+    fake.chmod(0o755)
+    artifacts = tmp_path / "artifacts"
+    with pytest.raises(driver.SimulatorFailure, match="failed \\(3\\)") as error:
+        driver.simulate_program(tmp_path, fake, "gemv", program, artifacts=artifacts)
+    assert error.value.retained == str(artifacts)
+    assert (artifacts / "kernel.trace").is_file() and (artifacts / "kernel.yaml").is_file()
+    assert (artifacts / "stdout.txt").read_text().startswith("partial output line")
+    assert "injected simulator failure" in (artifacts / "stderr.txt").read_text()
+    failure = json.loads((artifacts / "failure.json").read_text())
+    assert failure["stage"] == "simulator" and failure["returncode"] == 3 and failure["tiling"] == QKV_NH8
+    assert failure["trace_check"]["match"] and "-f" in failure["command"]
+    assert not Path(failure["workdir"]).exists()
+
+
+def test_failed_simulation_without_artifacts_keeps_the_work_directory(tmp_path, geometry, monkeypatch):
+    from benchmarks.attacc.scripts import run_ramulator as driver
+
+    program = _program(geometry, "gemv", (8, 5120, 384), QKV_NH8)
+    monkeypatch.setattr(driver, "write_trace", _fake_generator(program))
+    fake = tmp_path / "ramulator2"
+    fake.write_text("#!/bin/sh\nexit 1\n")
+    fake.chmod(0o755)
+    with pytest.raises(driver.SimulatorFailure) as error:
+        driver.simulate_program(tmp_path, fake, "gemv", program)
+    workdir = Path(error.value.retained)
+    try:
+        assert (workdir / "kernel.trace").is_file() and (workdir / "failure.json").is_file()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_simulator_timeout_is_a_retained_failure(tmp_path, geometry, monkeypatch):
+    from benchmarks.attacc.scripts import run_ramulator as driver
+
+    program = _program(geometry, "gemv", (8, 5120, 384), QKV_NH8)
+    monkeypatch.setattr(driver, "write_trace", _fake_generator(program))
+    fake = tmp_path / "ramulator2"
+    fake.write_text("#!/bin/sh\necho started\nsleep 30\n")
+    fake.chmod(0o755)
+    artifacts = tmp_path / "artifacts"
+    with pytest.raises(driver.SimulatorFailure, match="timed out"):
+        driver.simulate_program(tmp_path, fake, "gemv", program, artifacts=artifacts, timeout_s=1)
+    failure = json.loads((artifacts / "failure.json").read_text())
+    assert failure["stage"] == "simulator" and failure["returncode"] is None and failure["timeout_s"] == 1
+    assert (artifacts / "kernel.trace").is_file()
+
+
+def test_trace_mismatch_retains_the_trace_and_the_check(tmp_path, geometry, monkeypatch):
+    from benchmarks.attacc.scripts import run_ramulator as driver
+
+    program = _program(geometry, "gemv", (8, 5120, 384), QKV_NH8)
+    other = _program(geometry, "gemv", (8, 5120, 384), [[1, 8, 1], [14, 8, 46], [1, 1, 384]])
+    monkeypatch.setattr(driver, "write_trace", _fake_generator(other))
+    artifacts = tmp_path / "artifacts"
+    with pytest.raises(driver.TraceMismatch):
+        driver.simulate_program(tmp_path, tmp_path / "unused", "gemv", program, artifacts=artifacts)
+    failure = json.loads((artifacts / "failure.json").read_text())
+    assert failure["stage"] == "trace-check" and not failure["trace_check"]["match"]
+    assert (artifacts / "kernel.trace").is_file() and not (artifacts / "stdout.txt").exists()
+
+
+def test_driver_exits_nonzero_on_a_failed_shape(tmp_path, geometry, monkeypatch):
+    from benchmarks.attacc.scripts import run_ramulator as driver
+
+    program = _program(geometry, "gemv", (8, 5120, 384), QKV_NH8)
+    monkeypatch.setattr(driver, "write_trace", _fake_generator(program))
+    fake = tmp_path / "ramulator2"
+    fake.write_text("#!/bin/sh\nexit 2\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("ATTACC_DCC_ROOT", str(tmp_path))
+    (tmp_path / "attacc_trace_gen").mkdir()
+    monkeypatch.setenv("ATTACC_RAMULATOR", str(fake))
+    out = tmp_path / "session.json"
+    status = driver.main(["--gemv", "8", "5120", "384", "--artifacts", str(tmp_path / "art"), "--out", str(out)])
+    assert status == 1
+    session = json.loads(out.read_text())
+    assert session["runs"] == [] and len(session["failures"]) == 1
+    assert Path(session["failures"][0]["retained"]).joinpath("failure.json").is_file()

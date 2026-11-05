@@ -248,13 +248,14 @@ no data path).
   ranking's candidates, chosen position, ties and tie-break, the matched
   operations, the program manifest and estimate); writes the trace with
   DCC's generator into a private temporary directory; checks the trace
-  against the selected program with `benchmarks/attacc/trace_check.py`
-  (opcode totals, the phase ordering command by command, and the decoded
-  address mapping: channels, banks, matrix columns per channel, vector
-  positions; a mismatch fails the run) for both the GEMV and the attention
-  traces (each re-derived from the program's counts record in the
-  generator's emission order, validated against DCC's own generator output
-  in `tests/pim/test_attacc_trace_check.py`); runs the simulator; and
+  against the selected program with `benchmarks/attacc/trace_check.py`:
+  the complete command stream the program implies (opcode and address of
+  every store, GB write, MAC, drain, softmax, context move and barrier, in
+  the generator's emission order and region placement) is derived from the
+  program and the target geometry and compared command by command, for
+  GEMV and attention traces (validated against DCC's own generator output
+  in `tests/pim/test_attacc_trace_check.py`; a mismatch fails the run and
+  the inputs are retained); runs the simulator; and
   records the binary, library, trace
   and configuration digests, the command and the raw output, retaining
   trace, configuration and output per run under `--artifacts`. Labels:

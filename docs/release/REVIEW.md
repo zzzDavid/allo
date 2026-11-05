@@ -1653,6 +1653,28 @@ configurations through `compose_e2e.py` with the fresh kernel times
 (analytical composition, labelled), then the AiM X-19 and Gemini-I nominal
 rows.
 
+## Round 52 (2026-11-05): trace fidelity made per-command, failed runs retained, the decode configurations
+
+The reviewer found round 51's fidelity claim larger than its check
+(cardinalities of address sets, stores / drains / barriers unchecked) and
+the driver discarding a failed run's inputs.  Both repaired without
+renaming or weakening: the checker now derives the whole command stream
+(opcode and address of every command, the generator's region placement
+and composition) from the selected program and the target geometry and
+compares command by command; the reviewer's three mutations and four more
+fail; DCC's own output matches exactly on GEMV and attention shapes; all
+506 retained traces re-checked.  The driver retains inputs, complete
+output and a structured failure record on trace mismatch, simulator error
+and timeout, and exits nonzero.  Then the six decode configurations were
+composed from the fresh shared-pipeline kernel times with the input
+discipline the reviewer asked for (shared-pipeline records only, conflicts
+rejected, no reference substitution, unmeasured rows NaN): Tenon, DCC and
+the fixed baseline reproduce the frozen figure, table and text, and the
+archived batch-4 discrepancy is explained (missing measurements and the
+fixed variant's placement).  Required G10 set: 48 of 55 REPRODUCED, 7
+OPEN (X-19, X-22 / X-23), 0 UNVERIFIED.  Next: the four AiM RoPE rows
+(X-19), then the three nominal Gemini-I rows.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1692,7 +1714,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 51 (2026-11-05) at the candidate `0cc8187`+ (this
+Refreshed in round 52 (2026-11-05) at the candidate `eb34f62`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |
@@ -1706,16 +1728,15 @@ commit). Earlier judgments are kept in the round sections above.
 | G7 install/interfaces/maintainability | **PARTIAL** | installed-artifact runs at `7bdb475`, `e60973f`, `9255d29`; architecture docs follow the pipeline (`design/shared-compilation-path.md`); open: a fresh install at the candidate, the Samsung patches (P-04), P-23 lint, the public-payload review |
 | G8 backend execution | **PARTIAL** | installed-artifact evidence on the simulators at `69773fc` (Samsung, AiM, UPMEM probes, no checkout module loaded) and on the APU v1 board and the Gemini-II card at `69773fc`/`28cc922` (round 30: the archived paired protocols with the baselines re-run, exact outputs, device locks, launch provenance on every route); `tests/perf` at `69773fc` (545 passed, the one failure an NFS-tmpdir artifact fixed in `d2e3fda`), `tests/pim` at `69773fc` 564 passed with 20 Docker-backed simulator tests failing on the host's full `/var` (containerd ENOSPC, an administrator matter; the same rows passed from the installed wheel earlier in the round); open: the 20 simulator tests re-run when the host has space, the suites and installed-wheel checks at the final round 30 candidate, the ledag scratch fix (X-24) exercised only through its unit test and the sessions 3 and later |
 | G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | shared front stages and facts (rounds 12-18); both APUs' plans and typed records as candidates of the common pipeline with an enforced contract (rounds 13-17); Samsung, AiM, UPMEM and AttAcc declare effects from the facts and are checked at materialization (rounds 19-27, X-04 to X-20); shared transfer availability (X-09, X-17, X-18); the `APUv1Program` manifest from the retained IR (round 28); slice 5 traces at `653b059` from installed wheels (round 29); round 30: the paper rows measured through default selection from installed wheels under the archived protocols with launch provenance on every route; open: independent review of rounds 28-30, the full suites and installed-artifact runs at the final candidate, the remaining minor items |
-| G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), Gemini-II 5/5 REPRODUCED under the archived paired protocol with the GTML baseline re-run in the same rounds (round 30), Gemini-I under the archived paired protocol with the expert binaries re-run: 2/5 REPRODUCED (matrix multiply, histogram), kmeans and linear regression OPEN (nominal) on the pooled round 30 sessions (X-23; the single-session closure of kmeans was withdrawn in round 31), word count attributed to the generated program's loop-counter width and repaired (X-22, `dc41df7`): the repaired program at parity with the paper's own binary in the same rounds and 0.19% above the paper's archived median, OPEN (nominal); the Gemini-I vector GEMM layout row faster than the paper (round 31); the portability row REPRODUCED on both targets with the paper's inputs through the maintained in-repo driver (rounds 34-35, checkout evidence); the Samsung XOR row OPEN (measured): the identity-rows and F2-swizzled-rows placements are ordinary-source candidates executed by the conductor, the XOR packing 1.12-1.13x faster and bit identical on two GEMVs, the paper's within-round probe metric unreachable by the production program (round 36); the selected map made the contract and the default selection earning the swizzled rows on the paper shapes and a held-out shape (round 37); the 500-instance selector equivalence as a diagnostic; round 51: the six AttAcc kernel-tiling results REPRODUCED through the shared pipeline on the natively built Ramulator2-AttAcc (QKV / projection at the paper's values with fixed baselines re-run; score 1.00x / 1.13x over fixed as plotted; 123 / 316 / 61 against DCC's archived per-shape times, median loss 7.07%), every trace checked against the selected program; required set 42 of 55 REPRODUCED, 7 OPEN (X-19, X-22/X-23), 6 UNVERIFIED (the decode configurations); optional: token partitioning DIAGNOSTIC, UPMEM scaling, packing/selection/DCC studies, calibration, the virtual study, compile cost UNVERIFIED |
+| G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), Gemini-II 5/5 REPRODUCED under the archived paired protocol with the GTML baseline re-run in the same rounds (round 30), Gemini-I under the archived paired protocol with the expert binaries re-run: 2/5 REPRODUCED (matrix multiply, histogram), kmeans and linear regression OPEN (nominal) on the pooled round 30 sessions (X-23; the single-session closure of kmeans was withdrawn in round 31), word count attributed to the generated program's loop-counter width and repaired (X-22, `dc41df7`): the repaired program at parity with the paper's own binary in the same rounds and 0.19% above the paper's archived median, OPEN (nominal); the Gemini-I vector GEMM layout row faster than the paper (round 31); the portability row REPRODUCED on both targets with the paper's inputs through the maintained in-repo driver (rounds 34-35, checkout evidence); the Samsung XOR row OPEN (measured): the identity-rows and F2-swizzled-rows placements are ordinary-source candidates executed by the conductor, the XOR packing 1.12-1.13x faster and bit identical on two GEMVs, the paper's within-round probe metric unreachable by the production program (round 36); the selected map made the contract and the default selection earning the swizzled rows on the paper shapes and a held-out shape (round 37); the 500-instance selector equivalence as a diagnostic; round 51: the six AttAcc kernel-tiling results REPRODUCED through the shared pipeline on the natively built Ramulator2-AttAcc (QKV / projection at the paper's values with fixed baselines re-run; score 1.00x / 1.13x over fixed as plotted; 123 / 316 / 61 against DCC's archived per-shape times, median loss 7.07%), every trace checked against the selected program command by command (round 52); round 52: the six decode configurations REPRODUCED as an analytical composition from the shared-pipeline kernel times (Tenon, DCC and fixed variants re-run through DCC's model; the frozen figure, table and text values); required set 48 of 55 REPRODUCED, 7 OPEN (X-19, X-22/X-23), 0 UNVERIFIED; optional: token partitioning DIAGNOSTIC, UPMEM scaling, packing/selection/DCC studies, calibration, the virtual study, compile cost UNVERIFIED |
 
 Verdict: **NOT READY**. Blockers: G9 (independent review of rounds 28-30,
 the suites at the final candidate), G10 on its narrowed required scope
 (user, 2026-11-04: the Samsung, AiM, UPMEM, Gemini-I and Gemini-II kernel
 comparisons and the AttAcc kernel-tiling and decode figures; the inventory's
 `release_scope` column): the four AiM RoPE regressions X-19, the three
-nominal Gemini-I rows X-22/X-23 under the pooled-session rule, and the
-six AttAcc decode configurations not yet composed (the six kernel timings
-were reproduced in round 51); the independent re-challenge of G1-G8 at the candidate; P-04
+nominal Gemini-I rows X-22/X-23 under the pooled-session rule (the twelve
+AttAcc results were reproduced in rounds 51-52); the independent re-challenge of G1-G8 at the candidate; P-04
 and P-23 (deferred); the open minor items in ISSUES.md.  The optional
 supporting studies (scaling, layouts, packing, DCC, token partitioning,
 calibration, virtual sweeps, compile cost, LoC) keep their recorded

@@ -21,18 +21,22 @@ Pipeline:
    (github.com/SPIN-Research-Group/DCC; the study used commit
    ``212f86ea7f08da059836e3a1311d3a11afae8dbe``) has no license, so Tenon does
    not vendor or re-implement the trace emitter.  The trace is checked
-   against the selected program by ``benchmarks.attacc.trace_check``: opcode
-   totals, the command ordering (the generator's phase structure, for GEMV
-   and attention traces) and the decoded address mapping (channels, banks,
-   matrix columns, vector positions) must be the program's; a mismatch is a
-   failure, never a warning.
+   against the selected program by ``benchmarks.attacc.trace_check``: the
+   complete command stream the program implies (opcode and address of every
+   store, GB write, MAC, drain, softmax, context move and barrier, in the
+   generator's emission order) is derived from the program and the target
+   geometry and compared command by command; a mismatch is a failure,
+   never a warning.
 3. ``ramulator2-AttAcc`` (Ramulator 2.0 with the AttAcc HBM3-PIM model, MIT;
    built by DCC's ``Ramulator2/build.sh`` or by
    ``build_ramulator_attacc.sh`` next to this script) runs the trace in a
    private temporary directory, natively or inside a Docker image.  The
    binary's and library's digests, the trace's and configuration's digests,
    the command line and the raw output are recorded; ``--artifacts``
-   retains the trace, the configuration and the output per run.
+   retains the trace, the configuration and the complete output per run,
+   on failure too (trace mismatch, simulator error or timeout: the inputs,
+   stdout, stderr and a structured ``failure.json``; without an artifacts
+   directory the work directory is kept), and a failed run exits nonzero.
 
 Cycles are ``memory_system_cycles``; milliseconds use the ``HBM3_5.2Gbps``
 clock (tCK 0.769 ns, DCC ``predictor.get_running_time_ms``), the paper's
@@ -307,7 +311,16 @@ def write_trace(dcc_root: Path, family: str, tiling, workdir: Path) -> Path:
     return trace
 
 
-def run_simulator(binary: Path, dcc_root: Path, yaml_path: Path, workdir: Path) -> tuple[str, list[str]]:
+class SimulatorFailure(RuntimeError):
+    """The simulator did not produce a result; ``details`` holds the command,
+    exit status, complete stdout and stderr (or the timeout)."""
+
+    def __init__(self, message, details):
+        super().__init__(message)
+        self.details = details
+
+
+def run_simulator(binary: Path, dcc_root: Path, yaml_path: Path, workdir: Path, *, timeout_s: int = 3600) -> tuple[str, str, list[str]]:
     # The AttAcc trace recorder writes ./temp/log/attacc_bank/cmd.log.
     (workdir / "temp" / "log" / "attacc_bank").mkdir(parents=True, exist_ok=True)
     libdir = _libdir(binary)
@@ -323,30 +336,68 @@ def run_simulator(binary: Path, dcc_root: Path, yaml_path: Path, workdir: Path) 
         for path, mode in mounts.items():
             docker += ["-v", f"{path}:{path}:{mode}"]
         command = docker + [image] + command
-    result = subprocess.run(command, cwd=workdir, env=env, capture_output=True, text=True, timeout=3600)
+    try:
+        result = subprocess.run(command, cwd=workdir, env=env, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired as error:
+        raise SimulatorFailure(
+            f"ramulator2-AttAcc timed out after {timeout_s} s: {shlex.join(command)}",
+            {"command": shlex.join(command), "timeout_s": timeout_s, "returncode": None,
+             "stdout": (error.stdout or b"").decode(errors="replace") if isinstance(error.stdout, bytes) else (error.stdout or ""),
+             "stderr": (error.stderr or b"").decode(errors="replace") if isinstance(error.stderr, bytes) else (error.stderr or "")},
+        ) from error
     if result.returncode != 0:
-        raise RuntimeError(
-            f"ramulator2-AttAcc failed ({result.returncode}): {shlex.join(command)}\n{result.stderr[-2000:]}"
+        raise SimulatorFailure(
+            f"ramulator2-AttAcc failed ({result.returncode}): {shlex.join(command)}\n{result.stderr[-2000:]}",
+            {"command": shlex.join(command), "returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr},
         )
-    return result.stdout, command
+    return result.stdout, result.stderr, command
 
 
-def simulate_program(dcc_root: Path, binary: Path, family: str, program, *, keep_dir=None, artifacts=None) -> dict:
-    """Write the program's trace, check it against the program, simulate it."""
+def _retain(workdir: Path, artifacts, extra: dict):
+    """Copy whatever inputs and outputs exist into ``artifacts`` and write
+    ``extra`` beside them (used on success and on every failure)."""
+    if artifacts is None:
+        return None
+    artifacts = Path(artifacts)
+    artifacts.mkdir(parents=True, exist_ok=True)
+    for name in ("kernel.trace", "kernel.yaml"):
+        source = workdir / name
+        if source.is_file() and source.resolve() != (artifacts / name).resolve():
+            shutil.copy2(source, artifacts / name)
+    for name, text in extra.items():
+        if text is None:
+            continue
+        (artifacts / name).write_text(text if isinstance(text, str) else json.dumps(text, indent=1, default=str))
+    return str(artifacts)
+
+
+def simulate_program(dcc_root: Path, binary: Path, family: str, program, *, keep_dir=None, artifacts=None, timeout_s: int = 3600) -> dict:
+    """Write the program's trace, check it against the program, simulate it.
+
+    On any failure (trace mismatch, simulator error or timeout) the trace,
+    the configuration, the complete simulator output and a structured
+    ``failure.json`` are retained under ``artifacts`` (or the work directory
+    is kept when there is no artifacts directory) before the exception
+    propagates."""
     workdir = Path(tempfile.mkdtemp(prefix="tenon-attacc-"))
+    failure = None
     try:
         trace = write_trace(dcc_root, family, program.tiling.dcc_tiling(), workdir)
         check = trace_check.check_trace(trace, program)
-        if not check["totals_match"]:
-            raise TraceMismatch(f"trace opcode totals {check['totals']} differ from the compiled program {check['declared']}")
-        if check.get("ordering_checked") and not (check["ordering_match"] and check["mapping_match"]):
-            raise TraceMismatch(f"trace structure differs from the compiled program: {json.dumps({k: check[k] for k in ('first_difference', 'mapping')})}")
+        if not check["match"]:
+            failure = {"stage": "trace-check", "error": "the generator's trace differs from the selected program", "trace_check": check}
+            raise TraceMismatch(f"trace differs from the compiled program at command {check['first_difference']} (totals_match={check['totals_match']})")
         yaml_path = trace.with_suffix(".yaml")
         started = time.perf_counter()
-        stdout, command = run_simulator(binary, dcc_root, yaml_path, workdir)
+        try:
+            stdout, stderr, command = run_simulator(binary, dcc_root, yaml_path, workdir, timeout_s=timeout_s)
+        except SimulatorFailure as error:
+            failure = {"stage": "simulator", "error": str(error), **error.details, "trace_check": check}
+            raise
         elapsed = time.perf_counter() - started
         found = re.search(r"memory_system_cycles:\s*(\d+)", stdout)
         if found is None:
+            failure = {"stage": "simulator-output", "error": "ramulator2-AttAcc printed no memory_system_cycles", "command": shlex.join(command), "returncode": 0, "stdout": stdout, "stderr": stderr, "trace_check": check}
             raise RuntimeError("ramulator2-AttAcc printed no memory_system_cycles")
         cycles = int(found.group(1))
         record = {
@@ -362,16 +413,25 @@ def simulate_program(dcc_root: Path, binary: Path, family: str, program, *, keep
             "simulator_wall_s": elapsed,
             "stdout_tail": stdout[-600:],
         }
-        if artifacts is not None:
-            artifacts = Path(artifacts)
-            artifacts.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(trace, artifacts / "kernel.trace")
-            shutil.copy2(yaml_path, artifacts / "kernel.yaml")
-            (artifacts / "stdout.txt").write_text(stdout)
-            record["artifacts"] = str(artifacts)
+        retained = _retain(workdir, artifacts, {"stdout.txt": stdout, "stderr.txt": stderr})
+        if retained:
+            record["artifacts"] = retained
         if keep_dir:
             record["workdir"] = str(workdir)
         return record
+    except Exception as error:
+        if failure is None:
+            failure = {"stage": "trace-generation" if not (workdir / "kernel.trace").is_file() else "unknown", "error": f"{type(error).__name__}: {error}"}
+        failure.update({"family": family, "tiling": program.tiling.dcc_tiling(), "kernel": program.kernel.manifest(), "workdir": str(workdir)})
+        extra = {"stdout.txt": failure.get("stdout"), "stderr.txt": failure.get("stderr"), "failure.json": failure}
+        retained = _retain(workdir, artifacts, extra)
+        if retained is None:
+            # Nowhere else to retain the inputs: keep the work directory and
+            # write the failure record beside them.
+            keep_dir = True
+            _retain(workdir, workdir, extra)
+        error.retained = retained or str(workdir)
+        raise
     finally:
         if not keep_dir:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -452,8 +512,8 @@ def main(argv=None) -> int:
         try:
             records = time_shape(dcc_root, binary, family, shape, tiling=tiling, fixed_baseline=args.fixed_baseline, artifacts=args.artifacts, keep=args.keep, skip_selected=args.skip_selected)
         except (TraceMismatch, RuntimeError) as error:
-            session["failures"].append({"shape": list(shape), "error": f"{type(error).__name__}: {error}"})
-            print(f"FAIL {family} {shape}: {error}", file=sys.stderr, flush=True)
+            session["failures"].append({"shape": list(shape), "error": f"{type(error).__name__}: {error}", "retained": getattr(error, "retained", None)})
+            print(f"FAIL {family} {shape}: {error} (retained: {getattr(error, 'retained', None)})", file=sys.stderr, flush=True)
             continue
         session["runs"].extend(records)
         for rec in records:

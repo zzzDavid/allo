@@ -1142,3 +1142,22 @@ Working tree on top of `0cc8187`; evidence under
 Not evidence of: the six decode configurations (analytical composition,
 `compose_e2e.py`, next), the reference-best study, or any numerical
 execution (the simulator is timing-only).
+
+## Round 52 (2026-11-05): per-command trace fidelity, failure-path retention, the AttAcc decode configurations
+
+Working tree on top of `eb34f62`; evidence under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r52/`.
+
+| Check | Result |
+|---|---|
+| `benchmarks/attacc/trace_check.py` rewritten: the complete command stream a selected program implies (opcode and address of every store, GB write, MAC, bank-group drain, softmax, context move and barrier, in the generator's emission order, with the generator's region placement: vector at 0, matrix at the matrix size, result after the vector size) derived from the program and the target geometry and compared with the trace command by command | the reviewer's three mutations of the retained QKV trace now fail (zeroed store / drain / barrier addresses at command 1; every address shifted by one channel at command 0 with 2,564 commands outside the device; the matrix base shifted by one column at command 10,272), as do a swapped command pair, a dropped store, a displaced GB write and zeroed softmax / context moves on the attention stream (`tests/pim/test_attacc_trace_check.py`, 17 passed) |
+| DCC's own generator output against the derived stream | exact on the qkv batch-1 selection, the projection batch-4 selection, a fixed-form baseline candidate and three attention shapes (8 x 128 x 480, 32 x 128 x 4096, 8 x 128 x 144) |
+| `r52/attacc_trace_recheck.json` (all retained r51 traces) | 506 of 506 traces equal their program's derived stream command by command (496 attention, 8,707,296 commands including barriers); the r51 timings stand, no trace changed |
+| Failure-path retention (`run_ramulator.py::simulate_program`; `test_attacc_trace_check.py` failure tests) | a nonzero simulator exit, a timeout and a trace mismatch each retain the trace, the configuration, the complete stdout and stderr and a structured `failure.json` (stage, command, exit status or timeout, trace check) under the artifacts directory, or keep the work directory with the record when none was given; the driver exits 1 with the retained path in the session's failures |
+| Decode composition (`compose_e2e.py`, `r52/attacc_e2e.json`; `tests/pim/test_attacc_compose.py`, 4 passed) | 500 shared-pipeline kernel records (4 reference records ignored), every GPT-13B PIM row measured, the 6 other table rows NaN; Tenon full 6.50 / 6.95 / 7.40 / 3.09 / 3.48 / 3.87x and base 1.47 / 1.56 / 1.66 / 1.34 / 1.50 / 1.65x over the GPU roofline; DCC's selection re-run 6.50 / 6.95 / 7.40 / 3.05 / 3.44 / 3.82x and 1.47 / 1.56 / 1.66 / 1.34 / 1.49 / 1.64x; the fixed baseline with DCC's own placement (attention on PIM, QKV and projection on the GPU) 2.55 / 2.73 / 2.91 / 2.29 / 2.58 / 2.87x and 1.09 / 1.16 / 1.23 / 1.16 / 1.30 / 1.43x; at batch 4 Tenon's decode is 1.27% faster than DCC's in every configuration, QKV 1.2799 to 1.2332 ms of 3.9933 to 3.9431 ms at 128 / 2048; at batch 1 equal to two decimals with Tenon 0.0001 ms slower at 128 / 2048 |
+| Explained | the earlier smoke run's batch-4 numbers (1.28 / 1.45 / 1.61x) were the fixed-tiling times substituted for the unmeasured kernels under the PIM placement; with every kernel measured and DCC's placement rule for the fixed variant the composition reproduces all three columns |
+| Suites | `tests/pim/test_attacc_trace_check.py` + `test_attacc_virtual.py`: 61 passed, 1 skipped (`r52/pytest_attacc.log`); `test_attacc_compose.py` 4 passed; no production `allo/` change this round |
+
+Not evidence of: numerical execution (the simulator is timing-only), a
+measured decode step (the composition is analytical), or DCC's selector
+re-run (its recorded per-shape selections are the comparison baseline).

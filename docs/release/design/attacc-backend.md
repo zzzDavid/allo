@@ -148,9 +148,8 @@ result carries this as `extra["cost_validity"]` and `timing_scope`.
   column; the fixed-form baselines re-run (minimum over the fixed-form
   candidates, DCC's rule) 36,504 / 224,170 / 3,448 / 13,398 cycles, the
   paper's Fixed column. The DCC generator's trace of each selected program
-  has the ordering and address mapping the program declares (16 channels, 64
-  units addressed; matrix columns and vector positions as the serial
-  extents). Score rows, 248 shapes per batch: every selection equals
+  equals the stream the program implies command by command (round 52
+  check; round 51 compared phase order and fan-out cardinalities). Score rows, 248 shapes per batch: every selection equals
   `paper_selection.csv`; mean 0.00193 / 0.00678 ms; speedup over the fixed
   tiling 1.00x / 1.13x as the frozen figure plots (mean of per-shape
   ratios); against DCC's archived per-shape times 123 wins, 316 ties, 61
@@ -168,11 +167,19 @@ result carries this as `extra["cost_validity"]` and `timing_scope`.
 | GPT-13B decode composition | DCC `inference/system.py` + analytical A100 roofline (no license) | `compose_e2e.py` (`kind: "analytical-composition"`) |
 | Reference-best search, replay predictor, accuracy, DCC baselines | evaluation of the cost model against simulator sweeps; the paper excludes the replay from selection | archived under `<repo>/tenon-artifacts/attacc-llm-e2e/` |
 
-`compose_e2e.py` was smoke-run once with one measured kernel and
-`--missing=baseline`: it reproduces the archived batch-1 speedups (6.50 /
-6.95 / 7.40) but not batch 4 (1.28 / 1.45 / 1.61 against 3.09 / 3.48 /
-3.87 archived). It needs every kernel row timed for a real composition; the
-batch-4 difference is unexplained (open).
+`compose_e2e.py` (rewritten in round 52) composes the six configurations
+from the shared-pipeline kernel records only (conflicts rejected, forced
+and fixed references ignored, unmeasured rows NaN) and re-runs DCC's
+selection and the fixed baseline through the same model, the fixed variant
+with DCC's own placement (attention on PIM, QKV and projection on the
+GPU). With every kernel measured it reproduces the frozen figure, table
+and text: Tenon full 6.50 / 6.95 / 7.40 / 3.09 / 3.48 / 3.87x, base 1.47 /
+1.56 / 1.66 / 1.34 / 1.50 / 1.65x; DCC 6.50 / 6.95 / 7.40 / 3.05 / 3.44 /
+3.82x; fixed 2.55 / 2.73 / 2.91 / 2.29 / 2.58 / 2.87x; batch 4 Tenon 1.27%
+faster, QKV 1.2799 to 1.2332 ms of 3.9933 to 3.9431 ms. The earlier smoke
+run's batch-4 numbers (1.28 / 1.45 / 1.61x) were the fixed-tiling times
+substituted for the unmeasured kernels under the PIM placement; that
+substitution no longer exists.
 
 ## 7. Open items
 
@@ -189,8 +196,9 @@ batch-4 difference is unexplained (open).
    `attacc_base_placement`).
 6. DCC license (`attacc-boundary.md` open question 1) still applies to the
    external scripts.
-7. `trace_check.py` re-derives the generator's emission order for GEMV and
-   attention traces of one or two paired row blocks per pass as the
-   generator composes them; the paper's 500 instances all fit one row
-   block, so the multi-block attention branch is exercised only by the
-   synthetic test (no DCC-generated multi-block trace is in the evidence).
+7. `trace_check.py` (round 52) derives every command's opcode and address
+   from the selected program and the target geometry (the generator's
+   region placement, fan-out, serial walks and composition) and compares
+   command by command; validated against DCC's own output on GEMV and
+   attention shapes. The paper's 500 instances all fit one row block, so
+   the paired-block attention branch is exercised only synthetically.
