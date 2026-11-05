@@ -179,10 +179,19 @@ declaration at materialization, and the runtime binds the caller's arrays
 to the work body's buffers by retained identity. Restrictions, refused by
 name: a `"strict"` FP16 reduction (the tree regroups), a carried destination
 (the route zeroes its accumulator), a non-MAC work body. Device execution
-packs a dense FP16 GEMM (two rank-2 operands sharing the reduction extent,
-the result the whole output) one dot product per group with the batch count
-derived from the facts; any other shape (a region GEMV) compiles for its
-estimate (`backend="virtual"`) and is refused on the board with the reason.
+is the dense FP16 GEMM template, proven from the retained access relations
+of every work item of the kernel group before it is declared executable
+(round 62, X-29): operands read at `[r, k]` and `[k, c]` with the reduction
+in lane order, the result written at `[r, c]`, each work item one
+rectangular block, the blocks a disjoint cover of the whole `[M, N]`
+output, a zero accumulator; packed one dot product per group with the batch
+count derived from the template. A region that fails a condition (a
+reversed or permuted access, a partial or overlapping written domain, a
+GEMV, a non-FP16 operand) compiles for its estimate only
+(`backend="virtual"`, the candidate declared `virtual_only` with the
+condition named) and is refused before scheduling for `backend=None` and
+`backend="functional"` (no host model of the grouped program) with that
+condition.
 At most four work items are priced (V1-20). Not board-verified since the
 migration (the host's `/tmp`; V1-09 fixed earlier: output shapes from the
 compiled ABI, missing output files raise).

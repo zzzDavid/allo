@@ -961,6 +961,12 @@ def compile(
     require_matcher_route_policy(target, trace)
     if module is not None:
         _stamp_matcher_work_scopes(target, module, trace)
+    # The APU v1 grouped route executes one dense GEMM template per kernel
+    # group: a region that is not one is refused here for an executable
+    # backend, with the condition it fails (the work scopes are stamped).
+    from .pim.apu_v1_grouped_route import require_grouped_device_packing
+
+    require_grouped_device_packing(target, trace, backend)
     # The resource budget (``resources={"channel": 8}``): a cap on the units
     # a program may occupy, stamped before enumeration so the partition
     # domains, the ranking and the realization check all read it.

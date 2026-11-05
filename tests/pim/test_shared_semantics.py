@@ -4322,9 +4322,9 @@ def test_apu_v1_grouped_runtime_binds_the_callers_arrays_by_identity():
     with pytest.raises(ValueError, match="no argument for the work body's 'A'"):
         _apu_v1_prepare_io(inner, {"A": A, "B": B, "C": C})
     gemv = _compile_grouped(grouped_gemv_region).compiled
-    with pytest.raises(NotImplementedError, match="dense FP16 GEMM") as error:
+    with pytest.raises(NotImplementedError, match="device execution is not implemented") as error:
         _apu_v1_prepare_io(gemv, {"a": np.zeros((4, 8), np.float16), "b": np.zeros(8, np.float16), "c": np.zeros(4, np.float16)})
-    assert "mat[4, 8] x vec[8]" in str(error.value)
+    assert "rank-2 operands and a rank-2 result; got mat[4, 8], vec[8] -> dst[4]" in str(error.value)
 
 
 def test_apu_v1_grouped_restrictions_are_explicit():
@@ -4395,3 +4395,198 @@ def test_apu_v1_grouped_supplied_declaration_must_be_the_derivation():
     again = _compile_grouped(grouped_gemv_region, layout=[handle_only] * 4)
     assert again.compiled.cmds == compiled.compiled.cmds
     assert candidate_effects(again.compiled.layout[0]).manifest() == effects.manifest()
+
+
+# The dense GEMM template is proven from the retained access relations of
+# every work item of the kernel group (review round 61, ISSUES X-29): the
+# same-shaped sources below differ from the template in one access or in the
+# written domain, compile for the estimate only and are refused before
+# scheduling when an executable is requested.
+
+
+@allo.dataflow.region()
+def grouped_gemm_reversed_k(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+    @allo.work(mapping=[4], args=[p, q, r_out])
+    def row_block(A: float16[G_M, G_K], B: float16[G_K, G_N], C: float16[G_M, G_N]):
+        core = allo.get_wid()
+        for i in allo.grid(G_M // 4):
+            for j in allo.grid(G_N):
+                acc: float16 = 0
+                for k in allo.reduction(G_K):
+                    acc += A[core * (G_M // 4) + i, k] * B[G_K - 1 - k, j]
+                C[core * (G_M // 4) + i, j] = acc
+
+
+@allo.dataflow.region()
+def grouped_gemm_partial_rows(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+    @allo.work(mapping=[4], args=[p, q, r_out])
+    def row_block(A: float16[G_M, G_K], B: float16[G_K, G_N], C: float16[G_M, G_N]):
+        core = allo.get_wid()
+        for i in allo.grid(G_M // 8):
+            for j in allo.grid(G_N):
+                acc: float16 = 0
+                for k in allo.reduction(G_K):
+                    acc += A[core * (G_M // 4) + i, k] * B[k, j]
+                C[core * (G_M // 4) + i, j] = acc
+
+
+@allo.dataflow.region()
+def grouped_gemm_partial_columns(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+    @allo.work(mapping=[4], args=[p, q, r_out])
+    def row_block(A: float16[G_M, G_K], B: float16[G_K, G_N], C: float16[G_M, G_N]):
+        core = allo.get_wid()
+        for i in allo.grid(G_M // 4):
+            for j in allo.grid(G_N // 2):
+                acc: float16 = 0
+                for k in allo.reduction(G_K):
+                    acc += A[core * (G_M // 4) + i, k] * B[k, j]
+                C[core * (G_M // 4) + i, j] = acc
+
+
+@allo.dataflow.region()
+def grouped_gemm_repeated_row(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+    @allo.work(mapping=[4], args=[p, q, r_out])
+    def row_block(A: float16[G_M, G_K], B: float16[G_K, G_N], C: float16[G_M, G_N]):
+        core = allo.get_wid()
+        for i in allo.grid(G_M // 4):
+            for j in allo.grid(G_N):
+                acc: float16 = 0
+                for k in allo.reduction(G_K):
+                    acc += A[0, k] * B[k, j]
+                C[core * (G_M // 4) + i, j] = acc
+
+
+@allo.dataflow.region()
+def grouped_gemm_permuted_rows(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+    @allo.work(mapping=[4], args=[p, q, r_out])
+    def row_block(A: float16[G_M, G_K], B: float16[G_K, G_N], C: float16[G_M, G_N]):
+        core = allo.get_wid()
+        for i in allo.grid(G_M // 4):
+            for j in allo.grid(G_N):
+                acc: float16 = 0
+                for k in allo.reduction(G_K):
+                    acc += A[G_M - 1 - (core * (G_M // 4) + i), k] * B[k, j]
+                C[core * (G_M // 4) + i, j] = acc
+
+
+@allo.dataflow.region()
+def grouped_gemm_overlapping(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+    """Every work item writes the same four rows (the work id is unused)."""
+
+    @allo.work(mapping=[4], args=[p, q, r_out])
+    def row_block(A: float16[G_M, G_K], B: float16[G_K, G_N], C: float16[G_M, G_N]):
+        for i in allo.grid(G_M // 4):
+            for j in allo.grid(G_N):
+                acc: float16 = 0
+                for k in allo.reduction(G_K):
+                    acc += A[i, k] * B[k, j]
+                C[i, j] = acc
+
+
+@allo.dataflow.region()
+def grouped_gemm_column_blocks(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+    """A nearby supported partition: the work items own column blocks."""
+
+    @allo.work(mapping=[4], args=[p, q, r_out])
+    def column_block(A: float16[G_M, G_K], B: float16[G_K, G_N], C: float16[G_M, G_N]):
+        core = allo.get_wid()
+        for i in allo.grid(G_M):
+            for j in allo.grid(G_N // 4):
+                acc: float16 = 0
+                for k in allo.reduction(G_K):
+                    acc += A[i, k] * B[k, core * (G_N // 4) + j]
+                C[i, core * (G_N // 4) + j] = acc
+
+
+_NOT_THE_TEMPLATE = [
+    (grouped_gemm_reversed_k, "operand 'B' is read at \\[-1 \\* k \\+ 31, j\\] along the reduction", 32),
+    (grouped_gemm_partial_rows, "write 64 of the 128 elements of C\\[16, 8\\]", 16),
+    (grouped_gemm_partial_columns, "write 64 of the 128 elements of C\\[16, 8\\]", 16),
+    (grouped_gemm_repeated_row, "written at \\[i, j\\] while the operands are read at row 0 of 'A'", 32),
+    (grouped_gemm_permuted_rows, "read at row -1 \\* i \\+ 15 of 'A'", 32),
+    (grouped_gemm_overlapping, "work items \\(0,\\) and \\(1,\\) both write rows 0..3 x columns 0..7", 32),
+]
+
+
+@pytest.mark.parametrize(
+    "region, reason, instances",
+    _NOT_THE_TEMPLATE,
+    ids=["reversed_k", "partial_rows", "partial_columns", "repeated_row", "permuted_rows", "overlapping"],
+)
+def test_apu_v1_grouped_non_template_regions_are_refused_for_execution(region, reason, instances):
+    """Same buffers, same shapes, the same emitted body as the dense GEMM,
+    different semantics: an executable backend is refused before scheduling
+    with the failing condition; ``backend='virtual'`` keeps the estimate
+    with the candidate declared ``virtual_only`` and the reason, and the
+    runtime refuses to pack it."""
+    from allo.spmw_apu_v1 import _apu_v1_prepare_io
+    from allo.spmw_candidate import candidate_effects
+
+    with pytest.raises(NotImplementedError, match=reason) as error:
+        _compile_grouped(region, backend=None)
+    assert "the device packs a dense FP16 GEMM" in str(error.value)
+    with pytest.raises(NotImplementedError, match="no host functional model"):
+        _compile_grouped(region, backend="functional")
+    compiled = _compile_grouped(region, backend="virtual")
+    placement = compiled.compiled.layout[0]
+    effects = candidate_effects(placement)
+    (launch,) = effects.launches
+    assert launch.covers[-1] == "virtual_only" and launch.instances == (0, instances)
+    assert placement.extra["device_packing"] == "virtual_only"
+    import re
+
+    assert re.search(reason, placement.extra["device_packing_reason"])
+    arrays = {
+        "p": np.zeros((G_M, G_K), np.float16),
+        "q": np.zeros((G_K, G_N), np.float16),
+        "r_out": np.zeros((G_M, G_N), np.float16),
+    }
+    with pytest.raises(NotImplementedError, match=reason):
+        _apu_v1_prepare_io(compiled.compiled, arrays)
+
+
+def test_apu_v1_grouped_template_is_proven_over_the_whole_kernel_group():
+    """The proof reads every work item's facts: the canonical row-block
+    partition and a column-block partition are the template (the blocks a
+    disjoint cover of the output); the packing then implements the source
+    (the products the emitted multiply and group sum imply equal A @ B)."""
+    from allo.pim.apu_v1_grouped_route import (
+        group_contractions,
+        grouped_device_packing,
+        grouped_geometry,
+    )
+    from allo.spmw_apu_v1 import _apu_v1_prepare_io
+    from allo.spmw_candidate import candidate_effects
+
+    rng = np.random.default_rng(5)
+    A = rng.integers(-3, 4, size=(G_M, G_K)).astype(np.float16)
+    B = rng.integers(-3, 4, size=(G_K, G_N)).astype(np.float16)
+    for region, blocks in (
+        (grouped_gemm_region, [(0, 4, 0, 8), (4, 4, 0, 8), (8, 4, 0, 8), (12, 4, 0, 8)]),
+        (grouped_gemm_column_blocks, [(0, 16, 0, 2), (0, 16, 2, 2), (0, 16, 4, 2), (0, 16, 6, 2)]),
+    ):
+        compiled = _compile_grouped(region, backend=None)  # the board route
+        inner = compiled.compiled
+        placement = inner.layout[0]
+        group = group_contractions(inner.trace.matches)
+        assert [w for w, _f in group] == [(0,), (1,), (2,), (3,)]
+        packing = grouped_device_packing(group, grouped_geometry(inner.target, placement))
+        assert packing.kind == "gemm"
+        assert [(b.row0, b.rows, b.col0, b.columns) for b in packing.template.blocks] == blocks
+        assert (packing.template.lhs, packing.template.rhs, packing.template.output) == ("A", "B", "C")
+        (launch,) = candidate_effects(placement).launches
+        assert launch.covers[-1] == "gemm"
+        assert launch.instances == (0, blocks[0][1] * blocks[0][3])
+        normalized, specs, _packing = _apu_v1_prepare_io(inner, {"p": A, "q": B, "r_out": np.zeros((G_M, G_N), np.float16)})
+        batches = specs["r_out"][0][1]
+        x = normalized["p"].reshape(4, batches, 4, 8192).astype(np.float32)
+        y = normalized["q"].reshape(x.shape).astype(np.float32)
+        implied = (x * y).sum(axis=-1).reshape(4, -1)[:, : batches * 4]
+        rows_per_core = 4
+        gathered = implied.reshape(4, rows_per_core, G_N).reshape(G_M, G_N)
+        np.testing.assert_array_equal(gathered, A.astype(np.float32) @ B.astype(np.float32))
+    # The named-candidate path without a cost program stamps the group too.
+    named = allo.compile(
+        grouped_gemm_region, build_apu_v1_target(), None, layout="grouped_f16", backend="virtual", reduction_order="reassociate"
+    )
+    assert candidate_effects(named.compiled.layout[0]).launches[0].covers[-1] == "gemm"

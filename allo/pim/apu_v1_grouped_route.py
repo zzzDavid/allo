@@ -18,13 +18,18 @@ and ABI binding from the same facts:
   attaches to every grouped candidate and the contract re-derives against
   (`EFFECTS_DERIVERS["apu_v1"]`); `APUv1Ctx.check_realization` compares the
   recorded emission with the declaration at materialization.
-* `grouped_device_packing` is what the grouped runtime can execute on the
-  board: a dense FP16 GEMM (two rank-2 operands sharing the reduction
-  extent, the result covering the whole output) packed one dot product per
-  group, rows split over the four APUCs; the batch count the device program
-  loops over is derived here, so the emitted loop and the runtime's packing
-  agree.  Anything else is ``virtual_only``: the estimate is available, a
-  device run is refused with the reason.
+* `prove_dense_gemm_template` proves, from the retained access relations
+  of every work item of the kernel group, that the region is the dense FP16
+  GEMM the grouped runtime packs (operands read at ``[r, k]`` and ``[k, c]``
+  with the reduction in lane order, the result written at ``[r, c]``, each
+  work item one rectangular block, the blocks a disjoint cover of the whole
+  output, a zero accumulator), or names the first condition the source
+  fails; `grouped_device_packing` turns the proven template into the
+  packing (one dot product per group, rows split over the four APUCs) and
+  the batch count the device program loops over, so the emitted loop and
+  the runtime's packing agree.  Anything else is ``virtual_only``: the
+  estimate is available, an executable backend is refused before
+  scheduling (`require_grouped_device_packing`) with the reason.
 * `grouped_runtime_binding` binds the work body's buffers to the caller's
   parameters by retained identity (`trace.source_value_refs`), never by
   spelling, so a region whose work parameters are named differently from its
@@ -69,13 +74,47 @@ class GroupedGeometry:
 
 
 @dataclass(frozen=True)
-class GroupedPacking:
-    """What the grouped runtime executes for one work body.
+class WorkRectangle:
+    """The block of the output one work item writes: rows ``[row0, row0 +
+    rows)`` and columns ``[col0, col0 + columns)``."""
 
-    ``kind`` is ``"gemm"`` (packed one dot product per group, the rows of
-    the first operand split over the APUCs, ``batches`` 32K-lane batches per
-    APUC) or ``"virtual_only"`` (``reason`` names the restriction; only the
-    estimate is available).
+    work_id: tuple
+    row0: int
+    rows: int
+    col0: int
+    columns: int
+
+    @property
+    def area(self) -> int:
+        return self.rows * self.columns
+
+
+@dataclass(frozen=True)
+class GemmTemplate:
+    """The dense FP16 GEMM the grouped runtime executes, proven from the
+    retained access relations of every work item of the kernel group:
+    ``output[r, c] = sum_k lhs[r, k] * rhs[k, c]`` with the reduction in lane
+    order, a zero accumulator, and the work items' output blocks a disjoint
+    cover of the whole ``[rows, columns]`` buffer."""
+
+    lhs: str
+    rhs: str
+    output: str
+    rows: int
+    columns: int
+    reduction: int
+    blocks: tuple
+
+
+@dataclass(frozen=True)
+class GroupedPacking:
+    """What the grouped runtime executes for one kernel group.
+
+    ``kind`` is ``"gemm"`` (the proven `GemmTemplate`, packed one dot
+    product per group, the rows split over the APUCs, ``batches`` 32K-lane
+    batches per APUC) or ``"virtual_only"`` (``reason`` names the first
+    condition of the template the source fails; only the estimate is
+    available and an executable backend is refused before scheduling).
     """
 
     kind: str
@@ -88,6 +127,7 @@ class GroupedPacking:
     lhs: str | None = None
     rhs: str | None = None
     output: str | None = None
+    template: GemmTemplate | None = None
 
 
 def _product(values) -> int:
@@ -154,67 +194,348 @@ def _result_buffers(fact):
     return out
 
 
-def grouped_device_packing(fact, geometry: GroupedGeometry) -> GroupedPacking:
-    """The grouped runtime's packing of one work body, from its facts.
+def _affine(coord):
+    """``(coefficients by loop variable, constant)`` of one retained
+    coordinate (`spmw_match_engine.affine_form`), None when it is not
+    affine in loop variables."""
+    try:
+        terms, constant = coord
+        coefficients = {}
+        for var, coefficient in terms:
+            coefficients[str(var)] = coefficients.get(str(var), 0) + int(coefficient)
+        return {v: c for v, c in coefficients.items() if c != 0}, int(constant)
+    except (TypeError, ValueError):
+        return None
 
-    The runtime (`spmw_apu_v1._apu_v1_prepare_io`) packs a dense FP16 GEMM
-    ``x[M, K] * y[K, N]`` one dot product per ``group_size``-lane group,
-    the rows of ``x`` split over the four APUCs, ``ceil(ceil(M / 4) * N /
-    groups_per_vr)`` batches per APUC, and gathers the group heads into the
-    ``[M, N]`` result.  That is the whole result of the kernel group, so the
-    sink must be the ``[M, N]`` buffer.  Everything else (a GEMV, a
-    non-FP16 operand, a partial result) has no device packing.
+
+def _affine_text(coord, labels) -> str:
+    form = _affine(coord)
+    if form is None:
+        return "<non-affine>"
+    coefficients, constant = form
+    parts = []
+    for var, coefficient in coefficients.items():
+        label = labels.get(var, var)
+        parts.append(label if coefficient == 1 else f"{coefficient} * {label}")
+    if constant or not parts:
+        parts.append(str(constant))
+    return " + ".join(parts).replace("+ -", "- ")
+
+
+def group_contractions(matches):
+    """``[(work id, Contraction)]`` of every work item of the matches'
+    kernel group, as the ranking stamped them before enumeration
+    (``extra["spmw_group_contractions"]``, `_stamp_group_replication`);
+    None when the stamp or any fact is missing."""
+    if not matches:
+        return None
+    group = matches[0].extra.get("spmw_group_contractions")
+    if not group or any(fact is None for _work_id, fact in group):
+        return None
+    return list(group)
+
+
+def group_contractions_of_trace(trace) -> dict:
+    """``{group id: [(work id, Contraction)]}`` of a trace's kernel groups
+    (the pre-scheduling view, before the ranking stamps them)."""
+    from ..spmw_autoschedule import _matcher_work_scope
+
+    groups: dict = {}
+    for match in getattr(trace, "matches", ()):
+        scope = _matcher_work_scope(match)
+        groups.setdefault(scope.group_id, []).append(
+            (tuple(scope.work_id), match.extra.get("semantic_facts"))
+        )
+    return groups
+
+
+def prove_dense_gemm_template(group):
+    """Prove the dense GEMM template over the kernel group's work items, or
+    name the first condition the source fails.
+
+    Per work item (the `Contraction` facts of its one MAC): two rank-2
+    operands and one rank-2 external result of FP16; a multiply-add with a
+    zero accumulator; one reduction loop ``k`` and ``range(N)`` loops; the
+    first operand read at ``[r, k]`` and the second at ``[k, c]`` with the
+    reduction coordinate exactly ``k`` (lane order); the result written at
+    ``[r, c]`` with the same ``r`` and ``c`` as the operands; ``r`` and
+    ``c`` each a result loop plus a constant (or a constant), every result
+    loop used, so the work item writes one rectangular block once.  Across
+    the group: the same buffers and shapes, the blocks pairwise disjoint
+    and together the whole ``[rows, columns]`` output (an untouched element
+    would be overwritten by the device's gather).  Returns ``(template,
+    None)`` or ``(None, reason)``.
     """
-    reduction = reduction_extent(fact)
-    inputs = tuple(fact.inputs)
-    results = _result_buffers(fact)
-    if len(inputs) != 2 or not results:
-        return GroupedPacking(
-            "virtual_only",
-            reduction,
-            1,
-            reason="the grouped runtime packs a two-operand contraction with an "
-            f"external result; got {len(inputs)} operand(s) and "
-            f"{len(results)} result(s)",
+    if not group:
+        return None, "the kernel group has no work items with retained facts"
+    blocks = []
+    identity = None
+    for work_id, fact in group:
+        if fact is None or not hasattr(fact, "reduction_vars"):
+            return None, f"work item {tuple(work_id)} carries no contraction facts"
+        labels = dict(fact.loop_labels)
+        name = fact.function
+        where = f"work item {tuple(work_id)} ({name!r})"
+        inputs = tuple(fact.inputs)
+        results = _result_buffers(fact)
+        if len(inputs) != 2 or len(results) != 1:
+            return None, (
+                f"{where}: the device packs a two-operand contraction with one "
+                f"external result; the body has {len(inputs)} operand(s) and "
+                f"{len(results)} result(s)"
+            )
+        x, y = inputs
+        output, result = results[0]
+        if fact.accumulator_init != "zero":
+            return (
+                None,
+                f"{where}: the accumulator is {fact.accumulator_init!r}, not zero",
+            )
+        if (fact.product_kind, fact.accumulate_kind) != ("mul", "add"):
+            return None, (
+                f"{where}: the device multiplies and adds; the body is "
+                f"{fact.product_kind} / {fact.accumulate_kind}"
+            )
+        elements = {getattr(a.element, "text", None) for a in (x, y, result)}
+        if elements != {"f16"}:
+            return None, (
+                f"{where}: the device packs FP16 operands and results; the body has "
+                f"{sorted(str(e) for e in elements)}"
+            )
+        if any(not loop.normalized for loop in fact.loops):
+            return None, f"{where}: a loop is not range(N) (lower bound 0, step 1)"
+        if len(fact.reduction_vars) != 1:
+            return None, (
+                f"{where}: one reduction loop is packed in lane order; the body has "
+                f"{len(fact.reduction_vars)}"
+            )
+        k = fact.reduction_vars[0]
+        x_shape, y_shape = tuple(x.shape or ()), tuple(y.shape or ())
+        out_shape = tuple(result.shape or ())
+        x_coords, y_coords, out_coords = (
+            tuple(x.coords or ()),
+            tuple(y.coords or ()),
+            tuple(result.coords or ()),
         )
-    x, y = inputs
-    (output, result) = results[0]
-    x_shape, y_shape = tuple(x.shape or ()), tuple(y.shape or ())
-    result_shape = tuple(result.shape or ())
-    elements = {getattr(access.element, "text", None) for access in (x, y, result)}
-    if (
-        len(x_shape) == 2
-        and len(y_shape) == 2
-        and x_shape[1] == y_shape[0] == reduction
-        and result_shape == (x_shape[0], y_shape[1])
-        and elements == {"f16"}
-    ):
-        rows, columns = int(x_shape[0]), int(y_shape[1])
-        rows_per_apuc = math.ceil(rows / APUCS)
-        batches = max(1, math.ceil(rows_per_apuc * columns / geometry.groups_per_vr))
-        return GroupedPacking(
-            "gemm",
-            reduction,
-            batches,
-            rows=rows,
-            columns=columns,
-            rows_per_apuc=rows_per_apuc,
-            lhs=x.memref_name,
-            rhs=y.memref_name,
-            output=output,
+        if (
+            len(x_shape) != 2
+            or len(y_shape) != 2
+            or len(out_shape) != 2
+            or len(x_coords) != 2
+            or len(y_coords) != 2
+            or len(out_coords) != 2
+        ):
+            return None, (
+                f"{where}: the device packs rank-2 operands and a rank-2 result; got "
+                f"{x.memref_name}{list(x_shape)}, {y.memref_name}{list(y_shape)} -> "
+                f"{output}{list(out_shape)}"
+            )
+        k_form = ({k: 1}, 0)
+        if _affine(x_coords[1]) != k_form:
+            return None, (
+                f"{where}: operand {x.memref_name!r} is read at "
+                f"[{_affine_text(x_coords[0], labels)}, {_affine_text(x_coords[1], labels)}]"
+                f" along the reduction; the device packs {x.memref_name}[r, "
+                f"{labels.get(k, k)}] (the reduction in lane order)"
+            )
+        if _affine(y_coords[0]) != k_form:
+            return None, (
+                f"{where}: operand {y.memref_name!r} is read at "
+                f"[{_affine_text(y_coords[0], labels)}, {_affine_text(y_coords[1], labels)}]"
+                f" along the reduction; the device packs {y.memref_name}["
+                f"{labels.get(k, k)}, c] (the reduction in lane order)"
+            )
+        row_form, col_form = _affine(x_coords[0]), _affine(y_coords[1])
+        if row_form is None or col_form is None:
+            return None, f"{where}: an operand coordinate is not affine in the loops"
+        if _affine(out_coords[0]) != row_form or _affine(out_coords[1]) != col_form:
+            return None, (
+                f"{where}: the result {output!r} is written at "
+                f"[{_affine_text(out_coords[0], labels)}, {_affine_text(out_coords[1], labels)}]"
+                f" while the operands are read at row {_affine_text(x_coords[0], labels)} "
+                f"of {x.memref_name!r} and column {_affine_text(y_coords[1], labels)} of "
+                f"{y.memref_name!r}; the device computes {output}[r, c] = "
+                f"sum {x.memref_name}[r, k] * {y.memref_name}[k, c]"
+            )
+        extents = []
+        used = []
+        for axis, (coefficients, constant) in (("row", row_form), ("column", col_form)):
+            if len(coefficients) > 1 or any(c != 1 for c in coefficients.values()):
+                text = _affine_text(
+                    x_coords[0] if axis == "row" else y_coords[1], labels
+                )
+                return None, (
+                    f"{where}: the {axis} coordinate {text} is not a loop plus a "
+                    f"constant; the device writes one contiguous block of rows and "
+                    "columns per work item"
+                )
+            var = next(iter(coefficients), None)
+            if var is not None and var in used:
+                return (
+                    None,
+                    f"{where}: loop {labels.get(var, var)} indexes both the row and the column",
+                )
+            used.append(var)
+            extents.append(
+                (constant, 1 if var is None else int(fact.trips.get(var) or 0))
+            )
+        unused = [v for v in fact.result_vars if v not in used]
+        if unused:
+            return None, (
+                f"{where}: loop {labels.get(unused[0], unused[0])} does not index the "
+                f"result {output!r} (its iterations rewrite the same elements); the "
+                "device writes each output once"
+            )
+        reduction = int(fact.trips.get(k) or 0)
+        if x_shape[1] != reduction or y_shape[0] != reduction:
+            return None, (
+                f"{where}: the reduction loop has {reduction} iterations; "
+                f"{x.memref_name} has {x_shape[1]} columns and {y.memref_name} "
+                f"{y_shape[0]} rows (the device packs the whole reduction)"
+            )
+        if out_shape != (x_shape[0], y_shape[1]):
+            return None, (
+                f"{where}: the result {output}{list(out_shape)} is not [{x_shape[0]}, "
+                f"{y_shape[1]}] of {x.memref_name}[{x_shape[0]}, {reduction}] x "
+                f"{y.memref_name}[{reduction}, {y_shape[1]}]"
+            )
+        (row0, rows), (col0, columns) = extents
+        if (
+            row0 < 0
+            or col0 < 0
+            or row0 + rows > out_shape[0]
+            or col0 + columns > out_shape[1]
+        ):
+            return None, f"{where}: writes outside {output}{list(out_shape)}"
+        this = (x.memref_name, y.memref_name, output, x_shape, y_shape, out_shape)
+        if identity is None:
+            identity = this
+        elif this != identity:
+            return None, (
+                f"{where}: operates on {this[:3]} {list(x_shape)} x {list(y_shape)}, "
+                f"another work item on {identity[:3]}; one GEMM per kernel group"
+            )
+        blocks.append(WorkRectangle(tuple(work_id), row0, rows, col0, columns))
+    lhs, rhs, output, x_shape, _y_shape, out_shape = identity
+    total_rows, total_columns = out_shape
+    for index, block in enumerate(blocks):
+        for other in blocks[index + 1 :]:
+            if (
+                block.row0 < other.row0 + other.rows
+                and other.row0 < block.row0 + block.rows
+                and block.col0 < other.col0 + other.columns
+                and other.col0 < block.col0 + block.columns
+            ):
+                return None, (
+                    f"work items {block.work_id} and {other.work_id} both write "
+                    f"rows {block.row0}..{block.row0 + block.rows - 1} x columns "
+                    f"{block.col0}..{block.col0 + block.columns - 1} of {output!r} "
+                    "(overlapping blocks); the device writes each output once"
+                )
+    covered = sum(block.area for block in blocks)
+    if covered != total_rows * total_columns:
+        written = ", ".join(
+            f"rows {b.row0}..{b.row0 + b.rows - 1} x columns "
+            f"{b.col0}..{b.col0 + b.columns - 1}"
+            for b in blocks
         )
-    return GroupedPacking(
-        "virtual_only",
-        reduction,
-        1,
-        reason=(
-            "the grouped runtime packs a dense FP16 GEMM (two rank-2 operands "
-            "sharing the reduction extent, the result the whole [rows, columns] "
-            f"buffer) one dot product per group; got {x.memref_name}{list(x_shape)}"
-            f" x {y.memref_name}{list(y_shape)} -> {output}{list(result_shape)} "
-            f"with element types {sorted(str(e) for e in elements)}"
+        return None, (
+            f"the work items write {covered} of the {total_rows * total_columns} "
+            f"elements of {output}{list(out_shape)} ({written}); the device computes "
+            "and gathers the whole output, so an untouched element would be "
+            "overwritten"
+        )
+    reduction = int(x_shape[1])
+    return (
+        GemmTemplate(
+            lhs, rhs, output, total_rows, total_columns, reduction, tuple(blocks)
         ),
+        None,
     )
+
+
+def grouped_device_packing(group, geometry: GroupedGeometry) -> GroupedPacking:
+    """The grouped runtime's packing of one kernel group, from the proven
+    dense GEMM template (`prove_dense_gemm_template`) of its work items.
+
+    The runtime (`spmw_apu_v1._apu_v1_prepare_grouped_io`) packs
+    ``lhs[M, K] * rhs[K, N]`` one dot product per ``group_size``-lane group
+    (the reduction in lane order), the rows of ``lhs`` split over the four
+    APUCs, ``ceil(ceil(M / 4) * N / groups_per_vr)`` batches per APUC, and
+    gathers the group heads into the ``[M, N]`` result.  That is exactly the
+    template's semantics (each element once, from a zero accumulator);
+    anything the proof refuses is ``virtual_only`` with the reason.
+    """
+    reduction = 0
+    if group:
+        facts = [fact for _work_id, fact in group if fact is not None]
+        if facts and hasattr(facts[0], "reduction_vars"):
+            reduction = reduction_extent(facts[0])
+    template, reason = prove_dense_gemm_template(group)
+    if template is None:
+        return GroupedPacking("virtual_only", reduction, 1, reason=reason)
+    rows_per_apuc = math.ceil(template.rows / APUCS)
+    batches = max(
+        1, math.ceil(rows_per_apuc * template.columns / geometry.groups_per_vr)
+    )
+    return GroupedPacking(
+        "gemm",
+        template.reduction,
+        batches,
+        rows=template.rows,
+        columns=template.columns,
+        rows_per_apuc=rows_per_apuc,
+        lhs=template.lhs,
+        rhs=template.rhs,
+        output=template.output,
+        template=template,
+    )
+
+
+EXECUTABLE_BACKENDS = frozenset({None, "device", "functional"})
+
+
+def require_grouped_device_packing(target, trace, backend) -> None:
+    """Before scheduling: a dataflow region on APU v1 compiled for an
+    executable backend must be the dense GEMM template the grouped runtime
+    packs; otherwise compilation stops here with the condition the source
+    fails (``backend="virtual"`` keeps the estimate, declared
+    ``virtual_only``).  The functional backend has no model of the grouped
+    program and is refused as such.  Plain-function programs (the vector
+    plans) and traces without facts are not this route's."""
+    if getattr(target, "name", None) != "apu_v1" or backend not in EXECUTABLE_BACKENDS:
+        return
+    from ..spmw_autoschedule import _matcher_work_scope
+
+    matches = list(getattr(trace, "matches", ()))
+    if not matches or not any(_matcher_work_scope(m).group_shape for m in matches):
+        return
+    if any(m.extra.get("semantic_facts") is None for m in matches):
+        return
+    if any(m.extra.get("program_facts") is not None for m in matches) and any(
+        getattr(m.extra.get("program_facts"), "frontend", None) is not None
+        for m in matches
+    ):
+        return
+    if backend == "functional":
+        raise NotImplementedError(
+            "APU v1 grouped matcher program of a dataflow region: no host "
+            "functional model exists; compile with backend='virtual' for the "
+            "estimate or backend=None for the board"
+        )
+    for _group_id, group in group_contractions_of_trace(trace).items():
+        ops = sorted({fact.target_op_name for _w, fact in group if fact is not None})
+        if ops != ["MAC"]:
+            # Refused by the enumerator with `GROUPED_ROUTE_OPERATIONS`.
+            continue
+        template, reason = prove_dense_gemm_template(group)
+        if template is None:
+            raise NotImplementedError(
+                "APU v1 grouped matcher program: the device packs a dense FP16 GEMM "
+                "(output[r, c] = sum_k lhs[r, k] * rhs[k, c] over the whole output, "
+                f"zero accumulator) and this region is not one: {reason}; compile "
+                "with backend='virtual' for the estimate only"
+            )
 
 
 def _storage_name(handle) -> str | None:
@@ -278,7 +599,7 @@ def apu_v1_grouped_candidate_effects(target, matches, placement):
             f"{geometry.group_size}-lane group of the placement"
         )
     init = first.accumulator_init
-    packing = grouped_device_packing(first, geometry)
+    packing = grouped_device_packing(group_contractions(matches), geometry)
     batches = max(1, int(extra.get("n_out_tiles", 1) or 1))
     group = geometry.group_size
     inputs: list = []
@@ -435,15 +756,21 @@ __all__ = [
     "GROUPED_MODE",
     "GROUPED_ROUTE_OPERATIONS",
     "GroupedGeometry",
+    "GemmTemplate",
     "GroupedPacking",
     "LAUNCH_KIND",
+    "WorkRectangle",
     "apu_v1_grouped_candidate_effects",
     "contraction_facts",
     "declared_launch",
+    "group_contractions",
+    "group_contractions_of_trace",
     "grouped_device_packing",
     "grouped_geometry",
     "grouped_runtime_binding",
+    "prove_dense_gemm_template",
     "reduction_extent",
+    "require_grouped_device_packing",
     "require_grouped_operations",
     "result_instances",
 ]

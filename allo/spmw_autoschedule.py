@@ -1368,10 +1368,15 @@ def _apu_v1_grouped_enumerate(target, matches: list[MatchedOp]) -> list[Placemen
         # count the device program loops over is the runtime packing's, so
         # the emitted loop and the host's packing agree (`APUv1Ctx.
         # check_realization` compares the emission with the declaration).
-        packing = grouped_device_packing(facts[0], grouped_geometry(target, placement))
+        from .pim.apu_v1_grouped_route import group_contractions
+
+        packing = grouped_device_packing(
+            group_contractions(matches), grouped_geometry(target, placement)
+        )
         if packing.kind == "gemm":
             placement.extra["n_out_tiles"] = int(packing.batches)
         placement.extra["device_packing"] = packing.kind
+        placement.extra["device_packing_reason"] = packing.reason
         placement.extra["effects"] = apu_v1_grouped_candidate_effects(
             target, matches, placement
         )
@@ -1986,6 +1991,15 @@ def _stamp_group_replication(matches: list[MatchedOp]) -> None:
     if not fingerprints or None in fingerprints:
         return
     replicated = len(set(fingerprints)) == 1
+    # The kernel group's work items' facts, visible to every work item's
+    # enumeration: a route whose device program spans the group (APU v1's
+    # grouped GEMM) proves the group's coverage from them.
+    group = tuple(
+        (tuple(_matcher_work_scope(match).work_id), match.extra.get("semantic_facts"))
+        for match in matches
+    )
+    for match in matches:
+        match.extra["spmw_group_contractions"] = group
     for match in matches:
         match.extra["spmw_group_replicated"] = replicated
 

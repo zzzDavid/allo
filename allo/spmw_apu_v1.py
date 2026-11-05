@@ -988,7 +988,11 @@ def _apu_v1_prepare_grouped_io(compiled: "Compiled", layout, effects, inputs: di
             f"{geometry.groups_per_vr} groups of {geometry.group_size}; the candidate "
             f"declares {groups_per_vr} of {group_size}"
         )
-    packing = grouped_device_packing(facts[0], geometry)
+    from .pim.apu_v1_grouped_route import group_contractions
+
+    packing = grouped_device_packing(
+        group_contractions(compiled.trace.matches), geometry
+    )
     if packing.kind != "gemm" or declared_kind != "gemm":
         raise NotImplementedError(
             "APU v1 grouped matcher program: device execution is not implemented "

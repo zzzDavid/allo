@@ -1639,6 +1639,8 @@ def _select_named_candidates(view, trace, request):
     from .spmw_autoschedule import (
         _ENUMERATORS,
         _bucket_for_autoschedule,
+        _matcher_work_scope,
+        _stamp_group_replication,
         derive_layout_properties,
         select_candidates,
     )
@@ -1650,8 +1652,15 @@ def _select_named_candidates(view, trace, request):
             f"no autoscheduler enumerator registered for target "
             f"{getattr(view, 'name', None)!r}"
         )
+    buckets = _bucket_for_autoschedule(trace)
+    # Enumerators may read whole-group facts the ranking stamps first.
+    groups: dict = {}
+    for _scope, matches in buckets:
+        groups.setdefault(_matcher_work_scope(matches[0]).group_id, []).extend(matches)
+    for group_matches in groups.values():
+        _stamp_group_replication(group_matches)
     layouts = []
-    for _scope, matches in _bucket_for_autoschedule(trace):
+    for _scope, matches in buckets:
         candidates = select_candidates(enumerator(view, matches), request, matches)
         chosen = [
             candidate
@@ -1732,7 +1741,9 @@ def compile_for_target(
         from .spmw_plan import HostComputeStep, HostStep
 
         stages = [s for s in launch_schedule.steps if isinstance(s, HostComputeStep)]
-        if stages and not getattr(backend_context_class(target_name), "supports_host_compute", False):
+        if stages and not getattr(
+            backend_context_class(target_name), "supports_host_compute", False
+        ):
             raise NotImplementedError(
                 f"target {target_name!r} does not represent declared host stages "
                 f"(allo.host_compute {[s.name for s in stages]}); its program "
