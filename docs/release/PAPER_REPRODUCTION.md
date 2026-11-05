@@ -42,7 +42,7 @@ the AttAcc performance figures, followed by release-candidate validation.
 Report required and optional progress separately; the total number of
 unverified entries in the broad inventory is not a release criterion.
 
-Status (2026-11-05, round 52): **in progress, G10 FAIL** (required set: 48 of 55 REPRODUCED, 7 OPEN (the four AiM RoPE rows X-19, the three nominal Gemini-I rows X-22/X-23), 0 UNVERIFIED). User priority
+Status (2026-11-05, round 56, integration candidate `54cbb08`): **in progress, G10 FAIL** (required set at the candidate: 47 of 55 REPRODUCED, 8 OPEN (the four AiM RoPE rows X-19, the three nominal Gemini-I rows X-22/X-23 whose pre-registered campaign is pending on the host's temporary space, the nominal Gemini-II batched_gemm row X-26), 0 UNVERIFIED; the Gemini-II rows were re-measured from the installed wheel at the candidate over four paired sessions). User priority
 addition 2026-11-03, gate G10 of the containing repository's TASK.md. The
 machine-readable inventory (`paper_reproduction/inventory.csv`, 83 rows) is
 the authoritative per-case status; "Results so far" below summarizes it.
