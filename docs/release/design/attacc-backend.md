@@ -137,12 +137,34 @@ result carries this as `extra["cost_validity"]` and `timing_scope`.
 - Perturbation: `attacc_cost_program(AttAccTiming(n_bl=8))` selects
   `[[1,8,1],[4,8,160],[4,1,96]]` (8,576 cycles) on the same 3,043 legal
   candidates.
+- Round 51 (2026-11-05), the paper's kernel rows through the shared
+  pipeline with the native Ramulator2-AttAcc (`run_ramulator.py` rewritten:
+  compiled artifact kept, selection provenance, trace structure check,
+  simulator identity, retained artifacts; `benchmarks/attacc/trace_check.py`):
+  qkv batch 1 `[[1,8,1],[8,8,80],[2,1,192]]` 11,454 cycles (0.00881 ms),
+  qkv batch 4 `[[1,16,2],[16,4,80],[1,1,384]]` 43,750 (0.03364), projection
+  batch 1 `[[1,8,1],[1,4,32],[16,2,160]]` 3,448 (0.00265), projection batch
+  4 `[[1,32,1],[2,2,32],[8,1,640]]` 13,318 (0.01024): the paper's Tenon
+  column; the fixed-form baselines re-run (minimum over the fixed-form
+  candidates, DCC's rule) 36,504 / 224,170 / 3,448 / 13,398 cycles, the
+  paper's Fixed column. The DCC generator's trace of each selected program
+  has the ordering and address mapping the program declares (16 channels, 64
+  units addressed; matrix columns and vector positions as the serial
+  extents). Score rows, 248 shapes per batch: every selection equals
+  `paper_selection.csv`; mean 0.00193 / 0.00678 ms; speedup over the fixed
+  tiling 1.00x / 1.13x as the frozen figure plots (mean of per-shape
+  ratios); against DCC's archived per-shape times 123 wins, 316 ties, 61
+  losses over the 500 instances with a median loss of 7.07% (the frozen
+  text's 123 / 316 / 61 and 7.1%). The superseded table
+  `tables/eval-attacc-kernels.tex` (not input by the frozen paper) quotes
+  0.0019 / 0.00677 ms and "Tenon <= DCC on every shape"; the frozen figure
+  and text are what the measurements reproduce.
 
 ## 6. What stays external, and why
 
 | Item | Why | Script |
 |---|---|---|
-| Ramulator2-AttAcc timing | simulator binary outside the package; the trace emitter is DCC code (no license) | `run_ramulator.py` (`kind: "simulator-timing-only"`) |
+| Ramulator2-AttAcc timing | simulator binary outside the package (a native build recipe ships: `build_ramulator_attacc.sh`); the trace emitter is DCC code (no license) | `run_ramulator.py` (`kind: "simulator-timing-only"`; selection labels `shared-pipeline` / `forced-tiling` / `fixed-form-baseline`; the trace checked against the selected program by `trace_check.py`) |
 | GPT-13B decode composition | DCC `inference/system.py` + analytical A100 roofline (no license) | `compose_e2e.py` (`kind: "analytical-composition"`) |
 | Reference-best search, replay predictor, accuracy, DCC baselines | evaluation of the cost model against simulator sweeps; the paper excludes the replay from selection | archived under `<repo>/tenon-artifacts/attacc-llm-e2e/` |
 
@@ -167,3 +189,8 @@ batch-4 difference is unexplained (open).
    `attacc_base_placement`).
 6. DCC license (`attacc-boundary.md` open question 1) still applies to the
    external scripts.
+7. `trace_check.py` re-derives the generator's emission order for GEMV and
+   attention traces of one or two paired row blocks per pass as the
+   generator composes them; the paper's 500 instances all fit one row
+   block, so the multi-block attention branch is exercised only by the
+   synthetic test (no DCC-generated multi-block trace is in the evidence).

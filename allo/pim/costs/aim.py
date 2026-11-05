@@ -20,16 +20,18 @@ conversion is involved.  Device terms come from ``GDDR6_AiM_timing`` and
   exact ``AimContraction`` record codegen emits (``build_contraction`` with the
   placement's knob values; absent knobs resolve as in codegen), serially per
   channel group: one cost route for enumerated and ``layout=`` placements.
-  Calibration (``tests/pim/test_aim_program.py``, GEMV 256x256 mapping [32],
-  simulator run): ABK 223 estimated vs 222 simulated; SBK 1528 vs 1527.
-  Validity domain: single-issue command streams of the installed simulator;
-  every command is serialized (no overlap of a row activation with the
-  previous group's register traffic), refresh and inter-channel bus
-  contention are not modelled.  Observed error band beyond the calibration
-  probe: on the attention token-partition workloads
-  (``tests/pim/test_aim_token_partition.py``, QK + SV, 1-32 heads, 128-4096
-  tokens) estimates exceed simulated cycles by 1.25x to 1.59x; the estimate is
-  a ranking model there, not a cycle prediction.
+  Every command class is charged as measured on controlled single-factor
+  command streams of the installed simulator (release round 50, see the
+  constants below): calibration probe (``tests/pim/test_aim_cost_routes.py``,
+  GEMV 256x256 mapping [32]): ABK 223 estimated vs 222 simulated; SBK 1513 vs
+  1527.  Validity domain: single-issue command streams of the installed
+  simulator, one contraction at a time; refresh and inter-channel bus
+  contention are not modelled.  Observed error band beyond the probe
+  (held-out sweep of every budgeted candidate of the attention kernels on
+  ten programs, 2,520 candidates): mean 0.8%, largest 6.9% on single-bank
+  expansions that follow another kernel (see the contextual residual below);
+  the estimate is a cycle prediction within that band and a ranking model
+  beyond it.
 * Host link transfers (scatter/gather/broadcast) are priced per 256-bit burst
   of the *moved slice* (``host_slice`` metric when the execution graph carries
   it, the whole buffer otherwise); a transfer to a buffer declared resident
@@ -105,9 +107,13 @@ CMD_RD_REG = 3
 # simulated).  Measured per-class errors are at most one cycle per MAC line.
 # What the profile cannot see is the context of the previous kernel in the
 # same program: a contraction that follows another's register read pays no
-# entry TMOD, but its first activation then usually replaces that kernel's
-# open row (N_RP = N_MODCH); both are constants across the candidates of one
-# kernel and never reorder them.
+# entry TMOD, but its first activations then replace that kernel's open rows
+# (N_RP per bank opened, N_RP = N_MODCH).  For all-bank lines that is one
+# precharge per candidate and does not reorder the candidates of a kernel;
+# a single-bank expansion opens up to 16 banks and pays up to 16 x N_RP
+# more than priced, so the model can misorder single-bank against all-bank
+# candidates whose simulated spans lie within that margin (ISSUES M-19,
+# residual; measured 7% low on such candidates in the held-out sweep).
 FIRST_ROW_ACTIVATE_CYCLES = N_RCD_RD_MAC
 BATCH_MAPPING_ROW_ACTIVATE_CYCLES = N_RTP + N_RP + N_RCD_RD_MAC
 GROUP_ROW_SWITCH_CYCLES = N_RP + N_RCD_RD_MAC

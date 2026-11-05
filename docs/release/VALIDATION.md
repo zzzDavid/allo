@@ -1122,3 +1122,23 @@ pairs in the simulator's order; the previous charges beside):
 Not evidence of comparability: the row stays DIAGNOSTIC (declared host
 compute price; the recalibrated selections await the reviewer); the paper's
 seven of nine is on the paper's own boundary.
+
+## Round 51 (2026-11-05): the AttAcc kernel-tiling figure through the shared pipeline (required G10 rows), scope column, documentation defects
+
+Working tree on top of `0cc8187`; evidence under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r51/`.
+
+| Check | Result |
+|---|---|
+| Native Ramulator2-AttAcc (`benchmarks/attacc/scripts/build_ramulator_attacc.sh`, sources `DCC/src/src/Ramulator2/AttAcc` (MIT), conda gcc 12; `attacc-native/build.log`) | builds against glibc 2.31 (Docker's data root is full on this host); binary sha256 `01e857a7...`; the qkv batch-1 selected program simulates to 11,454 cycles, equal to the archived container run and the paper's 0.00881 ms |
+| `tests/pim/test_attacc_trace_check.py` (9 passed, 1 skipped) and `tests/pim/test_attacc_virtual.py` (49 passed, 2 skipped) | the checker's GEMV and attention sequences re-derive the generator's emission order from the counts record; a reordered trace with equal totals fails, a trace with every MAC on one channel fails the mapping check, a partial barrier group is an error; DCC's own generator traces for the qkv batch-1 selection and three attention shapes (the worst-loss 8 x 128 x 480, 32 x 128 x 4096, the shortest 8 x 128 x 144) match ordering and mapping; the two-row-block attention branch is exercised synthetically only (no paper instance needs two blocks) |
+| QKV and projection rows (`r51/attacc_{qkv,proj}_b{1,4}.json` + `.artifacts`) | shared-pipeline selections `[[1,8,1],[8,8,80],[2,1,192]]` 11,454 cycles = 0.00881 ms, `[[1,16,2],[16,4,80],[1,1,384]]` 43,750 = 0.03364, `[[1,8,1],[1,4,32],[16,2,160]]` 3,448 = 0.00265, `[[1,32,1],[2,2,32],[8,1,640]]` 13,318 = 0.01024 (the paper's Tenon values); fixed-form baselines re-run (minimum over 2 / 1 / 2 / 1 fixed-form candidates) 36,504 / 224,170 / 3,448 / 13,398 cycles = 0.02807 / 0.17239 / 0.00265 / 0.01030 ms (the paper's Fixed values); 3,043 / 4,478 / 1,391 / 2,273 candidates ranked, the tied qkv batch-4 and projection batch-1 minima resolved to the paper tiling by the tie-break rule; every trace: 16 channels and 64 units addressed, matrix columns and vector positions as declared |
+| Score rows, 248 shapes each (`r51/attacc_score_b{1,4}.json` + `.artifacts`, `r51/attacc_kernel_summary.json`) | no failure; every selection equals `paper_selection.csv` and the archived Tenon manifest's per-shape time on all 496 shapes; batch 1 mean 0.00193 ms, speedup over the fixed tiling 1.00x (mean of per-shape ratios; the figure's 1.00x; DCC's archived 1.01x), 48 wins / 144 ties / 56 losses against DCC's archived per-shape times; batch 4 mean 0.00678 ms, 1.13x (figure 1.13x; DCC 1.12x), 73 / 170 / 5; with the four GEMV rows the 500 instances give 123 wins, 316 ties, 61 losses, median loss 7.07% (text: 123 / 316 / 61, 7.1%); 2 batch-1 shapes slower than the fixed tiling by at most 2.9% (the paper's text already reports losses); the estimate is 0.69-0.95 of the simulated cycles (a ranking model, as documented) |
+| `r51/attacc_trace_recheck.json` | all 506 retained traces (10 GEMV incl. fixed-form candidates, 496 attention) re-checked with the final checker: totals, ordering and mapping match the program recorded beside each trace; 8,690,688 commands |
+| Not re-run | the fixed and DCC baselines of the 496 score shapes are DCC's archived per-shape simulations (`temp/simulation/@attacc-attn_inference.csv` in the DCC checkout); DCC's own selector was not re-run; the reference-best sweep (398/500) is an optional study |
+| `docs/release/paper_reproduction/inventory.csv` | `release_scope` column added to all 83 rows (55 `required_key_result`: 36 REPRODUCED + 6 this round = 42, 7 OPEN, 6 UNVERIFIED; 28 `optional_supporting`), CRLF preserved |
+| Suites at this revision | `tests/pim/test_attacc_virtual.py`, `test_attacc_trace_check.py`, `test_aim_profile_calibration.py`, `test_aim_cost_routes.py`: 64 passed, 2 skipped (`r51/pytest_final.log`); no production `allo/` behaviour changed this round (the AiM cost module's docstring and comments only) |
+
+Not evidence of: the six decode configurations (analytical composition,
+`compose_e2e.py`, next), the reference-best study, or any numerical
+execution (the simulator is timing-only).

@@ -219,22 +219,57 @@ no data path).
   authors' host (Ubuntu 20.04, GLIBC 2.31) cannot run it natively. The study
   ran it read-only inside the `aim-simulator-build` image (Ubuntu 24.04,
   GLIBC 2.39, see the AiM section) with the DCC checkout bind-mounted
-  read-only. `run_ramulator.py` does the same when
-  `ATTACC_RAMULATOR_IMAGE` is set:
+  read-only; `run_ramulator.py` does the same when `ATTACC_RAMULATOR_IMAGE`
+  is set.
+- **Tenon-owned native build (round 51, 2026-11-05):** when no container
+  is available (Docker's data root was full on the authors' host), build
+  the binary from the MIT sources of the DCC tree with
+  `benchmarks/attacc/scripts/build_ramulator_attacc.sh <DCC>/src/src/Ramulator2/AttAcc <out> [CXX [CC]]`
+  (CMake >= 3.14, a C++20 compiler; the authors used the conda gcc 12
+  toolchain of the native AiM build). It copies the sources once (the
+  checkout may be read-only), configures with the vendored `ext/` dependencies
+  and no network, and prints the `ATTACC_RAMULATOR` / `ATTACC_RAMULATOR_LIBDIR`
+  exports. The native binary (sha256 `01e857a7...`) reproduces the archived
+  Docker run exactly: 11,454 cycles for the qkv batch-1 selected program.
 
   ```bash
   export ATTACC_DCC_ROOT=<DCC checkout>/src/src      # attacc_trace_gen/, Ramulator2/
-  export ATTACC_RAMULATOR_IMAGE=aim-simulator-build  # omit to run natively
+  export ATTACC_RAMULATOR=<out>/build/ramulator2     # or the DCC-built binary
+  export ATTACC_RAMULATOR_LIBDIR=<out>/src           # libramulator.so
+  # export ATTACC_RAMULATOR_IMAGE=aim-simulator-build  # container route instead
+  python -m benchmarks.attacc.scripts.run_ramulator --row qkv_b1 --fixed-baseline \
+      --artifacts out.artifacts --out out.json
   python -m benchmarks.attacc.scripts.run_ramulator --gemv 8 5120 384
   python -m benchmarks.attacc.scripts.run_ramulator --attention 8 128 480
   ```
 
-  The script writes the trace, the YAML and `temp/log/` into a private
-  temporary directory, mounts only that directory writable, and checks the
-  trace's per-opcode counts against the compiled `AttAccCounts`. Smoke run
-  2026-11-02: 11,454 cycles (qkv batch 1, selected tiling) and 953 cycles
-  (attention 8 x 128 x 480, the paper's worst loss), equal to the archived
-  values.
+  The script compiles the kernel through `allo.compile` and keeps the
+  artifact; records the selection's provenance (compiler revision, the
+  ranking's candidates, chosen position, ties and tie-break, the matched
+  operations, the program manifest and estimate); writes the trace with
+  DCC's generator into a private temporary directory; checks the trace
+  against the selected program with `benchmarks/attacc/trace_check.py`
+  (opcode totals, the phase ordering command by command, and the decoded
+  address mapping: channels, banks, matrix columns per channel, vector
+  positions; a mismatch fails the run) for both the GEMV and the attention
+  traces (each re-derived from the program's counts record in the
+  generator's emission order, validated against DCC's own generator output
+  in `tests/pim/test_attacc_trace_check.py`); runs the simulator; and
+  records the binary, library, trace
+  and configuration digests, the command and the raw output, retaining
+  trace, configuration and output per run under `--artifacts`. Labels:
+  `shared-pipeline` (selection evidence), `forced-tiling` (`--tiling`, a
+  controlled reference), `fixed-form-baseline` (`--fixed-baseline`: the
+  paper's fixed AttAcc tiling as DCC's `predictor.py` defines it, the
+  minimum simulated time over the fixed-form candidates, each simulated and
+  recorded). Milliseconds use tCK 0.769 ns (`HBM3_5.2Gbps`), the paper's
+  unit. Round 51 results (`tenon-release-evidence/r51/attacc_*.json`): qkv
+  batch 1 / 4 and projection batch 1 / 4 selected programs 0.00881 /
+  0.03364 / 0.00265 / 0.01024 ms, the paper's values; fixed baselines
+  0.02807 / 0.17239 / 0.00265 / 0.01030 ms, the paper's; score batch 1 / 4
+  over 248 shapes each: 1.00x / 1.13x over the fixed tiling (the figure's),
+  123 wins / 316 ties / 61 losses against DCC's archived per-shape times on
+  the 500 instances (the text's).
 - **Licenses:** Ramulator2 (`Ramulator2/AttAcc/LICENSE`, MIT, SAFARI 2023)
   and the AttAcc simulator (MIT) permit redistribution with the notice.
   **DCC has no license file** (GitHub reports `license: null`), so DCC's
@@ -248,9 +283,8 @@ no data path).
   (analytical A100 roofline); `kind: "analytical-composition"`. Same DCC
   checkout, same license caveat.
 - **What a user must do:** clone DCC, build `ramulator2-AttAcc` with its
-  `build.sh` (a container with GLIBC >= 2.34 if the host is older), and set
-  the variables above. A Tenon-owned rebuild recipe from the MIT sources is
-  open.
+  `build.sh` or with `build_ramulator_attacc.sh` (above), and set the
+  variables above.
 
 ## UPMEM: uPIMulator and the UPMEM DPU SDK
 
