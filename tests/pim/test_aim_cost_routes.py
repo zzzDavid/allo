@@ -66,7 +66,12 @@ def test_layout_and_knob_paths_price_one_route():
     Calibration probe (aim_simulator 0f28a07, measured 2026-11-02): the ABK
     trace (WR_GB, WR_BIAS, MAC_ABK 16 columns, RD_MAC) simulates 222 cycles
     and the SBK expansion (16 MAC_SBK) 1527.  Before the repair the routes
-    priced them 255 (knobs) / 156 (layout=) and 720 / 765.
+    priced them 255 (knobs) / 156 (layout=) and 720 / 765.  The profile
+    recalibrated per command class (release round 50, M-19) prices them 223
+    and 1513: the entry mode change, one burst per WR_GB column, the
+    activation and column pitch of each MAC line, the read latency of RD_MAC;
+    the 14 cycles under on the SBK expansion are the one extra cycle each
+    consecutive fresh MAC_SBK takes on a new bank.
     """
     target = build_aim_target()
     ranked = _virtual(target)
@@ -78,7 +83,7 @@ def test_layout_and_knob_paths_price_one_route():
         if "batch_mapping=flattened" in mode and "reuse_group=1+" in mode:
             knob_cost.setdefault(scope, cycles)
     assert _virtual(target, abk).run_backend().cycles == knob_cost["abk"] == 223
-    assert _virtual(target, sbk).run_backend().cycles == knob_cost["sbk"] == 1528
+    assert _virtual(target, sbk).run_backend().cycles == knob_cost["sbk"] == 1513
 
 
 def test_cost_reads_geometry_from_target():

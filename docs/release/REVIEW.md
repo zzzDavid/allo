@@ -1590,6 +1590,41 @@ DIAGNOSTIC: the priced host compute is a declared model and the profile's
 charges await recalibration from command classes; 6 of 9 minima does not
 establish the paper's 7 of 9. G9/G10 and the recorded blockers remain open.
 
+## Round 50 (2026-11-04): the frozen study's control restored, the host protocol on the attention's inputs, the contraction profile recalibrated (M-19)
+
+The reviewer's round 50 findings, all accepted: (1) the round 49 control
+(current CENT policy, 16-slot reuse, heads up to eight) was not the frozen
+study's `cent-repaired` control (padded heads, reuse 1, eight channels,
+reserved row pitch, normalized against CENT's events); (2) the host
+protocol was timed on masked random words (scores up to 3.4e38, 127 of
+128 probabilities zero) with a duplicated BF16 rounding and without the
+historical warm-up/batching; (3) the calibration driver took the empty
+prefix as zero while EOC alone takes 2 cycles, and the profile's charges
+needed a focused production repair validated on controlled variations and
+held-out programs before any confirmation outcome; (4) stale docstring and
+`not_comparable_because` text.
+
+Delivered: the historical control restored through the shared pipeline
+(`cent_repaired_program`, `cent_repaired_layouts`, `CENT_REPAIRED_POLICY`,
+`CENT_REPAIRED_PROVENANCE`, command inventories per kernel; the round 49
+control kept as the `cent-policy` ablation); the host protocol measured on
+the functional computation's BF16 scores, encoded once, timed whole with
+the historical methodology and broken down beside it; the calibration
+baseline measured; the contraction profile recalibrated per command class
+from controlled single-factor command streams (`contraction_profile_charges`,
+the profile's activation classes, WR_GB columns, mode switches and
+register runs), validated on the standalone probe, on held-out programs
+(every budgeted candidate of each kernel simulated to its boundary) and
+only then on the nine workloads, which the normal selection now minimizes
+on all nine (every gap 0; estimates within 0.3% of the measured totals);
+docstrings and the driver's statement updated.  Not done on purpose: no
+benchmark selector, no tie rule, no fitting to archived winners; the paper
+frozen; the row stays DIAGNOSTIC (declared host compute price; the
+recalibrated selections await the reviewer); M-15 and M-19 remain open
+until reviewed; the deferred items unchanged.  Per the user's scope note,
+this closes the bounded token-partition/cost checkpoint; the next
+increment moves to the required backend rows and the AttAcc figures.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1629,7 +1664,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 49 (2026-11-04) at the candidate `586f575`+ (this
+Refreshed in round 50 (2026-11-04) at the candidate `2e7453e`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |
@@ -1638,7 +1673,7 @@ commit). Earlier judgments are kept in the round sections above.
 | G2 semantic preservation / explicit failure | **PARTIAL** | the rounds 8-11 repairs (C-19 to C-26) and the shared contract rounds (X-02 to X-14, X-17 to X-20) are implemented with regressions; the shared semantic checks run before every backend's selection; open: the deferred arithmetic findings (ISSUES), independent re-challenge of the whole domain on every runner |
 | G3 general mechanisms | **PARTIAL** | structural recognizers and template-derived legality on every backend; the AttAcc attention template is proven structurally (X-20); renamed and neighbouring programs compile to the same normalized decisions in the round 24-28 regressions; open: M-14, the constants inventory re-read against the current tree |
 | G4 search/layout/selected-program integrity | **PARTIAL** | complete assignments materialize under the real orchestration before acceptance (C-33b); every backend's realization is compared with its declaration (X-05 to X-16); transfer availability and physical addressing are checked (X-09 to X-11, X-17, X-18); open: the slice 5 forced-alternative traces through packing and launches on both hardware hosts |
-| G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1 in earlier rounds; the Samsung estimate includes each work item's share of the first matrix staging (partitioning the conductor's staging exactly, staging before the MAC, the same scope for the ordered program) and ranks the swizzled-rows placement first on both paper GEMVs, a held-out and a neighbouring shape, as the conductor measures (rounds 37-38, S-16 repaired); open: C-18, uniform movement weights, the perturbation traces at the current candidate on both hardware hosts |
+| G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1 in earlier rounds; the Samsung estimate includes each work item's share of the first matrix staging (partitioning the conductor's staging exactly, staging before the MAC, the same scope for the ordered program) and ranks the swizzled-rows placement first on both paper GEMVs, a held-out and a neighbouring shape, as the conductor measures (rounds 37-38, S-16 repaired); the AiM contraction profile recalibrated per command class from controlled simulator measurements and validated on held-out programs before the nine workloads (round 50, M-19 awaiting review); open: C-18, uniform movement weights, the perturbation traces at the current candidate on both hardware hosts |
 | G6 evidence beyond examples | **PARTIAL** | EVIDENCE.md plus the reviewer-driven probes of rounds 8-27 (renamings, operation changes, shape and slice neighbours, wrong declarations, reversed arithmetic); open: hardware-only confirmations, the probe list re-run at the candidate |
 | G7 install/interfaces/maintainability | **PARTIAL** | installed-artifact runs at `7bdb475`, `e60973f`, `9255d29`; architecture docs follow the pipeline (`design/shared-compilation-path.md`); open: a fresh install at the candidate, the Samsung patches (P-04), P-23 lint, the public-payload review |
 | G8 backend execution | **PARTIAL** | installed-artifact evidence on the simulators at `69773fc` (Samsung, AiM, UPMEM probes, no checkout module loaded) and on the APU v1 board and the Gemini-II card at `69773fc`/`28cc922` (round 30: the archived paired protocols with the baselines re-run, exact outputs, device locks, launch provenance on every route); `tests/perf` at `69773fc` (545 passed, the one failure an NFS-tmpdir artifact fixed in `d2e3fda`), `tests/pim` at `69773fc` 564 passed with 20 Docker-backed simulator tests failing on the host's full `/var` (containerd ENOSPC, an administrator matter; the same rows passed from the installed wheel earlier in the round); open: the 20 simulator tests re-run when the host has space, the suites and installed-wheel checks at the final round 30 candidate, the ledag scratch fix (X-24) exercised only through its unit test and the sessions 3 and later |

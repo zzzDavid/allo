@@ -69,28 +69,50 @@ N_RCD_WR = 28
 N_RCD_WRCP = 48
 N_RP = 32
 N_RAS = 54
+N_RTP = 12
 N_CWL = 6
 N_CCD = 2
 N_MODCH = 32
 
-# Per-command execution latency from ``m_command_meta``.
+# Per-command execution latency from ``m_command_latencies`` (GDDR6.cpp:
+# WRGB = nCWLGB + nBL, RDMAC16 = nCLREG + nBL, MAC16 = 1).
 CMD_MAC = 1
 CMD_EWMUL = 1
 CMD_AF = 1
 CMD_COPY = 1
 CMD_WR_GB = 3
-CMD_RD_REG = 2
+CMD_RD_REG = 3
 
-# Contraction pricing (spec 002 A7).  The simulator keeps rows open: a MAC
-# line whose banks have no open row pays the MAC-row activation only; one that
-# replaces an open row also pays the precharge.  The switch term is what
-# separates batch mappings that issue the same MAC count.  Calibrated against
-# the simulator on the GEMV probe (see module docstring): every MAC_SBK of an
-# SBK expansion targets a fresh bank and pays N_RCD_RD_MAC.
+# Contraction pricing (spec 002 A7), per command class of the lowered
+# stream, each class measured on the timing simulator with controlled
+# single-factor command streams (release round 50,
+# ``tenon-release-evidence/r50/controlled_variations.json``: WR_GB op size 1
+# to 64, WR_BIAS runs 1 to 16, MAC columns 1 to 64 after a fresh activation,
+# 2 to 9 consecutive MACs at new rows and at the same row, RD_MAC runs 1 to
+# 32, 1 to 8 channels, 1 to 8 reuse groups).  The simulator keeps rows open:
+# a MAC line whose banks have no open row pays the MAC-row activation and
+# then one column pitch per further column; a line that replaces an open row
+# also pays the precharge, after tRTP when the previous command was a MAC
+# (``BATCH_MAPPING_ROW_ACTIVATE_CYCLES``) and without it when register
+# commands came between (``GROUP_ROW_SWITCH_CYCLES``, the columns then all
+# pitch); a line whose row is open pays only the column pitch.  Register
+# commands cost their column pitch (WR_GB: one burst per op-size column after
+# a read's turnaround; WR_BIAS: one burst; RD_MAC: its read latency, the
+# first of a run one cycle more), and the controller's mode change (TMOD,
+# N_MODCH) is paid once per transition between register and array commands,
+# not per command, counted from the controller's initial array mode (the
+# standalone trace of the calibration probe below: 223 priced against 222
+# simulated).  Measured per-class errors are at most one cycle per MAC line.
+# What the profile cannot see is the context of the previous kernel in the
+# same program: a contraction that follows another's register read pays no
+# entry TMOD, but its first activation then usually replaces that kernel's
+# open row (N_RP = N_MODCH); both are constants across the candidates of one
+# kernel and never reorder them.
 FIRST_ROW_ACTIVATE_CYCLES = N_RCD_RD_MAC
-BATCH_MAPPING_ROW_ACTIVATE_CYCLES = N_RP + N_RCD_RD_MAC
-# Each WR_BIAS run opens a new accumulator reuse group (a mode change).
-REUSE_GROUP_SWITCH_CYCLES = N_MODCH
+BATCH_MAPPING_ROW_ACTIVATE_CYCLES = N_RTP + N_RP + N_RCD_RD_MAC
+GROUP_ROW_SWITCH_CYCLES = N_RP + N_RCD_RD_MAC
+MODE_SWITCH_CYCLES = N_MODCH
+REGISTER_READ_RUN_START_CYCLES = 1
 
 # Host DRAM traffic (spec 002 A2): the first burst of a transfer opens the
 # row; each further 256-bit burst issues after nCCD.
@@ -172,22 +194,31 @@ def _contraction_profile_cycles(candidate, geometry):
         raise InfeasibleSchedule(
             f"AiM contraction is not realizable: {error}"
         ) from error
+    return sum(contraction_profile_charges(profile).values())
+
+
+def contraction_profile_charges(profile):
+    """The profile's charges by command class (serial channel cycles)."""
     counts = profile["counts"]
-    mac_lines = profile["mac_lines"]
-    mac_cycles = (profile["mac_columns"] - mac_lines) * N_CCD + mac_lines * CMD_MAC
-    register_io = N_MODCH + CMD_WR_GB
-    register_read = N_MODCH + CMD_RD_REG
-    return (
-        mac_cycles
-        + profile["first_activations"] * FIRST_ROW_ACTIVATE_CYCLES
-        + profile["row_switches"] * BATCH_MAPPING_ROW_ACTIVATE_CYCLES
-        + profile["reuse_groups"] * REUSE_GROUP_SWITCH_CYCLES
-        + counts.get("WR_GB", 0) * register_io
-        + counts.get("WR_BIAS", 0) * register_io
-        + counts.get("RD_MAC", 0) * register_read
-        + counts.get("AF", 0) * (N_RCD_RD_AF + CMD_AF)
-        + counts.get("RD_AF", 0) * register_read
-    )
+    first = profile["first_activations"]
+    run_switches = profile["run_switches"]
+    group_switches = profile["group_switches"]
+    register_reads = counts.get("RD_MAC", 0) + counts.get("RD_AF", 0)
+    return {
+        "mac_continuing": profile["continuing_columns"] * N_CCD,
+        "mac_first_activations": first * FIRST_ROW_ACTIVATE_CYCLES
+        + (profile["first_columns"] - first) * N_CCD,
+        "mac_run_switches": run_switches * BATCH_MAPPING_ROW_ACTIVATE_CYCLES
+        + (profile["run_switch_columns"] - run_switches) * N_CCD,
+        "mac_group_switches": group_switches * GROUP_ROW_SWITCH_CYCLES
+        + profile["group_switch_columns"] * N_CCD,
+        "mode_switches": profile["mode_switches"] * MODE_SWITCH_CYCLES,
+        "wr_gb": counts.get("WR_GB", 0) * CMD_WR_GB + profile["wr_gb_columns"] * N_CCD,
+        "wr_bias": counts.get("WR_BIAS", 0) * N_CCD,
+        "register_reads": register_reads * CMD_RD_REG
+        + profile["register_read_runs"] * REGISTER_READ_RUN_START_CYCLES,
+        "af": counts.get("AF", 0) * (N_RCD_RD_AF + CMD_AF),
+    }
 
 
 def host_reduction_cycles(record, geometry):

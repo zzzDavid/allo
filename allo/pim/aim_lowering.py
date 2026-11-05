@@ -2333,6 +2333,12 @@ def lower_contraction(operation, geometry) -> list[str]:
     return lowerer.commands
 
 
+# ISRs the AiM controller serves in its register read/write mode (the
+# simulator's ``require_reg_RW_mod``: WR_GB, WR_BIAS, RD_MAC, RD_AF); a TMOD
+# precedes the first command after a mode change.
+REGISTER_MODE_OPCODES = frozenset({"WR_GB", "WR_BIAS", "RD_MAC", "RD_AF"})
+
+
 def aim_contraction_profile(operation, geometry, sbk_banks=None) -> dict:
     """Opcode counts, MAC column total, reuse groups and row activations.
 
@@ -2341,9 +2347,21 @@ def aim_contraction_profile(operation, geometry, sbk_banks=None) -> dict:
     ``AimCtx.emit_program`` expands it.  Each MAC line opens its target
     ``(mask, bank set, row)``: ``first_activations`` counts lines that open a
     row in banks with no open row, ``row_switches`` lines that replace another
-    open row of the same banks in some masked channel (precharge first).
-    ``row_activations`` is their sum.  ``reuse_groups`` counts maximal WR_BIAS
-    runs.  Open rows are tracked per (mask bit, bank).
+    open row of the same banks in some masked channel (precharge first), split
+    into ``run_switches`` (the previous MAC line touched this line's banks and
+    nothing came between: the precharge waits for tRTP, a bank-level
+    constraint) and ``group_switches`` (register commands came between, or
+    the previous MAC line was on other banks: tRTP has elapsed).  ``row_activations`` is their sum; the ``*_columns`` entries
+    hold the MAC columns of each class and ``continuing_columns`` those of
+    lines whose row is already open.  ``reuse_groups`` counts maximal WR_BIAS
+    runs; ``mode_switches`` the transitions between register-mode commands
+    (WR_GB, WR_BIAS, RD_MAC, RD_AF: the controller issues a TMOD before the
+    first command of either mode) and array commands, counted from the
+    controller's initial array mode (a contraction's first WR_GB pays one
+    when the contraction runs standalone or first; one that follows another
+    contraction's register read does not, a contextual N_MODCH);
+    ``register_read_runs`` the maximal RD_MAC/RD_AF runs; ``wr_gb_columns``
+    the summed WR_GB op sizes.  Open rows are tracked per (mask bit, bank).
     """
     banks = None if sbk_banks is None else tuple(int(bank) for bank in sbk_banks)
     key = (operation, geometry, banks)
@@ -2354,18 +2372,38 @@ def aim_contraction_profile(operation, geometry, sbk_banks=None) -> dict:
     mac_columns = 0
     mac_lines = 0
     first_activations = 0
-    row_switches = 0
+    first_columns = 0
+    run_switches = 0
+    run_switch_columns = 0
+    group_switches = 0
+    group_switch_columns = 0
+    continuing_columns = 0
     reuse_groups = 0
+    mode_switches = 0
+    register_read_runs = 0
+    wr_gb_columns = 0
     open_rows: dict = {}
     previous_opcode = None
+    previous_mode = "array"
+    previous_mac_banks: frozenset = frozenset()
     for line in lower_contraction(operation, geometry):
         fields = line.split(" ")
         opcode = fields[1]
+        mode = "register" if opcode in REGISTER_MODE_OPCODES else "array"
+        if mode != previous_mode:
+            mode_switches += 1
+        previous_mode = mode
         if opcode == "WR_BIAS" and previous_opcode != "WR_BIAS":
             reuse_groups += 1
+        if opcode in ("RD_MAC", "RD_AF") and previous_opcode not in ("RD_MAC", "RD_AF"):
+            register_read_runs += 1
+        if previous_opcode not in ("MAC_ABK", "MAC_SBK"):
+            previous_mac_banks = frozenset()
         previous_opcode = opcode
         if opcode != "MAC_ABK":
             counts[opcode] = counts.get(opcode, 0) + 1
+            if opcode == "WR_GB":
+                wr_gb_columns += int(fields[2])
             continue
         op_size, mask, row = (int(value) for value in fields[2:5])
         targets = ("all",) if banks is None else banks
@@ -2377,19 +2415,37 @@ def aim_contraction_profile(operation, geometry, sbk_banks=None) -> dict:
             mac_columns += op_size
             opened = {open_rows.get((bit, bank)) for bit in channel_bits}
             if opened - {None, row}:
-                row_switches += 1
+                if bank in previous_mac_banks or "all" in previous_mac_banks:
+                    run_switches += 1
+                    run_switch_columns += op_size
+                else:
+                    group_switches += 1
+                    group_switch_columns += op_size
             elif None in opened:
                 first_activations += 1
+                first_columns += op_size
+            else:
+                continuing_columns += op_size
             for bit in channel_bits:
                 open_rows[(bit, bank)] = row
+            previous_mac_banks = frozenset({bank})
     profile = {
         "counts": counts,
         "mac_lines": mac_lines,
         "mac_columns": mac_columns,
         "first_activations": first_activations,
-        "row_switches": row_switches,
-        "row_activations": first_activations + row_switches,
+        "first_columns": first_columns,
+        "row_switches": run_switches + group_switches,
+        "run_switches": run_switches,
+        "run_switch_columns": run_switch_columns,
+        "group_switches": group_switches,
+        "group_switch_columns": group_switch_columns,
+        "continuing_columns": continuing_columns,
+        "row_activations": first_activations + run_switches + group_switches,
         "reuse_groups": reuse_groups,
+        "mode_switches": mode_switches,
+        "register_read_runs": register_read_runs,
+        "wr_gb_columns": wr_gb_columns,
     }
     _PROFILE_CACHE.entries[key] = profile
     return profile

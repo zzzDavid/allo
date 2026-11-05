@@ -35,18 +35,7 @@ from allo import spmw_aim
 from allo.pim import aim_lowering
 from allo.pim.aim_lowering import _target_geometry
 from allo.pim.costs import aim as aim_costs
-from allo.pim.costs.aim import (
-    BATCH_MAPPING_ROW_ACTIVATE_CYCLES,
-    CMD_AF,
-    CMD_MAC,
-    CMD_RD_REG,
-    CMD_WR_GB,
-    FIRST_ROW_ACTIVATE_CYCLES,
-    N_CCD,
-    N_MODCH,
-    N_RCD_RD_AF,
-    REUSE_GROUP_SWITCH_CYCLES,
-)
+from allo.pim.costs.aim import contraction_profile_charges
 from allo.pim.targets import build_aim_target
 
 from .token_partition import (
@@ -86,40 +75,30 @@ def _simulate(target, lines):
 def increments(target, commands):
     """Incremental simulator cycles of every command of ``commands`` (which
     must end with ``AiM EOC``): the k-th prefix's cycles minus the
-    (k-1)-th's.  Returns the list of per-command records and the executor."""
+    (k-1)-th's, the empty prefix (``EOC`` alone) measured explicitly as the
+    baseline the first command's increment is taken from.  Prefix deltas are
+    contextual completion-time contributions under the commands before
+    them, not opcode latencies.  Returns the records, the baseline and the
+    executor."""
     body = [line for line in commands if line.strip() != "AiM EOC"]
     records = []
-    previous = 0
-    executor = None
+    baseline, executor = _simulate(target, ["AiM EOC"])
+    previous = baseline
     for k in range(1, len(body) + 1):
         cycles, executor = _simulate(target, body[:k] + ["AiM EOC"])
         records.append({"index": k - 1, "command": body[k - 1], "prefix_cycles": cycles, "increment": cycles - previous})
         previous = cycles
-    return records, executor
+    return records, baseline, executor
 
 
 def model_charges(candidate_extra, geometry):
     """The cost model's charges for one contraction candidate by class, from
-    the profile it prices (counts, lines, columns, activations, switches)."""
+    the profile it prices (``allo.pim.costs.aim.contraction_profile_charges``)."""
     operation = aim_costs._contraction_record(candidate_extra)
     profile = aim_lowering.aim_contraction_profile(operation, geometry, aim_costs._sbk_banks(candidate_extra, geometry))
-    counts = profile["counts"]
-    register_io = N_MODCH + CMD_WR_GB
-    register_read = N_MODCH + CMD_RD_REG
-    mac_lines = profile["mac_lines"]
     return {
-        "profile": {k: v for k, v in profile.items() if k != "counts"} | {"counts": dict(counts)},
-        "charges": {
-            "WR_GB": counts.get("WR_GB", 0) * register_io,
-            "WR_BIAS": counts.get("WR_BIAS", 0) * register_io,
-            "RD_MAC": counts.get("RD_MAC", 0) * register_read,
-            "AF": counts.get("AF", 0) * (N_RCD_RD_AF + CMD_AF),
-            "RD_AF": counts.get("RD_AF", 0) * register_read,
-            "MAC_columns": (profile["mac_columns"] - mac_lines) * N_CCD + mac_lines * CMD_MAC,
-            "MAC_first_activations": profile["first_activations"] * FIRST_ROW_ACTIVATE_CYCLES,
-            "MAC_row_switches": profile["row_switches"] * BATCH_MAPPING_ROW_ACTIVATE_CYCLES,
-            "MAC_reuse_group_switches": profile["reuse_groups"] * REUSE_GROUP_SWITCH_CYCLES,
-        },
+        "profile": {k: v for k, v in profile.items() if k != "counts"} | {"counts": dict(counts := profile["counts"])},
+        "charges": contraction_profile_charges(profile),
         "total": aim_costs._contraction_profile_cycles(candidate_extra, geometry),
     }
 
@@ -128,7 +107,7 @@ def calibrate_plan(target, attention, program, variants, choice, label):
     built = compile_variant(attention, program, target, variants, choice, budget=BUDGET)
     manifest = built.compiled.layout_ctx.lowering_manifest
     commands = [str(c) for c in built.compiled.cmds]
-    records, executor = increments(target, commands)
+    records, baseline, executor = increments(target, commands)
     classes = _classify([r["command"] for r in records])
     by_class = {}
     for record, klass in zip(records, classes):
@@ -160,6 +139,7 @@ def calibrate_plan(target, attention, program, variants, choice, label):
         "partitions": partitions_of(choice[1]),
         "commands": len(commands),
         "simulated_cycles": total_cycles,
+        "eoc_baseline_cycles": baseline,
         "estimate_cycles": built.estimate().cycles if hasattr(built, "estimate") else None,
         "by_class": by_class,
         "kernels": kernels,

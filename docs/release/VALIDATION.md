@@ -1075,3 +1075,50 @@ Working tree on top of `586f575`; evidence under
 | Nine workloads + neighbour with the CENT-derived control and the protocol samples (`r49/token_partition_bridged.{json,log}`) | pass, no failed plan or control, every comparison complete: 6 of 9 simulated minima, largest gap 1.04% (the same device cells as rounds 42-43); 40 distinct plans (the CENT-derived control added), 29 split plans merge-checked, every functional pipeline within 9.6e-3; the CENT-derived control (QK row-packed over 8 channels, SV channel-batched over 1 / 8 / 8 channels, unsplit, reuse 16) is the normal selection's own plan on every 8- and 32-head workload (ratio 1.00) and slower than it on the 1-head ones (1.03x at 128, 1.32x at 512, 2.23x at 4096 tokens) and on the neighbour (1.05x); the measured host protocol (decode + scaled softmax + staging + merge) is 31 us (1x128) to 899 us (32x4096) per call on this host, composed with the modelled link terms into `total_cycles_measured_host_protocol` beside the priced total |
 | Command-level calibration (`benchmarks/cent_aim/command_calibration.py`; `r49/calibration_{1x4096,1x128,1x512}.{json,log}`) | per-command increments on the simulator against the profile's class charges: WR_BIAS 2 and RD_MAC 4-7 cycles per command simulated against 35 and 34 charged (QK at 1x4096: 64 + 129 against 1,120 + 1,088); WR_GB 51 (one 128-element vector) to 131 (a flattened 4096-token write) against a constant 35; a reuse group's first MAC_ABK 101-245 against 56; the row-packed QK's consecutive MAC columns 3,534 against 480 + 2,728; SV spans: 1x4096 P1 1,656 simulated against 1,372 modelled, P8 1,455 against 1,795, which inverts the order; 1x128 P2 against P4 951 against 915 (model 1,347 against 1,315, totals tied by the 32-cycle host reduction step); 1x512 P4 against P8 1,023 against 951 (model 1,411 against 1,347, totals tied likewise) |
 | Suites at this revision | `tests/perf` whole 580 passed (`r49/perf_all.log`); the AiM token-partition, budget, host-compute, cost-route, program, CENT-workload and golden suites with the native executor 96 passed (`r49/aim_quick.log`) |
+
+## Round 50 (2026-11-04/05): the frozen study's control restored, the host protocol on the attention's inputs, the contraction profile recalibrated (M-19)
+
+Working tree on top of `2e7453e`; evidence under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r50/`.
+
+| Check | Result |
+|---|---|
+| Controlled single-factor command streams on the simulator (`r50/controlled_variations.{py,json,log}`, `controlled_variations_sbk.{py,json,log}`; EOC-only baseline 2 cycles) | WR_GB op size 1..64: 2n in register mode, 2n + 3 after a read, +32 as the first command; WR_BIAS runs 1..16: 2 each; first MAC_ABK after WR_BIAS, 1..64 columns, fresh row: 87 + 2(c - 1) including the mode change; consecutive MAC_ABK at new rows (2..9 lines, c = 2 / 8 / 32): 100 + 2(c - 1) per line; at the open row: 2c; one MAC per extra reuse group at a new row: 104 (c = 8), at the open row 16; MAC_SBK lines rotating 16 banks at new rows: 89 / 91 / 103 (c = 1 / 2 / 8), on one bank: 100 / 102 / 114, 16 fresh banks: 58.9 / 60.9 / 72.9 per line (the mode change amortized); RD_MAC runs 1..32: 36 then 3 per extra read; the same group on 1 / 2 / 4 / 8 channels: 188 each; reuse groups 1 / 2 / 4 / 8: 188 / 362 / 710 / 1406 at new rows, 188 / 274 / 446 / 790 at the open row |
+| Recalibrated charges (`allo/pim/costs/aim.py::contraction_profile_charges`, `aim_lowering.aim_contraction_profile`) against the round 49 per-command increments (`r49/calibration_*.json`, kernel spans) | QK 1x128: 191 against 190 simulated (before: 207); SV 1x128 P2 / P4: 952 / 916 against 951 / 915 (before: 1347 / 1315); SV 1x512 P4 / P8: 1024 / 952 against 1023 / 951 (before: 1411 / 1347); QK 1x4096: 3880 against 3879 (before: 5539); SV 1x4096 P1 / P8: 1666 / 1456 against 1656 / 1455 (before: 1372 / 1795, the inverted pair) |
+| `tests/pim/test_aim_cost_routes.py` (6 passed) | the standalone GEMV probe: ABK 223 against 222 simulated (unchanged), SBK 1513 against 1527 (pin updated from 1528; the one extra cycle per consecutive fresh single-bank line) |
+| `tests/pim/test_aim_profile_calibration.py` (5 passed, new) | the constants are the simulator's timings (N_RTP 12, CMD_RD_REG 3 = nCLREG + nBL); the single-group QK's classes and charges (191); the four-way channel-batched SV's classes (one fresh, seven in-run switches, three mode changes; 916); the historical control's reuse-1 SV pays two mode changes and a register run per group and its row-packed QK walks the open row; splitting one group into eight changes the price by exactly the per-group structure (385 cycles), not N_MODCH per register command |
+| Held-out validation (`r50/heldout_validation.{py,json,log}`): every distinct budgeted candidate of each kernel, the other kernel at its default selection, compiled through the shared pipeline and simulated whole and to the QK boundary; the kernel's simulated span against the recalibrated charge and the previous charges recomputed from the same profile | 20 kernel sets (four neighbouring shapes 3x192x64, 5x320x64, 2x256x128, 4x256x64; the study's 1x128/512/4096; the golden 32x128/512/4096), 2,520 candidates: mean absolute error 0.76% (largest 6.9%, a single-bank candidate after a kernel that left rows open), 168,272 of 168,328 ordered pairs in the simulator's order (99.97%), the simulator's best candidate the model's best in all 20 sets; the previous charges: 19.3% mean error (largest 107%), 165,830 pairs (98.5%); of the 56 disagreeing pairs the largest simulated gap is 1.14% and 51 are single-bank against all-bank candidates; per kernel below |
+| `r50/probe_sbk_lines.{py,log}` | on the 3 x 192 x 64 SV after the QK, every MAC_SBK line of the single-bank channel-batched candidate costs 99 cycles, the 16 lines on banks the profile sees as fresh included (the QK left rows open in all 16 banks): the previous kernel's context costs a single-bank expansion one precharge per bank; recorded as a residual (design doc 3a, ISSUES M-19) |
+| Nine workloads + neighbour on the recalibrated profile, both controls, whole host protocol (`r50/token_partition_nine.{json,log}` + `.artifacts/`) | pass, no failed plan or control, every comparison complete: 9 of 9 simulated minima, every gap 0 (the same device cells as rounds 42-49), estimates within 0.1% to 0.3% of the measured totals; 49 distinct plans, 30 split plans merge-checked, every functional pipeline within 3.7e-3; cent-repaired / selected 2.22 / 3.85 / 7.27 (1 head), 1.45 / 1.46 / 1.46 (8 and 32 heads), 2.39 (2 x 256); cent-policy / selected 1.04 / 1.32 / 2.25 (1 head), 1.00 (8 and 32 heads), 1.05 (2 x 256); the whole host protocol 32 us (1 x 128) to 623 us (32 x 4096) per call, inputs' score standard deviation 10 to 12, every probability populated, largest at most 0.09 |
+| `tests/perf/test_token_partition_driver.py` (18 passed within the perf suite) | the historical control is the padded program's candidates with the producer's knobs for 1, 8 and 32 heads (physical 8 / 8 / 32), its SV inventory one WR_BIAS run per MAC, its provenance names the producer's lines; the two controls differ and are recorded under their own names; the whole-protocol median is the comparable sample with 31 samples after ten warm-ups, the inputs the attention's (finite, every probability populated), staging encodes once |
+| Suites at this revision | `tests/perf` whole 584 passed, 1 skipped (`r50/perf_all.log`); the AiM token-partition, budget, host-compute, cost-route, profile, program, CENT-workload and golden suites with the native executor 144 passed, 23 skipped (`r50/aim_quick.log`; the three UPMEM golden rows fail on Docker ENOSPC as before, deselected here) |
+
+Held-out validation per kernel set (model error mean / largest; ordered
+pairs in the simulator's order; the previous charges beside):
+
+| Program | Kernel | Candidates | Error now | Pairs now | Error before | Pairs before | Best |
+|---|---|---:|---:|---:|---:|---:|---|
+| 3 x 192 x 64 | QK | 156 | 0.7% / 1.4% | 12008 / 12008 | 24.7% / 76.2% | 11625 / 12008 | same |
+| 3 x 192 x 64 | SV | 108 | 1.7% / 6.9% | 5669 / 5670 | 16.8% / 43.0% | 5650 / 5670 | same |
+| 5 x 320 x 64 | QK | 168 | 0.6% / 1.2% | 13982 / 13992 | 27.1% / 106.8% | 13763 / 13992 | same |
+| 5 x 320 x 64 | SV | 120 | 1.0% / 5.4% | 7020 / 7020 | 15.0% / 42.6% | 6993 / 7020 | same |
+| 2 x 256 x 128 | QK | 132 | 0.7% / 1.3% | 8537 / 8552 | 19.9% / 48.6% | 8453 / 8552 | same |
+| 2 x 256 x 128 | SV | 84 | 1.0% / 3.1% | 3444 / 3444 | 16.9% / 45.5% | 3419 / 3444 | same |
+| 4 x 256 x 64 | QK | 156 | 0.7% / 1.3% | 11990 / 12000 | 27.2% / 92.9% | 11768 / 12000 | same |
+| 4 x 256 x 64 | SV | 108 | 1.5% / 6.7% | 5670 / 5670 | 16.1% / 43.5% | 5647 / 5670 | same |
+| 1 x 128 x 128 | QK | 144 | 0.8% / 1.6% | 9988 / 9988 | 14.2% / 45.1% | 9661 / 9988 | same |
+| 1 x 128 x 128 | SV | 48 | 1.6% / 3.3% | 1104 / 1104 | 17.8% / 44.8% | 1085 / 1104 | same |
+| 1 x 512 x 128 | QK | 144 | 0.8% / 1.6% | 10144 / 10144 | 17.0% / 49.1% | 10036 / 10144 | same |
+| 1 x 512 x 128 | SV | 48 | 1.3% / 3.1% | 1104 / 1104 | 14.4% / 41.6% | 1093 / 1104 | same |
+| 1 x 4096 x 128 | QK | 144 | 0.8% / 1.6% | 10164 / 10164 | 17.7% / 49.0% | 10068 / 10164 | same |
+| 1 x 4096 x 128 | SV | 96 | 0.6% / 3.0% | 4440 / 4444 | 6.5% / 23.4% | 4400 / 4444 | same |
+| 32 x 128 x 128 | QK | 168 | 0.6% / 1.1% | 13941 / 13944 | 24.2% / 84.0% | 13722 / 13944 | same |
+| 32 x 128 x 128 | SV | 120 | 0.5% / 1.0% | 7080 / 7080 | 20.1% / 48.3% | 7052 / 7080 | same |
+| 32 x 512 x 128 | QK | 168 | 0.5% / 1.1% | 13997 / 14004 | 24.1% / 84.1% | 13720 / 14004 | same |
+| 32 x 512 x 128 | SV | 120 | 0.4% / 0.9% | 7080 / 7080 | 15.2% / 44.9% | 7057 / 7080 | same |
+| 32 x 4096 x 128 | QK | 168 | 0.5% / 1.1% | 13998 / 14004 | 24.0% / 84.2% | 13706 / 14004 | same |
+| 32 x 4096 x 128 | SV | 120 | 0.3% / 0.6% | 6912 / 6912 | 7.4% / 25.5% | 6912 / 6912 | same |
+
+Not evidence of comparability: the row stays DIAGNOSTIC (declared host
+compute price; the recalibrated selections await the reviewer); the paper's
+seven of nine is on the paper's own boundary.

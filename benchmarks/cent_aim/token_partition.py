@@ -32,14 +32,23 @@ host reduction, so nothing is counted twice.
   evidence** (the lowered QK program's oracle -> the compiled stage's own
   function -> the lowered SV program's oracle, against a float64 reference;
   ``functional_check``), the integer-exact merge check of a split plan,
-  measured host-stage samples (``host_stage_measured``, recorded beside
-  the modelled price and never substituted for it), and complete
+  measured host-stage samples and the historical host protocol measured
+  with the historical methodology on the attention's own score
+  distribution (``host_protocol_measured``: decode, the compiled scaled
+  softmax, staging, merge; recorded beside the modelled price and never
+  substituted for it), and complete
   provenance and artifacts written before the next plan runs; a failed
   plan is retained with its evidence.
-* Controls: the head-only plan; the CENT-derived attention program of the
-  same token length (``benchmarks.cent_aim`` ``attention_l<L>``, CENT's
-  layout and command stream, available for the 32-head workloads, its
-  boundary stated); the unbudgeted default selection, recorded only.
+* Controls: the head-only plan; the frozen study's ``cent-repaired``
+  control restored through the shared pipeline (the padded program, heads
+  to a multiple of eight, with the historical producer's knobs: QK
+  row-packed over the eight channels with one reuse group per MAC, SV
+  channel-batched over the eight channels, unsplit, one MAC per reuse
+  group; its provenance, policy and command inventory recorded); the
+  current-policy ablation ``cent-policy`` (CENT's mapping as the shared
+  pipeline selects it today on the CENT golden cases, with the 16-slot
+  reuse window and one head per channel up to the budget); the unbudgeted
+  default selection, recorded only.
 * Totals: ``total_cycles`` = device + priced host; also
   ``total_cycles_measured_host_stage`` with the measured stage median in
   place of the modelled stage (1 cycle = 1 ns at the simulator's declared
@@ -513,30 +522,55 @@ def measured_host_total(device_cycles, host_price, measured):
     )
 
 
-def host_protocol_samples(compiled, heads, tokens, *, repeats=20, seed=0):
-    """Measured host time of the historical bridge protocol on the compiled
-    program's shapes, each step separately (nanoseconds per call, median of
-    ``repeats`` after one warm-up): the decode of the QK readout entries
-    (BF16 words -> FP32), the compiled stage's own computation (the scaled
-    softmax), the staging of the probabilities for the upload (FP32 -> BF16
-    words) and, for a split SV, the merge of the partials by the compiled
-    host reduction.  Recorded beside the modelled prices and never
-    substituted for them; the link terms are modelled separately."""
+def _bf16_bits(values):
+    """BF16 words of FP32 values already rounded to BF16: the bit pattern's
+    upper half (no second rounding)."""
+    return (np.asarray(values, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16)
+
+
+def _bf16_values(words):
+    return (np.asarray(words, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+
+
+def historical_host_samples(function, *, warmups=10, samples=31, calls=100):
+    """The historical campaign's methodology (``host_samples``): ten warm-up
+    calls, then 31 samples each the mean of 100 back-to-back calls, in
+    nanoseconds per call."""
     import time
 
+    for _ in range(warmups):
+        function()
+    out = []
+    for _ in range(samples):
+        started = time.perf_counter_ns()
+        for _ in range(calls):
+            function()
+        out.append((time.perf_counter_ns() - started) / calls)
+    return out
+
+
+def host_protocol_samples(compiled, heads, tokens, *, seed=0, head_dim=HEAD_DIM):
+    """Measured host time of the historical bridge protocol on the compiled
+    program, with the historical methodology, on meaningful inputs.
+
+    The QK readout words are the BF16 scores of the functional computation
+    (unit-variance BF16 q and K, ``q . K`` in FP32 rounded to BF16), so the
+    scaled softmax works on the distribution the study's attention produces;
+    the protocol is the compiled program's own: decode of the readout words
+    (BF16 -> FP32), the compiled stage (the scaled softmax, which rounds its
+    output to BF16 once), the staging of those words for the upload (the bit
+    pattern, no second rounding) and, for a split SV, the compiled host
+    reduction's merge of partials shaped as the lowered program produces
+    them.  ``whole`` times the complete protocol in one call (the comparable
+    sample); the per-step medians are a diagnostic breakdown.  The inputs'
+    distribution and the protocol's outputs are recorded and checked (finite
+    scores, probabilities summing to one per head)."""
     stage = _stage(compiled)
-    rng = np.random.default_rng(seed)
-    # The QK readout as the host sees it: one BF16 word per score.
-    words = rng.integers(0, 1 << 16, size=(heads, tokens), dtype=np.uint16)
-    words = (words & np.uint16(0x7F7F)) | np.uint16(0x3C00)  # finite, moderate magnitudes
-
-    def decode(w):
-        return (w.astype(np.uint32) << 16).view(np.float32)
-
-    def staging(p):
-        bits = np.asarray(p, dtype=np.float32).view(np.uint32)
-        return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).astype(np.uint16)
-
+    rng = np.random.default_rng(seed + 31 * heads + tokens)
+    q = bf16_round(rng.standard_normal((heads, head_dim)).astype(np.float32))
+    K = bf16_round(rng.standard_normal((heads, tokens, head_dim)).astype(np.float32))
+    scores = bf16_round(np.einsum("hd,hld->hl", q, K, dtype=np.float32))
+    words = _bf16_bits(scores)
     merge = None
     partials = None
     sv = sv_entry(compiled)
@@ -545,33 +579,59 @@ def host_protocol_samples(compiled, heads, tokens, *, repeats=20, seed=0):
             h for h in compiled.compiled.layout_ctx.host_steps
             if isinstance(h, AimHostReduction) and h.source == sv["name"]
         )
-        partials = rng.standard_normal((merge.replicas, merge.batches, merge.partitions, merge.outputs)).astype(np.float32)
+        partials = bf16_round(
+            rng.standard_normal((merge.replicas, merge.batches, merge.partitions, merge.outputs)).astype(np.float32)
+        )
 
-    def timed(fn, *args):
-        fn(*args)
-        samples = []
-        for _ in range(repeats):
-            started = time.perf_counter_ns()
-            fn(*args)
-            samples.append(time.perf_counter_ns() - started)
-        samples.sort()
-        return {"median_ns": samples[len(samples) // 2], "min_ns": samples[0], "samples_ns": samples}
+    def decode():
+        return _bf16_values(words)
 
-    scores = decode(words)
-    probs = stage.run(scores)[0]
-    record = {
-        "unit": "ns per call",
-        "repeats": repeats,
-        "decode": timed(decode, words),
-        "softmax": timed(stage.run, scores),
-        "staging": timed(staging, probs),
-        "merge": timed(merge.merge, partials) if merge is not None else None,
-        "note": "historical bridge protocol (decode of the QK readout, scaled softmax, staging for the upload) and merge, measured on this host; link terms modelled; 1 simulated cycle = 1 ns",
+    def softmax(decoded):
+        return stage.run(decoded)[0]
+
+    def staging(probabilities):
+        return _bf16_bits(probabilities)
+
+    def whole():
+        staged = staging(softmax(decode()))
+        if merge is not None:
+            merge.merge(partials)
+        return staged
+
+    decoded = decode()
+    probabilities = softmax(decoded)
+    staged = staging(probabilities)
+    if not np.all(np.isfinite(decoded)) or not np.allclose(probabilities.sum(axis=-1), 1.0, atol=2e-2):
+        raise RuntimeError("host protocol inputs or outputs are not the attention's")
+    components = {
+        "decode": historical_host_samples(decode),
+        "softmax": historical_host_samples(lambda: softmax(decoded)),
+        "staging": historical_host_samples(lambda: staging(probabilities)),
+        "merge": historical_host_samples(lambda: merge.merge(partials)) if merge is not None else None,
     }
-    record["total_median_ns"] = sum(
-        record[k]["median_ns"] for k in ("decode", "softmax", "staging", "merge") if record[k] is not None
-    )
-    return record
+    whole_samples = historical_host_samples(whole)
+
+    def summary(values):
+        if values is None:
+            return None
+        ordered = sorted(values)
+        return {"median_ns": ordered[len(ordered) // 2], "min_ns": ordered[0], "samples_ns": values}
+
+    return {
+        "unit": "ns per call",
+        "methodology": "historical host_samples: 10 warm-ups, 31 samples of 100 back-to-back calls each (mean per call)",
+        "inputs": {
+            "scores": "bf16(q . K) of unit-variance BF16 q and K (the functional computation's distribution)",
+            "score_min": float(decoded.min()), "score_max": float(decoded.max()), "score_std": float(decoded.std()),
+            "max_probability": float(probabilities.max()), "nonzero_probabilities_per_head": float(np.mean((probabilities > 0).sum(axis=-1))),
+            "staged_words": int(staged.size),
+        },
+        "whole": summary(whole_samples),
+        "components": {k: summary(v) for k, v in components.items()},
+        "total_median_ns": sorted(whole_samples)[len(whole_samples) // 2],
+        "components_median_sum_ns": sum(sorted(v)[len(v) // 2] for v in components.values() if v is not None),
+        "note": "the whole-protocol median is the comparable sample; component medians are a diagnostic breakdown; link terms are modelled separately; 1 simulated cycle = 1 ns",
+    }
 
 
 def measured_host_protocol_total(device_cycles, host_price, protocol):
@@ -638,13 +698,82 @@ def _knobs(mode):
     return knobs
 
 
+# The frozen study's CENT control, as its producer defined it
+# (containing repository, reviews/experiments/aim_attention_campaign.py,
+# lines 115-125, variant ``cent-repaired``): the SV program of
+# ``AiMSVPartitionSpec(physical_h, l, d, partitions=1, channels=8,
+# reuse_group=1, reserved_row_chunks=ceil(4096 / 1024))`` with the heads
+# padded to a multiple of eight (``physical_h = 8 * ceil(h / 8)``: one head
+# per channel over the eight channels, the padded heads computed on zeros),
+# one MAC per reuse group, the KV-cache row pitch reserved for 4,096 tokens,
+# normalized against CENT's own event stream; its QK was the serial-explicit
+# variant (one reuse group per row-packed MAC).  Restored here through the
+# shared pipeline as the padded program's candidates with exactly those
+# decision knobs, under the study's budget, bridge and accounting; the
+# padded heads' work and host protocol are part of the control, as they
+# were historically.
+CENT_REPAIRED_POLICY = {
+    "attention_qk": {"bank_scope": "abk", "batch_mapping": "row_packed", "reuse_group": "1", "reduction_partitions": "1", "replica_partitions": "8"},
+    "attention_sv": {"bank_scope": "abk", "batch_mapping": "channels", "reuse_group": "1", "reduction_partitions": "1", "replica_partitions": "8"},
+}
+CENT_REPAIRED_PROVENANCE = {
+    "producer": "reviews/experiments/aim_attention_campaign.py:115-125 (containing repository), variant cent-repaired",
+    "spec": "AiMSVPartitionSpec(physical_h, tokens, features, partitions=1, channels=8, reuse_group=1, reserved_row_chunks=ceil(4096/1024))",
+    "padding": "physical_h = 8 * ceil(heads / 8); padded heads computed on zero values",
+    "normalization": "historically asserted equal to CENT's SV event stream (normalize_cent_sv); the release compares the padded program's command inventory, not CENT's harness",
+    "qk": "serial-explicit (one reuse group per row-packed MAC); here the row-packed candidate with reuse_group=1 over the eight channels",
+}
+
+
+def padded_heads(heads, group=CHANNEL_BUDGET):
+    return group * -(-int(heads) // group)
+
+
+def _policy_layouts(target, ranking, policy, what):
+    choices = kernel_choices(target, ranking)
+    layouts = [None] * len(choices)
+    description = {}
+    for kernel, wanted in policy.items():
+        index, scores = choices[kernel]
+        matches = [
+            (cycles, mode, placement)
+            for cycles, mode, placement in scores
+            if all(_knobs(mode).get(k, "1" if k == "reduction_partitions" else None) == v for k, v in wanted.items())
+        ]
+        if not matches:
+            raise LookupError(
+                f"no candidate of {kernel!r} carries the {what} policy {wanted} under the "
+                f"budget; scored modes: {sorted({m for _c, m, _p in scores})[:6]}..."
+            )
+        if len(matches) > 1:
+            raise LookupError(f"{len(matches)} candidates of {kernel!r} carry the {what} policy {wanted}")
+        cycles, mode, placement = matches[0]
+        layouts[index] = placement
+        description[kernel] = {"mode": mode, "ranked_cycles": cycles, "policy": wanted}
+    return layouts, description
+
+
+def cent_repaired_program(heads, tokens, head_dim=HEAD_DIM, max_tokens=MAX_TOKENS):
+    """The padded bridged program of the historical control: the study's
+    attention with the heads padded to a multiple of eight."""
+    return build_attention(padded_heads(heads), tokens, head_dim, max_tokens)
+
+
+def cent_repaired_layouts(target, ranking, heads, budget=CHANNEL_BUDGET):
+    """The historical ``cent-repaired`` control as explicit layouts of the
+    padded program's budgeted ranking (`CENT_REPAIRED_POLICY`): QK row-packed
+    over the eight channels with one reuse group per MAC, SV channel-batched
+    over the eight channels, unsplit, one MAC per reuse group.  Raises when
+    the enumeration has no such candidate (recorded, never substituted)."""
+    return _policy_layouts(target, ranking, CENT_REPAIRED_POLICY, "cent-repaired")
+
+
 def cent_derived_layouts(target, ranking, heads, budget=CHANNEL_BUDGET):
-    """The CENT-derived control as explicit layouts of the current program:
-    for each kernel, the candidate of the budgeted ranking whose decision is
-    CENT's mapping policy (`CENT_POLICY`) with the channel group of the
-    budget (QK) and one head per channel up to the budget (SV).  Returns
-    ``(layouts, description)``; raises when the enumeration has no such
-    candidate (recorded as the control's failure, never substituted)."""
+    """The current-policy ablation (`cent-policy`): CENT's mapping policy as
+    the shared pipeline selects it today on the CENT golden cases
+    (`CENT_POLICY`), with the channel group of the budget (QK) and one head
+    per channel up to the budget (SV).  Not the frozen study's control (see
+    `cent_repaired_layouts`); kept as an explicitly named ablation."""
     choices = kernel_choices(target, ranking)
     layouts = [None] * len(choices)
     description = {}
@@ -749,6 +878,20 @@ def _graph_activities(compiled):
         "activities": activities,
         "metadata": _json_ready(getattr(graph, "metadata", {}) or {}),
     }
+
+
+def _command_inventory(compiled, kernel):
+    """Opcode counts, command count and span of ``kernel``'s lowered
+    commands: the normalized inventory a historical control is compared on."""
+    entry = _entry(compiled, kernel)
+    begin, end = entry["command_span"]
+    commands = [str(c) for c in compiled.compiled.cmds[begin:end]]
+    counts = {}
+    for line in commands:
+        words = line.split()
+        opcode = words[1] if words and words[0] == "AiM" else (words[0] if words else "")
+        counts[opcode] = counts.get(opcode, 0) + 1
+    return {"span": [begin, end], "commands": len(commands), "opcode_counts": counts, "reuse_groups": sum(1 for i, l in enumerate(commands) if "WR_BIAS" in l and (i == 0 or "WR_BIAS" not in commands[i - 1]))}
 
 
 def _plan_provenance(compiled):
@@ -964,8 +1107,18 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
     try:
         cent_layouts, cent_description = cent_derived_layouts(target, ranking, heads, budget=CHANNEL_BUDGET)
         cent_failure = None
-    except Exception as error:  # the control's absence is evidence, never substituted
-        cent_layouts, cent_description, cent_failure = None, None, _failure_entry("cent_derived", error)
+    except Exception as error:  # the ablation's absence is evidence, never substituted
+        cent_layouts, cent_description, cent_failure = None, None, _failure_entry("cent_policy", error)
+    # The frozen study's control: the padded program (heads to a multiple of
+    # eight) with the historical producer's knobs, its own ranking under the
+    # same budget.
+    repaired = {"attention": None, "program": None, "layouts": None, "description": None, "failure": None, "heads": padded_heads(heads)}
+    try:
+        repaired["attention"], repaired["program"] = cent_repaired_program(heads, tokens)
+        repaired_ranking = compile_program(repaired["attention"], repaired["program"], target, budget=budget, virtual=True)
+        repaired["layouts"], repaired["description"] = cent_repaired_layouts(target, repaired_ranking, heads)
+    except Exception as error:
+        repaired["failure"] = _failure_entry("cent_repaired", error)
     plans += [(f"P{p}", choice) for p, choice in sorted(variants.per_partition.items())]
     # Established before execution: the head-only control is the P1 plan
     # itself when the ranking's cheapest unsplit plan is the one-head-per-
@@ -975,17 +1128,24 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
         aliases["head-only"] = "P1"
     else:
         plans.append(("head-only", variants.head_only))
+    if repaired["layouts"] is not None:
+        plans.append(("cent-repaired", ("cent-repaired", repaired["layouts"])))
     if cent_layouts is not None:
-        plans.append(("cent-derived", ("cent", cent_layouts)))
+        plans.append(("cent-policy", ("cent", cent_layouts)))
     expected = [label for label, _choice in plans]
     records, failures = {}, {}
+    if repaired["failure"] is not None:
+        failures["cent-repaired"] = repaired["failure"]
+        records["cent-repaired"] = {"label": "cent-repaired", "modes": None, "failure": repaired["failure"]}
     if cent_failure is not None:
-        failures["cent-derived"] = cent_failure
-        records["cent-derived"] = {"label": "cent-derived", "modes": None, "failure": cent_failure}
+        failures["cent-policy"] = cent_failure
+        records["cent-policy"] = {"label": "cent-policy", "modes": None, "failure": cent_failure}
     for label, choice in plans:
         try:
             if choice is None:
                 built = compile_program(attention, program, target, budget=budget)
+            elif isinstance(choice, tuple) and choice and choice[0] == "cent-repaired":
+                built = compile_program(repaired["attention"], repaired["program"], target, layouts=choice[1], budget=budget)
             elif isinstance(choice, tuple) and choice and choice[0] == "cent":
                 built = compile_program(attention, program, target, layouts=choice[1], budget=budget)
             else:
@@ -997,23 +1157,44 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
             failures[label] = record["failure"]
             continue
         try:
+            plan_heads = repaired["heads"] if label == "cent-repaired" else heads
+            plan_attention = repaired["attention"] if label == "cent-repaired" else attention
+            plan_program = repaired["program"] if label == "cent-repaired" else program
             record = measure_plan(
-                label, built, attention, program, target, heads, tokens,
+                label, built, plan_attention, plan_program, target, plan_heads, tokens,
                 simulate=simulate, budget=budget, artifacts=folder, sv_index=variants.sv_index,
             )
+            if label == "cent-repaired":
+                record["control"] = {
+                    "provenance": CENT_REPAIRED_PROVENANCE,
+                    "policy": CENT_REPAIRED_POLICY,
+                    "physical_heads": repaired["heads"],
+                    "layouts": repaired["description"],
+                    "sv_command_inventory": _command_inventory(built, "attention_sv"),
+                    "qk_command_inventory": _command_inventory(built, "attention_qk"),
+                }
         except PlanFailure as error:
             records[label] = error.record
             failures[label] = error.record["failure"]
             continue
-        if choice is not None and not (isinstance(choice, tuple) and choice and choice[0] == "cent"):
+        if choice is not None and not (isinstance(choice, tuple) and choice and choice[0] in ("cent", "cent-repaired")):
             record["ranked_cycles"] = choice[0]
         records[label] = record
     control = {
-        "policy": CENT_POLICY,
-        "derived_from": "the shared pipeline's selection on the CENT golden attention cases (32 heads x 128/512/4096 tokens, exact against CENT's vendor traces)",
-        "boundary": "the study's own: resident inputs, no cache append, the same bridge, budget and accounting",
-        "layouts": cent_description,
-        "failure": cent_failure,
+        "cent_repaired": {
+            "provenance": CENT_REPAIRED_PROVENANCE,
+            "policy": CENT_REPAIRED_POLICY,
+            "physical_heads": repaired["heads"],
+            "boundary": "the study's own (resident inputs, no cache append, the bridge, the budget, the accounting) on the padded program; the padded heads' work and host protocol included, as historically",
+            "layouts": repaired["description"],
+            "failure": repaired["failure"],
+        },
+        "cent_policy": {
+            "policy": CENT_POLICY,
+            "derived_from": "the shared pipeline's selection on the CENT golden attention cases today (32 heads x 128/512/4096 tokens, exact against CENT's vendor traces); an ablation, not the frozen study's control",
+            "layouts": cent_description,
+            "failure": cent_failure,
+        },
     }
     rows = {
         label: SimpleNamespace(
@@ -1038,15 +1219,20 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
         measured = [rows[label] for label in required]
         best = min(measured, key=lambda r: r.total)
         gap = default.total / best.total - 1.0
-    controls_complete = (
-        "head-only" in rows and (not simulate or rows["head-only"].total is not None)
-        and "cent-derived" in rows and (not simulate or rows["cent-derived"].total is not None)
+    controls_complete = all(
+        label in rows and (not simulate or rows[label].total is not None)
+        for label in ("head-only", "cent-repaired", "cent-policy")
     )
-    cent_over_selected = (
-        rows["cent-derived"].total / default.total
-        if simulate and "cent-derived" in rows and default is not None and default.total and rows["cent-derived"].total
-        else None
-    )
+
+    def ratio(label):
+        return (
+            rows[label].total / default.total
+            if simulate and label in rows and default is not None and default.total and rows[label].total
+            else None
+        )
+
+    cent_over_selected = ratio("cent-repaired")
+    cent_policy_over_selected = ratio("cent-policy")
     head_only_ratio = (
         rows["head-only"].total / default.total
         if simulate and controls_complete and default is not None and default.total
@@ -1071,9 +1257,10 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
         "best_partitions": None if best is None else best.partitions,
         "gap": gap,
         "head_only_over_selected": head_only_ratio,
-        "cent_derived_over_selected": cent_over_selected,
+        "cent_repaired_over_selected": cent_over_selected,
+        "cent_policy_over_selected": cent_policy_over_selected,
         "plans": records,
-        "controls": {"cent_derived": control},
+        "controls": control,
         "neighbor": bool(neighbor),
         "boundary": {
             "device": "AiM ramulator2 memory-system cycles of the complete program (QK, SV)",
@@ -1113,7 +1300,7 @@ def assert_complete(result) -> None:
     if not result.comparison_complete:
         problems.append(f"the minima comparison is incomplete: missing {result.record['comparison']['missing']}")
     if not result.controls_complete:
-        problems.append("a control (head-only or cent-derived) did not complete")
+        problems.append("a control (head-only, cent-repaired or cent-policy) did not complete")
     if problems:
         raise AssertionError(
             f"{result.heads} heads x {result.tokens} tokens: " + "; ".join(problems)
@@ -1147,8 +1334,11 @@ def summarize(results):
         "incomplete_workloads": incomplete,
         "minima_reached": reached,
         "max_gap": max(gaps) if gaps else None,
-        "cent_derived_over_selected": {
-            f"{r['heads']}x{r['tokens']}": r.get("cent_derived_over_selected") for r in complete
+        "cent_repaired_over_selected": {
+            f"{r['heads']}x{r['tokens']}": r.get("cent_repaired_over_selected") for r in complete
+        },
+        "cent_policy_over_selected": {
+            f"{r['heads']}x{r['tokens']}": r.get("cent_policy_over_selected") for r in complete
         },
         "head_only_over_selected_1x4096": (
             one_4096["head_only_over_selected"]
@@ -1160,12 +1350,14 @@ def summarize(results):
         "failed_plans": sum(len(r.get("failed_plans") or {}) for r in results if "error" not in r),
         "comparable_with_paper": False,
         "not_comparable_because": (
-            "the bridge, the readout/upload/partial link volumes and the host stage are "
-            "priced and measured, but the host stage's compute price is a declared "
-            "per-vector model (measured samples recorded beside it) and the CENT control "
-            "available here is CENT's own attention program with its own boundary; the "
-            "historical host protocol also covers decode/staging and merge; see the "
-            "module docstring"
+            "the bridge, the readout/upload/partial link volumes, the host stage, the "
+            "historical cent-repaired control (padded heads, reuse 1, eight channels) and "
+            "the measured host protocol (decode, scaled softmax, staging, merge; historical "
+            "methodology) are in place and the contraction profile's command charges are "
+            "recalibrated from controlled single-factor measurements (M-19, round 50); the "
+            "row stays diagnostic because the priced host compute is a declared per-vector "
+            "model (this host's measured protocol is not the paper's host) and because the "
+            "recalibrated model's selections await independent review; see the module docstring"
         ),
         "paper": PAPER,
     }

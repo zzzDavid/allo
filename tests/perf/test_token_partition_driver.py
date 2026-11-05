@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 
+import numpy as np
 import pytest
 
 from benchmarks.cent_aim import token_partition as tp
@@ -159,7 +160,7 @@ def test_a_failed_distinct_control_is_never_replaced_by_an_alias(monkeypatch, tm
     # head-only control and, when its SV shares that mapping, the
     # CENT-derived control; neither is aliased or substituted.
     assert "head-only" in result.expected and "head-only" in result.failures
-    assert set(result.failures) <= {"head-only", "cent-derived"}
+    assert set(result.failures) <= {"head-only", "cent-policy", "cent-repaired"}
     assert "head-only" not in result.record["aliases"] and "head-only" not in result.rows
     assert result.record["head_only_over_selected"] is None
     assert result.comparison_complete and result.gap is not None
@@ -287,11 +288,12 @@ def test_measured_host_total_keeps_the_link_and_reduction_terms():
 
 
 @pytest.mark.parametrize("heads,sv_replicas", [(1, 1), (8, 8), (32, 8)])
-def test_cent_derived_control_is_the_structural_policy_under_the_budget(heads, sv_replicas):
-    """The CENT-derived control is the budgeted candidate carrying CENT's
-    mapping policy: QK row-packed over the budget's eight channels, SV
-    channel-batched with one head per channel up to the budget, unsplit,
-    16-slot reuse; found for 1, 8 and 32 heads, never cost-selected."""
+def test_cent_policy_ablation_is_the_current_policy_under_the_budget(heads, sv_replicas):
+    """The current-policy ablation is the budgeted candidate carrying CENT's
+    mapping policy as the pipeline selects it today: QK row-packed over the
+    budget's eight channels, SV channel-batched with one head per channel up
+    to the budget, unsplit, 16-slot reuse; found for 1, 8 and 32 heads,
+    never cost-selected."""
     import allo
     from allo.pim.costs import aim_cost
     from allo.pim.targets import build_aim_target
@@ -309,6 +311,55 @@ def test_cent_derived_control_is_the_structural_policy_under_the_budget(heads, s
     assert [p.mode for p in tp._placements(built)] == [l.mode for l in layouts]
 
 
+@pytest.mark.parametrize("heads,physical", [(1, 8), (8, 8), (32, 32)])
+def test_cent_repaired_control_is_the_historical_producer_spec(heads, physical):
+    """The frozen study's ``cent-repaired`` control is restored on the padded
+    program (heads to a multiple of eight) as the budgeted candidates with
+    the historical producer's knobs: QK row-packed, SV channel-batched, both
+    over the eight channels with one reuse group per MAC, unsplit; its
+    command inventory has one WR_BIAS run per MAC (reuse 1) and the
+    provenance names the producer's spec."""
+    import allo
+    from allo.pim.costs import aim_cost
+    from allo.pim.targets import build_aim_target
+
+    assert tp.padded_heads(heads) == physical
+    target = build_aim_target()
+    attention, program = tp.cent_repaired_program(heads, 128)
+    ranking = allo.compile(attention, target, aim_cost, backend="virtual", host_moves=program, resources=tp.BUDGET, **tp.POLICY)
+    layouts, description = tp.cent_repaired_layouts(target, ranking, heads)
+    assert all(layout is not None for layout in layouts)
+    for kernel, mapping in (("attention_qk", "row_packed"), ("attention_sv", "channels")):
+        knobs = tp._knobs(description[kernel]["mode"])
+        assert knobs["batch_mapping"] == mapping and knobs["replica_partitions"] == "8" and knobs["reuse_group"] == "1"
+        assert tp.partitions_of(description[kernel]["mode"]) == 1
+    built = allo.compile(attention, target, aim_cost, host_moves=program, resources=tp.BUDGET, layout=layouts, **tp.POLICY)
+    assert [p.mode for p in tp._placements(built)] == [l.mode for l in layouts]
+    inventory = tp._command_inventory(built, "attention_sv")
+    assert inventory["opcode_counts"]["MAC_ABK"] == inventory["reuse_groups"] == inventory["opcode_counts"]["WR_BIAS"]
+    assert "aim_attention_campaign.py:115-125" in tp.CENT_REPAIRED_PROVENANCE["producer"]
+    assert tp.CENT_REPAIRED_POLICY["attention_sv"]["reuse_group"] == "1"
+
+
+def test_cent_repaired_control_is_not_the_current_policy():
+    """The two controls differ (reuse window, SV replication for one head)
+    and the study records both under their own names."""
+    result = tp.run_workload(1, 128, simulate=False)
+    plans = result.record["plans"]
+    assert "cent-repaired" in plans and "cent-policy" in plans and "cent-derived" not in plans
+    assert plans["cent-repaired"]["modes"] != plans["cent-policy"]["modes"]
+    control = plans["cent-repaired"]["control"]
+    assert control["physical_heads"] == 8 and control["provenance"] is tp.CENT_REPAIRED_PROVENANCE
+    assert control["sv_command_inventory"]["reuse_groups"] == control["sv_command_inventory"]["opcode_counts"]["MAC_ABK"]
+    # The control's protocol and functional check run on the padded program.
+    assert plans["cent-repaired"]["host_protocol_measured"]["inputs"]["staged_words"] == 8 * 128
+    assert plans["cent-policy"]["host_protocol_measured"]["inputs"]["staged_words"] == 128
+    assert plans["cent-repaired"]["functional_check"]["max_rel_error"] <= plans["cent-repaired"]["functional_check"]["tolerance"]
+    controls = result.record["controls"]
+    assert controls["cent_repaired"]["failure"] is None and controls["cent_policy"]["failure"] is None
+    assert "cent_repaired_over_selected" in result.record and "cent_policy_over_selected" in result.record
+
+
 def test_measured_host_protocol_total_keeps_both_link_terms():
     price = {"host_stage_link_cycles": 16, "host_reduction_link_cycles": 24, "host_stage_compute_cycles": 32, "host_reduction_compute_cycles": 8}
     protocol = {"total_median_ns": 1000}
@@ -316,9 +367,30 @@ def test_measured_host_protocol_total_keeps_both_link_terms():
     result = tp.run_workload(1, 128, simulate=False)
     record = result.record["plans"]["default"]
     measured = record["host_protocol_measured"]
-    assert measured["decode"]["median_ns"] > 0 and measured["softmax"]["median_ns"] > 0 and measured["staging"]["median_ns"] > 0
-    assert (measured["merge"] is not None) == (record["partitions"] > 1)
-    assert measured["total_median_ns"] == sum(measured[k]["median_ns"] for k in ("decode", "softmax", "staging", "merge") if measured[k] is not None)
+    components = measured["components"]
+    assert all(components[k]["median_ns"] > 0 for k in ("decode", "softmax", "staging"))
+    assert (components["merge"] is not None) == (record["partitions"] > 1)
+    # The comparable sample is the whole protocol in one call, with the
+    # historical methodology; the component medians are a breakdown.
+    assert measured["total_median_ns"] == measured["whole"]["median_ns"] > 0
+    assert len(measured["whole"]["samples_ns"]) == 31 and "10 warm-ups" in measured["methodology"]
+    assert measured["components_median_sum_ns"] == sum(c["median_ns"] for c in components.values() if c is not None)
+    # The inputs are the attention's: finite scores of the functional
+    # computation's distribution, every probability populated.
+    inputs = measured["inputs"]
+    assert -200 < inputs["score_min"] < 0 < inputs["score_max"] < 200 and 5 < inputs["score_std"] < 20
+    assert inputs["nonzero_probabilities_per_head"] == 128 and inputs["max_probability"] < 0.5
     assert record["host_price"]["host_reduction_cycles"] == record["host_price"]["host_reduction_link_cycles"] + record["host_price"]["host_reduction_compute_cycles"]
-    assert "cent-derived" in result.record["plans"] and not result.failures
-    assert result.record["controls"]["cent_derived"]["failure"] is None
+    assert "cent-policy" in result.record["plans"] and "cent-repaired" in result.record["plans"] and not result.failures
+
+
+def test_host_protocol_encodes_once_with_the_historical_methodology():
+    """Staging extracts the BF16 words of the stage's already-rounded output
+    (no second rounding); the historical sampler takes 31 samples of 100
+    calls after ten warm-ups."""
+    values = tp.bf16_round(np.array([1.0, -2.5, 3.14159, 1e-3], dtype=np.float32))
+    words = tp._bf16_bits(values)
+    assert np.array_equal(tp._bf16_values(words), values)
+    calls = []
+    samples = tp.historical_host_samples(lambda: calls.append(1))
+    assert len(samples) == 31 and len(calls) == 10 + 31 * 100 and all(s >= 0 for s in samples)

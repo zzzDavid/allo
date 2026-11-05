@@ -3,7 +3,7 @@
 
 # AiM token partitioning and cost-route repairs
 
-Status: implemented on `tenon` (working tree after `6efaca5`). Addresses
+Status: implemented on `tenon` (working tree after `6efaca5`; Section 3a updated through round 50). Addresses
 release audit `docs/release/audit/aim-attacc.md` M-03, M-05 (cost side; see
 Section 6 for the one plumbing edit outside this change), M-06, M-07, M-08,
 M-11 and M-12, and the paper subsection "Token Partitioning"
@@ -194,31 +194,86 @@ for every plan, split and unsplit, and for the neighbouring 2 heads x 256
 tokens workload.  The timing-only simulator produces no values and none
 are attributed to it.
 
-**Controls (round 49).**  The head-only plan (forced); the CENT-derived
-control: CENT's mapping policy, read from the shared pipeline's exact
-selection on the CENT golden attention cases (QK row-packed over the
-channel group with the 16-slot reuse window; SV channel-batched, one head
-per channel, unsplit, same window), matched by its decision knobs in each
-workload's budgeted enumeration (QK over the budget's eight channels, SV
-over the heads up to eight) and compiled as an explicit layout under the
-study's own budget, bridge and accounting (`cent_derived_layouts`); and
-the unbudgeted default selection (recorded only).  On every 8- and 32-head
-workload the CENT-derived control is the normal selection's own plan
-(ratio 1.00); on the 1-head workloads it is 1.03x (128 tokens), 1.32x
-(512) and 2.23x (4096) slower than the selection, and 1.05x on the 2x256
-neighbour.
+**Controls (rounds 49-50).**  The head-only plan (forced); the frozen
+study's own control restored (`cent-repaired`, round 50); the current-policy
+ablation (`cent-policy`, round 49's structurally derived control under its
+own name); and the unbudgeted default selection (recorded only).
 
-**Host protocol (round 49).**  Beside the priced host terms, the historical
-bridge protocol is measured step by step on each compiled program: the
-decode of the QK readout words (BF16 -> FP32), the compiled scaled softmax,
-the staging of the probabilities for the upload (FP32 -> BF16 words) and,
-for a split SV, the compiled merge (`host_protocol_measured`); their median
-sum replaces every modelled host compute term in
-`total_cycles_measured_host_protocol`, the stage's and the reduction's link
-terms retained.  On this host the protocol takes 31 us (1x128) to 899 us
-(32x4096) per call, NumPy on small arrays, far above the declared price;
-the paper's host is not this one, which is one reason the row stays
-DIAGNOSTIC.
+The historical control is the one the study's producer defined
+(`reviews/experiments/aim_attention_campaign.py:115-125` in the containing
+repository, variant `cent-repaired`): the SV program of
+`AiMSVPartitionSpec(physical_h, l, d, partitions=1, channels=8,
+reuse_group=1, reserved_row_chunks=ceil(4096 / 1024))` with the heads
+padded to a multiple of eight (`physical_h = 8 * ceil(h / 8)`, one head per
+channel over the eight channels, the padded heads computed on zeros), one
+MAC per reuse group, the KV-cache row pitch reserved for 4,096 tokens, its
+QK the serial-explicit variant (one reuse group per row-packed MAC), and
+its event stream historically asserted equal to CENT's own
+(`normalize_cent_sv`).  The release restores it through the shared
+pipeline: the padded program (`cent_repaired_program`, the study's
+attention with `padded_heads(h)` heads, the same bridge) is ranked under
+the study's budget and the candidates carrying exactly the producer's
+decision knobs (`CENT_REPAIRED_POLICY`: QK row-packed, SV channel-batched,
+both over the eight channels, `reuse_group=1`, unsplit) are compiled as an
+explicit layout, measured with the study's accounting, and recorded with
+the producer's provenance (`CENT_REPAIRED_PROVENANCE`), the padded head
+count and the lowered command inventory of both kernels (opcode counts,
+reuse groups, spans: `_command_inventory`), which is what the release
+compares in place of CENT's harness events (not in the release tree).  The
+padded heads' device work and host protocol are part of the control, as
+they were historically.  The inventory shows the producer's structure: one
+WR_BIAS run per MAC (reuse 1), for example 3,200 commands for the 32 x
+4096 QK (128 WR_GB, 1,024 each of WR_BIAS, MAC_ABK and RD_MAC) and 400 for
+its SV.
+
+The current-policy ablation keeps CENT's mapping as the shared pipeline
+selects it today on the CENT golden cases (QK row-packed over the budget's
+eight channels with the 16-slot reuse window; SV channel-batched with one
+head per channel up to the budget, unsplit, the same window), matched by
+its decision knobs in each workload's budgeted enumeration
+(`cent_derived_layouts`); it is not the frozen study's control and is
+labelled as an ablation.
+
+Round 50 measurements (host-inclusive totals over the normal selection's):
+
+| Heads | Tokens | cent-repaired / selected | cent-policy / selected |
+|---:|---:|---:|---:|
+| 1 | 128 | 2.22 | 1.04 |
+| 1 | 512 | 3.85 | 1.32 |
+| 1 | 4096 | 7.27 | 2.25 |
+| 8 | 128 / 512 / 4096 | 1.45 / 1.46 / 1.46 | 1.00 / 1.00 / 1.00 |
+| 32 | 128 / 512 / 4096 | 1.45 / 1.46 / 1.46 | 1.00 / 1.00 / 1.00 |
+| 2 (neighbour) | 256 | 2.39 | 1.05 |
+
+The historical control's cost is the reuse-1 structure: two controller
+mode changes and a register run per MAC (Section 3a, recalibration).  On
+the 1-head workloads it also computes seven padded heads.
+
+**Host protocol (rounds 49-50).**  Beside the priced host terms, the
+historical bridge protocol is measured on each compiled program with the
+historical methodology (`host_protocol_samples`): ten warm-up calls, then
+31 samples each the mean of 100 back-to-back calls (`historical_host_samples`,
+the campaign's `host_samples`).  The inputs are the attention's own: the
+QK readout words are the BF16 scores of the functional computation
+(unit-variance BF16 q and K, q.K in FP32 rounded to BF16; score standard
+deviation 10 to 12, every probability populated, the largest at most
+0.09), replacing round 49's masked random words (which produced scores up
+to 3.4e38 and left 127 of 128 probabilities zero).  The protocol is the
+compiled program's: decode of the readout words (BF16 to FP32), the
+compiled stage (the scaled softmax, which rounds its output to BF16 once),
+the staging of those words for the upload (the bit pattern; round 49
+rounded a second time) and, for a split SV, the compiled host reduction's
+merge of partials shaped as the lowered program produces them.  The whole
+protocol is timed in one call (`whole`, the comparable sample, its median
+`total_median_ns`); the per-step medians are a diagnostic breakdown whose
+sum is recorded beside it.  The distribution of the inputs and the
+protocol's outputs are recorded and checked (finite scores, probabilities
+summing to one per head).  `total_cycles_measured_host_protocol` = device +
+the stage's link term + the reduction's link term + the whole-protocol
+median (1 cycle = 1 ns).  On this host the whole protocol takes 32 us (1 x
+128) to 623 us (32 x 4096) per call, NumPy on small arrays, far above the
+declared price; the paper's host is not this one, which is one reason the
+row stays DIAGNOSTIC.
 
 **The one-head misses, calibrated command by command (round 49,
 `benchmarks/cent_aim/command_calibration.py`).**  The k-th command's
@@ -247,7 +302,97 @@ the register I/O, WR_GB and MAC charges from command classes measured this
 way across the CENT golden cases and the study's kernels, never from the
 study's winners (M-19).
 
-**Bridged run (2026-11-04, round 42, `tenon-release-evidence/r41/token_partition_bridged.json`).**
+**Recalibration of the contraction profile (round 50, M-19).**  The
+round 49 attribution above stands, with one correction: prefix deltas are
+contextual completion-time contributions, and the empty prefix (`EOC`
+alone) takes 2 cycles, which `command_calibration.increments` now measures
+explicitly as the baseline of the first increment (`eoc_baseline_cycles`).
+The repair was derived from controlled single-factor command streams on the
+simulator, not from any workload's increments or winners
+(`tenon-release-evidence/r50/controlled_variations.{py,json}`,
+`controlled_variations_sbk.{py,json}`; `allo/pim/costs/aim.py`
+`contraction_profile_charges`, profile `aim_contraction_profile`):
+
+| Class (one factor varied) | Measured | Charge now | Charge before |
+|---|---|---|---|
+| WR_GB, op size n = 1..64 | 2n in register mode; 2n + 3 after a read; +32 as the first command | `CMD_WR_GB + N_CCD * n` | 35 constant |
+| WR_BIAS, runs of 1..16 | 2 each | `N_CCD` | 35 each |
+| first MAC_ABK after WR_BIAS, c = 1..64 columns, fresh row | 87 + 2(c - 1) incl. the mode change | `N_RCD_RD_MAC + N_CCD * (c - 1)` + mode change | 56 + 2(c - 1) + 1 |
+| consecutive MAC_ABK at new rows, 2..9 lines, c = 2 / 8 / 32 | 100 + 2(c - 1) per line | `N_RTP + N_RP + N_RCD_RD_MAC + N_CCD * (c - 1)` (tRTP waits on the bank the previous MAC used) | 88 + 2(c - 1) + 1 |
+| MAC at a new row after register commands (one per extra reuse group, c = 8) | 104 | `N_RP + N_RCD_RD_MAC + N_CCD * c` | 88 + 15 |
+| consecutive MAC_ABK on the open row, c = 2 / 8 / 32 | 2c per line | `N_CCD * c` | 2(c - 1) + 1 |
+| MAC_SBK lines rotating over 16 banks at new rows, c = 1 / 2 / 8 | 89 / 91 / 103 per line | the group form above (the previous MAC was on another bank) | 88 + 2(c - 1) + 1 |
+| MAC_SBK lines on one bank at new rows | 100 / 102 / 114 | the in-run form above | same |
+| RD_MAC, runs of 1..32 | 36 then 3 per extra read (32 of the 36 the mode change) | `CMD_RD_REG = 3` each + 1 per run | 34 each |
+| the same group on 1, 2, 4, 8 channels | identical cycles | no per-channel term | same |
+| reuse groups 1, 2, 4, 8 | +174 per group at new rows, +86 at the open row | two mode changes per group (`N_MODCH` each) + its register runs | 32 per group + 35 / 34 per register command |
+
+The mode change is paid per transition between register commands (WR_GB,
+WR_BIAS, RD_MAC, RD_AF; the simulator's `require_reg_RW_mod`) and array
+commands, counted from the controller's initial array mode; the register
+commands themselves cost their burst or read latency.  What the profile
+cannot see is the previous kernel's context in the same program: a
+contraction after another's register read pays no entry mode change but
+its first activation usually replaces that kernel's open row (`N_RP` =
+`N_MODCH` = 32), a constant across the candidates of one kernel for the
+all-bank lines; a single-bank expansion pays it once per bank it opens
+(`r50/probe_sbk_lines.{py,log}`: on the 3 x 192 x 64 SV after the QK, every
+one of the 16 "fresh" MAC_SBK lines costs 99 cycles like the 48 switches
+that follow, 16 x 32 = 512 more than the profile's fresh charge; such
+candidates are priced 7% low and are four times the best all-bank
+candidate).  AF and RD_AF keep their previous charges (no AF in these
+streams; uncalibrated).
+
+Validation before any confirmation outcome was inspected: the standalone
+GEMV probe prices 223 against 222 simulated (ABK) and 1513 against 1527
+(SBK: the one extra cycle each consecutive fresh single-bank line takes;
+`tests/pim/test_aim_cost_routes.py`); the structure of the charges is
+pinned by `tests/pim/test_aim_profile_calibration.py`; and on held-out
+programs every distinct budgeted candidate of each kernel (the other kernel
+at its default) is compiled, simulated to its boundary and compared with
+the charge (`r50/heldout_validation.{py,json,log}`; see VALIDATION.md
+round 50 for the table): four neighbouring shapes (3x192x64, 5x320x64,
+2x256x128, 4x256x64), the study's three 1-head shapes and the three golden
+32-head shapes, 20 kernel sets, 2,520 candidates: mean absolute error
+0.76% (largest 6.9%, the single-bank residual below), 168,272 of 168,328
+ordered pairs in the simulator's order, the simulator's best candidate the
+model's in all 20 sets (the previous charges: 19.3% mean error, 98.5% of
+pairs); of the 56 disagreeing pairs the largest simulated gap is 1.14%.
+
+**Nine workloads on the recalibrated profile (round 50,
+`tenon-release-evidence/r50/token_partition_nine.json`).**  Cells: measured
+total = device + priced host (stage + reduction), with the estimate in
+parentheses; the normal budgeted selection equals the forced plan of its P
+on every workload; both controls complete, no failed plan, 49 distinct
+plans.
+
+| Heads | Tokens | P1 | P2 | P4 | P8 | Head-only | Selected P | Best P | Gap | cent-repaired | cent-policy |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 128 | 1261 (1263) | 1221 (1223) | 1217 (1219) | 1263 (1265) | 1261 | 4 | 4 | 0 | 2696 | 1261 |
+| 1 | 512 | 2194 (2196) | 1938 (1940) | 1826 (1828) | 1818 (1820) | 2194 | 8 | 8 | 0 | 6992 | 2407 |
+| 1 | 4096 | 7071 (7082) | 9509 (9514) | 7510 (7512) | 6998 (7000) | 13539 | 8 | 8 | 0 | 50880 | 15740 |
+| 8 | 128 | 1856 (1858) | 2991 (2996) | 5005 (5016) | 9033 (9056) | 1856 | 1 | 1 | 0 | 2696 | 1856 |
+| 8 | 512 | 4787 (4798) | 5922 (5936) | 7936 (7956) | 11964 (11996) | 4787 | 1 | 1 | 0 | 6992 | 4787 |
+| 8 | 4096 | 34780 (34884) | 35036 (35140) | 35292 (35396) | 39320 (39436) | 34780 | 1 | 1 | 0 | 50880 | 34780 |
+| 32 | 128 | 7424 (7444) | 11964 (11996) | 20020 (20076) | 36132 (36236) | 7424 | 1 | 1 | 0 | 10784 | 7424 |
+| 32 | 512 | 19148 (19204) | 23688 (23756) | 31744 (31836) | 47856 (47996) | 19148 | 1 | 1 | 0 | 27968 | 19148 |
+| 32 | 4096 | 139120 (139548) | 140144 (140572) | 141168 (141596) | 157280 (157756) | 139120 | 1 | 1 | 0 | 203520 | 139120 |
+| 2 (neighbour) | 256 | 1813 (1818) | 1733 (1738) | 1725 (1730) | 2732 (2737) | 1813 | 4 | 4 | 0 | 4128 | 1813 |
+
+The device cells are the same simulated programs as rounds 42-49 (the
+simulator did not change); the estimates now lie within 0.1% to 0.3% of
+the measured totals and the normal selection reaches the simulated minimum
+on all nine workloads and the neighbour (rounds 42-49: six of nine, the
+three one-head misses by 0.33% / 0.44% / 1.04%).  The paper reports seven
+of nine with a largest gap of 2.63% on its own boundary; the release's
+figure is the measurement above on its stated boundary and is not that
+number.  The row stays DIAGNOSTIC: the priced host compute is a declared
+per-vector model (the measured protocol on this host is not the paper's
+host), and the recalibrated selections await independent review.
+
+**Earlier results, superseded (kept for the record).**
+
+**Bridged run (2026-11-04, round 42, superseded by round 50, `tenon-release-evidence/r41/token_partition_bridged.json`).**
 Cells: measured total = device + priced host (stage + reduction), with the
 estimate in parentheses; the normal budgeted selection equals the forced
 plan of its P on every workload.
@@ -271,7 +416,7 @@ this host (18 us to 530 us per call, NumPy on small arrays) are far above
 the declared price (48 to 49,152 cycles) and are recorded separately, not
 substituted.
 
-**The one-head misses, from the retained graphs (round 43,
+**The one-head misses, from the retained graphs (round 43, resolved by the round 50 recalibration,
 `r41/token_partition_bridged.artifacts/h1_*/P*/plan.json`).**  The
 bridge's stage term is identical for every P of a workload and the host
 reduction term is small (32 cycles per doubling of P), so the order is
@@ -310,6 +455,8 @@ calibrate from the lowered command streams, not from these winners.
   profiled line by line. GEMV 256x256 mapping [32]: ABK 223 (before: 255
   knobs / 156 `layout=`), simulated 222; SBK 1528 (before 720 / 765),
   simulated 1527. The 14 CENT traces are byte-identical to their pins.
+  Round 50 recalibrated every command class from controlled measurements
+  (Section 3a): ABK still 223, SBK 1513.
 * Host transfers (M-05): the rule prices the moved slice (`host_slice`) and
   zero for a resident buffer (`host_resident`); the docstring states the
   validity domain. See Section 6 for the plumbing that supplies the metrics.
@@ -356,8 +503,12 @@ calibrate from the lowered command streams, not from these winners.
 * The `channels` mapping issues one masked WR_GB for distinct per-channel
   payloads (timing abstraction inherited from CENT's traces); the oracle
   checks ownership and merge, not GB payload routing.
-* Estimate accuracy on long streams (1.25x to 1.59x high) is the next
-  calibration target; it was not tuned against these results.
+* Estimate accuracy: round 50 recalibrated the contraction profile per
+  command class from controlled measurements (Section 3a); residuals are
+  the previous kernel's context (an entry mode change or a first-row
+  precharge, 32 cycles either way, constant per kernel), one cycle per
+  consecutive fresh single-bank line, and the uncalibrated AF / RD_AF
+  classes.
 
 ## 7. Owner-map row placement (movement ties, 2026-11-02)
 

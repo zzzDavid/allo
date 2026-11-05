@@ -3,6 +3,45 @@
 
 # Paper reproduction through the shared pipeline
 
+## Required scope: key tables and figures only
+
+User correction and confirmation, 2026-11-04: reproduce the key tables and
+figures; supporting work is optional. This section supersedes earlier
+exhaustive-campaign wording and historical next-action lists in this file.
+The inventory's `release_scope` column determines whether a reproduction
+result is required. Preserve existing measurements and honest statuses;
+optional UNVERIFIED/DIAGNOSTIC rows are not G10 reproduction blockers.
+
+| Required comparison | Frozen paper source | Required performance coverage |
+| --- | --- | --- |
+| Samsung GEMV | tables/eval-samsung.tex | Three GEMV shapes; cycles and speedups with outputs validated |
+| AiM vs CENT | tables/eval-skhynix.tex | Fourteen component/composed rows; timing-only result kind and generated work checked |
+| UPMEM kernel comparison | figures/eval_upmem, tables/eval-upmem.tex | Sixteen kernels; kernel latency and baseline comparison |
+| Gemini-I vs Phoenix | tables/eval-apuv1.tex | Five kernels; device cycles and speedups; LoC columns optional |
+| Gemini-II vs GTML | tables/eval-apuv2.tex | Five kernels; device cycles and speedups; LoC columns optional |
+| AttAcc kernel tiling | figures/eval_attacc_kernels, tables/eval-attacc-kernels.tex | QKV, projection and scoring at batches 1/4 (six plotted summaries), with comparable simulator timings |
+| AttAcc full-model decode | figures/eval_attacc_e2e, tables/eval-attacc-e2e*.tex | Six plotted prompt/generation/batch configurations; stated simulated/analytical composition and speedups |
+
+The required rows use shared-pipeline compilation, preserved source semantics
+and timing boundaries, matching-or-better comparable performance, and real
+declared execution modes. Architecture diagrams and mechanism illustrations
+remain implementation contracts under G1/G9; they do not create an obligation
+to regenerate every isolated probe or historical measurement in a caption.
+
+**Optional supporting work:** UPMEM scaling, exhaustive masked layouts,
+shared-selection/packing/DCC studies, isolated layout ablations, AiM token
+partitioning, AttAcc 500-instance timing-quality and prediction-error studies,
+compilation time and line counts, calibration, and virtual architecture sweeps.
+Keep useful existing evidence. Run more only to diagnose a required result
+or an actual compiler/shared-pipeline defect, or under a later user request.
+Optional reproduction incompleteness is distinct from a production defect.
+
+**Next work:** checkpoint the current token-partition/cost increment without
+extending the optional campaign, then address open required backend rows and
+the AttAcc performance figures, followed by release-candidate validation.
+Report required and optional progress separately; the total number of
+unverified entries in the broad inventory is not a release criterion.
+
 Status (2026-11-04, round 30): **in progress, G10 FAIL**. User priority
 addition 2026-11-03, gate G10 of the containing repository's TASK.md. The
 machine-readable inventory (`paper_reproduction/inventory.csv`, 83 rows) is
@@ -22,11 +61,13 @@ repaired program at parity with the paper's own binary in the same rounds
 and 0.19% above the paper's archived median, so OPEN (nominal) by the
 parity rule, X-22), and the 500-instance AttAcc selector equivalence as a diagnostic.
 DIAGNOSTIC: token partitioning (the normal selection under the eight-channel
-budget on the bridged boundary reaches 6 of 9 simulated minima, largest gap
-1.04%; the softmax bridge, the link volumes and the host stage are now in
-the priced and measured boundary; not comparable with the paper's row
-while the host stage's price is a declared model and the CENT control's
-boundary is CENT's own, M-15; rounds 39-42).
+budget on the bridged boundary reaches 9 of 9 simulated minima on the
+contraction profile recalibrated in round 50 (rounds 42-49: 6 of 9, largest
+gap 1.04%); the softmax bridge, the link volumes, the host stage, the frozen
+study's own control and the measured host protocol are in the priced and
+measured boundary; not comparable with the paper's row while the host
+stage's price is a declared model and the recalibrated selections await
+review, M-15, M-19; rounds 39-50).
 UNVERIFIED: the layout rows, UPMEM scaling, the packing,
 shared selection and DCC studies, AttAcc Ramulator2 timings and decode
 composition, calibration, the virtual-backend study and the compile-cost
@@ -41,12 +82,12 @@ allowed; preserve the paper's semantic/mechanism contracts and qualifications.
 
 Complete the current bounded backend integration increment, then inventory
 and measure paper workloads on each usable shared backend while finishing G9.
-Prioritize kernel performance and shared selection. Measure the program the
+Prioritize the required key comparisons listed above. Measure the program the
 shared driver selects and materializes; use explicit alternatives separately
 for controlled ablations. Fix implementation and performance gaps as found.
 Do not wait for unrelated arithmetic or lint debt to be closed first.
 
-For comparable latency/cycles, current/paper must be <= 1; for throughput,
+For required comparable latency/cycles, current/paper must be <= 1; for throughput,
 current/paper must be >= 1. Exact historical digits are unnecessary. Hardware
 needs repeated measurements, the stated statistic and reported uncertainty;
 a nominal regression stays open until parity is established or it is repaired.
@@ -56,9 +97,9 @@ paper capabilities. Missing comparable measurements stay UNVERIFIED.
 
 ## Initial coverage map
 
-References below are relative to the frozen paper's latex source. Expand
-these families into a machine-readable case/result inventory, including every
-reported size and substantive table/figure claim, with reproducible commands.
+References below are relative to the frozen paper's latex source. This is
+the broader historical coverage map; only the required set above blocks G10.
+Retain optional families and their statuses without demanding their completion.
 
 | Family | Frozen source | Required comparison and execution scope |
 | --- | --- | --- |
@@ -93,8 +134,10 @@ and containing-repository experiment reports. Audit their coverage and routes:
 a golden pass or archived winner is not proof of current shared selection.
 Include expensive paper_full rows explicitly. Export reusable reproduction
 commands/drivers in the release repo; measurements are evidence, not runtime
-compiler inputs. G10 remains open until independent review establishes the
-full coverage, preserved contracts and matching-or-better performance.
+compiler inputs. G10 remains open until independent review establishes
+coverage of the required key comparisons, preserved contracts and
+matching-or-better performance. Optional supporting entries need not be
+completed.
 
 ## Machine-readable inventory (round 25, 2026-11-04)
 
@@ -175,4 +218,5 @@ having loaded and fails the launch unless it equals the archived library.
 | AiM token partitioning (9 workloads + neighbour), round 42, bridged boundary | the bridged attention (QK scores -> host global softmax -> probabilities -> SV) with the softmax a declared host stage of the shared plan, priced in the selection graph (readout + upload over the 32 B/cycle link, four host vector passes; partial readout in the host reduction), the eight-channel budget as the compiler's policy, every plan with independent functional evidence (lowered QK and SV oracles around the compiled stage's function vs a float64 reference), measured host-stage samples beside the price, the CENT attention program as the 32-head control, every plan's artifacts retained | DIAGNOSTIC (M-15 narrowed): the normal selection reaches 6 of 9 simulated minima with a largest gap of 1.04% (paper 7 of 9, 2.63%), the three misses on the 1-head workloads (0.33%, 0.44%, 1.04%); head-only / selected 1.91x for 1 head x 4096 tokens (paper 1.071x); neighbour 2x256 at 0.46%; functional pipeline within 4.9e-3 on every plan; not yet comparable because the host stage's price is a declared model (this host's measured samples are 18-530 us per call) and the CENT control's boundary is CENT's own (`r41/token_partition_bridged.json`) |
 | AiM token partitioning, round 43, repaired bridge | the stage is the scaled softmax of the workload's head dimension bound at realization to the recorded computation, declared operation and realized position; the host price stored as link and compute terms and the measured-host total replacing the compute term only; the functional reference is scaled attention on operands that expose the scale | DIAGNOSTIC (M-15, M-17 fixed): the same cells and figures as round 42 (6 of 9, 1.04%; the simulator's cycles are data independent); every plan's functional pipeline within 9.6e-3 of the scaled float64 reference, the unscaled reference off by at least 5.3x; the one-head misses are two estimate ties and one 12% relative overprice of the 8-way command stream (design doc section 3a) (`r43/token_partition_bridged.json`) |
 | AiM token partitioning, round 49, CENT-derived control and host protocol | the eight-channel CENT control derived structurally (CENT's mapping policy from the shared pipeline's exact selection on the CENT golden cases, matched in each workload's budgeted enumeration and compiled under the study's budget, bridge and accounting), the historical host protocol measured step by step beside the price, every variant and control accounted for, the one-head misses calibrated command by command against the simulator | DIAGNOSTIC (M-15, M-19): same device cells, 6 of 9 minima, largest gap 1.04%; the CENT-derived control equals the selection on the 8- and 32-head workloads and is 1.03x-2.23x slower on the 1-head ones; the misses are the contraction profile's register I/O, WR_GB and MAC charges (recalibration pending), not the bridge or the accounting (`r49/token_partition_bridged.json`, `r49/calibration_*.json`) |
+| AiM token partitioning, round 50, historical control, host protocol, recalibrated profile | the frozen study's `cent-repaired` control restored through the shared pipeline (padded heads, reuse 1, eight channels; producer provenance and command inventories recorded), the round 49 control kept as the `cent-policy` ablation; the host protocol measured on the attention's own BF16 scores, encoded once, with the historical methodology; the contraction profile recalibrated per command class from controlled single-factor simulator measurements and validated on the standalone probe and held-out programs before the nine workloads | DIAGNOSTIC (M-15; M-19 repaired, awaiting review): same device cells; the normal selection reaches 9 of 9 simulated minima, every gap 0, estimates within 0.1-0.3% of the measured totals (rounds 42-49: 6 of 9, misses 0.33% / 0.44% / 1.04%; paper 7 of 9, 2.63%, on its own boundary); cent-repaired 2.22x / 3.85x / 7.27x over the selection on the 1-head workloads and 1.45x-1.46x on the 8- and 32-head ones; the measured whole protocol 32-623 us per call on this host (`r50/token_partition_nine.json`, `r50/controlled_variations.json`, `r50/heldout_validation.json`) |
 | layout rows (Samsung XOR, Gemini-I vector GEMM), scaling, packing, DCC, calibration, virtual study, compile cost | | UNVERIFIED this round; next in the order of the inventory |
