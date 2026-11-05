@@ -1586,10 +1586,24 @@ def _term_eq(a, b) -> bool:
             if a.value_ref is not None and b.value_ref is not None
             else a.memref_name == b.memref_name
         )
+        if not same_memref:
+            return False
+        if list(a.indices) == list(b.indices) and a.index_map == b.index_map:
+            return True
+        # Different index operands or maps may still name the same element:
+        # equal resolved affine coordinates (``A[64 + i]`` through an
+        # ``affine.load`` map and ``A[row0 + i]`` with ``row0 = 64`` through
+        # an address-only temporary) denote equal coordinates in every
+        # execution (`affine_form`).
+        left = _coords_of_terms(a.index_terms, a.index_map)
+        right = _coords_of_terms(b.index_terms, b.index_map)
         return (
-            same_memref
-            and list(a.indices) == list(b.indices)
-            and a.index_map == b.index_map
+            left is not None
+            and right is not None
+            and len(left) == len(right)
+            and all(c is not None for c in left)
+            and all(c is not None for c in right)
+            and tuple(left) == tuple(right)
         )
     if isinstance(a, WBlockArg):
         return a.ssa_name == b.ssa_name

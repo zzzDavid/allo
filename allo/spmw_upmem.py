@@ -470,17 +470,34 @@ _POINTWISE_BETA_SIGN = {"AXMBY": -1}
 _POINTWISE_OPERAND_ROLES = {"scale": ("x",)}
 
 
+def _access_coords(access):
+    """The resolved affine coordinates of an operand binding (``coords``) or
+    of a retained load term (`WLoad`: its traced index operands composed
+    with its access map, the engine's own derivation), None when the access
+    carries no resolved form; a coordinate that depends on loaded data is a
+    None entry."""
+    coords = getattr(access, "coords", None)
+    if coords is not None:
+        return tuple(coords)
+    terms = getattr(access, "index_terms", None)
+    if terms is None:
+        return None
+    return _engine()._coords_of_terms(terms, getattr(access, "index_map", None))
+
+
 def _coordinate_vars(operand) -> list:
     """The loop variable each coordinate of ``operand`` ranges over, from the
-    matcher's resolved affine forms (``coords``): a coordinate that is one
-    loop variable plus a constant (the per-work-item base ``dpu * ROWS + i``,
-    inline or hoisted into an address-only temporary, ISSUES U-16) names
-    that variable; any other coordinate keeps its raw index name (a constant,
-    a data-dependent index), which no loop variable equals.  Falls back to
-    the raw indices when no resolved form was retained.  Family recognition
-    reads coordinates through this so nearby spellings classify alike."""
+    matcher's resolved affine forms (an operand binding's ``coords``, a load
+    term's traced indices and map): a coordinate that is one loop variable
+    plus a constant (the per-work-item base ``dpu * ROWS + i``, inline or
+    hoisted into an address-only temporary, ISSUES U-16) names that
+    variable; any other coordinate keeps its raw index name (a constant, a
+    data-dependent index), which no loop variable equals.  Falls back to the
+    raw indices when no resolved form was retained.  A projection for the
+    geometry only: it drops the constants, so it never proves two accesses
+    equal (`_load_is` compares the full coordinates)."""
     indices = list(getattr(operand, "indices", ()) or ())
-    coords = getattr(operand, "coords", None)
+    coords = _access_coords(operand)
     if not coords or len(coords) != len(indices):
         return indices
     return [_coordinate_var(coord, raw) for coord, raw in zip(coords, indices)]
@@ -1002,12 +1019,28 @@ def _is_const(term, value) -> bool:
 
 
 def _load_is(term, operand) -> bool:
+    """Whether the load ``term`` (a guard's tested value) reads the element
+    the operand binding reads: the same memref and the same full resolved
+    coordinates (affine maps and constants included), so ``A[64 + i]``
+    equals ``A[row0 + i]`` with ``row0 = 64`` and differs from ``A[i]``.
+    Without a resolved form on both sides the raw index names must agree."""
     E = _engine()
-    return (
-        isinstance(term, E.WLoad)
-        and term.memref_name == operand.memref_name
-        and _coordinate_vars(term) == _coordinate_vars(operand)
-    )
+    if not isinstance(term, E.WLoad) or term.memref_name != operand.memref_name:
+        return False
+    left, right = _access_coords(term), _access_coords(operand)
+    if left is None or right is None:
+        return (
+            left is None
+            and right is None
+            and list(term.indices) == list(operand.indices)
+        )
+    if (
+        len(left) != len(right)
+        or any(c is None for c in left)
+        or any(c is None for c in right)
+    ):
+        return False
+    return tuple(left) == tuple(right)
 
 
 def _cmp_parts(term):

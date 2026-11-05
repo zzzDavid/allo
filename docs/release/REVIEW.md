@@ -2013,6 +2013,23 @@ frontend's 65-bit sum as the truncation it is; both forms compile to the
 same device source and object and simulate to the same cycles with exact
 outputs.  Board and Gemini-I work stay blocked by `/tmp`.
 
+## Round 69 (2026-11-05): load identity on full resolved coordinates (U-16 completed)
+
+The reviewer showed that round 68 fixed the operand geometry but left the
+selection and histogram families comparing the guard's load with the
+copied operand by raw index names: an equivalent hoisted selection was
+refused while a guard over another element was accepted and failed in
+packing.  Repaired in the shared retained analysis and the recognizers:
+load identity now compares the full resolved coordinates of both sides,
+including affine maps and constants, through the engine's own coordinate
+derivation; the geometry projection stays a projection; the engine's term
+equality treats loads with equal resolved coordinates and version as the
+same element.  Equivalent spellings compile and execute alike on the native
+simulator, differing guard and copy accesses are refused before selection,
+and the round 68 closure text is narrowed.  Checkout evidence; the next
+installed candidate must include it.  Nothing else changed: hardware work
+stays behind `/tmp`, the nine required rows stay OPEN.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -2052,10 +2069,10 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 68 (2026-11-05); the integration candidate `ba2f58d`
+Refreshed in round 69 (2026-11-05); the integration candidate `ba2f58d`
 (X-25 completed, X-27 and its correction, X-28 to X-31, the native UPMEM SDK
 executor), validated from installed artifacts on the simulators (UPMEM
-included) and the Gemini-II card, plus the U-16 repair of this commit
+included) and the Gemini-II card, plus the U-16 repair of rounds 68-69
 (checkout evidence); the grouped route's board validation and the Gemini-I
 campaign wait for the host's `/tmp` with status-propagating watchers. Earlier judgments are kept in the round sections above.
 
@@ -2063,7 +2080,7 @@ campaign wait for the host's `/tmp` with status-propagating watchers. Earlier ju
 |---|---|---|
 | G1 correspondence | **PARTIAL** | every substantive mechanism of Sections III and IV has a maintained implementation reachable through `allo.compile` (CLAIMS.md), now including both APUs through the shared pipeline; the claim matrix must be re-read against the G9 pipeline and the G10 inventory (same-or-better performance is part of G1 since the 2026-11-03 scope addition) |
 | G2 semantic preservation / explicit failure | **PARTIAL** | the rounds 8-11 repairs (C-19 to C-26) and the shared contract rounds (X-02 to X-14, X-17 to X-20) are implemented with regressions; the shared semantic checks run before every backend's selection; round 62: the APU v1 grouped route refuses, before scheduling and by name, a region whose accesses or written domain are not the dense GEMM its device program executes (X-29); open: the deferred arithmetic findings (ISSUES), independent re-challenge of the whole domain on every runner |
-| G3 general mechanisms | **PARTIAL** | structural recognizers and template-derived legality on every backend; the AttAcc attention template is proven structurally (X-20); the UPMEM recognizers read resolved coordinates so hoisted and inline address spellings classify alike (U-16, round 68); renamed and neighbouring programs compile to the same normalized decisions in the round 24-28 regressions; open: M-14, the constants inventory re-read against the current tree |
+| G3 general mechanisms | **PARTIAL** | structural recognizers and template-derived legality on every backend; the AttAcc attention template is proven structurally (X-20); the UPMEM recognizers read resolved coordinates so hoisted and inline address spellings classify alike, and guard / copy load identity is proven on full coordinates (U-16, rounds 68-69); renamed and neighbouring programs compile to the same normalized decisions in the round 24-28 regressions; open: M-14, the constants inventory re-read against the current tree |
 | G4 search/layout/selected-program integrity | **PARTIAL** | complete assignments materialize under the real orchestration before acceptance (C-33b); every backend's realization is compared with its declaration (X-05 to X-16; the APU v1 grouped route's map, batches, packing and emission since rounds 61-66, X-28 to X-31); transfer availability and physical addressing are checked (X-09 to X-11, X-17, X-18); open: the slice 5 forced-alternative traces through packing and launches on both hardware hosts |
 | G5 cost models | **PARTIAL** | provenance and validity labels everywhere; cost perturbations traced to executed programs on Samsung, UPMEM and APU v1 in earlier rounds; the Samsung estimate includes each work item's share of the first matrix staging (partitioning the conductor's staging exactly, staging before the MAC, the same scope for the ordered program) and ranks the swizzled-rows placement first on both paper GEMVs, a held-out and a neighbouring shape, as the conductor measures (rounds 37-38, S-16 repaired); the AiM contraction profile recalibrated per command class from controlled simulator measurements and validated on held-out programs before the nine workloads (round 50, M-19 awaiting review); open: C-18, uniform movement weights, the perturbation traces at the current candidate on both hardware hosts |
 | G6 evidence beyond examples | **PARTIAL** | EVIDENCE.md plus the reviewer-driven probes of rounds 8-27 (renamings, operation changes, shape and slice neighbours, wrong declarations, reversed arithmetic); open: hardware-only confirmations, the probe list re-run at the candidate |
