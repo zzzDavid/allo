@@ -668,22 +668,188 @@ class AimCtx(CodegenContext):
         if program.groups:
             self.emit_eoc()
 
+    def _check_launch_inventory(self, program, layouts, ops) -> None:  # noqa: C901
+        """The lowered records against the program's launch occurrences.
+
+        The expected inventory comes from the retained facts and the selected
+        candidates, never from the emitted records: every scheduled launch
+        occurrence of a group (each ``LaunchStep``; without a schedule, one
+        occurrence per group) lowers exactly one primary record per matched
+        contraction of the group (or one elementwise record), and, for a
+        contraction whose candidate declares P > 1 reduction partitions, one
+        host reduction of that contraction with that P, before any later
+        stage or launch begins.  The records of one occurrence are
+        contiguous in the realized sequence (host transfers, bank copies and
+        syncs are owned by other steps and not ordered here); a declared host
+        stage sits between occurrences exactly where the schedule puts it.
+        A duplicated, missing or displaced record is a realization failure.
+        """
+        from .spmw_candidate import candidate_effects
+        from .spmw_plan import HostComputeStep, LaunchStep
+
+        schedule = getattr(program, "schedule", None)
+        steps = list(getattr(schedule, "steps", ()) or ())
+        groups = {group.group_id: group for group in program.groups}
+
+        # Declared partitions per group: the selected candidate's launch
+        # record (``covers[2]``), else the group's own derived knob.
+        declared_partitions = {}
+        for layout in layouts:
+            gid = getattr(self, "_group_of_layout", {}).get(id(layout))
+            effects = candidate_effects(layout)
+            if gid is None or effects is None:
+                continue
+            launches = list(effects.launches)
+            if len(launches) == 1 and len(launches[0].covers) >= 3:
+                try:
+                    declared_partitions[gid] = int(launches[0].covers[2])
+                except (TypeError, ValueError):
+                    pass
+
+        def expectation(gid):
+            group = groups[gid]
+            if group.kind == "contraction":
+                names = [c["match"].func_name for c in group.contractions]
+                partitions = declared_partitions.get(gid, int(group.reduction_partitions))
+                merges = {name: partitions for name in names} if partitions > 1 else {}
+                return {"primaries": names, "merges": merges}
+            return {"primaries": [group.name], "merges": {}}
+
+        if steps:
+            tokens = []
+            occurrence = {}
+            for step in steps:
+                if isinstance(step, LaunchStep):
+                    occurrence[step.group_id] = occurrence.get(step.group_id, 0) + 1
+                    tokens.append(("launch", step.group_id, occurrence[step.group_id] - 1))
+                elif isinstance(step, HostComputeStep):
+                    tokens.append(("stage", step.name))
+        else:
+            tokens = [("launch", group.group_id, 0) for group in program.groups]
+
+        primary_group = {}
+        for group in program.groups:
+            if group.kind == "contraction":
+                for c in group.contractions:
+                    primary_group[c["match"].func_name] = group.group_id
+            else:
+                primary_group[group.name] = group.group_id
+
+        state = {"index": -1, "pending_primaries": [], "pending_merges": {}, "done_primaries": set()}
+
+        def describe(token):
+            return (
+                f"host stage {token[1]!r}" if token[0] == "stage"
+                else f"launch {token[2]} of group {groups[token[1]].name!r}"
+            )
+
+        def close_current():
+            if state["index"] < 0:
+                return
+            token = tokens[state["index"]]
+            if token[0] == "launch" and (state["pending_primaries"] or state["pending_merges"]):
+                raise RuntimeError(
+                    f"AiM realization: {describe(token)} is incomplete before the next "
+                    f"step: missing primary records {state['pending_primaries']} and host "
+                    f"reductions {sorted(state['pending_merges'])}"
+                )
+
+        def open_next(kind, gid=None, what=""):
+            close_current()
+            index = state["index"] + 1
+            if index >= len(tokens):
+                raise RuntimeError(
+                    f"AiM realization lowered {what} after the last scheduled step"
+                )
+            token = tokens[index]
+            if token[0] != kind or (kind == "launch" and token[1] != gid):
+                raise RuntimeError(
+                    f"AiM realization lowered {what} where the schedule expects "
+                    f"{describe(token)}"
+                )
+            state["index"] = index
+            if kind == "launch":
+                expected = expectation(gid)
+                state["pending_primaries"] = list(expected["primaries"])
+                state["pending_merges"] = dict(expected["merges"])
+                state["done_primaries"] = set()
+            else:
+                state["pending_primaries"], state["pending_merges"] = [], {}
+                state["done_primaries"] = set()
+
+        def current_launch(gid):
+            return (
+                state["index"] >= 0
+                and tokens[state["index"]][0] == "launch"
+                and tokens[state["index"]][1] == gid
+            )
+
+        for op in ops:
+            if isinstance(op, AimHostStage):
+                open_next("stage", what=f"host stage {op.stage!r}")
+                continue
+            if isinstance(op, (AimContraction, AimElementwise)):
+                name = str(op.name)
+                gid = primary_group.get(name)
+                if gid is None:
+                    raise RuntimeError(
+                        f"AiM realization lowered a primary record {name!r} that no "
+                        "matched group of the program declares"
+                    )
+                if not (current_launch(gid) and name in state["pending_primaries"]):
+                    open_next("launch", gid, what=f"primary record {name!r}")
+                    if name not in state["pending_primaries"]:
+                        raise RuntimeError(
+                            f"AiM realization lowered primary record {name!r} twice for "
+                            f"{describe(tokens[state['index']])}"
+                        )
+                state["pending_primaries"].remove(name)
+                state["done_primaries"].add(name)
+                continue
+            if isinstance(op, AimHostReduction):
+                source = str(op.source)
+                gid = primary_group.get(source)
+                if gid is None or not current_launch(gid):
+                    raise RuntimeError(
+                        f"AiM realization lowered the host reduction of {source!r} outside "
+                        "the launch occurrence that produces its partials"
+                    )
+                if source not in state["pending_merges"]:
+                    raise RuntimeError(
+                        f"AiM realization lowered a host reduction of {source!r} that "
+                        f"{describe(tokens[state['index']])} does not declare (or a second one)"
+                    )
+                if source not in state["done_primaries"]:
+                    raise RuntimeError(
+                        f"AiM realization lowered the host reduction of {source!r} before "
+                        "its contraction"
+                    )
+                expected = state["pending_merges"].pop(source)
+                if int(op.partitions) != int(expected):
+                    raise RuntimeError(
+                        f"AiM realization merges {op.partitions} partials of {source!r}; the "
+                        f"candidate declares {expected}"
+                    )
+                continue
+            # Host transfers, bank copies and syncs are owned by other steps.
+        close_current()
+        if state["index"] != len(tokens) - 1:
+            missing = tokens[state["index"] + 1 :]
+            raise RuntimeError(
+                "AiM realization lowered no records for "
+                + ", ".join(describe(t) for t in missing)
+            )
+
     def _check_host_stages(self, program, layouts, ops) -> None:  # noqa: C901
         """The lowered host stages against the schedule's declared stages:
-
-        * one `AimHostStage` per declared stage, with the declared label,
-          operation, buffers and the very computation the host program
-          recorded (the same callable object), in the realized sequence at
-          the declared position among the launches (the sequence of launch
-          occurrences and stages in ``ops`` equals the schedule's, repeated
-          launches included; host transfers are not ordered here);
-        * each stage input is produced before the stage: by an earlier
-          launch whose candidate declares it as an output, by an earlier
-          stage, or it is a region input no launch of the program writes
-          (host data from the start, as the shared availability walk reads
-          it);
-        * each stage output reaches a later launch through that launch's
-          declared host ingress.
+        one `AimHostStage` per declared stage (their order among the launch
+        occurrences is checked by `_check_launch_inventory`), each with the
+        declared label, operation and buffers and the very computation the
+        host program recorded (the same callable object); each stage input
+        produced before the stage (by an earlier launch whose candidate
+        declares it as an output, by an earlier stage, or a region input no
+        launch of the program writes); each stage output reaching a later
+        launch through that launch's declared host ingress.
         """
         from .spmw_autoschedule import _matcher_work_scope
         from .spmw_candidate import candidate_effects
@@ -700,81 +866,6 @@ class AimCtx(CodegenContext):
             )
         if not declared:
             return
-
-        # --- the realized sequence of launch occurrences and stages ---
-        group_of_function = {}
-        for group in program.groups:
-            for function in group.functions:
-                group_of_function[function] = group.group_id
-            group_of_function[group.name] = group.group_id
-
-        def group_of(op):
-            if isinstance(op, _HOST_TRANSFER_RECORDS):
-                return None
-            gid = getattr(op, "group_id", None)
-            if gid is not None:
-                return gid
-            for attr in ("source", "name"):
-                value = getattr(op, attr, None)
-                if not value:
-                    continue
-                text = str(value)
-                for candidate in (text, text.split(".", 1)[0]):
-                    if candidate in group_of_function:
-                        return group_of_function[candidate]
-            return None
-
-        primary = (AimContraction, AimElementwise)
-        launches = [s for s in steps if isinstance(s, LaunchStep)]
-        launches_of_group = {}
-        for step in launches:
-            launches_of_group[step.group_id] = launches_of_group.get(step.group_id, 0) + 1
-        primaries_of_group = {}
-        for op in ops:
-            if isinstance(op, primary):
-                gid = group_of(op)
-                primaries_of_group[gid] = primaries_of_group.get(gid, 0) + 1
-        per_launch = {}
-        for gid, count in launches_of_group.items():
-            total = primaries_of_group.get(gid, 0)
-            if total == 0 or total % count:
-                raise RuntimeError(
-                    f"AiM realization lowered {total} primary record(s) for group "
-                    f"{gid} launched {count} time(s)"
-                )
-            per_launch[gid] = total // count
-        realized = []  # ("launch", group_id) per occurrence | ("stage", index)
-        seen_primaries = {}
-        stage_index = 0
-        for op in ops:
-            if isinstance(op, AimHostStage):
-                realized.append(("stage", stage_index))
-                stage_index += 1
-                continue
-            gid = group_of(op)
-            if gid is None or gid not in per_launch:
-                continue
-            if isinstance(op, primary):
-                seen_primaries[gid] = seen_primaries.get(gid, 0) + 1
-                occurrence = (seen_primaries[gid] - 1) // per_launch[gid]
-                if not realized or realized[-1] != ("launch", gid, occurrence):
-                    realized.append(("launch", gid, occurrence))
-        realized = [
-            ("launch", item[1]) if item[0] == "launch" else item for item in realized
-        ]
-        expected = []
-        stage_index = 0
-        for step in steps:
-            if isinstance(step, LaunchStep):
-                expected.append(("launch", step.group_id))
-            elif isinstance(step, HostComputeStep):
-                expected.append(("stage", stage_index))
-                stage_index += 1
-        if realized != expected:
-            raise RuntimeError(
-                "AiM realization orders the host stages differently from the "
-                f"schedule: realized {realized}, declared {expected}"
-            )
 
         # --- per stage: identity, computation, inputs and outputs ---
         effects_of = {}
@@ -896,6 +987,7 @@ class AimCtx(CodegenContext):
                 "manifest entries"
             )
         manifest_of = {id(op): entry for op, entry in zip(ops, manifest)}
+        self._check_launch_inventory(program, layouts, ops)
         # The lowered program against the compile's resource budget: no
         # record may occupy more channels than the cap.
         cap = (getattr(self, "resource_budget", None) or {}).get("channel")

@@ -1475,6 +1475,22 @@ output. The study is re-run on the repaired boundary and stays DIAGNOSTIC;
 the one-head misses are examined from the retained graphs (design doc).
 G9/G10 and the recorded blockers remain open.
 
+## Round 44 (2026-11-04): independent review of b0c667b; launch occurrences and completion
+
+The reviewer accepted the round 43 repairs and showed the realization-order
+part of M-17 only partially closed: the per-launch record count came from
+the records under check (a duplicated QK contraction passed and reached
+the simulator), and host reductions were not ordered against stages (a
+stage before the producing launch's merge, or that merge dropped while a
+repeated launch kept its own, passed). Judgment: accepted. The expected
+inventory now comes from the retained facts and the selected candidates,
+per scheduled launch occurrence, and the lowered records are walked
+against it; a duplicated, missing, displaced or mis-parameterized record
+fails materialization before selection, and the unmodified repeated-launch
+program is accepted. M-17 is closed on that evidence; the study's label
+stays DIAGNOSTIC and 6 of 9 minima does not establish the paper's 7 of 9.
+G9/G10 and the recorded blockers remain open.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -1514,7 +1530,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 43 (2026-11-04) at the candidate `3a40971`+ (this
+Refreshed in round 44 (2026-11-04) at the candidate `b0c667b`+ (this
 commit). Earlier judgments are kept in the round sections above.
 
 | Gate | Judgment | Basis |

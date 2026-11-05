@@ -237,7 +237,11 @@ def test_realization_binds_the_stage_position_and_computation(monkeypatch, mutat
         return rest + stages + sv
 
     monkeypatch.setattr(spmw_aim._AimProgramDerivation, "records", mutated)
-    expected = "carries a computation other than" if mutation == "function" else "orders the host stages differently|primary record"
+    expected = (
+        "carries a computation other than"
+        if mutation == "function"
+        else "where the schedule expects|incomplete before the next step|after the last scheduled step"
+    )
     with pytest.raises(Exception, match=expected):
         allo.compile(attention, target, aim_cost, host_moves=program, **POLICY)
 
@@ -253,7 +257,7 @@ def test_realization_refuses_a_dropped_or_mismatched_stage(monkeypatch):
         return [r for r in original(self, host_moves, ctx) if not isinstance(r[0], AimHostStage)]
 
     monkeypatch.setattr(spmw_aim._AimProgramDerivation, "records", dropped)
-    with pytest.raises(Exception, match="lowered 0 host stage\\(s\\) for 1 declared"):
+    with pytest.raises(Exception, match="lowered 0 host stage|where the schedule expects host stage|lowered no records for host stage"):
         allo.compile(attention, target, aim_cost, host_moves=program, **POLICY)
 
     def renamed(self, host_moves, ctx):
@@ -326,3 +330,101 @@ def test_the_stage_is_the_scaled_softmax():
     assert np.allclose(out, bf16_round(reference.astype(np.float32)), atol=2.0**-9)
     unscaled = np.exp(scores - scores.max()); unscaled /= unscaled.sum()
     assert float(out.max()) < 0.02 < float(unscaled.max())
+
+
+def _repeated_program(attention):
+    """QK -> softmax -> split SV -> a stage reading heads_out and producing
+    probs -> SV again: a valid program with a repeated launch and two stages."""
+    softmax = ScaledSoftmax(128)
+
+    def repeated(q, k_cache, scores, probs, v_cache, heads_out):
+        allo.launch("attention_qk", q, k_cache, scores)
+        allo.host_compute("softmax", softmax, inputs=(scores,), outputs=(probs,), operation="softmax")
+        allo.launch("attention_sv", probs, v_cache, heads_out)
+        allo.host_compute("next", softmax, inputs=(heads_out,), outputs=(probs,), operation="softmax")
+        allo.launch("attention_sv", probs, v_cache, heads_out)
+
+    return allo.host_program(attention, resident=("q", "k_cache", "v_cache"))(repeated)
+
+
+def _split_sv_layout(target, attention, program, partitions=2):
+    ranking = allo.compile(attention, target, aim_cost, backend="virtual", host_moves=program, resources=BUDGET, **POLICY)
+    choices = kernel_choices(target, ranking)
+    sv_index, sv_scores = choices["attention_sv"]
+    qk_index, qk_scores = choices["attention_qk"]
+    layouts = [None, None]
+    layouts[sv_index] = min((s for s in sv_scores if partitions_of(s[1]) == partitions), key=lambda s: s[0])[2]
+    layouts[qk_index] = min(qk_scores)[2]
+    return layouts
+
+
+def test_repeated_launches_with_two_stages_are_accepted():
+    from allo.pim.aim_lowering import AimContraction, AimHostReduction
+
+    attention, _ = build_attention(1, 128)
+    target = build_aim_target()
+    program = _repeated_program(attention)
+    layouts = _split_sv_layout(target, attention, program)
+    built = allo.compile(attention, target, aim_cost, host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
+    kinds = [type(op).__name__ for op in built.compiled.layout_ctx.lowered_operations]
+    assert kinds == [
+        "AimContraction", "AimHostStage", "AimContraction", "AimHostReduction",
+        "AimHostStage", "AimContraction", "AimHostReduction",
+    ]
+    assert sum(isinstance(op, AimHostReduction) for op in built.compiled.layout_ctx.lowered_operations) == 2
+    assert sum(isinstance(op, AimContraction) for op in built.compiled.layout_ctx.lowered_operations) == 3
+
+
+@pytest.mark.parametrize("mutation", ["duplicate_qk", "stage_before_merge", "drop_first_merge", "wrong_partitions", "duplicate_qk_without_stages"])
+def test_realization_binds_each_launch_occurrence_and_its_completion(monkeypatch, mutation):
+    """Fault injection on the lowered sequence against the inventory derived
+    from the facts and the selected candidates: a duplicated primary
+    record, a stage placed before the producing launch's host reduction, a
+    dropped host reduction (while the repeated launch keeps its own) and a
+    reduction with another P are refused at materialization; with or
+    without host stages."""
+    from dataclasses import replace
+
+    from allo import spmw_aim
+    from allo.pim.aim_lowering import AimContraction, AimHostReduction
+
+    attention, plain = build_attention(1, 128, bridge=mutation != "duplicate_qk_without_stages")
+    target = build_aim_target()
+    program = plain if mutation in ("duplicate_qk", "duplicate_qk_without_stages") else _repeated_program(attention)
+    layouts = _split_sv_layout(target, attention, program)
+    original = spmw_aim._AimProgramDerivation.records
+
+    def mutated(self, host_moves, ctx):
+        records = list(original(self, host_moves, ctx))
+        if mutation in ("duplicate_qk", "duplicate_qk_without_stages"):
+            out = []
+            for record in records:
+                out.append(record)
+                if isinstance(record[0], AimContraction) and record[0].name.startswith("attention_qk"):
+                    out.append(record)
+            return out
+        if mutation == "stage_before_merge":
+            stage = next(r for r in records if isinstance(r[0], AimHostStage) and r[0].stage == "next")
+            records.remove(stage)
+            index = next(i for i, r in enumerate(records) if isinstance(r[0], AimHostReduction))
+            records.insert(index, stage)
+            return records
+        if mutation == "drop_first_merge":
+            index = next(i for i, r in enumerate(records) if isinstance(r[0], AimHostReduction))
+            del records[index]
+            return records
+        return [
+            (replace(op, partitions=op.partitions * 2), banks) if isinstance(op, AimHostReduction) else (op, banks)
+            for op, banks in records
+        ]
+
+    monkeypatch.setattr(spmw_aim._AimProgramDerivation, "records", mutated)
+    expected = {
+        "duplicate_qk": "primary record 'attention_qk_0' where the schedule expects host stage|twice",
+        "duplicate_qk_without_stages": "primary record 'attention_qk_0' where the schedule expects|twice",
+        "stage_before_merge": "incomplete before the next step: missing primary records \\[\\] and host reductions \\['attention_sv_0'\\]",
+        "drop_first_merge": "incomplete before the next step",
+        "wrong_partitions": "merges 4 partials of 'attention_sv_0'; the candidate declares 2",
+    }[mutation]
+    with pytest.raises(Exception, match=expected):
+        allo.compile(attention, target, aim_cost, host_moves=program, resources=BUDGET, layout=layouts, **POLICY)
