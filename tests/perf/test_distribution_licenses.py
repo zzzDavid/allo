@@ -11,6 +11,7 @@ are packaged into both forms through ``setup.py`` and ``MANIFEST.in``."""
 
 import hashlib
 import re
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -61,3 +62,20 @@ def test_setup_and_manifest_package_the_texts_into_both_forms():
     # The retained upstream notices stay in the dialect sources.
     for name in ("mlir/lib/Dialect/AlloOps.cpp", "mlir/lib/Dialect/AlloDialect.cpp"):
         assert "Apache-2.0 WITH LLVM-exception" in (ROOT / name).read_text(), name
+
+
+def test_every_bundled_text_is_tracked_by_git():
+    """The first round 88 build shipped only the LLVM text: a ``*.txt`` ignore
+    rule had kept the nanobind and uPIMulator files out of the commit, and
+    ``git archive`` packages the commit.  Every file in the directory must be
+    tracked, so a dropped text fails here before a build."""
+    tracked = subprocess.run(
+        ["git", "ls-files", "THIRD_PARTY_LICENSES"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    present = sorted(f"THIRD_PARTY_LICENSES/{p.name}" for p in LICENSES.iterdir())
+    assert sorted(tracked) == present, f"tracked {sorted(tracked)} vs present {present}"
+    assert len(present) == 3

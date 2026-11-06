@@ -105,3 +105,8 @@ dist/
 # Tenon: Samsung-derived PIMSimulator patches must never enter this repository
 # (simulators/PIMSimulator/README.md, release issue P-04)
 simulators/PIMSimulator/patches/
+
+# Bundled third-party license texts (THIRD_PARTY_NOTICES.md) are tracked
+# whatever their extension; a *.txt rule above must not drop them silently.
+!THIRD_PARTY_LICENSES/
+!THIRD_PARTY_LICENSES/**
