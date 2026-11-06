@@ -613,3 +613,75 @@ def test_apu_v1_cases_of_one_session_take_separate_scratch_directories(tmp_path)
     assert {path.name for path in scratches.values()} == {"word_count", "kmeans"}
     for record in records.values():
         assert record["problems"] == []
+
+
+def test_apu_v1_failed_baseline_launches_of_two_cases_do_not_collide(
+    monkeypatch, tmp_path
+):
+    """Round 86 (X-38, the reviewer's failure-path probe): the archived and
+    expert lanes of two cases launch for real up to the board call, which is
+    made to fail so every launch directory is retained; the current driver
+    makes all eight attempts with no collision, where the parent expression
+    met four ``FileExistsError`` after the first case's four directories."""
+    import contextlib
+
+    import allo.pim.apu_v1_program as runtime
+
+    root = Path(os.environ.get("TENON_ARTIFACTS", ""))
+    if not (root / "apuv1" / "tenon" / "word_count" / "workload.py").is_file():
+        pytest.skip("BLOCKED-ENV(tenon artifacts not found; set TENON_ARTIFACTS)")
+
+    class FakeTenon:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def describe(self):
+            return {}
+
+        def launch(self):
+            return {"crun": 100, "outputs_match_oracle": True}
+
+    attempts = []
+
+    def no_hardware(argv, cwd, **kwargs):
+        attempts.append(Path(cwd))
+        raise RuntimeError("deliberate read failure; no device invoked")
+
+    monkeypatch.setattr(paper_rows, "TenonLane", FakeTenon)
+    monkeypatch.setattr(
+        runtime, "apu_v1_board_lock", lambda: contextlib.nullcontext("no-device")
+    )
+    monkeypatch.setattr(runtime, "launch_on_board", no_hardware)
+    shared = tmp_path / "shared"
+    records = [
+        paper_rows.measure_case(
+            case,
+            root.resolve(),
+            backend="device",
+            measured=1,
+            expert=True,
+            layout=None,
+            device_source=None,
+            label=None,
+            historical_binary=True,
+            scratch=shared,
+        )
+        for case in ("word_count", "kmeans")
+    ]
+    errors = [
+        launch["error"]
+        for record in records
+        for launch in record["launches"]
+        if launch.get("error")
+    ]
+    # Two cases x two baseline lanes x (one warm-up + one measured) launches.
+    assert len(attempts) == 8
+    assert len(errors) == 8 and all("deliberate read failure" in e for e in errors)
+    assert not any("FileExistsError" in e for e in errors)
+    assert {Path(r["scratch"]) for r in records} == {
+        shared.resolve() / "word_count",
+        shared.resolve() / "kmeans",
+    }
+    assert len(list(shared.rglob("error.txt"))) == 8
+    # Each retained launch directory sits directly under its case's subdirectory.
+    assert {p.parent.name for p in attempts} == {"word_count", "kmeans"}

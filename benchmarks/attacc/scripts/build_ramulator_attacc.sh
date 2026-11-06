@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Build Ramulator2-AttAcc natively from its MIT sources (Ramulator 2.0 with
 # the AttAcc HBM3-PIM model, as packaged under DCC's src/src/Ramulator2/AttAcc:
 # CMakeLists.txt, src/, ext/{yaml-cpp,spdlog,argparse} vendored, LICENSE).
