@@ -84,8 +84,9 @@ out of the checkout:
 The reviewer's round 78 source review of this packet found that the APU v1
 vector route's realization check did not bind the realized computation to
 the retained contraction (X-35); repaired in round 79 (section 3, the
-vector row) with the reviewer's two injections refused and five regressions,
-at the checkout, to be re-executed from the next installed candidate.  Still
+vector row) with the reviewer's two injections refused and five regressions
+at the checkout and from the installed wheel of `6ce37ad`
+(`r79/installed_probes.log`).  Still
 open: the independent review of the repair and of the remaining packet
 (rounds 28 to 30: the `APUv1Program` manifest from the retained IR, the
 slice 5 traces); the Gemini-I rows at a candidate (the board's `/tmp`); the

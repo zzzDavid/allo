@@ -2271,9 +2271,9 @@ plan, the instructions from the operations, and requires each rendered
 call in the emitted source; a mismatch is the shared feasibility rejection,
 so a damaged candidate is rejected with the reason recorded and an intact
 alternative is selected, and a forced damaged candidate is refused.  Both
-injections are refused at the checkout; five regressions cover the intact
-program, both injections, the forced and default routes, and the intact
-alternative.  The stale summaries the reviewer named are replaced by one
+injections are refused at the checkout and from the installed wheel of
+`6ce37ad`; five regressions cover the intact program, both injections, the
+forced and default routes, and the intact alternative.  The stale summaries the reviewer named are replaced by one
 current snapshot (51 / 4) with history separated.  G9 stays FAIL until the
 repair and the packet are reviewed; every APU v1 suite at the checkout passes (the six
 failures of the decision batch are UPMEM and AiM execution tests run without
