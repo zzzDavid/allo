@@ -2275,36 +2275,47 @@ class _AimProgramDerivation:
             targets.append(target)
         records = []
         identity = self._identity(source, source_usage, key)
+        geometry = self.geometry
+        partitions = source.partitions * geometry.bank_groups
+        span = _ceil(source.elements, partitions)
+        rows = max(1, _ceil(span, geometry.row_elements))
         for target_slot, target_row in targets:
-            for bank_group in range(self.geometry.bank_groups):
+            for bank_group in range(geometry.bank_groups):
                 base = bank_group * self.group_width
-                common = dict(
-                    elements=source.elements,
-                    replicas=source.replicas,
-                    channels_per_replica=source.partitions,
-                    partitions_per_replica=source.partitions
-                    * self.geometry.bank_groups,
-                )
-                out = AimBankCopy(
-                    "bank_to_gb",
-                    bank=base + source_usage.slot,
-                    row=source.row,
-                    name=f"{source.name}.relocate.bank_{base + source_usage.slot}",
-                    **common,
-                )
-                back = AimBankCopy(
-                    "gb_to_bank",
-                    bank=base + target_slot,
-                    row=target_row,
-                    name=f"{source.name}.relocate.to_bank_{base + target_slot}",
-                    **common,
-                )
-                self._copy_identity[id(out)] = identity
-                self._copy_identity[id(back)] = identity
-                records.append((out, None))
-                records.append((back, None))
+                # One row of the vector at a time through the global buffer:
+                # the GB holds one row, so a chunk is written to its
+                # destination row before the next source row replaces it
+                # (round 74, ISSUES X-32: the reviewer's multi-row witness).
+                for offset in range(rows):
+                    chunk = min(
+                        geometry.row_elements, span - offset * geometry.row_elements
+                    )
+                    suffix = f".row{offset}" if rows > 1 else ""
+                    common = dict(
+                        elements=chunk * partitions,
+                        replicas=source.replicas,
+                        channels_per_replica=source.partitions,
+                        partitions_per_replica=partitions,
+                    )
+                    out = AimBankCopy(
+                        "bank_to_gb",
+                        bank=base + source_usage.slot,
+                        row=source.row + offset,
+                        name=f"{source.name}.relocate.bank_{base + source_usage.slot}{suffix}",
+                        **common,
+                    )
+                    back = AimBankCopy(
+                        "gb_to_bank",
+                        bank=base + target_slot,
+                        row=target_row + offset,
+                        name=f"{source.name}.relocate.to_bank_{base + target_slot}{suffix}",
+                        **common,
+                    )
+                    self._copy_identity[id(out)] = (identity, offset)
+                    self._copy_identity[id(back)] = (identity, offset)
+                    records.append((out, None))
+                    records.append((back, None))
         return records
-
     def _identity(self, group, usage, key):
         """What one bank cell holds: the buffer, its distribution and the
         bank family it is laid out in (the EWMUL slots or the MAC bank pairs)."""
@@ -2345,20 +2356,28 @@ class _AimProgramDerivation:
         def rows_of(elements, partitions):
             return max(1, _ceil(_ceil(elements, partitions), geometry.row_elements))
 
-        def place(row, rows, bank, identity):
+        # A cell holds one row chunk of a value: (identity, chunk), chunk
+        # being the row offset within the value's rows; so does the GB.
+        def place(row, rows, bank, identity, first_chunk=0):
             for offset in range(rows):
-                cells[(row + offset, bank)] = identity
+                cells[(row + offset, bank)] = (identity, first_chunk + offset)
 
-        def expect(row, rows, bank, identity, reader):
+        def describe(held):
+            if held is None:
+                return "nothing"
+            identity, chunk = held
+            return f"row chunk {chunk} of {self._describe_identity(identity)}"
+
+        def expect(row, rows, bank, identity, reader, first_chunk=0):
             for offset in range(rows):
                 held = cells.get((row + offset, bank))
-                if held != identity:
+                if held != (identity, first_chunk + offset):
                     raise InfeasibleSchedule(
-                        f"AiM {reader}: reads "
+                        f"AiM {reader}: reads row chunk {first_chunk + offset} of "
                         f"{self._describe_identity(identity)} at row {row + offset} "
                         f"bank slot {bank}, but that location holds "
-                        f"{self._describe_identity(held)} at that point of the "
-                        "program (physical liveness)"
+                        f"{describe(held)} at that point of the program (physical "
+                        "liveness)"
                     )
 
         # Buffers the schedule declares resident are on the device before
@@ -2437,25 +2456,34 @@ class _AimProgramDerivation:
                             op.row, rows, usage.slot, self._identity(group, usage, key)
                         )
             elif isinstance(op, AimBankCopy):
-                identity = self._copy_identity.get(id(op))
-                if identity is None:
+                moved = self._copy_identity.get(id(op))
+                if moved is None:
                     continue
+                identity, first_chunk = moved
                 partitions = op.partitions_per_replica or (
                     op.channels_per_replica * geometry.bank_groups
                 )
                 rows = rows_of(op.elements, partitions)
                 bank = op.bank % self.group_width
-                if op.direction == "bank_to_gb":
-                    expect(op.row, rows, bank, identity, f"copy {op.name}")
-                    gb = identity
-                else:
-                    if gb != identity:
-                        raise InfeasibleSchedule(
-                            f"AiM copy {op.name}: the global buffer holds "
-                            f"{self._describe_identity(gb)}, not "
-                            f"{self._describe_identity(identity)} (physical liveness)"
+                # The record is lowered one row after another; the GB holds
+                # the last row read, so a multi-row record cannot carry its
+                # rows faithfully.
+                for offset in range(rows):
+                    chunk = first_chunk + offset
+                    if op.direction == "bank_to_gb":
+                        expect(
+                            op.row + offset, 1, bank, identity, f"copy {op.name}", chunk
                         )
-                    place(op.row, rows, bank, identity)
+                        gb = (identity, chunk)
+                    else:
+                        if gb != (identity, chunk):
+                            raise InfeasibleSchedule(
+                                f"AiM copy {op.name}: the global buffer holds "
+                                f"{describe(gb)}, not row chunk {chunk} of "
+                                f"{self._describe_identity(identity)} (physical "
+                                "liveness)"
+                            )
+                        place(op.row + offset, 1, bank, identity, chunk)
     def _live_readers(self, key, position, steps, host_keys):
         """(group, usage) of every launch after ``position`` that reads buffer
         ``key`` from the device before its next writer: a launch storing it, a
