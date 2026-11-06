@@ -1728,6 +1728,8 @@ class _AimProgramDerivation:
         self.row_maps: dict[int, tuple] = {}
         self.groups = self._derive_groups()
         self.by_id = {group.group_id: group for group in self.groups}
+        # id(AimBankCopy record) -> the identity of the value it moves.
+        self._copy_identity: dict[int, tuple] = {}
         self.regions = self._allocate_rows()
 
     # ----------------------------- buffers ----------------------------- #
@@ -1982,18 +1984,6 @@ class _AimProgramDerivation:
 
     # --------------------------- row allocator ------------------------- #
 
-    def _relocated(self, group, key):
-        usage = group.usages[key]
-        if usage.store:
-            return False
-        return any(
-            other is not group
-            and key in other.usages
-            and other.usages[key].store
-            and other.usages[key].slot != usage.slot
-            for other in self.groups
-        )
-
     def _footprint(self, group, key, usage):
         geometry = self.geometry
         cols = geometry.row_elements
@@ -2041,70 +2031,88 @@ class _AimProgramDerivation:
         ) * _ceil(reduction, cols)
 
     def _allocate_rows(self):
+        """Bank rows of every value the program keeps in the banks.
+
+        A contraction's matrix has one region per buffer (its launches and
+        the host's matrix writes share it).  An elementwise group has one
+        region of its own: its operands sit in the EWMUL's x and y slots and
+        its result in the dst slot of that region's rows, and a value another
+        group reads is copied into that group's region (`_copy_records`).
+        Groups never share a region, so a later scatter or launch of one group
+        cannot overwrite a value another group still has to read (round 73,
+        ISSUES X-32: the reviewer's slot-liveness witness); the program-order
+        liveness of every slot is then checked on the emitted records
+        (`_check_physical_liveness`).
+        """
         from .pim.schedule_search import InfeasibleSchedule
 
         parent: dict = {}
 
-        def find(key):
-            parent.setdefault(key, key)
-            while parent[key] != key:
-                parent[key] = parent[parent[key]]
-                key = parent[key]
-            return key
+        def find(node):
+            parent.setdefault(node, node)
+            while parent[node] != node:
+                parent[node] = parent[parent[node]]
+                node = parent[node]
+            return node
 
         def union(a, b):
             ra, rb = find(a), find(b)
             if ra != rb:
                 parent[rb] = ra
 
+        def node_of(group, key):
+            # A contraction matrix is one region per buffer; an elementwise
+            # group's buffers are nodes of that group alone.
+            if group.kind == "contraction":
+                return ("key", key)
+            return ("group", group.group_id, key)
+
+        def key_of(node):
+            return node[-1]
+
+        order_of_group = {group.group_id: n for n, group in enumerate(self.groups)}
         anchors = {}
+        footprints: dict = {}
         for group in self.groups:
             keys = list(group.usages)
             if not keys:
                 continue
-            for key in keys:
-                find(key)
-            relocated = {key for key in keys if self._relocated(group, key)}
-            if group.kind == "mul" and any(key in self.resident for key in keys):
-                kept = [key for key in keys if key not in relocated]
-            else:
-                kept = keys
-            for key in kept[1:]:
-                union(kept[0], key)
-            anchors[group.group_id] = kept[0]
-
-        footprints: dict = {}
-        for group in self.groups:
+            nodes = [node_of(group, key) for key in keys]
+            for node in nodes:
+                find(node)
+            for node in nodes[1:]:
+                union(nodes[0], node)
+            anchors[group.group_id] = nodes[0]
             for key, usage in group.usages.items():
-                if (
-                    group.kind == "mul"
-                    and self._relocated(group, key)
-                    and any(k in self.resident for k in group.usages)
-                ):
-                    continue
-                root = find(key)
+                root = find(node_of(group, key))
                 footprints[root] = max(
                     footprints.get(root, 1), self._footprint(group, key, usage)
                 )
         components: dict = {}
-        for key in parent:
-            components.setdefault(find(key), []).append(key)
-        ordered = sorted(
-            components,
-            key=lambda root: min(
-                self.declaration.get(k, 1 << 30) for k in components[root]
-            ),
-        )
+        for node in parent:
+            components.setdefault(find(node), []).append(node)
+
+        def rank(root):
+            nodes = components[root]
+            groups = [order_of_group[n[1]] for n in nodes if n[0] == "group"]
+            return (
+                min(self.declaration.get(key_of(n), 1 << 30) for n in nodes),
+                min(groups) if groups else -1,
+            )
+
         rows = {}
         regions = []
         next_row = 0
-        for root in ordered:
+        for root in sorted(components, key=rank):
             count = max(1, footprints.get(root, 1))
             rows[root] = next_row
             regions.append(
                 {
                     "buffers": sorted(
-                        self.name_by_key.get(k, str(k)) for k in components[root]
+                        {
+                            self.name_by_key.get(key_of(n), str(key_of(n)))
+                            for n in components[root]
+                        }
                     ),
                     "row": next_row,
                     "rows": count,
@@ -2116,10 +2124,19 @@ class _AimProgramDerivation:
                 f"AiM bank rows: program needs {next_row}, target has "
                 f"{self.geometry.rows}"
             )
-        self.row_of_key = {key: rows[find(key)] for key in parent}
+        # A buffer's row: its matrix region, else the first elementwise
+        # region holding it (matrix records and the realization check
+        # address matrices only; elementwise records use their group's row).
+        self.row_of_key = {}
+        for node in parent:
+            if node[0] == "key":
+                self.row_of_key[key_of(node)] = rows[find(node)]
+        for group in self.groups:
+            for key in group.usages:
+                self.row_of_key.setdefault(key, rows[find(node_of(group, key))])
         for group in self.groups:
             if group.group_id in anchors:
-                group.row = self.row_of_key[anchors[group.group_id]]
+                group.row = rows[find(anchors[group.group_id])]
         return regions
 
     # ------------------------------ records ---------------------------- #
@@ -2223,62 +2240,222 @@ class _AimProgramDerivation:
             )
 
     def _relocations(self, group, position, steps, host_keys=None):
-        """EWMUL results that a reader of their live range takes from another
-        slot: one bank-to-GB-to-bank copy per distinct (slot, row) the readers
-        use, emitted right after the producer.  The live range ends at the
-        next device store or host write of the buffer (`_live_readers`); the
-        readers' distribution equals the producer's, which
-        `_check_device_value_layouts` establishes before any record is made."""
+        """Copies of the values a launch stores into the regions of the
+        readers of their live range (`_copy_records`), emitted right after the
+        launch while the producer's slot holds them."""
         records = []
         for key, usage in group.usages.items():
             if not usage.store:
                 continue
-            targets = []
-            for reader, reader_usage in self._live_readers(
-                key, position, steps, host_keys
-            ):
-                if reader_usage.kind != "slot":
-                    continue
-                target = (reader_usage.slot, reader.row)
-                if target[0] == usage.slot or target in targets:
-                    continue
-                targets.append(target)
-            for target_slot, target_row in targets:
-                for bank_group in range(self.geometry.bank_groups):
-                    base = bank_group * self.group_width
-                    common = dict(
-                        elements=group.elements,
-                        replicas=group.replicas,
-                        channels_per_replica=group.partitions,
-                        partitions_per_replica=group.partitions
-                        * self.geometry.bank_groups,
-                    )
-                    records.append(
-                        (
-                            AimBankCopy(
-                                "bank_to_gb",
-                                bank=base + usage.slot,
-                                row=group.row,
-                                name=f"{group.name}.relocate.bank_{base + usage.slot}",
-                                **common,
-                            ),
-                            None,
-                        )
-                    )
-                    records.append(
-                        (
-                            AimBankCopy(
-                                "gb_to_bank",
-                                bank=base + target_slot,
-                                row=target_row,
-                                name=f"{group.name}.relocate.to_bank_{base + target_slot}",
-                                **common,
-                            ),
-                            None,
-                        )
-                    )
+            records.extend(
+                self._copy_records(
+                    group,
+                    usage,
+                    key,
+                    self._live_readers(key, position, steps, host_keys),
+                )
+            )
         return records
 
+    def _copy_records(self, source, source_usage, key, readers):
+        """Bank-to-GB-to-bank copies of buffer ``key`` from the cell its
+        writer uses (``source`` group's row, ``source_usage`` slot) into every
+        distinct (row, slot) cell the ``readers`` (group, usage) take it from;
+        a reader whose cell is the writer's needs none.  Readers share the
+        writer's distribution (`_check_device_value_layouts`)."""
+        if source_usage.kind != "slot":
+            return []
+        targets = []
+        for reader, usage in readers:
+            if usage.kind != "slot":
+                continue
+            target = (usage.slot, reader.row)
+            if target == (source_usage.slot, source.row) or target in targets:
+                continue
+            targets.append(target)
+        records = []
+        identity = self._identity(source, source_usage, key)
+        for target_slot, target_row in targets:
+            for bank_group in range(self.geometry.bank_groups):
+                base = bank_group * self.group_width
+                common = dict(
+                    elements=source.elements,
+                    replicas=source.replicas,
+                    channels_per_replica=source.partitions,
+                    partitions_per_replica=source.partitions
+                    * self.geometry.bank_groups,
+                )
+                out = AimBankCopy(
+                    "bank_to_gb",
+                    bank=base + source_usage.slot,
+                    row=source.row,
+                    name=f"{source.name}.relocate.bank_{base + source_usage.slot}",
+                    **common,
+                )
+                back = AimBankCopy(
+                    "gb_to_bank",
+                    bank=base + target_slot,
+                    row=target_row,
+                    name=f"{source.name}.relocate.to_bank_{base + target_slot}",
+                    **common,
+                )
+                self._copy_identity[id(out)] = identity
+                self._copy_identity[id(back)] = identity
+                records.append((out, None))
+                records.append((back, None))
+        return records
+
+    def _identity(self, group, usage, key):
+        """What one bank cell holds: the buffer, its distribution and the
+        bank family it is laid out in (the EWMUL slots or the MAC bank pairs)."""
+        family = "pair" if usage.stride == self.bank_pair_stride else "slot"
+        return (key, int(group.replicas), int(group.partitions), family)
+
+    def _describe_identity(self, identity):
+        if identity is None:
+            return "nothing"
+        key, replicas, partitions, family = identity
+        return (
+            f"{self.name_by_key.get(key, key)} ({replicas} x {partitions} channels, "
+            f"{family} layout)"
+        )
+
+    def _check_physical_liveness(self, records):
+        """Every bank-slot read of the emitted program finds the value the
+        program order placed there.
+
+        Walk the records with one cell per (row, bank within a bank group):
+        a slot-layout host write places its buffers, an EWMUL reads its x and
+        y slots and places its result in the dst slot, a bank copy moves a
+        cell through the global buffer, a gather reads its cells.  A read of a
+        cell holding another buffer, another distribution or nothing is a
+        feasibility rejection of the candidate assignment (round 73, ISSUES
+        X-32: the reviewer's slot-liveness witness, where a host scatter and a
+        launch overwrote copies a later reader still needed).  Matrix regions
+        and the bank-pair inputs of contractions are not modelled; they live
+        in regions of their own.
+        """
+        from .pim.schedule_search import InfeasibleSchedule
+
+        geometry = self.geometry
+        cells: dict = {}
+        gb = None
+        by_name = {group.name: group for group in self.groups}
+
+        def rows_of(elements, partitions):
+            return max(1, _ceil(_ceil(elements, partitions), geometry.row_elements))
+
+        def place(row, rows, bank, identity):
+            for offset in range(rows):
+                cells[(row + offset, bank)] = identity
+
+        def expect(row, rows, bank, identity, reader):
+            for offset in range(rows):
+                held = cells.get((row + offset, bank))
+                if held != identity:
+                    raise InfeasibleSchedule(
+                        f"AiM {reader}: reads "
+                        f"{self._describe_identity(identity)} at row {row + offset} "
+                        f"bank slot {bank}, but that location holds "
+                        f"{self._describe_identity(held)} at that point of the "
+                        "program (physical liveness)"
+                    )
+
+        # Buffers the schedule declares resident are on the device before
+        # the program runs, in the layout of each kernel that reads them
+        # (CENT's norm gains and RoPE tables; nothing uploads them).
+        for group in self.groups:
+            if group.kind != "mul":
+                continue
+            for key, usage in group.usages.items():
+                if usage.store or key not in self.resident or usage.kind != "slot":
+                    continue
+                place(
+                    group.row,
+                    self._footprint(group, key, usage),
+                    usage.slot,
+                    self._identity(group, usage, key),
+                )
+
+        for op, _banks in records:
+            if isinstance(op, AimDistributedHostTransfer):
+                stride = int(op.bank_stride)
+                if stride not in (self.group_width, self.bank_pair_stride):
+                    continue
+                family = "slot" if stride == self.group_width else "pair"
+                partitions = op.channels_per_replica * (geometry.banks // stride)
+                total = op.vector_elements or op.elements
+                rows = rows_of(total, partitions)
+                refs = tuple(op.buffer_refs)
+                for copy in range(op.copies):
+                    key = refs[copy] if len(refs) == op.copies else refs[0]
+                    identity = (
+                        key,
+                        int(op.replicas),
+                        int(op.channels_per_replica),
+                        family,
+                    )
+                    if family == "slot":
+                        banks = [op.bank_offset + copy]
+                    else:
+                        banks = [
+                            op.bank_offset + copy + pair * stride
+                            for pair in range(self.group_width // stride)
+                        ]
+                    for bank in banks:
+                        if op.direction == "write":
+                            place(op.row, rows, bank, identity)
+                        else:
+                            expect(
+                                op.row,
+                                rows,
+                                bank,
+                                identity,
+                                f"host gather of {op.name}",
+                            )
+            elif isinstance(op, AimElementwise):
+                if op.operation != "mul":
+                    continue
+                group = by_name.get(op.name)
+                if group is None or group.kind != "mul":
+                    continue
+                partitions = group.partitions * geometry.bank_groups
+                rows = rows_of(op.elements, partitions)
+                for key, usage in group.usages.items():
+                    if usage.store:
+                        continue
+                    expect(
+                        op.row,
+                        rows,
+                        usage.slot,
+                        self._identity(group, usage, key),
+                        group.name,
+                    )
+                for key, usage in group.usages.items():
+                    if usage.store:
+                        place(
+                            op.row, rows, usage.slot, self._identity(group, usage, key)
+                        )
+            elif isinstance(op, AimBankCopy):
+                identity = self._copy_identity.get(id(op))
+                if identity is None:
+                    continue
+                partitions = op.partitions_per_replica or (
+                    op.channels_per_replica * geometry.bank_groups
+                )
+                rows = rows_of(op.elements, partitions)
+                bank = op.bank % self.group_width
+                if op.direction == "bank_to_gb":
+                    expect(op.row, rows, bank, identity, f"copy {op.name}")
+                    gb = identity
+                else:
+                    if gb != identity:
+                        raise InfeasibleSchedule(
+                            f"AiM copy {op.name}: the global buffer holds "
+                            f"{self._describe_identity(gb)}, not "
+                            f"{self._describe_identity(identity)} (physical liveness)"
+                        )
+                    place(op.row, rows, bank, identity)
     def _live_readers(self, key, position, steps, host_keys):
         """(group, usage) of every launch after ``position`` that reads buffer
         ``key`` from the device before its next writer: a launch storing it, a
@@ -2614,6 +2791,10 @@ class _AimProgramDerivation:
         self._check_device_value_layouts(steps, host_keys)
         records = []
         pending: list = []  # coalescible distributed transfers
+        # Copies of host-written values into the regions of their other
+        # readers, emitted after the transfers that place them (at the next
+        # flush, before any launch).
+        deferred: list = []
         gather_run = False
 
         def flush():
@@ -2624,6 +2805,8 @@ class _AimProgramDerivation:
             if gather_run:
                 records.append((AimSync(name="host_gather_split"), None))
             gather_run = False
+            records.extend(deferred)
+            deferred.clear()
 
         from .spmw_plan import HostComputeStep
 
@@ -2767,7 +2950,17 @@ class _AimProgramDerivation:
                 pending.clear()
                 pending.append(transfer)
             gather_run = verb == "gather"
+            if verb != "gather" and not transfer["reupload"]:
+                deferred.extend(
+                    self._copy_records(
+                        group,
+                        usage,
+                        key,
+                        self._live_readers(key, position, steps, host_keys),
+                    )
+                )
         flush()
+        self._check_physical_liveness(records)
         return records
 
 

@@ -197,12 +197,12 @@ _AIM_DEFAULT_CASES = frozenset(
 # here is at or below the paper's and below CENT's (`docs/release/
 # paper_reproduction/inventory.csv`).
 AIM_SELECTED_PROGRAM_CYCLES = {
-    "ffn_activation_l128": 3295,
-    "ffn_complete_l128": 253789,
-    "full_block_l128": 397080,
-    "full_block_l4096": 529019,
-    "full_block_l512": 408823,
-    "norm_residual_l128": 6932,
+    "ffn_activation_l128": 3672,
+    "ffn_complete_l128": 254166,
+    "full_block_l128": 397577,
+    "full_block_l4096": 529516,
+    "full_block_l512": 409320,
+    "norm_residual_l128": 7052,
     "qkvo_rope_l128": 123448,
     "softmax_pim_l128": 1686,
     "softmax_pim_l4096": 49545,

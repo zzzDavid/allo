@@ -62,40 +62,41 @@ TYPED_TRACE_LINES = MappingProxyType(
 # kernels to cover the D2-element vector the host scatters (the typed-route
 # program iterated D elements).  Round 71 (2026-11-05) realizes a replicated
 # elementwise grid once over the device's 32 channels instead of once per
-# contraction replica (`allo/spmw_aim.py`, ISSUES X-19): its operands and
-# result are written once, the EWMUL/EWADD op sizes are the single copy's,
-# and the rows the smaller footprints free shift the matrix rows allocated
-# after them (attention_l*: the K/V cache rows move from 11 to 8, every
-# command otherwise identical, cycles unchanged).  Every case's pin below is
-# the matcher path's trace at the revision that introduced the change
-# (`allo.compile(case.region, build_aim_target(), aim_cost,
-# host_moves=case.host_program, reduction_order="reassociate")`), simulated
-# natively with ramulator2 (`docs/release/paper_reproduction/inventory.csv`).
-# The four cases whose cycles are unchanged (`attention_l*`, `ffn_fc_l128`)
-# differ from their earlier pins only by that shift: adding 3 to the row
-# argument of every W MEM, WR_ABK and MAC_ABK line of the new trace
-# reproduces the earlier pin byte for byte.
+# contraction replica (`allo/spmw_aim.py`, ISSUES X-32): its operands and
+# result are written once and the EWMUL / EWADD op sizes are the single
+# copy's.  Round 73 (2026-11-05) gives every elementwise kernel group a bank
+# row region of its own and copies a value into each reader's region
+# (physical liveness, X-32: no scatter or launch of one group can overwrite a
+# value another group still has to read); the regions ahead of the K/V
+# caches and the weights are the round 25 ones again (attention_l* and
+# ffn_fc_l128 reproduce their typed-route pins byte for byte), and the rows
+# with an RMSNorm or FFN activation chain carry the copies into the next
+# group's region.  Every pin below is the matcher path's trace at the
+# revision that introduced the change (`allo.compile(case.region,
+# build_aim_target(), aim_cost, host_moves=case.host_program,
+# reduction_order="reassociate")`), simulated natively with ramulator2
+# (`docs/release/paper_reproduction/inventory.csv`).
 CORRECTED_TRACE_PROVENANCE = (
-    "matcher path @ tenon round 71, 2026-11-05 (replicated elementwise grids realized once over the device, X-19); "
-    "the round 25 RoPE D2 pins and the typed-route pins are superseded for every case whose default program changed"
+    "matcher path @ tenon round 73, 2026-11-05 (one bank-row region per elementwise group, X-32); "
+    "the round 71 pins are superseded for every case whose rows moved"
 )
 
 CORRECTED_TRACE_SHA256 = MappingProxyType(
     {
-        "attention_l128": "b26e089bfbf3697bb214cb486a80bbfea96298263ec98f289de3238c643d2272",
-        "attention_l4096": "37cd5413e640ce099fd6cbec0fcda4a6a23354b1dae6c3690fc41532905c5b5b",
-        "attention_l512": "13ede34e870d7b3d4345a3210c3ff4e0c9c93a82ca0eb30c62d9e76496f433b0",
-        "ffn_activation_l128": "991d9321f7beb7f767f5c7dbb874ce8ffd8329937be4518d1dcbebbb6ace051d",
-        "ffn_complete_l128": "2f1a131c2eba30ac320217f1dc123cf87aa3db529e4060a838157c2a774db706",
-        "ffn_fc_l128": "db2789ab08e3b37eabb62af7e00bdd3744546b8dba49977bcf496fee918c139e",
-        "full_block_l128": "2d6d1c49f013443ec0cabc5bcd50d1a512e7bd59e664bec9f2af549b509798d8",
-        "full_block_l4096": "27ed3b547c6e96d4f8109f39f7fd0dea26bb54e376adf1613d09ef59fb42781f",
-        "full_block_l512": "32dcab49ccce7056f5b669bad734c118defadebd0192451ee4221d02a9a4f211",
-        "norm_residual_l128": "2e728babe7c8d757d58ff7cd8fc5d92a1ff21d33ee741e9268cbaeea5e547805",
-        "qkvo_rope_l128": "fb745711ff46789775de9f95c9a170bca70d38407a3329716b3c0b5ce04051a8",
-        "softmax_pim_l128": "f94905736375a9351dc6632f89c109b2329f8dd21d02950f91e61fb0645fef43",
-        "softmax_pim_l4096": "76c5302bf97c3a687303c283e6b9790994e02bfd350a3ad72a218fcb0c8ce16f",
-        "softmax_pim_l512": "ba77059ade1efa172e530b7fb02121b6c47f2aa84508b4786b6043771a05b3d0",
+        "attention_l128": "29f3190aad6608c8ee3d4fd890344a9020ef51d72b8d016eab46e9c3462142ae",
+        "attention_l4096": "103edc8376c5e4f8035a68182b0b04ab7cf0c2f6171041005968d3f14a5964b1",
+        "attention_l512": "112c7bad9914c09d5ac0bfa684ef9ce6f0431f2b76ef5250f3ac86588dc35fa7",
+        "ffn_activation_l128": "7fca6f33363da25e333ba79da9cda881d170da0a619b8a5a9e4dd591e0da77e3",
+        "ffn_complete_l128": "0c715e6896ba24803ae8aa5b308c40bad999d679d093b0b9f250eacb434ad6ca",
+        "ffn_fc_l128": "833f14bacd24b628679d78bde7097cf0607c7eb65e4ba71998fce2a4241e4777",
+        "full_block_l128": "2d1d9f80a00feb6a82573af2e315ccce761783afa01808013219bb4344efe529",
+        "full_block_l4096": "79b1a3f60e4ad7fd32825e86c7ed99dbadddbdc259562ff4baa69fecb9938d7d",
+        "full_block_l512": "c6243af8f755559b33d6b52f15fcb7e90e0d232f0690553c86802e1db9047f64",
+        "norm_residual_l128": "06634de4e228c88de0c540ccf49f1b8e2b2679ce8b0c107323083d8fdf27b08c",
+        "qkvo_rope_l128": "2145cdc689bbf2bb09eb4271ac305800bdab412e65bbc6b9449827c0d98d4ae9",
+        "softmax_pim_l128": "2fc1c5d5412d7b8d80d305a1a5a6cfbd6703809f9c415969338d0d98bf4354d7",
+        "softmax_pim_l4096": "4e19e5f0de62c11c07fe4007b8eaacc475f81c5535ce8483289def6930b8afee",
+        "softmax_pim_l512": "007795b1e905d15754f5f19b2cbb5e661de8ba9910c935bdc4b9f2ebb159792b",
     }
 )
 

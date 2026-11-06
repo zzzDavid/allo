@@ -736,15 +736,15 @@ def build_layout(spec: DecodeSpec) -> DecodeLayout:
     group_rows = _distributed_rows(spec, spec.D, bank_stride=4, single_copy=True)
 
     for prefix in ("x", "sa"):
-        # The neighbor-bank source is dead after its partial MAC.  Reuse that
-        # row for the host-produced scale/vector pair and first EWMUL, then
-        # place the relocated norm-weight result in the adjacent live row.
-        allocator.allocate(
-            f"rms_{prefix}_work",
-            max(neighbor_rows, group_rows),
-            "dynamic",
-        )
-        allocator.allocate(f"rms_{prefix}_output", group_rows, "dynamic")
+        # One region per kernel group (round 73, ISSUES X-32): the
+        # neighbour-bank MAC source, the host-produced scale / vector pair
+        # with the first EWMUL's result, and the norm weights with the
+        # relocated scale result and the norm output.  No two groups share
+        # rows, so no scatter or launch overwrites a value another group has
+        # still to read.
+        allocator.allocate(f"rms_{prefix}_source", neighbor_rows, "dynamic")
+        allocator.allocate(f"rms_{prefix}_scale", group_rows, "dynamic")
+        allocator.allocate(f"rms_{prefix}_norm", group_rows, "dynamic")
     allocator.allocate(
         "rope_q", _distributed_rows(spec, 2 * spec.D, 4, single_copy=True), "dynamic"
     )
@@ -756,10 +756,13 @@ def build_layout(spec: DecodeSpec) -> DecodeLayout:
         _distributed_rows(spec, spec.H * spec.max_seq_len, 4, single_copy=True),
         "dynamic",
     )
+    # The FFN activation's two kernel groups (SiLU, the gate product), one
+    # region each.
     allocator.allocate(
-        "ffn_activation",
-        _distributed_rows(spec, spec.F, 4, single_copy=True),
-        "dynamic",
+        "ffn_silu", _distributed_rows(spec, spec.F, 4, single_copy=True), "dynamic"
+    )
+    allocator.allocate(
+        "ffn_gate", _distributed_rows(spec, spec.F, 4, single_copy=True), "dynamic"
     )
 
     allocator.allocate("k_cache", _qk_cache_rows(spec), "dynamic_cache")

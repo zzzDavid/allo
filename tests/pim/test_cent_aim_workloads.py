@@ -219,9 +219,10 @@ def test_probe_and_emit_derive_the_same_replicated_contraction():
         "reduction": 128,
         "batches": 32,
         "replicas": 4,
-        # 11 at tenon@ebb90a6; 8 since round 71, when the replicated
-        # elementwise groups allocated ahead of it shrank to one copy.
-        "row": 8,
+        # 11 at tenon@ebb90a6; 8 in round 71, when the replicated elementwise
+        # groups allocated ahead of it shrank to one copy; 11 again since
+        # round 73, when every elementwise group got a region of its own.
+        "row": 11,
         "channels": tuple(range(32)),
         "channels_per_replica": 8,
         "input_source": "gb",
@@ -376,8 +377,10 @@ def test_replicated_elementwise_groups_are_realized_once_over_the_device():
     }
     commands = [str(c) for c in compiled.compiled.cmds]
     assert [c for c in commands if "EWMUL" in c] == [
-        "AiM EWMUL 4 4294967295 4",
-        "AiM EWMUL 4 4294967295 5",
+        # Rows 6 and 7 since round 73 (one bank-row region per elementwise
+        # group; rows 4 and 5 in round 71).
+        "AiM EWMUL 4 4294967295 6",
+        "AiM EWMUL 4 4294967295 7",
     ]
     assert sum(c.startswith("W MEM") for c in commands) == 2048
     layouts = _force_replica_partitions(compiled, ("rope_q", "rope_k"), 8)
