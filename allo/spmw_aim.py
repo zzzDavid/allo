@@ -19,7 +19,6 @@ from .spmw_plan import HostStep, LaunchStep
 from .spmw_match import MatchedOp
 from .spmw_codegen import (
     CodegenContext,
-    _parse_loop_bound,
     RunResult,
     SimulatorUnavailable,
     Compiled,
@@ -1904,10 +1903,7 @@ class _AimProgramDerivation:
                         f"elementwise lowering realizes: {problem}"
                     )
                 group.kind = kind.lower()
-                group.elements = math.prod(
-                    _parse_loop_bound(ub)
-                    for _var, _lb, ub, _step in match.enclosing_loops
-                )
+                group.elements = self._dense_elementwise_domain(group, match)
                 self._spread_elementwise_grid(group, match, replicated)
                 if kind == "MUL":
                     roles = {op.role: op for op in match.operands}
@@ -1930,6 +1926,74 @@ class _AimProgramDerivation:
                 )
             groups.append(group)
         return groups
+
+    def _dense_elementwise_domain(self, group, match):
+        """The element count of an elementwise kernel whose iteration domain
+        and store image are provably dense, else NotImplementedError.
+
+        The EWMUL / EWADD stream writes every element of a contiguous span
+        of the result from the same elements of the operands, so the
+        lowering is sound only when the kernel's loops step by one and the
+        result's coordinates are, dimension by dimension, one loop variable
+        each (coefficient one, any constant offset) with every loop used
+        once: the store image is then the dense box of the trip counts, and
+        `access_region`'s bounding box (an over-approximation in general) is
+        exact.  A strided loop (``range(0, n, 2)``) or a strided coordinate
+        (``z[2 * i]``) would make the stream write elements the source
+        leaves unchanged (round 76, ISSUES X-33: the reviewer's stride-two
+        witness); such kernels are refused before selection.
+        """
+        facts = match.extra.get("semantic_facts")
+        axes = {
+            loop.var: loop for loop in (getattr(facts, "loops", None) or ())
+        }
+        enclosing = [var for var, _lb, _ub, _step in match.enclosing_loops]
+        for var, _lb, _ub, step in match.enclosing_loops:
+            axis = axes.get(var)
+            trip = getattr(axis, "trip", None)
+            step_value = getattr(axis, "step", step)
+            try:
+                step_value = int(step_value)
+            except (TypeError, ValueError):
+                step_value = None
+            if trip is None or step_value != 1:
+                raise NotImplementedError(
+                    f"AiM {group.name}: the elementwise lowering covers dense "
+                    f"iteration domains only; loop {var} steps by {step_value!r} "
+                    f"(trip {trip!r}), so the EWMUL / EWADD stream would write the "
+                    "elements the source skips"
+                )
+        store = match.extra.get("store_coords")
+        if not store:
+            raise NotImplementedError(
+                f"AiM {group.name}: the result's coordinates were not resolved; "
+                "the elementwise lowering needs a dense store image"
+            )
+        used = []
+        for coordinate in store:
+            atoms, _const = coordinate
+            atoms = tuple(atoms)
+            if (
+                len(atoms) != 1
+                or atoms[0][0] not in enclosing
+                or int(atoms[0][1]) != 1
+                or atoms[0][0] in used
+            ):
+                raise NotImplementedError(
+                    f"AiM {group.name}: the result coordinate {coordinate!r} is "
+                    "not one loop variable with coefficient one; the elementwise "
+                    "lowering writes a dense span of the result and is refused "
+                    "for strided or repeated stores"
+                )
+            used.append(atoms[0][0])
+        missing = [var for var in enclosing if var not in used]
+        if missing:
+            raise NotImplementedError(
+                f"AiM {group.name}: loop(s) {missing} do not index the result; "
+                "the elementwise lowering writes each result element once and is "
+                "refused for repeated stores"
+            )
+        return math.prod(int(axes[var].trip) for var in enclosing)
 
     def _spread_elementwise_grid(self, group, match, replicated):
         """Cover every work item of a partitioned elementwise grid (M-14).

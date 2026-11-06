@@ -2178,6 +2178,30 @@ statements are qualified below.  The installed candidate `b221972` (wheel
 regressions and the four reviewer probes from the wheel with identical results.
 X-22 / X-23 / X-26 and mvt stay OPEN.  NOT READY.
 
+## Round 76 (2026-11-06): the elementwise lowering proves a dense domain (the reviewer's stride-two witness, X-33); the Gemini-I campaign running
+
+The reviewer found a pre-existing defect independent of X-32: the AiM
+elementwise lowering took its element count from the loops' upper bounds
+and treated the access bounding box as an exact image, so a stride-two
+kernel lowered to dense EWMULs that overwrote the lanes the source leaves
+unchanged.  The lowering now proves the domain first (loops stepping by
+one, result coordinates one loop variable each with coefficient one, every
+loop indexing the result once, the count from the trip counts) and refuses
+strided or repeated stores before selection with the loop or coordinate
+named; dense kernels and dense suffixes are unchanged, and no required
+paper row has a strided elementwise domain.  Recorded as X-33 under G2 and
+G9, with the reviewer's failing witness preserved.  The queued Gemini-I
+campaign launched itself from the round 69 watcher when the host's `/tmp`
+freed (348 MB at launch); it runs from the installed wheel of `472bec9`,
+whose APU v1 code is unchanged since, under the pre-registered three-session
+protocol; its sessions are pooled when it finishes.  It did not get
+there: the host's `/tmp` refilled within minutes and session 1 lost its
+launches to the vendor tool's scratch (kmeans kept eight of ten measured
+launches per lane, the other two cases none), sessions 2 and 3 were
+refused by the guard, the record is kept and not pooled, and a retry of
+the same protocol is queued at a higher threshold.
+X-26 and mvt stay OPEN.  NOT READY.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
@@ -2217,7 +2241,7 @@ templates and `APUG2_U16_GEMM_BMAX = 31`; U-06 shape-exact paths).
 
 ## Gate judgments at the current candidate
 
-Refreshed in round 75 (2026-11-06); the integration candidate `b221972` (round 75, installed wheel `ace1b7b0...`) (X-32 repaired with physical liveness, row chunks and logical frames included; the fourteen AiM rows at or below the paper; X-19 REPRODUCED with the complete program; the grouped route's board validation and the installed grouped / U-16 regressions at `472bec9`); the candidate `472bec9`
+Refreshed in round 76 (2026-11-06); the integration candidate `b221972` (round 75, installed wheel `ace1b7b0...`) plus the round 76 checkout (X-33: the elementwise lowering proves a dense domain; X-32 repaired with physical liveness, row chunks and logical frames included; the fourteen AiM rows at or below the paper; X-19 REPRODUCED with the complete program; the grouped route's board validation and the installed grouped / U-16 regressions at `472bec9`); the candidate `472bec9`
 (X-25 completed, X-27 and its correction, X-28 to X-31, the native UPMEM SDK
 executor, U-16): the grouped route validated on the APU v1 board and the
 grouped and U-16 regressions run from its installed wheel; the simulator rows
@@ -2227,7 +2251,7 @@ and the Gemini-II card tests last run from the `ba2f58d` wheel; the grouped rout
 | Gate | Judgment | Basis |
 |---|---|---|
 | G1 correspondence | **PARTIAL** | every substantive mechanism of Sections III and IV has a maintained implementation reachable through `allo.compile` (CLAIMS.md), now including both APUs through the shared pipeline; the claim matrix must be re-read against the G9 pipeline and the G10 inventory (same-or-better performance is part of G1 since the 2026-11-03 scope addition) |
-| G2 semantic preservation / explicit failure | **PARTIAL** | the rounds 8-11 repairs (C-19 to C-26) and the shared contract rounds (X-02 to X-14, X-17 to X-20) are implemented with regressions; the shared semantic checks run before every backend's selection; round 62: the APU v1 grouped route refuses, before scheduling and by name, a region whose accesses or written domain are not the dense GEMM its device program executes (X-29); open: the deferred arithmetic findings (ISSUES), independent re-challenge of the whole domain on every runner |
+| G2 semantic preservation / explicit failure | **PARTIAL** | the rounds 8-11 repairs (C-19 to C-26) and the shared contract rounds (X-02 to X-14, X-17 to X-20) are implemented with regressions; round 76: the AiM elementwise lowering proves a dense iteration domain and store image before it is used and refuses strided or repeated stores before selection (X-33, the reviewer's stride-two witness); the shared semantic checks run before every backend's selection; round 62: the APU v1 grouped route refuses, before scheduling and by name, a region whose accesses or written domain are not the dense GEMM its device program executes (X-29); open: the deferred arithmetic findings (ISSUES), independent re-challenge of the whole domain on every runner |
 | G3 general mechanisms | **PARTIAL** | structural recognizers and template-derived legality on every backend; the AttAcc attention template is proven structurally (X-20); the UPMEM recognizers read resolved coordinates so hoisted and inline address spellings classify alike, and guard / copy load identity is proven on full coordinates (U-16, rounds 68-69); renamed and neighbouring programs compile to the same normalized decisions in the round 24-28 regressions; open: M-14, the constants inventory re-read against the current tree |
 | G4 search/layout/selected-program integrity | **PARTIAL** | complete assignments materialize under the real orchestration before acceptance (C-33b); round 72: an AiM assignment whose device reader takes a value in another distribution than its last writer left is a feasibility rejection for every reader of every live range (X-32, the reviewer's fan-out and inverse probes); round 73 (the reviewer's slot-liveness witness showed the round 72 relocations were not lifetime-safe): every elementwise group in its own bank row region, copies into each reader's region while the source is live, and the emitted records walked cell by cell so every slot read finds the value program order placed there, else a feasibility rejection; round 74 (the reviewer's multi-row witness): relocations one row chunk at a time through the global buffer, the liveness model tracking row chunks in cells and the GB, whole-vector copy records refused; round 75 (the reviewer's prefix witness): the logical frame and partition span of every slot layout are part of the compatibility and cell contracts, a reader of another frame refused before selection with both frames and the remedy named; every backend's realization is compared with its declaration (X-05 to X-16; the APU v1 grouped route's map, batches, packing and emission since rounds 61-66, X-28 to X-31); transfer availability and physical addressing are checked (X-09 to X-11, X-17, X-18); open: the slice 5 forced-alternative traces through packing and launches on both hardware hosts |
 | G5 cost models | **PARTIAL** | provenance and validity labels everywhere; the AiM single-copy elementwise form selected by estimated cost and confirmed by native simulation on every CENT row and a neighbouring block (round 71); cost perturbations traced to executed programs on Samsung, UPMEM and APU v1 in earlier rounds; the Samsung estimate includes each work item's share of the first matrix staging (partitioning the conductor's staging exactly, staging before the MAC, the same scope for the ordered program) and ranks the swizzled-rows placement first on both paper GEMVs, a held-out and a neighbouring shape, as the conductor measures (rounds 37-38, S-16 repaired); the AiM contraction profile recalibrated per command class from controlled simulator measurements and validated on held-out programs before the nine workloads (round 50, M-19 awaiting review); open: C-18, uniform movement weights, the perturbation traces at the current candidate on both hardware hosts |
