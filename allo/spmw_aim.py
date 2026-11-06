@@ -16,7 +16,6 @@ from pathlib import Path
 
 from .spmw_autoschedule import _matcher_work_scope
 from .spmw_plan import HostStep, LaunchStep
-from .spmw_match import MatchedOp
 from .spmw_codegen import (
     CodegenContext,
     RunResult,

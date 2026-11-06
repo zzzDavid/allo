@@ -2154,7 +2154,6 @@ def rank_matcher_placements(
 
     import math
     import time
-    from dataclasses import replace
 
     from . import spmw_plan
     from .pim.schedule_search import (

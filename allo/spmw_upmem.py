@@ -29,7 +29,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Callable, Mapping
 
 import numpy as np
 
@@ -56,7 +56,6 @@ from .pim.upmem_physical_search import (
     UPMEMOperandResidency,
     UPMEMPredicateLowering,
     UPMEMPhysicalDecision,
-    UPMEMPhysicalLegalityError,
     UPMEMPhysicalProblem,
     UPMEMPlanBuilderRejected,
     calibration_validity,

@@ -4,14 +4,10 @@
 
 from __future__ import annotations
 
-import importlib
-import inspect
 import math
 
-import numpy as np
 
 from ..perf import BoundCostSpec
-from ..spmw_codegen import RunResult
 from .apu_g2_composed_contraction import (
     APUG2ComposedContractionProgram,
     APUG2DotEpilogue,

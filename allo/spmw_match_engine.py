@@ -38,7 +38,7 @@ import ast
 import inspect
 import dataclasses
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from ._mlir.ir import AsmState

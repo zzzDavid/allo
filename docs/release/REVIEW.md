@@ -2561,11 +2561,13 @@ the reviewer pointed: the W0640 closures in `spmw_autoschedule.py`,
 An AST escape analysis over the six files establishes for every closure
 defined in a loop how it is used and, for each captured cell, where it is
 assigned relative to the definition and the calls.  Every one of the 89
-diagnostics is a closure executed within the iteration that defined it
-(or a decorator registration binding its values through default
-arguments, or a `key=lambda` consumed by `min`); no closure escapes to
-later execution, so no defect is demonstrated and no diagnostic is
-suppressed.  491 W/C/R diagnostics remain untriaged.  The active verdict
+diagnostics is either a closure executed within the iteration that
+defined it (five direct helpers and a `key=lambda` consumed by `min`) or
+one of the two decorated cost-rule registrations, which are retained for
+later execution but bind every loop value through default arguments
+evaluated at definition time; no closure reads a loop cell after the loop
+moves on, so no defect is demonstrated and no diagnostic is suppressed
+(wording corrected in round 91 after the reviewer's reading).  491 W/C/R diagnostics remain untriaged.  The active verdict
 below is refreshed: the public-payload and distribution audit's reviewed
 items are closed narrowly (P-25, rounds 88 and 89), P-04 and the
 final-candidate checks stay explicit.  Next concrete action: the Gemini-I
@@ -2573,6 +2575,25 @@ execution of the repaired vector path from installed artifacts containing
 `aae8b23` when the host's `/tmp` clears; meanwhile the next W/C/R class
 (`unused-import`, 20, the smallest class with a plausible defect).  NOT
 READY.
+
+## Round 91 (2026-11-06): the round 90 triage accepted; the unused-import class removed (20, no re-export or registration effect)
+
+The reviewer accepted the W0640 triage, asked for two wording
+corrections (applied: five direct helpers, one lambda and two decorated
+registrations that are retained for later execution but bind their loop
+values through defaults) and confirmed the board stays blocked (`/tmp` at
+about 128 KiB; 124 KiB here; nothing launched).  The next bounded P-23
+class, `unused-import`, was triaged import by import before any removal:
+other mentions in the file, `__all__`, `TYPE_CHECKING`, consumers of the
+name from the module, attribute-style users, star imports and test
+monkeypatches.  All twenty are genuinely unused, two of them function-local
+re-imports and two names inside otherwise used import statements; none is
+a public re-export or a registration import.  The twenty names are
+removed, pylint reports no `unused-import`, every file compiles and
+imports, and the focused suites over the twelve modules pass.  471 W/C/R
+diagnostics remain.  Next concrete action unchanged: the Gemini-I
+execution from installed artifacts containing `aae8b23` when the host's
+`/tmp` clears.  NOT READY.
 
 ## Rejected shortcuts
 
@@ -2650,9 +2671,9 @@ AiM, Samsung, UPMEM, AttAcc and the other four Gemini-II rows REPRODUCED
 at `88852b7` from installed artifacts; the final-candidate validation (the
 suites and installed-artifact runs at whichever revision is declared
 final); P-04 (the Samsung patches, a permission matter, its `Sconstruct`
-question included); P-23's remaining pylint stage (the E class and the
-W0640 class triaged with no defect beyond X-39; 491 W/C/R diagnostics
-untriaged); V1-19 (deferred by
+question included); P-23's remaining pylint stage (the E, W0640 and W0611 classes
+triaged, no defect beyond X-39, the twenty unused imports removed; 471
+W/C/R diagnostics untriaged); V1-19 (deferred by
 direction); the open minor items in ISSUES.md.  No longer blockers: the
 manifest and slice 5 source review of rounds 28 to 30 (accepted, round
 84 review); the installed-artifact runs at the earlier candidates

@@ -24,7 +24,7 @@ from types import CodeType, MappingProxyType, ModuleType
 
 from ..spmw_fingerprint import canonical_json
 from .evaluator import Evaluator
-from .graph import Activity, ExecutionGraph, HandleInstance, Occupancy
+from .graph import Activity, HandleInstance, Occupancy
 
 
 def _unit_path(unit):

@@ -46,10 +46,8 @@ from ..spmw_codegen import RunResult
 from .apu_g2_composed_contraction import (
     APUG2ComposedContractionProgram,
     APUG2DotEpilogue,
-    APUG2DotEpilogueMode,
 )
 from .apu_g2_composed_layout import (
-    gather_apu_g2_composed_output,
     interleave_apu_g2_dot_streams,
 )
 from .apu_g2_composed_program import build_apu_g2_composed_recipe

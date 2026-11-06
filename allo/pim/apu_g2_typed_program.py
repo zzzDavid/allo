@@ -10,8 +10,6 @@ individual matrix shapes never participate in legality or dispatch.
 
 from __future__ import annotations
 
-import importlib
-import inspect
 import math
 from dataclasses import dataclass
 from enum import Enum
@@ -20,7 +18,6 @@ from numbers import Integral
 import numpy as np
 
 from ..perf import BoundCostSpec
-from ..spmw_codegen import RunResult
 from .apu_g2_recipe import (
     APUG2Descriptor,
     APUG2DescriptorUse,

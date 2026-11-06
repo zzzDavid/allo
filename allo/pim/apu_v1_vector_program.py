@@ -540,7 +540,6 @@ class APUv1VectorCandidate:
             CandidateCoverage,
             CandidateEffects,
             CandidateLaunch,
-            CandidateTransfer,
             CandidateValueLayout,
         )
         from .apu_v1_vectorize import _UNIT_AXIS

@@ -21,7 +21,7 @@ from typing import Any
 
 import numpy as np
 
-from .spmw_target import MemoryRef, Register, UnitId
+from .spmw_target import Register, UnitId
 
 
 # --------------------------------------------------------------------- #
