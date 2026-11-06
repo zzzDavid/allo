@@ -42,13 +42,20 @@ def test_oracle_rounds_each_step_and_exposes_the_regrouping():
     # The oracle is a plain NumPy computation of the stated rule.
     acc = np.zeros((driver.M, 1), np.float16)
     for k in range(driver.K):
-        acc = (acc + (A[:, k, None] * B[k][None, :]).astype(np.float16)).astype(np.float16)
+        acc = (acc + (A[:, k, None] * B[k][None, :]).astype(np.float16)).astype(
+            np.float16
+        )
     assert np.array_equal(acc.view(np.uint16), oracle.view(np.uint16))
 
 
 class _Result:
     def __init__(self, kind, out_value, extra=None, cycles=5):
-        self.kind, self.cycles, self.extra, self.backend = kind, cycles, extra or {}, "fake"
+        self.kind, self.cycles, self.extra, self.backend = (
+            kind,
+            cycles,
+            extra or {},
+            "fake",
+        )
         self._out = out_value
 
     def fill(self, out):
@@ -94,12 +101,22 @@ def test_driver_fails_loudly_and_keeps_evidence(monkeypatch, tmp_path):
         # apu_v1 executes but one output is wrong; samsung ran virtually.
         if "samsung" in str(target).lower() or calls["n"] == 1:
             return _fake_compiled(_Result("virtual", oracle))
-        return _fake_compiled(_Result("device", wrong, {"binary_sha256": "ab" * 32, "profile_text": "total crun: 5"}))
+        return _fake_compiled(
+            _Result(
+                "device",
+                wrong,
+                {"binary_sha256": "ab" * 32, "profile_text": "total crun: 5"},
+            )
+        )
 
     monkeypatch.setattr(driver.allo, "compile", fake_compile)
     monkeypatch.setattr(driver, "_target", lambda name: (name, None))
-    monkeypatch.setattr(driver, "_board_lock", lambda name: __import__("contextlib").nullcontext())
-    monkeypatch.setattr(driver, "_samsung_identity", lambda: {"pim_driver_sha256": "cd" * 32})
+    monkeypatch.setattr(
+        driver, "_board_lock", lambda name: __import__("contextlib").nullcontext()
+    )
+    monkeypatch.setattr(
+        driver, "_samsung_identity", lambda: {"pim_driver_sha256": "cd" * 32}
+    )
     status = driver.main(["--out", str(tmp_path / "ev")])
     assert status == 1
     report = json.loads((tmp_path / "ev" / "report.json").read_text())
@@ -130,7 +147,9 @@ def test_driver_records_a_failed_run_before_exiting(monkeypatch, tmp_path):
 
     monkeypatch.setattr(driver.allo, "compile", lambda *a, **k: Boom())
     monkeypatch.setattr(driver, "_target", lambda name: (name, None))
-    monkeypatch.setattr(driver, "_board_lock", lambda name: __import__("contextlib").nullcontext())
+    monkeypatch.setattr(
+        driver, "_board_lock", lambda name: __import__("contextlib").nullcontext()
+    )
     assert driver.main(["--out", str(tmp_path / "ev"), "--targets", "apu_v1"]) == 1
     report = json.loads((tmp_path / "ev" / "report.json").read_text())
     assert report["runs"][0]["run_error"].startswith("RuntimeError: board unavailable")
@@ -158,9 +177,13 @@ def test_failed_or_misplaced_control_fails_the_command(monkeypatch, tmp_path):
 
         monkeypatch.setattr(driver.allo, "compile", fake_compile)
         monkeypatch.setattr(driver, "_target", lambda name: (name, None))
-        monkeypatch.setattr(driver, "_board_lock", lambda name: __import__("contextlib").nullcontext())
+        monkeypatch.setattr(
+            driver, "_board_lock", lambda name: __import__("contextlib").nullcontext()
+        )
         out = tmp_path / f"ev-{calls['n']}-{id(control)}"
-        status = driver.main(["--out", str(out), "--targets", "apu_v1", "--reassociate"])
+        status = driver.main(
+            ["--out", str(out), "--targets", "apu_v1", "--reassociate"]
+        )
         return status, json.loads((out / "report.json").read_text())
 
     class Failing:
@@ -173,10 +196,15 @@ def test_failed_or_misplaced_control_fails_the_command(monkeypatch, tmp_path):
 
     status, report = scenario(lambda: Failing())
     assert status == 1 and report["problems"] == ["apu_v1_reassociate: did not execute"]
-    assert report["runs"][1]["run_error"].startswith("RuntimeError: control launch failed")
+    assert report["runs"][1]["run_error"].startswith(
+        "RuntimeError: control launch failed"
+    )
 
     status, report = scenario(lambda: _fake_compiled(_Result("virtual", different)))
-    assert status == 1 and "apu_v1_reassociate: executed as 'virtual'" in report["problems"][0]
+    assert (
+        status == 1
+        and "apu_v1_reassociate: executed as 'virtual'" in report["problems"][0]
+    )
 
     status, report = scenario(lambda: _fake_compiled(_Result("device", different)))
     assert status == 0 and report["problems"] == []
@@ -215,18 +243,34 @@ def test_plan_provenance_is_structural_not_truncated():
         cur = cur["x"]
     assert driver._json_ready(deep_but_fine) is not None
 
-    compiled = allo.compile(driver.gemv_source(), build_apu_v1_target(), apu_v1_cost, backend="virtual")
+    compiled = allo.compile(
+        driver.gemv_source(), build_apu_v1_target(), apu_v1_cost, backend="virtual"
+    )
     plan = compiled.selected_plan
     assert isinstance(plan.metadata, types.MappingProxyType)
     metadata = driver._json_ready(plan.metadata)
     assert isinstance(metadata, dict)
-    for key in ("operation_counts", "transfer_facts", "accumulator_persistence", "accesses"):
+    for key in (
+        "operation_counts",
+        "transfer_facts",
+        "accumulator_persistence",
+        "accesses",
+    ):
         assert key in metadata and isinstance(metadata[key], (dict, list)), key
     manifest = driver._json_ready(plan.manifest())
-    assert {"name", "iteration_layout", "value_layouts", "transfers", "reduction_strategy", "operations"} <= set(manifest)
+    assert {
+        "name",
+        "iteration_layout",
+        "value_layouts",
+        "transfers",
+        "reduction_strategy",
+        "operations",
+    } <= set(manifest)
     assert manifest["name"] == plan.name
     effects = (getattr(compiled.compiled.layout, "extra", None) or {}).get("effects")
-    assert effects is not None, "the selected placement carries the shared candidate effects"
+    assert (
+        effects is not None
+    ), "the selected placement carries the shared candidate effects"
     effects_manifest = driver._json_ready(effects)
     assert isinstance(effects_manifest, dict) and effects_manifest
     text = json.dumps({"m": metadata, "p": manifest, "e": effects_manifest})

@@ -169,7 +169,9 @@ def global_softmax(scores, head_dim=HEAD_DIM):
     return ScaledSoftmax(head_dim)(scores)
 
 
-def build_attention(heads, tokens, head_dim=HEAD_DIM, max_tokens=MAX_TOKENS, *, bridge=True):
+def build_attention(
+    heads, tokens, head_dim=HEAD_DIM, max_tokens=MAX_TOKENS, *, bridge=True
+):
     """Resident-input decode attention: scores = q.K, probs = softmax(scores)
     on the host, heads_out = probs.V.
 
@@ -222,11 +224,17 @@ def build_attention(heads, tokens, head_dim=HEAD_DIM, max_tokens=MAX_TOKENS, *, 
         def host(q, k_cache, scores, probs, v_cache, heads_out):
             allo.launch("attention_qk", q, k_cache, scores)
             allo.host_compute(
-                "softmax", softmax, inputs=(scores,), outputs=(probs,), operation="softmax"
+                "softmax",
+                softmax,
+                inputs=(scores,),
+                outputs=(probs,),
+                operation="softmax",
             )
             allo.launch("attention_sv", probs, v_cache, heads_out)
 
-        program = allo.host_program(attention, resident=("q", "k_cache", "v_cache"))(host)
+        program = allo.host_program(attention, resident=("q", "k_cache", "v_cache"))(
+            host
+        )
         return attention, program
 
     def host_resident(q, k_cache, scores, probs, v_cache, heads_out):
@@ -292,7 +300,9 @@ def within_budget(mode, budget=CHANNEL_BUDGET):
     return int(knob(mode, "replica_partitions", 1)) <= budget
 
 
-def compile_program(attention, program, target, *, layouts=None, budget=BUDGET, virtual=False):
+def compile_program(
+    attention, program, target, *, layouts=None, budget=BUDGET, virtual=False
+):
     """One compile of a workload under the budget: the normal selection
     (``layouts`` None) or an explicit layout; ``virtual`` for the estimate."""
     kwargs = dict(host_moves=program, **POLICY)
@@ -346,7 +356,12 @@ def budget_variants(target, compiled, budget=CHANNEL_BUDGET):
     choices = kernel_choices(target, compiled)
     qk_index, qk_scores = choices.get("attention_qk", (None, []))
     sv_index, sv_scores = choices["attention_sv"]
-    outside = [m for scores in (qk_scores, sv_scores) for _c, m, _p in scores if not within_budget(m, budget)]
+    outside = [
+        m
+        for scores in (qk_scores, sv_scores)
+        for _c, m, _p in scores
+        if not within_budget(m, budget)
+    ]
     if outside:
         raise RuntimeError(f"ranking scored plans outside the budget: {outside[:3]}")
     qk = min(qk_scores, default=None)
@@ -450,7 +465,8 @@ def _entry(compiled, kernel):
 
 def _stage(compiled, name="softmax"):
     return next(
-        s for s in compiled.compiled.layout_ctx.host_steps
+        s
+        for s in compiled.compiled.layout_ctx.host_steps
         if isinstance(s, AimHostStage) and s.stage == name
     )
 
@@ -474,13 +490,23 @@ def functional_check(compiled, heads, tokens, *, seed=0, head_dim=HEAD_DIM):
     K = bf16_round(rng.standard_normal((heads, tokens, head_dim)).astype(np.float32))
     V = bf16_round(rng.standard_normal((heads, head_dim, tokens)).astype(np.float32))
     replicas = int(qk["replicas"])
-    scores = reference_outputs(qk, np.broadcast_to(K[None], (replicas, *K.shape)), np.broadcast_to(q[None], (replicas, *q.shape)))
+    scores = reference_outputs(
+        qk,
+        np.broadcast_to(K[None], (replicas, *K.shape)),
+        np.broadcast_to(q[None], (replicas, *q.shape)),
+    )
     probs = stage.run(scores[0])[0]
     split = sv.get("reduction_partition") is not None
-    out = reference_outputs(sv, np.broadcast_to(V[None], (int(sv["replicas"]), *V.shape)), np.broadcast_to(probs[None], (int(sv["replicas"]), *probs.shape)))
+    out = reference_outputs(
+        sv,
+        np.broadcast_to(V[None], (int(sv["replicas"]), *V.shape)),
+        np.broadcast_to(probs[None], (int(sv["replicas"]), *probs.shape)),
+    )
     # The independent reference: scaled attention, softmax(q.K / sqrt(d)).V
     # in float64, the scale from the workload's actual head dimension.
-    reference_scores = np.einsum("hd,hld->hl", q.astype(np.float64), K.astype(np.float64))
+    reference_scores = np.einsum(
+        "hd,hld->hl", q.astype(np.float64), K.astype(np.float64)
+    )
     scaled = reference_scores / math.sqrt(head_dim)
     reference_probs = np.exp(scaled - scaled.max(-1, keepdims=True))
     reference_probs /= reference_probs.sum(-1, keepdims=True)
@@ -491,13 +517,20 @@ def functional_check(compiled, heads, tokens, *, seed=0, head_dim=HEAD_DIM):
     unscaled_probs = np.exp(reference_scores - reference_scores.max(-1, keepdims=True))
     unscaled_probs /= unscaled_probs.sum(-1, keepdims=True)
     unscaled = np.einsum("hl,hdl->hd", unscaled_probs, V.astype(np.float64))
-    unscaled_error = float(np.max(np.abs(out[0] - unscaled)) / np.max(np.abs(reference)))
+    unscaled_error = float(
+        np.max(np.abs(out[0] - unscaled)) / np.max(np.abs(reference))
+    )
     tolerance = 2.0**-6
     if not error < tolerance:
         raise AssertionError(f"functional pipeline error {error} exceeds {tolerance}")
     return {
         "evidence": "functional oracle, not the timing-only simulator",
-        "pipeline": "reference_outputs(QK) -> stage.run -> " + ("reference_partial_sums(SV) + host merge" if split else "reference_outputs(SV)"),
+        "pipeline": "reference_outputs(QK) -> stage.run -> "
+        + (
+            "reference_partial_sums(SV) + host merge"
+            if split
+            else "reference_outputs(SV)"
+        ),
         "stage": stage.stage,
         "operation": stage.operation,
         "head_dim": int(head_dim),
@@ -525,7 +558,9 @@ def measured_host_total(device_cycles, host_price, measured):
 def _bf16_bits(values):
     """BF16 words of FP32 values already rounded to BF16: the bit pattern's
     upper half (no second rounding)."""
-    return (np.asarray(values, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16)
+    return (np.asarray(values, dtype=np.float32).view(np.uint32) >> 16).astype(
+        np.uint16
+    )
 
 
 def _bf16_values(words):
@@ -576,11 +611,14 @@ def host_protocol_samples(compiled, heads, tokens, *, seed=0, head_dim=HEAD_DIM)
     sv = sv_entry(compiled)
     if sv.get("reduction_partition") is not None:
         merge = next(
-            h for h in compiled.compiled.layout_ctx.host_steps
+            h
+            for h in compiled.compiled.layout_ctx.host_steps
             if isinstance(h, AimHostReduction) and h.source == sv["name"]
         )
         partials = bf16_round(
-            rng.standard_normal((merge.replicas, merge.batches, merge.partitions, merge.outputs)).astype(np.float32)
+            rng.standard_normal(
+                (merge.replicas, merge.batches, merge.partitions, merge.outputs)
+            ).astype(np.float32)
         )
 
     def decode():
@@ -601,13 +639,19 @@ def host_protocol_samples(compiled, heads, tokens, *, seed=0, head_dim=HEAD_DIM)
     decoded = decode()
     probabilities = softmax(decoded)
     staged = staging(probabilities)
-    if not np.all(np.isfinite(decoded)) or not np.allclose(probabilities.sum(axis=-1), 1.0, atol=2e-2):
+    if not np.all(np.isfinite(decoded)) or not np.allclose(
+        probabilities.sum(axis=-1), 1.0, atol=2e-2
+    ):
         raise RuntimeError("host protocol inputs or outputs are not the attention's")
     components = {
         "decode": historical_host_samples(decode),
         "softmax": historical_host_samples(lambda: softmax(decoded)),
         "staging": historical_host_samples(lambda: staging(probabilities)),
-        "merge": historical_host_samples(lambda: merge.merge(partials)) if merge is not None else None,
+        "merge": (
+            historical_host_samples(lambda: merge.merge(partials))
+            if merge is not None
+            else None
+        ),
     }
     whole_samples = historical_host_samples(whole)
 
@@ -615,21 +659,32 @@ def host_protocol_samples(compiled, heads, tokens, *, seed=0, head_dim=HEAD_DIM)
         if values is None:
             return None
         ordered = sorted(values)
-        return {"median_ns": ordered[len(ordered) // 2], "min_ns": ordered[0], "samples_ns": values}
+        return {
+            "median_ns": ordered[len(ordered) // 2],
+            "min_ns": ordered[0],
+            "samples_ns": values,
+        }
 
     return {
         "unit": "ns per call",
         "methodology": "historical host_samples: 10 warm-ups, 31 samples of 100 back-to-back calls each (mean per call)",
         "inputs": {
             "scores": "bf16(q . K) of unit-variance BF16 q and K (the functional computation's distribution)",
-            "score_min": float(decoded.min()), "score_max": float(decoded.max()), "score_std": float(decoded.std()),
-            "max_probability": float(probabilities.max()), "nonzero_probabilities_per_head": float(np.mean((probabilities > 0).sum(axis=-1))),
+            "score_min": float(decoded.min()),
+            "score_max": float(decoded.max()),
+            "score_std": float(decoded.std()),
+            "max_probability": float(probabilities.max()),
+            "nonzero_probabilities_per_head": float(
+                np.mean((probabilities > 0).sum(axis=-1))
+            ),
             "staged_words": int(staged.size),
         },
         "whole": summary(whole_samples),
         "components": {k: summary(v) for k, v in components.items()},
         "total_median_ns": sorted(whole_samples)[len(whole_samples) // 2],
-        "components_median_sum_ns": sum(sorted(v)[len(v) // 2] for v in components.values() if v is not None),
+        "components_median_sum_ns": sum(
+            sorted(v)[len(v) // 2] for v in components.values() if v is not None
+        ),
         "note": "the whole-protocol median is the comparable sample; component medians are a diagnostic breakdown; link terms are modelled separately; 1 simulated cycle = 1 ns",
     }
 
@@ -683,8 +738,18 @@ def host_stage_samples(compiled, heads, tokens, *, repeats=20, seed=0):
 # policy on the study's device budget: the channel group is the budget's
 # eight channels for QK, and for SV the heads up to eight (one per channel).
 CENT_POLICY = {
-    "attention_qk": {"bank_scope": "abk", "batch_mapping": "row_packed", "reuse_group": "16", "reduction_partitions": "1"},
-    "attention_sv": {"bank_scope": "abk", "batch_mapping": "channels", "reuse_group": "16", "reduction_partitions": "1"},
+    "attention_qk": {
+        "bank_scope": "abk",
+        "batch_mapping": "row_packed",
+        "reuse_group": "16",
+        "reduction_partitions": "1",
+    },
+    "attention_sv": {
+        "bank_scope": "abk",
+        "batch_mapping": "channels",
+        "reuse_group": "16",
+        "reduction_partitions": "1",
+    },
 }
 
 
@@ -713,8 +778,20 @@ def _knobs(mode):
 # padded heads' work and host protocol are part of the control, as they
 # were historically.
 CENT_REPAIRED_POLICY = {
-    "attention_qk": {"bank_scope": "abk", "batch_mapping": "row_packed", "reuse_group": "1", "reduction_partitions": "1", "replica_partitions": "8"},
-    "attention_sv": {"bank_scope": "abk", "batch_mapping": "channels", "reuse_group": "1", "reduction_partitions": "1", "replica_partitions": "8"},
+    "attention_qk": {
+        "bank_scope": "abk",
+        "batch_mapping": "row_packed",
+        "reuse_group": "1",
+        "reduction_partitions": "1",
+        "replica_partitions": "8",
+    },
+    "attention_sv": {
+        "bank_scope": "abk",
+        "batch_mapping": "channels",
+        "reuse_group": "1",
+        "reduction_partitions": "1",
+        "replica_partitions": "8",
+    },
 }
 CENT_REPAIRED_PROVENANCE = {
     "producer": "reviews/experiments/aim_attention_campaign.py:115-125 (containing repository), variant cent-repaired",
@@ -738,7 +815,10 @@ def _policy_layouts(target, ranking, policy, what):
         matches = [
             (cycles, mode, placement)
             for cycles, mode, placement in scores
-            if all(_knobs(mode).get(k, "1" if k == "reduction_partitions" else None) == v for k, v in wanted.items())
+            if all(
+                _knobs(mode).get(k, "1" if k == "reduction_partitions" else None) == v
+                for k, v in wanted.items()
+            )
         ]
         if not matches:
             raise LookupError(
@@ -746,7 +826,9 @@ def _policy_layouts(target, ranking, policy, what):
                 f"budget; scored modes: {sorted({m for _c, m, _p in scores})[:6]}..."
             )
         if len(matches) > 1:
-            raise LookupError(f"{len(matches)} candidates of {kernel!r} carry the {what} policy {wanted}")
+            raise LookupError(
+                f"{len(matches)} candidates of {kernel!r} carry the {what} policy {wanted}"
+            )
         cycles, mode, placement = matches[0]
         layouts[index] = placement
         description[kernel] = {"mode": mode, "ranked_cycles": cycles, "policy": wanted}
@@ -784,7 +866,10 @@ def cent_derived_layouts(target, ranking, heads, budget=CHANNEL_BUDGET):
         matches = [
             (cycles, mode, placement)
             for cycles, mode, placement in scores
-            if all(_knobs(mode).get(k, "1" if k == "reduction_partitions" else None) == v for k, v in wanted.items())
+            if all(
+                _knobs(mode).get(k, "1" if k == "reduction_partitions" else None) == v
+                for k, v in wanted.items()
+            )
         ]
         if not matches:
             raise LookupError(
@@ -792,7 +877,9 @@ def cent_derived_layouts(target, ranking, heads, budget=CHANNEL_BUDGET):
                 f"budget; scored modes: {sorted({m for _c, m, _p in scores})[:6]}..."
             )
         if len(matches) > 1:
-            raise LookupError(f"{len(matches)} candidates of {kernel!r} carry CENT's policy {wanted}")
+            raise LookupError(
+                f"{len(matches)} candidates of {kernel!r} carry CENT's policy {wanted}"
+            )
         cycles, mode, placement = matches[0]
         layouts[index] = placement
         description[kernel] = {"mode": mode, "ranked_cycles": cycles, "policy": wanted}
@@ -830,7 +917,10 @@ def compiler_revision():
     record = {"allo": allo.__file__, "git_revision": None, "git_dirty": None}
     try:
         rev = subprocess.run(
-            ["git", "-C", package, "rev-parse", "HEAD"], capture_output=True, timeout=20, check=False
+            ["git", "-C", package, "rev-parse", "HEAD"],
+            capture_output=True,
+            timeout=20,
+            check=False,
         )
         if rev.returncode == 0:
             record["git_revision"] = rev.stdout.decode().strip()
@@ -863,7 +953,11 @@ def _graph_activities(compiled):
                 "latency_cycles": getattr(activity, "latency_cycles", None),
                 "occupancy": [
                     {
-                        "handle": getattr(getattr(use, "handle", None), "name", repr(getattr(use, "handle", None))),
+                        "handle": getattr(
+                            getattr(use, "handle", None),
+                            "name",
+                            repr(getattr(use, "handle", None)),
+                        ),
                         "cycles": getattr(use, "cycles", None),
                         "amount": getattr(use, "amount", None),
                     }
@@ -889,9 +983,20 @@ def _command_inventory(compiled, kernel):
     counts = {}
     for line in commands:
         words = line.split()
-        opcode = words[1] if words and words[0] == "AiM" else (words[0] if words else "")
+        opcode = (
+            words[1] if words and words[0] == "AiM" else (words[0] if words else "")
+        )
         counts[opcode] = counts.get(opcode, 0) + 1
-    return {"span": [begin, end], "commands": len(commands), "opcode_counts": counts, "reuse_groups": sum(1 for i, l in enumerate(commands) if "WR_BIAS" in l and (i == 0 or "WR_BIAS" not in commands[i - 1]))}
+    return {
+        "span": [begin, end],
+        "commands": len(commands),
+        "opcode_counts": counts,
+        "reuse_groups": sum(
+            1
+            for i, l in enumerate(commands)
+            if "WR_BIAS" in l and (i == 0 or "WR_BIAS" not in commands[i - 1])
+        ),
+    }
 
 
 def _plan_provenance(compiled):
@@ -908,7 +1013,9 @@ def _plan_provenance(compiled):
             }
             for p in _placements(compiled)
         ],
-        "lowering_manifest": _json_ready(list(getattr(ctx, "lowering_manifest", ()) or ())),
+        "lowering_manifest": _json_ready(
+            list(getattr(ctx, "lowering_manifest", ()) or ())
+        ),
         "sv_lowering": _json_ready(sv_entry(compiled)),
         "host_steps": [_json_ready(step) for step in getattr(ctx, "host_steps", ())],
         "resource_budget": getattr(ctx, "resource_budget", None),
@@ -962,7 +1069,20 @@ def _failure_entry(stage, error):
     return entry
 
 
-def measure_plan(label, built, attention, program, target, heads, tokens, *, simulate, budget, artifacts, sv_index=None):
+def measure_plan(
+    label,
+    built,
+    attention,
+    program,
+    target,
+    heads,
+    tokens,
+    *,
+    simulate,
+    budget,
+    artifacts,
+    sv_index=None,
+):
     """Estimate, simulate and check one compiled plan.
 
     The plan's record (its modes and complete provenance) is established
@@ -978,7 +1098,9 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
     modes = [p.mode for p in _placements(built)]
     # The SV placement is the one compiled for the SV work item (the bucket
     # index the ranking reported); a single-kernel program has only it.
-    sv_mode = modes[sv_index] if sv_index is not None and sv_index < len(modes) else modes[-1]
+    sv_mode = (
+        modes[sv_index] if sv_index is not None and sv_index < len(modes) else modes[-1]
+    )
     record = {
         "label": label,
         "modes": modes,
@@ -1007,20 +1129,36 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
         record["completed"].append(stage)
         stage = "host_price"
         host_steps = list(built.compiled.layout_ctx.host_steps)
-        reduction_terms = [host_reduction_terms(s, geometry) for s in host_steps if isinstance(s, AimHostReduction)]
-        reduction_cycles = sum(t["link_cycles"] + t["compute_cycles"] for t in reduction_terms)
-        stage_terms = [host_stage_terms(s, geometry) for s in host_steps if isinstance(s, AimHostStage)]
+        reduction_terms = [
+            host_reduction_terms(s, geometry)
+            for s in host_steps
+            if isinstance(s, AimHostReduction)
+        ]
+        reduction_cycles = sum(
+            t["link_cycles"] + t["compute_cycles"] for t in reduction_terms
+        )
+        stage_terms = [
+            host_stage_terms(s, geometry)
+            for s in host_steps
+            if isinstance(s, AimHostStage)
+        ]
         stage_link = sum(t["link_cycles"] for t in stage_terms)
         stage_compute = sum(t["compute_cycles"] for t in stage_terms)
         record["host_price"] = {
             "unit": "cycles (1 cycle = 1 ns at the simulator's declared rate)",
             "host_reduction_cycles": reduction_cycles,
-            "host_reduction_link_cycles": sum(t["link_cycles"] for t in reduction_terms),
-            "host_reduction_compute_cycles": sum(t["compute_cycles"] for t in reduction_terms),
+            "host_reduction_link_cycles": sum(
+                t["link_cycles"] for t in reduction_terms
+            ),
+            "host_reduction_compute_cycles": sum(
+                t["compute_cycles"] for t in reduction_terms
+            ),
             "host_stage_link_cycles": stage_link,
             "host_stage_compute_cycles": stage_compute,
             "host_stage_cycles": stage_link + stage_compute,
-            "host_stages": [s.manifest() for s in host_steps if isinstance(s, AimHostStage)],
+            "host_stages": [
+                s.manifest() for s in host_steps if isinstance(s, AimHostStage)
+            ],
             "host_stage_terms": stage_terms,
             "link_model": "32 B/cycle, zero fixed latency (allo.pim.costs.aim)",
             "no_double_counting": "readout = stage inputs, upload = stage outputs, partial readout = host reduction only",
@@ -1028,19 +1166,32 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
         record["host_cycles"] = reduction_cycles + stage_link + stage_compute
         record["completed"].append(stage)
         stage = "estimate"
-        record["estimate_cycles"] = compile_program(
-            attention, program, target, layouts=built.compiled.layout, budget=budget, virtual=True
-        ).run_backend().cycles
+        record["estimate_cycles"] = (
+            compile_program(
+                attention,
+                program,
+                target,
+                layouts=built.compiled.layout,
+                budget=budget,
+                virtual=True,
+            )
+            .run_backend()
+            .cycles
+        )
         record["completed"].append(stage)
         stage = "merge_check"
         split = sv_entry(built).get("reduction_partition") is not None
         record["merge_check"]["applicable"] = split
         if split:
-            record["merge_check"]["bf16_error"] = check_merge_numerics(built, heads, tokens)
+            record["merge_check"]["bf16_error"] = check_merge_numerics(
+                built, heads, tokens
+            )
             record["merge_check"]["integer_exact"] = True
         record["completed"].append(stage)
         stage = "functional_check"
-        record["functional_check"] = functional_check(built, heads, tokens, seed=heads * 1000 + tokens)
+        record["functional_check"] = functional_check(
+            built, heads, tokens, seed=heads * 1000 + tokens
+        )
         record["completed"].append(stage)
         stage = "host_samples"
         record["host_stage_measured"] = host_stage_samples(built, heads, tokens)
@@ -1050,9 +1201,13 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
             stage = "simulate"
             result = built.run_backend()
             if result.kind != "simulator-timing-only":
-                raise RuntimeError(f"{label}: expected a simulator-timing-only run, got {result.kind!r}")
+                raise RuntimeError(
+                    f"{label}: expected a simulator-timing-only run, got {result.kind!r}"
+                )
             if not isinstance(result.cycles, int) or result.cycles <= 0:
-                raise RuntimeError(f"{label}: simulator reported cycles {result.cycles!r}")
+                raise RuntimeError(
+                    f"{label}: simulator reported cycles {result.cycles!r}"
+                )
             record["device_cycles"] = int(result.cycles)
             record["total_cycles"] = int(result.cycles) + record["host_cycles"]
             # The measured-host total replaces only the modelled compute term
@@ -1061,8 +1216,12 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
             record["total_cycles_measured_host_stage"] = measured_host_total(
                 int(result.cycles), record["host_price"], record["host_stage_measured"]
             )
-            record["total_cycles_measured_host_protocol"] = measured_host_protocol_total(
-                int(result.cycles), record["host_price"], record["host_protocol_measured"]
+            record["total_cycles_measured_host_protocol"] = (
+                measured_host_protocol_total(
+                    int(result.cycles),
+                    record["host_price"],
+                    record["host_protocol_measured"],
+                )
             )
             record["execution"] = {
                 "kind": result.kind,
@@ -1084,7 +1243,9 @@ def measure_plan(label, built, attention, program, target, heads, tokens, *, sim
     return record
 
 
-def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET, neighbor=False):
+def run_workload(
+    heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET, neighbor=False
+):
     """Compile, measure and record every plan of one workload: the normal
     selection under the budget and the forced alternatives.
 
@@ -1102,21 +1263,46 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
     target, attention, program, ranking = ranked(heads, tokens, budget=budget)
     variants = budget_variants(target, ranking)
     unrestricted = ranked(heads, tokens, budget=None)[3]
-    folder = None if artifacts is None else os.path.join(artifacts, f"h{heads}_l{tokens}")
+    folder = (
+        None if artifacts is None else os.path.join(artifacts, f"h{heads}_l{tokens}")
+    )
     plans = [("default", None)]
     try:
-        cent_layouts, cent_description = cent_derived_layouts(target, ranking, heads, budget=CHANNEL_BUDGET)
+        cent_layouts, cent_description = cent_derived_layouts(
+            target, ranking, heads, budget=CHANNEL_BUDGET
+        )
         cent_failure = None
     except Exception as error:  # the ablation's absence is evidence, never substituted
-        cent_layouts, cent_description, cent_failure = None, None, _failure_entry("cent_policy", error)
+        cent_layouts, cent_description, cent_failure = (
+            None,
+            None,
+            _failure_entry("cent_policy", error),
+        )
     # The frozen study's control: the padded program (heads to a multiple of
     # eight) with the historical producer's knobs, its own ranking under the
     # same budget.
-    repaired = {"attention": None, "program": None, "layouts": None, "description": None, "failure": None, "heads": padded_heads(heads)}
+    repaired = {
+        "attention": None,
+        "program": None,
+        "layouts": None,
+        "description": None,
+        "failure": None,
+        "heads": padded_heads(heads),
+    }
     try:
-        repaired["attention"], repaired["program"] = cent_repaired_program(heads, tokens)
-        repaired_ranking = compile_program(repaired["attention"], repaired["program"], target, budget=budget, virtual=True)
-        repaired["layouts"], repaired["description"] = cent_repaired_layouts(target, repaired_ranking, heads)
+        repaired["attention"], repaired["program"] = cent_repaired_program(
+            heads, tokens
+        )
+        repaired_ranking = compile_program(
+            repaired["attention"],
+            repaired["program"],
+            target,
+            budget=budget,
+            virtual=True,
+        )
+        repaired["layouts"], repaired["description"] = cent_repaired_layouts(
+            target, repaired_ranking, heads
+        )
     except Exception as error:
         repaired["failure"] = _failure_entry("cent_repaired", error)
     plans += [(f"P{p}", choice) for p, choice in sorted(variants.per_partition.items())]
@@ -1136,33 +1322,68 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
     records, failures = {}, {}
     if repaired["failure"] is not None:
         failures["cent-repaired"] = repaired["failure"]
-        records["cent-repaired"] = {"label": "cent-repaired", "modes": None, "failure": repaired["failure"]}
+        records["cent-repaired"] = {
+            "label": "cent-repaired",
+            "modes": None,
+            "failure": repaired["failure"],
+        }
     if cent_failure is not None:
         failures["cent-policy"] = cent_failure
-        records["cent-policy"] = {"label": "cent-policy", "modes": None, "failure": cent_failure}
+        records["cent-policy"] = {
+            "label": "cent-policy",
+            "modes": None,
+            "failure": cent_failure,
+        }
     for label, choice in plans:
         try:
             if choice is None:
                 built = compile_program(attention, program, target, budget=budget)
             elif isinstance(choice, tuple) and choice and choice[0] == "cent-repaired":
-                built = compile_program(repaired["attention"], repaired["program"], target, layouts=choice[1], budget=budget)
+                built = compile_program(
+                    repaired["attention"],
+                    repaired["program"],
+                    target,
+                    layouts=choice[1],
+                    budget=budget,
+                )
             elif isinstance(choice, tuple) and choice and choice[0] == "cent":
-                built = compile_program(attention, program, target, layouts=choice[1], budget=budget)
+                built = compile_program(
+                    attention, program, target, layouts=choice[1], budget=budget
+                )
             else:
-                built = compile_variant(attention, program, target, variants, choice, budget=budget)
-        except Exception as error:  # the plan did not compile: no record beyond the failure
-            record = {"label": label, "modes": None, "failure": _failure_entry("compile", error)}
+                built = compile_variant(
+                    attention, program, target, variants, choice, budget=budget
+                )
+        except (
+            Exception
+        ) as error:  # the plan did not compile: no record beyond the failure
+            record = {
+                "label": label,
+                "modes": None,
+                "failure": _failure_entry("compile", error),
+            }
             record["artifacts"] = _write_artifacts(folder, label, record, None)
             records[label] = record
             failures[label] = record["failure"]
             continue
         try:
             plan_heads = repaired["heads"] if label == "cent-repaired" else heads
-            plan_attention = repaired["attention"] if label == "cent-repaired" else attention
+            plan_attention = (
+                repaired["attention"] if label == "cent-repaired" else attention
+            )
             plan_program = repaired["program"] if label == "cent-repaired" else program
             record = measure_plan(
-                label, built, plan_attention, plan_program, target, plan_heads, tokens,
-                simulate=simulate, budget=budget, artifacts=folder, sv_index=variants.sv_index,
+                label,
+                built,
+                plan_attention,
+                plan_program,
+                target,
+                plan_heads,
+                tokens,
+                simulate=simulate,
+                budget=budget,
+                artifacts=folder,
+                sv_index=variants.sv_index,
             )
             if label == "cent-repaired":
                 record["control"] = {
@@ -1177,7 +1398,11 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
             records[label] = error.record
             failures[label] = error.record["failure"]
             continue
-        if choice is not None and not (isinstance(choice, tuple) and choice and choice[0] in ("cent", "cent-repaired")):
+        if choice is not None and not (
+            isinstance(choice, tuple)
+            and choice
+            and choice[0] in ("cent", "cent-repaired")
+        ):
             record["ranked_cycles"] = choice[0]
         records[label] = record
     control = {
@@ -1198,10 +1423,17 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
     }
     rows = {
         label: SimpleNamespace(
-            mode=r["sv_mode"], modes=r["modes"], partitions=r["partitions"],
-            ranked_cycles=r.get("ranked_cycles"), estimate=r["estimate_cycles"],
-            device=r["device_cycles"], host=r["host_cycles"], total=r["total_cycles"],
-            bf16_error=r["merge_check"]["bf16_error"], execution=r["execution"], provenance=r["provenance"],
+            mode=r["sv_mode"],
+            modes=r["modes"],
+            partitions=r["partitions"],
+            ranked_cycles=r.get("ranked_cycles"),
+            estimate=r["estimate_cycles"],
+            device=r["device_cycles"],
+            host=r["host_cycles"],
+            total=r["total_cycles"],
+            bf16_error=r["merge_check"]["bf16_error"],
+            execution=r["execution"],
+            provenance=r["provenance"],
         )
         for label, r in records.items()
         if "failure" not in r
@@ -1212,7 +1444,11 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
     default = rows.get("default")
     selected = default.partitions if default is not None else None
     required = ["default"] + [f"P{p}" for p in PARTITIONS]
-    missing = [label for label in required if label not in rows or (simulate and rows[label].total is None)]
+    missing = [
+        label
+        for label in required
+        if label not in rows or (simulate and rows[label].total is None)
+    ]
     comparison_complete = not missing
     best = gap = None
     if simulate and comparison_complete:
@@ -1227,7 +1463,11 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
     def ratio(label):
         return (
             rows[label].total / default.total
-            if simulate and label in rows and default is not None and default.total and rows[label].total
+            if simulate
+            and label in rows
+            and default is not None
+            and default.total
+            and rows[label].total
             else None
         )
 
@@ -1247,7 +1487,9 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
         "default_selection_unrestricted": [p.mode for p in _placements(unrestricted)],
         "expected_plans": expected,
         "selected_partitions": selected,
-        "default_equals_forced_choice": None if default is None or forced is None else default.mode == forced[1],
+        "default_equals_forced_choice": (
+            None if default is None or forced is None else default.mode == forced[1]
+        ),
         "comparison": {
             "complete": comparison_complete,
             "required": required,
@@ -1270,16 +1512,27 @@ def run_workload(heads, tokens, *, simulate=True, artifacts=None, budget=BUDGET,
         },
         "aliases": aliases,
         "failed_plans": failures,
-        "distinct_plans": len({tuple(r["modes"]) for r in records.values() if r.get("modes")}),
-        "split_plans_checked": sum(1 for r in records.values() if r.get("merge_check", {}).get("applicable")),
+        "distinct_plans": len(
+            {tuple(r["modes"]) for r in records.values() if r.get("modes")}
+        ),
+        "split_plans_checked": sum(
+            1 for r in records.values() if r.get("merge_check", {}).get("applicable")
+        ),
         "artifacts": folder,
     }
     return SimpleNamespace(
-        heads=heads, tokens=tokens, rows=rows, selected=selected,
-        best=None if best is None else best.partitions, gap=gap,
-        comparison_complete=comparison_complete, controls_complete=controls_complete,
-        expected=expected, default=record["default_selection_unrestricted"],
-        failures=failures, record=record,
+        heads=heads,
+        tokens=tokens,
+        rows=rows,
+        selected=selected,
+        best=None if best is None else best.partitions,
+        gap=gap,
+        comparison_complete=comparison_complete,
+        controls_complete=controls_complete,
+        expected=expected,
+        default=record["default_selection_unrestricted"],
+        failures=failures,
+        record=record,
     )
 
 
@@ -1289,7 +1542,9 @@ def assert_complete(result) -> None:
     complete and the controls completed; the paper_full test's gate."""
     problems = []
     for label, failure in sorted(result.failures.items()):
-        problems.append(f"{label} failed at {failure.get('stage')}: {failure.get('error')}")
+        problems.append(
+            f"{label} failed at {failure.get('stage')}: {failure.get('error')}"
+        )
     for label in result.expected:
         row = result.rows.get(label)
         if row is None:
@@ -1298,9 +1553,13 @@ def assert_complete(result) -> None:
         elif not (isinstance(row.device, int) and row.device > 0):
             problems.append(f"{label} has no simulated device cycles ({row.device!r})")
     if not result.comparison_complete:
-        problems.append(f"the minima comparison is incomplete: missing {result.record['comparison']['missing']}")
+        problems.append(
+            f"the minima comparison is incomplete: missing {result.record['comparison']['missing']}"
+        )
     if not result.controls_complete:
-        problems.append("a control (head-only, cent-repaired or cent-policy) did not complete")
+        problems.append(
+            "a control (head-only, cent-repaired or cent-policy) did not complete"
+        )
     if problems:
         raise AssertionError(
             f"{result.heads} heads x {result.tokens} tokens: " + "; ".join(problems)
@@ -1312,8 +1571,10 @@ def summarize(results):
     the module docstring for what the paper's boundary adds)."""
     results = [r for r in results if not r.get("neighbor")]
     complete = [
-        r for r in results
-        if r.get("gap") is not None and (r.get("comparison") or {}).get("complete", True)
+        r
+        for r in results
+        if r.get("gap") is not None
+        and (r.get("comparison") or {}).get("complete", True)
     ]
     incomplete = [
         {
@@ -1328,26 +1589,37 @@ def summarize(results):
     ]
     reached = sum(r["selected_partitions"] == r["best_partitions"] for r in complete)
     gaps = [r["gap"] for r in complete]
-    one_4096 = next((r for r in complete if (r["heads"], r["tokens"]) == (1, 4096)), None)
+    one_4096 = next(
+        (r for r in complete if (r["heads"], r["tokens"]) == (1, 4096)), None
+    )
     return {
         "workloads_completed": len(complete),
         "incomplete_workloads": incomplete,
         "minima_reached": reached,
         "max_gap": max(gaps) if gaps else None,
         "cent_repaired_over_selected": {
-            f"{r['heads']}x{r['tokens']}": r.get("cent_repaired_over_selected") for r in complete
+            f"{r['heads']}x{r['tokens']}": r.get("cent_repaired_over_selected")
+            for r in complete
         },
         "cent_policy_over_selected": {
-            f"{r['heads']}x{r['tokens']}": r.get("cent_policy_over_selected") for r in complete
+            f"{r['heads']}x{r['tokens']}": r.get("cent_policy_over_selected")
+            for r in complete
         },
         "head_only_over_selected_1x4096": (
             one_4096["head_only_over_selected"]
-            if one_4096 and (one_4096.get("comparison") or {}).get("controls_complete", True)
+            if one_4096
+            and (one_4096.get("comparison") or {}).get("controls_complete", True)
             else None
         ),
-        "distinct_plans": sum(int(r.get("distinct_plans") or 0) for r in results if "error" not in r),
-        "split_plans_checked": sum(int(r.get("split_plans_checked") or 0) for r in results if "error" not in r),
-        "failed_plans": sum(len(r.get("failed_plans") or {}) for r in results if "error" not in r),
+        "distinct_plans": sum(
+            int(r.get("distinct_plans") or 0) for r in results if "error" not in r
+        ),
+        "split_plans_checked": sum(
+            int(r.get("split_plans_checked") or 0) for r in results if "error" not in r
+        ),
+        "failed_plans": sum(
+            len(r.get("failed_plans") or {}) for r in results if "error" not in r
+        ),
         "comparable_with_paper": False,
         "not_comparable_because": (
             "the bridge, the readout/upload/partial link volumes, the host stage, the "
@@ -1375,9 +1647,19 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", required=True)
     parser.add_argument("--no-sim", action="store_true", help="estimates only")
-    parser.add_argument("--shapes", default=None, help="subset, e.g. 1x128,8x512 (default: all nine)")
-    parser.add_argument("--artifacts", default=None, help="per-plan artifacts directory (default: <out>.artifacts)")
-    parser.add_argument("--neighbor", default="2x256", help="a neighbouring supported workload run beside the nine (none to skip)")
+    parser.add_argument(
+        "--shapes", default=None, help="subset, e.g. 1x128,8x512 (default: all nine)"
+    )
+    parser.add_argument(
+        "--artifacts",
+        default=None,
+        help="per-plan artifacts directory (default: <out>.artifacts)",
+    )
+    parser.add_argument(
+        "--neighbor",
+        default="2x256",
+        help="a neighbouring supported workload run beside the nine (none to skip)",
+    )
     args = parser.parse_args(argv)
     shapes = _parse_shapes(args.shapes) if args.shapes else SHAPES
     neighbors = () if args.neighbor in ("", "none") else _parse_shapes(args.neighbor)
@@ -1405,7 +1687,13 @@ def main(argv=None) -> int:
         is_neighbor = (heads, tokens) in neighbors and (heads, tokens) not in shapes
         started = time.perf_counter()
         try:
-            result = run_workload(heads, tokens, simulate=simulate, artifacts=artifacts, neighbor=is_neighbor)
+            result = run_workload(
+                heads,
+                tokens,
+                simulate=simulate,
+                artifacts=artifacts,
+                neighbor=is_neighbor,
+            )
             record = result.record
             rows = result.rows
             failures += len(result.failures)
@@ -1439,15 +1727,25 @@ def main(argv=None) -> int:
         with open(args.out, "w", encoding="utf-8") as handle:
             json.dump(session, handle, indent=1, default=str)
     session["summary"] = summarize(session["workloads"])
-    session["status"] = "pass" if not failures else f"fail ({failures} plan(s)/workload(s))"
+    session["status"] = (
+        "pass" if not failures else f"fail ({failures} plan(s)/workload(s))"
+    )
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(session, handle, indent=1, default=str)
     summary = session["summary"]
     print(
         f"normal budgeted selection reaches {summary['minima_reached']} of "
         f"{summary['workloads_completed']} complete simulated comparisons"
-        + (f" ({len(summary['incomplete_workloads'])} incomplete)" if summary["incomplete_workloads"] else "")
-        + (f"; max gap {summary['max_gap'] * 100:.2f}%" if summary["max_gap"] is not None else "")
+        + (
+            f" ({len(summary['incomplete_workloads'])} incomplete)"
+            if summary["incomplete_workloads"]
+            else ""
+        )
+        + (
+            f"; max gap {summary['max_gap'] * 100:.2f}%"
+            if summary["max_gap"] is not None
+            else ""
+        )
         + f"; {summary['distinct_plans']} distinct plans, {summary['split_plans_checked']} split plans "
         f"numerically checked (diagnostic; paper: {PAPER['minima_reached']} of {PAPER['workloads']}, "
         f"{PAPER['max_gap'] * 100:.2f}%, not comparable yet)",

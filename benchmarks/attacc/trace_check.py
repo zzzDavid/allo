@@ -148,18 +148,29 @@ def expected_trace(program) -> list[tuple[str, int]]:
         for pos2 in range(s1):
             pos = row * s1 + pos2
             if pos % lanes == 0:
-                out += [(opcode, vec_base + lch * g["ch"] + unit * g["ba"] + pos) for unit in units for lch in channels]
+                out += [
+                    (opcode, vec_base + lch * g["ch"] + unit * g["ba"] + pos)
+                    for unit in units
+                    for lch in channels
+                ]
         return out
 
     def drains(base):
-        return [("PIM_MV_SB", base + lch * g["ch"] + group * g["bg"]) for group in groups for lch in channels]
+        return [
+            ("PIM_MV_SB", base + lch * g["ch"] + group * g["bg"])
+            for group in groups
+            for lch in channels
+        ]
 
     if kind == "gemv":
         mac = []
         for pos2 in range(s2):
             for pos1 in range(_ceil(s1, lanes)):
                 pos = pos1 * s2 + pos2
-                mac += [("PIM_MAC_AB", mat_base + lch * g["ch"] + pos * g["col"]) for lch in channels]
+                mac += [
+                    ("PIM_MAC_AB", mat_base + lch * g["ch"] + pos * g["col"])
+                    for lch in channels
+                ]
             if pos2 % lanes == lanes - 1 or pos2 == s2 - 1:
                 mac += drains(ret_base)
         seq: list[tuple[str, int]] = []
@@ -180,11 +191,17 @@ def expected_trace(program) -> list[tuple[str, int]]:
     for pos2 in range(s2):  # score: q . K^T, drains not emitted
         for pos1 in range(_ceil(s1, lanes)):
             pos = pos1 + pos2 * _ceil(s1, lanes)
-            mac += [("PIM_MAC_AB", mat_base + lch * g["ch"] + pos * g["col"]) for lch in channels]
+            mac += [
+                ("PIM_MAC_AB", mat_base + lch * g["ch"] + pos * g["col"])
+                for lch in channels
+            ]
     for pos2 in range(s1):  # context: p . V
         for pos1 in range(_ceil(s2, lanes)):
             pos = pos1 + pos2 * _ceil(s2, lanes)
-            mac += [("PIM_MAC_AB", mat_base + lch * g["ch"] + pos * g["col"]) for lch in channels]
+            mac += [
+                ("PIM_MAC_AB", mat_base + lch * g["ch"] + pos * g["col"])
+                for lch in channels
+            ]
         if pos2 % lanes == lanes - 1 or pos2 == s1 - 1:
             mac += drains(ret_base)
     row_units = counts.sfm // n // geometry.channels if n else 0
@@ -228,7 +245,9 @@ def expected_trace(program) -> list[tuple[str, int]]:
 def write_expected_trace(program, path) -> Path:
     """Write the derived stream in the trace format (for tests and probes)."""
     path = Path(path)
-    path.write_text("\n".join(f"{opcode} 0x{addr:08x}" for opcode, addr in expected_trace(program)))
+    path.write_text(
+        "\n".join(f"{opcode} 0x{addr:08x}" for opcode, addr in expected_trace(program))
+    )
     return path
 
 
@@ -244,7 +263,13 @@ def _summary(commands, geometry) -> dict:
             out_of_device += 1
     return {
         "channels_addressed": len(channels),
-        "units_addressed": len({(addr % g["ch"]) // g["ba"] for opcode, addr in commands if opcode in ("PIM_WR_GB", "ST", "PIM_MV_GB")}),
+        "units_addressed": len(
+            {
+                (addr % g["ch"]) // g["ba"]
+                for opcode, addr in commands
+                if opcode in ("PIM_WR_GB", "ST", "PIM_MV_GB")
+            }
+        ),
         "out_of_device_commands": out_of_device,
     }
 
@@ -262,14 +287,26 @@ def check_trace(path, program) -> dict:
     first = None
     for index, (exp, act) in enumerate(zip(expected, actual)):
         if exp != act:
-            first = {"index": index, "expected": [exp[0], f"0x{exp[1]:08x}"], "actual": [act[0], f"0x{act[1]:08x}"]}
+            first = {
+                "index": index,
+                "expected": [exp[0], f"0x{exp[1]:08x}"],
+                "actual": [act[0], f"0x{act[1]:08x}"],
+            }
             break
     if first is None and len(expected) != len(actual):
         index = min(len(expected), len(actual))
         first = {
             "index": index,
-            "expected": [expected[index][0], f"0x{expected[index][1]:08x}"] if index < len(expected) else None,
-            "actual": [actual[index][0], f"0x{actual[index][1]:08x}"] if index < len(actual) else None,
+            "expected": (
+                [expected[index][0], f"0x{expected[index][1]:08x}"]
+                if index < len(expected)
+                else None
+            ),
+            "actual": (
+                [actual[index][0], f"0x{actual[index][1]:08x}"]
+                if index < len(actual)
+                else None
+            ),
         }
     reg = regions(program)
     return {
@@ -282,8 +319,18 @@ def check_trace(path, program) -> dict:
         "totals_match": dict(totals) == declared,
         "regions": {k: v for k, v in reg.items()},
         "summary": _summary(actual, program.geometry),
-        "declared_fan_out": {"channels": program.counts.channels_used, "units": program.counts.units_used},
+        "declared_fan_out": {
+            "channels": program.counts.channels_used,
+            "units": program.counts.units_used,
+        },
     }
 
 
-__all__ = ["check_trace", "expected_trace", "granules", "parse_trace", "regions", "write_expected_trace"]
+__all__ = [
+    "check_trace",
+    "expected_trace",
+    "granules",
+    "parse_trace",
+    "regions",
+    "write_expected_trace",
+]

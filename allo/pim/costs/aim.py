@@ -251,7 +251,8 @@ def host_reduction_terms(record, geometry) -> dict:
     entry_bytes = geometry.vector_bits // 8
     link_bytes = vectors * (record.partitions + 1) * entry_bytes
     return {
-        "link_cycles": HOST_LINK_FIXED_CYCLES + _ceil_div(link_bytes, HOST_LINK_BYTES_PER_CYCLE),
+        "link_cycles": HOST_LINK_FIXED_CYCLES
+        + _ceil_div(link_bytes, HOST_LINK_BYTES_PER_CYCLE),
         "compute_cycles": vectors * (record.partitions - 1) * HOST_VECTOR_ADD_CYCLES,
         "link_bytes": link_bytes,
         "vectors": vectors,
@@ -274,7 +275,8 @@ def host_stage_terms(record, geometry) -> dict:
     link_bytes = int(record.readout_bytes) + int(record.upload_bytes)
     vectors = _ceil_div(int(record.elements), geometry.lanes)
     return {
-        "link_cycles": HOST_LINK_FIXED_CYCLES + _ceil_div(link_bytes, HOST_LINK_BYTES_PER_CYCLE),
+        "link_cycles": HOST_LINK_FIXED_CYCLES
+        + _ceil_div(link_bytes, HOST_LINK_BYTES_PER_CYCLE),
         "compute_cycles": vectors * passes * HOST_VECTOR_ADD_CYCLES,
         "link_bytes": link_bytes,
         "vectors": vectors,

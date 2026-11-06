@@ -496,7 +496,9 @@ class LaunchSchedule:
                         step.name,
                         step.operation,
                         tuple((n, tuple(sh or ()), int(b)) for n, sh, b in step.inputs),
-                        tuple((n, tuple(sh or ()), int(b)) for n, sh, b in step.outputs),
+                        tuple(
+                            (n, tuple(sh or ()), int(b)) for n, sh, b in step.outputs
+                        ),
                     )
                     if isinstance(step, HostComputeStep)
                     else (
@@ -622,6 +624,7 @@ def launch_schedule(host_program, trace, *, module=None) -> LaunchSchedule:
             operands = _check_launch_binding(record, declared.get(record.kernel))
             steps.append(LaunchStep(record.kernel, group_id, ordinal, operands))
         elif isinstance(record, HostComputeRecord):
+
             def binding(tokens):
                 out = []
                 for token in tokens:
@@ -636,7 +639,9 @@ def launch_schedule(host_program, trace, *, module=None) -> LaunchSchedule:
                             f"host_compute {record.name!r}: the region declares no "
                             f"shape for {token.name!r}"
                         )
-                    out.append((token.name, tuple(shape), int(bits_of.get(token.name, 0))))
+                    out.append(
+                        (token.name, tuple(shape), int(bits_of.get(token.name, 0)))
+                    )
                 return tuple(out)
 
             inputs, outputs = binding(record.inputs), binding(record.outputs)
@@ -672,9 +677,19 @@ def launch_schedule(host_program, trace, *, module=None) -> LaunchSchedule:
 
 
 _ELEMENT_BITS = {
-    "bf16": 16, "f16": 16, "f32": 32, "f64": 64,
-    "i1": 1, "i8": 8, "i16": 16, "i32": 32, "i64": 64,
-    "ui8": 8, "ui16": 16, "ui32": 32, "ui64": 64,
+    "bf16": 16,
+    "f16": 16,
+    "f32": 32,
+    "f64": 64,
+    "i1": 1,
+    "i8": 8,
+    "i16": 16,
+    "i32": 32,
+    "i64": 64,
+    "ui8": 8,
+    "ui16": 16,
+    "ui32": 32,
+    "ui64": 64,
 }
 
 
@@ -873,13 +888,19 @@ def build_execution_graph(
                     "stage": step.name,
                     "operation": step.operation,
                     "inputs": tuple((n, tuple(sh), int(b)) for n, sh, b in step.inputs),
-                    "outputs": tuple((n, tuple(sh), int(b)) for n, sh, b in step.outputs),
+                    "outputs": tuple(
+                        (n, tuple(sh), int(b)) for n, sh, b in step.outputs
+                    ),
                     "input_bytes": step.volume("inputs"),
                     "output_bytes": step.volume("outputs"),
                     "input_elements": step.elements("inputs"),
                     "output_elements": step.elements("outputs"),
                 },
-                {"phase": "host_compute", "stage": step.name, "operation": step.operation},
+                {
+                    "phase": "host_compute",
+                    "stage": step.name,
+                    "operation": step.operation,
+                },
                 dependencies,
             )
         )
@@ -1483,7 +1504,9 @@ def check_transfer_availability(trace, launch_schedule, host_moves, placements):
         if group["effects"] is None:
             continue
         written = {
-            t.value for t in group["effects"].transfers if t.direction in ("out", "inout")
+            t.value
+            for t in group["effects"].transfers
+            if t.direction in ("out", "inout")
         }
         for key in regions(group, written, "writes"):
             produced_keys.add(key)

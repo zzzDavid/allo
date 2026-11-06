@@ -734,7 +734,11 @@ def samsung_candidate_effects(target, matches, placement):
                     # into GRF_A per reduction tile (LD_A).
                     storage = "banks"
                 packing = None
-                if contraction and memref == getattr(fact.matrix, "memref_name", None) and not temporal:
+                if (
+                    contraction
+                    and memref == getattr(fact.matrix, "memref_name", None)
+                    and not temporal
+                ):
                     # The matrix's row packing in the banks is the selected
                     # half -> bank map (vendor: both rows in the tile's fiber).
                     try:
@@ -935,7 +939,9 @@ def samsung_half_fibers(placement) -> tuple:
             raise ValueError(f"half_bank_map cannot place half {half}: {error}")
         bank = int(physical[bank_index])
         if bank not in (0, 1):
-            raise ValueError(f"half_bank_map places half {half} in bank {bank}, not a fiber")
+            raise ValueError(
+                f"half_bank_map places half {half} in bank {bank}, not a fiber"
+            )
         halves.append(bank)
     return tuple(halves)
 
@@ -1229,7 +1235,10 @@ class SamsungCtx(CodegenContext):
             return
         declared = None
         for value_layout in effects.value_layouts:
-            if value_layout.value == rep.matrix_memref and value_layout.storage == "banks":
+            if (
+                value_layout.value == rep.matrix_memref
+                and value_layout.storage == "banks"
+            ):
                 declared = value_layout.packing
                 break
         realized = "half_bank:{},{}".format(*(program.half_fibers or (0, 0)))
@@ -2268,11 +2277,16 @@ class SamsungAccessStream:
 
 
 GEOMETRY_SOURCE_INSTALLED = "installed pim_driver --describe"
-GEOMETRY_SOURCE_DEFAULT = "SAMSUNG_DEFAULT_GEOMETRY (offline model, no installed simulator queried)"
+GEOMETRY_SOURCE_DEFAULT = (
+    "SAMSUNG_DEFAULT_GEOMETRY (offline model, no installed simulator queried)"
+)
 
 
 def samsung_reduce_access_stream(
-    program: SamsungProgram, geometry: dict, columns: int | None = None, weight_resident=None
+    program: SamsungProgram,
+    geometry: dict,
+    columns: int | None = None,
+    weight_resident=None,
 ) -> list:
     """The transaction stream the conductor issues for ``program`` during its
     passes, derived from the lowered program (``binds``, ``tile_fiber``,
@@ -2295,7 +2309,9 @@ def samsung_reduce_access_stream(
     facts = program.facts
     if program.kind != "REDUCE":
         raise ValueError(f"access stream of a {program.kind} program is not modelled")
-    program_columns = int(program.contraction.N) if program.contraction is not None else 1
+    program_columns = (
+        int(program.contraction.N) if program.contraction is not None else 1
+    )
     if columns is None:
         columns = program_columns
     elif isinstance(columns, bool) or not isinstance(columns, int) or columns <= 0:
@@ -2360,7 +2376,9 @@ def samsung_reduce_access_stream(
                 for _pc, kind, fiber, _operand, _offset in binds:
                     if kind == "matrix":
                         f = int(fiber)
-                        count = G if program.vector_from_bank else G * len(fiber_tiles[f])
+                        count = (
+                            G if program.vector_from_bank else G * len(fiber_tiles[f])
+                        )
                         sequence.extend([("matrix", f)] * count)
                     elif kind == "vector":
                         sequence.append(("vector", _pc))
@@ -2381,7 +2399,9 @@ def samsung_reduce_access_stream(
                     else:
                         loc, grp = divmod(e, G)
                     tile = tiles[loc]
-                    first_group_of_tile = (grp == 0) if not split else (f == 0 and grp == 0)
+                    first_group_of_tile = (
+                        (grp == 0) if not split else (f == 0 and grp == 0)
+                    )
                     if not program.vector_from_bank and first_group_of_tile:
                         rounds.append(
                             SamsungAccessRound(
@@ -2403,7 +2423,13 @@ def samsung_reduce_access_stream(
                             second = rounds.pop()
                             rounds.append(
                                 SamsungAccessRound(
-                                    len(rounds), n, j, "MAC", None, tile, grp,
+                                    len(rounds),
+                                    n,
+                                    j,
+                                    "MAC",
+                                    None,
+                                    tile,
+                                    grp,
                                     tuple(pending.accesses) + tuple(second.accesses),
                                 )
                             )

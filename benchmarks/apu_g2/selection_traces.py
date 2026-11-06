@@ -117,7 +117,9 @@ def launch_evidence_problem(records, plan) -> str | None:
     if not expected:
         return "the selected plan declares no launches"
     if len(records) != len(expected):
-        return f"{len(records)} launch record(s) for a plan of {len(expected)} launch(es)"
+        return (
+            f"{len(records)} launch record(s) for a plan of {len(expected)} launch(es)"
+        )
     for position, (record, launch) in enumerate(zip(records, expected)):
         index = record.get("index")
         if index is None:

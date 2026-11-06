@@ -108,7 +108,10 @@ def test_virtual_graph_includes_shape_aware_host_transfers():
         "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/ST_B",
         "samsung_hbm_pim/host/GATHER_BANKS",
     ]
-    assert [activity.label for activity in graph.activities][2:4] == ["mac_stage", "mac"]
+    assert [activity.label for activity in graph.activities][2:4] == [
+        "mac_stage",
+        "mac",
+    ]
     stage, mac = graph.activities[2], graph.activities[3]
     assert stage.id in mac.depends_on
     # Host moves are priced from their buffer bytes (64 B scatter -> 4 cycles,
@@ -277,9 +280,16 @@ def test_staging_shares_partition_the_conductors_staging():
     def staged(rows, k, candidate=None):
         graph = ExecutionGraph()
         event = CostEvent.create(
-            "mac", target.op("MAC"), work_id=(0, 0),
-            metrics={"loop_extents": (rows, k), "reduction_extent": k, "lanes": 16,
-                     "n_fibers": 1, "candidate": candidate or {}},
+            "mac",
+            target.op("MAC"),
+            work_id=(0, 0),
+            metrics={
+                "loop_extents": (rows, k),
+                "reduction_extent": k,
+                "lanes": 16,
+                "n_fibers": 1,
+                "candidate": candidate or {},
+            },
         )
         bound.emit(graph, event)
         labels = [a.label for a in graph.activities]
@@ -294,7 +304,11 @@ def test_staging_shares_partition_the_conductors_staging():
     assert staged(1024, 128) == 8 * staged(128, 128)
     G, E = int(target.grf_b.slots), int(target.grf_a.slots)
     small = samsung_staging_share(8, 128, G=G, E=E, lanes=16)
-    assert staged(8, 128) == small["latency"] == max(small["bus_cycles"], small["bank_cycles"])
+    assert (
+        staged(8, 128)
+        == small["latency"]
+        == max(small["bus_cycles"], small["bank_cycles"])
+    )
     assert small["bank_cycles"] > small["bus_cycles"] and small["writes"] == 64
     # The paper GEMV (8192 x 256) as its 128 work items of 64 rows: the shares
     # sum to the conductor's staging (64 channels x 2,048 writes per channel,
@@ -304,14 +318,28 @@ def test_staging_shares_partition_the_conductors_staging():
         share = samsung_staging_share(64, 256, G=G, E=E, lanes=16, split_rows=split)
         total_writes = 128 * share["writes"]
         total_exposed = 128 * share["exposed_row_changes"]
-        schedule = samsung_staging_schedule(2, 2, 1, (0, 1) if split else (0, 0), G, E, 32, 8)
+        schedule = samsung_staging_schedule(
+            2, 2, 1, (0, 1) if split else (0, 0), G, E, 32, 8
+        )
         whole = samsung_staging_cycles(schedule)
         assert total_writes == 64 * whole["writes"] == 64 * 2048
-        assert total_exposed == 64 * whole["exposed_row_changes"] == (0 if split else 64 * 32)
-        assert share["bus_cycles"] == share["writes"] * STAGE_WRITE_CYCLES + share["exposed_row_changes"] * STAGE_ROW_CHANGE_CYCLES
+        assert (
+            total_exposed
+            == 64 * whole["exposed_row_changes"]
+            == (0 if split else 64 * 32)
+        )
+        assert (
+            share["bus_cycles"]
+            == share["writes"] * STAGE_WRITE_CYCLES
+            + share["exposed_row_changes"] * STAGE_ROW_CHANGE_CYCLES
+        )
     # The split rows remove the exposed changes: a cheaper share, the
     # ranking the conductor confirms (VALIDATION rounds 37-38).
     assert staged(64, 256, {"tile_rows": "split_fibers"}) < staged(64, 256)
     # The ordered program carries the same scope (its own preload pattern).
     temporal = staged(64, 256, {"reduction_program": "temporal"})
-    assert temporal == samsung_staging_share(64, 256, G=G, E=E, lanes=16, temporal=True)["latency"] > 0
+    assert (
+        temporal
+        == samsung_staging_share(64, 256, G=G, E=E, lanes=16, temporal=True)["latency"]
+        > 0
+    )

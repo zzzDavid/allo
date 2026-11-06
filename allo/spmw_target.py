@@ -1294,7 +1294,15 @@ class HostProgram:
     host` works.
     """
 
-    __slots__ = ("region", "moves", "launches", "computes", "steps", "subset", "resident")
+    __slots__ = (
+        "region",
+        "moves",
+        "launches",
+        "computes",
+        "steps",
+        "subset",
+        "resident",
+    )
 
     def __init__(self, region, fn, *, subset=False, resident=()):
         import inspect

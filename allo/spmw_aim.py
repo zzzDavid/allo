@@ -716,7 +716,9 @@ class AimCtx(CodegenContext):
             group = groups[gid]
             if group.kind == "contraction":
                 names = [c["match"].func_name for c in group.contractions]
-                partitions = declared_partitions.get(gid, int(group.reduction_partitions))
+                partitions = declared_partitions.get(
+                    gid, int(group.reduction_partitions)
+                )
                 merges = {name: partitions for name in names} if partitions > 1 else {}
                 return {"primaries": names, "merges": merges}
             return {"primaries": [group.name], "merges": {}}
@@ -727,7 +729,9 @@ class AimCtx(CodegenContext):
             for step in steps:
                 if isinstance(step, LaunchStep):
                     occurrence[step.group_id] = occurrence.get(step.group_id, 0) + 1
-                    tokens.append(("launch", step.group_id, occurrence[step.group_id] - 1))
+                    tokens.append(
+                        ("launch", step.group_id, occurrence[step.group_id] - 1)
+                    )
                 elif isinstance(step, HostComputeStep):
                     tokens.append(("stage", step.name))
         else:
@@ -758,7 +762,9 @@ class AimCtx(CodegenContext):
 
             names = []
             for field in dataclass_fields(expected):
-                if getattr(realized, field.name, None) != getattr(expected, field.name, None):
+                if getattr(realized, field.name, None) != getattr(
+                    expected, field.name, None
+                ):
                     names.append(
                         f"{field.name}: realized {getattr(realized, field.name, None)!r}, "
                         f"expected {getattr(expected, field.name, None)!r}"
@@ -807,8 +813,16 @@ class AimCtx(CodegenContext):
                         f"{getattr(realized, 'name', type(realized).__name__)!r} was not retained"
                     )
                 realized_banks = emitted_payload[id(realized)]
-                normalized = None if realized_banks is None else tuple(int(b) for b in realized_banks)
-                expected_banks = None if derived_banks is None else tuple(int(b) for b in derived_banks)
+                normalized = (
+                    None
+                    if realized_banks is None
+                    else tuple(int(b) for b in realized_banks)
+                )
+                expected_banks = (
+                    None
+                    if derived_banks is None
+                    else tuple(int(b) for b in derived_banks)
+                )
                 if normalized != expected_banks:
                     raise RuntimeError(
                         f"AiM realization of {describe(token)} expands "
@@ -828,7 +842,8 @@ class AimCtx(CodegenContext):
 
         def describe(token):
             return (
-                f"host stage {token[1]!r}" if token[0] == "stage"
+                f"host stage {token[1]!r}"
+                if token[0] == "stage"
                 else f"launch {token[2]} of group {groups[token[1]].name!r}"
             )
 
@@ -836,7 +851,9 @@ class AimCtx(CodegenContext):
             if state["index"] < 0:
                 return
             token = tokens[state["index"]]
-            if token[0] == "launch" and (state["pending_primaries"] or state["pending_merges"]):
+            if token[0] == "launch" and (
+                state["pending_primaries"] or state["pending_merges"]
+            ):
                 raise RuntimeError(
                     f"AiM realization: {describe(token)} is incomplete before the next "
                     f"step: missing primary records {state['pending_primaries']} and host "
@@ -940,7 +957,12 @@ class AimCtx(CodegenContext):
                         f"AiM realization lowered the host reduction of {source!r} "
                         "without the contraction that produces its partials"
                     )
-                realized = (int(op.outputs), int(op.batches), int(op.replicas), int(op.partitions))
+                realized = (
+                    int(op.outputs),
+                    int(op.batches),
+                    int(op.replicas),
+                    int(op.partitions),
+                )
                 produced = (
                     int(producer.outputs),
                     int(producer.batches),
@@ -1006,7 +1028,8 @@ class AimCtx(CodegenContext):
             # value identities confirm it when present.
             names = set()
             matches = [
-                m for m in program.trace.matches
+                m
+                for m in program.trace.matches
                 if _matcher_work_scope(m).group_id == launch.group_id
             ]
             for match in matches:
@@ -1021,7 +1044,10 @@ class AimCtx(CodegenContext):
                     for operand in match.operands:
                         if operand.value_ref is not None and operand.value_ref == key:
                             names.add(operand.memref_name)
-                    if match.result_value_ref is not None and match.result_value_ref == key:
+                    if (
+                        match.result_value_ref is not None
+                        and match.result_value_ref == key
+                    ):
                         names.add(match.result_memref_name)
             return names
 
@@ -1041,13 +1067,17 @@ class AimCtx(CodegenContext):
             if key is None:
                 return False
             return any(
-                key in group.usages and group.usages[key].store for group in program.groups
+                key in group.usages and group.usages[key].store
+                for group in program.groups
             )
 
         produced_by_stages = set()
         for step, record in zip(declared, lowered):
             if (record.stage, record.operation, record.inputs, record.outputs) != (
-                step.name, step.operation, tuple(step.inputs), tuple(step.outputs)
+                step.name,
+                step.operation,
+                tuple(step.inputs),
+                tuple(step.outputs),
             ):
                 raise RuntimeError(
                     f"AiM realization of host stage {step.name!r} differs from the "
@@ -1200,7 +1230,8 @@ class AimCtx(CodegenContext):
                 # the same way.
                 for realized in records:
                     (entry,) = [
-                        c for c in group.contractions
+                        c
+                        for c in group.contractions
                         if c["match"].func_name == realized.name
                     ] or [None]
                     if entry is None:
@@ -1944,9 +1975,7 @@ class _AimProgramDerivation:
         witness); such kernels are refused before selection.
         """
         facts = match.extra.get("semantic_facts")
-        axes = {
-            loop.var: loop for loop in (getattr(facts, "loops", None) or ())
-        }
+        axes = {loop.var: loop for loop in (getattr(facts, "loops", None) or ())}
         enclosing = [var for var, _lb, _ub, _step in match.enclosing_loops]
         for var, _lb, _ub, step in match.enclosing_loops:
             axis = axes.get(var)
@@ -2380,6 +2409,7 @@ class _AimProgramDerivation:
                     records.append((out, None))
                     records.append((back, None))
         return records
+
     def _identity(self, group, usage, key):
         """What one bank cell holds: the buffer, its distribution, the bank
         family it is laid out in (the EWMUL slots or the MAC bank pairs) and
@@ -2643,7 +2673,6 @@ class _AimProgramDerivation:
         )
 
     @staticmethod
-
     def _describe_distribution(distribution):
         replicas, partitions, split, family, frame = distribution
         text = (
@@ -2949,9 +2978,7 @@ class _AimProgramDerivation:
                 flush()
                 group = self.by_id[step.group_id]
                 records.extend(self._launch_records(group))
-                records.extend(
-                    self._relocations(group, position, steps, host_keys)
-                )
+                records.extend(self._relocations(group, position, steps, host_keys))
                 continue
             if isinstance(step, HostComputeStep):
                 # The declared host stage, in program order: no commands; its
@@ -3267,7 +3294,19 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
     invocations: list[dict] = []
     segment_records: list[dict] = []
 
-    def failure(message, *, label, repeat, lines, command, cwd, returncode, stdout, stderr, error=None):
+    def failure(
+        message,
+        *,
+        label,
+        repeat,
+        lines,
+        command,
+        cwd,
+        returncode,
+        stdout,
+        stderr,
+        error=None,
+    ):
         text = "".join(str(line) + "\n" for line in lines)
         return AimSimulatorFailure(
             message,
@@ -3285,7 +3324,9 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
                 "returncode": returncode,
                 "stdout": stdout,
                 "stderr": stderr,
-                "exception": None if error is None else f"{type(error).__name__}: {error}",
+                "exception": (
+                    None if error is None else f"{type(error).__name__}: {error}"
+                ),
                 "completed_segments": [
                     {k: v for k, v in record.items() if k != "trace"}
                     for record in segment_records
@@ -3294,7 +3335,9 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
             },
         )
 
-    def run_segment(lines: list[str], label: str = "program", repeat: int = 1) -> tuple[int, str, int]:
+    def run_segment(
+        lines: list[str], label: str = "program", repeat: int = 1
+    ) -> tuple[int, str, int]:
         with tempfile.TemporaryDirectory(prefix="tenon-aim-") as trace_dir:
             trace_path = Path(trace_dir) / "segment.trace"
             trace_path.write_text("".join(str(line) + "\n" for line in lines))
@@ -3320,7 +3363,9 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
                 ]
                 run = {}
             cwd = run.get("cwd")
-            invocations.append({"command": list(command), **({"cwd": cwd} if cwd else {})})
+            invocations.append(
+                {"command": list(command), **({"cwd": cwd} if cwd else {})}
+            )
             try:
                 proc = subprocess.run(
                     command, capture_output=True, timeout=600, check=False, **run
@@ -3338,9 +3383,15 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
 
                 raise failure(
                     f"AiM ramulator2 invocation failed: {exc}",
-                    label=label, repeat=repeat, lines=lines, command=command, cwd=cwd,
+                    label=label,
+                    repeat=repeat,
+                    lines=lines,
+                    command=command,
+                    cwd=cwd,
                     returncode=None,
-                    stdout=_text(getattr(exc, "stdout", None) or getattr(exc, "output", None)),
+                    stdout=_text(
+                        getattr(exc, "stdout", None) or getattr(exc, "output", None)
+                    ),
                     stderr=_text(getattr(exc, "stderr", None)),
                     error=exc,
                 ) from exc
@@ -3353,8 +3404,14 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
             raise failure(
                 f"AiM ramulator2 exited with status {proc.returncode}; no cycles "
                 "are reported from a failed run; tail: " + combined[-400:],
-                label=label, repeat=repeat, lines=lines, command=command, cwd=cwd,
-                returncode=proc.returncode, stdout=stdout, stderr=stderr,
+                label=label,
+                repeat=repeat,
+                lines=lines,
+                command=command,
+                cwd=cwd,
+                returncode=proc.returncode,
+                stdout=stdout,
+                stderr=stderr,
             )
         values = [
             int(m) for m in re.findall(r"memory_system_cycles:\s*(\d+)", combined)
@@ -3363,8 +3420,14 @@ def _run_aim(compiled: "Compiled", **inputs) -> RunResult:
             raise failure(
                 "AiM ramulator2 returned but stdout missing "
                 "'memory_system_cycles: ...' line; tail: " + combined[-400:],
-                label=label, repeat=repeat, lines=lines, command=command, cwd=cwd,
-                returncode=proc.returncode, stdout=stdout, stderr=stderr,
+                label=label,
+                repeat=repeat,
+                lines=lines,
+                command=command,
+                cwd=cwd,
+                returncode=proc.returncode,
+                stdout=stdout,
+                stderr=stderr,
             )
         return max(values), combined, proc.returncode
 

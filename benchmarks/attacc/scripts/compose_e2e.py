@@ -61,11 +61,29 @@ from pathlib import Path
 
 TCK_NS = 0.769  # HBM3_5.2Gbps; DCC predictor.get_running_time_ms
 LABEL = "tenon_time(ms)"
-CONFIGS = [(lin, lout, batch) for batch in (1, 4) for lin, lout in ((128, 2048), (2048, 128), (2048, 2048))]
+CONFIGS = [
+    (lin, lout, batch)
+    for batch in (1, 4)
+    for lin, lout in ((128, 2048), (2048, 128), (2048, 2048))
+]
 # DCC's write_csv column order: tag (6) + config (12) + s_perf (7) + g_perf
 # (13: all, matmul, fc, comm, etc, qkv, prj, ff, g2g, x2g, softmax, act, norm).
 G_PERF = 18 + 7
-G_COLUMNS = ["all", "matmul", "fc", "comm", "etc", "qkv", "prj", "ff", "g2g", "x2g", "softmax", "act", "norm"]
+G_COLUMNS = [
+    "all",
+    "matmul",
+    "fc",
+    "comm",
+    "etc",
+    "qkv",
+    "prj",
+    "ff",
+    "g2g",
+    "x2g",
+    "softmax",
+    "act",
+    "norm",
+]
 # GPT-13B rows DCC's model reads from the PIM tables (per head instance count
 # 8 at batch 1, 32 at batch 4): the QKV and projection GEMVs and the scoring
 # kernel at every 16-aligned context length up to the longest configuration.
@@ -80,7 +98,9 @@ def _sha256(path):
 
 def _git(path, *args):
     try:
-        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, check=True).stdout.strip()
+        return subprocess.run(
+            ["git", "-C", str(path), *args], capture_output=True, text=True, check=True
+        ).stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
@@ -98,12 +118,24 @@ def selected_times(session_paths) -> tuple[dict, dict]:
                 continue
             cycles = int(record["memory_system_cycles"])
             if key in times and times[key] != cycles:
-                raise ValueError(f"conflicting measurements for {key}: {times[key]} in {sources[key]} and {cycles} in {path}")
+                raise ValueError(
+                    f"conflicting measurements for {key}: {times[key]} in {sources[key]} and {cycles} in {path}"
+                )
             times[key] = cycles
             sources.setdefault(key, str(path))
     provenance = {
         "sessions": [
-            {"path": str(p), "compiler": json.load(open(p)).get("compiler"), "simulator": {k: v for k, v in (json.load(open(p)).get("simulator") or {}).items() if k in ("binary_sha256", "library_sha256", "tck_ns")}, "runs": len(json.load(open(p))["runs"]), "failures": len(json.load(open(p)).get("failures", []))}
+            {
+                "path": str(p),
+                "compiler": json.load(open(p)).get("compiler"),
+                "simulator": {
+                    k: v
+                    for k, v in (json.load(open(p)).get("simulator") or {}).items()
+                    if k in ("binary_sha256", "library_sha256", "tck_ns")
+                },
+                "runs": len(json.load(open(p))["runs"]),
+                "failures": len(json.load(open(p)).get("failures", [])),
+            }
             for p in session_paths
         ],
         "selected_records": len(times),
@@ -127,11 +159,19 @@ def write_tables(dcc_root: Path, times: dict, out: Path) -> dict:
     rows converted at tCK, every other row NaN."""
     report = {"measured_rows": 0, "nan_rows": 0, "missing_required": []}
     filled = set()
-    for name, family in (("@attacc-gemv_inference.csv", "gemv"), ("@attacc-attn_inference.csv", "attention")):
+    for name, family in (
+        ("@attacc-gemv_inference.csv", "gemv"),
+        ("@attacc-attn_inference.csv", "attention"),
+    ):
         rows = list(csv.DictReader((dcc_root / "temp" / "simulation" / name).open()))
         header = list(rows[0]) + ([LABEL] if LABEL not in rows[0] else [])
         for row in rows:
-            key = (family, int(row["#head"]), int(row["input_dim"]), int(row["output_dim"]))
+            key = (
+                family,
+                int(row["#head"]),
+                int(row["input_dim"]),
+                int(row["output_dim"]),
+            )
             if key in times:
                 row[LABEL] = repr(times[key] * TCK_NS / 1e6)
                 report["measured_rows"] += 1
@@ -148,7 +188,18 @@ def write_tables(dcc_root: Path, times: dict, out: Path) -> dict:
     return report
 
 
-def decode(table_dir: Path, batch, lin, lout, *, label, gpu_only, pipe, parallel, qkv_proj_on_pim=True) -> dict:
+def decode(
+    table_dir: Path,
+    batch,
+    lin,
+    lout,
+    *,
+    label,
+    gpu_only,
+    pipe,
+    parallel,
+    qkv_proj_on_pim=True,
+) -> dict:
     from inference.config import (  # DCC, imported from ATTACC_DCC_ROOT
         DataType,
         DeviceType,
@@ -170,22 +221,40 @@ def decode(table_dir: Path, batch, lin, lout, *, label, gpu_only, pipe, parallel
     xpu = make_xpu_config(GPUType.A100a, num_gpu=1, mem_cap=80 * 1024**3)
     system = System(xpu["GPU"], model)
     if not gpu_only:
-        pim = make_pim_config(PIMType.BA, InterfaceType.NVLINK3, num_attacc=1, power_constraint=False, table_path=str(table_dir) + "/")
+        pim = make_pim_config(
+            PIMType.BA,
+            InterfaceType.NVLINK3,
+            num_attacc=1,
+            power_constraint=False,
+            table_path=str(table_dir) + "/",
+        )
         pim["RES_ATTACC_LABEL"] = label
         system.set_accelerator(model, DeviceType.PIM, pim)
     perfs = []
-    system.simulate(batch, lin, lout, perfs=perfs, pipe=pipe, parallel_ff=parallel, power_constraint=False)
+    system.simulate(
+        batch,
+        lin,
+        lout,
+        perfs=perfs,
+        pipe=pipe,
+        parallel_ff=parallel,
+        power_constraint=False,
+    )
     tag, config, perf = perfs[0]
     flat = tag + config + perf
     stages = {name: float(flat[G_PERF + i]) for i, name in enumerate(G_COLUMNS)}
     if not math.isfinite(stages["all"]):
-        raise ValueError(f"the composition read an unmeasured kernel row (label {label!r}, config {(lin, lout, batch)})")
+        raise ValueError(
+            f"the composition read an unmeasured kernel row (label {label!r}, config {(lin, lout, batch)})"
+        )
     return {"g_time_ms": stages["all"], "stages_ms": stages}
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--sessions", nargs="+", required=True, help="run_ramulator.py session files")
+    parser.add_argument(
+        "--sessions", nargs="+", required=True, help="run_ramulator.py session files"
+    )
     parser.add_argument("--out", help="write the composition record (JSON)")
     args = parser.parse_args(argv)
     root = os.environ.get("ATTACC_DCC_ROOT")
@@ -201,7 +270,22 @@ def main(argv=None) -> int:
         "python": sys.executable,
         "tck_ns": TCK_NS,
         "model": "DCC inference/system.py: GPT-13B, A100 roofline, PIMType.BA, NVLINK3, one AttAcc device; prefill excluded; base = no pipelining / no FFN parallelism, full = both",
-        "dcc": {"root": str(dcc_root), "git_revision": _git(dcc_root, "rev-parse", "HEAD"), "files_sha256": {name: _sha256(dcc_root / name) for name in ("inference/system.py", "inference/devices.py", "inference/config.py", "inference/model.py", "temp/simulation/@attacc-gemv_inference.csv", "temp/simulation/@attacc-attn_inference.csv") if (dcc_root / name).is_file()}},
+        "dcc": {
+            "root": str(dcc_root),
+            "git_revision": _git(dcc_root, "rev-parse", "HEAD"),
+            "files_sha256": {
+                name: _sha256(dcc_root / name)
+                for name in (
+                    "inference/system.py",
+                    "inference/devices.py",
+                    "inference/config.py",
+                    "inference/model.py",
+                    "temp/simulation/@attacc-gemv_inference.csv",
+                    "temp/simulation/@attacc-attn_inference.csv",
+                )
+                if (dcc_root / name).is_file()
+            },
+        },
         "kernel_times": provenance,
         "configs": [],
     }
@@ -210,22 +294,78 @@ def main(argv=None) -> int:
         table_dir = Path(tmp)
         record["tables"] = write_tables(dcc_root, times, table_dir)
         if record["tables"]["missing_required"]:
-            raise SystemExit(f"unmeasured GPT-13B kernel rows: {record['tables']['missing_required'][:5]} ... ({len(record['tables']['missing_required'])})")
+            raise SystemExit(
+                f"unmeasured GPT-13B kernel rows: {record['tables']['missing_required'][:5]} ... ({len(record['tables']['missing_required'])})"
+            )
         os.chdir(dcc_root)
         try:
             for lin, lout, batch in CONFIGS:
-                gpu = decode(table_dir, batch, lin, lout, label="baseline(ms)", gpu_only=True, pipe=0, parallel=False)
-                entry = {"lin": lin, "lout": lout, "batch": batch, "gpu_roofline_ms": gpu["g_time_ms"], "variants": {}}
-                for name, label, on_pim in (("tenon", LABEL, True), ("dcc", "our_time(ms)", True), ("fixed", "baseline(ms)", False)):
-                    base = decode(table_dir, batch, lin, lout, label=label, gpu_only=False, pipe=0, parallel=False, qkv_proj_on_pim=on_pim)
-                    full = decode(table_dir, batch, lin, lout, label=label, gpu_only=False, pipe=True, parallel=True, qkv_proj_on_pim=on_pim)
+                gpu = decode(
+                    table_dir,
+                    batch,
+                    lin,
+                    lout,
+                    label="baseline(ms)",
+                    gpu_only=True,
+                    pipe=0,
+                    parallel=False,
+                )
+                entry = {
+                    "lin": lin,
+                    "lout": lout,
+                    "batch": batch,
+                    "gpu_roofline_ms": gpu["g_time_ms"],
+                    "variants": {},
+                }
+                for name, label, on_pim in (
+                    ("tenon", LABEL, True),
+                    ("dcc", "our_time(ms)", True),
+                    ("fixed", "baseline(ms)", False),
+                ):
+                    base = decode(
+                        table_dir,
+                        batch,
+                        lin,
+                        lout,
+                        label=label,
+                        gpu_only=False,
+                        pipe=0,
+                        parallel=False,
+                        qkv_proj_on_pim=on_pim,
+                    )
+                    full = decode(
+                        table_dir,
+                        batch,
+                        lin,
+                        lout,
+                        label=label,
+                        gpu_only=False,
+                        pipe=True,
+                        parallel=True,
+                        qkv_proj_on_pim=on_pim,
+                    )
                     entry["variants"][name] = {
-                        "placement": "QKV, projection, attention and softmax on PIM" if on_pim else "attention and softmax on PIM, QKV and projection on the GPU (AttAcc's original placement, DCC's fixed baseline)",
-                        "base_ms": base["g_time_ms"], "base_speedup": gpu["g_time_ms"] / base["g_time_ms"], "base_stages_ms": base["stages_ms"],
-                        "full_ms": full["g_time_ms"], "full_speedup": gpu["g_time_ms"] / full["g_time_ms"], "full_stages_ms": full["stages_ms"],
+                        "placement": (
+                            "QKV, projection, attention and softmax on PIM"
+                            if on_pim
+                            else "attention and softmax on PIM, QKV and projection on the GPU (AttAcc's original placement, DCC's fixed baseline)"
+                        ),
+                        "base_ms": base["g_time_ms"],
+                        "base_speedup": gpu["g_time_ms"] / base["g_time_ms"],
+                        "base_stages_ms": base["stages_ms"],
+                        "full_ms": full["g_time_ms"],
+                        "full_speedup": gpu["g_time_ms"] / full["g_time_ms"],
+                        "full_stages_ms": full["stages_ms"],
                     }
                 record["configs"].append(entry)
-                print(f"{lin:5d} {lout:5d} bs{batch}: gpu {gpu['g_time_ms']:.4f} ms | " + " | ".join(f"{n} base {v['base_speedup']:.2f}x full {v['full_speedup']:.2f}x" for n, v in entry["variants"].items()), flush=True)
+                print(
+                    f"{lin:5d} {lout:5d} bs{batch}: gpu {gpu['g_time_ms']:.4f} ms | "
+                    + " | ".join(
+                        f"{n} base {v['base_speedup']:.2f}x full {v['full_speedup']:.2f}x"
+                        for n, v in entry["variants"].items()
+                    ),
+                    flush=True,
+                )
         finally:
             os.chdir(cwd)
     text = json.dumps(record, indent=1, default=str)

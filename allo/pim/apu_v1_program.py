@@ -605,12 +605,8 @@ def profile_counters(profile: str) -> dict:
     """The counters (``hits``, ``seu``, ``crun``, ``iall``, ``icm``, ``dcm``)
     of the last ``total`` PROF_PRINT record in ``profile``; empty when the
     record carries none."""
-    records = [
-        match.group(0) for match in _TOTAL_RECORD.finditer(profile)
-    ] or [profile]
-    return {
-        key.lower(): int(value) for key, value in _COUNTER_RE.findall(records[-1])
-    }
+    records = [match.group(0) for match in _TOTAL_RECORD.finditer(profile)] or [profile]
+    return {key.lower(): int(value) for key, value in _COUNTER_RE.findall(records[-1])}
 
 
 def launch_on_board(argv, cwd, *, expected_records, timeout, attempts=3):

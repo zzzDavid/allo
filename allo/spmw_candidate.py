@@ -958,7 +958,9 @@ def _derivation_problems(view, matches, placement, effects) -> list:
                 f"declares two layouts of {layout.value!r} (image {layout.image!r})"
             )
         declared_layouts.setdefault(key(layout), layout)
-    if len({(t.value, t.direction) for t in effects.transfers}) != len(effects.transfers):
+    if len({(t.value, t.direction) for t in effects.transfers}) != len(
+        effects.transfers
+    ):
         problems.append("declares two transfers of one value and direction")
     if problems:
         return problems
@@ -971,7 +973,8 @@ def _derivation_problems(view, matches, placement, effects) -> list:
             )
             continue
         if (declared_layout.storage, declared_layout.packing) != (
-            derived_layout.storage, derived_layout.packing
+            derived_layout.storage,
+            derived_layout.packing,
         ):
             problems.append(
                 f"declares {derived_layout.value!r} in storage "
@@ -1212,7 +1215,9 @@ def _with_current_effects(placement, current, matches, view, functions):
             problems = validate_candidate_effects(matches, normalized, view)
             if not problems:
                 problems = _declaration_differences(
-                    rebound, effects, against="the current candidate with the same decision"
+                    rebound,
+                    effects,
+                    against="the current candidate with the same decision",
                 )
         if problems:
             raise ValueError(
@@ -1356,9 +1361,7 @@ def rebind_supplied_layouts(view, trace, supplied) -> list:
         bare = Placement(
             placements=dict(placement.placements),
             mode=placement.mode,
-            extra={
-                k: v for k, v in (placement.extra or {}).items() if k != "effects"
-            },
+            extra={k: v for k, v in (placement.extra or {}).items() if k != "effects"},
             layout=getattr(placement, "layout", None),
         )
         derived = _redeclared(view, matches, bare)

@@ -109,8 +109,14 @@ def test_access_stream_follows_the_fiber_placement_with_the_row_carry():
         if r.kind == "MAC"
     ][:9]
     assert first == [
-        (0, 0, 0), (0, 0, 8), (0, 0, 16), (0, 0, 24),
-        (0, 1, 0), (0, 1, 8), (0, 1, 16), (0, 1, 24),
+        (0, 0, 0),
+        (0, 0, 8),
+        (0, 0, 16),
+        (0, 0, 24),
+        (0, 1, 0),
+        (0, 1, 8),
+        (0, 1, 16),
+        (0, 1, 24),
         (1, 0, 0),
     ]
     text = samsung_access_trace_text(dual_rounds)
@@ -182,15 +188,23 @@ def test_access_stream_is_the_whole_program_and_never_a_silent_default():
                     c[row0 + i, j] = acc
 
     compiled = allo.compile(
-        product, build_samsung_target(), samsung_cost,
-        reduction_order="reassociate", backend="virtual",
+        product,
+        build_samsung_target(),
+        samsung_cost,
+        reduction_order="reassociate",
+        backend="virtual",
     )
     program = compiled.compiled.layout_ctx.programs[0]
     assert program.kind == "REDUCE" and program.contraction.N == 2
     stream = samsung_access_stream(compiled, geometry=SAMSUNG_DEFAULT_GEOMETRY)
     assert stream.columns == 2
     assert {r.column_index for r in stream} == {0, 1}
-    assert samsung_access_stream(compiled, columns=2, geometry=SAMSUNG_DEFAULT_GEOMETRY).columns == 2
+    assert (
+        samsung_access_stream(
+            compiled, columns=2, geometry=SAMSUNG_DEFAULT_GEOMETRY
+        ).columns
+        == 2
+    )
     with pytest.raises(ValueError, match="not the program's stream"):
         samsung_access_stream(compiled, columns=1, geometry=SAMSUNG_DEFAULT_GEOMETRY)
     with pytest.raises(ValueError, match="positive integer"):

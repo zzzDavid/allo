@@ -173,10 +173,15 @@ def _json_ready(value, depth=0, *, path="value", _active=None):
         ]
     if isinstance(value, (set, frozenset)):
         return sorted(
-            (_json_ready(v, depth + 1, path=path, _active=active) for v in value), key=repr
+            (_json_ready(v, depth + 1, path=path, _active=active) for v in value),
+            key=repr,
         )
     if isinstance(value, np.ndarray):
-        return {"ndarray": list(value.shape), "dtype": str(value.dtype), "sha256": _sha256(value)}
+        return {
+            "ndarray": list(value.shape),
+            "dtype": str(value.dtype),
+            "sha256": _sha256(value),
+        }
     if isinstance(value, (np.integer,)):
         return int(value)
     if isinstance(value, (np.floating,)):
@@ -185,10 +190,14 @@ def _json_ready(value, depth=0, *, path="value", _active=None):
         return value
     manifest = getattr(value, "manifest", None)
     if callable(manifest):
-        return _json_ready(manifest(), depth + 1, path=f"{path}.manifest()", _active=active)
+        return _json_ready(
+            manifest(), depth + 1, path=f"{path}.manifest()", _active=active
+        )
     if hasattr(value, "__dataclass_fields__"):
         return {
-            name: _json_ready(getattr(value, name), depth + 1, path=f"{path}.{name}", _active=active)
+            name: _json_ready(
+                getattr(value, name), depth + 1, path=f"{path}.{name}", _active=active
+            )
             for name in value.__dataclass_fields__
         }
     return repr(value)
@@ -198,10 +207,16 @@ def environment(out_dir: Path) -> dict:
     allo_dir = Path(allo.__file__).resolve().parent
     revision = None
     try:
-        revision = subprocess.run(
-            ["git", "-C", str(allo_dir.parent), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=20, check=False,
-        ).stdout.strip() or None
+        revision = (
+            subprocess.run(
+                ["git", "-C", str(allo_dir.parent), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            ).stdout.strip()
+            or None
+        )
     except Exception:
         revision = None
     return {
@@ -260,7 +275,11 @@ def _board_lock(name):
 def run_target(name, A, B, oracle, out_dir: Path, *, backend, reduction_order=None):
     """Compile the shared source for one target, run it, keep everything."""
     label = f"{name}_{reduction_order or 'strict'}"
-    record = {"target": name, "label": label, "reduction_order": reduction_order or "strict (default)"}
+    record = {
+        "target": name,
+        "label": label,
+        "reduction_order": reduction_order or "strict (default)",
+    }
     target, cost = _target(name)
     kwargs = {"backend": None if backend == "device" else backend}
     if reduction_order:
@@ -281,7 +300,9 @@ def run_target(name, A, B, oracle, out_dir: Path, *, backend, reduction_order=No
     plan = getattr(compiled, "selected_plan", None)
     record["selected_plan"] = getattr(plan, "name", None)
     record["selected_plan_metadata"] = _json_ready(getattr(plan, "metadata", None))
-    record["reduction_strategy"] = _json_ready(getattr(plan, "reduction_strategy", None))
+    record["reduction_strategy"] = _json_ready(
+        getattr(plan, "reduction_strategy", None)
+    )
     if plan is not None and callable(getattr(plan, "manifest", None)):
         # The plan's own manifest: iteration and value layouts, transfers,
         # temporal and reduction strategies, operations, VR allocations.
@@ -294,15 +315,24 @@ def run_target(name, A, B, oracle, out_dir: Path, *, backend, reduction_order=No
         # The shared candidate contract the selection was checked against.
         record["candidate_effects_manifest"] = _json_ready(effects)
     record["layout_extra"] = _json_ready(
-        {k: v for k, v in (getattr(layout, "extra", None) or {}).items() if k != "effects"}
+        {
+            k: v
+            for k, v in (getattr(layout, "extra", None) or {}).items()
+            if k != "effects"
+        }
     )
-    programs = list(getattr(getattr(artifact, "layout_ctx", None), "programs", ()) or ())
+    programs = list(
+        getattr(getattr(artifact, "layout_ctx", None), "programs", ()) or ()
+    )
     if programs:
         record["samsung_programs"] = [
             {
-                "kind": p.kind, "lever_record": _json_ready(p.lever_record),
-                "k_tiles": p.k_tiles, "tile_fiber": list(p.tile_fiber),
-                "rows_per_block": p.rows_per_block, "vector_from_bank": p.vector_from_bank,
+                "kind": p.kind,
+                "lever_record": _json_ready(p.lever_record),
+                "k_tiles": p.k_tiles,
+                "tile_fiber": list(p.tile_fiber),
+                "rows_per_block": p.rows_per_block,
+                "vector_from_bank": p.vector_from_bank,
                 "row_map": p.row_map,
             }
             for p in programs
@@ -323,7 +353,9 @@ def run_target(name, A, B, oracle, out_dir: Path, *, backend, reduction_order=No
     if source_text:
         (out_dir / f"{label}.device_source.c").write_text(source_text)
         record["device_source"] = f"{label}.device_source.c"
-        record["device_source_sha256"] = hashlib.sha256(source_text.encode()).hexdigest()
+        record["device_source_sha256"] = hashlib.sha256(
+            source_text.encode()
+        ).hexdigest()
     # Run.
     out = np.zeros((M, N), dtype=np.float16)
     started = time.perf_counter()
@@ -353,11 +385,15 @@ def run_target(name, A, B, oracle, out_dir: Path, *, backend, reduction_order=No
     record["bit_exact_outputs"] = int(oracle.size - mismatches)
     record["mismatching_outputs"] = mismatches
     record["cancellation_rows_exact"] = bool(
-        np.array_equal(out[: len(CANCELLATION_ROWS)].view(np.uint16),
-                       oracle[: len(CANCELLATION_ROWS)].view(np.uint16))
+        np.array_equal(
+            out[: len(CANCELLATION_ROWS)].view(np.uint16),
+            oracle[: len(CANCELLATION_ROWS)].view(np.uint16),
+        )
     )
     exact32 = A.astype(np.float32) @ B.astype(np.float32)
-    record["max_abs_error_vs_fp32"] = float(np.max(np.abs(out.astype(np.float32) - exact32)))
+    record["max_abs_error_vs_fp32"] = float(
+        np.max(np.abs(out.astype(np.float32) - exact32))
+    )
     expected = EXPECTED_EXECUTION[name]
     record["execution_where_the_paper_executed"] = result.kind == expected
     record["dry_run"] = result.kind != expected
@@ -367,13 +403,26 @@ def run_target(name, A, B, oracle, out_dir: Path, *, backend, reduction_order=No
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", required=True, help="evidence directory (created)")
-    parser.add_argument("--targets", nargs="+", default=["samsung", "apu_v1"],
-                        choices=sorted(EXPECTED_EXECUTION))
-    parser.add_argument("--inputs", default="historical", choices=("historical", "gaussian"))
-    parser.add_argument("--reassociate", action="store_true",
-                        help="also run the regrouping compile of each target (the control)")
-    parser.add_argument("--backend", default="device", choices=("device", "virtual"),
-                        help="device: the paper's executors; virtual: a dry run, never a reproduction")
+    parser.add_argument(
+        "--targets",
+        nargs="+",
+        default=["samsung", "apu_v1"],
+        choices=sorted(EXPECTED_EXECUTION),
+    )
+    parser.add_argument(
+        "--inputs", default="historical", choices=("historical", "gaussian")
+    )
+    parser.add_argument(
+        "--reassociate",
+        action="store_true",
+        help="also run the regrouping compile of each target (the control)",
+    )
+    parser.add_argument(
+        "--backend",
+        default="device",
+        choices=("device", "virtual"),
+        help="device: the paper's executors; virtual: a dry run, never a reproduction",
+    )
     args = parser.parse_args(argv)
     out_dir = Path(args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -381,7 +430,13 @@ def main(argv=None) -> int:
     A, B = historical_inputs() if args.inputs == "historical" else gaussian_inputs()
     oracle = source_order_fp16(A, B)
     grouped = grouped_numpy_fp16(A, B)
-    np.savez(out_dir / "inputs_and_oracle.npz", A=A, B=B, oracle=oracle, grouped_numpy=grouped)
+    np.savez(
+        out_dir / "inputs_and_oracle.npz",
+        A=A,
+        B=B,
+        oracle=oracle,
+        grouped_numpy=grouped,
+    )
     report = {
         "experiment": "paper Sec. 5 portability: one FP16 GEMV source, strict order, bit-exact on both targets",
         "shape": {"M": M, "K": K, "N": N},
@@ -389,7 +444,8 @@ def main(argv=None) -> int:
             "kind": args.inputs,
             "seed": HISTORICAL_SEED if args.inputs == "historical" else 0,
             "products_exact": products_are_exact(A, B),
-            "A_sha256": _sha256(A), "B_sha256": _sha256(B),
+            "A_sha256": _sha256(A),
+            "B_sha256": _sha256(B),
             "oracle_sha256": _sha256(oracle),
             "rows_where_source_order_differs_from_numpy_grouped_sum": int(
                 np.count_nonzero(oracle.view(np.uint16) != grouped.view(np.uint16))
@@ -412,20 +468,42 @@ def main(argv=None) -> int:
         orders = [None] + (["reassociate"] if args.reassociate else [])
         for order in orders:
             try:
-                record = run_target(name, A, B, oracle, out_dir, backend=args.backend,
-                                    reduction_order=order)
+                record = run_target(
+                    name,
+                    A,
+                    B,
+                    oracle,
+                    out_dir,
+                    backend=args.backend,
+                    reduction_order=order,
+                )
             except Exception as error:  # the failure is evidence too
-                record = {"target": name, "label": f"{name}_{order or 'strict'}",
-                          "error": f"{type(error).__name__}: {error}"[:1000]}
+                record = {
+                    "target": name,
+                    "label": f"{name}_{order or 'strict'}",
+                    "error": f"{type(error).__name__}: {error}"[:1000],
+                }
             report["runs"].append(record)
             flush()
-            print(json.dumps({k: v for k, v in record.items()
-                              if k not in ("run_extra", "selected_plan_metadata")},
-                             default=str), flush=True)
+            print(
+                json.dumps(
+                    {
+                        k: v
+                        for k, v in record.items()
+                        if k not in ("run_extra", "selected_plan_metadata")
+                    },
+                    default=str,
+                ),
+                flush=True,
+            )
             # Every requested run must have executed where the paper executed;
             # only the strict runs are held to the source-order oracle (the
             # regrouping control is expected to differ from it).
-            if record.get("compile_error") or record.get("run_error") or record.get("error"):
+            if (
+                record.get("compile_error")
+                or record.get("run_error")
+                or record.get("error")
+            ):
                 report["problems"].append(f"{record['label']}: did not execute")
             elif record.get("dry_run"):
                 report["problems"].append(

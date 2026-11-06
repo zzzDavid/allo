@@ -47,13 +47,22 @@ def test_budget_is_validated_against_the_target():
     from allo.spmw_resources import supported_budget_units
 
     assert supported_budget_units(target) == {"channel"}
-    for other, unit in ((target, "bank"), (target, "bank_group"), (build_samsung_target(), "pseudo_channel")):
+    for other, unit in (
+        (target, "bank"),
+        (target, "bank_group"),
+        (build_samsung_target(), "pseudo_channel"),
+    ):
         with pytest.raises(ValueError, match="enforces no budget"):
             normalize_resource_budget({unit: 1}, other)
     with pytest.raises(ValueError, match="enforces no budget"):
         allo.compile(
-            *build_attention(1, 128)[:1], target, aim_cost, backend="virtual",
-            host_moves=build_attention(1, 128)[1], resources={"bank": 1}, **POLICY,
+            *build_attention(1, 128)[:1],
+            target,
+            aim_cost,
+            backend="virtual",
+            host_moves=build_attention(1, 128)[1],
+            resources={"bank": 1},
+            **POLICY,
         )
     for bad, reason in (
         ({"channel": 64}, "exceeds the 32 channel"),
@@ -83,13 +92,17 @@ def test_budget_caps_the_partition_domains_and_the_selected_program():
     )
     for compiled, limit in ((free, 32), (capped, 8)):
         for _name, (_index, scores) in kernel_choices(target, compiled).items():
-            replicas = {int(knob(mode, "replica_partitions", 1)) for _c, mode, _p in scores}
+            replicas = {
+                int(knob(mode, "replica_partitions", 1)) for _c, mode, _p in scores
+            }
             parts = {partitions_of(mode) for _c, mode, _p in scores}
             assert max(replicas) == limit and max(parts) == limit
     # The unbudgeted default occupies the whole device; the budgeted one
     # selects within the cap, and the cap is on every result.
     assert any(int(knob(p.mode, "replica_partitions", 1)) > 8 for p in _layouts(free))
-    assert all(int(knob(p.mode, "replica_partitions", 1)) <= 8 for p in _layouts(capped))
+    assert all(
+        int(knob(p.mode, "replica_partitions", 1)) <= 8 for p in _layouts(capped)
+    )
     assert capped.run_backend().extra["resource_budget"] == BUDGET
     assert free.run_backend().extra["resource_budget"] is None
     assert capped.resources == BUDGET

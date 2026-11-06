@@ -3818,53 +3818,100 @@ def _halve_recipe(launch):
         program=replace(
             launch.program,
             reduction_extent=launch.program.reduction_extent // 2,
-            output_type=replace(launch.program.output_type, bits=launch.program.output_type.bits - 1),
+            output_type=replace(
+                launch.program.output_type, bits=launch.program.output_type.bits - 1
+            ),
         ),
     )
 
 
 def test_transposed_gemini_ii_program_is_supported_unmodified():
-    compiled = allo.compile(transposed_dot_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    compiled = allo.compile(
+        transposed_dot_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual"
+    )
     assert compiled.plan.name == "single/k1" and compiled.estimate().cycles == 892
     (launch,) = compiled.plan.launches
     assert launch.program.reduction_extent == 32 and tuple(launch.reduction) == (0, 32)
     assert launch.final and launch.program.output_type.bits == 11
-    compiled.pack(a=np.ones((12, 32), np.int8), b=np.ones((32, 7), np.int8), z=np.zeros((7, 12), np.int16))
+    compiled.pack(
+        a=np.ones((12, 32), np.int8),
+        b=np.ones((32, 7), np.int8),
+        z=np.zeros((7, 12), np.int16),
+    )
 
 
-def test_damaged_cheapest_recipe_is_rejected_and_the_intact_alternative_selected(monkeypatch):
+def test_damaged_cheapest_recipe_is_rejected_and_the_intact_alternative_selected(
+    monkeypatch,
+):
     """The reviewer's probe: ``single/k1``'s recipe halved (K 16, 10-bit
     output) under an unchanged declared reduction (0, 32).  It is the
     cheapest estimate (700 against 1,494) and must be refused at
     materialization as a feasibility rejection, so the shared selection
     takes the intact ``single/k2``, whose artifact packs."""
     _damage_single_k1(monkeypatch, _halve_recipe)
-    compiled = allo.compile(transposed_dot_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    compiled = allo.compile(
+        transposed_dot_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual"
+    )
     assert compiled.plan.name == "single/k2" and compiled.estimate().cycles == 1494
-    assert [launch.program.reduction_extent for launch in compiled.plan.launches] == [16, 16]
-    assert [tuple(launch.reduction) for launch in compiled.plan.launches] == [(0, 16), (16, 32)]
+    assert [launch.program.reduction_extent for launch in compiled.plan.launches] == [
+        16,
+        16,
+    ]
+    assert [tuple(launch.reduction) for launch in compiled.plan.launches] == [
+        (0, 16),
+        (16, 32),
+    ]
     (kernel,) = compiled.placement_ranking.kernels
     assert [mode for _p, _c, mode in kernel.scores] == ["single/k1", "single/k2"]
     reasons = [reason for _position, reason in kernel.rejections]
-    assert any("recipe the contract does not imply" in reason and "reduction_extent realized 16 vs derived 32" in reason for reason in reasons), reasons
+    assert any(
+        "recipe the contract does not imply" in reason
+        and "reduction_extent realized 16 vs derived 32" in reason
+        for reason in reasons
+    ), reasons
     assert any("output_type" in reason for reason in reasons)
-    compiled.pack(a=np.ones((12, 32), np.int8), b=np.ones((32, 7), np.int8), z=np.zeros((7, 12), np.int16))
+    compiled.pack(
+        a=np.ones((12, 32), np.int8),
+        b=np.ones((32, 7), np.int8),
+        z=np.zeros((7, 12), np.int16),
+    )
 
 
 def test_forcing_the_damaged_recipe_fails_at_compilation(monkeypatch):
     _damage_single_k1(monkeypatch, _halve_recipe)
     with pytest.raises(Exception, match="recipe the contract does not imply"):
-        allo.compile(transposed_dot_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual", layout="single/k1")
+        allo.compile(
+            transposed_dot_g2,
+            build_apu_g2_target(),
+            apu_g2_cost,
+            backend="virtual",
+            layout="single/k1",
+        )
 
 
 @pytest.mark.parametrize(
     "name, mutate, expected",
     [
-        ("output geometry", lambda l: replace(l, program=replace(l.program, output_shape=(84,))), ("output_shape realized (84,) vs derived (7, 12)",)),
-        ("final routing", lambda l: replace(l, final=False), ("final realized False vs derived True",)),
+        (
+            "output geometry",
+            lambda l: replace(l, program=replace(l.program, output_shape=(84,))),
+            ("output_shape realized (84,) vs derived (7, 12)",),
+        ),
+        (
+            "final routing",
+            lambda l: replace(l, final=False),
+            ("final realized False vs derived True",),
+        ),
         # A first chunk declared chained is already refused by the shared
         # candidate contract (accumulator initialization), before realization.
-        ("accumulator mode", lambda l: replace(l, accumulator="previous"), ("accumulator realized 'previous' vs derived 'none'", "starts its accumulator as 'previous'")),
+        (
+            "accumulator mode",
+            lambda l: replace(l, accumulator="previous"),
+            (
+                "accumulator realized 'previous' vs derived 'none'",
+                "starts its accumulator as 'previous'",
+            ),
+        ),
     ],
 )
 def test_other_recipe_inconsistencies_are_rejected(monkeypatch, name, mutate, expected):
@@ -3873,10 +3920,14 @@ def test_other_recipe_inconsistencies_are_rejected(monkeypatch, name, mutate, ex
     (the recipe record itself refuses an output width inconsistent with its
     own reduction extent, so that case cannot be constructed)."""
     _damage_single_k1(monkeypatch, mutate)
-    compiled = allo.compile(transposed_dot_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    compiled = allo.compile(
+        transposed_dot_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual"
+    )
     assert compiled.plan.name == "single/k2"
     (kernel,) = compiled.placement_ranking.kernels
-    assert any(any(text in reason for text in expected) for _p, reason in kernel.rejections), (name, kernel.rejections)
+    assert any(
+        any(text in reason for text in expected) for _p, reason in kernel.rejections
+    ), (name, kernel.rejections)
 
 
 def nearby_pair_g2(a: int3[5, 16], b: int3[5, 16], x: int3[16], z: int15[5]):
@@ -3889,7 +3940,12 @@ def nearby_pair_g2(a: int3[5, 16], b: int3[5, 16], x: int3[16], z: int15[5]):
         z[i] = 3 * t + 2 * u
 
 
-_PAIR_ARGS = dict(a=np.ones((5, 16), np.int8), b=np.full((5, 16), 2, np.int8), x=np.ones(16, np.int8), z=np.zeros(5, np.int16))
+_PAIR_ARGS = dict(
+    a=np.ones((5, 16), np.int8),
+    b=np.full((5, 16), 2, np.int8),
+    x=np.ones(16, np.int8),
+    z=np.zeros(5, np.int16),
+)
 
 
 def _recipe_result(compiled):
@@ -3918,8 +3974,17 @@ def _reorder_streams(monkeypatch, swap_coefficients):
             for launch in plan.launches:
                 program = launch.program
                 if swap_coefficients:
-                    program = replace(program, epilogue=APUG2DotEpilogue(coefficients=tuple(reversed(program.epilogue.coefficients))))
-                launches.append(replace(launch, streams=tuple(reversed(launch.streams)), program=program))
+                    program = replace(
+                        program,
+                        epilogue=APUG2DotEpilogue(
+                            coefficients=tuple(reversed(program.epilogue.coefficients))
+                        ),
+                    )
+                launches.append(
+                    replace(
+                        launch, streams=tuple(reversed(launch.streams)), program=program
+                    )
+                )
             plan.launches = tuple(launches)
         return plans, rejected
 
@@ -3930,12 +3995,16 @@ def test_pair_affine_coefficients_follow_the_stream_identities():
     """The ordinary pair ``z = 3 (a x) + 2 (b x)``: one fused launch with
     the streams in contract order and coefficients (3, 2); the recipe's
     epilogue on the packed operands equals the source result."""
-    compiled = allo.compile(nearby_pair_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    compiled = allo.compile(
+        nearby_pair_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual"
+    )
     compiled.pack(**_PAIR_ARGS)
     (launch,) = compiled.plan.launches
     assert compiled.plan.name == "fused/k1" and tuple(launch.streams) == (0, 1)
     assert launch.program.epilogue.coefficients == (3, 2)
-    expected = 3 * (_PAIR_ARGS["a"].astype(np.int64) @ _PAIR_ARGS["x"]) + 2 * (_PAIR_ARGS["b"].astype(np.int64) @ _PAIR_ARGS["x"])
+    expected = 3 * (_PAIR_ARGS["a"].astype(np.int64) @ _PAIR_ARGS["x"]) + 2 * (
+        _PAIR_ARGS["b"].astype(np.int64) @ _PAIR_ARGS["x"]
+    )
     np.testing.assert_array_equal(_recipe_result(compiled), expected)
     assert expected.tolist() == [112] * 5
 
@@ -3949,7 +4018,9 @@ def test_reversed_streams_with_unchanged_coefficients_are_rejected(monkeypatch):
     fails instead of packing a wrong program."""
     _reorder_streams(monkeypatch, swap_coefficients=False)
     with pytest.raises(Exception, match="recipe the contract does not imply.*epilogue"):
-        allo.compile(nearby_pair_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+        allo.compile(
+            nearby_pair_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual"
+        )
 
 
 def test_reversed_streams_with_matching_coefficients_are_accepted(monkeypatch):
@@ -3957,10 +4028,15 @@ def test_reversed_streams_with_matching_coefficients_are_accepted(monkeypatch):
     order ((2, 3)) is a correct realization: accepted, packs, and the
     recipe on the packed operands equals the source result."""
     _reorder_streams(monkeypatch, swap_coefficients=True)
-    compiled = allo.compile(nearby_pair_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    compiled = allo.compile(
+        nearby_pair_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual"
+    )
     compiled.pack(**_PAIR_ARGS)
     (launch,) = compiled.plan.launches
-    assert tuple(launch.streams) == (1, 0) and launch.program.epilogue.coefficients == (2, 3)
+    assert tuple(launch.streams) == (1, 0) and launch.program.epilogue.coefficients == (
+        2,
+        3,
+    )
     np.testing.assert_array_equal(_recipe_result(compiled), [112] * 5)
 
 
@@ -3979,11 +4055,24 @@ def _reps_probe(a: int3[3, 32], b: int3[32, 5], z: int12[5, 3]):
         z[n, m] = acc
 
 
-_REPS_ARGS = dict(a=np.ones((3, 32), np.int8), b=np.ones((32, 5), np.int8), z=np.zeros((5, 3), np.int16))
+_REPS_ARGS = dict(
+    a=np.ones((3, 32), np.int8),
+    b=np.ones((32, 5), np.int8),
+    z=np.zeros((5, 3), np.int16),
+)
 
 
 def _partition(plan):
-    return [(tuple(l.streams), tuple(l.coordinates), tuple(l.reduction), l.accumulator, l.final) for l in plan.launches]
+    return [
+        (
+            tuple(l.streams),
+            tuple(l.coordinates),
+            tuple(l.reduction),
+            l.accumulator,
+            l.final,
+        )
+        for l in plan.launches
+    ]
 
 
 def test_repetitions_update_does_not_consult_the_enumerator(monkeypatch):
@@ -3994,13 +4083,18 @@ def test_repetitions_update_does_not_consult_the_enumerator(monkeypatch):
     changes, the artifact packs, and the enumerator is not called."""
     from allo.pim import apu_g2_source_route as route
 
-    compiled = allo.compile(_reps_probe, build_apu_g2_target(), apu_g2_cost, backend="virtual")
-    before = _partition(compiled.plan); estimate = compiled.estimate().cycles
+    compiled = allo.compile(
+        _reps_probe, build_apu_g2_target(), apu_g2_cost, backend="virtual"
+    )
+    before = _partition(compiled.plan)
+    estimate = compiled.estimate().cycles
     calls = []
 
     def broken(contract, **kwargs):
         calls.append(1)
-        raise AssertionError("the enumerator must not be consulted by a repetitions update")
+        raise AssertionError(
+            "the enumerator must not be consulted by a repetitions update"
+        )
 
     monkeypatch.setattr(route, "enumerate_apu_g2_launch_plans", broken)
     compiled.repetitions = 17
@@ -4013,25 +4107,46 @@ def test_repetitions_update_does_not_consult_the_enumerator(monkeypatch):
     assert compiled.estimate().cycles == estimate == compiled.plan.estimate_cycles
     assert compiled.execution_graph is compiled.plan.execution_graph
     compiled.pack(**_REPS_ARGS)
-    assert all(l["program"]["repetitions"] == 17 for l in compiled.manifest()["selected"]["launches"])
+    assert all(
+        l["program"]["repetitions"] == 17
+        for l in compiled.manifest()["selected"]["launches"]
+    )
 
 
-@pytest.mark.parametrize("name, mutate", [
-    ("halved reduction", lambda p: replace(p, reduction_extent=p.reduction_extent // 2, output_type=replace(p.output_type, bits=p.output_type.bits - 1))),
-    ("flattened output geometry", lambda p: replace(p, output_shape=(15,))),
-])
-def test_repetitions_update_rejects_a_drifted_recipe_and_keeps_the_valid_plan(monkeypatch, name, mutate):
+@pytest.mark.parametrize(
+    "name, mutate",
+    [
+        (
+            "halved reduction",
+            lambda p: replace(
+                p,
+                reduction_extent=p.reduction_extent // 2,
+                output_type=replace(p.output_type, bits=p.output_type.bits - 1),
+            ),
+        ),
+        ("flattened output geometry", lambda p: replace(p, output_shape=(15,))),
+    ],
+)
+def test_repetitions_update_rejects_a_drifted_recipe_and_keeps_the_valid_plan(
+    monkeypatch, name, mutate
+):
     """If the derivation itself returned a recipe differing from the
     validated launch in anything but repetitions, the update is refused and
     the previous plan, graph and repetition count stay installed."""
     from allo.pim import apu_g2_source_route as route
 
-    compiled = allo.compile(_reps_probe, build_apu_g2_target(), apu_g2_cost, backend="virtual")
-    before = _partition(compiled.plan); graph = compiled.execution_graph; estimate = compiled.estimate().cycles
+    compiled = allo.compile(
+        _reps_probe, build_apu_g2_target(), apu_g2_cost, backend="virtual"
+    )
+    before = _partition(compiled.plan)
+    graph = compiled.execution_graph
+    estimate = compiled.estimate().cycles
     original = route.launch_program_for
 
     def drifted(contract, group, coordinates, reduction, *, repetitions):
-        program, accumulator, final = original(contract, group, coordinates, reduction, repetitions=repetitions)
+        program, accumulator, final = original(
+            contract, group, coordinates, reduction, repetitions=repetitions
+        )
         return mutate(program), accumulator, final
 
     monkeypatch.setattr(route, "launch_program_for", drifted)
@@ -4050,18 +4165,33 @@ def test_repetitions_update_rejects_reordered_pair_streams(monkeypatch):
     from allo.pim import apu_g2_source_route as route
     from allo.pim.apu_g2_composed_contraction import APUG2DotEpilogue
 
-    compiled = allo.compile(nearby_pair_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    compiled = allo.compile(
+        nearby_pair_g2, build_apu_g2_target(), apu_g2_cost, backend="virtual"
+    )
     original = route.launch_program_for
 
     def swapped(contract, group, coordinates, reduction, *, repetitions):
-        program, accumulator, final = original(contract, group, coordinates, reduction, repetitions=repetitions)
-        return replace(program, epilogue=APUG2DotEpilogue(coefficients=tuple(reversed(program.epilogue.coefficients)))), accumulator, final
+        program, accumulator, final = original(
+            contract, group, coordinates, reduction, repetitions=repetitions
+        )
+        return (
+            replace(
+                program,
+                epilogue=APUG2DotEpilogue(
+                    coefficients=tuple(reversed(program.epilogue.coefficients))
+                ),
+            ),
+            accumulator,
+            final,
+        )
 
     monkeypatch.setattr(route, "launch_program_for", swapped)
     with pytest.raises(ValueError, match="epilogue"):
         compiled.repetitions = 17
     (launch,) = compiled.plan.launches
-    assert launch.program.epilogue.coefficients == (3, 2) and compiled.repetitions == 256
+    assert (
+        launch.program.epilogue.coefficients == (3, 2) and compiled.repetitions == 256
+    )
     compiled.pack(**_PAIR_ARGS)
     np.testing.assert_array_equal(_recipe_result(compiled), [112] * 5)
 
@@ -4070,9 +4200,20 @@ def test_repetitions_update_of_a_forced_nondefault_plan_is_valid():
     """A valid update of the forced two-launch plan: both launches keep
     their partition, each recipe carries the new count, the plan is
     re-priced, packing and provenance agree."""
-    compiled = allo.compile(_reps_probe, build_apu_g2_target(), apu_g2_cost, backend="virtual", layout="single/k2")
-    assert compiled.plan.name == "single/k2" and len(compiled.plan.launches) == 2 and compiled.selection == "forced"
-    before = _partition(compiled.plan); estimate = compiled.estimate().cycles
+    compiled = allo.compile(
+        _reps_probe,
+        build_apu_g2_target(),
+        apu_g2_cost,
+        backend="virtual",
+        layout="single/k2",
+    )
+    assert (
+        compiled.plan.name == "single/k2"
+        and len(compiled.plan.launches) == 2
+        and compiled.selection == "forced"
+    )
+    before = _partition(compiled.plan)
+    estimate = compiled.estimate().cycles
     compiled.repetitions = 17
     assert compiled.plan.name == "single/k2" and _partition(compiled.plan) == before
     assert [l.program.repetitions for l in compiled.plan.launches] == [17, 17]
@@ -4082,7 +4223,9 @@ def test_repetitions_update_of_a_forced_nondefault_plan_is_valid():
     compiled.pack(**_REPS_ARGS)
     manifest = compiled.manifest()
     assert manifest["selected"]["name"] == "single/k2"
-    assert all(l["program"]["repetitions"] == 17 for l in manifest["selected"]["launches"])
+    assert all(
+        l["program"]["repetitions"] == 17 for l in manifest["selected"]["launches"]
+    )
 
 
 def test_repetitions_update_runs_the_shared_graph_check_before_installing(monkeypatch):
@@ -4095,9 +4238,21 @@ def test_repetitions_update_runs_the_shared_graph_check_before_installing(monkey
     from allo import spmw_candidate
     from allo.pim import apu_g2_source_route as route
 
-    compiled = allo.compile(_reps_probe, build_apu_g2_target(), apu_g2_cost, backend="virtual", layout="single/k2")
-    plan, graph, estimate = compiled.plan, compiled.execution_graph, compiled.estimate().cycles
-    assert graph is compiled.plan.execution_graph and graph.metadata["launch_count"] == 2
+    compiled = allo.compile(
+        _reps_probe,
+        build_apu_g2_target(),
+        apu_g2_cost,
+        backend="virtual",
+        layout="single/k2",
+    )
+    plan, graph, estimate = (
+        compiled.plan,
+        compiled.execution_graph,
+        compiled.estimate().cycles,
+    )
+    assert (
+        graph is compiled.plan.execution_graph and graph.metadata["launch_count"] == 2
+    )
     calls = []
     original_check = spmw_candidate.check_graph_consistency
     original_price = route.price_apu_g2_launch_plan
@@ -4116,7 +4271,11 @@ def test_repetitions_update_runs_the_shared_graph_check_before_installing(monkey
     with pytest.raises(ValueError, match="prices 3 launch"):
         compiled.repetitions = 19
     assert calls == [3]
-    assert compiled.plan is plan and compiled.execution_graph is graph and compiled.plan.execution_graph is graph
+    assert (
+        compiled.plan is plan
+        and compiled.execution_graph is graph
+        and compiled.plan.execution_graph is graph
+    )
     assert compiled.repetitions == 256 and compiled.estimate().cycles == estimate
     assert [l.program.repetitions for l in compiled.plan.launches] == [256, 256]
     compiled.pack(**_REPS_ARGS)
@@ -4125,7 +4284,10 @@ def test_repetitions_update_runs_the_shared_graph_check_before_installing(monkey
     compiled.repetitions = 19
     assert calls == [3, 2]
     assert compiled.repetitions == 19 and compiled.plan is not plan
-    assert compiled.execution_graph is compiled.plan.execution_graph and compiled.execution_graph.metadata["launch_count"] == 2
+    assert (
+        compiled.execution_graph is compiled.plan.execution_graph
+        and compiled.execution_graph.metadata["launch_count"] == 2
+    )
     assert [l.program.repetitions for l in compiled.plan.launches] == [19, 19]
 
 
@@ -4152,7 +4314,9 @@ def grouped_gemv_region(a: float16[4, 8], b: float16[8], c: float16[4]):
 
 
 @allo.dataflow.region()
-def grouped_gemv_region_renamed(lhs_in: float16[4, 8], rhs_in: float16[8], out: float16[4]):
+def grouped_gemv_region_renamed(
+    lhs_in: float16[4, 8], rhs_in: float16[8], out: float16[4]
+):
     @allo.work(mapping=[4], args=[lhs_in, rhs_in, out])
     def one_row(A: float16[4, 8], x: float16[8], y: float16[4]):
         r = allo.get_wid()
@@ -4166,7 +4330,9 @@ G_M, G_K, G_N = 16, 32, 8
 
 
 @allo.dataflow.region()
-def grouped_gemm_region(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+def grouped_gemm_region(
+    p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]
+):
     """A nearby supported program: each of the four work items owns a block of
     four rows of a dense FP16 GEMM (the runtime's device packing)."""
 
@@ -4210,7 +4376,11 @@ def test_apu_v1_grouped_candidates_declare_effects_from_the_shared_facts():
     selected grouped placement declares coverage, layouts, transfers, the
     launch and the ABI derived from the work body's facts and the group
     layout, and the emitted body was checked against them."""
-    from allo.spmw_candidate import EFFECTS_DERIVERS, EFFECTS_REQUIRED_TARGETS, candidate_effects
+    from allo.spmw_candidate import (
+        EFFECTS_DERIVERS,
+        EFFECTS_REQUIRED_TARGETS,
+        candidate_effects,
+    )
 
     assert "apu_v1" in EFFECTS_REQUIRED_TARGETS
     compiled = _compile_grouped(grouped_gemv_region)
@@ -4222,12 +4392,22 @@ def test_apu_v1_grouped_candidates_declare_effects_from_the_shared_facts():
         effects = candidate_effects(placement)
         assert effects is not None
         assert effects.coverage.operations == ("MAC",)
-        assert effects.coverage.inputs == ("mat", "vec") and effects.coverage.outputs == ("dst",)
+        assert effects.coverage.inputs == (
+            "mat",
+            "vec",
+        ) and effects.coverage.outputs == ("dst",)
         assert effects.abi_inputs == ("mat", "vec") and effects.abi_outputs == ("dst",)
         layouts = {v.value: v for v in effects.value_layouts}
-        assert (layouts["mat"].storage, layouts["mat"].axes, layouts["mat"].packing) == ("vr0", ("k",), "group_lanes:8192")
+        assert (
+            layouts["mat"].storage,
+            layouts["mat"].axes,
+            layouts["mat"].packing,
+        ) == ("vr0", ("k",), "group_lanes:8192")
         assert (layouts["vec"].storage, layouts["vec"].axes) == ("vr1", ("k",))
-        assert (layouts["dst"].storage, layouts["dst"].packing) == ("vr2", "group_head:8192")
+        assert (layouts["dst"].storage, layouts["dst"].packing) == (
+            "vr2",
+            "group_head:8192",
+        )
         routes = {(t.value, t.direction): tuple(t.route) for t in effects.transfers}
         assert routes[("mat", "in")] == ("host_pack", "l4", "vmrs", "vr0")
         assert routes[("dst", "out")] == ("vr2", "vmrs", "l4", "host_gather")
@@ -4266,9 +4446,9 @@ def test_apu_v1_grouped_renamed_program_gets_the_same_decision():
     assert a["launches"] == b["launches"]
     # Axes are the source's loop labels (``k`` there, ``j`` here): compared
     # by count; storage and packing are the decision.
-    assert [(v["storage"], v["packing"], len(v["axes"])) for v in a["value_layouts"]] == [
-        (v["storage"], v["packing"], len(v["axes"])) for v in b["value_layouts"]
-    ]
+    assert [
+        (v["storage"], v["packing"], len(v["axes"])) for v in a["value_layouts"]
+    ] == [(v["storage"], v["packing"], len(v["axes"])) for v in b["value_layouts"]]
     assert b["coverage"]["inputs"] == ["A", "x"] and b["coverage"]["outputs"] == ["y"]
     assert renamed.compiled.cmds == first.compiled.cmds
 
@@ -4322,9 +4502,21 @@ def test_apu_v1_grouped_runtime_binds_the_callers_arrays_by_identity():
     with pytest.raises(ValueError, match="no argument for the work body's 'A'"):
         _apu_v1_prepare_io(inner, {"A": A, "B": B, "C": C})
     gemv = _compile_grouped(grouped_gemv_region).compiled
-    with pytest.raises(NotImplementedError, match="device execution is not implemented") as error:
-        _apu_v1_prepare_io(gemv, {"a": np.zeros((4, 8), np.float16), "b": np.zeros(8, np.float16), "c": np.zeros(4, np.float16)})
-    assert "rank-2 operands and a rank-2 result; got mat[4, 8], vec[8] -> dst[4]" in str(error.value)
+    with pytest.raises(
+        NotImplementedError, match="device execution is not implemented"
+    ) as error:
+        _apu_v1_prepare_io(
+            gemv,
+            {
+                "a": np.zeros((4, 8), np.float16),
+                "b": np.zeros(8, np.float16),
+                "c": np.zeros(4, np.float16),
+            },
+        )
+    assert (
+        "rank-2 operands and a rank-2 result; got mat[4, 8], vec[8] -> dst[4]"
+        in str(error.value)
+    )
 
 
 def test_apu_v1_grouped_restrictions_are_explicit():
@@ -4335,7 +4527,9 @@ def test_apu_v1_grouped_restrictions_are_explicit():
         _compile_grouped(grouped_gemv_region, reduction_order="strict")
     with pytest.raises(NotImplementedError, match="accumulator_init='carried'"):
         _compile_grouped(grouped_gemv_carried)
-    with pytest.raises(NotImplementedError, match="declares no program for the operations \\['ADD'\\]"):
+    with pytest.raises(
+        NotImplementedError, match="declares no program for the operations \\['ADD'\\]"
+    ):
         _compile_grouped(grouped_add_region)
 
 
@@ -4357,7 +4551,10 @@ def test_apu_v1_grouped_emission_is_checked_against_the_declaration(monkeypatch)
             self.group_size = saved
 
     monkeypatch.setattr(APUv1Ctx, "emit_group_reduce_f16", halved)
-    with pytest.raises(Exception, match="reduces groups of \\[4096\\] lanes; the candidate declares 8192"):
+    with pytest.raises(
+        Exception,
+        match="reduces groups of \\[4096\\] lanes; the candidate declares 8192",
+    ):
         _compile_grouped(grouped_gemv_region)
 
 
@@ -4373,7 +4570,8 @@ def test_apu_v1_grouped_supplied_declaration_must_be_the_derivation():
     edited = replace(
         effects,
         value_layouts=tuple(
-            replace(v, storage="vr5") if v.value == "mat" else v for v in effects.value_layouts
+            replace(v, storage="vr5") if v.value == "mat" else v
+            for v in effects.value_layouts
         ),
     )
     tampered = Placement(
@@ -4405,7 +4603,9 @@ def test_apu_v1_grouped_supplied_declaration_must_be_the_derivation():
 
 
 @allo.dataflow.region()
-def grouped_gemm_reversed_k(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+def grouped_gemm_reversed_k(
+    p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]
+):
     @allo.work(mapping=[4], args=[p, q, r_out])
     def row_block(A: float16[G_M, G_K], B: float16[G_K, G_N], C: float16[G_M, G_N]):
         core = allo.get_wid()
@@ -4418,7 +4618,9 @@ def grouped_gemm_reversed_k(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: f
 
 
 @allo.dataflow.region()
-def grouped_gemm_partial_rows(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+def grouped_gemm_partial_rows(
+    p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]
+):
     @allo.work(mapping=[4], args=[p, q, r_out])
     def row_block(A: float16[G_M, G_K], B: float16[G_K, G_N], C: float16[G_M, G_N]):
         core = allo.get_wid()
@@ -4431,7 +4633,9 @@ def grouped_gemm_partial_rows(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out:
 
 
 @allo.dataflow.region()
-def grouped_gemm_partial_columns(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+def grouped_gemm_partial_columns(
+    p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]
+):
     @allo.work(mapping=[4], args=[p, q, r_out])
     def row_block(A: float16[G_M, G_K], B: float16[G_K, G_N], C: float16[G_M, G_N]):
         core = allo.get_wid()
@@ -4444,7 +4648,9 @@ def grouped_gemm_partial_columns(p: float16[G_M, G_K], q: float16[G_K, G_N], r_o
 
 
 @allo.dataflow.region()
-def grouped_gemm_repeated_row(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+def grouped_gemm_repeated_row(
+    p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]
+):
     @allo.work(mapping=[4], args=[p, q, r_out])
     def row_block(A: float16[G_M, G_K], B: float16[G_K, G_N], C: float16[G_M, G_N]):
         core = allo.get_wid()
@@ -4457,7 +4663,9 @@ def grouped_gemm_repeated_row(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out:
 
 
 @allo.dataflow.region()
-def grouped_gemm_permuted_rows(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+def grouped_gemm_permuted_rows(
+    p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]
+):
     @allo.work(mapping=[4], args=[p, q, r_out])
     def row_block(A: float16[G_M, G_K], B: float16[G_K, G_N], C: float16[G_M, G_N]):
         core = allo.get_wid()
@@ -4470,7 +4678,9 @@ def grouped_gemm_permuted_rows(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out
 
 
 @allo.dataflow.region()
-def grouped_gemm_overlapping(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+def grouped_gemm_overlapping(
+    p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]
+):
     """Every work item writes the same four rows (the work id is unused)."""
 
     @allo.work(mapping=[4], args=[p, q, r_out])
@@ -4484,7 +4694,9 @@ def grouped_gemm_overlapping(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: 
 
 
 @allo.dataflow.region()
-def grouped_gemm_column_blocks(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]):
+def grouped_gemm_column_blocks(
+    p: float16[G_M, G_K], q: float16[G_K, G_N], r_out: float16[G_M, G_N]
+):
     """A nearby supported partition: the work items own column blocks."""
 
     @allo.work(mapping=[4], args=[p, q, r_out])
@@ -4499,21 +4711,42 @@ def grouped_gemm_column_blocks(p: float16[G_M, G_K], q: float16[G_K, G_N], r_out
 
 
 _NOT_THE_TEMPLATE = [
-    (grouped_gemm_reversed_k, "operand 'B' is read at \\[-1 \\* k \\+ 31, j\\] along the reduction", 32),
+    (
+        grouped_gemm_reversed_k,
+        "operand 'B' is read at \\[-1 \\* k \\+ 31, j\\] along the reduction",
+        32,
+    ),
     (grouped_gemm_partial_rows, "write 64 of the 128 elements of C\\[16, 8\\]", 16),
     (grouped_gemm_partial_columns, "write 64 of the 128 elements of C\\[16, 8\\]", 16),
-    (grouped_gemm_repeated_row, "written at \\[i, j\\] while the operands are read at row 0 of 'A'", 32),
+    (
+        grouped_gemm_repeated_row,
+        "written at \\[i, j\\] while the operands are read at row 0 of 'A'",
+        32,
+    ),
     (grouped_gemm_permuted_rows, "read at row -1 \\* i \\+ 15 of 'A'", 32),
-    (grouped_gemm_overlapping, "work items \\(0,\\) and \\(1,\\) both write rows 0..3 x columns 0..7", 32),
+    (
+        grouped_gemm_overlapping,
+        "work items \\(0,\\) and \\(1,\\) both write rows 0..3 x columns 0..7",
+        32,
+    ),
 ]
 
 
 @pytest.mark.parametrize(
     "region, reason, instances",
     _NOT_THE_TEMPLATE,
-    ids=["reversed_k", "partial_rows", "partial_columns", "repeated_row", "permuted_rows", "overlapping"],
+    ids=[
+        "reversed_k",
+        "partial_rows",
+        "partial_columns",
+        "repeated_row",
+        "permuted_rows",
+        "overlapping",
+    ],
 )
-def test_apu_v1_grouped_non_template_regions_are_refused_for_execution(region, reason, instances):
+def test_apu_v1_grouped_non_template_regions_are_refused_for_execution(
+    region, reason, instances
+):
     """Same buffers, same shapes, the same emitted body as the dense GEMM,
     different semantics: an executable backend is refused before scheduling
     with the failing condition; ``backend='virtual'`` keeps the estimate
@@ -4562,32 +4795,55 @@ def test_apu_v1_grouped_template_is_proven_over_the_whole_kernel_group():
     A = rng.integers(-3, 4, size=(G_M, G_K)).astype(np.float16)
     B = rng.integers(-3, 4, size=(G_K, G_N)).astype(np.float16)
     for region, blocks in (
-        (grouped_gemm_region, [(0, 4, 0, 8), (4, 4, 0, 8), (8, 4, 0, 8), (12, 4, 0, 8)]),
-        (grouped_gemm_column_blocks, [(0, 16, 0, 2), (0, 16, 2, 2), (0, 16, 4, 2), (0, 16, 6, 2)]),
+        (
+            grouped_gemm_region,
+            [(0, 4, 0, 8), (4, 4, 0, 8), (8, 4, 0, 8), (12, 4, 0, 8)],
+        ),
+        (
+            grouped_gemm_column_blocks,
+            [(0, 16, 0, 2), (0, 16, 2, 2), (0, 16, 4, 2), (0, 16, 6, 2)],
+        ),
     ):
         compiled = _compile_grouped(region, backend=None)  # the board route
         inner = compiled.compiled
         placement = inner.layout[0]
         group = group_contractions(inner.trace.matches)
         assert [w for w, _f in group] == [(0,), (1,), (2,), (3,)]
-        packing = grouped_device_packing(group, grouped_geometry(inner.target, placement))
+        packing = grouped_device_packing(
+            group, grouped_geometry(inner.target, placement)
+        )
         assert packing.kind == "gemm"
-        assert [(b.row0, b.rows, b.col0, b.columns) for b in packing.template.blocks] == blocks
-        assert (packing.template.lhs, packing.template.rhs, packing.template.output) == ("A", "B", "C")
+        assert [
+            (b.row0, b.rows, b.col0, b.columns) for b in packing.template.blocks
+        ] == blocks
+        assert (
+            packing.template.lhs,
+            packing.template.rhs,
+            packing.template.output,
+        ) == ("A", "B", "C")
         (launch,) = candidate_effects(placement).launches
         assert launch.covers[-1] == "gemm"
         assert launch.instances == (0, blocks[0][1] * blocks[0][3])
-        normalized, specs, _packing = _apu_v1_prepare_io(inner, {"p": A, "q": B, "r_out": np.zeros((G_M, G_N), np.float16)})
+        normalized, specs, _packing = _apu_v1_prepare_io(
+            inner, {"p": A, "q": B, "r_out": np.zeros((G_M, G_N), np.float16)}
+        )
         batches = specs["r_out"][0][1]
         x = normalized["p"].reshape(4, batches, 4, 8192).astype(np.float32)
         y = normalized["q"].reshape(x.shape).astype(np.float32)
         implied = (x * y).sum(axis=-1).reshape(4, -1)[:, : batches * 4]
         rows_per_core = 4
         gathered = implied.reshape(4, rows_per_core, G_N).reshape(G_M, G_N)
-        np.testing.assert_array_equal(gathered, A.astype(np.float32) @ B.astype(np.float32))
+        np.testing.assert_array_equal(
+            gathered, A.astype(np.float32) @ B.astype(np.float32)
+        )
     # The named-candidate path without a cost program stamps the group too.
     named = allo.compile(
-        grouped_gemm_region, build_apu_v1_target(), None, layout="grouped_f16", backend="virtual", reduction_order="reassociate"
+        grouped_gemm_region,
+        build_apu_v1_target(),
+        None,
+        layout="grouped_f16",
+        backend="virtual",
+        reduction_order="reassociate",
     )
     assert candidate_effects(named.compiled.layout[0]).launches[0].covers[-1] == "gemm"
 
@@ -4606,10 +4862,17 @@ def _one_batch_clones(compiled, keep_effects=False):
 
     clones = []
     for original in compiled.compiled.layout:
-        extra = {k: v for k, v in original.extra.items() if keep_effects or k != "effects"}
+        extra = {
+            k: v for k, v in original.extra.items() if keep_effects or k != "effects"
+        }
         extra["n_out_tiles"] = 1
         clones.append(
-            Placement(placements=dict(original.placements), mode=original.mode, layout=original.layout, extra=extra)
+            Placement(
+                placements=dict(original.placements),
+                mode=original.mode,
+                layout=original.layout,
+                extra=extra,
+            )
         )
     return clones
 
@@ -4625,14 +4888,21 @@ def test_apu_v1_grouped_supplied_placement_with_too_few_batches_is_refused():
 
     base = _compile_grouped(grouped_gemm_region, backend=None)
     assert base.compiled.layout[0].extra["n_out_tiles"] == 8
-    with pytest.raises(Exception, match="loops over 1 batch\\(es\\); the candidate declares 8"):
-        _compile_grouped(grouped_gemm_region, backend=None, layout=_one_batch_clones(base))
+    with pytest.raises(
+        Exception, match="loops over 1 batch\\(es\\); the candidate declares 8"
+    ):
+        _compile_grouped(
+            grouped_gemm_region, backend=None, layout=_one_batch_clones(base)
+        )
     edited = _one_batch_clones(base, keep_effects=True)
     for placement in edited:
         effects = candidate_effects(placement)
         (launch,) = effects.launches
         placement.extra["effects"] = replace(
-            effects, launches=(replace(launch, covers=launch.covers[:4] + (1,) + launch.covers[5:]),)
+            effects,
+            launches=(
+                replace(launch, covers=launch.covers[:4] + (1,) + launch.covers[5:]),
+            ),
         )
     with pytest.raises(ValueError, match="violates the candidate contract"):
         _compile_grouped(grouped_gemm_region, backend=None, layout=edited)
@@ -4661,7 +4931,9 @@ def test_apu_v1_grouped_search_rejects_an_under_batched_candidate(monkeypatch):
                 layout=placement.layout,
                 extra={**placement.extra, "n_out_tiles": 1},
             )
-            clone.extra["effects"] = apu_v1_grouped_candidate_effects(target, matches, clone)
+            clone.extra["effects"] = apu_v1_grouped_candidate_effects(
+                target, matches, clone
+            )
             clones.append(clone)
         return clones + intact
 
@@ -4670,9 +4942,19 @@ def test_apu_v1_grouped_search_rejects_an_under_batched_candidate(monkeypatch):
     assert compiled.compiled.layout[0].extra["n_out_tiles"] == 8
     assert compiled.compiled.layout_ctx.vector_batches == 8
     assert candidate_effects(compiled.compiled.layout[0]).launches[0].covers[4] == 8
-    assert compiled.estimate().cycles == _compile_grouped(grouped_gemm_region, backend=None).estimate().cycles
-    rejections = [reason for kernel in compiled.placement_ranking.kernels for _position, reason in kernel.rejections]
-    assert any("loops over 1 batch(es); the candidate declares 8" in reason for reason in rejections), rejections
+    assert (
+        compiled.estimate().cycles
+        == _compile_grouped(grouped_gemm_region, backend=None).estimate().cycles
+    )
+    rejections = [
+        reason
+        for kernel in compiled.placement_ranking.kernels
+        for _position, reason in kernel.rejections
+    ]
+    assert any(
+        "loops over 1 batch(es); the candidate declares 8" in reason
+        for reason in rejections
+    ), rejections
 
 
 # The placement's selected map must be the map the grouped executable
@@ -4685,7 +4967,10 @@ def _grouped_map_variants():
     from allo.spmw_linear_layout import LinearLayout
 
     interleaved = LinearLayout(
-        bases={"group": [(1,), (2,)], "lane_in_group": [(1 << b,) for b in range(2, 15)]},
+        bases={
+            "group": [(1,), (2,)],
+            "lane_in_group": [(1 << b,) for b in range(2, 15)],
+        },
         out_dims=("vr_lane",),
         out_sizes=(32768,),
     )
@@ -4722,16 +5007,31 @@ def test_apu_v1_grouped_non_contiguous_map_is_refused_when_supplied(variant):
 
     base = _compile_grouped(grouped_gemm_region, backend=None)
     canonical = base.compiled.layout[0]
-    assert grouped_map_problem(canonical.layout, grouped_geometry(base.compiled.target, canonical)) is None
+    assert (
+        grouped_map_problem(
+            canonical.layout, grouped_geometry(base.compiled.target, canonical)
+        )
+        is None
+    )
     layout = _grouped_map_variants()[variant]
-    with pytest.raises(ValueError, match="the placement's selected map is invalid") as error:
-        _compile_grouped(grouped_gemm_region, backend=None, layout=_with_map(base, layout))
+    with pytest.raises(
+        ValueError, match="the placement's selected map is invalid"
+    ) as error:
+        _compile_grouped(
+            grouped_gemm_region, backend=None, layout=_with_map(base, layout)
+        )
     assert "contiguous groups" in str(error.value)
     # the same map with the canonical declaration copied onto it: the
     # derivation disagrees with the declaration
     with pytest.raises(ValueError, match="violates the candidate contract"):
-        _compile_grouped(grouped_gemm_region, backend=None, layout=_with_map(base, layout, keep_effects=True))
-    again = _compile_grouped(grouped_gemm_region, backend=None, layout=_with_map(base, canonical.layout))
+        _compile_grouped(
+            grouped_gemm_region,
+            backend=None,
+            layout=_with_map(base, layout, keep_effects=True),
+        )
+    again = _compile_grouped(
+        grouped_gemm_region, backend=None, layout=_with_map(base, canonical.layout)
+    )
     assert again.compiled.cmds == base.compiled.cmds
 
 
@@ -4742,7 +5042,11 @@ def test_apu_v1_grouped_search_rejects_non_contiguous_maps(monkeypatch):
     invalid, the contract filters them per candidate and the intact
     (canonical) candidate is selected and emitted."""
     from allo import spmw_autoschedule as sa
-    from allo.pim.apu_v1_grouped_route import apu_v1_grouped_candidate_effects, grouped_map_problem, grouped_geometry
+    from allo.pim.apu_v1_grouped_route import (
+        apu_v1_grouped_candidate_effects,
+        grouped_map_problem,
+        grouped_geometry,
+    )
     from allo.spmw_autoschedule import Placement
     from allo.spmw_candidate import candidate_effects
 
@@ -4760,17 +5064,30 @@ def test_apu_v1_grouped_search_rejects_non_contiguous_maps(monkeypatch):
                     layout=layout,
                     extra={k: v for k, v in placement.extra.items() if k != "effects"},
                 )
-                clone.extra["effects"] = apu_v1_grouped_candidate_effects(target, matches, clone)
-                assert all(v.packing.startswith("invalid:") for v in clone.extra["effects"].value_layouts)
+                clone.extra["effects"] = apu_v1_grouped_candidate_effects(
+                    target, matches, clone
+                )
+                assert all(
+                    v.packing.startswith("invalid:")
+                    for v in clone.extra["effects"].value_layouts
+                )
                 clones.append(clone)
         return clones + intact
 
     monkeypatch.setitem(sa._ENUMERATORS, "apu_v1", injected)
     compiled = _compile_grouped(grouped_gemm_region, backend=None)
     selected = compiled.compiled.layout[0]
-    assert grouped_map_problem(selected.layout, grouped_geometry(compiled.compiled.target, selected)) is None
+    assert (
+        grouped_map_problem(
+            selected.layout, grouped_geometry(compiled.compiled.target, selected)
+        )
+        is None
+    )
     assert [v[0] for v in selected.layout.bases["lane_in_group"]][:3] == [1, 2, 4]
-    assert all(v.packing.startswith(("group_lanes", "group_head")) for v in candidate_effects(selected).value_layouts)
+    assert all(
+        v.packing.startswith(("group_lanes", "group_head"))
+        for v in candidate_effects(selected).value_layouts
+    )
     reference = _compile_grouped(grouped_gemm_region, backend=None)
     assert compiled.compiled.cmds == reference.compiled.cmds
     assert compiled.estimate().cycles == reference.estimate().cycles

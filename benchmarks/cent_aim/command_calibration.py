@@ -58,14 +58,20 @@ def _classify(commands):
         words = line.split()
         opcode = words[1] if words and words[0] == "AiM" else words[0]
         if opcode == "MAC_ABK" or opcode == "MAC_SBK":
-            opcode = f"{opcode}:first" if previous in ("WR_BIAS", "WR_GB") else f"{opcode}:next"
+            opcode = (
+                f"{opcode}:first"
+                if previous in ("WR_BIAS", "WR_GB")
+                else f"{opcode}:next"
+            )
         classes.append(opcode)
         previous = words[1] if words and words[0] == "AiM" else words[0]
     return classes
 
 
 def _simulate(target, lines):
-    probe = SimpleNamespace(target=target, cmds=list(lines), runtime_segments=(), layout_ctx=None)
+    probe = SimpleNamespace(
+        target=target, cmds=list(lines), runtime_segments=(), layout_ctx=None
+    )
     result = spmw_aim._run_aim(probe)
     if result.kind != "simulator-timing-only":
         raise RuntimeError(f"expected a simulator-timing-only run, got {result.kind!r}")
@@ -86,7 +92,14 @@ def increments(target, commands):
     previous = baseline
     for k in range(1, len(body) + 1):
         cycles, executor = _simulate(target, body[:k] + ["AiM EOC"])
-        records.append({"index": k - 1, "command": body[k - 1], "prefix_cycles": cycles, "increment": cycles - previous})
+        records.append(
+            {
+                "index": k - 1,
+                "command": body[k - 1],
+                "prefix_cycles": cycles,
+                "increment": cycles - previous,
+            }
+        )
         previous = cycles
     return records, baseline, executor
 
@@ -95,9 +108,12 @@ def model_charges(candidate_extra, geometry):
     """The cost model's charges for one contraction candidate by class, from
     the profile it prices (``allo.pim.costs.aim.contraction_profile_charges``)."""
     operation = aim_costs._contraction_record(candidate_extra)
-    profile = aim_lowering.aim_contraction_profile(operation, geometry, aim_costs._sbk_banks(candidate_extra, geometry))
+    profile = aim_lowering.aim_contraction_profile(
+        operation, geometry, aim_costs._sbk_banks(candidate_extra, geometry)
+    )
     return {
-        "profile": {k: v for k, v in profile.items() if k != "counts"} | {"counts": dict(counts := profile["counts"])},
+        "profile": {k: v for k, v in profile.items() if k != "counts"}
+        | {"counts": dict(counts := profile["counts"])},
         "charges": contraction_profile_charges(profile),
         "total": aim_costs._contraction_profile_cycles(candidate_extra, geometry),
     }
@@ -112,17 +128,23 @@ def calibrate_plan(target, attention, program, variants, choice, label):
     by_class = {}
     for record, klass in zip(records, classes):
         record["class"] = klass
-        entry = by_class.setdefault(klass, {"count": 0, "simulated_increment_cycles": 0})
+        entry = by_class.setdefault(
+            klass, {"count": 0, "simulated_increment_cycles": 0}
+        )
         entry["count"] += 1
         entry["simulated_increment_cycles"] += record["increment"]
     kernels = {}
-    for entry, placement in zip([e for e in manifest if e.get("kind") == "contraction"], _placements(built)):
+    for entry, placement in zip(
+        [e for e in manifest if e.get("kind") == "contraction"], _placements(built)
+    ):
         geometry = _target_geometry(target)
         span = entry["command_span"]
         kernel_records = records[span[0] : span[1]]
         kernel_classes = {}
         for r in kernel_records:
-            k = kernel_classes.setdefault(r["class"], {"count": 0, "simulated_increment_cycles": 0})
+            k = kernel_classes.setdefault(
+                r["class"], {"count": 0, "simulated_increment_cycles": 0}
+            )
             k["count"] += 1
             k["simulated_increment_cycles"] += r["increment"]
         kernels[entry["name"]] = {
@@ -140,7 +162,9 @@ def calibrate_plan(target, attention, program, variants, choice, label):
         "commands": len(commands),
         "simulated_cycles": total_cycles,
         "eoc_baseline_cycles": baseline,
-        "estimate_cycles": built.estimate().cycles if hasattr(built, "estimate") else None,
+        "estimate_cycles": (
+            built.estimate().cycles if hasattr(built, "estimate") else None
+        ),
         "by_class": by_class,
         "kernels": kernels,
         "increments": records,
@@ -156,7 +180,9 @@ def main(argv=None) -> int:
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
     target = build_aim_target()
-    target_, attention, program, ranking = ranked(args.heads, args.tokens, budget=BUDGET)
+    target_, attention, program, ranking = ranked(
+        args.heads, args.tokens, budget=BUDGET
+    )
     variants = budget_variants(target, ranking)
     session = {
         "host": platform.node(),
@@ -171,19 +197,31 @@ def main(argv=None) -> int:
         p = int(label[1:])
         choice = variants.per_partition.get(p)
         if choice is None:
-            session["plans"].append({"label": label, "error": "no budgeted plan with this P"}); failures += 1
+            session["plans"].append(
+                {"label": label, "error": "no budgeted plan with this P"}
+            )
+            failures += 1
             continue
         try:
             plan = calibrate_plan(target, attention, program, variants, choice, label)
         except Exception as error:
-            session["plans"].append({"label": label, "error": f"{type(error).__name__}: {error}"}); failures += 1
+            session["plans"].append(
+                {"label": label, "error": f"{type(error).__name__}: {error}"}
+            )
+            failures += 1
             continue
         session["plans"].append(plan)
-        print(f"== {label} ({plan['modes'][-1][:70]}): simulated {plan['simulated_cycles']} estimate {plan['estimate_cycles']} commands {plan['commands']}")
+        print(
+            f"== {label} ({plan['modes'][-1][:70]}): simulated {plan['simulated_cycles']} estimate {plan['estimate_cycles']} commands {plan['commands']}"
+        )
         for name, kernel in plan["kernels"].items():
-            print(f"   {name}: span cycles (simulated increments) {kernel['simulated_span_cycles']} | model total {kernel['model']['total']}")
+            print(
+                f"   {name}: span cycles (simulated increments) {kernel['simulated_span_cycles']} | model total {kernel['model']['total']}"
+            )
             for klass, entry in sorted(kernel["by_class"].items()):
-                print(f"      {klass:16s} n={entry['count']:4d} simulated {entry['simulated_increment_cycles']:7d}")
+                print(
+                    f"      {klass:16s} n={entry['count']:4d} simulated {entry['simulated_increment_cycles']:7d}"
+                )
             print("      model charges:", kernel["model"]["charges"])
         with open(args.out, "w", encoding="utf-8") as handle:
             json.dump(session, handle, indent=1, default=str)

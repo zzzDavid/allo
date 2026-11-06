@@ -203,7 +203,9 @@ class TenonLane:
 
             timing_problem = launch_evidence_problem(launches, self.compiled.plan)
         amortized = (
-            sum(float(t) / REPETITIONS for t in batch) if timing_problem is None else None
+            sum(float(t) / REPETITIONS for t in batch)
+            if timing_problem is None
+            else None
         )
         return {
             "amortized_ticks_per_pipeline": amortized,

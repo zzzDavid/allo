@@ -102,8 +102,14 @@ PAPER_ROWS = {
     "qkv_b4": ("gemv", [(32, 5120, 384)]),
     "proj_b1": ("gemv", [(8, 128, 5120)]),
     "proj_b4": ("gemv", [(32, 128, 5120)]),
-    "score_b1": ("attention", [(8, 128, length) for length in range(144, 4096 + 1, 16)]),
-    "score_b4": ("attention", [(32, 128, length) for length in range(144, 4096 + 1, 16)]),
+    "score_b1": (
+        "attention",
+        [(8, 128, length) for length in range(144, 4096 + 1, 16)],
+    ),
+    "score_b4": (
+        "attention",
+        [(32, 128, length) for length in range(144, 4096 + 1, 16)],
+    ),
 }
 
 
@@ -164,7 +170,9 @@ def _simulator(dcc_root: Path) -> Path:
 
 
 def _libdir(binary: Path) -> Path:
-    return Path(os.environ.get("ATTACC_RAMULATOR_LIBDIR", binary.parent / "AttAcc")).resolve()
+    return Path(
+        os.environ.get("ATTACC_RAMULATOR_LIBDIR", binary.parent / "AttAcc")
+    ).resolve()
 
 
 def environment_record(dcc_root: Path, binary: Path) -> dict:
@@ -175,7 +183,11 @@ def environment_record(dcc_root: Path, binary: Path) -> dict:
     libdir = _libdir(binary)
     library = libdir / "libramulator.so"
     generators = {}
-    for name in ("attacc_trace_gen/gen_trace_AttAcc_GEMV.py", "attacc_trace_gen/gen_trace_AttAcc_ATTN.py", "generate_configs.py"):
+    for name in (
+        "attacc_trace_gen/gen_trace_AttAcc_GEMV.py",
+        "attacc_trace_gen/gen_trace_AttAcc_ATTN.py",
+        "generate_configs.py",
+    ):
         path = dcc_root / name
         if path.is_file():
             generators[name] = _sha256(path)
@@ -186,7 +198,9 @@ def environment_record(dcc_root: Path, binary: Path) -> dict:
         "compiler": {
             "allo": str(allo_dir),
             "git_revision": _git(allo_dir, "rev-parse", "HEAD"),
-            "git_dirty": bool(_git(allo_dir, "status", "--porcelain", "--untracked-files=no")),
+            "git_dirty": bool(
+                _git(allo_dir, "status", "--porcelain", "--untracked-files=no")
+            ),
         },
         "simulator": {
             "name": "Ramulator2-AttAcc (external, MIT; AttAcc HBM3-PIM model)",
@@ -235,22 +249,46 @@ def compile_selected(family: str, shape) -> dict:
     (program,) = compiled.compiled.layout_ctx.programs
     (kernel,) = compiled.compiled.placement_ranking.kernels
     chosen = kernel.chosen_position
-    selected = next((s for s in kernel.scores if s[0] == chosen), kernel.scores[0] if kernel.scores else None)
+    selected = next(
+        (s for s in kernel.scores if s[0] == chosen),
+        kernel.scores[0] if kernel.scores else None,
+    )
     provenance = {
         "route": "allo.compile(region, build_attacc_target(), attacc_cost, backend='virtual', reduction_order='reassociate')",
         "matched_operations": [m.target_op_name for m in compiled.trace.matches],
         "reduction_order": compiled.reduction_order,
-        "candidates": len(kernel.candidates) if hasattr(kernel.candidates, "__len__") else kernel.candidates,
+        "candidates": (
+            len(kernel.candidates)
+            if hasattr(kernel.candidates, "__len__")
+            else kernel.candidates
+        ),
         "scored": len(kernel.scores),
         "probe_count": kernel.probe_count,
         "chosen_position": chosen,
-        "selected": {"position": selected[0], "ranked_cycles": selected[1], "decision": selected[2]} if selected else None,
-        "best_three": [{"position": s[0], "ranked_cycles": s[1], "decision": s[2]} for s in kernel.scores[:3]],
+        "selected": (
+            {
+                "position": selected[0],
+                "ranked_cycles": selected[1],
+                "decision": selected[2],
+            }
+            if selected
+            else None
+        ),
+        "best_three": [
+            {"position": s[0], "ranked_cycles": s[1], "decision": s[2]}
+            for s in kernel.scores[:3]
+        ],
         "cost_ties": _jsonable(kernel.cost_ties),
         "tie_break": _jsonable(kernel.tie_break),
         "fallback": None if kernel.fallback is None else str(kernel.fallback)[:200],
-        "materialized": None if kernel.materialized is None else str(kernel.materialized)[:200],
-        "rejections": len(kernel.rejections) if hasattr(kernel.rejections, "__len__") else _jsonable(kernel.rejections),
+        "materialized": (
+            None if kernel.materialized is None else str(kernel.materialized)[:200]
+        ),
+        "rejections": (
+            len(kernel.rejections)
+            if hasattr(kernel.rejections, "__len__")
+            else _jsonable(kernel.rejections)
+        ),
         "layout_extra_tiling": compiled.compiled.layout.extra.get("attacc_tiling"),
         "program": program.manifest(),
     }
@@ -299,11 +337,15 @@ def write_trace(dcc_root: Path, family: str, tiling, workdir: Path) -> Path:
     try:
         trace = workdir / "kernel.trace"
         if family == "gemv":
-            generator = importlib.import_module("attacc_trace_gen.gen_trace_AttAcc_GEMV")
+            generator = importlib.import_module(
+                "attacc_trace_gen.gen_trace_AttAcc_GEMV"
+            )
             generator.set_mode_gemv("inference")
             generator.run_GEMV([list(axis) for axis in tiling], str(trace))
         else:
-            generator = importlib.import_module("attacc_trace_gen.gen_trace_AttAcc_ATTN")
+            generator = importlib.import_module(
+                "attacc_trace_gen.gen_trace_AttAcc_ATTN"
+            )
             generator.set_mode_attn("inference")
             generator.run_attention([list(axis) for axis in tiling], str(trace))
     finally:
@@ -320,35 +362,76 @@ class SimulatorFailure(RuntimeError):
         self.details = details
 
 
-def run_simulator(binary: Path, dcc_root: Path, yaml_path: Path, workdir: Path, *, timeout_s: int = 3600) -> tuple[str, str, list[str]]:
+def run_simulator(
+    binary: Path,
+    dcc_root: Path,
+    yaml_path: Path,
+    workdir: Path,
+    *,
+    timeout_s: int = 3600,
+) -> tuple[str, str, list[str]]:
     # The AttAcc trace recorder writes ./temp/log/attacc_bank/cmd.log.
     (workdir / "temp" / "log" / "attacc_bank").mkdir(parents=True, exist_ok=True)
     libdir = _libdir(binary)
     command = [str(binary), "-f", str(yaml_path)]
     image = os.environ.get("ATTACC_RAMULATOR_IMAGE")
-    env = dict(os.environ, LD_LIBRARY_PATH=f"{libdir}:{os.environ.get('LD_LIBRARY_PATH', '')}")
+    env = dict(
+        os.environ, LD_LIBRARY_PATH=f"{libdir}:{os.environ.get('LD_LIBRARY_PATH', '')}"
+    )
     if image:
         mounts = {str(dcc_root): "ro", str(workdir): "rw"}
         for path in (binary.parent, libdir):
             if not str(path).startswith(str(dcc_root)):
                 mounts[str(path)] = "ro"
-        docker = ["docker", "run", "--rm", "-w", str(workdir), "-e", f"LD_LIBRARY_PATH={libdir}"]
+        docker = [
+            "docker",
+            "run",
+            "--rm",
+            "-w",
+            str(workdir),
+            "-e",
+            f"LD_LIBRARY_PATH={libdir}",
+        ]
         for path, mode in mounts.items():
             docker += ["-v", f"{path}:{path}:{mode}"]
         command = docker + [image] + command
     try:
-        result = subprocess.run(command, cwd=workdir, env=env, capture_output=True, text=True, timeout=timeout_s)
+        result = subprocess.run(
+            command,
+            cwd=workdir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
     except subprocess.TimeoutExpired as error:
         raise SimulatorFailure(
             f"ramulator2-AttAcc timed out after {timeout_s} s: {shlex.join(command)}",
-            {"command": shlex.join(command), "timeout_s": timeout_s, "returncode": None,
-             "stdout": (error.stdout or b"").decode(errors="replace") if isinstance(error.stdout, bytes) else (error.stdout or ""),
-             "stderr": (error.stderr or b"").decode(errors="replace") if isinstance(error.stderr, bytes) else (error.stderr or "")},
+            {
+                "command": shlex.join(command),
+                "timeout_s": timeout_s,
+                "returncode": None,
+                "stdout": (
+                    (error.stdout or b"").decode(errors="replace")
+                    if isinstance(error.stdout, bytes)
+                    else (error.stdout or "")
+                ),
+                "stderr": (
+                    (error.stderr or b"").decode(errors="replace")
+                    if isinstance(error.stderr, bytes)
+                    else (error.stderr or "")
+                ),
+            },
         ) from error
     if result.returncode != 0:
         raise SimulatorFailure(
             f"ramulator2-AttAcc failed ({result.returncode}): {shlex.join(command)}\n{result.stderr[-2000:]}",
-            {"command": shlex.join(command), "returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr},
+            {
+                "command": shlex.join(command),
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            },
         )
     return result.stdout, result.stderr, command
 
@@ -367,11 +450,22 @@ def _retain(workdir: Path, artifacts, extra: dict):
     for name, text in extra.items():
         if text is None:
             continue
-        (artifacts / name).write_text(text if isinstance(text, str) else json.dumps(text, indent=1, default=str))
+        (artifacts / name).write_text(
+            text if isinstance(text, str) else json.dumps(text, indent=1, default=str)
+        )
     return str(artifacts)
 
 
-def simulate_program(dcc_root: Path, binary: Path, family: str, program, *, keep_dir=None, artifacts=None, timeout_s: int = 3600) -> dict:
+def simulate_program(
+    dcc_root: Path,
+    binary: Path,
+    family: str,
+    program,
+    *,
+    keep_dir=None,
+    artifacts=None,
+    timeout_s: int = 3600,
+) -> dict:
     """Write the program's trace, check it against the program, simulate it.
 
     On any failure (trace mismatch, simulator error or timeout) the trace,
@@ -385,19 +479,40 @@ def simulate_program(dcc_root: Path, binary: Path, family: str, program, *, keep
         trace = write_trace(dcc_root, family, program.tiling.dcc_tiling(), workdir)
         check = trace_check.check_trace(trace, program)
         if not check["match"]:
-            failure = {"stage": "trace-check", "error": "the generator's trace differs from the selected program", "trace_check": check}
-            raise TraceMismatch(f"trace differs from the compiled program at command {check['first_difference']} (totals_match={check['totals_match']})")
+            failure = {
+                "stage": "trace-check",
+                "error": "the generator's trace differs from the selected program",
+                "trace_check": check,
+            }
+            raise TraceMismatch(
+                f"trace differs from the compiled program at command {check['first_difference']} (totals_match={check['totals_match']})"
+            )
         yaml_path = trace.with_suffix(".yaml")
         started = time.perf_counter()
         try:
-            stdout, stderr, command = run_simulator(binary, dcc_root, yaml_path, workdir, timeout_s=timeout_s)
+            stdout, stderr, command = run_simulator(
+                binary, dcc_root, yaml_path, workdir, timeout_s=timeout_s
+            )
         except SimulatorFailure as error:
-            failure = {"stage": "simulator", "error": str(error), **error.details, "trace_check": check}
+            failure = {
+                "stage": "simulator",
+                "error": str(error),
+                **error.details,
+                "trace_check": check,
+            }
             raise
         elapsed = time.perf_counter() - started
         found = re.search(r"memory_system_cycles:\s*(\d+)", stdout)
         if found is None:
-            failure = {"stage": "simulator-output", "error": "ramulator2-AttAcc printed no memory_system_cycles", "command": shlex.join(command), "returncode": 0, "stdout": stdout, "stderr": stderr, "trace_check": check}
+            failure = {
+                "stage": "simulator-output",
+                "error": "ramulator2-AttAcc printed no memory_system_cycles",
+                "command": shlex.join(command),
+                "returncode": 0,
+                "stdout": stdout,
+                "stderr": stderr,
+                "trace_check": check,
+            }
             raise RuntimeError("ramulator2-AttAcc printed no memory_system_cycles")
         cycles = int(found.group(1))
         record = {
@@ -413,7 +528,9 @@ def simulate_program(dcc_root: Path, binary: Path, family: str, program, *, keep
             "simulator_wall_s": elapsed,
             "stdout_tail": stdout[-600:],
         }
-        retained = _retain(workdir, artifacts, {"stdout.txt": stdout, "stderr.txt": stderr})
+        retained = _retain(
+            workdir, artifacts, {"stdout.txt": stdout, "stderr.txt": stderr}
+        )
         if retained:
             record["artifacts"] = retained
         if keep_dir:
@@ -421,9 +538,27 @@ def simulate_program(dcc_root: Path, binary: Path, family: str, program, *, keep
         return record
     except Exception as error:
         if failure is None:
-            failure = {"stage": "trace-generation" if not (workdir / "kernel.trace").is_file() else "unknown", "error": f"{type(error).__name__}: {error}"}
-        failure.update({"family": family, "tiling": program.tiling.dcc_tiling(), "kernel": program.kernel.manifest(), "workdir": str(workdir)})
-        extra = {"stdout.txt": failure.get("stdout"), "stderr.txt": failure.get("stderr"), "failure.json": failure}
+            failure = {
+                "stage": (
+                    "trace-generation"
+                    if not (workdir / "kernel.trace").is_file()
+                    else "unknown"
+                ),
+                "error": f"{type(error).__name__}: {error}",
+            }
+        failure.update(
+            {
+                "family": family,
+                "tiling": program.tiling.dcc_tiling(),
+                "kernel": program.kernel.manifest(),
+                "workdir": str(workdir),
+            }
+        )
+        extra = {
+            "stdout.txt": failure.get("stdout"),
+            "stderr.txt": failure.get("stderr"),
+            "failure.json": failure,
+        }
         retained = _retain(workdir, artifacts, extra)
         if retained is None:
             # Nowhere else to retain the inputs: keep the work directory and
@@ -442,22 +577,68 @@ def simulate_program(dcc_root: Path, binary: Path, family: str, program, *, keep
 # --------------------------------------------------------------------- #
 
 
-def time_shape(dcc_root, binary, family, shape, *, tiling=None, fixed_baseline=False, artifacts=None, keep=False, skip_selected=False) -> list[dict]:
+def time_shape(
+    dcc_root,
+    binary,
+    family,
+    shape,
+    *,
+    tiling=None,
+    fixed_baseline=False,
+    artifacts=None,
+    keep=False,
+    skip_selected=False,
+) -> list[dict]:
     """Records for one kernel shape: the shared-pipeline selection and,
     when asked, the forced tiling and the fixed-form baseline."""
     compiled = compile_selected(family, shape)
     program = compiled["program"]
     records = []
-    base = {"kind": "simulator-timing-only", "family": family, "shape": list(shape), "kernel": program.kernel.manifest()}
+    base = {
+        "kind": "simulator-timing-only",
+        "family": family,
+        "shape": list(shape),
+        "kernel": program.kernel.manifest(),
+    }
     art = Path(artifacts) if artifacts else None
     label = f"{family}_{'x'.join(str(d) for d in shape)}"
     if not skip_selected:
-        rec = simulate_program(dcc_root, binary, family, program, keep_dir=keep, artifacts=art / label / "selected" if art else None)
-        records.append({**base, "selection": "shared-pipeline", "analytical_estimate_cycles": compiled["estimate_cycles"], "provenance": compiled["provenance"], **rec})
+        rec = simulate_program(
+            dcc_root,
+            binary,
+            family,
+            program,
+            keep_dir=keep,
+            artifacts=art / label / "selected" if art else None,
+        )
+        records.append(
+            {
+                **base,
+                "selection": "shared-pipeline",
+                "analytical_estimate_cycles": compiled["estimate_cycles"],
+                "provenance": compiled["provenance"],
+                **rec,
+            }
+        )
     if tiling is not None:
         forced = forced_program(program, tiling)
-        rec = simulate_program(dcc_root, binary, family, forced, keep_dir=keep, artifacts=art / label / "forced" if art else None)
-        records.append({**base, "selection": "forced-tiling", "note": "controlled reference/ablation of a given tiling; not shared-pipeline selection evidence", "analytical_estimate_cycles": None, **rec})
+        rec = simulate_program(
+            dcc_root,
+            binary,
+            family,
+            forced,
+            keep_dir=keep,
+            artifacts=art / label / "forced" if art else None,
+        )
+        records.append(
+            {
+                **base,
+                "selection": "forced-tiling",
+                "note": "controlled reference/ablation of a given tiling; not shared-pipeline selection evidence",
+                "analytical_estimate_cycles": None,
+                **rec,
+            }
+        )
     if fixed_baseline:
         candidates = fixed_form_tilings(program)
         if not candidates:
@@ -465,19 +646,41 @@ def time_shape(dcc_root, binary, family, shape, *, tiling=None, fixed_baseline=F
         runs = []
         for index, candidate in enumerate(candidates):
             cand_program = forced_program(program, candidate)
-            rec = simulate_program(dcc_root, binary, family, cand_program, keep_dir=keep, artifacts=art / label / f"fixed-{index}" if art else None)
+            rec = simulate_program(
+                dcc_root,
+                binary,
+                family,
+                cand_program,
+                keep_dir=keep,
+                artifacts=art / label / f"fixed-{index}" if art else None,
+            )
             runs.append(rec)
         best = min(runs, key=lambda r: r["memory_system_cycles"])
-        records.append({
-            **base,
-            "selection": "fixed-form-baseline",
-            "note": "the paper's fixed AttAcc tiling baseline: DCC predictor.py's rule, the minimum simulated time over the fixed-form candidates; a controlled reference",
-            "analytical_estimate_cycles": None,
-            "tiling": best["tiling"],
-            "memory_system_cycles": best["memory_system_cycles"],
-            "milliseconds": best["milliseconds"],
-            "fixed_form_candidates": [{k: r[k] for k in ("tiling", "memory_system_cycles", "milliseconds", "trace_sha256", "artifacts") if k in r} for r in runs],
-        })
+        records.append(
+            {
+                **base,
+                "selection": "fixed-form-baseline",
+                "note": "the paper's fixed AttAcc tiling baseline: DCC predictor.py's rule, the minimum simulated time over the fixed-form candidates; a controlled reference",
+                "analytical_estimate_cycles": None,
+                "tiling": best["tiling"],
+                "memory_system_cycles": best["memory_system_cycles"],
+                "milliseconds": best["milliseconds"],
+                "fixed_form_candidates": [
+                    {
+                        k: r[k]
+                        for k in (
+                            "tiling",
+                            "memory_system_cycles",
+                            "milliseconds",
+                            "trace_sha256",
+                            "artifacts",
+                        )
+                        if k in r
+                    }
+                    for r in runs
+                ],
+            }
+        )
     return records
 
 
@@ -486,14 +689,31 @@ def main(argv=None) -> int:
     shape = parser.add_mutually_exclusive_group(required=True)
     shape.add_argument("--gemv", nargs=3, type=int, metavar=("H", "K", "N"))
     shape.add_argument("--attention", nargs=3, type=int, metavar=("H", "D", "L"))
-    shape.add_argument("--row", choices=sorted(PAPER_ROWS), help="a paper kernel row (all its shapes)")
-    parser.add_argument("--tiling", help="also time this tiling (JSON) as a controlled reference")
-    parser.add_argument("--fixed-baseline", action="store_true", help="also time the fixed-form baseline (every fixed-form candidate)")
-    parser.add_argument("--skip-selected", action="store_true", help="do not time the shared-pipeline selection (references only)")
+    shape.add_argument(
+        "--row", choices=sorted(PAPER_ROWS), help="a paper kernel row (all its shapes)"
+    )
+    parser.add_argument(
+        "--tiling", help="also time this tiling (JSON) as a controlled reference"
+    )
+    parser.add_argument(
+        "--fixed-baseline",
+        action="store_true",
+        help="also time the fixed-form baseline (every fixed-form candidate)",
+    )
+    parser.add_argument(
+        "--skip-selected",
+        action="store_true",
+        help="do not time the shared-pipeline selection (references only)",
+    )
     parser.add_argument("--limit", type=int, help="only the first N shapes of a row")
-    parser.add_argument("--artifacts", help="retain trace, configuration and output per run under this directory")
+    parser.add_argument(
+        "--artifacts",
+        help="retain trace, configuration and output per run under this directory",
+    )
     parser.add_argument("--out", help="write the session record (JSON)")
-    parser.add_argument("--keep", action="store_true", help="keep the temporary directories")
+    parser.add_argument(
+        "--keep", action="store_true", help="keep the temporary directories"
+    )
     args = parser.parse_args(argv)
     if args.row:
         family, shapes = PAPER_ROWS[args.row]
@@ -506,27 +726,57 @@ def main(argv=None) -> int:
     dcc_root = _dcc_root()
     binary = _simulator(dcc_root)
     session = environment_record(dcc_root, binary)
-    session.update({"paper_row": args.row, "family": family, "runs": [], "failures": []})
+    session.update(
+        {"paper_row": args.row, "family": family, "runs": [], "failures": []}
+    )
     tiling = json.loads(args.tiling) if args.tiling else None
     for shape in shapes:
         try:
-            records = time_shape(dcc_root, binary, family, shape, tiling=tiling, fixed_baseline=args.fixed_baseline, artifacts=args.artifacts, keep=args.keep, skip_selected=args.skip_selected)
+            records = time_shape(
+                dcc_root,
+                binary,
+                family,
+                shape,
+                tiling=tiling,
+                fixed_baseline=args.fixed_baseline,
+                artifacts=args.artifacts,
+                keep=args.keep,
+                skip_selected=args.skip_selected,
+            )
         except (TraceMismatch, RuntimeError) as error:
-            session["failures"].append({"shape": list(shape), "error": f"{type(error).__name__}: {error}", "retained": getattr(error, "retained", None)})
-            print(f"FAIL {family} {shape}: {error} (retained: {getattr(error, 'retained', None)})", file=sys.stderr, flush=True)
+            session["failures"].append(
+                {
+                    "shape": list(shape),
+                    "error": f"{type(error).__name__}: {error}",
+                    "retained": getattr(error, "retained", None),
+                }
+            )
+            print(
+                f"FAIL {family} {shape}: {error} (retained: {getattr(error, 'retained', None)})",
+                file=sys.stderr,
+                flush=True,
+            )
             continue
         session["runs"].extend(records)
         for rec in records:
-            print(f"{family} {shape} {rec['selection']:20s} tiling={rec['tiling']} cycles={rec['memory_system_cycles']} ms={rec['milliseconds']:.6f}", flush=True)
+            print(
+                f"{family} {shape} {rec['selection']:20s} tiling={rec['tiling']} cycles={rec['memory_system_cycles']} ms={rec['milliseconds']:.6f}",
+                flush=True,
+            )
     selected = [r for r in session["runs"] if r["selection"] == "shared-pipeline"]
     if selected:
         session["summary"] = {
             "shapes": len(selected),
-            "mean_milliseconds_selected": sum(r["milliseconds"] for r in selected) / len(selected),
+            "mean_milliseconds_selected": sum(r["milliseconds"] for r in selected)
+            / len(selected),
         }
-        baselines = [r for r in session["runs"] if r["selection"] == "fixed-form-baseline"]
+        baselines = [
+            r for r in session["runs"] if r["selection"] == "fixed-form-baseline"
+        ]
         if baselines:
-            session["summary"]["mean_milliseconds_fixed_baseline"] = sum(r["milliseconds"] for r in baselines) / len(baselines)
+            session["summary"]["mean_milliseconds_fixed_baseline"] = sum(
+                r["milliseconds"] for r in baselines
+            ) / len(baselines)
     if args.out:
         Path(args.out).write_text(json.dumps(session, indent=1, default=str))
     else:

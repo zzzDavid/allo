@@ -798,7 +798,9 @@ def launch_program_for(contract, group, coordinates, reduction, *, repetitions):
     if len(set(group)) != len(group) or any(
         not 0 <= int(index) < len(contract.streams) for index in group
     ):
-        raise ValueError(f"streams {tuple(group)} are not distinct streams of the contract")
+        raise ValueError(
+            f"streams {tuple(group)} are not distinct streams of the contract"
+        )
     if contract.pair_affine and sorted(group) != list(range(len(contract.streams))):
         raise ValueError(
             f"a pair-affine epilogue needs both streams in one launch, got {tuple(group)}"
@@ -833,7 +835,9 @@ def launch_program_for(contract, group, coordinates, reduction, *, repetitions):
     begin, end = (int(v) for v in coordinates)
     tiles = {
         (row_begin // terms, row_end // terms)
-        for row_begin, row_end in (tiling.tile_bounds(t) for t in range(tiling.tile_count))
+        for row_begin, row_end in (
+            tiling.tile_bounds(t) for t in range(tiling.tile_count)
+        )
     }
     if (begin, end) not in tiles:
         raise ValueError(
@@ -1276,7 +1280,9 @@ class APUG2SourceProgram:
         # Derive, validate and price first; install only when everything
         # succeeded, so a failure leaves the previous plan, graph and
         # repetition count in place (the validated artifact).
-        rebuilt = rebuild_apu_g2_launch_plan(self.contract, self.plan, repetitions=repetitions)
+        rebuilt = rebuild_apu_g2_launch_plan(
+            self.contract, self.plan, repetitions=repetitions
+        )
         graph = None
         if self.cost is not None:
             graph = price_apu_g2_launch_plan(rebuilt, self.target, self.cost)
@@ -1291,7 +1297,9 @@ class APUG2SourceProgram:
             if layout is not None:
                 from ..spmw_candidate import check_graph_consistency
 
-                for placement in layout if isinstance(layout, (list, tuple)) else [layout]:
+                for placement in (
+                    layout if isinstance(layout, (list, tuple)) else [layout]
+                ):
                     check_graph_consistency(placement, graph)
         self._repetitions = repetitions
         self.plan = rebuilt
@@ -1542,7 +1550,10 @@ def check_launch_recipes(contract, plan) -> None:
             "output_type": (program.output_type, expected.output_type),
             "output_shape": (tuple(program.output_shape), tuple(expected.output_shape)),
             "epilogue": (program.epilogue, expected.epilogue),
-            "structural_fingerprint": (program.structural_fingerprint, expected.structural_fingerprint),
+            "structural_fingerprint": (
+                program.structural_fingerprint,
+                expected.structural_fingerprint,
+            ),
             "accumulator": (launch.accumulator, accumulator),
             "final": (bool(launch.final), bool(final)),
         }
@@ -1552,7 +1563,10 @@ def check_launch_recipes(contract, plan) -> None:
                 f"Gemini-II launch {index} (streams {tuple(launch.streams)}, coordinates "
                 f"{tuple(launch.coordinates)}, reduction {tuple(launch.reduction)}) carries "
                 "a recipe the contract does not imply for that partition: "
-                + "; ".join(f"{name} realized {a!r} vs derived {b!r}" for name, (a, b) in wrong.items())
+                + "; ".join(
+                    f"{name} realized {a!r} vs derived {b!r}"
+                    for name, (a, b) in wrong.items()
+                )
             )
         key = (tuple(launch.streams), tuple(launch.coordinates))
         chains.setdefault(key, []).append(tuple(launch.reduction))
@@ -1561,9 +1575,12 @@ def check_launch_recipes(contract, plan) -> None:
                 finals.setdefault(int(stream), []).append(tuple(launch.coordinates))
     for key, ranges in chains.items():
         expected_ranges = sorted(ranges)
-        if ranges != expected_ranges or any(
-            ranges[i][1] != ranges[i + 1][0] for i in range(len(ranges) - 1)
-        ) or ranges[0][0] != 0 or ranges[-1][1] != contract.streams[key[0][0]].reduction_extent:
+        if (
+            ranges != expected_ranges
+            or any(ranges[i][1] != ranges[i + 1][0] for i in range(len(ranges) - 1))
+            or ranges[0][0] != 0
+            or ranges[-1][1] != contract.streams[key[0][0]].reduction_extent
+        ):
             raise RuntimeError(
                 f"Gemini-II launches of tile {key} do not chain the reduction in order "
                 f"from 0 to the contract's extent: {ranges}"
@@ -1585,9 +1602,13 @@ def check_launch_recipes(contract, plan) -> None:
             )
 
 
-
-
-_RECIPE_FIELDS = ("reduction_extent", "input_types", "output_type", "output_shape", "epilogue")
+_RECIPE_FIELDS = (
+    "reduction_extent",
+    "input_types",
+    "output_type",
+    "output_shape",
+    "epilogue",
+)
 
 
 def rebuild_apu_g2_launch_plan(contract, plan, *, repetitions):
@@ -1636,7 +1657,9 @@ def rebuild_apu_g2_launch_plan(contract, plan, *, repetitions):
                 final=launch.final,
             )
         )
-    rebuilt = APUG2LaunchPlan(plan.name, plan.fusion, plan.reduction_chunks, tuple(launches))
+    rebuilt = APUG2LaunchPlan(
+        plan.name, plan.fusion, plan.reduction_chunks, tuple(launches)
+    )
     try:
         check_launch_recipes(contract, rebuilt)
     except RuntimeError as error:

@@ -67,7 +67,9 @@ def normalize_resource_budget(value, target=None) -> dict | None:
     for unit, cap in value.items():
         name = str(unit)
         if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
-            raise ValueError(f"resources[{name!r}] must be a positive integer, got {cap!r}")
+            raise ValueError(
+                f"resources[{name!r}] must be a positive integer, got {cap!r}"
+            )
         if target is not None:
             try:
                 declared = target.unit(name)
@@ -78,16 +80,21 @@ def normalize_resource_budget(value, target=None) -> dict | None:
                 ) from error
             supported = supported_budget_units(target)
             if name not in supported:
-                enforced = ", ".join(
-                    f"{t}: {', '.join(sorted(units))}"
-                    for t, units in sorted(BUDGET_UNITS.items())
-                ) or "none"
+                enforced = (
+                    ", ".join(
+                        f"{t}: {', '.join(sorted(units))}"
+                        for t, units in sorted(BUDGET_UNITS.items())
+                    )
+                    or "none"
+                )
                 raise ValueError(
                     f"resources[{name!r}]: target {getattr(target, 'name', None)!r} "
                     f"enforces no budget on {name!r} (its enumeration and realization "
                     f"check do not read it); budgets are enforced for {enforced}"
                 )
-            count = math.prod(int(v) for v in getattr(declared, "axes", {}).values()) or 1
+            count = (
+                math.prod(int(v) for v in getattr(declared, "axes", {}).values()) or 1
+            )
             if cap > count:
                 raise ValueError(
                     f"resources[{name!r}] = {cap} exceeds the {count} {name} unit(s) "

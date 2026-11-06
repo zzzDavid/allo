@@ -140,7 +140,9 @@ STAGE_ROW_CHANGE_CYCLES = 16 + 14 + 10 - 4  # tWR + tRP + tRCDWR - tCCDL
 STAGE_ROW_VISIT_CYCLES = 16 + 14 + 10  # tWR + tRP + tRCDWR
 
 
-def samsung_staging_schedule(passes, tiles, fibers, half_fibers, G, E, cols_per_row, blocks):
+def samsung_staging_schedule(
+    passes, tiles, fibers, half_fibers, G, E, cols_per_row, blocks
+):
     """Channel-0 staging writes of the conductor as (bank, row) per burst, in
     issue order: for each pass, tile and PIM block, ``G*E`` consecutive
     columns of the tile at ``(pass * tiles_on_fiber + local) * G*E``, in the
@@ -192,8 +194,10 @@ def samsung_staging_cycles(sequence) -> dict:
             last_row[bank] = row
     bus = len(sequence) * STAGE_WRITE_CYCLES + exposed * STAGE_ROW_CHANGE_CYCLES
     bank = max(
-        (visits[b] * STAGE_ROW_VISIT_CYCLES + writes_per_bank[b] * STAGE_WRITE_CYCLES
-         for b in visits),
+        (
+            visits[b] * STAGE_ROW_VISIT_CYCLES + writes_per_bank[b] * STAGE_WRITE_CYCLES
+            for b in visits
+        ),
         default=0,
     )
     return {
@@ -206,8 +210,16 @@ def samsung_staging_cycles(sequence) -> dict:
 
 
 def samsung_staging_share(
-    rows, reduction, *, G, E, lanes, cols_per_row=32, split_rows=False,
-    temporal=False, columns=1,
+    rows,
+    reduction,
+    *,
+    G,
+    E,
+    lanes,
+    cols_per_row=32,
+    split_rows=False,
+    temporal=False,
+    columns=1,
 ) -> dict:
     """One work item's share of the program's first matrix staging, so that
     the shares of a kernel's work items partition the conductor's staging
@@ -295,10 +307,16 @@ def samsung_cost(target):
         columns = int(extents[1]) if len(extents) == 3 else 1
         lanes16 = int(target.grf_b.width) // 16
         stage(
-            event, ctx,
+            event,
+            ctx,
             samsung_staging_share(
-                rows, reduction, G=int(target.grf_b.slots), E=int(target.grf_a.slots),
-                lanes=lanes16, temporal=True, columns=columns,
+                rows,
+                reduction,
+                G=int(target.grf_b.slots),
+                E=int(target.grf_a.slots),
+                lanes=lanes16,
+                temporal=True,
+                columns=columns,
             ),
         )
         passes = _ceil_div(rows, lanes16) * columns
@@ -343,10 +361,15 @@ def samsung_cost(target):
         extents_stage = tuple(event.metrics.get("loop_extents", ()) or ())
         rows_stage = int(extents_stage[0]) if len(extents_stage) > 1 else 1
         stage(
-            event, ctx,
+            event,
+            ctx,
             samsung_staging_share(
-                rows_stage, reduction, G=int(target.grf_b.slots),
-                E=int(target.grf_a.slots), lanes=lanes, split_rows=split_rows,
+                rows_stage,
+                reduction,
+                G=int(target.grf_b.slots),
+                E=int(target.grf_a.slots),
+                lanes=lanes,
+                split_rows=split_rows,
             ),
         )
         occupy_compute(event, ctx, latency, MAC_CYCLES)

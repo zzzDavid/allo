@@ -290,8 +290,12 @@ class AimHostStage(AimOp):
             raise ValueError(f"host stage {self.stage!r} declares no operation")
         if not self.inputs or not self.outputs:
             raise ValueError(f"host stage {self.stage!r} needs inputs and outputs")
-        object.__setattr__(self, "inputs", tuple((n, tuple(sh), int(b)) for n, sh, b in self.inputs))
-        object.__setattr__(self, "outputs", tuple((n, tuple(sh), int(b)) for n, sh, b in self.outputs))
+        object.__setattr__(
+            self, "inputs", tuple((n, tuple(sh), int(b)) for n, sh, b in self.inputs)
+        )
+        object.__setattr__(
+            self, "outputs", tuple((n, tuple(sh), int(b)) for n, sh, b in self.outputs)
+        )
 
     @staticmethod
     def _bytes(triples) -> int:
@@ -2660,7 +2664,9 @@ def reference_outputs(details: dict, matrix, vector, *, arithmetic="bf16"):
     import numpy as np
 
     if details.get("reduction_partition"):
-        partials = reference_partial_sums(details, matrix, vector, arithmetic=arithmetic)
+        partials = reference_partial_sums(
+            details, matrix, vector, arithmetic=arithmetic
+        )
         dtype = np.int64 if arithmetic == "exact" else np.float32
         merged = np.sum(partials.astype(dtype), axis=-2, dtype=dtype)
         return merged if arithmetic == "exact" else bf16_round(merged)
@@ -2675,7 +2681,9 @@ def reference_outputs(details: dict, matrix, vector, *, arithmetic="bf16"):
             f"logical scalar MAC ({issued} of {logical})"
         )
     if details.get("coverage_missing"):
-        raise ValueError(f"lowered contraction {details.get('name')!r} leaves MACs uncovered")
+        raise ValueError(
+            f"lowered contraction {details.get('name')!r} leaves MACs uncovered"
+        )
     dtype = np.int64 if exact else np.float32
     weights = np.asarray(matrix)
     inputs = np.asarray(vector)
@@ -2692,7 +2700,8 @@ def reference_outputs(details: dict, matrix, vector, *, arithmetic="bf16"):
     ):
         raise ValueError("operands do not match the lowered contraction shape")
     if exact and not (
-        np.issubdtype(weights.dtype, np.integer) and np.issubdtype(inputs.dtype, np.integer)
+        np.issubdtype(weights.dtype, np.integer)
+        and np.issubdtype(inputs.dtype, np.integer)
     ):
         raise ValueError("exact arithmetic needs integer operands")
     rounding = (lambda values: values) if exact else bf16_round

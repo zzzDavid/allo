@@ -44,13 +44,26 @@ def _profiles(target, built):
     out = {}
     for name, placement in zip(("attention_qk", "attention_sv"), tp._placements(built)):
         operation = aim_costs._contraction_record(placement.extra)
-        profile = aim_lowering.aim_contraction_profile(operation, geometry, aim_costs._sbk_banks(placement.extra, geometry))
-        out[name] = (placement, profile, aim_costs.contraction_profile_charges(profile), aim_costs._contraction_profile_cycles(placement.extra, geometry))
+        profile = aim_lowering.aim_contraction_profile(
+            operation, geometry, aim_costs._sbk_banks(placement.extra, geometry)
+        )
+        out[name] = (
+            placement,
+            profile,
+            aim_costs.contraction_profile_charges(profile),
+            aim_costs._contraction_profile_cycles(placement.extra, geometry),
+        )
     return out
 
 
 def test_constants_are_the_simulator_timings():
-    assert aim_costs.N_RTP == 12 and aim_costs.N_RP == 32 and aim_costs.N_RCD_RD_MAC == 56 and aim_costs.N_CCD == 2 and aim_costs.N_MODCH == 32
+    assert (
+        aim_costs.N_RTP == 12
+        and aim_costs.N_RP == 32
+        and aim_costs.N_RCD_RD_MAC == 56
+        and aim_costs.N_CCD == 2
+        and aim_costs.N_MODCH == 32
+    )
     assert aim_costs.CMD_RD_REG == 3  # nCLREG + nBL
     assert aim_costs.CMD_WR_GB == 3  # nCWLGB + nBL
     assert aim_costs.BATCH_MAPPING_ROW_ACTIVATE_CYCLES == 100
@@ -65,10 +78,21 @@ def test_single_group_contraction_charges(target):
     attention, program = tp.build_attention(1, 128)
     built = tp.compile_program(attention, program, target, budget=tp.BUDGET)
     placement, profile, charges, total = _profiles(target, built)["attention_qk"]
-    assert tp._knobs(placement.mode)["batch_mapping"] == "flattened" and tp._knobs(placement.mode)["reuse_group"] == "1"
+    assert (
+        tp._knobs(placement.mode)["batch_mapping"] == "flattened"
+        and tp._knobs(placement.mode)["reuse_group"] == "1"
+    )
     assert profile["counts"] == {"WR_GB": 1, "WR_BIAS": 1, "MAC_ABK": 1, "RD_MAC": 1}
-    assert profile["wr_gb_columns"] == 8 and profile["mode_switches"] == 3 and profile["register_read_runs"] == 1
-    assert profile["first_activations"] == 1 and profile["first_columns"] == 8 and profile["row_switches"] == 0
+    assert (
+        profile["wr_gb_columns"] == 8
+        and profile["mode_switches"] == 3
+        and profile["register_read_runs"] == 1
+    )
+    assert (
+        profile["first_activations"] == 1
+        and profile["first_columns"] == 8
+        and profile["row_switches"] == 0
+    )
     assert charges == {
         "mac_continuing": 0,
         "mac_first_activations": 56 + 2 * 7,
@@ -90,17 +114,47 @@ def test_channel_batched_split_contraction_charges(target):
     RD_MAC; the mode changes once into register mode, once to the MACs and
     once back."""
     attention, program = tp.build_attention(1, 128)
-    ranking = tp.compile_program(attention, program, target, budget=tp.BUDGET, virtual=True)
+    ranking = tp.compile_program(
+        attention, program, target, budget=tp.BUDGET, virtual=True
+    )
     variants = tp.budget_variants(target, ranking)
-    built = tp.compile_variant(attention, program, target, variants, variants.per_partition[4], budget=tp.BUDGET)
+    built = tp.compile_variant(
+        attention,
+        program,
+        target,
+        variants,
+        variants.per_partition[4],
+        budget=tp.BUDGET,
+    )
     placement, profile, charges, total = _profiles(target, built)["attention_sv"]
-    assert tp._knobs(placement.mode)["batch_mapping"] == "channels" and tp.partitions_of(placement.mode) == 4
+    assert (
+        tp._knobs(placement.mode)["batch_mapping"] == "channels"
+        and tp.partitions_of(placement.mode) == 4
+    )
     assert profile["counts"] == {"WR_GB": 1, "WR_BIAS": 8, "MAC_ABK": 8, "RD_MAC": 8}
-    assert (profile["first_activations"], profile["run_switches"], profile["group_switches"]) == (1, 7, 0)
-    assert profile["first_columns"] == 2 and profile["run_switch_columns"] == 14 and profile["continuing_columns"] == 0
-    assert profile["mode_switches"] == 3 and profile["register_read_runs"] == 1 and profile["wr_gb_columns"] == 2
-    assert charges["mac_first_activations"] == 56 + 2 and charges["mac_run_switches"] == 7 * (100 + 2)
-    assert charges["wr_gb"] == 3 + 4 and charges["wr_bias"] == 16 and charges["register_reads"] == 8 * 3 + 1
+    assert (
+        profile["first_activations"],
+        profile["run_switches"],
+        profile["group_switches"],
+    ) == (1, 7, 0)
+    assert (
+        profile["first_columns"] == 2
+        and profile["run_switch_columns"] == 14
+        and profile["continuing_columns"] == 0
+    )
+    assert (
+        profile["mode_switches"] == 3
+        and profile["register_read_runs"] == 1
+        and profile["wr_gb_columns"] == 2
+    )
+    assert charges["mac_first_activations"] == 56 + 2 and charges[
+        "mac_run_switches"
+    ] == 7 * (100 + 2)
+    assert (
+        charges["wr_gb"] == 3 + 4
+        and charges["wr_bias"] == 16
+        and charges["register_reads"] == 8 * 3 + 1
+    )
     assert total == 916
 
 
@@ -112,19 +166,45 @@ def test_reuse_groups_pay_two_mode_changes_each(target):
     one reuse group per MAC walks the open row (column pitch only) except
     where a new WR_GB scope starts a new row."""
     attention, program = tp.cent_repaired_program(1, 512)
-    ranking = tp.compile_program(attention, program, target, budget=tp.BUDGET, virtual=True)
+    ranking = tp.compile_program(
+        attention, program, target, budget=tp.BUDGET, virtual=True
+    )
     layouts, _description = tp.cent_repaired_layouts(target, ranking, 1)
-    built = tp.compile_program(attention, program, target, layouts=layouts, budget=tp.BUDGET)
+    built = tp.compile_program(
+        attention, program, target, layouts=layouts, budget=tp.BUDGET
+    )
     profiles = _profiles(target, built)
     _placement, sv, sv_charges, sv_total = profiles["attention_sv"]
-    assert sv["reuse_groups"] == 8 and sv["mode_switches"] == 1 + 2 * 8 and sv["register_read_runs"] == 8
-    assert (sv["first_activations"], sv["run_switches"], sv["group_switches"]) == (1, 0, 7)
+    assert (
+        sv["reuse_groups"] == 8
+        and sv["mode_switches"] == 1 + 2 * 8
+        and sv["register_read_runs"] == 8
+    )
+    assert (sv["first_activations"], sv["run_switches"], sv["group_switches"]) == (
+        1,
+        0,
+        7,
+    )
     assert sv_charges["mac_group_switches"] == 7 * 88 + 2 * sv["group_switch_columns"]
-    assert sv_charges["mode_switches"] == 17 * 32 and sv_charges["register_reads"] == 8 * 3 + 8
+    assert (
+        sv_charges["mode_switches"] == 17 * 32
+        and sv_charges["register_reads"] == 8 * 3 + 8
+    )
     _placement, qk, qk_charges, qk_total = profiles["attention_qk"]
-    assert qk["reuse_groups"] == 32 and qk["mode_switches"] == 1 + 2 * 32 and qk["counts"]["WR_GB"] == 4
-    assert qk["continuing_columns"] == 224 and qk["group_switches"] == 3 and qk["run_switches"] == 0
-    assert qk_charges["mac_continuing"] == 2 * 224 and qk_charges["wr_gb"] == 4 * 3 + 2 * qk["wr_gb_columns"]
+    assert (
+        qk["reuse_groups"] == 32
+        and qk["mode_switches"] == 1 + 2 * 32
+        and qk["counts"]["WR_GB"] == 4
+    )
+    assert (
+        qk["continuing_columns"] == 224
+        and qk["group_switches"] == 3
+        and qk["run_switches"] == 0
+    )
+    assert (
+        qk_charges["mac_continuing"] == 2 * 224
+        and qk_charges["wr_gb"] == 4 * 3 + 2 * qk["wr_gb_columns"]
+    )
     assert sv_total == sum(sv_charges.values()) and qk_total == sum(qk_charges.values())
 
 
@@ -138,12 +218,19 @@ def test_register_commands_are_not_charged_a_mode_change_each(target):
     (tRTP + tRP + tRCD + the further columns); the WR_BIAS per accumulator
     is the same in both."""
     attention, program = tp.cent_repaired_program(1, 512)
-    ranking = tp.compile_program(attention, program, target, budget=tp.BUDGET, virtual=True)
+    ranking = tp.compile_program(
+        attention, program, target, budget=tp.BUDGET, virtual=True
+    )
     _index, scores = tp.kernel_choices(target, ranking)["attention_sv"]
     by_reuse = {}
     for _cycles, mode, placement in scores:
         knobs = tp._knobs(mode)
-        if knobs["bank_scope"] == "abk" and knobs["batch_mapping"] == "channels" and knobs["replica_partitions"] == "8" and tp.partitions_of(mode) == 1:
+        if (
+            knobs["bank_scope"] == "abk"
+            and knobs["batch_mapping"] == "channels"
+            and knobs["replica_partitions"] == "8"
+            and tp.partitions_of(mode) == 1
+        ):
             by_reuse[int(knobs["reuse_group"])] = placement
     geometry = aim_lowering._target_geometry(target)
     one = aim_costs._contraction_profile_cycles(by_reuse[1].extra, geometry)
