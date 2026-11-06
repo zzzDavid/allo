@@ -431,7 +431,23 @@ def _aim_replica_partitions_candidates(ctx: KnobCtx) -> list:
         group_shape = tuple(getattr(scope, "group_shape", ()) or ())
         replicas = math.prod(group_shape) if group_shape else 1
     domain = replica_partition_domain(replicas, channels)
-    if shape is None or shape["input_source"] != "gb":
+    if shape is None:
+        # An elementwise grid.  A replicated one (every work item computes the
+        # same values) may also be realized as a single copy over the whole
+        # device (``p = channels``: one EWMUL over every channel, every host
+        # transfer of its operands and result written once) instead of one
+        # copy per work item; the lowering refuses the single copy when a
+        # device reader needs the per-work-item copies (ISSUES X-19, round 71).
+        grid = (getattr(ctx.base, "extra", {}) or {}).get("aim_elementwise") or {}
+        if (
+            (getattr(ctx.base, "extra", {}) or {}).get("operation_name") == "MUL"
+            and grid.get("replicated")
+            and int(grid.get("work_items") or 1) > 1
+            and channels not in domain
+        ):
+            domain = domain + [channels]
+        return domain
+    if shape["input_source"] != "gb":
         return domain
     # Channels a replica can occupy with work.  A wider group either repeats
     # the same command stream with an identical mask (row_packed, channels)

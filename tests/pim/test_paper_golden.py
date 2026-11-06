@@ -186,18 +186,27 @@ _LEAF_CHECKED = {
 _AIM_DEFAULT_CASES = frozenset(
     {"norm_residual_l128", "attention_l128", "softmax_pim_l128"}
 )
-# Paper rows whose program was corrected after publication (ISSUES X-19,
-# round 25): the decode region's RoPE kernels covered D of the D2 elements
-# the host scatters (a strided half of each partition's data).  The rows keep
-# the paper's values; the live check pins the corrected program's cycles
-# exactly and reports the deviation.  Every value here is above the paper's by
-# the two wider EWMULs (32 cycles) and below CENT's (`docs/release/
+# The AiM rows whose default program is not at the paper's digits (release
+# gate G10, `docs/release/ISSUES.md` X-19 and the round 71 entry): the paper
+# produced the four RoPE-containing rows with RoPE kernels covering D of the
+# D2 elements the host scatters (corrected in round 25), and since round 71 a
+# replicated elementwise grid is realized once over the device instead of
+# once per contraction replica.  The rows keep the paper's values as the
+# comparison baseline; the live check pins the selected program's cycles
+# exactly (ramulator2 is deterministic) and prints the deviation.  Every value
+# here is at or below the paper's and below CENT's (`docs/release/
 # paper_reproduction/inventory.csv`).
-AIM_CORRECTED_PROGRAMS = {
-    "qkvo_rope_l128": 129637,
-    "full_block_l128": 421191,
-    "full_block_l512": 446835,
-    "full_block_l4096": 697348,
+AIM_SELECTED_PROGRAM_CYCLES = {
+    "ffn_activation_l128": 3295,
+    "ffn_complete_l128": 253789,
+    "full_block_l128": 397080,
+    "full_block_l4096": 529019,
+    "full_block_l512": 408823,
+    "norm_residual_l128": 6932,
+    "qkvo_rope_l128": 123448,
+    "softmax_pim_l128": 1686,
+    "softmax_pim_l4096": 49545,
+    "softmax_pim_l512": 6313,
 }
 _APU_V1_BOARD_CASES = frozenset({"histogram"})
 _SAMSUNG_COMPILE_BUDGET_S = 120.0
@@ -353,7 +362,7 @@ def test_aim_cent_paper_cycles(row, aim_sim_gate):
     # The trace carries no data; the region's buffers are not runtime inputs.
     result = compiled.run_backend()
 
-    corrected = AIM_CORRECTED_PROGRAMS.get(row.case_id)
+    corrected = AIM_SELECTED_PROGRAM_CYCLES.get(row.case_id)
     if corrected is not None:
         print(
             f"AIM_GOLDEN {row.case_id} paper={row.expected} corrected_program="

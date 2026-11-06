@@ -656,8 +656,14 @@ class _RowAllocator:
         return region
 
 
-def _distributed_rows(spec: DecodeSpec, elements: int, bank_stride: int) -> int:
-    partitions = spec.channels_per_replica * (BANKS_PER_CHANNEL // bank_stride)
+def _distributed_rows(
+    spec: DecodeSpec, elements: int, bank_stride: int, *, single_copy: bool = False
+) -> int:
+    """Rows a distributed vector occupies per bank: over the replica's
+    channels, or (``single_copy``, the replicated elementwise grids realized
+    once over the device since round 71) over every channel."""
+    channels = len(spec.channels) if single_copy else spec.channels_per_replica
+    partitions = channels * (BANKS_PER_CHANNEL // bank_stride)
     elements_per_partition = _ceil_div(elements, partitions)
     return _ceil_div(elements_per_partition, ROW_ELEMENTS)
 
@@ -723,8 +729,11 @@ def build_layout(spec: DecodeSpec) -> DecodeLayout:
     """Allocate a complete decode block without depending on a case name."""
 
     allocator = _RowAllocator()
+    # The neighbour-bank MAC source is replicated with its contraction; the
+    # elementwise vectors (scale pairs, norm results, RoPE, scores, the FFN
+    # activation) are realized once over the device.
     neighbor_rows = _distributed_rows(spec, spec.D, bank_stride=2)
-    group_rows = _distributed_rows(spec, spec.D, bank_stride=4)
+    group_rows = _distributed_rows(spec, spec.D, bank_stride=4, single_copy=True)
 
     for prefix in ("x", "sa"):
         # The neighbor-bank source is dead after its partial MAC.  Reuse that
@@ -736,14 +745,22 @@ def build_layout(spec: DecodeSpec) -> DecodeLayout:
             "dynamic",
         )
         allocator.allocate(f"rms_{prefix}_output", group_rows, "dynamic")
-    allocator.allocate("rope_q", _distributed_rows(spec, 2 * spec.D, 4), "dynamic")
-    allocator.allocate("rope_k", _distributed_rows(spec, 2 * spec.D, 4), "dynamic")
+    allocator.allocate(
+        "rope_q", _distributed_rows(spec, 2 * spec.D, 4, single_copy=True), "dynamic"
+    )
+    allocator.allocate(
+        "rope_k", _distributed_rows(spec, 2 * spec.D, 4, single_copy=True), "dynamic"
+    )
     allocator.allocate(
         "scores",
-        _distributed_rows(spec, spec.H * spec.max_seq_len, 4),
+        _distributed_rows(spec, spec.H * spec.max_seq_len, 4, single_copy=True),
         "dynamic",
     )
-    allocator.allocate("ffn_activation", _distributed_rows(spec, spec.F, 4), "dynamic")
+    allocator.allocate(
+        "ffn_activation",
+        _distributed_rows(spec, spec.F, 4, single_copy=True),
+        "dynamic",
+    )
 
     allocator.allocate("k_cache", _qk_cache_rows(spec), "dynamic_cache")
 

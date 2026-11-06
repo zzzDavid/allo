@@ -1386,6 +1386,30 @@ class AimCtx(CodegenContext):
                         f"{record.elements} elements ({items} work item(s)); the "
                         f"candidate declares {launch.kind} {launch.instances}"
                     )
+                if record.operation == "mul":
+                    # The copies and channels the record realizes are the
+                    # candidate's: ``replica_partitions`` channels per copy,
+                    # and as many copies as work items unless the candidate
+                    # asks for fewer (a replicated grid realized once over
+                    # the device, X-19 round 71).
+                    requested = (layout.extra or {}).get("replica_partitions")
+                    if requested not in (None, "none"):
+                        channels = int(requested)
+                        total = _target_geometry(self.target).channels
+                        expected_copies = max(items, 1)
+                        if expected_copies * channels > total:
+                            expected_copies = max(1, total // channels)
+                        realized = (
+                            int(getattr(record, "replicas", 0) or 0),
+                            int(getattr(record, "channels_per_replica", 0) or 0),
+                        )
+                        if realized != (expected_copies, channels):
+                            raise RuntimeError(
+                                f"AiM realization lowers {group.name!r} as "
+                                f"{realized[0]} copy(ies) over {realized[1]} channels each; "
+                                f"the candidate declares replica_partitions {channels} for "
+                                f"{items} work item(s) ({expected_copies} copy(ies))"
+                            )
                 home = "banks" if record.operation == "mul" else "gpr"
                 for v in effects.value_layouts:
                     if v.storage != home:
@@ -1651,12 +1675,17 @@ class _Group:
         "reduction_partitions",
         "row_map",
         "split_replicas",
+        "work_items",
     )
 
     def __init__(self, group_id, name):
         self.group_id = group_id
         self.name = name
         self.usages = {}
+        # Work items of the kernel group; ``replicas`` is the number of copies
+        # the lowering realizes (fewer than the work items for a replicated
+        # elementwise grid realized once over the device).
+        self.work_items = 1
         self.contractions = []
         self.sbk_banks = None
         self.elements = 0
@@ -1770,8 +1799,25 @@ class _AimProgramDerivation:
             placement = self.layout_by_scope[_matcher_search_scope(reps[0])]
             group.properties = derive_layout_properties(self.target, placement)
             replicated = group_replicated(matches)
-            group.replicas = len(functions) if replicated else 1
+            copies = len(functions) if replicated else 1
             partitions = group.properties.get("replica_partitions")
+            elementwise = not any(match.target_op_name == "MAC" for match in reps)
+            if partitions not in (None, "none"):
+                partitions = int(partitions)
+                if (
+                    replicated
+                    and elementwise
+                    and copies * partitions > self.geometry.channels
+                ):
+                    # The candidate realizes a replicated elementwise grid with
+                    # fewer copies than work items (one copy over the whole
+                    # device for ``partitions == channels``): every work item
+                    # computes the same values, so one copy is the program;
+                    # `_relocations` refuses it when a device reader needs the
+                    # per-work-item copies (X-19, round 71).
+                    copies = max(1, self.geometry.channels // partitions)
+            group.replicas = copies
+            group.work_items = len(functions)
             group.partitions = (
                 int(partitions)
                 if partitions not in (None, "none")
@@ -2189,7 +2235,22 @@ class _AimProgramDerivation:
                     if key in candidate.usages and not candidate.usages[key].store:
                         reader = candidate
                         break
-            if reader is None or reader.usages[key].kind != "slot":
+            if reader is None:
+                continue
+            from .pim.schedule_search import InfeasibleSchedule
+
+            if group.replicas < group.work_items and (
+                reader.replicas,
+                reader.partitions,
+            ) != (group.replicas, group.partitions):
+                raise InfeasibleSchedule(
+                    f"AiM {group.name}: realized as {group.replicas} copy(ies) over "
+                    f"{group.partitions} channels each, but {reader.name} reads "
+                    f"{self.name_by_key.get(key, key)} from the device in "
+                    f"{reader.replicas} copy(ies) over {reader.partitions} channels; "
+                    "a reduced-copy elementwise result needs readers of the same layout"
+                )
+            if reader.usages[key].kind != "slot":
                 continue
             target_slot = reader.usages[key].slot
             if target_slot == usage.slot:
