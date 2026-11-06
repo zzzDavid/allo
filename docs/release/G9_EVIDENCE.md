@@ -38,7 +38,7 @@ has to read, in pipeline order, with the evidence that exercises it.
 | SK hynix AiM | `_aim_enumerate` 1051 | `spmw_aim._derive_aim_effects` 264 | `AimCtx.check_realization` `allo/spmw_aim.py:1084`; the program derivation's own checks before any record is lowered: `_dense_elementwise_domain` (X-33), `_check_device_value_layouts` (X-32, frames), `_check_physical_liveness` (X-32, cells and row chunks) | native ramulator2 (timing-only) |
 | UPMEM | `_upmem_enumerate` 1180 | `spmw_upmem._derive_upmem_effects` 2150 | `UpmemCtx.check_realization` `allo/spmw_upmem.py:3586` | uPIMulator through the native SDK executor |
 | AttAcc | `_attacc_enumerate` 1387 | `spmw_attacc._derive_attacc_effects` 223 | `AttAccCtx.check_realization` `allo/spmw_attacc.py:349` | Ramulator2-AttAcc traces, analytical composition |
-| GSI APU v1, vector route | `_apu_v1_enumerate` 1227 (`allo/pim/apu_v1_record_frontend.py::apu_v1_program_candidates` 353; `apu_v1_vector_program.program_facts` 720) | the record frontend's contract from the shared facts | `APUv1Ctx.check_realization` `allo/spmw_apu_v1.py:202` | the board (ledag) |
+| GSI APU v1, vector route | `_apu_v1_enumerate` 1227 (`allo/pim/apu_v1_vector_program.py::apu_v1_vector_candidates` 638; `apu_v1_record_frontend.py::apu_v1_program_candidates` 353 for the record route) | `APUv1VectorCandidate.effects` (`apu_v1_vector_program.py` 534) from the contraction analysis of the shared facts | `APUv1Ctx.check_realization` `allo/spmw_apu_v1.py:202`: ABI, value layouts, transfers, launch extents, and since round 79 `_check_vector_compute` (X-35): the neutral operations re-derived from the contraction and the plan, the compute instructions re-derived from the operations, and the rendered calls required in the emitted source | the board (ledag) |
 | GSI APU v1, grouped route | `_apu_v1_grouped_enumerate` 1278 | `apu_v1_grouped_route.apu_v1_grouped_candidate_effects` 596 (`_derive_apu_v1_effects` 804) | `APUv1Ctx._check_grouped_realization` `allo/spmw_apu_v1.py:335` (declaration, independently re-derived packing, map) | the board |
 | GSI Gemini-II | `_apu_g2_enumerate` 1270 (`allo/pim/apu_g2_record_frontend.py::apu_g2_record_candidates` 957; `apu_g2_source_route.APUG2SourceContract` 208) | the record frontend's contract bound to the retained contract and the launch partition (X-25, X-27) | `APUG2Ctx.check_realization` `allo/spmw_apu_g2.py:150` | the zhang-x4 card |
 
@@ -81,7 +81,12 @@ out of the checkout:
 
 ## 6. What remains for G9
 
-The independent source review of rounds 28 to 30 (the `APUv1Program`
-manifest from the retained IR, the slice 5 traces) and the review of this
-packet; the Gemini-I rows at this candidate (the board's `/tmp`); the open
-minor items in `ISSUES.md`.
+The reviewer's round 78 source review of this packet found that the APU v1
+vector route's realization check did not bind the realized computation to
+the retained contraction (X-35); repaired in round 79 (section 3, the
+vector row) with the reviewer's two injections refused and five regressions,
+at the checkout, to be re-executed from the next installed candidate.  Still
+open: the independent review of the repair and of the remaining packet
+(rounds 28 to 30: the `APUv1Program` manifest from the retained IR, the
+slice 5 traces); the Gemini-I rows at a candidate (the board's `/tmp`); the
+open minor items in `ISSUES.md`.
