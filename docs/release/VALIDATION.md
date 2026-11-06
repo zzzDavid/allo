@@ -1677,3 +1677,19 @@ Checkout after `7bce26a`; evidence under
 | `tests/pim/test_apu_v1_realization_binding.py` | 11 passed |
 | APU v1 and shared suites at the checkout | the shared-semantics APU v1 and vector subset, the APU v1 perf suites (build config, cost provenance, distance argmin, hybrid manifest, native reductions, performance, recognizers, reduction policy, scalar surface, tile selection, vector compile), the compile interface, layout problem, legality, portability driver and fingerprint suites, and the layout-selection, transfer-dispatch and work-grid suites: 139 passed (`pytest_apu_v1_suites.log`); the paper APU v1 kernels' compile-only golden test, the matrix multiply at its accumulator-block plan among them: 5 passed (`pytest_golden_apu_v1_compile.log`) |
 | Not done | the installed re-execution (next candidate, which must contain `6ce37ad` and this commit); Gemini-I (the board host's `/tmp`); X-34's pre-registered campaign (the final candidate); the independent review of the repair |
+
+## Round 81 (2026-11-06): the structured emission schedule checked against the plan (X-36 reopened by the reviewer's round 80 injections, repaired)
+
+Checkout after `7fb19a4`; evidence under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r81/`.  The round 80
+rows that call the schedule bound are superseded by this section.
+
+| Check | Result |
+|---|---|
+| The reviewer's round 80 injections (`reviewer-r80/schedule_probe.py`) | at `7fb19a4` (the reviewer): the forged call binding, the early egress and the empty reduction loop all accepted with no rejection; at the repaired checkout the probe no longer imports (its flat `EmissionCall` / `EmissionLine` records were replaced by structured nodes, `schedule_probe_rerun.log`); the three injections ported to the structured nodes are refused (`test_apu_v1_realization_binding.py`: `substitutes 'q' by the register of 'p', which the plan does not allow in this scope`; `stores vr_r before a later compute defines it`; `loop 'reduction_step' (reduction_step) runs 0 times; the plan requires 8`) |
+| The round 78 and 79 probes re-run (`*_rerun.log`) | still refused (the intact program of the transfer probe accepted) |
+| The structured renderer against the parent renderer (`differential_actual.py`, the reviewer's comparator embedding the renderer of `7bce26a`; `differential_actual.log`) | 21 plans (the square, rectangular and large contractions, a GEMV, the paper's matrix multiply with accumulator blocks 1 to 8, the L4 variants and the spatial scatter form) identical byte for byte and valid under the checker: ALL_IDENTICAL_AND_VALID |
+| `tests/pim/test_apu_v1_realization_binding.py` | 15 passed |
+| APU v1 and shared suites at the checkout | the shared-semantics APU v1 and vector subset, the APU v1 perf suites, the compile interface, layout problem, legality, portability driver and fingerprint suites, the layout-selection, transfer-dispatch and work-grid suites and the paper golden rows selected by `apu_v1 or vector or gvml` (`pytest_apu_v1_suites.log`): 1 failed, 144 passed, 334 deselected, 4 warnings; the one failure is the board row `test_apu_v1_board_median_cycles[apu_v1-histogram]`, a device launch that needs the board host's `/tmp` (the vendor tool exited while reading the device log), the same blocker that holds the Gemini-I campaign; the compile-only golden rows, every realization and every compile test pass |
+| Evidence integrity | `r80/differential_emission.py` now exits with an error naming the executable comparator instead of printing an unchecked success |
+| Not done | the installed re-execution (the next named candidate must contain `6ce37ad`, `7fb19a4` and this commit); Gemini-I (the board host's `/tmp`); X-34's pre-registered campaign (the final candidate); the independent review of the repair |

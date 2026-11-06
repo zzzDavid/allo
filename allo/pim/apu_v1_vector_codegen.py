@@ -2298,68 +2298,182 @@ class APUVectorABI:
 
 
 @dataclass(frozen=True)
-class EmissionLine:
-    """One scaffold line of the device source (a loop header, a brace, an
-    index declaration, a reset).  ``defines`` names the VRs the line writes
-    (a reset), for the schedule's readiness check."""
+class ScheduleLine:
+    """A prologue or epilogue line of the device source (an include, the
+    function header, a register declaration, ``return 0;``, a brace)."""
 
     text: str
-    defines: tuple[str, ...] = ()
-
-    def render(self) -> str:
-        return self.text
 
 
 @dataclass(frozen=True)
-class EmissionCall:
-    """One instruction rendered once: under ``bindings`` (the realization's
-    register bindings, or a slot substitution of them) and
-    ``pointer_batches``, at ``indent``, in the named ``scope``."""
+class ScheduleIndex:
+    """``const uint32_t name = expression;`` (a batch index of the scope)."""
+
+    name: str
+    expression: str
+
+
+@dataclass(frozen=True)
+class ScheduleReset:
+    """``gvml_reset_16(register);`` of the output's compute register."""
+
+    register: str
+
+
+@dataclass(frozen=True)
+class ScheduleScatter:
+    """The spatial forms' store of the output's compute register ``register``
+    (the value ``output``) with ``gvml_get_entry_16`` lanes: the egress of
+    those forms.  ``header`` and ``body`` are its two source lines."""
+
+    output: str
+    register: str
+    header: str
+    body: str
+
+
+@dataclass(frozen=True)
+class ScheduleCall:
+    """One instruction rendered once.  ``overrides`` are the only register
+    substitutions the emission may apply, as (logical name, the logical name
+    whose binding it takes): the carried output onto an accumulator slot
+    (``(output, f"{output}__acc{k}")``) inside that slot's guard, or the
+    resident vector onto a resident bank inside that bank's section;
+    ``pointer_batches`` maps a pointer's value to the batch expression of the
+    scope."""
 
     instruction: GVMLInstruction
-    bindings: Mapping[str, VRBinding]
-    pointer_batches: Mapping[str, str]
-    indent: str
-    scope: str
+    overrides: tuple = ()
+    pointer_batches: Mapping[str, str] = field(default_factory=dict)
 
-    def render(self) -> str:
-        return self.indent + self.instruction.render(
-            self.bindings, self.pointer_batches
+    def bindings(self, base: Mapping[str, VRBinding]) -> dict:
+        bound = dict(base)
+        for name, source in self.overrides:
+            bound[name] = base[source]
+        return bound
+
+    def render(self, base: Mapping[str, VRBinding]) -> str:
+        return self.instruction.render(self.bindings(base), dict(self.pointer_batches))
+
+    def defined_registers(self, base) -> tuple[str, ...]:
+        bound = self.bindings(base)
+        return tuple(
+            bound[name].c_name for name in self.instruction.definitions if name in bound
         )
 
-    def defined_registers(self) -> tuple[str, ...]:
+    def used_registers(self, base) -> tuple[str, ...]:
+        bound = self.bindings(base)
         return tuple(
-            self.bindings[name].c_name
-            for name in self.instruction.definitions
-            if name in self.bindings
-        )
-
-    def used_registers(self) -> tuple[str, ...]:
-        return tuple(
-            self.bindings[argument.name].c_name
+            bound[argument.name].c_name
             for argument in self.instruction.args
             if isinstance(argument, VRRef)
             and argument.name in self.instruction.uses
-            and argument.name in self.bindings
+            and argument.name in bound
         )
+
+
+@dataclass(frozen=True)
+class ScheduleLoop:
+    """``for (uint32_t var = 0; var < count; ++var) { body }``; ``role`` is
+    the plan axis the loop walks (``output_batch``, ``reduction_step``,
+    ``output_block``, ``output_tile``)."""
+
+    role: str
+    var: str
+    count: int
+    body: tuple
+
+
+@dataclass(frozen=True)
+class ScheduleGuard:
+    """``if (output_block * block + slot < total) { body }``: the accumulator
+    slot ``slot`` of a block is live for the output batches it covers."""
+
+    slot: int
+    block: int
+    total: int
+    body: tuple
+
+    @property
+    def condition(self) -> str:
+        return f"output_block * {self.block} + {self.slot} < {self.total}"
+
+
+@dataclass(frozen=True)
+class ScheduleBank:
+    """The resident form's section for resident bank ``index`` (no source of
+    its own; the calls inside substitute the resident vector)."""
+
+    index: int
+    body: tuple
+
+
+_SCOPE_NODES = (ScheduleLoop, ScheduleGuard, ScheduleBank)
 
 
 @dataclass(frozen=True)
 class EmissionSchedule:
-    """The ordered emission of one realization: the single source the device
-    source is rendered from (round 80, ISSUES X-36).  ``omitted`` names the
-    instructions of the stream the emission form replaces by scaffold (the
-    spatial forms reset the output and scatter it from the compute register
-    instead of loading and storing it), each with the reason."""
+    """The structured emission of one realization: the single source the
+    device source is rendered from (rounds 80 and 81, ISSUES X-36).  Loops,
+    guards and bank sections carry their plan roles and counts, resets and
+    scatters their registers, calls their substitution declarations; the
+    validator reads these fields, never the rendered text."""
 
     steps: tuple
-    omitted: tuple = ()
 
-    def render(self) -> str:
-        return "\n".join(step.render() for step in self.steps)
+    def render(self, realization) -> str:
+        base = realization.binding_map
+        lines: list[str] = []
 
-    def calls(self) -> tuple[EmissionCall, ...]:
-        return tuple(step for step in self.steps if isinstance(step, EmissionCall))
+        def emit(steps, depth):
+            indent = "    " * depth
+            for step in steps:
+                if isinstance(step, ScheduleLine):
+                    lines.append(step.text)
+                elif isinstance(step, ScheduleIndex):
+                    lines.append(
+                        f"{indent}const uint32_t {step.name} = {step.expression};"
+                    )
+                elif isinstance(step, ScheduleReset):
+                    lines.append(f"{indent}gvml_reset_16({step.register});")
+                elif isinstance(step, ScheduleScatter):
+                    lines.append(indent + step.header)
+                    lines.append(indent + "    " + step.body)
+                elif isinstance(step, ScheduleCall):
+                    lines.append(indent + step.render(base))
+                elif isinstance(step, ScheduleLoop):
+                    lines.append(
+                        f"{indent}for (uint32_t {step.var} = 0; {step.var} < "
+                        f"{step.count}; ++{step.var}) {{"
+                    )
+                    emit(step.body, depth + 1)
+                    lines.append(f"{indent}}}")
+                elif isinstance(step, ScheduleGuard):
+                    lines.append(f"{indent}if ({step.condition}) {{")
+                    emit(step.body, depth + 1)
+                    lines.append(f"{indent}}}")
+                elif isinstance(step, ScheduleBank):
+                    emit(step.body, depth)
+                else:
+                    raise TypeError(f"unknown schedule step {type(step).__name__}")
+
+        # The function body is one level deep; prologue and epilogue lines
+        # carry their own indentation.
+        emit(self.steps, 1)
+        return "\n".join(lines)
+
+    def calls(self) -> tuple:
+        found = []
+
+        def walk(steps):
+            for step in steps:
+                if isinstance(step, ScheduleCall):
+                    found.append(step)
+                elif isinstance(step, _SCOPE_NODES):
+                    walk(step.body)
+
+        walk(self.steps)
+        return tuple(found)
 
 
 def _instruction_stream(plan, normalized_values, normalized_operations):
@@ -2526,61 +2640,411 @@ def validate_realization(realization, operations) -> list[str]:
         schedule = realization.emission_schedule()
     except (ValueError, UnsupportedVectorOperation, VRCapacityError) as error:
         return [f"the emission schedule cannot be built: {error}"]
-    calls = schedule.calls()
-    emitted_keys = {instruction_key(call.instruction) for call in calls}
-    omitted_keys = {
-        instruction_key(instruction) for instruction, _why in schedule.omitted
-    }
-    spatial_form = (
-        isinstance(realization.physical_emission, SpatialResidentReductionEmission)
-        or realization._spatial_scatter_elements() is not None
-    )
-    for instruction in realized:
-        key = instruction_key(instruction)
-        if key in emitted_keys:
-            continue
+    return _ScheduleChecker(realization, emission, output_names).check(schedule)
+
+
+class _ScheduleChecker:
+    """The executable contract of an emission schedule against the plan.
+
+    Facts of the plan: the output batches, reduction steps, accumulator
+    block and output blocks of a temporal form; the matrix tiles, reduction
+    tiles and resident banks of the resident form; the spatial scatter
+    elements.  Checked on the schedule's structured nodes (never on text):
+
+    * loops carry their plan role, and their counts are the plan's extents;
+      guards carry the block and total of the plan; bank sections index the
+      plan's resident banks;
+    * each call's execution count, the product of the enclosing loop counts
+      with the guard's live batches, equals what the plan requires: setup
+      once; the carried output's ingress and egress once per output batch;
+      an operand ingress once per compute instance, or once per reduction
+      step per block when it is batch-invariant (no batched pointer); every
+      compute instruction `operation_call_count` times; the spatial forms'
+      resets and scatters once per compute scope;
+    * a call's registers are the realization's bindings, except the carried
+      output inside the guard of accumulator slot k (bound to that slot) and
+      the resident vector inside bank section i (bound to that bank);
+      pointer batch expressions name only the indices of the scope;
+    * ordering: every register a call reads was defined earlier in the
+      schedule (first-iteration semantics) by an ingress, a setup, a compute
+      call or a reset; a reset precedes the computes of its scope; an egress
+      or scatter of a register follows every compute that defines it in the
+      enclosing scope, so the stored value is the final one.
+    """
+
+    def __init__(self, realization, emission, output_names):
+        self.realization = realization
+        self.plan = realization.plan
+        self.emission = emission
+        self.output_names = set(output_names)
+        self.base = realization.binding_map
+        self.problems: list[str] = []
+        self.block = int(realization.accumulator_block)
+        self.resident = (
+            emission if isinstance(emission, SpatialResidentReductionEmission) else None
+        )
+        self.spatial_elements = (
+            None
+            if self.resident is not None
+            else realization._spatial_scatter_elements()
+        )
+        self.output_batches = int(_plan_output_batches(self.plan))
+        self.reduction_steps = int(_plan_reduction_steps(self.plan))
+        self.output_blocks = math.ceil(self.output_batches / self.block)
+        self.compute_count = int(emission.operation_call_count)
+        self.counts: dict[tuple, int] = {}
+        self.reset_count = 0
+        self.scatter_count = 0
+        self.defined: set[str] = set()
+        self.loop_scope_symbols = {
+            "output_batch",
+            "reduction_step",
+            "output_block",
+            "output_tile",
+        }
+
+    # -- facts of the plan --------------------------------------------------
+    def expected_loop_count(self, role):
+        if role == "output_batch":
+            return self.output_batches
+        if role == "reduction_step":
+            return self.reduction_steps
+        if role == "output_block":
+            return self.output_blocks
+        if role == "output_tile":
+            return self.resident.matrix_tiles if self.resident is not None else None
+        return None
+
+    def expected_call_count(self, instruction):
+        phase = instruction.phase
+        if phase in {"resident_setup", "index_setup"}:
+            return 1
+        if phase == "compute":
+            return self.compute_count
         touches_output = bool(
-            set(instruction.definitions + instruction.uses) & output_names
+            set(instruction.definitions + instruction.uses) & self.output_names
             or {
                 argument.name
                 for argument in instruction.args
                 if isinstance(argument, (PointerRef, PointerOffsetRef))
             }
-            & output_names
+            & self.output_names
         )
-        if key in omitted_keys and spatial_form and touches_output:
-            continue
-        problems.append(
-            f"instruction {instruction.api} ({instruction.phase}) is never emitted"
-        )
-    compute_sequence = [instruction_key(i) for i in realized if i.phase == "compute"]
-    emitted_compute = [
-        instruction_key(call.instruction)
-        for call in calls
-        if call.instruction.phase == "compute"
-    ]
-    if compute_sequence:
-        count, remainder = divmod(len(emitted_compute), len(compute_sequence))
-        if remainder or count < 1 or emitted_compute != compute_sequence * count:
-            problems.append(
-                "the emitted compute calls are not whole repetitions of the "
-                f"operation sequence: {len(emitted_compute)} calls of "
-                f"{len(compute_sequence)} operations"
+        if phase == "transfer_out" or (phase == "transfer_in" and touches_output):
+            # The carried output lives in a register across the reduction:
+            # loaded and stored once per output batch (the spatial forms
+            # replace both by a reset and a scatter; see `omitted`).
+            return self.output_batches
+        if phase == "transfer_in":
+            if self.resident is not None:
+                return self.compute_count
+            batched = any(
+                isinstance(argument, PointerRef) and argument.batch_offset
+                for argument in instruction.args
             )
-    defined: set[str] = set()
-    for step in schedule.steps:
-        if isinstance(step, EmissionLine):
-            defined.update(step.defines)
-            continue
-        missing = [name for name in step.used_registers() if name not in defined]
+            return self.reduction_steps * (
+                self.output_batches if batched else self.output_blocks
+            )
+        return None
+
+    # -- the walk -----------------------------------------------------------
+    def check(self, schedule) -> list[str]:
+        self.walk(schedule.steps, loops=(), guard=None, bank=None, multiplier=1)
+        if self.problems:
+            return self.problems
+        # Every instruction's count against the plan.
+        for instruction in self.realization.instructions:
+            key = instruction_key(instruction)
+            expected = self.expected_call_count(instruction)
+            actual = self.counts.get(key, 0)
+            replaced = (
+                self.resident is not None or self.spatial_elements is not None
+            ) and (
+                instruction.phase == "transfer_out"
+                or (
+                    instruction.phase == "transfer_in"
+                    and expected == self.output_batches
+                    and instruction.phase != "compute"
+                )
+            )
+            if replaced:
+                if actual:
+                    self.problems.append(
+                        f"{instruction.api} ({instruction.phase}) is emitted {actual} "
+                        "times although the spatial form replaces the output's "
+                        "ingress and egress by its reset and scatter"
+                    )
+                continue
+            if expected is None:
+                self.problems.append(
+                    f"{instruction.api} ({instruction.phase}) has no plan-derived "
+                    "execution count"
+                )
+            elif actual != expected:
+                self.problems.append(
+                    f"{instruction.api} ({instruction.phase}) executes {actual} times; "
+                    f"the plan requires {expected}"
+                )
+        if self.resident is not None:
+            if (
+                self.reset_count != self.resident.matrix_tiles
+                or self.scatter_count != self.resident.matrix_tiles
+            ):
+                self.problems.append(
+                    f"the resident form resets the output {self.reset_count} times and "
+                    f"scatters it {self.scatter_count} times; the plan has "
+                    f"{self.resident.matrix_tiles} matrix tiles"
+                )
+        elif self.spatial_elements is not None:
+            if (
+                self.reset_count != self.compute_count
+                or self.scatter_count != self.compute_count
+            ):
+                self.problems.append(
+                    f"the spatial form resets the output {self.reset_count} times and "
+                    f"scatters it {self.scatter_count} times; the plan has "
+                    f"{self.compute_count} compute scopes"
+                )
+        elif self.reset_count or self.scatter_count:
+            self.problems.append("a temporal form resets or scatters the output")
+        return self.problems
+
+    def fail(self, message):
+        if len(self.problems) < 8:
+            self.problems.append(message)
+
+    def walk(self, steps, *, loops, guard, bank, multiplier):
+        for position, step in enumerate(steps):
+            if isinstance(step, ScheduleLine):
+                continue
+            if isinstance(step, ScheduleLoop):
+                expected = self.expected_loop_count(step.role)
+                if expected is None:
+                    self.fail(
+                        f"loop {step.var!r} has role {step.role!r} the plan does not define"
+                    )
+                    continue
+                if step.var != step.role or int(step.count) != expected:
+                    self.fail(
+                        f"loop {step.var!r} ({step.role}) runs {step.count} times; the plan "
+                        f"requires {expected}"
+                    )
+                    continue
+                roles = [role for role, _count in loops]
+                if step.role == "reduction_step" and not (
+                    {"output_batch", "output_block"} & set(roles)
+                ):
+                    self.fail("the reduction loop is not inside the output loop")
+                if (
+                    step.role in {"output_batch", "output_block", "output_tile"}
+                    and roles
+                ):
+                    self.fail(f"the {step.role} loop is nested inside {roles}")
+                self.walk(
+                    step.body,
+                    loops=loops + ((step.role, int(step.count)),),
+                    guard=guard,
+                    bank=bank,
+                    multiplier=multiplier * int(step.count),
+                )
+            elif isinstance(step, ScheduleGuard):
+                roles = [role for role, _count in loops]
+                if self.block <= 1 or "output_block" not in roles or guard is not None:
+                    self.fail("an accumulator-slot guard outside a blocked output loop")
+                    continue
+                if (
+                    step.block != self.block
+                    or step.total != self.output_batches
+                    or not 0 <= step.slot < self.block
+                ):
+                    self.fail(
+                        f"guard (slot {step.slot}, block {step.block}, total {step.total}) "
+                        f"differs from the plan (block {self.block}, {self.output_batches} batches)"
+                    )
+                    continue
+                live = sum(
+                    1
+                    for output_block in range(self.output_blocks)
+                    if output_block * step.block + step.slot < step.total
+                )
+                self.walk(
+                    step.body,
+                    loops=loops,
+                    guard=step.slot,
+                    bank=bank,
+                    multiplier=multiplier // self.output_blocks * live,
+                )
+            elif isinstance(step, ScheduleBank):
+                if (
+                    self.resident is None
+                    or bank is not None
+                    or not 0 <= step.index < len(self.resident.resident_names)
+                ):
+                    self.fail(
+                        f"resident bank section {step.index} outside the resident form"
+                    )
+                    continue
+                self.walk(
+                    step.body,
+                    loops=loops,
+                    guard=guard,
+                    bank=step.index,
+                    multiplier=multiplier,
+                )
+            elif isinstance(step, ScheduleIndex):
+                continue
+            elif isinstance(step, ScheduleReset):
+                output = next(iter(self.output_names), None)
+                if output is None or step.register != self.base[output].c_name:
+                    self.fail(f"reset of {step.register!r}, not the output's register")
+                    continue
+                self.reset_count += multiplier
+                self.defined.add(step.register)
+            elif isinstance(step, ScheduleScatter):
+                output = next(iter(self.output_names), None)
+                if (
+                    output is None
+                    or step.output != output
+                    or step.register != self.base[output].c_name
+                ):
+                    self.fail("scatter of a register that is not the output's")
+                    continue
+                if step.register not in self.defined:
+                    self.fail("the scatter stores a register nothing defined")
+                if self.compute_defines_later(steps[position + 1 :], step.register):
+                    self.fail(
+                        "the scatter stores the output before a later compute defines it"
+                    )
+                self.scatter_count += multiplier
+            elif isinstance(step, ScheduleCall):
+                self.check_call(
+                    step,
+                    loops=loops,
+                    guard=guard,
+                    bank=bank,
+                    multiplier=multiplier,
+                    rest=steps[position + 1 :],
+                )
+            else:
+                self.fail(f"unknown schedule step {type(step).__name__}")
+
+    def check_call(self, call, *, loops, guard, bank, multiplier, rest):
+        instruction = call.instruction
+        key = instruction_key(instruction)
+        self.counts[key] = self.counts.get(key, 0) + multiplier
+        # Substitutions.
+        output = next(iter(self.output_names), None)
+        for name, source in call.overrides:
+            legal = False
+            if (
+                output is not None
+                and name == output
+                and guard is not None
+                and guard >= 1
+                and source == f"{output}__acc{guard}"
+            ):
+                legal = True
+            if (
+                self.resident is not None
+                and bank is not None
+                and name == self.resident.resident_value
+                and source == self.resident.resident_names[bank]
+            ):
+                legal = True
+            if source not in self.base or name not in self.base:
+                legal = False
+            if not legal:
+                self.fail(
+                    f"{instruction.api} substitutes {name!r} by the register of {source!r}, "
+                    "which the plan does not allow in this scope"
+                )
+                return
+        if (
+            guard is not None
+            and guard >= 1
+            and output is not None
+            and output in (instruction.definitions + instruction.uses)
+        ):
+            if (output, f"{output}__acc{guard}") not in tuple(call.overrides):
+                self.fail(
+                    f"{instruction.api} touches the output in accumulator slot {guard} without the slot's register"
+                )
+                return
+        if (
+            bank is not None
+            and self.resident is not None
+            and self.resident.resident_value in instruction.uses
+        ):
+            if (
+                self.resident.resident_value,
+                self.resident.resident_names[bank],
+            ) not in tuple(call.overrides):
+                self.fail(
+                    f"{instruction.api} reads the resident vector in bank {bank} without that bank's register"
+                )
+                return
+        # Pointer batch expressions of the pointers this call addresses name
+        # only indices of the scope.
+        symbols = {role for role, _count in loops}
+        if guard is not None:
+            symbols.add("output_block")
+        allowed = symbols | {"batch"}
+        if bank is not None:
+            allowed.add(f"batch_{bank}")
+        addressed = {
+            argument.name
+            for argument in instruction.args
+            if isinstance(argument, PointerRef) and argument.batch_offset
+        }
+        for value, expression in dict(call.pointer_batches).items():
+            if value not in addressed:
+                continue
+            for identifier in set(re.findall(r"[A-Za-z_]\w*", str(expression))):
+                if identifier not in allowed:
+                    self.fail(
+                        f"{instruction.api} batches pointer {value!r} by {identifier!r}, "
+                        f"which is not an index of its scope {sorted(allowed)}"
+                    )
+                    return
+        # Ordering: readiness, and the finality of stores.
+        missing = [
+            name for name in call.used_registers(self.base) if name not in self.defined
+        ]
         if missing:
-            problems.append(
-                f"{step.instruction.api} in scope {step.scope!r} reads "
-                f"{missing} before anything in the emission defines them"
+            self.fail(
+                f"{instruction.api} reads {missing} before anything in the emission "
+                "defines them"
             )
-            break
-        defined.update(step.defined_registers())
-    return problems
+            return
+        if instruction.phase == "transfer_out":
+            for register in call.used_registers(self.base):
+                if self.compute_defines_later(rest, register):
+                    self.fail(
+                        f"{instruction.api} stores {register} before a later compute "
+                        "defines it"
+                    )
+                    return
+        if (
+            instruction.phase == "compute"
+            and self.resident is not None
+            and bank is None
+        ):
+            self.fail(f"{instruction.api} computes outside a resident bank section")
+            return
+        self.defined.update(call.defined_registers(self.base))
+
+    def compute_defines_later(self, rest, register) -> bool:
+        for step in rest:
+            if isinstance(step, ScheduleCall):
+                if (
+                    step.instruction.phase == "compute"
+                    and register in step.defined_registers(self.base)
+                ):
+                    return True
+            elif isinstance(step, _SCOPE_NODES):
+                if self.compute_defines_later(step.body, register):
+                    return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -2759,13 +3223,13 @@ class APUVectorRealization:
         return elements
 
     def emission_schedule(self) -> "EmissionSchedule":
-        """The structured emission the device source is rendered from: scaffold
-        lines (loop headers, braces, index declarations, resets) and calls
-        (one instruction rendered under one binding and pointer-batch
-        substitution, in one scope).  `validate_realization` checks the
-        schedule's order, multiplicity and data readiness; `device_source`
-        renders it, so the emitted text is the validated schedule's (round
-        80, ISSUES X-36)."""
+        """The structured emission the device source is rendered from
+        (rounds 80 and 81, ISSUES X-36): loops with their plan roles and
+        counts, accumulator-slot guards, resident-bank sections, resets,
+        scatters and calls with declared substitutions.
+        `validate_realization` checks the schedule's scopes, counts,
+        substitutions and ordering against the plan; `device_source`
+        renders it, so the emitted text is the validated schedule's."""
         bindings = self.binding_map
         pointer_values = sorted(
             {
@@ -2779,22 +3243,22 @@ class APUVectorRealization:
             f"uint16_t *{name}_{level}ptr" for name, level in pointer_values
         )
         function = re.sub(r"\W", "_", str(getattr(self.plan, "name", "apu_vector")))
-        steps: list = []
-        header = [
-            "#include <stdint.h>",
-            "#include <gsi/libgvml_memory.h>",
-            "#include <gsi/libgvml_element_wise.h>",
-            "#include <gsi/libgvml_iv.h>",
-            '#include "gsi_dma.h"',
-            "",
-            f"static int {function}_vector({params}) {{",
-            "    gvml_init_once();",
+        steps: list = [
+            ScheduleLine(text)
+            for text in (
+                "#include <stdint.h>",
+                "#include <gsi/libgvml_memory.h>",
+                "#include <gsi/libgvml_element_wise.h>",
+                "#include <gsi/libgvml_iv.h>",
+                '#include "gsi_dma.h"',
+                "",
+                f"static int {function}_vector({params}) {{",
+                "    gvml_init_once();",
+            )
         ]
-        scope = "prologue"
-        steps.extend(EmissionLine(text) for text in header)
         for binding in self.vr_bindings:
             steps.append(
-                EmissionLine(
+                ScheduleLine(
                     f"    enum gvml_vr16 {binding.c_name} = {binding.concrete_name};"
                 )
             )
@@ -2834,10 +3298,16 @@ class APUVectorRealization:
                         "output_batch * " f"{self.reduction_steps} + reduction_step"
                     )
 
-        steps.extend(
-            EmissionCall(instruction, bindings, pointer_batches, "    ", scope)
-            for instruction in resident_setup + index_setup
-        )
+        def call(instruction, overrides=(), batches=None):
+            return ScheduleCall(
+                instruction,
+                tuple(overrides),
+                dict(pointer_batches if batches is None else batches),
+            )
+
+        # The function body: setup first.
+        body: list = [call(instruction) for instruction in resident_setup + index_setup]
+        epilogue = [ScheduleLine(text) for text in ("    return 0;", "}", "")]
 
         emission = self.physical_emission
         if isinstance(emission, SpatialResidentReductionEmission):
@@ -2857,71 +3327,47 @@ class APUVectorRealization:
             rows_per_tile = emission.rows_per_tile
             output_rows = emission.output_extent
             matrix_tiles = emission.matrix_tiles
-            steps.append(
-                EmissionLine(
-                    f"    for (uint32_t output_tile = 0; output_tile < {matrix_tiles}; "
-                    "++output_tile) {"
-                )
-            )
-            scope = "output_tile"
-            steps.append(
-                EmissionLine(
-                    f"        gvml_reset_16({bindings[output].c_name});",
-                    defines=(bindings[output].c_name,),
-                )
-            )
+            tile_body: list = [ScheduleReset(bindings[output].c_name)]
             for reduction_index, resident_name in enumerate(resident_names):
-                steps.append(
-                    EmissionLine(
-                        f"        const uint32_t batch_{reduction_index} = "
-                        f"output_tile * {reduction_tiles} + {reduction_index};"
-                    )
-                )
-                slot_bindings = dict(bindings)
-                slot_bindings[vector] = bindings[resident_name]
                 slot_batches = dict(pointer_batches)
                 for instruction in inner_ingress:
                     for argument in instruction.args:
                         if isinstance(argument, PointerRef):
                             slot_batches[argument.name] = f"batch_{reduction_index}"
-                for instruction in inner_ingress:
-                    steps.append(
-                        EmissionCall(
-                            instruction, slot_bindings, slot_batches, "        ", scope
-                        )
+                overrides = ((vector, resident_name),)
+                bank: list = [
+                    ScheduleIndex(
+                        f"batch_{reduction_index}",
+                        f"output_tile * {reduction_tiles} + {reduction_index}",
                     )
-                steps.extend(
-                    EmissionCall(
-                        instruction, slot_bindings, slot_batches, "        ", scope
-                    )
+                ]
+                bank.extend(
+                    call(instruction, overrides, slot_batches)
+                    for instruction in inner_ingress
+                )
+                bank.extend(
+                    call(instruction, overrides, slot_batches)
                     for instruction in compute
                 )
-            steps.extend(
-                EmissionLine(text)
-                for text in (
-                    f"        for (uint32_t scatter = 0; scatter < {rows_per_tile} "
+                tile_body.append(ScheduleBank(reduction_index, tuple(bank)))
+            tile_body.append(
+                ScheduleScatter(
+                    output,
+                    bindings[output].c_name,
+                    f"for (uint32_t scatter = 0; scatter < {rows_per_tile} "
                     f"&& output_tile * {rows_per_tile} + scatter < {output_rows}; "
                     "++scatter)",
-                    f"            {output}_L4ptr[output_tile * {rows_per_tile} + "
+                    f"{output}_L4ptr[output_tile * {rows_per_tile} + "
                     f"scatter] = gvml_get_entry_16({bindings[output].c_name}, "
                     f"scatter * {group_size});",
-                    "    }",
-                    "    return 0;",
-                    "}",
-                    "",
                 )
             )
-            return EmissionSchedule(
-                tuple(steps),
-                omitted=tuple(
-                    (
-                        instruction,
-                        "spatial resident reduction: the output is reset and "
-                        "scattered from the compute register by the schedule",
-                    )
-                    for instruction in outer_ingress + egress
-                ),
+            body.append(
+                ScheduleLoop(
+                    "output_tile", "output_tile", matrix_tiles, tuple(tile_body)
+                )
             )
+            return EmissionSchedule(tuple(steps) + tuple(body) + tuple(epilogue))
 
         spatial_elements = self._spatial_scatter_elements()
         if self.accumulator_block > 1:
@@ -2935,10 +3381,11 @@ class APUVectorRealization:
                 )
             output = next(iter(output_names))
             block = self.accumulator_block
-            accumulator_bindings = (
-                bindings[output],
-                *(bindings[f"{output}__acc{slot}"] for slot in range(1, block)),
-            )
+            for slot in range(1, block):
+                if f"{output}__acc{slot}" not in bindings:
+                    raise VRCapacityError(
+                        f"accumulator slot {slot} of {output!r} has no allocated VR"
+                    )
 
             def has_batched_pointer(instruction):
                 return any(
@@ -2956,8 +3403,7 @@ class APUVectorRealization:
 
             def slot_substitution(slot):
                 current = f"(output_block * {block} + {slot})"
-                slot_bindings = dict(bindings)
-                slot_bindings[output] = accumulator_bindings[slot]
+                overrides = () if slot == 0 else ((output, f"{output}__acc{slot}"),)
                 slot_batches = dict(pointer_batches)
                 slot_batches[output] = current
                 for item in slot_ingress:
@@ -2968,161 +3414,117 @@ class APUVectorRealization:
                             slot_batches[argument.name] = (
                                 f"{current} * {self.reduction_steps} + reduction_step"
                             )
-                return slot_bindings, slot_batches
+                return overrides, slot_batches
 
             output_blocks = math.ceil(self.output_batches / block)
-            scope = "output_block"
-            steps.append(
-                EmissionLine(
-                    f"    for (uint32_t output_block = 0; output_block < {output_blocks}; "
-                    "++output_block) {"
-                )
-            )
+            block_body: list = []
             for slot in range(block):
-                steps.append(
-                    EmissionLine(
-                        f"        if (output_block * {block} + {slot} < "
-                        f"{self.output_batches}) {{"
+                overrides, batches = slot_substitution(slot)
+                block_body.append(
+                    ScheduleGuard(
+                        slot,
+                        block,
+                        self.output_batches,
+                        tuple(
+                            call(instruction, overrides, batches)
+                            for instruction in outer_ingress
+                        ),
                     )
                 )
-                steps.extend(
-                    EmissionCall(
-                        instruction, *slot_substitution(slot), "            ", scope
-                    )
-                    for instruction in outer_ingress
-                )
-                steps.append(EmissionLine("        }"))
-            steps.append(
-                EmissionLine(
-                    f"        for (uint32_t reduction_step = 0; reduction_step < "
-                    f"{self.reduction_steps}; ++reduction_step) {{"
-                )
-            )
-            steps.extend(
-                EmissionCall(
-                    instruction, bindings, pointer_batches, "            ", scope
-                )
-                for instruction in shared_ingress
-            )
+            reduction_body: list = [call(instruction) for instruction in shared_ingress]
             for slot in range(block):
-                steps.append(
-                    EmissionLine(
-                        f"            if (output_block * {block} + {slot} < "
-                        f"{self.output_batches}) {{"
-                    )
-                )
-                steps.append(
-                    EmissionLine(
-                        f"                const uint32_t batch = "
+                overrides, batches = slot_substitution(slot)
+                guarded: list = [
+                    ScheduleIndex(
+                        "batch",
                         f"(output_block * {block} + {slot}) * {self.reduction_steps} "
-                        "+ reduction_step;"
+                        "+ reduction_step",
                     )
-                )
-                steps.extend(
-                    EmissionCall(
-                        instruction, *slot_substitution(slot), "                ", scope
-                    )
+                ]
+                guarded.extend(
+                    call(instruction, overrides, batches)
                     for instruction in slot_ingress + compute
                 )
-                steps.append(EmissionLine("            }"))
-            steps.append(EmissionLine("        }"))
-            scope = "output_block_epilogue"
+                reduction_body.append(
+                    ScheduleGuard(slot, block, self.output_batches, tuple(guarded))
+                )
+            block_body.append(
+                ScheduleLoop(
+                    "reduction_step",
+                    "reduction_step",
+                    self.reduction_steps,
+                    tuple(reduction_body),
+                )
+            )
             for slot in range(block):
-                steps.append(
-                    EmissionLine(
-                        f"        if (output_block * {block} + {slot} < "
-                        f"{self.output_batches}) {{"
+                overrides, batches = slot_substitution(slot)
+                block_body.append(
+                    ScheduleGuard(
+                        slot,
+                        block,
+                        self.output_batches,
+                        tuple(
+                            call(instruction, overrides, batches)
+                            for instruction in egress
+                        ),
                     )
                 )
-                steps.extend(
-                    EmissionCall(
-                        instruction, *slot_substitution(slot), "            ", scope
-                    )
-                    for instruction in egress
+            body.append(
+                ScheduleLoop(
+                    "output_block", "output_block", output_blocks, tuple(block_body)
                 )
-                steps.append(EmissionLine("        }"))
-            steps.extend(
-                EmissionLine(text) for text in ("    }", "    return 0;", "}", "")
             )
-            return EmissionSchedule(tuple(steps))
+            return EmissionSchedule(tuple(steps) + tuple(body) + tuple(epilogue))
 
-        scope = "output_batch"
-        steps.append(
-            EmissionLine(
-                f"    for (uint32_t output_batch = 0; output_batch < {self.output_batches}; "
-                "++output_batch) {"
-            )
-        )
+        batch_body: list = []
         if spatial_elements is None:
-            steps.extend(
-                EmissionCall(instruction, bindings, pointer_batches, "        ", scope)
-                for instruction in outer_ingress
+            batch_body.extend(call(instruction) for instruction in outer_ingress)
+        reduction_body = [
+            ScheduleIndex(
+                "batch", f"output_batch * {self.reduction_steps} + reduction_step"
             )
-        scope = "reduction_step"
-        steps.append(
-            EmissionLine(
-                f"        for (uint32_t reduction_step = 0; reduction_step < "
-                f"{self.reduction_steps}; ++reduction_step) {{"
-            )
-        )
-        steps.append(
-            EmissionLine(
-                f"            const uint32_t batch = output_batch * {self.reduction_steps} "
-                "+ reduction_step;"
-            )
+        ]
+        output = next(
+            (value.name for value in self.values if value.intent in {"out", "inout"}),
+            None,
         )
         if spatial_elements is not None:
-            output = next(
-                value.name for value in self.values if value.intent in {"out", "inout"}
-            )
-            steps.append(
-                EmissionLine(
-                    f"            gvml_reset_16({bindings[output].c_name});",
-                    defines=(bindings[output].c_name,),
-                )
-            )
-        steps.extend(
-            EmissionCall(instruction, bindings, pointer_batches, "            ", scope)
-            for instruction in inner_ingress + compute
+            reduction_body.append(ScheduleReset(bindings[output].c_name))
+        reduction_body.extend(
+            call(instruction) for instruction in inner_ingress + compute
         )
         if spatial_elements is not None:
-            output = next(
-                value.name for value in self.values if value.intent in {"out", "inout"}
-            )
             group_size = _plan_group_size(self.plan)
-            steps.extend(
-                EmissionLine(text)
-                for text in (
-                    f"            for (uint32_t scatter = 0; scatter < {spatial_elements}; ++scatter)",
-                    f"                {output}_L4ptr[output_batch * {VR_LANES} + "
+            reduction_body.append(
+                ScheduleScatter(
+                    output,
+                    bindings[output].c_name,
+                    f"for (uint32_t scatter = 0; scatter < {spatial_elements}; ++scatter)",
+                    f"{output}_L4ptr[output_batch * {VR_LANES} + "
                     f"reduction_step * {spatial_elements} + scatter] = "
                     f"gvml_get_entry_16({bindings[output].c_name}, scatter * {group_size});",
                 )
             )
-        steps.append(EmissionLine("        }"))
-        scope = "output_batch_epilogue"
+        batch_body.append(
+            ScheduleLoop(
+                "reduction_step",
+                "reduction_step",
+                self.reduction_steps,
+                tuple(reduction_body),
+            )
+        )
         if spatial_elements is None:
-            steps.extend(
-                EmissionCall(instruction, bindings, pointer_batches, "        ", scope)
-                for instruction in egress
+            batch_body.extend(call(instruction) for instruction in egress)
+        body.append(
+            ScheduleLoop(
+                "output_batch", "output_batch", self.output_batches, tuple(batch_body)
             )
-        steps.append(EmissionLine("    }"))
-        steps.extend(EmissionLine(text) for text in ("    return 0;", "}", ""))
-        omitted = ()
-        if spatial_elements is not None:
-            omitted = tuple(
-                (
-                    instruction,
-                    "spatial group reduction: the output is reset and scattered "
-                    "from the compute register by the schedule",
-                )
-                for instruction in outer_ingress + egress
-            )
-        return EmissionSchedule(tuple(steps), omitted=omitted)
+        )
+        return EmissionSchedule(tuple(steps) + tuple(body) + tuple(epilogue))
 
     def device_source(self) -> str:
         """The device translation unit: the emission schedule rendered."""
-        return self.emission_schedule().render()
+        return self.emission_schedule().render(self)
 
     def execute_numpy(self, arrays: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
         """Execute high-level neutral operation semantics without board access."""

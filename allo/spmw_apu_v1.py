@@ -365,7 +365,7 @@ class APUv1Ctx(CodegenContext):
                 "APU v1 realization differs from the contraction and plan "
                 f"{plan.name!r}: " + "; ".join(problems)
             )
-        scheduled = realization.emission_schedule().render().splitlines()
+        scheduled = realization.emission_schedule().render(realization).splitlines()
         emitted = list(self.cmds)
         if [line.rstrip() for line in emitted] != [line.rstrip() for line in scheduled]:
             position = next(

@@ -24,6 +24,8 @@ from allo.ir.types import float16
 from allo.pim import apu_v1_vector_program as vp
 from allo.pim.apu_v1_vector_codegen import (
     APUVectorRealization,
+    ScheduleCall,
+    ScheduleLoop,
     VRRef,
     realize_apu_v1_plan,
 )
@@ -228,26 +230,144 @@ def test_swapped_emitted_lines_are_refused(monkeypatch):
         _compile_rectangular("temporal_svp")
 
 
-def test_a_reordered_schedule_is_refused_by_readiness(monkeypatch):
-    """A schedule that emits the product's accumulation before the multiply
-    (records intact) is refused by the readiness check, independent of the
-    rendered text."""
+def _rewrite(schedule, transform):
+    """A schedule with ``transform(steps) -> steps`` applied to every scope's
+    step tuple, innermost first."""
+
+    def rewrite(steps):
+        out = []
+        for step in steps:
+            if isinstance(step, ScheduleLoop):
+                step = replace(step, body=rewrite(step.body))
+            elif hasattr(step, "body"):
+                step = replace(step, body=rewrite(step.body))
+            out.append(step)
+        return tuple(transform(out))
+
+    return replace(schedule, steps=rewrite(schedule.steps))
+
+
+def _patch_schedule(monkeypatch, transform):
     original = APUVectorRealization.emission_schedule
 
-    def reordered(self):
-        schedule = original(self)
-        steps = list(schedule.steps)
-        calls = [
-            i
-            for i, step in enumerate(steps)
-            if getattr(step, "instruction", None) is not None
-            and step.instruction.phase == "compute"
-        ]
-        mul, add = calls[0], calls[1]
-        steps[mul], steps[add] = steps[add], steps[mul]
-        return replace(schedule, steps=tuple(steps))
+    def damaged(self):
+        return _rewrite(original(self), transform)
 
-    monkeypatch.setattr(APUVectorRealization, "emission_schedule", reordered)
+    monkeypatch.setattr(APUVectorRealization, "emission_schedule", damaged)
+
+
+def _is_call(step, phase=None, api=None):
+    return (
+        isinstance(step, ScheduleCall)
+        and (phase is None or step.instruction.phase == phase)
+        and (api is None or step.instruction.api == api)
+    )
+
+
+def test_a_forged_register_substitution_is_refused(monkeypatch):
+    """Reviewer round 80, injection 1: only the multiply call's binding maps
+    the right operand onto the left operand's register; the records stay
+    intact.  Substitutions are declared on the call and only the plan's two
+    kinds are legal."""
+
+    def forge(steps):
+        return [
+            (
+                replace(step, overrides=step.overrides + (("q", "p"),))
+                if _is_call(step, api="gvml_mul_f16")
+                else step
+            )
+            for step in steps
+        ]
+
+    _patch_schedule(monkeypatch, forge)
+    with pytest.raises(Exception, match="substitutes 'q' by the register of 'p'"):
+        _compile_rectangular("temporal_svp")
+
+
+def test_an_early_egress_is_refused(monkeypatch):
+    """Reviewer round 80, injection 2: the output's egress moved right after
+    its ingress, before the reduction loop; every call still occurs once, but
+    the stored value is not the final one."""
+
+    def hoist(steps):
+        egress = [s for s in steps if _is_call(s, phase="transfer_out")]
+        if not egress or not any(isinstance(s, ScheduleLoop) for s in steps):
+            return steps
+        rest = [s for s in steps if not _is_call(s, phase="transfer_out")]
+        loop_at = next(i for i, s in enumerate(rest) if isinstance(s, ScheduleLoop))
+        return rest[:loop_at] + egress + rest[loop_at:]
+
+    _patch_schedule(monkeypatch, hoist)
+    with pytest.raises(Exception, match="before a later compute defines it"):
+        _compile_rectangular("temporal_svp")
+
+
+def test_an_empty_reduction_loop_is_refused(monkeypatch):
+    """Reviewer round 80, injection 3: the reduction loop's count set to
+    zero; the loop count and every compute count differ from the plan."""
+
+    def empty(steps):
+        return [
+            (
+                replace(s, count=0)
+                if isinstance(s, ScheduleLoop) and s.role == "reduction_step"
+                else s
+            )
+            for s in steps
+        ]
+
+    _patch_schedule(monkeypatch, empty)
+    with pytest.raises(Exception, match="runs 0 times; the plan requires"):
+        _compile_rectangular("temporal_svp")
+
+
+def test_a_hoisted_operand_ingress_is_refused(monkeypatch):
+    """An operand's ingress moved out of the reduction loop (loaded once per
+    output batch instead of once per step) executes fewer times than the
+    plan requires."""
+
+    def hoist(steps):
+        loops = [
+            s
+            for s in steps
+            if isinstance(s, ScheduleLoop) and s.role == "reduction_step"
+        ]
+        if not loops:
+            return steps
+        loop = loops[0]
+        inner = [s for s in loop.body if _is_call(s, phase="transfer_in")]
+        if not inner:
+            return steps
+        kept = tuple(s for s in loop.body if not _is_call(s, phase="transfer_in"))
+        out = []
+        for s in steps:
+            if s is loop:
+                out.extend(inner)
+                out.append(replace(loop, body=kept))
+            else:
+                out.append(s)
+        return out
+
+    _patch_schedule(monkeypatch, hoist)
+    with pytest.raises(Exception, match="executes .* times; the plan requires"):
+        _compile_rectangular("temporal_svp")
+
+
+def test_a_reordered_schedule_is_refused_by_readiness(monkeypatch):
+    """The accumulation emitted before the multiply (records intact) is
+    refused by the readiness check, independent of the rendered text."""
+
+    def swap(steps):
+        calls = [i for i, s in enumerate(steps) if _is_call(s, phase="compute")]
+        if len(calls) < 2:
+            return steps
+        steps = list(steps)
+        a, b = calls[0], calls[1]
+        steps[a], steps[b] = steps[b], steps[a]
+        return steps
+
+    _patch_schedule(monkeypatch, swap)
     with pytest.raises(Exception, match="before anything in the emission defines them"):
         _compile_rectangular("temporal_svp")
 
@@ -277,6 +397,6 @@ def test_every_enumerated_plan_passes_the_realization_invariant():
                 lines,
             )
             assert (
-                forced.realization.emission_schedule().render()
+                forced.realization.emission_schedule().render(forced.realization)
                 == forced.device_source()
             )
