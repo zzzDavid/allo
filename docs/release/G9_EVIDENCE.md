@@ -100,6 +100,23 @@ same attestations (gemm 0.9999, batched_gemm 0.9992, gesummv 0.9880, bicg
 is installed-artifact evidence of the repair; it is not the independent
 review of it, which G9 still needs.
 
+Round 84 (`tenon-release-evidence/r84/`, `VALIDATION.md` round 84): the
+named candidate `88852b7` (code of `8d9136f`, every production fix since
+`d120084`), sdist from `git archive 88852b7`, local wheel `9d7b6be6...`
+and a zhang-x4 wheel in clean venvs.  From the installed artifacts: the
+reviewers' round 78, 79, 81 and 82 probes (the alias probe included) and
+the round 82 probe, every fault refused and every control accepted; the
+32 realization regressions and the compile-only golden rows; the AiM,
+Samsung, UPMEM and AttAcc rows identical to the `d120084` table above
+(the AttAcc stage inside the chain this time); shared semantics 156 passed
+and the one V1-19 failure; the Gemini-II card tests 15 passed and the one
+pre-registered session with the same attestations (gemm 0.9973,
+batched_gemm 0.9945, gesummv 0.9901, bicg 0.9959, mvt 1.0013 of the paper;
+mvt nominal, X-37); Gemini-I not run (the board host's `/tmp`).  The
+reviewer accepted the round 83 repair; the manifest and slice 5 review
+(rounds 28 to 30) and the Gemini-I execution at a candidate remain the open
+G9 items.
+
 ## 6. What remains for G9
 
 The reviewer's round 78 source review of this packet found that the APU v1
