@@ -25,17 +25,40 @@ def _sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+EXPECTED_TEXTS = {
+    "LLVM-LICENSE.TXT": (
+        "Version 2.0, January 2004",
+        "---- LLVM Exceptions to the Apache 2.0 License ----",
+    ),
+    "NANOBIND-LICENSE.txt": (
+        "Wenzel Jakob",
+        "Redistributions of source code must retain",
+    ),
+    "UPIMULATOR-LICENSE.txt": ("Permission is hereby granted, free of charge",),
+    "ROBIN-MAP-LICENSE.txt": ("MIT License", "Thibaut Goetghebuer-Planchon"),
+    "XXHASH-LICENSE.txt": ("Yann Collet", "BSD 2-Clause License"),
+    "CONVERTUTF-UNICODE-NOTICE.txt": (
+        "1991-2015 Unicode, Inc.",
+        "this copyright and permission notice appear",
+    ),
+    "LLVM-REGEX-COPYRIGHT.txt": ("Henry Spencer",),
+    "BLAKE3-LICENSE.txt": ("CC0 1.0", "Apache License"),
+    "MD5-NOTICE.txt": ("Alexander Peslyak", "placed in the public domain"),
+    "UPMEM-DPU-RT-LICENSE.txt": (
+        "Copyright (c) 2020, UPMEM",
+        "Redistribution and use in source and binary forms",
+    ),
+}
+
+
 def test_bundled_texts_are_the_upstream_licenses():
-    llvm = (LICENSES / "LLVM-LICENSE.TXT").read_text()
-    assert "Apache License" in llvm and "Version 2.0, January 2004" in llvm
-    assert "---- LLVM Exceptions to the Apache 2.0 License ----" in llvm
-    nanobind = (LICENSES / "NANOBIND-LICENSE.txt").read_text()
-    assert "Wenzel Jakob" in nanobind
-    assert "Redistributions of source code must retain" in nanobind
-    assert "Neither the name of the copyright holder" in nanobind
-    upimulator = LICENSES / "UPIMULATOR-LICENSE.txt"
-    assert "Permission is hereby granted, free of charge" in upimulator.read_text()
-    assert _sha256(upimulator) == UPIMULATOR_UPSTREAM_SHA256
+    present = sorted(p.name for p in LICENSES.iterdir())
+    assert present == sorted(EXPECTED_TEXTS), present
+    for name, phrases in EXPECTED_TEXTS.items():
+        text = (LICENSES / name).read_text()
+        for phrase in phrases:
+            assert phrase in text, (name, phrase)
+    assert _sha256(LICENSES / "UPIMULATOR-LICENSE.txt") == UPIMULATOR_UPSTREAM_SHA256
 
 
 def test_notices_inventory_names_every_bundled_text_with_its_checksum():
@@ -43,8 +66,23 @@ def test_notices_inventory_names_every_bundled_text_with_its_checksum():
     for path in sorted(LICENSES.iterdir()):
         assert f"THIRD_PARTY_LICENSES/{path.name}" in notices, path.name
         assert _sha256(path) in notices, f"checksum of {path.name} not recorded"
-    for component in ("LLVM / MLIR", "nanobind 2.10.2", "uPIMulator"):
-        assert component in notices
+    for component in (
+        "LLVM / MLIR",
+        "xxHash",
+        "Unicode, Inc.",
+        "Henry Spencer",
+        "BLAKE3",
+        "MD5",
+        "nanobind",
+        "robin-map",
+        "uPIMulator",
+        "UPMEM DPU runtime",
+    ):
+        assert component in notices, component
+    # nanobind has two origins; neither is presented as the only one.
+    assert "2.10.2" in notices and "2.13.0" in notices
+    # The UPMEM runtime hunks are distinguished from the MIT components.
+    assert "stdoutBufferState.c" in notices
     # What is deliberately not shipped is stated too.
     assert "Samsung PIMSimulator" in notices and "GSI Gemini-I SDK" in notices
 
@@ -78,4 +116,4 @@ def test_every_bundled_text_is_tracked_by_git():
     ).stdout.split()
     present = sorted(f"THIRD_PARTY_LICENSES/{p.name}" for p in LICENSES.iterdir())
     assert sorted(tracked) == present, f"tracked {sorted(tracked)} vs present {present}"
-    assert len(present) == 3
+    assert len(present) == len(EXPECTED_TEXTS) == 10

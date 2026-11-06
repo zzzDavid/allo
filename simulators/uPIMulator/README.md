@@ -19,9 +19,16 @@ not included and must be obtained by you (below).
   commit above).
 
 `tenon-upimulator.patch` contains Tenon's own code and modified hunks of
-upstream uPIMulator files (including the UPMEM BSD-style DPU runtime sources
-that upstream already bundles under `sdk/`). It is distributed under the
-upstream license, reproduced verbatim:
+upstream uPIMulator files. Two licenses apply, and both texts are shipped
+under the repository's `THIRD_PARTY_LICENSES/` (`THIRD_PARTY_NOTICES.md`):
+the hunks that modify upstream's own files (CMake, README and benchmark
+files under `golang/uPIMulator/benchmark/`) fall under upstream's MIT
+license, reproduced verbatim below; the hunks that modify the UPMEM DPU
+runtime sources upstream bundles under `golang/uPIMulator/sdk/`
+(`stdlib/stdio.c`, `syslib/dpuruntime.h`, the runtime's CMake files) and the
+new file `sdk/misc/stdoutBufferState.c`, written against those sources,
+fall under UPMEM's BSD-style license ("Copyright 2020 UPMEM", the notice the
+files carry; `THIRD_PARTY_LICENSES/UPMEM-DPU-RT-LICENSE.txt`). The MIT text:
 
 ```text
 Copyright (c) 2024, VIA Research Group at KAIST
