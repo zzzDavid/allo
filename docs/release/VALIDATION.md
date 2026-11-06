@@ -1859,3 +1859,75 @@ round 78 one pointed at `r84`.
 | Gemini-I | not launched: the board host's `/tmp` at about 108 KB free; `benchmarks/apu_v1/paper_rows.py` cannot run until the host's `/tmp` is usable; the three open rows stay explicitly blocked |
 | Inventory (`update_inventory.py`, byte-exact CRLF edit, 84 lines, 18 columns) | 55 required rows recorded at `88852b7`: the fourteen AiM, three Samsung, sixteen UPMEM and twelve AttAcc rows REPRODUCED from the installed wheel, the Gemini-II rows from the session (four REPRODUCED, mvt OPEN nominal), the five Gemini-I rows noted as not re-executed; snapshot 51 REPRODUCED, 4 OPEN (kmeans, linear regression, word count, mvt), 0 UNVERIFIED |
 | Not done | the independent review of the manifest and slice 5 packet (rounds 28 to 30; G9); the Gemini-I rows (the board host's `/tmp`); the X-34 / X-37 campaign (the final candidate); V1-19 (deferred); the packaging, licensing and final-candidate gates |
+
+## Round 85 (2026-11-06): the `/tmp` recovery and the Gemini-I execution of the candidate `88852b7` (pre-registration, written 12:20 EST, before any board launch)
+
+The reviewer accepted the round 84 evidence, the manifest source review
+(rounds 28 to 30) and supplied current Gemini-II slice 5 evidence
+(`reviewer-r84/`); the remaining execution gap is the candidate's APU v1
+vector path on the Gemini-I board, blocked by the host's full `/tmp`.
+
+**What blocked.** `ledag-ssh` is a PyInstaller bundle: it extracts itself
+into a temporary directory at start (`TMPDIR`, else `/tmp`) and writes a
+session log and an `online_log_<time>` copy of the device log (about 5 MB)
+into `/tmp` on every read, with no option to move them (`ledag-ssh --help`
+offers only `--host`).  With `/tmp` at a few hundred kB free the extraction
+fails (`fwrite: No space left on device`, exit 255; `r85/ledag_diag/`),
+and with it above that but below about 5 MB the read fails the same way.
+
+**What was recovered (bounded, owned scratch only).** Every top-level
+`/tmp` entry owned by this user except the runtime's device lock was copied
+to `tenon-release-evidence/tmp-relocated-20261106/` with `cp -a`, each entry
+compared with `diff -rq`, and only the entries that compared identical were
+removed (2,001 entries; 46 sockets and lock files kept; 22 entries kept
+unverified, among them `tenon-upmem`, whose Docker-era files are root-owned
+and cannot be removed; `REMOVED.txt`, `removed.txt`, `kept.txt`).  The
+ledger's early `/tmp` citations (`/tmp/tenon-release/r9`, `/tmp/g9`,
+`/tmp/upmem-fix`, the two Samsung reviewer scripts) are preserved under the
+relocated tree at the same relative paths.  Free space went from 552 kB to
+174,148 kB.  Nothing owned by another user was touched; the remaining ~15 GB
+is other users' unreadable directories and stays an external condition, so
+every run below is guarded on free space and recorded whatever happens.
+The vendor tool's self-extraction is pointed at the evidence tree through
+`TMPDIR`, a documented PyInstaller setting; its per-read `/tmp` scratch is
+removed by the runtime after each read as before.
+
+**What happened meanwhile.** The round 76 watcher fired on its own at
+11:34 EST when another user's deletion briefly left 288 MB free, and ran
+session 1 of the superseded `472bec9` campaign: kmeans kept 5 of 10 measured
+launches per lane before the partition refilled (every kept output exact,
+the driver marks the performance evidence invalid), linear regression and
+word count lost every launch, sessions 2 and 3 were guarded out
+(`r76/apu_v1_campaign.log`, `apu_v1_campaign_s1.json`, exit 3 at 12:01).
+It is recorded under X-22 / X-23 as a failed session at `472bec9`, not
+pooled with anything, and the watcher was ended so that no further launch
+happens at a superseded revision.
+
+**The runs (`r85/apu_v1_candidate.sh`, one pass, in this order, from the
+round 84 wheel `9d7b6be6...` of `88852b7`, under the runtime's board lock,
+`--scratch` under `r85/scratch`, outputs retained per launch, each run
+guarded on 25 MB free):**
+
+1. `protocol_rows`: kmeans, linear regression, word count, the round 30
+   protocol (one warm-up, ten measured launches per lane, the expert binary
+   and the archived paper-era Tenon binary interleaved, exact outputs
+   required).  This is the candidate's validation session; the statistic
+   at `88852b7` is this session's samples.  It is not the pre-registered
+   final-candidate confirmation campaign (three sessions at the final
+   candidate), which stays reserved; no further session is run here to
+   move a verdict.
+2. `vector_rows`: matrix multiply (the repaired vector route at its
+   accumulator-block plan) and histogram, the same protocol.
+3. `forced_acc4`: matrix multiply forced to
+   `temporal_dma_coalescing_broadcast_friendly_acc4`, five measured
+   launches (predicted slower than acc8).
+4. `perturbed_dma`: matrix multiply with `MICRO_DMA_L4_L1_32K` x0.01,
+   five measured launches (the selection is predicted to move to
+   `temporal_dma_coalescing` and to run slower than the stock pick).
+
+Acceptance: every launch's outputs equal the oracle; rows judged by the
+rule in PAPER_REPRODUCTION.md on this session's samples; the forced and
+perturbed runs are mechanism evidence (different device source, different
+fingerprint, the predicted ordering), not paper samples.  A session that
+loses launches to `/tmp` is kept, recorded as incomplete and not repeated
+in this round.
