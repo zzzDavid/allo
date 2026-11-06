@@ -192,9 +192,11 @@ GEMV, a non-FP16 operand) compiles for its estimate only
 condition named) and is refused before scheduling for `backend=None` and
 `backend="functional"` (no host model of the grouped program) with that
 condition.
-A placement's carried map must be the contiguous-group map the GVML tree and the host packing realize; an interleaved or collapsed map is refused per candidate (X-31). At most four work items are priced (V1-20). Not board-verified since the
-migration (the host's `/tmp`; V1-09 fixed earlier: output shapes from the
-compiled ABI, missing output files raise).
+A placement's carried map must be the contiguous-group map the GVML tree and the host packing realize; an interleaved or collapsed map is refused per candidate (X-31). At most four work items are priced (V1-20). Board-verified in round 70 from
+the installed wheel of `472bec9`: three dense FP16 GEMM regions (row and
+column blocks with eight batches per APUC, a 12 x 17 x 5 shape with four)
+with exact outputs and fresh profile records (`VALIDATION.md`; V1-09 fixed
+earlier: output shapes from the compiled ABI, missing output files raise).
 
 ## GSI APU v2 (Gemini-II)
 
