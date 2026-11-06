@@ -2002,3 +2002,16 @@ reviewer's observation), unchanged.
 | The bundle (commit `aae8b23`) | `THIRD_PARTY_LICENSES/` holds ten texts: the three of round 88 plus `ROBIN-MAP-LICENSE.txt`, `XXHASH-LICENSE.txt`, `CONVERTUTF-UNICODE-NOTICE.txt`, `LLVM-REGEX-COPYRIGHT.txt`, `BLAKE3-LICENSE.txt`, `MD5-NOTICE.txt`, `UPMEM-DPU-RT-LICENSE.txt`, each extracted or copied verbatim from the upstream file named in the inventory; `THIRD_PARTY_NOTICES.md` rewritten (components, placement, license, text, checksums, the symbol-based method, the not-shipped list); `tests/perf/test_distribution_licenses.py` pins the ten-file set, the phrases of each text, the inventory entries, the two nanobind origins, the UPMEM distinction and the git tracking of every file (4 passed, `pytest_distribution_licenses.log`) |
 | Archives rebuilt from `aae8b23` (`build_wheel.sh`, `build_wheel.log`, `pkg/`, `wheel_new/`, `sdist_new/`, `*_license_shas.txt`) | sdist `0a6746e9...`, 336 regular files, carrying `LICENSE`, `THIRD_PARTY_NOTICES.md` and the ten texts; wheel `7235d510...`, 433 members, `allo-0.5.dist-info/licenses/` holding `LICENSE`, the notices and the ten texts, `METADATA` with `License: Apache-2.0` and twelve `License-File` entries; every bundled text in both archives byte-identical to the repository's (sha256 lists compared); the wheel's `allo/` file set identical to the round 84 wheel's |
 | Not done | the Gemini-I rows and the vector route's board execution at `88852b7` (the external `/tmp` blocker, unchanged); the final-candidate campaigns; P-04 (permission); P-23's W/C/R classes; V1-19 (deferred); the next named candidate must contain `aae8b23` |
+
+## Round 90 (2026-11-06): P-23 W0640 triage (compile-only); no board launch
+
+Checkout after `3a16830`; evidence under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r90/`.  The host's
+`/tmp` at 128 KiB free, unchanged; nothing launched.
+
+| Check | Result |
+|---|---|
+| W0640 escape analysis (`w0640_escape_analysis.txt`) | over `spmw_autoschedule.py`, `spmw_plan.py`, `pim/apu_v1_vectorize.py`, `spmw_samsung.py`, `pim/upmem_irregular.py`, `pim/costs/upmem.py`: eight closures defined inside loops capture loop-scoped names; six are called directly in their loop body (`kernel_probe` at 2327 and 2336, `binding` at 647, `value_layout` at 840 to 842, `input_transfer` at 1281 to 1282, `layout_of` at 1314 to 1431), one is a `key=lambda` consumed by `min` (`upmem_irregular.py:1342`), two are decorator registrations with default-argument binding (`costs/upmem.py:782`, `:842`); none is stored, returned or passed to another function |
+| Captured-cell check (`w0640_cells.txt`) | for the six called closures, every captured name is assigned before the definition and not reassigned before the last call; the only later reassignments (`label`, `cost` at `spmw_autoschedule.py:2410`, nested, and `:2494`) follow the closure's last call and the closure is referenced nowhere after |
+| Verdict | 89 diagnostics, 0 defects, 0 suppressed; 491 W/C/R diagnostics remain untriaged (ISSUES P-23) |
+| Not done | the Gemini-I rows and the vector route's board execution at a candidate containing `aae8b23` (the external `/tmp` blocker, unchanged); the final-candidate campaigns; P-04; the remaining W/C/R classes; V1-19 (deferred) |
