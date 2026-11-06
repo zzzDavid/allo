@@ -127,9 +127,14 @@ The reviewer's round 82 alias probe (a reset moved across the live range
 of a value sharing its hardware register) showed the interpreter keyed
 storage by logical name; repaired in round 83 by keying every cell by the
 concrete VR (the reviewer's probe refused, the intact reuse accepted, 32
-regressions, 21 plans identical).  This packet does not claim G9 closed
-from that checker; the repair awaits the reviewer's independent read.  Still
-open: the independent review of the repair and of the remaining packet
-(rounds 28 to 30: the `APUv1Program` manifest from the retained IR, the
-slice 5 traces); the Gemini-I rows at a candidate (the board's `/tmp`); the
-open minor items in `ISSUES.md`.
+regressions, 21 plans identical).  The reviewer accepted that repair in
+round 83 (`reviewer-r83/`: the 32 regressions from checkout and installed
+code, the alias probe and a renamed uint16 11 x 17 x 7 contraction, the
+21-plan comparator, the retained-IR manifest suite 7 passed), closing the
+physical-alias finding; this packet still does not claim G9 closed, and
+the checker establishes no hardware correctness.  Still open: the
+independent review of the remaining packet (rounds 28 to 30: the
+`APUv1Program` manifest from the retained IR, the slice 5 traces); the
+execution evidence at the named candidate containing `8d9136f`
+(VALIDATION.md round 84); the Gemini-I rows at a candidate (the board's
+`/tmp`); the open minor items in `ISSUES.md`.

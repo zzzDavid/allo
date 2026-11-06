@@ -1789,3 +1789,54 @@ interpreter are superseded only in the identity of its register cells.
 | APU v1 and shared suites (`pytest_apu_v1_suites.log`, `suite_files.txt`) | 1 failed, 144 passed, 352 deselected; the failure is the board row `test_apu_v1_board_median_cycles[apu_v1-histogram]` (`ledag-ssh exited with 255`, the host's `/tmp`) |
 | From the installed wheel of the round 83 commit `8d9136f` (`build_wheel.log`, wheel `60999e64...`, clean venv, 0 dirty entries; `run_installed_probes.sh`, `installed_probes.log`, `installed/`) | `allo` from site-packages, the module exposing `_ScheduleInterpreter` and no `ScheduleLine`; the reviewer's alias probe (`installed/alias_probe.log`): intact accepted, the moved reset refused, the physical variant agreeing; the rounds 78, 79, 81 and 82 probes refused with their controls accepted; `test_apu_v1_realization_binding.py` 32 passed; the paper APU v1 kernels' compile-only golden rows 5 passed; GEMV tile and reduction policy 7 passed and 1 failed, shared semantics `apu_v1 or vector or gvml` 29 passed and 1 failed, both failures the deferred V1-19 tests under the venv's NumPy 2.5.4 (`installed/v1_19_rerun.log`: `test_functional_numerics_follow_the_selected_plan`, `test_local_accumulator_gemm_executes_on_apu_v1_functional_backend`, `ValueError: setting an array element with a sequence`, as at `92d4120`); that rerun's broadened selection also picked `test_corrupted_upmem_declarations_are_refused_before_costing`, which fails there only because the probe tree copies `tests` without `benchmarks` (`ModuleNotFoundError: No module named 'workloads'`, `installed/upmem_declarations_rerun.log`); it passed in the round 82 chain's whole-suite run from the wheel with the benchmarks copied and is outside the APU v1 subset. The full local and Gemini-II chains were not repeated: `git diff 92d4120..8d9136f -- allo` touches only `allo/pim/apu_v1_vector_codegen.py` |
 | Not done | the independent review of the repair (G4, G9); the next named candidate (must contain this commit); Gemini-I (the board host's `/tmp`); the X-34 / X-37 campaign (the final candidate); V1-19 (deferred) |
+
+## Round 84 (2026-11-06): the round 83 repair accepted; named-candidate milestone at `88852b7` (pre-registration, written 10:05 EST, before any launch)
+
+The reviewer accepted the round 83 repair (`reviewer-r83/`), closing the
+round 82 physical-alias finding only.  The named candidate for the
+remaining G9 execution evidence and the required G10 comparisons is
+`88852b7` on `fork/tenon`: its code tree is that of `8d9136f`, the first
+commit containing every production fix since `d120084` (`6ce37ad`,
+`7fb19a4`, `5965d1f`, `92d4120`, `8d9136f`; all in the APU v1 vector
+route), and `git diff 92d4120..88852b7 -- allo benchmarks` touches only
+`allo/pim/apu_v1_vector_codegen.py`.  The working tree carries uncommitted
+ledger edits (this pre-registration and the acceptance notes), so the
+sdist is taken from `git archive 88852b7` explicitly and the recorded
+dirty entries are documentation files only.  Evidence under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r84/`.  Scripts are
+the round 82 ones with the round changed and two corrections: the
+benchmarks copy no longer depends on a `pytest.ini` that the tree lacks
+(round 82's AttAcc stage failed on that), and the AttAcc comparator is the
+round 78 one pointed at `r84`.
+
+- `build_wheel.sh`: sdist from `88852b7`, wheel into a clean venv under
+  `r84/pkg` (the venv's NumPy 2.5.4 reproduces the deferred V1-19 pair).
+- `g2_remote_chain.sh` on zhang-x4: the sdist built there, the card tests
+  from that wheel (`tests/pim/test_apu_g2_hardware.py`), then ONE
+  pre-registered paired session of 20 rounds of
+  `benchmarks.apu_g2.paper_rows` under the device lock with actual
+  outputs, selected-program provenance and the existing timing boundaries.
+  Under the rule of PAPER_REPRODUCTION.md the statistic at this revision
+  is this session's pooled samples, recorded whatever the outcome; the
+  earlier sessions at `d120084` and `92d4120` are reported beside it, not
+  pooled.  It is not the bounded confirmation campaign (X-34 / X-37; at
+  most one, at the final candidate, three sessions pooled with that
+  revision's session) and not a further sample for the spent batched_gemm
+  campaign (X-26).  No further candidate is named to seek another session.
+- `run_installed.sh`: the local stages from the wheel as in round 82
+  (fresh-install and simulator probes, X-33, the AiM suites and rows
+  default and `paper_full`, the fourteen-row provenance, Samsung, UPMEM
+  default and `paper_full` and the GEMV test, the six AttAcc rows and the
+  composed configurations, the AttAcc suites, the whole shared-semantics
+  suite and the grouped route's section, the round 65 and 71 to 74
+  probes).  Acceptance: every row the same as at `92d4120`; a difference is
+  a finding.
+- `run_installed_probes.sh`: the rounds 78, 79, 81 and 82 reviewer probes
+  (the alias probe included) and the round 82 probe from the wheel, the 32
+  realization regressions, the compile-only golden rows, the GEMV tile and
+  reduction-policy suites, the shared-semantics APU v1 subset.
+- `benchmarks/apu_v1/paper_rows.py` (Gemini-I): NOT launched.  The board
+  host's `/tmp` is at about 116 KB free and the vendor tool fails there
+  (`ledag-ssh exited with 255`); the three open Gemini-I rows stay
+  explicitly blocked until execution is possible.  The retry watcher of
+  the pre-registered campaign stays queued.
