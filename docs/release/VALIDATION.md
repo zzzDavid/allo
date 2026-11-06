@@ -1663,3 +1663,17 @@ Checkout after `c874397`; evidence under
 | Ledger consistency | PAPER_REPRODUCTION's status paragraph rewritten as one current snapshot (51 REPRODUCED, 4 OPEN at `d120084`) with history separated; REVIEW's G10 row carries one current count; `G9_EVIDENCE.md` updated for X-35 |
 | From the installed wheel of `6ce37ad` (`build_wheel.log`, wheel `08b58ac9...`, clean venv; `run_installed_probes.sh`, `installed_probes.log`, `installed/`) | both reviewer probes refused with the same diagnostics as at the checkout (the instruction probe ending in `no feasible placement`); `test_apu_v1_realization_binding.py` 5 passed; the shared-semantics APU v1 subset 29 passed, 1 failed (the known deferred V1-19, NumPy 2.5.4) |
 | Not done | Gemini-I (the board host's `/tmp`, 132 kB free at the start of the round); X-34's pre-registered campaign (the final candidate); the independent review of the repair |
+
+## Round 80 (2026-11-06): one realization-boundary invariant for the APU v1 vector route (X-36)
+
+Checkout after `7bce26a`; evidence under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r80/`.
+
+| Check | Result |
+|---|---|
+| The reviewer's injections (`reviewer-r79/transfer_probe.py`, `emitted_order_probe.py`; re-run at the checkout: `transfer_probe_rerun.log`, `emitted_order_probe_rerun.log`) | at `6ce37ad` (the reviewer, installed wheel): both accepted; at the repaired checkout: the misdirected ingress refused under forced `temporal_svp`, forced `temporal_dma_coalescing` and default selection (`instruction 2 (transfer_in) differs from the plan's stream: realized (... ('vr', 'p') ...), derived (... ('vr', 'q') ...)`, ending in `no feasible placement`), the intact program still accepted; the swapped emission refused (`APU v1 emitted device source differs from the realization's emission schedule at line 19`) |
+| The round 78 injections re-run (`v1_realization_probe_rerun.log`, `v1_instruction_probe_rerun.log`) | still refused |
+| The schedule-based renderer against the previous renderer (`differential_emission.py`, `.log`; run while the previous renderer was still present in the working tree, then removed) | 21 plans of the square, rectangular and large contractions, a GEMV and the paper's matrix multiply (accumulator blocks 1, 2, 4 and 8, the L4 variants, the spatial scatter form `baseline_spatial_reduction`): the device source identical byte for byte, the invariant satisfied by every plan |
+| `tests/pim/test_apu_v1_realization_binding.py` | 11 passed |
+| APU v1 and shared suites at the checkout | the shared-semantics APU v1 and vector subset, the APU v1 perf suites (build config, cost provenance, distance argmin, hybrid manifest, native reductions, performance, recognizers, reduction policy, scalar surface, tile selection, vector compile), the compile interface, layout problem, legality, portability driver and fingerprint suites, and the layout-selection, transfer-dispatch and work-grid suites: 139 passed (`pytest_apu_v1_suites.log`); the paper APU v1 kernels' compile-only golden test, the matrix multiply at its accumulator-block plan among them: 5 passed (`pytest_golden_apu_v1_compile.log`) |
+| Not done | the installed re-execution (next candidate, which must contain `6ce37ad` and this commit); Gemini-I (the board host's `/tmp`); X-34's pre-registered campaign (the final candidate); the independent review of the repair |

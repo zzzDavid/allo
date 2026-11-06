@@ -1,8 +1,8 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The APU v1 vector route binds its realized computation to the shared
-contraction (round 79, ISSUES X-35).
+"""The APU v1 vector route binds its realized program to the shared
+contraction and the selected plan (round 79, ISSUES X-35; round 80, X-36).
 
 The reviewer's round 78 injections produced ``gvml_mul_f16(vr_product,
 vr_left, vr_left)`` for a source that multiplies ``left`` by ``right``,
@@ -22,7 +22,11 @@ import pytest
 import allo
 from allo.ir.types import float16
 from allo.pim import apu_v1_vector_program as vp
-from allo.pim.apu_v1_vector_codegen import realize_apu_v1_plan
+from allo.pim.apu_v1_vector_codegen import (
+    APUVectorRealization,
+    VRRef,
+    realize_apu_v1_plan,
+)
 from allo.pim.costs import apu_v1_cost
 from allo.pim.targets import build_apu_v1_target
 
@@ -114,7 +118,11 @@ def test_damaged_operations_on_every_plan_leave_nothing_to_select(monkeypatch):
 
 def test_damaged_instructions_are_refused(monkeypatch):
     monkeypatch.setattr(vp, "_realize", _damaged_instructions(vp._realize))
-    with pytest.raises(Exception, match="instructions differ from the contraction"):
+    # The public error quotes the per-candidate rejection, escaping the
+    # apostrophe of "plan's".
+    with pytest.raises(
+        Exception, match=r"\(compute\) differs from the plan\\?'s stream"
+    ):
         _compile()
 
 
@@ -141,3 +149,134 @@ def test_a_damaged_candidate_is_rejected_and_an_intact_alternative_selected(
     ]
     with pytest.raises(Exception, match="operations differ from the contraction"):
         _compile(layout=preferred)
+
+
+def rectangular(p: float16[5, 8], q: float16[8, 3], r: float16[5, 3]):
+    for m, n in allo.grid(5, 3):
+        for k in range(8):
+            r[m, n] += p[m, k] * q[k, n]
+
+
+def _compile_rectangular(layout=None):
+    return allo.compile(
+        rectangular,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="virtual",
+        layout=layout,
+    )
+
+
+def _damaged_ingress(original):
+    """``_realize`` redirecting the right operand's ingress into the left
+    operand's register (the reviewer's round 79 transfer injection): the
+    operations, the compute instructions and the plan stay intact."""
+
+    def damaged(analysis, plan):
+        real, error = original(analysis, plan)
+        if real is None:
+            return real, error
+        changed = []
+        for instruction in real.instructions:
+            if (
+                instruction.phase == "transfer_in"
+                and instruction.args
+                and instruction.args[0] == VRRef("q")
+            ):
+                instruction = replace(
+                    instruction, args=(VRRef("p"), *instruction.args[1:])
+                )
+            changed.append(instruction)
+        return replace(real, instructions=tuple(changed)), error
+
+    return damaged
+
+
+@pytest.mark.parametrize(
+    "layout", ["temporal_svp", "temporal_dma_coalescing", None], ids=str
+)
+def test_a_misdirected_operand_ingress_is_refused(monkeypatch, layout):
+    """Reviewer round 79 (`reviewer-r79/transfer_probe.py`): with the right
+    operand loaded into the left operand's register, the realization's
+    ingress differs from the plan's stream and the multiply would read a
+    register nothing loads; refused when forced and under default
+    selection."""
+    monkeypatch.setattr(vp, "_realize", _damaged_ingress(vp._realize))
+    with pytest.raises(
+        Exception, match=r"\(transfer_in\) differs from the plan\\?'s stream"
+    ):
+        _compile_rectangular(layout)
+
+
+def test_swapped_emitted_lines_are_refused(monkeypatch):
+    """Reviewer round 79 (`reviewer-r79/emitted_order_probe.py`): the
+    emission swaps the ADD and MUL lines while the realization's records stay
+    intact; the emitted source is no longer the schedule's rendering."""
+    original = APUVectorRealization.device_source
+
+    def swapped(self):
+        lines = original(self).splitlines()
+        mul = next(i for i, line in enumerate(lines) if "gvml_mul_f16(" in line)
+        add = next(i for i, line in enumerate(lines) if "gvml_add_f16(" in line)
+        lines[mul], lines[add] = lines[add], lines[mul]
+        return "\n".join(lines)
+
+    monkeypatch.setattr(APUVectorRealization, "device_source", swapped)
+    with pytest.raises(
+        Exception, match="differs from the realization's emission schedule"
+    ):
+        _compile_rectangular("temporal_svp")
+
+
+def test_a_reordered_schedule_is_refused_by_readiness(monkeypatch):
+    """A schedule that emits the product's accumulation before the multiply
+    (records intact) is refused by the readiness check, independent of the
+    rendered text."""
+    original = APUVectorRealization.emission_schedule
+
+    def reordered(self):
+        schedule = original(self)
+        steps = list(schedule.steps)
+        calls = [
+            i
+            for i, step in enumerate(steps)
+            if getattr(step, "instruction", None) is not None
+            and step.instruction.phase == "compute"
+        ]
+        mul, add = calls[0], calls[1]
+        steps[mul], steps[add] = steps[add], steps[mul]
+        return replace(schedule, steps=tuple(steps))
+
+    monkeypatch.setattr(APUVectorRealization, "emission_schedule", reordered)
+    with pytest.raises(Exception, match="before anything in the emission defines them"):
+        _compile_rectangular("temporal_svp")
+
+
+def test_every_enumerated_plan_passes_the_realization_invariant():
+    """Positive coverage of the unaffected paths: every plan the enumerator
+    offers for the square and the rectangular contraction (the plain
+    temporal loop nest, the coalesced DMA ingress, and the broadcast-friendly
+    plan with its resident and index setup) is accepted when forced, with no
+    rejection recorded and the multiply reading both operands."""
+    for compile_fn, lhs, rhs in (
+        (_compile, "left", "right"),
+        (_compile_rectangular, "p", "q"),
+    ):
+        compiled = compile_fn()
+        plans = [p.mode for _pos, p in compiled.placement_ranking.kernels[0].candidates]
+        assert len(plans) >= 2, plans
+        for plan in plans:
+            forced = compile_fn(plan)
+            assert forced.selected_plan.name == plan
+            assert forced.placement_ranking.kernels[0].rejections == ()
+            lines = [
+                l for l in forced.device_source().splitlines() if "gvml_mul_f16(" in l
+            ]
+            assert lines and all(f"vr_{lhs}, vr_{rhs})" in l for l in lines), (
+                plan,
+                lines,
+            )
+            assert (
+                forced.realization.emission_schedule().render()
+                == forced.device_source()
+            )

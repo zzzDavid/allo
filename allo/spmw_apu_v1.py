@@ -334,30 +334,23 @@ class APUv1Ctx(CodegenContext):
         self._check_vector_compute(realization, analysis, plan)
 
     def _check_vector_compute(self, realization, analysis, plan) -> None:
-        """The realized computation against the contraction (round 79,
-        ISSUES X-35).
+        """The realized program against the contraction and the plan (round
+        79, ISSUES X-35; round 80, X-36).
 
-        Three bindings, each re-derived structurally from the shared
-        contraction analysis and the selected plan, none from an approved
-        fingerprint: (1) the realization's neutral operations must be the
-        operations the contraction and the plan's reduction strategy derive
-        (`_realization_operations`: opcode, output, inputs in order, attrs);
-        (2) the realization's compute instructions must be the lowering of
-        those operations (`_op_instructions`: API, every argument including
-        the operand registers in order, definitions, uses, predicate); (3)
-        every such instruction, rendered with the realization's register
-        bindings, must appear in the emitted device source.  A realization
-        whose multiply reads the left operand twice, or whose emitted call
-        does, is refused here as a feasibility rejection of the candidate
-        (the reviewer's round 78 injections: damaged neutral operations
-        behind a coherent realization, and a damaged instruction behind
-        intact operations).
+        The neutral operations are re-derived from the shared contraction
+        analysis and the plan's reduction strategy; `validate_realization`
+        then checks, structurally and without any approved fingerprint, the
+        whole instruction stream (ingress, resident and index setup, compute,
+        egress: API, every argument including the operand registers in
+        order, definitions, uses, phase), the physical emission, the register
+        bindings, and the emission schedule (every instruction emitted, the
+        compute calls whole repetitions of the operation sequence, every
+        register read defined earlier in the emission); finally the device
+        source this context emitted must be the schedule's rendering, line
+        for line, so order and multiplicity are bound to the text.  A
+        mismatch is a feasibility rejection of the candidate.
         """
-        from .pim.apu_v1_vector_codegen import (
-            VRRef,
-            _normalize_operations,
-            _op_instructions,
-        )
+        from .pim.apu_v1_vector_codegen import validate_realization
         from .pim.apu_v1_vector_program import _realization_operations
 
         derived = _realization_operations(analysis, plan)
@@ -366,58 +359,30 @@ class APUv1Ctx(CodegenContext):
                 "APU v1 realization has no derivable computation for "
                 f"{analysis.multiply_operation!r} under {plan.name!r}"
             )
-        expected_ops = tuple(_normalize_operations(plan, derived))
-        realized_ops = tuple(realization.operations)
-
-        def op_key(op):
-            return (op.opcode, op.output, tuple(op.inputs), dict(op.attrs))
-
-        if [op_key(o) for o in realized_ops] != [op_key(o) for o in expected_ops]:
+        problems = validate_realization(realization, derived)
+        if problems:
             raise RuntimeError(
-                "APU v1 realization operations differ from the contraction: "
-                f"realized {[op_key(o) for o in realized_ops]}, derived from the "
-                f"shared contraction and plan {plan.name!r} "
-                f"{[op_key(o) for o in expected_ops]}"
+                "APU v1 realization differs from the contraction and plan "
+                f"{plan.name!r}: " + "; ".join(problems)
             )
-
-        def arg_key(value):
-            if isinstance(value, VRRef):
-                return ("vr", value.name)
-            return ("literal", repr(value))
-
-        def instr_key(instr):
-            return (
-                instr.opcode,
-                instr.api,
-                tuple(arg_key(a) for a in instr.args),
-                tuple(instr.definitions),
-                tuple(instr.uses),
-                instr.predicate,
+        scheduled = realization.emission_schedule().render().splitlines()
+        emitted = list(self.cmds)
+        if [line.rstrip() for line in emitted] != [line.rstrip() for line in scheduled]:
+            position = next(
+                (
+                    index
+                    for index, (a, b) in enumerate(zip(emitted, scheduled))
+                    if a.rstrip() != b.rstrip()
+                ),
+                min(len(emitted), len(scheduled)),
             )
-
-        expected_instr = [
-            instr
-            for index, op in enumerate(expected_ops)
-            for instr in _op_instructions(op, index)
-        ]
-        realized_instr = [i for i in realization.instructions if i.phase == "compute"]
-        if [instr_key(i) for i in realized_instr] != [
-            instr_key(i) for i in expected_instr
-        ]:
+            got = emitted[position].strip() if position < len(emitted) else None
+            want = scheduled[position].strip() if position < len(scheduled) else None
             raise RuntimeError(
-                "APU v1 realization instructions differ from the contraction's "
-                f"operations: realized {[instr_key(i) for i in realized_instr]}, "
-                f"derived {[instr_key(i) for i in expected_instr]}"
+                "APU v1 emitted device source differs from the realization's "
+                f"emission schedule at line {position + 1}: emitted {got!r}, "
+                f"scheduled {want!r}"
             )
-        bindings = {b.logical_name: b for b in realization.vr_bindings}
-        emitted = {line.strip() for line in self.cmds}
-        for instr in expected_instr:
-            text = instr.render(bindings).strip()
-            if text not in emitted:
-                raise RuntimeError(
-                    "APU v1 emitted device source lacks the contraction's "
-                    f"instruction {text!r}"
-                )
 
     def _check_grouped_realization(self, layouts) -> None:
         """The grouped program of a dataflow region against every work
