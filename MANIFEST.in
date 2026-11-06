@@ -7,6 +7,10 @@
 
 include README.md LICENSE requirements.txt requirements-dev.txt pyproject.toml setup.py MANIFEST.in
 
+# Third-party license texts the distributions carry (THIRD_PARTY_NOTICES.md).
+include THIRD_PARTY_NOTICES.md
+graft THIRD_PARTY_LICENSES
+
 # MLIR dialect + Python-binding sources built by setup.py's CMakeBuild.
 graft mlir
 prune mlir/build

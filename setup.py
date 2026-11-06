@@ -220,6 +220,15 @@ if __name__ == "__main__":
         ext_modules=[CMakeExtension("mlir", sourcedir="mlir")],
         cmdclass={"build_ext": CMakeBuild},
         url="https://github.com/cornell-zhang/allo",
+        # Allo's license plus the texts of the third parties the distributions
+        # carry (THIRD_PARTY_NOTICES.md); setuptools installs them under
+        # dist-info/licenses/ and the sdist includes them through MANIFEST.in.
+        license="Apache-2.0",
+        license_files=[
+            "LICENSE",
+            "THIRD_PARTY_NOTICES.md",
+            "THIRD_PARTY_LICENSES/*",
+        ],
         python_requires=">=3.12",
         classifiers=[
             "Programming Language :: Python :: 3.12",
