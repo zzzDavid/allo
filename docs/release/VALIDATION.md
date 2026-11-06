@@ -1710,3 +1710,65 @@ installed artifact and no board or card launch in this round.
 | APU v1 and shared suites at the checkout (`pytest_apu_v1_suites.log`, the file list in `suite_files.txt`) | selected by `apu_v1 or vector or gvml`: 1 failed, 144 passed, 352 deselected, 4 warnings; the one failure is the board row `test_apu_v1_board_median_cycles[apu_v1-histogram]` (`ledag-ssh exited with 255 while reading the device log`), the board host's `/tmp` at 124 KB free, the same blocker that holds the Gemini-I campaign; every compile-only golden row, realization and compile test passes |
 | GEMV tile and reduction-policy suites (compile the resident form) | `tests/perf/test_apu_v1_tile_selection.py`, `tests/perf/test_apu_v1_reduction_policy.py`: 8 passed |
 | Not done | the installed re-execution (the next named candidate must contain `6ce37ad`, `7fb19a4`, `5965d1f` and this commit); Gemini-I (the board host's `/tmp`, watcher alive); X-34's pre-registered campaign (the final candidate); the independent review of the repair; G4 and G9 are not claimed closed from this checker |
+
+## Round 82, named-candidate milestone at `92d4120` (pre-registration, written 2026-11-06 07:52 EST, before any result was read)
+
+The candidate is `92d4120` on `fork/tenon`, the first commit that contains
+every production fix after `d120084` (`6ce37ad`, `7fb19a4`, `5965d1f`,
+`92d4120`; `git diff d120084..92d4120 -- allo benchmarks` touches only
+`allo/pim/apu_v1_vector_codegen.py` and `allo/spmw_apu_v1.py`, so every
+other backend's production code is byte-identical to `d120084`).  Evidence
+under `/work/shared/users/phd/nz264/tenon-release-evidence/r82/`.  Launched
+in this order, each script a copy of the round 78 chain with the round
+changed and the scratch directory moved under `r82/tmp` (the host's `/tmp`
+is full):
+
+- `build_wheel.sh` (07:45): sdist from the committed tree (dirty entries 0),
+  wheel `dd91e58e...` built with the shared clang into a clean venv under
+  `r82/pkg` (`WHEEL_OK` at 07:48).
+- `g2_remote_chain.sh` on zhang-x4 (07:47): the same sdist built into a
+  wheel there, the card tests from that wheel, then ONE pre-registered
+  paired session of 20 rounds of `benchmarks.apu_g2.paper_rows`
+  (`g2_candidate_session.sh`; its purpose statement is in the script).  The
+  statistic at this revision is that session's pooled samples, recorded
+  whatever the outcome.  It is not the X-34 gemm campaign (pre-registered
+  for the final candidate, not launched) and not a further sample for the
+  exhausted batched_gemm campaign (X-26).
+- `run_installed.sh` (07:49): the local stages from the installed wheel
+  exactly as in round 78 (fresh-install and simulator probes, X-33's
+  refusal and dense neighbour, the AiM dense-domain and value-layout
+  suites, the rounds 71 to 74 reviewer probes, the golden AiM rows default
+  and `paper_full`, the CENT suite default and `paper_full`, the
+  fourteen-row provenance, the golden Samsung rows, the golden UPMEM rows
+  default and `paper_full`, the UPMEM GEMV test, the six AttAcc rows and
+  the composed decode configurations with the round 67 comparison, the
+  AttAcc suites, the whole shared-semantics suite and the grouped route's
+  section, the round 65 map probe).  Acceptance: every row the same as at
+  `d120084` (same cycles, same trace digests, same pass counts); a
+  difference is a finding, not a tolerance.
+- `run_installed_probes.sh` (07:49): from the installed wheel, the rounds
+  78, 79 and 81 reviewer probes and the round 82 probe (refusals expected,
+  intact controls accepted), the 29 realization-binding regressions, the
+  paper APU v1 kernels' compile-only golden rows, the GEMV tile and
+  reduction-policy suites and the shared-semantics APU v1 subset.
+- Not launched: anything on the Gemini-I board (the host's `/tmp` is at
+  124 KB free; the Gemini-I rows stay blocked); the X-34 gemm campaign.
+
+### Results (read after every chain finished, 09:25 EST)
+
+| Check | Result |
+|---|---|
+| Artifacts | sdist `e40df359...` from `git archive` of `92d4120` (0 dirty entries); local wheel `dd91e58e...` (`pkg/`), zhang-x4 wheel `32c005b6...` (`g2/`), both installed into clean venvs; `allo` and every backend module imported from site-packages in every log (`installed_run.log`, `installed_probes.log`, `g2-card-tests.log`, `g2-candidate-session.log`) |
+| The X-35 / X-36 refusals from the wheel (`installed_probes.log`, `installed/*.log`) | the module exposes `_ScheduleInterpreter` and no `ScheduleLine`; the round 78 probes refused (operations and instruction differences), the round 79 probes refused (the misdirected ingress under both forced plans and default selection, the emitted-order fault), the reviewer's round 81 probe: four injections refused by the contract and `scatter_zero` failing on the removed body text, the round 82 probe: all seven faults refused and the five intact controls accepted; `test_apu_v1_realization_binding.py` 29 passed; the paper APU v1 kernels' compile-only golden rows 5 passed; GEMV tile and reduction policy 7 passed, 1 failed (V1-19, `perf_rerun.log`); shared semantics `apu_v1 or vector or gvml` 29 passed, 1 failed (V1-19, `shared_rerun.log`) |
+| Fresh-install and simulator probes | `fresh_install_check`, `fresh_sim_check`, `aim_check`, `upmem_check` exit 0 |
+| X-33 and its neighbours | the stride-two witness refused (exit 1), the dense program accepted, `test_aim_dense_domains.py` + `test_aim_value_layouts.py` 21 passed |
+| The reviewer's round 65, 71 to 74 probes from the wheel | fan-out and inverse refused, slot liveness and multi-row at the source semantics, the prefix composition refused (`probes/`), the round 65 first map refused (exit 1) |
+| AiM | golden rows default 3 passed (11 skipped), `paper_full` 11 passed; the CENT suite default 8 passed (13 skipped), `paper_full` 13 passed; the fourteen-row provenance (`aim_rows_provenance.json`): every row's cycles and trace digest identical to the `d120084` set (attention 11,010 / 18,126 / 95,090 and ffn_fc 250,433 exact; the other ten below the paper as before) |
+| Samsung | 3 passed; default 4,108 / 7,057 / 7,255 against the paper's 4,435 / 8,041 / 8,247, identical to `d120084` |
+| UPMEM (native SDK executor) | default 19 passed, 13 skipped; `paper_full` 13 passed; the GEMV test 1 passed (as at `d120084`) |
+| AttAcc | the chain's own AttAcc stage failed at once (`ModuleNotFoundError: benchmarks`: the chain copies the benchmarks only after a `cp` of `pytest.ini`, which the tree does not have, so the copy never happens; the same defect as round 78) and the comparison lines it printed into `installed_run.log` compared `r57` with `r62` (the round 67 script's hard-coded rounds): those lines are disregarded. The twelve results re-run alone from the wheel with an explicit benchmarks copy (`run_attacc_installed.sh`, every row exit 0, compose exit 0; `attacc_*.json`, `attacc_e2e.json`); the round 78 comparator with the round changed (`compare_attacc.py`, `compare_attacc.log`): all six kernel rows and the composed configurations identical to the `r57` baseline, 0 differences excluding timestamps and paths; the AttAcc suites 65 passed, 1 skipped |
+| Shared semantics (whole) from the wheel | 1 failed, 156 passed (`installed_run.log`; re-run with failure names, `installed/shared_whole_rerun.log`: the one failure is `test_local_accumulator_gemm_executes_on_apu_v1_functional_backend`, V1-19 under the venv's NumPy 2.5.4, identical to the `d120084` run); the grouped route's section 19 passed |
+| Gemini-II (zhang-x4, `g2-card-tests.log`, `g2-candidate-session.log`, `g2_candidate_rows.json`) | the card tests 15 passed; the one pre-registered validation session: status pass, 210 launches, no timing problem, every output exact, the same program and layout fingerprints and packing attestations as the `d120084` session for all five rows; medians against the paper: gemm 1,733.025 / 1,733.225 (0.9999), batched_gemm 1,737.675 / 1,739.15 (0.9992), gesummv 1,837.725 / 1,860.075 (0.9880), bicg 2,545.175 / 2,548.825 (0.9986), mvt 2,767.075 / 2,766.625 (1.0002, the paper inside the IQR 2,754.6 to 2,777.0); under the pre-registered rule the statistic at this revision is this session's samples: gemm REPRODUCED at `92d4120` (X-34, reported beside the `d120084` session, not pooled), mvt OPEN (nominal) at `92d4120` (X-37); the confirmation campaign stays pre-registered for the final candidate and was not launched |
+| Gemini-I | not run (the board host's `/tmp` at 124 KB free); the three open rows stay blocked |
+| Inventory (`docs/release/paper_reproduction/inventory.csv`, `update_inventory.py`, byte-exact CRLF edit, 84 lines, 18 columns) | 55 required rows recorded at `92d4120`: the fourteen AiM, three Samsung, sixteen UPMEM and twelve AttAcc rows REPRODUCED from the installed wheel, the Gemini-II rows from the session (four REPRODUCED, mvt OPEN nominal), the five Gemini-I rows noted as not re-executed; snapshot 51 REPRODUCED, 4 OPEN (kmeans, linear regression, word count, mvt), 0 UNVERIFIED |
+| Not done | the independent review of the round 82 repair (G4, G9); the Gemini-I rows (the board host's `/tmp`); the X-34 / X-37 campaign (the final candidate); V1-19 (deferred by direction) |

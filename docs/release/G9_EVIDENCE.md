@@ -82,6 +82,24 @@ out of the checkout:
 | Gemini-II (zhang-x4) | the card tests 11 passed; the pre-registered validation session: status pass, every output exact (batched_gemm 0.9976, gesummv 0.9853, bicg 0.9961, mvt 0.9985 of the paper; gemm 1.0042, nominal, X-34) |
 | Gemini-I | not run at this candidate (the board host's `/tmp`) |
 
+Round 82 (`tenon-release-evidence/r82/`, `VALIDATION.md` round 82): the
+named candidate `92d4120`, the first that contains every production fix
+after `d120084` (`6ce37ad`, `7fb19a4`, `5965d1f`, `92d4120`, all in the APU
+v1 vector route); sdist `e40df359...` (0 dirty entries), local wheel
+`dd91e58e...`, zhang-x4 wheel `32c005b6...`, clean venvs, every module from
+site-packages.  From the installed artifacts: the X-35 / X-36 refusals (the
+reviewers' round 78, 79 and 81 probes and the round 82 probe, every fault
+refused, every intact control accepted), the 29 realization-binding
+regressions, the paper APU v1 kernels' compile-only golden rows; the AiM,
+Samsung, UPMEM and AttAcc rows identical to the `d120084` table above (the
+chain's AttAcc stage re-run alone; the stale comparison lines it printed are
+disregarded); shared semantics 156 passed and the one V1-19 failure; the
+Gemini-II card tests 15 passed and the one pre-registered session with the
+same attestations (gemm 0.9999, batched_gemm 0.9992, gesummv 0.9880, bicg
+0.9986, mvt 1.0002 of the paper; mvt nominal, X-37); Gemini-I not run.  This
+is installed-artifact evidence of the repair; it is not the independent
+review of it, which G9 still needs.
+
 ## 6. What remains for G9
 
 The reviewer's round 78 source review of this packet found that the APU v1
