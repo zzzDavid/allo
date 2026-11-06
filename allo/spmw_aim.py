@@ -15,7 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .spmw_autoschedule import _matcher_work_scope
-from .spmw_plan import LaunchStep
+from .spmw_plan import HostStep, LaunchStep
 from .spmw_match import MatchedOp
 from .spmw_codegen import (
     CodegenContext,
@@ -2222,72 +2222,197 @@ class _AimProgramDerivation:
                 f"{span}-element bank-pair span, the reduction is {reduction}"
             )
 
-    def _relocations(self, group, position, steps):
-        """EWMUL results whose next reader takes them from another slot."""
+    def _relocations(self, group, position, steps, host_keys=None):
+        """EWMUL results that a reader of their live range takes from another
+        slot: one bank-to-GB-to-bank copy per distinct (slot, row) the readers
+        use, emitted right after the producer.  The live range ends at the
+        next device store or host write of the buffer (`_live_readers`); the
+        readers' distribution equals the producer's, which
+        `_check_device_value_layouts` establishes before any record is made."""
         records = []
         for key, usage in group.usages.items():
             if not usage.store:
                 continue
-            reader = None
-            for step in steps[position + 1 :]:
-                if isinstance(step, LaunchStep):
-                    candidate = self.by_id[step.group_id]
-                    if key in candidate.usages and not candidate.usages[key].store:
-                        reader = candidate
-                        break
-            if reader is None:
-                continue
-            from .pim.schedule_search import InfeasibleSchedule
-
-            if group.replicas < group.work_items and (
-                reader.replicas,
-                reader.partitions,
-            ) != (group.replicas, group.partitions):
-                raise InfeasibleSchedule(
-                    f"AiM {group.name}: realized as {group.replicas} copy(ies) over "
-                    f"{group.partitions} channels each, but {reader.name} reads "
-                    f"{self.name_by_key.get(key, key)} from the device in "
-                    f"{reader.replicas} copy(ies) over {reader.partitions} channels; "
-                    "a reduced-copy elementwise result needs readers of the same layout"
-                )
-            if reader.usages[key].kind != "slot":
-                continue
-            target_slot = reader.usages[key].slot
-            if target_slot == usage.slot:
-                continue
-            for bank_group in range(self.geometry.bank_groups):
-                base = bank_group * self.group_width
-                common = dict(
-                    elements=group.elements,
-                    replicas=group.replicas,
-                    channels_per_replica=group.partitions,
-                    partitions_per_replica=group.partitions * self.geometry.bank_groups,
-                )
-                records.append(
-                    (
-                        AimBankCopy(
-                            "bank_to_gb",
-                            bank=base + usage.slot,
-                            row=group.row,
-                            name=f"{group.name}.relocate.bank_{base + usage.slot}",
-                            **common,
-                        ),
-                        None,
+            targets = []
+            for reader, reader_usage in self._live_readers(
+                key, position, steps, host_keys
+            ):
+                if reader_usage.kind != "slot":
+                    continue
+                target = (reader_usage.slot, reader.row)
+                if target[0] == usage.slot or target in targets:
+                    continue
+                targets.append(target)
+            for target_slot, target_row in targets:
+                for bank_group in range(self.geometry.bank_groups):
+                    base = bank_group * self.group_width
+                    common = dict(
+                        elements=group.elements,
+                        replicas=group.replicas,
+                        channels_per_replica=group.partitions,
+                        partitions_per_replica=group.partitions
+                        * self.geometry.bank_groups,
                     )
-                )
-                records.append(
-                    (
-                        AimBankCopy(
-                            "gb_to_bank",
-                            bank=base + target_slot,
-                            row=reader.row,
-                            name=f"{group.name}.relocate.to_bank_{base + target_slot}",
-                            **common,
-                        ),
-                        None,
+                    records.append(
+                        (
+                            AimBankCopy(
+                                "bank_to_gb",
+                                bank=base + usage.slot,
+                                row=group.row,
+                                name=f"{group.name}.relocate.bank_{base + usage.slot}",
+                                **common,
+                            ),
+                            None,
+                        )
                     )
-                )
+                    records.append(
+                        (
+                            AimBankCopy(
+                                "gb_to_bank",
+                                bank=base + target_slot,
+                                row=target_row,
+                                name=f"{group.name}.relocate.to_bank_{base + target_slot}",
+                                **common,
+                            ),
+                            None,
+                        )
+                    )
         return records
+
+    def _live_readers(self, key, position, steps, host_keys):
+        """(group, usage) of every launch after ``position`` that reads buffer
+        ``key`` from the device before its next writer: a launch storing it, a
+        host scatter / broadcast of it, or a host stage producing it."""
+        from .spmw_plan import HostComputeStep
+
+        host_keys = host_keys or {}
+        readers = []
+        for index in range(position + 1, len(steps)):
+            step = steps[index]
+            if isinstance(step, LaunchStep):
+                candidate = self.by_id[step.group_id]
+                usage = candidate.usages.get(key)
+                if usage is None:
+                    continue
+                if usage.store:
+                    break
+                readers.append((candidate, usage))
+            elif isinstance(step, HostComputeStep):
+                if key in self._stage_keys(step.outputs):
+                    break
+            else:
+                verb, host_key = host_keys.get(index, (None, None))
+                if host_key == key and verb in ("scatter", "broadcast"):
+                    break
+        return readers
+
+    def _stage_keys(self, buffers):
+        keys = set()
+        for entry in buffers or ():
+            name = entry[0] if isinstance(entry, (tuple, list)) else entry
+            key = self.key_by_name.get(name)
+            if key is not None:
+                keys.add(key)
+        return keys
+
+    def _host_step_keys(self, steps, host_moves):
+        """position -> (verb, buffer key) of every host transfer step whose
+        buffer is a region parameter (the main walk reports the others)."""
+        host_keys = {}
+        for position, step in enumerate(steps):
+            if not isinstance(step, HostStep):
+                continue
+            resolved = host_moves[step.host_index]
+            verb = getattr(getattr(resolved, "verb", None), "name", None)
+            role = resolved.buffer_role
+            base = getattr(role, "base", None) if not isinstance(role, str) else None
+            if base is None:
+                base, _index = _parse_buffer_role(str(role))
+            key = self.key_by_name.get(base)
+            if verb is not None and key is not None:
+                host_keys[position] = (verb, key)
+        return host_keys
+
+    @staticmethod
+    def _distribution(group, usage):
+        """The physical distribution of one buffer held by one group: copies,
+        channels per copy, whether the copies split the vector, and the bank
+        family (the slot stride, or the matrix layout)."""
+        return (
+            int(group.replicas),
+            int(group.partitions),
+            bool(group.split_replicas),
+            ("slot", int(usage.stride)) if usage.kind == "slot" else ("matrix",),
+        )
+
+    @staticmethod
+    def _describe_distribution(distribution):
+        replicas, partitions, split, family = distribution
+        text = (
+            f"{replicas} {'work-item part' if split else 'cop'}"
+            f"{'s' if split and replicas != 1 else ('y' if replicas == 1 else 'ies')} "
+            f"over {partitions} channels each"
+        )
+        if family[0] == "slot":
+            return f"{text}, bank stride {family[1]}"
+        return f"{text}, a contraction matrix layout"
+
+    def _check_device_value_layouts(self, steps, host_keys):
+        """Every device read of a buffer takes the distribution its last
+        writer left on the device.
+
+        Walk the schedule keeping, per buffer, the distribution of its last
+        writer: a launch that stores it, or a host scatter / broadcast (which
+        follows the layout `_host_usage` binds it to).  A host stage that
+        produces the buffer ends its device residency.  A launch reading the
+        buffer in another distribution is refused for this candidate
+        assignment: no redistribution between slot layouts is lowered, so the
+        reader would address data the writer never placed there (reviewer,
+        round 71: a fan-out whose second reader differs, and a producer whose
+        readers differ, both with ordinary source and enumerated candidates).
+        """
+        from .pim.schedule_search import InfeasibleSchedule
+        from .spmw_plan import HostComputeStep
+
+        resident: dict = {}
+        for position, step in enumerate(steps):
+            if isinstance(step, LaunchStep):
+                group = self.by_id[step.group_id]
+                for key, usage in group.usages.items():
+                    if usage.store:
+                        continue
+                    held = resident.get(key)
+                    if held is None:
+                        continue
+                    writer, distribution = held
+                    reading = self._distribution(group, usage)
+                    if reading != distribution:
+                        name = self.name_by_key.get(key, key)
+                        raise InfeasibleSchedule(
+                            f"AiM {group.name}: reads {name} from the device as "
+                            f"{self._describe_distribution(reading)}, but {writer} "
+                            f"left it as {self._describe_distribution(distribution)}; "
+                            "a device-resident value needs readers of the same "
+                            "layout (no redistribution is lowered)"
+                        )
+                for key, usage in group.usages.items():
+                    if usage.store:
+                        resident[key] = (
+                            f"launch {group.name}",
+                            self._distribution(group, usage),
+                        )
+            elif isinstance(step, HostComputeStep):
+                for key in self._stage_keys(step.outputs):
+                    resident.pop(key, None)
+            else:
+                verb, key = host_keys.get(position, (None, None))
+                if key is None or verb not in ("scatter", "broadcast"):
+                    continue
+                bound, usage = self._host_usage(key, position, steps, verb)
+                resident[key] = (
+                    f"the host {verb} (laid out for {bound.name})",
+                    self._distribution(bound, usage),
+                )
 
     def _host_usage(self, key, position, steps, direction):
         """(group, usage) whose layout a host step at ``position`` follows."""
@@ -2485,6 +2610,8 @@ class _AimProgramDerivation:
 
         steps = list(self.schedule.steps)
         host_moves = list(host_moves or ())
+        host_keys = self._host_step_keys(steps, host_moves)
+        self._check_device_value_layouts(steps, host_keys)
         records = []
         pending: list = []  # coalescible distributed transfers
         gather_run = False
@@ -2505,7 +2632,9 @@ class _AimProgramDerivation:
                 flush()
                 group = self.by_id[step.group_id]
                 records.extend(self._launch_records(group))
-                records.extend(self._relocations(group, position, steps))
+                records.extend(
+                    self._relocations(group, position, steps, host_keys)
+                )
                 continue
             if isinstance(step, HostComputeStep):
                 # The declared host stage, in program order: no commands; its
