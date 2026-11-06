@@ -328,62 +328,81 @@ def test_a_host_reupload_ends_the_producers_live_range():
 
 
 VALUES = dict(a=2, b=3, c=5, d=7)  # exactly representable in bf16
-ROW_STEP = 10  # the value of a vector in its row chunk r is base + r * ROW_STEP
+ROW_ELEMENTS = 1024  # elements of one bank row (the target's row payload)
 
 
-def _value(name, chunk):
-    return VALUES[name] + chunk * ROW_STEP
+def _value(name, index):
+    """The value of vector ``name`` at logical element ``index``: it differs
+    from one row chunk to the next and from one bank partition to the next,
+    so a chunk carried to the wrong row or the wrong partition is visible."""
+    return VALUES[name] + index // ROW_ELEMENTS
 
 
 def _witness(compiled):
-    """Independent command-level walk of the emitted trace: one cell per
-    (row, bank) of channel 0's first bank group, every row of every vector.
-    Host writes place the row chunk of their buffer (the vectors differ from
-    row to row, so a chunk carried to the wrong row is visible), an EWMUL
-    multiplies its x and y slots into the dst slot per row, COPY_BKGB /
-    COPY_GBBK move one cell through the global buffer, host reads collect
-    the result chunks.  Returns ``{(name, chunk): value}`` for the program's
-    results (``None`` where nothing was written).  A generated-work check,
-    not a numerical AiM execution (the simulator is timing-only)."""
+    """Independent command-level walk of the emitted trace over every
+    channel, bank and row: the first burst of each (channel, bank, row) in
+    a host transfer carries that cell's first logical lane, whose index the
+    transfer's own layout gives (`partition * elements_per_partition + row
+    offset * row elements`, partitions numbered channel-major then bank
+    slot, as `aim_lowering._distributed_host_transfer` walks them).  Host
+    writes place the value of that lane, an EWMUL multiplies the x and y
+    slots of every bank group into the dst slot per row, COPY_BKGB /
+    COPY_GBBK move one cell through each channel's global buffer, host reads
+    collect the result lanes.  Returns ``{(name, index): value}`` for the
+    program's results.  A generated-work check, not a numerical AiM
+    execution (the simulator is timing-only)."""
     ctx = compiled.compiled.layout_ctx
     commands = [str(c) for c in ctx.cmds]
-    cells, outputs, gb = {}, {}, None
+    cells, outputs, gb = {}, {}, {}
     for (op, _banks), entry in zip(ctx._lowered_records, ctx.lowering_manifest):
         assert entry["name"] == op.name
         begin, end = entry["command_span"]
+        seen = set()
         for line in commands[begin:end]:
             w = line.split()
             if w[:2] in (["W", "MEM"], ["R", "MEM"]):
                 channel, bank, row = map(int, w[2:])
-                if channel != 0 or bank >= 4:
+                if (channel, bank, row) in seen:
                     continue
+                seen.add((channel, bank, row))
                 names = str(op.name).split("+")
-                name = (
-                    names[bank - op.bank_offset]
-                    if len(names) == op.copies
-                    else names[0]
+                copy = (bank - op.bank_offset) % op.bank_stride
+                name = (names[copy] if len(names) == op.copies else names[0]).split(
+                    "["
+                )[0]
+                cpr = int(entry["channels_per_replica"])
+                partition = (channel % cpr) * (
+                    16 // op.bank_stride
+                ) + bank // op.bank_stride
+                index = (
+                    int(entry.get("first_element") or 0)
+                    + partition * int(entry["elements_per_partition"])
+                    + (row - op.row) * ROW_ELEMENTS
                 )
-                chunk = row - op.row
                 if w[0] == "W":
-                    cells[row, bank] = (
-                        _value(name, chunk)
+                    cells[channel, row, bank] = (
+                        _value(name, index)
                         if name in VALUES
-                        else outputs.get((name, chunk))
+                        else outputs.get((name, index))
                     )
                 else:
-                    outputs[name, chunk] = cells.get((row, bank))
+                    outputs[name, index] = cells.get((channel, row, bank))
             elif w[:2] == ["AiM", "EWMUL"]:
                 row = int(w[-1])
-                x, y = cells.get((row, 0)), cells.get((row, 1))
-                cells[row, 2] = None if x is None or y is None else x * y
+                for channel in range(32):
+                    for base in range(0, 16, 4):
+                        x = cells.get((channel, row, base))
+                        y = cells.get((channel, row, base + 1))
+                        cells[channel, row, base + 2] = (
+                            None if x is None or y is None else x * y
+                        )
             elif len(w) > 1 and w[1] in ("COPY_BKGB", "COPY_GBBK"):
                 bank, row = map(int, w[-2:])
-                if bank >= 4:
-                    continue
-                if w[1] == "COPY_BKGB":
-                    gb = cells.get((row, bank))
-                else:
-                    cells[row, bank] = gb
+                for channel in range(32):
+                    if w[1] == "COPY_BKGB":
+                        gb[channel] = cells.get((channel, row, bank))
+                    else:
+                        cells[channel, row, bank] = gb.get(channel)
     return {key: value for key, value in outputs.items() if key[0] in ("u", "v")}
 
 
@@ -395,14 +414,26 @@ def _rows_of(compiled, name):
     raise KeyError(name)
 
 
-def _expected(program_kind, rows=1):
+def _expected(program_kind, witnessed):
+    """The source semantics at the lanes the witness observed."""
     out = {}
-    for r in range(rows):
-        a, b, c, d = (_value(k, r) for k in "abcd")
+    for name, index in witnessed:
+        a, b, c, d = (_value(k, index) for k in "abcd")
         t = a * b
-        out["u", r] = t * c
-        out["v", r] = (t * c) * t if program_kind == "chain" else t * d
+        u = t * c
+        out[name, index] = (
+            u if name == "u" else ((u * t) if program_kind == "chain" else t * d)
+        )
     return out
+
+
+def _check(compiled, program_kind, *, lanes=None):
+    observed = _witness(compiled)
+    assert observed and None not in observed.values(), observed
+    assert observed == _expected(program_kind, observed)
+    if lanes is not None:
+        assert len(observed) == lanes, len(observed)
+    return observed
 
 
 def test_two_reader_slots_keep_the_producers_value_alive():
@@ -415,7 +446,8 @@ def test_two_reader_slots_keep_the_producers_value_alive():
     the source semantics."""
     program, host = _fanout_program(second_reads_as_y=True)
     compiled = _compile(program, host)
-    assert _witness(compiled) == _expected("fanout") == {("u", 0): 30, ("v", 0): 42}
+    observed = _check(compiled, "fanout")
+    assert observed[("u", 0)] == 30 and observed[("v", 0)] == 42
     regions = compiled.compiled.layout_ctx.row_regions
     rows = {tuple(r["buffers"]): r["row"] for r in regions}
     assert len({rows[k] for k in rows}) == 3  # one region per group
@@ -423,7 +455,7 @@ def test_two_reader_slots_keep_the_producers_value_alive():
 
 def test_witness_on_the_default_fan_out(fanout):
     _program, _host, compiled = fanout
-    assert _witness(compiled) == _expected("fanout")
+    _check(compiled, "fanout")
 
 
 def test_witness_on_the_per_item_alternative(fanout):
@@ -431,15 +463,15 @@ def test_witness_on_the_per_item_alternative(fanout):
     per_item = _compile(
         program, host, _choice(compiled, {"producer": 8, "first": 8, "second": 8})
     )
-    assert _witness(per_item) == _expected("fanout")
+    _check(per_item, "fanout")
 
 
 def test_witness_on_the_reupload_composition():
     program, host = _fanout_program(reupload=True)
     compiled = _compile(program, host)
-    assert _witness(compiled) == _expected("fanout")
+    _check(compiled, "fanout")
     mixed = _compile(program, host, _choice(compiled, {"second": 8}))
-    assert _witness(mixed) == _expected("fanout")
+    _check(mixed, "fanout")
 
 
 def test_witness_on_the_neighbouring_chain():
@@ -449,7 +481,8 @@ def test_witness_on_the_neighbouring_chain():
     producer) and the first reader's launch does not disturb them."""
     program, host = _fanout_program(chain=True)
     compiled = _compile(program, host)
-    assert _witness(compiled) == _expected("chain") == {("u", 0): 30, ("v", 0): 180}
+    observed = _check(compiled, "chain")
+    assert observed[("u", 0)] == 30 and observed[("v", 0)] == 180
 
 
 def test_a_slot_read_of_an_overwritten_cell_is_refused(monkeypatch):
@@ -488,7 +521,8 @@ def test_multirow_copies_carry_every_row_chunk(multirow):
     _program, _host, compiled = multirow
     rows = _rows_of(compiled, "v")
     assert rows == 2
-    assert _witness(compiled) == _expected("fanout", rows)
+    # 32 channels x 4 bank groups x 2 rows x 2 results
+    _check(compiled, "fanout", lanes=32 * 4 * rows * 2)
     commands = [str(c) for c in compiled.compiled.layout_ctx.cmds]
     copies = [c.split() for c in commands if "COPY_" in c]
     # Source and destination rows alternate chunk by chunk per bank.
@@ -509,7 +543,8 @@ def test_multirow_copies_in_the_per_item_layout(multirow):
     )
     rows = _rows_of(per_item, "v")
     assert rows == 5
-    assert _witness(per_item) == _expected("fanout", rows)
+    # The four copies hold the same lanes: 8 channels x 4 bank groups x rows.
+    _check(per_item, "fanout", lanes=8 * 4 * rows * 2)
 
 
 def test_multirow_chain(multirow):
@@ -517,7 +552,7 @@ def test_multirow_chain(multirow):
     compiled = _compile(program, host)
     rows = _rows_of(compiled, "v")
     assert rows == 2
-    assert _witness(compiled) == _expected("chain", rows)
+    _check(compiled, "chain", lanes=32 * 4 * rows * 2)
 
 
 def test_a_whole_vector_copy_record_is_refused(monkeypatch):
@@ -555,3 +590,105 @@ def test_a_whole_vector_copy_record_is_refused(monkeypatch):
     program, host = _fanout_program(second_reads_as_y=True, n=N_MULTIROW)
     with pytest.raises(Exception, match="global buffer holds row chunk"):
         _compile(program, host)
+
+
+N_PREFIX = 262144
+
+
+def _prefix_program(*, host_prefix=False):
+    """Producer ``t = a * b`` over the whole buffer; ``consumer`` ``u[i] =
+    t[i] * c[i]`` over the first half only (the reviewer's round 74
+    composition).  With ``host_prefix`` the host gathers ``t`` and scatters
+    its first half for the consumer, which is the frame the consumer reads."""
+    n = N_PREFIX
+    h = n // 2
+
+    @region()
+    def program(
+        a: bfloat16[n],
+        b: bfloat16[n],
+        c: bfloat16[n],
+        t: bfloat16[n],
+        u: bfloat16[n],
+    ):
+        @allo.work(mapping=[4], args=[a, b, t])
+        def producer(x: bfloat16[n], y: bfloat16[n], z: bfloat16[n]):
+            for i in range(n):
+                z[i] = x[i] * y[i]
+
+        @allo.work(mapping=[4], args=[t, c, u])
+        def consumer(x: bfloat16[n], y: bfloat16[n], z: bfloat16[n]):
+            for i in range(h):
+                z[i] = x[i] * y[i]
+
+    if host_prefix:
+
+        @allo.host_program(program)
+        def host(
+            a: bfloat16[n],
+            b: bfloat16[n],
+            c: bfloat16[n],
+            t: bfloat16[n],
+            u: bfloat16[n],
+        ):
+            allo.host_xfer.scatter(a, allo.host_xfer.banks)
+            allo.host_xfer.scatter(b, allo.host_xfer.banks)
+            allo.launch("producer", a, b, t)
+            allo.host_xfer.gather(t, allo.host_xfer.banks)
+            allo.host_xfer.scatter(t[:h], allo.host_xfer.banks)
+            allo.host_xfer.scatter(c[:h], allo.host_xfer.banks)
+            allo.launch("consumer", t, c, u)
+            allo.host_xfer.gather(u[:h], allo.host_xfer.banks)
+
+    else:
+
+        @allo.host_program(program)
+        def host(
+            a: bfloat16[n],
+            b: bfloat16[n],
+            c: bfloat16[n],
+            t: bfloat16[n],
+            u: bfloat16[n],
+        ):
+            allo.host_xfer.scatter(a, allo.host_xfer.banks)
+            allo.host_xfer.scatter(b, allo.host_xfer.banks)
+            allo.launch("producer", a, b, t)
+            allo.host_xfer.scatter(c[:h], allo.host_xfer.banks)
+            allo.launch("consumer", t, c, u)
+            allo.host_xfer.gather(u[:h], allo.host_xfer.banks)
+
+    return program, host
+
+
+def test_a_prefix_reader_of_a_device_value_is_refused_with_the_frames():
+    """Reviewer round 74 (`reviewer-r74/prefix.py`): producer and consumer
+    agree on copies, channels and bank family but lay out different element
+    ranges over the same bank partitions (2,048 against 1,024 elements per
+    partition), so a partition-preserving copy fed the consumer `t[2048]`
+    where it needs `t[1024]`.  The frames are part of the contract: the
+    assignment is refused before selection with both frames named."""
+    program, host = _prefix_program()
+    with pytest.raises(Exception) as caught:
+        _compile(program, host)
+    message = str(caught.value)
+    assert "elements [0, 131072) at 1024 per bank partition" in message
+    assert "elements [0, 262144) at 2048 per bank partition" in message
+    assert "scatter the region the reader needs" in message
+
+
+def test_a_host_scattered_prefix_is_read_in_its_own_frame():
+    """The same consumer with the host providing the half it reads: the
+    scatter is laid out for the consumer's frame, the producer's result is
+    gathered whole, and every lane the witness sees is the source's."""
+    program, host = _prefix_program(host_prefix=True)
+    compiled = _compile(program, host)
+    observed = _witness(compiled)
+    assert observed and None not in observed.values()
+    # u[i] = a[i] * b[i] * c[i] at the observed lanes of the first half.
+    assert all(index < N_PREFIX // 2 for _name, index in observed)
+    assert observed == {
+        key: _value("a", key[1]) * _value("b", key[1]) * _value("c", key[1])
+        for key in observed
+    }
+    # 131,072 elements over 128 partitions: one row per partition.
+    assert len({index for _name, index in observed}) == 32 * 4

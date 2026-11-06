@@ -2317,19 +2317,30 @@ class _AimProgramDerivation:
                     records.append((back, None))
         return records
     def _identity(self, group, usage, key):
-        """What one bank cell holds: the buffer, its distribution and the
-        bank family it is laid out in (the EWMUL slots or the MAC bank pairs)."""
+        """What one bank cell holds: the buffer, its distribution, the bank
+        family it is laid out in (the EWMUL slots or the MAC bank pairs) and
+        the logical frame the partitions hold."""
         family = "pair" if usage.stride == self.bank_pair_stride else "slot"
-        return (key, int(group.replicas), int(group.partitions), family)
+        return (
+            key,
+            int(group.replicas),
+            int(group.partitions),
+            family,
+            self._frame(group, usage, key),
+        )
 
     def _describe_identity(self, identity):
         if identity is None:
             return "nothing"
-        key, replicas, partitions, family = identity
-        return (
+        key, replicas, partitions, family, frame = identity
+        text = (
             f"{self.name_by_key.get(key, key)} ({replicas} x {partitions} channels, "
-            f"{family} layout)"
+            f"{family} layout"
         )
+        if frame is not None:
+            first, total, span = frame
+            text += f", elements [{first}, {first + total}) at {span} per partition"
+        return text + ")"
 
     def _check_physical_liveness(self, records):
         """Every bank-slot read of the emitted program finds the value the
@@ -2406,14 +2417,13 @@ class _AimProgramDerivation:
                 total = op.vector_elements or op.elements
                 rows = rows_of(total, partitions)
                 refs = tuple(op.buffer_refs)
+                bound = self.by_id.get(op.group_id)
                 for copy in range(op.copies):
                     key = refs[copy] if len(refs) == op.copies else refs[0]
-                    identity = (
-                        key,
-                        int(op.replicas),
-                        int(op.channels_per_replica),
-                        family,
-                    )
+                    usage = bound.usages.get(key) if bound is not None else None
+                    if usage is None:
+                        continue
+                    identity = self._identity(bound, usage, key)
                     if family == "slot":
                         banks = [op.bank_offset + copy]
                     else:
@@ -2484,6 +2494,7 @@ class _AimProgramDerivation:
                                 "liveness)"
                             )
                         place(op.row + offset, 1, bank, identity, chunk)
+
     def _live_readers(self, key, position, steps, host_keys):
         """(group, usage) of every launch after ``position`` that reads buffer
         ``key`` from the device before its next writer: a launch storing it, a
@@ -2538,28 +2549,50 @@ class _AimProgramDerivation:
                 host_keys[position] = (verb, key)
         return host_keys
 
-    @staticmethod
-    def _distribution(group, usage):
+    def _frame(self, group, usage, key):
+        """(first element, element count, elements per bank partition) of the
+        logical vector a slot layout holds: bank partition p of the group's
+        channels holds elements [first + p * span, first + (p + 1) * span) of
+        the buffer (`aim_lowering._distributed_host_transfer`); None for a
+        matrix layout."""
+        if usage.kind != "slot":
+            return None
+        first, total = self._slot_frame(group, key)
+        if group.split_replicas:
+            total = _ceil(total, group.replicas)
+        partitions = group.partitions * (self.geometry.banks // usage.stride)
+        return (int(first), int(total), _ceil(total, partitions))
+
+    def _distribution(self, group, usage, key):
         """The physical distribution of one buffer held by one group: copies,
-        channels per copy, whether the copies split the vector, and the bank
-        family (the slot stride, or the matrix layout)."""
+        channels per copy, whether the copies split the vector, the bank
+        family (the slot stride, or the matrix layout), and the logical
+        frame the partitions hold (round 75, ISSUES X-32: the reviewer's
+        prefix composition, where producer and consumer agreed on every
+        count but assigned different elements to the same bank partition)."""
         return (
             int(group.replicas),
             int(group.partitions),
             bool(group.split_replicas),
             ("slot", int(usage.stride)) if usage.kind == "slot" else ("matrix",),
+            self._frame(group, usage, key),
         )
 
     @staticmethod
+
     def _describe_distribution(distribution):
-        replicas, partitions, split, family = distribution
+        replicas, partitions, split, family, frame = distribution
         text = (
             f"{replicas} {'work-item part' if split else 'cop'}"
             f"{'s' if split and replicas != 1 else ('y' if replicas == 1 else 'ies')} "
             f"over {partitions} channels each"
         )
         if family[0] == "slot":
-            return f"{text}, bank stride {family[1]}"
+            first, total, span = frame
+            return (
+                f"{text}, bank stride {family[1]}, elements [{first}, "
+                f"{first + total}) at {span} per bank partition"
+            )
         return f"{text}, a contraction matrix layout"
 
     def _check_device_value_layouts(self, steps, host_keys):
@@ -2590,21 +2623,30 @@ class _AimProgramDerivation:
                     if held is None:
                         continue
                     writer, distribution = held
-                    reading = self._distribution(group, usage)
+                    reading = self._distribution(group, usage, key)
                     if reading != distribution:
                         name = self.name_by_key.get(key, key)
+                        hint = (
+                            "a device-resident value is read in the frame its "
+                            "writer laid out (no redistribution between bank "
+                            "partitions is lowered): make the kernels cover the "
+                            "same elements of the buffer, or have the host "
+                            "scatter the region the reader needs"
+                            if reading[:4] == distribution[:4]
+                            else "a device-resident value needs readers of the "
+                            "same layout (no redistribution is lowered)"
+                        )
                         raise InfeasibleSchedule(
                             f"AiM {group.name}: reads {name} from the device as "
                             f"{self._describe_distribution(reading)}, but {writer} "
                             f"left it as {self._describe_distribution(distribution)}; "
-                            "a device-resident value needs readers of the same "
-                            "layout (no redistribution is lowered)"
+                            + hint
                         )
                 for key, usage in group.usages.items():
                     if usage.store:
                         resident[key] = (
                             f"launch {group.name}",
-                            self._distribution(group, usage),
+                            self._distribution(group, usage, key),
                         )
             elif isinstance(step, HostComputeStep):
                 for key in self._stage_keys(step.outputs):
@@ -2616,7 +2658,7 @@ class _AimProgramDerivation:
                 bound, usage = self._host_usage(key, position, steps, verb)
                 resident[key] = (
                     f"the host {verb} (laid out for {bound.name})",
-                    self._distribution(bound, usage),
+                    self._distribution(bound, usage, key),
                 )
 
     def _host_usage(self, key, position, steps, direction):
