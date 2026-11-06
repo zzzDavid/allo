@@ -580,9 +580,11 @@ GAL_TASK_ENTRY_POINT(apu_kernel_task, in, out)
 """
 
 
+# ``MAX_RESIDENT_CHUNKS`` was a fixed hardware limit this module no longer
+# defines (the resident-chunk bound is derived per program); its stale export
+# made ``from ... import *`` fail (round 87, P-23 triage).
 __all__ = [
     "APUv1RecordFrequencyAnalysis",
     "APUv1RecordFrequencyLowering",
-    "MAX_RESIDENT_CHUNKS",
     "analyze_apu_v1_record_frequency",
 ]
