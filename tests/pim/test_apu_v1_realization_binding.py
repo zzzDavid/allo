@@ -23,6 +23,15 @@ accumulator slot, a scatter's register, base or extent, or a resident bank's
 substitution that changes a stored value, a destination or a count is
 refused; the specialized lowerings (accumulator blocks, spatial scatter,
 resident GEMV) pass intact.
+
+Round 83 (the reviewer's round 82 alias probe): the machines key their
+storage by the concrete VR, not the logical name, because the allocator
+reuses one hardware register across disjoint live ranges; a legal opcode
+moved across the live range of a value sharing its register (the reduce
+temporary's reset moved before the multiply that reads the operand in the
+same VR) changes the stored value and is refused, while the intact reuse
+passes and a damaged preferred candidate falls back to an intact
+alternative.
 """
 
 import re
@@ -678,3 +687,111 @@ def test_a_resident_bank_without_its_substitution_is_refused(monkeypatch):
         Exception, match="reads the resident vector in bank 1 without that bank"
     ):
         _compile_gemv(RESIDENT)
+
+
+# --------------------------------------------------------------------------- #
+# Round 83 (reviewer round 82): physical register aliasing.
+# --------------------------------------------------------------------------- #
+
+
+def nearby(x: float16[9, 13], y: float16[13, 6], z: float16[9, 6]):
+    for r, c in allo.grid(9, 6):
+        for k in allo.reduction(13):
+            z[r, c] += x[r, k] * y[k, c]
+
+
+ALIASED = "baseline_spatial_reduction"
+
+
+def _compile_nearby(layout=None):
+    return allo.compile(
+        nearby,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="virtual",
+        layout=layout,
+        reduction_order="reassociate",
+    )
+
+
+def _move_reset_before_multiply(steps):
+    """The reviewer's round 82 injection: the existing ``RESET_16`` of the
+    reduce temporary moved immediately before the multiply, after the
+    operand ingress.  No instruction, binding, loop, pointer or priced count
+    changes; the temporary shares its hardware register with the multiply's
+    left operand, so the reset destroys that operand."""
+    steps = list(steps)
+    mul = next(
+        (
+            i
+            for i, s in enumerate(steps)
+            if _is_call(s) and s.instruction.opcode == "MUL_F16"
+        ),
+        None,
+    )
+    reset = next(
+        (
+            i
+            for i, s in enumerate(steps)
+            if _is_call(s) and s.instruction.opcode == "RESET_16"
+        ),
+        None,
+    )
+    if mul is not None and reset is not None:
+        step = steps.pop(reset)
+        steps.insert(mul, step)
+    return steps
+
+
+def _shared_registers(realization):
+    """concrete VR -> the C names of the logical values the allocator placed
+    in it, for the registers holding more than one."""
+    by_concrete: dict = {}
+    for binding in realization.vr_bindings:
+        by_concrete.setdefault(binding.concrete, []).append(binding.c_name)
+    return {k: v for k, v in by_concrete.items() if len(v) > 1}
+
+
+def test_legal_register_reuse_passes_the_contract():
+    """The intact lowering places the reduce temporary and the left operand
+    in one VR (disjoint live ranges in the plan's order) and is accepted:
+    the interpreter models the shared cell, and the plan's own order never
+    reads a clobbered value."""
+    forced = _compile_nearby(ALIASED)
+    assert forced.selected_plan.name == ALIASED
+    assert forced.placement_ranking.kernels[0].rejections == ()
+    shared = _shared_registers(forced.realization)
+    assert any(
+        {"vr_x", "vr___z_reduce_tmp"} <= set(names) for names in shared.values()
+    ), shared
+    assert (
+        forced.realization.emission_schedule().render(forced.realization)
+        == forced.device_source()
+    )
+
+
+def test_a_reset_moved_across_an_aliased_register_is_refused(monkeypatch):
+    """Reviewer round 82: the reset of the reduce temporary moved before the
+    multiply clobbers the left operand sharing its VR; everything the shape
+    checks see is unchanged, the stored value is not."""
+    _patch_schedule(monkeypatch, _move_reset_before_multiply)
+    with pytest.raises(Exception, match=WRONG_VALUE):
+        _compile_nearby(ALIASED)
+
+
+def test_a_clobbering_preferred_candidate_falls_back_to_an_intact_alternative(
+    monkeypatch,
+):
+    """Default selection prefers the aliased plan; with its schedule damaged
+    (the alternatives have no reset to move) the candidate is rejected with
+    the reason recorded and an intact alternative is selected."""
+    assert _compile_nearby().selected_plan.name == ALIASED
+    _patch_schedule(monkeypatch, _move_reset_before_multiply)
+    compiled = _compile_nearby()
+    assert compiled.selected_plan.name != ALIASED
+    rejections = compiled.placement_ranking.kernels[0].rejections
+    assert any(
+        f"plan '{ALIASED}'" in text and "receives a value other than" in text
+        for _index, text in rejections
+    ), rejections
+    assert _shared_registers(compiled.realization) == {}

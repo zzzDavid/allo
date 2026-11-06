@@ -1772,3 +1772,20 @@ is full):
 | Gemini-I | not run (the board host's `/tmp` at 124 KB free); the three open rows stay blocked |
 | Inventory (`docs/release/paper_reproduction/inventory.csv`, `update_inventory.py`, byte-exact CRLF edit, 84 lines, 18 columns) | 55 required rows recorded at `92d4120`: the fourteen AiM, three Samsung, sixteen UPMEM and twelve AttAcc rows REPRODUCED from the installed wheel, the Gemini-II rows from the session (four REPRODUCED, mvt OPEN nominal), the five Gemini-I rows noted as not re-executed; snapshot 51 REPRODUCED, 4 OPEN (kmeans, linear regression, word count, mvt), 0 UNVERIFIED |
 | Not done | the independent review of the round 82 repair (G4, G9); the Gemini-I rows (the board host's `/tmp`); the X-34 / X-37 campaign (the final candidate); V1-19 (deferred by direction) |
+
+## Round 83 (2026-11-06): the interpreter's storage keyed by the concrete VR (X-36 reopened by the reviewer's round 82 alias probe, repaired)
+
+Checkout after `f88dde9` (code after `92d4120`); evidence under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r83/`.  Compile-only;
+no board or card launch.  The rows of round 82 that describe the
+interpreter are superseded only in the identity of its register cells.
+
+| Check | Result |
+|---|---|
+| The reviewer's alias probe (`reviewer-r82/alias_probe.py`) | at `92d4120` (the reviewer, checkout and installed wheel): the reset moved before the multiply accepted with no rejection; at the repaired checkout (`alias_probe_rerun.log`): the intact program accepted, the moved reset refused by the production checker (`batch 0 of 'z' receives a value other than the plan's computation`), the reviewer's physical-key variant agreeing on both |
+| The rounds 78, 79, 81 and 82 probes re-run (`*_rerun.log`) | every fault refused, every intact control accepted (the round 78 and 79 probes exit 1 on the raised refusal as before) |
+| The structured renderer against the parent renderer (`differential_actual.py`, the reviewer's round 81 comparator; `differential_actual.log`) | 21 plans identical byte for byte and valid: ALL_IDENTICAL_AND_VALID |
+| `tests/pim/test_apu_v1_realization_binding.py` (`pytest_realization_binding.log`) | 32 passed: the 29 earlier cases, the intact aliased lowering accepted (`vr_x` and `vr___z_reduce_tmp` in one VR, no rejection, the emitted text the schedule's), the moved reset refused, and default selection rejecting the damaged preferred plan `baseline_spatial_reduction` with `receives a value other than` recorded and selecting an alternative that shares no register |
+| APU v1 and shared suites (`pytest_apu_v1_suites.log`, `suite_files.txt`) | 1 failed, 144 passed, 352 deselected; the failure is the board row `test_apu_v1_board_median_cycles[apu_v1-histogram]` (`ledag-ssh exited with 255`, the host's `/tmp`) |
+| Installed probe | see the row added below after the wheel of the round 83 commit |
+| Not done | the independent review of the repair (G4, G9); the next named candidate (must contain this commit); Gemini-I (the board host's `/tmp`); the X-34 / X-37 campaign (the final candidate); V1-19 (deferred) |

@@ -2781,6 +2781,13 @@ class _Values:
         return self.ids.setdefault(key, len(self.ids))
 
 
+def _register_key(binding) -> tuple:
+    """The physical identity of a binding: the concrete VR.  Every machine
+    cell is keyed by this, so logical names sharing one hardware register
+    (the allocator reuses VRs across disjoint live ranges) share one cell."""
+    return ("vr", int(binding.concrete))
+
+
 class _Machine:
     """An abstract APU: VR registers and L1 slots hold abstract values;
     stores to L4 are recorded by destination.  An instruction's effect is
@@ -2802,26 +2809,31 @@ class _Machine:
     def count(self, key):
         self.counts[key] = self.counts.get(key, 0) + 1
 
-    def read(self, register, api):
-        if register not in self.registers:
+    def read(self, key, label, api):
+        """The value of the physical register ``key`` (``label`` names it
+        for the message).  Storage is keyed by the concrete VR, never by a
+        logical name, so two logical values the allocator placed in one
+        hardware register share one cell and a write to either is a write
+        to both (the clobber a schedule change can introduce)."""
+        if key not in self.registers:
             raise _Fault(
-                f"{api} reads {register} before anything in the emission defines it"
+                f"{api} reads {label} before anything in the emission defines it"
             )
-        return self.registers[register]
+        return self.registers[key]
 
     def store(self, key, value):
         previous = self.stores.get(key)
         self.stores[key] = (value, 1 if previous is None else previous[1] + 1)
 
-    def reset(self, register):
-        self.count(("reset", register))
-        self.registers[register] = self.values.make("zero")
+    def reset(self, key):
+        self.count(("reset", key))
+        self.registers[key] = self.values.make("zero")
 
-    def scatter(self, output, register, base, count, lane_stride, bound):
+    def scatter(self, output, key, label, base, count, lane_stride, bound):
         self.count(("scatter", output))
         self.store(
             ("scatter", output, int(base), int(count), int(lane_stride), bound),
-            self.read(register, "the scatter"),
+            self.read(key, label, "the scatter"),
         )
 
     def execute(self, instruction, bound, scope, batch_of):
@@ -2835,11 +2847,19 @@ class _Machine:
         self.count(instruction_key(instruction))
         api = instruction.api
 
-        def register(name):
+        def binding(name):
             try:
-                return bound[name].c_name
+                return bound[name]
             except KeyError as error:
                 raise _Fault(f"{api} names {name!r}, which has no register") from error
+
+        def register(name):
+            # The physical identity after the call's substitutions.
+            return _register_key(binding(name))
+
+        def label(name):
+            b = binding(name)
+            return f"{b.c_name} ({b.concrete_name})"
 
         def pointer(argument):
             if isinstance(argument, PointerRef):
@@ -2873,7 +2893,9 @@ class _Machine:
             return
         if opcode == "STORE_16":
             destination, source = args
-            self.memory[slot(destination)] = self.read(register(source.name), api)
+            self.memory[slot(destination)] = self.read(
+                register(source.name), label(source.name), api
+            )
             return
         if opcode == "DMA_L1_TO_L4_32K":
             destination, source = args
@@ -2885,7 +2907,7 @@ class _Machine:
             destination, source = args
             self.store(
                 ("store",) + pointer(destination)[1:],
-                self.read(register(source.name), api),
+                self.read(register(source.name), label(source.name), api),
             )
             return
         operands = []
@@ -2897,14 +2919,22 @@ class _Machine:
                 ):
                     operands.append(("dst",))
                 else:
-                    operands.append(("vr", self.read(register(argument.name), api)))
+                    operands.append(
+                        (
+                            "vr",
+                            self.read(
+                                register(argument.name), label(argument.name), api
+                            ),
+                        )
+                    )
             elif isinstance(argument, VRBankRef):
                 index = int(evaluator.evaluate(argument.index))
                 if not 0 <= index < len(argument.names):
                     raise _Fault(
                         f"{api} selects resident bank {index} of {len(argument.names)}"
                     )
-                operands.append(("vr", self.read(register(argument.names[index]), api)))
+                chosen = argument.names[index]
+                operands.append(("vr", self.read(register(chosen), label(chosen), api)))
             elif isinstance(argument, (PointerRef, PointerOffsetRef)):
                 operands.append(pointer(argument))
             elif isinstance(argument, CExpression):
@@ -2997,13 +3027,27 @@ class _ScheduleInterpreter:
 
     @property
     def output_register(self):
+        """The output's C register name (the schedule's reset and scatter
+        nodes name it)."""
         return self.base[self.output].c_name
+
+    @property
+    def output_key(self):
+        """The output's physical register, the machine cell its resets and
+        scatters touch."""
+        return _register_key(self.base[self.output])
+
+    @property
+    def output_label(self):
+        b = self.base[self.output]
+        return f"{b.c_name} ({b.concrete_name})"
 
     # ------------------------------------------------------------------ #
     def reference(self) -> _Machine:
         machine = _Machine(self.values)
         base = self.base
-        out = self.output_register
+        out = self.output_key
+        label = self.output_label
         for instruction in self.setup:
             machine.execute(instruction, base, {}, lambda name: 0)
         if self.resident is not None:
@@ -3023,6 +3067,7 @@ class _ScheduleInterpreter:
                 machine.scatter(
                     self.output,
                     out,
+                    label,
                     tile * int(form.rows_per_tile),
                     int(form.rows_per_tile),
                     int(form.reduction_tile_extent),
@@ -3046,6 +3091,7 @@ class _ScheduleInterpreter:
                     machine.scatter(
                         self.output,
                         out,
+                        label,
                         batch * VR_LANES + step * int(self.spatial),
                         int(self.spatial),
                         int(_plan_group_size(self.plan)),
@@ -3162,7 +3208,10 @@ class _ScheduleInterpreter:
         for key, times in reference.counts.items():
             emitted = run.counts.get(key, 0)
             if isinstance(key[0], str) and key[0] in {"reset", "scatter"}:
-                label = f"the {key[0]} of {key[1]}"
+                target = (
+                    f"GVML_VR16_{key[1][1]}" if isinstance(key[1], tuple) else key[1]
+                )
+                label = f"the {key[0]} of {target}"
                 exact = True
             else:
                 instruction = self.stream_keys[key]
@@ -3280,14 +3329,15 @@ class _ScheduleInterpreter:
                     raise _Fault(
                         f"reset of {step.register!r}, which is not the output's register"
                     )
-                machine.reset(step.register)
+                machine.reset(self.output_key)
             elif isinstance(step, ScheduleScatter):
                 if step.output != self.output or step.register != self.output_register:
                     raise _Fault("a scatter of a register that is not the output's")
                 base = _ExpressionEvaluator(scope).evaluate(step.destination_base)
                 machine.scatter(
                     step.output,
-                    step.register,
+                    self.output_key,
+                    self.output_label,
                     int(base),
                     int(step.count),
                     int(step.lane_stride),
