@@ -13,19 +13,35 @@ contraction and the plan, the instructions from the operations, and the
 emitted calls from the instructions; a mismatch is a feasibility rejection
 of the candidate, so an intact alternative stays selectable and a forced
 damaged candidate is refused.  Compile-only checks of generated work.
+
+Rounds 80 to 82 (X-36) extend the check to the emission: the device source
+is rendered from a structured schedule, and the schedule is executed on an
+abstract machine against the plan's batching (the reference executes the
+plan's instruction stream per output batch, work tile or matrix tile and
+resident bank), so an index, a pointer batch, an undeclared call, a folded
+accumulator slot, a scatter's register, base or extent, or a resident bank's
+substitution that changes a stored value, a destination or a count is
+refused; the specialized lowerings (accumulator blocks, spatial scatter,
+resident GEMV) pass intact.
 """
 
+import re
 from dataclasses import replace
 
 import pytest
 
 import allo
-from allo.ir.types import float16
+from allo.ir.types import float16, uint16
 from allo.pim import apu_v1_vector_program as vp
 from allo.pim.apu_v1_vector_codegen import (
     APUVectorRealization,
+    ScheduleBank,
     ScheduleCall,
+    ScheduleGuard,
+    ScheduleIndex,
     ScheduleLoop,
+    ScheduleScatter,
+    SpatialResidentReductionEmission,
     VRRef,
     realize_apu_v1_plan,
 )
@@ -237,9 +253,7 @@ def _rewrite(schedule, transform):
     def rewrite(steps):
         out = []
         for step in steps:
-            if isinstance(step, ScheduleLoop):
-                step = replace(step, body=rewrite(step.body))
-            elif hasattr(step, "body"):
+            if isinstance(step, (ScheduleLoop, ScheduleGuard, ScheduleBank)):
                 step = replace(step, body=rewrite(step.body))
             out.append(step)
         return tuple(transform(out))
@@ -247,11 +261,16 @@ def _rewrite(schedule, transform):
     return replace(schedule, steps=rewrite(schedule.steps))
 
 
-def _patch_schedule(monkeypatch, transform):
+def _patch_schedule(monkeypatch, transform, only_plan=None):
+    """Every realization's schedule (or only the plan named ``only_plan``)
+    rewritten by ``transform`` before validation and rendering."""
     original = APUVectorRealization.emission_schedule
 
     def damaged(self):
-        return _rewrite(original(self), transform)
+        schedule = original(self)
+        if only_plan is not None and getattr(self.plan, "name", None) != only_plan:
+            return schedule
+        return _rewrite(schedule, transform)
 
     monkeypatch.setattr(APUVectorRealization, "emission_schedule", damaged)
 
@@ -299,7 +318,9 @@ def test_an_early_egress_is_refused(monkeypatch):
         return rest[:loop_at] + egress + rest[loop_at:]
 
     _patch_schedule(monkeypatch, hoist)
-    with pytest.raises(Exception, match="before a later compute defines it"):
+    with pytest.raises(
+        Exception, match="receives a value other than the plan\\\\?'s computation"
+    ):
         _compile_rectangular("temporal_svp")
 
 
@@ -350,7 +371,9 @@ def test_a_hoisted_operand_ingress_is_refused(monkeypatch):
         return out
 
     _patch_schedule(monkeypatch, hoist)
-    with pytest.raises(Exception, match="executes .* times; the plan requires"):
+    # The hoisted loads address ``batch``, an index of the reduction loop's
+    # scope, outside it; the interpreter refuses the index before any value.
+    with pytest.raises(Exception, match="unknown index 'batch'"):
         _compile_rectangular("temporal_svp")
 
 
@@ -368,7 +391,7 @@ def test_a_reordered_schedule_is_refused_by_readiness(monkeypatch):
         return steps
 
     _patch_schedule(monkeypatch, swap)
-    with pytest.raises(Exception, match="before anything in the emission defines them"):
+    with pytest.raises(Exception, match="before anything in the emission defines it"):
         _compile_rectangular("temporal_svp")
 
 
@@ -400,3 +423,258 @@ def test_every_enumerated_plan_passes_the_realization_invariant():
                 forced.realization.emission_schedule().render(forced.realization)
                 == forced.device_source()
             )
+
+
+# --------------------------------------------------------------------------- #
+# Round 82 (reviewer round 81): the schedule executed against the plan.
+# --------------------------------------------------------------------------- #
+
+
+def integer_neighbor(a: uint16[192, 256], b: uint16[256, 1024], c: uint16[192, 1024]):
+    for i, j in allo.grid(192, 1024):
+        for k in allo.reduction(256):
+            c[i, j] += a[i, k] * b[k, j]
+
+
+def paper_gemv(A: float16[4096, 256], B: float16[256, 1], out: float16[4096, 1]):
+    for i, j in allo.grid(4096, 1):
+        for k in allo.reduction(256):
+            out[i, j] += A[i, k] * B[k, j]
+
+
+ACC2 = "temporal_dma_coalescing_broadcast_friendly_acc2"
+ACC4 = "temporal_dma_coalescing_broadcast_friendly_acc4"
+SPATIAL = "baseline_spatial_reduction"
+RESIDENT = "spatial_gemv_group_reduction_k64"
+WRONG_VALUE = r"receives a value other than the plan\\?'s computation"
+
+
+def _compile_integer(layout=None):
+    return allo.compile(
+        integer_neighbor,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="virtual",
+        layout=layout,
+    )
+
+
+def _compile_gemv(layout=None):
+    return allo.compile(
+        paper_gemv,
+        build_apu_v1_target(),
+        apu_v1_cost,
+        backend="virtual",
+        layout=layout,
+        reduction_order="reassociate",
+    )
+
+
+def _fold_slots(steps):
+    """Reviewer round 81, injection 4: every accumulator-slot section above
+    slot zero replaced by the slot-zero section (ingress, compute and egress
+    alike); every aggregate count is unchanged, half the batches are never
+    computed or stored."""
+    slot0 = None
+    out = []
+    for step in steps:
+        if isinstance(step, ScheduleGuard) and step.slot == 0:
+            slot0 = step
+        if isinstance(step, ScheduleGuard) and step.slot > 0 and slot0 is not None:
+            step = slot0
+        out.append(step)
+    return out
+
+
+def test_a_zeroed_index_definition_is_refused(monkeypatch):
+    """Reviewer round 81, injection 1: every scoped index defined as zero;
+    the loads address the first packed tile on every iteration."""
+
+    def zero(steps):
+        return [
+            replace(s, expression="0") if isinstance(s, ScheduleIndex) else s
+            for s in steps
+        ]
+
+    _patch_schedule(monkeypatch, zero)
+    with pytest.raises(Exception, match=WRONG_VALUE):
+        _compile_rectangular("temporal_svp")
+
+
+def test_zeroed_pointer_batches_are_refused(monkeypatch):
+    """Reviewer round 81, injection 2: the ingress calls' pointer batches
+    replaced by zero while the index definitions stay intact."""
+
+    def zero(steps):
+        return [
+            (
+                replace(s, pointer_batches={"p": "0", "q": "0", "r": "0"})
+                if _is_call(s, phase="transfer_in")
+                else s
+            )
+            for s in steps
+        ]
+
+    _patch_schedule(monkeypatch, zero)
+    with pytest.raises(Exception, match=WRONG_VALUE):
+        _compile_rectangular("temporal_svp")
+
+
+def test_an_undeclared_call_is_refused(monkeypatch):
+    """Reviewer round 81, injection 3: a valid GVML call that is not in the
+    plan's instruction stream (the accumulator doubled after every add)."""
+
+    def double(steps):
+        out = []
+        for s in steps:
+            out.append(s)
+            if _is_call(s, api="gvml_add_f16"):
+                extra = replace(
+                    s.instruction,
+                    args=(VRRef("r"), VRRef("r"), VRRef("r")),
+                    definitions=("r",),
+                    uses=("r",),
+                )
+                out.append(replace(s, instruction=extra))
+        return out
+
+    _patch_schedule(monkeypatch, double)
+    with pytest.raises(Exception, match="not in the plan\\\\?'s instruction stream"):
+        _compile_rectangular("temporal_svp")
+
+
+def test_a_folded_accumulator_slot_is_refused(monkeypatch):
+    """Reviewer round 81, injection 4, on the unsigned 192x256 times 256x1024
+    contraction forced to its two-accumulator plan."""
+    _patch_schedule(monkeypatch, _fold_slots)
+    with pytest.raises(
+        Exception, match=r"batch 0 of 'c' is stored 2 times; the plan stores it 1"
+    ):
+        _compile_integer(ACC2)
+
+
+@pytest.mark.parametrize(
+    "fault, message",
+    [
+        ("register", r"a scatter of a register that is not the output\\?'s"),
+        ("base", r"is stored \d+ times; the plan stores it 1 time"),
+        ("count", r"lanes .* is never stored"),
+    ],
+)
+def test_a_damaged_spatial_scatter_is_refused(monkeypatch, fault, message):
+    """Reviewer round 81, injection 5, against the structured scatter: the
+    lanes of another register, every work tile scattered to element zero,
+    or twice the plan's lanes per work tile."""
+
+    def damage(steps):
+        out = []
+        for s in steps:
+            if isinstance(s, ScheduleScatter):
+                if fault == "register":
+                    s = replace(s, register="vr_a")
+                elif fault == "base":
+                    s = replace(s, destination_base="0")
+                else:
+                    s = replace(s, count=s.count * 2)
+            out.append(s)
+        return out
+
+    _patch_schedule(monkeypatch, damage)
+    with pytest.raises(Exception, match=message):
+        _compile_integer(SPATIAL)
+
+
+@pytest.mark.parametrize("plan, block", [(ACC2, 2), (ACC4, 4), (SPATIAL, 1)])
+def test_specialized_integer_plans_pass_the_contract(plan, block):
+    """The accumulator-blocked and spatial-scatter lowerings pass intact, with
+    no rejection recorded, and the emitted text is the schedule's."""
+    forced = _compile_integer(plan)
+    assert forced.selected_plan.name == plan
+    assert forced.placement_ranking.kernels[0].rejections == ()
+    assert forced.realization.accumulator_block == block
+    assert (forced.realization._spatial_scatter_elements() is not None) == (
+        plan == SPATIAL
+    )
+    assert (
+        forced.realization.emission_schedule().render(forced.realization)
+        == forced.device_source()
+    )
+
+
+def test_a_damaged_preferred_candidate_leaves_an_intact_alternative_selectable(
+    monkeypatch,
+):
+    """Only the cost-preferred plan's schedule is damaged (the slots folded);
+    that candidate is rejected with the reason recorded and selection falls
+    through to an intact alternative."""
+    preferred = _compile_integer().selected_plan.name
+    assert preferred == ACC4
+    _patch_schedule(monkeypatch, _fold_slots, only_plan=preferred)
+    compiled = _compile_integer()
+    assert compiled.selected_plan.name != preferred
+    rejections = compiled.placement_ranking.kernels[0].rejections
+    assert any(
+        f"plan '{preferred}'" in text and "is stored 4 times" in text
+        for _index, text in rejections
+    ), rejections
+
+
+def test_the_resident_gemv_form_passes_the_contract():
+    forced = _compile_gemv(RESIDENT)
+    assert forced.selected_plan.name == RESIDENT
+    # The only rejections are other candidates' L3 budgets, none the contract's.
+    assert not any(
+        "realization" in text
+        for _index, text in forced.placement_ranking.kernels[0].rejections
+    )
+    emission = forced.realization.physical_emission
+    assert isinstance(emission, SpatialResidentReductionEmission)
+    assert len(emission.resident_names) == emission.reduction_tiles == 4
+    assert (
+        forced.realization.emission_schedule().render(forced.realization)
+        == forced.device_source()
+    )
+
+
+def test_a_resident_bank_reading_the_first_tile_is_refused(monkeypatch):
+    """Every bank section's streamed tile index aliased to bank zero's: the
+    counts, banks and substitutions are intact, the tiles reduced are not."""
+
+    def alias(steps):
+        return [
+            (
+                replace(s, expression=re.sub(r"\+ \d+$", "+ 0", s.expression))
+                if isinstance(s, ScheduleIndex) and s.name.startswith("batch_")
+                else s
+            )
+            for s in steps
+        ]
+
+    _patch_schedule(monkeypatch, alias)
+    with pytest.raises(Exception, match=WRONG_VALUE):
+        _compile_gemv(RESIDENT)
+
+
+def test_a_resident_bank_without_its_substitution_is_refused(monkeypatch):
+    """The calls of every bank above zero stripped of their resident-bank
+    substitution, so they read bank zero's register."""
+
+    def strip(steps):
+        out = []
+        for s in steps:
+            if isinstance(s, ScheduleBank) and s.index > 0:
+                s = replace(
+                    s,
+                    body=tuple(
+                        replace(c, overrides=()) if isinstance(c, ScheduleCall) else c
+                        for c in s.body
+                    ),
+                )
+            out.append(s)
+        return out
+
+    _patch_schedule(monkeypatch, strip)
+    with pytest.raises(
+        Exception, match="reads the resident vector in bank 1 without that bank"
+    ):
+        _compile_gemv(RESIDENT)

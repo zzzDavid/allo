@@ -6,8 +6,8 @@
 Prepared in round 78 (2026-11-06) for the outstanding G9 source review, at
 the named candidate `d120084` (its code tree is that of `9d7dc81`), and
 updated in rounds 79 and 80 for the APU v1 vector route's realization
-boundary (X-35 in `6ce37ad`, X-36 in `7fb19a4` and the round 81 commit; these
-commits change production code after `d120084`, so the next named
+boundary (X-35 in `6ce37ad`, X-36 in `7fb19a4`, `5965d1f` and the round 82 commit;
+these commits change production code after `d120084`, so the next named
 candidate must contain them).  Line numbers are those of `d120084` unless a row says
 otherwise.  The design history is in
 `design/shared-compilation-path.md`; this packet lists what the reviewer
@@ -41,7 +41,7 @@ has to read, in pipeline order, with the evidence that exercises it.
 | SK hynix AiM | `_aim_enumerate` 1051 | `spmw_aim._derive_aim_effects` 264 | `AimCtx.check_realization` `allo/spmw_aim.py:1084`; the program derivation's own checks before any record is lowered: `_dense_elementwise_domain` (X-33), `_check_device_value_layouts` (X-32, frames), `_check_physical_liveness` (X-32, cells and row chunks) | native ramulator2 (timing-only) |
 | UPMEM | `_upmem_enumerate` 1180 | `spmw_upmem._derive_upmem_effects` 2150 | `UpmemCtx.check_realization` `allo/spmw_upmem.py:3586` | uPIMulator through the native SDK executor |
 | AttAcc | `_attacc_enumerate` 1387 | `spmw_attacc._derive_attacc_effects` 223 | `AttAccCtx.check_realization` `allo/spmw_attacc.py:349` | Ramulator2-AttAcc traces, analytical composition |
-| GSI APU v1, vector route | `_apu_v1_enumerate` 1227 (`allo/pim/apu_v1_vector_program.py::apu_v1_vector_candidates` 638; `apu_v1_record_frontend.py::apu_v1_program_candidates` 353 for the record route) | `APUv1VectorCandidate.effects` (`apu_v1_vector_program.py` 534) from the contraction analysis of the shared facts | `APUv1Ctx.check_realization` `allo/spmw_apu_v1.py:202`: ABI, value layouts, transfers, launch extents, and `_check_vector_compute` (rounds 79 and 80, X-35 and X-36): `apu_v1_vector_codegen.validate_realization` re-derives the operations from the contraction and the plan, the whole instruction stream from `_instruction_stream` (the realizer's own builder), the physical emission and the register bindings, and checks the structured `EmissionSchedule` against the plan (round 81: loop roles and counts, guards, bank sections, every call's execution count, the declared register substitutions and pointer indices, readiness and store finality, the spatial forms' resets and scatters); the context then compares the emitted source with the schedule's rendering line for line | the board (ledag) |
+| GSI APU v1, vector route | `_apu_v1_enumerate` 1227 (`allo/pim/apu_v1_vector_program.py::apu_v1_vector_candidates` 638; `apu_v1_record_frontend.py::apu_v1_program_candidates` 353 for the record route) | `APUv1VectorCandidate.effects` (`apu_v1_vector_program.py` 534) from the contraction analysis of the shared facts | `APUv1Ctx.check_realization` `allo/spmw_apu_v1.py:202`: ABI, value layouts, transfers, launch extents, and `_check_vector_compute` (rounds 79 and 80, X-35 and X-36): `apu_v1_vector_codegen.validate_realization` re-derives the operations from the contraction and the plan, the whole instruction stream from `_instruction_stream` (the realizer's own builder), the physical emission and the register bindings, and checks the structured `EmissionSchedule` against the plan (round 81: loop roles and counts, guards, bank sections, every call's execution count, the declared register substitutions and pointer indices, readiness and store finality, the spatial forms' resets and scatters; round 82: `_ScheduleInterpreter` executes the plan's instruction stream under the plan's batching and the structured schedule concretely on two abstract machines and compares every store's value, destination and multiplicity, the scatter coverage, the compute, reset and setup counts and the priced inventory); the context then compares the emitted source with the schedule's rendering line for line as a tamper check | the board (ledag) |
 | GSI APU v1, grouped route | `_apu_v1_grouped_enumerate` 1278 | `apu_v1_grouped_route.apu_v1_grouped_candidate_effects` 596 (`_derive_apu_v1_effects` 804) | `APUv1Ctx._check_grouped_realization` `allo/spmw_apu_v1.py:335` (declaration, independently re-derived packing, map) | the board |
 | GSI Gemini-II | `_apu_g2_enumerate` 1270 (`allo/pim/apu_g2_record_frontend.py::apu_g2_record_candidates` 957; `apu_g2_source_route.APUG2SourceContract` 208) | the record frontend's contract bound to the retained contract and the launch partition (X-25, X-27) | `APUG2Ctx.check_realization` `allo/spmw_apu_g2.py:150` | the zhang-x4 card |
 
@@ -98,7 +98,15 @@ round 81 with a structured schedule (loops, guards, bank sections, resets,
 scatters, calls with declared substitutions) checked against the plan's
 counts, roles, substitutions and ordering (all injections of rounds 78 to
 80 refused, 15 regressions, 21 plans rendered identically to the parent
-renderer by the reviewer's own comparator).  Still
+renderer by the reviewer's own comparator); the reviewer's round 81
+injections (zeroed indices, zeroed pointer batches, an undeclared call,
+folded accumulator slots, a scatter writing zeros) showed that shape checks
+do not establish meaning, repaired in round 82 with an abstract interpreter
+that executes the plan's batching and the schedule on two machines and
+compares stores, coverage and counts (all injections of rounds 78 to 81
+refused, 29 regressions, the specialized forms intact, 21 plans identical).
+This packet does not claim G9 closed from that checker; the repair awaits
+the reviewer's independent read.  Still
 open: the independent review of the repair and of the remaining packet
 (rounds 28 to 30: the `APUv1Program` manifest from the retained IR, the
 slice 5 traces); the Gemini-I rows at a candidate (the board's `/tmp`); the
