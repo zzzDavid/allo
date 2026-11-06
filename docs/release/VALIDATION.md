@@ -1596,6 +1596,40 @@ No new launches; evidence under
 |---|---|
 | Selection and generated work (`g2_plan_probe.py`, `.json`, compile-only from the checkout; the session records' per-launch provenance) | batched_gemm selects `single/k1` (estimate 1,714; the only alternative `single/k2` at 2,550), mvt `fused/k1` (2,740; `separate/k1` 5,480), one launch each; every recorded session carries one program fingerprint, one layout fingerprint and one packing attestation per row, unchanged since round 30 |
 | Measurement scope | the statistic is the repeated batch's device pipeline ticks divided by the repetitions (`benchmarks/apu_g2/paper_rows.py`); host launch timings are recorded per launch and are outside it |
-| Session-by-session attribution (`g2_gap_attribution.py`, `.json`: r30 runs 1 and 2 at `69773fc`, the four `54cbb08` sessions, the `cd744bb` session, the five-round round 29 run) | batched_gemm: Tenon 1,716.35 / 1,731.55 / 1,744.55 / 1,740.58 / 1,743.43 / 1,740.65 / 1,739.68 ticks (0.9869 to 1.0031 of the paper's 1,739.15) with the GTML lane in the same rounds at 1,916.1 / 1,910.9 / 1,912.9 / 1,919.7 / 1,913.4 / 1,913.5 (1.0023 to 1.0070 of the paper's 1,906.4); the vendor's drift exceeds Tenon's in 5 of 6 paired sessions; the paired same-round GTML/Tenon ratio 1.1048 / 1.0946 / 1.0974 / 1.0984 / 1.0983 / 1.1004 (pooled 1.0983) against the paper's 1.0962, at or above it in 5 of 6. mvt: Tenon 2,743.85 / 2,755.03 / 2,763.33 / 2,762.13 / 2,755.6 / 2,771.3 / 2,767.23 (0.9918 to 1.0017 of 2,766.625; pooled over the six paired sessions 0.9986), GTML 0.9961 to 1.0003 of 3,089.65, the paired ratio 1.1149 to 1.1221 (pooled 1.1158) against the paper's 1.1168 |
-| Conclusion | the residual gaps (0.5 and 0.6 ticks at `cd744bb`) are within the card's session-to-session drift, which the re-run baseline shares; attributed to measurement drift, not generated work, selection or launch overhead; no mechanism repair supported; statuses unchanged under the pooled-session rule (X-26's campaign spent; no session added); the Gemini-II rows are re-measured once more only as the final-candidate validation session |
+| Session-by-session reading (`g2_gap_attribution.py`, `.json`, corrected in round 78: every launch sample pooled, complete packing attestations compared; r30 runs 1 and 2 at `69773fc`, the four `54cbb08` sessions, the `cd744bb` session, the five-round round 29 run) | batched_gemm: Tenon session medians 1,716.35 / 1,731.55 / 1,744.55 / 1,740.58 / 1,743.43 / 1,740.65 / 1,739.68 ticks (0.9869 to 1.0031 of the paper's 1,739.15) with the GTML lane in the same rounds at 1,916.1 / 1,910.9 / 1,912.9 / 1,919.7 / 1,913.4 / 1,913.5 (1.0023 to 1.0070 of the paper's 1,906.4); the vendor's excess exceeds Tenon's in 5 of 6 paired sessions; the paired same-round GTML/Tenon ratio 1.1048 / 1.0946 / 1.0974 / 1.0984 / 1.0983 / 1.1004 against the paper's 1.0962, at or above it in 5 of 6; pooled over the 120 launch samples of the six paired sessions the Tenon median is 1.001150 of the paper's column (the median of the session medians 1.000841) and the paired ratio 1.0984. mvt: Tenon 2,743.85 / 2,755.03 / 2,763.33 / 2,762.13 / 2,755.6 / 2,771.3 / 2,767.23 (0.9918 to 1.0017 of 2,766.625), GTML 0.9961 to 1.0003 of 3,089.65, the paired ratio 1.1149 to 1.1221 against 1.1168; pooled over the 120 samples 0.999223 of the paper (the median of the session medians 0.998590), the paired ratio 1.1160. One program, layout and complete packing attestation per row across every session |
+| Conclusion | no generated-program change is identified between the sessions below and above the paper; the enumerated rankings show the selected plan has the lowest estimate among the enumerated candidates, not that no alternative could run faster; the observations are consistent with session-to-session measurement variability of the card that the re-run baseline shares, and do not establish the cause of the residual gaps (0.5 and 0.6 ticks at `cd744bb`); no mechanism repair is supported by the evidence; both rows OPEN under the pooled-session rule (X-26's campaign spent; no session added); the Gemini-II rows are re-measured once more only as the pre-registered final-candidate validation session |
 | Not done | the Gemini-I retry still queued behind the `/tmp` watcher (X-22 / X-23 OPEN); the final-candidate runs of the Samsung, UPMEM, AttAcc and Gemini-II rows, X-33's installed refusal and the G9 review at one named candidate |
+
+## Round 78 (2026-11-06): the named-candidate integration milestone (pre-registration, written before any launch)
+
+Candidate: the revision of this commit (the code tree is that of `9d7dc81`,
+X-33 included; the commits after it change release documentation only).
+Evidence under `/work/shared/users/phd/nz264/tenon-release-evidence/r78/`.
+
+Pre-registered before the launch:
+
+- Local: sdist from `git archive` of the candidate, wheel and clean venv
+  (`r78/pkg`); from the installed wheel with the tests and benchmarks copied
+  out of the checkout: the round 8 probes, X-33's refusal (`reviewer-r75/strided.py even`) and its dense neighbours (`dense.py full`, `test_aim_dense_domains.py`), the value-layout
+  regressions and the reviewer's round 71 to 74 probes, the fourteen AiM rows
+  (golden default and `paper_full`, the CENT suite, the fourteen-row
+  provenance), the three Samsung rows (PIMSimulator), the sixteen UPMEM rows
+  through the native SDK executor, the twelve AttAcc results (six kernel rows
+  through `run_ramulator.py` with the fixed-form baselines, six decode
+  configurations through `compose_e2e.py`), the shared-semantics suite and
+  the grouped route's section u, the reviewer's round 65 map probe.
+- Gemini-II: the sdist built into a wheel on zhang-x4 and installed into a
+  clean venv there; the card tests from that wheel; then ONE paired session
+  of 20 rounds of `benchmarks.apu_g2.paper_rows` for all five rows under the
+  device lock (the archived protocol: one warm-up per lane and case, the
+  GTML lane interleaved, exact outputs required).  It is the candidate's
+  validation session, recorded whatever the outcome; at this revision the
+  rows' statistic is the pooled samples of this one session; it is not a
+  further sample of the spent batched_gemm campaign at `54cbb08` (X-26), and
+  no second session follows at this revision.
+- Gemini-I: not run at this candidate (the host's `/tmp`, 140 kB free); the
+  queued retry at `472bec9` (`r76/campaign_watcher.sh`) stays as
+  pre-registered and cannot establish execution at this candidate; recorded
+  as not re-executed here.
+
+Results follow in this section as the stages complete.
