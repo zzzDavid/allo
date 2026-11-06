@@ -131,7 +131,9 @@ def test_apu_g2_vendor_lane_checks_the_loaded_device_library(tmp_path):
 
     ok = g2_paper_rows.loaded_device_library({"device_library": str(same)}, expected)
     assert ok["problem"] is None and ok["loaded_device_library_sha256"] == expected
-    wrong = g2_paper_rows.loaded_device_library({"device_library": str(other)}, expected)
+    wrong = g2_paper_rows.loaded_device_library(
+        {"device_library": str(other)}, expected
+    )
     assert "other than the archived one" in wrong["problem"]
     missing = g2_paper_rows.loaded_device_library(
         {"device_library": str(tmp_path / "gone.bin")}, expected
@@ -143,15 +145,69 @@ def test_apu_g2_vendor_lane_checks_the_loaded_device_library(tmp_path):
 
 def test_apu_v1_paired_ratios_use_same_round_valid_launches_only():
     launches = [
-        {"lane": "tenon", "kind": "warmup", "round": 0, "crun": 999, "outputs_match_oracle": True},
-        {"lane": "tenon", "kind": "measured", "round": 1, "crun": 100, "outputs_match_oracle": True},
-        {"lane": "control:paper", "kind": "measured", "round": 1, "crun": 90, "outputs_match_oracle": True},
-        {"lane": "expert", "kind": "measured", "round": 1, "crun": 110, "outputs_match_oracle": True},
-        {"lane": "tenon", "kind": "measured", "round": 2, "crun": 200, "outputs_match_oracle": True},
-        {"lane": "control:paper", "kind": "measured", "round": 2, "crun": 100, "outputs_match_oracle": False},
-        {"lane": "expert", "kind": "measured", "round": 2, "crun": 220, "error": "boom"},
-        {"lane": "tenon", "kind": "measured", "round": 3, "crun": 0, "outputs_match_oracle": True},
-        {"lane": "expert", "kind": "measured", "round": 3, "crun": 300, "outputs_match_oracle": True},
+        {
+            "lane": "tenon",
+            "kind": "warmup",
+            "round": 0,
+            "crun": 999,
+            "outputs_match_oracle": True,
+        },
+        {
+            "lane": "tenon",
+            "kind": "measured",
+            "round": 1,
+            "crun": 100,
+            "outputs_match_oracle": True,
+        },
+        {
+            "lane": "control:paper",
+            "kind": "measured",
+            "round": 1,
+            "crun": 90,
+            "outputs_match_oracle": True,
+        },
+        {
+            "lane": "expert",
+            "kind": "measured",
+            "round": 1,
+            "crun": 110,
+            "outputs_match_oracle": True,
+        },
+        {
+            "lane": "tenon",
+            "kind": "measured",
+            "round": 2,
+            "crun": 200,
+            "outputs_match_oracle": True,
+        },
+        {
+            "lane": "control:paper",
+            "kind": "measured",
+            "round": 2,
+            "crun": 100,
+            "outputs_match_oracle": False,
+        },
+        {
+            "lane": "expert",
+            "kind": "measured",
+            "round": 2,
+            "crun": 220,
+            "error": "boom",
+        },
+        {
+            "lane": "tenon",
+            "kind": "measured",
+            "round": 3,
+            "crun": 0,
+            "outputs_match_oracle": True,
+        },
+        {
+            "lane": "expert",
+            "kind": "measured",
+            "round": 3,
+            "crun": 300,
+            "outputs_match_oracle": True,
+        },
     ]
     assert paper_rows._paired_ratios(launches, "control:paper") == [0.9]
     assert paper_rows._paired_ratios(launches, "expert") == [1.1]
@@ -268,7 +324,13 @@ def test_apu_g2_timing_evidence_requires_complete_positive_ticks():
 
     assert selection_traces.amortized_ticks(Zero(), 20) is None
     assert selection_traces._timing_problems(
-        {"stock": {"amortized_ticks_per_pipeline": None, "launches": [], "expected_launches": 2}}
+        {
+            "stock": {
+                "amortized_ticks_per_pipeline": None,
+                "launches": [],
+                "expected_launches": 2,
+            }
+        }
     ) == ["stock: no complete device tick evidence (0 launch record(s) for 2 expected)"]
 
 
@@ -315,7 +377,9 @@ def test_apu_g2_selection_traces_require_the_plans_launches():
 
         def __call__(self, **args):
             return type(
-                "R", (), {"kind": "device", "cycles": 100, "extra": {"launches": good[:1]}}
+                "R",
+                (),
+                {"kind": "device", "cycles": 100, "extra": {"launches": good[:1]}},
             )()
 
     run = selection_traces._run(Compiled(), {})
@@ -326,7 +390,9 @@ def test_apu_g2_selection_traces_require_the_plans_launches():
     ]
 
 
-def test_apu_g2_selection_traces_command_rejects_a_missing_stock_launch(monkeypatch, tmp_path):
+def test_apu_g2_selection_traces_command_rejects_a_missing_stock_launch(
+    monkeypatch, tmp_path
+):
     """Exact outputs with one of the stock plan's two launches missing: the
     command exits 1 and keeps the invalid evidence."""
     import numpy as np
@@ -344,12 +410,20 @@ def test_apu_g2_selection_traces_command_rejects_a_missing_stock_launch(monkeypa
             # exact outputs: fill the destinations from the arguments
             self._outputs(args)
             launches = [
-                {"index": i, "layout_fingerprint": f, "raw_ticks": {"pipeline": 100 + i}}
+                {
+                    "index": i,
+                    "layout_fingerprint": f,
+                    "raw_ticks": {"pipeline": 100 + i},
+                }
                 for i, f in enumerate(("f1" * 20, "f2" * 20))
             ]
             if self._drop:
                 launches = launches[:1]
-            return type("R", (), {"kind": "device", "cycles": 10, "extra": {"launches": launches}})()
+            return type(
+                "R",
+                (),
+                {"kind": "device", "cycles": 10, "extra": {"launches": launches}},
+            )()
 
     def fake_compile(workload, target, cost, layout=None):
         calls["n"] += 1
@@ -357,15 +431,21 @@ def test_apu_g2_selection_traces_command_rejects_a_missing_stock_launch(monkeypa
         if n in (1, 2):  # perturbation: stock (drops a launch), perturbed
 
             def gemm_outputs(args):
-                args["C"][...] = (args["A"].astype(np.int64) @ args["B"].astype(np.int64)).astype(np.int16)
+                args["C"][...] = (
+                    args["A"].astype(np.int64) @ args["B"].astype(np.int64)
+                ).astype(np.int16)
 
-            return FakeCompiled("single/k2" if n == 1 else "single/k1", None, gemm_outputs, n == 1)
+            return FakeCompiled(
+                "single/k2" if n == 1 else "single/k1", None, gemm_outputs, n == 1
+            )
 
         def bicg_outputs(args):
             args["q"][...] = (args["A"].astype(np.int64) @ args["p"]).astype(np.int16)
             args["s"][...] = (args["r"].astype(np.int64) @ args["A"]).astype(np.int16)
 
-        return FakeCompiled("fused/k1" if n == 3 else "separate/k1", None, bicg_outputs, False)
+        return FakeCompiled(
+            "fused/k1" if n == 3 else "separate/k1", None, bicg_outputs, False
+        )
 
     monkeypatch.setattr(selection_traces.allo, "compile", fake_compile)
     out = tmp_path / "traces.json"
@@ -373,13 +453,21 @@ def test_apu_g2_selection_traces_command_rejects_a_missing_stock_launch(monkeypa
     session = json.loads(out.read_text())
     stock = session["experiments"][0]["runs"]["stock"]
     assert stock["outputs_exact"] is True
-    assert stock["timing_evidence_problem"] == "1 launch record(s) for a plan of 2 launch(es)"
+    assert (
+        stock["timing_evidence_problem"]
+        == "1 launch record(s) for a plan of 2 launch(es)"
+    )
     assert stock["amortized_ticks_per_pipeline"] is None
     assert len(stock["launches"]) == 1  # the invalid evidence is retained
-    assert any("stock: 1 launch record(s)" in p for p in session["experiments"][0]["invariant_problems"])
+    assert any(
+        "stock: 1 launch record(s)" in p
+        for p in session["experiments"][0]["invariant_problems"]
+    )
 
 
-def test_apu_v1_archived_lane_accepts_a_relative_scratch_directory(monkeypatch, tmp_path):
+def test_apu_v1_archived_lane_accepts_a_relative_scratch_directory(
+    monkeypatch, tmp_path
+):
     import subprocess
     import sys
 
@@ -406,9 +494,15 @@ def test_apu_v1_archived_lane_accepts_a_relative_scratch_directory(monkeypatch, 
         # The archived binary runs with the launch directory as cwd and the
         # output argument as given: it must be absolute.
         subprocess.run(
-            [sys.executable, "-c",
-             "import sys, numpy as np; np.arange(4, dtype='<u2').tofile(sys.argv[1])", argv[-1]],
-            cwd=cwd, check=True, capture_output=True,
+            [
+                sys.executable,
+                "-c",
+                "import sys, numpy as np; np.arange(4, dtype='<u2').tofile(sys.argv[1])",
+                argv[-1],
+            ],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
         )
         return "", "total crun: 5 hits: 1", [5]
 
@@ -424,7 +518,7 @@ def test_apu_v1_archived_lane_accepts_a_relative_scratch_directory(monkeypatch, 
     with pytest.raises(RuntimeError):
         lane.launch()
     assert original.read_bytes() == before
-    kept = (tmp_path / "relative_scratch" / "expert-launch-002")
+    kept = tmp_path / "relative_scratch" / "expert-launch-002"
     assert kept.is_absolute() and (kept / "error.txt").exists()
     assert (kept / "counts.bin").read_bytes() == b"partial"
 
@@ -468,10 +562,54 @@ def test_apu_g2_paper_rows_lane_applies_the_plan_correspondence(monkeypatch):
         {
             "plan": _Plan("two", ("expected-a", "expected-b")),
             "__call__": lambda self, **a: type(
-                "R", (), {"kind": "device", "cycles": 10, "extra": {"launches": records}}
+                "R",
+                (),
+                {"kind": "device", "cycles": 10, "extra": {"launches": records}},
             )(),
         },
     )()
     launch = lane.launch()
     assert launch["amortized_ticks_per_pipeline"] is None
-    assert launch["timing_evidence_problem"] == "launch record 0 carries no launch index"
+    assert (
+        launch["timing_evidence_problem"] == "launch record 0 carries no launch index"
+    )
+
+
+def test_apu_v1_cases_of_one_session_take_separate_scratch_directories(tmp_path):
+    """Round 85 (X-38): a session run with ``--scratch`` over several cases
+    gave every case's lanes the same launch directory names, so the second
+    case's expert and archived launches failed with ``FileExistsError``;
+    each case now takes its own subdirectory of the supplied scratch."""
+    root = Path(os.environ.get("TENON_ARTIFACTS", ""))
+    if not (root / "apuv1" / "tenon" / "word_count" / "workload.py").is_file():
+        pytest.skip("BLOCKED-ENV(tenon artifacts not found; set TENON_ARTIFACTS)")
+    out = tmp_path / "rows.json"
+    shared = tmp_path / "shared"
+    status = paper_rows.main(
+        [
+            "--artifacts",
+            str(root),
+            "--backend",
+            "virtual",
+            "--expert",
+            "--measured",
+            "2",
+            "--cases",
+            "word_count",
+            "kmeans",
+            "--scratch",
+            str(shared),
+            "--out",
+            str(out),
+        ]
+    )
+    assert status == 0
+    session = json.loads(out.read_text())
+    records = {record["case"]: record for record in session["records"]}
+    assert set(records) == {"word_count", "kmeans"}
+    scratches = {case: Path(record["scratch"]) for case, record in records.items()}
+    assert scratches["word_count"] != scratches["kmeans"]
+    assert {path.parent for path in scratches.values()} == {shared.resolve()}
+    assert {path.name for path in scratches.values()} == {"word_count", "kmeans"}
+    for record in records.values():
+        assert record["problems"] == []

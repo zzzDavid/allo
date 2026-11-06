@@ -505,8 +505,13 @@ def measure_case(
 
     if measured <= 0:
         raise MeasurementError(f"measured launches must be positive, got {measured}")
+    # A caller-supplied scratch directory is shared by every case of the
+    # session, and the lanes name their launch directories per lane and
+    # launch number only, so each case takes its own subdirectory (round 85,
+    # ISSUES X-38: the second case's expert and archived launches collided
+    # with the first case's and were lost to ``FileExistsError``).
     scratch = (
-        Path(scratch).resolve()
+        Path(scratch).resolve() / case
         if scratch
         else Path(tempfile.mkdtemp(prefix=f"tenon-apu-v1-session-{case}-"))
     )

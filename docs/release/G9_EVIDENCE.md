@@ -149,9 +149,31 @@ round 83 (`reviewer-r83/`: the 32 regressions from checkout and installed
 code, the alias probe and a renamed uint16 11 x 17 x 7 contraction, the
 21-plan comparator, the retained-IR manifest suite 7 passed), closing the
 physical-alias finding; this packet still does not claim G9 closed, and
-the checker establishes no hardware correctness.  Still open: the
-independent review of the remaining packet (rounds 28 to 30: the
-`APUv1Program` manifest from the retained IR, the slice 5 traces); the
-execution evidence at the named candidate containing `8d9136f`
-(VALIDATION.md round 84); the Gemini-I rows at a candidate (the board's
-`/tmp`); the open minor items in `ISSUES.md`.
+the checker establishes no hardware correctness.
+
+Round 84 review (`reviewer-r84/README.txt`): the manifest source review of
+rounds 28 to 30 is complete for the reviewed domain.  The reviewer read
+`allo/compiler.py::compile` (line 829) through the common frontend,
+candidate validation, materialization and scoring and the APU hooks,
+`allo/pim/apu_v1_hybrid.py` (line 375, retained IR), and the X-21 repair
+(returned allocations and initialization values bound correctly), and ran
+the installed-wheel manifest and measurement-driver suites (25 passed,
+`manifest_driver_tests.log`).  Source acceptance, not G9 closure.  The
+reviewer also supplied current Gemini-II slice 5 evidence from the round 84
+wheel on zhang-x4 under the runtime's device lock
+(`g2_focused.py`, `g2_selection_traces.json`): a cost perturbation moves
+the 64 x 128 x 33 GEMM from `single/k2` to `single/k1` (2,652 to 3,444
+ticks per body), forced selection moves BiCG from `fused/k1` to
+`separate/k1` (2,534 to 5,065), every output exact, every launch carrying
+packing attestations, program and layout fingerprints and artifact hashes;
+a reviewer-chosen renamed 48 x 64 x 35 int4/int15 contraction executed
+exactly with inputs, actual outputs and independent expected arrays
+retained (`g2_neighbor_*`); a K96 neighbour was refused before launch by
+the documented power-of-two reduction rule.  Mechanism checks, not paper
+confirmation samples.
+
+Still open for G9: the candidate's repaired APU v1 vector path executed on
+the Gemini-I board (VALIDATION.md round 85: the host's `/tmp` recovered
+from this user's own scratch, the runs pre-registered and launched from
+the round 84 wheel); the open minor items in `ISSUES.md`.  The manifest and
+slice 5 review is no longer pending.
