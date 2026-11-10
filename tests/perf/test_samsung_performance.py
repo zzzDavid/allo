@@ -242,7 +242,6 @@ def test_reduce_run_zero_pads_into_physical_slots(monkeypatch, tmp_path):
     monkeypatch.setattr(spmw_samsung, "_invoke_conductor", fake_conductor)
     program = _gemv_program(1024, 1408)
     result = spmw_samsung._samsung_run_reduce(
-        None,
         program,
         [PIMCmd(type_="EXIT")],
         tmp_path,
@@ -343,3 +342,59 @@ def test_staging_shares_partition_the_conductors_staging():
         == samsung_staging_share(64, 256, G=G, E=E, lanes=16, temporal=True)["latency"]
         > 0
     )
+
+
+def test_staging_share_follows_the_geometry_columns_per_row():
+    """Round 92 (P-23 W0613 triage): ``samsung_staging_share`` accepted
+    ``cols_per_row`` and ignored it, hard-coding the two physical rows a
+    64-column run spans at the simulator's 32 burst columns per row.  The
+    rows per run now derive from the geometry: the default is unchanged,
+    sixteen columns per row makes a run span four rows (three exposed
+    changes per run, four row visits), sixty-four removes the exposed change,
+    and the split map's half runs follow the same rule."""
+    from allo.pim.costs.samsung import (
+        STAGE_ROW_CHANGE_CYCLES,
+        STAGE_ROW_VISIT_CYCLES,
+        STAGE_WRITE_CYCLES,
+        samsung_staging_share,
+    )
+
+    G, E, lanes = 8, 8, 16  # run = G*E = 64 writes; 256-wide reduction = 2 tiles
+    default = samsung_staging_share(64, 256, G=G, E=E, lanes=lanes)
+    explicit = samsung_staging_share(64, 256, G=G, E=E, lanes=lanes, cols_per_row=32)
+    assert default == explicit
+    groups, tiles = 8, 2
+    assert default["exposed_row_changes"] == groups * tiles  # two rows per run
+    assert default["bank_cycles"] == tiles * (
+        2 * STAGE_ROW_VISIT_CYCLES + 64 * STAGE_WRITE_CYCLES
+    )
+    narrow = samsung_staging_share(64, 256, G=G, E=E, lanes=lanes, cols_per_row=16)
+    assert narrow["writes"] == default["writes"]
+    assert narrow["exposed_row_changes"] == groups * tiles * 3
+    assert narrow["bank_cycles"] == tiles * (
+        4 * STAGE_ROW_VISIT_CYCLES + 64 * STAGE_WRITE_CYCLES
+    )
+    assert narrow["bus_cycles"] == (
+        narrow["writes"] * STAGE_WRITE_CYCLES
+        + narrow["exposed_row_changes"] * STAGE_ROW_CHANGE_CYCLES
+    )
+    wide = samsung_staging_share(64, 256, G=G, E=E, lanes=lanes, cols_per_row=64)
+    assert wide["exposed_row_changes"] == 0
+    assert wide["bank_cycles"] == tiles * (
+        STAGE_ROW_VISIT_CYCLES + 64 * STAGE_WRITE_CYCLES
+    )
+    split_default = samsung_staging_share(
+        64, 256, G=G, E=E, lanes=lanes, split_rows=True
+    )
+    split_narrow = samsung_staging_share(
+        64, 256, G=G, E=E, lanes=lanes, split_rows=True, cols_per_row=16
+    )
+    assert split_default["exposed_row_changes"] == 0
+    assert (
+        split_narrow["exposed_row_changes"] == groups * tiles * 2
+    )  # 32 writes span 2 rows per bank
+    assert split_narrow["bank_cycles"] == tiles * (
+        2 * STAGE_ROW_VISIT_CYCLES + 32 * STAGE_WRITE_CYCLES
+    )
+    with pytest.raises(ValueError, match="cols_per_row"):
+        samsung_staging_share(64, 256, G=G, E=E, lanes=lanes, cols_per_row=0)

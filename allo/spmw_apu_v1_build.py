@@ -226,7 +226,6 @@ def _gvml_sdk_available() -> bool:
 
 
 def _role_io_table(
-    compiled: "Compiled",
     inputs: dict,
     output_specs: dict,
 ) -> tuple[list[str], list[str]]:
@@ -840,7 +839,7 @@ def gen_apu_v1_low_mode_project(
     stage_apu_v1_template(dst)
 
     # Step 2: validate IO and determine role order.
-    in_roles, out_roles = _role_io_table(compiled, inputs, output_specs)
+    in_roles, out_roles = _role_io_table(inputs, output_specs)
 
     # Step 3: compute byte sizes for host.c allocations.
     input_byte_sizes: dict[str, int] = {}

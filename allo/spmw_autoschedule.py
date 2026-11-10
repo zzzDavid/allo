@@ -906,7 +906,7 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
     # The contraction shape rides on every base layout, so a placement passed
     # as ``layout=`` is priced by the same lowered-record cost program as an
     # enumerated (knob-crossed) one.
-    shape = _aim_contraction_shape(target, matches)
+    shape = _aim_contraction_shape(matches)
     # Banks one SBK launch visits (AimCtx._sbk_banks order), for the cost.
     sbk_banks = []
     for work_bank in range(single_bank_layout.size_of("work_bank")):
@@ -952,7 +952,7 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
     return layouts
 
 
-def _aim_contraction_shape(target, matches: list[MatchedOp]) -> dict:
+def _aim_contraction_shape(matches: list[MatchedOp]) -> dict:
     """Shape of the bucket's first MAC match, as the knobs and cost see it.
 
     Replication comes from the group stamp of ``rank_matcher_placements``;
@@ -1060,7 +1060,7 @@ def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
 
     names = {match.target_op_name for match in matches}
     if "MAC" in names:
-        shape = _aim_contraction_shape(target, matches)
+        shape = _aim_contraction_shape(matches)
         bases = []
         for candidate in _aim_layout_candidates(target, matches):
             candidate.extra["aim_shape"] = dict(shape)

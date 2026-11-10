@@ -2518,7 +2518,7 @@ def aligned_reduction(reduction: int, lanes: int) -> int:
     return math.ceil(reduction / lanes) * lanes
 
 
-def resolve_batch_mapping(shape: dict, requested, geometry) -> str:
+def resolve_batch_mapping(shape: dict, requested) -> str:
     """The batch mapping the lowerer realizes (its ``auto`` rule otherwise)."""
     if requested not in (None, "auto", "none"):
         return requested

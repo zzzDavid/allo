@@ -2286,7 +2286,6 @@ def samsung_reduce_access_stream(
     program: SamsungProgram,
     geometry: dict,
     columns: int | None = None,
-    weight_resident=None,
 ) -> list:
     """The transaction stream the conductor issues for ``program`` during its
     passes, derived from the lowered program (``binds``, ``tile_fiber``,
@@ -2715,7 +2714,7 @@ _ELTWISE_TIMING_SCOPE = (
 
 
 def _samsung_run_reduce(
-    compiled, program, crf_words, root, geometry, matrix, vectors, weight_resident=None
+    program, crf_words, root, geometry, matrix, vectors, weight_resident=None
 ):
     """Execute one REDUCE program for `vectors` (N, K) and return the result
     rows (N, M), cycles, phases, plan and conductor receipt."""
@@ -2998,9 +2997,7 @@ def _run_samsung_program(compiled, program, root, geometry, inputs) -> RunResult
             vectors = B[: c.K, : c.N].T
         else:
             vectors = B[: c.N, : c.K]
-        res = _samsung_run_reduce(
-            compiled, program, crf_words, root, geometry, matrix, vectors
-        )
+        res = _samsung_run_reduce(program, crf_words, root, geometry, matrix, vectors)
         rows = res["rows"]
         outputs = {"y": rows[0]} if c.column_var is None else {"out": rows.T}
         extra = {
@@ -3736,7 +3733,7 @@ def _run_samsung_batched(
     matrix = (W if c.matrix_k_axis == 1 else W.T)[: program.rows, : c.K]
     resident = program.weight_resident
     tenon = _samsung_run_reduce(
-        compiled, program, crf_words, root, geometry, matrix, X[:, : c.K], resident
+        program, crf_words, root, geometry, matrix, X[:, : c.K], resident
     )
     extra = {
         "kernel": "GENERIC_REDUCE",
@@ -3756,7 +3753,7 @@ def _run_samsung_batched(
     stdout = tenon["log"]
     if compare_native:
         native = _samsung_run_reduce(
-            compiled, program, crf_words, root, geometry, matrix, X[:, : c.K], False
+            program, crf_words, root, geometry, matrix, X[:, : c.K], False
         )
         extra["native_total"] = native["cycles"]
         extra["native_phases"] = native["phases"]

@@ -187,19 +187,38 @@ def test_noncanonical_placements_execute_their_own_programs(
 
 
 def test_tampered_crf_is_rejected_not_canonicalized(samsung_sim_gate, gemv_inputs):
+    """The conductor executes the uploaded CRF; it neither canonicalizes a
+    tampered program nor reports success for it.  Two tampers of the selected
+    GEMV program (MAC even, MAC odd, JUMP x7 over both, NOP drain, EXIT):
+
+    * shortening the tile loop (JUMP x3) terminates with too few MAC groups
+      per fiber, rejected against the plan's group count;
+    * replacing the odd-bank MAC by a second JUMP makes the two JUMPs reset
+      each other's counters (PIMRank::doPIM's ``lastJumpIdx_`` rule, which
+      the conductor's walk mirrors), so the program never reaches EXIT; the
+      walk's column-command budget, derived from the plan's tiles and
+      groups, rejects it instead of looping."""
     workload, _M, _K = _workloads()["gemv_m4096_k256"]
     compiled = allo.compile(
         workload, build_samsung_target(), samsung_cost, **REASSOCIATE
     )
     (program,) = compiled.compiled.layout_ctx.programs
     words = list(compiled.compiled.cmds)
-    words[1] = PIMCmd(type_="JUMP", loopCounter_=3, loopOffset_=2)
+    assert words[2].type_ == "JUMP" and words[2].loopCounter_ == 7
     W, x, _ref = gemv_inputs
     root = pimsim_root()
     geometry = spmw_samsung.samsung_simulator_geometry(root)
+    short_loop = list(words)
+    short_loop[2] = PIMCmd(type_="JUMP", loopCounter_=3, loopOffset_=3)
     with pytest.raises(RuntimeError, match="MAC groups on fiber 0"):
         spmw_samsung._samsung_run_reduce(
-            compiled.compiled, program, words, root, geometry, W, x.reshape(1, K)
+            program, short_loop, root, geometry, W, x.reshape(1, K)
+        )
+    nonterminating = list(words)
+    nonterminating[1] = PIMCmd(type_="JUMP", loopCounter_=3, loopOffset_=2)
+    with pytest.raises(RuntimeError, match="column commands without reaching EXIT"):
+        spmw_samsung._samsung_run_reduce(
+            program, nonterminating, root, geometry, W, x.reshape(1, K)
         )
 
 

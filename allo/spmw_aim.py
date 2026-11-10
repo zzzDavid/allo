@@ -1879,7 +1879,7 @@ class _AimProgramDerivation:
                         for other in reps
                     )
                     mapping = resolve_batch_mapping(
-                        shape, group.properties.get("batch_mapping"), self.geometry
+                        shape, group.properties.get("batch_mapping")
                     )
                     contraction = {
                         "match": match,

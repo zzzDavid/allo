@@ -235,6 +235,11 @@ def samsung_staging_share(
     the even bank, per column.  Returns the bus time (channel occupancy),
     the bank time (a latency, banks in parallel) and the item's latency.
     """
+    if isinstance(cols_per_row, bool) or int(cols_per_row) <= 0:
+        raise ValueError(
+            f"cols_per_row must be a positive integer, got {cols_per_row!r}"
+        )
+    cols_per_row = int(cols_per_row)
     if temporal:
         blocks = _ceil_div(rows, lanes)
         writes = blocks * (reduction + 1) * columns
@@ -247,13 +252,22 @@ def samsung_staging_share(
         run = G * E
         writes = groups * tiles * run
         if split_rows:
-            exposed = 0
-            # per group, each of the two banks: `tiles` visits of run/2 writes
-            bank = tiles * (STAGE_ROW_VISIT_CYCLES + (run // 2) * STAGE_WRITE_CYCLES)
+            # per group, each of the two banks: `tiles` runs of run/2 writes,
+            # each spanning rows_half physical rows (one at 32 columns per row)
+            rows_half = max(1, _ceil_div(run // 2, cols_per_row))
+            exposed = groups * tiles * 2 * (rows_half - 1)
+            bank = tiles * (
+                rows_half * STAGE_ROW_VISIT_CYCLES + (run // 2) * STAGE_WRITE_CYCLES
+            )
         else:
-            exposed = groups * tiles
-            # per group, one bank: `tiles` runs of two rows each
-            bank = tiles * (2 * STAGE_ROW_VISIT_CYCLES + run * STAGE_WRITE_CYCLES)
+            # per group, one bank: `tiles` runs, each spanning rows_per_run
+            # physical rows (two at 32 columns per row), one exposed change
+            # per row boundary
+            rows_per_run = max(1, _ceil_div(run, cols_per_row))
+            exposed = groups * tiles * (rows_per_run - 1)
+            bank = tiles * (
+                rows_per_run * STAGE_ROW_VISIT_CYCLES + run * STAGE_WRITE_CYCLES
+            )
     bus = writes * STAGE_WRITE_CYCLES + exposed * STAGE_ROW_CHANGE_CYCLES
     return {
         "writes": writes,
@@ -288,7 +302,7 @@ def samsung_cost(target):
             name=event.primitive.name.lower(),
         )
 
-    def stage(event, ctx, share):
+    def stage(ctx, share):
         # The first matrix staging (the conductor's preload phase): the bus
         # part occupies the channel, the bank part is latency only (banks in
         # parallel); it precedes the MAC, as the conductor stages first.
@@ -307,7 +321,6 @@ def samsung_cost(target):
         columns = int(extents[1]) if len(extents) == 3 else 1
         lanes16 = int(target.grf_b.width) // 16
         stage(
-            event,
             ctx,
             samsung_staging_share(
                 rows,
@@ -361,7 +374,6 @@ def samsung_cost(target):
         extents_stage = tuple(event.metrics.get("loop_extents", ()) or ())
         rows_stage = int(extents_stage[0]) if len(extents_stage) > 1 else 1
         stage(
-            event,
             ctx,
             samsung_staging_share(
                 rows_stage,

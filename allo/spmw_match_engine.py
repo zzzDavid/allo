@@ -3775,7 +3775,7 @@ class _FunctionCoverage:
 
         for dest, entries in acc_sites.items():
             for index, match in entries:
-                init, found = self._accumulator_init(dest, index, category)
+                init, found = self._accumulator_init(dest, index)
                 match.extra["accumulator_init"] = init
                 if init == "carried":
                     # ``y[i] += ...``: the matched store itself writes the
@@ -4057,7 +4057,7 @@ class _FunctionCoverage:
 
     # -- accumulator initialization ------------------------------------ #
 
-    def _accumulator_init(self, dest, index, category):
+    def _accumulator_init(self, dest, index):
         others = [i for i in self.stores if i != index and self._dest(i) == dest]
         if not others:
             if dest in self.arg_refs:
