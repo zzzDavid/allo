@@ -1182,6 +1182,58 @@ def _effective_access_forms(fact):
     return out
 
 
+def _repeated_axis_problems(fact) -> list[str]:
+    """An operand that reads one loop variable in two coordinates (``b[k, k]``,
+    ``a[i, i, k]``) addresses a diagonal of its buffer: no PIM lowering
+    stages such a gather (they stage each dimension along its own loops), so
+    it is reported per operand, naming the coordinates (X-42, round 99)."""
+    loop_vars = set(fact.loop_vars)
+    labels = fact.loop_labels
+    problems = []
+    for access in fact.inputs:
+        coords = getattr(access, "coords", None) or ()
+        seen: dict = {}
+        for position, coord in enumerate(coords):
+            if coord is None:
+                continue
+            for atom, c in coord[0]:
+                if atom in loop_vars and int(c) != 0:
+                    seen.setdefault(atom, []).append(position)
+        for atom, positions in seen.items():
+            if len(positions) > 1:
+                problems.append(
+                    f"input {access.memref_name!r} (operand {access.role!r}) reads "
+                    f"loop {labels.get(atom, atom)!r} in coordinates "
+                    f"{positions}, a diagonal of the buffer; the PIM lowerings "
+                    "stage each dimension of an operand along its own loops and "
+                    "realize no gather"
+                )
+    return problems
+
+
+def _bounds_problem(fact, key, effective, constant):
+    """The staged extent of a dense coordinate must fit the buffer dimension:
+    ``offset + product of the trip counts <= shape[coordinate]``."""
+    role, memref, position = key
+    access = next(
+        (a for a in fact.inputs if a.role == role and a.memref_name == memref),
+        None,
+    )
+    shape = getattr(access, "shape", None) if access is not None else None
+    if not shape or position >= len(shape) or shape[position] is None:
+        return None
+    extent = 1
+    for _atom, _c, trip in effective:
+        extent *= int(trip)
+    if constant < 0 or constant + extent > int(shape[position]):
+        return (
+            f"input {memref!r} (operand {role!r}) coordinate {position} stages "
+            f"{extent} element(s) from offset {constant} of a dimension of "
+            f"{int(shape[position])}; the access leaves the buffer"
+        )
+    return None
+
+
 def _is_dense_flattening(effective) -> bool:
     """The innermost effective coefficient is one and every outer coefficient
     is the product of the trip counts of the terms inside it."""
@@ -1222,18 +1274,20 @@ def contraction_access_problems(
     allowed, an effective constant on a coordinate reading a reduction loop
     (``b[k + 1]``, ``range(128, K)``); and, under ``result_offsets="none"``,
     an effective constant on a result-loop coordinate (``a[16 + i]`` with
-    ``c[16 + i]``, ``range(16, 32)``).  A coordinate with no retained form
+    ``c[16 + i]``, ``range(16, 32)``); per operand, a loop variable read in
+    two coordinates (``b[k, k]``, a diagonal gather) and a dense coordinate
+    whose staged extent leaves the buffer dimension.  A coordinate with no retained form
     (data dependent) or with an atom that is not a loop variable is not
     judged here; the backends' own checks keep handling those.  A loop
     without a static domain is reported."""
     if not hasattr(fact, "reduction_vars"):
         return []
-    problems = []
+    problems = list(_repeated_axis_problems(fact))
     for item in _effective_access_forms(fact):
         if isinstance(item, str):
             problems.append(item)
             continue
-        _key, where, read, effective, constant, reads_reduction = item
+        key, where, read, effective, constant, reads_reduction = item
         if not _is_dense_flattening(effective):
             problems.append(
                 f"{where} reads {read}, which is not one loop counter or a "
@@ -1256,6 +1310,10 @@ def contraction_access_problems(
                 "rows from the first row and realizes no result offset "
                 "(partition the rows over a work grid, or index from zero)"
             )
+            continue
+        bounds = _bounds_problem(fact, key, effective, constant)
+        if bounds is not None:
+            problems.append(bounds)
     return problems
 
 

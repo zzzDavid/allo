@@ -489,3 +489,66 @@ def test_same_buffer_operands_keep_both_accesses():
         match=r"input 'a' \(operand 'x'\) coordinate 0 reads i; the work items' effective offsets \[16, 32\] do not tile the realized frontier \[0, 16\]",
     ):
         _aim(same_buffer_grid_shifted)
+
+
+DM, DK, DB = 16, 256, 4
+
+
+@region()
+def diagonal_vector(W: bfloat16[DM, DK], x: bfloat16[DK, DK], y: bfloat16[DM]):
+    @allo.work(mapping=[1], args=[W, x, y])
+    def dot(a: bfloat16[DM, DK], b: bfloat16[DK, DK], c: bfloat16[DM]):
+        for i in range(DM):
+            acc: bfloat16 = 0
+            for k in range(DK):
+                acc += a[i, k] * b[k, k]
+            c[i] = acc
+
+
+@region()
+def diagonal_matrix(W: bfloat16[DM, DM, DK], x: bfloat16[DK], y: bfloat16[DM]):
+    @allo.work(mapping=[1], args=[W, x, y])
+    def dot(a: bfloat16[DM, DM, DK], b: bfloat16[DK], c: bfloat16[DM]):
+        for i in range(DM):
+            acc: bfloat16 = 0
+            for k in range(DK):
+                acc += a[i, i, k] * b[k]
+            c[i] = acc
+
+
+@region()
+def batched_neighbour(W: bfloat16[DM, DK], X: bfloat16[DB, DK], Y: bfloat16[DB, DM]):
+    @allo.work(mapping=[1], args=[W, X, Y])
+    def dot(a: bfloat16[DM, DK], x: bfloat16[DB, DK], c: bfloat16[DB, DM]):
+        for bb in range(DB):
+            for i in range(DM):
+                acc: bfloat16 = 0
+                for k in range(DK):
+                    acc += a[i, k] * x[bb, k]
+                c[bb, i] = acc
+
+
+def test_repeated_loop_variables_across_coordinates_are_refused():
+    """The reviewer's round 98 probe (`reviewer-r98/diagonal_probe.py`):
+    ``b[k, k]`` passed because each coordinate is a plain loop counter on
+    its own, and the AiM lowering staged the contiguous prefix of ``b``
+    instead of its diagonal (with ``a`` ones and ``b`` the identity the
+    source gives 256 per row, the staged program 1).  A loop variable read
+    in two coordinates of one operand is refused per operand; the ordinary
+    two-dimensional vector operand of a batched GEMV (``x[bb, k]``, each
+    coordinate its own loop) stays accepted with no reported problem."""
+    with pytest.raises(
+        NotImplementedError,
+        match=r"input 'b' \(operand 'y'\) reads loop 'k' in coordinates \[0, 1\], a diagonal",
+    ):
+        _aim(diagonal_vector)
+    with pytest.raises(
+        NotImplementedError,
+        match=r"input 'a' \(operand 'x'\) reads loop 'i' in coordinates \[0, 1\], a diagonal",
+    ):
+        _aim(diagonal_matrix)
+    compiled = _aim(batched_neighbour)
+    fact = compiled.trace.matches[0].extra["semantic_facts"]
+    assert contraction_access_problems(fact, reduction_offsets=False) == []
+    roles = compiled.trace.matches[0].extra["axis_roles"]
+    assert len(roles["batch"]) == 1 and len(roles["output"]) == 1
