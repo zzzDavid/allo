@@ -127,7 +127,7 @@ discovery variables in `INSTALL.md` section 3.
 
 | Aspect | Status |
 |---|---|
-| Input | Source FP16 kernels on one work item (`mapping=[1]`): GEMV `y[h, n] = sum_k W[h, n, k] * x[h, k]` (one `MAC`) and attention scoring `QK^T -> exp/sum/divide -> PV` (`MAC`, `SFM_EXP`, `SFM_SUM`, `SFM_DIV`, `MAC`). Axes come from `axis_roles`; other dtypes, carried accumulators, multi-item grids and other op mixes raise `AttAccDomainError`. The max-stabilized softmax is **not** accepted (needs a `-inf` accumulator initializer the matcher does not support); the un-stabilized form is. Requires `reduction_order="reassociate"`. Sources: `benchmarks/attacc/workloads.py`. |
+| Input | Source FP16 kernels on one work item (`mapping=[1]`): GEMV `y[h, n] = sum_k W[h, n, k] * x[h, k]` (one `MAC`), a GEMM `C[p, q] = sum_r A[p, r] * B[r, q]` as a batch of GEMVs in either storage orientation (both the `attacc_gemv` and the `attacc_gemv_transposed` candidates, the bank-resident operand named by `AttAccKernel.matrix`, selected by cost whichever input is written first; round 95, X-41) and attention scoring `QK^T -> exp/sum/divide -> PV` (`MAC`, `SFM_EXP`, `SFM_SUM`, `SFM_DIV`, `MAC`). Axes come from `axis_roles` and, for a GEMM, from the operands' resolved coordinates under the chosen orientation; other dtypes, carried accumulators, multi-item grids and other op mixes raise `AttAccDomainError`. The max-stabilized softmax is **not** accepted (needs a `-inf` accumulator initializer the matcher does not support); the un-stabilized form is. Requires `reduction_order="reassociate"`. Sources: `benchmarks/attacc/workloads.py`. |
 | Compile-only | `compiled.compiled.cmds` lists the command inventory (`"PIM_MAC_AB count=15360"`); `compiled.compiled.layout_ctx.programs` the `AttAccProgram` records (kernel, tiling, counts, `dcc_tiling()`); `compiled.placement_ranking` every legal tiling ranked (3,043 for qkv batch 1). |
 | Analytical | `attacc_cost`: the paper's closed forms (`m8` GEMV, `serial_q_cf` attention) over the command counts, one device, priced once per kernel record. Ranking model: paper Spearman 0.94 / 0.98, MAPE 30.78% / 14.19% vs Ramulator2-AttAcc; row-buffer state and issue order omitted; `extra["cost_validity"]`, `extra["timing_scope"]`. Selected tiling in `extra["attacc_tiling"]`. Details: `design/attacc-backend.md`. |
 | Simulator | none in the package; `backend=None` raises `NotImplementedError` (analytical-only). `benchmarks/attacc/scripts/run_ramulator.py` times the selected program in Ramulator2-AttAcc as an external evaluation step (`kind: "simulator-timing-only"`), using DCC's unlicensed trace generator from a user checkout (`simulators.md`). |
@@ -227,6 +227,19 @@ ships only the uint16 add, typed and composed programs. Open: G2-12 (docs),
 without coefficients.
 
 ## Cross-cutting status
+
+- Contraction operand accesses (X-42, round 95): before any backend's
+  candidates, `compile_for_target` refuses a contraction input coordinate
+  that no PIM lowering realizes as written (`spmw_semantics.
+  contraction_access_problems`): accepted are one loop variable, a loop
+  variable plus a constant on a result loop (`W[row0 + i, k]`) and a dense
+  row-major flattening of several loops (`xs[p*Q + k]` with `Q` the trip
+  count of `k`); refused, naming the function, operand, coordinate and the
+  form read, are a stride on the innermost loop (`x[2*k]`), a padded
+  flattening (`xs[p*32 + k]` with `k` to 64) and a constant shift of a
+  reduction loop on either operand (`x[k + 1]`, `W[i, k + 8]`), which the
+  AiM and AttAcc lowerings would otherwise have staged as the plain access.
+  Data-dependent coordinates stay with the backends' own checks.
 
 - Source semantics the matcher enforces before any backend is consulted
   (C-02, C-14, C-17, C-19, C-20, C-21): every store of every work-item

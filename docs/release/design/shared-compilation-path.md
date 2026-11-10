@@ -22,6 +22,19 @@ through the same front stages (`allo/spmw_pipeline.py::normalize_source`):
 | semantic validation | dropped effects, unsupported accumulator initializers, unproven conversions, operand/result aliases, copy and precision contracts raise `UnsupportedWorkloadError` before any planner | `require_match_coverage(trace, target=view, defer_unknown=True)` |
 | semantic analysis | `ProgramFacts` (`allo/spmw_semantics.py`): parameters (ordinal, shape, element type with signedness from the frontend's `itypes` / `unsigned` attributes, retained identity); per contraction: loop nest with static trips and source labels, reduction/output/batch loops from the matcher's roles, inputs and accumulator as `BufferAccess` records with resolved coordinates and plain-dimension loop variables, accumulator initialization, output sinks (`OutputSink`), guards, product/accumulate operations, element types, reduction policy, alias facts; epilogues (`Epilogue`: operands, literal constants, result, store coordinates); matches outside those two shapes (`other_matches`); matches in other functions (`foreign_functions`) | `analyze_program(view, module, trace, parameter_names=...)`; derived once per compilation (`SourceProgram.program_facts()`), never from MLIR text |
 
+### Round 95: the access-to-realization contract and explicit storage orientations
+
+| Stage | Contract | Implementation |
+|---|---|---|
+| access legality (shared, before any backend's candidates) | every retained input coordinate of every matched contraction is one the lowerings stage as written: one loop variable, a result-loop variable plus a constant, or a dense row-major flattening of several loops; strides, padded flattenings and constant shifts of a reduction loop are refused naming the function, operand, coordinate and form (X-42) | `spmw_semantics.contraction_access_problems`, called by `spmw_codegen.require_contraction_accesses_realizable` in `compile_for_target` ahead of the virtual-only branch |
+| storage orientation (AttAcc) | semantic incidence (which loops each input reads) comes from the facts; which input the datapath keeps in the banks is a candidate decision: one orientation when the roles come from index containment, both when the analysis stamps `matrix_by == "pattern_order"` (a GEMM), each with its own kernel extents and tilings, ranked by cost, forceable through `layout="attacc_gemv_transposed"`; the realization check follows the orientation (X-41) | `allo/pim/attacc_tiling.py::attacc_orientations`, `_oriented_extents`, `AttAccKernel.matrix`; `spmw_attacc.attacc_base_placement(target, matches, orientation)`, `attacc_orientation_of`; `spmw_autoschedule._attacc_enumerate` |
+| role analysis | operand index sets from the matcher's resolved coordinates (`OperandBinding.coords`), not raw index names; the two-sided tie stamped `matrix_by: pattern_order` so consumers can tell a convention from a derived role (round 94) | `spmw_match_engine.operand_index_terms`, `_axis_roles`; `aim_lowering.mac_operands` reads the same sets |
+
+Open under X-41: the AiM tie orientation is still the pattern's order (every
+paper row is a containment case); making it a cost decision like AttAcc's is
+the next increment; the layout problem's opaque-index rule still reads the
+naming.
+
 ### Round 13: both APUs' plans are candidates of the common selection stage
 
 After the shared front stages every target, including both APUs, continues
