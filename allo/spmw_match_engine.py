@@ -2385,6 +2385,46 @@ def _accumulator_scope_depth(acc: OperandBinding) -> int | None:
     return (len(path) - 4) // 3
 
 
+def operand_index_terms(operand, loop_vars) -> tuple[set, list]:
+    """``(loop variables, opaque atoms)`` an operand's coordinates range over.
+
+    Reads the matcher's resolved coordinates (``OperandBinding.coords``: one
+    affine form per coordinate over loop variables and load-free SSA atoms,
+    or None for a data-dependent coordinate), so ``lA[row0 + i, k]`` ranges
+    over ``{i, k}`` whatever SSA value names the row (release ledger X-41:
+    the role analysis compared raw index names and left such a program's
+    roles unresolved, differently from its matrix-first spelling).  Falls
+    back to the textual indices when the operand carries no coordinates.
+    An atom that is not a loop variable, and a coordinate with no form, are
+    opaque: their dependence on the loops is not retained.
+    """
+    loop_vars = set(loop_vars)
+    variables, opaque = set(), []
+    coords = getattr(operand, "coords", None)
+    if coords is None:
+        for index in operand.indices:
+            if index in loop_vars:
+                variables.add(index)
+            else:
+                opaque.append(index)
+        return variables, opaque
+    for position, coord in enumerate(coords):
+        if coord is None:
+            name = (
+                operand.indices[position]
+                if position < len(operand.indices)
+                else f"coordinate {position}"
+            )
+            opaque.append(str(name))
+            continue
+        for atom, _coefficient in coord[0]:
+            if atom in loop_vars:
+                variables.add(atom)
+            else:
+                opaque.append(str(atom))
+    return variables, opaque
+
+
 def _axis_roles(match: MatchedOp) -> dict:
     """Structural role of every enclosing loop of one accumulating match.
 
@@ -2453,12 +2493,26 @@ def _axis_roles(match: MatchedOp) -> dict:
 
     first, second = inputs
     same_buffer = first.memref_name == second.memref_name
+    terms = {opb.role: operand_index_terms(opb, loop_vars) for opb in (first, second)}
+    index_sets = {
+        role: variables | set(opaque) for role, (variables, opaque) in terms.items()
+    }
     if same_buffer:
         matrix = vector = first
-    elif set(second.indices) > set(first.indices):
+        roles["matrix_by"] = "same_buffer"
+    elif index_sets[second.role] > index_sets[first.role]:
         matrix, vector = second, first
-    else:
+        roles["matrix_by"] = "containment"
+    elif index_sets[first.role] > index_sets[second.role]:
         matrix, vector = first, second
+        roles["matrix_by"] = "containment"
+    else:
+        # Neither index set contains the other (a GEMM: each input reads
+        # the reduction loop and one result loop): the naming is the
+        # pattern's order, a convention consumers must not read as a
+        # storage decision (X-40, X-41).
+        matrix, vector = first, second
+        roles["matrix_by"] = "pattern_order"
     roles["matrix"], roles["vector"] = matrix.role, vector.role
     roles["same_buffer"] = same_buffer
 
@@ -2491,12 +2545,12 @@ def _axis_roles(match: MatchedOp) -> dict:
         result_vars = loop_vars[:depth]
     roles["reduction"] = tuple(var for var in loop_vars if var not in result_vars)
 
-    vector_opaque = [index for index in vector.indices if index not in loop_vars]
+    vector_vars, vector_opaque = terms[vector.role]
     outputs, batches = [], []
     for var in result_vars:
         if same_buffer:
             outputs.append(var)
-        elif var in vector.indices:
+        elif var in vector_vars:
             batches.append(var)
         elif vector_opaque:
             return unresolved(

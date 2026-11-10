@@ -2077,8 +2077,14 @@ def mac_operands(match):
         )
     if x_operand.memref_name == y_operand.memref_name:
         return x_operand, y_operand
-    x_indices, y_indices = set(x_operand.indices), set(y_operand.indices)
-    if y_indices > x_indices:
+    # The same index sets the shared role analysis reads (resolved
+    # coordinates, so an SSA row coordinate counts as its loop variable).
+    from ..spmw_match_engine import operand_index_terms
+
+    loop_vars = {loop[0] for loop in match.enclosing_loops}
+    x_vars, x_opaque = operand_index_terms(x_operand, loop_vars)
+    y_vars, y_opaque = operand_index_terms(y_operand, loop_vars)
+    if (y_vars | set(y_opaque)) > (x_vars | set(x_opaque)):
         return y_operand, x_operand
     return x_operand, y_operand
 
