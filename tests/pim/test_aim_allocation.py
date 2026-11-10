@@ -218,3 +218,35 @@ def test_realization_check_refuses_rows_outside_the_region(monkeypatch):
     assert refused, kernel.rejections[:3]
     regions, ranges = _rows(compiled)
     _assert_within(regions, ranges)
+
+
+SB_M, SB_K, SB_R = 64, 256, 16
+
+
+@region()
+def same_buffer_dot(W: bfloat16[SB_M, SB_K], y: bfloat16[SB_M, SB_R]):
+    @allo.work(mapping=[1], args=[W, y])
+    def dot(a: bfloat16[SB_M, SB_K], c: bfloat16[SB_M, SB_R]):
+        for i in range(SB_R):
+            for j in range(SB_R):
+                acc: bfloat16 = 0
+                for k in range(SB_K):
+                    acc += a[i, k] * a[j, k]
+                c[i, j] = acc
+
+
+def test_bank_sourced_same_buffer_contraction_reserves_its_launch_rows():
+    """A contraction whose two operands read one buffer sources both from
+    the bank pair (a slot usage) and its records address launch-major
+    matrix rows (``output launches x reduction rows``).  The slot footprint
+    alone reserved one row for two addressed (the round 101 invariant
+    refused every such candidate: `r105/same_buffer_probe3.py`); the
+    footprint now covers both images."""
+    compiled = _compile(same_buffer_dot)
+    regions, ranges = _rows(compiled)
+    assert ranges, ranges
+    _assert_within(regions, ranges)
+    (begin, end), allocated, _mapping = ranges[0]
+    assert allocated == end - begin >= 2
+    kernel = compiled.placement_ranking.kernels[0]
+    assert not [r for r in kernel.rejections if "the row allocator reserved" in r[1]]

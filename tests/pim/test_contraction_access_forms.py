@@ -552,3 +552,67 @@ def test_repeated_loop_variables_across_coordinates_are_refused():
     assert contraction_access_problems(fact, reduction_offsets=False) == []
     roles = compiled.trace.matches[0].extra["axis_roles"]
     assert len(roles["batch"]) == 1 and len(roles["output"]) == 1
+
+
+def test_a_flat_view_of_a_multidimensional_buffer_is_bounded_by_its_element_count():
+    """The Gemini-II typed ``block_sum`` record declares one coordinate
+    ``b*K + k`` over its logical shape (the card test at `f6b19bd` found the
+    round 99 rule comparing that flat extent with the first dimension and
+    refusing a correct program; `r105/g2-card-tests.log`).  A flat view is
+    bounded by the buffer's element count; one that exceeds it is refused."""
+    from types import SimpleNamespace
+
+    from allo.pim.apu_g2_typed_program import APUG2ScalarType as S
+    from allo.pim.apu_g2_typed_program import APUG2TypedProgram
+    from allo.pim.costs import apu_g2_cost
+    from allo.pim.targets import build_apu_g2_target
+    from allo.spmw_semantics import BufferAccess, LoopAxis
+
+    program = APUG2TypedProgram(
+        "block_sum", (S(8, False),), S(16, False), (1024, 256), 256, repetitions=4
+    )
+    compiled = allo.compile(
+        program, build_apu_g2_target(), apu_g2_cost, backend="virtual"
+    )
+    fact = compiled.trace.matches[0].extra["semantic_facts"]
+    (access,) = fact.inputs
+    assert len(access.coords) == 1 and access.shape == (1024, 256)
+    assert contraction_access_problems(fact, reduction_offsets=False) == []
+
+    def flat_fact(shape, blocks, k):
+        access = BufferAccess(
+            role="x",
+            memref_name="src",
+            parameter="src",
+            local=False,
+            value_ref=None,
+            shape=shape,
+            element=None,
+            coords=(((("b", k), ("k", 1)), 0),),
+            dims=(None,) * len(shape),
+            indices=("b*K+k",),
+            index_map=None,
+        )
+        loops = (LoopAxis("b", "b", 0, blocks, 1), LoopAxis("k", "k", 0, k, 1))
+        return SimpleNamespace(
+            loops=loops,
+            loop_vars=("b", "k"),
+            reduction_vars=("k",),
+            trips={"b": blocks, "k": k},
+            loop_labels={"b": "b", "k": "k"},
+            inputs=(access,),
+        )
+
+    assert (
+        contraction_access_problems(
+            flat_fact((1024, 256), 1024, 256), reduction_offsets=False
+        )
+        == []
+    )
+    problems = contraction_access_problems(
+        flat_fact((1024, 256), 1025, 256), reduction_offsets=False
+    )
+    assert (
+        len(problems) == 1
+        and "a flat view of 262144 elements (1024x256)" in problems[0]
+    )

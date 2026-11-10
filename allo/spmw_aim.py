@@ -1941,11 +1941,16 @@ class _AimProgramDerivation:
                     group.contractions.append(contraction)
                     key = contraction["matrix"]
                     if shape["input_source"] == "banks":
+                        # The same-buffer contraction reads its one operand
+                        # from the bank pair (a slot image) and its records
+                        # address launch-major matrix rows: the footprint
+                        # covers both (`_footprint`, X-43).
                         group.usages[key] = _Usage(
                             "slot",
                             stride=self.bank_pair_stride,
                             slot=self.bank_pair_slots[0],
                             copies=len(self.bank_pair_slots),
+                            contraction=contraction,
                         )
                     else:
                         group.usages[key] = _Usage("matrix", contraction=contraction)
@@ -2133,8 +2138,23 @@ class _AimProgramDerivation:
             if group.split_replicas:
                 elements = _ceil(elements, group.replicas)
             partitions = group.partitions * (geometry.banks // usage.stride)
-            return _ceil(_ceil(elements, partitions), cols)
-        contraction = usage.contraction
+            slot_rows = _ceil(_ceil(elements, partitions), cols)
+            if usage.contraction is None:
+                return slot_rows
+            # A bank-sourced contraction (both operands one buffer) also
+            # addresses `output launches x reduction rows` of its region,
+            # as the dot realization does (`aim_lowering`: launch-major
+            # matrix rows); reserve the larger of the two (X-43).
+            shape_rows = self._contraction_rows(group, key, usage.contraction)
+            return max(slot_rows, shape_rows)
+        return self._contraction_rows(group, key, usage.contraction)
+
+    def _contraction_rows(self, group, key, contraction):
+        """Bank rows a contraction's records address for the matrix ``key``,
+        from the realized shape (and the buffer's extents where larger)
+        under the group's mapping and partitions."""
+        geometry = self.geometry
+        cols = geometry.row_elements
         shape = self.shape_by_key.get(key) or ()
         # The footprint is the larger of what the buffer stores along each
         # role (a matrix with a batch coordinate, ``kc[h, s, d]``, holds every

@@ -1212,24 +1212,38 @@ def _repeated_axis_problems(fact) -> list[str]:
 
 
 def _bounds_problem(fact, key, effective, constant):
-    """The staged extent of a dense coordinate must fit the buffer dimension:
-    ``offset + product of the trip counts <= shape[coordinate]``."""
+    """The staged extent of a dense coordinate must fit the buffer: with one
+    coordinate per buffer dimension, ``offset + product of the trip counts
+    <= shape[coordinate]``; with a single coordinate over a buffer of
+    higher rank (a flat view of the whole buffer, the Gemini-II typed
+    ``block_sum`` record's ``src[b*K + k]`` over its logical shape), against
+    the buffer's element count.  Any other arity is not judged here."""
     role, memref, position = key
     access = next(
         (a for a in fact.inputs if a.role == role and a.memref_name == memref),
         None,
     )
     shape = getattr(access, "shape", None) if access is not None else None
-    if not shape or position >= len(shape) or shape[position] is None:
+    coords = getattr(access, "coords", None) if access is not None else None
+    if not shape or any(dim is None for dim in shape) or coords is None:
         return None
     extent = 1
     for _atom, _c, trip in effective:
         extent *= int(trip)
-    if constant < 0 or constant + extent > int(shape[position]):
+    if len(coords) == len(shape):
+        bound, what = int(shape[position]), f"a dimension of {int(shape[position])}"
+    elif len(coords) == 1:
+        bound = 1
+        for dim in shape:
+            bound *= int(dim)
+        what = f"a flat view of {bound} elements ({'x'.join(str(d) for d in shape)})"
+    else:
+        return None
+    if constant < 0 or constant + extent > bound:
         return (
             f"input {memref!r} (operand {role!r}) coordinate {position} stages "
-            f"{extent} element(s) from offset {constant} of a dimension of "
-            f"{int(shape[position])}; the access leaves the buffer"
+            f"{extent} element(s) from offset {constant} of {what}; the access "
+            "leaves the buffer"
         )
     return None
 
