@@ -1120,6 +1120,40 @@ class AimCtx(CodegenContext):
                         "which no later launch receives through a declared host ingress"
                     )
 
+    @staticmethod
+    def _check_matrix_rows_within_regions(program, manifest) -> None:
+        """Every lowered contraction's matrix row range lies inside the bank
+        region the row allocator reserved for its buffer (release ledger
+        X-43: a footprint derived from the buffer's dimensions alone reserved
+        one row for a broadcast matrix whose channels-mapped realization
+        addressed two, so a neighbouring allocation could overlap it).  The
+        realization is refused, before selection accepts the candidate, when
+        a record's ``matrix_row_range`` starts outside every region or ends
+        past its region."""
+        regions = list(getattr(program, "regions", ()) or ())
+        for entry in manifest:
+            if not isinstance(entry, dict):
+                continue
+            row_range = entry.get("matrix_row_range")
+            if not row_range:
+                continue
+            begin, end = int(row_range[0]), int(row_range[1])
+            region = next((r for r in regions if int(r["row"]) == begin), None)
+            if region is None:
+                raise RuntimeError(
+                    f"AiM realization of {entry.get('name')!r} addresses matrix "
+                    f"rows [{begin}, {end}) but no bank region starts at row "
+                    f"{begin} (regions {regions})"
+                )
+            limit = int(region["row"]) + int(region["rows"])
+            if end > limit:
+                raise RuntimeError(
+                    f"AiM realization of {entry.get('name')!r} addresses matrix "
+                    f"rows [{begin}, {end}) but the row allocator reserved "
+                    f"[{region['row']}, {limit}) for {region['buffers']}; "
+                    "the footprint does not cover the realized mapping"
+                )
+
     def check_realization(self, layouts) -> None:
         """The lowered AiM records against the selected candidates' declared
         effects, per kernel group: the contraction's result instances and
@@ -1150,6 +1184,7 @@ class AimCtx(CodegenContext):
             )
         manifest_of = {id(op): entry for op, entry in zip(ops, manifest)}
         self._check_launch_inventory(program, layouts, ops)
+        self._check_matrix_rows_within_regions(program, manifest)
         # The lowered program against the compile's resource budget: no
         # record may occupy more channels than the cap.
         cap = (getattr(self, "resource_budget", None) or {}).get("channel")
@@ -1882,7 +1917,7 @@ class _AimProgramDerivation:
                         replicas=group.replicas,
                         orientation=orientation,
                     )
-                    matrix, vector = mac_operands(match, orientation)
+                    matrix, _vector = mac_operands(match, orientation)
                     acc = next(op for op in match.operands if op.role == "acc")
                     activation = any(
                         other.target_op_name == "AF"
@@ -2101,16 +2136,24 @@ class _AimProgramDerivation:
             return _ceil(_ceil(elements, partitions), cols)
         contraction = usage.contraction
         shape = self.shape_by_key.get(key) or ()
+        # The footprint is the larger of what the buffer stores along each
+        # role (a matrix with a batch coordinate, ``kc[h, s, d]``, holds every
+        # batch's rows; a reduction extent wider than the loop is staged
+        # whole) and what the realized contraction addresses (a broadcast
+        # matrix has no batch coordinate, yet the channels and row-packed
+        # mappings allocate one matrix-row group per batch group, so the
+        # realized ``batches`` decide; release ledger X-43).
         extents = {"batch": 1, "output": 1, "reduction": 1}
         if len(shape) == len(contraction["axes"]):
             for extent, role in zip(shape, contraction["axes"]):
                 extents[role] *= extent
-        else:
-            extents = {
-                "batch": contraction["shape"]["batches"],
-                "output": contraction["shape"]["outputs"],
-                "reduction": contraction["shape"]["reduction"],
-            }
+        realized = {
+            "batch": int(contraction["shape"]["batches"]),
+            "output": int(contraction["shape"]["outputs"]),
+            "reduction": int(contraction["shape"]["reduction"]),
+        }
+        for role, extent in realized.items():
+            extents[role] = max(int(extents[role]), extent)
         batch, outputs, reduction = (
             extents["batch"],
             extents["output"],
