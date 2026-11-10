@@ -676,8 +676,23 @@ def samsung_candidate_effects(target, matches, placement):
     instances = reduction = None
     init = None
     vector_memref = None
+    bank_matrix = None
     for match, fact in zip(matches, facts):
         if hasattr(fact, "reduction_vars"):
+            if contraction and not temporal and bank_matrix is None:
+                # The bank-resident operand is the one the REDUCE lowering
+                # stages into the banks: the input indexed by the result's
+                # row loop and the reduction loop (`samsung_contraction`,
+                # the derivation `_emit_reduce` runs).  The shared facts'
+                # `matrix`/`vector` naming breaks the GEMM tie by pattern
+                # order, which is a labeling convention, not the storage
+                # decision (release ledger X-40).  A contraction the lowering
+                # cannot derive declares no bank operand; the lowering
+                # rejects it with its own message.
+                try:
+                    bank_matrix = samsung_contraction(match).matrix_memref
+                except SamsungUnsupported:
+                    bank_matrix = None
             trips = fact.trips
             extent = 1
             for var in fact.result_vars:
@@ -734,11 +749,7 @@ def samsung_candidate_effects(target, matches, placement):
                     # into GRF_A per reduction tile (LD_A).
                     storage = "banks"
                 packing = None
-                if (
-                    contraction
-                    and memref == getattr(fact.matrix, "memref_name", None)
-                    and not temporal
-                ):
+                if contraction and not temporal and memref == bank_matrix:
                     # The matrix's row packing in the banks is the selected
                     # half -> bank map (vendor: both rows in the tile's fiber).
                     try:

@@ -369,3 +369,93 @@ def test_target_facts_raise_instead_of_guessing():
         8,
         16,
     )
+
+
+GEMM_N = 4
+
+
+@_df_region()
+def gemm_vector_first(A: fp16[M, K], B: fp16[K, GEMM_N], C: fp16[M, GEMM_N]):
+    @allo.work(mapping=[16, 8], args=[A, B, C])
+    def kernel(lA: fp16[M, K], lB: fp16[K, GEMM_N], lC: fp16[M, GEMM_N]):
+        pid, uid = allo.get_wid()
+        row0 = (pid * 8 + uid) * ROWS
+        for i in range(ROWS):
+            for j in range(GEMM_N):
+                acc: fp16 = 0
+                for k in range(K):
+                    acc += lB[k, j] * lA[row0 + i, k]
+                lC[row0 + i, j] = acc
+
+
+@_df_region()
+def gemm_matrix_first(A: fp16[M, K], B: fp16[K, GEMM_N], C: fp16[M, GEMM_N]):
+    @allo.work(mapping=[16, 8], args=[A, B, C])
+    def kernel(lA: fp16[M, K], lB: fp16[K, GEMM_N], lC: fp16[M, GEMM_N]):
+        pid, uid = allo.get_wid()
+        row0 = (pid * 8 + uid) * ROWS
+        for i in range(ROWS):
+            for j in range(GEMM_N):
+                acc: fp16 = 0
+                for k in range(K):
+                    acc += lA[row0 + i, k] * lB[k, j]
+                lC[row0 + i, j] = acc
+
+
+def test_gemm_operand_order_does_not_change_the_selected_program():
+    """Release ledger X-40: the candidate contract named the bank-resident
+    matrix after the shared facts' ``matrix`` role, which breaks the GEMM
+    tie (two inputs each indexed by the reduction loop and one result loop)
+    by pattern order.  With the vector written first, every REDUCE candidate
+    declared the matrix packing on the GRF_A operand, the realization check
+    rejected all of them ("declared packing None") and selection fell back to
+    the TEMPORAL program at 9.8x the cycles.  The bank-resident operand is
+    now the one the REDUCE lowering stages into the banks, so both operand
+    orders select the same program."""
+    from allo.spmw_candidate import candidate_effects
+
+    target = build_samsung_target()
+    compiled = {}
+    for name, workload in (
+        ("vector_first", gemm_vector_first),
+        ("matrix_first", gemm_matrix_first),
+    ):
+        compiled[name] = allo.compile(
+            workload, target, samsung_cost, reduction_order="reassociate"
+        )
+    programs = {name: c.compiled.layout_ctx.programs[0] for name, c in compiled.items()}
+    kernels = {name: c.placement_ranking.kernels[0] for name, c in compiled.items()}
+    for name, program in programs.items():
+        assert program.kind == "REDUCE", (name, program.kind)
+        assert program.contraction.matrix_memref == "lA", name
+        assert program.contraction.vector_memref == "lB", name
+        assert program.weight_resident is True, name
+        kernel = kernels[name]
+        chosen = [s for s in kernel.scores if s[0] == kernel.chosen_position]
+        assert chosen and chosen[0][2].startswith("split_rows"), (name, chosen)
+        # The selected candidate declares the matrix packing on the banks
+        # operand, the realization check accepted it, and no candidate was
+        # rejected for its declared packing.
+        layout = next(
+            pl for pos, pl in kernel.candidates if pos == kernel.chosen_position
+        )
+        effects = candidate_effects(layout)
+        declared = {v.value: (v.storage, v.packing) for v in effects.value_layouts}
+        realized = "half_bank:{},{}".format(*program.half_fibers)
+        assert declared["lA"] == ("banks", realized), (declared, realized)
+        assert declared["lB"][0] == "grf_a", declared
+        assert not [r for r in kernel.rejections if "declared packing" in r[1]], name
+    assert _words(compiled["vector_first"]) == _words(compiled["matrix_first"])
+    a, b = programs["vector_first"], programs["matrix_first"]
+    assert (a.k_tiles, a.tile_fiber, a.binds, a.half_fibers) == (
+        b.k_tiles,
+        b.tile_fiber,
+        b.binds,
+        b.half_fibers,
+    )
+    assert kernels["vector_first"].scores[0][1] == kernels["matrix_first"].scores[0][1]
+    chosen = {
+        name: [s for s in k.scores if s[0] == k.chosen_position][0][1:]
+        for name, k in kernels.items()
+    }
+    assert chosen["vector_first"] == chosen["matrix_first"], chosen
