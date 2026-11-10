@@ -2590,10 +2590,86 @@ monkeypatches.  All twenty are genuinely unused, two of them function-local
 re-imports and two names inside otherwise used import statements; none is
 a public re-export or a registration import.  The twenty names are
 removed, pylint reports no `unused-import`, every file compiles and
-imports, and the focused suites over the twelve modules pass.  471 W/C/R
-diagnostics remain.  Next concrete action unchanged: the Gemini-I
+imports, and the focused suites over the twelve modules pass except the
+environment-blocked Gemini-II lock test (`ENOSPC` on the host's full
+`/tmp`, identical at the committed tree).  471 W/C/R diagnostics remain.  Next concrete action unchanged: the Gemini-I
 execution from installed artifacts containing `aae8b23` when the host's
 `/tmp` clears.  NOT READY.
+
+## Round 92 (2026-11-06): the round 91 cleanup accepted; unused-argument triaged (19 kept, 1 resource dependence repaired, 7 vestigial removed)
+
+The reviewer accepted round 91 and asked, while the board stays blocked
+(`/tmp` at 124 KiB; nothing launched), for a bounded `unused-argument`
+triage that inspects whether each ignored argument is a required hook
+parameter or a missing semantic or resource check before any signature
+changes.  Each of the 27 was classified from its registration, overrides,
+callers and body (`r92/w0613_triage.md`).  Nineteen are required
+signatures and are kept: the knob registry's callables, the codegen
+context's hooks overridden by six backends, the UPMEM executor interface,
+the op-table emitter `drain`, the backend run entry on a timing-only
+simulator, and one internal index left for the component awaiting board
+validation.  One was a missing resource dependence: the Samsung staging
+share accepted the geometry's columns per row and ignored it, hard-coding
+the two rows a 64-column run spans at the simulator's 32; it now derives
+the rows per run from the geometry, unchanged at the default and pinned
+at three geometries by a new test.  Seven were vestigial and are removed
+with their callers, each after confirming nothing should have depended on
+them (the AiM lowering groups batches over channels, so the resolver
+needs no geometry; the Samsung stream excludes staging, so residency
+cannot change it).  Nothing is suppressed; the focused suites over the
+touched modules are recorded in VALIDATION round 92.  444 W/C/R
+diagnostics remain.  Next concrete action unchanged: the Gemini-I
+execution from installed artifacts containing `aae8b23` and these
+changes when the host's `/tmp` clears.  NOT READY.
+
+## Round 93 (2026-11-10): round 92 finished; the Samsung simulator bundled by direction (P-04); a shared-contract defect found by the first run of an execution test (X-40)
+
+The user resumed the work on 2026-11-10 with the round 92 edits
+uncommitted and its conductor-subset failure unexplained.  Finishing round
+92 first: the failure is a stale test expectation, not a defect.  The
+conductor now bounds its CRF walk by a column-command budget derived from
+the plan, and the test's tampered program (two JUMPs resetting each
+other's counters, exactly as `PIMRank::doPIM` would) never reaches EXIT,
+so the budget rejects it before the group-count check the test expected.
+The test now covers both rejections: a terminating tamper for the group
+count and the non-terminating one for the budget.  Running the whole
+conductor file for the first time since the realization check landed
+exposed `test_gemm_matrix_residency_lever_changes_staging`, which fails
+identically at the committed tree: the GEMM written vector first makes
+every REDUCE candidate's declared contract name the wrong bank-resident
+operand, the realization check rejects all 28 of them, and selection
+silently falls back to the ordered program at 9.8x the cycles (X-40).  The
+cause is a contract built on the shared facts' `matrix`/`vector` *naming*,
+which `_axis_roles` decides by containment and otherwise by pattern order,
+while the lowering decides the bank operand structurally.  The repair
+derives the contract's bank operand from the lowering's own derivation,
+so the contract describes the storage decision; the regression pins both
+spellings to the same program.  The naming convention's order dependence,
+and the unresolved roles an SSA operand coordinate causes, remain open as
+X-41 with the consumers listed: that fix touches the AiM batch mapping and
+AttAcc roles and is a bounded increment of its own.  Lesson recorded: an
+execution test that is never run guards nothing; the conductor file now
+has a current run.
+
+P-04 is implemented under the user's direction of 2026-11-06 to distribute
+the simulator with the tool.  Design: the pristine upstream subset
+`pim_driver` builds and reads is vendored with a per-file manifest, the
+five patches are tracked, and a package-level command assembles a build
+root, applies the patches, builds and checks the geometry; discovery adds
+one default root (`$TENON_HOME/simulators/PIMSimulator`) *after* the
+existing variables, used only once it holds `pim_driver`, so an installed
+copy needs no configuration and a configured one is unchanged.  The wheel
+carries the recipe through a `build_py` hook (one source of truth in the
+checkout; the copy exists only in `build_lib`); the sdist ships it in
+place.  The terms are stated where a user meets them (`NOTICE.md`, the
+README, `THIRD_PARTY_NOTICES.md`, INSTALL): Samsung's notice is reproduced
+verbatim, the maintainers' decision is dated, and the absence of a recorded
+permission is stated rather than implied away.  Judged as packaging: the
+bundle rebuilds the evaluation's conductor byte for byte (after stripping)
+and runs the compiler's GEMV; the installed-artifact run from a wheel at
+the candidate is the next validation.  One real defect surfaced by doing
+it: SCons strips the environment, so a user with a full `/tmp` could not
+build; the Tenon `Sconstruct` now passes `TMPDIR` through.  NOT READY.
 
 ## Rejected shortcuts
 
@@ -2654,7 +2730,7 @@ and the Gemini-II card tests last run from the `ba2f58d` wheel; the grouped rout
 | G9 one shared compilation pipeline incl. both APUs | **FAIL (in progress)** | shared front stages and facts (rounds 12-18); both APUs' plans and typed records as candidates of the common pipeline with an enforced contract (rounds 13-17); Samsung, AiM, UPMEM and AttAcc declare effects from the facts and are checked at materialization (rounds 19-27, X-04 to X-20); shared transfer availability (X-09, X-17, X-18); the `APUv1Program` manifest from the retained IR (round 28); slice 5 traces at `653b059` from installed wheels (round 29); round 30: the paper rows measured through default selection from installed wheels under the archived protocols with launch provenance on every route; round 54: Gemini-II launch recipes bound to the retained contract and the launch partition at materialization (X-25, found by the reviewer's fault injection; a mismatch is the shared feasibility rejection); round 58: the public repetitions update re-derives the validated plan's launches from their own partitions, validates, prices and installs atomically (X-27, the reviewer's second fault injection; round 59 correction: the graph check actually runs on the public route); round 60: the repaired setter exercised from the installed wheel of `cd744bb` on the card through the paper-row driver with identical plans and fingerprints; round 61: the APU v1 grouped route of a dataflow region declares its effects from the shared facts, is checked at materialization and binds its runtime by retained identity (X-28, the reviewer's public-source probe); round 62: its executable dense GEMM template proven from every work item's retained accesses and the written domain before it is declared executable, non-template regions refused for execution with the failing condition (X-29); round 63: X-28 and X-29 exercised from the installed wheel of `8795e8f` (section u, 14 passed) with the board validation of the grouped GEMM runtime pending on the host's `/tmp` (an explicit blocker); round 64: the grouped candidates' batch count validated against the proven packing at materialization, under-batched candidates feasibility-rejected (X-30, the reviewer's damaged-candidate injection); round 65: X-30 exercised from the installed wheel of `c43061f` (section u, 16 passed) and the board checker corrected to fail on any incomplete case; round 66: a grouped placement's map must be the contiguous-group map the executable realizes, other maps refused per candidate (X-31, the reviewer's interleaved and collapsed maps); round 67: X-31 exercised from the installed wheel of `f418762` (section u, 19 passed; the reviewer's map probe refused from the wheel); round 70: the grouped route executed on the board from the installed wheel of `472bec9` (three GEMM regions, multiple batches, a column-block partition and a neighbouring shape, exact outputs, fresh profile records, archived provenance); round 71-73: the AiM single-copy elementwise realization (X-32) with producer-consumer distribution compatibility established over every live range before lowering (the reviewer's round 71 probes refused per candidate) and, after the reviewer's round 72 witness showed the relocations were not lifetime-safe, per-group bank row regions, copies into the readers' regions and a cell-level liveness check of the emitted program (round 73), and row-chunked relocations with row chunks tracked after the reviewer's multi-row witness (round 74), and the logical frame of every slot layout in the contracts after the reviewer's prefix witness (round 75); round 78: the named candidate `d120084` built and validated from installed artifacts with the G9 packet `G9_EVIDENCE.md`; round 79: the APU v1 vector route's realized computation bound to the contraction after the reviewer's injections (X-35); round 80: the whole realized program bound; round 81: the structured emission schedule checked against the plan (X-36); round 82: the schedule executed against the plan's batching, stores, coverage and counts compared (X-36, awaiting review); round 83: the interpreter's storage keyed by the physical register (X-36; the reviewer accepted the repair in round 83, closing the alias finding only); round 84 review: the manifest source review of rounds 28 to 30 accepted for the reviewed domain and current Gemini-II slice 5 evidence supplied by the reviewer; open: the candidate's APU v1 vector path executed on the Gemini-I board (round 85, launched), the full suites and installed-artifact runs at the final candidate, the remaining minor items |
 | G10 paper results through the shared pipeline | **FAIL (in progress)** | inventory of 83 rows (`paper_reproduction/inventory.csv`); measured through default selection: Samsung 3/3 faster than the paper (outputs checked), UPMEM 16/16 exact, AiM 10/14 exact with the 4 RoPE rows an OPEN 32-cycle regression (X-19), Gemini-II 5/5 REPRODUCED under the archived paired protocol with the GTML baseline re-run in the same rounds (round 30), Gemini-I under the archived paired protocol with the expert binaries re-run: 2/5 REPRODUCED (matrix multiply, histogram), kmeans and linear regression OPEN (nominal) on the pooled round 30 sessions (X-23; the single-session closure of kmeans was withdrawn in round 31), word count attributed to the generated program's loop-counter width and repaired (X-22, `dc41df7`): the repaired program at parity with the paper's own binary in the same rounds and 0.19% above the paper's archived median, OPEN (nominal); the Gemini-I vector GEMM layout row faster than the paper (round 31); the portability row REPRODUCED on both targets with the paper's inputs through the maintained in-repo driver (rounds 34-35, checkout evidence); the Samsung XOR row OPEN (measured): the identity-rows and F2-swizzled-rows placements are ordinary-source candidates executed by the conductor, the XOR packing 1.12-1.13x faster and bit identical on two GEMVs, the paper's within-round probe metric unreachable by the production program (round 36); the selected map made the contract and the default selection earning the swizzled rows on the paper shapes and a held-out shape (round 37); the 500-instance selector equivalence as a diagnostic; round 51: the six AttAcc kernel-tiling results REPRODUCED through the shared pipeline on the natively built Ramulator2-AttAcc (QKV / projection at the paper's values with fixed baselines re-run; score 1.00x / 1.13x over fixed as plotted; 123 / 316 / 61 against DCC's archived per-shape times, median loss 7.07%), every trace checked against the selected program command by command (round 52); round 52: the six decode configurations REPRODUCED as an analytical composition from the shared-pipeline kernel times (Tenon, DCC and fixed variants re-run through DCC's model; the frozen figure, table and text values); required set 48 of 55 REPRODUCED, 7 OPEN (X-19, X-22/X-23), 0 UNVERIFIED; rounds 56-57 at the integration candidate `54cbb08`: Gemini-II re-measured from the installed wheel over four paired sessions (four REPRODUCED, batched_gemm OPEN (nominal), X-26), the fourteen AiM rows and three Samsung rows re-executed from the installed wheel (10 exact, 4 corrected RoPE programs OPEN, Samsung faster), the Gemini-I campaign pending; historical coverage 47 of 55 REPRODUCED, 8 OPEN; the twelve AttAcc results re-executed from the installed wheel with identical results; at the candidate itself the UPMEM and Gemini-I rows not yet re-executed; round 60 at the candidate `cd744bb` from installed artifacts: the fourteen AiM, three Samsung and twelve AttAcc results identical to the `54cbb08` runs, Gemini-II in one pre-registered session (gemm, gesummv, bicg at or below the paper; batched_gemm 1.0003 and mvt 1.0002 nominally above, mvt therefore OPEN (nominal) at this revision under the pooled rule), required set 46 REPRODUCED, 9 OPEN, UPMEM and Gemini-I still not re-executed at the candidate; round 63 at `8795e8f` from installed artifacts: AiM 14, Samsung 3 and AttAcc 12 identical again, the Gemini-II kernels compiling to the `cd744bb` session's plans and fingerprints (no new session), UPMEM and Gemini-I still blocked; round 65 at `c43061f` and round 67 at `f418762`: the same three sets identical again and the same Gemini-II equivalence; round 67: the sixteen UPMEM rows exact at the checkout through the native SDK executor (the Docker data root being full); round 68: the same sixteen rows exact from the installed wheel of `ba2f58d`, and no Gemini-II plan estimated cheaper than the selected one for any paper kernel; the X-19 RoPE rows: all 16 candidate pairs of the two RoPE groups simulated natively for all four rows in round 66 (the default pair the minimum in each, every pair above the paper's digits: OPEN with a measured bound over the RoPE groups' joint candidate space); round 71 at the checkout: the replicated elementwise grids realized once over the device (X-32), every AiM row's selected program at or below the paper (four exact, ten faster; the four RoPE rows 123,448 / 397,080 / 408,823 / 529,019 with the complete program), X-19 REPRODUCED; round 72 at the candidate `2096239` from installed artifacts: the fourteen AiM rows, the CENT suite, the value-layout regressions and the reviewer's fan-out probe from the wheel; round 73 at the candidate `26fd884` from installed artifacts (`r73/installed_run.log`, `r73/aim_rows_provenance.json`): the fourteen rows at the per-group-region pins (norm_residual 7,052, ffn_activation 3,672, ffn_complete 254,166, full_block 397,577 / 409,320 / 529,516, the others unchanged), the CENT suite, the value-layout regressions, the fan-out probe refused and the slot-liveness witness at the source semantics from the wheel; round 74 at the candidate `db2ad84` from installed artifacts (`r74/installed_run.log`, `r74/aim_rows_provenance.json`): the fourteen rows unchanged, the CENT suite, the value-layout regressions and the three reviewer probes from the wheel; round 75 at the candidate `b221972` from installed artifacts (`r75/installed_run.log`, `r75/aim_rows_provenance.json`): the fourteen rows unchanged, the CENT suite, the value-layout regressions and the four reviewer probes from the wheel; round 78 at the named candidate `d120084` from installed artifacts (`r78/installed_run.log`, `r78/g2_candidate_rows.json`): the fourteen AiM rows unchanged, the three Samsung rows faster than the paper, the sixteen UPMEM rows exact through the native SDK executor, the twelve AttAcc results identical to every earlier candidate, the five Gemini-II rows in the one pre-registered session (batched_gemm 0.9976, gesummv 0.9853, bicg 0.9961, mvt 0.9985 REPRODUCED at this revision; gemm 1.0042 OPEN (nominal), X-34), Gemini-I not run (the board host's `/tmp`); **current snapshot of the required set at the latest recorded revisions: 51 REPRODUCED, 4 OPEN (the three Gemini-I rows X-22 / X-23 and the Gemini-II gemm row X-34), 0 UNVERIFIED**; round 82 at the named candidate `92d4120` from installed artifacts: the AiM, Samsung, UPMEM and AttAcc rows identical to `d120084`; the Gemini-II session gemm 0.9999 REPRODUCED, mvt 1.0002 OPEN (nominal, X-37), the other three REPRODUCED; Gemini-I not run; round 84 at the named candidate `88852b7` from installed artifacts: the AiM, Samsung, UPMEM and AttAcc rows identical again; the Gemini-II session gemm 0.9973, batched_gemm 0.9945, gesummv 0.9901, bicg 0.9959 REPRODUCED, mvt 1.0013 OPEN (nominal, X-37); Gemini-I not run (the board host's `/tmp`); **snapshot at the latest recorded revisions: 51 REPRODUCED, 4 OPEN (the three Gemini-I rows and the Gemini-II mvt row), 0 UNVERIFIED**; the counts quoted in earlier rounds above are history; round 77: the Gemini-II batched_gemm (X-26) and mvt gaps read against every recorded session and its re-run GTML lane (one program, plan and complete packing attestation throughout; observations consistent with measurement variability the baseline shares; the enumerated rankings show the lowest estimate among enumerated candidates, not that no alternative could run faster), no session added; optional: token partitioning DIAGNOSTIC, UPMEM scaling, packing/selection/DCC studies, calibration, the virtual study, compile cost UNVERIFIED |
 
-Verdict: **NOT READY** (refreshed in round 90; the history above is
+Verdict: **NOT READY** (refreshed in round 93; the history above is
 kept as written).  Current blockers: G9, the candidate's repaired APU v1
 vector path executed on the Gemini-I board from the installed artifacts
 (the forced alternative and the cost perturbation included), blocked by
@@ -2670,10 +2746,15 @@ confirmation campaign with X-34 reserved for the final candidate), the
 AiM, Samsung, UPMEM, AttAcc and the other four Gemini-II rows REPRODUCED
 at `88852b7` from installed artifacts; the final-candidate validation (the
 suites and installed-artifact runs at whichever revision is declared
-final); P-04 (the Samsung patches, a permission matter, its `Sconstruct`
-question included); P-23's remaining pylint stage (the E, W0640 and W0611 classes
-triaged, no defect beyond X-39, the twenty unused imports removed; 471
-W/C/R diagnostics untriaged); V1-19 (deferred by
+final); X-41 (the shared role analysis's operand-order dependence and
+unresolved roles on SSA operand coordinates; X-40 repaired); the
+installed-artifact run of the bundled Samsung simulator route from a wheel
+at the candidate (P-04 implemented in round 93 as packaging under the
+user's direction; the permission question is recorded in `NOTICE.md` for
+the maintainers, not a technical blocker); P-23's remaining pylint stage (the E, W0640, W0611 and W0613
+classes triaged: X-39 and the Samsung staging-share geometry dependence
+repaired, twenty imports and seven vestigial parameters removed, nineteen
+required signatures kept; 444 W/C/R diagnostics untriaged); V1-19 (deferred by
 direction); the open minor items in ISSUES.md.  No longer blockers: the
 manifest and slice 5 source review of rounds 28 to 30 (accepted, round
 84 review); the installed-artifact runs at the earlier candidates
