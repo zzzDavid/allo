@@ -1391,12 +1391,18 @@ def _attacc_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     record; the knob fans out every legal tiling of it
     (``allo/pim/attacc_tiling.py``).
     """
+    from .pim.attacc_tiling import attacc_orientations
     from .spmw_attacc import attacc_base_placement, attacc_candidate_effects
     from .spmw_knobs import cross_with_knobs
 
-    candidates = cross_with_knobs(
-        target, [attacc_base_placement(target, matches)], matches, {}
-    )
+    # One base per storage orientation: a GEMM (neither input's index set
+    # contains the other's) has two, the shared roles' and the transposed
+    # one, each with its own kernel extents and tilings (X-41).
+    bases = [
+        attacc_base_placement(target, matches, orientation)
+        for orientation in attacc_orientations(matches)
+    ]
+    candidates = cross_with_knobs(target, bases, matches, {})
     # Every candidate of a program with shared facts declares its effects
     # from those facts and its tiling; `AttAccCtx.check_realization` compares
     # the emitted command inventory's kernel and tiling with the declaration.

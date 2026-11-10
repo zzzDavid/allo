@@ -134,18 +134,26 @@ class AttAccKernel:
     rows: int
     reduction: int
     outputs: int
+    # The bank-resident (matrix) operand of a GEMV kernel, by memref name:
+    # the orientation the kernel realizes (`attacc_orientations`).  None
+    # for attention (its roles follow from index containment) and for
+    # records built before orientations were explicit.
+    matrix: str | None = None
 
     @property
     def dims(self) -> tuple[int, int, int]:
         return (self.rows, self.reduction, self.outputs)
 
     def manifest(self) -> dict:
-        return {
+        out = {
             "kind": self.kind,
             "rows": self.rows,
             "reduction": self.reduction,
             "outputs": self.outputs,
         }
+        if self.matrix is not None:
+            out["matrix"] = self.matrix
+        return out
 
 
 _ATTENTION_SOFTMAX = ("SFM_EXP", "SFM_SUM", "SFM_DIV")
@@ -158,7 +166,79 @@ def _element_type(memref_type) -> str | None:
     return text[len("memref<") :].rstrip(">").split(",")[0].split("x")[-1].strip()
 
 
-def _contraction_extents(match) -> tuple[int, int, int]:
+def attacc_orientations(matches) -> list[dict]:
+    """The storage orientations of one work item's kernel: which input the
+    AttAcc datapath keeps in the banks (the matrix) and which it streams
+    through the GEMV buffer (the vector).
+
+    The shared role analysis names the matrix by index containment
+    (``K[h, s, d]`` over ``q[h, d]``, ``W[i, k]`` over ``x[k]``); that is the
+    one orientation.  When neither input's index set contains the other's
+    (a GEMM: each input reads the reduction loop and one result loop), the
+    analysis stamps ``matrix_by == "pattern_order"`` and the naming is a
+    convention, not a storage decision (release ledger X-41): both
+    orientations are legal realizations of the same contraction (``C`` or
+    ``C^T`` as a batch of GEMVs), so both are candidates, priced and ranked
+    with their tilings; the candidate set does not depend on which input
+    is written first.  Each entry: ``matrix``/``vector`` memref names,
+    their operand roles, and ``by`` (``roles`` or ``alternative``)."""
+    macs = [match for match in matches if match.target_op_name == "MAC"]
+    if len(macs) != 1:
+        return [{"by": "roles"}]
+    match = macs[0]
+    roles = match.extra.get("axis_roles") or {}
+    by_role = {op.role: op for op in match.operands}
+    matrix_role, vector_role = roles.get("matrix"), roles.get("vector")
+    if matrix_role not in by_role or vector_role not in by_role:
+        return [{"by": "roles"}]
+    first = {
+        "matrix": by_role[matrix_role].memref_name,
+        "vector": by_role[vector_role].memref_name,
+        "matrix_role": matrix_role,
+        "vector_role": vector_role,
+        "by": "roles",
+    }
+    if roles.get("matrix_by") != "pattern_order" or roles.get("same_buffer"):
+        return [first]
+    second = {
+        "matrix": by_role[vector_role].memref_name,
+        "vector": by_role[matrix_role].memref_name,
+        "matrix_role": vector_role,
+        "vector_role": matrix_role,
+        "by": "alternative",
+    }
+    return [first, second]
+
+
+def _oriented_extents(match, roles, orientation) -> tuple[int, int, int]:
+    """``(rows, reduction, outputs)`` under an explicit orientation: the
+    result loops that index the vector operand are the GEMV rows (a vector
+    per iteration), the other result loops the outputs (the matrix rows),
+    from the operands' resolved coordinates."""
+    from ..spmw_match_engine import operand_index_terms
+
+    trips = roles["trips"]
+    loop_vars = [loop[0] for loop in match.enclosing_loops]
+    by_role = {op.role: op for op in match.operands}
+    vector = by_role[orientation["vector_role"]]
+    vector_vars, _opaque = operand_index_terms(vector, set(loop_vars))
+    result_vars = [
+        var
+        for var in loop_vars
+        if var in set(roles.get("output", ())) | set(roles.get("batch", ()))
+    ]
+    rows = outputs = reduction = 1
+    for var in result_vars:
+        if var in vector_vars:
+            rows *= int(trips[var])
+        else:
+            outputs *= int(trips[var])
+    for var in roles.get("reduction", ()):
+        reduction *= int(trips[var])
+    return rows, reduction, outputs
+
+
+def _contraction_extents(match, orientation=None) -> tuple[int, int, int]:
     roles = match.extra.get("axis_roles") or {}
     reason = roles.get("unresolved", "no axis roles were stamped")
     if not roles or reason is not None:
@@ -204,6 +284,8 @@ def _contraction_extents(match) -> tuple[int, int, int]:
                 f"{match.func_name} has element type {element!r}; the AttAcc "
                 "datapath and its command counts are FP16"
             )
+    if orientation is not None and orientation.get("vector_role") is not None:
+        return _oriented_extents(match, roles, orientation)
     return extent(roles["batch"]), extent(roles["reduction"]), extent(roles["output"])
 
 
@@ -226,13 +308,16 @@ def _loop_extent(match) -> int:
     return out
 
 
-def attacc_kernel_from_matches(matches) -> AttAccKernel:
+def attacc_kernel_from_matches(matches, orientation=None) -> AttAccKernel:
     """Classify the matches of one work item as an AttAcc kernel.
 
     A GEMV is exactly one ``MAC``.  Attention scoring is exactly two ``MAC``
     (score, then context) and one each of ``SFM_EXP``, ``SFM_SUM`` and
     ``SFM_DIV`` over the score rows, where the context reduces over the score
     outputs and produces the score reduction extent.  Anything else raises.
+    ``orientation`` (one entry of `attacc_orientations`) fixes which GEMV
+    input is the bank-resident matrix; the default is the orientation the
+    shared roles name.
     """
     from ..spmw_autoschedule import _matcher_work_scope
 
@@ -253,8 +338,10 @@ def attacc_kernel_from_matches(matches) -> AttAccKernel:
     macs = [match for match in matches if match.target_op_name == "MAC"]
     softmax = [match for match in matches if match.target_op_name != "MAC"]
     if len(macs) == 1 and not softmax:
-        rows, reduction, outputs = _contraction_extents(macs[0])
-        return AttAccKernel("gemv", rows, reduction, outputs)
+        if orientation is None or orientation.get("vector_role") is None:
+            orientation = attacc_orientations(matches)[0]
+        rows, reduction, outputs = _contraction_extents(macs[0], orientation)
+        return AttAccKernel("gemv", rows, reduction, outputs, orientation.get("matrix"))
     counts = sorted(match.target_op_name for match in softmax)
     if len(macs) == 2 and counts == sorted(_ATTENTION_SOFTMAX):
         score, context = (_contraction_extents(match) for match in macs)
@@ -827,6 +914,7 @@ __all__ = [
     "attacc_command_counts",
     "attacc_geometry",
     "attacc_kernel_from_matches",
+    "attacc_orientations",
     "attacc_program",
     "attacc_tiling_space",
     "rank_attacc_tilings",

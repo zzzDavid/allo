@@ -16,6 +16,7 @@ generator it needs is unlicensed DCC code (``docs/release/simulators.md``).
 from __future__ import annotations
 
 from .pim.attacc_tiling import (
+    attacc_orientations,
     AttAccDomainError,
     AttAccKernel,
     AttAccTiling,
@@ -35,8 +36,27 @@ ATTACC_ANALYTICAL_ONLY = (
 )
 
 
-def attacc_base_placement(target, matches):
-    """The single base placement of one AttAcc kernel.
+def attacc_orientation_of(matches, extra) -> dict:
+    """The orientation a placement realizes: its ``attacc_orientation``, else
+    the one whose matrix the carried kernel names, else the shared roles'."""
+    orientations = attacc_orientations(matches)
+    extra = extra or {}
+    stated = extra.get("attacc_orientation")
+    if stated is not None:
+        return stated
+    carried = extra.get("attacc_kernel")
+    matrix = getattr(carried, "matrix", None)
+    if matrix is not None:
+        for orientation in orientations:
+            if orientation.get("matrix") == matrix:
+                return orientation
+    return orientations[0]
+
+
+def attacc_base_placement(target, matches, orientation=None):
+    """One base placement of one AttAcc kernel, per storage orientation
+    (`allo.pim.attacc_tiling.attacc_orientations`; the shared roles' one by
+    default).
 
     Matrix operands (weights, K and V caches) live in the banks, vector
     operands in the per-bank GEMV buffer, MAC accumulators in the PIM
@@ -48,7 +68,9 @@ def attacc_base_placement(target, matches):
     """
     from .spmw_autoschedule import Placement
 
-    kernel = attacc_kernel_from_matches(matches)
+    if orientation is None:
+        orientation = attacc_orientations(matches)[0]
+    kernel = attacc_kernel_from_matches(matches, orientation)
     homes: dict[str, set] = {}
 
     def want(memref, handle):
@@ -58,12 +80,14 @@ def attacc_base_placement(target, matches):
     for match in matches:
         if match.target_op_name == "MAC":
             roles = match.extra["axis_roles"]
+            matrix_role = orientation.get("matrix_role", roles["matrix"])
+            vector_role = orientation.get("vector_role", roles["vector"])
             for operand in match.operands:
                 if operand.is_loop_carried:
                     want(operand.memref_name, target.acc)
-                elif operand.role == roles["matrix"]:
+                elif operand.role == matrix_role:
                     want(operand.memref_name, target.banks)
-                elif operand.role == roles["vector"]:
+                elif operand.role == vector_role:
                     want(operand.memref_name, target.gemv_buffer)
         else:
             for operand in match.operands:
@@ -74,10 +98,18 @@ def attacc_base_placement(target, matches):
         for memref, handles in homes.items()
         if len(handles) == 1
     }
+    suffix = "_transposed" if orientation.get("by") == "alternative" else ""
+    name = f"attacc_{kernel.kind}{suffix}"
     return Placement(
         placements=placements,
-        mode=f"attacc_{kernel.kind}",
-        extra={"attacc_kernel": kernel},
+        mode=name,
+        extra={
+            "attacc_kernel": kernel,
+            "attacc_orientation": orientation,
+            # ``layout="attacc_gemv_transposed"`` forces an orientation (every
+            # tiling of it stays a candidate; the cheapest is selected).
+            "candidate_families": (name,),
+        },
     )
 
 
@@ -139,9 +171,12 @@ def attacc_candidate_effects(target, matches, placement):
         labels.update(fact.loop_labels)
     inputs, outputs, layouts, transfers, launches = [], [], {}, {}, []
     allocations = [("accumulator", 0, "acc")]
+    orientation = attacc_orientation_of(matches, extra)
     for index, (match, fact) in enumerate(zip(matches, facts)):
         if hasattr(fact, "reduction_vars"):
-            matrix = fact.matrix.memref_name if fact.matrix is not None else None
+            matrix = orientation.get("matrix") if len(facts) == 1 else None
+            if matrix is None:
+                matrix = fact.matrix.memref_name if fact.matrix is not None else None
             for access in fact.inputs:
                 memref = access.memref_name
                 if memref is None or access.local or memref in inputs:
@@ -303,8 +338,9 @@ class AttAccCtx(CodegenContext):
             layouts = [layouts] * len(buckets)
         built = []
         for (_scope, matches), placement in zip(buckets, layouts):
-            kernel = attacc_kernel_from_matches(matches)
             extra = getattr(placement, "extra", {}) or {}
+            orientation = attacc_orientation_of(matches, extra)
+            kernel = attacc_kernel_from_matches(matches, orientation)
             carried = extra.get("attacc_kernel")
             if carried is not None and carried != kernel:
                 raise InfeasibleSchedule(
@@ -321,7 +357,7 @@ class AttAccCtx(CodegenContext):
             except (AttAccDomainError, ValueError) as error:
                 raise InfeasibleSchedule(str(error)) from error
             self._program_of_layout[id(placement)] = program
-            self._roles_of_layout[id(placement)] = _datapath_roles(matches)
+            self._roles_of_layout[id(placement)] = _datapath_roles(matches, orientation)
             self._launches_of_layout[id(placement)] = 0
             built.append((_matcher_work_scope(matches[0]).group_id, placement, program))
         if schedule is None:
@@ -490,18 +526,22 @@ class AttAccCtx(CodegenContext):
         return extra
 
 
-def _datapath_roles(matches) -> dict:
+def _datapath_roles(matches, orientation=None) -> dict:
     """``{"matrix": [...], "vector": [...], "result": [...]}``: the external
     values of the work item's MAC facts by the role the AttAcc datapath gives
     them (bank-resident matrix, GEMV-buffer vector, accumulator result).  A
     local vector (attention's probabilities) and local accumulators are
     internal to the inventory."""
     roles: dict = {"matrix": [], "vector": [], "result": []}
+    oriented = (orientation or {}).get("matrix")
+    single = sum(1 for m in matches if m.target_op_name == "MAC") == 1
     for match in matches:
         fact = match.extra.get("semantic_facts")
         if fact is None or not hasattr(fact, "reduction_vars"):
             continue
-        matrix = fact.matrix.memref_name if fact.matrix is not None else None
+        matrix = oriented if (oriented is not None and single) else None
+        if matrix is None:
+            matrix = fact.matrix.memref_name if fact.matrix is not None else None
         for access in fact.inputs:
             if access.local or access.memref_name is None:
                 continue
@@ -527,4 +567,5 @@ __all__ = [
     "attacc_candidate_effects",
     "attacc_placement",
     "attacc_tiling_candidates",
+    "attacc_orientation_of",
 ]

@@ -623,6 +623,7 @@ def test_virtual_result_kind_and_extra(qkv_nh8):
         "rows": 8,
         "reduction": 5120,
         "outputs": 384,
+        "matrix": "lW",
     }
     assert extra["attacc_counts"]["PIM_MAC_AB"] == 15360
     assert "ranking model" in extra["cost_validity"]
