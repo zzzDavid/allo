@@ -34,10 +34,10 @@ runtime and for inspection.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib
 import json
-import warnings
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -85,6 +85,43 @@ _APU_V1_PHYSICAL_METADATA_FIELDS = (
     "operation_counts",
     "scalar_work_items",
 )
+
+
+@contextlib.contextmanager
+def _scalar_one_dimensional_loops():
+    """Run Allo DSL source as Python with scalar induction variables for
+    one-dimensional ``allo.grid`` / ``allo.reduction`` ranges.
+
+    The DSL's Python fallbacks return ``np.ndindex``, whose items are tuples
+    (``(k,)`` for a 1-D range).  Multi-dimensional ranges keep their tuples
+    (``for i, j in allo.grid(M, N)`` unpacks them); a 1-D range yields the
+    integer, so ``W[i, k]`` indexes one element and the accumulated value is
+    a scalar the source's store accepts on every NumPy version (V1-19).
+    Only the functional host reference uses this; compilation reads the
+    retained MLIR, never this execution."""
+    import allo as _allo
+    from allo import dsl as _dsl
+
+    def _range(*args, **_kwargs):
+        if len(args) == 1 and not isinstance(args[0], (tuple, list)):
+            return iter(range(int(args[0])))
+        return np.ndindex(*args)
+
+    saved = {}
+    for module, name in (
+        (_allo, "grid"),
+        (_allo, "reduction"),
+        (_dsl, "grid"),
+        (_dsl, "reduction"),
+    ):
+        if hasattr(module, name):
+            saved[(module, name)] = getattr(module, name)
+            setattr(module, name, _range)
+    try:
+        yield
+    finally:
+        for (module, name), value in saved.items():
+            setattr(module, name, value)
 
 
 @dataclass(frozen=True)
@@ -965,18 +1002,17 @@ class APUv1VectorProgram:
                     "the APU v1 functional model executes the source workload on "
                     "the host; the compiled artifact carries no source workload"
                 )
-            # ``allo.reduction(1-D)`` is represented by ``np.ndindex`` when an
-            # Allo DSL function is executed directly, so its induction variable
-            # is a one-element tuple.  NumPy currently accepts that
-            # scalar-shaped access but emits a deprecation warning.  This
-            # functional reference is intentionally temporary; the retained
-            # MLIR, not this warning, is the compilation source of truth.
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="Conversion of an array with ndim > 0 to a scalar",
-                    category=DeprecationWarning,
-                )
+            # The source workload runs as plain Python.  Allo's ``grid`` and
+            # ``reduction`` iterate ``np.ndindex``, whose induction variable is
+            # a tuple even for one dimension; inside a multi-dimensional
+            # access (``W[i, k]`` with ``k == (5,)``) NumPy treats that tuple
+            # as a sequence index and the product becomes a one-element array,
+            # which NumPy 2.4+ refuses to store into a scalar element
+            # (release ledger V1-19; earlier NumPy only warned).  The
+            # functional reference therefore iterates one-dimensional ranges
+            # with scalar induction variables, exactly the source loops'
+            # meaning, while multi-dimensional ranges keep their tuples.
+            with _scalar_one_dimensional_loops():
                 returned = workload(**arguments)
             numerics = (
                 "source order"
