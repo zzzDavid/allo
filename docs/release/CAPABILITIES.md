@@ -228,18 +228,24 @@ without coefficients.
 
 ## Cross-cutting status
 
-- Contraction operand accesses (X-42, round 95): before any backend's
+- Contraction operand accesses (X-42, rounds 95-96): before any backend's
   candidates, `compile_for_target` refuses a contraction input coordinate
   that no PIM lowering realizes as written (`spmw_semantics.
-  contraction_access_problems`): accepted are one loop variable, a loop
-  variable plus a constant on a result loop (`W[row0 + i, k]`) and a dense
-  row-major flattening of several loops (`xs[p*Q + k]` with `Q` the trip
-  count of `k`); refused, naming the function, operand, coordinate and the
-  form read, are a stride on the innermost loop (`x[2*k]`), a padded
-  flattening (`xs[p*32 + k]` with `k` to 64) and a constant shift of a
-  reduction loop on either operand (`x[k + 1]`, `W[i, k + 8]`), which the
-  AiM and AttAcc lowerings would otherwise have staged as the plain access.
-  Data-dependent coordinates stay with the backends' own checks.
+  contraction_access_problems`), judged on the effective access after each
+  loop variable is substituted by `lower + step * t`. Accepted are one
+  normalized loop counter, a dense row-major flattening of several counters
+  (`xs[p*Q + k]` with `Q` the trip count of `k`), and a result-loop counter
+  plus a constant where the backend realizes result offsets (Samsung's
+  `W[row0 + i, k]`) or where the work grid tiles the result (every
+  multi-item kernel); refused, naming the function, operand, coordinate,
+  form and loop domain, are a stride on the innermost loop (`x[2*k]`,
+  `range(0, K, 2)`), a padded flattening (`xs[p*32 + k]` with `k` to 64),
+  an effective shift of a reduction loop (`x[k + 1]`, `W[i, k + 8]`,
+  `range(128, K)`) and, on AiM and AttAcc (`REALIZES_RESULT_OFFSETS =
+  False`: they stage one work item's rows from row zero), a single work
+  item's result-loop offset (`range(16, 32)`, `W[16 + i, k]` with
+  `y[16 + i]`). Data-dependent coordinates stay with the backends' own
+  checks.
 
 - Source semantics the matcher enforces before any backend is consulted
   (C-02, C-14, C-17, C-19, C-20, C-21): every store of every work-item
