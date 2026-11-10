@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import weakref
 
 import numpy as np
 
@@ -431,6 +432,21 @@ class MLIRToCModule:
         )
 
 
+def _release_library(library, tmpdir):
+    """Unload a ctypes library (so NFS releases its placeholder) and then
+    remove the scratch directory; a directory that still cannot be removed is
+    left in place rather than raised (``ignore_cleanup_errors``)."""
+    handle = getattr(library, "_handle", None)
+    if handle:
+        try:
+            import _ctypes
+
+            _ctypes.dlclose(handle)
+        except (OSError, AttributeError):
+            pass
+    tmpdir.cleanup()
+
+
 class CompiledCModule:
     """Host shared-library execution for :class:`MLIRToCModule`."""
 
@@ -443,7 +459,15 @@ class CompiledCModule:
         compile_flags=(),
     ):
         self.artifact = artifact
-        self._tmpdir = tempfile.TemporaryDirectory(prefix="allo-c-")
+        # The compiled library is dlopen'ed from this directory.  On NFS a
+        # mapped file is replaced by a ``.nfs*`` placeholder until the mapping
+        # is released, so the directory cannot be removed while the library is
+        # loaded: the module releases the library before removing the
+        # directory (``close`` / the finalizer below) and a cleanup that still
+        # fails is not raised at interpreter exit (release issue P-27).
+        self._tmpdir = tempfile.TemporaryDirectory(
+            prefix="allo-c-", ignore_cleanup_errors=True
+        )
         root = Path(self._tmpdir.name)
         compiler = compiler or shutil.which("clang") or shutil.which("gcc")
         if compiler is None:
@@ -485,6 +509,15 @@ class CompiledCModule:
                 f"compiled library does not export {artifact.top_func_name!r}"
             ) from error
         self.function.restype = None
+        # Registered after the TemporaryDirectory's own finalizer, so at exit
+        # it runs first: unload, then remove.
+        self._finalizer = weakref.finalize(
+            self, _release_library, self.library, self._tmpdir
+        )
+
+    def close(self):
+        """Unload the compiled library and remove its scratch directory."""
+        self._finalizer()
 
     @staticmethod
     def _dtype(argument: CArgument) -> np.dtype:
