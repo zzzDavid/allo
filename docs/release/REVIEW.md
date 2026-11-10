@@ -3093,8 +3093,14 @@ corrected in three design documents, and the closure record says it was
 premature.  The symbol check that should have been run first exists now
 and its one surviving run is preserved; its 28 unresolved tokens are each
 accounted for, and what it cannot establish is stated.  The installed
-validation of the backend-repair revision runs in the background on both
-hosts with no Gemini-II session.  NOT READY.
+validation of the backend-repair revision then completed on both hosts
+with no Gemini-II session: every local stage passed with the same results
+as the packaged candidate's, and the card tests passed from a zhang-x4
+wheel of its own.  I propose `ab239e3` as the replacement and leave the
+decision, which turns on whether byte-identical Gemini-II modules let the
+completed campaign stand for it, to the reviewer rather than flip the
+table myself.  NOT READY: the Gemini-I rows and the APU v1 installed
+execution remain outstanding; gemm and mvt stay open under the fixed rule.
 
 ## Rejected shortcuts
 
