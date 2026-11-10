@@ -6,18 +6,27 @@ REPRODUCED if the pooled median is at or below the paper's value with every
 output exact, otherwise OPEN (nominal) when the paper's value lies inside the
 pooled interquartile range and OPEN (regression) when it lies below it.
 
-Every session is validated before anything is pooled (round 108, the
-reviewer's incomplete-session probe): a session whose status is not ``pass``
-or that records problems is rejected; per case and lane the measured
-launches must cover every paired round exactly once with ``outputs_exact``
-recorded ``True`` (missing evidence is a rejection, never exactness), no
-timing-evidence problem, the expected launch count, and the summarized
-``amortized_ticks`` must equal the measured launches' per-round values; the
-Tenon lane must carry a program fingerprint, a layout fingerprint and a
-packing attestation on every launch.  Across sessions the host, the
-installed package, the protocol, the device lock, the paper values, the
-plan, the program and layout fingerprints and the vendor baseline binaries
-must agree.  Any rejection exits 2 and writes nothing unless
+Every session is validated before anything is pooled (rounds 108-109, the
+reviewer's incomplete-session, raw-disagreement, unpaired-rounds and
+different-inputs probes): a session whose status is not ``pass`` or that
+records problems is rejected; per case both lanes must measure exactly the
+producer's rounds 1..N once each, every measured record must carry the
+timing-evidence field explicitly and record no problem, ``outputs_exact``
+recorded ``True`` (missing evidence is a rejection, never exactness), raw
+repeated-batch device ticks that are positive and finite with the expected
+launch count (one per launch of the selected plan on the Tenon lane, each
+launch item's ``raw_ticks.pipeline`` equal to its batch record), and the
+derived sample must equal ``sum(raw batch ticks) / repetitions`` as
+``benchmarks/apu_g2/paper_rows.py`` derives it; the summarized lane samples
+and median must equal the per-round values re-derived from the raw ticks;
+the paired vendor/Tenon ratios must equal the ratios re-derived by matching
+round identifiers; the two lanes must run the same fixture (identical
+``inputs_sha256`` for the inputs and the oracle); the Tenon lane must carry
+a program fingerprint, a layout fingerprint and a packing attestation on
+every launch.  Across sessions the host, the installed package, the
+protocol, the device lock, the paper values, the plan, the fixture hashes,
+the program and layout fingerprints and the vendor baseline binaries must
+agree.  The pooled samples are the values re-derived from the raw ticks.  Any rejection exits 2 and writes nothing unless
 ``--exclude-invalid`` is given, which pools only the valid sessions and
 lists the rejected ones in the output.
 
@@ -26,6 +35,7 @@ lists the rejected ones in the output.
 
 import argparse
 import json
+import math
 import statistics
 import sys
 
@@ -58,6 +68,33 @@ def _require(condition, message):
         raise SessionInvalid(message)
 
 
+def _positive_finite(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+def _close(a, b):
+    return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(b)))
+
+
+def _fixture_identity(name, lane, inputs):
+    """The fixture a lane ran: the sha256 of every input and of the oracle."""
+    _require(
+        isinstance(inputs, dict) and inputs, f"{name}/{lane}: no inputs_sha256 recorded"
+    )
+    _require("oracle" in inputs, f"{name}/{lane}: inputs_sha256 records no oracle")
+    for key, value in inputs.items():
+        _require(
+            isinstance(value, str) and len(value) >= 16,
+            f"{name}/{lane}: inputs_sha256[{key!r}] is not a digest",
+        )
+    return tuple(sorted(inputs.items()))
+
+
 def validate_session(d):
     """Return the per-case evidence of one session or raise SessionInvalid."""
     _require(d.get("status") == "pass", f"status is {d.get('status')!r}, not 'pass'")
@@ -67,7 +104,15 @@ def validate_session(d):
     protocol = d["protocol"]
     rounds = protocol.get("paired_rounds")
     _require(
-        isinstance(rounds, int) and rounds > 0, f"protocol.paired_rounds is {rounds!r}"
+        isinstance(rounds, int) and not isinstance(rounds, bool) and rounds > 0,
+        f"protocol.paired_rounds is {rounds!r}",
+    )
+    repetitions = protocol.get("repetitions")
+    _require(
+        isinstance(repetitions, int)
+        and not isinstance(repetitions, bool)
+        and repetitions > 0,
+        f"protocol.repetitions is {repetitions!r}",
     )
     _require(isinstance(d["launches"], list) and d["launches"], "no launch records")
     cases = {}
@@ -81,18 +126,26 @@ def validate_session(d):
         _require(
             isinstance(c.get("paper_tenon"), (int, float)), f"{name}: no paper_tenon"
         )
+        inputs = _fixture_identity(name, "tenon", lanes["tenon"].get("inputs_sha256"))
+        _require(
+            inputs
+            == _fixture_identity(
+                name, "vendor", lanes[vendor_key].get("inputs_sha256")
+            ),
+            f"{name}: the tenon and vendor lanes record different fixtures (inputs_sha256)",
+        )
         evidence = {
             "case_id": c.get("case_id"),
             "paper_tenon": c["paper_tenon"],
             "paper_gtml": c.get("paper_gtml"),
             "plan": lanes["tenon"].get("plan"),
+            "inputs": inputs,
             "program_fingerprints": set(),
             "layout_fingerprints": set(),
             "vendor_binaries": set(),
             "samples": {},
-            "paired": list(
-                c.get("comparison", {}).get("paired_round_ratios_vendor_over_tenon", [])
-            ),
+            "by_round": {},
+            "paired": [],
         }
         for lane_name, lane_key in (("tenon", "tenon"), ("vendor", vendor_key)):
             measured = [
@@ -108,44 +161,59 @@ def validate_session(d):
             )
             seen = sorted(l.get("round") for l in measured)
             # paper_rows numbers the warmup round 0 and the measured rounds 1..N;
-            # each measured round exactly once, consecutively.
+            # both lanes must measure exactly those rounds, once each.
             _require(
-                all(isinstance(r, int) for r in seen)
-                and seen == list(range(seen[0], seen[0] + rounds)),
-                f"{name}/{lane_name}: measured rounds covered {seen}, {rounds} consecutive rounds required",
+                seen == list(range(1, rounds + 1)),
+                f"{name}/{lane_name}: measured rounds {seen}, rounds 1..{rounds} required",
             )
-            per_round = []
+            by_round = {}
             for l in measured:
+                where = f"{name}/{lane_name} round {l.get('round')}"
+                _require(
+                    "timing_evidence_problem" in l,
+                    f"{where}: timing-evidence field absent",
+                )
+                _require(
+                    l["timing_evidence_problem"] is None,
+                    f"{where}: timing evidence problem {l['timing_evidence_problem']!r}",
+                )
                 _require(
                     l.get("outputs_exact") is True,
-                    f"{name}/{lane_name} round {l.get('round')}: outputs_exact is {l.get('outputs_exact')!r}",
+                    f"{where}: outputs_exact is {l.get('outputs_exact')!r}",
                 )
+                batch = l.get("repeated_batch_ticks")
                 _require(
-                    l.get("timing_evidence_problem") is None,
-                    f"{name}/{lane_name} round {l.get('round')}: timing evidence problem {l.get('timing_evidence_problem')!r}",
+                    isinstance(batch, list) and batch,
+                    f"{where}: no raw repeated-batch ticks",
                 )
-                ticks = l.get("amortized_ticks_per_pipeline")
-                _require(
-                    isinstance(ticks, (int, float)) and ticks > 0,
-                    f"{name}/{lane_name} round {l.get('round')}: no amortized ticks",
-                )
-                per_round.append(ticks)
+                for index, ticks in enumerate(batch):
+                    _require(
+                        _positive_finite(ticks),
+                        f"{where}: launch {index} raw device ticks {ticks!r} are not a positive finite count",
+                    )
                 if lane_name == "tenon":
                     items = l.get("launches")
                     _require(
-                        isinstance(items, list) and items,
-                        f"{name}/tenon round {l.get('round')}: no launch items",
+                        isinstance(items, list) and items, f"{where}: no launch items"
                     )
+                    expected = l.get("expected_launches")
                     _require(
-                        l.get("expected_launches") == len(items),
-                        f"{name}/tenon round {l.get('round')}: {len(items)} launch items, expected {l.get('expected_launches')!r}",
+                        isinstance(expected, int)
+                        and expected > 0
+                        and expected == len(items) == len(batch),
+                        f"{where}: {len(items)} launch items and {len(batch)} batch records for a plan of {expected!r} launch(es)",
                     )
-                    for item in items:
+                    for index, item in enumerate(items):
                         for field in TENON_LAUNCH_FIELDS:
                             _require(
                                 item.get(field),
-                                f"{name}/tenon round {l.get('round')}: launch without {field}",
+                                f"{where}: launch {index} without {field}",
                             )
+                        pipeline = (item.get("raw_ticks") or {}).get("pipeline")
+                        _require(
+                            _positive_finite(pipeline) and pipeline == batch[index],
+                            f"{where}: launch {index} raw_ticks.pipeline {pipeline!r} does not match its batch record {batch[index]!r}",
+                        )
                         evidence["program_fingerprints"].add(
                             item["program_fingerprint"]
                         )
@@ -153,24 +221,58 @@ def validate_session(d):
                 else:
                     _require(
                         l.get("host_sha256") and l.get("device_library_sha256"),
-                        f"{name}/vendor round {l.get('round')}: baseline binaries not recorded",
+                        f"{where}: baseline binaries not recorded",
                     )
                     evidence["vendor_binaries"].add(
                         (l["host_sha256"], l["device_library_sha256"])
                     )
+                derived = sum(float(t) for t in batch) / repetitions
+                recorded = l.get("amortized_ticks_per_pipeline")
+                _require(
+                    _positive_finite(recorded) and _close(recorded, derived),
+                    f"{where}: derived sample {recorded!r} disagrees with the raw ticks ({batch} / {repetitions} = {derived})",
+                )
+                by_round[l["round"]] = derived
+            per_round = [by_round[r] for r in range(1, rounds + 1)]
             summarized = lanes[lane_key].get("amortized_ticks")
             _require(
                 isinstance(summarized, list)
-                and sorted(summarized) == sorted(per_round),
-                f"{name}/{lane_name}: summarized samples do not equal the measured launches' per-round ticks",
+                and len(summarized) == rounds
+                and all(
+                    _close(a, b) for a, b in zip(sorted(summarized), sorted(per_round))
+                ),
+                f"{name}/{lane_name}: summarized samples do not equal the per-round values re-derived from the raw ticks",
             )
             stats = lanes[lane_key].get("statistics") or {}
             if "median" in stats:
                 _require(
-                    abs(stats["median"] - statistics.median(per_round)) < 1e-9,
-                    f"{name}/{lane_name}: summarized median differs from the launches",
+                    _close(stats["median"], statistics.median(per_round)),
+                    f"{name}/{lane_name}: summarized median differs from the raw-derived samples",
                 )
             evidence["samples"][lane_name] = per_round
+            evidence["by_round"][lane_name] = by_round
+        ratios = [
+            evidence["by_round"]["vendor"][r] / evidence["by_round"]["tenon"][r]
+            for r in range(1, rounds + 1)
+        ]
+        recorded_ratios = c.get("comparison", {}).get(
+            "paired_round_ratios_vendor_over_tenon"
+        )
+        _require(
+            isinstance(recorded_ratios, list)
+            and len(recorded_ratios) == rounds
+            and all(
+                _close(a, b) for a, b in zip(sorted(recorded_ratios), sorted(ratios))
+            ),
+            f"{name}: the recorded paired vendor/tenon ratios do not equal the ratios re-derived by round",
+        )
+        ratio_stats = c.get("comparison", {}).get("paired_ratio_statistics") or {}
+        if "median" in ratio_stats:
+            _require(
+                _close(ratio_stats["median"], statistics.median(ratios)),
+                f"{name}: the paired-ratio median differs from the ratios re-derived by round",
+            )
+        evidence["paired"] = ratios
         _require(
             len(evidence["program_fingerprints"]) == 1,
             f"{name}: {len(evidence['program_fingerprints'])} program fingerprints in one session",
@@ -210,6 +312,7 @@ def check_compatible(reference, other, label):
             "paper_tenon",
             "paper_gtml",
             "plan",
+            "inputs",
             "program_fingerprints",
             "layout_fingerprints",
             "vendor_binaries",
@@ -254,6 +357,7 @@ def pool(validated):
                 (ref["paper_gtml"] / paper) if ref["paper_gtml"] else None
             ),
             "plan": ref["plan"],
+            "inputs_sha256": dict(ref["inputs"]),
             "program_fingerprint": sorted(ref["program_fingerprints"])[0],
             "layout_fingerprint": sorted(ref["layout_fingerprints"])[0],
             "outputs_exact": True,
