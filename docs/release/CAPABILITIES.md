@@ -246,8 +246,10 @@ without coefficients.
   False`: they stage one work item's rows from row zero), a single work
   item's result-loop offset (`range(16, 32)`, `W[16 + i, k]` with
   `y[16 + i]`) and a grid whose offsets do not tile the frontier
-  (`W[16 + ch*R + i, k]`, `W[ch*32 + i, k]` with 16-row items). Data-dependent
-  coordinates stay with the backends' own checks.
+  (`W[16 + ch*R + i, k]`, `W[ch*32 + i, k]` with 16-row items), a loop
+  variable read in two coordinates of one operand (`B[k, k]`, `W[i, i, k]`:
+  a diagonal gather) and a staged extent that leaves the buffer dimension.
+  Data-dependent coordinates stay with the backends' own checks.
 
 - Source semantics the matcher enforces before any backend is consulted
   (C-02, C-14, C-17, C-19, C-20, C-21): every store of every work-item
