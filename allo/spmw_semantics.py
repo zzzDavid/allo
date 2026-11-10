@@ -1137,7 +1137,10 @@ def _effective_access_forms(fact):
             )
             if not loop_terms:
                 continue
-            where = f"input {access.memref_name!r} coordinate {position}"
+            where = (
+                f"input {access.memref_name!r} (operand {access.role!r}) "
+                f"coordinate {position}"
+            )
             spelled = " + ".join(
                 f"{c}*{labels.get(atom, atom)}" if c != 1 else labels.get(atom, atom)
                 for atom, c in loop_terms
@@ -1168,7 +1171,7 @@ def _effective_access_forms(fact):
             reads_reduction = any(atom in reduction for atom, _c in loop_terms)
             out.append(
                 (
-                    (access.memref_name, position),
+                    (access.role, access.memref_name, position),
                     where,
                     read,
                     tuple(effective),
@@ -1257,8 +1260,10 @@ def contraction_access_problems(
 
 
 def contraction_result_offsets(fact) -> dict:
-    """``{(memref, coordinate): (read, effective constant, extent)}`` for every
-    dense input coordinate of the contraction that reads result loops only:
+    """``{(operand role, memref, coordinate): (read, effective constant,
+    extent)}`` for every dense input coordinate of the contraction that
+    reads result loops only (keyed by the operand, so two operands reading
+    one buffer, ``a[16 + i, k] * a[j, k]``, keep both accesses):
     the constant offset the coordinate adds over the loops' normalized
     counters and the extent those counters span (the product of their trip
     counts).  A work grid realizes such offsets only when its items tile the

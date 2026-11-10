@@ -1761,15 +1761,16 @@ def require_contraction_accesses_realizable(trace, ctx_cls=None) -> None:
         if count <= 1 or len(bodies) <= 1:
             for _flat, body in bodies:
                 for match, offsets in body:
-                    for (memref, position), (
+                    for (role, memref, position), (
                         read,
                         constant,
                         _extent,
                     ) in offsets.items():
                         if constant != 0:
                             problems.append(
-                                f"{match.func_name}: input {memref!r} coordinate "
-                                f"{position} reads {read}, an effective offset of "
+                                f"{match.func_name}: input {memref!r} (operand "
+                                f"{role!r}) coordinate {position} reads {read}, an "
+                                f"effective offset of "
                                 f"{constant} on a result loop; this backend stages a "
                                 "single work item's rows from the first row and "
                                 "realizes no result offset (partition the rows over "
@@ -1793,13 +1794,14 @@ def require_contraction_accesses_realizable(trace, ctx_cls=None) -> None:
             keys = set().union(*(set(offsets) for _f, (_m, offsets) in column))
             first_name = column[0][1][0].func_name
             for key in sorted(keys):
-                memref, position = key
+                role, memref, position = key
+                operand = f"{memref!r} (operand {role!r})"
                 rows = [
                     (flat, match, offsets.get(key)) for flat, (match, offsets) in column
                 ]
                 if any(entry is None for _f, _m, entry in rows):
                     problems.append(
-                        f"{first_name}: input {memref!r} coordinate {position} is not "
+                        f"{first_name}: input {operand} coordinate {position} is not "
                         "read alike by every work item of the kernel group"
                     )
                     continue
@@ -1808,7 +1810,7 @@ def require_contraction_accesses_realizable(trace, ctx_cls=None) -> None:
                 if len(set(constants)) == 1:
                     if constants[0] != 0:
                         problems.append(
-                            f"{first_name}: input {memref!r} coordinate {position} reads "
+                            f"{first_name}: input {operand} coordinate {position} reads "
                             f"{rows[0][2][0]} in every work item, an effective offset of "
                             f"{constants[0]} the work grid does not tile; this backend "
                             "stages the group's result frontier from row zero"
@@ -1816,7 +1818,7 @@ def require_contraction_accesses_realizable(trace, ctx_cls=None) -> None:
                     continue
                 if len(extents) != 1:
                     problems.append(
-                        f"{first_name}: input {memref!r} coordinate {position} spans "
+                        f"{first_name}: input {operand} coordinate {position} spans "
                         f"different extents across the work items ({sorted(extents)})"
                     )
                     continue
@@ -1824,7 +1826,7 @@ def require_contraction_accesses_realizable(trace, ctx_cls=None) -> None:
                 expected = [flat * extent for flat, _m, _e in rows]
                 if constants != expected:
                     problems.append(
-                        f"{first_name}: input {memref!r} coordinate {position} reads "
+                        f"{first_name}: input {operand} coordinate {position} reads "
                         f"{rows[0][2][0]}; the work items' effective offsets "
                         f"{constants} do not tile the realized frontier {expected} "
                         f"(item w must read offset w x {extent} in work-id order); "

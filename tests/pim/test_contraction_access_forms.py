@@ -119,7 +119,7 @@ def test_strided_vector_is_refused_before_selection_on_aim():
     message = str(excinfo.value)
     assert "unsupported contraction operand access" in message
     assert (
-        "dot_0: input 'b' coordinate 0 reads 2*k, which is not one loop counter"
+        "dot_0: input 'b' (operand 'y') coordinate 0 reads 2*k, which is not one loop counter"
         in message
     )
 
@@ -127,12 +127,12 @@ def test_strided_vector_is_refused_before_selection_on_aim():
 def test_shifted_reduction_coordinates_are_refused_on_either_operand():
     with pytest.raises(
         NotImplementedError,
-        match="input 'b' coordinate 0 reads k, an effective shift of 128 on a reduction loop",
+        match=r"input 'b' \(operand 'y'\) coordinate 0 reads k, an effective shift of 128 on a reduction loop",
     ):
         _aim(shifted_vector)
     with pytest.raises(
         NotImplementedError,
-        match="input 'a' coordinate 1 reads k, an effective shift of 8 on a reduction loop",
+        match=r"input 'a' \(operand 'x'\) coordinate 1 reads k, an effective shift of 8 on a reduction loop",
     ):
         _aim(shifted_matrix)
 
@@ -196,7 +196,7 @@ def test_dense_flattening_is_accepted_and_a_padded_stride_is_refused():
     assert contraction_access_problems(fact, reduction_offsets=False) == []
     with pytest.raises(
         NotImplementedError,
-        match="input 'xs' coordinate 0 reads 32\\*p \\+ k, which is not one loop counter",
+        match=r"input 'xs' \(operand 'x'\) coordinate 0 reads 32\*p \+ k, which is not one loop counter",
     ):
         _aim(padded_flattened)
 
@@ -276,12 +276,12 @@ def test_loop_domains_are_substituted_before_judging_the_access():
     loop domain."""
     with pytest.raises(
         NotImplementedError,
-        match=r"input 'b' coordinate 0 reads k with k in \[128, 256\), an effective shift of 128",
+        match=r"input 'b' \(operand 'y'\) coordinate 0 reads k with k in \[128, 256\), an effective shift of 128",
     ):
         _aim(reduction_lower_bound)
     with pytest.raises(
         NotImplementedError,
-        match=r"input 'b' coordinate 0 reads k with k in \[0, 256\) step 2, which is not one loop counter",
+        match=r"input 'b' \(operand 'y'\) coordinate 0 reads k with k in \[0, 256\) step 2, which is not one loop counter",
     ):
         _aim(reduction_step_two)
     for workload in (attacc_reduction_lower_bound, attacc_reduction_step_two):
@@ -307,12 +307,12 @@ def test_single_item_result_offsets_are_refused_where_the_backend_stages_from_ro
     accepted (`tests/pim/test_aim_axis_roles.py`)."""
     with pytest.raises(
         NotImplementedError,
-        match=r"input 'a' coordinate 0 reads i with i in \[16, 32\), an effective offset of 16 on a result loop",
+        match=r"input 'a' \(operand 'x'\) coordinate 0 reads i with i in \[16, 32\), an effective offset of 16 on a result loop",
     ):
         _aim(result_lower_bound)
     with pytest.raises(
         NotImplementedError,
-        match=r"input 'a' coordinate 0 reads i, an effective offset of 16 on a result loop",
+        match=r"input 'a' \(operand 'x'\) coordinate 0 reads i, an effective offset of 16 on a result loop",
     ):
         _aim(result_offset_single_item)
 
@@ -386,7 +386,106 @@ def test_work_grid_offsets_must_tile_the_realized_frontier():
     ):
         with pytest.raises(
             NotImplementedError,
-            match=rf"input 'a' coordinate 0 reads .*; the work items' effective offsets "
+            match=rf"input 'a' \(operand 'x'\) coordinate 0 reads .*; the work items' effective offsets "
             rf"{offsets} do not tile the realized frontier \[0, 16\]",
         ):
             _aim(workload)
+
+
+SM, SR = 64, 16
+
+
+@region()
+def same_buffer_base(W: bfloat16[SM, K], y: bfloat16[SM, SR]):
+    @allo.work(mapping=[1], args=[W, y])
+    def dot(a: bfloat16[SM, K], c: bfloat16[SM, SR]):
+        for i in range(SR):
+            for j in range(SR):
+                acc: bfloat16 = 0
+                for k in range(K):
+                    acc += a[i, k] * a[j, k]
+                c[i, j] = acc
+
+
+@region()
+def same_buffer_shifted(W: bfloat16[SM, K], y: bfloat16[SM, SR]):
+    @allo.work(mapping=[1], args=[W, y])
+    def dot(a: bfloat16[SM, K], c: bfloat16[SM, SR]):
+        for i in range(SR):
+            for j in range(SR):
+                acc: bfloat16 = 0
+                for k in range(K):
+                    acc += a[16 + i, k] * a[j, k]
+                c[16 + i, j] = acc
+
+
+@region()
+def same_buffer_shifted_reversed(W: bfloat16[SM, K], y: bfloat16[SM, SR]):
+    @allo.work(mapping=[1], args=[W, y])
+    def dot(a: bfloat16[SM, K], c: bfloat16[SM, SR]):
+        for i in range(SR):
+            for j in range(SR):
+                acc: bfloat16 = 0
+                for k in range(K):
+                    acc += a[j, k] * a[16 + i, k]
+                c[16 + i, j] = acc
+
+
+@region()
+def same_buffer_grid(W: bfloat16[SM, K], y: bfloat16[SM, SR]):
+    @allo.work(mapping=[2], args=[W, y])
+    def dot(a: bfloat16[SM, K], c: bfloat16[SM, SR]):
+        ch = allo.get_wid()
+        for i in range(SR):
+            for j in range(SR):
+                acc: bfloat16 = 0
+                for k in range(K):
+                    acc += a[ch * SR + i, k] * a[j, k]
+                c[ch * SR + i, j] = acc
+
+
+@region()
+def same_buffer_grid_shifted(W: bfloat16[SM, K], y: bfloat16[SM, SR]):
+    @allo.work(mapping=[2], args=[W, y])
+    def dot(a: bfloat16[SM, K], c: bfloat16[SM, SR]):
+        ch = allo.get_wid()
+        for i in range(SR):
+            for j in range(SR):
+                acc: bfloat16 = 0
+                for k in range(K):
+                    acc += a[16 + ch * SR + i, k] * a[j, k]
+                c[16 + ch * SR + i, j] = acc
+
+
+def test_same_buffer_operands_keep_both_accesses():
+    """The reviewer's round 97 probe (`reviewer-r97/access_probes2.py`): the
+    result-offset records were keyed by buffer and coordinate, so the two
+    operands of ``a[16 + i, k] * a[j, k]`` overwrote each other and the
+    shifted operand's offset was lost in one operand order.  The records
+    are keyed by operand; the shifted program is refused in both orders,
+    the zero-offset neighbour is accepted, and on a grid the shifted
+    operand is judged on its own against the frontier."""
+    from allo.spmw_semantics import contraction_result_offsets
+
+    compiled = _aim(same_buffer_base)
+    fact = compiled.trace.matches[0].extra["semantic_facts"]
+    offsets = contraction_result_offsets(fact)
+    assert sorted(offsets) == [("x", "a", 0), ("y", "a", 0)]
+    assert {value[1] for value in offsets.values()} == {0}
+    for workload in (same_buffer_shifted, same_buffer_shifted_reversed):
+        with pytest.raises(
+            NotImplementedError,
+            match=r"input 'a' \(operand '[xy]'\) coordinate 0 reads i, an effective offset of 16 on a result loop",
+        ):
+            _aim(workload)
+    # On a grid AiM's own work-axis derivation refuses a same-buffer kernel
+    # (it cannot tell which axis the grid partitions) with an explicit
+    # error, after the shared check has judged the accesses: the tiling grid
+    # reaches that derivation, the shifted grid is refused first.
+    with pytest.raises(ValueError, match="cannot tell which contraction axis"):
+        _aim(same_buffer_grid)
+    with pytest.raises(
+        NotImplementedError,
+        match=r"input 'a' \(operand 'x'\) coordinate 0 reads i; the work items' effective offsets \[16, 32\] do not tile the realized frontier \[0, 16\]",
+    ):
+        _aim(same_buffer_grid_shifted)
