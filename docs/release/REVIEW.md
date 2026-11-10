@@ -2666,8 +2666,11 @@ README, `THIRD_PARTY_NOTICES.md`, INSTALL): Samsung's notice is reproduced
 verbatim, the maintainers' decision is dated, and the absence of a recorded
 permission is stated rather than implied away.  Judged as packaging: the
 bundle rebuilds the evaluation's conductor byte for byte (after stripping)
-and runs the compiler's GEMV; the installed-artifact run from a wheel at
-the candidate is the next validation.  One real defect surfaced by doing
+and runs the compiler's GEMV, and the wheel built from the candidate
+`39449d6` installs into a clean venv from which, outside the checkout and
+without any simulator variable, the package verifies its bundle, builds the
+conductor (stripped identity again the evaluation's), discovers it and
+executes a compiled GEMV correctly (VALIDATION round 93).  One real defect surfaced by doing
 it: SCons strips the environment, so a user with a full `/tmp` could not
 build; the Tenon `Sconstruct` now passes `TMPDIR` through.  NOT READY.
 
@@ -2747,11 +2750,10 @@ AiM, Samsung, UPMEM, AttAcc and the other four Gemini-II rows REPRODUCED
 at `88852b7` from installed artifacts; the final-candidate validation (the
 suites and installed-artifact runs at whichever revision is declared
 final); X-41 (the shared role analysis's operand-order dependence and
-unresolved roles on SSA operand coordinates; X-40 repaired); the
-installed-artifact run of the bundled Samsung simulator route from a wheel
-at the candidate (P-04 implemented in round 93 as packaging under the
-user's direction; the permission question is recorded in `NOTICE.md` for
-the maintainers, not a technical blocker); P-23's remaining pylint stage (the E, W0640, W0611 and W0613
+unresolved roles on SSA operand coordinates; X-40 repaired); P-04
+implemented and validated from the `39449d6` wheel in round 93 as
+packaging under the user's direction (the permission question is recorded
+in `NOTICE.md` for the maintainers, not a technical blocker); P-23's remaining pylint stage (the E, W0640, W0611 and W0613
 classes triaged: X-39 and the Samsung staging-share geometry dependence
 repaired, twenty imports and seven vestigial parameters removed, nineteen
 required signatures kept; 444 W/C/R diagnostics untriaged); V1-19 (deferred by
