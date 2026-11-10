@@ -1696,6 +1696,29 @@ def carried_accumulator_message(target_name: str, match) -> str:
     )
 
 
+def require_contraction_accesses_realizable(trace) -> None:
+    """Refuse, for every matched contraction of the trace, an input access no
+    PIM lowering realizes as written (`spmw_semantics.
+    contraction_access_problems`; release ledger X-42).  The message names
+    the function, the operand, the coordinate and what was read."""
+    from .spmw_semantics import contraction_access_problems
+
+    problems = []
+    for match in trace.matches:
+        fact = match.extra.get("semantic_facts")
+        if fact is None:
+            continue
+        for problem in contraction_access_problems(fact, reduction_offsets=False):
+            problems.append(f"{match.func_name}: {problem}")
+    if problems:
+        raise NotImplementedError(
+            "unsupported contraction operand access (no PIM backend stages a "
+            "strided, shifted-reduction or compound-index operand; rewrite the "
+            "access as a plain loop index, or gather the operand on the host "
+            "first):\n  " + "\n  ".join(sorted(set(problems)))
+        )
+
+
 def compile_for_target(
     target: Any,
     trace: MatchTrace,
@@ -1799,6 +1822,12 @@ def compile_for_target(
         from .spmw_legality import check_layouts
 
         check_layouts(view, trace, layout).raise_if_illegal("user-supplied layout")
+
+    # Release gate G2 / G9 (X-42): a contraction operand access the PIM
+    # lowerings cannot realize as written (a strided or compound loop
+    # coordinate) is refused here, before any backend's candidates are
+    # selected, instead of being staged as the contiguous access.
+    require_contraction_accesses_realizable(trace)
 
     # A virtual-only target needs no code generator. Its executable cost spec
     # lowers the trace directly to the retained handle-based graph.

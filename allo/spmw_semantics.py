@@ -1109,6 +1109,81 @@ def product_extent(values) -> int:
     return math.prod(int(v) for v in values)
 
 
+def contraction_access_problems(fact, *, reduction_offsets: bool = True) -> list[str]:
+    """Input accesses of a contraction that no PIM lowering realizes as
+    written (release ledger X-42).
+
+    The lowerings stage a contraction operand contiguously along its loops:
+    a coordinate may be one loop variable (``b[k]``), that variable plus a
+    constant on a result loop (the work item's matrix rows ``row0 + i``), or
+    a dense row-major flattening of several loops (``xs[p * Q + k]`` with
+    ``Q`` the trip count of ``k``; ``lx[jo * KI + ji]``), which addresses
+    the same contiguous elements a multi-dimensional access would.  A
+    coordinate whose innermost loop has a coefficient other than one
+    (``b[2*k]``), whose outer coefficient is not the product of the inner
+    trip counts (``xs[p * 2Q + k]``, a padded stride), or, unless
+    ``reduction_offsets`` is allowed, that shifts a reduction loop by a
+    constant (``b[k + 1]``) would be read as the dense access and is
+    reported, one message per coordinate.  A coordinate with no retained
+    form (data dependent) or with an atom that is not a loop variable is
+    not judged here; the backends' own checks keep handling those."""
+    if not hasattr(fact, "reduction_vars"):
+        return []
+    order = list(fact.loop_vars)
+    loop_vars = set(order)
+    reduction = set(fact.reduction_vars)
+    trips = fact.trips
+    labels = fact.loop_labels
+    problems = []
+    for access in fact.inputs:
+        coords = getattr(access, "coords", None) or ()
+        for position, coord in enumerate(coords):
+            if coord is None:
+                continue
+            terms, constant = coord
+            if any(atom not in loop_vars for atom, _c in terms):
+                continue
+            loop_terms = sorted(
+                ((atom, int(c)) for atom, c in terms if int(c) != 0),
+                key=lambda item: order.index(item[0]),
+            )
+            if not loop_terms:
+                continue
+            where = f"input {access.memref_name!r} coordinate {position}"
+            spelled = " + ".join(
+                f"{c}*{labels.get(atom, atom)}" if c != 1 else labels.get(atom, atom)
+                for atom, c in loop_terms
+            )
+            # Dense row-major flattening: the innermost term has coefficient
+            # one and every outer coefficient is the product of the trip
+            # counts of the terms inside it.
+            expected, dense = 1, True
+            for atom, c in reversed(loop_terms):
+                if c != expected:
+                    dense = False
+                    break
+                expected *= int(trips.get(atom) or 0)
+            if not dense:
+                problems.append(
+                    f"{where} reads {spelled}, which is not one loop variable or a "
+                    "dense row-major flattening of its loops; the PIM lowerings "
+                    "stage a contraction operand contiguously, so a strided or "
+                    "padded access would be read as the dense one"
+                )
+                continue
+            if (
+                not reduction_offsets
+                and int(constant) != 0
+                and any(atom in reduction for atom, _c in loop_terms)
+            ):
+                problems.append(
+                    f"{where} reads {spelled} shifted by {int(constant)}; the PIM "
+                    "lowerings stage the reduction extent from the operand's "
+                    "first element"
+                )
+    return problems
+
+
 def stamp_program_facts(
     trace: MatchTrace, facts: ProgramFacts, *, primary: bool = True
 ) -> None:
@@ -1135,6 +1210,7 @@ def stamp_program_facts(
 
 
 __all__ = [
+    "contraction_access_problems",
     "BufferAccess",
     "Contraction",
     "ElementType",

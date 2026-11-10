@@ -4711,11 +4711,6 @@ def grouped_gemm_column_blocks(
 
 
 _NOT_THE_TEMPLATE = [
-    (
-        grouped_gemm_reversed_k,
-        "operand 'B' is read at \\[-1 \\* k \\+ 31, j\\] along the reduction",
-        32,
-    ),
     (grouped_gemm_partial_rows, "write 64 of the 128 elements of C\\[16, 8\\]", 16),
     (grouped_gemm_partial_columns, "write 64 of the 128 elements of C\\[16, 8\\]", 16),
     (
@@ -4723,7 +4718,6 @@ _NOT_THE_TEMPLATE = [
         "written at \\[i, j\\] while the operands are read at row 0 of 'A'",
         32,
     ),
-    (grouped_gemm_permuted_rows, "read at row -1 \\* i \\+ 15 of 'A'", 32),
     (
         grouped_gemm_overlapping,
         "work items \\(0,\\) and \\(1,\\) both write rows 0..3 x columns 0..7",
@@ -4736,11 +4730,9 @@ _NOT_THE_TEMPLATE = [
     "region, reason, instances",
     _NOT_THE_TEMPLATE,
     ids=[
-        "reversed_k",
         "partial_rows",
         "partial_columns",
         "repeated_row",
-        "permuted_rows",
         "overlapping",
     ],
 )
@@ -4776,6 +4768,43 @@ def test_apu_v1_grouped_non_template_regions_are_refused_for_execution(
     }
     with pytest.raises(NotImplementedError, match=reason):
         _apu_v1_prepare_io(compiled.compiled, arrays)
+
+
+@pytest.mark.parametrize(
+    "region, grouped_reason, shared_reason",
+    [
+        (
+            grouped_gemm_reversed_k,
+            "operand 'B' is read at \\[-1 \\* k \\+ 31, j\\] along the reduction",
+            "row_block_0: input 'B' coordinate 0 reads -1\\*k, which is not one loop "
+            "variable or a dense row-major flattening",
+        ),
+        (
+            grouped_gemm_permuted_rows,
+            "read at row -1 \\* i \\+ 15 of 'A'",
+            "row_block_0: input 'A' coordinate 0 reads -1\\*i, which is not one loop "
+            "variable or a dense row-major flattening",
+        ),
+    ],
+    ids=["reversed_k", "permuted_rows"],
+)
+def test_apu_v1_grouped_reversed_accesses_are_refused_on_every_backend(
+    region, grouped_reason, shared_reason
+):
+    """A reversed operand access (``B[K-1-k]``, ``A[M-1-i]``) is refused on
+    every backend: the grouped route's template proof refuses the board
+    program before scheduling with its own reason, no host functional model
+    exists, and the virtual estimate, which through round 94 was kept with
+    the candidate declared ``virtual_only``, is now refused by the shared
+    access contract (release ledger X-42): no PIM lowering stages such an
+    access as written, so there is no realizable program to estimate."""
+    with pytest.raises(NotImplementedError, match=grouped_reason) as error:
+        _compile_grouped(region, backend=None)
+    assert "the device packs a dense FP16 GEMM" in str(error.value)
+    with pytest.raises(NotImplementedError, match="no host functional model"):
+        _compile_grouped(region, backend="functional")
+    with pytest.raises(NotImplementedError, match=shared_reason):
+        _compile_grouped(region, backend="virtual")
 
 
 def test_apu_v1_grouped_template_is_proven_over_the_whole_kernel_group():
