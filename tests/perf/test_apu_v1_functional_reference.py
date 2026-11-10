@@ -146,3 +146,87 @@ def test_overlapping_references_and_exceptions_leave_the_bindings_untouched():
 def test_a_non_function_workload_is_refused_with_its_type():
     with pytest.raises(RuntimeError, match="Python function; got int"):
         _scalar_loop_view(3)
+
+
+def make_direct():
+    """A factory whose contraction captures locally imported ranges."""
+    from allo import grid as local_grid
+    from allo import reduction as local_reduction
+
+    def contraction(left: uint16[M, K], right: uint16[K, N], result: uint16[M, N]):
+        for row, column in local_grid(M, N):
+            for depth in local_reduction(K):
+                result[row, column] += left[row, depth] * right[depth, column]
+
+    return contraction
+
+
+def make_module():
+    """A factory whose contraction captures a locally imported module."""
+    import allo as local_allo
+
+    def contraction(left: uint16[M, K], right: uint16[K, N], result: uint16[M, N]):
+        for row, column in local_allo.grid(M, N):
+            for depth in local_allo.reduction(K):
+                result[row, column] += left[row, depth] * right[depth, column]
+
+    return contraction
+
+
+def nested_dsl(left: uint16[M, K], right: uint16[K, N], result: uint16[M, N]):
+    for row, column in allo.dsl.grid(M, N):
+        for depth in allo.dsl.reduction(K):
+            result[row, column] += left[row, depth] * right[depth, column]
+
+
+UNRELATED = object()
+
+
+def make_with_unrelated_capture():
+    from allo import reduction as local_reduction
+
+    unrelated = UNRELATED
+
+    def contraction(left: uint16[M, K], right: uint16[K, N], result: uint16[M, N]):
+        for row, column in allo.grid(M, N):
+            for depth in local_reduction(K):
+                result[row, column] += left[row, depth] * right[depth, column]
+        return unrelated
+
+    return contraction
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [make_direct, make_module, lambda: nested_dsl],
+    ids=["closure_imports", "closure_module", "allo_dsl_attribute"],
+)
+def test_closure_captures_and_the_dsl_submodule_follow_the_view(factory):
+    """The reviewer's round 104 probes (`reviewer-r104/probe_closures.py`):
+    a factory's locally imported ranges or module live in closure cells,
+    which the round 104 form reused unchanged, and ``allo.dsl.grid``
+    escaped through the module view's delegation.  Both now follow the
+    view through ``allo.compile``'s functional route."""
+    workload = factory()
+    result = _run_functional(workload)
+    np.testing.assert_array_equal(result, np.full((M, N), K, dtype=np.uint16))
+    assert allo.grid is ORIGINAL_GRID and allo_dsl.reduction is ORIGINAL_REDUCTION
+
+
+def test_closure_cells_are_fresh_and_unrelated_captures_are_kept():
+    workload = make_with_unrelated_capture()
+    original_cells = workload.__closure__
+    original_contents = [cell.cell_contents for cell in original_cells]
+    view = _scalar_loop_view(workload)
+    assert view.__closure__ is not original_cells
+    assert all(a is not b for a, b in zip(view.__closure__, original_cells))
+    # The original cells still hold the original range and the unrelated value.
+    assert [cell.cell_contents for cell in original_cells] == original_contents
+    assert ORIGINAL_REDUCTION in original_contents and UNRELATED in original_contents
+    rebound = {id(c.cell_contents) for c in view.__closure__}
+    assert id(UNRELATED) in rebound and id(ORIGINAL_REDUCTION) not in rebound
+    left, right, result = _inputs()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        assert view(left, right, result) is UNRELATED
+    np.testing.assert_array_equal(result, np.full((M, N), K, dtype=np.uint16))

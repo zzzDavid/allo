@@ -97,6 +97,14 @@ def _scalar_one_dimensional_range(*args, **_kwargs):
     return np.ndindex(*args)
 
 
+def _is_allo_loop_module(value) -> bool:
+    """Whether ``value`` is the ``allo`` package or its ``dsl`` module."""
+    import allo as allo_module
+    from allo import dsl as dsl_module
+
+    return value is allo_module or value is dsl_module
+
+
 class _ScalarLoopModuleView:
     """A read-only view of a module (``allo`` or ``allo.dsl``) whose ``grid``
     and ``reduction`` are the scalar-yielding ranges; every other attribute
@@ -110,10 +118,23 @@ class _ScalarLoopModuleView:
     def __getattr__(self, name):
         if name in ("grid", "reduction"):
             return _scalar_one_dimensional_range
-        return getattr(self._module, name)
+        value = getattr(self._module, name)
+        # ``allo.dsl.grid`` reaches the ranges through the submodule: the
+        # view is preserved through that access.
+        if _is_allo_loop_module(value):
+            return _ScalarLoopModuleView(value)
+        return value
 
     def __setattr__(self, name, value):
         raise AttributeError("the functional reference's module view is read-only")
+
+
+def _cell_is_bound(cell) -> bool:
+    try:
+        cell.cell_contents  # noqa: B018 - raises for an empty cell
+    except ValueError:
+        return False
+    return True
 
 
 def _scalar_loop_view(workload) -> Callable[..., Any]:
@@ -133,11 +154,13 @@ def _scalar_loop_view(workload) -> Callable[..., Any]:
     ``allo.dsl`` becomes a read-only view whose ``grid``/``reduction`` are
     the scalar ranges, and every name bound directly to those two
     functions (``from allo import grid, reduction``, ``reduction as red``)
-    becomes the scalar range.  No module attribute is mutated, so
-    concurrent compilation, other DSL execution and overlapping references
-    observe the original bindings.  Only the workload function's own
-    globals are rebound; a helper it calls iterates with its own module's
-    bindings."""
+    becomes the scalar range; the function's closure cells (a factory's
+    local imports) are rebound the same way into fresh cells, and the
+    ``dsl`` submodule reached through the view is a view too.  No module
+    attribute or original cell is mutated, so concurrent compilation, other
+    DSL execution and overlapping references observe the original bindings.
+    Only the workload function's own globals and closure are rebound; a
+    helper it calls iterates with its own module's bindings."""
     import types
 
     import allo as allo_module
@@ -157,12 +180,27 @@ def _scalar_loop_view(workload) -> Callable[..., Any]:
         id(dsl_module.grid),
         id(dsl_module.reduction),
     }
-    rebound_globals = dict(function.__globals__)
-    for name, value in list(rebound_globals.items()):
-        if value is allo_module or value is dsl_module:
-            rebound_globals[name] = _ScalarLoopModuleView(value)
-        elif id(value) in originals:
-            rebound_globals[name] = _scalar_one_dimensional_range
+
+    def rebind(value):
+        if _is_allo_loop_module(value):
+            return _ScalarLoopModuleView(value)
+        if id(value) in originals:
+            return _scalar_one_dimensional_range
+        return value
+
+    rebound_globals = {
+        name: rebind(value) for name, value in function.__globals__.items()
+    }
+    # Closure cells (a factory that imports ``grid``/``reduction`` or the
+    # module locally and returns the contraction) are rebound the same way
+    # into **fresh** cells; the original cells and every unrelated captured
+    # value are untouched.
+    rebound_closure = None
+    if function.__closure__:
+        rebound_closure = tuple(
+            types.CellType(rebind(cell.cell_contents)) if _cell_is_bound(cell) else cell
+            for cell in function.__closure__
+        )
     # ``functools.update_wrapper`` copies the name, docstring and attributes
     # of the source onto the rebound function (and records ``__wrapped__``).
     view = functools.update_wrapper(
@@ -171,7 +209,7 @@ def _scalar_loop_view(workload) -> Callable[..., Any]:
             rebound_globals,
             function.__name__,
             function.__defaults__,
-            function.__closure__,
+            rebound_closure,
         ),
         function,
     )
