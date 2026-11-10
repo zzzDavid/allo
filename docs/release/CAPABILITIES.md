@@ -236,16 +236,18 @@ without coefficients.
   normalized loop counter, a dense row-major flattening of several counters
   (`xs[p*Q + k]` with `Q` the trip count of `k`), and a result-loop counter
   plus a constant where the backend realizes result offsets (Samsung's
-  `W[row0 + i, k]`) or where the work grid tiles the result (every
-  multi-item kernel); refused, naming the function, operand, coordinate,
+  `W[row0 + i, k]`) or where the work grid's items are proven to tile the
+  realized result frontier (item `w` reads offset `w x extent` in work-id
+  order: the CENT rows' `lW[ch*ROWS + i, k]`); refused, naming the function, operand, coordinate,
   form and loop domain, are a stride on the innermost loop (`x[2*k]`,
   `range(0, K, 2)`), a padded flattening (`xs[p*32 + k]` with `k` to 64),
   an effective shift of a reduction loop (`x[k + 1]`, `W[i, k + 8]`,
   `range(128, K)`) and, on AiM and AttAcc (`REALIZES_RESULT_OFFSETS =
   False`: they stage one work item's rows from row zero), a single work
   item's result-loop offset (`range(16, 32)`, `W[16 + i, k]` with
-  `y[16 + i]`). Data-dependent coordinates stay with the backends' own
-  checks.
+  `y[16 + i]`) and a grid whose offsets do not tile the frontier
+  (`W[16 + ch*R + i, k]`, `W[ch*32 + i, k]` with 16-row items). Data-dependent
+  coordinates stay with the backends' own checks.
 
 - Source semantics the matcher enforces before any backend is consulted
   (C-02, C-14, C-17, C-19, C-20, C-21): every store of every work-item
