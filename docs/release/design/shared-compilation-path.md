@@ -30,10 +30,15 @@ through the same front stages (`allo/spmw_pipeline.py::normalize_source`):
 | storage orientation (AttAcc) | semantic incidence (which loops each input reads) comes from the facts; which input the datapath keeps in the banks is a candidate decision: one orientation when the roles come from index containment, both when the analysis stamps `matrix_by == "pattern_order"` (a GEMM), each with its own kernel extents and tilings, ranked by cost, forceable through `layout="attacc_gemv_transposed"`; the realization check follows the orientation (X-41) | `allo/pim/attacc_tiling.py::attacc_orientations`, `_oriented_extents`, `AttAccKernel.matrix`; `spmw_attacc.attacc_base_placement(target, matches, orientation)`, `attacc_orientation_of`; `spmw_autoschedule._attacc_enumerate` |
 | role analysis | operand index sets from the matcher's resolved coordinates (`OperandBinding.coords`), not raw index names; the two-sided tie stamped `matrix_by: pattern_order` so consumers can tell a convention from a derived role (round 94) | `spmw_match_engine.operand_index_terms`, `_axis_roles`; `aim_lowering.mac_operands` reads the same sets |
 
-Open under X-41: the AiM tie orientation is still the pattern's order (every
-paper row is a containment case); making it a cost decision like AttAcc's is
-the next increment; the layout problem's opaque-index rule still reads the
-naming.
+Round 100 (X-41 closed): `spmw_match_engine.contraction_orientations` is the
+one shared statement of a contraction's storage orientations (the roles' one;
+under a `pattern_order` tie also the alternative with the result loops
+re-split from the operands' resolved coordinates and the flipped work axis).
+AiM enumerates one layout set per orientation (`aim_bank_operand=<memref>`
+families, `+transposed` modes) and its shape derivation, effects, program
+derivation and realization check read the candidate's `aim_orientation`;
+AttAcc delegates to the same helper; the layout problem's opaque-coordinate
+resolver relies on its structural conditions, not the `matrix` name.
 
 ### Round 13: both APUs' plans are candidates of the common selection stage
 
