@@ -5,6 +5,7 @@
 import subprocess
 import shutil
 import tempfile
+from pathlib import Path
 
 import allo
 import numpy as np
@@ -335,3 +336,33 @@ def test_wide_index_cast_of_an_address_temporary_is_exact():
     out = np.zeros(16, np.int64)
     artifact.compile()(a.copy(), out)
     assert out.tolist() == [0] * 8 + [3 * v for v in range(8, 16)]
+
+
+def test_compiled_module_lifecycle_close_is_idempotent_and_use_after_close_is_refused(
+    tmp_path, monkeypatch
+):
+    """P-27 (release): the module executes, ``close`` unloads the library and
+    removes the scratch directory, a second ``close`` is a no-op, and a call
+    after ``close`` raises instead of invoking an unloaded pointer."""
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    tempfile.tempdir = None  # re-read TMPDIR
+
+    def add_one(a: int32[4], b: int32[4]):
+        for i in range(4):
+            b[i] = a[i] + 1
+
+    module = emit_c_from_mlir(allo.customize(add_one).module, "add_one").compile()
+    scratch = Path(module._tmpdir.name)
+    assert scratch.is_dir() and not module.closed
+    a = np.array([1, 2, 3, 4], dtype=np.int32)
+    b = np.zeros_like(a)
+    module(a, b)
+    np.testing.assert_array_equal(b, a + 1)
+    module.close()
+    assert module.closed and not scratch.exists()
+    module.close()  # idempotent
+    assert module.closed
+    with pytest.raises(PortableCError, match="is closed"):
+        module(a, b)
+    np.testing.assert_array_equal(b, a + 1)  # untouched by the refused call
+    tempfile.tempdir = None

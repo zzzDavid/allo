@@ -516,8 +516,17 @@ class CompiledCModule:
         )
 
     def close(self):
-        """Unload the compiled library and remove its scratch directory."""
+        """Unload the compiled library and remove its scratch directory.
+
+        Idempotent; after it the module cannot be called (``PortableCError``),
+        since its function pointer refers to the unloaded library."""
         self._finalizer()
+        self.function = None
+        self.library = None
+
+    @property
+    def closed(self) -> bool:
+        return not self._finalizer.alive
 
     @staticmethod
     def _dtype(argument: CArgument) -> np.dtype:
@@ -529,6 +538,11 @@ class CompiledCModule:
             ) from error
 
     def __call__(self, *inputs):
+        if self.closed:
+            raise PortableCError(
+                f"compiled module {self.artifact.top_func_name!r} is closed: its "
+                "library was unloaded; compile the artifact again to run it"
+            )
         source_arguments = [
             argument
             for argument in self.artifact.arguments
