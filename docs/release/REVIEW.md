@@ -2986,8 +2986,15 @@ confirmation campaign was launched there from the same wheel as its
 validation session, under the rule as written in round 78: three sessions
 pooled with the round 106 session, the status then fixed.  I did not run
 the campaign earlier at a non-final candidate, and I will not add sessions
-after it.  NOT READY: the campaign's result, the Gemini-I rows and the
-APU v1 installed execution remain outstanding.
+after it.  The campaign completed in the same round (three PASS sessions, 840
+exact launches, one program per row): pooled with the validation session,
+gemm is OPEN (nominal) at 1.0009 and mvt OPEN (nominal) at
+1.0001, both fixed by the rule; batched_gemm, gesummv and
+bicg are REPRODUCED.  mvt had been REPRODUCED in the single validation
+session; the pooled statistic decides and is what I record.  The required
+set stands at 50 REPRODUCED, 5 OPEN.  NOT READY: the Gemini-I rows and the
+APU v1 installed execution remain outstanding, and gemm and mvt stay open
+unless a production repair with a stated cause resolves them.
 
 ## Rejected shortcuts
 
@@ -3059,13 +3066,13 @@ from a candidate containing `aae8b23`; G10 on its narrowed required scope (user,
 the three Gemini-I rows kmeans, linear regression and word count (X-22 /
 X-23, nominal at `472bec9`, no complete session since; their bounded
 confirmation campaign reserved for the final candidate) and the Gemini-II
-gemm row (X-34, OPEN (nominal) at the named candidate `b994fc0` in its one
-pre-registered session, round 106, 1.0015 with the paper's value inside
-the IQR; OPEN (regression) at `fdee44b` (1.0048) and at `f6b19bd`,
-reproduced at four earlier revisions; the bounded confirmation campaign
-with X-37 is the only further measurement), the Gemini-II batched_gemm,
-gesummv, bicg and mvt rows REPRODUCED at `b994fc0` (round 106, 210 of 210
-launches exact, the card tests 15 passed from the same wheel), the AiM,
+gemm and mvt rows (X-34 / X-37: at the final compiler candidate `b994fc0`
+the pre-registered confirmation campaign ran in round 107 and, pooled
+with the round 106 validation session, fixed both as OPEN (nominal) at
+1.0009 and 1.0001, every output exact, no
+further sessions), the Gemini-II batched_gemm, gesummv and bicg rows
+REPRODUCED on the same pooled samples (the card tests 15 passed from the
+same wheel), the AiM,
 Samsung, UPMEM and AttAcc rows REPRODUCED from the `b994fc0` wheel
 outside the checkout in round 106 (the golden and `paper_full` rows, the
 Samsung conductor runs through the bundled simulator built from the
