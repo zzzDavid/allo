@@ -881,18 +881,20 @@ def derive_layout_problem(target, matches, *, bound_cost=None) -> DerivedLayoutP
 def _resolve_opaque(match, op, memref, coords, parsed, opaque, loop_pos, assumptions):
     """Resolve a contraction matrix row retained only as an SSA name.
 
-    Applies only when: the operand is the matcher's ``matrix`` input of an
-    accumulation with resolved axis roles and a zero-initialized scalar
+    Applies only when: the operand is an input (not the carried accumulator)
+    of an accumulation with resolved axis roles and a zero-initialized scalar
     accumulator; the opaque value is one whole coordinate; the operand's other
-    coordinates are exactly the reduction loops; and the accumulator has a
-    single one-coordinate output sink.  The coordinate then equals the sink
-    row.  Anything else is rejected.
+    coordinates are exactly the reduction loops (so the operand is the one
+    that carries the result row, whichever input the roles happen to name
+    ``matrix``, release ledger X-41); and the accumulator has a single
+    one-coordinate output sink.  The coordinate then equals the sink row,
+    proven by the matcher's resolved output map.  Anything else is rejected.
     """
 
     roles = match.extra.get("axis_roles") or {}
     names = sorted({name for _i, name in opaque})
     reason = f"{memref}: index {names} is an SSA value the matcher does not retain"
-    if op is None or op.is_loop_carried or roles.get("matrix") != op.role:
+    if op is None or op.is_loop_carried:
         raise LayoutDerivationError(reason)
     if (
         roles.get("unresolved") is not None

@@ -801,7 +801,9 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     return candidates
 
 
-def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
+def _aim_layout_candidates(
+    target, matches: list[MatchedOp], orientation=None
+) -> list[Placement]:
     """Construct the analyzable SBK and ABK layouts for SK-Hynix AiM.
 
     Per spec 013 §D.1, the AiM A/B choice is "does the layout factor `bank`
@@ -826,7 +828,7 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
             "aim enumerator: trace is missing one of x/y/acc roles; "
             f"got {sorted(role_to_memref)}"
         )
-    matrix, vector = mac_operands(mac_matches[0])
+    matrix, vector = mac_operands(mac_matches[0], orientation)
     x_mref = matrix.memref_name
     y_mref = vector.memref_name
     input_source = "banks" if x_mref == y_mref else "gb"
@@ -906,7 +908,7 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
     # The contraction shape rides on every base layout, so a placement passed
     # as ``layout=`` is priced by the same lowered-record cost program as an
     # enumerated (knob-crossed) one.
-    shape = _aim_contraction_shape(matches)
+    shape = _aim_contraction_shape(matches, orientation)
     # Banks one SBK launch visits (AimCtx._sbk_banks order), for the cost.
     sbk_banks = []
     for work_bank in range(single_bank_layout.size_of("work_bank")):
@@ -952,7 +954,7 @@ def _aim_layout_candidates(target, matches: list[MatchedOp]) -> list[Placement]:
     return layouts
 
 
-def _aim_contraction_shape(matches: list[MatchedOp]) -> dict:
+def _aim_contraction_shape(matches: list[MatchedOp], orientation=None) -> dict:
     """Shape of the bucket's first MAC match, as the knobs and cost see it.
 
     Replication comes from the group stamp of ``rank_matcher_placements``;
@@ -982,6 +984,7 @@ def _aim_contraction_shape(matches: list[MatchedOp]) -> dict:
         mac,
         replicated=replicated,
         replicas=buckets if replicated else 1,
+        orientation=orientation,
     )
     acc = next(op for op in mac.operands if op.role == "acc")
     shape["activation"] = any(
@@ -1060,11 +1063,26 @@ def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
 
     names = {match.target_op_name for match in matches}
     if "MAC" in names:
-        shape = _aim_contraction_shape(matches)
+        from .spmw_match_engine import contraction_orientations
+
+        mac = next(match for match in matches if match.target_op_name == "MAC")
         bases = []
-        for candidate in _aim_layout_candidates(target, matches):
-            candidate.extra["aim_shape"] = dict(shape)
-            bases.append(candidate)
+        # One set of layouts per storage orientation: a two-sided tie (a
+        # GEMM, a batched GEMV) is enumerated with either input resident in
+        # the banks, each with its own shape, priced and ranked (X-41);
+        # ``layout="aim_bank_operand=<memref>"`` forces one.
+        for orientation in contraction_orientations(mac):
+            shape = _aim_contraction_shape(matches, orientation)
+            family = f"aim_bank_operand={orientation['matrix']}"
+            for candidate in _aim_layout_candidates(target, matches, orientation):
+                candidate.extra["aim_shape"] = dict(shape)
+                candidate.extra["aim_orientation"] = dict(orientation)
+                candidate.extra["candidate_families"] = tuple(
+                    candidate.extra.get("candidate_families", ())
+                ) + (family,)
+                if orientation["by"] == "alternative":
+                    candidate.mode = f"{candidate.mode}+transposed"
+                bases.append(candidate)
         role_to_memref = _trace_memrefs_by_role(
             [match for match in matches if match.target_op_name == "MAC"]
         )

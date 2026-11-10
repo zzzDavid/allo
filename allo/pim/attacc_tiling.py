@@ -185,29 +185,22 @@ def attacc_orientations(matches) -> list[dict]:
     macs = [match for match in matches if match.target_op_name == "MAC"]
     if len(macs) != 1:
         return [{"by": "roles"}]
-    match = macs[0]
-    roles = match.extra.get("axis_roles") or {}
-    by_role = {op.role: op for op in match.operands}
-    matrix_role, vector_role = roles.get("matrix"), roles.get("vector")
-    if matrix_role not in by_role or vector_role not in by_role:
-        return [{"by": "roles"}]
-    first = {
-        "matrix": by_role[matrix_role].memref_name,
-        "vector": by_role[vector_role].memref_name,
-        "matrix_role": matrix_role,
-        "vector_role": vector_role,
-        "by": "roles",
-    }
-    if roles.get("matrix_by") != "pattern_order" or roles.get("same_buffer"):
-        return [first]
-    second = {
-        "matrix": by_role[vector_role].memref_name,
-        "vector": by_role[matrix_role].memref_name,
-        "matrix_role": vector_role,
-        "vector_role": matrix_role,
-        "by": "alternative",
-    }
-    return [first, second]
+    from ..spmw_match_engine import contraction_orientations
+
+    out = []
+    for orientation in contraction_orientations(macs[0]):
+        if orientation.get("matrix_role") is None:
+            return [{"by": "roles"}]
+        out.append(
+            {
+                "matrix": orientation["matrix"],
+                "vector": orientation["vector"],
+                "matrix_role": orientation["matrix_role"],
+                "vector_role": orientation["vector_role"],
+                "by": orientation["by"],
+            }
+        )
+    return out
 
 
 def _oriented_extents(match, roles, orientation) -> tuple[int, int, int]:

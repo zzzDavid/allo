@@ -123,8 +123,13 @@ def aim_candidate_effects(target, matches, placement):
             instances = extent if instances is None else instances
             reduction = red if reduction is None else reduction
             init = fact.accumulator_init
-            matrix = fact.matrix.memref_name if fact.matrix is not None else None
-            vector = fact.vector.memref_name if fact.vector is not None else None
+            orientation = extra.get("aim_orientation") or {}
+            matrix = orientation.get("matrix") or (
+                fact.matrix.memref_name if fact.matrix is not None else None
+            )
+            vector = orientation.get("vector") or (
+                fact.vector.memref_name if fact.vector is not None else None
+            )
             for access in fact.inputs:
                 memref = access.memref_name
                 if memref is None or memref in inputs:
@@ -1868,12 +1873,16 @@ class _AimProgramDerivation:
                 for match in reps:
                     if match.target_op_name != "MAC":
                         continue
+                    orientation = (getattr(placement, "extra", None) or {}).get(
+                        "aim_orientation"
+                    )
                     shape = contraction_shape(
                         match,
                         replicated=replicated,
                         replicas=group.replicas,
+                        orientation=orientation,
                     )
-                    matrix, vector = mac_operands(match)
+                    matrix, vector = mac_operands(match, orientation)
                     acc = next(op for op in match.operands if op.role == "acc")
                     activation = any(
                         other.target_op_name == "AF"
@@ -1891,7 +1900,7 @@ class _AimProgramDerivation:
                         "shape": shape,
                         "activation": activation,
                         "mapping": mapping,
-                        "axes": matrix_axes(match),
+                        "axes": matrix_axes(match, orientation),
                         "matrix": self._key(matrix.value_ref, matrix.memref_name),
                     }
                     group.contractions.append(contraction)

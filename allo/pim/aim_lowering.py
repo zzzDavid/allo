@@ -2061,13 +2061,18 @@ def _memref_shape(type_text: str | None) -> tuple[int, ...]:
     return tuple(dims)
 
 
-def mac_operands(match):
+def mac_operands(match, orientation=None):
     """Return ``(matrix, vector)`` operand bindings of one MAC match.
 
-    The matrix is the bank-resident operand.  It is the input whose index set
+    The matrix is the bank-resident operand.  Under an explicit
+    ``orientation`` (`spmw_match_engine.contraction_orientations`, carried by
+    the candidate as ``extra["aim_orientation"]``) it is the operand of the
+    orientation's ``matrix_role``.  Otherwise it is the input whose index set
     strictly contains the other input's (``K[h, s, d]`` over ``q[h, d]``,
-    ``W[i, j]`` over ``x[j]``); otherwise the pattern's ``x`` role.  When both
-    roles bind one memref, both entries are that operand.
+    ``W[i, j]`` over ``x[j]``); otherwise the pattern's ``x`` role (the
+    roles' convention; a two-sided tie is enumerated in both orientations by
+    the AiM enumerator, release ledger X-41).  When both roles bind one
+    memref, both entries are that operand.
     """
     roles = {operand.role: operand for operand in match.operands}
     x_operand, y_operand = roles.get("x"), roles.get("y")
@@ -2077,6 +2082,10 @@ def mac_operands(match):
         )
     if x_operand.memref_name == y_operand.memref_name:
         return x_operand, y_operand
+    if orientation is not None and orientation.get("matrix_role") in roles:
+        matrix = roles[orientation["matrix_role"]]
+        vector = roles[orientation["vector_role"]]
+        return matrix, vector
     # The same index sets the shared role analysis reads (resolved
     # coordinates, so an SSA row coordinate counts as its loop variable).
     from ..spmw_match_engine import operand_index_terms
@@ -2117,7 +2126,9 @@ def program_scalar_macs(match) -> int:
     return per_item * _work_items(match)
 
 
-def contraction_shape(match, *, replicated: bool, replicas: int) -> dict:
+def contraction_shape(
+    match, *, replicated: bool, replicas: int, orientation=None
+) -> dict:
     """Shape of one AiM contraction from one bucket's MAC match.
 
     Axis roles come from the matcher-stamped ``extra['axis_roles']`` (see
@@ -2156,9 +2167,18 @@ def contraction_shape(match, *, replicated: bool, replicas: int) -> dict:
             f"AiM {match.func_name}: the output map is not the identity the "
             f"lowering realizes: {problem}"
         )
-    matrix, vector = mac_operands(match)
+    matrix, vector = mac_operands(match, orientation)
     same_buffer = matrix.memref_name == vector.memref_name
-    if not same_buffer and matrix.role != roles["matrix"]:
+    if orientation is not None:
+        # The candidate's orientation names the output and batch loops and
+        # the partitioned axis under it (`contraction_orientations`).
+        roles = dict(
+            roles,
+            output=tuple(orientation.get("output", roles["output"])),
+            batch=tuple(orientation.get("batch", roles["batch"])),
+            work_axis=orientation.get("work_axis", roles.get("work_axis")),
+        )
+    elif not same_buffer and matrix.role != roles["matrix"]:
         raise ValueError(
             f"AiM {match.func_name}: matrix operand {matrix.role!r} differs from "
             f"the matcher's {roles['matrix']!r}"
@@ -2537,9 +2557,9 @@ def resolve_batch_mapping(shape: dict, requested) -> str:
     return "row_packed"
 
 
-def matrix_axes(match) -> list[str]:
+def matrix_axes(match, orientation=None) -> list[str]:
     """Role of each matrix dimension: ``reduction``, ``batch`` or ``output``."""
-    matrix, vector = mac_operands(match)
+    matrix, vector = mac_operands(match, orientation)
     reduction_var = match.enclosing_loops[-1][0]
     same_buffer = matrix.memref_name == vector.memref_name
     roles = []

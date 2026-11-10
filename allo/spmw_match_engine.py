@@ -2425,6 +2425,66 @@ def operand_index_terms(operand, loop_vars) -> tuple[set, list]:
     return variables, opaque
 
 
+def contraction_orientations(match: MatchedOp) -> list[dict]:
+    """The storage orientations of one contraction: which input a backend may
+    keep resident as the matrix and which it streams as the vector.
+
+    The shared roles name the matrix by index containment (``K[h, s, d]``
+    over ``q[h, d]``, ``W[i, k]`` over ``x[k]``); that is the one orientation.
+    When neither input's index set contains the other's (a GEMM or a batched
+    GEMV: each input reads the reduction loop and its own result loops), the
+    analysis stamps ``matrix_by == "pattern_order"`` and the naming is a
+    convention, not a storage decision (release ledger X-41): both
+    orientations are legal realizations of the same contraction, so a
+    backend enumerates both as candidates.  Each entry: the operand roles
+    and memrefs, the result loops that are ``output`` (indexing the matrix)
+    and ``batch`` (indexing the vector) under that orientation, the
+    ``work_axis`` the work grid partitions under it, and ``by`` (``roles``
+    or ``alternative``).  A match without resolved roles or with one shared
+    buffer has the roles' orientation only."""
+    roles = match.extra.get("axis_roles") or {}
+    by_role = {op.role: op for op in match.operands}
+    matrix_role, vector_role = roles.get("matrix"), roles.get("vector")
+    base = {
+        "matrix_role": matrix_role,
+        "vector_role": vector_role,
+        "matrix": getattr(by_role.get(matrix_role), "memref_name", None),
+        "vector": getattr(by_role.get(vector_role), "memref_name", None),
+        "output": tuple(roles.get("output", ())),
+        "batch": tuple(roles.get("batch", ())),
+        "work_axis": roles.get("work_axis"),
+        "by": "roles",
+    }
+    if (
+        matrix_role not in by_role
+        or vector_role not in by_role
+        or roles.get("unresolved") is not None
+        or roles.get("same_buffer")
+        or roles.get("matrix_by") != "pattern_order"
+    ):
+        return [base]
+    loop_vars = [loop[0] for loop in match.enclosing_loops]
+    new_vector = by_role[matrix_role]
+    vector_vars, _opaque = operand_index_terms(new_vector, set(loop_vars))
+    result_vars = [
+        var for var in loop_vars if var in set(base["output"]) | set(base["batch"])
+    ]
+    batch = tuple(var for var in result_vars if var in vector_vars)
+    output = tuple(var for var in result_vars if var not in vector_vars)
+    flipped = {"output": "batch", "batch": "output"}
+    alternative = {
+        "matrix_role": vector_role,
+        "vector_role": matrix_role,
+        "matrix": by_role[vector_role].memref_name,
+        "vector": by_role[matrix_role].memref_name,
+        "output": output,
+        "batch": batch,
+        "work_axis": flipped.get(roles.get("work_axis"), roles.get("work_axis")),
+        "by": "alternative",
+    }
+    return [base, alternative]
+
+
 def _axis_roles(match: MatchedOp) -> dict:
     """Structural role of every enclosing loop of one accumulating match.
 
