@@ -21,8 +21,17 @@ compiled = allo.compile(aim_gemv, build_aim_target(), aim_cost, reduction_order=
 rng = np.random.default_rng(1)
 W = (rng.standard_normal((M, K)) * 0.1).astype(np.float32); x = (rng.standard_normal(K) * 0.1).astype(np.float32)
 y = np.full(M, 7.0, np.float32)
+W0, x0 = W.copy(), x.copy()
 r = compiled(W, x, y)
 print("aim_root", spmw_simenv.aim_root())
 print("RunResult kind", r.kind, "backend", r.backend, "cycles", r.cycles, "outputs", r.outputs, "y untouched", bool(np.all(y == 7.0)))
+# Contract (round 108): the AiM route is timing-only on Ramulator2: kind "simulator-timing-only",
+# backend "aim", a positive integer cycle count, no outputs, and every caller array unchanged.
+assert spmw_simenv.aim_root() is not None, "no AiM simulator root"
+assert r.kind == "simulator-timing-only" and r.backend == "aim", (r.kind, r.backend)
+assert isinstance(r.cycles, int) and r.cycles > 0, r.cycles
+assert r.outputs == {}, r.outputs
+assert np.all(y == 7.0) and np.array_equal(W, W0) and np.array_equal(x, x0), "a timing-only run must not write any caller array"
 (k,) = compiled.placement_ranking.kernels
 print("chosen", k.scores[k.chosen_position] if hasattr(k, "chosen_position") else None)
+print("AIM_CHECK_OK")

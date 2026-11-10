@@ -21,3 +21,11 @@ y = np.full(M, 123456, np.int32)
 r = compiled(W, x, y)
 exact = bool(np.array_equal(y, (W.astype(np.int64) @ x.astype(np.int64)).astype(np.int32)))
 print("RunResult kind", r.kind, "backend", r.backend, "cycles", r.cycles, "exact", exact, "sdk_build", r.extra.get("sdk_build"))
+# Contract (round 108): the program executed on the UPMEM simulator (kind "simulator", backend
+# "upmem", a positive integer cycle count, per-segment execution records present) and the int32
+# outputs are exact.
+assert r.kind == "simulator" and r.backend == "upmem", (r.kind, r.backend)
+assert isinstance(r.cycles, int) and r.cycles > 0, r.cycles
+assert r.extra.get("upmem"), "no UPMEM execution records"
+assert exact, "UPMEM outputs are not exact"
+print("UPMEM_CHECK_OK")

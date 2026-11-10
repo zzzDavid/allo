@@ -11,3 +11,12 @@ r = compiled(W, x, y)
 err = np.abs(y.astype(np.float32) - W.astype(np.float32) @ x.astype(np.float32)).max()
 print("pimsim_root", spmw_simenv.pimsim_root())
 print("RunResult kind", r.kind, "cycles", r.cycles, "max abs err", float(err))
+# Contract (round 108): the program executed on the Samsung simulator (kind "simulator", a
+# positive integer cycle count from the conductor) and the simulated FP16 output matches the
+# float32 reference at the tolerance the Samsung suites use (rtol=1e-2, atol=1e-2;
+# tests/pim/samsung_hbm_pim/test_samsung_conductor_runs.py, tests/pim/test_paper_golden.py).
+assert spmw_simenv.pimsim_root() is not None, "no Samsung simulator root"
+assert r.kind == "simulator", r.kind
+assert isinstance(r.cycles, int) and r.cycles > 0, r.cycles
+np.testing.assert_allclose(y.astype(np.float32), W.astype(np.float32) @ x.astype(np.float32), rtol=1e-2, atol=1e-2)
+print("FRESH_SIM_CHECK_OK")

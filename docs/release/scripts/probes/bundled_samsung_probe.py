@@ -48,5 +48,6 @@ print("run %.1f s" % (time.time() - t0), "cycles", result.cycles, "max abs err %
       "conductor pimcmdgen_calls", result.extra["conductor"].get("pimcmdgen_calls"),
       "driver", result.extra.get("simulator", {}).get("pim_driver") if isinstance(result.extra.get("simulator"), dict) else "")
 assert err < 0.02, err
+assert result.kind == "simulator" and isinstance(result.cycles, int) and result.cycles > 0, (result.kind, result.cycles)
 assert result.extra["conductor"]["pimcmdgen_calls"] == 0
 print("BUNDLED_ROUTE_OK cycles", result.cycles)
