@@ -34,12 +34,13 @@ runtime and for inspection.
 
 from __future__ import annotations
 
-import contextlib
+import functools
 import hashlib
 import importlib
 import json
+import operator
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -87,41 +88,95 @@ _APU_V1_PHYSICAL_METADATA_FIELDS = (
 )
 
 
-@contextlib.contextmanager
-def _scalar_one_dimensional_loops():
-    """Run Allo DSL source as Python with scalar induction variables for
-    one-dimensional ``allo.grid`` / ``allo.reduction`` ranges.
+def _scalar_one_dimensional_range(*args, **_kwargs):
+    """Python iteration of an Allo loop range for the functional reference:
+    a one-dimensional range yields the integer (``for k in reduction(K)``),
+    a multi-dimensional one the ``np.ndindex`` tuple the source unpacks."""
+    if len(args) == 1 and not isinstance(args[0], (tuple, list)):
+        return iter(range(int(args[0])))
+    return np.ndindex(*args)
 
-    The DSL's Python fallbacks return ``np.ndindex``, whose items are tuples
-    (``(k,)`` for a 1-D range).  Multi-dimensional ranges keep their tuples
-    (``for i, j in allo.grid(M, N)`` unpacks them); a 1-D range yields the
-    integer, so ``W[i, k]`` indexes one element and the accumulated value is
-    a scalar the source's store accepts on every NumPy version (V1-19).
-    Only the functional host reference uses this; compilation reads the
-    retained MLIR, never this execution."""
-    import allo as _allo
-    from allo import dsl as _dsl
 
-    def _range(*args, **_kwargs):
-        if len(args) == 1 and not isinstance(args[0], (tuple, list)):
-            return iter(range(int(args[0])))
-        return np.ndindex(*args)
+class _ScalarLoopModuleView:
+    """A read-only view of a module (``allo`` or ``allo.dsl``) whose ``grid``
+    and ``reduction`` are the scalar-yielding ranges; every other attribute
+    is the module's own.  The module itself is never modified."""
 
-    saved = {}
-    for module, name in (
-        (_allo, "grid"),
-        (_allo, "reduction"),
-        (_dsl, "grid"),
-        (_dsl, "reduction"),
-    ):
-        if hasattr(module, name):
-            saved[(module, name)] = getattr(module, name)
-            setattr(module, name, _range)
-    try:
-        yield
-    finally:
-        for (module, name), value in saved.items():
-            setattr(module, name, value)
+    __slots__ = ("_module",)
+
+    def __init__(self, module):
+        object.__setattr__(self, "_module", module)
+
+    def __getattr__(self, name):
+        if name in ("grid", "reduction"):
+            return _scalar_one_dimensional_range
+        return getattr(self._module, name)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("the functional reference's module view is read-only")
+
+
+def _scalar_loop_view(workload) -> Callable[..., Any]:
+    """The source workload rebound to a copy of its own globals in which every
+    binding of Allo's ``grid`` / ``reduction`` yields scalars for
+    one-dimensional ranges (V1-19).
+
+    Allo's ``grid`` and ``reduction`` return ``np.ndindex`` when the source
+    runs as plain Python, so a one-dimensional induction variable is a
+    tuple; inside a multi-dimensional access (``W[i, k]`` with ``k ==
+    (5,)``) NumPy treats it as a sequence index, the product becomes a
+    one-element array, and NumPy 2.4+ refuses to store it into a scalar
+    element (earlier versions warned).  The reference therefore runs the
+    workload with the loops' own meaning, scalar counters for one
+    dimension, and does so **locally**: the function's globals are copied
+    and, in the copy, every name bound to the module ``allo`` or
+    ``allo.dsl`` becomes a read-only view whose ``grid``/``reduction`` are
+    the scalar ranges, and every name bound directly to those two
+    functions (``from allo import grid, reduction``, ``reduction as red``)
+    becomes the scalar range.  No module attribute is mutated, so
+    concurrent compilation, other DSL execution and overlapping references
+    observe the original bindings.  Only the workload function's own
+    globals are rebound; a helper it calls iterates with its own module's
+    bindings."""
+    import types
+
+    import allo as allo_module
+    from allo import dsl as dsl_module
+
+    function = workload
+    while hasattr(function, "__wrapped__"):
+        function = function.__wrapped__
+    if not isinstance(function, types.FunctionType):
+        raise RuntimeError(
+            "the APU v1 functional model runs the source workload as a Python "
+            f"function; got {type(workload).__name__}"
+        )
+    originals = {
+        id(getattr(allo_module, "grid", None)),
+        id(getattr(allo_module, "reduction", None)),
+        id(dsl_module.grid),
+        id(dsl_module.reduction),
+    }
+    rebound_globals = dict(function.__globals__)
+    for name, value in list(rebound_globals.items()):
+        if value is allo_module or value is dsl_module:
+            rebound_globals[name] = _ScalarLoopModuleView(value)
+        elif id(value) in originals:
+            rebound_globals[name] = _scalar_one_dimensional_range
+    # ``functools.update_wrapper`` copies the name, docstring and attributes
+    # of the source onto the rebound function (and records ``__wrapped__``).
+    view = functools.update_wrapper(
+        types.FunctionType(
+            function.__code__,
+            rebound_globals,
+            function.__name__,
+            function.__defaults__,
+            function.__closure__,
+        ),
+        function,
+    )
+    view.__kwdefaults__ = function.__kwdefaults__
+    return view
 
 
 @dataclass(frozen=True)
@@ -1002,18 +1057,12 @@ class APUv1VectorProgram:
                     "the APU v1 functional model executes the source workload on "
                     "the host; the compiled artifact carries no source workload"
                 )
-            # The source workload runs as plain Python.  Allo's ``grid`` and
-            # ``reduction`` iterate ``np.ndindex``, whose induction variable is
-            # a tuple even for one dimension; inside a multi-dimensional
-            # access (``W[i, k]`` with ``k == (5,)``) NumPy treats that tuple
-            # as a sequence index and the product becomes a one-element array,
-            # which NumPy 2.4+ refuses to store into a scalar element
-            # (release ledger V1-19; earlier NumPy only warned).  The
-            # functional reference therefore iterates one-dimensional ranges
-            # with scalar induction variables, exactly the source loops'
-            # meaning, while multi-dimensional ranges keep their tuples.
-            with _scalar_one_dimensional_loops():
-                returned = workload(**arguments)
+            # The source workload runs as plain Python with scalar induction
+            # variables for its one-dimensional loops, rebound locally to this
+            # call (`_scalar_loop_view`, release ledger V1-19).
+            # ``operator.call``: the view is built by ``types.FunctionType``,
+            # which static inference does not know to be callable.
+            returned = operator.call(_scalar_loop_view(workload), **arguments)
             numerics = (
                 "source order"
                 if not self.candidate.regroups
