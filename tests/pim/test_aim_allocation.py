@@ -145,32 +145,44 @@ def test_forced_a_resident_orientation_reserves_its_rows_too():
     _assert_within(regions, ranges)
 
 
-def _forced(compiled, substring):
+def _cheapest_candidate(compiled, bank_operand, knob):
+    """The cheapest priced candidate of the ranking that realizes ``knob``
+    with ``bank_operand`` resident (``None`` when the ranking has none)."""
     kernel = compiled.placement_ranking.kernels[0]
-    candidates = [pl for _pos, pl in kernel.candidates if substring in pl.mode]
-    assert candidates, substring
-    return candidates
+    score_of = {position: cycles for position, cycles, _mode in kernel.scores}
+    candidates = [
+        (score_of.get(position, 1 << 60), position, placement)
+        for position, placement in kernel.candidates
+        if knob in placement.mode
+        and placement.extra["aim_orientation"]["matrix"] == bank_operand
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[2]
 
 
+@pytest.mark.parametrize("bank_operand", ["a", "x"])
 @pytest.mark.parametrize("knob", ["batch_mapping=row_packed", "reduction_partitions=2"])
-def test_other_mappings_reserve_their_rows(knob):
-    """Row-packed and reduction-partitioned realizations of both orientations
-    (each candidate forced through ``layout=``) allocate what they address."""
+def test_other_mappings_reserve_their_rows(bank_operand, knob):
+    """Row-packed and reduction-partitioned realizations of **each**
+    orientation allocate what they address: the cheapest candidate of the
+    ranking carrying the knob with the given operand resident is forced
+    through ``layout=``; it must compile (no error is swallowed) and its
+    record's rows must lie in its region."""
     compiled = _compile(left)
-    seen = 0
-    for placement in _forced(compiled, knob)[:6]:
-        try:
-            forced = _compile(left, layout=[placement] * CH)
-        except Exception as error:  # noqa: BLE001 - an unrealizable knob mix
-            assert "realization" not in str(error).lower() or "reserved" not in str(
-                error
-            )
-            continue
-        regions, ranges = _rows(forced)
-        assert ranges
-        _assert_within(regions, ranges)
-        seen += 1
-    assert seen >= 1, knob
+    placement = _cheapest_candidate(compiled, bank_operand, knob)
+    assert placement is not None, (bank_operand, knob)
+    assert placement.extra["aim_orientation"]["matrix"] == bank_operand
+    forced = _compile(left, layout=[placement] * CH)
+    regions, ranges = _rows(forced)
+    assert ranges and knob in placement.mode
+    if knob == "batch_mapping=row_packed":
+        assert ranges[0][2] == "row_packed"
+    _assert_within(regions, ranges)
+    # The forced compile keeps the orientation it was given.
+    realized = forced.compiled.layout
+    realized = realized[0] if isinstance(realized, (list, tuple)) else realized
+    assert realized.extra["aim_orientation"]["matrix"] == bank_operand
 
 
 def test_two_live_bank_allocations_do_not_overlap():

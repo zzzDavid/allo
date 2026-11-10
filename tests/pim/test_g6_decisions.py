@@ -316,31 +316,103 @@ SAMSUNG_NO_FIBER_TERM = _rebound_cost(
 )
 
 
+def _samsung_residency(placement):
+    return set((placement.extra.get("grf_residency") or {}).values()) or {"crf"}
+
+
+def _samsung_scored(compiled):
+    """``position -> (cycles, placement)`` of every priced candidate."""
+    (kernel,) = compiled.placement_ranking.kernels
+    by_position = dict(kernel.candidates)
+    return {
+        position: (cycles, by_position[position])
+        for position, cycles, _mode in kernel.scores
+        if position in by_position
+    }
+
+
+def _samsung_units_per_channel(compiled):
+    """Work items sharing one pseudo-channel's column-command bus (the
+    inner extent of the work grid: ``mapping=[16, 8]`` puts eight items,
+    one per PIM unit, on a channel)."""
+    scope = compiled.trace.matches[0].extra["spmw_work_scope"]
+    return int(scope.group_shape[-1])
+
+
+def _samsung_odd_fiber_tiles(placement, program):
+    """Odd-fiber reduction tiles one work item pays `FIBER_TILE_CYCLES` for,
+    read from the candidate and its program exactly as the cost rule does
+    (`allo/pim/costs/samsung.py`, the MAC rule): one per tile fiber beyond the
+    first, plus one per tile when the tile rows are split across the fibers
+    (every tile's second row lives in the odd fiber)."""
+    extra = placement.extra or {}
+    later_fibers = max(0, int(extra.get("n_fibers", 1)) - 1)
+    split = extra.get("tile_rows") == "split_fibers"
+    return later_fibers + (int(program.k_tiles) if split else 0)
+
+
+def _samsung_host_fill_flip_factor(compiled):
+    """The smallest `HOST_BURST_CYCLES` at which the cheapest realizable
+    CRF-filled candidate undercuts the cheapest host-filled one, derived from
+    the stock ranking: a host fill broadcasts the eight GRF_A entries of a
+    work item at one burst each on the critical path, so each extra cycle per
+    burst adds eight cycles to a host-filled estimate while a CRF-filled
+    estimate does not read the constant.  Candidates whose tile rows are
+    split across the fibers have no CRF-filled variant (the realization
+    refuses them), so they are not the cheapest realizable CRF fill."""
+    scored = _samsung_scored(compiled)
+    host = min(c for c, pl in scored.values() if _samsung_residency(pl) == {"host"})
+    crf = min(
+        c
+        for c, pl in scored.values()
+        if _samsung_residency(pl) == {"crf"}
+        and (pl.extra or {}).get("tile_rows") != "split_fibers"
+    )
+    gap = crf - host
+    assert gap > 0, (host, crf)
+    return 1 + gap // 8 + 1, gap
+
+
 def test_samsung_host_fill_cost_flip_reaches_execution(
     samsung_sim_gate, record_property
 ):
     """Stock and perturbed cost programs select different placements; both
     execute correctly; a fixed layout compiles to the same program under both.
 
-    Stated before running (design/samsung-execution.md section 7.3, measured
-    4,389 versus 4,589 cycles at 4096x256): the calibrated program's choice
-    (bank_row, host fill) is faster in the simulator than the perturbed
-    program's choice (bank_row, CRF fill), so the perturbed preference
-    disagrees with the simulator.
+    Derived from the current model before running (S-17 restatement,
+    round 102): the stock selection is host-filled (since round 37
+    ``split_rows`` with the host GRF_A fill, the estimate including the
+    matrix staging share).  The cheapest CRF-filled candidates are the
+    split-row ones, 16 cycles dearer, but a split-row tile has no CRF-filled
+    variant (the realization refuses it), so the cheapest realizable CRF fill
+    is the ``bank_row``/``dual_fiber`` family, about 3,500 cycles dearer.  A
+    host fill costs eight bursts at ``HOST_BURST_CYCLES`` each on the
+    critical path, so the selection flips to that family once the constant
+    exceeds ``1 + gap // 8``; the round 36 ``x8`` perturbation (56 extra
+    cycles) can no longer flip it and is not what this test applies.  The
+    perturbation is a counterfactual, so the stock choice is predicted to be
+    faster in the simulator than the perturbed choice (previously measured
+    4,108 versus 4,589 cycles at 4096x256).
     """
     workload, M, K = _samsung_paper_gemv()
     target = build_samsung_target()
-    assert (
-        SAMSUNG_HOST_BUS_X8.bind(target).fingerprint
-        != samsung_cost.bind(target).fingerprint
-    )
     stock = allo.compile(workload, target, samsung_cost, **REASSOCIATE)
-    moved = allo.compile(workload, target, SAMSUNG_HOST_BUS_X8, **REASSOCIATE)
+    factor, gap = _samsung_host_fill_flip_factor(stock)
+    flip_cost = _rebound_cost(
+        samsung_cost,
+        samsung_costs,
+        f"samsung_cost_host_bus_x{factor}",
+        HOST_BURST_CYCLES=factor,
+    )
+    assert flip_cost.bind(target).fingerprint != samsung_cost.bind(target).fingerprint
+    moved = allo.compile(workload, target, flip_cost, **REASSOCIATE)
 
-    assert _samsung_placement(stock) == ("bank_row", {"host"})
-    assert _samsung_placement(moved) == ("bank_row", {"crf"})
+    assert _samsung_placement(stock)[1] == {"host"}
+    assert _samsung_placement(moved)[1] == {"crf"}
+    assert _samsung_placement(moved)[0] != "split_rows"
     stock_decision, moved_decision = _samsung_decision(stock), _samsung_decision(moved)
     assert stock_decision["crf"] != moved_decision["crf"]
+    # A CRF fill adds one FILL per fiber the program reads (two here).
     assert (
         moved_decision["opcodes"]["FILL"]
         == stock_decision["opcodes"].get("FILL", 0) + 2
@@ -360,27 +432,44 @@ def test_samsung_host_fill_cost_flip_reaches_execution(
         assert stock_rejected[position] == moved_rejected[position]
     assert stock_decision["chosen_position"] not in moved_rejected
     assert moved_decision["chosen_position"] not in stock_rejected
+    # The split-row CRF fills were cheaper than the chosen program under the
+    # perturbed model, were probed in cost order and were refused at
+    # realization: the flip lands on the cheapest realizable CRF fill.
+    moved_scored = _samsung_scored(moved)
+    cheaper_split_crf = [
+        position
+        for position, (cycles, pl) in moved_scored.items()
+        if _samsung_residency(pl) == {"crf"}
+        and (pl.extra or {}).get("tile_rows") == "split_fibers"
+        and cycles < moved.estimate().cycles
+    ]
+    assert cheaper_split_crf
+    assert all(position in moved_rejected for position in cheaper_split_crf)
 
     # A fixed layout: identical program under both cost programs, estimate
-    # moves (the vendor placement fills GRF_A from the host).
+    # moves by exactly the host fill's extra bursts (the vendor placement
+    # fills GRF_A from the host).
     vendor = spmw_samsung.samsung_vendor_gemv_layout(target, stock.trace)
     pinned = {
         name: allo.compile(
             workload, target, spec, layout=vendor, backend="virtual", **REASSOCIATE
         )
-        for name, spec in (("stock", samsung_cost), ("moved", SAMSUNG_HOST_BUS_X8))
+        for name, spec in (("stock", samsung_cost), ("moved", flip_cost))
     }
     pinned_decisions = {name: _samsung_decision(c) for name, c in pinned.items()}
     for key in ("kind", "lever", "program", "contraction", "crf", "opcodes", "layouts"):
         assert pinned_decisions["stock"][key] == pinned_decisions["moved"][key], key
-    assert pinned["moved"].estimate().cycles > pinned["stock"].estimate().cycles
+    assert (
+        pinned["moved"].estimate().cycles - pinned["stock"].estimate().cycles
+        == (factor - 1) * 8
+    )
 
     # Each cost program prices its own pick below the other's.
     cross = {
         "stock_pick_under_moved": allo.compile(
             workload,
             target,
-            SAMSUNG_HOST_BUS_X8,
+            flip_cost,
             layout=list(stock.compiled.layout),
             backend="virtual",
             **REASSOCIATE,
@@ -399,10 +488,12 @@ def test_samsung_host_fill_cost_flip_reaches_execution(
         .cycles,
     }
     assert stock.estimate().cycles < cross["moved_pick_under_stock"]
+    assert cross["moved_pick_under_stock"] - stock.estimate().cycles == gap
     # The CRF-filled program issues no host broadcast: its estimate does not
     # read the perturbed constant.
     assert cross["moved_pick_under_stock"] == moved.estimate().cycles
     assert moved.estimate().cycles < cross["stock_pick_under_moved"]
+    assert cross["stock_pick_under_moved"] - stock.estimate().cycles == (factor - 1) * 8
 
     seed = _seed()
     rng = np.random.default_rng(seed)
@@ -423,8 +514,18 @@ def test_samsung_host_fill_cost_flip_reaches_execution(
     record_property(
         "samsung_cost_flip",
         {
-            "stock": ("bank_row+host", stock.estimate().cycles, cycles["stock"]),
-            "moved": ("bank_row+crf", moved.estimate().cycles, cycles["moved"]),
+            "flip_factor": factor,
+            "gap": gap,
+            "stock": (
+                "+".join(_samsung_placement(stock)[0:1]) + "+host",
+                stock.estimate().cycles,
+                cycles["stock"],
+            ),
+            "moved": (
+                _samsung_placement(moved)[0] + "+crf",
+                moved.estimate().cycles,
+                cycles["moved"],
+            ),
             "cross_estimates": cross,
             "perturbed_matches_simulator": perturbed_matches_simulator,
         },
@@ -433,13 +534,19 @@ def test_samsung_host_fill_cost_flip_reaches_execution(
     assert not perturbed_matches_simulator
 
 
-def test_samsung_fiber_term_removal_keeps_bank_row_by_construction():
-    """Reasoned invariant: with the odd-fiber row-open term set to zero,
-    dual_fiber still issues every MAC column command of bank_row plus one more
-    JUMP, so no constant of the calibrated program ranks it first; the
-    estimate of bank_row (no odd-fiber tile) is unchanged and that of the
-    vendor dual_fiber program drops by exactly the removed term (one odd-fiber
-    tile per work item at K=256)."""
+def test_samsung_fiber_term_removal_moves_every_estimate_by_its_odd_fiber_tiles():
+    """Reasoned invariant (S-17 restatement, round 102): the odd-fiber
+    row-open term enters the MAC rule once per tile fiber beyond the first
+    and, for split tile rows, once per tile; a channel's units serialize on
+    its bus, so an estimate carries the term ``units x tiles`` times.
+    Setting the term to zero therefore lowers every candidate's estimate by
+    exactly ``FIBER_TILE_CYCLES x units x odd-fiber tiles``, derived from
+    the candidate (``n_fibers``, ``tile_rows``) and its program
+    (``k_tiles``); ``bank_row`` (no odd-fiber tile) is unchanged, the vendor
+    ``dual_fiber`` drops by one tile per unit, the default ``split_rows``
+    by three (one later fiber and two split tiles).  The ranking under the
+    zero-term program is the stock ranking shifted by those derived amounts,
+    and the selection stays the stock one (the shift favours it)."""
     workload, _M, _K = _samsung_paper_gemv()
     target = build_samsung_target()
     stock = allo.compile(
@@ -448,57 +555,85 @@ def test_samsung_fiber_term_removal_keeps_bank_row_by_construction():
     moved = allo.compile(
         workload, target, SAMSUNG_NO_FIBER_TERM, backend="virtual", **REASSOCIATE
     )
-    assert (
-        _samsung_placement(stock) == _samsung_placement(moved) == ("bank_row", {"host"})
+    units = _samsung_units_per_channel(stock)
+    term = samsung_costs.FIBER_TILE_CYCLES
+    (program,) = stock.compiled.layout_ctx.programs
+
+    assert _samsung_placement(stock) == _samsung_placement(moved)
+    assert _samsung_placement(stock)[0] == "split_rows"
+    stock_scored, moved_scored = _samsung_scored(stock), _samsung_scored(moved)
+    assert stock_scored.keys() == moved_scored.keys()
+    shifts = {}
+    for position, (cycles, placement) in stock_scored.items():
+        expected = cycles - term * units * _samsung_odd_fiber_tiles(placement, program)
+        shifts[position] = expected
+        assert moved_scored[position][0] == expected, (position, placement.mode)
+    chosen = stock.placement_ranking.kernels[0].chosen_position
+    assert moved.placement_ranking.kernels[0].chosen_position == chosen
+    selected = stock_scored[chosen][1]
+    assert _samsung_odd_fiber_tiles(selected, program) == 1 + program.k_tiles
+    assert stock.estimate().cycles - moved.estimate().cycles == term * units * (
+        1 + program.k_tiles
     )
-    assert stock.estimate().cycles == moved.estimate().cycles
+
+    def pinned(layout):
+        return {
+            spec.name: allo.compile(
+                workload, target, spec, layout=layout, backend="virtual", **REASSOCIATE
+            )
+            .estimate()
+            .cycles
+            for spec in (samsung_cost, SAMSUNG_NO_FIBER_TERM)
+        }
 
     vendor = spmw_samsung.samsung_vendor_gemv_layout(target, stock.trace)
-    estimates = {
-        spec.name: allo.compile(
-            workload, target, spec, layout=vendor, backend="virtual", **REASSOCIATE
-        )
-        .estimate()
-        .cycles
-        for spec in (samsung_cost, SAMSUNG_NO_FIBER_TERM)
-    }
-    assert (
-        estimates["samsung_cost"] - estimates["samsung_cost_no_fiber_term"]
-        == samsung_costs.FIBER_TILE_CYCLES
+    estimates = pinned(vendor)
+    assert estimates["samsung_cost"] - estimates["samsung_cost_no_fiber_term"] == (
+        term * units
     )
-    assert estimates["samsung_cost_no_fiber_term"] > moved.estimate().cycles
+    bank_row = next(
+        pl
+        for _cycles, pl in stock_scored.values()
+        if pl.mode.startswith("bank_row")
+        and _samsung_residency(pl) == {"host"}
+        and (pl.extra or {}).get("crf_issue") == "shared"
+        and not (pl.extra or {}).get("stage_resident")
+    )
+    n = stock.placement_ranking.kernels[0].bucket_count
+    estimates = pinned([bank_row] * n)
+    assert estimates["samsung_cost"] == estimates["samsung_cost_no_fiber_term"]
+    assert estimates["samsung_cost"] > moved.estimate().cycles
 
 
-def test_samsung_host_burst_cost_shows_the_documented_list_scheduling_anomaly():
-    """C-18: the Samsung estimate is not monotone in HOST_BURST_CYCLES (b),
-    and that is the evaluator's documented first-fit policy (Evaluator
-    docstring), not a priced effect. A channel's 8 PIM units each take a
-    4-cycle channel slot for LD_A, LD_B and MAC; the host GRF_A fill lasts
-    2 + 8*b cycles, so unit 0's LD_B slot opens at that cycle and units 0-5's
-    fill slots end at 24. At b=3 the remaining gap [24, 26) cannot hold unit
-    6's fill slot, which waits behind the six LD_B and MAC slots until 76
-    (estimate 275); at b=4 the gap [24, 34) holds units 6 and 7 (estimate
-    257). From b=4 on each extra burst cycle adds 8 (one per GRF_A entry
-    of the last unit's fill)."""
+def test_samsung_host_burst_cost_follows_the_documented_first_fit_schedule():
+    """C-18 restated (S-17, round 102): the shared evaluator places each
+    unit's LD_A fill slot first-fit (Evaluator docstring).  A channel's 8
+    PIM units each take a 4-cycle channel slot for LD_A, LD_B and MAC; the
+    host GRF_A fill lasts ``2 + 8*b`` cycles, so unit 0's LD_B slot opens at
+    that cycle and units 0-5's fill slots end at 24.  At ``b=3`` the gap
+    ``[24, 26)`` cannot hold unit 6's fill slot, which first-fits behind the
+    units' LD_B and MAC slots; at ``b=4`` the gap ``[24, 34)`` holds units 6
+    and 7 at 24 and 28.  Through round 36 that made the kernel estimate
+    non-monotone (275 at ``b=3``, 257 at ``b=4``, the anomaly C-18 records).
+    Since round 37 the estimate includes the matrix staging share, behind
+    which the delayed fills complete, so the total is monotone: each extra
+    burst cycle adds 8 (one per GRF_A entry of the last unit's fill).  Both
+    statements are checked on the default placement and on ``bank_row``."""
     workload, _M, _K = _samsung_paper_gemv()
     target = build_samsung_target()
     stock = allo.compile(
         workload, target, samsung_cost, backend="virtual", **REASSOCIATE
     )
-    layout = list(stock.compiled.layout)
-    estimates = {
-        b: allo.compile(
-            workload,
-            target,
-            _rebound_cost(
-                samsung_cost, samsung_costs, f"samsung_burst_{b}", HOST_BURST_CYCLES=b
-            ),
-            layout=layout,
-            backend="virtual",
-            **REASSOCIATE,
-        ).estimate()
-        for b in (3, 4, 5)
-    }
+    stock_scored = _samsung_scored(stock)
+    bank_row = next(
+        pl
+        for _cycles, pl in stock_scored.values()
+        if pl.mode.startswith("bank_row")
+        and _samsung_residency(pl) == {"host"}
+        and (pl.extra or {}).get("crf_issue") == "shared"
+        and not (pl.extra or {}).get("stage_resident")
+    )
+    n = stock.placement_ranking.kernels[0].bucket_count
 
     def fill_start(estimate, unit):
         (span,) = [
@@ -508,9 +643,37 @@ def test_samsung_host_burst_cost_shows_the_documented_list_scheduling_anomaly():
         ]
         return span.start_cycle
 
-    assert {b: e.cycles for b, e in estimates.items()} == {3: 275, 4: 257, 5: 265}
-    assert [fill_start(estimates[3], u) for u in (5, 6, 7)] == [20, 76, 80]
-    assert [fill_start(estimates[4], u) for u in (5, 6, 7)] == [20, 24, 28]
+    for name, layout in (
+        ("default", list(stock.compiled.layout)),
+        ("bank_row", [bank_row] * n),
+    ):
+        estimates = {
+            b: allo.compile(
+                workload,
+                target,
+                _rebound_cost(
+                    samsung_cost,
+                    samsung_costs,
+                    f"samsung_burst_{name}_{b}",
+                    HOST_BURST_CYCLES=b,
+                ),
+                layout=layout,
+                backend="virtual",
+                **REASSOCIATE,
+            ).estimate()
+            for b in (3, 4, 5)
+        }
+        cycles = {b: e.cycles for b, e in estimates.items()}
+        assert cycles[4] - cycles[3] == 8 and cycles[5] - cycles[4] == 8, (name, cycles)
+        # b=4: units 6 and 7 fit the gap after the first six fills.
+        assert [fill_start(estimates[4], u) for u in (5, 6, 7)] == [20, 24, 28], name
+        # b=3: unit 5 still fills at 20; units 6 and 7 first-fit behind the
+        # LD_B and MAC slots, well after the gap they no longer fit.
+        starts = [fill_start(estimates[3], u) for u in (5, 6, 7)]
+        assert starts[0] == 20 and starts[1] > 28 and starts[2] == starts[1] + 4, (
+            name,
+            starts,
+        )
 
 
 VA_N = 12288
