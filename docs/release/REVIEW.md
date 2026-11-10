@@ -2925,6 +2925,28 @@ outside the checkout with the bundled Samsung simulator and the shared
 paths executed), the hardware confirmations, the Gemini-I rows and the
 Gemini-II gemm regression remain open.
 
+## Round 105 (2026-11-10): V1-19 closed; the integration milestone begun at `f6b19bd`, and what it found
+
+With V1-19's last two forms closed, the named candidate `f6b19bd` went
+through the installed-artifact path the reviewer asked for: a wheel built
+from the commit, a clean venv outside the checkout, the Samsung simulator
+built from the wheel's own bundle and found with no variable, the shared
+paths executed (Samsung GEMV on that conductor, AiM timing through the
+native simulator, UPMEM through the native SDK, the golden rows with
+Samsung on the bundled build), and on `zhang-x4` a wheel, the card tests
+and the pre-registered session.  The milestone did what it is for: the
+card tests failed one typed program, because the round 99 bounds rule
+compared a flat view's extent with the first dimension (X-44), and the
+re-run of a same-buffer contraction showed the round 101 invariant had
+been refusing that family since round 101 because its slot footprint did
+not cover the launch rows (X-43's second family).  Both are repaired with
+their regressions; both were invisible to the suites the intervening
+rounds ran, which is the argument for the milestone.  The session itself
+reproduced four rows again and left gemm nominal (1.0033, the paper inside
+the IQR), recorded as such.  Because the repairs change shared code, the
+next commit is the candidate to validate: the card tests and a session on
+`zhang-x4`, the installed stages locally, at that revision.  NOT READY.
+
 ## Rejected shortcuts
 
 - Relabelling the Gemini-II emitted-only route as "functional-only" instead
