@@ -24,10 +24,11 @@ recursive-include allo/library/aie/modules *.py
 include allo/backend/aie/README.md
 recursive-include allo/pim/templates *
 
-# Simulator build recipes (docs/release/simulators.md). The Samsung-derived
-# PIMSimulator patches are not redistributable and must never be shipped.
+# Simulator build recipes (docs/release/simulators.md), including the bundled
+# Samsung PIMSimulator sources, their patches and NOTICE.md
+# (simulators/PIMSimulator/). The wheel carries the PIMSimulator recipe under
+# allo/pim/simulators/ (setup.py BuildPy).
 graft simulators
-prune simulators/PIMSimulator/patches
 
 # allo/_mlir is a symlink into the local CMake build (mlir/build); the sdist
 # rebuilds it instead of shipping a partial copy of one developer's build.

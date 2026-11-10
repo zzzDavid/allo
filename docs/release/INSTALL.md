@@ -17,7 +17,7 @@ What you need depends on what you want to run:
 | Goal | Needs |
 |---|---|
 | Compile, inspect, and get analytical estimates (`backend="virtual"`) for every PIM target | Allo + MLIR bindings only |
-| Samsung HBM-PIM simulation | + PIMSimulator at `3703d1f` with Tenon's overlay (`pim_driver`; section 3a) |
+| Samsung HBM-PIM simulation | + the bundled PIMSimulator (`pim_driver`), built with `python -m allo.pim.samsung_simulator build`; needs g++, SCons and `patch` (section 3a) |
 | SK hynix AiM timing simulation | + aim_simulator at `0f28a07` + a Docker image built from Tenon's Dockerfile (section 3a) |
 | UPMEM simulation | + uPIMulator at `870d916` with `tenon-upimulator.patch` + a UPMEM DPU SDK 2023.1.0 Docker image you build from your own copy of the SDK (section 3a) |
 | GSI APU v1 (Gemini-I) hardware | + GSI APU SDK, ARC toolchain, GVML headers, `example-gvml` project, a Gemini-I board |
@@ -141,7 +141,8 @@ reason without running anything.
 | Variable | Meaning | Default when unset |
 |---|---|---|
 | `TENON_SIMULATORS_DIR` | Directory holding `PIMSimulator/` and `aim_simulator/` | `<repo>/experiments/simulators` when the package runs from the Tenon repository checkout; otherwise unset (installed copies must set it or the per-simulator roots) |
-| `PIMSIMULATOR_ROOT` | Samsung PIMSimulator tree containing `pim_driver` | `$TENON_SIMULATORS_DIR/PIMSimulator` |
+| `PIMSIMULATOR_ROOT` | Samsung PIMSimulator tree containing `pim_driver` | `$TENON_SIMULATORS_DIR/PIMSimulator`; when neither is set, the bundled simulator's build root below, once it holds `pim_driver` |
+| `TENON_HOME` | Where Tenon keeps what it builds for the user; the bundled Samsung simulator installs under `$TENON_HOME/simulators/PIMSimulator` (`allo.spmw_simenv.default_pimsim_root()`) | `$XDG_DATA_HOME/tenon`, else `~/.local/share/tenon` |
 | `AIM_SIMULATOR_ROOT` | aim_simulator tree (`build/ramulator2`, `test/example.yaml`) | `$TENON_SIMULATORS_DIR/aim_simulator` |
 | `TENON_AIM_SIM_IMAGE` | Docker image that runs `ramulator2` | `aim-simulator-build` |
 | `TENON_AIM_RAMULATOR2` | a natively built `ramulator2` binary to run instead of the Docker image (its SHA-256 is recorded with every run) | unset (Docker) |
@@ -212,9 +213,10 @@ README per simulator, `simulators/README.md` for the overview); `$ALLO` is
 the root of your checkout of `zzzDavid/allo`, branch `tenon`. Each recipe was
 run from a fresh upstream clone in a scratch directory with a new Docker tag,
 from the copies in `simulators/`, then exercised through `allo.compile`; full
-commands, hashes, times and licensing are in `simulators.md`. AiM and UPMEM
+commands, hashes, times and licensing are in `simulators.md`. All three
 build from this repository alone (UPMEM also needs the DPU SDK you obtain
-yourself).
+yourself); the Samsung simulator is bundled, sources included, and builds
+from the installed package without a checkout.
 
 ```bash
 # SK hynix AiM
@@ -243,37 +245,44 @@ docker run --rm -v $UPIMULATOR_ROOT:/root/uPIMulator $TENON_UPMEM_SDK_IMAGE \
     python3 /root/uPIMulator/sdk/build.py --num_tasklets 12
 #   paper GEMV (96x128): 359,026 cycles, sdk_build "user-build:d45e285c34b5"
 
-# Samsung HBM-PIM: NOT buildable from this repository alone (see below)
-git clone https://github.com/SAITPublic/PIMSimulator.git
-git -C PIMSimulator checkout 3703d1f19c8f027360cc33a3243eb271e3bb6898
-bash $ALLO/simulators/PIMSimulator/apply.sh PIMSimulator <patches-dir>   # ~12 s
-export PIMSIMULATOR_ROOT=$PWD/PIMSimulator
+# Samsung HBM-PIM: bundled (sources, patches and conductor ship with Tenon)
+python -m pip install scons                              # or the distribution's scons; g++ and patch needed too
+python -m allo.pim.samsung_simulator build               # ~15 s on 16 cores
+#   copies the bundled upstream sources to $TENON_HOME/simulators/PIMSimulator
+#   (default ~/.local/share/tenon/simulators/PIMSimulator), applies the five
+#   patches, installs the Tenon conductor, runs scons, prints PIM_GEOMETRY;
+#   pimsim_root() finds that root without any variable. Compiler temporaries
+#   follow TMPDIR. `--root DIR` builds elsewhere (then export PIMSIMULATOR_ROOT=DIR).
+python -m allo.pim.samsung_simulator locate              # the recipe, the default root, what pimsim_root() finds
 #   paper GEMV 4096x256: vendor layout 4,435 cycles, cost-selected default 4,389
+# or into your own upstream clone:
+#   git clone https://github.com/SAITPublic/PIMSimulator.git
+#   git -C PIMSimulator checkout 3703d1f19c8f027360cc33a3243eb271e3bb6898
+#   bash $ALLO/simulators/PIMSimulator/apply.sh PIMSimulator && export PIMSIMULATOR_ROOT=$PWD/PIMSimulator
 ```
 
-**Samsung limitation.** `pim_driver` needs five patches to Samsung-licensed
-PIMSimulator files (`src/tests/PIMKernel.h`, `src/tests/PIMKernel.cpp`,
-`src/tests/PIMCmdGen.h`, `src/tests/PIMCmdGen.cpp`, `src/Burst.h`).
-PIMSimulator is distributed under Samsung's notice (no copying or
-distribution without Samsung's express written permission), so the patches
-are not in this repository, and until Samsung authorizes their publication
-the Samsung HBM-PIM simulator route cannot be built from the release
-repository alone (`ISSUES.md` P-04). Without `<patches-dir>`,
-`simulators/PIMSimulator/apply.sh` exits with status 2 and says so. The
-Samsung compile route and `backend="virtual"` need no simulator.
+**Samsung terms.** The bundled PIMSimulator sources
+(`simulators/PIMSimulator/upstream/`, pristine at `3703d1f`, hashed in
+`UPSTREAM_MANIFEST.sha256`) and the five Tenon patches to them
+(`simulators/PIMSimulator/patches/`) carry Samsung's notice: use is
+restricted to non-commercial, personal or academic research, and copying or
+distribution requires Samsung's express written permission. The Tenon
+maintainers decided on 2026-11-06 to distribute the simulator with the tool;
+no written permission is recorded in this repository. Read
+`simulators/PIMSimulator/NOTICE.md` (also `THIRD_PARTY_NOTICES.md`) before
+redistributing Tenon; the release ledger tracks this as P-04. The Samsung
+compile route and `backend="virtual"` need no simulator.
 
-What you must obtain yourself, in every case: the PIMSimulator source under
-Samsung's notice (no redistribution, non-commercial research only), the
-UPMEM DPU SDK (proprietary; the official host returned HTTP 403, the
-CMU-SAFARI mirror carries no license file), and, for the GSI backends, the
-GSI SDKs and boards. Never publish an image or tarball containing the UPMEM
-SDK, and do not reuse the tag `bongjoonhyun/upimulator` (the upstream
-author's Docker Hub name; P-17).
+What you must obtain yourself: the UPMEM DPU SDK (proprietary; the official
+host returned HTTP 403, the CMU-SAFARI mirror carries no license file), and,
+for the GSI backends, the GSI SDKs and boards. Never publish an image or
+tarball containing the UPMEM SDK, and do not reuse the tag
+`bongjoonhyun/upimulator` (the upstream author's Docker Hub name; P-17).
 
 Historical note: before 2026-11-02 these recipes lived only in the
 containing Tenon research repository under
-`<repo>/experiments/simulators/setup/`; `simulators/` holds the
-redistributable copies, and the Samsung patches remain only there.
+`<repo>/experiments/simulators/setup/`; `simulators/` holds the copies, and
+since 2026-11-10 the Samsung patches and the pinned upstream sources as well.
 
 ## 4. Running the tests
 

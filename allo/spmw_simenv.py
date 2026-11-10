@@ -153,6 +153,26 @@ def simulators_dir() -> Path | None:
     return None
 
 
+def tenon_data_home() -> Path:
+    """Where Tenon keeps what it builds for the user (the bundled simulators):
+    ``$TENON_HOME``, else ``$XDG_DATA_HOME/tenon``, else
+    ``~/.local/share/tenon``.  Nothing is created here; the build commands
+    create what they install."""
+    override = os.environ.get("TENON_HOME")
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
+    return base / "tenon"
+
+
+def default_pimsim_root() -> Path:
+    """Where ``python -m allo.pim.samsung_simulator build`` installs the
+    bundled Samsung PIMSimulator by default, and the last place
+    :func:`pimsim_root` looks."""
+    return tenon_data_home() / "simulators" / _PIMSIM_DIRNAME
+
+
 def _simulator_root(variable: str, dirname: str) -> Path | None:
     override = os.environ.get(variable)
     if override is not None:
@@ -162,8 +182,20 @@ def _simulator_root(variable: str, dirname: str) -> Path | None:
 
 
 def pimsim_root() -> Path | None:
-    """Samsung PIMSimulator tree, or None when no location is configured."""
-    return _simulator_root("PIMSIMULATOR_ROOT", _PIMSIM_DIRNAME)
+    """Samsung PIMSimulator tree, or None when no location is configured.
+
+    Precedence: ``PIMSIMULATOR_ROOT``; ``$TENON_SIMULATORS_DIR/PIMSimulator``
+    (the repository's ``experiments/simulators`` when running from the Tenon
+    checkout); then the bundled simulator's default build root
+    (:func:`default_pimsim_root`), used only once it holds ``pim_driver``.
+    """
+    configured = _simulator_root("PIMSIMULATOR_ROOT", _PIMSIM_DIRNAME)
+    if configured is not None:
+        return configured
+    built = default_pimsim_root()
+    if (built / "pim_driver").is_file():
+        return built
+    return None
 
 
 def aim_root() -> Path | None:
@@ -591,11 +623,16 @@ def samsung_unavailable_reason() -> str | None:
     if root is None:
         return (
             "PIMSimulator location is not configured "
-            "(set PIMSIMULATOR_ROOT or TENON_SIMULATORS_DIR)"
+            "(set PIMSIMULATOR_ROOT or TENON_SIMULATORS_DIR, or build the "
+            "bundled simulator with `python -m allo.pim.samsung_simulator "
+            f"build`, which installs it under {default_pimsim_root()})"
         )
     driver = root / "pim_driver"
     if not driver.exists():
-        return f"pim_driver not found at {driver} (set PIMSIMULATOR_ROOT)"
+        return (
+            f"pim_driver not found at {driver} (set PIMSIMULATOR_ROOT, or "
+            "build it: `python -m allo.pim.samsung_simulator build`)"
+        )
     if not os.access(driver, os.X_OK):
         return f"pim_driver at {driver} is not executable"
     return None

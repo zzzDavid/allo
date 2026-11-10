@@ -1,0 +1,18 @@
+--- a/src/tests/PIMKernel.cpp
++++ b/src/tests/PIMKernel.cpp
+@@ -12,11 +12,15 @@
+ 
+ #include "tests/PIMKernel.h"
+ 
++#include <fstream>
+ #include <iomanip>
++#include <stdexcept>
+ #include <string>
+ 
+ #include "AddressMapping.h"
+ #include "tests/PIMCmdGen.h"
++#include "tests/TemporalReduce.inc"
++#include "tests/TenonConductor.inc"
+ 
+ void PIMKernel::runPIM()
+ {

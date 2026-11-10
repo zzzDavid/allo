@@ -28,14 +28,13 @@ in the release ledger (`docs/release/VALIDATION.md`, rounds 88 and 89).
 | robin-map (Thibaut Goetghebuer-Planchon), nanobind's `ext/robin_map` dependency | template instantiations compiled into every `allo/_mlir/_mlir_libs/_*.so` extension module (`tsl::detail_robin_hash::` symbols in all twenty) | the wheel | MIT | `THIRD_PARTY_LICENSES/ROBIN-MAP-LICENSE.txt` (the notice at the head of `tsl/robin_map.h`) |
 | uPIMulator (VIA-Research, commit `870d916334e9ff0b190f555f951a9ec3c4257781`) | the hunks of `simulators/uPIMulator/tenon-upimulator.patch` that modify upstream's own files (CMake, README and benchmark files under `golang/uPIMulator/benchmark/`), plus Tenon's own hunks | the sdist, `simulators/uPIMulator/` | MIT (upstream `LICENSE`, sha256 `73de95273ba877b7c8b1037d8c478179fd58ff97169da6683bc10d88b79fd16d`) | `THIRD_PARTY_LICENSES/UPIMULATOR-LICENSE.txt` |
 | UPMEM DPU runtime (`dpu-rt`, "Copyright 2020 UPMEM", BSD-style), as bundled by upstream uPIMulator under `golang/uPIMulator/sdk/` | the hunks of the same patch that modify the runtime sources `sdk/stdlib/stdio.c` and `sdk/syslib/dpuruntime.h`, the runtime's CMake files under `sdk/`, and the new file `sdk/misc/stdoutBufferState.c`, which Tenon wrote against those sources and placed under UPMEM's retained notice | the sdist, `simulators/uPIMulator/` | BSD 3-Clause (UPMEM's `dpu-rt/LICENSE`, identical text in the UPMEM SDK 2023.1.0 and referenced by the files' headers) | `THIRD_PARTY_LICENSES/UPMEM-DPU-RT-LICENSE.txt` |
+| Samsung PIMSimulator (SAITPublic, commit `3703d1f19c8f027360cc33a3243eb271e3bb6898`) | the pristine upstream sources the Samsung HBM-PIM conductor `pim_driver` builds from and reads (`src/`, `lib/`, `tools/`, `ini/`, `system_hbm*.ini`, upstream's `Sconstruct`, `README.md`, both license files; hashed in `UPSTREAM_MANIFEST.sha256`; upstream's `data/` and `dump/` inputs are not shipped), the five Tenon patches to upstream files (`patches/`, which carry context lines of Samsung's files) and Tenon's `Sconstruct`, a derivative of upstream's. Bundled by the maintainers' decision of 2026-11-06 so that the Samsung route installs from the distribution; the notice requires Samsung's written permission for distribution and restricts use to non-commercial research, and no such permission is recorded here (`simulators/PIMSimulator/NOTICE.md`, release ledger P-04) | the sdist, `simulators/PIMSimulator/`; the wheel, `allo/pim/simulators/PIMSimulator/` | Samsung Electronics notice: property of Samsung, no copying or distribution without express written permission, non-commercial / personal / academic research use only (upstream `LICENSE-PIMSimulator`) | `THIRD_PARTY_LICENSES/PIMSIMULATOR-LICENSE.txt` |
+| DRAMSim2 (Elliott Cooper-Balis, Paul Rosenfeld, Bruce Jacob, University of Maryland), the memory-system simulator PIMSimulator is built on | the DRAMSim2-derived sources inside the bundled PIMSimulator `src/` (upstream keeps its license beside Samsung's) | the sdist and the wheel, with the PIMSimulator sources above | BSD 3-Clause (upstream `LICENSE-DRAMSIM2`) | `THIRD_PARTY_LICENSES/DRAMSIM2-LICENSE.txt` |
 
 ## Not shipped, by design
 
-* Samsung PIMSimulator sources and the five Tenon patches to them
-  (Samsung's notice forbids redistribution; `simulators/PIMSimulator/README.md`,
-  release ledger P-04). The package ships only Tenon's own conductor sources
-  under `simulators/PIMSimulator/src/`, `apply.sh` and a `Sconstruct` whose
-  structure follows upstream's (listed as an open question of P-04).
+* Samsung PIMSimulator's `data/` and `dump/` benchmark inputs (about
+  25 MiB, not read by `pim_driver`); the bundled sources are listed above.
 * GSI Gemini-I SDK files (`example-gvml`): staged from the user's SDK at
   build time by `allo/spmw_apu_v1_build.py`, recorded in a per-project
   `THIRD_PARTY.txt`, never copied into this package (release ledger V1-08).
@@ -47,10 +46,12 @@ in the release ledger (`docs/release/VALIDATION.md`, rounds 88 and 89).
 
 * `THIRD_PARTY_LICENSES/BLAKE3-LICENSE.txt`: `6a94bedb8b707ed97f6e310d0d015ab14e0683ffa0a612b02958581b9cc9fc0e`
 * `THIRD_PARTY_LICENSES/CONVERTUTF-UNICODE-NOTICE.txt`: `34f4f9bd10889e31554b8d07edccc41a9d26b6b138da9024020eee6ea6989029`
+* `THIRD_PARTY_LICENSES/DRAMSIM2-LICENSE.txt`: `162a7a7ee155774e44235c670daf235cb0cda8c0171da4fc276fe89993cfd421`
 * `THIRD_PARTY_LICENSES/LLVM-LICENSE.TXT`: `8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee`
 * `THIRD_PARTY_LICENSES/LLVM-REGEX-COPYRIGHT.txt`: `0424e57d4303164dc59a8509c20dae0518b853692e5c2b0e98b11816fdbc97c7`
 * `THIRD_PARTY_LICENSES/MD5-NOTICE.txt`: `b95327f2bd0adacaed56b02916fc90a9be2ca2ab2324332c6f1217414d5383cb`
 * `THIRD_PARTY_LICENSES/NANOBIND-LICENSE.txt`: `f305091a4e57805870b217a28ea4b1f16610eece8457d2370f822a9696b75836`
+* `THIRD_PARTY_LICENSES/PIMSIMULATOR-LICENSE.txt`: `357574fbfdc45b7f944619617bc8a00ef690276d6ded0702def3feb9bc772871`
 * `THIRD_PARTY_LICENSES/ROBIN-MAP-LICENSE.txt`: `ecbbd4f8369e99a884dc41bf6b3f79a2c1efdadcd2a5ecc03947c09c78759bd1`
 * `THIRD_PARTY_LICENSES/UPIMULATOR-LICENSE.txt`: `73de95273ba877b7c8b1037d8c478179fd58ff97169da6683bc10d88b79fd16d`
 * `THIRD_PARTY_LICENSES/UPMEM-DPU-RT-LICENSE.txt`: `8f49c23ec6464b86586dde2e0dc2694494d20ff28a45f7337e756b2eda0b498f`

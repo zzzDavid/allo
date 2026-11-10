@@ -4,10 +4,12 @@
 """The third-party license texts the distributions carry (release ledger
 P-25, round 88): the wheel bundles the LLVM/MLIR Python bindings and
 extension modules (Apache-2.0 with LLVM Exceptions) with nanobind embedded
-(BSD 3-Clause), and the sdist carries two dialect sources under the LLVM
-header and the uPIMulator patch (MIT).  The texts live under
-``THIRD_PARTY_LICENSES/``, are inventoried in ``THIRD_PARTY_NOTICES.md`` and
-are packaged into both forms through ``setup.py`` and ``MANIFEST.in``."""
+(BSD 3-Clause), the sdist carries two dialect sources under the LLVM
+header and the uPIMulator patch (MIT), and both carry the bundled Samsung
+PIMSimulator sources (Samsung's notice; DRAMSim2 parts BSD 3-Clause; P-04).
+The texts live under ``THIRD_PARTY_LICENSES/``, are inventoried in
+``THIRD_PARTY_NOTICES.md`` and are packaged into both forms through
+``setup.py`` and ``MANIFEST.in``."""
 
 import hashlib
 import re
@@ -46,6 +48,16 @@ EXPECTED_TEXTS = {
     "MD5-NOTICE.txt": ("Alexander Peslyak", "placed in the public domain"),
     "UPMEM-DPU-RT-LICENSE.txt": (
         "Copyright (c) 2020, UPMEM",
+        "Redistribution and use in source and binary forms",
+    ),
+    "PIMSIMULATOR-LICENSE.txt": (
+        "Copyright (C) 2021 Samsung Electronics Co. LTD",
+        "express written permission of Samsung Electronics",
+        "non-commercial, personal or academic, research purpose",
+    ),
+    "DRAMSIM2-LICENSE.txt": (
+        "Copyright (c) 2010-2011, Elliott Cooper-Balis",
+        "University of Maryland",
         "Redistribution and use in source and binary forms",
     ),
 }
@@ -116,4 +128,4 @@ def test_every_bundled_text_is_tracked_by_git():
     ).stdout.split()
     present = sorted(f"THIRD_PARTY_LICENSES/{p.name}" for p in LICENSES.iterdir())
     assert sorted(tracked) == present, f"tracked {sorted(tracked)} vs present {present}"
-    assert len(present) == len(EXPECTED_TEXTS) == 10
+    assert len(present) == len(EXPECTED_TEXTS) == 12

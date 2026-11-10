@@ -1,0 +1,17 @@
+--- a/src/Burst.h
++++ b/src/Burst.h
+@@ -398,11 +398,9 @@
+         loadTobShape((double)16);
+         for (int i = 0; i < u16Data.size(); i += 16)
+         {
+-            BurstType burst((u16Data[i]), (u16Data[i + 1]), (u16Data[i + 2]), (u16Data[i + 3]),
+-                            (u16Data[i + 4]), (u16Data[i + 5]), (u16Data[i + 6]), (u16Data[i + 7]),
+-                            (u16Data[i + 8]), (u16Data[i + 9]), (u16Data[i + 10]),
+-                            (u16Data[i + 11]), (u16Data[i + 12]), (u16Data[i + 13]),
+-                            (u16Data[i + 14]), (u16Data[i + 15]));
++            BurstType burst;
++            for (int lane = 0; lane < 16 && i + lane < u16Data.size(); ++lane)
++                burst.u16Data_[lane] = u16Data[i + lane];
+             bData.push_back(burst);
+         }
+     }

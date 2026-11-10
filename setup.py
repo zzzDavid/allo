@@ -8,6 +8,7 @@ import sys
 import subprocess
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
+from setuptools.command.build_py import build_py
 from setuptools import find_packages
 
 MIN_CMAKE = (3, 20)
@@ -42,6 +43,40 @@ PACKAGE_DATA = {
     "allo.harness.makefile_gen": ["description.json"],
     "allo.pim": ["templates/apu_g2/*", "templates/apu_g2/device/*"],
 }
+
+
+# Simulator recipes the wheel carries inside the package so that an installed
+# copy can build them without the repository (docs/release/simulators.md):
+# simulators/<name>/ -> allo/pim/simulators/<name>/. The checkout keeps them
+# at the top level only (allo/pim/simulators/ is ignored by git); the copy is
+# made in build_lib. Upstream build outputs never belong in the copy.
+BUNDLED_SIMULATOR_RECIPES = ("PIMSimulator",)
+BUNDLED_SIMULATOR_IGNORE = shutil.ignore_patterns(
+    "__pycache__",
+    "*.pyc",
+    "bin",
+    "libdramsim",
+    "pim_driver",
+    "sim",
+    "*.o",
+    "*.a",
+    "*.os",
+)
+
+
+class BuildPy(build_py):
+    def run(self):
+        super().run()
+        if getattr(self, "editable_mode", False):
+            return  # the checkout's simulators/ is found by path
+        here = os.path.dirname(os.path.abspath(__file__))
+        for name in BUNDLED_SIMULATOR_RECIPES:
+            src = os.path.join(here, "simulators", name)
+            if not os.path.isdir(src):
+                raise RuntimeError(f"bundled simulator recipe missing: {src}")
+            dest = os.path.join(self.build_lib, "allo", "pim", "simulators", name)
+            shutil.rmtree(dest, ignore_errors=True)
+            shutil.copytree(src, dest, ignore=BUNDLED_SIMULATOR_IGNORE)
 
 
 class CMakeExtension(Extension):
@@ -218,7 +253,7 @@ if __name__ == "__main__":
         ),
         package_data=PACKAGE_DATA,
         ext_modules=[CMakeExtension("mlir", sourcedir="mlir")],
-        cmdclass={"build_ext": CMakeBuild},
+        cmdclass={"build_ext": CMakeBuild, "build_py": BuildPy},
         url="https://github.com/cornell-zhang/allo",
         # Allo's license plus the texts of the third parties the distributions
         # carry (THIRD_PARTY_NOTICES.md); setuptools installs them under

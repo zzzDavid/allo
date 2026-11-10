@@ -64,6 +64,11 @@ def getSources(target):
 def build(target_name, base_path, build_flags):
     # setup the default build envronments
     env = Environment()
+    # SCons runs the compiler with a minimal environment; pass the temporary
+    # directory through so the build does not depend on free space in /tmp.
+    for var in ("TMPDIR", "TMP", "TEMP"):
+        if var in os.environ:
+            env['ENV'][var] = os.environ[var]
 
     env.Append(CXXFLAGS=build_flags["CXXFLAGS"] + build_flags["gprof_option"])
     env.Append(LINKFLAGS=build_flags["LINKFLAGS"] + build_flags["gprof_option"])

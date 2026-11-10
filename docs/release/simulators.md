@@ -3,20 +3,20 @@
 
 # Simulators and vendor SDKs used by Tenon backends
 
-Tenon does not bundle any simulator, vendor SDK or Docker image. This page
-records, for each external dependency, where it comes from, the revision the
-evaluation used, where the Tenon-side changes live, how to build it, its
-license, and what a user has to obtain on their own. Discovery variables are
-in `INSTALL.md` section 3.
+Tenon bundles one simulator, Samsung's PIMSimulator (sources, Tenon's
+patches and conductor, and a build command; its notice is reproduced in
+`simulators/PIMSimulator/NOTICE.md`), and no vendor SDK or Docker image.
+This page records, for each external dependency, where it comes from, the
+revision the evaluation used, where the Tenon-side changes live, how to build
+it, its license, and what a user has to obtain on their own. Discovery
+variables are in `INSTALL.md` section 3.
 
 The Tenon-side recipes are in this repository under `simulators/`
 (`simulators/README.md`); `$ALLO` below is the root of a checkout of
-`zzzDavid/allo`, branch `tenon`. The AiM and UPMEM routes build from that
-checkout alone (UPMEM also needs the UPMEM DPU SDK, which you obtain
-yourself). **Samsung is the exception: the five patches to Samsung-licensed
-PIMSimulator files are not in this repository, so until Samsung authorizes
-their publication the Samsung HBM-PIM simulator route cannot be built from the
-release repository alone** (P-04; Samsung section below).
+`zzzDavid/allo`, branch `tenon`. All three routes build from that checkout
+alone (UPMEM also needs the UPMEM DPU SDK, which you obtain yourself); the
+Samsung route also builds from the installed wheel, which carries the recipe
+under `allo/pim/simulators/PIMSimulator` (P-04; Samsung section below).
 
 Revisions were read on the authors' host on 2026-11-02 with
 `git -C <checkout> rev-parse HEAD` (PIMSimulator through the parent
@@ -47,7 +47,7 @@ in `<repo>`.
 
 | Dependency | Upstream | Pinned revision | Tenon changes (in `simulators/` of this repository) | License | Rebuildable from this repository and public sources? |
 |---|---|---|---|---|---|
-| Samsung PIMSimulator | <https://github.com/SAITPublic/PIMSimulator> | `3703d1f19c8f027360cc33a3243eb271e3bb6898` (2024-07-01) | `PIMSimulator/`: `pim_driver` conductor sources, `Sconstruct`, `apply.sh`; the 5 patches to Samsung files are **not included** | Samsung proprietary notice (no redistribution without written permission; non-commercial research only); DRAMSim2 part BSD | **No**: needs the 5 Samsung-derived patches, which await Samsung's permission (P-04); verified with the authors' copy of the patches |
+| Samsung PIMSimulator | <https://github.com/SAITPublic/PIMSimulator> | `3703d1f19c8f027360cc33a3243eb271e3bb6898` (2024-07-01) | `PIMSimulator/`: the pristine upstream sources `pim_driver` builds from (`upstream/`, hashed in `UPSTREAM_MANIFEST.sha256`), the 5 patches to upstream files (`patches/`), the conductor sources, `Sconstruct`, `apply.sh`, `NOTICE.md`; built by `python -m allo.pim.samsung_simulator build` | Samsung proprietary notice (no redistribution without written permission; non-commercial research only; bundled by the maintainers' decision of 2026-11-06, no permission recorded); DRAMSim2 part BSD 3-Clause | **Yes**, from the checkout or the installed wheel, given g++, SCons and `patch` (verified 2026-11-10; Samsung section) |
 | SK hynix AiM simulator (Ramulator 2.0 based) | <https://github.com/arkhadem/aim_simulator> | `0f28a07bdb83e42b9305ad3d45410ebd3aa2c091` (2025-07-22) | `aim_simulator/Dockerfile`, `README.md` | MIT (University of Michigan, 2025) | **Yes** (verified from the release copy) |
 | Ramulator2-AttAcc (evaluation script only; not used by the package) | DCC artifact <https://github.com/SPIN-Research-Group/DCC> `src/Ramulator2/` (AttAcc model from <https://github.com/scale-snu/attacc_simulator>) | DCC `212f86ea7f08da059836e3a1311d3a11afae8dbe` | none (no Tenon recipe yet) | Ramulator2 and AttAcc simulator MIT; DCC (trace generator, `inference/`) **no license** | user builds it from the DCC checkout (`build.sh`); no Tenon recipe |
 | uPIMulator (Go) | <https://github.com/VIA-Research/uPIMulator> | `870d916334e9ff0b190f555f951a9ec3c4257781` (2025-02-01) | `uPIMulator/tenon-upimulator.patch` (47 files), `apply.sh`, `Dockerfile`, README | MIT (VIA Research Group, KAIST, 2024) | **Yes** (verified from the release copy), given the user-obtained SDK |
@@ -63,38 +63,60 @@ in `<repo>`.
   (`allo/spmw_samsung.py` always passes `--op GENERIC`), the `ini/`
   configurations of the upstream tree, and, for the layout-swizzle probe
   only, `libdramsim/libdramsim2.a`.
-- **Where the Tenon changes are:** `simulators/PIMSimulator/` in this
-  repository (README with the file list): `Sconstruct`, `src/pim_driver.cc`,
-  `src/tests/TenonConductor.{h,inc}`, `src/tests/TemporalReduce.inc`,
-  `apply.sh`. Samsung files are changed only through
-  `patches/{PIMKernel.h,PIMKernel.cpp,PIMCmdGen.h,PIMCmdGen.cpp,Burst.h}.patch`
-  (against `src/tests/PIMKernel.h`, `src/tests/PIMKernel.cpp`,
-  `src/tests/PIMCmdGen.h`, `src/tests/PIMCmdGen.cpp`, `src/Burst.h`), which
-  are **not in this repository**; for the authors they live in
-  `<repo>/experiments/simulators/setup/PIMSimulator/patches/`.
-- **Samsung limitation:** until Samsung authorizes publication of those five
-  patches, the Samsung HBM-PIM simulator route cannot be built from the
-  release repository alone. `simulators/PIMSimulator/apply.sh` exits with
-  status 2 and prints that message when the patches are missing; it accepts
-  them as its second argument, through `TENON_PIMSIM_PATCHES`, or as a
-  `patches/` directory next to it (ignored by git and pruned from the sdist).
-- The earlier `--slice-plan` route (`SamsungSlicePlan.*`) and the stale
-  323-line overlay are gone; every overlay file now equals the installed
-  tree's, and the installed tree has no other modified tracked file.
-- **Build recipe (verified; needs the patches):**
+- **Where everything is:** `simulators/PIMSimulator/` in this repository
+  (README with the file list): `upstream/`, a pristine copy of the pinned
+  upstream restricted to what `pim_driver` builds and reads (`src/`, `lib/`,
+  `tools/`, `ini/`, `system_hbm*.ini`, upstream's `Sconstruct`, `README.md`,
+  `LICENSE-PIMSimulator`, `LICENSE-DRAMSIM2`; 70 files, 772 KiB; upstream's
+  `data/` and `dump/` inputs, about 25 MiB and unused by `pim_driver`, are
+  left out), hashed file by file in `UPSTREAM_MANIFEST.sha256` (every entry
+  equals the object at commit `3703d1f` in the authors' upstream clone, and
+  exactly the five patched files differ from the authors' installed tree);
+  `patches/{PIMKernel.h,PIMKernel.cpp,PIMCmdGen.h,PIMCmdGen.cpp,Burst.h}.patch`;
+  Tenon's `Sconstruct`, `src/pim_driver.cc`, `src/tests/TenonConductor.{h,inc}`,
+  `src/tests/TemporalReduce.inc`; `apply.sh`; `NOTICE.md`. The wheel carries
+  the same directory under `allo/pim/simulators/PIMSimulator` (`setup.py`
+  `BuildPy`; 84 files), the sdist under `simulators/PIMSimulator`.
+- **Build recipe (verified 2026-11-10):**
 
   ```bash
-  git clone https://github.com/SAITPublic/PIMSimulator.git
-  git -C PIMSimulator checkout 3703d1f19c8f027360cc33a3243eb271e3bb6898
-  bash $ALLO/simulators/PIMSimulator/apply.sh PIMSimulator <patches-dir>
-  #   without <patches-dir> it stops: "...cannot be built from the release
-  #   repository alone..." (exit 2)
-  #   applies the patches, installs the conductor sources, runs
-  #   `scons pim_driver libdramsim/libdramsim2.a -j$(nproc)`, prints PIM_GEOMETRY
-  export PIMSIMULATOR_ROOT=$PWD/PIMSimulator
+  python -m allo.pim.samsung_simulator build      # ~15 s on 16 cores (g++ 9.4.0, SCons 3.1.2)
+  #   assembles $TENON_HOME/simulators/PIMSimulator from upstream/, applies
+  #   the patches, installs the Tenon files, scons pim_driver
+  #   libdramsim/libdramsim2.a, prints PIM_GEOMETRY; pimsim_root() then
+  #   discovers it without PIMSIMULATOR_ROOT or TENON_SIMULATORS_DIR
+  python -m allo.pim.samsung_simulator verify     # the bundled upstream against the manifest
+  python -m allo.pim.samsung_simulator locate     # recipe, default root, the discovered root
   ```
 
-  Needs g++ with C++14 and SCons; no gtest for `pim_driver`. No Docker image.
+  `--root DIR` builds elsewhere (then `export PIMSIMULATOR_ROOT=DIR`),
+  `--jobs N`, `--skip-build` (assemble and patch only), `--scons EXE`.
+  `apply.sh <tree>` does the same for a user's own upstream clone at the
+  pinned commit. Needs g++ with C++14, SCons (`python -m pip install scons`
+  or the distribution package) and `patch`; no gtest, no Docker image. The
+  build passes the caller's `TMPDIR` to the compiler (the `Sconstruct`
+  change of 2026-11-10): on the authors' host, whose shared `/tmp` is full,
+  the first attempt failed with the compiler's `No space left on device`
+  until the environment's `TMPDIR` reached the compiler.
+- **Verification (2026-11-10, bundled route, round 93):** from the checkout,
+  `python -m allo.pim.samsung_simulator build --jobs 16` with `TENON_HOME`
+  on the evidence tree: 5 patches applied, build 12.8 s, `PIM_GEOMETRY
+  channels=64 ranks=1 pim_blocks=8 banks=16 bank_groups=4 grf_a=8 grf_b=8
+  lanes=16 crf_words=32 cols_per_row=32 rows=16384`
+  (`r93/bundled_build.log`). The built `pim_driver` (sha256 `055d6c24...`)
+  and the authors' installed one (`6c50596b...`) are identical after
+  `objcopy --strip-all --remove-section=.note.gnu.build-id` (both
+  `9aea49bffc5c04b23b033695a7bcc072fe24ac203ad349895dabee61d80ee21d`): the
+  bundle reproduces the conductor the evaluation ran. With
+  `PIMSIMULATOR_ROOT` at that build, `tests/pim/test_gemv_all_targets.py -k
+  samsung` passes (`r93/pytest_gemv_samsung_bundled_root.log`, 48 s). The
+  recipe tests (`tests/perf/test_simulator_recipes.py`,
+  `test_samsung_simulator_bundle.py`: manifest, tampering, assemble,
+  discovery precedence, `build_py` copy, CLI, a real build into a temporary
+  `TENON_HOME`) and the license tests pass (68 passed,
+  `r93/pytest_bundle_packaging.log`). Installed-artifact validation of the
+  bundled route from a wheel built at the candidate is recorded in
+  `VALIDATION.md` (round 93).
 - **Verification (2026-11-02, first round, `<repo>` overlay):** clone + `apply.sh` took about 12 s (48
   cores). Scratch `pim_driver` sha256
   `75dd297c3c102b33f6a77080f82819ff067d6102c2387a186b7f061f62441734`;
@@ -114,17 +136,19 @@ in `<repo>`.
 - **License and redistribution:** `LICENSE-PIMSimulator` states that the
   software is the property of Samsung Electronics, that no part may be copied
   or distributed without Samsung's express written permission, and that use
-  is restricted to non-commercial academic research. The Allo-authored
-  conductor files are ours, but the five patches carry context lines from
-  Samsung files, so publishing them still needs Samsung's permission (open
-  question in `audit/packaging.md` section 9). The containing repository also
-  tracks modified Samsung files under `dev/` (P-04; untracking commands in
-  `RELEASE_CHECKLIST.md`); they must not be part of any public tree.
-- **What a user must do:** today a user outside the authors' group cannot
-  build the Samsung simulator route from this repository: besides cloning
-  PIMSimulator (accepting Samsung's notice), `apply.sh` needs the five
-  patches, which are published only once Samsung authorizes it. The Samsung
-  compile and `backend="virtual"` routes need no simulator.
+  is restricted to non-commercial academic research; the DRAMSim2 parts are
+  BSD 3-Clause (`LICENSE-DRAMSIM2`). Both texts ship in
+  `THIRD_PARTY_LICENSES/` and are inventoried in `THIRD_PARTY_NOTICES.md`.
+  The maintainers decided on 2026-11-06 to distribute the simulator with the
+  tool; `simulators/PIMSimulator/NOTICE.md` reproduces the notice, lists
+  what is and is not included and states that no written permission from
+  Samsung is recorded in the repository (P-04). The containing research
+  repository also tracks modified Samsung files under `dev/` (untracking
+  commands in `RELEASE_CHECKLIST.md`); they are not part of this tree.
+- **What a user must do:** install g++, SCons and `patch`, run
+  `python -m allo.pim.samsung_simulator build`, and accept Samsung's terms
+  (non-commercial research use). The Samsung compile and
+  `backend="virtual"` routes need no simulator.
 
 ## SK hynix AiM: aim_simulator (Ramulator 2.0)
 

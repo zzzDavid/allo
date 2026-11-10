@@ -1,0 +1,28 @@
+--- a/src/tests/PIMCmdGen.cpp
++++ b/src/tests/PIMCmdGen.cpp
+@@ -14,10 +14,16 @@
+ 
+ #include <memory>
+ 
++namespace
++{
++std::uint64_t pim_cmd_gen_invocations = 0;
++}
++
+ vector<PIMCmd> PIMCmdGen::getPIMCmds(KernelType ktype, int num_jump_to_be_taken,
+                                      int num_jump_to_be_taken_odd_bank,
+                                      int num_jump_to_be_taken_even_bank)
+ {
++    ++pim_cmd_gen_invocations;
+     unique_ptr<IPIMCmd> pim_kernel = nullptr;
+     switch (ktype)
+     {
+@@ -47,3 +53,8 @@
+     return pim_kernel->generateKernel(num_jump_to_be_taken, num_jump_to_be_taken_odd_bank,
+                                       num_jump_to_be_taken_even_bank);
+ }
++
++std::uint64_t PIMCmdGen::getInvocationCount()
++{
++    return pim_cmd_gen_invocations;
++}

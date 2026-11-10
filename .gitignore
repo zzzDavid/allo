@@ -102,9 +102,10 @@ tests/xlscc_tests/**/test
 *.lock
 dist/
 
-# Tenon: Samsung-derived PIMSimulator patches must never enter this repository
-# (simulators/PIMSimulator/README.md, release issue P-04)
-simulators/PIMSimulator/patches/
+# Tenon: the bundled PIMSimulator sources (simulators/PIMSimulator/upstream/,
+# patches/) are tracked; a user's build tree never lives inside the repository.
+# The in-package copy exists only in build_lib (setup.py BuildPy), never here.
+allo/pim/simulators/
 
 # Bundled third-party license texts (THIRD_PARTY_NOTICES.md) are tracked
 # whatever their extension; a *.txt rule above must not drop them silently.

@@ -1,0 +1,18 @@
+--- a/src/tests/PIMCmdGen.h
++++ b/src/tests/PIMCmdGen.h
+@@ -13,6 +13,7 @@
+ #ifndef __PIM_KERNEL_GEN_H__
+ #define __PIM_KERNEL_GEN_H__
+ 
++#include <cstdint>
+ #include <vector>
+ 
+ #include "MultiChannelMemorySystem.h"
+@@ -163,6 +164,7 @@
+     static vector<PIMCmd> getPIMCmds(KernelType ktype, int num_jump_to_be_taken,
+                                      int num_jump_to_be_taken_odd_bank,
+                                      int num_jump_to_be_taken_even_bank);
++    static std::uint64_t getInvocationCount();
+ };
+ 
+ #endif  // __PIM_KERNEL_GEN_H__

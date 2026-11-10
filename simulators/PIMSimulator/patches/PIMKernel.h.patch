@@ -1,0 +1,35 @@
+--- a/src/tests/PIMKernel.h
++++ b/src/tests/PIMKernel.h
+@@ -22,6 +22,7 @@
+ #include "PIMCmd.h"
+ #include "SystemConfiguration.h"
+ #include "tests/KernelAddrGen.h"
++#include "tests/TenonConductor.h"
+ 
+ using namespace std;
+ using namespace DRAMSim;
+@@ -64,6 +65,24 @@
+     void addBarrier();
+     void runPIM();
+     uint64_t getCycle();
++    // Ordered FP16 contraction conductor (tests/TemporalReduce.inc).
++    void runTemporalReduce(NumpyBurstType& weights, NumpyBurstType& rhs,
++                           NumpyBurstType& initial, int rows, int depth, int columns,
++                           vector<PIMCmd>& cmds, const string& audit_prefix,
++                           vector<BurstType>& output, uint64_t& preload,
++                           uint64_t& execution, uint64_t& readback);
++    // Tenon plan-driven conductor (tests/TenonConductor.inc): uploads the
++    // supplied CRF verbatim and issues the column commands it consumes.
++    void tenonDescribe(std::ostream& out);
++    void tenonCheckGeometry(const TenonGeometry& geometry, size_t crf_words);
++    void tenonRunReduce(const TenonReducePlan& plan, const std::string& plan_text,
++                        vector<PIMCmd>& crf, NumpyBurstType& weight, NumpyBurstType& vectors,
++                        vector<BurstType>& result, TenonAudit& audit, uint64_t& preload,
++                        uint64_t& execution);
++    void tenonRunEltwise(const TenonEltwisePlan& plan, const std::string& plan_text,
++                         vector<PIMCmd>& crf, std::vector<NumpyBurstType>& inputs,
++                         vector<BurstType>& result, TenonAudit& audit, uint64_t& preload,
++                         uint64_t& execution);
+     void parkIn();
+     void parkOut();
+     void changePIMMode(dramMode mode1, dramMode mode2);

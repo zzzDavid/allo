@@ -153,12 +153,17 @@ def test_simulator_roots_follow_tenon_simulators_dir(monkeypatch, tmp_path):
 def test_unconfigured_simulator_location_names_the_variable(monkeypatch, tmp_path):
     for variable in ("PIMSIMULATOR_ROOT", "AIM_SIMULATOR_ROOT", "TENON_SIMULATORS_DIR"):
         monkeypatch.delenv(variable, raising=False)
-    # An installed copy has no checkout-relative simulators directory.
+    # An installed copy has no checkout-relative simulators directory, and
+    # the bundled simulator's default root is not built here.
     monkeypatch.setattr(spmw_simenv, "_CHECKOUT_SIMULATORS_DIR", tmp_path / "absent")
+    monkeypatch.setenv("TENON_HOME", str(tmp_path / "home"))
     assert spmw_simenv.simulators_dir() is None
     assert spmw_simenv.pimsim_root() is None
     reason = spmw_simenv.samsung_unavailable_reason()
     assert "PIMSIMULATOR_ROOT" in reason and "TENON_SIMULATORS_DIR" in reason
+    # ... and names the bundled build command and where it installs.
+    assert "python -m allo.pim.samsung_simulator build" in reason
+    assert str(tmp_path / "home" / "simulators" / "PIMSimulator") in reason
     monkeypatch.setattr(spmw_simenv, "docker_image_unavailable_reason", lambda _n: None)
     reason = spmw_simenv.aim_unavailable_reason()
     assert "AIM_SIMULATOR_ROOT" in reason and "TENON_SIMULATORS_DIR" in reason
