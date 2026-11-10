@@ -315,3 +315,78 @@ def test_single_item_result_offsets_are_refused_where_the_backend_stages_from_ro
         match=r"input 'a' coordinate 0 reads i, an effective offset of 16 on a result loop",
     ):
         _aim(result_offset_single_item)
+
+
+GM, GR, GN = 64, 16, 2
+
+
+@region()
+def grid_base(W: bfloat16[GM, K], x: bfloat16[K], y: bfloat16[GM]):
+    @allo.work(mapping=[GN], args=[W, x, y])
+    def dot(a: bfloat16[GM, K], b: bfloat16[K], c: bfloat16[GM]):
+        ch = allo.get_wid()
+        for i in range(GR):
+            acc: bfloat16 = 0
+            for k in range(K):
+                acc += a[ch * GR + i, k] * b[k]
+            c[ch * GR + i] = acc
+
+
+@region()
+def grid_shifted(W: bfloat16[GM, K], x: bfloat16[K], y: bfloat16[GM]):
+    @allo.work(mapping=[GN], args=[W, x, y])
+    def dot(a: bfloat16[GM, K], b: bfloat16[K], c: bfloat16[GM]):
+        ch = allo.get_wid()
+        for i in range(GR):
+            acc: bfloat16 = 0
+            for k in range(K):
+                acc += a[16 + ch * GR + i, k] * b[k]
+            c[16 + ch * GR + i] = acc
+
+
+@region()
+def grid_lower_bound(W: bfloat16[GM, K], x: bfloat16[K], y: bfloat16[GM]):
+    @allo.work(mapping=[GN], args=[W, x, y])
+    def dot(a: bfloat16[GM, K], b: bfloat16[K], c: bfloat16[GM]):
+        ch = allo.get_wid()
+        for i in range(16, 32):
+            acc: bfloat16 = 0
+            for k in range(K):
+                acc += a[ch * GR + i, k] * b[k]
+            c[ch * GR + i] = acc
+
+
+@region()
+def grid_strided_items(W: bfloat16[GM, K], x: bfloat16[K], y: bfloat16[GM]):
+    @allo.work(mapping=[GN], args=[W, x, y])
+    def dot(a: bfloat16[GM, K], b: bfloat16[K], c: bfloat16[GM]):
+        ch = allo.get_wid()
+        for i in range(GR):
+            acc: bfloat16 = 0
+            for k in range(K):
+                acc += a[ch * 32 + i, k] * b[k]
+            c[ch * 32 + i] = acc
+
+
+def test_work_grid_offsets_must_tile_the_realized_frontier():
+    """The reviewer's round 96 probe (`reviewer-r96/grid_offsets.py`): on a
+    two-item grid AiM stages the result frontier rows 0..31 in work-id
+    order, so ``a[ch*R + i]`` is realized as written while
+    ``a[16 + ch*R + i]`` (rows 16..47), ``range(16, 32)`` (rows 16..47 as
+    well) and ``a[ch*32 + i]`` (rows 0..15 and 32..47) compiled to the same
+    program.  The grid's offsets are now proven against the frontier
+    (item ``w`` reads offset ``w x R``); the base grid stays accepted and
+    the three others are refused before selection."""
+    compiled = _aim(grid_base)
+    assert len(compiled.trace.matches) == GN
+    for workload, offsets in (
+        (grid_shifted, r"\[16, 32\]"),
+        (grid_lower_bound, r"\[16, 32\]"),
+        (grid_strided_items, r"\[0, 32\]"),
+    ):
+        with pytest.raises(
+            NotImplementedError,
+            match=rf"input 'a' coordinate 0 reads .*; the work items' effective offsets "
+            rf"{offsets} do not tile the realized frontier \[0, 16\]",
+        ):
+            _aim(workload)

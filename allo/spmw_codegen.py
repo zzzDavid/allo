@@ -1707,29 +1707,129 @@ def require_contraction_accesses_realizable(trace, ctx_cls=None) -> None:
     """Refuse, for every matched contraction of the trace, an input access no
     PIM lowering realizes as written (`spmw_semantics.
     contraction_access_problems`, over the effective access after the loop
-    domains are substituted; release ledger X-42).  Reduction shifts are
-    refused for every backend; a result-loop offset of a single work item is
-    refused unless the backend declares ``REALIZES_RESULT_OFFSETS`` (Samsung
-    places rows at the offset; AiM and AttAcc stage from row zero).  The
-    message names the function, the operand, the coordinate and what was
-    read."""
+    domains are substituted; release ledger X-42).
+
+    Reduction shifts, strides and padded flattenings are refused for every
+    backend.  Result-loop offsets are judged against what the backend
+    realizes: a context declaring ``REALIZES_RESULT_OFFSETS`` (the default;
+    Samsung places rows at the source's offset through its own derivation)
+    accepts them; a context declaring it False (AiM, AttAcc) stages a kernel
+    group's result frontier from row zero in work-id order, so for it the
+    offsets must be **proven** against that frontier: within a kernel group,
+    every dense result-loop coordinate must either be identical across the
+    items with offset zero, or read offset ``w * extent`` in work item ``w``
+    (work-id order over the group shape) with ``extent`` the rows the item's
+    loops span, so that the items tile the result exactly as the realization
+    assumes (``a[ch * R + i, k]``); a shifted grid (``a[16 + ch * R + i, k]``),
+    a lower bound (``range(16, 32)``) or a single item's offset is refused.
+    The message names the function, operand, coordinate and what was read."""
     import math
 
-    from .spmw_semantics import contraction_access_problems
+    from .spmw_semantics import (
+        contraction_access_problems,
+        contraction_result_offsets,
+    )
 
     realizes_offsets = bool(getattr(ctx_cls, "REALIZES_RESULT_OFFSETS", True))
     problems = []
+    # Kernel group -> work item (function) -> its contractions in match
+    # order; the same contraction of every item is one column.
+    groups: dict = {}
     for match in trace.matches:
         fact = match.extra.get("semantic_facts")
         if fact is None:
             continue
-        scope = match.extra.get("spmw_work_scope")
-        items = math.prod(tuple(getattr(scope, "group_shape", ()) or (1,)))
-        policy = "any" if (realizes_offsets or items > 1) else "none"
-        for problem in contraction_access_problems(
-            fact, reduction_offsets=False, result_offsets=policy
-        ):
+        for problem in contraction_access_problems(fact, reduction_offsets=False):
             problems.append(f"{match.func_name}: {problem}")
+        if realizes_offsets or not hasattr(fact, "reduction_vars"):
+            continue
+        scope = match.extra.get("spmw_work_scope")
+        shape = tuple(getattr(scope, "group_shape", ()) or ())
+        work_id = tuple(getattr(scope, "work_id", ()) or ())
+        flat = 0
+        if shape and len(work_id) == len(work_id) and len(work_id) == len(shape):
+            for index, extent in zip(work_id, shape):
+                flat = flat * int(extent) + int(index)
+        group_id = getattr(scope, "group_id", 0) if scope is not None else 0
+        items = groups.setdefault((group_id, shape), {})
+        items.setdefault(match.func_name, (flat, []))[1].append(
+            (match, contraction_result_offsets(fact))
+        )
+    for (_group_id, shape), items in groups.items():
+        count = math.prod(shape) if shape else 1
+        bodies = sorted(items.values(), key=lambda item: item[0])
+        if count <= 1 or len(bodies) <= 1:
+            for _flat, body in bodies:
+                for match, offsets in body:
+                    for (memref, position), (
+                        read,
+                        constant,
+                        _extent,
+                    ) in offsets.items():
+                        if constant != 0:
+                            problems.append(
+                                f"{match.func_name}: input {memref!r} coordinate "
+                                f"{position} reads {read}, an effective offset of "
+                                f"{constant} on a result loop; this backend stages a "
+                                "single work item's rows from the first row and "
+                                "realizes no result offset (partition the rows over "
+                                "a work grid, or index from zero)"
+                            )
+            continue
+        depth = max(len(body) for _flat, body in bodies)
+        for column_index in range(depth):
+            column = [
+                (flat, body[column_index])
+                for flat, body in bodies
+                if column_index < len(body)
+            ]
+            if len(column) != len(bodies):
+                problems.append(
+                    f"{bodies[0][1][0][0].func_name}: the work items of the kernel "
+                    "group differ in matched structure (contraction "
+                    f"{column_index} is absent from some items)"
+                )
+                continue
+            keys = set().union(*(set(offsets) for _f, (_m, offsets) in column))
+            first_name = column[0][1][0].func_name
+            for key in sorted(keys):
+                memref, position = key
+                rows = [
+                    (flat, match, offsets.get(key)) for flat, (match, offsets) in column
+                ]
+                if any(entry is None for _f, _m, entry in rows):
+                    problems.append(
+                        f"{first_name}: input {memref!r} coordinate {position} is not "
+                        "read alike by every work item of the kernel group"
+                    )
+                    continue
+                constants = [entry[1] for _f, _m, entry in rows]
+                extents = {entry[2] for _f, _m, entry in rows}
+                if len(set(constants)) == 1:
+                    if constants[0] != 0:
+                        problems.append(
+                            f"{first_name}: input {memref!r} coordinate {position} reads "
+                            f"{rows[0][2][0]} in every work item, an effective offset of "
+                            f"{constants[0]} the work grid does not tile; this backend "
+                            "stages the group's result frontier from row zero"
+                        )
+                    continue
+                if len(extents) != 1:
+                    problems.append(
+                        f"{first_name}: input {memref!r} coordinate {position} spans "
+                        f"different extents across the work items ({sorted(extents)})"
+                    )
+                    continue
+                (extent,) = extents
+                expected = [flat * extent for flat, _m, _e in rows]
+                if constants != expected:
+                    problems.append(
+                        f"{first_name}: input {memref!r} coordinate {position} reads "
+                        f"{rows[0][2][0]}; the work items' effective offsets "
+                        f"{constants} do not tile the realized frontier {expected} "
+                        f"(item w must read offset w x {extent} in work-id order); "
+                        "this backend stages the group's result frontier from row zero"
+                    )
     if problems:
         raise NotImplementedError(
             "unsupported contraction operand access (no PIM backend stages a "
