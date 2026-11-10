@@ -119,7 +119,10 @@ heuristic order: fewest matrix tiles, fewest resident tiles, widest tile).
 `layout="spatial_gemv_group_reduction_k64"` forces one tile;
 `layout="spatial_gemv_group_reduction"` keeps the tile cost-ranked within the
 family. Each plan's `metadata["tile_decision"]` and its estimate graph record
-the decision; `APUv1VectorCallable.tile_decision` lists every tile with its
+the decision; the selected plan's `metadata["tile_decision"]` (reachable from the
+common `CompiledCallable` through its realized backend program and the
+estimate graph's metadata; the former `APUv1VectorCallable.tile_decision`
+wrapper attribute was removed in round 13) lists every tile with its
 estimate (or `None` when not realizable) and the selected tile, and
 functional/virtual runs return it in `RunResult.extra["tile_decision"]`.
 

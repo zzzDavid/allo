@@ -56,8 +56,9 @@ partial sums").
 * The compiled object: `CompiledCallable.reduction_order`, and
   `CompiledCallable.reduction_policy_pruned`, which holds the `(mode,
   reason)` pairs the enumerators pruned, also kept in the ranking record
-  as `KernelRanking.policy_pruned`. On APU v1:
-  `APUv1VectorCallable.reduction_order` and `.reduction_policy_pruned`.
+  as `KernelRanking.policy_pruned`. On APU v1 the same two attributes of the
+  common `CompiledCallable` (the former `APUv1VectorCallable` wrapper was
+  removed in round 13).
 * Every result: `RunResult.extra["reduction_order"]`, plus
   `extra["reduction_policy"]`, a list of `{"accumulator_type",
   "may_regroup"}` entries (matcher route). On the APU v1 vector route the
@@ -85,7 +86,7 @@ suggests `reduction_order="reassociate"`.
 | AiM (`_REGROUPING_MATCHER_ROUTES["aim"]`) | every `MAC_ABK`/`MAC_SBK` reduces the 16 BF16 products of a burst through the bank adder tree before accumulating | `ReductionOrderError`. AiM has no source-order program. `replica_partitions` spreads a replica's *outputs* over channels and never splits the reduction axis (audit M-08). The CENT RMS bank-pair idiom (`spmw_aim._check_bank_pair_span`) does split one, but under strict it is unreachable because every AiM float reduction is refused. The `reduction_partitions` knob (token split, `spmw_knobs._aim_reduction_partitions_candidates`) reads `reduction_policy(match)` and offers only P = 1 when regrouping is forbidden. |
 | APU v1 matcher route (`_REGROUPING_MATCHER_ROUTES["apu_v1"]`) | `gvml_add_subgrps` group tree | `ReductionOrderError`. The source-order plans live on the vector route. |
 | `pim/apu_v1_vector_program._apply_reduction_policy` | `group_tree` / `pairwise` / `host` / `partial` reduction kinds (`apu_v1_plan_regroups`). `temporal_accumulate`, `serial` and `none` add one product per step in source order. | Regrouping plans are removed before `search_apu_v1_vector_plans` and the legacy incumbent ranking. `layout=<pruned plan>` raises. If no plan remains, the compile raises. |
-| `APUv1VectorCallable._run_functional` (`backend="functional"`/`"virtual"`) | numerics of the selected plan | With a temporal plan the source program runs, which is the plan's order. With a regrouping FP16 plan (only possible with `"reassociate"`) the run uses `_grouped_fp16_contraction`: FP16 products, a halving FP16 tree over each `group_size` group, then groups added to the output in ascending order. That is the order of `fp16_contraction_ops`. The halving order is a model of `gvml_add_subgrps`; it has not been checked against the board. |
+| `apu_v1_vector_program._run_functional` (the vector route's host model behind `backend="functional"`/`"virtual"`; formerly reached as `APUv1VectorCallable._run_functional`) | numerics of the selected plan | With a temporal plan the source program runs, which is the plan's order. With a regrouping FP16 plan (only possible with `"reassociate"`) the run uses `_grouped_fp16_contraction`: FP16 products, a halving FP16 tree over each `group_size` group, then groups added to the output in ascending order. That is the order of `fp16_contraction_ops`. The halving order is a model of `gvml_add_subgrps`; it has not been checked against the board. |
 
 Gemini-II (`apu_v2`) has no source route. Its typed records reject the
 argument.

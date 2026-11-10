@@ -38,10 +38,15 @@ are not reproduced by this release.
 ## 2. Route
 
 `allo.compile(source, build_apu_g2_target(), apu_g2_cost)`:
-`compiler.py` sends every non-record workload on `apu_v2` to
-`allo.pim.apu_g2_source_route.compile_apu_g2_source_workload`, which returns
-a `CompiledCallable` (outputs copied into the caller's arrays for
-`kind="device"`, untouched for `kind="virtual"`). Anything outside the family
+`compiler.py` sends every non-record workload on `apu_v2` through the
+common pipeline: the shared front stages, then the `autoschedule`
+enumerator `apu_g2_source_candidates`
+(`allo/pim/apu_g2_source_route.py`, called from `allo/spmw_autoschedule.py`),
+legality, the shared ranking and the `APUG2Ctx` materialization; the result
+is the common `CompiledCallable` (outputs copied into the caller's arrays for
+`kind="device"`, untouched for `kind="virtual"`). The route-specific entry
+`compile_apu_g2_source_workload` this section once named was removed in
+round 13 (`shared-compilation-path.md`). Anything outside the family
 raises `APUG2SourceRouteError` (a `NotImplementedError`) whose message names
 the reason and the supported family.
 

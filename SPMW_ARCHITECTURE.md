@@ -120,10 +120,18 @@ result = compiled(*arrays)        # RunResult
 estimate = compiled.estimate()    # perf.Estimate from the retained graph
 ```
 
-`allo/compiler.py::compile` returns a `CompiledWorkload`
-(`CompiledCallable` for matcher and Gemini-II source routes,
-`APUv1VectorCallable`, `APUv1ProgramCallable`, `APUG2TypedCallable`,
-`APUG2ComposedContractionCallable` otherwise). `reduction_order` is
+`allo/compiler.py::compile` returns a `CompiledCallable` (the one
+concrete implementation of the `CompiledWorkload` protocol) for every
+input: source workloads on every target, the APU v1 whole-function
+program record and the Gemini-II typed and composed records, which enter
+through their record frontends (`allo/pim/apu_v1_record_frontend.py`,
+`allo/pim/apu_g2_record_frontend.py`, Section 2.0) and leave as
+candidates of the common pipeline. The per-route result wrappers of the
+pre-round-13 tree (`APUv1VectorCallable`, `APUv1ProgramCallable`,
+`APUG2TypedCallable`, `APUG2ComposedContractionCallable`) no longer exist;
+`CompiledCallable` carries `reduction_order`, `reduction_policy_pruned`,
+`placement_ranking`, `execution_graph`, `estimate()` and the realized
+backend program for all of them. `reduction_order` is
 `"strict"` (default) or `"reassociate"` (`allo/spmw_reduction_policy.py`);
 typed program records reject it. `backend="virtual"` evaluates the cost
 program only.
@@ -765,8 +773,11 @@ G2-06).
   `APUG2RecordProgram` and the shared artifact follow; ``out`` may be
   omitted in a call and is then allocated and returned in
   ``RunResult.extra["outputs"]``.
-* **Source route** (`apu_g2_source_route.py`,
-  `compile_apu_g2_source_workload`): a plain integer contraction function
+* **Source route** (`apu_g2_source_route.py`; entered from the common
+  pipeline through the `autoschedule` enumerator `apu_g2_source_candidates`,
+  `allo/spmw_autoschedule.py`, not through a route-specific compile entry;
+  the former `compile_apu_g2_source_workload` was removed in round 13): a
+  plain integer contraction function
   passes the shared front stages, matched against the target's declared
   view `build_apu_g2_contraction_patterns()` (`MAC`, `AXPBY`, the latter
   declaring `intermediate="i24"` for its wide epilogue);
