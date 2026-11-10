@@ -160,6 +160,10 @@ def test_cli_verify_and_locate(isolated_home):
 def test_build_py_bundles_the_recipe_inside_the_package(tmp_path):
     """The wheel carries simulators/PIMSimulator as allo/pim/simulators/
     PIMSimulator (setup.py BuildPy), without upstream build outputs."""
+    # setuptools is the only prerequisite; its absence is detected narrowly
+    # before the build so that a build failure is a failure, not a skip.
+    if importlib.util.find_spec("setuptools") is None:
+        pytest.skip("setuptools is not installed")
     build_lib = tmp_path / "lib"
     result = subprocess.run(
         [
@@ -176,8 +180,10 @@ def test_build_py_bundles_the_recipe_inside_the_package(tmp_path):
         timeout=600,
         check=False,
     )
-    if result.returncode != 0:
-        pytest.skip(f"setup.py build_py unavailable here: {result.stderr[-1500:]}")
+    assert result.returncode == 0, (
+        f"setup.py build_py exited with {result.returncode}\n"
+        f"stdout:\n{result.stdout[-2000:]}\nstderr:\n{result.stderr[-2000:]}"
+    )
     copied = build_lib / "allo" / "pim" / "simulators" / "PIMSimulator"
     assert (copied / "apply.sh").is_file()
     assert (copied / "NOTICE.md").is_file()
