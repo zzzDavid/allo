@@ -2240,3 +2240,18 @@ hardware.
 | APU v1 and shared-semantics suites on the final code (`pytest_apu_v1_slice.log`) | the APU v1 recognizer, functional-reference, build-config, cost-provenance, tile-selection, vector-compile, native-reduction, reduction-policy, scalar-surface, hybrid-manifest and distance-argmin suites, the run-result contract and the shared-semantics suite (the two board tests deselected): 279 passed in 848 s; `pylint` (E, unused-import, unused-variable, undefined-variable) on the changed module: 0 (the view is invoked through `operator.call`, since static inference does not know a `types.FunctionType`-built function to be callable; no diagnostic is suppressed) |
 | Not done | the APU v1 installed-artifact vector, forced-plan and cost-perturbation execution and the three Gemini-I rows (the board host's `/tmp` at 2.4 MB); the X-34 / X-37 confirmation campaign (reserved for the final candidate); the final-candidate installed-artifact validation on the simulators (the bundled Samsung build from the wheel included) and both hardware hosts |
 
+## Round 105 (2026-11-10): V1-19, closure cells and the `dsl` submodule follow the local view (the reviewer's round 104 probes)
+
+Checkout after `2556cd2`; evidence under
+`/work/shared/users/phd/nz264/tenon-release-evidence/r105/`.  The host's
+`/tmp` at about 2.4 MB (the reviewer's reading); nothing launched on
+hardware.
+
+| Check | Result |
+|---|---|
+| The reviewer's probes (`reviewer-r104/probe_closures.py`, `probe_closures.log`) against the round 104 code | three accepted source forms compiled as `temporal_svp` and failed at execution under NumPy 2.5.4: a factory capturing `from allo import grid, reduction` in closure cells, a factory capturing `import allo as local_allo`, and `allo.dsl.grid` reached through the module view's delegation |
+| Repair (`_scalar_loop_view`, `_ScalarLoopModuleView.__getattr__`, `_cell_is_bound`) | closure cells are rebound into fresh `types.CellType` cells with the same rule as the globals (module references become views, direct bindings become the scalar range, everything else kept); the module view returns a view for the `allo`/`allo.dsl` modules reached through it. No original cell or module attribute changes |
+| `tests/perf/test_apu_v1_functional_reference.py` with the four recorded V1-19 tests | NumPy 2.5.4 (`-W error::DeprecationWarning`): 15 passed in 36 s (`pytest_v1_19_np254.log`); NumPy 2.3.5 with the tuple-conversion deprecation an error: 15 passed in 35 s (`pytest_v1_19_np235.log`). New cases: the two factory forms and the `allo.dsl` form through `allo.compile`'s functional route, and the closure cells shown fresh with the unrelated captured value kept and the original cells' contents unchanged |
+| The reviewer's probe rerun (`reviewer_probe_closures_rerun.log`) | all three forms PASS `functional` under NumPy 2.5.4 |
+| APU v1 and shared-semantics suites on the final code (`pytest_apu_v1_slice.log`) | the APU v1 recognizer, functional-reference, build-config, cost-provenance, tile-selection, vector-compile, native-reduction, reduction-policy, scalar-surface, hybrid-manifest and distance-argmin suites, the run-result contract and the shared-semantics suite (the two board tests deselected): 283 passed in 893 s; pylint (E, unused-import, unused-variable, undefined-variable) on the changed module: 0 |
+
