@@ -1109,30 +1109,46 @@ def product_extent(values) -> int:
     return math.prod(int(v) for v in values)
 
 
-def contraction_access_problems(fact, *, reduction_offsets: bool = True) -> list[str]:
+def contraction_access_problems(
+    fact,
+    *,
+    reduction_offsets: bool = True,
+    result_offsets: str = "any",
+) -> list[str]:
     """Input accesses of a contraction that no PIM lowering realizes as
-    written (release ledger X-42).
+    written (release ledger X-42), judged on the **effective** access: every
+    loop variable is substituted by ``lower + step * t`` over its normalized
+    counter ``t`` (`LoopAxis.lower`, `LoopAxis.step`), so a loop that starts
+    at 128 or advances by two is judged like the coordinate ``k + 128`` or
+    ``2*k`` it is.
 
-    The lowerings stage a contraction operand contiguously along its loops:
-    a coordinate may be one loop variable (``b[k]``), that variable plus a
-    constant on a result loop (the work item's matrix rows ``row0 + i``), or
-    a dense row-major flattening of several loops (``xs[p * Q + k]`` with
-    ``Q`` the trip count of ``k``; ``lx[jo * KI + ji]``), which addresses
-    the same contiguous elements a multi-dimensional access would.  A
-    coordinate whose innermost loop has a coefficient other than one
-    (``b[2*k]``), whose outer coefficient is not the product of the inner
-    trip counts (``xs[p * 2Q + k]``, a padded stride), or, unless
-    ``reduction_offsets`` is allowed, that shifts a reduction loop by a
-    constant (``b[k + 1]``) would be read as the dense access and is
-    reported, one message per coordinate.  A coordinate with no retained
-    form (data dependent) or with an atom that is not a loop variable is
-    not judged here; the backends' own checks keep handling those."""
+    The lowerings stage a contraction operand contiguously along its loops
+    from the operand's first element: the effective coordinate may be one
+    normalized loop counter (``b[k]`` over ``range(K)``), a result-loop
+    counter plus a constant where the backend realizes result offsets (the
+    Samsung row offset ``row0 + i``) or where the work grid tiles the result
+    (every multi-item kernel), or a dense row-major flattening of several
+    counters (``xs[p * Q + k]`` with ``Q`` the trip count of ``k``), which
+    addresses the same contiguous elements a multi-dimensional access would.
+    Reported, one message per coordinate: an innermost effective coefficient
+    other than one (``b[2*k]``, ``range(0, K, 2)``); an outer coefficient
+    that is not the product of the inner trip counts (``xs[p * 2Q + k]``);
+    unless ``reduction_offsets`` is allowed, an effective constant on a
+    coordinate reading a reduction loop (``b[k + 1]``, ``range(128, K)``);
+    and, under ``result_offsets="none"`` (a single work item on a backend
+    that stages the result from row zero), an effective constant on a
+    result-loop coordinate (``a[16 + i]`` with ``c[16 + i]``,
+    ``range(16, 32)``).  A coordinate with no retained form (data dependent)
+    or with an atom that is not a loop variable is not judged here; the
+    backends' own checks keep handling those.  A loop without a static
+    domain is reported."""
     if not hasattr(fact, "reduction_vars"):
         return []
-    order = list(fact.loop_vars)
+    loops = list(fact.loops)
+    order = [loop.var for loop in loops]
     loop_vars = set(order)
+    by_var = {loop.var: loop for loop in loops}
     reduction = set(fact.reduction_vars)
-    trips = fact.trips
     labels = fact.loop_labels
     problems = []
     for access in fact.inputs:
@@ -1154,32 +1170,65 @@ def contraction_access_problems(fact, *, reduction_offsets: bool = True) -> list
                 f"{c}*{labels.get(atom, atom)}" if c != 1 else labels.get(atom, atom)
                 for atom, c in loop_terms
             )
-            # Dense row-major flattening: the innermost term has coefficient
-            # one and every outer coefficient is the product of the trip
+            # The effective form over the normalized loop counters.
+            effective_constant = int(constant)
+            effective = []
+            domain_problem = None
+            for atom, c in loop_terms:
+                loop = by_var[atom]
+                if loop.lower is None or loop.upper is None or loop.step <= 0:
+                    domain_problem = (
+                        f"{where} reads {spelled} over loop "
+                        f"{labels.get(atom, atom)!r} without a static domain"
+                    )
+                    break
+                effective.append((atom, c * loop.step, loop.trip or 0))
+                effective_constant += c * loop.lower
+            if domain_problem is not None:
+                problems.append(domain_problem)
+                continue
+            domains = ", ".join(
+                f"{labels.get(atom, atom)} in [{by_var[atom].lower}, {by_var[atom].upper})"
+                + (f" step {by_var[atom].step}" if by_var[atom].step != 1 else "")
+                for atom, _c in loop_terms
+                if by_var[atom].lower != 0 or by_var[atom].step != 1
+            )
+            read = f"{spelled}" + (f" with {domains}" if domains else "")
+            # Dense row-major flattening: the innermost effective coefficient
+            # is one and every outer coefficient is the product of the trip
             # counts of the terms inside it.
             expected, dense = 1, True
-            for atom, c in reversed(loop_terms):
+            for _atom, c, trip in reversed(effective):
                 if c != expected:
                     dense = False
                     break
-                expected *= int(trips.get(atom) or 0)
+                expected *= int(trip)
             if not dense:
                 problems.append(
-                    f"{where} reads {spelled}, which is not one loop variable or a "
+                    f"{where} reads {read}, which is not one loop counter or a "
                     "dense row-major flattening of its loops; the PIM lowerings "
                     "stage a contraction operand contiguously, so a strided or "
                     "padded access would be read as the dense one"
                 )
                 continue
+            reads_reduction = any(atom in reduction for atom, _c in loop_terms)
+            if effective_constant != 0 and reads_reduction and not reduction_offsets:
+                problems.append(
+                    f"{where} reads {read}, an effective shift of {effective_constant} "
+                    "on a reduction loop; the PIM lowerings stage the reduction "
+                    "extent from the operand's first element"
+                )
+                continue
             if (
-                not reduction_offsets
-                and int(constant) != 0
-                and any(atom in reduction for atom, _c in loop_terms)
+                effective_constant != 0
+                and not reads_reduction
+                and result_offsets == "none"
             ):
                 problems.append(
-                    f"{where} reads {spelled} shifted by {int(constant)}; the PIM "
-                    "lowerings stage the reduction extent from the operand's "
-                    "first element"
+                    f"{where} reads {read}, an effective offset of {effective_constant} "
+                    "on a result loop; this backend stages a single work item's "
+                    "rows from the first row and realizes no result offset "
+                    "(partition the rows over a work grid, or index from zero)"
                 )
     return problems
 

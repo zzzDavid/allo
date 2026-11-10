@@ -534,6 +534,11 @@ class AimCtx(CodegenContext):
     # The AiM program represents, prices and binds declared host stages
     # (``allo.host_compute``); ``compile_for_target`` refuses them elsewhere.
     supports_host_compute = True
+    # The lowering stages a single work item's matrix rows and results from
+    # row zero (`AimContraction.row` counts whole items); a constant result
+    # offset of one item is not realized and is refused before selection
+    # (X-42).  Multi-item kernels tile the result through the work grid.
+    REALIZES_RESULT_OFFSETS = False
     """Codegen ctx for AiM: emits the ramulator2 text trace.
 
     ``self.cmds`` is a list of trace lines (not ``PIMCmd`` records).  Every

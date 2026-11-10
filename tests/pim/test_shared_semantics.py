@@ -4777,13 +4777,13 @@ def test_apu_v1_grouped_non_template_regions_are_refused_for_execution(
             grouped_gemm_reversed_k,
             "operand 'B' is read at \\[-1 \\* k \\+ 31, j\\] along the reduction",
             "row_block_0: input 'B' coordinate 0 reads -1\\*k, which is not one loop "
-            "variable or a dense row-major flattening",
+            "counter or a dense row-major flattening",
         ),
         (
             grouped_gemm_permuted_rows,
             "read at row -1 \\* i \\+ 15 of 'A'",
             "row_block_0: input 'A' coordinate 0 reads -1\\*i, which is not one loop "
-            "variable or a dense row-major flattening",
+            "counter or a dense row-major flattening",
         ),
     ],
     ids=["reversed_k", "permuted_rows"],

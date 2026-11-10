@@ -203,6 +203,13 @@ class CodegenContext:
 
     Each backend supplies its own subclass exposing the methods its
     `emit` lambdas need (Samsung: `ctx.cmd(name, dst, src0, src1)`).
+
+    ``REALIZES_RESULT_OFFSETS`` (class attribute, default True): whether the
+    lowering places a single work item's result rows at the constant offset
+    the source reads them at (``a[16 + i]`` with ``c[16 + i]``,
+    ``range(16, 32)``); a backend that stages every item from row zero sets
+    it False and `require_contraction_accesses_realizable` refuses such a
+    program before selection instead of lowering the wrong rows (X-42).
     """
 
     def __init__(self, target):
@@ -1696,19 +1703,32 @@ def carried_accumulator_message(target_name: str, match) -> str:
     )
 
 
-def require_contraction_accesses_realizable(trace) -> None:
+def require_contraction_accesses_realizable(trace, ctx_cls=None) -> None:
     """Refuse, for every matched contraction of the trace, an input access no
     PIM lowering realizes as written (`spmw_semantics.
-    contraction_access_problems`; release ledger X-42).  The message names
-    the function, the operand, the coordinate and what was read."""
+    contraction_access_problems`, over the effective access after the loop
+    domains are substituted; release ledger X-42).  Reduction shifts are
+    refused for every backend; a result-loop offset of a single work item is
+    refused unless the backend declares ``REALIZES_RESULT_OFFSETS`` (Samsung
+    places rows at the offset; AiM and AttAcc stage from row zero).  The
+    message names the function, the operand, the coordinate and what was
+    read."""
+    import math
+
     from .spmw_semantics import contraction_access_problems
 
+    realizes_offsets = bool(getattr(ctx_cls, "REALIZES_RESULT_OFFSETS", True))
     problems = []
     for match in trace.matches:
         fact = match.extra.get("semantic_facts")
         if fact is None:
             continue
-        for problem in contraction_access_problems(fact, reduction_offsets=False):
+        scope = match.extra.get("spmw_work_scope")
+        items = math.prod(tuple(getattr(scope, "group_shape", ()) or (1,)))
+        policy = "any" if (realizes_offsets or items > 1) else "none"
+        for problem in contraction_access_problems(
+            fact, reduction_offsets=False, result_offsets=policy
+        ):
             problems.append(f"{match.func_name}: {problem}")
     if problems:
         raise NotImplementedError(
@@ -1827,7 +1847,9 @@ def compile_for_target(
     # lowerings cannot realize as written (a strided or compound loop
     # coordinate) is refused here, before any backend's candidates are
     # selected, instead of being staged as the contiguous access.
-    require_contraction_accesses_realizable(trace)
+    require_contraction_accesses_realizable(
+        trace, backend_context_class(target_name) if target_name in _BACKENDS else None
+    )
 
     # A virtual-only target needs no code generator. Its executable cost spec
     # lowers the trace directly to the retained handle-based graph.

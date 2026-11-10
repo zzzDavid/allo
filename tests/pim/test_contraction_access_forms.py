@@ -119,25 +119,27 @@ def test_strided_vector_is_refused_before_selection_on_aim():
     message = str(excinfo.value)
     assert "unsupported contraction operand access" in message
     assert (
-        "dot_0: input 'b' coordinate 0 reads 2*k, which is not one loop variable"
+        "dot_0: input 'b' coordinate 0 reads 2*k, which is not one loop counter"
         in message
     )
 
 
 def test_shifted_reduction_coordinates_are_refused_on_either_operand():
     with pytest.raises(
-        NotImplementedError, match="input 'b' coordinate 0 reads k shifted by 128"
+        NotImplementedError,
+        match="input 'b' coordinate 0 reads k, an effective shift of 128 on a reduction loop",
     ):
         _aim(shifted_vector)
     with pytest.raises(
-        NotImplementedError, match="input 'a' coordinate 1 reads k shifted by 8"
+        NotImplementedError,
+        match="input 'a' coordinate 1 reads k, an effective shift of 8 on a reduction loop",
     ):
         _aim(shifted_matrix)
 
 
 def test_strided_vector_is_refused_on_attacc_and_samsung_by_the_shared_check():
     with pytest.raises(
-        NotImplementedError, match="reads 2\\*k, which is not one loop variable"
+        NotImplementedError, match="reads 2\\*k, which is not one loop counter"
     ):
         allo.compile(
             strided_attacc,
@@ -147,7 +149,7 @@ def test_strided_vector_is_refused_on_attacc_and_samsung_by_the_shared_check():
             reduction_order="reassociate",
         )
     with pytest.raises(
-        NotImplementedError, match="reads 2\\*k, which is not one loop variable"
+        NotImplementedError, match="reads 2\\*k, which is not one loop counter"
     ):
         allo.compile(
             strided_samsung,
@@ -194,6 +196,122 @@ def test_dense_flattening_is_accepted_and_a_padded_stride_is_refused():
     assert contraction_access_problems(fact, reduction_offsets=False) == []
     with pytest.raises(
         NotImplementedError,
-        match="input 'xs' coordinate 0 reads 32\\*p \\+ k, which is not one loop",
+        match="input 'xs' coordinate 0 reads 32\\*p \\+ k, which is not one loop counter",
     ):
         _aim(padded_flattened)
+
+
+@region()
+def reduction_lower_bound(W: bfloat16[M, K], x: bfloat16[V], y: bfloat16[M]):
+    @allo.work(mapping=[1], args=[W, x, y])
+    def dot(a: bfloat16[M, K], b: bfloat16[V], c: bfloat16[M]):
+        for i in range(M):
+            acc: bfloat16 = 0
+            for k in range(128, K):
+                acc += a[i, k] * b[k]
+            c[i] = acc
+
+
+@region()
+def reduction_step_two(W: bfloat16[M, K], x: bfloat16[V], y: bfloat16[M]):
+    @allo.work(mapping=[1], args=[W, x, y])
+    def dot(a: bfloat16[M, K], b: bfloat16[V], c: bfloat16[M]):
+        for i in range(M):
+            acc: bfloat16 = 0
+            for k in range(0, K, 2):
+                acc += a[i, k] * b[k]
+            c[i] = acc
+
+
+@region()
+def result_lower_bound(W: bfloat16[M, K], x: bfloat16[K], y: bfloat16[M]):
+    @allo.work(mapping=[1], args=[W, x, y])
+    def dot(a: bfloat16[M, K], b: bfloat16[K], c: bfloat16[M]):
+        for i in range(16, 32):
+            acc: bfloat16 = 0
+            for k in range(K):
+                acc += a[i, k] * b[k]
+            c[i] = acc
+
+
+@region()
+def result_offset_single_item(W: bfloat16[M, K], x: bfloat16[K], y: bfloat16[M]):
+    @allo.work(mapping=[1], args=[W, x, y])
+    def dot(a: bfloat16[M, K], b: bfloat16[K], c: bfloat16[M]):
+        for i in range(16):
+            acc: bfloat16 = 0
+            for k in range(K):
+                acc += a[16 + i, k] * b[k]
+            c[16 + i] = acc
+
+
+@region()
+def attacc_reduction_lower_bound(W: float16[M, K], x: float16[V], y: float16[M]):
+    @allo.work(mapping=[1], args=[W, x, y])
+    def dot(a: float16[M, K], b: float16[V], c: float16[M]):
+        for i in range(M):
+            acc: float16 = 0
+            for k in range(128, K):
+                acc += a[i, k] * b[k]
+            c[i] = acc
+
+
+@region()
+def attacc_reduction_step_two(W: float16[M, K], x: float16[V], y: float16[M]):
+    @allo.work(mapping=[1], args=[W, x, y])
+    def dot(a: float16[M, K], b: float16[V], c: float16[M]):
+        for i in range(M):
+            acc: float16 = 0
+            for k in range(0, K, 2):
+                acc += a[i, k] * b[k]
+            c[i] = acc
+
+
+def test_loop_domains_are_substituted_before_judging_the_access():
+    """The reviewer's round 95 probes: ``range(128, K)`` and ``range(0, K, 2)``
+    read ``b[k]`` but mean ``b[k + 128]`` and ``b[2*k]``; AiM and AttAcc
+    lowered both as the dense ``range(128)`` program (with ``a = 1`` and
+    ``b[0:128] = 0``, ``b[128:256] = 1`` the source gives 128 and 64, the
+    lowered program 0).  Both are refused on both backends, naming the
+    loop domain."""
+    with pytest.raises(
+        NotImplementedError,
+        match=r"input 'b' coordinate 0 reads k with k in \[128, 256\), an effective shift of 128",
+    ):
+        _aim(reduction_lower_bound)
+    with pytest.raises(
+        NotImplementedError,
+        match=r"input 'b' coordinate 0 reads k with k in \[0, 256\) step 2, which is not one loop counter",
+    ):
+        _aim(reduction_step_two)
+    for workload in (attacc_reduction_lower_bound, attacc_reduction_step_two):
+        with pytest.raises(
+            NotImplementedError, match="unsupported contraction operand access"
+        ):
+            allo.compile(
+                workload,
+                build_attacc_target(),
+                attacc_cost,
+                backend="virtual",
+                reduction_order="reassociate",
+            )
+
+
+def test_single_item_result_offsets_are_refused_where_the_backend_stages_from_row_zero():
+    """AiM stages one work item's rows from row zero (`AimContraction.row`
+    counts items), so ``range(16, 32)`` and ``a[16 + i]`` / ``c[16 + i]`` on
+    one item compiled to the rows 0..15 program (`r96/row_offset_probe.log`,
+    `domain_probe2.log`); ``AimCtx.REALIZES_RESULT_OFFSETS`` is False and
+    both are refused before selection.  Multi-item kernels (the CENT rows'
+    ``lW[ch * ROWS + i, k]``) tile the result through the work grid and stay
+    accepted (`tests/pim/test_aim_axis_roles.py`)."""
+    with pytest.raises(
+        NotImplementedError,
+        match=r"input 'a' coordinate 0 reads i with i in \[16, 32\), an effective offset of 16 on a result loop",
+    ):
+        _aim(result_lower_bound)
+    with pytest.raises(
+        NotImplementedError,
+        match=r"input 'a' coordinate 0 reads i, an effective offset of 16 on a result loop",
+    ):
+        _aim(result_offset_single_item)

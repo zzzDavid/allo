@@ -296,6 +296,10 @@ def attacc_placement(kernel: AttAccKernel, tiling, placements=None):
 class AttAccCtx(CodegenContext):
     """Lowers each kernel to its AttAcc command inventory."""
 
+    # The command inventory covers the kernel's rows from zero; a constant
+    # result offset of the one work item is not realized (X-42).
+    REALIZES_RESULT_OFFSETS = False
+
     def __init__(self, target):
         super().__init__(target)
         self.geometry = attacc_geometry(target)
