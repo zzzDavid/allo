@@ -1,6 +1,8 @@
 <!--- Copyright Allo authors. All Rights Reserved. -->
 <!--- SPDX-License-Identifier: Apache-2.0  -->
 
+> **SUPERSEDED (historical rationale, 2026-06/07).** This note does not describe the working tree: no PolyBench suite or `UPMEMProgram` route exists; the UPMEM route supports nine recognized families with one DPU per `@allo.work` item; see `../design/README.md` for the statements of this note that are no longer true and `../docs/release/design/upmem-domain.md` for the current design. Kept for the reasoning it records (release issue U-08).
+
 # UPMEM PolyBench execution matrix
 
 This document is an implementation inventory for faithful execution of the 30

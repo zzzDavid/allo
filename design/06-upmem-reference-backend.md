@@ -1,6 +1,8 @@
 <!--- Copyright Allo authors. All Rights Reserved. -->
 <!--- SPDX-License-Identifier: Apache-2.0  -->
 
+> **SUPERSEDED (historical rationale, 2026-06/07).** This note does not describe the working tree: the UPMEM route compiles through the matcher (`allo/spmw_upmem.py`, nine kernel families, `GENERIC` fixtures on uPIMulator); see `../design/README.md` for the statements of this note that are no longer true and `../docs/release/design/upmem-domain.md` for the current design. Kept for the reasoning it records (release issue U-08).
+
 # UPMEM as a Tenon reference backend
 
 UPMEM is represented with the same three independent programming abstractions

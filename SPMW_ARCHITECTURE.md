@@ -602,24 +602,6 @@ by slice (M-05). `_check_simulator_geometry` rejects targets whose geometry
 differs from the 32-channel preset (M-10). Design:
 `docs/release/design/aim-token-partition.md`. Open: skill-doc bank geometry.
 
-### 3.6 AttAcc (`attacc`, analytical only)
-
-`build_attacc_target()` describes the paper's AttAcc device (5 HBM3 PIM
-devices x 16 pseudo-channels x 64 banks, FP16; `MAC`, `SFM_EXP`, `SFM_SUM`,
-`SFM_DIV`; no timing). `allo/pim/attacc_tiling.py` enumerates the legal
-tilings from the geometry and the matched contraction, the `attacc_tiling`
-knob makes each a candidate, and `allo/pim/costs/attacc.py` prices the
-retained command inventory with the paper's closed-form rules
-(re-implemented from the paper's source, no DCC code; validity domain in
-the docstring). `allo/spmw_attacc.py::AttAccCtx` emits the command
-inventory; there is no runner, so `backend=None` raises and only
-`backend="virtual"` (`kind="virtual"`) is supported. All 500 paper
-instances select the paper tiling through `allo.compile`
-(`benchmarks/attacc/`, `tests/pim/test_attacc_virtual.py`). The
-Ramulator2-AttAcc timing and the DCC decode composition are external
-scripts with named dependencies (`benchmarks/attacc/scripts/`). Design:
-`docs/release/design/attacc-backend.md`.
-
 ### 3.3 UPMEM (`allo/spmw_upmem.py`, `allo/pim/upmem_physical*.py`, `allo/pim/upmem_irregular.py`, `allo/pim/costs/upmem.py`)
 
 Input: source dataflow workloads with `mapping=[N]` (one DPU per work item;
@@ -819,6 +801,24 @@ are 1 (G2-10); the template holds the uint16 add, typed and composed programs
 only, and the typed and composed runtimes build their one host target
 (G2-11). Open: G2-12, device index semantics, `t + u` epilogue without
 coefficients.
+
+### 3.6 AttAcc (`attacc`, analytical only)
+
+`build_attacc_target()` describes the paper's AttAcc device (5 HBM3 PIM
+devices x 16 pseudo-channels x 64 banks, FP16; `MAC`, `SFM_EXP`, `SFM_SUM`,
+`SFM_DIV`; no timing). `allo/pim/attacc_tiling.py` enumerates the legal
+tilings from the geometry and the matched contraction, the `attacc_tiling`
+knob makes each a candidate, and `allo/pim/costs/attacc.py` prices the
+retained command inventory with the paper's closed-form rules
+(re-implemented from the paper's source, no DCC code; validity domain in
+the docstring). `allo/spmw_attacc.py::AttAccCtx` emits the command
+inventory; there is no runner, so `backend=None` raises and only
+`backend="virtual"` (`kind="virtual"`) is supported. All 500 paper
+instances select the paper tiling through `allo.compile`
+(`benchmarks/attacc/`, `tests/pim/test_attacc_virtual.py`). The
+Ramulator2-AttAcc timing and the DCC decode composition are external
+scripts with named dependencies (`benchmarks/attacc/scripts/`). Design:
+`docs/release/design/attacc-backend.md`.
 
 ## 4. Extending Tenon
 
