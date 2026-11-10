@@ -13,7 +13,7 @@ for i in $(seq 1 90); do [ -f $E/pkg/dist/allo-0.5.tar.gz ] && break; sleep 10; 
 stage sdist_present -- test -f $E/pkg/dist/allo-0.5.tar.gz || { milestone_finish; exit 1; }
 sleep 20
 stage build_wheel -- "$HERE/g2_build_wheel.sh" $E || { milestone_finish; exit 1; }
-stage copy_tests_and_benchmarks -- bash -c "rm -rf $E/g2/bench $E/g2/tests && mkdir -p $E/g2/bench $E/g2/tests && cp -r $ALLO/benchmarks $E/g2/bench/ && cp -r $ALLO/tests/pim $E/g2/tests/ && { [ -f $ALLO/tests/conftest.py ] && cp $ALLO/tests/conftest.py $E/g2/tests/ || true; }"
+stage copy_tests_and_benchmarks -- bash -c "source $HERE/stage_lib.sh && copy_tree_with_optional $E/g2/bench $ALLO benchmarks && copy_tree_with_optional $E/g2/tests $ALLO tests/pim -- tests/conftest.py"
 stage card_tests -- "$HERE/g2_card_tests.sh" $E
 stage candidate_session -- "$HERE/g2_session.sh" $E/g2 $E/g2_candidate_rows.json
 milestone_finish

@@ -54,3 +54,28 @@ milestone_finish() {
   echo "MILESTONE PASSED (every required stage exited 0)" | tee -a "$STAGE_DIR/SUMMARY.txt"
   return 0
 }
+
+# copy_tree_with_optional DEST SRC_ROOT MANDATORY... [-- OPTIONAL...]
+# Copies each MANDATORY path (relative to SRC_ROOT) into DEST and fails if any is missing or
+# fails to copy; each OPTIONAL path is copied when present, its absence tolerated, but a copy
+# that fails is an error (P-26 follow-up: `[ -f x ] && cp x || true` hid copy failures).
+copy_tree_with_optional() {
+  local dest=$1 root=$2; shift 2
+  local optional=0 rel
+  rm -rf "$dest" && mkdir -p "$dest" || return 1
+  for rel in "$@"; do
+    if [ "$rel" = "--" ]; then optional=1; continue; fi
+    if [ -e "$root/$rel" ]; then
+      cp -r "$root/$rel" "$dest/" || { echo "copy failed: $root/$rel" >&2; return 1; }
+    elif [ $optional -eq 1 ]; then
+      echo "optional $rel absent (tolerated)"
+    else
+      echo "mandatory $rel missing: $root/$rel" >&2; return 1
+    fi
+  done
+  return 0
+}
+
+
+# available to `bash -c` stage commands as well
+export -f copy_tree_with_optional

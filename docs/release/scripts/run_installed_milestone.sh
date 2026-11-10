@@ -42,7 +42,9 @@ for s in fresh_install_check fresh_sim_check aim_check upmem_check; do
   stage probe_$s -- timeout 1800 $PY $S/$s.py
 done
 
-rm -rf $E/testtree && mkdir -p $E/testtree && cp -r $ALLO/tests $ALLO/benchmarks $E/testtree/ && cp $ALLO/pytest.ini $ALLO/conftest.py $E/testtree/ 2>/dev/null
+# tests and benchmarks copied out of the checkout (mandatory); pytest.ini and a root
+# conftest.py are optional (this tree has neither); a failed copy fails the milestone.
+stage copy_test_tree -- copy_tree_with_optional $E/testtree $ALLO tests benchmarks -- pytest.ini conftest.py
 T=$E/testtree; cd $T; export PYTHONPATH=$T
 stage golden_rows -- timeout 3600 $PY -m pytest -q -p no:cacheprovider tests/pim/test_paper_golden.py -k "not apu_v1" -s
 stage golden_rows_paper_full -- timeout 5400 $PY -m pytest -q -p no:cacheprovider tests/pim/test_paper_golden.py -k "not apu_v1" -m paper_full
@@ -50,6 +52,25 @@ stage samsung_conductor_and_gemv_all_targets -- timeout 3600 $PY -m pytest -q -p
 stage cent_suite -- timeout 3600 $PY -m pytest -q -p no:cacheprovider tests/pim/test_cent_aim_workloads.py
 stage cent_suite_paper_full -- timeout 5400 $PY -m pytest -q -p no:cacheprovider tests/pim/test_cent_aim_workloads.py -m paper_full
 stage shared_contract_set -- timeout 3600 $PY -m pytest -q -p no:cacheprovider tests/pim/test_attacc_virtual.py tests/pim/test_attacc_orientation.py tests/pim/test_aim_allocation.py tests/pim/test_contraction_access_forms.py tests/pim/test_aim_orientation.py tests/pim/test_axis_roles_coordinates.py
+# AttAcc required figures (G10): the six kernel rows on the natively built Ramulator2-AttAcc
+# with the DCC trace generator (ATTACC_* below), command-by-command trace checks, the six decode
+# configurations composed from these sessions, and the comparison with the frozen figures
+# (docs/release/scripts/attacc_compare_frozen.py).  Traces, configurations and raw outputs are
+# retained under $E/attacc/*.artifacts.  tests/pim/test_attacc_virtual.py (in the shared-contract
+# stage above) runs no simulator and is not figure evidence.
+export ATTACC_DCC_ROOT=${ATTACC_DCC_ROOT:-/work/shared/users/sg2682/project/pim-compilation/repro/dcc-attacc/src/src}
+export ATTACC_RAMULATOR=${ATTACC_RAMULATOR:-/work/shared/users/phd/nz264/attacc-native/build/ramulator2}
+export ATTACC_RAMULATOR_LIBDIR=${ATTACC_RAMULATOR_LIBDIR:-/work/shared/users/phd/nz264/attacc-native/src}
+mkdir -p $E/attacc; cd $E/attacc
+for row in qkv_b1 qkv_b4 proj_b1 proj_b4; do
+  stage attacc_$row -- timeout 3600 $PY -m benchmarks.attacc.scripts.run_ramulator --row $row --fixed-baseline --artifacts $E/attacc/attacc_$row.artifacts --out $E/attacc/attacc_$row.json
+done
+for row in score_b1 score_b4; do
+  stage attacc_$row -- timeout 5400 $PY -m benchmarks.attacc.scripts.run_ramulator --row $row --artifacts $E/attacc/attacc_$row.artifacts --out $E/attacc/attacc_$row.json
+done
+stage attacc_compose_e2e -- timeout 1800 $PY -m benchmarks.attacc.scripts.compose_e2e --sessions $E/attacc/attacc_qkv_b1.json $E/attacc/attacc_qkv_b4.json $E/attacc/attacc_proj_b1.json $E/attacc/attacc_proj_b4.json $E/attacc/attacc_score_b1.json $E/attacc/attacc_score_b4.json --out $E/attacc/attacc_e2e.json
+stage attacc_compare_frozen -- $PY $HERE/attacc_compare_frozen.py --sessions-dir $E/attacc --inventory $ALLO/docs/release/paper_reproduction/inventory.csv --manifest ${TENON_ARTIFACTS}/attacc-llm-e2e/tenon/tenon_manifest.csv --out $E/attacc/attacc_compare_frozen.json
+cd $T
 stage apu_v1_functional_reference -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/perf/test_apu_v1_functional_reference.py -W error::DeprecationWarning
 stage numpy24_venv -- bash -c "env -u PYTHONPATH $SPMW_PY -m venv --system-site-packages $E/venv-np24 && $E/venv-np24/bin/python -m pip install -q 'numpy>=2.4' && $E/venv-np24/bin/python -m pip install -q --no-deps --force-reinstall $P/wheel/allo-0.5-*.whl && $E/venv-np24/bin/python -c 'import numpy, allo; print(\"numpy\", numpy.__version__, \"allo\", allo.__file__)'"
 stage apu_v1_functional_reference_numpy24 -- timeout 1800 $E/venv-np24/bin/python -m pytest -q -p no:cacheprovider tests/perf/test_apu_v1_functional_reference.py "tests/perf/test_apu_v1_recognizers.py::test_temporal_plan_accumulates_nonzero_initial_output" "tests/pim/test_shared_semantics.py::test_local_accumulator_gemm_executes_on_apu_v1_functional_backend" -W error::DeprecationWarning
