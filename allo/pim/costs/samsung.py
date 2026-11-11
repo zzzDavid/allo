@@ -13,10 +13,12 @@ drain, and explicit host moves when the workload records ``host_xfer.*``.
 The unit is the memory-clock cycle of these modeled activities on the
 declared device, scheduled over the pim / pseudo_channel / host resources.
 It models the first matrix staging of a REDUCE placement (``mac_stage``,
-from the conductor's staging schedule, round 37) but not the CRF upload or
-the readback unless host moves are supplied, and it prices the logical
-(unpadded) shape. It is
-therefore *not* the quantity PIMSimulator reports for an executed program
+from the conductor's staging schedule, round 37) and, when the placement
+fills GRF_A from the bank (``grf_residency`` ``crf``), the conductor's
+staging of the vector into every PIM block (``mac_vector_stage``, from its
+``stage_vector`` loop, round 132), but not the CRF upload or the readback
+unless host moves are supplied, and it prices the logical (unpadded)
+shape. It is therefore *not* the quantity PIMSimulator reports for an executed program
 (``RunResult.cycles``: padded preload + execution + readback on the
 simulated 64-channel system, ``RunResult.extra["timing_scope"]``); the two
 are compared only by candidate ranking
@@ -278,6 +280,47 @@ def samsung_staging_share(
     }
 
 
+def samsung_vector_staging_share(
+    reduction,
+    *,
+    E,
+    lanes,
+    cols_per_row=32,
+    columns=1,
+) -> dict:
+    """One work item's share of the conductor's vector staging for a
+    bank-filled GRF_A (``TenonConductor.inc`` ``stage_vector``): before the
+    passes, the vector's ``k_tiles x E`` bursts (per result column) are
+    written at consecutive columns of the even bank of *every* PIM block,
+    once whatever the pass count, and the FILL column command later loads
+    GRF_A from them; a host-filled GRF_A has no such staging (its HAB
+    broadcast is the LD_A rule).  The replication is per PIM unit, not per
+    matrix row, so a work item's share is its unit's copy on the declared
+    grid (one unit per work item): the eight units of a channel together
+    write the ``8 x k_tiles x E`` bursts the conductor writes per channel.
+    Bus: one STAGE_WRITE_CYCLES per write; consecutive writes alternate
+    blocks (the loop is tile, block, entry), so no same-bank row change is
+    exposed on the bus.  Bank: the unit's bank visits ``ceil(k_tiles * E *
+    columns / cols_per_row)`` rows plus its writes, banks in parallel."""
+    if isinstance(cols_per_row, bool) or int(cols_per_row) <= 0:
+        raise ValueError(
+            f"cols_per_row must be a positive integer, got {cols_per_row!r}"
+        )
+    cols_per_row = int(cols_per_row)
+    tiles = max(1, _ceil_div(reduction, E * lanes))
+    writes = tiles * E * max(1, int(columns))
+    rows_visited = max(1, _ceil_div(writes, cols_per_row))
+    bus = writes * STAGE_WRITE_CYCLES
+    bank = rows_visited * STAGE_ROW_VISIT_CYCLES + writes * STAGE_WRITE_CYCLES
+    return {
+        "writes": writes,
+        "exposed_row_changes": 0,
+        "bus_cycles": bus,
+        "bank_cycles": bank,
+        "latency": max(bus, bank),
+    }
+
+
 def _ceil_div(value, divisor):
     if divisor <= 0:
         raise ValueError("cost divisor must be positive")
@@ -310,6 +353,16 @@ def samsung_cost(target):
             latency=share["latency"],
             occupy=[ctx.use(channel, cycles=share["bus_cycles"])],
             name="mac_stage",
+        )
+
+    def stage_vector(ctx, share):
+        # The vector staging of a bank-filled GRF_A (the conductor's
+        # stage_vector, in the preload phase after the matrix): bus part on
+        # the channel, bank part latency only; before the MAC's FILLs.
+        ctx.step(
+            latency=share["latency"],
+            occupy=[ctx.use(channel, cycles=share["bus_cycles"])],
+            name="mac_vector_stage",
         )
 
     def temporal_mac(event, ctx):
@@ -370,35 +423,45 @@ def samsung_cost(target):
             latency += tiles * (groups_per_tile // 2) * ROW_PAIR_SAME_BANK_CYCLES
         # This work item's share of the first matrix staging (its own rows'
         # bursts; the shares of a kernel's work items partition the
-        # conductor's staging), before the MAC.
-        extents_stage = tuple(event.metrics.get("loop_extents", ()) or ())
-        rows_stage = int(extents_stage[0]) if len(extents_stage) > 1 else 1
+        # conductor's staging), before the MAC.  Columns come from the nest
+        # the Samsung lowering accepts, [row, k] or [row, column, k]
+        # (spmw_samsung.samsung_contraction), not from the matcher's
+        # batch_dim, which depends on source operand order.
+        extents = tuple(event.metrics.get("loop_extents", ()) or ())
+        rows = int(extents[0]) if len(extents) > 1 else 1
+        columns = int(extents[1]) if len(extents) == 3 else 1
+        batch = max(columns, int(event.metrics.get("batch", 1)))
+        G = int(target.grf_b.slots)
+        E = int(target.grf_a.slots)
         stage(
             ctx,
             samsung_staging_share(
-                rows_stage,
+                rows,
                 reduction,
-                G=int(target.grf_b.slots),
-                E=int(target.grf_a.slots),
+                G=G,
+                E=E,
                 lanes=lanes,
                 split_rows=split_rows,
             ),
         )
+        if not grf_a_fill_is_host_broadcast(event):
+            # A bank-filled GRF_A: the conductor also stages the vector (every
+            # column's tiles) into every PIM unit before the passes; this
+            # work item's share is its unit's copy (S-12, round 132).  A
+            # host-filled GRF_A stages nothing (the broadcast is in LD_A).
+            stage_vector(
+                ctx,
+                samsung_vector_staging_share(
+                    reduction, E=E, lanes=lanes, columns=batch
+                ),
+            )
         occupy_compute(event, ctx, latency, MAC_CYCLES)
         # Several reduction columns (GEMM N, batched GEMV) with a restaged
         # matrix: each extra column rewrites this work item's matrix rows
         # (rows x K/16 bursts) over its pseudo-channel before its pass;
-        # resident staging writes once. The first staging is outside this
-        # graph's scope (module docstring), so only the extra ones appear.
-        # Columns come from the nest the Samsung lowering accepts, [row, k]
-        # or [row, column, k] (spmw_samsung.samsung_contraction), not from
-        # the matcher's batch_dim, which depends on source operand order.
-        extents = tuple(event.metrics.get("loop_extents", ()) or ())
-        columns = int(extents[1]) if len(extents) == 3 else 1
-        batch = max(columns, int(event.metrics.get("batch", 1)))
-        candidate = event.metrics.get("candidate", {}) or {}
+        # resident staging writes once. The first staging is in the
+        # mac_stage step above, so only the extra ones appear here.
         if batch > 1 and not candidate.get("stage_resident", False):
-            rows = int(extents[0]) if len(extents) > 1 else 1
             lanes16 = int(target.grf_a.width) // 16
             bursts = rows * _ceil_div(reduction, lanes16)
             restage = (batch - 1) * bursts * HOST_BURST_CYCLES

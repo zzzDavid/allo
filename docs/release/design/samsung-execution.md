@@ -721,3 +721,89 @@ reference magnitude and `z` with `V @ y_gathered`).
   rejected (whole-buffer transfers only); `run_batched` covers the
   resident-matrix batch.
 
+## 10. CRF-fill vector staging in the candidate cost (S-12, round 132, 2026-11-11)
+
+Sections 7.2 and 7.3 left the residency pairs (P0,P3) and (P2,P3)
+disagreeing and named the cause: a bank-filled GRF_A (``grf_residency``
+``crf``) costs the simulator 93 to 375 preload cycles for replicating the
+vector into every PIM block, and that replication was outside the cost
+graph, whose residency term was 16 cycles per work item (``BANK_LOAD_CYCLES``
+against the host broadcast). Round 132 re-read ``allo/pim/costs/samsung.py``
+against the conductor's emitted preload work and confirmed the omission
+still existed after the round 37-38 matrix staging: the ``mac_stage`` share
+priced the matrix only, and nothing priced ``stage_vector``.
+
+### 10.1 What the conductor emits
+
+``TenonConductor.inc`` ``stage_vector(n)``: for every reduction tile ``t``
+(``k_tiles``), every PIM block of every channel (``C x P``) and every GRF_A
+entry ``a`` (``E``), one write to the even bank of that block at column
+``vector_base + (n * T + t) * E + a``. It runs once per result column
+before the passes (resident matrix) or before each column's pass (restaged
+matrix), once whatever the pass count, and only when ``vector_from_bank``;
+a host-filled GRF_A stages nothing (the HAB broadcast is in the pass, the
+LD_A rule). Per channel: ``P x k_tiles x E`` writes, i.e. 128 at K = 256
+and 256 at K = 512, whatever the row count (design 6.2: the preload rises
+by 93 cycles at both 4096x256 and 8192x256).
+
+### 10.2 Rule
+
+``samsung_vector_staging_share(reduction, E, lanes, cols_per_row, columns)``
+prices one work item's share as its PIM unit's copy on the declared grid
+(one unit per work item, so the eight items of a channel together write
+what the conductor writes per channel): ``k_tiles x E x columns`` writes at
+``STAGE_WRITE_CYCLES`` on the channel bus (consecutive writes alternate
+blocks, no exposed same-bank row change), and as bank latency
+``ceil(writes / cols_per_row)`` row visits at ``STAGE_ROW_VISIT_CYCLES``
+plus the writes; the step ``mac_vector_stage`` follows ``mac_stage`` and
+precedes the MAC, and is emitted only when the placement is not a host
+broadcast (the same predicate as the LD_A rule). The constants are the
+staging constants of round 37 (device ini timings); nothing was fitted.
+Per work item: latency 72 (bus 32) at K = 256, 104 (64) at K = 512, 208
+(128) at K = 1024.
+
+### 10.3 Expected outcome, stated before the runs
+
+(P0,P3) flips to agree in every shape (the term exceeds the model's
+fiber-term gap); (P0,P2) and (P1,P3) stay agreed; (P2,P3) stays
+disagreed where it is not a tie, since both candidates are bank-filled and
+the term is identical for them (the simulator's small preference for
+dual_fiber under CRF fill is not this mechanism); the default selection
+stays ``split_rows`` + host fill with the golden cycles unchanged; the
+simulated cycles of the unchanged programs equal 6.2.
+
+### 10.4 Results (``r132/s12_pairs.py``, ``r132/after/*.json``, ``r132/s12_summary.txt``)
+
+Estimates before (``bbbba43``) and after the term, simulated cycles on the
+bundled conductor (``r129/tenon-home``, ``pim_driver`` stripped identity
+``9aea49bf...``; all paper-shape cycles equal 6.2):
+
+| Shape | P0 dual_fiber host | P1 bank_row host | P2 dual_fiber CRF | P3 bank_row CRF | P8 split_rows host (default) |
+|---|---|---|---|---|---|
+| 4096x256 | 22,486 / 22,486 / 4,435 | 22,102 / 22,102 / 4,389 | 22,502 / 23,334 / 4,560 | 22,118 / 22,950 / 4,589 | 18,630 / 18,630 / **4,108** |
+| 4096x512 | 44,878 / 44,878 / 8,041 | 44,118 / 44,118 / 7,947 | 44,894 / 46,558 / 8,410 | 44,134 / 45,798 / 8,458 | 37,166 / 37,166 / **7,057** |
+| 8192x256 | 43,478 / 43,478 / 8,247 | 43,094 / 43,094 / 8,153 | 43,494 / 44,326 / 8,359 | 43,110 / 43,942 / 8,397 | 35,014 / 35,014 / **7,255** |
+| 2048x512 (neighbour) | 23,886 / 23,886 / 8,041 | 23,126 / 23,126 / 7,947 | 23,902 / 25,566 / 8,410 | 23,142 / 24,806 / 8,458 | 20,782 / 20,782 / **7,057** |
+| 2048x1024 (neighbour) | 47,678 / 47,678 / 15,251 | 46,166 / 46,166 / 15,051 | 47,694 / 51,022 / 16,051 | 46,182 / 49,510 / 16,201 | 41,470 / 41,470 / **12,873** |
+
+(cells: estimate before / estimate after / simulated cycles; P9 split_rows
++ CRF is refused at realization, as before.) Outputs within 4.0e-4 of FP32
+in every run. Pairwise (6.1 rule, ten pairs per shape): before, (P0,P3)
+disagreed in all five shapes; after, (P0,P3) agrees in all five and the
+only remaining non-agreement is (P2,P3): disagree at 4096x256 (+0.63%),
+4096x512 (+0.57%), 2048x512 (+0.57%) and 2048x1024 (+0.93%), tie at
+8192x256 (+0.45%). Tally after: 9 agree + 1 disagree per shape (9 + 1 tie
+at 8192x256). The default selection is ``split_rows`` + host fill in all
+five shapes, the measured fastest in all five, with the golden cycles
+4,108 / 7,057 / 7,255 unchanged. The 2048x512 neighbour executes in the
+same cycles as 4096x512 (half a pass padded to a whole pass).
+
+### 10.5 Remaining scope
+
+(P2,P3): under a bank fill the simulator runs dual_fiber 0.45-0.93%
+faster than bank_row (execution 1,170 against 1,178 and preload 3,209
+against 3,230 at 4096x256), while the model keeps the odd-fiber term of
+section 7 for dual_fiber whatever the fill; the interaction is not
+modelled and the pair stays open in ISSUES S-12 as the narrowed residue.
+Absolute estimates remain on the declared grid and are compared by ranking
+only.

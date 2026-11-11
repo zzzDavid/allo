@@ -99,21 +99,26 @@ def test_virtual_graph_includes_shape_aware_host_transfers():
     # drain around the MAC; the host moves bracket the device program.  Since
     # round 37 the MAC event also carries this work item's share of the first
     # matrix staging (``mac_stage``), which precedes the MAC as the conductor
-    # stages before it executes (round 38).
+    # stages before it executes (round 38); this placement declares no GRF_A
+    # residency, which the model prices as a bank fill (as the LD_A rule
+    # does), so the vector staging of that fill (``mac_vector_stage``, round
+    # 132) follows the matrix staging.
     assert [activity.primitive for activity in graph.activities] == [
         "samsung_hbm_pim/host/SCATTER_BANKS",
         "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/LD_B",
         "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/MAC",
         "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/MAC",
+        "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/MAC",
         "samsung_hbm_pim/hbm_pim/pseudo_channel/pim/ST_B",
         "samsung_hbm_pim/host/GATHER_BANKS",
     ]
-    assert [activity.label for activity in graph.activities][2:4] == [
+    assert [activity.label for activity in graph.activities][2:5] == [
         "mac_stage",
+        "mac_vector_stage",
         "mac",
     ]
-    stage, mac = graph.activities[2], graph.activities[3]
-    assert stage.id in mac.depends_on
+    stage, vector, mac = graph.activities[2:5]
+    assert stage.id in vector.depends_on and vector.id in mac.depends_on
     # Host moves are priced from their buffer bytes (64 B scatter -> 4 cycles,
     # 32 B gather -> 3 cycles) and serialize with the device program.
     device_only = bound.evaluate(
@@ -287,7 +292,9 @@ def test_staging_shares_partition_the_conductors_staging():
                 "reduction_extent": k,
                 "lanes": 16,
                 "n_fibers": 1,
-                "candidate": candidate or {},
+                # a host-filled GRF_A: the matrix staging alone (the vector
+                # staging of a bank fill is `test_vector_staging_shares_...`)
+                "candidate": {"grf_residency": {"x": "host"}, **(candidate or {})},
             },
         )
         bound.emit(graph, event)
@@ -342,6 +349,87 @@ def test_staging_shares_partition_the_conductors_staging():
         == samsung_staging_share(64, 256, G=G, E=E, lanes=16, temporal=True)["latency"]
         > 0
     )
+
+
+def test_vector_staging_shares_partition_the_conductors_vector_staging():
+    """Round 132 (S-12): a bank-filled GRF_A (``grf_residency`` ``crf``) is
+    charged its blocks' share of the conductor's vector staging
+    (``stage_vector``: every PIM block receives the vector's k_tiles x E
+    bursts per column before the passes), the shares of a kernel's work
+    items of a channel together write what the conductor writes per channel,
+    a host-filled GRF_A has no such
+    step, columns scale it, and it sits between the matrix staging and the
+    MAC in the priced graph."""
+    from allo.perf import CostEvent, ExecutionGraph
+    from allo.pim.costs.samsung import (
+        STAGE_ROW_VISIT_CYCLES,
+        STAGE_WRITE_CYCLES,
+        samsung_vector_staging_share,
+    )
+
+    target = build_samsung_target()
+    bound = samsung_cost.bind(target)
+    E = int(target.grf_a.slots)
+
+    def emitted(rows, k, residency, extents=None):
+        graph = ExecutionGraph()
+        event = CostEvent.create(
+            "mac",
+            target.op("MAC"),
+            work_id=(0, 0),
+            metrics={
+                "loop_extents": extents or (rows, k),
+                "reduction_extent": k,
+                "lanes": 16,
+                "n_fibers": 1,
+                "candidate": {"grf_residency": {"x": residency}},
+            },
+        )
+        bound.emit(graph, event)
+        return graph
+
+    host = emitted(32, 256, "host")
+    assert [a.label for a in host.activities][:2] == ["mac_stage", "mac"]
+    crf = emitted(32, 256, "crf")
+    labels = [a.label for a in crf.activities]
+    assert labels[:3] == ["mac_stage", "mac_vector_stage", "mac"], labels
+    stage, vector, mac = crf.activities[:3]
+    assert stage.id in vector.depends_on and vector.id in mac.depends_on
+    share = samsung_vector_staging_share(256, E=E, lanes=16)
+    assert vector.latency_cycles == share["latency"] > 0
+    # The replication is per PIM unit, once whatever the pass count: the
+    # conductor writes k_tiles (2) x E bursts into each of its 8 blocks per
+    # channel (64 x 128 writes on its 64-channel system; design 6.2 measures
+    # the same preload increase, 93 cycles, at 4096 x 256 and 8192 x 256),
+    # and the eight work items of a declared channel together write that.
+    assert share["writes"] == 2 * E == 16
+    assert 8 * share["writes"] == 8 * 2 * E
+    assert share["exposed_row_changes"] == 0
+    assert share["bus_cycles"] == share["writes"] * STAGE_WRITE_CYCLES
+    assert share["bank_cycles"] == STAGE_ROW_VISIT_CYCLES + 2 * E * STAGE_WRITE_CYCLES
+    assert emitted(64, 256, "crf").activities[1].latency_cycles == vector.latency_cycles
+    # Padded tiles cost the same; the bank's row visits grow once the staged
+    # columns exceed one row (32 columns = 4 tiles).
+    assert share == samsung_vector_staging_share(129, E=E, lanes=16)
+    wide = samsung_vector_staging_share(1024, E=E, lanes=16)
+    assert wide["writes"] == 8 * E
+    assert (
+        wide["bank_cycles"] == 2 * STAGE_ROW_VISIT_CYCLES + 8 * E * STAGE_WRITE_CYCLES
+    )
+    # Every result column stages its own tiles (the conductor stages the
+    # vector of every column, resident or restaged).
+    two = emitted(32, 256, "crf", extents=(32, 2, 256))
+    assert two.activities[1].label == "mac_vector_stage"
+    assert (
+        two.activities[1].latency_cycles
+        == samsung_vector_staging_share(256, E=E, lanes=16, columns=2)["latency"]
+        > vector.latency_cycles
+    )
+    # The bank fill now carries the staging the simulator charges it, so a
+    # bank-filled program of the same rows costs more than the host-filled
+    # one (design 6.2: CRF fill 4,560 / 4,589 against 4,435 / 4,389 cycles).
+    total = lambda graph: sum(a.latency_cycles for a in graph.activities)
+    assert total(crf) > total(host)
 
 
 def test_staging_share_follows_the_geometry_columns_per_row():
