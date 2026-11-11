@@ -34,6 +34,10 @@ echo "host $(hostname) date $(date -Is) commit $(cat $P/revision.txt)" | tee -a 
 sha256sum $P/wheel/allo-0.5-*.whl $P/dist/allo-0.5.tar.gz | tee -a $E/stages/SUMMARY.txt
 
 stage module_origin -- $PY -c "import allo, allo.spmw_aim, allo.spmw_apu_v1, allo.spmw_apu_g2, allo.spmw_upmem, allo.spmw_attacc, allo.spmw_samsung, sys; print(allo.__file__); assert not any(p.startswith('$ALLO') for p in sys.path)"
+# The dependency versions the stages below run under are recorded from the interpreter, not
+# assumed from the venv's name (round 120: the "release NumPy" venv had installed unpinned
+# numpy 2.5.4 while the ledger said 2.3.5).  TENON_MILESTONE_NUMPY, when set, is asserted.
+stage environment_versions -- $PY -c "import sys, numpy, allo; print('python', sys.version.split()[0]); print('numpy', numpy.__version__); print('allo', allo.__file__); expected = '${TENON_MILESTONE_NUMPY:-}'; assert not expected or numpy.__version__ == expected, (numpy.__version__, expected)"
 stage samsung_verify -- $PY -m allo.pim.samsung_simulator verify
 stage samsung_locate_before_build -- bash -c "$PY -m allo.pim.samsung_simulator locate; rc=\$?; [ \$rc -eq 1 ]"   # 1 expected: nothing built yet
 stage samsung_build -- $PY -m allo.pim.samsung_simulator build --jobs 16
@@ -78,6 +82,11 @@ cd $T
 stage apu_v1_grouped_mapping -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/pim/test_apu_v1_grouped_mapping.py
 stage apu_v1_shared_semantics_selection -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/pim/test_shared_semantics.py -k "apu_v1 or grouped"
 stage apu_v1_functional_reference -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/perf/test_apu_v1_functional_reference.py -W error::DeprecationWarning
-stage numpy24_venv -- bash -c "env -u PYTHONPATH $SPMW_PY -m venv --system-site-packages $E/venv-np24 && $E/venv-np24/bin/python -m pip install -q 'numpy>=2.4' && $E/venv-np24/bin/python -m pip install -q --no-deps --force-reinstall $P/wheel/allo-0.5-*.whl && $E/venv-np24/bin/python -c 'import numpy, allo; print(\"numpy\", numpy.__version__, \"allo\", allo.__file__)'"
+stage numpy24_venv -- bash -c "env -u PYTHONPATH $SPMW_PY -m venv --system-site-packages $E/venv-np24 && $E/venv-np24/bin/python -m pip install -q 'numpy>=2.4' && $E/venv-np24/bin/python -m pip install -q --no-deps --force-reinstall $P/wheel/allo-0.5-*.whl"
+stage numpy24_versions_asserted -- $E/venv-np24/bin/python -c "import numpy, allo; print('numpy', numpy.__version__, 'allo', allo.__file__); major, minor = (int(x) for x in numpy.__version__.split('.')[:2]); assert (major, minor) >= (2, 4), numpy.__version__; assert '/venv-np24/' in allo.__file__, allo.__file__"
+RELEASE_NUMPY=${TENON_RELEASE_NUMPY:-2.3.5}
+stage release_numpy_venv -- bash -c "rm -rf $E/venv-release-numpy && env -u PYTHONPATH $SPMW_PY -m venv $E/venv-release-numpy && $E/venv-release-numpy/bin/python -m pip install -q 'numpy==$RELEASE_NUMPY' PyYAML sympy ml_dtypes rich tabulate xmltodict pandas pyparsing graphviz psutil pytest && $E/venv-release-numpy/bin/python -m pip install -q --no-deps --force-reinstall $P/wheel/allo-0.5-*.whl"
+stage release_numpy_versions_asserted -- $E/venv-release-numpy/bin/python -c "import numpy, allo; print('numpy', numpy.__version__, 'allo', allo.__file__); assert numpy.__version__ == '$RELEASE_NUMPY', numpy.__version__; assert '/venv-release-numpy/' in allo.__file__, allo.__file__"
+stage apu_v1_functional_reference_release_numpy -- timeout 1800 $E/venv-release-numpy/bin/python -m pytest -q -p no:cacheprovider tests/perf/test_apu_v1_functional_reference.py tests/pim/test_apu_v1_grouped_mapping.py -W error::DeprecationWarning
 stage apu_v1_functional_reference_numpy24 -- timeout 1800 $E/venv-np24/bin/python -m pytest -q -p no:cacheprovider tests/perf/test_apu_v1_functional_reference.py "tests/perf/test_apu_v1_recognizers.py::test_temporal_plan_accumulates_nonzero_initial_output" "tests/pim/test_shared_semantics.py::test_local_accumulator_gemm_executes_on_apu_v1_functional_backend" -W error::DeprecationWarning
 milestone_finish
