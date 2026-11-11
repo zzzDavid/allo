@@ -3114,7 +3114,9 @@ natively built Ramulator2-AttAcc with the DCC trace generator, the decode
 composition, and a comparator against the frozen figures that checks
 every selected run's trace command by command and reproduces the
 500-instance tally; checked first against the round 84 sessions, then run
-from the `ab239e3` wheel.  The copy helper's optional semantics are
+from the `ab239e3` wheel: all twelve figure results REPRODUCED, 500
+selected traces checked, the records identical to round 84's apart from
+a new operand-name field.  The copy helper's optional semantics are
 explicit and exercised (absent optional tolerated, unreadable optional
 fails, missing mandatory fails).  `ab239e3` is the packaged working
 candidate by the reviewer's decision; the `b994fc0` Gemini-II campaign is
