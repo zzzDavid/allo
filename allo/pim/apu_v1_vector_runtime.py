@@ -28,6 +28,7 @@ from ..spmw_apu_v1_build import _apu_v1_build_config
 from ..spmw_codegen import RunResult
 from ..spmw_fingerprint import canonical_json
 from .apu_v1_program import (
+    APUV1LaunchFailure,
     _generate_project,
     _ledag_available_reason,
     apu_v1_lock_path,
@@ -392,9 +393,30 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
         argv.extend(str(output_paths[name]) for name in sorted(output_paths))
         argv.extend(str(initial_paths[name]) for name in sorted(initial_paths))
         binary_sha256 = hashlib.sha256(Path(binary).read_bytes()).hexdigest()
-        text, profile, cycles = launch_on_board(
-            argv, project, expected_records=1, timeout=900
-        )
+        device_source = dict(runtime_artifact.project_files)["device.c"].decode("utf-8")
+        try:
+            text, profile, cycles = launch_on_board(
+                argv, project, expected_records=1, timeout=900
+            )
+        except APUV1LaunchFailure as failure:
+            # The build directory is removed below; the failure keeps what it
+            # would otherwise lose (ISSUES V1-21).
+            failure.diagnostics.update(
+                {
+                    "device_source": device_source,
+                    "device_source_sha256": hashlib.sha256(
+                        device_source.encode()
+                    ).hexdigest(),
+                    "selected_plan": realization.plan.name,
+                    "build_mode": build_config.mode,
+                    "launch_roles": {
+                        "inputs": sorted(input_paths),
+                        "outputs": sorted(output_paths),
+                        "initial": sorted(initial_paths),
+                    },
+                }
+            )
+            raise
 
         raw_outputs = {}
         packed_outputs = dict(packed)
@@ -422,9 +444,7 @@ def run_apu_v1_vector(compiled, arrays, *, lab_name: str = "tenon-vector"):
                 "raw_outputs": raw_outputs,
                 "selected_plan": realization.plan.name,
                 "plan_selection": getattr(compiled, "plan_selection", None),
-                "device_source": dict(runtime_artifact.project_files)[
-                    "device.c"
-                ].decode("utf-8"),
+                "device_source": device_source,
                 "build_mode": build_config.mode,
                 "single_apuc": True,
                 "initial_outputs_transferred": sorted(initial_paths),

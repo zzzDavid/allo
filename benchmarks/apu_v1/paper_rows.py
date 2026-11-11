@@ -54,7 +54,6 @@ import hashlib
 import importlib.util
 import inspect
 import json
-import shutil
 import tempfile
 import os
 import platform
@@ -100,6 +99,59 @@ def _load_workload(root: Path, case: str):
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module.build()
+
+
+class LaunchFailure(MeasurementError):
+    """A launch that produced no valid measurement, with its preserved
+    evidence: ``record`` is the launch entry the session keeps (the error,
+    the launch directory holding the diagnostics, the binary identity, the
+    argv, the launched source hash, the fresh-record count), never a cycle
+    count (ISSUES V1-21)."""
+
+    def __init__(self, record):
+        super().__init__(record.get("error", "launch failed"))
+        self.record = dict(record)
+
+
+def _json_ready(value):
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _write_failure_diagnostics(launch_dir, message, diagnostics):
+    """Serialize a failed launch beside whatever it wrote: the error, the
+    structured diagnostics, the generated source, the device log read before
+    the launch, every read after it and every attempt's process output."""
+    launch_dir = Path(launch_dir)
+    launch_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics = dict(diagnostics or {})
+    (launch_dir / "error.txt").write_text(message + "\n")
+    source = diagnostics.pop("device_source", None)
+    if source:
+        (launch_dir / "device.c").write_text(source)
+    before = diagnostics.pop("device_log_before", None)
+    if before is not None:
+        (launch_dir / "device_log_before.txt").write_text(before)
+    reads = diagnostics.pop("device_log_reads_after", None) or []
+    for index, read in enumerate(reads, 1):
+        (launch_dir / f"device_log_after_{index}.txt").write_text(read or "")
+    attempts = diagnostics.get("attempts") or []
+    for index, attempt in enumerate(attempts, 1):
+        (launch_dir / f"process_output_{index}.txt").write_text(
+            attempt.get("process_output") or ""
+        )
+    diagnostics["files"] = sorted(
+        {p.name for p in launch_dir.iterdir()} | {"diagnostics.json"}
+    )
+    (launch_dir / "diagnostics.json").write_text(
+        json.dumps(_json_ready(diagnostics), indent=1)
+    )
+    return diagnostics
 
 
 def _sha256_text(text: str) -> str:
@@ -157,7 +209,17 @@ class TenonLane:
     """The shared pipeline's program for one case: compiled once, launched
     through the public callable."""
 
-    def __init__(self, case, root, *, backend, layout=None, device_source=None):
+    def __init__(
+        self,
+        case,
+        root,
+        *,
+        backend,
+        layout=None,
+        device_source=None,
+        scratch=None,
+        name="tenon",
+    ):
         import allo
         from allo.pim.costs import apu_v1_cost
         from allo.pim.targets import build_apu_v1_target
@@ -165,6 +227,12 @@ class TenonLane:
         self.case = case
         self.root = root
         self.backend = backend
+        # Per-launch evidence (generated source, actual outputs, identities,
+        # failure diagnostics) is kept under the session's scratch directory,
+        # outside the archive and outside the installed compiler.
+        self.scratch = Path(scratch).resolve() if scratch else None
+        self.name = name
+        self.count = 0
         workload = _load_workload(root, case)
         target = build_apu_v1_target()
         kwargs = {"layout": layout} if layout is not None else {}
@@ -283,14 +351,73 @@ class TenonLane:
             "outputs": list(self.returned) + self.in_place_outputs,
         }
 
+    def _launch_dir(self):
+
+        self.count = getattr(self, "count", 0) + 1
+        scratch = getattr(self, "scratch", None)
+        if scratch is None:
+            scratch = self.scratch = Path(
+                tempfile.mkdtemp(prefix=f"tenon-apu-v1-{self.case}-{self.name}-")
+            ).resolve()
+        launch_dir = Path(scratch) / f"{self.name}-launch-{self.count:03d}"
+        launch_dir.mkdir(parents=True, exist_ok=False)
+        return launch_dir
+
     def launch(self):
         import numpy as np
 
+        from allo.pim.apu_v1_program import APUV1LaunchFailure
+
+        launch_dir = self._launch_dir()
+        launched_sha = (
+            self.substituted_source["sha256"]
+            if getattr(self, "substituted_source", None)
+            else getattr(self, "device_source_sha256", None)
+        )
         fresh = {name: value.copy() for name, value in self.arguments.items()}
-        if self.keyword_call:
-            result = self.compiled(**fresh)
-        else:
-            result = self.compiled(*(fresh[name] for name in self.parameters))
+        try:
+            if self.keyword_call:
+                result = self.compiled(**fresh)
+            else:
+                result = self.compiled(*(fresh[name] for name in self.parameters))
+        except APUV1LaunchFailure as failure:
+            # The runtime's structured diagnostics, serialized beside the
+            # launch; the record carries no cycle count (ISSUES V1-21).
+            diagnostics = _write_failure_diagnostics(
+                launch_dir, f"{type(failure).__name__}: {failure}", failure.diagnostics
+            )
+            raise LaunchFailure(
+                {
+                    "error": f"{type(failure).__name__}: {failure}",
+                    "crun": None,
+                    "outputs_match_oracle": None,
+                    "launch_dir": str(launch_dir),
+                    "argv": diagnostics.get("argv"),
+                    "binary_sha256": diagnostics.get("binary_sha256"),
+                    "binary_bytes": diagnostics.get("binary_bytes"),
+                    "launched_source_sha256": diagnostics.get("device_source_sha256")
+                    or launched_sha,
+                    "expected_records": diagnostics.get("expected_records"),
+                    "fresh_records_found": diagnostics.get("fresh_records_found"),
+                    "board_lock": diagnostics.get("board_lock"),
+                    "diagnostics": sorted(diagnostics.get("files") or []),
+                }
+            ) from failure
+        except Exception as error:
+            _write_failure_diagnostics(
+                launch_dir,
+                f"{type(error).__name__}: {error}",
+                {"device_source": getattr(self, "device_source", None)},
+            )
+            raise LaunchFailure(
+                {
+                    "error": f"{type(error).__name__}: {error}",
+                    "crun": None,
+                    "outputs_match_oracle": None,
+                    "launch_dir": str(launch_dir),
+                    "launched_source_sha256": launched_sha,
+                }
+            ) from error
         if result.kind != "device":
             raise MeasurementError(f"expected a device run, got {result.kind!r}")
         outputs = dict(result.extra.get("outputs", {}) or {})
@@ -303,7 +430,24 @@ class TenonLane:
             for p in produced
         )
         extra = result.extra
-        return {
+        # Retained per launch: the generated source that was built, the
+        # actual output arrays, the profiler text and the device log, and
+        # the identities tying them together.
+        source = extra.get("device_source") or getattr(self, "device_source", None)
+        if source:
+            (launch_dir / "device.c").write_text(source)
+        outputs_dir = launch_dir / "outputs"
+        outputs_dir.mkdir(exist_ok=True)
+        outputs_sha256 = {}
+        for name, value in outputs.items():
+            array = np.ascontiguousarray(np.asarray(value))
+            path = outputs_dir / f"{name}.{array.dtype.name}.bin"
+            array.tofile(path)
+            outputs_sha256[name] = _sha256_file(path)
+        (launch_dir / "profile.txt").write_text(extra.get("profile_text") or "")
+        device_log = result.stdout if hasattr(result, "stdout") else None
+        (launch_dir / "device.log").write_text(device_log or "")
+        launch = {
             "crun": result.cycles,
             "counters": extra.get("profile_counters"),
             "outputs_match_oracle": exact,
@@ -312,10 +456,26 @@ class TenonLane:
             "build_mode": extra.get("build_mode"),
             "board_lock": extra.get("board_lock"),
             "profile_text": extra.get("profile_text"),
-            "device_log": result.stdout if hasattr(result, "stdout") else None,
+            "device_log": device_log,
             "route": extra.get("native_vector_route"),
             "scalar_arc": extra.get("scalar_arc"),
+            "launched_source_sha256": _sha256_text(source) if source else launched_sha,
+            "outputs_sha256": outputs_sha256,
+            "launch_dir": str(launch_dir),
         }
+        (launch_dir / "launch.json").write_text(
+            json.dumps(
+                _json_ready(
+                    {
+                        k: v
+                        for k, v in launch.items()
+                        if k not in ("profile_text", "device_log")
+                    }
+                ),
+                indent=1,
+            )
+        )
+        return launch
 
 
 class ExpertLane:
@@ -425,13 +585,21 @@ class ExpertLane:
         argv = [str(Path(self.binary).resolve())]
         argv.extend(str(Path(path).resolve()) for _role, path in self.inputs)
         argv.extend(str(path) for _role, path, _d, _s in outputs)
+        binary_bytes = (
+            Path(self.binary).stat().st_size if Path(self.binary).is_file() else None
+        )
         try:
             text, profile, cycles = launch_on_board(
                 argv, launch_dir, expected_records=1, timeout=900
             )
         except Exception as error:
-            # The failed launch's diagnostics stay beside whatever it wrote.
-            (launch_dir / "error.txt").write_text(f"{type(error).__name__}: {error}\n")
+            # The failed launch's diagnostics stay beside whatever it wrote
+            # (the runtime's structured diagnostics when it raised them).
+            _write_failure_diagnostics(
+                launch_dir,
+                f"{type(error).__name__}: {error}",
+                getattr(error, "diagnostics", None) or {},
+            )
             (launch_dir / "argv.json").write_text(json.dumps(argv, indent=1))
             raise
         produced = [
@@ -443,24 +611,55 @@ class ExpertLane:
             and np.array_equal(p.astype(self.oracle.dtype), self.oracle)
             for p in produced
         )
-        if exact:
-            shutil.rmtree(launch_dir, ignore_errors=True)
-        else:
-            (launch_dir / "device.log").write_text(text or "")
-        return {
+        # Every launch's actual outputs stay in its directory with the device
+        # log, the profiler text and the identities (round 137; successful
+        # launches were removed before, leaving no per-launch evidence).
+        (launch_dir / "device.log").write_text(text or "")
+        (launch_dir / "profile.txt").write_text(profile or "")
+        (launch_dir / "argv.json").write_text(json.dumps(argv, indent=1))
+        outputs_sha256 = {role: _sha256_file(path) for role, path, _d, _s in outputs}
+        launch = {
             "crun": cycles[0],
             "counters": profile_counters(profile),
             "outputs_match_oracle": exact,
             "binary_sha256": self.binary_sha256,
+            "binary_bytes": binary_bytes,
             "profile_text": profile,
             "device_log": text,
-            "launch_dir": None if exact else str(launch_dir),
+            "outputs_sha256": outputs_sha256,
+            "launch_dir": str(launch_dir),
         }
+        (launch_dir / "launch.json").write_text(
+            json.dumps(
+                _json_ready(
+                    {
+                        k: v
+                        for k, v in launch.items()
+                        if k not in ("profile_text", "device_log")
+                    }
+                ),
+                indent=1,
+            )
+        )
+        return launch
 
 
 # ----------------------------------------------------------------------- #
 # Protocol
 # ----------------------------------------------------------------------- #
+
+
+def attempt_launch(lane) -> dict:
+    """One launch of a lane as the session records it: the lane's launch
+    entry, or, for a failed launch, its preserved evidence (``LaunchFailure``
+    record, or the error alone when a lane raised without one) with no cycle
+    count.  The failed launch is evidence; it is never retried here."""
+    try:
+        return lane.launch()
+    except LaunchFailure as failure:
+        return dict(failure.record)
+    except Exception as error:  # the failed launch is evidence
+        return {"error": f"{type(error).__name__}: {error}", "crun": None}
 
 
 def _control_lane_name(path) -> str:
@@ -539,7 +738,12 @@ def measure_case(
         "problems": [],
     }
     tenon = TenonLane(
-        case, root, backend=backend, layout=layout, device_source=device_source
+        case,
+        root,
+        backend=backend,
+        layout=layout,
+        device_source=device_source,
+        scratch=scratch,
     )
     record["lanes"]["tenon"] = tenon.describe()
     lanes = {"tenon": tenon}
@@ -548,7 +752,14 @@ def measure_case(
         # program with a different generated device source (a historical
         # or candidate program), never reported as the default selection.
         name = _control_lane_name(path)
-        control = TenonLane(case, root, backend=backend, device_source=path)
+        control = TenonLane(
+            case,
+            root,
+            backend=backend,
+            device_source=path,
+            scratch=scratch,
+            name="control-" + Path(path).stem,
+        )
         description = control.describe()
         description["lane"] = name
         record["lanes"][name] = description
@@ -576,11 +787,7 @@ def measure_case(
         return record
 
     def run(lane_name, kind, round_index):
-        lane = lanes[lane_name]
-        try:
-            launch = lane.launch()
-        except Exception as error:  # the failed launch is evidence
-            launch = {"error": f"{type(error).__name__}: {error}"}
+        launch = attempt_launch(lanes[lane_name])
         launch.update(lane=lane_name, kind=kind, round=round_index)
         record["launches"].append(launch)
         if launch.get("error"):

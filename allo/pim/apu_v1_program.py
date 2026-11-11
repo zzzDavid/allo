@@ -689,40 +689,105 @@ def profile_counters(profile: str) -> dict:
     return {key.lower(): int(value) for key, value in _COUNTER_RE.findall(records[-1])}
 
 
+class APUV1LaunchFailure(RuntimeError):
+    """A board launch that produced no attributable measurement.
+
+    ``diagnostics`` is the structured evidence of the failed launch, gathered
+    before raising (ISSUES V1-21): the argv and working directory, the
+    binary's identity, every attempt's exit status and process output, the
+    device log read before the launch and every read after it, the number of
+    fresh ``total`` records found against the number expected, the board lock
+    and the time.  The runtimes add the generated source and the launch's
+    roles; a measurement driver serializes it beside the launch.  No cycle
+    count is ever derived from such a launch.
+    """
+
+    def __init__(self, message, diagnostics):
+        super().__init__(message)
+        self.diagnostics = dict(diagnostics)
+
+
+def _binary_identity(argv):
+    path = Path(argv[0]) if argv else None
+    if path is None or not path.is_file():
+        return {
+            "binary_path": None if path is None else str(path),
+            "binary_sha256": None,
+            "binary_bytes": None,
+        }
+    return {
+        "binary_path": str(path),
+        "binary_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "binary_bytes": path.stat().st_size,
+    }
+
+
 def launch_on_board(argv, cwd, *, expected_records, timeout, attempts=3):
     """Run one built APU v1 binary under the board lock with a fresh profile.
 
     Returns ``(run text, profile text, crun tuple)``.  The device log is read
     before every attempt and after the run; :func:`parse_fresh_profile`
     proves that exactly the expected PROF_PRINT records were appended by this
-    launch.
+    launch.  A failed run or an unattributable profile raises
+    :class:`APUV1LaunchFailure` carrying the launch's diagnostics (argv,
+    binary identity, process output, the device-log reads) so that nothing
+    about the failure is lost when the caller discards its build directory.
     """
 
     process = None
     text = ""
     before = ""
+    diagnostics = {
+        "argv": [str(a) for a in argv],
+        "cwd": str(cwd),
+        **_binary_identity([str(a) for a in argv]),
+        "board_lock": str(apu_v1_lock_path()),
+        "expected_records": int(expected_records),
+        "attempts": [],
+        "device_log_before": None,
+        "device_log_reads_after": [],
+        "fresh_records_found": None,
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
     with apu_v1_board_lock():
         for attempt in range(attempts):
             before = _ledag_drain()
+            diagnostics["device_log_before"] = before
             process = subprocess.run(
                 argv, cwd=cwd, capture_output=True, timeout=timeout, check=False
             )
             text = process.stdout.decode(errors="replace") + process.stderr.decode(
                 errors="replace"
             )
+            diagnostics["attempts"].append(
+                {"returncode": process.returncode, "process_output": text}
+            )
             if process.returncode == 0 or "no valid context" not in text:
                 break
             time.sleep(attempt + 1)
         if process is None or process.returncode:
             code = None if process is None else process.returncode
-            raise RuntimeError(f"APU v1 device run failed ({code}):\n{text[-6000:]}")
+            raise APUV1LaunchFailure(
+                f"APU v1 device run failed ({code}):\n{text[-6000:]}", diagnostics
+            )
         profile = ""
         for _ in range(4):
             time.sleep(0.75)
             profile = _ledag_drain()
+            diagnostics["device_log_reads_after"].append(profile)
             if len(fresh_profile_records(before, profile)) >= expected_records:
                 break
-    return text, profile, parse_fresh_profile(before, profile, expected_records)
+        try:
+            diagnostics["fresh_records_found"] = len(
+                fresh_profile_records(before, profile)
+            )
+        except RuntimeError:
+            diagnostics["fresh_records_found"] = "unattributable (log rotated)"
+        try:
+            cycles = parse_fresh_profile(before, profile, expected_records)
+        except RuntimeError as error:
+            raise APUV1LaunchFailure(str(error), diagnostics) from error
+    return text, profile, cycles
 
 
 def read_output_image(path, role: str, dtype, shape) -> np.ndarray:
@@ -1106,9 +1171,32 @@ class CompiledAPUv1Program:
             argv.extend(str(input_paths[name]) for name in sorted(input_paths))
             argv.extend(str(output_paths[name]) for name in sorted(output_paths))
             binary_sha256 = hashlib.sha256(Path(binary).read_bytes()).hexdigest()
-            text, profile, cycles = launch_on_board(
-                argv, project, expected_records=1, timeout=900
-            )
+            try:
+                text, profile, cycles = launch_on_board(
+                    argv, project, expected_records=1, timeout=900
+                )
+            except APUV1LaunchFailure as failure:
+                # The build directory is removed below; the failure keeps
+                # what it would otherwise lose (ISSUES V1-21).
+                failure.diagnostics.update(
+                    {
+                        "device_source": self.device_source,
+                        "device_source_sha256": hashlib.sha256(
+                            self.device_source.encode()
+                        ).hexdigest(),
+                        "native_vector_route": (
+                            None
+                            if self.native_vector_lowering is None
+                            else self.native_vector_lowering.route
+                        ),
+                        "build_mode": build_config.mode,
+                        "launch_roles": {
+                            "inputs": sorted(input_paths),
+                            "outputs": sorted(output_paths),
+                        },
+                    }
+                )
+                raise
             log = text + "\n" + profile
             counters = profile_counters(profile)
             outputs = {}
@@ -1164,6 +1252,7 @@ class CompiledAPUv1Program:
 
 
 __all__ = [
+    "APUV1LaunchFailure",
     "apu_v1_board_lock",
     "apu_v1_lock_path",
     "launch_on_board",

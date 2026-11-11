@@ -7,6 +7,7 @@ a clean run exits zero."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -362,18 +363,52 @@ def test_apu_v1_archived_lane_never_writes_into_the_archive(monkeypatch, tmp_pat
     launch = lane.launch()
     assert launch["crun"] == 5 and launch["outputs_match_oracle"]
     assert original.read_bytes() == before
+    # Round 137 (V1-21 review): the successful launch's actual outputs,
+    # device log, profiler text, argv and identities are kept, not removed.
+    first = scratch / "expert-launch-001"
+    assert launch["launch_dir"] == str(first)
+    assert (first / "counts.uint16.bin").read_bytes() == lane.oracle.astype(
+        "<u2"
+    ).tobytes()
+    assert (first / "profile.txt").read_text() == "total crun: 5 hits: 1"
+    assert (first / "device.log").read_text() == "log"
+    identity = json.loads((first / "launch.json").read_text())
+    assert identity["binary_sha256"] == "0" * 64 and identity["crun"] == 5
+    assert (
+        identity["outputs_sha256"]["counts"]
+        == hashlib.sha256(lane.oracle.astype("<u2").tobytes()).hexdigest()
+    )
+    assert json.loads((first / "argv.json").read_text())[0].endswith("binary")
 
     def failing(argv, cwd, **kwargs):
         Path(argv[-1]).write_bytes(b"partial")
-        raise RuntimeError("simulated failed launch")
+        raise runtime.APUV1LaunchFailure(
+            "simulated failed launch",
+            {
+                "argv": list(argv),
+                "device_log_before": "old",
+                "device_log_reads_after": ["old"],
+                "attempts": [{"returncode": 0, "process_output": "ran"}],
+                "fresh_records_found": 0,
+                "expected_records": 1,
+            },
+        )
 
     monkeypatch.setattr(runtime, "launch_on_board", failing)
     with pytest.raises(RuntimeError, match="simulated failed launch"):
         lane.launch()
     assert original.read_bytes() == before
     kept = scratch / "expert-launch-002"
-    assert (kept / "error.txt").read_text().startswith("RuntimeError")
+    assert (kept / "error.txt").read_text().startswith("APUV1LaunchFailure")
     assert (kept / "counts.uint16.bin").read_bytes() == b"partial"
+    # the runtime's structured diagnostics are serialized beside the launch
+    diagnostics = json.loads((kept / "diagnostics.json").read_text())
+    assert (
+        diagnostics["fresh_records_found"] == 0 and diagnostics["expected_records"] == 1
+    )
+    assert (kept / "device_log_before.txt").read_text() == "old"
+    assert (kept / "device_log_after_1.txt").read_text() == "old"
+    assert (kept / "process_output_1.txt").read_text() == "ran"
 
 
 def test_apu_v1_driver_rejects_empty_cases_and_nonpositive_counts(tmp_path):
@@ -591,6 +626,9 @@ def test_apu_v1_archived_lane_accepts_a_relative_scratch_directory(
     monkeypatch.setattr(runtime, "launch_on_board", child_writes)
     assert lane.launch()["outputs_match_oracle"]
     assert original.read_bytes() == before
+    assert (
+        tmp_path / "relative_scratch" / "expert-launch-001" / "launch.json"
+    ).is_file()
 
     def child_fails(argv, cwd, **kwargs):
         Path(argv[-1]).write_bytes(b"partial")
@@ -767,3 +805,200 @@ def test_apu_v1_failed_baseline_launches_of_two_cases_do_not_collide(
     assert len(list(shared.rglob("error.txt"))) == 8
     # Each retained launch directory sits directly under its case's subdirectory.
     assert {p.parent.name for p in attempts} == {"word_count", "kmeans"}
+
+
+def test_launch_on_board_missing_profile_preserves_diagnostics(monkeypatch, tmp_path):
+    """Round 137 (ISSUES V1-21): a launch whose device log shows no fresh
+    ``total`` record raises ``APUV1LaunchFailure`` carrying the argv, the
+    binary identity, the process output, the device log read before the
+    launch and every read after it, and the record counts, so the evidence
+    survives the caller's build-directory cleanup; the freshness check itself
+    is unchanged (no cycle count is produced)."""
+    import contextlib
+    import subprocess
+    from types import SimpleNamespace
+
+    from allo.pim import apu_v1_program as program
+
+    binary = tmp_path / "tenon-kernel"
+    binary.write_bytes(b"\x7fELF fake binary")
+    stale = "ARCT[0]: *** total - hits:1 seu:1 crun:4242 iall:1 icm:0 dcm:0"
+    monkeypatch.setattr(program, "apu_v1_board_lock", lambda: contextlib.nullcontext())
+    monkeypatch.setattr(
+        program, "_ledag_drain", lambda: stale
+    )  # nothing new after the launch
+    monkeypatch.setattr(program.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        program.subprocess,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(
+            returncode=0, stdout=b"PASS!\n", stderr=b""
+        ),
+    )
+    argv = [str(binary), str(tmp_path / "in.bin"), str(tmp_path / "out.bin")]
+    with pytest.raises(
+        program.APUV1LaunchFailure, match="freshness check failed"
+    ) as info:
+        program.launch_on_board(argv, tmp_path, expected_records=1, timeout=5)
+    diagnostics = info.value.diagnostics
+    assert diagnostics["argv"] == argv and diagnostics["cwd"] == str(tmp_path)
+    assert (
+        diagnostics["binary_sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
+    )
+    assert diagnostics["binary_bytes"] == binary.stat().st_size
+    assert diagnostics["attempts"] == [{"returncode": 0, "process_output": "PASS!\n"}]
+    assert diagnostics["device_log_before"] == stale
+    assert len(diagnostics["device_log_reads_after"]) == 4  # every read, not the last
+    assert (
+        diagnostics["fresh_records_found"] == 0 and diagnostics["expected_records"] == 1
+    )
+    assert "board_lock" in diagnostics and "time" in diagnostics
+    # a failed device run carries the same evidence
+    monkeypatch.setattr(
+        program.subprocess,
+        "run",
+        lambda argv, **kwargs: SimpleNamespace(
+            returncode=3, stdout=b"", stderr=b"boom"
+        ),
+    )
+    with pytest.raises(program.APUV1LaunchFailure, match="device run failed") as info:
+        program.launch_on_board(
+            argv, tmp_path, expected_records=1, timeout=5, attempts=1
+        )
+    assert info.value.diagnostics["attempts"] == [
+        {"returncode": 3, "process_output": "boom"}
+    ]
+    assert info.value.diagnostics["fresh_records_found"] is None
+
+
+def _tenon_lane(tmp_path, compiled):
+    import numpy as np
+
+    lane = object.__new__(paper_rows.TenonLane)
+    lane.case, lane.name, lane.count = "case", "tenon", 0
+    lane.scratch = tmp_path / "scratch"
+    lane.compiled = compiled
+    lane.keyword_call, lane.parameters = False, ["x"]
+    lane.arguments = {"x": np.zeros(4, dtype=np.uint16)}
+    lane.in_place_outputs, lane.returned = [], ("y",)
+    lane.oracle = np.arange(4, dtype=np.uint16)
+    lane.device_source = "int main(void) { return 0; }\n"
+    lane.device_source_sha256 = hashlib.sha256(lane.device_source.encode()).hexdigest()
+    lane.substituted_source = None
+    return lane
+
+
+def test_apu_v1_tenon_lane_keeps_per_launch_evidence_and_failed_diagnostics(tmp_path):
+    """Round 137 (ISSUES V1-21): a successful Tenon launch retains the
+    generated source, the actual output arrays, the profiler text, the
+    device log and the identities tying them together under the scratch
+    directory; a launch the runtime could not attribute is recorded with its
+    serialized diagnostics and no cycle count, and the session's launch
+    record carries that evidence instead of the bare error."""
+    import numpy as np
+    from types import SimpleNamespace
+
+    from allo.pim import apu_v1_program as program
+
+    source = "int main(void) { return 0; }\n"
+
+    def succeed(*args):
+        return SimpleNamespace(
+            kind="device",
+            cycles=7,
+            stdout="device log",
+            extra={
+                "outputs": {"y": np.arange(4, dtype=np.uint16)},
+                "device_source": source,
+                "binary_sha256": "a" * 64,
+                "binary_bytes": 123,
+                "profile_text": "total crun: 7 hits: 1",
+                "profile_counters": {"crun": 7, "hits": 1},
+                "board_lock": "/tmp/lock",
+                "build_mode": "release",
+            },
+        )
+
+    lane = _tenon_lane(tmp_path, succeed)
+    launch = paper_rows.attempt_launch(lane)
+    assert launch["crun"] == 7 and launch["outputs_match_oracle"]
+    kept = tmp_path / "scratch" / "tenon-launch-001"
+    assert launch["launch_dir"] == str(kept)
+    assert (kept / "device.c").read_text() == source
+    assert (
+        launch["launched_source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
+    )
+    output = kept / "outputs" / "y.uint16.bin"
+    assert np.fromfile(output, dtype=np.uint16).tolist() == [0, 1, 2, 3]
+    assert (
+        launch["outputs_sha256"]["y"] == hashlib.sha256(output.read_bytes()).hexdigest()
+    )
+    assert (kept / "profile.txt").read_text() == "total crun: 7 hits: 1"
+    assert (kept / "device.log").read_text() == "device log"
+    identity = json.loads((kept / "launch.json").read_text())
+    assert identity["binary_sha256"] == "a" * 64 and identity["binary_bytes"] == 123
+    assert (
+        identity["crun"] == 7 and identity["outputs_sha256"] == launch["outputs_sha256"]
+    )
+
+    def lose_the_profile(*args):
+        raise program.APUV1LaunchFailure(
+            "APU v1 profile freshness check failed: expected 1 fresh 'total' "
+            "PROF_PRINT record(s) after the launch, found 0",
+            {
+                "argv": ["/build/tenon-kernel", "in.bin", "out.bin"],
+                "cwd": "/build",
+                "binary_sha256": "b" * 64,
+                "binary_bytes": 456,
+                "board_lock": "/tmp/lock",
+                "expected_records": 1,
+                "attempts": [{"returncode": 0, "process_output": "PASS!"}],
+                "device_log_before": "old record",
+                "device_log_reads_after": ["old record", "old record"],
+                "fresh_records_found": 0,
+                "device_source": source,
+                "device_source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                "native_vector_route": "gvml_route",
+            },
+        )
+
+    lane = _tenon_lane(tmp_path / "second", lose_the_profile)
+    with pytest.raises(paper_rows.LaunchFailure) as info:
+        lane.launch()
+    record = info.value.record
+    failed = tmp_path / "second" / "scratch" / "tenon-launch-001"
+    assert record["crun"] is None and record["outputs_match_oracle"] is None
+    assert record["error"].startswith(
+        "APUV1LaunchFailure: APU v1 profile freshness check failed"
+    )
+    assert record["launch_dir"] == str(failed)
+    assert record["binary_sha256"] == "b" * 64 and record["binary_bytes"] == 456
+    assert record["argv"] == ["/build/tenon-kernel", "in.bin", "out.bin"]
+    assert (
+        record["launched_source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
+    )
+    assert record["fresh_records_found"] == 0 and record["expected_records"] == 1
+    assert (failed / "device.c").read_text() == source
+    assert (failed / "device_log_before.txt").read_text() == "old record"
+    assert (failed / "device_log_after_2.txt").read_text() == "old record"
+    assert (failed / "process_output_1.txt").read_text() == "PASS!"
+    diagnostics = json.loads((failed / "diagnostics.json").read_text())
+    assert diagnostics["native_vector_route"] == "gvml_route"
+    assert "device_source" not in diagnostics  # kept as device.c, not duplicated
+    assert set(record["diagnostics"]) >= {"device.c", "diagnostics.json", "error.txt"}
+    # the session keeps that record, with the error and without a cycle count
+    lane = _tenon_lane(tmp_path / "third", lose_the_profile)
+    entry = paper_rows.attempt_launch(lane)
+    assert entry["error"].startswith("APUV1LaunchFailure") and entry["crun"] is None
+    assert entry["binary_sha256"] == "b" * 64 and entry["launch_dir"].endswith(
+        "tenon-launch-001"
+    )
+    # a lane raising without diagnostics still yields an error entry without timing
+    lane = _tenon_lane(
+        tmp_path / "fourth", lambda *a: (_ for _ in ()).throw(OSError("board gone"))
+    )
+    entry = paper_rows.attempt_launch(lane)
+    assert entry["error"] == "OSError: board gone" and entry["crun"] is None
+    assert (
+        tmp_path / "fourth" / "scratch" / "tenon-launch-001" / "error.txt"
+    ).is_file()
