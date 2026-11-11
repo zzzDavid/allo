@@ -387,7 +387,9 @@ def _emit_device_c(
     ctx_l4_roles: list[str] = []
     try:
         ctx_l4_roles = list(compiled.layout_ctx.iter_l4_roles())  # type: ignore[attr-defined]
-    except Exception:
+    except AttributeError:
+        # a context without the APU v1 iterator (release issue C-13: only the
+        # absence of the method is a fallback; its own errors surface)
         ctx_l4_roles = []
 
     # Fall back: scan compiled.cmds for the L4 ptr substrings.
@@ -436,7 +438,7 @@ def _emit_device_c(
     vr_aliases: list[tuple[str, str]] = []
     try:
         vr_aliases = list(compiled.layout_ctx.iter_vr_aliases())  # type: ignore[attr-defined]
-    except Exception:
+    except AttributeError:
         vr_aliases = []
     if not vr_aliases:
         vr_aliases = [

@@ -631,7 +631,10 @@ def _output_row_packing(target, matches, placement) -> str:
 
     try:
         _backend, movement = split_movement_layout(getattr(placement, "layout", None))
-    except Exception:  # pylint: disable=broad-exception-caught
+    except (TypeError, ValueError):
+        # a placement whose layout is not a splittable LinearLayout carries no
+        # movement part (release issue C-13: the splitter's own type and value
+        # errors are the only expected failures)
         movement = None
     return "row_slots:movement" if movement is not None else "row_slots:identity"
 
