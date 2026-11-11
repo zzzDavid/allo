@@ -183,7 +183,40 @@ reproduce the paper's rows with exact outputs; the forced
 different generated source and execution with exact outputs, the model's
 order confirmed by the board.  Rounds 85 to 135 had recorded this as
 blocked by the board host's `/tmp` (VALIDATION.md round 85); the host
-recovered before round 136.  Still open for G9: the open review and
-contract items in `ISSUES.md` (V1-21's retention repair landed in round
-137; the remaining minor items as listed).  The manifest and slice 5 review
-is no longer pending.
+recovered before round 136.  The manifest and slice 5 review of rounds 28 to 30 is no longer pending.
+
+Specifically outstanding for G9 (round 139, replacing the earlier
+"remaining minor items" wording): (1) the independent review, at the final
+candidate, of the shared candidate contract as implemented: the invariant
+that every selected placement's declared `CandidateEffects`
+(`allo/spmw_candidate.py`: `CandidateCoverage`, `CandidateValueLayout`,
+`CandidateTransfer`, `CandidateLaunch`) equals the derivation from the
+current program facts (`_derivation_problems`, `rebind_supplied_layouts`
+for a supplied `layout=`) and passes `validate_candidate_effects`
+(`_check_value_layouts`, `_check_transfers`, `_check_launches` /
+`_check_operation_launches`; `require_candidate_effects` for every target in
+`EFFECTS_REQUIRED_TARGETS`; `check_graph_consistency` against the priced
+graph), with the per-backend derivers `samsung_candidate_effects`,
+`aim_candidate_effects`, `upmem_candidate_effects`,
+`attacc_candidate_effects`, `apu_v1_grouped_candidate_effects` and the APU
+v1 vector and Gemini-II candidates' effects, and the realization checks
+`SamsungCtx.check_realization`, `AimCtx.check_realization`,
+`UpmemCtx.check_realization`, `AttAccCtx.check_realization`,
+`spmw_apu_v1.check_realization` (the plan interpreter of rounds 79 to 83)
+and `spmw_apu_g2.check_realization`; the rounds 78 to 84 reviews covered
+these at earlier revisions, and X-01 stays in-progress until that review
+is recorded at the final candidate.  (2) The Gemini-II slice 5 traces at
+the current candidate: `benchmarks/apu_g2/selection_traces.py` (a forced
+alternative and a cost perturbation reaching generated programs and
+launches on the card with exact outputs and packing attestations) was last
+executed from the round 84 wheel (`88852b7`, the reviewer's
+`g2_selection_traces.json`); the maintained card chain
+(`g2_card_tests.sh`, `tests/pim/test_apu_g2_hardware.py`, 15 tests) does
+not run it, so it is owed from the final candidate's installed wheel under
+the device lock (mechanism traces, not performance sessions).  (3) The APU
+v1 side of slice 5 is demonstrated at `c762d4d` (round 136) and the
+runtime's failure evidence is complete since `dbe0543` (V1-21); the round
+136 lost sample itself stays unverified.  Nothing else of G9 is open: the
+migration, the matcher-backend contracts, the retained-IR manifest and the
+hardware provenance bindings are recorded above.
+
