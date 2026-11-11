@@ -1,3 +1,5 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Negative exercise of the installed-artifact probes (round 108): run a probe
 with `allo.compile` replaced by a fake that returns a "virtual" result with
 zero cycles and computes nothing (the reviewer's injection).  Every probe must

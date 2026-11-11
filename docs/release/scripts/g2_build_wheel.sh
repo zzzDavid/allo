@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Build the candidate's sdist into a wheel on zhang-x4 and install it into a clean venv
 # (the round 15 recipe; no card run here).   g2_build_wheel.sh <evidence-round-dir>
 set -u

@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 # ONE paired Gemini-II session of benchmarks.apu_g2.paper_rows (20 rounds, all five rows) from
 # the installed wheel under the device lock.   g2_session.sh <g2-dir-holding-venv-and-bench> <out.json>
 set -u

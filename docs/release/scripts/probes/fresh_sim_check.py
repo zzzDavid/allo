@@ -1,3 +1,5 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 import numpy as np, allo
 from allo.pim import build_samsung_target, samsung_cost
 from allo import spmw_simenv

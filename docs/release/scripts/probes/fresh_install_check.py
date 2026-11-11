@@ -1,3 +1,5 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 import sys, time, importlib.resources as res
 import numpy as np
 import allo

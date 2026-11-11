@@ -1,3 +1,5 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 import allo
 from allo.dataflow import region as _df_region
 from allo.ir.types import float16 as fp16

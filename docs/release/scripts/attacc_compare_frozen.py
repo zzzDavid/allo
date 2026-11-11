@@ -1,3 +1,5 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Compare an installed-artifact AttAcc session set with the frozen paper's figures.
 
     python attacc_compare_frozen.py --sessions-dir DIR --inventory inventory.csv \\

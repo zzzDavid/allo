@@ -1,3 +1,5 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Installed-artifact probe (round 93): the bundled Samsung simulator route from the
 wheel, outside the checkout, no PYTHONPATH, safe path, no simulator variables."""
 import os, sys, time

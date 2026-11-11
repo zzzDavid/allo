@@ -1,3 +1,5 @@
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Pool Gemini-II sessions at one revision under the recorded rule
 (PAPER_REPRODUCTION.md, ISSUES X-34 / X-37): per row, the median of the
 pooled Tenon samples (amortized device ticks per body, one per paired round)

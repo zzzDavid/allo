@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Stage harness for the release milestone scripts (docs/release/VALIDATION.md,
 # round 107).  Every stage runs under `stage`, which keeps the complete output
 # of the stage in its own log, records the command's own exit status (not the

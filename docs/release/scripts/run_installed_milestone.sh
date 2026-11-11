@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Installed-artifact milestone, local part (docs/release/VALIDATION.md):
 # every stage from the wheel in a clean venv, outside the checkout (no
 # PYTHONPATH into it; tests and benchmarks copied out), the Samsung simulator

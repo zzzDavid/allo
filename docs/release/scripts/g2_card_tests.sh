@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Gemini-II card tests from the installed wheel (waits for the device lock).  g2_card_tests.sh <evidence-round-dir>
 set -u
 E=${1:?evidence round dir}/g2

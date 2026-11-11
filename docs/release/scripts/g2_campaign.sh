@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 # The pre-registered Gemini-II confirmation campaign (ISSUES X-34 / X-37, PAPER_REPRODUCTION.md):
 # at the final candidate, three further paired sessions of 20 rounds of all five rows from the
 # SAME zhang-x4 wheel as that candidate's validation session, under the device lock, pooled per row

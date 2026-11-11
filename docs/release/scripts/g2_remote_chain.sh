@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright Allo authors. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Gemini-II chain on zhang-x4 for a named candidate: wheel from the candidate's sdist, the card
 # tests, then the ONE pre-registered validation session.   g2_remote_chain.sh <evidence-round-dir>
 # Each step is a stage (stage_lib.sh): complete logs under <dir>/g2/stages, own exit statuses,
