@@ -35,6 +35,7 @@ class APUG2SourceCtx(CodegenContext):
         super().__init__(target)
         self.cmds: list[str] = []
         self.program = None
+        self.realized_payload = None
 
     # -- shared-pipeline candidate hooks ---------------------------------------
 
@@ -131,6 +132,9 @@ class APUG2SourceCtx(CodegenContext):
                 f"{record_fingerprint(payload.record)}"
             ]
             return
+        # Kept for the realization check: the declaration is compared with
+        # this payload's own derivation in full (round 140, X-45).
+        self.realized_payload = payload
         self.program = APUG2SourceProgram(
             payload.contract,
             self.target,
@@ -232,6 +236,25 @@ class APUG2SourceCtx(CodegenContext):
             raise RuntimeError(
                 f"Gemini-II realization reads {sorted(inputs)}, the candidate "
                 f"declared {sorted(effects.abi_inputs)}"
+            )
+        # The complete declaration (value layouts with storage and packing,
+        # transfers with routes, launches, allocations, scope) against the
+        # realized payload's derivation from the retained facts and the
+        # selected plan (round 140, X-45).
+        payload = getattr(self, "realized_payload", None)
+        if payload is None:
+            raise RuntimeError(
+                "Gemini-II realization kept no payload to compare the declaration with"
+            )
+        from .spmw_candidate import declaration_differences
+
+        differences = declaration_differences(
+            effects, payload.effects(), against="the realized Gemini-II plan"
+        )
+        if differences:
+            raise RuntimeError(
+                "Gemini-II realization differs from the candidate contract: "
+                + "; ".join(differences)
             )
 
     def runtime_route(self, commands) -> tuple[str, tuple]:

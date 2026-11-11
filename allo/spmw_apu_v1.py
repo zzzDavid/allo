@@ -298,6 +298,21 @@ class APUv1Ctx(CodegenContext):
                 f"realized {sorted(realized_transfers)}, declared "
                 f"{sorted(declared_transfers)}"
             )
+        # The complete declaration against the realized plan's own derivation
+        # (storage, packing, images, transfer routes and physical flags,
+        # launches, allocations, synthetic axes, scope), not only the names
+        # and axes above (round 140, X-45).
+        from .spmw_candidate import declaration_differences
+
+        actual = self.program.candidate.effects()
+        differences = declaration_differences(
+            effects, actual, against="the realized APU v1 plan"
+        )
+        if differences:
+            raise RuntimeError(
+                "APU v1 realization differs from the candidate contract: "
+                + "; ".join(differences)
+            )
         launches = effects.launches
         if (
             len(launches) != 1

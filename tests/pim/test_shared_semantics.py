@@ -1150,8 +1150,37 @@ def test_elementwise_record_launch_must_cover_every_result_instance(monkeypatch)
         return candidates
 
     monkeypatch.setattr(records, "apu_g2_record_candidates", swapped_route)
-    with pytest.raises(RuntimeError, match="differs from the candidate contract"):
+    # Round 140 (X-45): the record's declaration is compared with the
+    # record's own derivation before costing, so the edited route is refused
+    # by the contract, not first at materialization.
+    with pytest.raises(ValueError, match="violates the candidate contract"):
         allo.compile(add, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    monkeypatch.undo()
+    # The independent realization check still refuses the edited declaration
+    # when it is handed the realized record directly.
+    from allo.spmw_autoschedule import Placement
+
+    stock = allo.compile(add, build_apu_g2_target(), apu_g2_cost, backend="virtual")
+    layout = stock.compiled.layout
+    (placement,) = layout if isinstance(layout, (list, tuple)) else [layout]
+    effects = placement.extra["effects"]
+    tampered = Placement(
+        placements=dict(placement.placements),
+        mode=placement.mode,
+        extra={
+            **placement.extra,
+            "effects": replace(
+                effects,
+                transfers=tuple(
+                    replace(t, route=("host_pack", "l1")) if t.value == "out" else t
+                    for t in effects.transfers
+                ),
+            ),
+        },
+        layout=getattr(placement, "layout", None),
+    )
+    with pytest.raises(RuntimeError, match="differs from the candidate contract"):
+        stock.compiled.layout_ctx.check_realization([tampered])
     assert APUG2SourceCtx.check_realization is not None
 
 
@@ -1262,7 +1291,11 @@ def test_record_contract_cannot_hide_a_read_or_a_transfer(monkeypatch):
         return placements
 
     monkeypatch.setattr(record_frontend, "apu_v1_program_candidates", no_scratch)
-    with pytest.raises(RuntimeError, match="realization allocates"):
+    # Round 140 (X-45): compared with the record's own derivation before
+    # costing; the realization check below still refuses it independently.
+    with pytest.raises(
+        ValueError, match="declares allocations \\[\\]; the derivation gives"
+    ):
         allo.compile(_record(keep_unselected), target, apu_v1_cost, backend="virtual")
 
     def host_only_out(view, matches):
@@ -1279,8 +1312,50 @@ def test_record_contract_cannot_hide_a_read_or_a_transfer(monkeypatch):
         return placements
 
     monkeypatch.setattr(record_frontend, "apu_v1_program_candidates", host_only_out)
-    with pytest.raises(RuntimeError, match="realization moves"):
+    with pytest.raises(ValueError, match="declares transfer 'out' inout as"):
         allo.compile(_record(keep_unselected), target, apu_v1_cost, backend="virtual")
+    monkeypatch.undo()
+    # The independent realization check refuses both edited declarations
+    # when handed the realized program directly.
+    from allo.spmw_autoschedule import Placement
+
+    stock = allo.compile(
+        _record(keep_unselected), target, apu_v1_cost, backend="virtual"
+    )
+    layout = stock.compiled.layout
+    (placement,) = layout if isinstance(layout, (list, tuple)) else [layout]
+    effects = placement.extra["effects"]
+
+    def tampered(edited):
+        return Placement(
+            placements=dict(placement.placements),
+            mode=placement.mode,
+            extra={**placement.extra, "effects": edited},
+            layout=getattr(placement, "layout", None),
+        )
+
+    with pytest.raises(RuntimeError, match="realization allocates"):
+        stock.compiled.layout_ctx.check_realization(
+            [tampered(replace(effects, allocations=()))]
+        )
+    with pytest.raises(RuntimeError, match="realization moves"):
+        stock.compiled.layout_ctx.check_realization(
+            [
+                tampered(
+                    replace(
+                        effects,
+                        transfers=tuple(
+                            (
+                                replace(t, route=("host_readback",))
+                                if t.value == "out"
+                                else t
+                            )
+                            for t in effects.transfers
+                        ),
+                    )
+                )
+            ]
+        )
 
 
 # --------------------------------------------------------------------------- #

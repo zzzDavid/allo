@@ -910,16 +910,38 @@ def check_graph_consistency(placement, graph) -> None:
 EFFECTS_DERIVERS: dict = {}
 
 
+def derive_candidate_effects(view, matches, placement):
+    """The effects the target derives for ``placement`` now, independently
+    of what the placement declares: the registered deriver's result for a
+    matcher backend's placement, else the placement's executable payload's
+    own derivation from the retained facts and its selected plan (the APU v1
+    vector plans and program records, the Gemini-II source plans and typed
+    records: ``payload.effects()``).  None when neither exists (round 140,
+    X-45: a payload candidate's declaration was not compared with any
+    derivation, so an edited declaration passed selection and realization).
+    """
+    deriver = EFFECTS_DERIVERS.get(getattr(view, "name", None))
+    derived = deriver(view, matches, placement) if deriver is not None else None
+    if derived is not None:
+        return derived
+    payload = (getattr(placement, "extra", None) or {}).get("payload")
+    effects = getattr(payload, "effects", None)
+    if callable(effects):
+        derived = effects()
+        if isinstance(derived, CandidateEffects):
+            return derived
+    return None
+
+
 def _redeclared(view, matches, placement):
-    """Attach the deriver's effects to a placement that declares none (a
+    """Attach the derived effects to a placement that declares none (a
     caller-supplied handle-only placement).  A placement that already
     declares effects keeps them: a declaration that differs from the
     derivation is a contract violation for ``validate_candidate_effects``
     to report, not something to overwrite silently."""
-    deriver = EFFECTS_DERIVERS.get(getattr(view, "name", None))
-    if deriver is None or candidate_effects(placement) is not None:
+    if candidate_effects(placement) is not None:
         return placement
-    effects = deriver(view, matches, placement)
+    effects = derive_candidate_effects(view, matches, placement)
     if effects is None:
         return placement
     from .spmw_autoschedule import Placement
@@ -937,14 +959,19 @@ def _derivation_problems(view, matches, placement, effects) -> list:
     the ones the target's deriver states for this placement: a declaration
     edited after enumeration (a different packing, a different map) is
     rejected before costing and selection."""
-    deriver = EFFECTS_DERIVERS.get(getattr(view, "name", None))
-    if deriver is None:
-        return []
     try:
-        derived = deriver(view, matches, placement)
+        derived = derive_candidate_effects(view, matches, placement)
     except Exception as error:  # the deriver's own rejection is a problem too
         return [f"the target's effects derivation rejects the placement: {error}"]
     if derived is None:
+        if _effects_required(matches, view):
+            # A declaration that no derivation can be compared with is not
+            # accepted on its own word (round 140, X-45).
+            return [
+                "no effects derivation is available for target "
+                f"{getattr(view, 'name', None)!r} (no registered deriver and no "
+                "executable payload), so the declaration cannot be checked"
+            ]
         return []
     problems = []
 
@@ -1009,6 +1036,12 @@ def _derivation_problems(view, matches, placement, effects) -> list:
             _declaration_differences(effects, derived, against="the derivation")
         )
     return problems
+
+
+def declaration_differences(declared, current, *, against) -> list:
+    """Public name of :func:`_declaration_differences` for the realization
+    checks that compare a declaration with the realized plan's derivation."""
+    return _declaration_differences(declared, current, against=against)
 
 
 def _declaration_differences(declared, current, *, against) -> list:
@@ -1372,6 +1405,8 @@ def rebind_supplied_layouts(view, trace, supplied) -> list:
 
 
 __all__ = [
+    "declaration_differences",
+    "derive_candidate_effects",
     "EFFECTS_DERIVERS",
     "EFFECTS_REQUIRED_TARGETS",
     "HOST_HOOKS",
