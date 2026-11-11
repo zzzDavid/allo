@@ -172,8 +172,18 @@ retained (`g2_neighbor_*`); a K96 neighbour was refused before launch by
 the documented power-of-two reduction rule.  Mechanism checks, not paper
 confirmation samples.
 
-Still open for G9: the candidate's repaired APU v1 vector path executed on
-the Gemini-I board (VALIDATION.md round 85: the host's `/tmp` recovered
-from this user's own scratch, the runs pre-registered and launched from
-the round 84 wheel); the open minor items in `ISSUES.md`.  The manifest and
-slice 5 review is no longer pending.
+The candidate's repaired APU v1 vector path executed on the Gemini-I
+board in round 136 (VALIDATION.md round 136, the packaged working
+candidate `c762d4d` from its installed wheel, pre-registered before launch):
+the default vector programs matrix_multiply (plan
+`temporal_dma_coalescing_broadcast_friendly_acc8`) and histogram
+reproduce the paper's rows with exact outputs; the forced
+`temporal_dma_coalescing_broadcast_friendly_acc4` plan and the
+`MICRO_DMA_L4_L1_32K x 0.01` cost perturbation reach selection, a
+different generated source and execution with exact outputs, the model's
+order confirmed by the board.  Rounds 85 to 135 had recorded this as
+blocked by the board host's `/tmp` (VALIDATION.md round 85); the host
+recovered before round 136.  Still open for G9: the open review and
+contract items in `ISSUES.md` (V1-21's retention repair landed in round
+137; the remaining minor items as listed).  The manifest and slice 5 review
+is no longer pending.
