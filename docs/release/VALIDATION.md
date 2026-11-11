@@ -2457,3 +2457,14 @@ Checkout after the round 105 commits; evidence under
 | Scope kept | no wheel rebuilt, no compiler source changed (`git diff --stat 7dc7a85 HEAD -- allo` empty); `ab239e3` stays the packaged working candidate; the inherited `b994fc0` Gemini-II campaign and its OPEN gemm / mvt outcomes untouched; the board blocked (`/tmp` about 3.9 MB) |
 | Not done | the APU v1 installed-artifact vector, forced-plan and cost-perturbation execution and the three Gemini-I rows (`/tmp`); the full milestone at a revision that would replace `ab239e3`; the final verdict (NOT READY) |
 
+## Round 121 (2026-11-10): the round 106 attribution corrected; P-07 completed (distribution identity)
+
+| Check | Result |
+|---|---|
+| `REVIEW.md` round 106 attribution (the review's remaining correction) | the verdict block now states that both environments of round 106's APU v1 functional-reference stage held NumPy 2.5.4, and that the asserted NumPy 2.3.5 evidence is round 120's from the `7dc7a85` wheel and validates nothing about `b994fc0` under 2.3.5 |
+| Board headroom | `/tmp` 3.9 MB free throughout: the Gemini-I campaign and the installed APU v1 vector execution stay blocked; nothing launched |
+| P-07 (release identity is upstream Allo) | `setup.py` metadata: summary, home page, maintainer and project URLs as recorded in ISSUES P-07; `python setup.py --name --version --description --url --maintainer` prints `allo`, `0.5`, the Tenon summary, the fork URL and the Tenon maintainer; an sdist built from the working tree (`r121/sdist/allo-0.5.tar.gz`, `sdist.log`) carries `Summary`, `Home-page`, `Maintainer` and the four `Project-URL` lines in `PKG-INFO`; `tests/perf/test_packaging.py` 17 passed including the new `test_distribution_metadata_identifies_the_tenon_fork`. The package name and version line stay upstream Allo's by recorded decision (the fork is installed in place of upstream Allo). **Closed** |
+| C-13 (broad exception swallowing in the generic path) | the named modules carry no broad handler (grep); the residue outside the named scope is listed by file and line in ISSUES C-13 and left unchanged (a production change there would be a separate bounded item) |
+| Scope kept | no compiler module changed (`git diff --stat 7dc7a85 HEAD -- allo` empty); `setup.py` metadata is the one packaging change after `ab239e3` and the next built artifact carries it; no wheel rebuilt for prose; `ab239e3` stays the packaged working candidate; the inherited `b994fc0` Gemini-II campaign and its OPEN gemm / mvt outcomes untouched |
+| Not done | the APU v1 installed-artifact vector, forced-plan and cost-perturbation execution and the three Gemini-I rows (`/tmp`); the full milestone at a revision that would replace `ab239e3`; the final verdict (NOT READY) |
+

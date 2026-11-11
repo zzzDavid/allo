@@ -374,3 +374,37 @@ def test_upmem_calibration_table_regenerates():
     table = script["factors"]()
     assert table == upmem_costs.PHYSICAL_CALIBRATION_FACTORS
     assert list(table) == list(upmem_costs.PHYSICAL_CALIBRATION_FACTORS)
+
+
+def test_distribution_metadata_identifies_the_tenon_fork():
+    """P-07: the distribution's own metadata names the Tenon fork, the PIM
+    targets it adds, its publishing repository and its upstream; the package
+    name and version line stay upstream Allo's by decision (installed in
+    place of upstream Allo)."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "setup.py",
+            "--quiet",
+            "--name",
+            "--version",
+            "--description",
+            "--url",
+            "--maintainer",
+        ],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    name, version, description, url, maintainer = result.stdout.strip().splitlines()[
+        -5:
+    ]
+    assert name == "allo" and version == "0.5"
+    assert "Tenon" in description and "processing-in-memory" in description
+    for target in ("Samsung", "AiM", "UPMEM", "Gemini-I", "Gemini-II", "AttAcc"):
+        assert target in description, target
+    assert url == "https://github.com/zzzDavid/allo/tree/tenon"
+    assert "zzzDavid/allo" in maintainer and "tenon" in maintainer

@@ -237,11 +237,22 @@ if __name__ == "__main__":
     with open("README.md", encoding="utf-8") as fp:
         long_description = fp.read()
 
+    # Release identity (docs/release/ISSUES.md P-07): this distribution is the
+    # Tenon fork of Allo (branch `tenon` of zzzDavid/allo).  The package name
+    # and the version line are kept, by decision, as upstream Allo's: the fork
+    # is installed in place of upstream Allo, never beside it (INSTALL.md).
+    # The metadata below says what it is, so an installed copy or an index
+    # listing identifies the fork, its upstream and its release records.
     setup(
         name="allo",
-        description="Allo",
+        description=(
+            "Allo accelerator design language with the Tenon extensions for "
+            "processing-in-memory targets (Samsung HBM-PIM, SK hynix AiM, UPMEM, "
+            "GSI Gemini-I and Gemini-II, AttAcc)"
+        ),
         version="0.5",
         author="Allo Community",
+        maintainer="Tenon authors (zzzDavid/allo, branch tenon)",
         long_description=long_description,
         long_description_content_type="text/markdown",
         setup_requires=["nanobind>=2.9,<3.0"],
@@ -254,7 +265,13 @@ if __name__ == "__main__":
         package_data=PACKAGE_DATA,
         ext_modules=[CMakeExtension("mlir", sourcedir="mlir")],
         cmdclass={"build_ext": CMakeBuild, "build_py": BuildPy},
-        url="https://github.com/cornell-zhang/allo",
+        url="https://github.com/zzzDavid/allo/tree/tenon",
+        project_urls={
+            "Upstream (Cornell Allo)": "https://github.com/cornell-zhang/allo",
+            "Release status": "https://github.com/zzzDavid/allo/blob/tenon/docs/release/STATUS.md",
+            "Installation": "https://github.com/zzzDavid/allo/blob/tenon/docs/release/INSTALL.md",
+            "Capabilities": "https://github.com/zzzDavid/allo/blob/tenon/docs/release/CAPABILITIES.md",
+        },
         # Allo's license plus the texts of the third parties the distributions
         # carry (THIRD_PARTY_NOTICES.md); setuptools installs them under
         # dist-info/licenses/ and the sdist includes them through MANIFEST.in.
