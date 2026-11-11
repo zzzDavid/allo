@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -27,34 +28,38 @@ def comparator():
     return module
 
 
-# a small archived manifest: the four GEMV rows and two attention shapes per head count
+# a small archived manifest: the four GEMV rows and two attention shapes per head
+# count, with every timing an exact multiple of the simulator clock so that the
+# cycle / milliseconds agreement the comparator enforces holds for the fixture
+TCK_NS = 0.769
+
+
+def ms_of(cycles: int) -> str:
+    return repr(cycles * TCK_NS / 1e6)
+
+
+def _row(ident, family, nhead, dim, out, dcc_cycles, fixed_cycles, tenon_cycles):
+    return (
+        ident,
+        family,
+        nhead,
+        dim,
+        out,
+        ms_of(dcc_cycles),
+        ms_of(fixed_cycles),
+        ms_of(tenon_cycles),
+    )
+
+
 MANIFEST = [
-    ("qkv_gemv_nh8", "GEMV", "8", "5120", "384", "0.0088", "0.0280", "0.0088"),
-    ("qkv_gemv_nh32", "GEMV", "32", "5120", "384", "0.0336", "0.1720", "0.0336"),
-    ("proj_gemv_nh8", "GEMV", "8", "128", "5120", "0.0026", "0.0026", "0.0026"),
-    ("proj_gemv_nh32", "GEMV", "32", "128", "5120", "0.0102", "0.0103", "0.0102"),
-    ("score_nh8_a", "attention-QK^T", "8", "128", "144", "0.0010", "0.0010", "0.0010"),
-    ("score_nh8_b", "attention-QK^T", "8", "128", "160", "0.0011", "0.0011", "0.0011"),
-    (
-        "score_nh32_a",
-        "attention-QK^T",
-        "32",
-        "128",
-        "144",
-        "0.0040",
-        "0.0046",
-        "0.0040",
-    ),
-    (
-        "score_nh32_b",
-        "attention-QK^T",
-        "32",
-        "128",
-        "160",
-        "0.0042",
-        "0.0047",
-        "0.0042",
-    ),
+    _row("qkv_gemv_nh8", "GEMV", "8", "5120", "384", 11444, 36410, 11444),
+    _row("qkv_gemv_nh32", "GEMV", "32", "5120", "384", 43693, 223667, 43693),
+    _row("proj_gemv_nh8", "GEMV", "8", "128", "5120", 3381, 3381, 3381),
+    _row("proj_gemv_nh32", "GEMV", "32", "128", "5120", 13264, 13394, 13264),
+    _row("score_nh8_a", "attention-QK^T", "8", "128", "144", 1300, 1300, 1300),
+    _row("score_nh8_b", "attention-QK^T", "8", "128", "160", 1430, 1430, 1430),
+    _row("score_nh32_a", "attention-QK^T", "32", "128", "144", 5202, 5982, 5202),
+    _row("score_nh32_b", "attention-QK^T", "32", "128", "160", 5462, 6112, 5462),
 ]
 PAPER = {
     "attacc_kernel_qkv_b1": "0.00880",
@@ -63,11 +68,11 @@ PAPER = {
     "attacc_kernel_proj_b4": "0.01020",
     "attacc_kernel_score_b1": "Tenon 1.00x over fixed (figure)",
     "attacc_kernel_score_b4": "Tenon 1.13x over fixed (figure)",
-    "attacc_e2e_in128_out2048_bs1": "base 1.47x, full 6.5x",
+    "attacc_e2e_in128_out2048_bs1": "base 1.47x, full 6.50x",
     "attacc_e2e_in2048_out128_bs1": "base 1.56x, full 6.95x",
-    "attacc_e2e_in2048_out2048_bs1": "base 1.66x, full 7.4x",
+    "attacc_e2e_in2048_out2048_bs1": "base 1.66x, full 7.40x",
     "attacc_e2e_in128_out2048_bs4": "base 1.34x, full 3.09x",
-    "attacc_e2e_in2048_out128_bs4": "base 1.5x, full 3.48x",
+    "attacc_e2e_in2048_out128_bs4": "base 1.50x, full 3.48x",
     "attacc_e2e_in2048_out2048_bs4": "base 1.65x, full 3.87x",
 }
 GEMV_SHAPES = {
@@ -94,30 +99,82 @@ E2E_SPEEDUPS = {
 }
 
 
-def run_record(shape, ms, selection="shared-pipeline", trace=True):
+def run_record(
+    shape,
+    ms,
+    selection="shared-pipeline",
+    trace=True,
+    family="attention",
+    artifacts=None,
+):
+    cycles = round(ms * 1e6 / TCK_NS)
     record = {
         "kind": "simulator-timing-only",
+        "family": family,
         "shape": list(shape),
         "selection": selection,
-        "milliseconds": ms,
+        "milliseconds": cycles * TCK_NS / 1e6,
+        "memory_system_cycles": cycles,
         "tiling": [[1, 1, 1]],
     }
     if trace:
         record["trace_check"] = {"match": True, "totals_match": True}
+    if artifacts is not None:
+        record["artifacts"] = str(artifacts)
+        record["trace_sha256"] = retain_raw_output(artifacts, cycles, shape)
     return record
+
+
+def set_timing(record, ms):
+    """Change a record's timing consistently: cycles, milliseconds and, for a
+    selected run, the retained simulator output's cycle line."""
+    cycles = round(ms * 1e6 / TCK_NS)
+    record["memory_system_cycles"] = cycles
+    record["milliseconds"] = cycles * TCK_NS / 1e6
+    if record.get("artifacts"):
+        stdout = Path(record["artifacts"]) / "stdout.txt"
+        stdout.write_text(
+            f"MemorySystem:\n  impl: PIMDRAM\n  memory_system_cycles: {cycles}\n"
+        )
+
+
+def retain_raw_output(directory, cycles, shape):
+    """A retained raw-output directory as run_ramulator keeps it: the
+    simulator's stdout with its cycle line and the trace; returns the trace sha."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "stdout.txt").write_text(
+        f"MemorySystem:\n  impl: PIMDRAM\n  memory_system_cycles: {cycles}\n"
+    )
+    trace = directory / "kernel.trace"
+    trace.write_text("PIM_WR_GB 0\nPIM_MAC_AB 1\n" * (1 + sum(shape) % 5))
+    return hashlib.sha256(trace.read_bytes()).hexdigest()
 
 
 def make_sessions(tmp_path):
     d = tmp_path / "sessions"
     d.mkdir()
-    sim = {"name": "Ramulator2-AttAcc (test)", "binary_sha256": "s" * 64}
+    sim = {
+        "name": "Ramulator2-AttAcc (test)",
+        "binary_sha256": "s" * 64,
+        "tck_ns": TCK_NS,
+    }
     for row, shape in GEMV_SHAPES.items():
         key = tuple(str(x) for x in shape)
         archived = next(m for m in MANIFEST if (m[2], m[3], m[4]) == key)
         runs = [
-            run_record(shape, float(archived[7])),
             run_record(
-                shape, float(archived[6]), selection="fixed-form-baseline", trace=False
+                shape,
+                float(archived[7]),
+                family="gemv",
+                artifacts=d / f"{row}.artifacts" / "selected",
+            ),
+            run_record(
+                shape,
+                float(archived[6]),
+                selection="fixed-form-baseline",
+                trace=False,
+                family="gemv",
             ),
         ]
         json.dump(
@@ -126,7 +183,14 @@ def make_sessions(tmp_path):
         )
     for row, nhead in (("score_b1", "8"), ("score_b4", "32")):
         runs = [
-            run_record((int(m[2]), int(m[3]), int(m[4])), float(m[7]))
+            run_record(
+                (int(m[2]), int(m[3]), int(m[4])),
+                float(m[7]),
+                artifacts=d
+                / f"{row}.artifacts"
+                / f"attention_{m[2]}x{m[3]}x{m[4]}"
+                / "selected",
+            )
             for m in MANIFEST
             if m[1] != "GEMV" and m[2] == nhead
         ]
@@ -134,20 +198,26 @@ def make_sessions(tmp_path):
             {"simulator": sim, "failures": [], "runs": runs},
             open(d / f"attacc_{row}.json", "w"),
         )
-    configs = [
-        {
-            "lin": k[0],
-            "lout": k[1],
-            "batch": k[2],
-            "variants": {
-                "tenon": {
-                    "base_speedup": E2E_SPEEDUPS[k][0],
-                    "full_speedup": E2E_SPEEDUPS[k][1],
-                }
-            },
-        }
-        for k in E2E_KEYS
-    ]
+    configs = []
+    for k in E2E_KEYS:
+        base, full = E2E_SPEEDUPS[k]
+        roofline = 10.0
+        configs.append(
+            {
+                "lin": k[0],
+                "lout": k[1],
+                "batch": k[2],
+                "gpu_roofline_ms": roofline,
+                "variants": {
+                    "tenon": {
+                        "base_ms": roofline / base,
+                        "full_ms": roofline / full,
+                        "base_speedup": base,
+                        "full_speedup": full,
+                    }
+                },
+            }
+        )
     json.dump(
         {"kind": "analytical-composition", "configs": configs},
         open(d / "attacc_e2e.json", "w"),
@@ -297,7 +367,7 @@ def test_score_trace_check_required(comparator, inputs, tmp_path, capsys):
     code, _ = run(comparator, inputs, tmp_path)
     assert (
         code == 1
-        and "trace check missing or not matched for shape [32, 128, 144]"
+        and "score_b4: shape [32, 128, 144]: trace check missing or not matched"
         in capsys.readouterr().err
     )
 
@@ -308,7 +378,7 @@ def test_gemv_regression_fails_and_improvement_passes(comparator, inputs, tmp_pa
     def slower(d):
         for r in d["runs"]:
             if r["selection"] == "shared-pipeline":
-                r["milliseconds"] = 0.03368  # archived 0.0336
+                set_timing(r, 0.03368)  # archived 0.0336
 
     mutate(sessions, "qkv_b4", slower)
     code, report = run(comparator, inputs, tmp_path)
@@ -320,7 +390,7 @@ def test_gemv_regression_fails_and_improvement_passes(comparator, inputs, tmp_pa
     def faster(d):
         for r in d["runs"]:
             if r["selection"] == "shared-pipeline":
-                r["milliseconds"] = 0.0330
+                set_timing(r, 0.0330)
 
     mutate(sessions, "qkv_b4", faster)
     code, report = run(comparator, inputs, tmp_path)
@@ -329,7 +399,7 @@ def test_gemv_regression_fails_and_improvement_passes(comparator, inputs, tmp_pa
 
 def test_score_shape_slower_than_archived_fails(comparator, inputs, tmp_path):
     sessions = inputs[0]
-    mutate(sessions, "score_b4", lambda d: d["runs"][0].update(milliseconds=0.0041))
+    mutate(sessions, "score_b4", lambda d: set_timing(d["runs"][0], 0.0041))
     code, report = run(comparator, inputs, tmp_path)
     assert (
         code == 1
@@ -356,7 +426,7 @@ def test_gemv_evidence_shape_and_selection_requirements(
         in err
     )
     assert "proj_b4: no fixed-form-baseline run" in err
-    assert "qkv_b1: trace check missing or not matched" in err
+    assert "qkv_b1: shape [8, 5120, 384]: trace check missing or not matched" in err
 
 
 def test_missing_session_and_recorded_failures_fail(
@@ -379,3 +449,141 @@ def test_half_ulp_comes_from_the_printed_digits(comparator):
     assert comparator.half_ulp("6.5") == pytest.approx(0.05)
     assert comparator.half_ulp("1.47") == pytest.approx(0.005)
     assert comparator.first_number("base 1.5x, full 3.48x", after="full") == "3.48"
+
+
+def _set_decode(cfg_index, **fields):
+    def mutate_e2e(e):
+        tenon = e["configs"][cfg_index]["variants"]["tenon"]
+        tenon.update(fields)
+
+    return mutate_e2e
+
+
+def test_decode_speedup_below_printed_precision_fails_consistently(
+    comparator, inputs, tmp_path
+):
+    """The frozen table prints 6.50 and 1.50; a consistent 6.46 or 1.46 (latency and
+    speedup agreeing) is below the printed value less half an ulp and fails."""
+    sessions = inputs[0]
+    mutate(sessions, "e2e", _set_decode(0, full_ms=10.0 / 6.46, full_speedup=6.46))
+    code, report = run(comparator, inputs, tmp_path)
+    assert code == 1 and report["problems"] == []
+    assert report["decode"]["attacc_e2e_in128_out2048_bs1"][
+        "full_bound"
+    ] == pytest.approx(6.495)
+    assert report["decode"]["attacc_e2e_in128_out2048_bs1"]["verdict"].startswith(
+        "DIFFERS"
+    )
+    mutate(sessions, "e2e", _set_decode(0, full_ms=10.0 / 6.50, full_speedup=6.50))
+    mutate(sessions, "e2e", _set_decode(4, base_ms=10.0 / 1.46, base_speedup=1.46))
+    code, report = run(comparator, inputs, tmp_path)
+    assert code == 1
+    assert report["decode"]["attacc_e2e_in2048_out128_bs4"][
+        "base_bound"
+    ] == pytest.approx(1.495)
+    mutate(sessions, "e2e", _set_decode(4, base_ms=10.0 / 1.495, base_speedup=1.495))
+    code, report = run(comparator, inputs, tmp_path)
+    assert code == 0  # at the printed value less half an ulp
+
+
+def test_decode_fields_must_agree_and_be_finite(comparator, inputs, tmp_path, capsys):
+    sessions = inputs[0]
+    mutate(
+        sessions, "e2e", _set_decode(0, full_ms=10.0 / 6.50 * 10)
+    )  # latency tenfold, speedup unchanged
+    code, _ = run(comparator, inputs, tmp_path)
+    err = capsys.readouterr().err
+    assert (
+        code == 1
+        and "recorded speedups" in err
+        and "do not equal gpu_roofline_ms over the recorded latencies" in err
+    )
+    mutate(
+        sessions, "e2e", _set_decode(0, full_ms=10.0 / 6.50, full_speedup=float("inf"))
+    )
+    code, _ = run(comparator, inputs, tmp_path)
+    assert (
+        code == 1 and "not positive finite: ['full_speedup']" in capsys.readouterr().err
+    )
+
+
+def test_kernel_cycles_clock_and_raw_output_must_agree(
+    comparator, inputs, tmp_path, capsys
+):
+    sessions = inputs[0]
+    mutate(
+        sessions,
+        "qkv_b4",
+        lambda d: d["runs"][0].update(
+            memory_system_cycles=d["runs"][0]["memory_system_cycles"] * 10
+        ),
+    )
+    code, _ = run(comparator, inputs, tmp_path)
+    err = capsys.readouterr().err
+    assert code == 1
+    assert (
+        "do not equal memory_system_cycles" in err
+        and "does not report memory_system_cycles" in err
+    )
+
+
+def test_retained_raw_output_is_required_and_checked(
+    comparator, inputs, tmp_path, capsys
+):
+    sessions = inputs[0]
+    mutate(sessions, "proj_b1", lambda d: d["runs"][0].pop("artifacts"))
+    (sessions / "qkv_b1.artifacts" / "selected" / "kernel.trace").write_text(
+        "tampered\n"
+    )
+    code, _ = run(comparator, inputs, tmp_path)
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "proj_b1: shape [8, 128, 5120]: retained raw output directory missing" in err
+    assert "qkv_b1: shape [8, 5120, 384]: retained trace sha256" in err
+
+
+def test_baselines_must_be_the_rows_workload(comparator, inputs, tmp_path, capsys):
+    sessions = inputs[0]
+
+    def wrong_shape(d):
+        for r in d["runs"]:
+            if r["selection"] == "fixed-form-baseline":
+                r["shape"] = [1, 1, 1]
+
+    mutate(sessions, "qkv_b4", wrong_shape)
+    code, report = run(comparator, inputs, tmp_path)
+    err = capsys.readouterr().err
+    assert code == 1 and "qkv_b4" not in report["kernel_rows"]
+    assert (
+        "fixed-form baseline shape [1, 1, 1] is not the row's shape ('32', '5120', '384'); record rejected"
+        in err
+    )
+    assert "qkv_b4: no fixed-form baseline of the row's shape" in err
+    mutate(sessions, "proj_b1", lambda d: d["runs"][1].update(family="attention"))
+    code, _ = run(comparator, inputs, tmp_path)
+    assert (
+        code == 1 and "family 'attention', 'gemv' required" in capsys.readouterr().err
+    )
+
+
+def test_missing_simulator_clock_fails(comparator, inputs, tmp_path, capsys):
+    sessions = inputs[0]
+    mutate(sessions, "score_b1", lambda d: d["simulator"].pop("tck_ns"))
+    code, _ = run(comparator, inputs, tmp_path)
+    assert code == 1 and "no positive finite simulator clock" in capsys.readouterr().err
+
+
+def test_inventory_carries_the_tables_printed_precision():
+    """The frozen decode table prints two decimals for every speedup; the
+    inventory's paper values must carry them (round 116: 6.5, 7.4 and 1.5 had
+    been stored, widening the half-ulp bound tenfold)."""
+    inventory = REPO / "docs" / "release" / "paper_reproduction" / "inventory.csv"
+    rows = {r["case_id"]: r for r in csv.DictReader(open(inventory))}
+    import re
+
+    for case in PAPER:
+        if case.startswith("attacc_e2e_"):
+            for number in re.findall(r"\d+\.\d+", rows[case]["paper_value"]):
+                assert len(number.split(".")[1]) == 2, (case, number)
+        elif case.startswith("attacc_kernel_") and "score" not in case:
+            assert len(rows[case]["paper_value"].split(".")[1]) == 5, case

@@ -27,13 +27,22 @@ version certified incomplete or relabelled evidence):
   regressions fail.
 * The 500-instance tally against DCC (123 / 316 / 61, median loss 7.1 percent)
   is reported as a diagnostic and does not decide the verdict.
+* Evidence consistency (round 116): every run's milliseconds must equal its
+  memory_system_cycles at the session's simulator clock; a selected run must
+  retain its raw output (stdout.txt reporting the same cycle count, the trace
+  whose sha256 the record carries); fixed-form baselines must be the row's
+  family and shape; decode speedups must equal gpu_roofline_ms over the
+  recorded base_ms / full_ms, all positive and finite.  The printed paper
+  values come from the inventory, which carries the tables' printed digits.
 * Success requires all twelve result verdicts present and REPRODUCED and no
   evidence problem; otherwise the exit status is 1.
 """
 
 import argparse
 import csv
+import hashlib
 import json
+import math
 import re
 import statistics
 import sys
@@ -99,22 +108,74 @@ def shape_key(run):
     return (str(h), str(dim), str(l))
 
 
-def check_run(run, label, problems, *, require_trace):
+def positive_finite(value) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+def close(a, b, rel=1e-9) -> bool:
+    return abs(float(a) - float(b)) <= rel * max(1.0, abs(float(b)))
+
+
+def check_run(run, label, problems, *, require_trace, tck_ns, family=None):
+    """A run's timing evidence: kind, family, positive finite cycles and
+    milliseconds, milliseconds derived from the cycles at the session's clock,
+    and for a selected run its matching trace check and retained raw output
+    (the simulator's cycle count and the trace hash agree with the record)."""
+    where = f"{label}: shape {run.get('shape')}"
     if run.get("kind") != "simulator-timing-only":
-        problems.append(
-            f"{label}: run kind {run.get('kind')!r} for shape {run.get('shape')}"
-        )
-    ms = run.get("milliseconds")
-    if isinstance(ms, bool) or not isinstance(ms, (int, float)) or ms <= 0:
-        problems.append(
-            f"{label}: no positive milliseconds for shape {run.get('shape')}"
-        )
+        problems.append(f"{where}: run kind {run.get('kind')!r}")
+    if family is not None and run.get("family") != family:
+        problems.append(f"{where}: family {run.get('family')!r}, {family!r} required")
+    ms, cycles = run.get("milliseconds"), run.get("memory_system_cycles")
+    if not positive_finite(ms):
+        problems.append(f"{where}: no positive finite milliseconds")
+    if not positive_finite(cycles) or int(cycles) != cycles:
+        problems.append(f"{where}: no positive finite integer memory_system_cycles")
+    if positive_finite(ms) and positive_finite(cycles) and positive_finite(tck_ns):
+        derived = cycles * tck_ns / 1e6
+        if not close(ms, derived):
+            problems.append(
+                f"{where}: milliseconds {ms} do not equal memory_system_cycles {cycles} x tCK {tck_ns} ns = {derived}"
+            )
     if require_trace:
         tc = run.get("trace_check") or {}
         if tc.get("match") is not True or tc.get("totals_match") is not True:
+            problems.append(f"{where}: trace check missing or not matched")
+        artifacts = run.get("artifacts")
+        if not isinstance(artifacts, str) or not Path(artifacts).is_dir():
             problems.append(
-                f"{label}: trace check missing or not matched for shape {run.get('shape')}"
+                f"{where}: retained raw output directory missing ({artifacts!r})"
             )
+        else:
+            stdout = Path(artifacts) / "stdout.txt"
+            trace = Path(artifacts) / "kernel.trace"
+            if not stdout.is_file():
+                problems.append(
+                    f"{where}: retained simulator output stdout.txt missing"
+                )
+            elif positive_finite(cycles):
+                text = stdout.read_text(errors="ignore")
+                if not re.search(
+                    r"memory_system_cycles:\s*" + str(int(cycles)) + r"\b", text
+                ):
+                    problems.append(
+                        f"{where}: retained simulator output does not report memory_system_cycles: {int(cycles)}"
+                    )
+            if not trace.is_file():
+                problems.append(f"{where}: retained trace kernel.trace missing")
+            elif run.get("trace_sha256"):
+                digest = hashlib.sha256(trace.read_bytes()).hexdigest()
+                if digest != run["trace_sha256"]:
+                    problems.append(
+                        f"{where}: retained trace sha256 {digest[:12]} differs from the record's {str(run['trace_sha256'])[:12]}"
+                    )
+            else:
+                problems.append(f"{where}: no trace_sha256 recorded")
 
 
 def same_or_better(value, archived, printed):
@@ -170,6 +231,15 @@ def main(argv=None):
         if not isinstance(data.get("runs"), list):
             problems.append(f"{name}: no runs list")
             return None
+        tck = (data.get("simulator") or {}).get("tck_ns")
+        try:
+            data["_tck_ns"] = float(tck)
+        except (TypeError, ValueError):
+            data["_tck_ns"] = None
+        if not positive_finite(data["_tck_ns"]):
+            problems.append(
+                f"{name}: no positive finite simulator clock (simulator.tck_ns = {tck!r})"
+            )
         if report["simulator"] is None and isinstance(data.get("simulator"), dict):
             report["simulator"] = {
                 "name": data["simulator"].get("name"),
@@ -204,13 +274,38 @@ def main(argv=None):
                 f"{row}: {len(others)} run(s) of another selection: {sorted({r.get('selection') for r in others})}"
             )
         for r in selected:
-            check_run(r, row, problems, require_trace=True)
+            check_run(
+                r,
+                row,
+                problems,
+                require_trace=True,
+                tck_ns=data["_tck_ns"],
+                family="gemv",
+            )
             if shape_key(r) != expected:
                 problems.append(
                     f"{row}: selected run shape {r.get('shape')} is not the row's shape {expected}"
                 )
+        accepted_fixed = []
         for r in fixed:
-            check_run(r, row, problems, require_trace=False)
+            # a baseline supplies the reported speedup only when it is the same workload
+            check_run(
+                r,
+                row,
+                problems,
+                require_trace=False,
+                tck_ns=data["_tck_ns"],
+                family="gemv",
+            )
+            if shape_key(r) != expected:
+                problems.append(
+                    f"{row}: fixed-form baseline shape {r.get('shape')} is not the row's shape {expected}; record rejected"
+                )
+                continue
+            accepted_fixed.append(r)
+        if fixed and not accepted_fixed:
+            problems.append(f"{row}: no fixed-form baseline of the row's shape")
+        fixed = accepted_fixed
         if len(selected) != 1 or not fixed:
             continue
         ms = selected[0]["milliseconds"]
@@ -261,7 +356,14 @@ def main(argv=None):
                     f"{row}: record of selection {r.get('selection')!r} for shape {r.get('shape')} (only shared-pipeline records are evidence)"
                 )
                 continue
-            check_run(r, row, problems, require_trace=True)
+            check_run(
+                r,
+                row,
+                problems,
+                require_trace=True,
+                tck_ns=data["_tck_ns"],
+                family="attention",
+            )
             if key is None or key not in expected:
                 problems.append(
                     f"{row}: shape {r.get('shape')} is not one of the row's {len(expected)} archived shapes (nhead {nhead})"
@@ -378,8 +480,31 @@ def main(argv=None):
             case = E2E[key]
             tenon = (cfg.get("variants") or {}).get("tenon") or {}
             base, full = tenon.get("base_speedup"), tenon.get("full_speedup")
-            if not isinstance(base, (int, float)) or not isinstance(full, (int, float)):
-                problems.append(f"e2e: {case} has no tenon base/full speedup")
+            roofline, base_ms, full_ms = (
+                cfg.get("gpu_roofline_ms"),
+                tenon.get("base_ms"),
+                tenon.get("full_ms"),
+            )
+            bad = [
+                name
+                for name, value in (
+                    ("gpu_roofline_ms", roofline),
+                    ("base_ms", base_ms),
+                    ("full_ms", full_ms),
+                    ("base_speedup", base),
+                    ("full_speedup", full),
+                )
+                if not positive_finite(value)
+            ]
+            if bad:
+                problems.append(f"e2e: {case}: not positive finite: {bad}")
+                continue
+            if not close(base, roofline / base_ms) or not close(
+                full, roofline / full_ms
+            ):
+                problems.append(
+                    f"e2e: {case}: recorded speedups {base:.6f} / {full:.6f} do not equal gpu_roofline_ms over the recorded latencies = {roofline / base_ms:.6f} / {roofline / full_ms:.6f}"
+                )
                 continue
             printed = paper[case]["paper_value"]
             pb, pf = first_number(printed, after="base"), first_number(
