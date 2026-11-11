@@ -385,12 +385,12 @@ def _emit_device_c(
     # actually appear in the body, so we can avoid unused-variable
     # warnings.
     ctx_l4_roles: list[str] = []
-    try:
-        ctx_l4_roles = list(compiled.layout_ctx.iter_l4_roles())  # type: ignore[attr-defined]
-    except AttributeError:
-        # a context without the APU v1 iterator (release issue C-13: only the
-        # absence of the method is a fallback; its own errors surface)
-        ctx_l4_roles = []
+    # Only the absence of the APU v1 iterator is a fallback (release issue
+    # C-13): the method is looked up, not called, inside the guard, so an
+    # AttributeError raised while an existing iterator runs propagates.
+    iter_l4_roles = getattr(compiled.layout_ctx, "iter_l4_roles", None)
+    if iter_l4_roles is not None:
+        ctx_l4_roles = list(iter_l4_roles())
 
     # Fall back: scan compiled.cmds for the L4 ptr substrings.
     if not ctx_l4_roles:
@@ -436,10 +436,9 @@ def _emit_device_c(
     # VR alias decls -- pulled from the ctx via iter_vr_aliases(); fall
     # back to the canonical pair the declarative-mode body needs.
     vr_aliases: list[tuple[str, str]] = []
-    try:
-        vr_aliases = list(compiled.layout_ctx.iter_vr_aliases())  # type: ignore[attr-defined]
-    except AttributeError:
-        vr_aliases = []
+    iter_vr_aliases = getattr(compiled.layout_ctx, "iter_vr_aliases", None)
+    if iter_vr_aliases is not None:
+        vr_aliases = list(iter_vr_aliases())
     if not vr_aliases:
         vr_aliases = [
             ("vr0", "GVML_VR16_0"),
