@@ -232,9 +232,17 @@ own derivation (`payload.effects()`) where no deriver applies, a required
 target with neither is a problem, and `spmw_apu_v1.check_realization` and
 `spmw_apu_g2.check_realization` compare the complete declaration with the
 realized payload's derivation (regressions
-`tests/pim/test_candidate_contract_payload_routes.py`).  The item (1)
-review at the final candidate therefore still stands, now over the
-repaired boundary.  Apart from items (1), (2) and the unverified sample,
+`tests/pim/test_candidate_contract_payload_routes.py`).  The round
+140 review accepted the repaired boundary (`reviewer-r140/README.txt`:
+the 31 contract regressions and both adjusted record tests from the
+`89e7b745...` wheel, the three changed modules byte-identical to the
+source, reviewer probes on renamed irregular uint16 contractions with
+overflow and carried outputs, a guarded whole-function record and a
+non-mutating Gemini-II virtual result; no weakened numerical check,
+benchmark-specific dispatch or fabricated execution found).  That is the
+acceptance of the X-45 boundary, not a declaration that every G9 gate
+passes: the item (1) review at the final candidate still stands, now over
+the repaired boundary.  Apart from items (1), (2) and the unverified sample,
 nothing else of G9 is open: the migration, the matcher-backend contracts,
 the retained-IR manifest and the hardware provenance bindings are recorded
 above.
