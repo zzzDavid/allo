@@ -991,3 +991,51 @@ def test_templates_take_the_sdk_root_and_device_index():
         assert "${TENON_APU_G2_SDK_ROOT}" in text
     for host in _TEMPLATE.glob("host*.cc"):
         assert "DeviceConfig{TENON_APU_G2_DEVICE_INDEX, 0}" in host.read_text()
+
+
+def test_emulated_launch_records_forward_the_runtime_provenance(
+    emulated_card, tmp_path
+):
+    """G2-15: the public source route forwards each launch's underlying
+    provenance (the device lock it held, the recipe identity, the project
+    record with card information, commands, source and runtime hashes) and
+    keeps numerical arrays out of the launch records; two launches carry
+    distinct per-launch provenance."""
+    import json
+
+    compiled = _compile(gemm_n33)
+    compiled.repetitions = 20
+    args = _random_args(compiled, np.random.default_rng(91))
+    expected = args["A"].astype(np.int64) @ args["B"].astype(np.int64)
+    result = compiled(**args)
+    np.testing.assert_array_equal(args["C"], expected)
+    launches = result.extra["launches"]
+    assert len(launches) == len(compiled.plan.launches) >= 2
+    lock = str(tmp_path / "card.lock")
+    assert result.extra["device_lock"] == lock
+    for record in launches:
+        assert record["device_lock"] == lock
+        assert record["recipe_fingerprint"] and record["repetitions"] == 20
+        project = record["project"]
+        for key in (
+            "card_info",
+            "commands",
+            "source_sha256",
+            "runtime_sha256",
+            "python_implementation_sha256",
+            "device_library",
+            "host_binary",
+        ):
+            assert project.get(key) not in (None, "", [], {}), key
+        assert (
+            record["artifact_sha256"]["device_library"]
+            and record["artifact_sha256"]["host_binary"]
+        )
+        # numerical arrays stay out of the provenance record
+        assert "outputs" not in record and "oracle" not in record
+        json.dumps(record)  # serialisable as a session record
+    # distinct per-launch provenance: each launch built and ran its own project
+    commands = [json.dumps(record["project"]["commands"]) for record in launches]
+    assert len(set(commands)) == len(commands)
+    assert len({record["program_fingerprint"] for record in launches}) >= 1
+    assert len({json.dumps(record["raw_ticks"]) for record in launches}) >= 1

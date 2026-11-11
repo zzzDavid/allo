@@ -1462,6 +1462,7 @@ class APUG2SourceProgram:
                 partial[("previous", launch.streams, launch.coordinates)] = gathered
             total += int(result.cycles)
             stdout.append(result.stdout)
+            project = result.extra["project"]
             launches.append(
                 {
                     "index": index,
@@ -1472,7 +1473,31 @@ class APUG2SourceProgram:
                     "raw_ticks": result.extra["raw_ticks"],
                     "final_pipeline_ticks": result.extra["final_pipeline_ticks"],
                     "host_timings_us": result.extra["host_timings_us"],
-                    "artifact_sha256": result.extra["project"]["artifact_sha256"],
+                    "artifact_sha256": project["artifact_sha256"],
+                    # The underlying runtime's provenance, forwarded per launch
+                    # (release issue G2-15): the device lock the launch held,
+                    # the recipe identity, and the project record (card, build
+                    # and launch commands, source and runtime hashes).  Numerical
+                    # arrays (outputs, oracle) stay in the result's own fields.
+                    "device_lock": result.extra.get("device_lock"),
+                    "recipe_fingerprint": result.extra.get("recipe_fingerprint"),
+                    "repetitions": result.extra.get("repetitions"),
+                    "sources": result.extra.get("sources"),
+                    "project": {
+                        key: project.get(key)
+                        for key in (
+                            "card_info",
+                            "commands",
+                            "source_sha256",
+                            "runtime_sha256",
+                            "python_implementation_sha256",
+                            "device_library",
+                            "host_binary",
+                            "template_path",
+                            "generated_project_path",
+                            "temporary_project_kept",
+                        )
+                    },
                 }
             )
         written = {}
@@ -1495,6 +1520,16 @@ class APUG2SourceProgram:
             extra={
                 "outputs": written,
                 "launches": launches,
+                # The lock the launches held: one path when every launch agrees
+                # (the normal case), else the per-launch list.
+                "device_lock": (
+                    launches[0]["device_lock"]
+                    if launches
+                    and all(
+                        l["device_lock"] == launches[0]["device_lock"] for l in launches
+                    )
+                    else [l["device_lock"] for l in launches]
+                ),
                 "plan": self.manifest(),
                 "estimate_cycles": self.plan.estimate_cycles,
                 "cost_model": None if self.cost is None else self.cost.spec.name,
