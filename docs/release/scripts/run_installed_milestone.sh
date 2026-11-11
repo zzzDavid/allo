@@ -34,6 +34,9 @@ echo "host $(hostname) date $(date -Is) commit $(cat $P/revision.txt)" | tee -a 
 sha256sum $P/wheel/allo-0.5-*.whl $P/dist/allo-0.5.tar.gz | tee -a $E/stages/SUMMARY.txt
 
 stage module_origin -- $PY -c "import allo, allo.spmw_aim, allo.spmw_apu_v1, allo.spmw_apu_g2, allo.spmw_upmem, allo.spmw_attacc, allo.spmw_samsung, sys; print(allo.__file__); assert not any(p.startswith('$ALLO') for p in sys.path)"
+# The installed distribution's own metadata must identify the Tenon fork (ISSUES P-07): the
+# summary, home page, maintainer and project URLs read back from the installed dist-info.
+stage distribution_metadata -- $PY -c "from importlib.metadata import metadata; m = metadata('allo'); print('Summary:', m['Summary']); print('Home-page:', m['Home-page']); print('Maintainer:', m['Maintainer']); urls = m.get_all('Project-URL') or []; print('Project-URL:', urls); assert 'Tenon' in m['Summary'] and 'processing-in-memory' in m['Summary'], m['Summary']; assert m['Home-page'] == 'https://github.com/zzzDavid/allo/tree/tenon', m['Home-page']; assert 'tenon' in (m['Maintainer'] or ''), m['Maintainer']; assert any('cornell-zhang/allo' in u for u in urls) and any('STATUS.md' in u for u in urls), urls"
 # The dependency versions the stages below run under are recorded from the interpreter, not
 # assumed from the venv's name (round 120: the "release NumPy" venv had installed unpinned
 # numpy 2.5.4 while the ledger said 2.3.5).  TENON_MILESTONE_NUMPY, when set, is asserted.
