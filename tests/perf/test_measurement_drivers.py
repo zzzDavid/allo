@@ -249,6 +249,43 @@ def test_ledag_drain_removes_the_tool_scratch_it_created(monkeypatch, tmp_path):
     assert not (tmp_path / "online_log_2026_11_04_04_23_48").exists()
 
 
+def test_ledag_drain_refuses_without_scratch_headroom(monkeypatch, tmp_path):
+    """X-24 (round 130): a read is refused before any session when the tool's
+    scratch directory lacks the headroom one read needs, naming the directory,
+    the free space and the requirement; with headroom the session runs."""
+    import collections
+    import subprocess
+
+    from allo.pim import apu_v1_program as program
+
+    monkeypatch.setattr(program, "_LEDAG_SCRATCH", tmp_path)
+    usage = collections.namedtuple("usage", "total used free")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=b"total crun: 3 hits: 1\n")
+
+    monkeypatch.setattr(program.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        program.shutil,
+        "disk_usage",
+        lambda path: usage(10**12, 10**12, 2 * 1024 * 1024),
+    )
+    with pytest.raises(RuntimeError, match="2.0 MiB free") as excinfo:
+        program._ledag_drain()
+    assert str(tmp_path) in str(excinfo.value) and "regardless of TMPDIR" in str(
+        excinfo.value
+    )
+    assert calls == []  # no session was started
+    monkeypatch.setattr(
+        program.shutil, "disk_usage", lambda path: usage(10**12, 0, 10**9)
+    )
+    assert program.ledag_scratch_headroom_problem() is None
+    assert "crun: 3" in program._ledag_drain()
+    assert len(calls) == 1
+
+
 def test_apu_v1_archived_lane_never_writes_into_the_archive(monkeypatch, tmp_path):
     import numpy as np
 

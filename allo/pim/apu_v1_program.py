@@ -466,6 +466,30 @@ def _ledag_available_reason() -> str | None:
 # small /tmp and then every later read fails with ENOSPC.
 _LEDAG_SCRATCH = Path("/tmp")
 _LEDAG_SCRATCH_PATTERNS = ("online_log_*", "ledag_ssh_*_log.txt")
+# One read needs room in that directory for the tool's device-log copy (about
+# 5 MB) and its session log; the tool writes them there regardless of
+# ``TMPDIR`` (only its bootloader's self-extraction follows ``TMPDIR``).  A
+# session started without this headroom fails inside the tool with ENOSPC and
+# fills a shared ``/tmp`` for everyone else first, so the headroom is checked
+# before the session (release issue X-24, round 130).
+_LEDAG_SCRATCH_REQUIRED_BYTES = 8 * 1024 * 1024
+
+
+def ledag_scratch_headroom_problem() -> str | None:
+    """Why a ``ledag-ssh`` read cannot run now, or None: the scratch directory
+    the tool writes its logs to lacks the headroom one read needs."""
+    try:
+        free = shutil.disk_usage(_LEDAG_SCRATCH).free
+    except OSError as error:
+        return f"cannot measure the free space of {_LEDAG_SCRATCH}: {error}"
+    if free < _LEDAG_SCRATCH_REQUIRED_BYTES:
+        return (
+            f"{_LEDAG_SCRATCH} has {free / 1024 / 1024:.1f} MiB free; a ledag-ssh "
+            f"read writes its device-log copy and session log there (about "
+            f"{_LEDAG_SCRATCH_REQUIRED_BYTES // (1024 * 1024)} MiB needed) regardless "
+            "of TMPDIR, so the board profile cannot be read until space is freed"
+        )
+    return None
 
 
 def _ledag_scratch_files() -> set:
@@ -507,6 +531,9 @@ def _ledag_drain() -> str:
     appended between them.
     """
 
+    problem = ledag_scratch_headroom_problem()
+    if problem is not None:
+        raise RuntimeError(f"ledag-ssh cannot read the device log: {problem}")
     before = _ledag_scratch_files()
     try:
         process = subprocess.run(
