@@ -249,40 +249,85 @@ def test_ledag_drain_removes_the_tool_scratch_it_created(monkeypatch, tmp_path):
     assert not (tmp_path / "online_log_2026_11_04_04_23_48").exists()
 
 
-def test_ledag_drain_refuses_without_scratch_headroom(monkeypatch, tmp_path):
-    """X-24 (round 130): a read is refused before any session when the tool's
-    scratch directory lacks the headroom one read needs, naming the directory,
-    the free space and the requirement; with headroom the session runs."""
+def _usage(free):
     import collections
+
+    usage = collections.namedtuple("usage", "total used free")
+    return usage(10**12, 10**12 - free, free)
+
+
+def test_ledag_drain_refuses_without_scratch_headroom(monkeypatch, tmp_path):
+    """X-24 (rounds 130-131): with TMPDIR unset the bootloader extracts into the
+    log directory too, so the combined headroom is required there; 9 MiB
+    free passes neither; the refusal names the directory, the free space and
+    the requirement, and no session is started."""
     import subprocess
 
     from allo.pim import apu_v1_program as program
 
-    monkeypatch.setattr(program, "_LEDAG_SCRATCH", tmp_path)
-    usage = collections.namedtuple("usage", "total used free")
+    logs = tmp_path / "shared-tmp"
+    logs.mkdir()
+    monkeypatch.setattr(program, "_LEDAG_SCRATCH", logs)
+    monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.setattr(program.tempfile, "gettempdir", lambda: str(logs))
+    monkeypatch.setattr(program, "_same_filesystem", lambda a, b: True)
     calls = []
 
     def fake_run(argv, **kwargs):
-        calls.append(argv)
+        calls.append(kwargs.get("env", {}))
         return subprocess.CompletedProcess(argv, 0, stdout=b"total crun: 3 hits: 1\n")
 
     monkeypatch.setattr(program.subprocess, "run", fake_run)
     monkeypatch.setattr(
-        program.shutil,
-        "disk_usage",
-        lambda path: usage(10**12, 10**12, 2 * 1024 * 1024),
+        program.shutil, "disk_usage", lambda path: _usage(9 * 1024 * 1024)
     )
-    with pytest.raises(RuntimeError, match="2.0 MiB free") as excinfo:
+    with pytest.raises(RuntimeError, match="9.0 MiB free") as excinfo:
         program._ledag_drain()
-    assert str(tmp_path) in str(excinfo.value) and "regardless of TMPDIR" in str(
-        excinfo.value
-    )
-    assert calls == []  # no session was started
-    monkeypatch.setattr(
-        program.shutil, "disk_usage", lambda path: usage(10**12, 0, 10**9)
-    )
+    message = str(excinfo.value)
+    assert str(logs) in message and "24.0 MiB" in message and "unset" in message
+    assert calls == []
+    # with the combined headroom the session runs and the child extracts there
+    monkeypatch.setattr(program.shutil, "disk_usage", lambda path: _usage(10**9))
     assert program.ledag_scratch_headroom_problem() is None
     assert "crun: 3" in program._ledag_drain()
+    assert calls[0]["TMPDIR"] == str(logs)
+
+
+def test_ledag_drain_with_a_separately_provisioned_extraction_directory(
+    monkeypatch, tmp_path
+):
+    """TMPDIR set to another filesystem: the log directory needs 8 MiB, the
+    extraction directory 16 MiB, each checked on its own; the child receives
+    that TMPDIR; a short extraction directory is refused by name."""
+    import subprocess
+
+    from allo.pim import apu_v1_program as program
+
+    logs = tmp_path / "shared-tmp"
+    extraction = tmp_path / "work-scratch"
+    logs.mkdir()
+    extraction.mkdir()
+    monkeypatch.setattr(program, "_LEDAG_SCRATCH", logs)
+    monkeypatch.setenv("TMPDIR", str(extraction))
+    monkeypatch.setattr(program, "_same_filesystem", lambda a, b: False)
+    free = {str(logs): 9 * 1024 * 1024, str(extraction): 10**9}
+    monkeypatch.setattr(
+        program.shutil, "disk_usage", lambda path: _usage(free[str(path)])
+    )
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(kwargs.get("env", {}))
+        return subprocess.CompletedProcess(argv, 0, stdout=b"total crun: 5 hits: 1\n")
+
+    monkeypatch.setattr(program.subprocess, "run", fake_run)
+    assert program.ledag_scratch_headroom_problem() is None
+    assert "crun: 5" in program._ledag_drain()
+    assert calls[0]["TMPDIR"] == str(extraction)
+    free[str(extraction)] = 12 * 1024 * 1024  # below the 16 MiB the extraction needs
+    with pytest.raises(RuntimeError, match="bundle extraction") as excinfo:
+        program._ledag_drain()
+    assert str(extraction) in str(excinfo.value) and "16.0 MiB" in str(excinfo.value)
     assert len(calls) == 1
 
 

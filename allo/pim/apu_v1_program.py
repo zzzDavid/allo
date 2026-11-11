@@ -466,29 +466,79 @@ def _ledag_available_reason() -> str | None:
 # small /tmp and then every later read fails with ENOSPC.
 _LEDAG_SCRATCH = Path("/tmp")
 _LEDAG_SCRATCH_PATTERNS = ("online_log_*", "ledag_ssh_*_log.txt")
-# One read needs room in that directory for the tool's device-log copy (about
-# 5 MB) and its session log; the tool writes them there regardless of
-# ``TMPDIR`` (only its bootloader's self-extraction follows ``TMPDIR``).  A
-# session started without this headroom fails inside the tool with ENOSPC and
-# fills a shared ``/tmp`` for everyone else first, so the headroom is checked
-# before the session (release issue X-24, round 130).
-_LEDAG_SCRATCH_REQUIRED_BYTES = 8 * 1024 * 1024
+# One read needs scratch in two places (release issue X-24, rounds 130-131).
+# The tool writes its device-log copy (about 5 MB) and its session log to
+# ``_LEDAG_SCRATCH`` regardless of ``TMPDIR``; its PyInstaller bootloader also
+# extracts the bundle (about 11.5 MB of binaries and data) at every start into
+# ``$TMPDIR`` when that is set, else into ``/tmp``.  A session started without
+# that headroom fails inside the tool with ENOSPC and fills a shared ``/tmp``
+# for everyone else first, so both are checked before the session and the
+# child is given an explicit, checked extraction directory (``TMPDIR`` kept
+# when the caller set one; the system temporary directory otherwise).
+_LEDAG_LOG_REQUIRED_BYTES = 8 * 1024 * 1024
+_LEDAG_EXTRACTION_REQUIRED_BYTES = 16 * 1024 * 1024
+
+
+def _ledag_extraction_dir() -> Path:
+    """Where the tool's bootloader will extract: the caller's ``TMPDIR`` when
+    set (the supported relocation), else the system temporary directory."""
+    configured = os.environ.get("TMPDIR")
+    return Path(configured) if configured else Path(tempfile.gettempdir())
+
+
+def _same_filesystem(first: Path, second: Path) -> bool:
+    try:
+        return first.stat().st_dev == second.stat().st_dev
+    except OSError:
+        return first.resolve() == second.resolve()
+
+
+def _mib(value: int) -> str:
+    return f"{value / 1024 / 1024:.1f} MiB"
 
 
 def ledag_scratch_headroom_problem() -> str | None:
-    """Why a ``ledag-ssh`` read cannot run now, or None: the scratch directory
-    the tool writes its logs to lacks the headroom one read needs."""
-    try:
-        free = shutil.disk_usage(_LEDAG_SCRATCH).free
-    except OSError as error:
-        return f"cannot measure the free space of {_LEDAG_SCRATCH}: {error}"
-    if free < _LEDAG_SCRATCH_REQUIRED_BYTES:
-        return (
-            f"{_LEDAG_SCRATCH} has {free / 1024 / 1024:.1f} MiB free; a ledag-ssh "
-            f"read writes its device-log copy and session log there (about "
-            f"{_LEDAG_SCRATCH_REQUIRED_BYTES // (1024 * 1024)} MiB needed) regardless "
-            "of TMPDIR, so the board profile cannot be read until space is freed"
+    """Why a ``ledag-ssh`` read cannot run now, or None.
+
+    The log directory needs ``_LEDAG_LOG_REQUIRED_BYTES``; the extraction
+    directory needs ``_LEDAG_EXTRACTION_REQUIRED_BYTES``; when the two are one
+    filesystem the sum is required of it.
+    """
+    extraction = _ledag_extraction_dir()
+    needs = [
+        (
+            _LEDAG_SCRATCH,
+            _LEDAG_LOG_REQUIRED_BYTES,
+            "the device-log copy and session log",
         )
+    ]
+    if _same_filesystem(extraction, _LEDAG_SCRATCH):
+        needs = [
+            (
+                _LEDAG_SCRATCH,
+                _LEDAG_LOG_REQUIRED_BYTES + _LEDAG_EXTRACTION_REQUIRED_BYTES,
+                f"the device-log copy and session log plus the bundle extraction (TMPDIR {'set to the same filesystem' if os.environ.get('TMPDIR') else 'unset, so the bootloader extracts here too'})",
+            )
+        ]
+    else:
+        needs.append(
+            (
+                extraction,
+                _LEDAG_EXTRACTION_REQUIRED_BYTES,
+                "the bundle extraction (TMPDIR)",
+            )
+        )
+    for directory, required, what in needs:
+        try:
+            free = shutil.disk_usage(directory).free
+        except OSError as error:
+            return f"cannot measure the free space of {directory}: {error}"
+        if free < required:
+            return (
+                f"{directory} has {_mib(free)} free; a ledag-ssh read needs about "
+                f"{_mib(required)} there for {what}, so the board profile cannot be "
+                "read until space is freed or TMPDIR names a filesystem with room"
+            )
     return None
 
 
@@ -535,6 +585,8 @@ def _ledag_drain() -> str:
     if problem is not None:
         raise RuntimeError(f"ledag-ssh cannot read the device log: {problem}")
     before = _ledag_scratch_files()
+    # The bootloader extracts into the checked directory, explicitly.
+    environment = dict(os.environ, TMPDIR=str(_ledag_extraction_dir()))
     try:
         process = subprocess.run(
             ["ledag-ssh", "-o", "localhost"],
@@ -542,6 +594,7 @@ def _ledag_drain() -> str:
             capture_output=True,
             timeout=30,
             check=False,
+            env=environment,
         )
     except (subprocess.SubprocessError, OSError) as error:
         raise RuntimeError(f"ledag-ssh failed while reading the device log: {error}")
