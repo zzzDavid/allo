@@ -73,6 +73,10 @@ done
 stage attacc_compose_e2e -- timeout 1800 $PY -m benchmarks.attacc.scripts.compose_e2e --sessions $E/attacc/attacc_qkv_b1.json $E/attacc/attacc_qkv_b4.json $E/attacc/attacc_proj_b1.json $E/attacc/attacc_proj_b4.json $E/attacc/attacc_score_b1.json $E/attacc/attacc_score_b4.json --out $E/attacc/attacc_e2e.json
 stage attacc_compare_frozen -- $PY $HERE/attacc_compare_frozen.py --sessions-dir $E/attacc --inventory $ALLO/docs/release/paper_reproduction/inventory.csv --manifest ${TENON_ARTIFACTS}/attacc-llm-e2e/tenon/tenon_manifest.csv --out $E/attacc/attacc_compare_frozen.json
 cd $T
+# The APU v1 grouped-enumerator regressions (V1-20) and the grouped / APU v1 selection of the
+# shared-semantics suite: the functional-reference stages below do not exercise that enumerator.
+stage apu_v1_grouped_mapping -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/pim/test_apu_v1_grouped_mapping.py
+stage apu_v1_shared_semantics_selection -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/pim/test_shared_semantics.py -k "apu_v1 or grouped"
 stage apu_v1_functional_reference -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/perf/test_apu_v1_functional_reference.py -W error::DeprecationWarning
 stage numpy24_venv -- bash -c "env -u PYTHONPATH $SPMW_PY -m venv --system-site-packages $E/venv-np24 && $E/venv-np24/bin/python -m pip install -q 'numpy>=2.4' && $E/venv-np24/bin/python -m pip install -q --no-deps --force-reinstall $P/wheel/allo-0.5-*.whl && $E/venv-np24/bin/python -c 'import numpy, allo; print(\"numpy\", numpy.__version__, \"allo\", allo.__file__)'"
 stage apu_v1_functional_reference_numpy24 -- timeout 1800 $E/venv-np24/bin/python -m pytest -q -p no:cacheprovider tests/perf/test_apu_v1_functional_reference.py "tests/perf/test_apu_v1_recognizers.py::test_temporal_plan_accumulates_nonzero_initial_output" "tests/pim/test_shared_semantics.py::test_local_accumulator_gemm_executes_on_apu_v1_functional_backend" -W error::DeprecationWarning
