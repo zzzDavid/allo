@@ -268,7 +268,7 @@ def test_apu_v1_vector_neighbor_computes_exactly_with_a_faithful_declaration(
     """The route whose stock plan declares an edited packing is rejected and
     the faithful alternative executes the neighbouring contraction exactly on
     the functional backend."""
-    module, symbol, fn, build_target, cost, backend = ROUTES["apu_v1_vector"]
+    module, symbol, _fn, _build_target, _cost, _backend = ROUTES["apu_v1_vector"]
     stock_mode = _single_placement(stock["apu_v1_vector"]).mode
     monkeypatch.setattr(
         module, symbol, _corrupting(module, symbol, "packing", {stock_mode})

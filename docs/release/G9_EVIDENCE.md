@@ -212,11 +212,30 @@ launches on the card with exact outputs and packing attestations) was last
 executed from the round 84 wheel (`88852b7`, the reviewer's
 `g2_selection_traces.json`); the maintained card chain
 (`g2_card_tests.sh`, `tests/pim/test_apu_g2_hardware.py`, 15 tests) does
-not run it, so it is owed from the final candidate's installed wheel under
-the device lock (mechanism traces, not performance sessions).  (3) The APU
+not run it; executed in round 140 from the `f57c840` wheel on the card
+under the device lock (VALIDATION round 140: the cost perturbation moves
+the 64x128x33 GEMM from `single/k2` to `single/k1`, 2,713 to 3,441 cycles,
+the forced `separate/k1` BiCG against the default `fused/k1`, 2,516 to
+5,082, every launch exact), to be repeated from the final candidate's
+wheel if that revision differs (mechanism traces, not performance
+sessions).  (3) The APU
 v1 side of slice 5 is demonstrated at `c762d4d` (round 136) and the
 runtime's failure evidence is complete since `dbe0543` (V1-21); the round
-136 lost sample itself stays unverified.  Nothing else of G9 is open: the
-migration, the matcher-backend contracts, the retained-IR manifest and the
-hardware provenance bindings are recorded above.
+136 lost sample itself stays unverified.  (4) The round 139 review's own
+pass over item (1) found the contract boundary open on the payload routes
+(ISSUES X-45): `_derivation_problems` skipped the comparison when the
+target had no deriver (Gemini-II) or the deriver returned None (the APU v1
+vector plans and program records), so an edited `CandidateValueLayout.
+packing` passed selection and both realization checks; repaired in round
+140 (`f57c840`): `derive_candidate_effects` takes the executable payload's
+own derivation (`payload.effects()`) where no deriver applies, a required
+target with neither is a problem, and `spmw_apu_v1.check_realization` and
+`spmw_apu_g2.check_realization` compare the complete declaration with the
+realized payload's derivation (regressions
+`tests/pim/test_candidate_contract_payload_routes.py`).  The item (1)
+review at the final candidate therefore still stands, now over the
+repaired boundary.  Apart from items (1), (2) and the unverified sample,
+nothing else of G9 is open: the migration, the matcher-backend contracts,
+the retained-IR manifest and the hardware provenance bindings are recorded
+above.
 
