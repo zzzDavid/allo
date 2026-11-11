@@ -129,6 +129,9 @@ ROW_PAIR_SAME_BANK_CYCLES = 2845
 # (second row in the odd fiber: none); the model gives 5,248 against 4,096,
 # the right order and a gap of 1,152 against the measured 1,033.  No
 # constant is fitted.
+ELEMENT_BITS = (
+    16  # the PIM datapath element (FP16, PIMBlock::mac); a 256-bit burst holds 16
+)
 STAGE_WRITE_CYCLES = 2  # tCCDS
 STAGE_ROW_CHANGE_CYCLES = 16 + 14 + 10 - 4  # tWR + tRP + tRCDWR - tCCDL
 # A bank's occupancy per row it is written in: write recovery, precharge and
@@ -226,6 +229,10 @@ def samsung_staging_share(
     """One work item's share of the program's first matrix staging, so that
     the shares of a kernel's work items partition the conductor's staging
     without duplication (checked against the staging dump in the tests).
+    ``lanes`` is the number of elements in one burst (the GRF width over
+    ``ELEMENT_BITS``, 16 for the 256-bit FP16 registers), which sizes a
+    reduction tile (``E x lanes``) and the ordered program's row block; it
+    is not ``Register.lanes`` (the entry count the MAC rule reads).
 
     REDUCE: the item's rows occupy ceil(rows / G) PIM-block row groups; each
     group receives, per reduction tile, one run of G*E consecutive column
@@ -284,36 +291,65 @@ def samsung_vector_staging_share(
     reduction,
     *,
     E,
-    lanes,
+    burst_elements,
     cols_per_row=32,
     columns=1,
+    resident=False,
 ) -> dict:
     """One work item's share of the conductor's vector staging for a
-    bank-filled GRF_A (``TenonConductor.inc`` ``stage_vector``): before the
-    passes, the vector's ``k_tiles x E`` bursts (per result column) are
-    written at consecutive columns of the even bank of *every* PIM block,
-    once whatever the pass count, and the FILL column command later loads
-    GRF_A from them; a host-filled GRF_A has no such staging (its HAB
+    bank-filled GRF_A (``TenonConductor.inc`` ``stage_vector``): the
+    vector's ``k_tiles x E`` bursts of a result column are written at
+    consecutive columns of the even bank of *every* PIM block, after the
+    matrix (``vector_base`` is row aligned) and before the column's passes,
+    once whatever the pass count; the FILL column command later loads
+    GRF_A from them.  A host-filled GRF_A has no such staging (its HAB
     broadcast is the LD_A rule).  The replication is per PIM unit, not per
     matrix row, so a work item's share is its unit's copy on the declared
     grid (one unit per work item): the eight units of a channel together
-    write the ``8 x k_tiles x E`` bursts the conductor writes per channel.
+    write the ``8 x k_tiles x E x columns`` bursts the conductor writes per
+    channel.  ``k_tiles`` comes from the burst width (``burst_elements``,
+    the GRF width over ``ELEMENT_BITS``), as the conductor's does.
+
     Bus: one STAGE_WRITE_CYCLES per write; consecutive writes alternate
     blocks (the loop is tile, block, entry), so no same-bank row change is
-    exposed on the bus.  Bank: the unit's bank visits ``ceil(k_tiles * E *
-    columns / cols_per_row)`` rows plus its writes, banks in parallel."""
+    exposed on the bus.  Bank: one row visit (STAGE_ROW_VISIT_CYCLES) each
+    time the staging enters a row of the unit's bank, plus its writes.
+    The conductor stages every column's vector in one phase when the
+    matrix is resident (``columns`` contiguous spans, one visit per distinct
+    row), and otherwise stages each column's vector in its own phase,
+    separated by that column's matrix restaging and the previous column's
+    passes, so a row revisited by the next column is entered again (the
+    visits of the columns' spans add; a span crossing a row boundary visits
+    both rows)."""
     if isinstance(cols_per_row, bool) or int(cols_per_row) <= 0:
         raise ValueError(
             f"cols_per_row must be a positive integer, got {cols_per_row!r}"
         )
+    if isinstance(burst_elements, bool) or int(burst_elements) <= 0:
+        raise ValueError(
+            f"burst_elements must be a positive integer, got {burst_elements!r}"
+        )
     cols_per_row = int(cols_per_row)
-    tiles = max(1, _ceil_div(reduction, E * lanes))
-    writes = tiles * E * max(1, int(columns))
-    rows_visited = max(1, _ceil_div(writes, cols_per_row))
+    columns = max(1, int(columns))
+    tiles = max(1, _ceil_div(reduction, int(E) * int(burst_elements)))
+    per_column = tiles * int(E)
+    writes = per_column * columns
+    if resident:
+        visits = _ceil_div(writes, cols_per_row)
+    else:
+        visits = sum(
+            ((n + 1) * per_column - 1) // cols_per_row
+            - (n * per_column) // cols_per_row
+            + 1
+            for n in range(columns)
+        )
     bus = writes * STAGE_WRITE_CYCLES
-    bank = rows_visited * STAGE_ROW_VISIT_CYCLES + writes * STAGE_WRITE_CYCLES
+    bank = visits * STAGE_ROW_VISIT_CYCLES + writes * STAGE_WRITE_CYCLES
     return {
+        "tiles": tiles,
         "writes": writes,
+        "row_visits": visits,
+        "phases": 1 if resident else columns,
         "exposed_row_changes": 0,
         "bus_cycles": bus,
         "bank_cycles": bank,
@@ -433,6 +469,11 @@ def samsung_cost(target):
         batch = max(columns, int(event.metrics.get("batch", 1)))
         G = int(target.grf_b.slots)
         E = int(target.grf_a.slots)
+        # Staging counts bursts: a reduction tile is E bursts of
+        # grf_a.width / ELEMENT_BITS elements (16 FP16), the conductor's
+        # k_tiles.  Register.lanes (the event's `lanes`, the entry count the
+        # calibrated MAC term reads) is not the burst width (round 132).
+        burst = max(1, int(target.grf_a.width) // ELEMENT_BITS)
         stage(
             ctx,
             samsung_staging_share(
@@ -440,7 +481,7 @@ def samsung_cost(target):
                 reduction,
                 G=G,
                 E=E,
-                lanes=lanes,
+                lanes=burst,
                 split_rows=split_rows,
             ),
         )
@@ -449,10 +490,15 @@ def samsung_cost(target):
             # column's tiles) into every PIM unit before the passes; this
             # work item's share is its unit's copy (S-12, round 132).  A
             # host-filled GRF_A stages nothing (the broadcast is in LD_A).
+            # A restaged matrix stages each column's vector in its own phase.
             stage_vector(
                 ctx,
                 samsung_vector_staging_share(
-                    reduction, E=E, lanes=lanes, columns=batch
+                    reduction,
+                    E=E,
+                    burst_elements=burst,
+                    columns=batch,
+                    resident=bool(candidate.get("stage_resident", False)),
                 ),
             )
         occupy_compute(event, ctx, latency, MAC_CYCLES)

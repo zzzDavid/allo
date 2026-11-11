@@ -290,7 +290,9 @@ def test_staging_shares_partition_the_conductors_staging():
             metrics={
                 "loop_extents": (rows, k),
                 "reduction_extent": k,
-                "lanes": 16,
+                # the production metric: Register.lanes of the GRF (8 entries),
+                # not the burst width; the staging must not read it (round 132)
+                "lanes": int(target.grf_b.lanes),
                 "n_fibers": 1,
                 # a host-filled GRF_A: the matrix staging alone (the vector
                 # staging of a bank fill is `test_vector_staging_shares_...`)
@@ -309,6 +311,16 @@ def test_staging_shares_partition_the_conductors_staging():
     assert staged(64, 256) == staged(32, 512) == staged(128, 128)
     assert staged(1024, 128) == 8 * staged(128, 128)
     G, E = int(target.grf_b.slots), int(target.grf_a.slots)
+    assert int(target.grf_b.lanes) == 8 and int(target.grf_a.width) // 16 == 16
+    # the bursts are sized by the register width (16 FP16), not by the
+    # entry count the event carries: the production graph equals the share
+    # at 16 elements per burst and not the one at 8 (round 132)
+    assert (
+        staged(32, 256) == samsung_staging_share(32, 256, G=G, E=E, lanes=16)["latency"]
+    )
+    assert (
+        staged(32, 256) != samsung_staging_share(32, 256, G=G, E=E, lanes=8)["latency"]
+    )
     small = samsung_staging_share(8, 128, G=G, E=E, lanes=16)
     assert (
         staged(8, 128)
@@ -370,8 +382,9 @@ def test_vector_staging_shares_partition_the_conductors_vector_staging():
     target = build_samsung_target()
     bound = samsung_cost.bind(target)
     E = int(target.grf_a.slots)
+    assert int(target.grf_b.lanes) == 8 and int(target.grf_a.width) // 16 == 16
 
-    def emitted(rows, k, residency, extents=None):
+    def emitted(rows, k, residency, extents=None, resident=False):
         graph = ExecutionGraph()
         event = CostEvent.create(
             "mac",
@@ -380,9 +393,13 @@ def test_vector_staging_shares_partition_the_conductors_vector_staging():
             metrics={
                 "loop_extents": extents or (rows, k),
                 "reduction_extent": k,
-                "lanes": 16,
+                # the production metric (Register.lanes, 8), not the burst width
+                "lanes": int(target.grf_b.lanes),
                 "n_fibers": 1,
-                "candidate": {"grf_residency": {"x": residency}},
+                "candidate": {
+                    "grf_residency": {"x": residency},
+                    "stage_resident": resident,
+                },
             },
         )
         bound.emit(graph, event)
@@ -395,35 +412,68 @@ def test_vector_staging_shares_partition_the_conductors_vector_staging():
     assert labels[:3] == ["mac_stage", "mac_vector_stage", "mac"], labels
     stage, vector, mac = crf.activities[:3]
     assert stage.id in vector.depends_on and vector.id in mac.depends_on
-    share = samsung_vector_staging_share(256, E=E, lanes=16)
+    # The conductor's k_tiles come from the burst width (16 FP16 per 256-bit
+    # burst): K = 256 is two tiles of E bursts, 16 writes, one row, whatever
+    # the entry count the event carries (round 132: the first version read
+    # Register.lanes = 8 and charged four tiles).
+    share = samsung_vector_staging_share(256, E=E, burst_elements=16)
+    assert share["tiles"] == 2 and share["writes"] == 2 * E == 16
     assert vector.latency_cycles == share["latency"] > 0
+    assert vector.latency_cycles != (
+        samsung_vector_staging_share(256, E=E, burst_elements=8)["latency"]
+    )
     # The replication is per PIM unit, once whatever the pass count: the
     # conductor writes k_tiles (2) x E bursts into each of its 8 blocks per
     # channel (64 x 128 writes on its 64-channel system; design 6.2 measures
     # the same preload increase, 93 cycles, at 4096 x 256 and 8192 x 256),
     # and the eight work items of a declared channel together write that.
-    assert share["writes"] == 2 * E == 16
     assert 8 * share["writes"] == 8 * 2 * E
-    assert share["exposed_row_changes"] == 0
+    assert share["exposed_row_changes"] == 0 and share["row_visits"] == 1
     assert share["bus_cycles"] == share["writes"] * STAGE_WRITE_CYCLES
     assert share["bank_cycles"] == STAGE_ROW_VISIT_CYCLES + 2 * E * STAGE_WRITE_CYCLES
     assert emitted(64, 256, "crf").activities[1].latency_cycles == vector.latency_cycles
     # Padded tiles cost the same; the bank's row visits grow once the staged
     # columns exceed one row (32 columns = 4 tiles).
-    assert share == samsung_vector_staging_share(129, E=E, lanes=16)
-    wide = samsung_vector_staging_share(1024, E=E, lanes=16)
-    assert wide["writes"] == 8 * E
+    assert share == samsung_vector_staging_share(129, E=E, burst_elements=16)
+    wide = samsung_vector_staging_share(1024, E=E, burst_elements=16)
+    assert wide["writes"] == 8 * E and wide["row_visits"] == 2
     assert (
         wide["bank_cycles"] == 2 * STAGE_ROW_VISIT_CYCLES + 8 * E * STAGE_WRITE_CYCLES
     )
-    # Every result column stages its own tiles (the conductor stages the
-    # vector of every column, resident or restaged).
-    two = emitted(32, 256, "crf", extents=(32, 2, 256))
-    assert two.activities[1].label == "mac_vector_stage"
+    # Every result column stages its own tiles.  With a resident matrix the
+    # conductor stages all columns' vectors in one phase (contiguous spans,
+    # one visit per distinct row: 48 writes, two rows); with a restaged
+    # matrix each column's vector is its own phase after that column's
+    # matrix staging, so its row is entered again (three visits here).
+    restaged = emitted(32, 256, "crf", extents=(32, 3, 256))
+    resident = emitted(32, 256, "crf", extents=(32, 3, 256), resident=True)
     assert (
-        two.activities[1].latency_cycles
-        == samsung_vector_staging_share(256, E=E, lanes=16, columns=2)["latency"]
-        > vector.latency_cycles
+        restaged.activities[1].label
+        == resident.activities[1].label
+        == "mac_vector_stage"
+    )
+    three_restaged = samsung_vector_staging_share(
+        256, E=E, burst_elements=16, columns=3
+    )
+    three_resident = samsung_vector_staging_share(
+        256, E=E, burst_elements=16, columns=3, resident=True
+    )
+    assert three_restaged["writes"] == three_resident["writes"] == 48
+    assert (three_restaged["phases"], three_restaged["row_visits"]) == (3, 3)
+    assert (three_resident["phases"], three_resident["row_visits"]) == (1, 2)
+    assert restaged.activities[1].latency_cycles == three_restaged["latency"]
+    assert resident.activities[1].latency_cycles == three_resident["latency"]
+    assert three_restaged["latency"] > three_resident["latency"] > vector.latency_cycles
+    # A column span crossing a row boundary visits both rows in its phase
+    # (K = 384: 24 writes per column; columns 24-47 and 48-71 each span two
+    # rows): 1 + 2 + 2 restaged, 3 distinct rows resident.
+    crossing = samsung_vector_staging_share(384, E=E, burst_elements=16, columns=3)
+    assert (crossing["writes"], crossing["row_visits"]) == (72, 5)
+    assert (
+        samsung_vector_staging_share(
+            384, E=E, burst_elements=16, columns=3, resident=True
+        )["row_visits"]
+        == 3
     )
     # The bank fill now carries the staging the simulator charges it, so a
     # bank-filled program of the same rows costs more than the host-filled

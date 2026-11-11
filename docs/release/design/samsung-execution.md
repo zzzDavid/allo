@@ -746,21 +746,43 @@ LD_A rule). Per channel: ``P x k_tiles x E`` writes, i.e. 128 at K = 256
 and 256 at K = 512, whatever the row count (design 6.2: the preload rises
 by 93 cycles at both 4096x256 and 8192x256).
 
-### 10.2 Rule
+### 10.2 Rule (as corrected by the round 132 review)
 
-``samsung_vector_staging_share(reduction, E, lanes, cols_per_row, columns)``
-prices one work item's share as its PIM unit's copy on the declared grid
-(one unit per work item, so the eight items of a channel together write
-what the conductor writes per channel): ``k_tiles x E x columns`` writes at
-``STAGE_WRITE_CYCLES`` on the channel bus (consecutive writes alternate
-blocks, no exposed same-bank row change), and as bank latency
-``ceil(writes / cols_per_row)`` row visits at ``STAGE_ROW_VISIT_CYCLES``
-plus the writes; the step ``mac_vector_stage`` follows ``mac_stage`` and
-precedes the MAC, and is emitted only when the placement is not a host
-broadcast (the same predicate as the LD_A rule). The constants are the
-staging constants of round 37 (device ini timings); nothing was fitted.
-Per work item: latency 72 (bus 32) at K = 256, 104 (64) at K = 512, 208
-(128) at K = 1024.
+``samsung_vector_staging_share(reduction, E, burst_elements, cols_per_row,
+columns, resident)`` prices one work item's share as its PIM unit's copy
+on the declared grid (one unit per work item, so the eight items of a
+channel together write what the conductor writes per channel):
+``k_tiles x E x columns`` writes at ``STAGE_WRITE_CYCLES`` on the channel
+bus (consecutive writes alternate blocks, no exposed same-bank row
+change), and as bank latency one ``STAGE_ROW_VISIT_CYCLES`` per row visit
+plus the writes. ``k_tiles`` is sized by the burst, ``grf_a.width /
+ELEMENT_BITS`` = 16 FP16 elements, as the conductor's is. Row visits
+follow the conductor's phase structure: with a resident matrix all
+columns' vectors are staged in one phase (contiguous spans, one visit per
+distinct row); with a restaged matrix each column's vector is its own
+phase, separated by that column's matrix staging and the previous
+column's passes, so a column re-enters its row (the columns' span visits
+add, and a span crossing a row boundary visits both rows). The step
+``mac_vector_stage`` follows ``mac_stage`` and precedes the MAC, and is
+emitted only when the placement is not a host broadcast (the LD_A
+predicate). The constants are the staging constants of round 37 (device
+ini timings); nothing was fitted. Per work item: latency 72 (bus 32) at
+K = 256, 104 (64) at K = 512, 208 (128) at K = 1024, one column.
+
+The first version of the term (commit ``0d43a8a``) had two errors the
+round 132 review found with an independent ordinary-source 1024x128x3
+contraction (``reviewer-r132/``): it sized the tile by the event's
+``lanes`` metric, which is ``Register.lanes`` = 8 (the GRF entry count
+the calibrated MAC term reads), so K = 256 was charged four tiles instead
+of two; and it counted distinct rows, so the restaged three-column
+program (three vector-row visits in the conductor's trace) and the
+resident one (one visit) were both priced 176 cycles where this model's
+own constants give 168 and 88. The same ``lanes`` confusion was in the
+neighbouring matrix-staging call of rounds 37-38 (``mac_stage``): the
+production share counted twice the conductor's bursts (the round 38
+partition test injected 16 elements per burst directly), which left every
+REDUCE candidate's ranking intact (all scaled alike) but doubled the
+absolute term; both calls now take the burst width from the target.
 
 ### 10.3 Expected outcome, stated before the runs
 
@@ -774,22 +796,26 @@ simulated cycles of the unchanged programs equal 6.2.
 
 ### 10.4 Results (``r132/s12_pairs.py``, ``r132/after/*.json``, ``r132/s12_summary.txt``)
 
-Estimates before (``bbbba43``) and after the term, simulated cycles on the
-bundled conductor (``r129/tenon-home``, ``pim_driver`` stripped identity
-``9aea49bf...``; all paper-shape cycles equal 6.2):
+Estimates before (``bbbba43``) and after the corrected term, simulated
+cycles on the bundled conductor (``r129/tenon-home``, ``pim_driver``
+stripped identity ``9aea49bf...``; all paper-shape cycles equal 6.2). The
+"after" estimates are about half the "before" ones because the matrix
+staging share no longer counts twice the bursts (10.2); the ranking
+within the host-filled placements is unchanged.
 
 | Shape | P0 dual_fiber host | P1 bank_row host | P2 dual_fiber CRF | P3 bank_row CRF | P8 split_rows host (default) |
 |---|---|---|---|---|---|
-| 4096x256 | 22,486 / 22,486 / 4,435 | 22,102 / 22,102 / 4,389 | 22,502 / 23,334 / 4,560 | 22,118 / 22,950 / 4,589 | 18,630 / 18,630 / **4,108** |
-| 4096x512 | 44,878 / 44,878 / 8,041 | 44,118 / 44,118 / 7,947 | 44,894 / 46,558 / 8,410 | 44,134 / 45,798 / 8,458 | 37,166 / 37,166 / **7,057** |
-| 8192x256 | 43,478 / 43,478 / 8,247 | 43,094 / 43,094 / 8,153 | 43,494 / 44,326 / 8,359 | 43,110 / 43,942 / 8,397 | 35,014 / 35,014 / **7,255** |
-| 2048x512 (neighbour) | 23,886 / 23,886 / 8,041 | 23,126 / 23,126 / 7,947 | 23,902 / 25,566 / 8,410 | 23,142 / 24,806 / 8,458 | 20,782 / 20,782 / **7,057** |
-| 2048x1024 (neighbour) | 47,678 / 47,678 / 15,251 | 46,166 / 46,166 / 15,051 | 47,694 / 51,022 / 16,051 | 46,182 / 49,510 / 16,201 | 41,470 / 41,470 / **12,873** |
+| 4096x256 | 22,486 / 11,990 / 4,435 | 22,102 / 11,606 / 4,389 | 22,502 / 12,582 / 4,560 | 22,118 / 12,198 / 4,589 | 18,630 / 10,438 / **4,108** |
+| 4096x512 | 44,878 / 23,886 / 8,041 | 44,118 / 23,126 / 7,947 | 44,894 / 24,734 / 8,410 | 44,134 / 23,974 / 8,458 | 37,166 / 20,782 / **7,057** |
+| 8192x256 | 43,478 / 22,486 / 8,247 | 43,094 / 22,102 / 8,153 | 43,494 / 23,078 / 8,359 | 43,110 / 22,694 / 8,397 | 35,014 / 18,630 / **7,255** |
+| 2048x512 (neighbour) | 23,886 / 13,390 / 8,041 | 23,126 / 12,630 / 7,947 | 23,902 / 14,238 / 8,410 | 23,142 / 13,478 / 8,458 | 20,782 / 12,590 / **7,057** |
+| 2048x1024 (neighbour) | 47,678 / 26,686 / 15,251 | 46,166 / 25,174 / 15,051 | 47,694 / 28,366 / 16,051 | 46,182 / 26,854 / 16,201 | 41,470 / 25,086 / **12,873** |
 
 (cells: estimate before / estimate after / simulated cycles; P9 split_rows
-+ CRF is refused at realization, as before.) Outputs within 4.0e-4 of FP32
-in every run. Pairwise (6.1 rule, ten pairs per shape): before, (P0,P3)
-disagreed in all five shapes; after, (P0,P3) agrees in all five and the
++ CRF is refused at realization, as before.) Outputs finite and within
+4.1e-4 of FP32 in every run. Pairwise (6.1 rule, ten pairs per shape):
+before, (P0,P3) disagreed in all five shapes; after, (P0,P3) agrees in all
+five (P3 above P0 by 208, 88, 208, 88 and 168 estimated cycles) and the
 only remaining non-agreement is (P2,P3): disagree at 4096x256 (+0.63%),
 4096x512 (+0.57%), 2048x512 (+0.57%) and 2048x1024 (+0.93%), tie at
 8192x256 (+0.45%). Tally after: 9 agree + 1 disagree per shape (9 + 1 tie
@@ -797,6 +823,19 @@ at 8192x256). The default selection is ``split_rows`` + host fill in all
 five shapes, the measured fastest in all five, with the golden cycles
 4,108 / 7,057 / 7,255 unchanged. The 2048x512 neighbour executes in the
 same cycles as 4096x512 (half a pass padded to a whole pass).
+
+The production-path regression
+(``tests/pim/samsung_hbm_pim/test_vector_staging.py``) compiles an
+ordinary-source 1024x384x3 contraction (three tiles; the second and third
+columns' spans cross a row boundary) with forced bank_row + CRF
+placements, resident and restaged, and checks the emitted
+``mac_vector_stage`` of every work item against counts derived from a
+transcription of the conductor's loops written in the test (72 writes;
+5 visits restaged, 3 resident), the ``mac_stage`` against the share at 16
+elements per burst and not at 8, the paper GEMV against two tiles (72
+cycles), and, with the simulator, the conductor's own address trace
+(every even bank: 72 vector writes, 5 or 3 row visits, ``vector_base``
+row aligned).
 
 ### 10.5 Remaining scope
 
