@@ -728,65 +728,131 @@ def launch_on_board(argv, cwd, *, expected_records, timeout, attempts=3):
     Returns ``(run text, profile text, crun tuple)``.  The device log is read
     before every attempt and after the run; :func:`parse_fresh_profile`
     proves that exactly the expected PROF_PRINT records were appended by this
-    launch.  A failed run or an unattributable profile raises
-    :class:`APUV1LaunchFailure` carrying the launch's diagnostics (argv,
-    binary identity, process output, the device-log reads) so that nothing
-    about the failure is lost when the caller discards its build directory.
+    launch.  Every way the launch can fail to yield an attributable
+    measurement raises :class:`APUV1LaunchFailure` carrying the launch's
+    diagnostics (argv, binary identity, every attempt's exit status and
+    output including a timed-out process's partial output, every device-log
+    read before and after, the record counts, and an explicit ``reason``:
+    ``device_run_failed``, ``timeout``, ``device_log_read_failed``,
+    ``log_rotated``, ``missing_or_stale_profile``, ``malformed_profile_record``
+    or ``unexpected``), so that nothing about the failure is lost when the
+    caller discards its build directory.  No cycle count is produced for a
+    failed launch (ISSUES V1-21).
     """
+
+    argv_text = [str(a) for a in argv]
+    diagnostics = {
+        "argv": argv_text,
+        "cwd": str(cwd),
+        **_binary_identity(argv_text),
+        "board_lock": str(apu_v1_lock_path()),
+        "expected_records": int(expected_records),
+        "attempts": [],
+        # every read before an attempt (one per retry) and the last one
+        "device_log_before_reads": [],
+        "device_log_before": None,
+        "device_log_reads_after": [],
+        "fresh_records_found": None,
+        "reason": None,
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+
+    def fail(reason, message, cause=None):
+        diagnostics["reason"] = reason
+        failure = APUV1LaunchFailure(message, diagnostics)
+        if cause is not None:
+            raise failure from cause
+        raise failure
+
+    def decode(data):
+        if data is None:
+            return ""
+        return data.decode(errors="replace") if isinstance(data, bytes) else str(data)
 
     process = None
     text = ""
     before = ""
-    diagnostics = {
-        "argv": [str(a) for a in argv],
-        "cwd": str(cwd),
-        **_binary_identity([str(a) for a in argv]),
-        "board_lock": str(apu_v1_lock_path()),
-        "expected_records": int(expected_records),
-        "attempts": [],
-        "device_log_before": None,
-        "device_log_reads_after": [],
-        "fresh_records_found": None,
-        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-    }
     with apu_v1_board_lock():
-        for attempt in range(attempts):
-            before = _ledag_drain()
-            diagnostics["device_log_before"] = before
-            process = subprocess.run(
-                argv, cwd=cwd, capture_output=True, timeout=timeout, check=False
-            )
-            text = process.stdout.decode(errors="replace") + process.stderr.decode(
-                errors="replace"
-            )
-            diagnostics["attempts"].append(
-                {"returncode": process.returncode, "process_output": text}
-            )
-            if process.returncode == 0 or "no valid context" not in text:
-                break
-            time.sleep(attempt + 1)
-        if process is None or process.returncode:
-            code = None if process is None else process.returncode
-            raise APUV1LaunchFailure(
-                f"APU v1 device run failed ({code}):\n{text[-6000:]}", diagnostics
-            )
-        profile = ""
-        for _ in range(4):
-            time.sleep(0.75)
-            profile = _ledag_drain()
-            diagnostics["device_log_reads_after"].append(profile)
-            if len(fresh_profile_records(before, profile)) >= expected_records:
-                break
         try:
-            diagnostics["fresh_records_found"] = len(
-                fresh_profile_records(before, profile)
+            for attempt in range(attempts):
+                try:
+                    before = _ledag_drain()
+                except Exception as error:  # the vendor logging tool failed
+                    fail(
+                        "device_log_read_failed",
+                        f"APU v1 device log could not be read before the launch: {error}",
+                        error,
+                    )
+                diagnostics["device_log_before_reads"].append(before)
+                diagnostics["device_log_before"] = before
+                try:
+                    process = subprocess.run(
+                        argv, cwd=cwd, capture_output=True, timeout=timeout, check=False
+                    )
+                except subprocess.TimeoutExpired as error:
+                    partial = decode(error.stdout) + decode(error.stderr)
+                    diagnostics["attempts"].append(
+                        {
+                            "returncode": None,
+                            "timed_out_after_seconds": timeout,
+                            "process_output": partial,
+                        }
+                    )
+                    fail(
+                        "timeout",
+                        f"APU v1 device run timed out after {timeout} s:\n{partial[-6000:]}",
+                        error,
+                    )
+                text = decode(process.stdout) + decode(process.stderr)
+                diagnostics["attempts"].append(
+                    {"returncode": process.returncode, "process_output": text}
+                )
+                if process.returncode == 0 or "no valid context" not in text:
+                    break
+                time.sleep(attempt + 1)
+            if process is None or process.returncode:
+                code = None if process is None else process.returncode
+                fail(
+                    "device_run_failed",
+                    f"APU v1 device run failed ({code}):\n{text[-6000:]}",
+                )
+            profile = ""
+            for _ in range(4):
+                time.sleep(0.75)
+                try:
+                    profile = _ledag_drain()
+                except Exception as error:
+                    fail(
+                        "device_log_read_failed",
+                        f"APU v1 device log could not be read after the launch: {error}",
+                        error,
+                    )
+                diagnostics["device_log_reads_after"].append(profile)
+                try:
+                    found = len(fresh_profile_records(before, profile))
+                except RuntimeError as error:  # the log rotated past the launch
+                    diagnostics["fresh_records_found"] = "unattributable (log rotated)"
+                    fail("log_rotated", str(error), error)
+                diagnostics["fresh_records_found"] = found
+                if found >= expected_records:
+                    break
+            try:
+                cycles = parse_fresh_profile(before, profile, expected_records)
+            except RuntimeError as error:
+                reason = (
+                    "malformed_profile_record"
+                    if "not one fresh measurement" in str(error)
+                    else "missing_or_stale_profile"
+                )
+                fail(reason, str(error), error)
+        except APUV1LaunchFailure:
+            raise
+        except Exception as error:  # anything else inside the launch window
+            fail(
+                "unexpected",
+                f"APU v1 launch failed: {type(error).__name__}: {error}",
+                error,
             )
-        except RuntimeError:
-            diagnostics["fresh_records_found"] = "unattributable (log rotated)"
-        try:
-            cycles = parse_fresh_profile(before, profile, expected_records)
-        except RuntimeError as error:
-            raise APUV1LaunchFailure(str(error), diagnostics) from error
     return text, profile, cycles
 
 

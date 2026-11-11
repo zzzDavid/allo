@@ -1002,3 +1002,216 @@ def test_apu_v1_tenon_lane_keeps_per_launch_evidence_and_failed_diagnostics(tmp_
     assert (
         tmp_path / "fourth" / "scratch" / "tenon-launch-001" / "error.txt"
     ).is_file()
+
+
+def _patched_launch_environment(monkeypatch, program, drains, process):
+    import contextlib
+
+    monkeypatch.setattr(program, "apu_v1_board_lock", lambda: contextlib.nullcontext())
+    reads = iter(drains)
+
+    def drain():
+        value = next(reads)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(program, "_ledag_drain", drain)
+    monkeypatch.setattr(program.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(program.subprocess, "run", process)
+
+
+def test_launch_on_board_every_failure_path_carries_diagnostics(monkeypatch, tmp_path):
+    """Round 138 (V1-21 review): a rotated device log, a timed-out process
+    with partial output, and a failed post-launch device-log read each raise
+    ``APUV1LaunchFailure`` with an explicit reason, the argv and binary
+    identity, every read made and every attempt's output; a retried attempt
+    keeps each attempt's before-log.  No path yields a cycle count."""
+    import subprocess
+    from types import SimpleNamespace
+
+    from allo.pim import apu_v1_program as program
+
+    binary = tmp_path / "tenon-kernel"
+    binary.write_bytes(b"\x7fELF fake binary")
+    argv = [str(binary), "in.bin", "out.bin"]
+    old = "ARCT[0]: *** total - hits:1 seu:1 crun:111 iall:1 icm:0 dcm:0"
+    rotated = "ARCT[0]: *** total - hits:1 seu:1 crun:222 iall:1 icm:0 dcm:0"
+    ran = lambda *a, **k: SimpleNamespace(
+        returncode=0, stdout=b"process evidence", stderr=b""
+    )
+
+    # 1. the log rotated past the launch window: unattributable, no cycles
+    _patched_launch_environment(monkeypatch, program, [old, rotated], ran)
+    with pytest.raises(program.APUV1LaunchFailure, match="not a prefix") as info:
+        program.launch_on_board(argv, tmp_path, expected_records=1, timeout=1)
+    d = info.value.diagnostics
+    assert d["reason"] == "log_rotated"
+    assert d["device_log_before"] == old and d["device_log_reads_after"] == [rotated]
+    assert d["fresh_records_found"] == "unattributable (log rotated)"
+    assert d["attempts"] == [{"returncode": 0, "process_output": "process evidence"}]
+    assert d["binary_sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
+
+    # 2. the process timed out: its partial stdout/stderr are kept
+    def timed_out(*a, **k):
+        raise subprocess.TimeoutExpired(
+            a[0], 1, output=b"partial stdout", stderr=b"partial stderr"
+        )
+
+    _patched_launch_environment(monkeypatch, program, [old], timed_out)
+    with pytest.raises(program.APUV1LaunchFailure, match="timed out") as info:
+        program.launch_on_board(argv, tmp_path, expected_records=1, timeout=1)
+    d = info.value.diagnostics
+    assert d["reason"] == "timeout" and d["device_log_before"] == old
+    assert d["attempts"] == [
+        {
+            "returncode": None,
+            "timed_out_after_seconds": 1,
+            "process_output": "partial stdoutpartial stderr",
+        }
+    ]
+    assert d["device_log_reads_after"] == [] and d["fresh_records_found"] is None
+
+    # 3. the device log could not be read after the launch
+    _patched_launch_environment(
+        monkeypatch,
+        program,
+        [old, RuntimeError("ledag-ssh exited with 3 while reading the device log")],
+        ran,
+    )
+    with pytest.raises(
+        program.APUV1LaunchFailure, match="could not be read after"
+    ) as info:
+        program.launch_on_board(argv, tmp_path, expected_records=1, timeout=1)
+    d = info.value.diagnostics
+    assert d["reason"] == "device_log_read_failed"
+    assert (
+        d["attempts"][0]["process_output"] == "process evidence"
+        and d["device_log_before"] == old
+    )
+
+    # 4. the device log could not be read before the launch: nothing ran
+    _patched_launch_environment(
+        monkeypatch, program, [RuntimeError("ledag-ssh exited with 255")], ran
+    )
+    with pytest.raises(program.APUV1LaunchFailure, match="before the launch") as info:
+        program.launch_on_board(argv, tmp_path, expected_records=1, timeout=1)
+    assert info.value.diagnostics["reason"] == "device_log_read_failed"
+    assert info.value.diagnostics["attempts"] == []
+
+    # 5. a retried attempt ("no valid context") keeps every before-log
+    calls = []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            return SimpleNamespace(returncode=1, stdout=b"no valid context", stderr=b"")
+        return SimpleNamespace(returncode=0, stdout=b"ok", stderr=b"")
+
+    fresh = old + "\nARCT[0]: *** total - hits:1 seu:1 crun:333 iall:1 icm:0 dcm:0"
+    _patched_launch_environment(
+        monkeypatch, program, ["first before", old, fresh], flaky
+    )
+    text, profile, cycles = program.launch_on_board(
+        argv, tmp_path, expected_records=1, timeout=1
+    )
+    assert cycles == (333,) and text == "ok"
+
+
+def test_archived_lane_failure_reaches_the_session_record_with_its_evidence(
+    monkeypatch, tmp_path
+):
+    """Round 138 (V1-21 review): an archived-lane launch the runtime could
+    not attribute reaches the session record through ``attempt_launch`` with
+    the evidence location, the argv, the binary identity, the reason and the
+    diagnostic files, and no cycle count (the round 137 record held only the
+    error)."""
+    from allo.pim import apu_v1_program as runtime
+
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    binary = archive / "binary"
+    binary.write_bytes(b"archived binary")
+    lane = object.__new__(paper_rows.ExpertLane)
+    lane.case, lane.name, lane.dir, lane.count = "case", "expert", archive, 0
+    lane.scratch = tmp_path / "scratch"
+    lane.binary, lane.binary_sha256 = (
+        binary,
+        hashlib.sha256(binary.read_bytes()).hexdigest(),
+    )
+    lane.inputs, lane.outputs = [], []
+    old = "ARCT[0]: *** total - hits:1 seu:1 crun:111 iall:1 icm:0 dcm:0"
+
+    def lost(argv, cwd, **kwargs):
+        raise runtime.APUV1LaunchFailure(
+            "lost profile",
+            {
+                "argv": list(argv),
+                "reason": "missing_or_stale_profile",
+                "expected_records": 1,
+                "fresh_records_found": 0,
+                "board_lock": "/tmp/lock",
+                "device_log_before": old,
+                "device_log_reads_after": [old, old],
+                "attempts": [{"returncode": 0, "process_output": "evidence"}],
+            },
+        )
+
+    monkeypatch.setattr(runtime, "launch_on_board", lost)
+    record = paper_rows.attempt_launch(lane)
+    kept = tmp_path / "scratch" / "expert-launch-001"
+    assert (
+        record["error"] == "APUV1LaunchFailure: lost profile" and record["crun"] is None
+    )
+    assert record["reason"] == "missing_or_stale_profile"
+    assert record["launch_dir"] == str(kept) and record["argv"][0] == str(binary)
+    assert record["binary_sha256"] == lane.binary_sha256 and record[
+        "binary_bytes"
+    ] == len(b"archived binary")
+    assert record["fresh_records_found"] == 0 and record["expected_records"] == 1
+    assert {
+        "diagnostics.json",
+        "error.txt",
+        "argv.json",
+        "device_log_before.txt",
+    } <= set(record["diagnostics"])
+    assert (
+        json.loads((kept / "diagnostics.json").read_text())["reason"]
+        == "missing_or_stale_profile"
+    )
+    assert (kept / "device_log_after_2.txt").read_text() == old
+
+    # a Tenon-lane timeout reaches the record the same way
+    def timeout_failure(*args):
+        raise runtime.APUV1LaunchFailure(
+            "APU v1 device run timed out after 900 s",
+            {
+                "argv": ["/build/tenon-kernel"],
+                "reason": "timeout",
+                "expected_records": 1,
+                "attempts": [
+                    {
+                        "returncode": None,
+                        "timed_out_after_seconds": 900,
+                        "process_output": "partial",
+                    }
+                ],
+                "device_log_before": old,
+                "device_log_reads_after": [],
+                "fresh_records_found": None,
+                "binary_sha256": "c" * 64,
+                "binary_bytes": 9,
+                "device_source": "int main(void){}",
+            },
+        )
+
+    tenon = _tenon_lane(tmp_path / "tenon", timeout_failure)
+    entry = paper_rows.attempt_launch(tenon)
+    assert (
+        entry["reason"] == "timeout"
+        and entry["crun"] is None
+        and entry["binary_sha256"] == "c" * 64
+    )
+    failed = tmp_path / "tenon" / "scratch" / "tenon-launch-001"
+    assert (failed / "process_output_1.txt").read_text() == "partial"
+    assert (failed / "device.c").read_text() == "int main(void){}"

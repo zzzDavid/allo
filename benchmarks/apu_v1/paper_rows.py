@@ -389,6 +389,7 @@ class TenonLane:
             raise LaunchFailure(
                 {
                     "error": f"{type(failure).__name__}: {failure}",
+                    "reason": diagnostics.get("reason"),
                     "crun": None,
                     "outputs_match_oracle": None,
                     "launch_dir": str(launch_dir),
@@ -594,14 +595,33 @@ class ExpertLane:
             )
         except Exception as error:
             # The failed launch's diagnostics stay beside whatever it wrote
-            # (the runtime's structured diagnostics when it raised them).
-            _write_failure_diagnostics(
+            # (the runtime's structured diagnostics when it raised them), and
+            # the session's record carries the evidence location and the
+            # identities, never a cycle count (ISSUES V1-21).
+            diagnostics = _write_failure_diagnostics(
                 launch_dir,
                 f"{type(error).__name__}: {error}",
                 getattr(error, "diagnostics", None) or {},
             )
             (launch_dir / "argv.json").write_text(json.dumps(argv, indent=1))
-            raise
+            raise LaunchFailure(
+                {
+                    "error": f"{type(error).__name__}: {error}",
+                    "reason": diagnostics.get("reason"),
+                    "crun": None,
+                    "outputs_match_oracle": None,
+                    "launch_dir": str(launch_dir),
+                    "argv": argv,
+                    "binary_sha256": self.binary_sha256,
+                    "binary_bytes": binary_bytes,
+                    "expected_records": diagnostics.get("expected_records"),
+                    "fresh_records_found": diagnostics.get("fresh_records_found"),
+                    "board_lock": diagnostics.get("board_lock"),
+                    "diagnostics": sorted(
+                        set(diagnostics.get("files") or []) | {"argv.json"}
+                    ),
+                }
+            ) from error
         produced = [
             read_output_image(path, role, dtype, shape).reshape(-1)
             for role, path, dtype, shape in outputs
