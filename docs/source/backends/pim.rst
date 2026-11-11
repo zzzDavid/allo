@@ -29,8 +29,12 @@ Targets and executors
 =====================
 
 Target constructors live in ``allo.pim.targets`` and the cost programs in
-``allo.pim.costs``; both are re-exported from ``allo.pim`` except
-``attacc_cost``, which is imported from ``allo.pim.costs``.
+``allo.pim.costs``.  ``allo.pim`` re-exports the Samsung, AiM, UPMEM,
+Gemini-I and Gemini-II constructors and cost programs; the AttAcc pair is
+imported from its modules::
+
+    from allo.pim.targets import build_attacc_target
+    from allo.pim.costs import attacc_cost
 
 .. list-table::
    :header-rows: 1
@@ -98,8 +102,13 @@ UPMEM
     see ``docs/release/INSTALL.md`` section 3.
 
 GSI Gemini-I and Gemini-II
-    The vendor SDKs and the devices; the Gemini-II SDK root and card index
-    are read from ``TENON_APU_G2_SDK_ROOT`` and ``TENON_APU_G2_DEVICE``.
+    The vendor SDKs and the devices.  The Gemini-II SDK root and card are
+    read from ``TENON_APU_G2_SDK_ROOT`` and ``TENON_APU_G2_DEVICE``, but only
+    the shipped settings are supported today: the project templates compile
+    in ``/opt/gsi`` and the host programs open device 0 (``apu-00``), so any
+    other value is refused with a named reason
+    (``allo.spmw_simenv.apu_g2_unsupported_override_reason``) rather than
+    executed against an installation the templates were not built for.
     Both routes take a per-device lock.
 
 The full variable list and the simulator build instructions are in

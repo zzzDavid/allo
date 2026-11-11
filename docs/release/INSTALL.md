@@ -23,8 +23,13 @@ What you need depends on what you want to run:
 | GSI APU v1 (Gemini-I) hardware | + GSI APU SDK, ARC toolchain, GVML headers, `example-gvml` project, a Gemini-I board |
 | GSI APU v2 (Gemini-II) hardware | + GSI Gemini-II SDK under `/opt/gsi`, `gsi_tool`, a Gemini-II card |
 
-None of the simulators or vendor SDKs is bundled. `simulators.md` lists where
-each comes from, its license, and which parts you have to obtain yourself.
+Of the simulators, only Samsung's is bundled: the package carries the
+PIMSimulator sources and Tenon's conductor as a build recipe
+(`python -m allo.pim.samsung_simulator build`, section 3; read its `NOTICE.md`
+for the non-commercial research terms). The AiM Ramulator model, uPIMulator,
+the UPMEM SDK and the GSI SDKs are external and are not bundled.
+`simulators.md` lists where each comes from, its license, and which parts you
+have to obtain yourself.
 `CAPABILITIES.md` lists what each backend can do and how well that is
 verified.
 

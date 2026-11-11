@@ -1344,6 +1344,25 @@ def _apu_v1_grouped_enumerate(target, matches: list[MatchedOp]) -> list[Placemen
             f"APU v1 reduction extent {reduction} exceeds the {group_size}-lane "
             f"group selected by mapping={group_count}"
         )
+    if not scope.coalesced_axes:
+        # A dataflow region's grouped program is one SPMD body on the four
+        # APUCs with the output rows split over the cores (`apu_v1_grouped_route.
+        # grouped_device_packing`); its work items are priced one stream per
+        # APUC coordinate.  More work items than APUCs have no unit mapping:
+        # refuse here with the shared work-grid policy's reason instead of
+        # failing later in costing with a coordinate error (V1-20).
+        apucs = int(target.work_grid()[0][0])
+        if group_count > apucs:
+            raise ValueError(
+                f"work grid does not partition target {target.name!r}: kernel "
+                f"group {scope.group_id} declares the work grid [{group_count}] "
+                f"({group_count} items), which is neither the unit-tree fanout "
+                f"[{apucs}] nor an outer prefix of it; the APU v1 grouped program "
+                f"executes one SPMD body on the {apucs} APUCs with the output rows "
+                f"split over the cores, so a dataflow region declares "
+                f"@allo.work(mapping=[{apucs}]) and gives each work item its "
+                f"ceil(rows / {apucs})-row block (ISSUES V1-20)"
+            )
     groups_per_vr = group_count
     group_bits = groups_per_vr.bit_length() - 1
     lane_bits = group_size.bit_length() - 1
