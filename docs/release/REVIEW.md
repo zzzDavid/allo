@@ -3585,8 +3585,12 @@ remain.
 With the X-45 boundary accepted, the consolidated tree was run through
 the maintained milestone and the card chain under the device lock, after
 pruning my own regenerable installed venvs to make room on the shared
-quota.  REVIEW_141_PENDING  `dbe0543` stays the packaged working
-checkpoint pending the decision.  NOT READY: the five required G10 cases,
+quota.  The card chain passed from the candidate's sdist built on the
+card host and the local milestone passed all forty-two stages with every
+count equal to round 139's, so `f57c840` carries what the final-candidate
+decision requires; the pre-registered Gemini-I confirmation campaign was
+launched at it only after both had passed.  `dbe0543` stays the packaged
+working checkpoint pending the decision.  NOT READY: the five required G10 cases,
 the invariant review at the final candidate and the final decision
 remain.
 
