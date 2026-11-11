@@ -837,6 +837,26 @@ cycles), and, with the simulator, the conductor's own address trace
 (every even bank: 72 vector writes, 5 or 3 row visits, ``vector_base``
 row aligned).
 
+### 10.4a Column count from the validated contraction (round 134)
+
+The round 133 review ran an ordinary-source 1024x640x5 contraction with
+the multiplication operands reversed (``b[k, col] * a[row, k]``) from the
+``aa8d11d`` wheel: the matcher's ``batch_dim`` then names the row loop
+(8) instead of the column loop (5), the validated contraction still has
+N = 5, the emitted program and the conductor's work are identical (22,520
+cycles, 200 vector writes and seven row visits per even bank), yet each
+``mac_vector_stage`` was 1,040 instead of 680 because the MAC rule took
+``max(columns, batch)`` and fed it to the vector staging and to the matrix
+restaging. The rule now reads rows and columns only from the accepted
+nest (``samsung_contraction``: ``row_var`` the first loop, ``column_var``
+the second of three, N its trip count) and does not read the ``batch``
+metric. The production-path regression gains the reversed operand order
+on the 1024x384x3 contraction (``matcher_batch_dim`` 8 against 3,
+asserted), resident and restaged: equal ``mac_vector_stage`` and
+``mac_restage`` steps, equal sorted graphs and estimates, and on the
+simulator the same cycles and the same per-bank trace counts as the
+normal order. Single-column programs (the GEMV pair study) are unchanged.
+
 ### 10.5 Remaining scope
 
 (P2,P3): under a bank fill the simulator runs dual_fiber 0.45-0.93%

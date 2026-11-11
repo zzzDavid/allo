@@ -459,14 +459,17 @@ def samsung_cost(target):
             latency += tiles * (groups_per_tile // 2) * ROW_PAIR_SAME_BANK_CYCLES
         # This work item's share of the first matrix staging (its own rows'
         # bursts; the shares of a kernel's work items partition the
-        # conductor's staging), before the MAC.  Columns come from the nest
-        # the Samsung lowering accepts, [row, k] or [row, column, k]
-        # (spmw_samsung.samsung_contraction), not from the matcher's
-        # batch_dim, which depends on source operand order.
+        # conductor's staging), before the MAC.  Rows and columns come from
+        # the nest the Samsung lowering accepts, [k], [row, k] or [row,
+        # column, k] (spmw_samsung.samsung_contraction: row_var the first
+        # loop, column_var the second of three, N its trip count), and only
+        # from there: the matcher's `batch` metric (batch_dim) names whichever
+        # operand carries the free axis in source order and is the row loop
+        # when the vector is written first, so it is not read here (rounds
+        # 132 to 134).
         extents = tuple(event.metrics.get("loop_extents", ()) or ())
         rows = int(extents[0]) if len(extents) > 1 else 1
         columns = int(extents[1]) if len(extents) == 3 else 1
-        batch = max(columns, int(event.metrics.get("batch", 1)))
         G = int(target.grf_b.slots)
         E = int(target.grf_a.slots)
         # Staging counts bursts: a reduction tile is E bursts of
@@ -497,20 +500,19 @@ def samsung_cost(target):
                     reduction,
                     E=E,
                     burst_elements=burst,
-                    columns=batch,
+                    columns=columns,
                     resident=bool(candidate.get("stage_resident", False)),
                 ),
             )
         occupy_compute(event, ctx, latency, MAC_CYCLES)
-        # Several reduction columns (GEMM N, batched GEMV) with a restaged
-        # matrix: each extra column rewrites this work item's matrix rows
-        # (rows x K/16 bursts) over its pseudo-channel before its pass;
-        # resident staging writes once. The first staging is in the
-        # mac_stage step above, so only the extra ones appear here.
-        if batch > 1 and not candidate.get("stage_resident", False):
-            lanes16 = int(target.grf_a.width) // 16
-            bursts = rows * _ceil_div(reduction, lanes16)
-            restage = (batch - 1) * bursts * HOST_BURST_CYCLES
+        # Several result columns (GEMM N) with a restaged matrix: each extra
+        # column rewrites this work item's matrix rows (rows x K/burst
+        # bursts) over its pseudo-channel before its pass; resident staging
+        # writes once. The first staging is in the mac_stage step above, so
+        # only the extra ones appear here.
+        if columns > 1 and not candidate.get("stage_resident", False):
+            bursts = rows * _ceil_div(reduction, burst)
+            restage = (columns - 1) * bursts * HOST_BURST_CYCLES
             ctx.step(
                 latency=restage,
                 occupy=[ctx.use(channel, cycles=restage)],
