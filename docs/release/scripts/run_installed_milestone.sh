@@ -82,6 +82,9 @@ stage attacc_compare_frozen -- $PY $HERE/attacc_compare_frozen.py --sessions-dir
 cd $T
 # The APU v1 grouped-enumerator regressions (V1-20) and the grouped / APU v1 selection of the
 # shared-semantics suite: the functional-reference stages below do not exercise that enumerator.
+# The APU v1 build harness's iterator boundary (C-13, rounds 126 to 128) and the build
+# configuration tests, so a candidate's evidence carries those regressions.
+stage apu_v1_build_iterators_and_config -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/perf/test_apu_v1_build_iterators.py tests/perf/test_apu_v1_build_config.py
 stage apu_v1_grouped_mapping -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/pim/test_apu_v1_grouped_mapping.py
 stage apu_v1_shared_semantics_selection -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/pim/test_shared_semantics.py -k "apu_v1 or grouped"
 stage apu_v1_functional_reference -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/perf/test_apu_v1_functional_reference.py -W error::DeprecationWarning
