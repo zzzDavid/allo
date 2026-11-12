@@ -225,7 +225,10 @@ to `single/k1`, 2,716 to 3,457 cycles; the forced `separate/k1` against the
 default `fused/k1`, 2,552 to 5,054; every launch exact; mechanism traces,
 not performance sessions), and again in round 192 from the accepted candidate
 `f32b8e3`'s wheel (`single/k2` 2,678 to `single/k1` 3,446; `fused/k1` 2,550 to
-`separate/k1` 5,058; every launch exact), so item (2) is executed at the candidate.  (3) The APU
+`separate/k1` 5,058; every launch exact), and again in round 196 from the working
+candidate's `448a51f` wheel built on the card host (`single/k2` 2,699 to
+`single/k1` 3,476; `fused/k1` 2,510 to `separate/k1` 5,077; every
+launch exact), so item (2) is executed at the working candidate's package.  (3) The APU
 v1 side of slice 5 is demonstrated at `c762d4d` (round 136) and the
 runtime's failure evidence is complete since `dbe0543` (V1-21); the round
 136 lost sample itself stays unverified.  (4) The round 139 review's own
@@ -306,10 +309,12 @@ composition cases (21 passed, round 194).  Inherited from `f32b8e3` through
 artifact identity, limited to the verified unchanged paths: 496 of the 501
 installed files are byte-identical, the two compiled libraries identical after
 the build-path substitution, `allo/__init__.py` and `allo/spmw_target.py`
-changed and `allo/spmw_host_program.py` absent (`r193/run/installed_file_identity.json`), so the
-Gemini-II card tests, the pair-affine record, the selection traces and item
-(2) (round 192 at `f32b8e3`) describe the same code at `448a51f`; `f32b8e3`'s
-evidence keeps its own identity and is not relabeled.  Still owed at the
+changed and `allo/spmw_host_program.py` absent (`r193/run/installed_file_identity.json`).  In round
+196 the Gemini-II card tests, the pair-affine record, the selection traces
+and item (2) were executed at `448a51f` itself from the wheel built on the
+card host from the `448a51f` sdist, and the 42-stage installed-artifact
+milestone passed from the `r193` wheel, so those no longer rest on the
+inheritance; `f32b8e3`'s evidence keeps its own identity and is not relabeled.  Still owed at the
 working candidate: item (3), the APU v1 vector-path execution with the forced
 plan and the cost perturbation, and the Gemini-I remaining quota (kmeans 2,
 word count 2, linear regression 3), both blocked on the board host's `/tmp`.
