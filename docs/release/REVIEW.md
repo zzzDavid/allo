@@ -3800,12 +3800,16 @@ byte for byte the same, so the question could be put to the code: both
 images were decoded with the vendor's own toolchain and compared with
 the addresses, the branch displacements and the update tool's per-image
 microcode indices masked.  The composed-dot task, everything it calls
-to three levels, and the microcode those calls dispatch are present
-unchanged in the paper's library; the two differ in which tasks sit
-beside it and where things were placed.  That removes the rebuild as a
-cause of the gemm and mvt gaps as far as the executed instructions go,
-and says nothing about the card or the host; the fixed outcomes stand,
-and no session was run.  NOT READY.
+to three levels, have normalized-body matches in the paper's library,
+and every microcode record the current image carries is present in it
+somewhere.  The review then showed how much my normalization hid: it
+masked immediates that are not relocations, it never tied a dispatch
+site to its fragment, and it never checked that the archived call sites
+reach the matched bodies.  So the result is weaker than I first wrote:
+the rebuild is deterministic and the bodies match under a loose mask;
+executed-stream equivalence and the build's share of the gaps stay
+unestablished (round 154).  The fixed outcomes stand, and no session
+was run.  NOT READY.
 
 ## Rejected shortcuts
 
