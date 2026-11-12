@@ -1703,6 +1703,32 @@ def carried_accumulator_message(target_name: str, match) -> str:
     )
 
 
+RECORD_REALIZED_ACCESSES = "record_realized_accesses"
+
+
+def _record_realized_accesses(match, problems) -> frozenset:
+    """The operand coordinates a program record's frontend declares its own
+    lowering realizes by construction: ``extra["record_realized_accesses"]``
+    maps ``(role, memref, coordinate)`` to the reason (the Gemini-II composed
+    route's pair-affine streams read rows ``2*d + term`` of the interleaved
+    operand, which that route's layout realizes directly; release ledger
+    G2-16).  Only a synthetic record match (``op_range == ("record",
+    "record")``, a program without source whose frontend also owns the
+    lowering) may declare one; a declaration on a source program's match is
+    itself refused and the match is judged in full."""
+    declared = match.extra.get(RECORD_REALIZED_ACCESSES) or {}
+    if not declared:
+        return frozenset()
+    if tuple(getattr(match, "op_range", ()) or ()) != ("record", "record"):
+        problems.append(
+            f"{match.func_name}: a source program's match declares operand "
+            f"accesses realized by construction ({sorted(declared)}); only a "
+            "program record's frontend, which also owns the lowering, may"
+        )
+        return frozenset()
+    return frozenset(tuple(key) for key in declared)
+
+
 def require_contraction_accesses_realizable(trace, ctx_cls=None) -> None:
     """Refuse, for every matched contraction of the trace, an input access no
     PIM lowering realizes as written (`spmw_semantics.
@@ -1739,7 +1765,10 @@ def require_contraction_accesses_realizable(trace, ctx_cls=None) -> None:
         fact = match.extra.get("semantic_facts")
         if fact is None:
             continue
-        for problem in contraction_access_problems(fact, reduction_offsets=False):
+        realized = _record_realized_accesses(match, problems)
+        for problem in contraction_access_problems(
+            fact, reduction_offsets=False, realized=realized
+        ):
             problems.append(f"{match.func_name}: {problem}")
         if realizes_offsets or not hasattr(fact, "reduction_vars"):
             continue

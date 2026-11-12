@@ -616,3 +616,126 @@ def test_a_flat_view_of_a_multidimensional_buffer_is_bounded_by_its_element_coun
         len(problems) == 1
         and "a flat view of 262144 elements (1024x256)" in problems[0]
     )
+
+
+def _pair_affine_record():
+    I2 = allo.APUG2ScalarType(2, True)
+    I15 = allo.APUG2ScalarType(15, True)
+    return allo.APUG2ComposedContractionProgram(
+        (I2, I2), I15, (1024,), 128, allo.APUG2DotEpilogue((3, 2)), repetitions=7
+    )
+
+
+def test_the_pair_affine_record_declares_the_interleaved_rows_its_layout_realizes():
+    """G2-16: the Gemini-II composed record's pair-affine epilogue describes
+    its two streams as reading rows ``2*d + term`` of the interleaved operands,
+    and from the X-42 rule (a917335) until round 168 that coefficient was
+    refused as a stride no lowering stages, so the documented epilogue could
+    not compile (``tests/perf/test_apu_g2_composed_contraction.py``).  The
+    composed layout realizes the pair itself, and the record declares the two
+    coordinates realized; the rule still sees the stride when asked without
+    the declaration, and the identity record declares nothing."""
+    from allo.pim.costs import apu_g2_cost
+    from allo.pim.targets import build_apu_g2_target
+    from allo.spmw_codegen import RECORD_REALIZED_ACCESSES
+
+    compiled = allo.compile(
+        _pair_affine_record(), build_apu_g2_target(), apu_g2_cost, backend="virtual"
+    )
+    assert compiled.estimate().cycles > 0
+    streams = [m for m in compiled.trace.matches if m.target_op_name == "MAC"]
+    assert len(streams) == 2
+    for term, match in enumerate(streams):
+        assert match.op_range == ("record", "record")
+        declared = match.extra[RECORD_REALIZED_ACCESSES]
+        assert set(declared) == {("x", "lhs", 0), ("y", "rhs", 0)}
+        assert all(f"2*d + {term}" in why for why in declared.values())
+        fact = match.extra["semantic_facts"]
+        undeclared = contraction_access_problems(fact, reduction_offsets=False)
+        assert len(undeclared) == 2 and all("reads 2*d" in p for p in undeclared)
+        assert (
+            contraction_access_problems(
+                fact, reduction_offsets=False, realized=frozenset(declared)
+            )
+            == []
+        )
+
+    I4 = allo.APUG2ScalarType(4, True)
+    identity = allo.compile(
+        allo.APUG2ComposedContractionProgram(
+            (I4, I4), allo.APUG2ScalarType(15, True), (64, 31), 128
+        ),
+        build_apu_g2_target(),
+        apu_g2_cost,
+        backend="virtual",
+    )
+    (plain,) = [m for m in identity.trace.matches if m.target_op_name == "MAC"]
+    assert RECORD_REALIZED_ACCESSES not in plain.extra
+    assert (
+        contraction_access_problems(
+            plain.extra["semantic_facts"], reduction_offsets=False
+        )
+        == []
+    )
+
+
+def test_only_a_record_match_may_declare_its_accesses_realized():
+    """The declaration is confined: a record match's declaration covers the
+    named coordinates only, and a source program's match carrying one is
+    refused for the declaration as well as for the access."""
+    from types import SimpleNamespace
+
+    from allo.spmw_codegen import (
+        RECORD_REALIZED_ACCESSES,
+        require_contraction_accesses_realizable,
+    )
+    from allo.spmw_semantics import BufferAccess, LoopAxis
+
+    def strided_fact():
+        access = BufferAccess(
+            role="x",
+            memref_name="b",
+            parameter="b",
+            local=False,
+            value_ref=None,
+            shape=(512,),
+            element=None,
+            coords=(((("k", 2),), 0),),
+            dims=(None,),
+            indices=("2*k",),
+            index_map=None,
+        )
+        return SimpleNamespace(
+            loops=(LoopAxis("k", "k", 0, 256, 1),),
+            loop_vars=("k",),
+            reduction_vars=("k",),
+            trips={"k": 256},
+            loop_labels={"k": "k"},
+            inputs=(access,),
+        )
+
+    def trace(op_range, declared):
+        match = SimpleNamespace(
+            func_name="dot",
+            op_range=op_range,
+            extra={
+                "semantic_facts": strided_fact(),
+                RECORD_REALIZED_ACCESSES: declared,
+            },
+        )
+        return SimpleNamespace(matches=[match])
+
+    require_contraction_accesses_realizable(
+        trace(("record", "record"), {("x", "b", 0): "the record's layout reads it"}),
+        None,
+    )
+    with pytest.raises(NotImplementedError, match=r"coordinate 0 reads 2\*k"):
+        require_contraction_accesses_realizable(
+            trace(("record", "record"), {("x", "b", 1): "another coordinate"}), None
+        )
+    with pytest.raises(NotImplementedError) as info:
+        require_contraction_accesses_realizable(
+            trace((3, 9), {("x", "b", 0): "claimed by a source program"}), None
+        )
+    assert "reads 2*k" in str(info.value)
+    assert "only a program record's frontend" in str(info.value)

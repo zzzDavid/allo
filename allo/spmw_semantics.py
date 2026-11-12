@@ -1264,6 +1264,7 @@ def contraction_access_problems(
     *,
     reduction_offsets: bool = True,
     result_offsets: str = "any",
+    realized=frozenset(),
 ) -> list[str]:
     """Input accesses of a contraction that no PIM lowering realizes as
     written (release ledger X-42), judged on the **effective** access: every
@@ -1293,7 +1294,11 @@ def contraction_access_problems(
     whose staged extent leaves the buffer dimension.  A coordinate with no retained form
     (data dependent) or with an atom that is not a loop variable is not
     judged here; the backends' own checks keep handling those.  A loop
-    without a static domain is reported."""
+    without a static domain is reported.  ``realized`` names the operand
+    coordinates ``(role, memref, position)`` whose access the program's own
+    lowering realizes by construction (a program record's declaration,
+    admitted by `spmw_codegen.require_contraction_accesses_realizable` for
+    record matches only, G2-16); those coordinates are not judged."""
     if not hasattr(fact, "reduction_vars"):
         return []
     problems = list(_repeated_axis_problems(fact))
@@ -1302,6 +1307,8 @@ def contraction_access_problems(
             problems.append(item)
             continue
         key, where, read, effective, constant, reads_reduction = item
+        if key in realized:
+            continue
         if not _is_dense_flattening(effective):
             problems.append(
                 f"{where} reads {read}, which is not one loop counter or a "

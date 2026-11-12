@@ -602,7 +602,25 @@ def _composed_semantics(record, order, params, shapes, types):
                 "acc", name, ordinal, (), acc_element, (), (), local=True
             )
             row_coords = (((("d", 2),), term), ((("k", 1),), 0))
-            mac(row_coords, f"2*d+{term}", acc_binding, acc_access, "zero", None, None)
+            stream = mac(
+                row_coords, f"2*d+{term}", acc_binding, acc_access, "zero", None, None
+            )
+            # Stream `term` reads the interleaved rows 2*d + term of the
+            # (dots, K) operands.  The composed layout places every dot row
+            # and sums each adjacent pair itself (`apu_g2_composed_layout`,
+            # "pair_affine_result_rows: even logical dot rows"), so the access
+            # is realized by construction; it is declared so for the shared
+            # X-42 rule, which otherwise reads the coefficient 2 as a stride
+            # no lowering stages (release ledger G2-16).
+            why = (
+                f"pair-affine stream {term} reads rows 2*d + {term} of the "
+                "interleaved (dots, K) operand; the composed layout realizes "
+                "the pair directly"
+            )
+            stream.extra["record_realized_accesses"] = {
+                ("x", "lhs", 0): why,
+                ("y", "rhs", 0): why,
+            }
             locals_.append((name, ordinal, acc_binding, acc_element))
         alpha, beta = record.epilogue.coefficients
         operands = [
