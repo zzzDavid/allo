@@ -77,7 +77,7 @@ workload reaches it**: the Samsung enumerator raises for any non-MAC trace (S-07
   (`extra` has no `outputs`). Not exercised by any test (`grep run_batched tests/` empty).
   Not reachable from `CompiledCallable` (no `run_batched` wrapper).
 - `run_samsung_reduce` / `execute_host_schedule_samsung` (`spmw_samsung.py:707-760`): harness
-  helpers that call the same REDUCE conductor per `HostSchedule` group; no compile artifact
+  helpers that call the same REDUCE conductor per host-schedule group (the `HostSchedule` type was removed with C-10 in release round 193); no compile artifact
   involved.
 - `allo.pim.samsung_layout_swizzle.select_autoscheduled_xor_layout` (`:195-288`): builds a
   synthetic one-match `MatchTrace` (not a user workload), runs `autoschedule`, lifts the chosen

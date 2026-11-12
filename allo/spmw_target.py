@@ -1287,11 +1287,13 @@ class HostProgram:
 
     A user's host-side driver: an ordered sequence (`.steps`) of `host_xfer.*`
     data moves (`.moves`) interleaved with `allo.launch(...)` kernel invocations
-    (`.launches`). The residency analysis (`allo.spmw_host_program.analyze`)
-    turns it into a host schedule that the run path executes and the cost model
-    prices from one source. `.moves` also threads into `compile_for_target(
-    host_moves=...)`; iterating / `len()` yields the moves, so `HOST_MOVES =
-    host` works.
+    (`.launches`). Weight residency is decided by the shared autoscheduler
+    (the `stage_resident` placement flag, priced by the executable cost
+    program) and declared by the user through `@allo.host_program(resident=...)`;
+    the earlier separate residency analysis (`allo.spmw_host_program`, release
+    ledger C-10) had no caller and was removed. `.moves` threads into
+    `compile_for_target(host_moves=...)`; iterating / `len()` yields the moves,
+    so `HOST_MOVES = host` works.
     """
 
     __slots__ = (

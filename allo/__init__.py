@@ -55,13 +55,6 @@ from .spmw_target import (
 # SPMW/PIM exports below load on first attribute access (PEP 562), so
 # `import allo` does not import the PIM compiler stack.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
-    "HostSchedule": ("allo.spmw_host_program", "HostSchedule"),
-    "HostGroup": ("allo.spmw_host_program", "HostGroup"),
-    "HostLaunch": ("allo.spmw_host_program", "HostLaunch"),
-    "analyze_host_program": ("allo.spmw_host_program", "analyze"),
-    "resolve_host_program_shapes": ("allo.spmw_host_program", "resolve_shapes"),
-    "schedule_residency": ("allo.spmw_host_program", "schedule_residency"),
-    "schedule_cost": ("allo.spmw_host_program", "schedule_cost"),
     "CostSpec": ("allo.perf", "CostSpec"),
     "BoundCostSpec": ("allo.perf", "BoundCostSpec"),
     "cost": ("allo.perf", "cost"),

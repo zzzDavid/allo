@@ -46,3 +46,25 @@ def test_compile_is_the_compiler_entry_point():
     import allo.compiler
 
     assert allo.compile is allo.compiler.compile
+
+
+def test_removed_host_scheduling_helpers_are_not_public():
+    """C-10 (round 193): the parallel host-scheduling helpers had no production
+    caller; they are gone from the public table and the module is gone, so the
+    maintained host stage (`@allo.host_program`, the autoscheduler's residency
+    flag, `compile_for_target(host_moves=...)`) is the only host path."""
+    import importlib
+
+    for name in (
+        "HostSchedule",
+        "HostGroup",
+        "HostLaunch",
+        "analyze_host_program",
+        "resolve_host_program_shapes",
+        "schedule_residency",
+        "schedule_cost",
+    ):
+        assert name not in allo._LAZY_EXPORTS, name
+        assert not hasattr(allo, name), name
+    assert importlib.util.find_spec("allo.spmw_host_program") is None
+
