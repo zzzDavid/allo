@@ -2823,3 +2823,14 @@ Checkout after the round 105 commits; evidence under
 | Board host | `/tmp` 4,534,272 bytes available (the guard needs 8 MiB): no launch; the next attempts use `g1_board.sh` and `g1_campaign.sh` in fresh directories with the `f57c840` wheel and drivers copied from the checkout at or after `de5a114` |
 | Not done | the `f57c840` board evidence; the Gemini-I remaining quota (kmeans 2, word count 2, linear regression 3); the final verdict (NOT READY) |
 
+## Round 150 (2026-11-11): X-48 closed, one launched source per lane; the board still blocked
+
+| Check | Result |
+|---|---|
+| The round 149 review's finding | with several distinct launched sources across a plan-routed lane's launches, the driver left the lane identity null, counted the samples and reported the comparison valid (`reviewer-r149/source_consistency_probe.py`: three differing wrapped sources each containing the declaration) |
+| Repair (`benchmarks/apu_v1/paper_rows.py`, `1f115a3`; evaluation driver, the compiler `f57c840` unchanged) | a Tenon lane's successful warm-up and measured launches must report one launched source (`launched_sources_of_successful_launches` recorded); several distinct sources, or a source other than a native lane's declared launched identity, append an explicit provenance problem, so the comparison is `invalid (see problems)` and `main` exits nonzero; every conflicting launch and its files stay, no hash is chosen, no sample is discarded; a plan route's identity is filled only from agreeing launches |
+| Regressions (through the real `TenonLane.launch`, `measure_case` and `main`) | three differing wrapped sources: three launches kept with their device.c, no error on any, lane identity null, the three hashes recorded, the samples recorded, the provenance problem, the comparison invalid; the session's exit 1 and `fail` status with every launch preserved; a native lane whose consistent launched source is not its declared text: a problem, the declaration kept. The reviewer's probe now prints the problem and `invalid (see problems)` with a null lane identity |
+| The four suites with the assets enabled (`r150/pytest_assets_enabled.log`) | **70 passed**, none skipped; `git diff --check` clean |
+| Board host | `/tmp` 4,534,272 bytes available (the guard needs 8 MiB): no launch; the next attempts use `g1_board.sh` and `g1_campaign.sh` in fresh directories with the `f57c840` wheel and drivers copied from the checkout at or after `1f115a3` |
+| Not done | the `f57c840` board evidence; the Gemini-I remaining quota (kmeans 2, word count 2, linear regression 3); the final verdict (NOT READY) |
+
