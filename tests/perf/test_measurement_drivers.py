@@ -773,6 +773,10 @@ def test_apu_v1_failed_baseline_launches_of_two_cases_do_not_collide(
         runtime, "apu_v1_board_lock", lambda: contextlib.nullcontext("no-device")
     )
     monkeypatch.setattr(runtime, "launch_on_board", no_hardware)
+    # No hardware and no host scratch is involved here: the session's
+    # stop-at-loss check (round 147) must see headroom, whatever the real
+    # host's /tmp holds, so that all eight attempts are made.
+    monkeypatch.setattr(runtime, "ledag_scratch_headroom_problem", lambda: None)
     shared = tmp_path / "shared"
     records = [
         paper_rows.measure_case(
