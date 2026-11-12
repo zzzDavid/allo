@@ -3966,9 +3966,12 @@ run from a wheel at it: the AiM value-layout and dense-domain checks, the
 APU v1 realization binding, and the payload-route contract.  All four
 ran from the installed candidate outside the checkout: eighty-four
 passed, none skipped, every one a compile-time or virtual check, and the
-record says so rather than borrowing the word execution.  What is left
-unrun from this wheel are the two Gemini-II regressions that need the
-card host.  The board is still behind the host's scratch.  NOT READY.
+record says so rather than borrowing the word execution.  I then
+misfiled two things, corrected in round 165: the Gemini-II fault
+injections had already passed from this wheel in round 162, and the
+source-route suite runs on local emulation; only the card tests need
+the card host.  The board is still behind the host's scratch.  NOT
+READY.
 
 ## Rejected shortcuts
 
