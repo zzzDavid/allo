@@ -175,7 +175,7 @@ def test_the_sequence_scratch_budget_is_a_prerequisite(tmp_path):
     sb = _sandbox(tmp_path)
     free = shutil.disk_usage(tmp_path).free
     # a per-launch figure that the 78 launches cannot fit: refused, nothing launched
-    code, out = _run(sb, tmp_path / "e8", env_extra={"G1_TMP_PATH": str(tmp_path), "G1_TMP_PER_LAUNCH_BYTES": str(free // 78 + 1)})
+    code, out = _run(sb, tmp_path / "e8", env_extra={"G1_TMP_PATH": str(tmp_path), "G1_TMP_PER_LAUNCH_BYTES": str(free * 2)})
     assert code == 1 and "prerequisite scratch_budget failed" in out and "nothing launched" in out
     assert "planned launches 78 x" in out and _driver_calls(sb) == []
     # a per-launch figure that fits: the dry run proceeds to the three commands

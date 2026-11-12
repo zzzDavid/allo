@@ -32,6 +32,11 @@ MAX_SESSIONS=${G1_MAX_SESSIONS:-6}; MEASURED=${G1_MEASURED:-10}
 PER_LAUNCH=${G1_TMP_PER_LAUNCH_BYTES:-60000000}; TMP_PATH=${G1_TMP_PATH:-/tmp}
 DRY=${G1_DRY_RUN:-0}
 EXISTING=(${G1_EXISTING:-})
+# G1_EQUIVALENCE: an installation-equivalence manifest (g1_pool.py --write-equivalence) that lets this
+# package's sessions pool with existing sessions of a verified-equivalent installed package (a
+# replacement candidate whose reviewed delta is recorded in the manifest); without it, a different
+# installed package than the existing sessions' is refused before any launch (round 159).
+EQ=(); [ -n "${G1_EQUIVALENCE:-}" ] && EQ=(--equivalence "$G1_EQUIVALENCE")
 CAMP=$E/campaign; [ "$DRY" = "1" ] && CAMP=$E/campaign-dry-run
 if [ -e "$CAMP" ]; then
   echo "refusing to run: $CAMP already exists (a prior attempt's evidence is never overwritten; use a fresh evidence directory)" >&2
@@ -52,6 +57,13 @@ abort() { echo "$1 $(date -Is)" | tee -a $CAMP/stages/SUMMARY.txt >&2; milestone
 stage module_origin -- $PYV -c "import allo, benchmarks, os, sys; pkg = os.path.realpath('$P'); print('allo from', allo.__file__); print('benchmarks from', benchmarks.__file__); assert os.path.realpath(allo.__file__).startswith(pkg + '/venv/'), (os.path.realpath(allo.__file__), pkg); assert os.path.realpath(benchmarks.__file__).startswith(os.path.realpath('$T') + '/'); assert not any(p.startswith('$HERE'.rsplit('/docs/',1)[0]) for p in sys.path)" || abort "prerequisite module_origin failed; nothing launched"
 stage assets_present -- $PYV -c "import os; root = os.environ['TENON_ARTIFACTS']; cases = '$(cases_of_quota)'.split(); missing = [c for c in cases if not os.path.isdir(os.path.join(root, 'apuv1', 'tenon', c))]; print('assets', root, 'cases', cases); assert not missing, missing" || abort "prerequisite assets_present failed; nothing launched"
 stage existing_sessions_present -- bash -c 'set -e; for f in "$@"; do if [ -f "$f" ]; then echo "existing: $f"; else echo "MISSING existing session file: $f" >&2; exit 1; fi; done; echo "${#@} existing session file(s)"' _ "${EXISTING[@]}" || abort "prerequisite existing_sessions_present failed (every G1_EXISTING file must exist: give explicit absolute file names); nothing launched"
+# The installed package of this campaign must pool with every existing session: identical to theirs,
+# or a verified-equivalent installation under G1_EQUIVALENCE (the pooler re-hashes both installations
+# and the wheels, and accepts only the manifest's reviewed differences); refused before any launch.
+if [ ${#EXISTING[@]} -gt 0 ]; then
+  INSTALL=$($PYV -c "import allo; print(allo.__file__)")
+  stage installation_compatibility -- $PYV -I $HERE/g1_pool.py ${EQ[@]+"${EQ[@]}"} --out /dev/null --preflight-install "$INSTALL" "${EXISTING[@]}" || abort "prerequisite installation_compatibility failed (the existing sessions' installed package differs from this campaign's and no verified equivalence covers the pair); nothing launched"
+fi
 # plan FILES...: pool the existing and given files into a fresh plan.  Prints the next session's
 # cases (empty when every row is at its quota) and returns 0 when the pooler reported a valid
 # planning outcome (0: at quota, 3: rows still owed); any other pooler status, or a missing fresh
@@ -64,7 +76,7 @@ plan() {
     return 0
   fi
   local rc=0
-  $PYV -I $HERE/g1_pool.py --out $CAMP/apu_v1_campaign_pooled.json --row-quota "$ROW_QUOTA" --measured $MEASURED --plan-out $CAMP/plan.json "${files[@]}" > $CAMP/plan.log 2>&1 || rc=$?
+  $PYV -I $HERE/g1_pool.py ${EQ[@]+"${EQ[@]}"} --out $CAMP/apu_v1_campaign_pooled.json --row-quota "$ROW_QUOTA" --measured $MEASURED --plan-out $CAMP/plan.json "${files[@]}" > $CAMP/plan.log 2>&1 || rc=$?
   if [ $rc -ne 0 ] && [ $rc -ne 3 ]; then
     echo "PLANNING FAILED: g1_pool.py exited $rc (see $CAMP/plan.log)" >&2
     return 1
@@ -101,7 +113,7 @@ for s in $(seq 1 $MAX_SESSIONS); do
 done
 all=("${EXISTING[@]}" "${files[@]}")
 if [ ${#all[@]} -gt 0 ]; then
-  stage pool_campaign -- $PYV -I $HERE/g1_pool.py --out $CAMP/apu_v1_campaign_pooled.json --row-quota "$ROW_QUOTA" --measured $MEASURED --plan-out $CAMP/plan.json "${all[@]}"
+  stage pool_campaign -- $PYV -I $HERE/g1_pool.py ${EQ[@]+"${EQ[@]}"} --out $CAMP/apu_v1_campaign_pooled.json --row-quota "$ROW_QUOTA" --measured $MEASURED --plan-out $CAMP/plan.json "${all[@]}"
 else
   stage pool_campaign -- false
 fi
