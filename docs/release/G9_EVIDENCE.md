@@ -287,8 +287,30 @@ candidate: that execution and the Gemini-I remaining quota.  The Gemini-I pooler
 transitions only through verified installation-equivalence manifests
 (round 159, `r159/installation_equivalence.json`, `f57c840` to `273305c`;
 round 170, `r170/installation_equivalence.json`, `f57c840`, `273305c` and the
-accepted candidate `40f9b64`; ISSUES X-49).  Apart from items (1), (2) and the unverified sample,
+accepted candidate `40f9b64`; round 192, `r192/installation_equivalence.json`, adding `f32b8e3`; round 195, `r195/installation_equivalence.json`, adding the `448a51f` build with `spmw_host_program.py` explicitly allowed absent, the pooler extended for that one file in `48a6a70`; ISSUES X-49).  Apart from items (1), (2) and the unverified sample,
 nothing else of G9 is open: the migration, the matcher-backend contracts,
 the retained-IR manifest and the hardware provenance bindings are recorded
 above.
+
+**Candidate transition (round 194 review, 2026-11-12).** `56f37e5` is adopted as
+the working source candidate for completing validation, not release approval:
+`f32b8e3` plus the C-10 resolution (the callerless host-scheduling module, its
+seven exports and its five analysis tests removed; the maintained-path
+host-program tests restored).  Its `allo/` is identical to `448a51f`, the
+revision the `r193` wheel `88e61410171715cb...` was built at; the wheel is the
+package-build identity and `56f37e5` the source identity, kept distinct.
+Executed from that wheel: the public-surface, public-exports, APU v1
+scalar-surface and packaging suites (134 passed, 27 skipped, round 193) and
+the restored host-program tests with the joint-selection and Samsung
+composition cases (21 passed, round 194).  Inherited from `f32b8e3` through
+artifact identity, limited to the verified unchanged paths: 496 of the 501
+installed files are byte-identical, the two compiled libraries identical after
+the build-path substitution, `allo/__init__.py` and `allo/spmw_target.py`
+changed and `allo/spmw_host_program.py` absent (`r193/run/installed_file_identity.json`), so the
+Gemini-II card tests, the pair-affine record, the selection traces and item
+(2) (round 192 at `f32b8e3`) describe the same code at `448a51f`; `f32b8e3`'s
+evidence keeps its own identity and is not relabeled.  Still owed at the
+working candidate: item (3), the APU v1 vector-path execution with the forced
+plan and the cost perturbation, and the Gemini-I remaining quota (kmeans 2,
+word count 2, linear regression 3), both blocked on the board host's `/tmp`.
 
