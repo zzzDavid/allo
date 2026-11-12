@@ -4312,7 +4312,10 @@ candidate's code, and the two libraries differ in those tasks and in
 where the linker put everything.  With the archived library in hand
 the question could be asked directly, under a design written down
 before the first launch: the sessions' library and the archived one,
-alternating on the paper's gemm, 192 launches.  the library difference moves the metric at the order of the gap.
+alternating on the paper's gemm, 192 launches.  The library difference
+moves the metric at the order of the gap, but the archived library is
+the slower one today, the opposite sign to the gap it was suspected of
+causing; the gaps stay unattributed.
 Nothing is pooled, no verdict moves, and no task goes back into the
 product to chase a number.  The board is still blocked.  NOT READY.
 
