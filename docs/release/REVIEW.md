@@ -3991,6 +3991,8 @@ manifest and slice 5 source review of rounds 28 to 30 (accepted, round
 (superseded by `88852b7`); the public-payload and distribution audit's
 reviewed items, closed narrowly by the reviewer's acceptance of rounds 88
 and 89 (P-25: the third-party texts and inventory validated in the
-archives built from `aae8b23`; P-04 and the final-candidate installed
-artifacts remain open as listed).  The optional supporting studies keep their
+archives built from `aae8b23`; P-04 closed as packaging in round 93
+under the user's direction and verified from the installed `f57c840` wheel
+in round 141; the final-candidate installed artifacts remain open as
+listed).  The optional supporting studies keep their
 recorded statuses and are not release blockers on reproduction grounds.
