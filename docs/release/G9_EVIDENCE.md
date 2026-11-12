@@ -186,7 +186,10 @@ blocked by the board host's `/tmp` (VALIDATION.md round 85); the host
 recovered before round 136.  The manifest and slice 5 review of rounds 28 to 30 is no longer pending.
 
 Specifically outstanding for G9 (round 139, replacing the earlier
-"remaining minor items" wording): (1) the independent review, at the final
+"remaining minor items" wording; item (1) carried to `40f9b64` in the round 187
+review: the reviewer accepts the round 141 contract-boundary source review
+for the verified unchanged paths plus the inspected S-18 and G2-16 changes,
+a limited acceptance that is neither hardware nor whole-release acceptance): (1) the independent review, at the final
 candidate, of the shared candidate contract as implemented: the invariant
 that every selected placement's declared `CandidateEffects`
 (`allo/spmw_candidate.py`: `CandidateCoverage`, `CandidateValueLayout`,
