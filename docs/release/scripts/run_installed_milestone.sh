@@ -51,9 +51,13 @@ for s in fresh_install_check fresh_sim_check aim_check upmem_check; do
   stage probe_$s -- timeout 1800 $PY $S/$s.py
 done
 
-# tests and benchmarks copied out of the checkout (mandatory); pytest.ini and a root
-# conftest.py are optional (this tree has neither); a failed copy fails the milestone.
-stage copy_test_tree -- copy_tree_with_optional $E/testtree $ALLO tests benchmarks -- pytest.ini conftest.py
+# tests and benchmarks copied out of the checkout (mandatory), with the release scripts under
+# docs/release/scripts that tests/perf/test_measurement_drivers.py loads relative to its own
+# location (the Gemini-I pooler, round 147: the round 196 milestone failed its
+# measurement_drivers_suite stage with FileNotFoundError on g1_pool.py because the copied tree
+# held tests and benchmarks only); pytest.ini and a root conftest.py are optional (this tree has
+# neither); a failed copy fails the milestone.
+stage copy_test_tree -- bash -c "source $HERE/stage_lib.sh && copy_tree_with_optional $E/testtree $ALLO tests benchmarks -- pytest.ini conftest.py && mkdir -p $E/testtree/docs/release && cp -r $ALLO/docs/release/scripts $E/testtree/docs/release/ && test -f $E/testtree/docs/release/scripts/g1_pool.py"
 T=$E/testtree; cd $T; export PYTHONPATH=$T
 stage golden_rows -- timeout 3600 $PY -m pytest -q -p no:cacheprovider tests/pim/test_paper_golden.py -k "not apu_v1" -s
 stage golden_rows_paper_full -- timeout 5400 $PY -m pytest -q -p no:cacheprovider tests/pim/test_paper_golden.py -k "not apu_v1" -m paper_full
