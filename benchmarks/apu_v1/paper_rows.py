@@ -260,11 +260,17 @@ class TenonLane:
             realization = getattr(self.compiled, "realization", None)
             source = realization.device_source() if realization is not None else None
             self._program = getattr(self.compiled, "compiled", None)
+            # A plan route declares the realization's kernel; the runtime
+            # wraps that text verbatim into the launched device.c (entry
+            # point, profiling, staging), so the launched source is a
+            # different file that contains it (round 148, ISSUES X-48).
+            self.device_source_scope = "realization_kernel"
         else:
             self.selection["native_vector_route"] = getattr(
                 self.compiled, "route", None
             )
             source = getattr(self.compiled, "device_source", None)
+            self.device_source_scope = "device_source"
             self._program = getattr(self.compiled, "lowered", None) or getattr(
                 self.compiled, "compiled", None
             )
@@ -339,8 +345,13 @@ class TenonLane:
             **self.selection,
             "estimate_cycles": self.estimate_cycles,
             "device_source_sha256": self.device_source_sha256,
+            # "device_source": the declared text is the launched device.c;
+            # "realization_kernel": the launched device.c wraps it (each
+            # launch records whether it contains the declared text).
+            "device_source_scope": self.device_source_scope,
             "substituted_source": self.substituted_source,
-            # The source actually built and launched by this lane.
+            # The source this lane declares for its launches (a plan route's
+            # launches record the wrapped file's own identity as well).
             "launched_source_sha256": (
                 self.substituted_source["sha256"]
                 if self.substituted_source
@@ -437,6 +448,15 @@ class TenonLane:
         source = extra.get("device_source") or getattr(self, "device_source", None)
         if source:
             (launch_dir / "device.c").write_text(source)
+        declared = (
+            self.substituted_source and self.substituted_source.get("sha256")
+        ) or getattr(self, "device_source_sha256", None)
+        declared_text = (
+            Path(self.substituted_source["path"]).read_text()
+            if getattr(self, "substituted_source", None)
+            else getattr(self, "device_source", None)
+        )
+        contains = declared_source_in_launched(declared_text, source)
         outputs_dir = launch_dir / "outputs"
         outputs_dir.mkdir(exist_ok=True)
         outputs_sha256 = {}
@@ -461,6 +481,10 @@ class TenonLane:
             "route": extra.get("native_vector_route"),
             "scalar_arc": extra.get("scalar_arc"),
             "launched_source_sha256": _sha256_text(source) if source else launched_sha,
+            "declared_source_sha256": declared,
+            # False means the launched device.c does not contain the text
+            # the lane declared: the launch is not evidence for the lane.
+            "launched_source_contains_declared": contains,
             "outputs_sha256": outputs_sha256,
             "launch_dir": str(launch_dir),
         }
@@ -675,6 +699,16 @@ class ExpertLane:
 # ----------------------------------------------------------------------- #
 
 
+def declared_source_in_launched(declared, launched):
+    """Whether the launched device source contains the declared text verbatim
+    (equal for a native route; the plan routes' runtime wraps the declared
+    realization kernel into the device.c it builds).  None when either text is
+    unknown."""
+    if not declared or not launched:
+        return None
+    return declared in launched
+
+
 def attempt_launch(lane) -> dict:
     """One launch of a lane as the session records it: the lane's launch
     entry, or, for a failed launch, its preserved evidence (``LaunchFailure``
@@ -852,6 +886,11 @@ def measure_case(
         elif not launch.get("outputs_match_oracle"):
             record["problems"].append(
                 f"{lane_name} {kind} {round_index}: outputs differ from the oracle"
+            )
+        elif launch.get("launched_source_contains_declared") is False:
+            record["problems"].append(
+                f"{lane_name} {kind} {round_index}: the launched source does not "
+                "contain the declared source"
             )
         return launch
 

@@ -1357,3 +1357,65 @@ def test_without_scratch_loss_the_session_is_complete(monkeypatch, tmp_path):
     session = json.loads(out.read_text())
     assert "incomplete" not in session and session["status"] == "pass"
     assert len(session["records"][0]["launches"]) == 33 and len(_FakeLane.calls) == 33
+
+
+# --- round 148 (ISSUES X-48): the declared source and the launched device.c
+
+
+def test_declared_source_containment():
+    f = paper_rows.declared_source_in_launched
+    assert f("int k(void) { return 1; }", "#include <x.h>\nint k(void) { return 1; }\nmain") is True
+    assert f("same\n", "same\n") is True
+    assert f("int k(void) { return 1; }", "int k(void) { return 2; }") is False
+    assert f(None, "x") is None and f("x", None) is None and f("", "") is None
+
+
+def test_a_launch_not_containing_the_declared_source_is_a_recorded_problem(monkeypatch, tmp_path):
+    fixtures = _load_g1_fixtures()
+    _fake_lanes(monkeypatch, fixtures, lose_after=10**6)
+    original = _FakeLane.launch
+
+    def launch(self):
+        record = original(self)
+        if self.lane == "tenon":
+            record["launched_source_contains_declared"] = self.n != 3  # one mismatch
+        return record
+
+    monkeypatch.setattr(_FakeLane, "launch", launch)
+    out = tmp_path / "s.json"
+    status = paper_rows.main(
+        ["--cases", "kmeans", "--measured", "3", "--expert", "--historical-binary",
+         "--scratch", str(tmp_path / "scratch"), "--out", str(out)]
+    )
+    assert status == 1
+    record = json.loads(out.read_text())["records"][0]
+    assert record["problems"] == [
+        "tenon measured 2: the launched source does not contain the declared source"
+    ]
+    assert len(record["launches"]) == 12  # the session itself ran to completion
+
+
+def test_plan_route_declares_the_realization_kernel_and_native_routes_the_device_source(tmp_path):
+    root = Path(os.environ.get("TENON_ARTIFACTS", ""))
+    if not (root / "apuv1" / "tenon" / "matrix_multiply" / "workload.py").is_file():
+        pytest.skip("BLOCKED-ENV(tenon artifacts not found; set TENON_ARTIFACTS)")
+    mm = paper_rows.TenonLane(
+        "matrix_multiply", root.resolve(), backend="virtual", layout=None,
+        device_source=None, scratch=tmp_path / "mm",
+    )
+    assert mm.describe()["device_source_scope"] == "realization_kernel"
+    assert mm.describe()["selected_plan"]
+    # The runtime wraps exactly this text into the device.c it builds
+    # (allo/pim/apu_v1_vector_runtime.py, _full_device_source).
+    import numpy as np
+    from allo.pim import apu_v1_vector_runtime as runtime
+
+    role_bytes = {name: np.asarray(v).nbytes for name, v in mm.arguments.items()}
+    wrapped = runtime._full_device_source(mm.compiled.realization, role_bytes)
+    assert wrapped != mm.device_source
+    assert paper_rows.declared_source_in_launched(mm.device_source, wrapped) is True
+    hist = paper_rows.TenonLane(
+        "histogram", root.resolve(), backend="virtual", layout=None,
+        device_source=None, scratch=tmp_path / "hist",
+    )
+    assert hist.describe()["device_source_scope"] == "device_source"
