@@ -64,9 +64,16 @@ def test_gemv_samsung_hbm_pim(case, samsung_sim_gate, record_property):
     assert len(kernels) == 1
     assert kernels[0].bucket_count == 128
     assert kernels[0].fallback is None
-    # 24 REDUCE placements plus 2 ordered ones, x the restage/resident
-    # residency knob that the whole-trace liveness enables inside autoschedule.
-    assert len(kernels[0].scores) == 52
+    # Six REDUCE bases (bank_row, dual_fiber, grf_staged and, since the S-13
+    # tile-row levers of 2026-11-04, their row-pairing and split-rows forms)
+    # x two CRF issue modes x two resident-weight settings x the four
+    # residency variants the whole-trace liveness enables inside
+    # autoschedule = 96, plus the ordered temporal program x two CRF issue
+    # modes x two residency variants = 4.  (The count was pinned at 52 before
+    # the S-13 levers and never rerun from an installed wheel until round
+    # 166; candidates sharing a label differ in their residency fields.)
+    assert len(kernels[0].scores) == 100
+    assert len({position for position, _cost, _label in kernels[0].scores}) == 100
     vendor = allo.compile(
         workload,
         target,
