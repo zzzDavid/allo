@@ -2885,3 +2885,12 @@ Checkout after the round 105 commits; evidence under
 | Board host | `/tmp` 4,546,560 bytes available (the guard needs 8 MiB): no launch |
 | Not done | the `f57c840` board evidence; the Gemini-I remaining quota (kmeans 2, word count 2, linear regression 3); X-34 / X-37 under the fixed rule; the final same-candidate gate reconciliation; the final verdict (NOT READY) |
 
+## Round 155 (2026-11-11): the round 154 comparison restated; the same-candidate gate reconciliation at `f57c840`; the board still blocked
+
+| Check | Result |
+|---|---|
+| Round 154 restated (`4bb40a5`) | the comparator tightened (every non-displacement branch operand compared, identical-encoding branches target-checked, data words and unequal lengths unverified; the review's single-bit change of a branch's compared register a fourth control, flagged); its counts are recorded as observations in the round 154 rows, ISSUES X-34, REVIEW and STATUS, with instruction equivalence and build attribution unestablished; the comparison is left there |
+| Same-candidate gate reconciliation | STATUS.md section "Same-candidate gate reconciliation at `f57c840` (round 155)": per gate G1 to G10, what was executed at exactly `f57c840` (the round 141 milestone and card chain, the round 140 Gemini-II traces, the round 141 Gemini-I session, the X-45 repair), what is inherited by exact revision with its link (`c762d4d`'s board traces through the round 148 identity comparison; `b994fc0`'s Gemini-II campaign through byte-identical modules), and what is outstanding (the `f57c840` board execution of the vector programs, forced plan and perturbation; the Gemini-I quota kmeans 2, word count 2, linear regression 3; X-34 / X-37 under the fixed rule; the non-hardware items `REVIEW.md` names) |
+| Board host | `/tmp` 4,579,328 bytes available (the guard needs 8 MiB): no launch |
+| Not done | the two hardware items above; the final verdict (NOT READY) |
+
