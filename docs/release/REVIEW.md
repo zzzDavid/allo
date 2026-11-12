@@ -3821,12 +3821,18 @@ pair functions by where the calls actually go from the task's entry,
 compare encodings, and accept a difference only when a branch lands at
 the same place in the same paired function, a dispatch names a
 fragment with the same bytes, or an address immediate points at the
-same code or the same bytes.  One hundred ninety-one reachable
-functions, no instruction difference, sixty-six dispatches to identical
-microcode; a changed immediate, swapped calls and a moved fragment
-index are each caught.  What remains open is said plainly: data windows
-that differ, indirect calls not followed, and placement, which this
-cannot speak to and which is where timing lives.  NOT READY.
+same code or the same bytes.  The review then flipped one bit in a
+branch's compared register and the comparator did not notice, because
+its branch clause looked only at the mnemonic and the target; and the
+linear disassembly still reads some vendor extension words as branches.
+Tightened (round 155), it reports what it sees and no more: sixty-six
+dispatches to identical microcode, thousands of identical encodings,
+fifty-eight flagged positions beside data words in the vendor primitives
+that it cannot decide, two hundred sixty-three boundaries it cannot
+verify, and four mutation controls caught including the review's.  That
+is a set of observations, not a proof: instruction equivalence and the
+build's share of the gaps stay unestablished, placement is not
+compared, and this comparison is now left where it is.  NOT READY.
 
 ## Rejected shortcuts
 
