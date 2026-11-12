@@ -216,9 +216,11 @@ not run it; executed in round 140 from the `f57c840` wheel on the card
 under the device lock (VALIDATION round 140: the cost perturbation moves
 the 64x128x33 GEMM from `single/k2` to `single/k1`, 2,713 to 3,441 cycles,
 the forced `separate/k1` BiCG against the default `fused/k1`, 2,516 to
-5,082, every launch exact), to be repeated from the final candidate's
-wheel if that revision differs (mechanism traces, not performance
-sessions).  (3) The APU
+5,082, every launch exact), and repeated in round 174 from the accepted
+candidate `40f9b64`'s wheel on the card (VALIDATION round 174: `single/k2`
+to `single/k1`, 2,716 to 3,457 cycles; the forced `separate/k1` against the
+default `fused/k1`, 2,552 to 5,054; every launch exact; mechanism traces,
+not performance sessions), so item (2) is executed at the candidate.  (3) The APU
 v1 side of slice 5 is demonstrated at `c762d4d` (round 136) and the
 runtime's failure evidence is complete since `dbe0543` (V1-21); the round
 136 lost sample itself stays unverified.  (4) The round 139 review's own
@@ -277,8 +279,10 @@ device lock), so they are no longer inherited.  Still executed at no
 candidate but `c762d4d`: item (3), the APU v1 vector-path execution with the
 forced plan and the cost perturbation; still owed at the accepted
 candidate: that execution and the Gemini-I remaining quota.  The Gemini-I pooler and campaign accept the
-transition only through the verified installation-equivalence manifest of
-round 159 (`r159/installation_equivalence.json`, ISSUES X-49).  Apart from items (1), (2) and the unverified sample,
+transitions only through verified installation-equivalence manifests
+(round 159, `r159/installation_equivalence.json`, `f57c840` to `273305c`;
+round 170, `r170/installation_equivalence.json`, `f57c840`, `273305c` and the
+accepted candidate `40f9b64`; ISSUES X-49).  Apart from items (1), (2) and the unverified sample,
 nothing else of G9 is open: the migration, the matcher-backend contracts,
 the retained-IR manifest and the hardware provenance bindings are recorded
 above.
