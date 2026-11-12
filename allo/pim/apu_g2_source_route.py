@@ -1063,10 +1063,14 @@ def _source_operand(contract, name, value) -> np.ndarray:
         raise ValueError(
             f"argument '{name}' must have shape {shape}, got {array.shape}"
         )
-    wide = array.astype(np.int64)
-    if np.any(wide < scalar.minimum) or np.any(wide > scalar.maximum):
-        raise ValueError(f"argument '{name}' has values outside {scalar.name}")
-    return wide
+    # The range check reads the original integers (release ledger G2-18): converting an
+    # unsigned 64-bit container to int64 first wrapped 2**64 - 8 to -8 and let it pass an
+    # int4 check.  The array's extrema are exact as Python ints for every integer dtype.
+    if array.size:
+        low, high = int(array.min()), int(array.max())
+        if low < scalar.minimum or high > scalar.maximum:
+            raise ValueError(f"argument '{name}' has values outside {scalar.name}")
+    return array.astype(np.int64)
 
 
 def apu_g2_stream_dots(

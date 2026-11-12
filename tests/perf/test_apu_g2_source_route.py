@@ -1039,3 +1039,48 @@ def test_emulated_launch_records_forward_the_runtime_provenance(
     assert len(set(commands)) == len(commands)
     assert len({record["program_fingerprint"] for record in launches}) >= 1
     assert len({json.dumps(record["raw_ticks"]) for record in launches}) >= 1
+
+
+def test_operand_range_is_checked_on_the_original_integers_before_conversion():
+    """G2-18: the source route converted operands to int64 before checking the
+    declared range, so the uint64 values 2**64 - 8 and 2**64 - 1 wrapped to -8
+    and -1 and passed an int4 input's check while 8 was rightly refused
+    (reviewer probe, round 190).  The check now reads the original integers:
+    the wrapped values are refused before any dispatch, the valid endpoints
+    and ordinary out-of-range values behave as before, and valid values in
+    wider containers of either signedness stay accepted."""
+
+    def row_products(matrix: int4[3, 8], vector: int4[8], destination: int11[3]):
+        for row in range(3):
+            total: int11 = 0
+            for col in range(8):
+                total += matrix[row, col] * vector[col]
+            destination[row] = total
+
+    compiled = _compile(row_products, backend="virtual")
+    vector = np.ones(8, dtype=np.int8)
+    destination = np.zeros(3, dtype=np.int16)
+
+    def pack_with(value, dtype):
+        return compiled.pack(
+            matrix=np.full((3, 8), value, dtype=dtype),
+            vector=vector,
+            destination=destination,
+        )
+
+    # valid endpoints, in narrow and wide containers of either signedness
+    for value, dtype in ((7, np.uint64), (7, np.int64), (7, np.uint8), (-8, np.int64), (-8, np.int8), (0, np.uint32)):
+        (packed,) = pack_with(value, dtype)
+        assert set(np.unique(packed["lhs"]).tolist()) <= {0, value}
+    # ordinary out-of-range values are refused
+    for value, dtype in ((8, np.uint64), (8, np.int64), (-9, np.int64), (-9, np.int16)):
+        with pytest.raises(ValueError, match="argument 'matrix' has values outside int4"):
+            pack_with(value, dtype)
+    # the wrapped unsigned values are refused, not accepted as -8 and -1
+    for value in ((1 << 64) - 8, (1 << 64) - 1):
+        with pytest.raises(ValueError, match="argument 'matrix' has values outside int4"):
+            pack_with(value, np.uint64)
+    # a non-integer container is still a type error
+    with pytest.raises(TypeError, match="must be an integer NumPy array"):
+        pack_with(7.0, np.float64)
+
