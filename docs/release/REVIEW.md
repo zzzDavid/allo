@@ -3667,12 +3667,20 @@ percent above the paper.  The current programs, compiled through the
 public route, are the paper's archived programs in every compared
 identity: layout, the exact device call sequence and its fingerprint,
 the certificate, every program field, the timed scope and its one
-barrier.  The only thing that differs is the build of the Tenon device
-library, and the vendor binary that did not change at all drifted
-further from its own paper value than Tenon did, across eleven sessions.
-There is no production cause here to repair, and none is claimed; the
-fixed outcomes stand as fixed.  NOT READY: the Gemini-I quota waits for
-the host's scratch, and the final decision remains.
+barrier.  The Tenon device library was rebuilt from the same
+composed-dot source; the vendor binary that did not change at all
+drifted further from its own paper value than Tenon did across eleven
+sessions, and the two lanes' deviations are weakly correlated.  That
+supports one statement and not a stronger one: no production cause is
+established in the generated work or the timing boundary.  It does not
+prove the drift environmental and does not exclude every production
+cause (the round 145 wording claimed more, and said the session
+GTML/Tenon ratios were all at or above the paper's when five mvt
+sessions were below; corrected in round 146).  Nothing is repaired
+because nothing was found to repair; the outcomes stay OPEN (nominal)
+under the fixed rule, and no further unchanged-program session or
+repeat of this investigation is owed.  NOT READY: the Gemini-I quota
+waits for the host's scratch, and the final decision remains.
 
 ## Rejected shortcuts
 
