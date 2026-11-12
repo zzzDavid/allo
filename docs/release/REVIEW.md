@@ -3589,8 +3589,17 @@ quota.  The card chain passed from the candidate's sdist built on the
 card host and the local milestone passed all forty-two stages with every
 count equal to round 139's, so `f57c840` carries what the final-candidate
 decision requires; the pre-registered Gemini-I confirmation campaign was
-launched at it only after both had passed.  `dbe0543` stays the packaged
-working checkpoint pending the decision.  NOT READY: the five required G10 cases,
+launched at it only after both had passed.  The campaign got one session:
+kmeans and word count complete and nominal, kmeans one cycle above the
+paper's median with the paper-era binary slower in the same rounds,
+linear regression's control lane losing one launch (its diagnostics kept
+this time); then the host's scratch, which other users had drained from
+fifteen gigabytes to five megabytes over the afternoon, refused every
+launch of the second and third sessions through the headroom guard, each
+refusal recorded.  Nothing was retried; the statuses are the pooled
+medians of what completed, and the lost sessions are the reviewer's to
+dispose of.  `dbe0543` stays the packaged working checkpoint pending the
+decision.  NOT READY: the five required G10 cases,
 the invariant review at the final candidate and the final decision
 remain.
 
