@@ -460,7 +460,8 @@ def _package_root(allo_init):
 
     root = os.path.dirname(allo_init)
     _require(
-        os.path.basename(allo_init) == "__init__.py" and os.path.basename(root) == "allo",
+        os.path.basename(allo_init) == "__init__.py"
+        and os.path.basename(root) == "allo",
         f"not an installed allo package path: {allo_init!r}",
     )
     return root
@@ -487,7 +488,9 @@ def _file_sha256(path):
         return hashlib.sha256(fh.read()).hexdigest()
 
 
-def write_equivalence(out_path, installations, allowed, substitutions, decision):
+def write_equivalence(
+    out_path, installations, allowed, substitutions, decision, allowed_absent=()
+):
     """Write an installation-equivalence manifest from live artifacts.
 
     ``installations``: ``[(allo_init_path, wheel_path, revision), ...]``;
@@ -495,12 +498,16 @@ def write_equivalence(out_path, installations, allowed, substitutions, decision)
     delta allows to differ; ``substitutions``: ``[(old, new), ...]`` byte
     strings whose substitution must make an allowed file identical (embedded
     build paths).  Every file of every installation is hashed now; the pooler
-    re-hashes at use and refuses any drift."""
+    re-hashes at use and refuses any drift.  ``allowed_absent``: ``[(relative file,
+    reason), ...]`` the files the reviewed delta removed, present in some listed
+    installations and absent from others (release ledger C-10, round 195); any
+    other file present in one installation and not another is refused."""
     manifest = {
         "schema": EQUIVALENCE_SCHEMA,
         "decision": decision,
         "installations": [],
         "allowed_differences": [{"file": f, "reason": r} for f, r in allowed],
+        "allowed_absent": [{"file": f, "reason": r} for f, r in allowed_absent],
         "substitutions": [[a, b] for a, b in substitutions],
     }
     for allo_init, wheel, revision in installations:
@@ -592,14 +599,29 @@ def installations_equivalent(manifest, allo_a, allo_b):
     if os.path.realpath(allo_a) == os.path.realpath(allo_b):
         return True  # the same installation, verified against the manifest
     eb = _verify_installation(manifest, allo_b)
-    allowed = {d["file"]: d.get("reason", "") for d in manifest.get("allowed_differences", [])}
+    allowed = {
+        d["file"]: d.get("reason", "") for d in manifest.get("allowed_differences", [])
+    }
+    allowed_absent = {
+        d["file"]: d.get("reason", "") for d in manifest.get("allowed_absent", [])
+    }
     files_a, files_b = ea["files"], eb["files"]
+    only_one = sorted(set(files_a) ^ set(files_b))
+    unexpected_sets = [f for f in only_one if f not in allowed_absent]
     _require(
-        set(files_a) == set(files_b),
+        not unexpected_sets,
         "the two installations do not have the same files: "
-        f"only in one: {sorted(set(files_a) ^ set(files_b))[:5]}",
+        f"only in one: {unexpected_sets[:5]}",
     )
-    differing = sorted(f for f in files_a if files_a[f] != files_b[f])
+    for f in only_one:
+        # an allowed removed file: recorded (and live-verified above) where it is
+        # present, and verified absent from the disk of the installation that lacks it
+        lacking = allo_b if f in files_a else allo_a
+        _require(
+            not os.path.exists(os.path.join(_package_root(lacking), f)),
+            f"removed file {f!r} is present on disk in {lacking!r} but not in its manifest record",
+        )
+    differing = sorted(f for f in files_a if f in files_b and files_a[f] != files_b[f])
     unexpected = [f for f in differing if f not in allowed]
     _require(
         not unexpected,
@@ -672,7 +694,11 @@ def check_compatible(reference, other, label):
             f"{label}: installed package {other['allo']!r} differs from the first "
             f"session's {reference['allo']!r} (no equivalence manifest given)",
         )
-        key = tuple(sorted((os.path.realpath(reference["allo"]), os.path.realpath(other["allo"]))))
+        key = tuple(
+            sorted(
+                (os.path.realpath(reference["allo"]), os.path.realpath(other["allo"]))
+            )
+        )
         if key not in _EQUIVALENCE["verified_pairs"]:
             try:
                 installations_equivalent(manifest, reference["allo"], other["allo"])
@@ -824,7 +850,11 @@ def pool(validated, labels, *, quota, row_quota=None):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--out", default=None, help="the pooled result (required unless --write-equivalence)")
+    ap.add_argument(
+        "--out",
+        default=None,
+        help="the pooled result (required unless --write-equivalence)",
+    )
     ap.add_argument("--measured", type=int, default=10)
     ap.add_argument("--warmups", type=int, default=1)
     ap.add_argument("--required-lanes", default="tenon,expert,historical_binary")
@@ -882,29 +912,54 @@ def main(argv=None):
         default=[],
         help="OLD=NEW: byte strings whose substitution makes an allowed non-Python file identical",
     )
-    ap.add_argument("--decision", default="", help="the reviewed decision the manifest records")
+    ap.add_argument(
+        "--allow-absent",
+        action="append",
+        default=[],
+        help="RELATIVE_FILE=REASON: a file the reviewed delta removed, present in some listed "
+        "installations and absent from others (any other file-set difference is refused)",
+    )
+    ap.add_argument(
+        "--decision", default="", help="the reviewed decision the manifest records"
+    )
     ap.add_argument("files", nargs="*")
     args = ap.parse_args(argv)
     if args.write_equivalence:
         if not args.installation or not args.decision:
-            print("--write-equivalence needs --installation entries and --decision", file=sys.stderr)
+            print(
+                "--write-equivalence needs --installation entries and --decision",
+                file=sys.stderr,
+            )
             return 2
         installations = []
         for item in args.installation:
             parts = item.split(":")
             if len(parts) != 3:
-                print(f"--installation expects ALLO_INIT_PATH:WHEEL_PATH:REVISION, got {item!r}", file=sys.stderr)
+                print(
+                    f"--installation expects ALLO_INIT_PATH:WHEEL_PATH:REVISION, got {item!r}",
+                    file=sys.stderr,
+                )
                 return 2
             installations.append(tuple(parts))
         allowed = [tuple(a.split("=", 1)) for a in args.allow]
+        allowed_absent = [tuple(a.split("=", 1)) for a in args.allow_absent]
         substitutions = [tuple(s.split("=", 1)) for s in args.substitution]
         try:
-            manifest = write_equivalence(args.write_equivalence, installations, allowed, substitutions, args.decision)
+            manifest = write_equivalence(
+                args.write_equivalence,
+                installations,
+                allowed,
+                substitutions,
+                args.decision,
+                allowed_absent,
+            )
         except (SessionInvalid, OSError) as exc:
             print(f"equivalence manifest not written: {exc}", file=sys.stderr)
             return 2
         for entry in manifest["installations"]:
-            print(f"installation {entry['allo']}: {len(entry['files'])} files, wheel {entry['wheel_sha256'][:16]}, revision {entry['revision']}")
+            print(
+                f"installation {entry['allo']}: {len(entry['files'])} files, wheel {entry['wheel_sha256'][:16]}, revision {entry['revision']}"
+            )
         print(f"wrote {args.write_equivalence}")
         return 0
     if not args.files:
@@ -927,10 +982,15 @@ def main(argv=None):
         try:
             # the package under test is verified against the manifest on its
             # own, before any session is compared with it
-            verify_installation_under_manifest(args.preflight_install, "preflight installation")
+            verify_installation_under_manifest(
+                args.preflight_install, "preflight installation"
+            )
         except SessionInvalid as exc:
             print(f"INCOMPATIBLE: {exc}", file=sys.stderr)
-            print(f"preflight: {args.preflight_install} fails the equivalence manifest; nothing launched", file=sys.stderr)
+            print(
+                f"preflight: {args.preflight_install} fails the equivalence manifest; nothing launched",
+                file=sys.stderr,
+            )
             return 2
         for f in args.files:
             try:
@@ -946,9 +1006,14 @@ def main(argv=None):
                 problems.append(str(exc))
                 print(f"INCOMPATIBLE: {exc}", file=sys.stderr)
         if problems:
-            print(f"preflight: {len(problems)} session file(s) cannot pool with {args.preflight_install}; nothing launched", file=sys.stderr)
+            print(
+                f"preflight: {len(problems)} session file(s) cannot pool with {args.preflight_install}; nothing launched",
+                file=sys.stderr,
+            )
             return 2
-        print(f"preflight: {args.preflight_install} may pool with all {len(args.files)} session file(s)")
+        print(
+            f"preflight: {args.preflight_install} may pool with all {len(args.files)} session file(s)"
+        )
         return 0
     lanes = tuple(x for x in args.required_lanes.split(",") if x)
     if not lanes or lanes[0] != "tenon":

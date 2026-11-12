@@ -786,7 +786,9 @@ def test_per_row_quota_and_the_remaining_plan(pool, tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def _install(root, name, *, module_text="CHECK = 'old'\n", build_tag="pkgA", drift=None):
+def _install(
+    root, name, *, module_text="CHECK = 'old'\n", build_tag="pkgA", drift=None
+):
     """A fake installed package: allo/__init__.py, two modules, a fake binding
     whose bytes embed a build path, and a wheel file.  Returns (allo_init, wheel)."""
     lib = root / name / "venv" / "lib" / "allo"
@@ -803,11 +805,26 @@ def _install(root, name, *, module_text="CHECK = 'old'\n", build_tag="pkgA", dri
     return str(lib / "__init__.py"), str(wheel)
 
 
-def _manifest(pool, out, a, b, allowed=(("spmw_autoschedule.py", "reviewed"), ("_binding.so", "build path")), subs=(("pkgA", "pkgB"),)):
-    return pool.write_equivalence(str(out), [(a[0], a[1], "revA"), (b[0], b[1], "revB")], list(allowed), list(subs), "test decision")
+def _manifest(
+    pool,
+    out,
+    a,
+    b,
+    allowed=(("spmw_autoschedule.py", "reviewed"), ("_binding.so", "build path")),
+    subs=(("pkgA", "pkgB"),),
+):
+    return pool.write_equivalence(
+        str(out),
+        [(a[0], a[1], "revA"), (b[0], b[1], "revB")],
+        list(allowed),
+        list(subs),
+        "test decision",
+    )
 
 
-def test_sessions_of_two_installations_pool_only_through_a_verified_manifest(pool, tmp_path):
+def test_sessions_of_two_installations_pool_only_through_a_verified_manifest(
+    pool, tmp_path
+):
     a = _install(tmp_path, "pkgA")
     b = _install(tmp_path, "pkgB", module_text="CHECK = 'new'\n", build_tag="pkgB")
     sa = make_session("sa", allo=a[0])
@@ -819,12 +836,30 @@ def test_sessions_of_two_installations_pool_only_through_a_verified_manifest(poo
         files.append(str(f))
     # without a manifest: refused as before
     pool.set_equivalence_manifest(None)
-    rc = pool.main(["--out", str(tmp_path / "o.json"), "--row-quota", "kmeans=3,word_count=3,linear_regression=3", *files])
+    rc = pool.main(
+        [
+            "--out",
+            str(tmp_path / "o.json"),
+            "--row-quota",
+            "kmeans=3,word_count=3,linear_regression=3",
+            *files,
+        ]
+    )
     assert rc == 2
     # with a manifest that lists both installations and the reviewed delta: pooled
     manifest = tmp_path / "eq.json"
     _manifest(pool, manifest, a, b)
-    rc = pool.main(["--equivalence", str(manifest), "--out", str(tmp_path / "o2.json"), "--row-quota", "kmeans=3,word_count=3,linear_regression=3", *files])
+    rc = pool.main(
+        [
+            "--equivalence",
+            str(manifest),
+            "--out",
+            str(tmp_path / "o2.json"),
+            "--row-quota",
+            "kmeans=3,word_count=3,linear_regression=3",
+            *files,
+        ]
+    )
     assert rc == 3  # two complete sessions per row, below the quota of three
     out = json.loads((tmp_path / "o2.json").read_text())
     assert out["rows"]["kmeans"]["complete_sessions"] == 2
@@ -832,11 +867,31 @@ def test_sessions_of_two_installations_pool_only_through_a_verified_manifest(poo
     link = tmp_path / "linkB"
     link.symlink_to(tmp_path / "pkgB")
     linked = str(link / "venv" / "lib" / "allo" / "__init__.py")
-    rc = pool.main(["--equivalence", str(manifest), "--out", "/dev/null", "--preflight-install", linked, *files])
+    rc = pool.main(
+        [
+            "--equivalence",
+            str(manifest),
+            "--out",
+            "/dev/null",
+            "--preflight-install",
+            linked,
+            *files,
+        ]
+    )
     assert rc == 0
     # preflight of an installation the manifest does not list: refused
     c = _install(tmp_path, "pkgC", build_tag="pkgC")
-    rc = pool.main(["--equivalence", str(manifest), "--out", "/dev/null", "--preflight-install", c[0], *files])
+    rc = pool.main(
+        [
+            "--equivalence",
+            str(manifest),
+            "--out",
+            "/dev/null",
+            "--preflight-install",
+            c[0],
+            *files,
+        ]
+    )
     assert rc == 2
 
 
@@ -851,7 +906,9 @@ def test_manifest_refusals(pool, tmp_path):
     pim_b = Path(b[0]).parent / "pim" / "__init__.py"
     original = pim_b.read_text()
     pim_b.write_text("PIM = 2\n")
-    with pytest.raises(pool.SessionInvalid, match="differs from the manifest's recorded files"):
+    with pytest.raises(
+        pool.SessionInvalid, match="differs from the manifest's recorded files"
+    ):
         pool.installations_equivalent(loaded, a[0], b[0])
     # the same drift recorded in a fresh manifest is still refused: outside the allowed set
     fresh = tmp_path / "eq2.json"
@@ -862,7 +919,9 @@ def test_manifest_refusals(pool, tmp_path):
     # (2) the allowed module changed after the manifest was written (an unreviewed delta): refused
     mod_b = Path(b[0]).parent / "spmw_autoschedule.py"
     mod_b.write_text("CHECK = 'newer'\n")
-    with pytest.raises(pool.SessionInvalid, match="differs from the manifest's recorded files"):
+    with pytest.raises(
+        pool.SessionInvalid, match="differs from the manifest's recorded files"
+    ):
         pool.installations_equivalent(loaded, a[0], b[0])
     mod_b.write_text("CHECK = 'new'\n")
     # (3) the binding differs beyond the recorded substitution: refused
@@ -875,7 +934,9 @@ def test_manifest_refusals(pool, tmp_path):
     bind_b.write_bytes(b"\x7fELF/build/pkgB/src")
     # (4) the wheel no longer matches the manifest: refused
     Path(b[1]).write_bytes(b"another wheel")
-    with pytest.raises(pool.SessionInvalid, match="does not match the manifest's sha256"):
+    with pytest.raises(
+        pool.SessionInvalid, match="does not match the manifest's sha256"
+    ):
         pool.installations_equivalent(loaded, a[0], b[0])
     Path(b[1]).write_bytes(b"wheel-pkgB")
     # (5) a manifest without a decision or with another schema is refused outright
@@ -890,7 +951,9 @@ def test_manifest_refusals(pool, tmp_path):
         pool.load_equivalence(str(tmp_path / "bad2.json"))
     # (6) an installation the manifest does not list
     c = _install(tmp_path, "pkgC", build_tag="pkgC")
-    with pytest.raises(pool.SessionInvalid, match="not listed in the equivalence manifest"):
+    with pytest.raises(
+        pool.SessionInvalid, match="not listed in the equivalence manifest"
+    ):
         pool.installations_equivalent(loaded, a[0], c[0])
     # the untouched pair still verifies
     assert pool.installations_equivalent(loaded, a[0], b[0]) is True
@@ -917,16 +980,69 @@ def test_same_installation_drift_is_refused_under_a_manifest(pool, tmp_path):
     a, b, manifest, session = _single_install_setup(pool, tmp_path)
     quota = ["--row-quota", "kmeans=3,word_count=3,linear_regression=3"]
     # the untouched installation: preflight and the single-session pool pass under the manifest
-    assert pool.main(["--equivalence", str(manifest), "--out", "/dev/null", "--preflight-install", a[0], str(session)]) == 0
-    assert pool.main(["--equivalence", str(manifest), "--out", str(tmp_path / "o.json"), *quota, str(session)]) == 3
+    assert (
+        pool.main(
+            [
+                "--equivalence",
+                str(manifest),
+                "--out",
+                "/dev/null",
+                "--preflight-install",
+                a[0],
+                str(session),
+            ]
+        )
+        == 0
+    )
+    assert (
+        pool.main(
+            [
+                "--equivalence",
+                str(manifest),
+                "--out",
+                str(tmp_path / "o.json"),
+                *quota,
+                str(session),
+            ]
+        )
+        == 3
+    )
     # a compiler file of that same installation changes after the manifest was written
     (Path(a[0]).parent / "pim" / "__init__.py").write_text("PIM = 99\n")
     # (1) the same-installation preflight is refused
-    assert pool.main(["--equivalence", str(manifest), "--out", "/dev/null", "--preflight-install", a[0], str(session)]) == 2
+    assert (
+        pool.main(
+            [
+                "--equivalence",
+                str(manifest),
+                "--out",
+                "/dev/null",
+                "--preflight-install",
+                a[0],
+                str(session),
+            ]
+        )
+        == 2
+    )
     # (2) the single-session pool is refused
-    assert pool.main(["--equivalence", str(manifest), "--out", str(tmp_path / "o2.json"), *quota, str(session)]) == 2
+    assert (
+        pool.main(
+            [
+                "--equivalence",
+                str(manifest),
+                "--out",
+                str(tmp_path / "o2.json"),
+                *quota,
+                str(session),
+            ]
+        )
+        == 2
+    )
     # without a manifest the identity behaviour is unchanged: the same path pools and preflights as before
-    assert pool.main(["--out", "/dev/null", "--preflight-install", a[0], str(session)]) == 0
+    assert (
+        pool.main(["--out", "/dev/null", "--preflight-install", a[0], str(session)])
+        == 0
+    )
     assert pool.main(["--out", str(tmp_path / "o3.json"), *quota, str(session)]) == 3
 
 
@@ -936,16 +1052,68 @@ def test_unlisted_same_installation_is_refused_under_a_manifest(pool, tmp_path):
     session_c = tmp_path / "sc.json"
     session_c.write_text(json.dumps(make_session("c", allo=c[0])))
     # (3) the preflight of an installation the manifest does not list, against its own session
-    assert pool.main(["--equivalence", str(manifest), "--out", "/dev/null", "--preflight-install", c[0], str(session_c)]) == 2
+    assert (
+        pool.main(
+            [
+                "--equivalence",
+                str(manifest),
+                "--out",
+                "/dev/null",
+                "--preflight-install",
+                c[0],
+                str(session_c),
+            ]
+        )
+        == 2
+    )
     # and the single-session pool of that unlisted installation under the manifest
-    assert pool.main(["--equivalence", str(manifest), "--out", str(tmp_path / "o.json"), "--row-quota", "kmeans=3,word_count=3,linear_regression=3", str(session_c)]) == 2
+    assert (
+        pool.main(
+            [
+                "--equivalence",
+                str(manifest),
+                "--out",
+                str(tmp_path / "o.json"),
+                "--row-quota",
+                "kmeans=3,word_count=3,linear_regression=3",
+                str(session_c),
+            ]
+        )
+        == 2
+    )
     # the symlink alias of a listed installation is verified as that installation
     link = tmp_path / "aliasA"
     link.symlink_to(tmp_path / "pkgA")
     alias = str(link / "venv" / "lib" / "allo" / "__init__.py")
-    assert pool.main(["--equivalence", str(manifest), "--out", "/dev/null", "--preflight-install", alias, str(_session)]) == 0
+    assert (
+        pool.main(
+            [
+                "--equivalence",
+                str(manifest),
+                "--out",
+                "/dev/null",
+                "--preflight-install",
+                alias,
+                str(_session),
+            ]
+        )
+        == 0
+    )
     (Path(a[0]).parent / "spmw_autoschedule.py").write_text("CHECK = 'tampered'\n")
-    assert pool.main(["--equivalence", str(manifest), "--out", "/dev/null", "--preflight-install", alias, str(_session)]) == 2
+    assert (
+        pool.main(
+            [
+                "--equivalence",
+                str(manifest),
+                "--out",
+                "/dev/null",
+                "--preflight-install",
+                alias,
+                str(_session),
+            ]
+        )
+        == 2
+    )
 
 
 def test_verification_cache_is_scoped_to_the_manifest_invocation(pool, tmp_path):
@@ -953,8 +1121,82 @@ def test_verification_cache_is_scoped_to_the_manifest_invocation(pool, tmp_path)
     loaded = pool.load_equivalence(str(manifest))
     pool.set_equivalence_manifest(loaded)
     assert pool.verify_installation_under_manifest(a[0], "first") is not None
-    assert Path(a[0]).parent.resolve().as_posix() in {Path(k).parent.resolve().as_posix() for k in pool._EQUIVALENCE["verified_installations"]}
+    assert Path(a[0]).parent.resolve().as_posix() in {
+        Path(k).parent.resolve().as_posix()
+        for k in pool._EQUIVALENCE["verified_installations"]
+    }
     pool.set_equivalence_manifest(loaded)  # a new invocation starts empty
-    assert pool._EQUIVALENCE["verified_installations"] == {} and pool._EQUIVALENCE["verified_pairs"] == set()
+    assert (
+        pool._EQUIVALENCE["verified_installations"] == {}
+        and pool._EQUIVALENCE["verified_pairs"] == set()
+    )
     pool.set_equivalence_manifest(None)
     assert pool.verify_installation_under_manifest(a[0], "none") is None
+
+
+def test_a_removed_file_pools_only_when_the_manifest_allows_its_absence(pool, tmp_path):
+    """Round 195 (C-10): a reviewed delta may remove a file, so two installations
+    may differ in their file sets by exactly the files the manifest lists as
+    allowed absent; any other addition or removal is refused, the file's
+    presence is live-verified where it exists, and its absence is verified
+    on disk where it does not."""
+
+    def remove_pim_init(lib):
+        (lib / "pim" / "__init__.py").unlink()
+
+    a = _install(tmp_path, "pkgA")
+    b = _install(tmp_path, "pkgB", build_tag="pkgB", drift=remove_pim_init)
+    # without the allowance: the file-set difference is refused
+    plain = tmp_path / "eq_plain.json"
+    _manifest(pool, plain, a, b)
+    with pytest.raises(pool.SessionInvalid, match="do not have the same files"):
+        pool.installations_equivalent(pool.load_equivalence(str(plain)), a[0], b[0])
+    # with the allowance: accepted both ways
+    allowed = tmp_path / "eq_absent.json"
+    pool.write_equivalence(
+        str(allowed),
+        [(a[0], a[1], "revA"), (b[0], b[1], "revB")],
+        [("spmw_autoschedule.py", "reviewed"), ("_binding.so", "build path")],
+        [("pkgA", "pkgB")],
+        "test decision",
+        allowed_absent=[("pim/__init__.py", "removed by the reviewed delta")],
+    )
+    loaded = pool.load_equivalence(str(allowed))
+    assert loaded["allowed_absent"] == [
+        {"file": "pim/__init__.py", "reason": "removed by the reviewed delta"}
+    ]
+    assert pool.installations_equivalent(loaded, a[0], b[0]) is True
+    assert pool.installations_equivalent(loaded, b[0], a[0]) is True
+    # the allowed-absent file reappearing in the installation that lacked it is drift, refused
+    lib_b = Path(b[0]).parent
+    (lib_b / "pim" / "__init__.py").write_text("PIM = 1\n")
+    with pytest.raises(
+        pool.SessionInvalid, match="differs from the manifest's recorded"
+    ):
+        pool.installations_equivalent(loaded, a[0], b[0])
+    (lib_b / "pim" / "__init__.py").unlink()
+    assert pool.installations_equivalent(loaded, a[0], b[0]) is True
+
+
+def test_an_unlisted_file_set_difference_is_refused_even_beside_an_allowed_absence(
+    pool, tmp_path
+):
+    def remove_two(lib):
+        (lib / "pim" / "__init__.py").unlink()
+        (lib / "spmw_autoschedule.py").unlink()
+
+    a = _install(tmp_path, "pkgA")
+    c = _install(tmp_path, "pkgC", build_tag="pkgC", drift=remove_two)
+    out = tmp_path / "eq_two.json"
+    pool.write_equivalence(
+        str(out),
+        [(a[0], a[1], "revA"), (c[0], c[1], "revC")],
+        [("_binding.so", "build path")],
+        [("pkgA", "pkgC")],
+        "test decision",
+        allowed_absent=[("pim/__init__.py", "removed by the reviewed delta")],
+    )
+    with pytest.raises(
+        pool.SessionInvalid, match=r"do not have the same files.*spmw_autoschedule\.py"
+    ):
+        pool.installations_equivalent(pool.load_equivalence(str(out)), a[0], c[0])
