@@ -408,28 +408,28 @@ hybrid manifest from the retained IR, the slice 5 traces) is complete and
 recorded in VALIDATION.md and G9_EVIDENCE.md.
 
 1. G9 (G9_EVIDENCE.md section 6): item (1), the source-invariant review,
-   accepted at the final candidate  (round 141 review); item (2),
-   the Gemini-II slice 5 traces, executed at  (round 140). Still
+   accepted at the final candidate `f57c840` (round 141 review); item (2),
+   the Gemini-II slice 5 traces, executed at `f57c840` (round 140). Still
    explicit: the APU v1 vector-path execution with the forced plan and the
-   cost perturbation was last executed at  (round 136), not at
-   ; the round 136 lost sample stays unverified.
+   cost perturbation was last executed at `c762d4d` (round 136), not at
+   `f57c840`; the round 136 lost sample stays unverified.
 2. G10, Gemini-II gemm and mvt (X-34 / X-37, OPEN (nominal) under the
    fixed pooled rule): investigate production causes of the nominal gap in
    the selected programs and the packing (no new sessions of unchanged
    programs; a substantive mechanism repair is the only path to new
    validation).
 3. G10, Gemini-I kmeans, linear regression and word count (X-22 / X-23):
-   the pre-registered campaign at  has one complete session for
+   the pre-registered campaign at `f57c840` has one complete session for
    kmeans and word count (both OPEN (nominal)) and none for linear
    regression; the reviewer allows the environmental losses to be replaced
-   under the same campaign at  with the fixed remaining quota
+   under the same campaign at `f57c840` with the fixed remaining quota
    recorded in VALIDATION round 142 (two more complete sessions each for
    kmeans and word count, three for linear regression, every required lane
-   complete;  with  and
-   , pooled by ); every failed attempt is preserved,
+   complete; `docs/release/scripts/g1_campaign.sh` with `G1_SESSIONS` and
+   `G1_QUOTA`, pooled by `g1_pool.py`); every failed attempt is preserved,
    every complete row at this candidate is pooled, and no extra complete
    session is obtained to move a finished outcome; blocked while the board
-   host's  stays near 5 MiB.
+   host's `/tmp` stays near 5 MiB.
 4. Final candidate: declare one consolidated compiler revision, run the
    maintained installed-artifact milestone (42 stages) and the Gemini-II
    card chain at it, the Gemini-I confirmation campaign from its installed
