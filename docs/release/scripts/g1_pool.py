@@ -29,11 +29,27 @@ derived samples; no problem is recorded for the row.  A row that fails any of th
 is reported with its reasons and excluded; the other rows of the same
 session still pool (Gemini-I's per-row completeness rule).
 
-Across sessions: the installed package path, the protocol, the paper
-values, the fixture and oracle, the Tenon source, route and cost
-fingerprint, and the archived binaries must be identical for a row; two
-sessions presenting the same launch directories or the same measured
-evidence are duplicates and both are refused.
+Only a default-selection row counts as reproduction evidence: its label
+is ``default_selection``, the session records no cost perturbation, the
+Tenon lane declares no substituted source, and its launched source is the
+compiler-selected source (``launched_source_sha256`` equal to
+``device_source_sha256``, both valid); its route is the lane's native
+route (every launch's ``route`` equal to it) or its selected vector plan;
+its cost fingerprint is recorded.  A row that is a labelled control (a
+historical or substituted program, a forced plan, a perturbed cost) is
+validated the same way but reported under ``controls`` and never pooled.
+The launch sequence must be the driver's: every lane's warm-up in the
+protocol's lane order, then rounds 1..N with the lanes in that order on
+odd rounds and reversed on even rounds.
+
+Across sessions: the installed package path and host are checked against
+the first session, and each row is checked against its first complete
+occurrence in any session (so a row incomplete in the first session is
+still compared between the later sessions): protocol, paper values,
+fixtures, oracle, Tenon source, route and cost fingerprint, archived
+binaries and board lock must be identical; two sessions presenting the
+same launch directories or the same measured evidence are duplicates and
+both are refused.
 
 Rule (``docs/release/PAPER_REPRODUCTION.md``, round 31): the row's
 statistic is the median of the pooled Tenon samples of its complete rows at
@@ -95,11 +111,47 @@ def _sha(value):
     return isinstance(value, str) and bool(_SHA.match(value))
 
 
-def validate_row(record, *, measured, warmups, required_lanes):
+DEFAULT_LABEL = "default_selection"
+
+
+def row_kind(record, session_perturbation=None):
+    """``"default"`` for a default-selection row of an unperturbed session,
+    else ``"control"`` with the reason (a labelled control, a substituted
+    program or a perturbed cost program)."""
+    label = record.get("label")
+    tenon = (record.get("lanes") or {}).get("tenon") or {}
+    reasons = []
+    if label != DEFAULT_LABEL:
+        reasons.append(f"label {label!r}")
+    if tenon.get("substituted_source") not in (None, {}):
+        reasons.append("a substituted source")
+    if session_perturbation not in (None, "None", {}):
+        reasons.append(f"a perturbed cost program {session_perturbation!r}")
+    return ("control", "; ".join(reasons)) if reasons else ("default", "")
+
+
+def expected_launch_sequence(lanes, measured, warmups):
+    """The driver's launch order (``paper_rows.py``): every lane's warm-ups
+    in the protocol's lane order, then rounds 1..N with the lanes in that
+    order on odd rounds and reversed on even rounds."""
+    sequence = []
+    for _ in range(warmups):
+        for lane in lanes:
+            sequence.append((lane, "warmup", 0))
+    for rnd in range(1, measured + 1):
+        order = list(lanes) if rnd % 2 == 1 else list(reversed(lanes))
+        for lane in order:
+            sequence.append((lane, "measured", rnd))
+    return sequence
+
+
+def validate_row(
+    record, *, measured, warmups, required_lanes, session_perturbation=None
+):
     """The derived evidence of one row, or a list of reasons it is incomplete.
 
     Returns ``(evidence, problems)``: ``evidence`` is None when ``problems``
-    is non-empty.
+    is non-empty.  ``evidence["kind"]`` is ``"default"`` or ``"control"``.
     """
     problems = []
     case = record.get("case")
@@ -124,6 +176,22 @@ def validate_row(record, *, measured, warmups, required_lanes):
         if lane not in (protocol.get("lanes") or ()):
             problems.append(f"{case}: lane {lane!r} not in the protocol's lanes")
     if problems:
+        return None, problems
+    protocol_lanes = list(protocol.get("lanes") or ())
+    actual = [(l.get("lane"), l.get("kind"), l.get("round")) for l in launches]
+    expected = expected_launch_sequence(protocol_lanes, measured, warmups)
+    if actual != expected:
+        first = next(
+            (i for i, (a, b) in enumerate(zip(actual, expected)) if a != b),
+            min(len(actual), len(expected)),
+        )
+        problems.append(
+            f"{case}: the launch sequence is not the driver's interleaved order "
+            f"(first difference at launch {first}: recorded "
+            f"{actual[first] if first < len(actual) else None}, expected "
+            f"{expected[first] if first < len(expected) else None}; "
+            f"{len(actual)} recorded, {len(expected)} expected)"
+        )
         return None, problems
     paper = record.get("paper_tenon_cycles")
     if not isinstance(paper, (int, float)) or isinstance(paper, bool) or paper <= 0:
@@ -205,17 +273,19 @@ def validate_row(record, *, measured, warmups, required_lanes):
             if l.get("launch_dir"):
                 launch_dirs.append(l["launch_dir"])
             if lane == "tenon":
-                if l.get("launched_source_sha256") != lanes["tenon"].get(
+                if not _sha(l.get("launched_source_sha256")) or l.get(
                     "launched_source_sha256"
-                ):
+                ) != lanes["tenon"].get("launched_source_sha256"):
                     problems.append(
-                        f"{where}: launched source differs from the lane's declared source"
+                        f"{where}: launched source "
+                        f"{str(l.get('launched_source_sha256'))[:12]!r} is not the "
+                        "lane's declared launched source"
                     )
-                if lanes["tenon"].get("native_vector_route") is not None and l.get(
-                    "route"
-                ) != lanes["tenon"].get("native_vector_route"):
+                native = lanes["tenon"].get("native_vector_route")
+                if native is not None and l.get("route") != native:
                     problems.append(
-                        f"{where}: route {l.get('route')!r} differs from the lane's {lanes['tenon'].get('native_vector_route')!r}"
+                        f"{where}: route {l.get('route')!r} differs from the lane's "
+                        f"native route {native!r}"
                     )
             if l.get("kind") == "measured" and _positive_int(crun):
                 by_round.setdefault(l.get("round"), {})[lane] = crun
@@ -255,6 +325,41 @@ def validate_row(record, *, measured, warmups, required_lanes):
             )
     if len(locks) > 1:
         problems.append(f"{case}: launches under different board locks {sorted(locks)}")
+    # The Tenon lane's provenance: the compiler-selected source, the launched
+    # source bound to it, exactly one route form, the cost fingerprint.
+    tenon = lanes["tenon"]
+    selected_source = tenon.get("device_source_sha256")
+    launched_source = tenon.get("launched_source_sha256")
+    if not _sha(selected_source):
+        problems.append(
+            f"{case}/tenon: no valid compiler-selected source identity (device_source_sha256)"
+        )
+    if not _sha(launched_source):
+        problems.append(
+            f"{case}/tenon: no valid launched source identity (launched_source_sha256)"
+        )
+    kind, kind_reason = row_kind(record, session_perturbation)
+    if (
+        kind == "default"
+        and _sha(selected_source)
+        and launched_source != selected_source
+    ):
+        problems.append(
+            f"{case}/tenon: the launched source is not the compiler-selected source"
+        )
+    native = tenon.get("native_vector_route")
+    plan = tenon.get("selected_plan")
+    if bool(native) == bool(plan):
+        problems.append(
+            f"{case}/tenon: exactly one route form is required "
+            f"(native_vector_route {native!r}, selected_plan {plan!r})"
+        )
+    elif not isinstance(native or plan, str):
+        problems.append(f"{case}/tenon: the route identity is not a name")
+    if not isinstance(tenon.get("cost_fingerprint"), str) or not tenon.get(
+        "cost_fingerprint"
+    ):
+        problems.append(f"{case}/tenon: no cost fingerprint")
     if problems:
         return None, problems
     paired = []
@@ -266,15 +371,18 @@ def validate_row(record, *, measured, warmups, required_lanes):
             paired.append(lanes_in_round["expert"] / lanes_in_round["tenon"])
     evidence = {
         "case": case,
+        "kind": kind,
+        "kind_reason": kind_reason,
+        "label": record.get("label"),
         "paper_tenon": paper,
         "paper_expert": record.get("paper_expert_cycles"),
         "protocol": protocol,
         "inputs": inputs,
         "oracle": oracle,
         "board_lock": sorted(locks)[0] if locks else None,
-        "tenon_source": lanes["tenon"].get("launched_source_sha256"),
-        "tenon_route": lanes["tenon"].get("native_vector_route")
-        or lanes["tenon"].get("selected_plan"),
+        "tenon_source": launched_source,
+        "selected_source": selected_source,
+        "tenon_route": native or plan,
         "cost_fingerprint": lanes["tenon"].get("cost_fingerprint"),
         "binaries": binaries,
         "samples": samples,
@@ -296,18 +404,25 @@ def validate_session(d, *, measured, warmups, required_lanes):
     for key in ("host", "allo", "records"):
         _require(key in d, f"missing field {key!r}")
     _require(isinstance(d["records"], list) and d["records"], "no records")
-    rows, incomplete = {}, {}
+    rows, controls, incomplete = {}, {}, {}
     for record in d["records"]:
         case = record.get("case")
         _require(isinstance(case, str) and case, "a record without a case name")
         _require(
-            case not in rows and case not in incomplete, f"two records for {case!r}"
+            case not in rows and case not in incomplete and case not in controls,
+            f"two records for {case!r}",
         )
         evidence, problems = validate_row(
-            record, measured=measured, warmups=warmups, required_lanes=required_lanes
+            record,
+            measured=measured,
+            warmups=warmups,
+            required_lanes=required_lanes,
+            session_perturbation=d.get("perturbation"),
         )
         if evidence is None:
             incomplete[case] = problems
+        elif evidence["kind"] == "control":
+            controls[case] = evidence
         else:
             rows[case] = evidence
     return {
@@ -315,51 +430,76 @@ def validate_session(d, *, measured, warmups, required_lanes):
         "allo": d["allo"],
         "date": d.get("date"),
         "status": d.get("status"),
+        "perturbation": d.get("perturbation"),
         "rows": rows,
+        "controls": controls,
         "incomplete": incomplete,
     }
 
 
+ROW_IDENTITY = (
+    "paper_tenon",
+    "paper_expert",
+    "protocol",
+    "inputs",
+    "oracle",
+    "tenon_source",
+    "selected_source",
+    "tenon_route",
+    "cost_fingerprint",
+    "board_lock",
+)
+
+
 def check_compatible(reference, other, label):
+    """The session-level identities against the first session."""
     _require(
         reference["allo"] == other["allo"],
-        f"{label}: installed package {other['allo']!r} differs from the first session's {reference['allo']!r}",
+        f"{label}: installed package {other['allo']!r} differs from the first "
+        f"session's {reference['allo']!r}",
     )
     _require(
         reference["host"] == other["host"],
         f"{label}: host differs from the first session",
     )
-    for case, a in reference["rows"].items():
-        b = other["rows"].get(case)
-        if b is None:
-            continue
-        for key in (
-            "paper_tenon",
-            "paper_expert",
-            "protocol",
-            "inputs",
-            "oracle",
-            "tenon_source",
-            "tenon_route",
-            "cost_fingerprint",
-            "board_lock",
-        ):
-            _require(
-                a[key] == b[key],
-                f"{label}: {case} {key} differs from the first session",
-            )
-        for lane, hashes in a["binaries"].items():
-            if lane != "tenon":
-                _require(
-                    hashes == b["binaries"].get(lane),
-                    f"{label}: {case} {lane} archived binary differs from the first session",
-                )
+
+
+def check_rows_compatible(validated, labels):
+    """Every complete occurrence of a row (default or control) against the
+    row's first complete occurrence in any session, whatever the input
+    order; the reference holder is named in the message."""
+    reference = {}
+    for v, label in zip(validated, labels):
+        for group in ("rows", "controls"):
+            for case, e in v[group].items():
+                # default rows are compared with default rows; a labelled
+                # control (another program by design) with controls of the
+                # same label only
+                key = (case, group, e["label"] if group == "controls" else None)
+                ref = reference.get(key)
+                if ref is None:
+                    reference[key] = (e, label)
+                    continue
+                a, held = ref
+                for key in ROW_IDENTITY:
+                    _require(
+                        a[key] == e[key],
+                        f"{label}: {case} {key} differs from its first complete "
+                        f"occurrence in {held!r}",
+                    )
+                for lane, hashes in a["binaries"].items():
+                    if lane != "tenon":
+                        _require(
+                            hashes == e["binaries"].get(lane),
+                            f"{label}: {case} {lane} archived binary differs from "
+                            f"its first complete occurrence in {held!r}",
+                        )
 
 
 def check_duplicates(validated, labels):
     seen_dirs, seen_evidence = {}, {}
     for v, label in zip(validated, labels):
-        for case, e in v["rows"].items():
+        for case, e in list(v["rows"].items()) + list(v["controls"].items()):
             for directory in e["launch_dirs"]:
                 _require(
                     directory not in seen_dirs,
@@ -373,14 +513,15 @@ def check_duplicates(validated, labels):
             seen_evidence[e["evidence_key"]] = label
 
 
-def pool(validated, labels, *, quota):
+def pool(validated, labels, *, quota, row_quota=None):
     rows = {}
     cases = []
     for v in validated:
-        for case in list(v["rows"]) + list(v["incomplete"]):
+        for case in list(v["rows"]) + list(v["incomplete"]) + list(v["controls"]):
             if case not in cases:
                 cases.append(case)
     for case in cases:
+        case_quota = (row_quota or {}).get(case, quota)
         complete = [
             (v, label) for v, label in zip(validated, labels) if case in v["rows"]
         ]
@@ -389,11 +530,26 @@ def pool(validated, labels, *, quota):
             for v, label in zip(validated, labels)
             if case in v["incomplete"]
         }
+        controls = {
+            label: {
+                "label": v["controls"][case]["label"],
+                "reason": v["controls"][case]["kind_reason"],
+                "launched_source_sha256": v["controls"][case]["tenon_source"],
+                "selected_source_sha256": v["controls"][case]["selected_source"],
+                "tenon_median": statistics.median(
+                    v["controls"][case]["samples"]["tenon"]
+                ),
+            }
+            for v, label in zip(validated, labels)
+            if case in v["controls"]
+        }
         if not complete:
             rows[case] = {
                 "complete_sessions": 0,
-                "quota": quota,
+                "quota": case_quota,
+                "remaining": case_quota,
                 "incomplete_sessions": incomplete,
+                "controls": controls,
                 "status": "no complete session",
             }
             continue
@@ -416,9 +572,11 @@ def pool(validated, labels, *, quota):
             status = "OPEN (regression)"
         rows[case] = {
             "complete_sessions": len(complete),
-            "quota": quota,
+            "quota": case_quota,
+            "remaining": max(0, case_quota - len(complete)),
             "sessions": [label for _v, label in complete],
             "incomplete_sessions": incomplete,
+            "controls": controls,
             "paper_tenon": paper,
             "paper_expert": ref["paper_expert"],
             "pooled_tenon": t,
@@ -431,6 +589,7 @@ def pool(validated, labels, *, quota):
                 (ref["paper_expert"] / paper) if ref["paper_expert"] else None
             ),
             "tenon_source_sha256": ref["tenon_source"],
+            "selected_source_sha256": ref["selected_source"],
             "tenon_route": ref["tenon_route"],
             "cost_fingerprint": ref["cost_fingerprint"],
             "binaries": ref["binaries"],
@@ -452,6 +611,16 @@ def main(argv=None):
         "--quota", type=int, default=3, help="pre-registered complete sessions per row"
     )
     ap.add_argument(
+        "--row-quota",
+        default="",
+        help="per-row quotas overriding --quota, e.g. kmeans=3,word_count=3,linear_regression=3",
+    )
+    ap.add_argument(
+        "--plan-out",
+        default=None,
+        help="also write the remaining per-row plan (complete rows still owed, the cases of the next session)",
+    )
+    ap.add_argument(
         "--exclude-invalid",
         action="store_true",
         help="pool the valid sessions and list the rejected files instead of failing",
@@ -462,6 +631,10 @@ def main(argv=None):
     if not lanes or lanes[0] != "tenon":
         print("the required lanes must start with 'tenon'", file=sys.stderr)
         return 2
+    row_quota = {}
+    for item in (x for x in args.row_quota.split(",") if x):
+        case, _eq, value = item.partition("=")
+        row_quota[case.strip()] = int(value)
     validated, labels, rejected = [], [], []
     for f in args.files:
         try:
@@ -472,6 +645,7 @@ def main(argv=None):
             )
             if validated:
                 check_compatible(validated[0], v, f)
+            check_rows_compatible(validated + [v], labels + [f])
             check_duplicates(validated + [v], labels + [f])
             validated.append(v)
             labels.append(f)
@@ -486,8 +660,30 @@ def main(argv=None):
     if not validated:
         print("no valid session", file=sys.stderr)
         return 2
-    rows = pool(validated, labels, quota=args.quota)
-    below = [case for case, r in rows.items() if r["complete_sessions"] < args.quota]
+    rows = pool(validated, labels, quota=args.quota, row_quota=row_quota)
+    for case in row_quota:
+        rows.setdefault(
+            case,
+            {
+                "complete_sessions": 0,
+                "quota": row_quota[case],
+                "remaining": row_quota[case],
+                "incomplete_sessions": {},
+                "controls": {},
+                "status": "no complete session",
+            },
+        )
+    below = [case for case, r in rows.items() if r["complete_sessions"] < r["quota"]]
+    plan = {
+        "remaining_complete_rows": {
+            case: r["remaining"] for case, r in rows.items() if r["remaining"]
+        },
+        "next_session_cases": [case for case, r in rows.items() if r["remaining"]],
+        "pooled_files": list(labels),
+    }
+    if args.plan_out:
+        with open(args.plan_out, "w") as fh:
+            json.dump(plan, fh, indent=1)
     for case, r in rows.items():
         if r["complete_sessions"]:
             t = r["pooled_tenon"]
@@ -498,8 +694,13 @@ def main(argv=None):
             print(f"{case}: 0/{args.quota} complete sessions -> {r['status']}")
         for label, problems in r["incomplete_sessions"].items():
             print(
-                f"   incomplete in {label}: {problems[0]}"
+                f"   incomplete in {label}: {problems[0][:200]}"
                 + (f" (+{len(problems) - 1} more)" if len(problems) > 1 else "")
+            )
+        for label, control in r.get("controls", {}).items():
+            print(
+                f"   control (not pooled) in {label}: {control['label']} "
+                f"({control['reason']}), tenon median {control['tenon_median']}"
             )
     with open(args.out, "w") as fh:
         json.dump(
@@ -525,6 +726,7 @@ def main(argv=None):
                 ],
                 "rejected_sessions": rejected,
                 "rows": rows,
+                "plan": plan,
                 "campaign_complete": not below,
             },
             fh,
@@ -533,7 +735,7 @@ def main(argv=None):
         )
     if below:
         print(
-            f"CAMPAIGN INCOMPLETE: rows below the quota of {args.quota}: {below}",
+            f"CAMPAIGN INCOMPLETE: rows below their quota: {plan['remaining_complete_rows']}",
             file=sys.stderr,
         )
         return 3
