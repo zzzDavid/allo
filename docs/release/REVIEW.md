@@ -4340,7 +4340,7 @@ The programs are the paper's; the paper's library is the candidate's
 code plus tasks since deleted, and that library is slower today, not
 faster; and now the statistic and the protocol are the same on both
 sides, with no warm-up effect inside a session.  Laid out session by
-session (five sessions as first written; all twelve retained sessions in
+session (five sessions as first written; all eleven retained sessions with per-round lanes in
 the round 188 correction), Tenon's gemm medians lie -0.41 to +0.48 percent from
 the paper's figure and the vendor's unchanged binary +0.02 to +0.96 percent
 from its own.  No production cause is established; the observations are
