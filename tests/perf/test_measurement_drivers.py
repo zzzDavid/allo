@@ -1419,3 +1419,111 @@ def test_plan_route_declares_the_realization_kernel_and_native_routes_the_device
         device_source=None, scratch=tmp_path / "hist",
     )
     assert hist.describe()["device_source_scope"] == "device_source"
+
+
+# --- round 149 (ISSUES X-48): the launched identity comes from the runtime only
+
+
+def _session_lane(tmp_path, compiled, *, scope="device_source"):
+    """A real TenonLane (no assets) usable through measure_case."""
+    lane = _tenon_lane(tmp_path, compiled)
+    lane.compile_seconds, lane.cost_fingerprint = 0.1, "0c6e5955e1663302"
+    lane.selection = {"native_vector_route": "gvml_route"} if scope == "device_source" else {"selected_plan": "acc8"}
+    lane.estimate_cycles = 1
+    lane.input_sha256, lane.oracle_sha256 = {"x": "1" * 64}, "c" * 64
+    lane.device_source_scope = scope
+    return lane
+
+
+def _device_result(source, **extra):
+    import numpy as np
+    from types import SimpleNamespace
+
+    payload = {"outputs": {"y": np.arange(4, dtype=np.uint16)}, "profile_text": "total - crun:7"}
+    if source is not None:
+        payload["device_source"] = source
+    payload.update(extra)
+    return lambda *args: SimpleNamespace(kind="device", cycles=7, stdout="device log", extra=payload)
+
+
+def _measure_with(monkeypatch, tmp_path, lane, measured=1):
+    fixtures = _load_g1_fixtures()
+    _fake_lanes(monkeypatch, fixtures, lose_after=10**6)
+    monkeypatch.setattr(paper_rows, "TenonLane", lambda *a, **k: lane)
+    return paper_rows.measure_case(
+        "kmeans", Path("/assets"), backend="device", measured=measured, expert=False,
+        layout=None, device_source=None, label=None, scratch=tmp_path / "session",
+    )
+
+
+def test_a_launch_without_runtime_source_is_recorded_but_not_evidence(monkeypatch, tmp_path):
+    lane = _session_lane(tmp_path, _device_result(None))
+    record = _measure_with(monkeypatch, tmp_path, lane)
+    launches = record["launches"]
+    assert len(launches) == 2
+    for launch in launches:
+        assert launch["crun"] == 7 and launch["outputs_match_oracle"] is True
+        assert launch["source_provenance"] == "missing"
+        assert launch["launched_source_sha256"] is None
+        assert launch["declared_source_sha256"] == lane.device_source_sha256
+        assert launch["launched_source_contains_declared"] is None
+        assert launch["error"].startswith("no device source provenance from the runtime")
+        kept = Path(launch["launch_dir"])
+        assert not (kept / "device.c").exists()
+        assert (kept / "declared_device.c").read_text() == lane.device_source
+        assert (kept / "outputs" / "y.uint16.bin").is_file()
+        assert (kept / "profile.txt").read_text() == "total - crun:7"
+        assert (kept / "device.log").read_text() == "device log"
+    assert record["problems"] and any("no device source provenance" in p for p in record["problems"])
+    assert record["lanes"]["tenon"]["statistics"] == {} and record["lanes"]["tenon"]["measured_crun"] == []
+    # no valid sample, so no performance evidence can be claimed
+    assert record.get("comparison", {}).get("performance_evidence") != "valid"
+
+
+def test_a_launch_whose_source_does_not_contain_the_declaration_is_excluded(monkeypatch, tmp_path):
+    lane = _session_lane(tmp_path, _device_result("int other(void) { return 2; }\n"))
+    record = _measure_with(monkeypatch, tmp_path, lane)
+    for launch in record["launches"]:
+        assert launch["source_provenance"] == "runtime"
+        assert launch["launched_source_contains_declared"] is False
+        assert launch["error"] == "the launched source does not contain the declared source"
+        assert (Path(launch["launch_dir"]) / "device.c").read_text().startswith("int other")
+    assert record["lanes"]["tenon"]["measured_crun"] == []
+    assert any("does not contain the declared source" in p for p in record["problems"])
+
+
+def test_native_and_wrapped_kernel_launches_are_valid_evidence(monkeypatch, tmp_path):
+    wrapped = "#include <x.h>\nint main(void) { return 0; }\nPROF_VAR(total);\n"
+    # both lanes are built before TenonLane is replaced for the sessions
+    native = _session_lane(tmp_path / "native", _device_result("int main(void) { return 0; }\n"))
+    plan = _session_lane(tmp_path / "plan", _device_result(wrapped), scope="realization_kernel")
+    # native route: the runtime launches the declared text itself
+    lane = native
+    record = _measure_with(monkeypatch, tmp_path / "native", lane)
+    assert record["problems"] == [] and record["lanes"]["tenon"]["measured_crun"] == [7]
+    assert record["lanes"]["tenon"]["launched_source_sha256"] == lane.device_source_sha256
+    for launch in record["launches"]:
+        assert launch["launched_source_contains_declared"] is True
+        assert launch["launched_source_sha256"] == lane.device_source_sha256
+    # plan route: the runtime wraps the declared kernel; the lane's launched
+    # identity is unknown before launching and filled from the launches
+    lane = plan
+    assert lane.describe()["launched_source_sha256"] is None
+    record = _measure_with(monkeypatch, tmp_path / "plan", lane)
+    assert record["problems"] == [] and record["lanes"]["tenon"]["measured_crun"] == [7]
+    assert record["lanes"]["tenon"]["launched_source_sha256"] == hashlib.sha256(wrapped.encode()).hexdigest()
+    assert record["lanes"]["tenon"]["launched_source_sha256_from"] == "runtime launches"
+    assert record["lanes"]["tenon"]["device_source_sha256"] == lane.device_source_sha256
+
+
+def test_a_failed_launch_records_no_manufactured_launched_identity(tmp_path):
+    def boom(*args):
+        raise RuntimeError("deliberate failure before any runtime evidence")
+
+    lane = _tenon_lane(tmp_path, boom)
+    entry = paper_rows.attempt_launch(lane)
+    assert entry["launched_source_sha256"] is None
+    assert entry["declared_source_sha256"] == lane.device_source_sha256
+    failed = tmp_path / "scratch" / "tenon-launch-001"
+    assert not (failed / "device.c").exists()
+    assert (failed / "declared_device.c").read_text() == lane.device_source

@@ -134,6 +134,9 @@ def _write_failure_diagnostics(launch_dir, message, diagnostics):
     source = diagnostics.pop("device_source", None)
     if source:
         (launch_dir / "device.c").write_text(source)
+    declared = diagnostics.pop("declared_device_source", None)
+    if declared:
+        (launch_dir / "declared_device.c").write_text(declared)
     before = diagnostics.pop("device_log_before", None)
     if before is not None:
         (launch_dir / "device_log_before.txt").write_text(before)
@@ -350,12 +353,19 @@ class TenonLane:
             # launch records whether it contains the declared text).
             "device_source_scope": self.device_source_scope,
             "substituted_source": self.substituted_source,
-            # The source this lane declares for its launches (a plan route's
-            # launches record the wrapped file's own identity as well).
+            # The launched identity this lane can declare before launching: a
+            # substituted control's text, or a native route's device source
+            # (the launched file).  A plan route's launched file is only known
+            # from the runtime's evidence and is filled in from the launches.
             "launched_source_sha256": (
                 self.substituted_source["sha256"]
                 if self.substituted_source
-                else self.device_source_sha256
+                else (
+                    self.device_source_sha256
+                    if getattr(self, "device_source_scope", "device_source")
+                    == "device_source"
+                    else None
+                )
             ),
             "inputs_sha256": self.input_sha256,
             "oracle_sha256": self.oracle_sha256,
@@ -380,10 +390,18 @@ class TenonLane:
         from allo.pim.apu_v1_program import APUV1LaunchFailure
 
         launch_dir = self._launch_dir()
-        launched_sha = (
+        # What the lane declared (kept apart from what the runtime reports
+        # it launched; the launched identity comes from runtime evidence
+        # only and is never manufactured from the declaration: X-48).
+        declared = (
             self.substituted_source["sha256"]
             if getattr(self, "substituted_source", None)
             else getattr(self, "device_source_sha256", None)
+        )
+        declared_text = (
+            Path(self.substituted_source["path"]).read_text()
+            if getattr(self, "substituted_source", None)
+            else getattr(self, "device_source", None)
         )
         fresh = {name: value.copy() for name, value in self.arguments.items()}
         try:
@@ -394,6 +412,7 @@ class TenonLane:
         except APUV1LaunchFailure as failure:
             # The runtime's structured diagnostics, serialized beside the
             # launch; the record carries no cycle count (ISSUES V1-21).
+            runtime_source = (failure.diagnostics or {}).get("device_source")
             diagnostics = _write_failure_diagnostics(
                 launch_dir, f"{type(failure).__name__}: {failure}", failure.diagnostics
             )
@@ -407,8 +426,10 @@ class TenonLane:
                     "argv": diagnostics.get("argv"),
                     "binary_sha256": diagnostics.get("binary_sha256"),
                     "binary_bytes": diagnostics.get("binary_bytes"),
+                    # runtime evidence only; None when the runtime had none
                     "launched_source_sha256": diagnostics.get("device_source_sha256")
-                    or launched_sha,
+                    or (_sha256_text(runtime_source) if runtime_source else None),
+                    "declared_source_sha256": declared,
                     "expected_records": diagnostics.get("expected_records"),
                     "fresh_records_found": diagnostics.get("fresh_records_found"),
                     "board_lock": diagnostics.get("board_lock"),
@@ -419,7 +440,7 @@ class TenonLane:
             _write_failure_diagnostics(
                 launch_dir,
                 f"{type(error).__name__}: {error}",
-                {"device_source": getattr(self, "device_source", None)},
+                {"declared_device_source": declared_text},
             )
             raise LaunchFailure(
                 {
@@ -427,7 +448,8 @@ class TenonLane:
                     "crun": None,
                     "outputs_match_oracle": None,
                     "launch_dir": str(launch_dir),
-                    "launched_source_sha256": launched_sha,
+                    "launched_source_sha256": None,
+                    "declared_source_sha256": declared,
                 }
             ) from error
         if result.kind != "device":
@@ -445,17 +467,15 @@ class TenonLane:
         # Retained per launch: the generated source that was built, the
         # actual output arrays, the profiler text and the device log, and
         # the identities tying them together.
-        source = extra.get("device_source") or getattr(self, "device_source", None)
+        # The launched source is the runtime's evidence only.  Without it
+        # the launch is recorded with everything it produced but is not
+        # evidence for the lane; the declaration is kept apart as
+        # declared_device.c and never saved as the launched device.c.
+        source = extra.get("device_source") or None
         if source:
             (launch_dir / "device.c").write_text(source)
-        declared = (
-            self.substituted_source and self.substituted_source.get("sha256")
-        ) or getattr(self, "device_source_sha256", None)
-        declared_text = (
-            Path(self.substituted_source["path"]).read_text()
-            if getattr(self, "substituted_source", None)
-            else getattr(self, "device_source", None)
-        )
+        elif declared_text:
+            (launch_dir / "declared_device.c").write_text(declared_text)
         contains = declared_source_in_launched(declared_text, source)
         outputs_dir = launch_dir / "outputs"
         outputs_dir.mkdir(exist_ok=True)
@@ -480,7 +500,8 @@ class TenonLane:
             "device_log": device_log,
             "route": extra.get("native_vector_route"),
             "scalar_arc": extra.get("scalar_arc"),
-            "launched_source_sha256": _sha256_text(source) if source else launched_sha,
+            "launched_source_sha256": _sha256_text(source) if source else None,
+            "source_provenance": "runtime" if source else "missing",
             "declared_source_sha256": declared,
             # False means the launched device.c does not contain the text
             # the lane declared: the launch is not evidence for the lane.
@@ -488,6 +509,15 @@ class TenonLane:
             "outputs_sha256": outputs_sha256,
             "launch_dir": str(launch_dir),
         }
+        if not source:
+            launch["error"] = (
+                "no device source provenance from the runtime: the launch is "
+                "recorded with its outputs, profile and device log, not evidence"
+            )
+        elif contains is False:
+            launch["error"] = (
+                "the launched source does not contain the declared source"
+            )
         (launch_dir / "launch.json").write_text(
             json.dumps(
                 _json_ready(
@@ -907,6 +937,23 @@ def measure_case(
     except _ScratchLost:
         pass  # recorded in record["incomplete"] and record["problems"]
 
+    # A plan route's launched identity is known only from the runtime: the
+    # one launched source of its valid launches, if they agree (X-48).
+    for lane_name, lane in lanes.items():
+        description = record["lanes"][lane_name]
+        if description.get("launched_source_sha256") is None and getattr(
+            lane, "device_source_scope", None
+        ) == "realization_kernel":
+            shas = {
+                l.get("launched_source_sha256")
+                for l in record["launches"]
+                if l["lane"] == lane_name
+                and not l.get("error")
+                and l.get("launched_source_sha256")
+            }
+            if len(shas) == 1:
+                description["launched_source_sha256"] = shas.pop()
+                description["launched_source_sha256_from"] = "runtime launches"
     # Statistics over valid measured launches only (an invalid launch is
     # recorded but never contributes a cycle count).
     for lane_name in lanes:
