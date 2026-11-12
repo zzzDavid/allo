@@ -256,7 +256,27 @@ programs; any claim of execution at `f57c840` requires that run); the
 Gemini-II slice 5 traces were executed at `f57c840` (round 140); the round
 136 lost linear-regression launch stays unverified; the Gemini-I
 confirmation campaign at `f57c840` is incomplete (VALIDATION rounds 141
-and 142).  Apart from items (1), (2) and the unverified sample,
+and 142).
+
+**Candidate transition (round 158 review, 2026-11-12).** `273305c` (the
+S-18 diagnostic repair: the Samsung enumerator's op-set check before role
+binding, the only compiler source change after `f57c840`) is accepted as
+the replacement compiler candidate for completing the gates.  Executed at
+`273305c` from its installed wheel `1e86935a...`: the Samsung lowering
+suite with the mixed-body regression, the joint-selection suite and the
+host-program suite (38 passed, VALIDATION round 158).  Inherited from
+`f57c840` through artifact identity, limited to the verified unchanged
+paths: 498 of the 501 installed files are byte-identical and the two
+compiled bindings are identical after the embedded build path is
+substituted, so items (1) and (2) above and the rounds 140, 141 and 157
+installed evidence describe the same code at `273305c` except the Samsung
+enumerator's refusal ordering; `f57c840`'s evidence keeps its own identity
+and is not relabeled.  Still executed at no candidate but `c762d4d`: item
+(3), the APU v1 vector-path execution with the forced plan and the cost
+perturbation; still owed at the accepted candidate: that execution and the
+Gemini-I remaining quota.  The Gemini-I pooler and campaign accept the
+transition only through the verified installation-equivalence manifest of
+round 159 (`r159/installation_equivalence.json`, ISSUES X-49).  Apart from items (1), (2) and the unverified sample,
 nothing else of G9 is open: the migration, the matcher-backend contracts,
 the retained-IR manifest and the hardware provenance bindings are recorded
 above.
