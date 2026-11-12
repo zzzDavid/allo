@@ -188,26 +188,13 @@ def test_strict_and_reassociative_gemv_values_on_board(apu_v1_device_gate, M, K,
     np.testing.assert_allclose(_f32(y_relaxed), exact, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="V1-16: the Gemini-I device's FP16 results differ at the bit level "
-    "from the host NumPy models of both plans (source-order loop and halving "
-    "tree); about half of the outputs differ by a few ulps while agreeing with "
-    "FP32 within FP16 tolerance. The functional route's models are plan-order "
-    "models, not bit-exact models of the device arithmetic. See docs/release/ISSUES.md.",
-)
-@pytest.mark.parametrize(
-    "M, K, seed", [(512, 256, 706), (384, 200, 707)], ids=["full_group", "padded_group"]
-)
-def test_strict_and_reassociative_gemv_bit_equal_to_models_on_board(
-    apu_v1_device_gate, M, K, seed
-):
-    """Bit-level comparison of the device results with the functional route's
-    numerics models. Expected to fail until the models reproduce the device
-    arithmetic (V1-16); the mismatch counts are printed for the record."""
-    W, x, _exact, y_strict, y_relaxed, plan = _strict_and_reassociative_runs(M, K, seed)
-    source = G6._fp16_source_order(np.zeros(M), (W[:, k] * x[k] for k in range(K)))
-    tree = G6._halving_tree_fp16(W * x, plan.reduction_strategy.group_size)
+class BitModelMismatch(AssertionError):
+    """The device's FP16 results differ at the bit level from the host models
+    (V1-16).  The only failure the bit-model test expects: compilation, plan
+    validation and launch failures are not expected and fail the test."""
+
+
+def _compare_bit_models(y_strict, y_relaxed, source, tree, M):
     strict_mismatch = int(
         np.count_nonzero(y_strict.view(np.uint16) != source.view(np.uint16))
     )
@@ -217,5 +204,35 @@ def test_strict_and_reassociative_gemv_bit_equal_to_models_on_board(
     print(
         f"APU_V1_BIT_MODEL strict_mismatch={strict_mismatch}/{M} relaxed_mismatch={relaxed_mismatch}/{M}"
     )
-    np.testing.assert_array_equal(y_strict.view(np.uint16), source.view(np.uint16))
-    np.testing.assert_array_equal(y_relaxed.view(np.uint16), tree.view(np.uint16))
+    if strict_mismatch or relaxed_mismatch:
+        raise BitModelMismatch(
+            f"V1-16: {strict_mismatch}/{M} strict and {relaxed_mismatch}/{M} "
+            "relaxed outputs differ at the bit level from the host models"
+        )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=BitModelMismatch,
+    reason="V1-16: the Gemini-I device's FP16 results differ at the bit level "
+    "from the host NumPy models of both plans (source-order loop and halving "
+    "tree); about half of the outputs differ by a few ulps while agreeing with "
+    "FP32 within FP16 tolerance. The functional route's models are plan-order "
+    "models, not bit-exact models of the device arithmetic. See docs/release/ISSUES.md. "
+    "Only the final bit-model mismatch is expected (raises=BitModelMismatch, round "
+    "167): a compilation, plan-validation or launch failure fails this test.",
+)
+@pytest.mark.parametrize(
+    "M, K, seed", [(512, 256, 706), (384, 200, 707)], ids=["full_group", "padded_group"]
+)
+def test_strict_and_reassociative_gemv_bit_equal_to_models_on_board(
+    apu_v1_device_gate, M, K, seed
+):
+    """Bit-level comparison of the device results with the functional route's
+    numerics models. Expected to fail with ``BitModelMismatch`` until the
+    models reproduce the device arithmetic (V1-16); the mismatch counts are
+    printed for the record.  Any other exception is a real failure."""
+    W, x, _exact, y_strict, y_relaxed, plan = _strict_and_reassociative_runs(M, K, seed)
+    source = G6._fp16_source_order(np.zeros(M), (W[:, k] * x[k] for k in range(K)))
+    tree = G6._halving_tree_fp16(W * x, plan.reduction_strategy.group_size)
+    _compare_bit_models(y_strict, y_relaxed, source, tree, M)
