@@ -223,7 +223,9 @@ the forced `separate/k1` BiCG against the default `fused/k1`, 2,516 to
 candidate `40f9b64`'s wheel on the card (VALIDATION round 174: `single/k2`
 to `single/k1`, 2,716 to 3,457 cycles; the forced `separate/k1` against the
 default `fused/k1`, 2,552 to 5,054; every launch exact; mechanism traces,
-not performance sessions), so item (2) is executed at the candidate.  (3) The APU
+not performance sessions), and again in round 192 from the accepted candidate
+`f32b8e3`'s wheel (`single/k2` 2,678 to `single/k1` 3,446; `fused/k1` 2,550 to
+`separate/k1` 5,058; every launch exact), so item (2) is executed at the candidate.  (3) The APU
 v1 side of slice 5 is demonstrated at `c762d4d` (round 136) and the
 runtime's failure evidence is complete since `dbe0543` (V1-21); the round
 136 lost sample itself stays unverified.  (4) The round 139 review's own
