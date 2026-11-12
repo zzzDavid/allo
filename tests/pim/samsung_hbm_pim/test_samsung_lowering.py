@@ -459,3 +459,54 @@ def test_gemm_operand_order_does_not_change_the_selected_program():
         for name, k in kernels.items()
     }
     assert chosen["vector_first"] == chosen["matrix_first"], chosen
+
+
+# --------------------------------------------------------------------------- #
+# Round 156 (G1 claim 8 review): a body that stores a GEMV row and then an
+# elementwise product of that row is outside the released Samsung domain (a
+# kernel is one contraction or one elementwise op).  The refusal must name
+# that rule; before the round, role binding across the mixed matches raised
+# first with an internal-inconsistency message blaming the matcher.
+# --------------------------------------------------------------------------- #
+
+_MX_M, _MX_K, _MX_R = 64, 64, 4
+
+
+@_df_region()
+def _mixed_gemv_then_scale(
+    W: fp16[_MX_M, _MX_K],
+    x: fp16[_MX_K],
+    s: fp16[_MX_M],
+    y: fp16[_MX_M],
+    z: fp16[_MX_M],
+):
+    @allo.work(mapping=[16], args=[W, x, s, y, z])
+    def body(
+        lW: fp16[_MX_M, _MX_K],
+        lx: fp16[_MX_K],
+        ls: fp16[_MX_M],
+        ly: fp16[_MX_M],
+        lz: fp16[_MX_M],
+    ):
+        (c,) = allo.get_wid()
+        for i in range(_MX_R):
+            acc: fp16 = 0
+            for k in range(_MX_K):
+                acc += lW[c * _MX_R + i, k] * lx[k]
+            ly[c * _MX_R + i] = acc
+        for i in range(_MX_R):
+            lz[c * _MX_R + i] = ly[c * _MX_R + i] * ls[c * _MX_R + i]
+
+
+def test_mixed_contraction_and_elementwise_body_is_refused_by_the_domain_rule():
+    with pytest.raises(SamsungUnsupported, match="mixes ops") as info:
+        allo.compile(
+            _mixed_gemv_then_scale,
+            build_samsung_target(),
+            samsung_cost,
+            backend="virtual",
+        )
+    message = str(info.value)
+    assert "MAC" in message and "MUL" in message
+    assert "a kernel is one contraction or one elementwise op" in message
+    assert "binds to multiple memrefs" not in message

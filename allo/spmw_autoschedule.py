@@ -585,8 +585,18 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     )
 
     facts = samsung_target_facts(target)
-    role_to_memref = _trace_memrefs_by_role(matches)
     ops = {m.target_op_name for m in matches}
+    # The released domain first: a Samsung kernel is one contraction or one
+    # elementwise op.  A body that mixes them (a GEMV store followed by an
+    # elementwise store of the same row, round 156's claim 8 probe) is
+    # refused here by name; binding roles across the mixed matches first
+    # raised an internal-inconsistency message that blamed the matcher.
+    if len(ops) > 1:
+        raise SamsungUnsupported(
+            f"Samsung lowering: kernel group mixes ops {sorted(ops)}; "
+            "a kernel is one contraction or one elementwise op"
+        )
+    role_to_memref = _trace_memrefs_by_role(matches)
 
     # Fiber handles from the swizzled F2 layout (SPEC-022 D3): the segment
     # (tile) axis has banks-per-pim values; materialising it at each value
