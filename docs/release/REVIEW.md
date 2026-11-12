@@ -3993,9 +3993,11 @@ from an installed wheel, so it was started from the accepted candidate's
 installation with every simulator the host offers.  It is slow and it
 is not finished; this record says so and gives the counts as they
 stand.  Thirteen tests have failed so far and each was followed to its
-cause: eleven are the board tests, which reach the production launcher
+cause: nine are the board tests, which reach the production launcher
 and are refused by the scratch guard that blocks the board for every
-other purpose; one was a probe whose helper script the copied tree did
+other purpose (two more board tests show as expected failures only
+because their broad V1-16 marker swallowed that same refusal; they
+prove nothing about V1-16 here); one was a probe whose helper script the copied tree did
 not carry and whose binary wanted a bare `/tmp`; three pinned a
 candidate count from before the tile-row levers of early November and
 had not been run since.  The last two are evaluation fixes, made and
