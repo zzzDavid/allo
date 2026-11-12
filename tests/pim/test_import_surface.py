@@ -67,4 +67,3 @@ def test_removed_host_scheduling_helpers_are_not_public():
         assert name not in allo._LAZY_EXPORTS, name
         assert not hasattr(allo, name), name
     assert importlib.util.find_spec("allo.spmw_host_program") is None
-
