@@ -188,3 +188,33 @@ def test_a_campaign_at_quota_launches_nothing(fixtures, tmp_path):
     # with no existing files every row of the quota is owed
     code, out = _run(tmp_path, tmp_path / "e5b", [])
     assert code == 0 and "--cases kmeans word_count linear_regression " in out
+
+
+def test_a_session_is_launched_only_within_its_scratch_budget(fixtures, tmp_path):
+    """Round 152 (X-47): the session's planned launches x the per-launch
+    consumption must be free; a session over budget is recorded as not
+    launched and the driver is not invoked."""
+    import shutil
+
+    sb = _sandbox(tmp_path)
+    free = shutil.disk_usage(tmp_path).free
+    calls = tmp_path / "calls.txt"
+    (sb["tree"] / "benchmarks" / "apu_v1").mkdir(parents=True, exist_ok=True)
+    (sb["tree"] / "benchmarks" / "apu_v1" / "__init__.py").write_text("")
+    (sb["tree"] / "benchmarks" / "apu_v1" / "paper_rows.py").write_text(
+        f"import sys\nopen({str(calls)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\nsys.exit(1)\n"
+    )
+    # three rows owed: 99 launches planned for session 1; a budget it cannot meet
+    code, out = _run(tmp_path, tmp_path / "e6", [], env_extra={
+        "G1_DRY_RUN": "0", "G1_MAX_SESSIONS": "1",
+        "G1_TMP_PATH": str(tmp_path), "G1_TMP_PER_LAUNCH_BYTES": str(free // 99 + 1),
+    })
+    assert "planned launches 99 x" in out and "session 1 NOT LAUNCHED: the headroom gate failed" in out
+    assert not calls.exists()
+    # within budget the session is launched (the stub driver fails, which is a failed stage)
+    code, out = _run(tmp_path, tmp_path / "e7", [], env_extra={
+        "G1_DRY_RUN": "0", "G1_MAX_SESSIONS": "1",
+        "G1_TMP_PATH": str(tmp_path), "G1_TMP_PER_LAUNCH_BYTES": "1",
+    })
+    assert "planned launches 99 x 1 bytes = 99 needed" in out and calls.exists()
+    assert "--cases kmeans word_count linear_regression" in calls.read_text()

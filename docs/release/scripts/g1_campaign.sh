@@ -20,12 +20,16 @@
 # of which must exist: give explicit absolute file names, not a quoted brace pattern, which the shell
 # does not expand inside a variable), G1_MAX_SESSIONS (attempts at most, default 6), G1_MEASURED
 # (default 10), G1_DRY_RUN=1 (prerequisites and the plan only, under <dir>/campaign-dry-run; no
-# launch), TENON_ARTIFACTS (the evaluation assets).
+# launch), TENON_ARTIFACTS (the evaluation assets), G1_TMP_PER_LAUNCH_BYTES (the host scratch each
+# launch consumes, default 60000000: rounds 136 and 146 measured 54 to 56 MB per launch of the board
+# host's /tmp; a session is launched only when its whole budget is free, since the 8 MiB production
+# guard protects one attempt, not a session, X-47), G1_TMP_PATH (the scratch filesystem, default /tmp).
 set -u
 E=${1:?evidence dir}; P=$E/pkg; T=${G1_TESTTREE:-$E/testtree}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROW_QUOTA=${G1_ROW_QUOTA:-"kmeans=3,word_count=3,linear_regression=3"}
 MAX_SESSIONS=${G1_MAX_SESSIONS:-6}; MEASURED=${G1_MEASURED:-10}
+PER_LAUNCH=${G1_TMP_PER_LAUNCH_BYTES:-60000000}; TMP_PATH=${G1_TMP_PATH:-/tmp}
 DRY=${G1_DRY_RUN:-0}
 EXISTING=(${G1_EXISTING:-})
 CAMP=$E/campaign; [ "$DRY" = "1" ] && CAMP=$E/campaign-dry-run
@@ -85,7 +89,9 @@ for s in $(seq 1 $MAX_SESSIONS); do
   next=$(plan "${files[@]}") || abort "planning failed before session $s; no further session is launched"
   if [ -z "$next" ]; then echo "every row at its quota after $((s - 1)) session(s); no further session is launched $(date -Is)" | tee -a $CAMP/stages/SUMMARY.txt; break; fi
   echo "session $s plans the rows still owed: [$next] $(date -Is)" | tee -a $CAMP/stages/SUMMARY.txt
-  if stage headroom_before_session_$s -- bash -c "set -e; df -B1 --output=avail /tmp | tail -1; $PYV -c 'from allo.pim.apu_v1_program import ledag_scratch_headroom_problem as f; p = f(); print(\"guard:\", p); assert p is None'"; then
+  # The session's scratch budget: its cases x three lanes x (one warm-up + MEASURED) launches.
+  ncases=$(echo "$next" | wc -w); launches=$(( ncases * 3 * (1 + MEASURED) ))
+  if stage headroom_before_session_$s -- bash -c "set -e; avail=\$(df -B1 --output=avail '$TMP_PATH' | tail -1); need=\$(( $launches * $PER_LAUNCH )); echo \"planned launches $launches x $PER_LAUNCH bytes = \$need needed; \$avail available in $TMP_PATH\"; [ \"\$avail\" -ge \"\$need\" ]; $PYV -c 'from allo.pim.apu_v1_program import ledag_scratch_headroom_problem as f; p = f(); print(\"guard:\", p); assert p is None'"; then
     stage session_$s -- timeout 7200 $PYV -m benchmarks.apu_v1.paper_rows --measured $MEASURED --expert --historical-binary --cases $next --scratch $CAMP/scratch/session_$s --out $CAMP/apu_v1_campaign_s$s.json
     [ -f $CAMP/apu_v1_campaign_s$s.json ] && files+=($CAMP/apu_v1_campaign_s$s.json)
   else

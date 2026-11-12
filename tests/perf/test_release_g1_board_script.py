@@ -74,6 +74,9 @@ def _run(sb, evidence: Path, *, dry=True, env_extra=None):
             "G1_TESTTREE": str(sb["tree"]),
             "TENON_ARTIFACTS": str(sb["assets"]),
             "TMPDIR": str(tmp),
+            # the sequence budget is checked on the sandbox's filesystem, not
+            # the host's /tmp (which may be full while the tests run)
+            "G1_TMP_PATH": str(tmp),
         }
     )
     if dry:
@@ -162,3 +165,20 @@ def test_each_stage_runs_behind_its_own_gate_and_a_lost_gate_is_a_failed_stage(t
     sb = _sandbox(tmp_path / "four", driver_exit=1)
     code, out = _run(sb, tmp_path / "e7", dry=False)
     assert code == 1 and "stage vector_rows FAIL" in out and len(_driver_calls(sb)) == 3
+
+
+def test_the_sequence_scratch_budget_is_a_prerequisite(tmp_path):
+    """The whole sequence's scratch must be free before the first launch
+    (round 152, X-47): 78 planned launches x the per-launch consumption."""
+    import shutil
+
+    sb = _sandbox(tmp_path)
+    free = shutil.disk_usage(tmp_path).free
+    # a per-launch figure that the 78 launches cannot fit: refused, nothing launched
+    code, out = _run(sb, tmp_path / "e8", env_extra={"G1_TMP_PATH": str(tmp_path), "G1_TMP_PER_LAUNCH_BYTES": str(free // 78 + 1)})
+    assert code == 1 and "prerequisite scratch_budget failed" in out and "nothing launched" in out
+    assert "planned launches 78 x" in out and _driver_calls(sb) == []
+    # a per-launch figure that fits: the dry run proceeds to the three commands
+    code, out = _run(sb, tmp_path / "e9", env_extra={"G1_TMP_PATH": str(tmp_path), "G1_TMP_PER_LAUNCH_BYTES": "1"})
+    assert code == 0 and "planned launches 78 x 1 bytes = 78 needed" in out
+    assert out.count("DRY RUN: would launch") == 3

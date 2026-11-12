@@ -16,11 +16,16 @@
 # origin is compared by resolved path) and the drivers under <dir>/testtree (or G1_TESTTREE).
 # Environment: G1_MEASURED (vector rows, default 10), G1_FORCED_MEASURED (forced plan and
 # perturbation, default 5), G1_DRY_RUN=1 (prerequisites and the commands only, under
-# <dir>/board-dry-run; no launch), TENON_ARTIFACTS (the evaluation assets).
+# <dir>/board-dry-run; no launch), TENON_ARTIFACTS (the evaluation assets), G1_TMP_PER_LAUNCH_BYTES
+# (the host scratch each launch consumes, default 60000000: rounds 136 and 146 measured 54 to 56 MB
+# per launch of the board host's /tmp; the whole sequence's budget must be free before the first
+# launch, since the 8 MiB production guard protects one attempt, not a sequence, X-47), G1_TMP_PATH
+# (the scratch filesystem checked, default /tmp).
 set -u
 E=${1:?evidence dir}; P=$E/pkg; T=${G1_TESTTREE:-$E/testtree}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MEASURED=${G1_MEASURED:-10}; FORCED_MEASURED=${G1_FORCED_MEASURED:-5}
+PER_LAUNCH=${G1_TMP_PER_LAUNCH_BYTES:-60000000}; TMP_PATH=${G1_TMP_PATH:-/tmp}
 DRY=${G1_DRY_RUN:-0}
 B=$E/board; [ "$DRY" = "1" ] && B=$E/board-dry-run
 if [ -e "$B" ]; then
@@ -42,6 +47,10 @@ GUARD='from allo.pim.apu_v1_program import ledag_scratch_headroom_problem as f; 
 stage module_origin -- $PYV -c "import allo, benchmarks, os, sys; pkg = os.path.realpath('$P'); print('allo from', allo.__file__); print('benchmarks from', benchmarks.__file__); assert os.path.realpath(allo.__file__).startswith(pkg + '/venv/'), (os.path.realpath(allo.__file__), pkg); assert os.path.realpath(benchmarks.__file__).startswith(os.path.realpath('$T') + '/'); assert not any(p.startswith('$HERE'.rsplit('/docs/',1)[0]) for p in sys.path)" || abort "prerequisite module_origin failed; nothing launched"
 stage assets_present -- $PYV -c "import os; root = os.environ['TENON_ARTIFACTS']; cases = ['matrix_multiply', 'histogram']; missing = [c for c in cases if not os.path.isdir(os.path.join(root, 'apuv1', 'tenon', c))]; print('assets', root, 'cases', cases); assert not missing, missing" || abort "prerequisite assets_present failed; nothing launched"
 stage headroom_before_board -- bash -c "set -e; df -B1 --output=avail /tmp | tail -1; env -u TMPDIR $PYV -c '$GUARD'; $PYV -c '$GUARD'" || abort "prerequisite headroom_before_board failed; nothing launched"
+# The sequence's scratch budget: two vector cases x three lanes x (one warm-up + MEASURED), plus the
+# forced plan and the perturbation (one lane each, one warm-up + FORCED_MEASURED).
+LAUNCHES=$(( 2 * 3 * (1 + MEASURED) + 2 * (1 + FORCED_MEASURED) ))
+stage scratch_budget -- bash -c "set -e; avail=\$(df -B1 --output=avail '$TMP_PATH' | tail -1); need=\$(( $LAUNCHES * $PER_LAUNCH )); echo \"planned launches $LAUNCHES x $PER_LAUNCH bytes = \$need needed; \$avail available in $TMP_PATH\"; [ \"\$avail\" -ge \"\$need\" ]" || abort "prerequisite scratch_budget failed (the sequence would exhaust the host's scratch before finishing; set G1_TMP_PER_LAUNCH_BYTES only from measured consumption); nothing launched"
 # run NAME DRIVER-ARGS...: the stage's own headroom gate, then the driver; a gate failure is a
 # failed stage (the evidence is incomplete), recorded, and the following stages still try their gates.
 run() {
