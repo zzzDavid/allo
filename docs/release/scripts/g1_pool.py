@@ -588,9 +588,10 @@ def installations_equivalent(manifest, allo_a, allo_b):
     after it.  Raises ``SessionInvalid`` otherwise."""
     import os
 
-    if allo_a == allo_b:
-        return True
-    ea, eb = _verify_installation(manifest, allo_a), _verify_installation(manifest, allo_b)
+    ea = _verify_installation(manifest, allo_a)
+    if os.path.realpath(allo_a) == os.path.realpath(allo_b):
+        return True  # the same installation, verified against the manifest
+    eb = _verify_installation(manifest, allo_b)
     allowed = {d["file"]: d.get("reason", "") for d in manifest.get("allowed_differences", [])}
     files_a, files_b = ea["files"], eb["files"]
     _require(
@@ -617,38 +618,67 @@ def installations_equivalent(manifest, allo_a, allo_b):
     return True
 
 
-_EQUIVALENCE = {"manifest": None, "verified": set()}
+_EQUIVALENCE = {"manifest": None, "verified_installations": {}, "verified_pairs": set()}
 
 
 def set_equivalence_manifest(manifest):
+    """Install the manifest for this invocation; the verification caches are
+    scoped to it (a new manifest, or None, empties them)."""
     _EQUIVALENCE["manifest"] = manifest
-    _EQUIVALENCE["verified"] = set()
+    _EQUIVALENCE["verified_installations"] = {}
+    _EQUIVALENCE["verified_pairs"] = set()
+
+
+def verify_installation_under_manifest(allo_init, label):
+    """When a manifest is loaded, every installation a session or a preflight
+    refers to is verified against it (listed, the wheel's digest, every
+    installed file's hash), once per invocation per resolved installation,
+    before any identity shortcut; without a manifest nothing is verified
+    (the no-manifest behaviour is unchanged)."""
+    import os
+
+    manifest = _EQUIVALENCE["manifest"]
+    if manifest is None:
+        return None
+    key = os.path.realpath(allo_init)
+    cache = _EQUIVALENCE["verified_installations"]
+    if key not in cache:
+        try:
+            cache[key] = _verify_installation(manifest, allo_init)
+        except SessionInvalid as exc:
+            raise SessionInvalid(f"{label}: {exc}") from exc
+    return cache[key]
 
 
 def check_compatible(reference, other, label):
-    """The session-level identities against the first session.  A different
-    installed package is accepted only when an equivalence manifest lists
-    both installations and the live artifacts verify as the reviewed delta
-    allows (``--equivalence``); otherwise it is refused as before."""
+    """The session-level identities against the first session.  Under an
+    equivalence manifest both installations are verified first (listed, the
+    wheel, every file), whether or not they are the same path; a different
+    installed package is then accepted only when the manifest's reviewed
+    delta covers the pair.  Without a manifest a different package is
+    refused as before and identical paths are accepted as before."""
     import os
 
+    manifest = _EQUIVALENCE["manifest"]
+    if manifest is not None:
+        verify_installation_under_manifest(reference["allo"], label)
+        verify_installation_under_manifest(other["allo"], label)
     same_installation = reference["allo"] == other["allo"] or (
         os.path.realpath(reference["allo"]) == os.path.realpath(other["allo"])
     )
     if not same_installation:
-        manifest = _EQUIVALENCE["manifest"]
         _require(
             manifest is not None,
             f"{label}: installed package {other['allo']!r} differs from the first "
             f"session's {reference['allo']!r} (no equivalence manifest given)",
         )
-        key = tuple(sorted((reference["allo"], other["allo"])))
-        if key not in _EQUIVALENCE["verified"]:
+        key = tuple(sorted((os.path.realpath(reference["allo"]), os.path.realpath(other["allo"]))))
+        if key not in _EQUIVALENCE["verified_pairs"]:
             try:
                 installations_equivalent(manifest, reference["allo"], other["allo"])
             except SessionInvalid as exc:
                 raise SessionInvalid(f"{label}: {exc}") from exc
-            _EQUIVALENCE["verified"].add(key)
+            _EQUIVALENCE["verified_pairs"].add(key)
     _require(
         reference["host"] == other["host"],
         f"{label}: host differs from the first session",
@@ -883,6 +913,9 @@ def main(argv=None):
     if not args.out:
         print("--out is required", file=sys.stderr)
         return 2
+    # The equivalence state is scoped to this invocation: no manifest unless
+    # this invocation names one (an earlier in-process call must not leak).
+    set_equivalence_manifest(None)
     if args.equivalence:
         try:
             set_equivalence_manifest(load_equivalence(args.equivalence))
@@ -891,6 +924,14 @@ def main(argv=None):
             return 2
     if args.preflight_install:
         problems = []
+        try:
+            # the package under test is verified against the manifest on its
+            # own, before any session is compared with it
+            verify_installation_under_manifest(args.preflight_install, "preflight installation")
+        except SessionInvalid as exc:
+            print(f"INCOMPATIBLE: {exc}", file=sys.stderr)
+            print(f"preflight: {args.preflight_install} fails the equivalence manifest; nothing launched", file=sys.stderr)
+            return 2
         for f in args.files:
             try:
                 with open(f) as fh:
@@ -925,6 +966,9 @@ def main(argv=None):
             v = validate_session(
                 d, measured=args.measured, warmups=args.warmups, required_lanes=lanes
             )
+            # under a manifest every session's installation is verified, the
+            # first one included (later ones through check_compatible too)
+            verify_installation_under_manifest(v["allo"], f)
             if validated:
                 check_compatible(validated[0], v, f)
             check_rows_compatible(validated + [v], labels + [f])

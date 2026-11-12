@@ -894,3 +894,67 @@ def test_manifest_refusals(pool, tmp_path):
         pool.installations_equivalent(loaded, a[0], c[0])
     # the untouched pair still verifies
     assert pool.installations_equivalent(loaded, a[0], b[0]) is True
+
+
+# --------------------------------------------------------------------------- #
+# Round 160: under a manifest every referenced installation is verified before
+# any identity shortcut (the round 159 review's three cases); without a
+# manifest the identity behaviour is unchanged.
+# --------------------------------------------------------------------------- #
+
+
+def _single_install_setup(pool, tmp_path):
+    a = _install(tmp_path, "pkgA")
+    b = _install(tmp_path, "pkgB", module_text="CHECK = 'new'\n", build_tag="pkgB")
+    manifest = tmp_path / "eq.json"
+    _manifest(pool, manifest, a, b)
+    session = tmp_path / "s1.json"
+    session.write_text(json.dumps(make_session("one", allo=a[0])))
+    return a, b, manifest, session
+
+
+def test_same_installation_drift_is_refused_under_a_manifest(pool, tmp_path):
+    a, b, manifest, session = _single_install_setup(pool, tmp_path)
+    quota = ["--row-quota", "kmeans=3,word_count=3,linear_regression=3"]
+    # the untouched installation: preflight and the single-session pool pass under the manifest
+    assert pool.main(["--equivalence", str(manifest), "--out", "/dev/null", "--preflight-install", a[0], str(session)]) == 0
+    assert pool.main(["--equivalence", str(manifest), "--out", str(tmp_path / "o.json"), *quota, str(session)]) == 3
+    # a compiler file of that same installation changes after the manifest was written
+    (Path(a[0]).parent / "pim" / "__init__.py").write_text("PIM = 99\n")
+    # (1) the same-installation preflight is refused
+    assert pool.main(["--equivalence", str(manifest), "--out", "/dev/null", "--preflight-install", a[0], str(session)]) == 2
+    # (2) the single-session pool is refused
+    assert pool.main(["--equivalence", str(manifest), "--out", str(tmp_path / "o2.json"), *quota, str(session)]) == 2
+    # without a manifest the identity behaviour is unchanged: the same path pools and preflights as before
+    assert pool.main(["--out", "/dev/null", "--preflight-install", a[0], str(session)]) == 0
+    assert pool.main(["--out", str(tmp_path / "o3.json"), *quota, str(session)]) == 3
+
+
+def test_unlisted_same_installation_is_refused_under_a_manifest(pool, tmp_path):
+    a, b, manifest, _session = _single_install_setup(pool, tmp_path)
+    c = _install(tmp_path, "pkgC", build_tag="pkgC")
+    session_c = tmp_path / "sc.json"
+    session_c.write_text(json.dumps(make_session("c", allo=c[0])))
+    # (3) the preflight of an installation the manifest does not list, against its own session
+    assert pool.main(["--equivalence", str(manifest), "--out", "/dev/null", "--preflight-install", c[0], str(session_c)]) == 2
+    # and the single-session pool of that unlisted installation under the manifest
+    assert pool.main(["--equivalence", str(manifest), "--out", str(tmp_path / "o.json"), "--row-quota", "kmeans=3,word_count=3,linear_regression=3", str(session_c)]) == 2
+    # the symlink alias of a listed installation is verified as that installation
+    link = tmp_path / "aliasA"
+    link.symlink_to(tmp_path / "pkgA")
+    alias = str(link / "venv" / "lib" / "allo" / "__init__.py")
+    assert pool.main(["--equivalence", str(manifest), "--out", "/dev/null", "--preflight-install", alias, str(_session)]) == 0
+    (Path(a[0]).parent / "spmw_autoschedule.py").write_text("CHECK = 'tampered'\n")
+    assert pool.main(["--equivalence", str(manifest), "--out", "/dev/null", "--preflight-install", alias, str(_session)]) == 2
+
+
+def test_verification_cache_is_scoped_to_the_manifest_invocation(pool, tmp_path):
+    a, b, manifest, session = _single_install_setup(pool, tmp_path)
+    loaded = pool.load_equivalence(str(manifest))
+    pool.set_equivalence_manifest(loaded)
+    assert pool.verify_installation_under_manifest(a[0], "first") is not None
+    assert Path(a[0]).parent.resolve().as_posix() in {Path(k).parent.resolve().as_posix() for k in pool._EQUIVALENCE["verified_installations"]}
+    pool.set_equivalence_manifest(loaded)  # a new invocation starts empty
+    assert pool._EQUIVALENCE["verified_installations"] == {} and pool._EQUIVALENCE["verified_pairs"] == set()
+    pool.set_equivalence_manifest(None)
+    assert pool.verify_installation_under_manifest(a[0], "none") is None
