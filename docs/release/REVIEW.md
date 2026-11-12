@@ -3764,13 +3764,18 @@ NOT READY.
 With the board still blocked, the Gemini-I rows were asked the one
 question the existing sessions can answer: how does the current program
 compare with the paper's own Tenon binary, run in the same rounds on the
-same days?  In every session that carries that control the current
-program runs at or below it for word count and linear regression, and
-in five of six for kmeans, while the paper-era binary itself sits above
-its paper value by as much as or more than the current program does.
-That reads as the board having moved, not the compiler; it is read as
-nothing more, and the fixed rule still decides the outcomes on complete
-rows the campaign has yet to collect.  NOT READY.
+same days?  Comparing the lanes' medians, the current program runs at
+or below that binary in every session for word count and linear
+regression and in five of six for kmeans (the medians of the paired
+per-round ratios count differently: two of three, two of three and four
+of six, as VALIDATION records), and the paper-era binary itself sits
+above its paper value by as much as or more than the current program
+does in every session but one (the round 69 kmeans session, where the
+current program was 1.0002 of the paper and the paper-era binary
+0.9999).  Few sessions, not all complete.  That is consistent with
+environmental variation; no cause is established, and a compiler or
+build contribution is not excluded.  The fixed rule still decides the
+outcomes on complete rows the campaign has yet to collect.  NOT READY.
 
 ## Rejected shortcuts
 
