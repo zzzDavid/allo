@@ -241,8 +241,22 @@ overflow and carried outputs, a guarded whole-function record and a
 non-mutating Gemini-II virtual result; no weakened numerical check,
 benchmark-specific dispatch or fabricated execution found).  That is the
 acceptance of the X-45 boundary, not a declaration that every G9 gate
-passes: the item (1) review at the final candidate still stands, now over
-the repaired boundary.  Apart from items (1), (2) and the unverified sample,
+passes.  **Item (1) accepted (round 141 review, )
+at the final compiler candidate **: the reviewer followed
+normalization, facts, candidate validation, movement, supplied-layout
+rebinding, materialization, graph construction and final realization
+through the backend hooks on the installed wheel  and
+accepted the source invariant; recorded here as that acceptance, not as
+every G9 and G10 requirement passed.  The hardware obligations stay
+explicit by revision: the APU v1 vector-path execution with the forced
+plan and the cost perturbation was executed at  (round 136) and
+has not been re-executed at  (the runtime's failure path and the
+contract's derivation changed since, not its launch procedure or
+programs; any claim of execution at  requires that run); the
+Gemini-II slice 5 traces were executed at  (round 140); the round
+136 lost linear-regression launch stays unverified; the Gemini-I
+confirmation campaign at  is incomplete (VALIDATION rounds 141
+and 142).  Apart from items (1), (2) and the unverified sample,
 nothing else of G9 is open: the migration, the matcher-backend contracts,
 the retained-IR manifest and the hardware provenance bindings are recorded
 above.
