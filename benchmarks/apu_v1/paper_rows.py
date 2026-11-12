@@ -638,12 +638,18 @@ class ExpertLane:
         (launch_dir / "profile.txt").write_text(profile or "")
         (launch_dir / "argv.json").write_text(json.dumps(argv, indent=1))
         outputs_sha256 = {role: _sha256_file(path) for role, path, _d, _s in outputs}
+        from allo.pim.apu_v1_program import apu_v1_lock_path
+
         launch = {
             "crun": cycles[0],
             "counters": profile_counters(profile),
             "outputs_match_oracle": exact,
             "binary_sha256": self.binary_sha256,
             "binary_bytes": binary_bytes,
+            # The launch ran under the production launcher's board lock
+            # (held by launch_on_board); recorded per launch as the Tenon
+            # lane's runtime records it (round 142).
+            "board_lock": str(apu_v1_lock_path()),
             "profile_text": profile,
             "device_log": text,
             "outputs_sha256": outputs_sha256,
