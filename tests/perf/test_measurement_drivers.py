@@ -1527,3 +1527,77 @@ def test_a_failed_launch_records_no_manufactured_launched_identity(tmp_path):
     failed = tmp_path / "scratch" / "tenon-launch-001"
     assert not (failed / "device.c").exists()
     assert (failed / "declared_device.c").read_text() == lane.device_source
+
+
+# --- round 150 (ISSUES X-48): one executable source per lane
+
+
+def _varying_source_result(prefix_per_call):
+    """A device result whose wrapped source differs per call but always
+    contains the declared kernel."""
+    import itertools
+    from types import SimpleNamespace
+    import numpy as np
+
+    counter = itertools.count()
+
+    def compiled(*args):
+        n = next(counter)
+        source = f"{prefix_per_call[n % len(prefix_per_call)]}\nint main(void) {{ return 0; }}\n"
+        return SimpleNamespace(
+            kind="device", cycles=7 + n, stdout="log",
+            extra={"outputs": {"y": np.arange(4, dtype=np.uint16)}, "device_source": source},
+        )
+
+    return compiled
+
+
+def test_distinct_launched_sources_across_a_lane_are_a_provenance_problem(monkeypatch, tmp_path):
+    lane = _session_lane(
+        tmp_path, _varying_source_result(["#include <a.h>", "#include <b.h>", "#include <c.h>"]),
+        scope="realization_kernel",
+    )
+    record = _measure_with(monkeypatch, tmp_path, lane, measured=2)
+    launches = record["launches"]
+    assert len(launches) == 3 and all(l["launched_source_contains_declared"] for l in launches)
+    assert all(l.get("error") is None for l in launches)  # every launch kept as it was
+    assert len({l["launched_source_sha256"] for l in launches}) == 3
+    for l in launches:
+        assert (Path(l["launch_dir"]) / "device.c").is_file()
+    tenon = record["lanes"]["tenon"]
+    assert tenon["launched_source_sha256"] is None  # no hash chosen
+    assert len(tenon["launched_sources_of_successful_launches"]) == 3
+    assert tenon["measured_crun"] == [8, 9]  # samples recorded, not discarded
+    assert any("3 distinct launched sources" in p and "no single executable source" in p for p in record["problems"])
+    assert record["comparison"]["performance_evidence"] != "valid"
+
+
+def test_distinct_launched_sources_fail_the_session_exit_status(monkeypatch, tmp_path):
+    lane = _session_lane(
+        tmp_path, _varying_source_result(["#include <a.h>", "#include <b.h>"]),
+        scope="realization_kernel",
+    )
+    fixtures = _load_g1_fixtures()
+    _fake_lanes(monkeypatch, fixtures, lose_after=10**6)
+    monkeypatch.setattr(paper_rows, "TenonLane", lambda *a, **k: lane)
+    out = tmp_path / "s.json"
+    status = paper_rows.main(
+        ["--cases", "kmeans", "--measured", "2", "--scratch", str(tmp_path / "session"), "--out", str(out)]
+    )
+    assert status == 1
+    session = json.loads(out.read_text())
+    assert session["status"].startswith("fail")
+    record = session["records"][0]
+    assert any("distinct launched sources" in p for p in record["problems"])
+    assert len(record["launches"]) == 3  # every conflicting launch preserved
+
+
+def test_a_native_lane_launching_other_than_its_declared_identity_is_a_problem(monkeypatch, tmp_path):
+    # the runtime reports one consistent source that contains, but is not,
+    # the native route's declared launched text
+    wrapped = "#include <x.h>\nint main(void) { return 0; }\n"
+    lane = _session_lane(tmp_path, _device_result(wrapped))  # scope device_source
+    record = _measure_with(monkeypatch, tmp_path, lane)
+    assert all(l["launched_source_contains_declared"] for l in record["launches"])
+    assert any("differs from the lane's declared launched identity" in p for p in record["problems"])
+    assert record["lanes"]["tenon"]["launched_source_sha256"] == lane.device_source_sha256  # the declaration stays

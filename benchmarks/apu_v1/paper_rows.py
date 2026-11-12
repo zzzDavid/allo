@@ -937,23 +937,43 @@ def measure_case(
     except _ScratchLost:
         pass  # recorded in record["incomplete"] and record["problems"]
 
-    # A plan route's launched identity is known only from the runtime: the
-    # one launched source of its valid launches, if they agree (X-48).
+    # One executable source per Tenon lane (X-48): the successful warm-up
+    # and measured launches must report one launched source.  Several
+    # distinct sources, or a source other than the lane's declared launched
+    # identity, are a recorded provenance problem that invalidates the
+    # case; every launch and its files stay, no hash is chosen and no
+    # sample is discarded (the problem is what invalidates the evidence).
+    # A plan route's identity is known only from the runtime and is filled
+    # in from its agreeing launches.
     for lane_name, lane in lanes.items():
+        if not hasattr(lane, "device_source_scope"):
+            continue
         description = record["lanes"][lane_name]
-        if description.get("launched_source_sha256") is None and getattr(
-            lane, "device_source_scope", None
-        ) == "realization_kernel":
-            shas = {
+        shas = sorted(
+            {
                 l.get("launched_source_sha256")
                 for l in record["launches"]
                 if l["lane"] == lane_name
                 and not l.get("error")
                 and l.get("launched_source_sha256")
             }
-            if len(shas) == 1:
-                description["launched_source_sha256"] = shas.pop()
-                description["launched_source_sha256_from"] = "runtime launches"
+        )
+        declared_launch = description.get("launched_source_sha256")
+        description["launched_sources_of_successful_launches"] = shas
+        if len(shas) > 1:
+            record["problems"].append(
+                f"{lane_name}: {len(shas)} distinct launched sources across its "
+                f"successful launches ({', '.join(x[:12] for x in shas)}): no single "
+                "executable source is established for the lane"
+            )
+        elif declared_launch is not None and shas and shas[0] != declared_launch:
+            record["problems"].append(
+                f"{lane_name}: the launched source {shas[0][:12]} differs from the "
+                f"lane's declared launched identity {declared_launch[:12]}"
+            )
+        elif declared_launch is None and len(shas) == 1:
+            description["launched_source_sha256"] = shas[0]
+            description["launched_source_sha256_from"] = "runtime launches"
     # Statistics over valid measured launches only (an invalid launch is
     # recorded but never contributes a cycle count).
     for lane_name in lanes:
