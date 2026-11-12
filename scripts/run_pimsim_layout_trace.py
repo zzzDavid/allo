@@ -130,7 +130,10 @@ def _compile_inputs(root: Path) -> list[Path]:
 
 
 def default_binary() -> Path:
-    return Path(f"/tmp/tenon-pimsim-layout-trace-{os.getuid()}")
+    # The process's temporary directory (TMPDIR when set), not a bare /tmp:
+    # the harness binary is linked here, and a host whose /tmp is full must
+    # not fail the probe when the caller provided scratch elsewhere.
+    return Path(tempfile.gettempdir()) / f"tenon-pimsim-layout-trace-{os.getuid()}"
 
 
 def vendor_build_command(root: Path, jobs: int = 8) -> list[str]:
