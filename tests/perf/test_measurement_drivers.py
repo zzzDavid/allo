@@ -8,6 +8,7 @@ a clean run exits zero."""
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -1215,3 +1216,140 @@ def test_archived_lane_failure_reaches_the_session_record_with_its_evidence(
     failed = tmp_path / "tenon" / "scratch" / "tenon-launch-001"
     assert (failed / "process_output_1.txt").read_text() == "partial"
     assert (failed / "device.c").read_text() == "int main(void){}"
+
+
+# --- round 147 (ISSUES X-47): the session stops when the scratch headroom is lost
+
+
+def _load_g1_pool():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / "docs/release/scripts/g1_pool.py"
+    spec = importlib.util.spec_from_file_location("g1_pool_for_driver_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_g1_fixtures():
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "test_release_g1_pooling_script.py"
+    spec = importlib.util.spec_from_file_location("g1_fixtures_for_driver_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeLane:
+    """A lane whose launches are the pooler fixture's realistic records."""
+
+    calls = []
+
+    def __init__(self, case, lane, fixtures, description):
+        self.case, self.lane, self.fx, self.description = case, lane, fixtures, description
+        self.n = 0
+        self.binary_matches_archive = True
+        self.binary_sha256 = description.get("binary_sha256", "")
+
+    def describe(self):
+        return dict(self.description)
+
+    def launch(self):
+        self.n += 1
+        _FakeLane.calls.append((self.case, self.lane, self.n))
+        kind = "warmup" if self.n == 1 else "measured"
+        rnd = 0 if kind == "warmup" else self.n - 1
+        return self.fx._launch(self.case, self.lane, kind, rnd, 600000 + self.n, "t")
+
+
+def _fake_lanes(monkeypatch, fixtures, lose_after):
+    """Install fake Tenon/expert/historical lanes and a headroom check that
+    reports a problem once ``lose_after`` launches have run."""
+    from allo.pim import apu_v1_program as program
+
+    session = fixtures.make_session("t", cases=("kmeans",))
+    descriptions = session["records"][0]["lanes"]
+    _FakeLane.calls = []
+
+    def tenon(case, root, **kw):
+        return _FakeLane(case, "tenon", fixtures, descriptions["tenon"])
+
+    def expert(case, root, lane_dir=None, name="expert", scratch=None):
+        return _FakeLane(case, name, fixtures, descriptions[name])
+
+    monkeypatch.setattr(paper_rows, "TenonLane", tenon)
+    monkeypatch.setattr(paper_rows, "ExpertLane", expert)
+    monkeypatch.setattr(
+        program,
+        "ledag_scratch_headroom_problem",
+        lambda: (
+            None
+            if len(_FakeLane.calls) < lose_after
+            else "/tmp has 0.4 MiB free; a ledag-ssh read needs about 8.0 MiB there"
+        ),
+    )
+
+    @contextlib.contextmanager
+    def lock():
+        yield Path("/tmp/tenon-apu-v1-test.lock")
+
+    monkeypatch.setattr(program, "apu_v1_board_lock", lock)
+    monkeypatch.setattr(paper_rows, "_artifacts_root", lambda value: Path("/assets"))
+
+
+def test_scratch_loss_stops_the_session_and_the_partial_row_cannot_pool(monkeypatch, tmp_path):
+    fixtures = _load_g1_fixtures()
+    pool = _load_g1_pool()
+    lanes = ("tenon", "expert", "historical_binary")
+    # Headroom disappears after 7 launches (the three warm-ups, the first
+    # measured round and the first lane of the reversed second round, as in
+    # round 146); the eighth attempt is refused before any lane is called.
+    _fake_lanes(monkeypatch, fixtures, lose_after=7)
+    out = tmp_path / "session.json"
+    status = paper_rows.main(
+        [
+            "--cases", "kmeans", "word_count",
+            "--measured", "10", "--expert", "--historical-binary",
+            "--scratch", str(tmp_path / "scratch"), "--out", str(out),
+        ]
+    )
+    assert status == 1
+    session = json.loads(out.read_text())
+    # No lane was called after the loss: exactly 7 launches, all in kmeans.
+    assert len(_FakeLane.calls) == 7 and {c[0] for c in _FakeLane.calls} == {"kmeans"}
+    record = session["records"][0]
+    assert len(record["launches"]) == 7
+    assert record["incomplete"]["reason"] == "scratch_headroom_lost"
+    assert record["incomplete"]["not_attempted"] == {
+        "lane": "historical_binary", "kind": "measured", "round": 2,
+    }
+    assert record["incomplete"]["launches_recorded"] == 7
+    assert any("session stopped before historical_binary measured 2" in p for p in record["problems"])
+    # The remaining case was never started; the session says so and is incomplete.
+    assert [r["case"] for r in session["records"]] == ["kmeans"]
+    assert session["incomplete"]["case"] == "kmeans"
+    assert session["incomplete"]["cases_not_attempted"] == ["word_count"]
+    assert session["status"].startswith("incomplete (scratch headroom lost during kmeans; 1 case(s) not attempted)")
+    # The partial row is preserved evidence but cannot pool as complete.
+    evidence, problems = pool.validate_row(
+        record, measured=10, warmups=1, required_lanes=lanes
+    )
+    assert evidence is None and problems
+    assert any("problems recorded" in p or "launch" in p for p in problems)
+
+
+def test_without_scratch_loss_the_session_is_complete(monkeypatch, tmp_path):
+    fixtures = _load_g1_fixtures()
+    _fake_lanes(monkeypatch, fixtures, lose_after=10**6)
+    out = tmp_path / "session.json"
+    status = paper_rows.main(
+        [
+            "--cases", "kmeans", "--measured", "10", "--expert", "--historical-binary",
+            "--scratch", str(tmp_path / "scratch"), "--out", str(out),
+        ]
+    )
+    assert status == 0
+    session = json.loads(out.read_text())
+    assert "incomplete" not in session and session["status"] == "pass"
+    assert len(session["records"][0]["launches"]) == 33 and len(_FakeLane.calls) == 33

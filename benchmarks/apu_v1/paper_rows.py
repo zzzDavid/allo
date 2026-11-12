@@ -726,7 +726,10 @@ def measure_case(
     scratch=None,
 ):
     import allo  # noqa: F401  (the lanes import the pipeline)
-    from allo.pim.apu_v1_program import apu_v1_board_lock
+    from allo.pim.apu_v1_program import (
+        apu_v1_board_lock,
+        ledag_scratch_headroom_problem,
+    )
 
     if measured <= 0:
         raise MeasurementError(f"measured launches must be positive, got {measured}")
@@ -812,7 +815,33 @@ def measure_case(
     if backend != "device":
         return record
 
+    class _ScratchLost(Exception):
+        pass
+
     def run(lane_name, kind, round_index):
+        # The production launcher refuses an attempt whose scratch headroom
+        # is gone (each refusal is a retained failure with no device
+        # process).  The session stops at the first attempt the launcher
+        # would refuse instead of attempting every remaining launch against
+        # a host that cannot read the device log (round 147, ISSUES X-47):
+        # the partial session is preserved and marked incomplete, no lane is
+        # called after the loss, and the pooler sees an incomplete row.
+        problem = ledag_scratch_headroom_problem()
+        if problem is not None:
+            record["incomplete"] = {
+                "reason": "scratch_headroom_lost",
+                "problem": problem,
+                "not_attempted": {
+                    "lane": lane_name,
+                    "kind": kind,
+                    "round": round_index,
+                },
+                "launches_recorded": len(record["launches"]),
+            }
+            record["problems"].append(
+                f"session stopped before {lane_name} {kind} {round_index}: {problem}"
+            )
+            raise _ScratchLost(problem)
         launch = attempt_launch(lanes[lane_name])
         launch.update(lane=lane_name, kind=kind, round=round_index)
         record["launches"].append(launch)
@@ -827,14 +856,17 @@ def measure_case(
         return launch
 
     order = list(lanes)
-    with apu_v1_board_lock() as lock_path:
-        record["board_lock"] = str(lock_path)
-        for lane_name in order:
-            run(lane_name, "warmup", 0)
-        for round_index in range(1, measured + 1):
-            sequence = order if round_index % 2 == 1 else list(reversed(order))
-            for lane_name in sequence:
-                run(lane_name, "measured", round_index)
+    try:
+        with apu_v1_board_lock() as lock_path:
+            record["board_lock"] = str(lock_path)
+            for lane_name in order:
+                run(lane_name, "warmup", 0)
+            for round_index in range(1, measured + 1):
+                sequence = order if round_index % 2 == 1 else list(reversed(order))
+                for lane_name in sequence:
+                    run(lane_name, "measured", round_index)
+    except _ScratchLost:
+        pass  # recorded in record["incomplete"] and record["problems"]
 
     # Statistics over valid measured launches only (an invalid launch is
     # recorded but never contributes a cycle count).
@@ -998,6 +1030,20 @@ def main(argv=None) -> int:
         if record.get("error") or record.get("problems"):
             failures += 1
         session["records"].append(record)
+        if record.get("incomplete"):
+            # The host's scratch is gone: the remaining cases are not
+            # attempted (every attempt would be refused); the session is
+            # incomplete and says which cases it never reached.
+            remaining = args.cases[args.cases.index(case) + 1 :]
+            session["incomplete"] = dict(
+                record["incomplete"], case=case, cases_not_attempted=remaining
+            )
+            print(
+                f"session incomplete: {record['incomplete']['problem']}; "
+                f"cases not attempted: {remaining}",
+                file=sys.stderr,
+                flush=True,
+            )
         summary = {
             k: record.get(k)
             for k in ("case", "label", "error", "problems", "comparison")
@@ -1020,12 +1066,20 @@ def main(argv=None) -> int:
             for name, lane in (record.get("lanes") or {}).items()
         }
         print(json.dumps(summary, default=str), flush=True)
-    session["status"] = "pass" if not failures else f"fail ({failures} case(s))"
+        if session.get("incomplete"):
+            break
+    if session.get("incomplete"):
+        session["status"] = (
+            f"incomplete (scratch headroom lost during {session['incomplete']['case']}; "
+            f"{len(session['incomplete']['cases_not_attempted'])} case(s) not attempted)"
+        )
+    else:
+        session["status"] = "pass" if not failures else f"fail ({failures} case(s))"
     Path(args.out).write_text(json.dumps(session, indent=1, default=str))
     print(session["status"], flush=True)
-    # A failed execution, a wrong output or a violated invariant is a
-    # nonzero exit; every record is preserved in --out.
-    return 0 if not failures else 1
+    # A failed execution, a wrong output, a violated invariant or an
+    # incomplete session is a nonzero exit; every record is preserved in --out.
+    return 0 if not failures and not session.get("incomplete") else 1
 
 
 if __name__ == "__main__":
