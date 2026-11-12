@@ -3306,3 +3306,12 @@ recipe_dir -> /work/shared/users/phd/nz264/tenon-release-evidence/r170/envfix/ve
 | Board host | `/tmp` 5,464,064 bytes available (the guard needs 8 MiB for one attempt, the board sequence about 4.7 GB): no Gemini-I launch |
 | Not done | the Gemini-I board execution of the vector programs, forced plan and cost perturbation (G9 item (3), G8) and the remaining quota (kmeans 2, word count 2, linear regression 3) at `40f9b64`; X-34 / X-37 under the fixed rule; the final verdict (NOT READY) |
 
+## Round 190 (2026-11-12): an evidenced documentation defect of a supported Gemini-II interface fixed in the release docs (G2-17); the board still blocked
+
+| Check | Result |
+|---|---|
+| The defect and its evidence | `APUG2TypedProgram` and `APUG2ComposedContractionProgram` accept operand arrays only in the type's exact storage dtype (`APUG2ScalarType.numpy_dtype`: `int8`/`uint8` for widths up to 8 bits, `int16`/`uint16` up to 16, `int32`/`uint32` above) and shape; any other dtype is refused before any launch (`apu_g2_record_frontend._checked_array`, `TypeError: APUg2 operand '<name>' must have storage dtype <dtype>`). The source route accepts any integer dtype and converts. `CAPABILITIES.md`'s Gemini-II section documented neither; the round 169 card probe's first attempt was refused for `int16` arrays on int2 inputs (`r169/g2/pair_affine_probe_attempt1_int16_storage.json`), the evidence that a caller can hit it |
+| Fix (release documentation only) | an Operands row in the Gemini-II table of `CAPABILITIES.md` states the records' rule with the refusal text and the source route's permissive rule; ISSUES G2-17 logged and fixed in the same round. The runtime's behaviour is fail-closed and correct and is unchanged; no code, test or candidate changed |
+| Board host | `/tmp` 5,464,064 bytes available (the guard needs 8 MiB for one attempt, the board sequence about 4.7 GB): no Gemini-I launch |
+| Not done | the Gemini-I board execution of the vector programs, forced plan and cost perturbation (G9 item (3), G8) and the remaining quota (kmeans 2, word count 2, linear regression 3) at `40f9b64`; X-34 / X-37 under the fixed rule; the final verdict (NOT READY) |
+
