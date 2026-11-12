@@ -2846,3 +2846,15 @@ Checkout after the round 105 commits; evidence under
 | Board host | `/tmp` 4,554,752 bytes available (the guard needs 8 MiB): no launch |
 | Not done | the `f57c840` board evidence; the Gemini-I remaining quota (kmeans 2, word count 2, linear regression 3); the final verdict (NOT READY) |
 
+## Round 152 (2026-11-11): the round 151 wording corrected; the scripts require the whole sequence's scratch budget; the board still blocked
+
+| Check | Result |
+|---|---|
+| Round 151 wording (`fe9ecbb`) | REVIEW, VALIDATION, ISSUES X-22 / X-23 and STATUS now name the ratio-of-medians counts and the paired-ratio counts separately, keep the round 69 kmeans exception (current 1.0002 of the paper, paper-era binary 0.9999), and say "consistent with environmental variation; no cause established; a compiler or build contribution not excluded" |
+| Gap closed (`d5e338d`, evaluation scripts) | round 146 passed the 8 MiB production guard and exhausted the host's scratch seven launches into a 78-launch sequence; the guard protects one attempt, not a sequence. `g1_board.sh` gains a `scratch_budget` prerequisite: planned launches (2 cases x 3 lanes x (1 + measured) + 2 x (1 + forced measured) = 78 at the defaults) x `G1_TMP_PER_LAUNCH_BYTES` must be free on `G1_TMP_PATH` before the first launch, else it aborts with nothing launched; `g1_campaign.sh` launches a session only when its planned launches (cases x 3 x (1 + measured): 99 for three rows, 33 for one) fit, recording an over-budget session as not launched |
+| The per-launch figure (default 60,000,000 bytes) | from this work's own stage records: round 136 `/tmp` fell 5,522,288,640 bytes over the 99 `protocol_rows` launches (55.8 MB each) and 3,527,610,368 over the 66 `vector_rows` launches (53.5 MB each); round 146 fell 445 MB over the seven complete launches and the refused attempts; the default is the measured consumption plus a margin and is to be set only from measured consumption (`G1_TMP_PER_LAUNCH_BYTES`); what consumes the scratch is not identified and is not claimed |
+| What the budget means for the next attempt | the board sequence needs about 4.7 GB free, a three-row campaign session about 5.9 GB and a one-row session about 2.0 GB, on top of the production guard's 8 MiB; today's 4,534,272 bytes meet neither |
+| Regressions (`tests/perf/test_release_g1_board_script.py`, `test_release_g1_campaign_script.py`) | an unmeetable budget: `scratch_budget` fails, nothing launched, the driver never invoked; a meetable one: the dry run names the three stages; a campaign session over budget is recorded as not launched with no driver invocation, within budget it launches; the board sandbox tests check the budget on the sandbox's filesystem rather than the host's full `/tmp` |
+| The four suites with the assets enabled (`r152/pytest_assets_enabled.log`) | **72 passed**, none skipped; `git diff --check` clean |
+| Not done | the `f57c840` board evidence; the Gemini-I remaining quota (kmeans 2, word count 2, linear regression 3); X-34 / X-37 unresolved under the fixed rule; the final verdict (NOT READY) |
+
