@@ -44,9 +44,24 @@ def isolated_home(monkeypatch, tmp_path):
     return home
 
 
-def test_recipe_dir_is_the_checkout_copy(monkeypatch):
+def test_recipe_dir_resolves_to_the_shipped_copy(monkeypatch):
+    """Without an override the resolver returns the package's own bundled
+    recipe when the package ships one (an installed wheel: ``allo/pim/
+    simulators/PIMSimulator``), and the checkout's ``simulators/PIMSimulator``
+    when it does not (the source tree, where the bundled copy is created only
+    at sdist build).  Both branches name the exact directory expected; the
+    earlier form of this test asserted the checkout copy unconditionally and
+    failed from every installed package (release rounds 168 to 183)."""
     monkeypatch.delenv("TENON_PIMSIM_RECIPE", raising=False)
-    assert bundle.recipe_dir() == RECIPE
+    bundled = Path(bundle.__file__).resolve().parent / "simulators" / "PIMSimulator"
+    if (bundled / "apply.sh").is_file() and (bundled / "upstream").is_dir():
+        expected = bundled
+    else:
+        assert not bundled.exists(), f"an incomplete bundled copy at {bundled}"
+        expected = RECIPE
+    found = bundle.recipe_dir()
+    assert found.resolve() == expected.resolve()
+    assert (found / "apply.sh").is_file() and (found / "upstream").is_dir()
 
 
 def test_recipe_dir_override_and_missing(monkeypatch, tmp_path):
