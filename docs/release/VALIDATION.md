@@ -3000,3 +3000,13 @@ Checkout after the round 105 commits; evidence under
 | Board host | `/tmp` 4,423,680 bytes available (the guard needs 8 MiB): no launch |
 | Not done | the `273305c` board execution of the vector programs, forced plan and cost perturbation; the Gemini-I remaining quota (kmeans 2, word count 2, linear regression 3); X-34 / X-37 under the fixed rule; the final verdict (NOT READY) |
 
+## Round 165 (2026-11-12): the Gemini-II card chain at the accepted candidate `273305c`; the round 164 accounting corrected; the Gemini-I board still blocked
+
+| Check | Result |
+|---|---|
+| Accounting corrected (`6972861`) | the X-25 and X-27 fault-injection regressions passed from the `273305c` wheel in round 162 (`test_shared_semantics.py` sections q and r); `tests/perf/test_apu_g2_source_route.py` is local emulation and from the `273305c` wheel outside the checkout gives 44 passed and 5 skipped (`r165/run/pytest_g2_source_route_local.log`; the five archived-packing comparisons look the archive up relative to the test tree's parent instead of `TENON_ARTIFACTS`, an evaluation-test portability limit); only `tests/pim/test_apu_g2_hardware.py` needs the card host |
+| The chain (`r165/g2_chain_no_session.sh`, the round 141 chain with its round directory changed; `r165/g2-chain.log`, `r165/g2/stages/`; zhang-x4, the vendor tools on `PATH`; **MILESTONE PASSED**, 4 stages, 03:05 to 03:10) | `sdist_present`: the `273305c` sdist `ff03f88c9842fb4e...` through `r165/pkg -> r158/pkg`; `build_wheel` (`g2_build_wheel.sh`): zhang-x4 wheel `8a7f5bb2126e14d0...` built from that sdist and installed into the clean venv `r165/g2/venv`; `copy_tests_and_benchmarks`: `tests/pim` and `benchmarks` copied out of the checkout (identical to `273305c`'s); `card_tests` (`g2_card_tests.sh`, `flock -w 7200 /tmp/tenon-apu-g2.lock`): **15 passed in 124.13s** from the installed wheel (`allo` from `r165/g2/venv`), the device lock recorded in the launches (21 lock references in the log); no validation session, no campaign: a correctness and provenance validation, not performance confirmation |
+| What this changes | the Gemini-II card tests are now executed at `273305c` (they had been inherited from the round 141 run at `f57c840` through the byte-identical Gemini-II modules); X-34 and X-37 stay OPEN (nominal) under the fixed rule with no unchanged-program session |
+| Gemini-I board host | `/tmp` 4,440,064 bytes available (the guard needs 8 MiB and the sequence budgets more): no launch |
+| Not done | the `273305c` Gemini-I board execution of the vector programs, forced plan and cost perturbation; the Gemini-I remaining quota (kmeans 2, word count 2, linear regression 3); X-34 / X-37 under the fixed rule; the final verdict (NOT READY) |
+

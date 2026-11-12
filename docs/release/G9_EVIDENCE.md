@@ -271,10 +271,12 @@ compiled bindings are identical after the embedded build path is
 substituted, so items (1) and (2) above and the rounds 140, 141 and 157
 installed evidence describe the same code at `273305c` except the Samsung
 enumerator's refusal ordering; `f57c840`'s evidence keeps its own identity
-and is not relabeled.  Still executed at no candidate but `c762d4d`: item
-(3), the APU v1 vector-path execution with the forced plan and the cost
-perturbation; still owed at the accepted candidate: that execution and the
-Gemini-I remaining quota.  The Gemini-I pooler and campaign accept the
+and is not relabeled.  The Gemini-II card tests were executed at `273305c` in round 165 (the
+zhang-x4 wheel `8a7f5bb2126e...` from the `273305c` sdist, 15 passed under the
+device lock), so they are no longer inherited.  Still executed at no
+candidate but `c762d4d`: item (3), the APU v1 vector-path execution with the
+forced plan and the cost perturbation; still owed at the accepted
+candidate: that execution and the Gemini-I remaining quota.  The Gemini-I pooler and campaign accept the
 transition only through the verified installation-equivalence manifest of
 round 159 (`r159/installation_equivalence.json`, ISSUES X-49).  Apart from items (1), (2) and the unverified sample,
 nothing else of G9 is open: the migration, the matcher-backend contracts,
