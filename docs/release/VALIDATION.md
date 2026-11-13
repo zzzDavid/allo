@@ -3453,3 +3453,13 @@ recipe_dir -> /work/shared/users/phd/nz264/tenon-release-evidence/r170/envfix/ve
 | Board host | `/tmp` 290,816 bytes available (the guard needs 8 MiB for one attempt, the board sequence about 4.7 GB, the campaign about 5.9 GB): no Gemini-I launch; guards not bypassed |
 | Not done | the Gemini-I board execution (G9 item (3), G8) and the owed rows (kmeans 2, word count 2, linear regression 3) at `r193/pkg`, `r194/testtree`, the `r195` manifest; X-34 / X-37 OPEN under the fixed rule; the final verdict (NOT READY) |
 
+## Round 204 (2026-11-12): two stale Samsung rows of CAPABILITIES corrected (carried accumulators; the reassociating default)
+
+| Check | Result |
+|---|---|
+| Input row (review finding) | said a carried accumulator is rejected before scheduling; the implementation admits it: the matcher records `accumulator_init == "carried"`, the Samsung lowering selects the ordered TEMPORAL program whose conductor loads the caller's initial values, and the REDUCE candidates that zero GRF_B are pruned (`tests/pim/test_match_coverage.py::test_carried_accumulator_selects_the_ordered_program_on_samsung`, PASSED from the installed `448a51f` wheel in the round 197 `tests/pim` run and in the reviewer's independent run); AiM rejects it instead (`test_carried_accumulator_rejected_where_the_device_zeroes_it`, PASSED in the same run); the row now states this and keeps the old statement as history |
+| Selection row (review finding) | named bank_row at 4,389 / 7,947 / 8,153 as the reassociating default; aligned with CLAIMS E1 (round 201): the default layout selection under `reduction_order="reassociate"` is `split_rows` + host GRF_A fill + shared CRF at 4,108 / 7,057 / 7,255 cycles (`design/samsung-execution.md` sections 8 and 10.4; the round 196 `SAMSUNG_GOLDEN` lines from the `448a51f` wheel), the strict default's ordered TEMPORAL program (26,807 cycles) retained as the distinct policy; the Numerical-scope row lists `split_rows` among the REDUCE programs reassociation admits; the bank_row figures kept as history |
+| What did not change | no compiler, package or test change (`allo/` identical to `448a51f`); no inventory status or value; no validation campaign launched |
+| Board host | `/tmp` 233,472 bytes available (the guard needs 8 MiB for one attempt, the board sequence 4,680,000,000 bytes, the three-row campaign session 5,940,000,000): no Gemini-I launch; guards not bypassed |
+| Not done | the Gemini-I board execution (G9 item (3), G8) and the owed rows (kmeans 2, word count 2, linear regression 3) at `r193/pkg`, `r194/testtree`, the `r195` manifest; X-34 / X-37 OPEN under the fixed rule; the final verdict (NOT READY) |
+
