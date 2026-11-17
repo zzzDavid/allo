@@ -3,7 +3,7 @@
 
 # Validation record
 
-## Round 211: target FP16 model, before installed confirmation
+## Round 211: installed target FP16 model and board confirmation
 
 Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r211`.
 `paper-lock-check.json`: 73/73 frozen files match. `exhaustive-v1` covers all
@@ -20,16 +20,125 @@ the two new shape probes, 16 focused primitive/G6 checks passed. The earlier
 `focused-second.log` records an incorrect test filename and no tests; corrected
 invocation is `focused-third.log`. Black and shell syntax/diff checks pass.
 Pylint reports two existing `pending` inference errors at spmw_apu_v1.py:523;
-`pylint-baseline.log` reproduces both on the unchanged HEAD text. No new
+`pylint-baseline.log` reproduces both on the pre-repair HEAD text. No new
 error was reported in the arithmetic model, integration or SDK harness.
 The requested conda environment `allo` is absent; checks use the installed
 `spmw` environment, with all scratch on host-local storage.
 
-The predeclared board protocol is in `design/gemini-i-fp16.md`. Build/install,
-exact program/payload identity, fresh board execution and the 42-stage
-installed milestone are the next actions. Performance campaigns stay fixed.
+Candidate `e0c568aab27d742b5ad74c31f1270429e7215fef` was committed and
+fast-forward pushed to `fork/tenon`. `build_candidate.sh` builds the sdist,
+then the wheel from that sdist, and installs outside the checkout in `r211/pkg`.
+Wheel SHA256: `c4a13fa7b1c5699b4d9cccf44fad4ef9904dcf01be082c044d1f4a581767bd56`.
+Sdist SHA256: `212de7b76bfa5b25ddcec97fc1c9238beb4173b14286bfb7c6f295fb05620790`.
+`candidate-equivalence.json` verifies all 501 installed package files against
+the wheel. Against `5fec806`, the complete payload delta is:
 
-## Current candidate hardware completion (r210, 2026-11-17)
+- Added `allo/pim/apu_v1_fp16.py`.
+- Changed `allo/pim/apu_v1_vector_program.py`,
+  `allo/pim/apu_v1_vector_codegen.py`, and `allo/spmw_apu_v1.py` for functional
+  arithmetic and numerics metadata.
+- Changed `allo/compiler.py`, `allo/spmw_pipeline.py`, and
+  `allo/spmw_autoschedule.py` only in docstrings/comments (AST comparison in
+  `source-delta-audit.json`).
+- Changed wheel RECORD. The other 512 payload files, including bindings,
+  are byte-identical. No vendor reference library, header or bridge is bundled.
+
+`exhaustive-installed` repeats the complete SDK comparison through this
+installed model: zero differences, 114.57 seconds. The contiguous chunk
+coverage and current model/SDK/header hashes are independently checked in
+`exhaustive-coverage-audit.json`. The SDK check directly invokes subgroup
+reduction, rather than inferring its tree from contractions. The two
+retained audit-script development failures (syntax and a hash-field schema
+assumption) preceded the corrected passing audit; neither is a model failure.
+Three failure-scope regressions confirm that launch exceptions and bit
+mismatches fail while equal outputs pass. No xfail remains on these board
+contractions. The separate IEEE oracle remains available and disagrees on
+the expected inexact products; the frozen exact-product experiment is
+predicted bit-exact by the maintained model. The additional installed
+prediction in `paper-numerics-prediction.json` also matches the historical
+regrouped count (859 of 4,096 equal to source order, versus 4,096 under
+strict); it uses no hardware and does not reopen a measurement campaign.
+
+`generated-program-equivalence.json` compares the seven Gemini-I campaign
+programs from old and new installations. All 49 emitted source/project/ABI
+files are byte-identical; selected plans, packing and recorded identity fields
+also agree. All 25 Gemini-II payload files are byte-identical. The extended
+`installation_equivalence.json` rehashes nine installations, preserving the
+previous manifests and their reviewed normalization rules. It is an evidence
+link, not a production source allowlist. No campaign was rerun, no pool was
+recomputed, and the three OPEN outcomes remain fixed.
+
+The board protocol in `design/gemini-i-fp16.md` was committed before launch:
+zero uint16 mismatches, including NaNs. `run_board.sh` runs the new installed
+wheel against an archived test tree. The unchanged 41-reading window over
+600.000 seconds held 170,713,088 free bytes throughout, with passing guards,
+no leaked reserves and zero net drop. Read-only transport preflight passed
+in 48.442 seconds. No capacity or retry rule was reduced.
+
+| Shape (M × K), seed | Strict mismatches | Regrouped mismatches | Independent IEEE source-order differences |
+| --- | ---: | ---: | ---: |
+| 512 × 256, 706 | 0 / 512 | 0 / 512 | 259 |
+| 384 × 200, 707 | 0 / 384 | 0 / 384 | 194 |
+| 640 × 96, 9211 | 0 / 640 | 0 / 640 | 301 |
+| 1000 × 300, 9212 | 0 / 1000 | 0 / 1000 | 518 |
+
+The additional 32x1 by 1x32 outer product, with signed zeros, subnormals,
+overflow/underflow, infinities and NaNs, has zero mismatches in 1,024 output
+encodings. Total: **nine launches, 6,096 exact output encodings, five tests
+passed**, no xfail or skip (`board/tests.log`, 962.90 seconds).
+`board-evidence-inspection.json` binds results to raw readback bytes and
+source, binary and input hashes, and reparses the chronological raw profiles.
+Each launch has exactly one fresh record and exactly two reads; 19 successful
+reads include the preflight. Retained profile bytes: 664,638,981. No extra
+flush-lag retry was needed; this observation is not a universal firmware
+flush bound. Firmware `220.13.500.7` and ledag-ssh `100.12.0.1.1000.25` are
+in the manifests. These cycles are semantic-run provenance, not new samples
+for the fixed performance campaigns. All earlier failed evidence is retained.
+
+Reproduction entry points (paths below are relative to the evidence root):
+`build_candidate.sh`, `compile_identity.sh`, `run_board.sh`, and
+`run_milestone.sh`. The exhaustive command is
+`pkg/venv/bin/python -m benchmarks.apu_v1.fp16_reference --exhaustive --out
+/absolute/fresh/evidence`, with benchmarks copied outside the checkout.
+The installed milestone completed **42/42 required stages PASS**, exit 0,
+with `ALLO_CHECKOUT=r211/pkg/tree` (the pinned source archive), test/benchmark
+copies under `r211/testtree`, and imports from the installed venv. NumPy 2.3.5
+was asserted for the main run; separate release and newer-NumPy environments
+also passed (newer NumPy was 2.5.5). Its two RuntimeWarnings are the existing
+uint16 modular-overflow oracle in `test_temporal_plan_accumulates_nonzero_initial_output`,
+not FP16 model mismatches; both expected results passed. Samsung built from
+the wheel's bundled source/recipe in a fresh
+`TENON_HOME`; no private Samsung tree supplied that execution.
+
+`milestone-audit.json` records every required stage, exit status, complete-log
+hash and pytest summary. The 24 `paper_full` rows omitted by the first golden
+selection all passed in its explicit full selection; likewise all 13 deferred
+CENT rows passed in their full selection. One shared-contract test, the
+optional full-500-instance selector tally, remained unselected under its
+`paper_full` marker; the required 500 selected simulator configurations ran
+separately in the AttAcc figure stages. These are scheduling markers, not
+unavailable-backend waivers. The new SDK-reference and board-failure-scope
+checks ran in the installed functional-reference stage.
+
+Fresh required results: Samsung 3, AiM 14 (timing-only), UPMEM 16, AttAcc
+kernel tiling 6 and modeled decode 6. AttAcc retains all 248 configurations
+per attention row, raw command/trace checks and simulator outputs; its frozen
+comparison reports all 12 verdicts REPRODUCED with no evidence problems.
+`inventory-update-audit.json` confirms its comparison records are identical
+to the previous validated run, and preserves every existing value/verdict.
+The initial inventory-audit tokenizer distinguished `REPRODUCED:` from
+`REPRODUCED` and refused before any write; the retained script/log explain
+its correction. No result status changed. The inventory now points to fresh
+evidence for those 45 rows and exact program/payload carry for the ten hardware rows: **52 REPRODUCED, three OPEN**.
+No new hardware campaign, pooled statistic or tolerance was introduced.
+
+The post-validation change is documentation only. `final-identity-audit.json`
+binds its revision to source candidate e0c568a, rehashes all 501 installed
+package files plus the wheel/sdist and all 73 frozen-paper files, and records
+the six inherited untracked verifier scripts. No release publication, tag,
+PR, force push or upstream push is part of this checkpoint.
+
+## Historical hardware completion (r210, 2026-11-17)
 
 Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r210`.
 Installed compiler remains `5fec806`, wheel and equivalence identities below.

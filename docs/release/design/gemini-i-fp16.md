@@ -74,7 +74,7 @@ Independent recomputation from the SDK also matches all eight retained r210
 strict/regrouped board outputs exactly (`r211/retained-board-comparison.json`).
 The independent IEEE source-order oracle remains in the tests. The K=1 probe
 (seed 300, 1,024 products) gives the same 66 IEEE differences. This evidence
-explains the prior failures; fresh installed confirmation below is still owed.
+explains the prior failures; fresh installed confirmation below independently agrees.
 
 ## Frozen paper and scope
 
@@ -84,6 +84,10 @@ The lock was rechecked: 73/73 files at paper commit
 experiment; its signed-power-of-two operands times one have exact products.
 The model predicts all 4,096 IEEE-oracle outputs exactly in
 `test_ieee_product_difference_and_exact_product_paper_inputs`.
+A separate installed-model prediction (`r211/paper-numerics-prediction.json`)
+also gives the historical regrouped result: 859 of 4,096 outputs equal the
+source-order reference, versus 4,096 for strict. This is a functional
+prediction, not a new device measurement.
 `sections/6-discussion.tex:27–30` discusses permission to regroup and the
 limits of exact-integer probes. Neither establishes arbitrary-product IEEE
 multiplication on Gemini-I. The paper is unchanged; CLAIMS E11 retains that
@@ -114,5 +118,36 @@ Use the unchanged ten-minute, 15-second, 16-MiB residual-space window and
 read-only transport preflight before the nine launches. No xfail, tolerance
 change or failed-sample replacement is allowed. Any disagreement is a defect
 to diagnose against device ground truth, followed by fresh-input confirmation.
-Existing performance campaigns are fixed and must not be resampled. V1-16
-remains pending installed confirmation until that evidence is recorded.
+Existing performance campaigns are fixed and must not be resampled. V1-16 is a documented target-arithmetic boundary after the confirmation below.
+
+
+## Installed confirmation at e0c568a
+
+The protocol above was committed before launch. Wheel SHA256
+`c4a13fa7b1c5699b4d9cccf44fad4ef9904dcf01be082c044d1f4a581767bd56`
+was installed outside the checkout. `r211/board` completed all nine launches:
+
+| M × K | Seed | Strict mismatches | Regrouped mismatches | IEEE source-order differences |
+| --- | ---: | ---: | ---: | ---: |
+| 512 × 256 | 706 | 0 / 512 | 0 / 512 | 259 |
+| 384 × 200 | 707 | 0 / 384 | 0 / 384 | 194 |
+| 640 × 96 | 9211 | 0 / 640 | 0 / 640 | 301 |
+| 1000 × 300 | 9212 | 0 / 1000 | 0 / 1000 | 518 |
+
+The 32x1 by 1x32 special-value outer product had zero mismatches of 1,024
+encodings, including NaN payloads/signs. Five tests passed, no xfails or
+skips. The independent inspection binds every logical result to retained
+raw device bytes, generated source/binary/input hashes and exactly one fresh
+profile record (`r211/board-evidence-inspection.json`). Every launch used two
+reads; no extra flush-lag retry was needed. This is evidence for these runs,
+not a universal firmware flush-time bound. Firmware `220.13.500.7` and
+ledag-ssh `100.12.0.1.1000.25` are recorded in the copied-log manifests.
+
+The unchanged 41-reading, ten-minute window held 170,713,088 free bytes with
+no drop, guard failure or leaked reserve. The real transport preflight took
+48.44 seconds. The installed model's complete SDK validation also passed
+(`r211/exhaustive-installed`, 114.57 seconds); contiguous chunk coverage and
+installed model/SDK hashes were independently rechecked. The eight archived
+r210 outputs remain distinct explanatory evidence. No performance campaign
+was rerun or repooled, and no arithmetic tolerance or accepted input class
+was changed.

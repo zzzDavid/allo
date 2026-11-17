@@ -7,6 +7,11 @@ Status: implemented for release issues C-09 (core), S-03 (Samsung ordered
 program) and V1-03 (APU v1 plan selection). Module:
 `allo/spmw_reduction_policy.py`.
 
+Sections 1–7 retain the original migration design and its historical findings;
+current shared routes are documented in `shared-compilation-path.md`. The
+Gemini-I target-arithmetic section below supersedes the initial FP16 model
+and its unvalidated numerical claims.
+
 ## 1. Problem
 
 The paper states that "combining partial sums in a different order requires
@@ -27,7 +32,7 @@ could not be reached from `allo.compile`.
 
 | value | meaning |
 |---|---|
-| `"strict"` (default; also `None`) | Every accumulation keeps the source order and the source rounding. The accumulator is updated once per reduction iteration, in ascending iteration order, and every multiply and add rounds to the accumulator's element type. A schedule that forms partial sums of a floating-point reduction and combines them is illegal. |
+| `"strict"` (default; also `None`) | Every accumulation keeps source order and each primitive’s documented target rounding (Gemini-I uses GVML FP16 products, not IEEE RNE products). The accumulator is updated once per reduction iteration, in ascending iteration order, and every multiply and add rounds to the accumulator's element type. A schedule that forms partial sums of a floating-point reduction and combines them is illegal. |
 | `"reassociate"` | Partial sums may be formed, grouped and combined in any order, and in a wider type. |
 
 **Integer accumulators.** For `i*`, `ui*`, `si*` and `index` types,
@@ -86,7 +91,7 @@ suggests `reduction_order="reassociate"`.
 | AiM (`_REGROUPING_MATCHER_ROUTES["aim"]`) | every `MAC_ABK`/`MAC_SBK` reduces the 16 BF16 products of a burst through the bank adder tree before accumulating | `ReductionOrderError`. AiM has no source-order program. `replica_partitions` spreads a replica's *outputs* over channels and never splits the reduction axis (audit M-08). The CENT RMS bank-pair idiom (`spmw_aim._check_bank_pair_span`) does split one, but under strict it is unreachable because every AiM float reduction is refused. The `reduction_partitions` knob (token split, `spmw_knobs._aim_reduction_partitions_candidates`) reads `reduction_policy(match)` and offers only P = 1 when regrouping is forbidden. |
 | APU v1 matcher route (`_REGROUPING_MATCHER_ROUTES["apu_v1"]`) | `gvml_add_subgrps` group tree | `ReductionOrderError`. The source-order plans live on the vector route. |
 | `pim/apu_v1_vector_program._apply_reduction_policy` | `group_tree` / `pairwise` / `host` / `partial` reduction kinds (`apu_v1_plan_regroups`). `temporal_accumulate`, `serial` and `none` add one product per step in source order. | Regrouping plans are removed before `search_apu_v1_vector_plans` and the legacy incumbent ranking. `layout=<pruned plan>` raises. If no plan remains, the compile raises. |
-| `apu_v1_vector_program._run_functional` (the vector route's host model behind `backend="functional"`/`"virtual"`; formerly reached as `APUv1VectorCallable._run_functional`) | numerics of the selected plan | With a temporal plan the source program runs, which is the plan's order. With a regrouping FP16 plan (only possible with `"reassociate"`) the run uses `_grouped_fp16_contraction`: FP16 products, a halving FP16 tree over each `group_size` group, then groups added to the output in ascending order. That is the order of `fp16_contraction_ops`. The halving order is a model of `gvml_add_subgrps`; it has not been checked against the board. |
+| `apu_v1_vector_program._run_functional` (the vector route's host model behind `backend="functional"`/`"virtual"`; formerly reached as `APUv1VectorCallable._run_functional`) | numerics of the selected plan | Current FP16 execution uses `_fp16_contraction` with retained accesses and GVML primitives: temporal plans add products in source order; regrouped plans use adjacent-pair trees within each selected group and add group heads in ascending order. Both policies have installed board bit-equality evidence (round 211, below). |
 
 Gemini-II (`apu_v2`) has no source route. Its typed records reject the
 argument.
@@ -181,7 +186,8 @@ accumulator).
 
 ## 5. APU v1 (V1-03)
 
-4096x256 FP16 GEMV, functional backend:
+Historical 4096x256 FP16 GEMV check of the initial functional model (the
+regrouped count is not evidence for the corrected target model):
 
 | policy | selected plan | pruned | bit-equal to source order |
 |---|---|---|---|
@@ -240,23 +246,29 @@ because they exercise regrouping programs:
    `require_matcher_route_policy` runs in `allo.compile`. A direct
    `compile_for_target` call on an AiM trace with strict stamps is not
    refused.
-3. The APU v1 functional tree model has not been checked against the board
-   (no hardware runs in this change).
+3. Resolved in round 211: the corrected APU v1 primitive and reduction model
+   agrees with nine fresh installed board launches (below).
 4. The policy is per compile. A per-reduction policy (one strict reduction
    and one regrouped reduction in the same workload) has no syntax yet. The
    stamp is per match, so the enumerators already read it per reduction.
 
 
-## Board finding on APU v1 (round 6, V1-16)
+## Gemini-I target arithmetic (V1-16)
 
-`tests/pim/apu_v1/test_g6_board_semantics.py` ran both plans of a 512x256
-and a 384x200 FP16 GEMV on the Gemini-I board. Both plans agree with FP32
-within FP16 tolerance, but neither is bit-equal to its host model: about
-half of the outputs differ from the source-order loop (strict plan) and
-from the halving tree (reassociating plan) by a few ulps. The strict policy
-on APU v1 therefore guarantees that the selected plan does not regroup the
-reduction, and the functional route models the plan's order; it does not
-guarantee bit-equality with an IEEE FP16 round-to-nearest model, because
-the GVML FP16 multiply and add have not been characterized at that level.
-The bit-equality test is kept as a strict xfail with the mismatch counts
-printed.
+The initial IEEE-product and first-half/second-half-tree models did not match
+the device. Round 211 re-derived the installed vendor reference: GVML multiply
+rounds its significand before truncating normalization/underflow, add/subtract
+use nearest-even with explicit target NaN rules, and subgroup heads reduce
+adjacent pairs at every level. All 2^32 multiply pairs and the full special
+classes for add/subtract match the maintained NumPy model. Strict and
+reassociating functional execution use those primitives and retained accesses.
+
+Strict therefore means source operation order with GVML primitive arithmetic.
+It does not select an IEEE replacement or grant permission to regroup.
+`RunResult.extra["numerics"]` discloses the target contract. The independent
+IEEE oracle remains beside target bit-equality checks, and the old xfail is
+removed: a model mismatch or transport failure fails. Fresh installed board
+confirmation passed all nine launches under the predeclared protocol in
+[gemini-i-fp16.md](gemini-i-fp16.md): 6,096 exact output encodings, including
+special values, with one fresh profile record per launch.
+The frozen paper's exact-product experiment is predicted unchanged.

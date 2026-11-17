@@ -72,6 +72,20 @@ imported from its modules::
        produced by ``benchmarks/attacc/scripts``
      - ``virtual``
 
+Gemini-I FP16 arithmetic
+=======================
+
+Gemini-I uses the vendor GVML binary16 primitives. Multiplication rounds the
+significand before truncating normalization and underflow shifts; an inexact
+finite product can be one binary16 step smaller in magnitude than IEEE RNE.
+Addition is nearest-even. Strict reduction preserves source operation order
+with those target primitives. Reassociation admits the selected adjacent-pair
+group tree. Functional execution models the same arithmetic; it is not a
+hardware measurement. Results disclose this in ``extra["numerics"]``.
+Special-value rules and validation are in
+``docs/release/design/gemini-i-fp16.md``. Callers requiring IEEE-exact products
+must account for this target contract; no IEEE substitution is performed.
+
 Installation and discovery
 ==========================
 

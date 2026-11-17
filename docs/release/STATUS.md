@@ -17,24 +17,50 @@
 3. Gemini-I FP16 defaults to the vendor multiply contract, not IEEE RNE
    products. Strict preserves source order with that target arithmetic.
    The repair and its complete primitive checks are described in
-   [the arithmetic contract](design/gemini-i-fp16.md); installed board
-   confirmation remains required before accepting V1-16 as a boundary.
+   [the arithmetic contract](design/gemini-i-fp16.md). Installed board
+   confirmation is bit-exact; V1-16 is now a documented target boundary.
 
-## Active V1-16 repair (round 211)
+## Current candidate e0c568a — NOT READY
 
-Working source introduces a maintained NumPy model for all FP16 encodings,
-uses it in strict and grouped functional execution and low-level operation
-execution, and exposes target numerics in results. Exhaustive SDK-reference
-multiply validation covers all 2^32 pairs with zero differences; add/subtract
-special-class and random checks and direct subgroup checks also pass.
-Eight retained r210 board outputs independently match the vendor reference.
-The paper lock remains 73/73 exact. Evidence root:
+Committed and pushed to `fork/tenon`. The new installed wheel is
+`r211/pkg`, SHA256
+`c4a13fa7b1c5699b4d9cccf44fad4ef9904dcf01be082c044d1f4a581767bd56`;
+sdist `212de7b76bfa5b25ddcec97fc1c9238beb4173b14286bfb7c6f295fb05620790`.
+All 501 installed package files match. The exact delta from `5fec806` is one
+new arithmetic module, six changed Python modules (three only comments or
+docstrings), and RECORD; 512 other payload files are identical.
+
+V1-16 is repaired and documented as target arithmetic. Exhaustive installed
+SDK checks pass for all 2^32 multiply pairs, full add/subtract special classes
+in both orders, large random sets and direct subgroup calls. The installed
+board run passed all nine launches: strict and regrouped plans at the two
+original and two new shapes, plus signed-zero/subnormal/overflow/underflow/
+infinity/NaN operands. All 6,096 output encodings are exact. No xfails,
+skips, transport failure or extra read: exactly one fresh record and two
+reads per launch. The independent IEEE oracle remains visible.
+
+All seven G1 campaign programs and 49 emitted source/project/ABI files are
+byte-identical to the prior candidate. All 25 G2 payload files are identical;
+the nine-installation equivalence chain was rehashed without repooling.
+Fixed campaigns carry by program identity. The three performance misses and
+Samsung permission question above remain unresolved. Paper lock: 73/73.
+
+The required installed milestone completed once: **42/42 required stages
+PASS**, including fresh execution of all 45 required simulator/model results.
+The hardware outcomes carry by exact program identity; the inventory remains
+52 REPRODUCED and three OPEN. No required result is missing or incomplete.
+The G1–G10 actor walkthrough is in REVIEW.md; final independent approval is
+still required. No hardware, simulator or milestone job remains active.
+
+Next action: independent source/evidence review of this exact candidate and
+the target-arithmetic boundary, with the three decisions above carried to the
+user. Do not resample fixed hardware results or rerun the unchanged milestone.
+The subsequent documentation-only commit changes no compiler/package payload;
+`final-identity-audit.json` records its revision and rechecks the installed
+files and frozen paper. Evidence root:
 `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r211`.
-Next: commit the bounded repair, install its wheel, execute the predeclared
-nine board launches and the installed 42-stage milestone, and prove unchanged
-campaign program identities. No fixed performance campaign is rerun.
 
-## Current candidate checkpoint (2026-11-17)
+## Historical round-210 candidate checkpoint (before the V1-16 repair)
 
 **NOT READY.** Named compiler candidate:
 `5fec80627675094d83dc7d22910e2cc6698adb8f`, committed and pushed normally to

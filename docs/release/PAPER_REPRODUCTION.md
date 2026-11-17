@@ -3,7 +3,28 @@
 
 # Paper reproduction through the shared pipeline
 
-## Current fixed outcomes and environment context (candidate 5fec806)
+## Current candidate e0c568a: fresh simulation and fixed hardware outcomes
+
+Installed wheel SHA256
+`c4a13fa7b1c5699b4d9cccf44fad4ef9904dcf01be082c044d1f4a581767bd56`
+passed all 42 required milestone stages in `r211/stages`. All 45 required
+simulator/model rows were freshly executed: Samsung 3, AiM 14, UPMEM 16,
+AttAcc kernel tiling 6 and modeled decode 6. Values are unchanged. Samsung
+was built from the bundled recipe; AiM remains timing-only and AttAcc decode
+remains analytical composition. Full evidence and commands are in VALIDATION.
+
+The FP16 repair changes functional arithmetic and numerics metadata, not
+generated device work. All seven Gemini-I programs / 49 emitted source,
+project and ABI files are byte-identical to candidate 5fec806; all 25
+Gemini-II payload files are byte-identical. The nine-installation equivalence
+chain is rehashed in `r211/installation_equivalence.json`. Thus the ten
+hardware rows below carry by program identity, with no new performance
+launch, resampling or repooling. The separate nine-launch FP16 confirmation
+checks semantics only and is not used for these performance comparisons.
+Required outcomes remain **52 REPRODUCED and three OPEN**; optional rows and
+all failed/partial evidence are preserved.
+
+## Fixed outcomes and environment context (measured at prior identical programs)
 
 Gemini-II GEMM stays **OPEN (nominal)**: the fixed four-session median is
 1734.0 versus the frozen paper's 1733.225 ticks. The fresh interleaved GTML

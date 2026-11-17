@@ -3,64 +3,71 @@
 
 # Release review: architecture, constants, specialization, gate judgments
 
-## Final candidate source/evidence walkthrough: 5fec806 — NOT READY
+## Candidate source/evidence walkthrough: e0c568a — NOT READY
 
-Named compiler candidate: `5fec80627675094d83dc7d22910e2cc6698adb8f`.
+Named compiler candidate: `e0c568aab27d742b5ad74c31f1270429e7215fef`.
 Installed wheel SHA256
-`45c98918aa6e99d70c5e18724d1226e6974f1060dd0f3d35280da9ac997718e3`.
-The independent review accepted the guard/campaign controls and checked the
-r209 artifact equivalence. This actor walkthrough follows the current common
-stage boundaries and both APU hooks, and incorporates the completed r210
-installed hardware evidence. It combines retained independent audits
-with exact payload identity, rather than claiming every old execution ran
-from a new installation pathname. No final independent release approval or
-all-gates PASS is inferred.
+`c4a13fa7b1c5699b4d9cccf44fad4ef9904dcf01be082c044d1f4a581767bd56`.
+This actor walkthrough combines the retained independent audits with a fresh
+read of the common orchestration, semantic/effect checks, both APU candidate
+hooks, and the changed functional/runtime paths. It does not impersonate
+independent final approval. The required installed milestone completed once:
+all 42 required stages PASS, with all 45 required simulator/model results
+freshly reproduced. Fixed hardware results carry by exact program identity.
+No all-gates PASS is inferred.
 
-The paper lock was rechecked: all 73 files match frozen commit
-`30b6f49e64583b5d301d2a5e8b902498f5578e4e` (r210/paper-lock-check.json).
-Source correspondence uses that baseline and the required/optional mapping.
+The frozen paper is unchanged: 73/73 files match commit
+`30b6f49e64583b5d301d2a5e8b902498f5578e4e`. Requirements use that lock and the
+required/optional reproduction scope. Gemini-I's exact-product experiment
+is predicted unchanged; its broader target arithmetic is now explicit.
 
 | Gate | Current source/evidence assessment | Remaining qualification or blocker |
 | --- | --- | --- |
-| G1 | `compiler.compile` normalizes ordinary source through `normalize_source`; both typed APU frontends normalize into the shared trace/facts. CLAIMS maps the maintained target/layout/search/runtime mechanisms and separately labels external evaluation assets. | Every required comparison now has a complete verdict, but three fixed G10 outcomes remain OPEN; no performance closure. Existing supported-domain qualifications remain explicit. |
-| G2 | `require_match_coverage`, shared `ProgramFacts`, realizable-access checks and `require_effects_realized` run before selection. Selected declarations and realized effects are checked again. The new allocation guard refuses before CLI invocation and does not change freshness or outputs. | Installed G6 confirms seven semantic value checks and two expected bit-model failures. V1-16 remains an OPEN semantic blocker: native GVML rounding does not establish the strict FP16 source contract. It is not waived by tolerance or by an expected-mismatch test. |
-| G3 | APU planners consume retained program facts; their catalogs derive from semantic contraction/recipe properties. The reviewed G2 switch is on the existing semantic epilogue enum. New storage constants are empirical reserves/explicit operational policy, not benchmark selectors. | Prior constant/specialization audits remain the evidence for unchanged code. No new benchmark identity, expected-answer, or approved-source-hash selector was introduced in production. Evaluation identity manifests do not select compiler semantics. |
-| G4 | `autoschedule` applies placement legality and `validate_candidate_effects`; `rank_matcher_placements` realizes candidates, retains a feasible incumbent and labels bounded complete versus per-group heuristic search. `compile_for_target` rebinds supplied choices, rechecks effects/legality/transfers and calls `check_realization` after emission. | Masked/bounded/scalable layout domains remain distinct. No universal optimality claim. Round 208 hardware alternative traces, seven identical candidate programs and the two r210 forced-layout executions support selected-program integrity; operational checks completed with retained raw evidence. |
-| G5 | The resource-calendar evaluator prices retained graphs. Backend recipes provide event multiplicities and validity scopes. Round 208 forced/cost-perturbed programs reached actual launches on both APUs. The guard/control changes do not alter costs. | No new calibration, fitted winner, or GEMM parity allowance. G6 contraction estimates are labeled extrapolated and are not validated for timing accuracy by these semantic checks. Amortized ARC pipeline ticks are not isolated instruction latency. V1-16 remains a separate open semantic blocker. |
-| G6 | Existing installed milestone/generalization evidence transfers for byte-identical compiler modules; exact generated identities include all five G1 defaults and both controlled alternatives. | Current installed follow-ups completed: 9 passed, 2 narrowly expected `BitModelMismatch` failures, no ordinary failure or skip. V1-16 prevents full semantic closure; no transport failure was absorbed by xfail. |
-| G7 | Fresh committed sdist/wheel install outside checkout; all 500 package files match. Exact wheel delta from 7f52c11 is only `apu_v1_program.py` plus RECORD; all 517 other payload files, including bindings, match. Bundled Samsung sources/notices/build recipe remain identical to the executed artifact. | SDKs and evaluation-only simulator/DCC assets retain their documented external installation/license boundaries. P-04 packaging is implemented, but Samsung written redistribution permission remains unrecorded in the distributed NOTICE; bundling direction is not evidence resolving that question. No package publication. Residual-space provisioning is an explicit operational prerequisite. |
-| G8 | Round 208 exercised local simulators/models and both hardware hosts; AiM remains timing-only with no fabricated outputs, AttAcc remains analytical composition. Current artifact equivalence is documented by mode. | Installed 5fec806 now completed 198 campaign, 33 histogram and 20 G6/layout launches; raw evidence and device outputs retained. Execution is no longer storage-blocked. V1-16 still qualifies the numerical contract. |
-| G9 | One `compile_for_target`/autoschedule/realization path follows both source and typed normalization. `apu_v1_vector_candidates` and `apu_g2_source_candidates` require shared facts; candidate effects, materialization and graph selection are common. No public end-to-end APU compiler bypass was added. | Migration source contracts and actual forced/cost traces are present; current G1 confirmations are complete with exact payload equivalence. Final independent gate approval is not inferred from this actor walkthrough; V1-16 remains a separate semantic defect. |
-| G10 | 52 required comparisons REPRODUCED, three fixed OPEN, no incomplete or missing required verdict. Optional studies remain separate. The quota and one authorized histogram row completed without replacement. | FAIL: word count 172,091 vs 171,988; linear regression 95,018 vs 94,618.5; X-34 GEMM 1734.0 vs 1733.225. Favorable controls do not waive absolute misses. No resampling or partial-row promotion. |
+| G1 | `compiler.compile` normalizes ordinary source through `normalize_source` and derives `ProgramFacts` once. Both typed APU frontends enter the same downstream driver. CLAIMS E11 now maps the frozen exact-product experiment to the defined GVML arithmetic and the maintained model. | Existing backend domains remain explicit. The paper is not edited to conceal an implementation gap. Three G10 misses remain. |
+| G2 | Shared coverage, cast/precision, initialization, alias, guard and effect checks run before selection. The FP16 model consumes retained accesses and the selected reduction strategy; it uses the same staged initial output and alias snapshots as the runtime. | V1-16 is a documented target-arithmetic boundary: exhaustive SDK checks and nine installed board launches agree bit for bit, including special values. Strict means source order with GVML primitives, not IEEE products. No tolerance or input-class restriction was added. |
+| G3 | The new model is a generic binary16 algorithm. Its masks, exponent widths, normalization shifts and NaN encoding are format/target facts; the subnormal shift table is derived from bit length. Group sizes are ISA powers of two, not workload identities. | No seeds, expected results, benchmark labels, archived winners or SDK hashes select production behavior. The SDK oracle is optional evaluation code, never imported by the compiler. V1-18 is an explicit non-core matcher boundary, not silent fallback. |
+| G4 | `autoschedule` validates candidate effects, materializes candidates and ranks their realized graphs. Complete assignments are evaluated within the joint budget; larger domains retain the labeled per-group heuristic. `compile_for_target` rechecks supplied layouts, transfers, effects and realization. | Seven G1 programs and 49 source/project/ABI files are byte-identical to the campaign candidate; all 25 G2 payload files are identical. No new optimality claim. Both selected FP16 plan orders reach real board execution. |
+| G5 | Cost rules, event multiplicities, reservations and selected graphs are unchanged. The new arithmetic module supplies functional values only; device paths add numerics metadata without changing timed work. | No calibration is fitted to the three misses. G6 cycle counts are provenance, not performance samples or prediction validation. M-19's observed charge defect is repaired; its residual domain and G2-14's empirical tick residual are explicit boundaries. |
+| G6 | All 2^32 multiply pairs, full add/subtract special classes in both orders, large random sets and direct subgroup calls match the SDK. Four shapes under both policies and one special-value outer product yield 6,096 exact device output encodings. | Five board tests pass without xfail/skip. Injected launch errors and bit mismatches fail; equal bits pass. The independent IEEE oracle remains visible. Existing alias/initializer/realization regressions passed; no device output is supplied by an oracle. |
+| G7 | Fresh sdist/wheel installation outside the checkout: 501 package files match. One new model, six changed Python files and RECORD are the complete delta from 5fec806; 512 other payload files, including bindings, are identical. The vendor reference library/headers are not bundled. | All 42 installed stages pass. Samsung's bundled license requires express written distribution permission; none is recorded. P-04 implementation does not resolve that permission. SDK and evaluation-only DCC/simulator dependencies retain their documented installation boundaries. |
+| G8 | Nine fresh installed Gemini-I launches have raw output/source/binary/input identities, one fresh profile record each and two reads each. Firmware and CLI versions are retained. The unchanged 16-MiB/ten-minute guard window and real transport preflight passed. | Local simulator/model checks passed at this wheel, including all required comparisons. Prior G1/G2 fixed campaigns carry by exact program/payload identity, without new sampling. AiM remains timing-only; AttAcc decode remains analytical composition. No new remote card run is claimed. |
+| G9 | Ordinary and typed frontends converge at `compile_for_target`. `apu_v1_vector_candidates` and `apu_g2_source_candidates` require shared facts; their effects, legality, materialization and selection are common contracts. | The FP16 repair consumes those facts rather than reparsing source or adding an end-to-end compiler. Existing forced/cost-perturbed hardware traces carry by exact identity. Migration comments now describe the implemented path. Final independent review remains required. |
+| G10 | Required inventory: 52 REPRODUCED, three fixed OPEN, no incomplete or missing required verdict. Optional studies remain separate. No campaign was rerun or repooled in this repair. | FAIL: word count 172,091 vs 171,988; linear regression 95,018 vs 94,618.5; Gemini-II GEMM 1734.0 vs 1733.225. Same-round historical binaries and paired baselines are context, not parity. No new tolerance, resampling or statistical relabeling. |
 
-The Samsung runner slices the selected `compiled.cmds` into its conductor
-invocations; AiM returns `simulator-timing-only` with retained command segments
-and no output arrays. APU source enumerators read `program_facts` and reject
-missing facts; their typed frontends stamp that same contract. The intrinsic
-lowerings remain target-specific, with their effects visible to common
-validation. A new primitive must supply target semantics, structural matching,
-legality/effect derivation, lowering/realization and executable cost rules;
-it cannot be introduced by a benchmark registration alone. The existing
-extension documentation and prior probes remain applicable because these
-modules are byte-identical. Historical migration comments in `normalize_source`
-and the liveness prepass still describe earlier slices; the actual calls above
-and current architecture document establish the current path.
+The changed paths were followed beyond their API labels. The shared
+contraction analysis rejects guards, non-normalized loops, repeated or
+unresolved axes, incomplete output coverage, unsupported access forms and
+mixed types before the vector planner. `_fp16_contraction` therefore reads
+whole retained operands through axis permutations/broadcast views, rounds each
+product with `mul_f16`, and follows either source order or the selected
+adjacent-pair group tree. Output staging occurs before the model runs.
+`APUVectorRealization.execute_numpy` uses the same primitives; the device
+emitter, packing and runtime construction are unchanged. The other FP16 sites
+in `spmw_apu_v1` validate and pack values; they do not perform an IEEE host
+product. The scalar C11 frontend already rejects half types. No covert CPU
+replacement was added to device execution.
 
-Operational additions are bounded: leaked owned regular reserve files cause
-a pre-session refusal; no automatic sweep guesses process ownership. The
-loop stops at its first gate failure or failed/incomplete session and checks
-an operator stop file before another session. Started attempts are recorded;
-a refused pre-session gate spends none. The pure pooler/session protocol and
-numerical/freshness checks are unchanged. Thirty-three installed focused
-checks pass; no optional launch wait/retry was introduced.
+`source-delta-audit.json` distinguishes functional/metadata changes from
+emission: compiler and pipeline docstrings and the liveness comment have no
+executable AST change; `spmw_apu_v1` adds numerics metadata only. Full emitted
+files were independently regenerated from the old and new installations and
+compared as bytes. The nine-installation evidence chain was rehashed; its
+manifest is evidence-only and does not govern compiler eligibility. New
+hardware results are bound back to raw readback bytes, never patched by the
+model. SDK/reference and hardware evidence are separately retained.
 
-**NOT READY.** All ordered hardware work has finished; G2/G6 remain blocked
-by V1-16's numerical contract, and G10 by the three fixed absolute misses.
-P-04 bundling is implemented and executed; its recorded redistribution
-permission question is still unresolved. The remaining work is resolution
-of these findings and independent final-candidate review, not another
-unchanged milestone or confirmation campaign. The 52 reproduced comparisons
-and successful transport do not average away any failed gate. No release,
+Samsung still dispatches the selected command stream through the conductor;
+AiM retains work/transfer/order provenance and reports simulated timing with
+no fabricated numerical outputs. A new primitive must declare semantics,
+legality, effects, lowering/realization and executable costs, not enroll a
+benchmark case. The arithmetic repair illustrates that extension boundary
+without adding a second compiler or a benchmark-specific adapter.
+
+**NOT READY.** V1-16's implementation defect is repaired with an explicit
+target-arithmetic boundary. The three fixed performance misses and Samsung
+redistribution permission remain unresolved. The installed milestone is
+complete; return this exact candidate and evidence for independent review. Do not repeat hardware campaigns, change tolerances, alter the frozen
+paper, or treat successful semantic checks as performance parity. No release,
 package publication, tag, PR, upstream push or history rewrite occurred.
 
 ## Round 208 new bounded patch awaiting independent review
