@@ -17,11 +17,14 @@ from dataclasses import dataclass, replace
 import fcntl
 import hashlib
 import inspect
+import json
 import math
 import os
 from pathlib import Path
 import re
 import shutil
+import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -460,155 +463,313 @@ def _ledag_available_reason() -> str | None:
     return None
 
 
-# ``ledag-ssh`` leaves a copy of every log it prints (``online_log_<time>``,
-# about 5 MB each) and its own session log (``ledag_ssh_<user>_<pid>_log.txt``)
-# in this directory; a measurement session of a few hundred launches fills a
-# small /tmp and then every later read fails with ENOSPC.
+# The documented interactive ``scp d2h`` command copies the firmware's ten
+# numbered rotation slots directly to host storage. No ``flo`` download is
+# made. The vendor CLI still writes a small session log in /tmp; its
+# PyInstaller extraction and the retained copies are independently located.
 _LEDAG_SCRATCH = Path("/tmp")
-_LEDAG_SCRATCH_PATTERNS = ("online_log_*", "ledag_ssh_*_log.txt")
-# One read needs scratch in two places (release issue X-24, rounds 130-131).
-# The tool writes its device-log copy (about 5 MB) and its session log to
-# ``_LEDAG_SCRATCH`` regardless of ``TMPDIR``; its PyInstaller bootloader also
-# extracts the bundle (about 11.5 MB of binaries and data) at every start into
-# ``$TMPDIR`` when that is set, else into ``/tmp``.  A session started without
-# that headroom fails inside the tool with ENOSPC and fills a shared ``/tmp``
-# for everyone else first, so both are checked before the session and the
-# child is given an explicit, checked extraction directory (``TMPDIR`` kept
-# when the caller set one; the system temporary directory otherwise).
-_LEDAG_LOG_REQUIRED_BYTES = 8 * 1024 * 1024
-_LEDAG_EXTRACTION_REQUIRED_BYTES = 16 * 1024 * 1024
+_LEDAG_LOG_REQUIRED_BYTES = 64 * 1024  # diagnostic session: 1,983 bytes; reserve
+_LEDAG_EXTRACTION_REQUIRED_BYTES = 16 * 1024 * 1024  # measured bundle: 11.5 MB
+_LEDAG_COPY_REQUIRED_BYTES = 64 * 1024 * 1024  # measured ten-slot snapshot: 34 MB
+_LEDAG_CARD_LOG_ROOT = "/run/media/mmcblk0p2/logs"
+_LEDAG_COPY_TIMEOUT_SECONDS = 300
+_LEDAG_LOG_SLOTS = range(10)  # vendor firmware rotation format, not active slot
+_LEDAG_TIMESTAMP = re.compile(
+    r"TIME STAMP:\s*(\d{2})/(\d{2})/(\d{2})\s+"
+    r"(\d{2}):(\d{2}):(\d{2})\.(\d{1,9})\s+UTC"
+)
+_LEDAG_NON_TEXT = bytes(
+    b for b in range(256) if not (32 <= b < 127 or b in (9, 10, 13))
+)
 
 
 def _ledag_extraction_dir() -> Path:
-    """Where the tool's bootloader will extract: the caller's ``TMPDIR`` when
-    set (the supported relocation), else the system temporary directory."""
     configured = os.environ.get("TMPDIR")
-    return Path(configured) if configured else Path(tempfile.gettempdir())
+    return (Path(configured) if configured else Path(tempfile.gettempdir())).resolve()
+
+
+def ledag_profile_dir() -> Path:
+    """Explicit retained profile storage; never accumulate raw logs in /tmp."""
+    configured = os.environ.get("TENON_APU_V1_PROFILE_DIR")
+    if not configured:
+        raise ValueError(
+            "set TENON_APU_V1_PROFILE_DIR to a provisioned retained-evidence "
+            "directory writable by the vendor daemon before reading board profiles"
+        )
+    return Path(configured).resolve()
+
+
+def _ledag_setting(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        result = int(value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a positive integer") from error
+    if result <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return result
 
 
 def _same_filesystem(first: Path, second: Path) -> bool:
-    try:
-        return first.stat().st_dev == second.stat().st_dev
-    except OSError:
-        return first.resolve() == second.resolve()
+    return first.stat().st_dev == second.stat().st_dev
 
 
 def _mib(value: int) -> str:
-    return f"{value / 1024 / 1024:.1f} MiB"
+    return f"{value / 1024 / 1024:.3f} MiB"
 
 
 def ledag_scratch_headroom_problem() -> str | None:
-    """Why a ``ledag-ssh`` read cannot run now, or None.
+    """Check actual session-log, extraction and direct-copy filesystems.
 
-    The log directory needs ``_LEDAG_LOG_REQUIRED_BYTES``; the extraction
-    directory needs ``_LEDAG_EXTRACTION_REQUIRED_BYTES``; when the two are one
-    filesystem the sum is required of it.
+    Requirements sharing a filesystem are added, not checked independently.
+    These are per-read reserves, not a campaign budget or a disk reservation.
+    A transfer can still fail (e.g. concurrent consumption); it never yields
+    timing on failure. Provision larger retained-evidence budgets separately.
     """
-    extraction = _ledag_extraction_dir()
+    try:
+        profile_root = ledag_profile_dir()
+        copy_bytes = _ledag_setting(
+            "TENON_APU_V1_PROFILE_COPY_BYTES", _LEDAG_COPY_REQUIRED_BYTES
+        )
+        _ledag_setting(
+            "TENON_APU_V1_PROFILE_TIMEOUT_SECONDS", _LEDAG_COPY_TIMEOUT_SECONDS
+        )
+    except ValueError as error:
+        return str(error)
     needs = [
+        (_LEDAG_SCRATCH, _LEDAG_LOG_REQUIRED_BYTES, "vendor session log"),
         (
-            _LEDAG_SCRATCH,
-            _LEDAG_LOG_REQUIRED_BYTES,
-            "the device-log copy and session log",
-        )
+            _ledag_extraction_dir(),
+            _LEDAG_EXTRACTION_REQUIRED_BYTES,
+            "bundle extraction (TMPDIR)",
+        ),
+        (profile_root, copy_bytes, "direct-copy firmware logs"),
     ]
-    if _same_filesystem(extraction, _LEDAG_SCRATCH):
-        needs = [
-            (
-                _LEDAG_SCRATCH,
-                _LEDAG_LOG_REQUIRED_BYTES + _LEDAG_EXTRACTION_REQUIRED_BYTES,
-                f"the device-log copy and session log plus the bundle extraction (TMPDIR {'set to the same filesystem' if os.environ.get('TMPDIR') else 'unset, so the bootloader extracts here too'})",
-            )
-        ]
-    else:
-        needs.append(
-            (
-                extraction,
-                _LEDAG_EXTRACTION_REQUIRED_BYTES,
-                "the bundle extraction (TMPDIR)",
-            )
-        )
-    for directory, required, what in needs:
-        try:
+    grouped = []
+    try:
+        for directory, required, what in needs:
+            if not directory.is_dir():
+                return f"profile storage directory does not exist: {directory}"
+            for group in grouped:
+                if _same_filesystem(directory, group[0]):
+                    group[1] += required
+                    group[2] += f", {what} at {directory}"
+                    break
+            else:
+                grouped.append([directory, required, f"{what} at {directory}"])
+        for directory, required, what in grouped:
             free = shutil.disk_usage(directory).free
-        except OSError as error:
-            return f"cannot measure the free space of {directory}: {error}"
-        if free < required:
-            return (
-                f"{directory} has {_mib(free)} free; a ledag-ssh read needs about "
-                f"{_mib(required)} there for {what}, so the board profile cannot be "
-                "read until space is freed or TMPDIR names a filesystem with room"
-            )
+            if free < required:
+                return (
+                    f"{directory} has {_mib(free)} free; a ledag-ssh read needs "
+                    f"{_mib(required)} there for {what}; provision these actual "
+                    "directories (TMPDIR and TENON_APU_V1_PROFILE_DIR are configurable)"
+                )
+    except OSError as error:
+        return f"cannot check profile storage: {error}"
     return None
 
 
-def _ledag_scratch_files() -> set:
-    files = set()
-    for pattern in _LEDAG_SCRATCH_PATTERNS:
-        try:
-            files.update(_LEDAG_SCRATCH.glob(pattern))
-        except OSError:
-            pass
-    return files
+def _ledag_owned_session_logs(session_id: int) -> dict:
+    """Identify live CLI logs by kernel session ID, not a before/after glob.
 
-
-def _remove_ledag_scratch(before: set) -> list:
-    """Remove the scratch files one ``ledag-ssh`` session left behind.
-
-    Only files that did not exist before the session, match the tool's
-    names and belong to this user are removed; the device log itself has
-    already been captured from the session's stdout.
+    PyInstaller forks: the log's PID can be the child, not Popen.pid. Only a
+    live member of our new process session proves ownership. Unknown files
+    are left alone, including simultaneous tools run by this same user.
     """
-
-    removed = []
-    uid = os.getuid() if hasattr(os, "getuid") else None
-    for path in sorted(_ledag_scratch_files() - before):
-        try:
-            if uid is not None and path.stat().st_uid != uid:
-                continue
-            path.unlink()
-            removed.append(path)
-        except OSError:
+    owned = {}
+    for path in _LEDAG_SCRATCH.glob("ledag_ssh_*_log.txt"):
+        match = re.search(r"_(\d+)_log\.txt$", path.name)
+        if match is None:
             continue
-    return removed
+        try:
+            pid = int(match.group(1))
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                continue
+            if os.getsid(pid) == session_id:
+                owned[path] = (info.st_dev, info.st_ino)
+        except (OSError, ValueError):
+            continue
+    return owned
+
+
+def _ledag_copy_session_logs(owned: dict, evidence: Path) -> None:
+    """Retain then unlink only identified files, checking identity again."""
+    for path, identity in owned.items():
+        try:
+            info = path.lstat()
+            if (info.st_dev, info.st_ino) != identity or not stat.S_ISREG(info.st_mode):
+                continue
+            shutil.copyfile(path, evidence / path.name)
+            # Retention must succeed before reclaiming the residual /tmp file.
+            if (path.lstat().st_dev, path.lstat().st_ino) == identity:
+                path.unlink()
+        except OSError:
+            # Keep the original if it cannot be retained; the next guard still
+            # accounts for any resulting loss of /tmp headroom.
+            continue
+
+
+def _ledag_copy_logs(evidence: Path) -> dict:
+    commands = (
+        "".join(
+            f"scp d2h {_LEDAG_CARD_LOG_ROOT}/{slot} {evidence / str(slot)}\n"
+            for slot in _LEDAG_LOG_SLOTS
+        )
+        + "quit\n"
+    )
+    (evidence / "commands.txt").write_text(commands)
+    owned = {}
+    stdout, stderr = b"", b""
+    process = None
+    timeout = _ledag_setting(
+        "TENON_APU_V1_PROFILE_TIMEOUT_SECONDS", _LEDAG_COPY_TIMEOUT_SECONDS
+    )
+    deadline = time.monotonic() + timeout
+    try:
+        process = subprocess.Popen(
+            ["ledag-ssh", "-o", "localhost"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(os.environ, TMPDIR=str(_ledag_extraction_dir())),
+            cwd=evidence,
+            start_new_session=True,
+        )
+        pending_input = commands.encode()
+        while True:
+            owned.update(_ledag_owned_session_logs(process.pid))
+            try:
+                stdout, stderr = process.communicate(input=pending_input, timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                pending_input = None
+                if time.monotonic() >= deadline:
+                    # Stop the CLI and PyInstaller child together. Preserve
+                    # partial destinations; this read cannot yield timing.
+                    os.killpg(process.pid, signal.SIGKILL)
+                    stdout, stderr = process.communicate()
+                    raise RuntimeError(
+                        f"ledag-ssh profile copy timed out after {timeout} seconds"
+                    )
+        if process.returncode:
+            raise RuntimeError(f"ledag-ssh exited with {process.returncode}")
+        if stdout.count(b"Download Success") != len(_LEDAG_LOG_SLOTS):
+            raise RuntimeError("ledag-ssh did not confirm every numbered log copy")
+        transcript = stdout.decode(errors="replace")
+        cli_version = re.search(r"^Version:\s*(\S+)", transcript, re.MULTILINE)
+        firmware_versions = sorted(
+            set(re.findall(r"'Version':\s*'([^']+)'", transcript))
+        )
+        return {
+            "returncode": process.returncode,
+            "pid": process.pid,
+            "ledag_ssh_version": cli_version.group(1) if cli_version else None,
+            "firmware_versions": firmware_versions,
+            "timeout_seconds": timeout,
+        }
+    finally:
+        if process is not None and process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+        # Preserve the partial transcript even on timeout or failed transfer.
+        (evidence / "stdout.txt").write_bytes(stdout)
+        (evidence / "stderr.txt").write_bytes(stderr)
+        _ledag_copy_session_logs(owned, evidence)
+
+
+def _ledag_order_logs(evidence: Path) -> tuple[str, list]:
+    logs = []
+    for slot in _LEDAG_LOG_SLOTS:
+        path = evidence / str(slot)
+        raw = path.read_bytes()  # missing copies fail; stdout alone is insufficient
+        text = raw.translate(None, _LEDAG_NON_TEXT).decode("ascii")
+        stamps = [
+            (
+                int(y),
+                int(mo),
+                int(day),
+                int(h),
+                int(mi),
+                int(s),
+                int(frac.ljust(9, "0")),
+            )
+            for mo, day, y, h, mi, s, frac in _LEDAG_TIMESTAMP.findall(text)
+        ]
+        if not stamps or any(a > b for a, b in zip(stamps, stamps[1:])):
+            raise RuntimeError(
+                f"firmware log slot {slot} has missing or nonmonotonic timestamps"
+            )
+        logs.append(
+            (
+                stamps[0],
+                stamps[-1],
+                slot,
+                text,
+                {
+                    "slot": slot,
+                    "bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "first_timestamp": stamps[0],
+                    "last_timestamp": stamps[-1],
+                },
+            )
+        )
+    logs.sort(key=lambda item: item[0])
+    if any(a[1] >= b[0] for a, b in zip(logs, logs[1:])):
+        raise RuntimeError(
+            "firmware rotation slots overlap or have ambiguous chronology"
+        )
+    return "\n".join(item[3] for item in logs), [item[4] for item in logs]
 
 
 def _ledag_drain() -> str:
-    """Read the device log through one ``ledag-ssh`` session.
+    """Read all firmware rotation slots with supported direct-copy transport.
 
-    Each session's ``flo`` prints the whole log the device still holds (the
-    read pointer is per session), so two reads differ only by the records
-    appended between them.
+    Raw files, commands, CLI output and the timestamp/hash manifest survive
+    failures. The launch window's outer lock remains held across both reads;
+    taking it here too also serializes independent diagnostic reads.
     """
-
-    problem = ledag_scratch_headroom_problem()
-    if problem is not None:
-        raise RuntimeError(f"ledag-ssh cannot read the device log: {problem}")
-    before = _ledag_scratch_files()
-    # The bootloader extracts into the checked directory, explicitly.
-    environment = dict(os.environ, TMPDIR=str(_ledag_extraction_dir()))
-    try:
-        process = subprocess.run(
-            ["ledag-ssh", "-o", "localhost"],
-            input=b"flo\nquit\n",
-            capture_output=True,
-            timeout=30,
-            check=False,
-            env=environment,
-        )
-    except (subprocess.SubprocessError, OSError) as error:
-        raise RuntimeError(f"ledag-ssh failed while reading the device log: {error}")
-    finally:
-        _remove_ledag_scratch(before)
-    if process.returncode:
-        raise RuntimeError(
-            f"ledag-ssh exited with {process.returncode} while reading the device log"
-        )
-    return "".join(
-        chr(byte)
-        for byte in process.stdout or b""
-        if 32 <= byte < 127 or byte in (9, 10, 13)
-    )
+    with apu_v1_board_lock():
+        problem = ledag_scratch_headroom_problem()
+        if problem is not None:
+            raise RuntimeError(f"ledag-ssh cannot read the device log: {problem}")
+        # The vendor command parser does not document escaping/quoting. Refuse
+        # paths it could tokenize as multiple arguments before starting it.
+        root = ledag_profile_dir()
+        if re.search(r"[^A-Za-z0-9_./-]", str(root)):
+            raise RuntimeError(
+                "TENON_APU_V1_PROFILE_DIR must use only letters, digits, _, ., / or -"
+            )
+        evidence = Path(tempfile.mkdtemp(prefix="tenon-profile-", dir=root))
+        started = time.monotonic()
+        manifest = {
+            "transport": "ledag-ssh scp d2h",
+            "evidence": str(evidence),
+            "extraction": str(_ledag_extraction_dir()),
+            "board_lock": str(apu_v1_lock_path()),
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "status": "incomplete",
+        }
+        try:
+            manifest.update(_ledag_copy_logs(evidence))
+            text, files = _ledag_order_logs(evidence)
+            manifest.update(status="copied", files=files)
+            return f"Tenon profile copy evidence: {evidence}\n" + text
+        except Exception as error:
+            manifest["error"] = f"{type(error).__name__}: {error}"
+            raise RuntimeError(
+                f"ledag-ssh profile read failed; evidence {evidence}: {error}"
+            ) from error
+        finally:
+            manifest["elapsed_seconds"] = time.monotonic() - started
+            (evidence / "manifest.json").write_text(
+                json.dumps(manifest, indent=2) + "\n"
+            )
 
 
 _TOTAL_RECORD = re.compile(r"\btotal\b[^\n]*?\bcrun\s*[:=]\s*(\d+)[^\n]*")

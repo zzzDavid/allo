@@ -553,8 +553,9 @@ ships `simulators/**` but never `simulators/PIMSimulator/patches/`).
   `arc_gnu_2021.09-release_elf32_le_linux_no_sdata`, GDL/GAL host and device
   libraries, GVML headers under `<include>/gsi/libgvml_*.h`), the GSI
   `example-gvml` project (Tenon copies its `Makefile`/`Common/` harness), a
-  Gemini-I PCI board (vendor `0x1e4c`), and `ledag-ssh`/`flo` for optional
-  profile logs.
+  Gemini-I PCI board (vendor `0x1e4c`), and `ledag-ssh` interactive `scp d2h` for attributable
+  profile logs. Configure `TENON_APU_V1_PROFILE_DIR` on storage writable by
+  the vendor daemon; see INSTALL.md for retention, timeouts and preflight.
 - **Discovery:** `TENON_APU_V1_TOOLCHAIN_BASE`, `TENON_APU_V1_GVML_INCLUDE_ROOT`,
   `TENON_APU_V1_TEMPLATE_DIR`, `TENON_APU_V1_PCI_NODE`.
 - **License:** GSI proprietary; nothing from the SDK is bundled. The APU v1

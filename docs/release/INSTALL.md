@@ -363,8 +363,85 @@ Failure behaviour, timeouts and temporary files:
 | AiM | `docker run ... ramulator2` 600 s per segment | trace in a private `tenon-aim-*` temp directory mounted read-only at `/trace`; the simulator checkout is not written |
 | UPMEM | SDK build 600 s, simulation 1800 s per segment | `$TENON_UPMEM_SCRATCH/root-<sha12>/` (staged snapshot, reused; Docker writes root-owned files there), `runs/<key>/`, `root.lock` (staging), `run.lock` next to the root (serializes the shared `benchmark/<slot>`) |
 | APU v1 vector route | build 600 s, execution 900 s | `tenon-apu-*` temp directories; board `flock` on `$TENON_APU_V1_LOCK` (default `/tmp/tenon-apu-v1-<pci node>.lock`) around every launch (V1-07 repair, in progress) |
-| APU v1 device-log reads (`ledag-ssh`, every Gemini-I launch) | 30 s per read | the vendor tool is a PyInstaller bundle: it extracts itself into `$TMPDIR` (else `/tmp`, about 20 MB) at every start, and writes its session log and an `online_log_<time>` copy of the device log (about 5 MB) into `/tmp` regardless of `TMPDIR`; it has no option to move them (`--help` lists only `--host`). Set `TMPDIR` to a directory with space for the extraction; the runtime removes the two `/tmp` files it created after each read, but each read still needs about 5 MB free in `/tmp`, else the tool exits 255 and the launch is recorded as lost (round 85) |
+| APU v1 device-log reads (`ledag-ssh`, every Gemini-I launch) | 300 s per direct-copy session by default (configurable) | `scp d2h` copies the ten numbered firmware rotation slots to unique retained `tenon-profile-*` directories under `$TENON_APU_V1_PROFILE_DIR` (required; no system-temp retention fallback). The bundle extracts into `$TMPDIR`. Only the small vendor session log still uses `/tmp`; proven session-owned files are copied into the evidence directory before unlinking. The device-host board lock stays at its shared path. See the profile-storage contract below. |
 | APU v2 | configure 120 s, builds 600 s, execution 120-180 s, `gsi_tool info` 15 s | `tenon-apu-g2-*` temp directories (kept with `TENON_APU_G2_KEEP_TMP=1`); card ownership checked with `gsi_tool`, no `flock` yet (G2-06) |
+
+### Gemini-I profile storage
+
+Create storage directories on filesystems with space before starting a run.
+`TENON_APU_V1_PROFILE_DIR` is required: an unconfigured invocation refuses
+before copying, so raw snapshots cannot silently accumulate in `/tmp`. The
+profile directory must be writable by the **vendor gsi-ledag-server daemon**,
+which may run as root; user-level write access does not establish that a
+root-squashed NFS destination will work:
+
+```sh
+export TMPDIR=/path/with/space/build-tmp
+export TENON_APU_V1_PROFILE_DIR=/path/with/space/profiles
+mkdir -p "$TMPDIR" "$TENON_APU_V1_PROFILE_DIR"
+```
+
+The maintained transport uses the vendor interactive command `scp d2h`,
+not `flo`. Validated versions: firmware **220.13.500.7** and `ledag-ssh`
+**100.12.0.1.1000.25**. The observed CLI and firmware versions and elapsed
+read time are recorded in each successful manifest. This firmware stores
+ten numbered files at
+`/run/media/mmcblk0p2/logs/0` through `9` with `TIME STAMP` UTC records.
+Every copy must be acknowledged and present. Monotonic timestamps within
+files and disjoint timestamp ranges order the rotation slots; missing,
+nonmonotonic or overlapping ranges fail closed. The existing launch check
+still requires exactly the expected fresh positive-CRUN records under the
+board lock. Copying logs alone is not a fresh measurement.
+
+Every read retains raw slots, command text, CLI stdout/stderr and a manifest
+with chronological order, byte counts and SHA256 hashes on success. Failures
+retain partial files and an error manifest; the launch error names that
+directory. Returned profile text names the evidence directory too. No
+retained profile directory is automatically deleted. Manage retention after
+saving the measurements you need. Vendor command parsing supports only
+letters, digits, `_`, `.`, `/` and `-` in the resolved profile-root path;
+other paths are refused before invoking the tool.
+
+The per-read guard checks 64 KiB in `/tmp` for the residual session log,
+16 MiB for extraction and 64 MiB for a raw snapshot, summing requirements
+when directories share a filesystem. Set `TENON_APU_V1_PROFILE_COPY_BYTES`
+to a positive byte count to provision larger snapshots. Set
+`TENON_APU_V1_PROFILE_TIMEOUT_SECONDS` to a positive integer to change the
+300-second per-read hang guard. Neither setting changes freshness checks.
+These are conservative empirical
+reserves (observed session 1,983 bytes, extraction about 11.5 MB, snapshot
+about 34 MB), not firmware capacity claims or disk reservations. Copy or
+storage failure never yields timing. Only files identified by a live process
+in this CLI invocation's kernel session and unchanged inode are eligible
+for session-log cleanup; unidentifiable files remain, and subsequent guards
+account for their space.
+
+`g1_board.sh` and `g1_campaign.sh` also budget retained copies, normalized
+measurement evidence and build scratch on every actual filesystem used,
+with a default reserve of 1 GiB per planned launch (up to seven 64 MiB
+snapshots, normalized evidence and build/output overhead). They recheck
+before each sequence/session, preserving per-attempt guards and incomplete
+results. This is a provisioning estimate, not a completion guarantee.
+`G1_TMP_PATH` now actually sets `TMPDIR`; changing it does not move the
+shared device lock or vendor session log. Use a fresh absolute evidence
+directory on roomy storage: build scratch and benchmark evidence go there.
+`TENON_APU_V1_PROFILE_DIR` can separately locate retained firmware copies.
+Do not use the older `flo`-based campaign budgets for this transport.
+
+The round-207 real read took **47 seconds** for **34,125,826 bytes**; every
+launch needs at least two reads and can need seven with retries. Each real
+board/campaign invocation therefore first performs a read-only transport
+preflight, proving destination access and chronology and measuring elapsed
+time. Its stage timeout is `600 + planned_launches * seconds_per_launch`,
+where `seconds_per_launch = max(600, ceil(14 * measured_read_seconds + 120))`.
+This allows seven reads at twice the preflight duration plus 120 seconds of
+per-launch host/device work and 600 seconds of stage setup. For a 47-second
+read, a 99-launch session's guard is 77,622 seconds, not the old 7,200.
+`G1_SECONDS_PER_LAUNCH` can increase this budget. Dry runs do not contact the
+board. These time budgets are empirical hang guards; runtime failure and
+incomplete-session reporting remain in force. Record reads per launch and
+actual retained bytes from the installed board runs; a missing fresh record
+requires diagnosis, never a relaxed freshness rule.
 
 ## 6. Fresh-install transcript (this host, 2026-11-02)
 

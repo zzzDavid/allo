@@ -41,6 +41,7 @@ def _sandbox(root: Path) -> dict:
     (lib / "allo" / "__init__.py").write_text("")
     (lib / "allo" / "pim" / "__init__.py").write_text("")
     (lib / "allo" / "pim" / "apu_v1_program.py").write_text(
+        "def _ledag_drain():\n    return 'sandbox read-only transport'\n"
         "def ledag_scratch_headroom_problem():\n    return None\n"
     )
     python = pkg / "venv" / "bin" / "python"
@@ -73,6 +74,8 @@ def _run(root: Path, evidence: Path, existing, env_extra=None):
         (evidence / "pkg").symlink_to(sb["pkg"])
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
+    env["G1_TMP_PER_LAUNCH_BYTES"] = "1024"
+    env.pop("G1_SECONDS_PER_LAUNCH", None)
     env.update(
         {
             "G1_DRY_RUN": "1",
@@ -297,3 +300,19 @@ def test_preflight_accepts_a_verified_equivalent_installation_and_refuses_an_unv
     code, out = _run(tmp_path, tmp_path / "e9d", other, env_extra={"G1_EQUIVALENCE": str(manifest)})
     assert code == 1 and "installation_compatibility failed" in out and "DRY RUN" not in out
     assert "differs from the manifest's recorded" in out or "outside the reviewed delta" in out
+
+
+def test_transport_duration_budget_preserves_long_campaigns(monkeypatch):
+    path = REPO / "docs" / "release" / "scripts" / "g1_transport_preflight.py"
+    spec = importlib.util.spec_from_file_location("g1_transport_preflight", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.delenv("G1_SECONDS_PER_LAUNCH", raising=False)
+    # Observed r207 read: 47 seconds; 99 launches cannot fit 7200 seconds.
+    assert module.seconds_per_launch(47) == 778
+    assert 600 + 99 * module.seconds_per_launch(47) == 77622
+    monkeypatch.setenv("G1_SECONDS_PER_LAUNCH", "1000")
+    assert module.seconds_per_launch(47) == 1000
+    monkeypatch.setenv("G1_SECONDS_PER_LAUNCH", "1")
+    with pytest.raises(ValueError, match="measured budget"):
+        module.seconds_per_launch(47)

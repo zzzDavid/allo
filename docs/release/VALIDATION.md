@@ -3,6 +3,96 @@
 
 # Validation record
 
+## Round 208 (2026-11-17): review corrections, before installation
+
+Evidence root: /work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r208.
+Base 21dd7c9 plus the reviewed round-207 transport and reviewer-requested
+corrections. Same spmw environment as round 207 (the requested allo Conda
+environment remains absent). With TMPDIR=r208/tmp and TENON_ARTIFACTS
+explicitly set, the four focused files passed **62 tests in 31.21 s**
+(`focused-tests.log`). The transport suite was then checked with additional
+fake CLI/firmware banner assertions (`version-provenance-test.log`). Runtime
+pylint --errors-only, focused Black, bash -n and git diff --check pass.
+The broad lint entry point stops at the same 38 existing bundled Samsung
+license-header cases (`task-lint.log`); their upstream notices are preserved.
+
+The independently inspected r207 real read took 47 seconds from directory
+creation to manifest, copying 34,125,826 bytes. New manifests record elapsed
+seconds directly. Real board/campaign invocations first run
+`g1_transport_preflight.py` from the installed interpreter; it proves daemon
+storage access and chronology, records measured duration and derives a
+per-launch time allowance for the planned stage. At 47 seconds, the
+99-launch session timeout is 77,622 seconds. This is an empirical hang
+guard, not a changed measurement boundary. The script tests exercise the
+66-/6-launch guards, failed preflight (no launch), and 99-launch derivation.
+Sandbox per-launch storage is explicitly 1024 bytes; the dedicated low-space
+tests retain explicit too-large budgets. No 84-GB test-space dependency.
+
+The reviewer-r207 rotation probes and r207 failures remain retained. The
+next sections will identify the committed source, new distribution hashes,
+installed milestone and actual board/campaign results as they are produced.
+No source-only test is claimed as an installed or hardware execution result.
+
+
+## Round 207 (2026-11-17): integrated direct-copy transport, pre-review
+
+Identity: `experiments/allo`, `tenon`, base `21dd7c9` plus the round-207 patch.
+No package build, commit or push this round. The six inherited verifier
+scripts and frozen paper are unchanged (73/73 SHA256 matches). Evidence is
+`/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r207`; `working-patch.diff`, `source-snapshot/` and `identity.json`
+identify the submitted working files. The earlier r193 wheel remains
+unchanged and **does not contain this fix**.
+
+The repository asks for `conda activate allo`; that environment is absent.
+After recording the failure, used the existing `spmw` environment with
+working bindings, not a new environment or system-package change:
+
+```sh
+source /work/zhang-capra/users/nz264/miniforge3/etc/profile.d/conda.sh
+conda activate spmw
+export TMPDIR=/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r207/tmp
+export TENON_ARTIFACTS=/work/shared/users/phd/nz264/spmw-for-pim/tenon-artifacts
+python -m pytest -q tests/perf/test_apu_v1_profile_transport.py \
+  tests/perf/test_measurement_drivers.py \
+  tests/perf/test_release_g1_board_script.py \
+  tests/perf/test_release_g1_campaign_script.py -rs
+```
+
+`focused-tests-with-assets.log`: **58 passed, 27.08 s**, no skips. The first
+run without TENON_ARTIFACTS was 53 passed/4 skipped; its log is retained.
+The final run includes the added actual-directory shell check. The new
+transport suite drives real fake-CLI subprocesses to cover wrapped slot
+ordering, incomplete/failed copies, malformed chronology, timeout partial
+output, own-session cleanup versus concurrent unrelated files, all three
+storage locations and shared-filesystem sums. Existing freshness/failure,
+partial-session, no-overwrite and quota/pooling tests still pass.
+
+Real transport diagnostic (read only, **no kernel launch or timing credit**):
+from the maintained source, with TMPDIR as above and
+`TENON_APU_V1_PROFILE_DIR=/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r207/transport-read`, called `_ledag_drain()`
+under the unchanged device-host lock. `transport-read.log` and
+`transport-read/tenon-profile-390iwbb2/` retain commands, raw files, full CLI
+output, the 2,185-byte vendor session log and the manifest. All ten copies
+succeeded; chronological slots 5,6,7,8,9,0,1,2,3,4; 34,125,826 raw bytes;
+4,763 historical totals; `/tmp` free bytes 1,003,520 both before and after.
+The source hash at that read is printed in the log; the only subsequent
+runtime edit changes a timeout comment. This is source-transport evidence,
+not installation of the fix or a replacement campaign sample.
+
+`bash -n` on both shell drivers and `git diff --check` pass. Focused Black
+checks on the runtime, new transport tests and new storage helper pass.
+`changed-runtime-pylint.log`: pylint `--errors-only` passes for the changed
+runtime. The required `bash scripts/lint/task_lint.sh` was run and stopped
+at the origin/main license check: **38 existing bundled upstream Samsung
+files** do not carry Allo-style headers (`task-lint.log`). Preserved their
+upstream license text; no unrelated lint sweep or license rewriting.
+
+Next: independent review, focused commit to tenon and permitted fork push,
+new installed artifact/equivalence manifest, installed numerical+fresh-record
+transport validation, owed G8/G9 board programs, then only the remaining
+pre-registered Gemini-I rows. No gate status changes from this increment.
+
+
 Reproducible commands and pointers to compact raw evidence for the release
 candidate. Every result names the revision it was produced at. Evidence
 produced by simulators is labelled as such; nothing here is a physical

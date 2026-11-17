@@ -3,6 +3,108 @@
 
 # Release status
 
+## Current round 208 (2026-11-17): reviewer corrections and installation work
+
+**NOT READY.** The round-207 core was independently reviewed, including
+successful append/rotation attribution and failure probes (reviewer-r207).
+The reviewer authorized committing/pushing after four bounded corrections,
+then building and executing the installed artifact without another review
+pause. Those corrections are now implemented: the installed milestone
+includes the new transport suite/names; stage timeouts scale with planned
+launches and a real read-only preflight; raw retention requires an explicit
+TENON_APU_V1_PROFILE_DIR; script tests use small explicit sandbox budgets.
+
+Read timeout defaults to 300 seconds, with positive integer overrides
+TENON_APU_V1_PROFILE_TIMEOUT_SECONDS and TENON_APU_V1_PROFILE_COPY_BYTES.
+Manifests record observed CLI/firmware versions and elapsed read time.
+A real preflight also proves vendor-daemon destination access. Failed board
+stage messages name the failed guard. INSTALL and simulators.md describe
+validated firmware 220.13.500.7 / CLI 100.12.0.1.1000.25. The round-207
+34,125,826-byte read took **47 seconds**: two copies cost about 94 seconds
+per launch before device work. A 99-launch session cannot use a 7200-second
+limit. Current stage guards use 600 setup seconds plus planned launches
+times max(600, ceil(14 * preflight_read_seconds + 120)); the optional
+G1_SECONDS_PER_LAUNCH may increase that derived budget. No freshness or
+numerical rule changed.
+
+Validation before commit: 62 focused tests passed with evaluation assets;
+the additional version-banner assertions passed in the transport suite.
+Focused formatting, runtime pylint error checks, shell syntax and diff
+checks pass. The broad lint entry point still fails on 38 existing bundled
+Samsung upstream license headers; no upstream notices changed. Evidence:
+/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r208/.
+
+Next in this authorized run: focused commit/push to fork/tenon; fresh sdist,
+wheel and outside-checkout installation in r208; installed milestone;
+exact-output/fresh-record board probe; owed g1_board programs; reviewed
+installation equivalence then only the remaining campaign quota. Measure
+reads/launch and retained bytes; diagnose any missing/stale profile without
+relaxing attribution. No new G8/G9/G10 closure yet. X-34/X-37 remain open
+without unchanged Gemini-II resampling. Earlier round-207 pending-review
+instructions below are historical and superseded by the user's review.
+
+
+## Current increment: direct-copy profiling transport (2026-11-17, round 207)
+
+**NOT READY.** Base HEAD and local `fork/tenon` ref: `21dd7c9`. The round-207
+patch is uncommitted and submitted for independent RLAR review; no new
+package, board kernel launch, campaign session or gate closure is claimed.
+The six inherited untracked verifier scripts are untouched. All 73 locked
+paper files match `30b6f49e64583b5d301d2a5e8b902498f5578e4e`.
+
+This supersedes the older next-action instructions to wait for gigabytes in
+`/tmp` or run the unchanged r193 artifact. The runtime now uses documented
+`ledag-ssh scp d2h` for all ten firmware rotation slots. It retains unique raw
+copies, commands, stdout/stderr and hash/timestamp manifests under
+`TENON_APU_V1_PROFILE_DIR` (default TMPDIR). Timestamp chronology, copy
+completeness, board locking and the existing fresh-record checks fail closed.
+The extraction directory stays TMPDIR; only the small vendor session log
+uses `/tmp`. Cleanup requires a live PID in this invocation's process session
+and an unchanged inode, and retains the log before unlinking it.
+
+The per-read guard adds 64 KiB session-log, 16 MiB extraction and 64 MiB
+copy reserves on shared filesystems. Board/campaign scripts now check the
+actual profile, extraction, build and evidence filesystems, conservatively
+reserving 1 GiB per planned launch for retained raw/normalized reads and
+build/output overhead. `G1_TMP_PATH` actually sets TMPDIR; device-host locks
+stay put. These are provisioning estimates, not capacity facts or reserved
+disk space. Quotas, existing-file pooling and numerical/freshness rules are
+unchanged. Place the new evidence root on roomy host-local storage.
+
+Evidence: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r207`. The focused four-file run with explicit evaluation
+assets passed **58 tests, no skips**. A real read-only transfer from the
+working source copied **34,125,826 bytes**, ordered all ten slots, and read
+4,763 historical total records. Its own **2,185-byte** session log was retained
+and removed; `/tmp` free space stayed **1,003,520 bytes**. This demonstrates
+the integrated transport, not numerical execution, a new timing sample or
+installed-artifact validation. The repository lint entry point fails on
+38 existing upstream Samsung license-header cases; upstream notices remain
+intact. Changed-runtime pylint error checks and focused format checks pass.
+
+Next concrete actions:
+
+1. Independent review of this bounded patch (runtime, storage guards,
+   subprocess/failure tests and INSTALL contract); inspect the live read's
+   manifest/transcripts. Commit only after review, in `experiments/allo`,
+   branch `tenon`; normal push only to `fork/tenon`, never a PR.
+2. Build/install a new sdist/wheel in a fresh host-local evidence directory,
+   using r193's build recipe as a lead, with extraction/build scratch there.
+   Copy the current tests, benchmarks and release scripts (including the new
+   `g1_storage_budget.py`) outside the checkout. Validate the installed
+   transport and its numerical/fresh-record launch, then run `g1_board.sh`
+   for the owed default-vector, forced-acc4 and perturbed-DMA programs.
+   Do not credit the earlier adapter probe or the read-only round-207 check.
+3. Rehash/update the r195 installation-equivalence manifest with the reviewed
+   runtime-only delta (`pim/apu_v1_program.py`) and new wheel identity; verify
+   generated-program identity before pooling. Retain the explicit three
+   r141 session paths below. Finish only kmeans 2, word_count 2 and
+   linear_regression 3 complete rows with the unchanged quota. Retain every
+   partial/failed attempt and recheck storage between sequences/sessions.
+4. G10 still has 50/55 reproduced, four open and one without a verdict.
+   X-34/X-37 remain independent blockers; no unchanged Gemini-II resampling.
+   Final-candidate review and required candidate evidence remain outstanding.
+
+
 **User scope correction, confirmed 2026-11-04:** G10 requires only the main
 Samsung/AiM/UPMEM/Gemini-I/Gemini-II performance comparisons and the AttAcc
 kernel/decode figures. All supporting studies are optional. The inventory's

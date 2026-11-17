@@ -93,12 +93,13 @@ stage apu_v1_grouped_mapping -- timeout 1800 $PY -m pytest -q -p no:cacheprovide
 stage apu_v1_shared_semantics_selection -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/pim/test_shared_semantics.py -k "apu_v1 or grouped"
 # The Samsung cost program's staging accounting (S-12, rounds 132 to 134): the unit tests and the
 # production-path regression against the bundled conductor built above (the trace test must run,
-# not skip), and the APU v1 measurement driver's scratch precondition (X-24, rounds 130 to 131)
-# with its mocked headroom regressions; both suites are required stages of the milestone.
+# not skip), and the APU v1 direct-copy transport and measurement drivers: rotation,
+# residual /tmp and actual storage headroom, subprocess failures and session cleanup
+# (X-24/X-47). Both suites and their named regressions are required stages.
 stage samsung_cost_staging_suites -- timeout 2400 $PY -m pytest -q -p no:cacheprovider tests/perf/test_samsung_performance.py tests/pim/samsung_hbm_pim/test_vector_staging.py -rA
 stage samsung_staging_regressions_named -- bash -c "for t in test_vector_staging_shares_partition_the_conductors_vector_staging test_emitted_vector_staging_equals_the_conductors_work test_operand_order_does_not_change_the_staging_counts test_conductor_trace_matches_the_transcription; do grep -c \"PASSED.*\$t\" $E/stages/samsung_cost_staging_suites.log || exit 1; done"
-stage measurement_drivers_suite -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/perf/test_measurement_drivers.py -rA
-stage headroom_regressions_named -- bash -c "grep -c 'PASSED.*test_ledag_drain_refuses_without_scratch_headroom' $E/stages/measurement_drivers_suite.log && grep -c 'PASSED.*separately_provisioned_extraction_directory' $E/stages/measurement_drivers_suite.log"
+stage measurement_drivers_suite -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/perf/test_measurement_drivers.py tests/perf/test_apu_v1_profile_transport.py -rA
+stage headroom_regressions_named -- bash -c "for t in test_direct_copy_orders_rotation_preserves_evidence_and_owns_cleanup test_headroom_groups_actual_filesystems_and_checks_residual_tmp test_copy_failures_retain_partial_evidence; do grep -c \"PASSED.*\$t\" $E/stages/measurement_drivers_suite.log || exit 1; done"
 stage apu_v1_functional_reference -- timeout 1800 $PY -m pytest -q -p no:cacheprovider tests/perf/test_apu_v1_functional_reference.py -W error::DeprecationWarning
 stage numpy24_venv -- bash -c "env -u PYTHONPATH $SPMW_PY -m venv --system-site-packages $E/venv-np24 && $E/venv-np24/bin/python -m pip install -q 'numpy>=2.4' && $E/venv-np24/bin/python -m pip install -q --no-deps --force-reinstall $P/wheel/allo-0.5-*.whl"
 stage numpy24_versions_asserted -- $E/venv-np24/bin/python -c "import numpy, allo; print('numpy', numpy.__version__, 'allo', allo.__file__); major, minor = (int(x) for x in numpy.__version__.split('.')[:2]); assert (major, minor) >= (2, 4), numpy.__version__; assert '/venv-np24/' in allo.__file__, allo.__file__"

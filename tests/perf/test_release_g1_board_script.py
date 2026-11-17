@@ -32,6 +32,7 @@ def _sandbox(root: Path, *, headroom="None", driver_exit=0) -> dict:
     # when ``headroom`` says so (scratch lost between stages).
     (lib / "allo" / "pim" / "apu_v1_program.py").write_text(
         "import os\n"
+        "def _ledag_drain():\n    return 'sandbox read-only transport'\n"
         "def ledag_scratch_headroom_problem():\n"
         f"    return {headroom}\n"
     )
@@ -67,6 +68,8 @@ def _run(sb, evidence: Path, *, dry=True, env_extra=None):
         (evidence / "pkg").symlink_to(sb["pkg"])
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
+    env["G1_TMP_PER_LAUNCH_BYTES"] = "1024"
+    env.pop("G1_SECONDS_PER_LAUNCH", None)
     tmp = evidence.parent / "tmp"
     tmp.mkdir(exist_ok=True)
     env.update(
@@ -140,6 +143,7 @@ def test_each_stage_runs_behind_its_own_gate_and_a_lost_gate_is_a_failed_stage(t
     calls = sb["calls"]
     (sb["pkg"] / "venv" / "lib" / "allo" / "pim" / "apu_v1_program.py").write_text(
         "import os\n"
+        "def _ledag_drain():\n    return 'sandbox read-only transport'\n"
         "def ledag_scratch_headroom_problem():\n"
         f"    return '/tmp has 0.4 MiB free' if os.path.exists({str(calls)!r}) else None\n"
     )
@@ -153,7 +157,7 @@ def test_each_stage_runs_behind_its_own_gate_and_a_lost_gate_is_a_failed_stage(t
     assert "stage vector_rows PASS" in out
     assert "stage headroom_before_forced_acc4 FAIL" in out and "stage forced_acc4 FAIL" in out
     assert "stage perturbed_dma FAIL" in out and "MILESTONE FAILED" in out
-    assert out.count("NOT LAUNCHED: the headroom gate failed") >= 2
+    assert out.count("NOT LAUNCHED: gate headroom_before_") >= 2
     # With scratch intact all three stages run the driver, in order.
     sb = _sandbox(tmp_path / "three")
     code, out = _run(sb, tmp_path / "e6", dry=False)
@@ -182,3 +186,51 @@ def test_the_sequence_scratch_budget_is_a_prerequisite(tmp_path):
     code, out = _run(sb, tmp_path / "e9", env_extra={"G1_TMP_PATH": str(tmp_path), "G1_TMP_PER_LAUNCH_BYTES": "1"})
     assert code == 0 and "planned launches 78 x 1 bytes = 78 needed" in out
     assert out.count("DRY RUN: would launch") == 3
+
+
+def test_redirected_storage_is_passed_to_runtime_and_budgeted(tmp_path):
+    import json
+
+    sb = _sandbox(tmp_path)
+    extract = tmp_path / "actual-extraction"
+    profiles = tmp_path / "actual-profiles"
+    observed = tmp_path / "guard-paths.json"
+    (sb["pkg"] / "venv" / "lib" / "allo" / "pim" / "apu_v1_program.py").write_text(
+        "import os, json\n"
+        "def _ledag_drain():\n    return 'sandbox read-only transport'\n"
+        "def ledag_scratch_headroom_problem():\n"
+        f"    with open({str(observed)!r}, 'w') as f:\n"
+        "        json.dump([os.environ['TMPDIR'], os.environ['TENON_APU_V1_PROFILE_DIR']], f)\n"
+        "    return None\n"
+    )
+    code, output = _run(
+        sb,
+        tmp_path / "redirected",
+        env_extra={
+            "G1_TMP_PATH": str(extract),
+            "TENON_APU_V1_PROFILE_DIR": str(profiles),
+        },
+    )
+    assert code == 0, output
+    assert json.loads(observed.read_text()) == [str(extract), str(profiles)]
+    log = (
+        tmp_path / "redirected" / "board-dry-run" / "stages" / "scratch_budget.log"
+    ).read_text()
+    for directory in (extract, profiles, tmp_path / "redirected" / "board-dry-run"):
+        assert f"actual storage: {directory}" in log
+
+
+def test_time_budget_scales_with_launches_and_transport_preflight_is_required(tmp_path):
+    sb = _sandbox(tmp_path)
+    code, output = _run(sb, tmp_path / "timed", dry=False)
+    assert code == 0, output
+    assert "stage transport_preflight PASS" in output
+    assert "stage vector_rows timeout: 600 + 66 x 600 = 40200 seconds" in output
+    assert "stage forced_acc4 timeout: 600 + 6 x 600 = 4200 seconds" in output
+    runtime = sb["pkg"] / "venv" / "lib" / "allo" / "pim" / "apu_v1_program.py"
+    runtime.write_text("def ledag_scratch_headroom_problem():\n    return None\n"
+                       "def _ledag_drain():\n    raise RuntimeError('vendor daemon cannot write destination')\n")
+    before = _driver_calls(sb)
+    code, output = _run(sb, tmp_path / "cannot-copy", dry=False)
+    assert code == 1 and "prerequisite transport_preflight failed; nothing launched" in output
+    assert _driver_calls(sb) == before

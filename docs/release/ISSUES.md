@@ -3,6 +3,34 @@
 
 # Tenon release issue ledger
 
+## Round 208 follow-up on X-24 / X-47
+
+The independent round-207 review found four integration issues: stale named
+milestone regressions, insufficient two-hour stage timeouts for 47-second
+copies, unbounded default temporary-directory retention, and oversized test
+sandbox prerequisites. All are fixed in the transport increment; see current
+STATUS/VALIDATION. Profiling now requires explicit retained storage, and real
+board/campaign scripts preflight the actual vendor-daemon copy and derive a
+stage timeout from its measured duration and planned launch count. Required
+installed/board/campaign evidence remains owed until executed. No fixed
+performance outcome or partial campaign record was altered.
+
+
+## Current X-24 / X-47 update (round 207, 2026-11-17)
+
+The older multi-gigabyte `/tmp` prerequisites describe the `flo` transport.
+The user proved direct `scp d2h` support; the round-207 uncommitted runtime
+patch integrates it and budgets actual profile/extraction/build/evidence
+storage separately from the small residual `/tmp` session log. The working
+source copied all ten firmware files in a read-only diagnostic, with no
+loss of `/tmp` space. Fifty-eight focused software tests passed. See STATUS,
+REVIEW and VALIDATION for the patch and evidence identities. Independent
+review and a new installed artifact are still owed; X-47's board/campaign
+evidence obligations remain open. This does not close G8/G9/G10, replace
+campaign losses or change fixed Gemini-II outcomes. Historical failure
+records and the r193 artifact are untouched.
+
+
 Each entry: observed failure or source concern, severity, root cause, affected
 public behaviour, planned repair, closure evidence. IDs come from the per-area
 audits in `audit/` (S Samsung, U UPMEM, M AiM/AttAcc, V1 APU v1, G2 Gemini-II,

@@ -3,6 +3,51 @@
 
 # Release review: architecture, constants, specialization, gate judgments
 
+## Round 208: independent round-207 review addressed
+
+The reviewer accepted the transport core subject to four fixes, independently
+verified rotation attribution/failure rejection, and explicitly instructed
+committing/pushing and continuing installation/hardware work after fixing
+those items, without another review pause. All four are addressed: milestone
+suite/name integration, measured scalable time budgets and configurable
+copy reserves/timeouts, explicit retention-root requirement, and small test
+sandbox budgets. The same patch includes real read-only preflight, accurate
+failed-guard messages, observed-version manifests and corrected transport
+documentation. Evidence and tests are in VALIDATION's round-208 entry.
+
+This is acceptance of the bounded transport increment, not readiness or
+installed execution. Numerical/freshness checks, fixed campaign quotas and
+Gemini-II outcomes are unchanged. Hardware campaign and final-candidate
+findings remain open; done=false until their required evidence exists.
+
+
+## Round 207 review submission: direct-copy log transport
+
+Actor submission, **independent review pending**, base `21dd7c9`. This is a
+bounded production/runtime and storage-guard patch, not gate approval.
+`apu_v1_program._ledag_drain` replaces `flo` with documented direct copies;
+`_ledag_order_logs` validates and orders timestamp ranges; the existing
+`launch_on_board`, `fresh_profile_records` and `parse_fresh_profile` logic
+is unchanged. No compiler search, source semantics, materialization, device
+program, numerical oracle or campaign quota changes.
+
+Review the supported ten-slot firmware log format, completeness checks,
+chronological ordering across rotation, file retention on all failure paths,
+the kernel-session ownership checks for cleanup, and the actual-directory
+space guards. A snapshot (about 34 MB observed) is not a measurement; only
+the unchanged locked before/after launch protocol can attribute a sample.
+The 64 KiB /tmp reserve is for the small vendor session log, not a lowered
+budget for `flo`: `flo` is removed. The 1 GiB campaign reserve is an empirical
+provisioning estimate on actual storage, rechecked per sequence/session.
+Other writers and larger future logs can still fail; no failure yields cycles.
+
+The working source completed one read-only real-board log transfer; all
+58 focused software tests passed. Evidence and caveats are in VALIDATION's
+round-207 entry and `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r207`. No installed artifact or hardware kernel
+validation yet. G8/G9 Gemini-I execution, the owed Gemini-I campaign rows,
+X-34/X-37 and the final candidate remain blockers. Return done=false.
+
+
 This file records the expert review of the release candidate against gates
 G1-G8 of the task, the rejected shortcuts, and the remaining limitations. It
 is updated at each round; judgments name the revision they apply to.

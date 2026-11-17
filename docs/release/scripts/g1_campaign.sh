@@ -20,16 +20,19 @@
 # of which must exist: give explicit absolute file names, not a quoted brace pattern, which the shell
 # does not expand inside a variable), G1_MAX_SESSIONS (attempts at most, default 6), G1_MEASURED
 # (default 10), G1_DRY_RUN=1 (prerequisites and the plan only, under <dir>/campaign-dry-run; no
-# launch), TENON_ARTIFACTS (the evaluation assets), G1_TMP_PER_LAUNCH_BYTES (the host scratch each
-# launch consumes, default 60000000: rounds 136 and 146 measured 54 to 56 MB per launch of the board
-# host's /tmp; a session is launched only when its whole budget is free, since the 8 MiB production
-# guard protects one attempt, not a session, X-47), G1_TMP_PATH (the scratch filesystem, default /tmp).
+# launch), TENON_ARTIFACTS (the evaluation assets), G1_TMP_PER_LAUNCH_BYTES
+# (the retained-log/build/evidence reserve per launch, default 1 GiB: up to seven
+# 64 MiB raw reads, their normalized evidence and build/output scratch). G1_TMP_PATH
+# actually selects TMPDIR; it is not a pretend relocation of /tmp. Bulk profile
+# copies use TENON_APU_V1_PROFILE_DIR (default <run>/profiles). All actual storage
+# filesystems are budgeted; /tmp's small vendor session log is checked separately
+# by the runtime. Place the evidence directory on a filesystem with room.
 set -u
-E=${1:?evidence dir}; P=$E/pkg; T=${G1_TESTTREE:-$E/testtree}
+E=${1:?evidence dir}; [[ "$E" = /* ]] || { echo "evidence directory must be absolute" >&2; exit 1; }; P=$E/pkg; T=${G1_TESTTREE:-$E/testtree}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROW_QUOTA=${G1_ROW_QUOTA:-"kmeans=3,word_count=3,linear_regression=3"}
 MAX_SESSIONS=${G1_MAX_SESSIONS:-6}; MEASURED=${G1_MEASURED:-10}
-PER_LAUNCH=${G1_TMP_PER_LAUNCH_BYTES:-60000000}; TMP_PATH=${G1_TMP_PATH:-/tmp}
+PER_LAUNCH=${G1_TMP_PER_LAUNCH_BYTES:-1073741824}
 DRY=${G1_DRY_RUN:-0}
 EXISTING=(${G1_EXISTING:-})
 # G1_EQUIVALENCE: an installation-equivalence manifest (g1_pool.py --write-equivalence) that lets this
@@ -42,12 +45,14 @@ if [ -e "$CAMP" ]; then
   echo "refusing to run: $CAMP already exists (a prior attempt's evidence is never overwritten; use a fresh evidence directory)" >&2
   exit 1
 fi
-export PYTHONSAFEPATH=1 PYTHONPATH=$T TMPDIR=$CAMP/tmp
+export PYTHONSAFEPATH=1 PYTHONPATH=$T TMPDIR=${G1_TMP_PATH:-$CAMP/tmp}
+export TENON_APU_V1_PROFILE_DIR=${TENON_APU_V1_PROFILE_DIR:-$CAMP/profiles}
 export TENON_ARTIFACTS=${TENON_ARTIFACTS:-/work/shared/users/phd/nz264/spmw-for-pim/tenon-artifacts}
 unset LLVM_BUILD_DIR
 PYV=$P/venv/bin/python
 source "$HERE/stage_lib.sh"
-mkdir -p $CAMP/tmp $CAMP/scratch $CAMP/run && cd $CAMP/run
+mkdir -p "$TMPDIR" "$TENON_APU_V1_PROFILE_DIR" "$CAMP/scratch" "$CAMP/run" || exit 1
+cd "$CAMP/run" || exit 1
 milestone_begin $CAMP/stages
 echo "host $(hostname) date $(date -Is) commit $(cat $P/revision.txt) row quota [$ROW_QUOTA] existing [${EXISTING[*]:-}] max sessions $MAX_SESSIONS dry run $DRY" | tee -a $CAMP/stages/SUMMARY.txt
 sha256sum $P/wheel/allo-0.5-*.whl | tee -a $CAMP/stages/SUMMARY.txt
@@ -95,7 +100,12 @@ if [ "$DRY" = "1" ]; then
   fi
   milestone_finish; exit 0
 fi
-stage headroom_before_campaign -- bash -c "set -e; df -B1 --output=avail /tmp | tail -1; env -u TMPDIR $PYV -c 'from allo.pim.apu_v1_program import ledag_scratch_headroom_problem as f; p = f(); print(\"guard (TMPDIR unset):\", p); assert p is None'; $PYV -c 'from allo.pim.apu_v1_program import ledag_scratch_headroom_problem as f; p = f(); print(\"guard (TMPDIR on the evidence tree):\", p); assert p is None'" || abort "prerequisite headroom_before_campaign failed; nothing launched"
+GUARD='from allo.pim.apu_v1_program import ledag_scratch_headroom_problem as f; p = f(); print("guard:", p); assert p is None, p'
+stage headroom_before_campaign -- "$PYV" -c "$GUARD" || abort "prerequisite headroom_before_campaign failed; nothing launched"
+if [ -n "$next" ]; then
+  stage transport_preflight -- "$PYV" "$HERE/g1_transport_preflight.py" "$CAMP/transport-preflight.json" || abort "prerequisite transport_preflight failed; nothing launched"
+  SECONDS_PER_LAUNCH=$("$PYV" -c 'import json,sys; print(json.load(open(sys.argv[1]))["seconds_per_launch"])' "$CAMP/transport-preflight.json") || abort "cannot read fresh transport time budget; nothing launched"
+fi
 files=()
 for s in $(seq 1 $MAX_SESSIONS); do
   next=$(plan "${files[@]}") || abort "planning failed before session $s; no further session is launched"
@@ -103,11 +113,13 @@ for s in $(seq 1 $MAX_SESSIONS); do
   echo "session $s plans the rows still owed: [$next] $(date -Is)" | tee -a $CAMP/stages/SUMMARY.txt
   # The session's scratch budget: its cases x three lanes x (one warm-up + MEASURED) launches.
   ncases=$(echo "$next" | wc -w); launches=$(( ncases * 3 * (1 + MEASURED) ))
-  if stage headroom_before_session_$s -- bash -c "set -e; avail=\$(df -B1 --output=avail '$TMP_PATH' | tail -1); need=\$(( $launches * $PER_LAUNCH )); echo \"planned launches $launches x $PER_LAUNCH bytes = \$need needed; \$avail available in $TMP_PATH\"; [ \"\$avail\" -ge \"\$need\" ]; $PYV -c 'from allo.pim.apu_v1_program import ledag_scratch_headroom_problem as f; p = f(); print(\"guard:\", p); assert p is None'"; then
-    stage session_$s -- timeout 7200 $PYV -m benchmarks.apu_v1.paper_rows --measured $MEASURED --expert --historical-binary --cases $next --scratch $CAMP/scratch/session_$s --out $CAMP/apu_v1_campaign_s$s.json
+  if stage headroom_before_session_$s -- "$PYV" -I "$HERE/g1_storage_budget.py" "$launches" "$PER_LAUNCH" "$CAMP" "$TMPDIR" "$TENON_APU_V1_PROFILE_DIR" && stage guard_before_session_$s -- "$PYV" -c "$GUARD"; then
+    stage_seconds=$((600 + launches * SECONDS_PER_LAUNCH))
+    echo "session $s timeout: 600 + $launches x $SECONDS_PER_LAUNCH = $stage_seconds seconds" | tee -a $CAMP/stages/SUMMARY.txt
+    stage session_$s -- timeout "$stage_seconds" $PYV -m benchmarks.apu_v1.paper_rows --measured $MEASURED --expert --historical-binary --cases $next --scratch $CAMP/scratch/session_$s --out $CAMP/apu_v1_campaign_s$s.json
     [ -f $CAMP/apu_v1_campaign_s$s.json ] && files+=($CAMP/apu_v1_campaign_s$s.json)
   else
-    echo "session $s NOT LAUNCHED: the headroom gate failed at $(date -Is) ($(df -B1 --output=avail /tmp | tail -1) bytes free in /tmp)" | tee -a $CAMP/stages/SUMMARY.txt
+    echo "session $s NOT LAUNCHED: the headroom gate failed (headroom_before_session_$s or guard_before_session_$s; see stage logs for actual storage paths) at $(date -Is)" | tee -a $CAMP/stages/SUMMARY.txt
   fi
   echo "/tmp after session $s: $(df -B1 --output=avail /tmp | tail -1) bytes free $(date -Is)" | tee -a $CAMP/stages/SUMMARY.txt
 done
