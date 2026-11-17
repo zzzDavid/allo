@@ -3,6 +3,19 @@
 
 # Tenon release issue ledger
 
+## Round209 current disposition
+
+The accepted residual allocation guard and requested leaked-reserve/campaign
+stop controls are committed in5fec806 and installed/tested. The runtime
+false-positive headroom check is repaired; it does not provision space.
+Owned stale files reclaimed6,656,000bytes, but41 observations overten minutes
+remain below the16-MiB go/no-go margin. The21.2MB simbuild data is root-owned
+and preserved. X-24/X-47 operational evidence obligations remain blocked on
+at least16MiB durable total free space in/tmp, not on compiler tests. No new
+attempt was spent. X-34 stays fixed OPEN with GTML context; V1-16 and the
+required G6/histogram/native-row evidence remain explicit in the final
+5fec806 walkthrough (REVIEW/STATUS).
+
 ## Round 208 residual guard follow-up (X-24 / X-47, uncommitted)
 
 The byte-count guard accepted `/tmp` with 167,936 bytes free, but the vendor

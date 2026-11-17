@@ -3,6 +3,59 @@
 
 # Validation record
 
+## Round209 final artifact, equivalence, and no-go decision
+
+Candidate5fec806, built from its committed git archive through a fresh sdist
+and wheel, installed outside checkout at `r209/pkg-candidate`:
+wheel `45c98918aa6e99d70c5e18724d1226e6974f1060dd0f3d35280da9ac997718e3`;
+sdist `38b3b61086e9e8b5e2c52ef5421c05d0d5697e9235350bdf6ff1bf4c92a30c00`.
+`build_candidate.sh`, `build-candidate.log`, and `candidate-equivalence.json`
+record the build and check.517 payload files equal the7f52c11 artifact byte
+for byte; only runtime `apu_v1_program.py` and RECORD changed. AST comparison
+finds only the headroom guard changed, with launch/freshness/codegen nodes
+identical. All500 installed package files equal the wheel. Installed checks
+from copied committed tests:33 passed in25.17seconds, no skips
+(`installed-check/{origin.txt,tests.log}`). This rechecks the changed guard
+and script controls without repeating the unchanged full simulator milestone.
+
+`compile_identity.sh` compiles all five G1 defaults and both controlled
+matrix alternatives virtually from the installed artifact. Seven programs
+match all nine identity fields against r208, as recorded in
+`generated-program-equivalence.json`. This is identity evidence, not a new
+measurement. Frozen paper lock recheck:73/73, `paper-lock-check.json`.
+
+`update_equivalence.py` rehashes all eight installations/wheels. The initial
+strict verifier rejected the reviewed G2 template difference because every
+allowed non-Python file must still equal after substitutions. That failure
+and initial manifest are retained. The updated manifest records an exact
+full-source mapping from old template SHA256 `0ea162829dd5258f0c3ebff7d29c3e40f50affce258366ae03a4d5cb773648a4`
+to reviewed218ccde source `de7b1a87f2546896b04116e14e512da5aaaaa532b7ec333c8f996c685f3f2b04`.
+Both full texts are absent from every one of3996 other recorded files,
+including all compiled bindings (`g2-template-normalization-scope.json`).
+Consequently this mapping affects only that non-G1 template; binding checks
+still apply their original path substitutions only. The G1 pooler itself,
+its eligibility/statistic/quota rules, and r195/r208 manifests are unchanged.
+`installation_equivalence.json` and `update-equivalence.log` report success.
+The unchanged pooler's installation preflight then accepted the new installed
+artifact against all three r141 and both r208 session files, exit 0
+(`existing-session-preflight.{log,exit}`). This checked identity only; it did
+not produce new measurements or revise the incomplete quota.
+This explicit source mapping is reviewable evidence, not a claim that old
+and new Gemini-II programs have equal timing or a permission to resample.
+
+The storage observation completed41 samples over600.000seconds: free bytes
+6,881,280 throughout, all guard probes successful, no owned reserve leaks,
+net drop0. **NO-GO** because the preregistered minimum is16MiB.
+`residual-space-verdict.json` and `residual-tmp-snapshots.jsonl` retain the
+period; source guard hash equals the installed guard. The actual installed
+pre-session helper also exited1 (`installed-residual-policy.{log,exit}`)
+with the16-MiB policy. No vendor read, device launch, histogram row or G6
+board check was attempted in round209. Exact external ask:16MiB durable
+total free space in `/tmp`; root-owned simbuild contents remain untouched.
+The former r197 follow-ups stay UNVERIFIED, including the narrow V1-16
+expected-mismatch checks. Storage probes are not their execution evidence.
+
+
 ## Round 209 authorized temporary-storage archive
 
 Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r209`.
