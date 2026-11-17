@@ -160,34 +160,44 @@ void accumulate_epilogue(const ComposedDotViews &v) {
   copy(v.epilogue_result, v.out);
 }
 
-void pipeline(const ComposedDotViews &v, const ApuG2ComposedDotParams &p) {
-  reduce_dots(v, p);
+template <void (*Epilogue)(const ComposedDotViews &)>
+void repeat_pipeline(const ComposedDotViews &v, const ApuG2ComposedDotParams &p,
+                     uint32_t repetitions) {
+  for (uint32_t i = 0; i < repetitions; ++i) {
+    reduce_dots(v, p);
+    Epilogue(v);
+  }
+}
+
+void pipeline(const ComposedDotViews &v, const ApuG2ComposedDotParams &p,
+              uint32_t repetitions) {
+  // The host's task parameters are immutable during this synchronous call.
+  // Select the epilogue once per timed window, retaining its dispatch cost
+  // inside that window and every repetition's complete primitive sequence.
   switch (p.epilogue) {
   case APUG2_COMPOSED_DOT_IDENTITY:
-    identity_epilogue(v);
+    repeat_pipeline<identity_epilogue>(v, p, repetitions);
     return;
   case APUG2_COMPOSED_DOT_PAIR_AFFINE:
-    pair_affine_epilogue(v);
+    repeat_pipeline<pair_affine_epilogue>(v, p, repetitions);
     return;
   case APUG2_COMPOSED_DOT_ACCUMULATE:
-    accumulate_epilogue(v);
+    repeat_pipeline<accumulate_epilogue>(v, p, repetitions);
     return;
   default:
     return;
   }
 }
 
-template <typename Body>
-void measure(const ApuG2ComposedDotParams &p, Body body,
+void measure(const ApuG2ComposedDotParams &p, const ComposedDotViews &v,
              ApuG2ComposedDotTimings &timings) {
   gsi_perf_start();
-  for (uint32_t i = 0; i < p.repetitions; ++i)
-    body();
+  pipeline(v, p, p.repetitions);
   seu_barrier();
   timings.pipeline_ticks = gsi_perf_end();
 
   gsi_perf_start();
-  body();
+  pipeline(v, p, 1);
   seu_barrier();
   timings.final_pipeline_ticks = gsi_perf_end();
 }
@@ -202,7 +212,7 @@ GSI_LIBRARY_ENTRY_POINT(tenon_apu_g2_composed_dot, uint64_t params_l5) {
 
   const ComposedDotViews views(*p);
   ApuG2ComposedDotTimings timings{};
-  measure(*p, [&]() { pipeline(views, *p); }, timings);
+  measure(*p, views, timings);
   auto *result = reinterpret_cast<ApuG2ComposedDotTimings *>(
       static_cast<uintptr_t>(p->timings_l5));
   *result = timings;
