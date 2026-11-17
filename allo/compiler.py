@@ -900,7 +900,8 @@ def compile(
     reduction_order : {"strict", "reassociate"} or None
         Whether partial sums of a reduction may be regrouped. ``"strict"``
         (the default, also selected by None) keeps the source accumulation
-        order and rounding of every floating-point accumulator: schedules
+        order and each primitive's documented target rounding (Gemini-I
+        GVML FP16 multiply is not IEEE RNE; see CAPABILITIES): schedules
         that split such a reduction (bank fibers, SIMD lane partials, tree
         reductions) are pruned before ranking, and a backend with no
         order-preserving program raises ``ReductionOrderError``. Integer

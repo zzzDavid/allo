@@ -3874,9 +3874,13 @@ class APUVectorRealization:
     def execute_numpy(self, arrays: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
         """Execute high-level neutral operation semantics without board access."""
 
+        from .apu_v1_fp16 import add_f16, mul_f16, add_subgrps_f16_grp
+
         state = {name: np.asarray(value).copy() for name, value in arrays.items()}
         for op in self.operations:
-            if op.opcode in {"ADD_F16", "ADD_S16", "ADD_U16"}:
+            if op.opcode == "ADD_F16":
+                state[op.output] = add_f16(state[op.inputs[0]], state[op.inputs[1]])
+            elif op.opcode in {"ADD_S16", "ADD_U16"}:
                 state[op.output] = (state[op.inputs[0]] + state[op.inputs[1]]).astype(
                     state[op.inputs[0]].dtype
                 )
@@ -3889,7 +3893,7 @@ class APUVectorRealization:
                     np.uint16
                 )
             elif op.opcode == "MUL_F16":
-                state[op.output] = state[op.inputs[0]] * state[op.inputs[1]]
+                state[op.output] = mul_f16(state[op.inputs[0]], state[op.inputs[1]])
             elif op.opcode == "XOR_16":
                 state[op.output] = np.bitwise_xor(
                     state[op.inputs[0]], state[op.inputs[1]]
@@ -3935,6 +3939,9 @@ class APUVectorRealization:
                     raise ValueError(
                         f"NumPy group reduction size {flat.size} is not divisible by {group}"
                     )
+                if op.opcode == "GROUP_REDUCE_F16":
+                    state[op.output] = add_subgrps_f16_grp(flat, group)
+                    continue
                 reduced = flat.reshape(-1, group).sum(axis=1)
                 if op.opcode == "GROUP_REDUCE_U16":
                     reduced = reduced.astype(np.uint16)

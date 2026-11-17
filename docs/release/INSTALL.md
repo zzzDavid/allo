@@ -560,3 +560,15 @@ editable copy (pip reports the wheel's requirement satisfied and the
 editable finder shadows site-packages), and the wheel's metadata lists the
 development requirements (`past@<github url>`, `pylint`, `pytest`), so
 install the wheel with `--no-deps` after `requirements.txt`.
+
+
+### Optional Gemini-I arithmetic reference validation
+
+The installed compiler’s NumPy FP16 model needs no vendor library. On a host
+with the licensed GSI SDK, `benchmarks/apu_v1/fp16_reference.py` can verify it
+against `libgsigvml_ref.a`; set `TENON_APU_V1_REF_LIBRARY` and
+`TENON_APU_V1_REF_INCLUDE` when discovery is ambiguous. The include directory
+contains `gsi/refgvml*.h`. The harness builds its wrapper in the chosen evidence
+directory. No SDK library, header or resulting wrapper binary is distributed.
+See [the target arithmetic contract](design/gemini-i-fp16.md) for the exhaustive
+command, input-class coverage and the distinction from IEEE products.

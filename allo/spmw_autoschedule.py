@@ -1594,14 +1594,10 @@ def autoschedule(
 
     bound_cost = cost.bind(target) if isinstance(cost, CostSpec) else cost
 
-    # Whole-trace liveness pre-pass (SPEC-023 D1): run ONCE before the
-    # per-group loop and thread it (via a contextvar `cross_with_knobs` reads)
-    # into every group's `KnobCtx`, so the cross-kernel/cross-work-id residency
-    # knob can bound its candidate set by the whole-trace analysis. The
-    # per-group argmin below stays structurally intact -- liveness only bounds
-    # the residency knob's candidate set; the cross-kernel decision is resolved
-    # by the post-argmin reconciliation, NOT a joint search. Single-op GEMV
-    # flags nothing -> residency returns ["restage"] (1x fan) -> byte-identical.
+    # Derive liveness once for residency enumeration and whole-program
+    # realization. Ranking first reconciles group choices, then evaluates
+    # complete assignments within the joint budget; larger domains retain
+    # the explicitly labelled per-group heuristic incumbent.
     from .spmw_liveness import trace_liveness
     from .spmw_knobs import set_active_liveness, reset_active_liveness
 

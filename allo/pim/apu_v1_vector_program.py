@@ -44,6 +44,13 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from .apu_v1_fp16 import (
+    NUMERICS as FP16_NUMERICS,
+    add_f16,
+    mul_f16,
+    add_subgrps_f16_grp,
+)
+
 from ..spmw_codegen import RunResult
 from ..spmw_reduction_policy import (
     ReductionOrderError,
@@ -391,53 +398,43 @@ def _prune_by_reduction_policy(candidates, analysis, order):
     return tuple(keep), tuple(pruned)
 
 
-def _grouped_fp16_contraction(analysis, plan, arrays):
-    """FP16 result of a group-tree plan in that plan's accumulation order.
+def _fp16_contraction(analysis, plan, arrays, *, regroup):
+    """Execute retained contraction accesses with target primitive rounding.
 
-    Products round to FP16; each reduction group (``group_size`` consecutive
-    reduction elements, zero padded) is summed by a halving tree whose every
-    add rounds to FP16; the group sums are added to the incoming output in
-    ascending group order (``fp16_contraction_ops``: MUL_F16,
-    GROUP_REDUCE_F16, ADD_F16).
+    Broadcast views preserve each operand's axis order. Strict schedules add
+    products in source reduction order; regrouping schedules pad each group,
+    reduce adjacent pairs, then add group heads in ascending order.
     """
-    letters = {}
-
-    def subscripts(indices):
-        return "".join(
-            letters.setdefault(axis, chr(ord("a") + len(letters))) for axis in indices
-        )
+    axes = (*analysis.output.indices, analysis.reduction_axis)
 
     def operand(access):
-        return np.reshape(
-            np.asarray(arrays[access.value], dtype=np.float16), access.shape
-        ).astype(np.float32)
+        value = np.asarray(arrays[access.value], dtype=np.float16).reshape(access.shape)
+        order = sorted(
+            range(len(access.indices)), key=lambda i: axes.index(access.indices[i])
+        )
+        value = value.transpose(order)
+        extents = dict(zip(access.indices, access.shape))
+        return value.reshape(tuple(extents.get(axis, 1) for axis in axes))
 
-    output = np.reshape(
-        np.asarray(arrays[analysis.output.value], dtype=np.float16),
-        analysis.output.shape,
-    ).copy()
-    spec = (
-        f"{subscripts(analysis.lhs.indices)},{subscripts(analysis.rhs.indices)}"
-        f"->{subscripts(analysis.output.indices)}"
-        f"{subscripts((analysis.reduction_axis,))}"
+    left, right = np.broadcast_arrays(operand(analysis.lhs), operand(analysis.rhs))
+    output = (
+        np.asarray(arrays[analysis.output.value], dtype=np.float16)
+        .reshape(analysis.output.shape)
+        .copy()
     )
-    # An FP16 x FP16 product is exact in FP32, so one rounding gives MUL_F16.
-    products = np.einsum(spec, operand(analysis.lhs), operand(analysis.rhs)).astype(
-        np.float16
-    )
-    depth = products.shape[-1]
+    depth = left.shape[-1]
+    if not regroup:
+        for index in range(depth):
+            output = add_f16(output, mul_f16(left[..., index], right[..., index]))
+        return output
     group = int(plan.reduction_strategy.group_size or 1 << (depth - 1).bit_length())
     for start in range(0, depth, group):
-        chunk = np.zeros(products.shape[:-1] + (group,), dtype=np.float16)
-        piece = products[..., start : start + group]
-        chunk[..., : piece.shape[-1]] = piece
-        width = group
-        while width > 1:
-            width //= 2
-            chunk = (chunk[..., :width] + chunk[..., width : 2 * width]).astype(
-                np.float16
-            )
-        output = (output + chunk[..., 0]).astype(np.float16)
+        chunk = np.zeros(left.shape[:-1] + (group,), dtype=np.float16)
+        products = mul_f16(
+            left[..., start : start + group], right[..., start : start + group]
+        )
+        chunk[..., : products.shape[-1]] = products
+        output = add_f16(output, add_subgrps_f16_grp(chunk, group)[..., 0])
     return output
 
 
@@ -988,6 +985,14 @@ class APUv1VectorProgram:
         if self.realization is not None and self.analysis.output_initializer != "zero":
             self.realization.check_initial_outputs(arrays)
 
+    def _fp16_numerics(self):
+        order = (
+            "selected plan order; adjacent-pair groups added in ascending order"
+            if self.candidate.regroups
+            else "source order"
+        )
+        return f"{order}; {FP16_NUMERICS}"
+
     def virtual_extra(self) -> dict:
         return {
             "plan": self.selected_plan.name,
@@ -995,6 +1000,11 @@ class APUv1VectorProgram:
             "tile_decision": self.tile_decision,
             "cost_validity": self.cost_validity,
             "plan_regroups_reduction": self.candidate.regroups,
+            "numerics": (
+                self._fp16_numerics()
+                if self.analysis.multiply_operation == "arith.mulf"
+                else "modular integer arithmetic"
+            ),
         }
 
     # -- execution -----------------------------------------------------------------
@@ -1011,6 +1021,8 @@ class APUv1VectorProgram:
                 f"'functional', or 'virtual'; got {backend!r}"
             )
         result.extra["plan_regroups_reduction"] = self.candidate.regroups
+        if self.analysis.multiply_operation == "arith.mulf":
+            result.extra["numerics"] = self._fp16_numerics()
         return result
 
     def _stage_output(self, inputs: Mapping[str, object]) -> dict:
@@ -1039,16 +1051,12 @@ class APUv1VectorProgram:
         return arguments
 
     def _run_functional(self, compiled, inputs: Mapping[str, object]):
-        """Host-side NumPy model of the selected plan's arithmetic order.
+        """Host model with GVML primitive rounding and the selected plan's order.
 
-        Not compiled device code: neither the GVML realization nor any
-        lowered program runs.  A plan that regroups an FP16 reduction is
-        modelled by ``_grouped_fp16_contraction`` (FP16 products, the
-        plan's FP16 group tree, groups added in ascending order); any other
-        plan keeps the source order, so the original Allo function is
-        executed on the host as that model.  ``kind="functional"``; the
-        outputs are written to the caller's arrays and ``cycles`` is the
-        selected plan's analytical estimate, not a measurement.
+        Floating-point contraction meaning comes from the retained shared
+        analysis, not Python's IEEE product. Integer/bitwise contractions
+        retain the source interpreter. This is explicitly functional output;
+        any cycle count is the selected graph's estimate, not a measurement.
         """
         arguments = {
             name: value
@@ -1067,27 +1075,23 @@ class APUv1VectorProgram:
             self.realization.check_initial_outputs(arguments)
         output_name = self.analysis.output.value
         returned = None
-        if (
-            self.candidate.regroups
-            and self.analysis.multiply_operation == "arith.mulf"
-            and output_name in arguments
-        ):
-            # The selected plan regroups an FP16 reduction: reproduce its
-            # order, not the source order.
+        if self.analysis.multiply_operation == "arith.mulf":
+            if output_name not in arguments:
+                raise RuntimeError(
+                    "APU v1 FP16 contraction requires its retained output buffer"
+                )
             destination = arguments[output_name]
             np.copyto(
                 destination,
-                _grouped_fp16_contraction(
-                    self.analysis, self.selected_plan, arguments
+                _fp16_contraction(
+                    self.analysis,
+                    self.selected_plan,
+                    arguments,
+                    regroup=self.candidate.regroups,
                 ).reshape(destination.shape),
                 casting="same_kind",
             )
-            numerics = (
-                "selected plan order: FP16 products, halving FP16 tree over each "
-                f"reduction group of {self.selected_plan.reduction_strategy.group_size} "
-                "(model of gvml_add_subgrps; not checked against the device), "
-                "groups added to the output in ascending order"
-            )
+            numerics = self._fp16_numerics()
         else:
             workload = getattr(compiled, "source_workload", None)
             if workload is None:

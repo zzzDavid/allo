@@ -672,7 +672,11 @@ class APUv1Ctx(CodegenContext):
         return "apu-v1-vector-gvml-v1", (self.program.selected_plan.name, decision[-1])
 
     def virtual_run_extra(self) -> dict:
-        return {} if self.program is None else self.program.virtual_extra()
+        if self.program is not None:
+            return self.program.virtual_extra()
+        from .pim.apu_v1_fp16 import NUMERICS
+
+        return {"numerics": NUMERICS}
 
     def virtual_run_check(self, inputs) -> None:
         if self.program is not None:
@@ -1306,6 +1310,8 @@ def _run_apu_v1_grouped(compiled: "Compiled", **inputs) -> RunResult:
             read_output_image,
         )
 
+        from .pim.apu_v1_fp16 import NUMERICS as fp16_numerics
+
         binary_sha256 = hashlib.sha256(Path(bin_path).read_bytes()).hexdigest()
         # The board lock is held across launch and the pre/post device-log
         # drains, so the parsed totals belong to this launch only.
@@ -1362,6 +1368,7 @@ def _run_apu_v1_grouped(compiled: "Compiled", **inputs) -> RunResult:
                 "profile_counters": profile_counters(ledag_text),
                 "profile_text": ledag_text,
                 "apuc_cycles": list(apuc_cycles),
+                "numerics": fp16_numerics,
             },
         )
     finally:

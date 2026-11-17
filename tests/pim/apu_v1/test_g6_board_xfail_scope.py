@@ -1,13 +1,11 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The bit-model board test (test_g6_board_semantics.py, V1-16) expects one
-failure only: the final bit-level mismatch between the device results and the
-host models.  Round 167: its unrestricted xfail had absorbed a pre-execution
-scratch refusal as an expected failure.  These checks run that test in a
-subprocess with injected outcomes and no hardware (the device gate is
-bypassed and the device-run helper replaced by a plugin): a launcher error
-must fail the test, a bit-model mismatch is the expected failure, and
-model-equal device results are a strict unexpected pass that fails."""
+"""No board failure may be hidden by xfail after the V1-16 model repair.
+
+Host-only subprocess injections prove launch errors and bit mismatches fail,
+while model-equal readback passes. This retains the round-167 regression for
+an unrestricted xfail that once absorbed a pre-execution scratch refusal.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +18,7 @@ import pytest
 HERE = Path(__file__).resolve().parent
 TARGET = "tests/pim/apu_v1/test_g6_board_semantics.py::test_strict_and_reassociative_gemv_bit_equal_to_models_on_board[full_group]"
 
-PLUGIN = '''
+PLUGIN = """
 import numpy as np
 import pytest
 from types import SimpleNamespace
@@ -46,8 +44,8 @@ def pytest_runtest_setup(item):
         plan = SimpleNamespace(reduction_strategy=SimpleNamespace(group_size=4))
         if MODE == "launch_error":
             raise RuntimeError("ledag-ssh cannot read the device log: injected pre-execution refusal")
-        source = module.G6._fp16_source_order(np.zeros(M), (W[:, k] * x[k] for k in range(K)))
-        tree = module.G6._halving_tree_fp16(W * x, plan.reduction_strategy.group_size)
+        source = module.G6._fp16_source_order(np.zeros(M), (module.G6.mul_f16(W[:, k], x[k]) for k in range(K)))
+        tree = module.G6._adjacent_tree_fp16(module.G6.mul_f16(W, x), plan.reduction_strategy.group_size)
         if MODE == "mismatch":
             y_strict = source.copy(); y_strict.view(np.uint16)[::2] ^= 1
             y_relaxed = tree.copy(); y_relaxed.view(np.uint16)[1::2] ^= 1
@@ -56,7 +54,7 @@ def pytest_runtest_setup(item):
         return W, x, exact, y_strict, y_relaxed, plan
 
     module._strict_and_reassociative_runs = injected
-'''
+"""
 
 
 def _run_with_injection(tmp_path, mode):
@@ -65,12 +63,29 @@ def _run_with_injection(tmp_path, mode):
     (plugin_dir / f"inject_{mode}.py").write_text(PLUGIN.format(mode=mode))
     root = HERE.parents[2]
     env = dict(__import__("os").environ)
-    env["PYTHONPATH"] = f"{plugin_dir}:{root}" + (f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else "")
+    env["PYTHONPATH"] = f"{plugin_dir}:{root}" + (
+        f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else ""
+    )
     env.pop("PYTHONSAFEPATH", None)
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", f"inject_{mode}",
-         "--basetemp", str(tmp_path / f"bt_{mode}"), TARGET],
-        cwd=root, capture_output=True, text=True, timeout=600, env=env,
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            f"inject_{mode}",
+            "--basetemp",
+            str(tmp_path / f"bt_{mode}"),
+            TARGET,
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
     )
     return result.returncode, result.stdout + result.stderr
 
@@ -82,13 +97,14 @@ def test_a_launch_error_is_a_failure_not_an_expected_one(tmp_path):
     assert "injected pre-execution refusal" in out
 
 
-def test_a_bit_model_mismatch_is_the_expected_failure(tmp_path):
+def test_a_bit_model_mismatch_is_a_failure(tmp_path):
     code, out = _run_with_injection(tmp_path, "mismatch")
-    assert code == 0, out[-1500:]
-    assert "1 xfailed" in out, out[-1500:]
-
-
-def test_model_equal_results_are_a_strict_unexpected_pass(tmp_path):
-    code, out = _run_with_injection(tmp_path, "equal")
     assert code != 0, out[-1500:]
-    assert "1 failed" in out and "XPASS(strict)" in out, out[-1500:]
+    assert "1 failed" in out and "xfailed" not in out, out[-1500:]
+    assert "BitModelMismatch" in out
+
+
+def test_model_equal_results_pass(tmp_path):
+    code, out = _run_with_injection(tmp_path, "equal")
+    assert code == 0, out[-1500:]
+    assert "1 passed" in out, out[-1500:]

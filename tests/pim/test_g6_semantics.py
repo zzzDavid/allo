@@ -87,6 +87,7 @@ from allo.pim.apu_v1_vectorize import IllegalContractionError
 from allo.pim.apu_g2_source_route import APUG2SourceRouteError
 from allo.pim.costs import aim_cost, apu_v1_cost, samsung_cost, upmem_cost
 from allo.pim.costs.apu_g2 import apu_g2_cost
+from allo.pim.apu_v1_fp16 import add_f16, mul_f16
 from allo.pim.targets import (
     build_aim_target,
     build_apu_g2_target,
@@ -114,12 +115,20 @@ def _f32(a):
     return np.asarray(a).astype(np.float32)
 
 
-def _fp16_source_order(initial, products_by_k):
+def _ieee_fp16_source_order(initial, products_by_k):
     """``out = initial; for k: out = fp16(out + fp16(product_k))``."""
 
     out = np.array(initial, dtype=np.float16, copy=True)
     for product in products_by_k:
         out = (out + np.asarray(product, dtype=np.float16)).astype(np.float16)
+    return out
+
+
+def _fp16_source_order(initial, products_by_k):
+    """Source-order GVML addition; callers supply target-rounded products."""
+    out = np.array(initial, dtype=np.float16, copy=True)
+    for product in products_by_k:
+        out = add_f16(out, product)
     return out
 
 
@@ -502,7 +511,7 @@ def test_samsung_call_aliases_read_pre_call_values(samsung_sim_gate):
     x = x0.copy()
     result = carried(W0, x, x)
     assert result.extra["kernel"] == "GENERIC_TEMPORAL_REDUCE"
-    want = _fp16_source_order(x0, (W0[:, k] * x0[k] for k in range(SQ)))
+    want = _ieee_fp16_source_order(x0, (W0[:, k] * x0[k] for k in range(SQ)))
     np.testing.assert_array_equal(x.view(np.uint16), want.view(np.uint16))
 
     # The vector is a strided view of the matrix (input/input overlap).
@@ -553,7 +562,8 @@ def test_apu_v1_functional_call_aliases_read_pre_call_values():
 
     def source_order(initial, left, right):
         return _fp16_source_order(
-            initial, (left[:, d : d + 1] * right[d : d + 1, :] for d in range(AQ))
+            initial,
+            (mul_f16(left[:, d : d + 1], right[d : d + 1, :]) for d in range(AQ)),
         )
 
     shared = L0.copy()
@@ -770,13 +780,15 @@ def test_apu_v1_fp16_carried_output_follows_the_source_order():
     assert compiled.realization.carries_output_ingress
     C = C0.copy()
     result = compiled(L, R, C)
-    assert result.extra["numerics"] == "source order"
+    assert "source order" in result.extra["numerics"]
+    assert "Gemini-I GVML binary16" in result.extra["numerics"]
     want = _fp16_source_order(
-        C0, (L[:, d : d + 1] * R[d : d + 1, :] for d in range(ZK))
+        C0, (mul_f16(L[:, d : d + 1], R[d : d + 1, :]) for d in range(ZK))
     )
     np.testing.assert_array_equal(C.view(np.uint16), want.view(np.uint16))
     from_zero = _fp16_source_order(
-        np.zeros_like(C0), (L[:, d : d + 1] * R[d : d + 1, :] for d in range(ZK))
+        np.zeros_like(C0),
+        (mul_f16(L[:, d : d + 1], R[d : d + 1, :]) for d in range(ZK)),
     )
     assert np.count_nonzero(C != from_zero) > C.size // 2
 
@@ -936,8 +948,8 @@ def test_apu_g2_zero_operands_give_zero_dots(emulated_card):
 # ===================================================================== #
 
 
-def _halving_tree_fp16(products, group):
-    """FP16 halving tree over ``group``-wide blocks (zero padded), blocks
+def _adjacent_tree_fp16(products, group):
+    """GVML adjacent-pair tree over ``group``-wide blocks (zero padded), blocks
     added in ascending order into an FP16 zero."""
 
     rows, width = products.shape
@@ -947,14 +959,13 @@ def _halving_tree_fp16(products, group):
     for start in range(0, padded.shape[1], group):
         block = padded[:, start : start + group]
         while block.shape[1] > 1:
-            half = block.shape[1] // 2
-            block = (block[:, :half] + block[:, half : 2 * half]).astype(np.float16)
-        out = (out + block[:, 0]).astype(np.float16)
+            block = add_f16(block[:, 0::2], block[:, 1::2])
+        out = add_f16(out, block[:, 0])
     return out
 
 
 @pytest.mark.parametrize(
-    "M, K, seed", [(512, 256, 651), (384, 200, 652)], ids=["full_group", "padded_group"]
+    "M, K, seed", [(512, 256, 651), (384, 200, 652), (640, 96, 9211), (1000, 300, 9212)]
 )
 def test_apu_v1_strict_and_reassociative_gemv(M, K, seed):
     def gemv(W: float16[M, K], x: float16[K], y: float16[M]):
@@ -967,7 +978,7 @@ def test_apu_v1_strict_and_reassociative_gemv(M, K, seed):
     x = (rng.standard_normal(K) * 0.2).astype(np.float16)
     exact = _f32(W) @ _f32(x)
     source = _fp16_source_order(
-        np.zeros(M, np.float16), (W[:, k] * x[k] for k in range(K))
+        np.zeros(M, np.float16), (mul_f16(W[:, k], x[k]) for k in range(K))
     )
 
     strict = _apu_v1(gemv)
@@ -981,12 +992,14 @@ def test_apu_v1_strict_and_reassociative_gemv(M, K, seed):
     assert apu_v1_plan_regroups(plan)
     group = plan.reduction_strategy.group_size
     assert group & (group - 1) == 0
-    assert (K % group != 0) == (K == 200)  # 200 lanes padded inside the tree
+    assert group >= 1
+    if K == 200:
+        assert K % group != 0  # boundary probe pads inside the selected tree
     y = np.zeros(M, np.float16)
     result = relaxed(W, x, y)
     assert result.extra["plan_regroups_reduction"] is True
     np.testing.assert_array_equal(
-        y.view(np.uint16), _halving_tree_fp16(W * x, group).view(np.uint16)
+        y.view(np.uint16), _adjacent_tree_fp16(mul_f16(W, x), group).view(np.uint16)
     )
     differing = int(np.count_nonzero(y.view(np.uint16) != source.view(np.uint16)))
     assert differing > M // 2
@@ -1015,7 +1028,8 @@ def test_apu_v1_odd_gemm_shape_follows_the_source_order():
     C = np.zeros((37, 23), np.float16)
     compiled(L, R, C)
     want = _fp16_source_order(
-        np.zeros((37, 23)), (L[:, d : d + 1] * R[d : d + 1, :] for d in range(19))
+        np.zeros((37, 23)),
+        (mul_f16(L[:, d : d + 1], R[d : d + 1, :]) for d in range(19)),
     )
     np.testing.assert_array_equal(C.view(np.uint16), want.view(np.uint16))
 

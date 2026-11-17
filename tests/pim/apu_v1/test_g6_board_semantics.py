@@ -190,8 +190,8 @@ def test_strict_and_reassociative_gemv_values_on_board(apu_v1_device_gate, M, K,
 
 class BitModelMismatch(AssertionError):
     """The device's FP16 results differ at the bit level from the host models
-    (V1-16).  The only failure the bit-model test expects: compilation, plan
-    validation and launch failures are not expected and fail the test."""
+    (V1-16).  No mismatch is accepted; compilation, plan validation and launch
+    failures also fail the test."""
 
 
 def _compare_bit_models(y_strict, y_relaxed, source, tree, M):
@@ -211,28 +211,101 @@ def _compare_bit_models(y_strict, y_relaxed, source, tree, M):
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=BitModelMismatch,
-    reason="V1-16: the Gemini-I device's FP16 results differ at the bit level "
-    "from the host NumPy models of both plans (source-order loop and halving "
-    "tree); about half of the outputs differ by a few ulps while agreeing with "
-    "FP32 within FP16 tolerance. The functional route's models are plan-order "
-    "models, not bit-exact models of the device arithmetic. See docs/release/ISSUES.md. "
-    "Only the final bit-model mismatch is expected (raises=BitModelMismatch, round "
-    "167): a compilation, plan-validation or launch failure fails this test.",
-)
 @pytest.mark.parametrize(
-    "M, K, seed", [(512, 256, 706), (384, 200, 707)], ids=["full_group", "padded_group"]
+    "M, K, seed",
+    [(512, 256, 706), (384, 200, 707), (640, 96, 9211), (1000, 300, 9212)],
+    ids=["full_group", "padded_group", "short_reduction", "multiple_groups"],
 )
 def test_strict_and_reassociative_gemv_bit_equal_to_models_on_board(
-    apu_v1_device_gate, M, K, seed
+    apu_v1_device_gate, tmp_path, M, K, seed
 ):
-    """Bit-level comparison of the device results with the functional route's
-    numerics models. Expected to fail with ``BitModelMismatch`` until the
-    models reproduce the device arithmetic (V1-16); the mismatch counts are
-    printed for the record.  Any other exception is a real failure."""
+    """Expected before launch: zero bit mismatches, both plans, all rows."""
     W, x, _exact, y_strict, y_relaxed, plan = _strict_and_reassociative_runs(M, K, seed)
-    source = G6._fp16_source_order(np.zeros(M), (W[:, k] * x[k] for k in range(K)))
-    tree = G6._halving_tree_fp16(W * x, plan.reduction_strategy.group_size)
+    source = G6._fp16_source_order(
+        np.zeros(M), (G6.mul_f16(W[:, k], x[k]) for k in range(K))
+    )
+    tree = G6._adjacent_tree_fp16(G6.mul_f16(W, x), plan.reduction_strategy.group_size)
+    ieee = G6._ieee_fp16_source_order(np.zeros(M), (W[:, k] * x[k] for k in range(K)))
+    np.savez(
+        tmp_path / "bits.npz",
+        W=W,
+        x=x,
+        strict=y_strict,
+        relaxed=y_relaxed,
+        expected_strict=source,
+        expected_relaxed=tree,
+        ieee_source_order=ieee,
+    )
+    print(
+        "IEEE_SOURCE_ORDER_DIFFERENCES",
+        int(np.count_nonzero(ieee.view(np.uint16) != source.view(np.uint16))),
+    )
     _compare_bit_models(y_strict, y_relaxed, source, tree, M)
+
+
+def test_fp16_special_values_bit_equal_on_board(apu_v1_device_gate, tmp_path):
+    """One outer product, expected zero bit mismatches including NaN encodings."""
+
+    def outer(A: float16[32, 1], B: float16[1, 32], C: float16[32, 32]):
+        for i, j in allo.grid(32, 32):
+            for k in allo.reduction(1):
+                C[i, j] += A[i, k] * B[k, j]
+
+    bits = np.array(
+        [
+            0x0000,
+            0x8000,
+            0x0001,
+            0x8001,
+            0x0002,
+            0x8002,
+            0x03FF,
+            0x83FF,
+            0x0400,
+            0x8400,
+            0x0401,
+            0x8401,
+            0x3800,
+            0xB800,
+            0x3C00,
+            0xBC00,
+            0x3C01,
+            0xBC01,
+            0x4000,
+            0xC000,
+            0x7BFF,
+            0xFBFF,
+            0x7C00,
+            0xFC00,
+            0x7C01,
+            0xFC01,
+            0x7E00,
+            0xFE00,
+            0x7FFF,
+            0xFFFF,
+            0x3555,
+            0xB555,
+        ],
+        dtype=np.uint16,
+    )
+    A = bits.view(np.float16).reshape(32, 1).copy()
+    B = bits.view(np.float16).reshape(1, 32).copy()
+    initial = np.full((32, 32), -0.0, dtype=np.float16)
+    expected = G6.add_f16(initial, G6.mul_f16(A, B))
+    actual = initial.copy()
+    compiled = _device(outer)
+    result = _run(compiled, A, B, actual)
+    np.savez(
+        tmp_path / "special-bits.npz",
+        A=A,
+        B=B,
+        initial=initial,
+        actual=actual,
+        expected=expected,
+    )
+    assert "Gemini-I GVML binary16" in result.extra["numerics"]
+    print(
+        "APU_V1_SPECIAL_BIT_MISMATCHES",
+        int(np.count_nonzero(actual.view(np.uint16) != expected.view(np.uint16))),
+    )
+    np.testing.assert_array_equal(actual.view(np.uint16), expected.view(np.uint16))

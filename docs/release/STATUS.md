@@ -3,6 +3,37 @@
 
 # Release status
 
+## Decisions for the user
+
+1. Three required absolute performance misses remain fixed OPEN: word count
+   172,091 vs 171,988 cycles; linear regression 95,018 vs 94,618.5;
+   Gemini-II GEMM 1734.0 vs 1733.225 ticks. Same-round paper-era G1 binaries
+   measured 172,268 and 94,986 cycles, no faster than the current programs.
+   The fresh G2 GTML baseline is 1921.8 vs paper 1903.85 (+0.94%); paired
+   vendor/Tenon ratio 1.106 vs paper 1.098. This context is not parity.
+2. Samsung redistribution: `THIRD_PARTY_LICENSES/PIMSIMULATOR-LICENSE.txt`
+   requires express written permission for distribution. Sources were bundled
+   on the fork at the user's direction; written permission is not recorded.
+3. Gemini-I FP16 defaults to the vendor multiply contract, not IEEE RNE
+   products. Strict preserves source order with that target arithmetic.
+   The repair and its complete primitive checks are described in
+   [the arithmetic contract](design/gemini-i-fp16.md); installed board
+   confirmation remains required before accepting V1-16 as a boundary.
+
+## Active V1-16 repair (round 211)
+
+Working source introduces a maintained NumPy model for all FP16 encodings,
+uses it in strict and grouped functional execution and low-level operation
+execution, and exposes target numerics in results. Exhaustive SDK-reference
+multiply validation covers all 2^32 pairs with zero differences; add/subtract
+special-class and random checks and direct subgroup checks also pass.
+Eight retained r210 board outputs independently match the vendor reference.
+The paper lock remains 73/73 exact. Evidence root:
+`/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r211`.
+Next: commit the bounded repair, install its wheel, execute the predeclared
+nine board launches and the installed 42-stage milestone, and prove unchanged
+campaign program identities. No fixed performance campaign is rerun.
+
 ## Current candidate checkpoint (2026-11-17)
 
 **NOT READY.** Named compiler candidate:

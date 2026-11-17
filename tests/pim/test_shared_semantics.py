@@ -256,9 +256,9 @@ def test_local_accumulator_gemm_executes_on_apu_v1_functional_backend():
     assert run.kind == "functional"
     reference = np.zeros((M, N), np.float16)
     for d in range(K):
-        reference = (reference + (left[:, d : d + 1] * right[d : d + 1, :])).astype(
-            np.float16
-        )
+        from allo.pim.apu_v1_fp16 import add_f16, mul_f16
+
+        reference = add_f16(reference, mul_f16(left[:, d : d + 1], right[d : d + 1, :]))
     np.testing.assert_array_equal(result.view(np.uint16), reference.view(np.uint16))
     # The equivalent carried form selects the same plan family.
     carried = allo.compile(

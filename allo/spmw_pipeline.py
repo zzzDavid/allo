@@ -155,8 +155,8 @@ def normalize_source(
     backend planner is consulted, for every target.  The semantic facts
     (:func:`allo.spmw_semantics.analyze_program`) are derived from the same
     trace on the first ``program_facts()`` call (``analyze=True`` derives
-    them here); the matcher backends consume the trace directly until their
-    candidate contract is unified (gate G9, slice 3).
+    them here). All backend hooks consume those retained facts and enter
+    the common candidate validation, realization and selection contracts.
     """
 
     match_target = matcher_view(target)

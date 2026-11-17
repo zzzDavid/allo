@@ -3,6 +3,32 @@
 
 # Validation record
 
+## Round 211: target FP16 model, before installed confirmation
+
+Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r211`.
+`paper-lock-check.json`: 73/73 frozen files match. `exhaustive-v1` covers all
+4,294,967,296 multiply pairs with zero differences, 1,073,741,824 add/subtract
+special-class pairs (both orders), 4,194,304 random pairs per primitive and
+64 direct SDK subgroup checks. Runtime 92.78 seconds; full ranges, hashes,
+SDK identities and failures (none) retained. `retained-board-comparison.json`
+independently calls the SDK on r210 inputs and matches all eight archived
+strict/regrouped outputs bit for bit. This does not replace fresh execution.
+
+Focused source checks: 24 passed for primitives/functional/G6, then 84 passed
+for local initialization, recognizers and realization binding. After adding
+the two new shape probes, 16 focused primitive/G6 checks passed. The earlier
+`focused-second.log` records an incorrect test filename and no tests; corrected
+invocation is `focused-third.log`. Black and shell syntax/diff checks pass.
+Pylint reports two existing `pending` inference errors at spmw_apu_v1.py:523;
+`pylint-baseline.log` reproduces both on the unchanged HEAD text. No new
+error was reported in the arithmetic model, integration or SDK harness.
+The requested conda environment `allo` is absent; checks use the installed
+`spmw` environment, with all scratch on host-local storage.
+
+The predeclared board protocol is in `design/gemini-i-fp16.md`. Build/install,
+exact program/payload identity, fresh board execution and the 42-stage
+installed milestone are the next actions. Performance campaigns stay fixed.
+
 ## Current candidate hardware completion (r210, 2026-11-17)
 
 Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r210`.
