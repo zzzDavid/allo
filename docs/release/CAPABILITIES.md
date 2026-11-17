@@ -11,6 +11,16 @@ Finding IDs (S-xx, M-xx, U-xx, V1-xx, G2-xx, C-xx, P-xx, F-xx) refer to
 `ISSUES.md`; check it for the current status of each. The implementation map
 (modules, stages, inspection fields) is `SPMW_ARCHITECTURE.md`.
 
+Current hardware evidence at compiler candidate `5fec806` is linked by exact
+payload/generated-program equivalence in STATUS and VALIDATION. Gemini-I:
+r208 default/forced/cost-perturbed programs, r210 completed native campaign
+and one histogram row (231 new exact launches), plus installed G6/layout
+checks (9 passed, 2 expected bit-model mismatches, 20 device runs). The latter
+confirm the open V1-16 limitation; they do not certify bit-exact FP16 semantics.
+Gemini-II: r208 reviewed dispatch, card/selection probes and the fixed 840-launch
+campaign, retained locally with no new sampling. Earlier Evidence table rows
+below are historical probes, not the current candidate identity.
+
 Terms used below:
 
 - **Input kind.** *Source*: an ordinary `@allo` workload (usually an

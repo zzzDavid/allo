@@ -3,7 +3,7 @@
 
 # Paper reproduction through the shared pipeline
 
-## Round 209 fixed GEMM outcome and environment context
+## Current fixed outcomes and environment context (candidate 5fec806)
 
 Gemini-II GEMM stays **OPEN (nominal)**: the fixed four-session median is
 1734.0 versus the frozen paper's 1733.225 ticks. The fresh interleaved GTML
@@ -15,11 +15,35 @@ than the 0.775-tick miss. No resampling is permitted. Another program change
 and campaign would require a disassembly-verified mechanism predicting an
 effect larger than that spread; no such mechanism is established here.
 
-The residual allocation guard and campaign-control changes do not change
-generated programs or reopen the fixed Gemini-II measurements. Gemini-I
-still owes complete rows 1/2/3 (kmeans/word_count/linear_regression), plus the
-incomplete histogram comparison and G6 checks. No new hardware attempt is
-credited by the storage relocation or guard tests.
+The residual allocation guard and campaign controls do not change generated
+programs or reopen the fixed Gemini-II measurements. The Gemini-I campaign
+has now completed at installed candidate `5fec806`: three new sessions,
+198 exact launches, no new failures, all row quotas fulfilled, one remaining
+attempt unused. The unchanged pooler retains all three r141 and both r208
+files plus these three new files; all 133 r208 failures remain recorded.
+Each result uses three eligible complete rows and 30 measured samples:
+
+| Gemini-I row | Current median cycles | Paper | Current IQR | Fixed verdict |
+| --- | ---: | ---: | --- | --- |
+| kmeans | 624,488 | 624,677 | 624,260–624,808 | REPRODUCED |
+| word_count | 172,091 | 171,988 | 171,746–172,719 | OPEN (nominal) |
+| linear_regression | 95,018 | 94,618.5 | 94,680–95,231 | OPEN (regression) |
+
+Fresh expert / historical-binary medians are respectively 641,444.5 / 625,012
+(kmeans), 175,776.5 / 172,268 (word count), and 94,987 / 94,986 (linear
+regression). These controls and paired ratios are environment context, not
+proof of a cause or permission to relabel the absolute misses. The outcomes
+are fixed; no further samples. Full provenance, session medians and paired
+ratios: `r210/campaign-run/campaign/apu_v1_campaign_pooled.json`.
+The separately authorized histogram row completed all 33 exact launches and
+**REPRODUCED**: median 166,356.5 vs paper 166,783, IQR 166,147–166,483, with
+fresh expert 167,806.5 and historical binary 165,917. The failed r208 row is
+retained separately; no sample replacement or mixing. Evidence:
+`r210/histogram/{row,pooled}.json`. Required current results are now **52
+REPRODUCED and 3 OPEN**, with no incomplete or missing required comparison.
+The OPEN rows are word count, linear regression and Gemini-II GEMM. These
+fixed outcomes fail G10; optional studies remain separate. Installed G6
+checks do not reopen any performance campaign.
 
 ## Round 208 installed candidate (2026-11-17)
 

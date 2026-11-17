@@ -3,6 +3,136 @@
 
 # Validation record
 
+## Current candidate hardware completion (r210, 2026-11-17)
+
+Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r210`.
+Installed compiler remains `5fec806`, wheel and equivalence identities below.
+`verify_final_payload.py` / `final-payload-equivalence.json` rehash all 500
+installed package files against that wheel and verify the tracked delta from
+the candidate is release documentation only. No source change, new wheel or
+unchanged milestone rerun. The frozen paper lock again matches 73/73 files
+(`paper-lock-check.json`).
+
+The authorized cleanup described below recovered 24,600,576 bytes. The
+unchanged `RESIDUAL_SPACE_PROTOCOL.md` window completed 41 readings over
+600.000 seconds, all at 31,473,664 bytes, all installed guard probes passing,
+no owned reserve leaks and zero net drop. The read-only installed transport
+preflight passed in 47.873 seconds; the maintained campaign ran its own
+preflight, approximately 48 seconds. The measured budget was 794 seconds per
+planned launch plus 600 seconds per stage, a hang guard rather than a timing
+measurement. The campaign set the residual floor explicitly to 16,777,216
+bytes and reserved 2 GiB per planned launch on the actual destination
+filesystems. Device-host lock files were not relocated.
+
+Reproduction command: `bash r210/run_owed_campaign.sh`, invoking the unchanged
+maintained `g1_campaign.sh` from `r209/pkg-candidate/tree/docs/release/scripts`.
+It uses the installed venv, an archived test/benchmark tree outside checkout,
+`G1_MAX_SESSIONS=4`, `G1_RESIDUAL_MIN_FREE_BYTES=16777216`, all three r141 and
+both r208 session files, and `r209/installation_equivalence.json`. The unchanged
+strict pool accepted all eight files after three new sessions and fulfilled
+the original three-complete-row quota per case. One attempt slot stayed
+unused. New sessions contain 99, 66 and 33 exact launches, respectively;
+no new failed launch. All 133 failed r208 attempts and original r141 partial
+rows remain retained; no failed sample was replaced. `campaign-run.exit` is
+0; `campaign-run/campaign/stages/SUMMARY.txt` records every required stage.
+
+Fixed medians from 30 measured samples per case: kmeans 624,488 vs paper
+624,677 (**REPRODUCED**), word count 172,091 vs 171,988 (**OPEN nominal**),
+linear regression 95,018 vs 94,618.5 (**OPEN regression**). Full quartiles,
+interleaved expert/historical controls, exact outputs, source/binary/input
+identities and eligibility decisions are in
+`campaign-run/campaign/apu_v1_campaign_pooled.json`. Completion of the quota
+is not performance parity. No further samples are authorized by this result.
+
+`campaign-profile-inspection.json` independently reopens the raw numbered
+logs, rechecks their hashes/order and applies the installed unchanged
+`parse_fresh_profile` to every before/after pair: all 198 launches have exactly
+one fresh record equal to the recorded cycle count; all 66 Tenon launches'
+retained generated sources match their launched-source hashes. Each launch
+used two reads; 397 successful reads include the preflight. Per-launch reads
+took 47.31–48.52 seconds, median 47.96 (`campaign-read-duration.json`).
+No flush-lag retry,
+missing/stale record, failed copy or unassigned read occurred. This observed
+read distribution is evidence for these launches, not a firmware flush bound.
+
+`campaign-run/campaign/transport-usage.json` reports 33,019,715,584 allocated
+bytes retained for 198 launches (166,766,240 bytes per attempt amortized over
+profiles, build scratch and session records). Raw copies plus individual
+launch directories span 97,273,478–127,051,211 bytes; largest retained build
+is 71,697,622 bytes. The 2-GiB reserve is about 12.9 times the observed
+amortized allocation and allows growth/retries; it is an empirical preflight
+reserve, not an allocation guarantee. No quota or guard was reduced.
+
+The monitor observed two transient global-/tmp dips (08:55 and 12:55) that
+recovered before diagnostic sampling; no launch failed and no sample was
+retried. `progress.jsonl`, `space-loss-observation.json`, and
+`second-space-dip.json` retain the observations. The later increase to about
+163 MiB was not caused by additional cleanup here; no cause is attributed.
+Only the explicitly authorized project tree was removed.
+
+The histogram's own unchanged 600-second window passed all 41 samples
+(minimum 170,938,368 bytes, no failed guard or reserve leak), followed by its
+actual transport preflight. Exactly one complete fresh row ran under
+`design/g1-histogram-completion.md`: all 33 launches exact, no failures,
+10 measured samples per lane. Median Tenon 166,356.5 vs paper 166,783,
+IQR 166,147–166,483, **REPRODUCED**. Fresh expert median 167,806.5,
+historical-binary median 165,917, paired expert/Tenon median 1.009245.
+`histogram/{row,pooled}.json`, `run.exit` (0), and `pool.log` retain the
+unchanged one-row pool verdict. The failed r208 row remains separate; no
+replacement or mixing. `histogram-profile-inspection.json` verifies all 33
+raw before/after pairs, hashes/chronology, exactly one fresh record each and
+launched Tenon source identities; 67 successful reads include the preflight.
+
+`histogram-followup-identity.json` and `histogram-followup-coverage.json`
+prove that this installed paired-row driver and the former r197 histogram
+golden probe select the same generated source, ABI, input arrays and oracle.
+The fresh row covers that program with stricter exact checks and the paper
+comparison; the old three-sample pytest function was not separately rerun
+or claimed as executed.
+
+Installed G6 and the two optional vector-layout checks completed after their
+independent residual/storage/real-transport preflight: **9 passed, 2 xfailed
+in 2148.18 seconds**, no ordinary failure or skip. Commands and environment
+are in `run_histogram_and_g6.sh`; raw pytest output/JUnit and exit 0 are
+`g6-board/{tests.log,results.xml,tests.exit}`. The copied tests came from the
+committed archive, `allo` from the r209 installed venv, with host-local
+TMPDIR/profile storage, KEEP_TMP=1, and the unchanged device-host lock.
+The checks cover aliasing, uint16 wrap, carried FP16 output, zero/sentinel
+initialization, 37x19x23 GEMM, full/padded strict and reassociated GEMV, and
+two distinct forced vector layouts. Exact integer/zero checks and existing
+FP16 tolerances were unchanged.
+
+The two xfails are specifically `BitModelMismatch`, after successful
+execution: strict/relaxed mismatch counts 259/365 of 512 and 194/289 of 384.
+No guard, transport, compilation or launch failure was accepted as an xfail.
+These results **confirm V1-16 remains an open semantic blocker**, not a
+boundary waiver. The printed contraction estimates remain explicitly
+`extrapolated` (`apu_v1_vector_cost` -> `apu_v1_cost_validity`): for example,
+full/padded grouped estimates 203,459 / 159,852 vs observed 282,743 / 251,350
+cycles in the value checks. These semantic probes establish no calibration
+accuracy claim and do not refit the model.
+
+`g6-evidence-inspection.json` reopens all 40 per-launch raw snapshots plus
+the retained preflight, rechecks their hashes/chronology, verifies exactly
+one fresh record per execution and matches the 14 semantic-run cycle records.
+All 20 generated projects, binaries and input/initial/output images remain
+retained with hashes. The other six runs are the two optional layout tests'
+three samples each; they do not add samples to any required comparison.
+`g6-layout-realization.json` confirms distinct generated sources and packed
+input images for the two selected plans, stable within each triplet. Their
+medians are 91,617,238 and 7,148,396 cycles respectively; both original layout
+tests pass. These are controlled alternatives, not new required-row samples.
+The initial read-only evidence checker looked for the xfail reason in XML
+element text; this pytest version stores it in `skipped.message`. That
+checker failure and original script remain as `g6-evidence-inspection-v1.log`
+and `inspect_g6_evidence_v1.py`; the corrected reader passed, and
+`g6-xfail-evidence.json` also verifies the copied narrow-xfail test's hash
+against the committed source. No test or hardware execution was repeated.
+`ordered-work.exit` is 0 and no board job remains active. The final compiler
+candidate is still `5fec806`; `final-payload-equivalence.json` proves exact
+installed payload identity instead of repeating the unchanged milestone.
+
+
 ## Round 209 final artifact, equivalence, and no-go decision
 
 Candidate 5fec806, built from its committed git archive through a fresh sdist
@@ -91,8 +221,7 @@ removed the stopped container. Nothing else was mounted or cleaned.
 `authorized-directory-ownership.tar`, and the cleanup logs retain the exact
 commands, directory list and checks. `/tmp` free bytes: 6,873,088 before,
 31,473,664 after (24,600,576 reclaimed). Locks, sockets, `/tmp/tenon-upmem`
-and unrelated entries were untouched. The full unchanged observation is
-being repeated from the installed artifact; r209's failed window remains
+and unrelated entries were untouched. The full unchanged observation passed from the installed artifact; r209's failed window remains
 retained, never overwritten.
 
 

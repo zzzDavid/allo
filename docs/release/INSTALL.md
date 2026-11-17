@@ -446,6 +446,11 @@ therefore insufficient for that stage. Successful launches used two reads
 each; a transient residual-`/tmp` refusal retained one failed attempt with
 only its baseline read. Raw snapshots plus each launch directory ranged
 from 91,781,652 to 125,539,744 bytes, excluding builds and shared records.
+The later installed 198-launch native campaign retained 33,019,715,584
+allocated bytes (about 159 MiB per attempt amortized), with exactly two
+reads per launch and no failed read; each read took 47.31–48.52 seconds
+(median 47.96). This smaller native-kernel footprint does not replace the
+larger perturbed-DMA observation when sizing a general sequence.
 The new default covers this observed packing and log footprint with margin;
 larger snapshots or more retries can require a larger explicit
 `G1_TMP_PER_LAUNCH_BYTES`. These are observations and an empirical reserve,
