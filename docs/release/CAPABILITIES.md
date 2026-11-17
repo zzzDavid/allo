@@ -24,6 +24,14 @@ probes, not fresh executions at this installation. The new local installed
 milestone passed all 42 required stages, freshly reproducing all 45 required
 simulator/model results (STATUS/VALIDATION).
 
+Ordinary matched reductions require their output buffer as an argument.
+Returning a local array accumulator is unsupported on that route, even when
+the declaration initializes it with a whole-buffer zero fill. The diagnostic
+names the output ABI restriction and asks the caller to pass an output
+argument; nonzero and post-reduction fills are not treated as valid zero
+initializers. This does not restrict the separately documented verbatim C11
+record frontend, which retains and executes returned-local fill effects.
+
 Terms used below:
 
 - **Input kind.** *Source*: an ordinary `@allo` workload (usually an

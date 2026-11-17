@@ -18,6 +18,21 @@ The old r210 failures remain retained and are explained by the corrected model. 
 deployment/API boundaries. The rows distinguish closed implementation
 findings from outstanding performance, semantics and redistribution questions.
 
+## Current bounded reviewer findings (round 212)
+
+| ID | Disposition | Implementation and evidence |
+| --- | --- | --- |
+| V1-22 | repaired; installed validation pending | Removed the callerless public `APUVectorRealization.execute_numpy` method. It broadcast elementwise op records without executing the contraction's tiled/packed loops, so it could silently return an 8x8 result for an 8-element GEMV. The maintained functional runner is the only contraction functional route. The misleading review/design citations and old audit recommendation are corrected. No device emitter, ABI packing or GVML primitive changes. |
+| C-36 | diagnostic repaired; returned-local ABI boundary | A local array accumulator initialized by `linalg.fill` was falsely called never initialized because accumulator classification considered only element stores. Returned buffer identities are now retained for the diagnostic: the existing refusal names the unsupported returned-local output ABI and asks for an output argument. No fill is accepted as a zero initializer. Zero, nonzero, source late-fill and direct post-loop MLIR-fill regressions cover the boundary; the C11 verbatim record frontend remains distinct. |
+
+The independent reviewer accepted V1-16 and additionally checked all 2^32
+add pairs and all 2^32 subtract pairs against the installed NumPy model,
+with zero differences. That is independent evidence reported by the reviewer,
+not a repetition of the actor's special-class/random checks. The three fixed
+performance rows remain OPEN. Linear regression's historical binary was 32
+cycles faster than the current program, not slower; STATUS now reports that
+and the paired ratio 1.0013 vs paper 1.0123 without changing the verdict.
+
 ## Round 208 residual guard follow-up (X-24 / X-47, uncommitted)
 
 The byte-count guard accepted `/tmp` with 167,936 bytes free, but the vendor

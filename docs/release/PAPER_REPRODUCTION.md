@@ -52,7 +52,11 @@ Each result uses three eligible complete rows and 30 measured samples:
 
 Fresh expert / historical-binary medians are respectively 641,444.5 / 625,012
 (kmeans), 175,776.5 / 172,268 (word count), and 94,987 / 94,986 (linear
-regression). These controls and paired ratios are environment context, not
+regression). The word-count historical binary is slower than current 172,091;
+the linear-regression historical binary is 32 cycles faster than current
+95,018. Linear regression's paired expert/Tenon ratio is 1.0013 vs paper
+1.0123, with expert median 94,987 vs paper 95,785. These controls and paired
+ratios are environment context, not
 proof of a cause or permission to relabel the absolute misses. The outcomes
 are fixed; no further samples. Full provenance, session medians and paired
 ratios: `r210/campaign-run/campaign/apu_v1_campaign_pooled.json`.

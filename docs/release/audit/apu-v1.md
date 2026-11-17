@@ -214,9 +214,11 @@ documentation/hygiene.
 - Repair: add an explicit reduction-order policy (e.g. `allo.compile(...,
   reduction_order="source"|"reassociate")` or a per-phase/precision policy),
   filter candidates by it before ranking, default to "source" for floating
-  point, and make the functional backend execute the realization's
-  `execute_numpy` (`apu_v1_vector_codegen.py:2704`) rather than the Python
-  function so virtual numerics match the selected plan.
+  point, and make functional numerics follow the selected plan. Current
+  implementation: the maintained functional runner consumes the contraction's
+  retained accesses and GVML primitive model. The realization-level helper
+  proposed in this historical audit did not execute tiled contraction semantics
+  and was removed in round 212.
 
 ### V1-04 (major, G2/G8) `APUv1Program` ignores `backend`; "virtual"/"functional" launch hardware
 

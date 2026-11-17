@@ -8,7 +8,10 @@
 1. Three required absolute performance misses remain fixed OPEN: word count
    172,091 vs 171,988 cycles; linear regression 95,018 vs 94,618.5;
    Gemini-II GEMM 1734.0 vs 1733.225 ticks. Same-round paper-era G1 binaries
-   measured 172,268 and 94,986 cycles, no faster than the current programs.
+   measured 172,268 cycles for word count (slower than current 172,091),
+   and 94,986 for linear regression (32 cycles faster than current 95,018).
+   Linear regression's paired expert/Tenon ratio is 1.0013 vs paper 1.0123;
+   the fresh expert is 94,987 vs paper 95,785 cycles.
    The fresh G2 GTML baseline is 1921.8 vs paper 1903.85 (+0.94%); paired
    vendor/Tenon ratio 1.106 vs paper 1.098. This context is not parity.
 2. Samsung redistribution: `THIRD_PARTY_LICENSES/PIMSIMULATOR-LICENSE.txt`
@@ -20,7 +23,22 @@
    [the arithmetic contract](design/gemini-i-fp16.md). Installed board
    confirmation is bit-exact; V1-16 is now a documented target boundary.
 
-## Current candidate e0c568a — NOT READY
+## Round 212 bounded follow-up — NOT READY
+
+The unused realization-level NumPy helper is removed. The shared matcher now
+names the returned-local output ABI restriction instead of falsely claiming
+that a whole-buffer-filled accumulator is never initialized. The existing
+refusal is preserved; no nonzero or late fill is accepted as zero. CAPABILITIES
+states the boundary and the verbatim C11 record exception.
+
+The three requested corrections are implemented. Focused verification,
+new sdist/wheel installation, generated-program/payload identity and the
+installed matcher-dependent stages are in progress under
+`/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r212`.
+Hardware campaigns remain fixed. V1-16's arithmetic model and actual device
+path are unchanged; its independent review is accepted.
+
+## Previous candidate e0c568a — NOT READY
 
 Committed and pushed to `fork/tenon`. The new installed wheel is
 `r211/pkg`, SHA256

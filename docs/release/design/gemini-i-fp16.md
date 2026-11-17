@@ -95,8 +95,9 @@ experiment's bounded claim. This arithmetic definition applies throughout
 the existing supported FP16 domain, not only to those exact-product inputs.
 
 Integration audit: the ordinary-source vector route uses the retained
-contraction accesses for both orders; low-level `execute_numpy` uses the same
-primitive model. `spmw_apu_v1`'s other FP16 sites validate/pack data, not
+contraction accesses for both orders. The unused realization-level NumPy
+helper was removed in round 212: it evaluated elementwise op records without
+the contraction's loop/packing semantics and was not execution evidence. `spmw_apu_v1`'s other FP16 sites validate/pack data, not
 compute host products; its grouped route reports the same target numerics.
 The separate scalar C11 record route rejects half types in the C emitter,
 so it has no hidden IEEE FP16 functional execution path.

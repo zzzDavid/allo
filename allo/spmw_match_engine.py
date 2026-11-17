@@ -3338,6 +3338,13 @@ class _FunctionCoverage:
             for argument in func.arguments
             if _is_memref_value(argument)
         }
+        self.return_refs = {
+            self._ref(value)
+            for op, _loops, _guards in sites
+            if op.operation.name == "func.return"
+            for value in op.operands
+            if _is_memref_value(value)
+        }
         self.stores = [
             index
             for index, (op, _loops, _guards) in enumerate(sites)
@@ -3905,6 +3912,11 @@ class _FunctionCoverage:
                         )
                 if found:
                     loops = self.sites[index][1]
+                    hint = (
+                        ""
+                        if dest in self.return_refs and dest not in self.arg_refs
+                        else _COVERAGE_ACC_HINT
+                    )
                     problems.setdefault(
                         (self.work_root, index, "accumulator"),
                         [
@@ -3912,7 +3924,7 @@ class _FunctionCoverage:
                             f"'{match.result_memref_name}' of "
                             f"{match.target_op_name} (store {self._handle(index)}, "
                             f"loop nest {_render_loops(loops)}) is not supported: "
-                            f"{'; '.join(found)}. {_COVERAGE_ACC_HINT}",
+                            f"{'; '.join(found)}. {hint}".rstrip(),
                             [],
                         ],
                     )[1].append(self.func_name)
@@ -4176,6 +4188,15 @@ class _FunctionCoverage:
         if not others:
             if dest in self.arg_refs:
                 return "carried", []
+            if dest in self.return_refs:
+                # A linalg.fill is retained as an effect, but these matched
+                # reductions do not bind a returned allocation to an output
+                # argument. Refuse that ABI rather than claiming no fill
+                # exists or treating any (possibly late/nonzero) fill as zero.
+                return "unsupported", [
+                    "a returned local output buffer is unsupported for this "
+                    "matched reduction; pass the output as an argument"
+                ]
             return "unsupported", ["it is a local buffer that is never initialized"]
         _op, match_loops, match_guards = self.sites[index]
         match_ivs = [loop[0] for loop in match_loops]

@@ -3,6 +3,28 @@
 
 # Release review: architecture, constants, specialization, gate judgments
 
+## Round 212 independent review and bounded corrections
+
+The reviewer independently accepted the GVML arithmetic model, fresh board
+readbacks and functional generality. Their exhaustive add/subtract checks
+extend the actor's special-class/random evidence. They found a separate
+callerless realization method that did not execute contraction loops; it is
+removed, and the earlier citation below is corrected. The maintained
+functional runner and device program are unchanged.
+
+The shared-matcher change is a diagnostic correction for an already refused
+returned-local accumulator. It tracks returned memref identities, reports
+the unsupported output ABI, and removes the inappropriate initialization
+hint from that case. It neither assumes a fill's value/order nor makes a
+candidate feasible. New tests include zero, nonzero and post-loop fills;
+verbatim record initialization semantics remain covered by existing checks.
+
+STATUS's decision context now distinguishes the slower word-count historical
+binary from the slightly faster linear-regression historical binary and gives
+the latter's paired expert/Tenon ratio. No measurements, pooling or verdicts
+changed. Installed confirmation of this bounded source delta is pending;
+NOT READY remains for the fixed performance rows and Samsung permission.
+
 ## Candidate source/evidence walkthrough: e0c568a — NOT READY
 
 Named compiler candidate: `e0c568aab27d742b5ad74c31f1270429e7215fef`.
@@ -41,8 +63,10 @@ mixed types before the vector planner. `_fp16_contraction` therefore reads
 whole retained operands through axis permutations/broadcast views, rounds each
 product with `mul_f16`, and follows either source order or the selected
 adjacent-pair group tree. Output staging occurs before the model runs.
-`APUVectorRealization.execute_numpy` uses the same primitives; the device
-emitter, packing and runtime construction are unchanged. The other FP16 sites
+The maintained functional runner uses those primitives; the device emitter,
+packing and runtime construction are unchanged. The callerless realization
+helper cited in the original round-211 review did not implement the tiled
+contraction and has been removed following independent review. The other FP16 sites
 in `spmw_apu_v1` validate and pack values; they do not perform an IEEE host
 product. The scalar C11 frontend already rejects half types. No covert CPU
 replacement was added to device execution.
