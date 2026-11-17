@@ -418,8 +418,20 @@ account for their space.
 
 `g1_board.sh` and `g1_campaign.sh` also budget retained copies, normalized
 measurement evidence and build scratch on every actual filesystem used,
-with a default reserve of 1 GiB per planned launch (up to seven 64 MiB
-snapshots, normalized evidence and build/output overhead). They recheck
+with a default reserve of 2 GiB per planned launch. The installed round-208
+board run retained 20,409,626,624 allocated bytes across 78 attempts (about
+250 MiB per attempt, including shared session records and retained builds).
+However, each DMA-perturbed build contained **two 512 MiB input images**:
+1,144,551,490 logical bytes including build artifacts, before its profile
+copies and measurement records. The earlier 1 GiB per-launch estimate was
+therefore insufficient for that stage. Successful launches used two reads
+each; a transient residual-`/tmp` refusal retained one failed attempt with
+only its baseline read. Raw snapshots plus each launch directory ranged
+from 91,781,652 to 125,539,744 bytes, excluding builds and shared records.
+The new default covers this observed packing and log footprint with margin;
+larger snapshots or more retries can require a larger explicit
+`G1_TMP_PER_LAUNCH_BYTES`. These are observations and an empirical reserve,
+not a universal bound. The scripts recheck
 before each sequence/session, preserving per-attempt guards and incomplete
 results. This is a provisioning estimate, not a completion guarantee.
 `G1_TMP_PATH` now actually sets `TMPDIR`; changing it does not move the

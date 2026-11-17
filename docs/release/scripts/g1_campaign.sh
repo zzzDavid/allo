@@ -21,8 +21,9 @@
 # does not expand inside a variable), G1_MAX_SESSIONS (attempts at most, default 6), G1_MEASURED
 # (default 10), G1_DRY_RUN=1 (prerequisites and the plan only, under <dir>/campaign-dry-run; no
 # launch), TENON_ARTIFACTS (the evaluation assets), G1_TMP_PER_LAUNCH_BYTES
-# (the retained-log/build/evidence reserve per launch, default 1 GiB: up to seven
-# 64 MiB raw reads, their normalized evidence and build/output scratch). G1_TMP_PATH
+# (the retained-log/build/evidence reserve per launch, default 2 GiB: the
+# measured DMA-perturbed plan packs 1 GiB of inputs before logs/build overhead).
+# This is an empirical reserve, not a bound on future log growth. G1_TMP_PATH
 # actually selects TMPDIR; it is not a pretend relocation of /tmp. Bulk profile
 # copies use TENON_APU_V1_PROFILE_DIR (default <run>/profiles). All actual storage
 # filesystems are budgeted; /tmp's small vendor session log is checked separately
@@ -32,7 +33,7 @@ E=${1:?evidence dir}; [[ "$E" = /* ]] || { echo "evidence directory must be abso
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROW_QUOTA=${G1_ROW_QUOTA:-"kmeans=3,word_count=3,linear_regression=3"}
 MAX_SESSIONS=${G1_MAX_SESSIONS:-6}; MEASURED=${G1_MEASURED:-10}
-PER_LAUNCH=${G1_TMP_PER_LAUNCH_BYTES:-1073741824}
+PER_LAUNCH=${G1_TMP_PER_LAUNCH_BYTES:-2147483648}
 DRY=${G1_DRY_RUN:-0}
 EXISTING=(${G1_EXISTING:-})
 # G1_EQUIVALENCE: an installation-equivalence manifest (g1_pool.py --write-equivalence) that lets this

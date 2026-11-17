@@ -17,8 +17,9 @@
 # Environment: G1_MEASURED (vector rows, default 10), G1_FORCED_MEASURED (forced plan and
 # perturbation, default 5), G1_DRY_RUN=1 (prerequisites and the commands only, under
 # <dir>/board-dry-run; no launch), TENON_ARTIFACTS (the evaluation assets), G1_TMP_PER_LAUNCH_BYTES
-# (the retained-log/build/evidence reserve per launch, default 1 GiB: up to seven
-# 64 MiB raw reads, their normalized evidence and build/output scratch). G1_TMP_PATH
+# (the retained-log/build/evidence reserve per launch, default 2 GiB: the
+# measured DMA-perturbed plan packs 1 GiB of inputs before logs/build overhead).
+# This is an empirical reserve, not a bound on future log growth. G1_TMP_PATH
 # actually selects TMPDIR; it is not a pretend relocation of /tmp. Bulk profile
 # copies use TENON_APU_V1_PROFILE_DIR (default <run>/profiles). All actual storage
 # filesystems are budgeted; /tmp's small vendor session log is checked separately
@@ -27,7 +28,7 @@ set -u
 E=${1:?evidence dir}; [[ "$E" = /* ]] || { echo "evidence directory must be absolute" >&2; exit 1; }; P=$E/pkg; T=${G1_TESTTREE:-$E/testtree}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MEASURED=${G1_MEASURED:-10}; FORCED_MEASURED=${G1_FORCED_MEASURED:-5}
-PER_LAUNCH=${G1_TMP_PER_LAUNCH_BYTES:-1073741824}
+PER_LAUNCH=${G1_TMP_PER_LAUNCH_BYTES:-2147483648}
 DRY=${G1_DRY_RUN:-0}
 B=$E/board; [ "$DRY" = "1" ] && B=$E/board-dry-run
 if [ -e "$B" ]; then
