@@ -524,6 +524,8 @@ def ledag_scratch_headroom_problem() -> str | None:
     """Check actual session-log, extraction and direct-copy filesystems.
 
     Requirements sharing a filesystem are added, not checked independently.
+    Also create and sync an owned session-log reserve: a nearly full filesystem
+    can report sufficient free bytes while refusing a new directory entry.
     These are per-read reserves, not a campaign budget or a disk reservation.
     A transfer can still fail (e.g. concurrent consumption); it never yields
     timing on failure. Provision larger retained-evidence budgets separately.
@@ -569,6 +571,21 @@ def ledag_scratch_headroom_problem() -> str | None:
                 )
     except OSError as error:
         return f"cannot check profile storage: {error}"
+    try:
+        # Named creation exercises the same directory-entry allocation that the
+        # vendor logger needs. O_TMPFILE or statvfs alone does not establish it.
+        # The context removes only this invocation's file, including on error.
+        with tempfile.NamedTemporaryFile(
+            prefix="tenon-ledag-reserve-", dir=_LEDAG_SCRATCH
+        ) as reserve:
+            reserve.write(bytes(_LEDAG_LOG_REQUIRED_BYTES))
+            reserve.flush()
+            os.fsync(reserve.fileno())
+    except OSError as error:
+        return (
+            f"cannot allocate vendor session-log reserve in {_LEDAG_SCRATCH}: "
+            f"{error}; provision writable residual session-log space there"
+        )
     return None
 
 

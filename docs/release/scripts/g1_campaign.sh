@@ -6,9 +6,16 @@
 # only the rows that still owe complete sessions under the per-row quota, counting the complete rows
 # of the existing session files (G1_EXISTING) and of this campaign's own sessions (g1_pool.py's
 # freshly generated plan; a planner failure stops the campaign instead of choosing hardware work
-# from a stale or absent plan); a session whose headroom gate fails is skipped and recorded; every
+# from a stale or absent plan); the first gate refusal or failed/incomplete session stops the loop; every
 # session's record is kept; a prior attempt's directory is never overwritten; the maintained pooler
 # pools every complete row of every file under the fixed rule at the end.
+# A not-launched session does NOT consume an attempt. Each invocation of the
+# session driver does, even if it fails before a device launch. attempts-started.txt
+# records the count for continuation; never reset an inherited attempt ceiling.
+# Create G1_STOP_FILE (default <dir>/campaign/STOP) to stop between sessions.
+# It does not interrupt an active session. Stop requests still preserve/pool evidence.
+# G1_RESIDUAL_MIN_FREE_BYTES may impose an additional pre-session free-byte
+# margin in /tmp; the runtime's allocation guard still applies independently.
 #
 #   g1_campaign.sh <evidence-dir>
 #
@@ -42,6 +49,7 @@ EXISTING=(${G1_EXISTING:-})
 # installed package than the existing sessions' is refused before any launch (round 159).
 EQ=(); [ -n "${G1_EQUIVALENCE:-}" ] && EQ=(--equivalence "$G1_EQUIVALENCE")
 CAMP=$E/campaign; [ "$DRY" = "1" ] && CAMP=$E/campaign-dry-run
+STOP_FILE=${G1_STOP_FILE:-$CAMP/STOP}
 if [ -e "$CAMP" ]; then
   echo "refusing to run: $CAMP already exists (a prior attempt's evidence is never overwritten; use a fresh evidence directory)" >&2
   exit 1
@@ -108,19 +116,35 @@ if [ -n "$next" ]; then
   SECONDS_PER_LAUNCH=$("$PYV" -c 'import json,sys; print(json.load(open(sys.argv[1]))["seconds_per_launch"])' "$CAMP/transport-preflight.json") || abort "cannot read fresh transport time budget; nothing launched"
 fi
 files=()
+started=0
+echo "$started" > "$CAMP/attempts-started.txt"
 for s in $(seq 1 $MAX_SESSIONS); do
+  if [ -e "$STOP_FILE" ]; then
+    echo "operator stop file present: $STOP_FILE; no further session launched" | tee -a "$CAMP/stages/SUMMARY.txt"
+    break
+  fi
   next=$(plan "${files[@]}") || abort "planning failed before session $s; no further session is launched"
   if [ -z "$next" ]; then echo "every row at its quota after $((s - 1)) session(s); no further session is launched $(date -Is)" | tee -a $CAMP/stages/SUMMARY.txt; break; fi
   echo "session $s plans the rows still owed: [$next] $(date -Is)" | tee -a $CAMP/stages/SUMMARY.txt
   # The session's scratch budget: its cases x three lanes x (one warm-up + MEASURED) launches.
   ncases=$(echo "$next" | wc -w); launches=$(( ncases * 3 * (1 + MEASURED) ))
-  if stage headroom_before_session_$s -- "$PYV" -I "$HERE/g1_storage_budget.py" "$launches" "$PER_LAUNCH" "$CAMP" "$TMPDIR" "$TENON_APU_V1_PROFILE_DIR" && stage guard_before_session_$s -- "$PYV" -c "$GUARD"; then
+  if stage residual_reserves_before_session_$s -- "$PYV" -I "$HERE/g1_reserve_check.py" && stage headroom_before_session_$s -- "$PYV" -I "$HERE/g1_storage_budget.py" "$launches" "$PER_LAUNCH" "$CAMP" "$TMPDIR" "$TENON_APU_V1_PROFILE_DIR" && stage guard_before_session_$s -- "$PYV" -c "$GUARD"; then
     stage_seconds=$((600 + launches * SECONDS_PER_LAUNCH))
     echo "session $s timeout: 600 + $launches x $SECONDS_PER_LAUNCH = $stage_seconds seconds" | tee -a $CAMP/stages/SUMMARY.txt
-    stage session_$s -- timeout "$stage_seconds" $PYV -m benchmarks.apu_v1.paper_rows --measured $MEASURED --expert --historical-binary --cases $next --scratch $CAMP/scratch/session_$s --out $CAMP/apu_v1_campaign_s$s.json
+    started=$((started + 1)); echo "$started" > "$CAMP/attempts-started.txt"
+    session_rc=0
+    stage session_$s -- timeout "$stage_seconds" $PYV -m benchmarks.apu_v1.paper_rows --measured $MEASURED --expert --historical-binary --cases $next --scratch $CAMP/scratch/session_$s --out $CAMP/apu_v1_campaign_s$s.json || session_rc=$?
     [ -f $CAMP/apu_v1_campaign_s$s.json ] && files+=($CAMP/apu_v1_campaign_s$s.json)
+    if [ "$session_rc" -ne 0 ]; then
+      echo "session $s failed; stopping before another attempt (all evidence retained)" | tee -a "$CAMP/stages/SUMMARY.txt"
+      break
+    fi
+    if ! stage session_record_$s -- "$PYV" -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert not d.get("incomplete") and not any(r.get("incomplete") for r in d["records"]), "headroom-lost/incomplete session; stop before another attempt"' "$CAMP/apu_v1_campaign_s$s.json"; then
+      break
+    fi
   else
-    echo "session $s NOT LAUNCHED: the headroom gate failed (headroom_before_session_$s or guard_before_session_$s; see stage logs for actual storage paths) at $(date -Is)" | tee -a $CAMP/stages/SUMMARY.txt
+    echo "session $s NOT LAUNCHED: the headroom gate failed (residual_reserves_before_session_$s, headroom_before_session_$s or guard_before_session_$s; see stage logs for actual storage paths); stopping at $(date -Is)" | tee -a $CAMP/stages/SUMMARY.txt
+    break
   fi
   echo "/tmp after session $s: $(df -B1 --output=avail /tmp | tail -1) bytes free $(date -Is)" | tee -a $CAMP/stages/SUMMARY.txt
 done

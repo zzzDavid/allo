@@ -3,6 +3,50 @@
 
 # Release review: architecture, constants, specialization, gate judgments
 
+## Round 208 new bounded patch awaiting independent review
+
+The actual campaign showed that free-byte counters can pass while named
+session-log creation returns ENOSPC. The working runtime guard now proves
+that its residual reserve can be created, written and synced in the vendor
+log directory, then removes only its own file. It retains the same capacities,
+locks, chronology and freshness protocol. Two focused failure regressions
+plus the existing transport/session-stop checks pass (17 total); a direct
+working-source check also refused the real failing filesystem state.
+This patch is uncommitted and absent from all installed artifacts below.
+Review its error/cleanup behavior and the campaign interruption evidence;
+do not infer a new gate pass from it. No further compiler workstream is
+being added to this actor checkpoint.
+
+
+## Round 208 additional increments: actor checks, independent review pending
+
+`f214f79` raises the empirical retained-space reserve after measured DMA
+inputs exceeded 1 GiB; it does not lower a guard. `218ccde` removes repeated
+invariant epilogue dispatch from the generic Gemini-II composed-dot loop.
+The dispatch stays inside timing; legality, operand views, primitive bodies,
+repetitions and barriers are retained. Source comparison, real ARC control
+flow and eight installed card checks support the transformation; they do
+not establish a paper performance result. The specialization domain remains
+the three existing semantic ABI epilogues. No benchmark selector, fitted
+coefficient or fixture-dependent production branch was introduced.
+
+`7f52c11` preserves the evaluation vendor's failed evidence and explicit
+retained-success evidence, including subprocess commands and streams. The
+numerical/measurement/pooling contract is unchanged. A fixed four-session
+campaign of the changed Gemini-II program completed all 840 launches, with
+its protocol recorded before launch. Four rows reproduce; GEMM remains OPEN
+(nominal), median 1734.0 versus paper 1733.225. No additional samples or
+tolerance were introduced. Retained binary/source/witness checks and the
+separate installed cost/forced-selection traces passed. The old fixed
+outcomes remain OPEN at their old candidate. The new `7f52c11` complete wheel
+has an exact payload comparison to the transport wheel (only the Gemini-II
+template and RECORD differ). All three increments require independent review;
+no gate closure
+is inferred from these actor checks. The Gemini-I owed-row campaign
+stopped after two saved sessions using the earlier immutable installed
+transport artifact. Only one new complete kmeans row is credited; allocation
+failures and every incomplete row remain retained.
+
 ## Round 208: independent round-207 review addressed
 
 The reviewer accepted the transport core subject to four fixes, independently
@@ -19,6 +63,19 @@ This is acceptance of the bounded transport increment, not readiness or
 installed execution. Numerical/freshness checks, fixed campaign quotas and
 Gemini-II outcomes are unchanged. Hardware campaign and final-candidate
 findings remain open; done=false until their required evidence exists.
+
+Actor evidence update: the resulting commit is `8a8c794` on fork/tenon.
+Its wheel `667ad734...` passed the complete 42-stage installed milestone
+and a real 32x16 GEMV probe (32 exact outputs, one fresh profile record,
+two direct-copy reads). The default matrix-multiply row completed all 33
+launches with no output/profile problem and a median below the paper.
+Both controlled stages passed six launches each; all 34 selected-program
+launches were rechecked against retained raw evidence. One histogram expert
+control lost its after-read to a transient residual-/tmp shortage; its row
+and the overall board milestone remain incomplete/FAIL. The campaign is
+still owed. Measured retained builds also require increasing the per-launch
+storage estimate to 2 GiB; 14 focused script tests pass. These are
+execution facts for independent review, not a final G1–G10 verdict.
 
 
 ## Round 207 review submission: direct-copy log transport

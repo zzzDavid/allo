@@ -3,7 +3,231 @@
 
 # Release status
 
+## Round 209: accepted guard, bounded controls, storage provisioning
+
+The independent review accepted the named allocation guard and checked the
+four round-208 commits. This increment adds the requested reserve-leak
+pre-session refusal and campaign stopping controls. SIGTERM/SIGKILL leaks
+are documented; no automatic sweep infers a dead owner from a filename.
+The campaign stops on its first gate refusal or failed/incomplete session,
+honors an operator stop file between sessions, and records actual started
+attempts. An unlaunched session consumes no attempt. Fresh checks:33 focused
+transport/board/campaign tests passed; after the explicit residual-policy
+check was added, all12 campaign tests passed. Focused Black/pylint, shell
+syntax and diff checks pass. No launch retry/freshness change was added.
+
+Owned stale storage was copied to host-local r209/tmp-relocation-verified,
+verified by per-file SHA256/link manifests, checked with lsof before and
+after copying, and removed only where uid matched nz264. Six complete paths
+were removed: /tmp/hmz-1579329 and the five ledag_ssh_nz264_348*_log.txt files.
+The simbuild tree was archived but retained: its626 non-nz264 entries and
+21,219,050 file bytes are root-owned. Its nz264 directories remain because
+they contain those protected entries. Reclaimed6,656,000 bytes; /tmp free
+rose from225,280 to6,881,280. No other owner's source entry was removed.
+
+Before observation, RESIDUAL_SPACE_PROTOCOL.md fixed a16-MiB minimum for
+ten minutes at15-second intervals, successful guard probes/no owned leaked
+reserves throughout, no net drop above1MiB, then a fresh read-only vendor
+preflight with16MiB remaining; the margin also applies before each session.
+This is256times the64-KiB per-read reserve, not a firmware requirement.
+Current free space is below this criterion. **External blocker: provide at
+least16MiB of durable total free space in /tmp on this host.** No further
+hardware attempt starts unless the criterion is met. The1/2/3 row quota,
+four remaining attempt ceiling and all133 failed r208 attempts are retained.
+
+
 ## Current round 208 (2026-11-17): reviewer corrections and installation work
+
+**Checkpoint at 06:42 EST: no hardware campaign remains active.** HEAD and
+fork/tenon are `7f52c11`; the residual named-allocation guard and its two
+regressions are uncommitted, along with evidence/documentation updates.
+The two Gemini-I sessions saved 198 attempt records: 65 valid, 133 failed
+(`device_log_read_failed`). Session 1's kmeans row is complete; every other
+new row is incomplete. The unchanged strict pooler, including all three
+r141 files and both new files with verified installation equivalence, exits
+3 for incomplete quota. **Still owed: kmeans 1, word_count 2,
+linear_regression 3 complete rows.** Two of the original six attempt sessions
+have been used; a continuation has at most four attempts, not a reset quota.
+All 65 valid launches used two reads. There were 265 transport reads: 132
+complete snapshots and 133 failed copies, with no unassigned evidence.
+The new failures were ENOSPC session-log creation, not missing/stale records.
+Raw reinspection passed for all 65 valid launch windows (exactly one fresh
+record each) and all 21 Tenon source hashes; archived control sources were
+not reconstructed (`r208/campaign-profile-inspection.json`).
+The measured retained tree used 13,461,540,864 allocated bytes; this average
+includes many early failures and does not justify reducing the 2-GiB reserve.
+
+Next: independent review of the bounded allocation guard and the committed
+Gemini-II/retention increments, then build/install a reviewed guard artifact,
+verify its exact delta/equivalence and provision actual residual allocation
+before continuing only those owed rows. Retain every r141/r208 file, use
+`G1_MAX_SESSIONS=4` for the remaining attempt ceiling, and preserve strict
+pooling. The pending G6 checks and histogram comparison still need resolution.
+GEMM X-34 remains open at the fixed new Gemini-II outcome. No further Gemini-II
+samples, weakened freshness checks, or final release readiness are claimed.
+
+
+**New active blocker and uncommitted guard fix (06:38 EST):** during the
+owed campaign, the vendor session-log creation began returning `ENOSPC`
+even though `/tmp` reported 167,936 bytes available, above the 64-KiB byte
+threshold. An independent owned-file creation also failed. Session 1 saved
+33 valid kmeans launches, 31 valid word-count launches and two failed ones,
+and 33 failed linear-regression attempts. The strict plan credits that
+complete kmeans row: remaining complete rows are 1/2/3, before session 2.
+The outer campaign loop has been terminated (exit 143) to stop additional
+sessions under the known failure. Attempted STOP signals did not hold the
+traced wrapper; session 2 had already begun at 06:33:56. Its active driver finished saving its record, with output recovered to
+`campaign/stages/session_2.recovered.log` after the parent tee exited. Both
+started attempts count; no quota or eligibility rule changed. Full control
+history: `r208/campaign-control.json`. No hardware driver remains live; the next review/install step is above.
+
+The working runtime now creates, writes and syncs an owned 64-KiB named
+reserve in the actual vendor session-log directory, then removes it. This
+catches directory-entry/allocation failure that the byte counter missed;
+concurrent consumption can still fail a later transfer without timing.
+Two allocation-failure regressions plus the transport/session-stop checks:
+17 passed, 38 deselected in 6.30 seconds; focused formatting/pylint pass.
+At 06:38 the working guard itself refused the observed 167,936-byte state
+(`residual-allocation-production-observation.json`). An earlier diagnostic
+expected continued failure but saw a temporary recovery to 225,280 bytes
+and succeeded; its assertion failure is retained, not credited as a failed-
+allocation reproduction. The storage fluctuation's cause is unestablished.
+This new patch needs independent review and installation; no artifact below
+contains it. G6 board follow-up has not run. The release remains NOT READY.
+
+
+**Gemini-II campaign completed at 05:49 EST:** all four prescribed sessions
+passed, 840 launches with exact outputs, 80 measured samples per kernel and
+no rejected sessions. The changed dispatch program reproduces batched GEMM,
+GESUMMV, BiCG and MVT; GEMM remains **OPEN (nominal)** at 1,734.0 versus paper
+1,733.225 cycles (ratio 1.000447143). MVT is 2,757.25 versus 2,766.625.
+The fixed historical X-34/X-37 samples were not resampled or relabeled. The
+new four-session outcome is now fixed too; do not extend it to seek parity.
+`r208/g2-pooled.json` records the complete comparison. Read-only inspection
+bound all 420 Tenon records to retained host/device binaries and the changed
+template, and checked all 420 vendor actual/oracle witnesses. The separate
+installed selection trace passed: cost perturbation changed GEMM k2 to k1,
+and forced separate BiCG changed one launch to two, all outputs exact.
+
+**Committed candidate artifact:** a fresh sdist/wheel built directly from
+`7f52c11` and installed outside the checkout in `r208/pkg-candidate`.
+Wheel SHA256 `acf1eec4c9f0d96cf853c2ef03dcfb1d6df7c72464339f6a6968264407adc21a`;
+sdist `0b2ff75f9856c4012979f049f02b4aa82341d3cf15df6972455b72b03a415b97`.
+All 500 installed package files match the wheel. Versus the mapped `8a8c794`
+wheel, 517 files are byte-identical, with only the intended Gemini-II template
+and RECORD changed; compiled bindings are identical. The template's two
+recording-execution tests passed from this installation. Hardware campaigns
+retain their original artifact identities; this comparison establishes the
+exact payload delta, not a claim that they ran from the new pathname.
+
+**Campaign launch history (now stopped; see checkpoint above):** the owed-row chain started at 04:41 EST, after generated
+program identity and strict installation equivalence passed. All five prior
+installations and wheels were rehashed; r195 is untouched. Session 1 began
+at 04:43 EST with kmeans, word_count and linear_regression, under the existing
+3/3/3 total quota and the three explicit r141 session files. The starting obligation was kmeans 2, word_count 2 and linear_regression 3
+complete rows; the current strict remainder is above. Archived logs:
+`r208/campaign-run/campaign/stages/SUMMARY.txt` and
+`r208/owed-campaign-chain.log` (exec session 17658 ended 143). Every
+failure/partial attempt remains retained; the quota is incomplete.
+
+**Separate Gemini-II increment:** while the immutable installed
+Gemini-I artifact executes, the composed-dot task now selects its invariant
+epilogue once inside each timed window. The old binary dispatched inside
+every repetition; new ARC disassembly shows three loops with unchanged
+7/11/15 primitive call sequences, with dispatch still after perf_start and
+both completion barriers retained. Legality, views and primitive bodies are
+byte-identical to HEAD. Seven focused software tests pass, including a native
+recording execution of the actual template. Remote compile-only evidence:
+`r208/g2-dispatch-control-flow.json` and `g2-dispatch-build.log`; source hash
+`de7b1a87f2546896b04116e14e512da5aaaaa532b7ec333c8f996c685f3f2b04`.
+The change is committed/pushed as `218ccde`; the measured storage reserve is
+`f214f79`. Its separately built zhang-x4 working wheel `61e16c13...` passed
+eight real-card functional checks (all three epilogues, nearby two-launch
+shape, aliasing and forced layouts). All 193 distributed source entries match
+the committed compiler; the working sdist predates commit documentation,
+which is disclosed in its equivalence record. No compiler binding changed
+in source. This is separate from the running Gemini-I wheel.
+
+HEAD/fork/tenon is now `7f52c11`: the follow-up evaluation-driver repair keeps
+vendor witnesses on failure and honors KEEP_TMP on success, with complete
+command/stream evidence. Forty driver tests passed; five focused retention
+checks also passed from the remote installed environment. No timing or
+eligibility rule changed. The new program's fixed four-session paired
+confirmation started at 05:06 EST, as preregistered in committed
+`design/apu-g2-timed-dispatch.md`. Monitor `r208/g2-paired-chain.log` and the
+remote `r208/g2-dispatch-candidate/paired/campaign-stages/SUMMARY.txt`
+(exec session 21477). No unchanged Gemini-II program was resampled.
+The old X-34/X-37 outcomes remain separately fixed OPEN; the completed new
+program's verdict is above. These increments still need
+independent source review; the release remains NOT READY.
+
+**Execution identity update:** transport commit `8a8c794ebc22aa5a6430ea65f6c7c759c222fb96`
+is pushed fast-forward to `fork/tenon`. Current installed artifact is
+`r208/pkg-mapped`, wheel SHA256
+`667ad7341c474c0f9a44edbf01a20c9642403a91b61ae8578b4bfacd96357c4d`,
+sdist `9cb7fe1a74901a0c1a8429bd007c65972201cba573aa776867feed1e5e5cb5b4`.
+The build uses `-ffile-prefix-map` to give embedded compiler source paths the
+same length/location pattern as the existing equivalence chain, while all
+physical build storage remains host-local. Both compiled bindings equal
+r193's after the existing path substitution (`r208/binding-equivalence.json`).
+The first host-local wheel (45d8efef...) changed binary layout through longer
+embedded paths; its artifact and intentionally interrupted partial milestone
+remain in `r208/pkg` and `r208/milestone` with `INTERRUPTED.json`. No check was
+weakened. The mapped artifact's fresh milestone **passed all 42 required
+stages** at 2026-11-17 02:18 EST (`r208/milestone-mapped/stages/SUMMARY.txt`).
+This includes installed direct-copy transport regressions, both NumPy
+environments, bundled Samsung build/execution, AiM timing-only and UPMEM
+execution, and the twelve AttAcc kernel/decode comparisons. The 45 required
+simulator/model results are freshly reproduced with unchanged values.
+The board execution outcome below and remaining campaign are separate;
+this milestone does not close every gate.
+
+**Installed hardware probe passed at 02:20 EST:** the ordinary-source
+32x16 FP16 GEMV produced 32 exact outputs and exactly one fresh record,
+170,904 device cycles, through the installed production transport (no
+adapter). Two profile reads sufficed. Raw snapshots, arrays, selected
+effects, generated source, binary identity and launch metadata are retained
+in `r208/installed-probe`. This is a transport/functional check, not a paper
+campaign sample. The guarded `g1_board.sh` sequence finished at 04:32 EST.
+
+The default matrix-multiply row has now completed all 33 launches (three
+warm-ups and ten interleaved measured rounds per lane), with no numerical
+or profile failure. Current Tenon median 8,758,810 cycles is below paper
+8,764,900; measured range 8,755,872–8,760,360. The fresh expert median is
+8,785,371 and historical-binary median 8,759,176. Source/selection identity
+is retained with each launch. `r208/completed-board-rows.json` extracts the
+complete row from the original stage log. Both controlled-plan stages
+passed six launches each, with distinct generated matrix programs and a
+changed cost fingerprint for perturbed DMA. The whole sequence remains FAIL
+because of the histogram control failure below.
+
+**Retained histogram control failure:** expert-launch-008 started at
+03:54:27 EST; its error evidence was written at 03:55:16 EST. It returned
+from the device, but the after-launch profile guard reported only
+0.027 MiB free in `/tmp` (below the unchanged 65,536-byte residual
+requirement). It returned `device_log_read_failed`, with no timing credit.
+Space recovered to 630,784 bytes at the immediate recheck. The cause of
+this transient consumption is unestablished; bulk profile storage still
+has ample space. Full failure evidence is retained under the launch
+directory and indexed by `r208/board-failure-001.json`. The driver completed
+the prescribed sequence without replacing the failed sample. This histogram
+row is incomplete under the paired protocol; do not count it as a complete
+G10 comparison or report the whole board stage as passed.
+
+Final board totals: 78 prescribed attempts, 77 valid launches, one failed
+expert control. Independent raw-evidence reinspection verified all 34 Tenon
+launches, exact output checks, binary/source identities and exactly one fresh
+record each (`r208/board-execution-inspection.json`). All 77 valid launches
+used two reads; the failed attempt retained its baseline read. No flush
+retry or missing/stale record occurred. Retained allocated storage was
+20,409,626,624 bytes (about 249.5 MiB per attempt including shared evidence).
+The largest DMA-perturbed build was 1,144,551,490 bytes: the prior 1 GiB
+per-launch estimate underreserved this stage. Working scripts now default
+to 2 GiB, with the unchanged explicit override available for larger work;
+14 board/campaign script tests passed in 19.22 s. This is a guard/documentation
+delta, not an installed compiler change. The owed campaign uses the same
+2 GiB reserve explicitly with the committed driver.
+
 
 **NOT READY.** The round-207 core was independently reviewed, including
 successful append/rotation attribution and failure probes (reviewer-r207).
@@ -34,17 +258,15 @@ checks pass. The broad lint entry point still fails on 38 existing bundled
 Samsung upstream license headers; no upstream notices changed. Evidence:
 /work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r208/.
 
-Next in this authorized run: focused commit/push to fork/tenon; fresh sdist,
-wheel and outside-checkout installation in r208; installed milestone;
-exact-output/fresh-record board probe; owed g1_board programs; reviewed
-installation equivalence then only the remaining campaign quota. Measure
-reads/launch and retained bytes; diagnose any missing/stale profile without
-relaxing attribution. No new G8/G9/G10 closure yet. X-34/X-37 remain open
-without unchanged Gemini-II resampling. Earlier round-207 pending-review
-instructions below are historical and superseded by the user's review.
+Generated-program/installation equivalence, transport usage and the fixed
+changed-program Gemini-II campaign are now recorded above. The next bounded
+action is review/install of the residual allocation guard and the remaining
+quota, not repetition of completed milestones. No overall G8/G9/G10 closure
+is claimed. Earlier round-207 pending-review instructions below are historical
+and superseded by the user's review.
 
 
-## Current increment: direct-copy profiling transport (2026-11-17, round 207)
+## Historical round 207: direct-copy profiling transport (2026-11-17)
 
 **NOT READY.** Base HEAD and local `fork/tenon` ref: `21dd7c9`. The round-207
 patch is uncommitted and submitted for independent RLAR review; no new

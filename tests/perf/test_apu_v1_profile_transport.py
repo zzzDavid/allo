@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The real subprocess boundary of direct profile copies; no device execution."""
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -178,6 +179,32 @@ def test_unsafe_vendor_path_is_refused_before_command(storage, monkeypatch):
     with pytest.raises(RuntimeError, match="must use only"):
         runtime._ledag_drain()
     assert not list(unsafe.iterdir())
+
+
+@pytest.mark.parametrize("failure_at", ["creation", "sync"])
+def test_residual_allocation_failure_refuses_despite_reported_free_bytes(
+    storage, monkeypatch, failure_at
+):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        runtime.shutil, "disk_usage", lambda p: SimpleNamespace(free=10**9)
+    )
+    unrelated = storage["session"] / "someone-elses-log"
+    unrelated.write_text("preserve")
+
+    def no_space(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    if failure_at == "creation":
+        monkeypatch.setattr(runtime.tempfile, "NamedTemporaryFile", no_space)
+    else:
+        monkeypatch.setattr(runtime.os, "fsync", no_space)
+    with pytest.raises(RuntimeError, match="cannot allocate vendor session-log"):
+        runtime._ledag_drain()
+    assert list(storage["session"].iterdir()) == [unrelated]
+    assert unrelated.read_text() == "preserve"
+    assert not list(storage["profiles"].iterdir())
 
 
 def test_unconfigured_retention_refuses_without_touching_tmp(storage, monkeypatch):

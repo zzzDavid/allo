@@ -3,6 +3,298 @@
 
 # Validation record
 
+## Round 209 authorized temporary-storage archive
+
+Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r209`.
+`tmp-relocation-verified/manifest.json` contains full old/new paths, SHA256
+for every regular file, symlink targets, removed-entry lists and preserved
+foreign-uid entries. Both pre-copy and pre-removal `lsof +D` checks (or file
+checks for the five logs) returned1 with empty output: no live holder found.
+The initial script refused the mixed-ownership simbuild before modifying
+anything; its failed log/source remain. The corrected archival checks each
+entry's uid and never removes root-owned data.
+
+| Original path | Archive path relative to r209 | Source disposition |
+| --- | --- | --- |
+| `/tmp/tenon-release/simbuild` | `tmp-relocation-verified/tenon-release/simbuild` | Copied/verified; root-owned contents and enclosing directories preserved |
+| `/tmp/hmz-1579329` | `tmp-relocation-verified/hmz-1579329` | Copied/verified;219 nz264-owned entries removed |
+| `/tmp/ledag_ssh_nz264_3481162_log.txt` | `tmp-relocation-verified/ledag_ssh_nz264_3481162_log.txt` | Copied/verified; removed |
+| `/tmp/ledag_ssh_nz264_3481389_log.txt` | `tmp-relocation-verified/ledag_ssh_nz264_3481389_log.txt` | Copied/verified; removed |
+| `/tmp/ledag_ssh_nz264_3481588_log.txt` | `tmp-relocation-verified/ledag_ssh_nz264_3481588_log.txt` | Copied/verified; removed |
+| `/tmp/ledag_ssh_nz264_3481785_log.txt` | `tmp-relocation-verified/ledag_ssh_nz264_3481785_log.txt` | Copied/verified; removed |
+| `/tmp/ledag_ssh_nz264_3482789_log.txt` | `tmp-relocation-verified/ledag_ssh_nz264_3482789_log.txt` | Copied/verified; removed |
+
+6,656,000 bytes reclaimed; free bytes225,280→6,881,280. The remaining
+simbuild file bytes21,219,050 are uid0, not authorized for removal. The
+preregistered16-MiB/ten-minute rule is `RESIDUAL_SPACE_PROTOCOL.md`; observations
+are `residual-tmp-snapshots.jsonl`, with final decision in
+`residual-space-verdict.json`. This is storage evidence, not board execution.
+
+Software verification: `focused-tests.log` (33 passed,29.01s); final campaign
+checks `campaign-final-tests.log` (12 passed,14.15s), including gate refusal,
+operator stop, failed/incomplete session stop, attempt accounting, and leaked
+reserve detection. Black/errors-only pylint/shell syntax/diff checks pass.
+The prior accepted guard tests and independent review remain in round208.
+No timing, numerical, pooling, quota, or transport freshness rule changed.
+
+
+## Round 208 residual allocation failure and working guard
+
+Both session JSONs are now saved; no hardware process remains active.
+Session 1: kmeans 33/33 valid, word_count 31/33, linear_regression 0/33.
+Session 2: kmeans 1/33, word_count 0/33, linear_regression 0/33.
+There are 65 valid launches and 133 failed attempts, all failures explicitly
+`device_log_read_failed`. The output reader exited zero; the orphaned
+session driver's exit code was not captured, and its saved status is
+`fail (3 case(s))`. `campaign-completion-inspection.json` summarizes without
+promoting incomplete rows. `campaign-control.json` / `CAMPAIGN_INTERRUPTED.json`
+retain the outer-loop intervention and recovered stdout identity.
+
+The unchanged strict pooler was run with `--equivalence
+r208/installation_equivalence.json --row-quota
+kmeans=3,word_count=3,linear_regression=3 --measured 10`, all three r141
+sessions and both r208 sessions, without `--exclude-invalid`. It exited 3:
+quota incomplete, remaining 1/2/3. Outputs are
+`campaign-run/campaign/post-interruption-{pooled,plan}.json`; command log and
+exit are `campaign-post-interruption-pool.{log,exit}`. Only one new complete
+kmeans row is credited. Both started sessions count against the original
+six-attempt ceiling; at most four remain. No failed sample was replaced.
+
+Transport usage inspection: 265 reads, 133 failed; all 65 successful launches
+used exactly two reads. One failed attempt had a complete baseline plus a
+failed after-read; the other 132 failed on their first read. No chronology
+assignment problem or trailing unassigned read. Retained allocated tree
+13,461,540,864 bytes (snapshot before administrative interruption notes),
+largest build 71,697,622 bytes. The many early failures make the average
+unrepresentative of successful launch capacity; the 2-GiB reserve remains.
+Raw report: `campaign-run/campaign/transport-usage.json`. No missing/stale
+profile failure was observed; successful reads do not waive ENOSPC failures.
+
+Read-only raw-profile reinspection subsequently passed for all 65 valid
+launches: every copied slot's hash/chronology matches its manifest, and
+reparsing the before/after window yields exactly one fresh record equal to
+the saved cycles. The 21 Tenon launch sources also match their recorded
+hashes. Archived control binaries do not carry reconstructed source files;
+their binary identities remain bound by the strict session evidence.
+`r208/campaign-profile-inspection.{json,log}` records this check. The first
+two inspection-helper failures incorrectly assumed control-source files/
+fields existed; their logs are retained. Neither incomplete rows nor failed
+attempts were promoted by the corrected, explicitly scoped inspection.
+
+
+The owed Gemini-I campaign exposed a residual filesystem failure at 06:31:
+`ledag-ssh` exited 255 from Python `logging.FileHandler` creation with
+`ENOSPC` for its `/tmp/ledag_ssh_nz264_<pid>_log.txt`. `/tmp` reported
+167,936 bytes free and 18,889 free inodes. An owned `mkstemp` probe also
+failed at creation; no other user's files were touched. Bulk storage had
+about 920 GB free. `r208/residual-tmp-allocation-failure.json` and failed
+transport directories preserve the observation; no failed read yielded cycles.
+
+The uncommitted runtime guard adds a real named allocation/write/fsync of
+its 64-KiB reserve, removed on both success and error. The transport suite
+and existing stop-at-headroom-loss driver checks passed: 17 passed,
+38 deselected in 6.30 seconds (`residual-allocation-tests.log`). Creation
+and fsync ENOSPC regressions establish refusal before CLI invocation and
+preservation of unrelated files. Black/errors-only pylint/diff checks pass.
+The real working guard refused the recurring 167,936-byte state at 06:38
+(`residual-allocation-production-observation.json`). The earlier diagnostic
+at a temporarily recovered 225,280 bytes succeeded and therefore failed
+its expectation of continued refusal; JSON and explanatory stderr remain.
+The guard is not a disk reservation and does not guarantee against a race.
+No installed artifact or board execution is credited to this working patch.
+
+The original session 1 was saved before stopping the outer campaign loop.
+STOP signals did not leave the traced wrapper stopped; session 2 started
+before termination. That active driver was left to finish saving its own
+record; its pipe output was recovered after the parent tee exited. See
+`r208/campaign-control.json`. All failed/partial records count as started
+attempts and remain eligible only under the unchanged strict row pooler.
+No new sampling protocol or relaxed quota was introduced.
+
+
+## Round 208 completed Gemini-II campaign and committed artifact
+
+The preregistered changed-program campaign finished at 05:49 EST on
+2026-11-17. All four sessions exited zero: 840 launches, exact numerical
+outputs, 80 measured samples per kernel, no rejected session. The unchanged
+strict pooler reports GEMM OPEN (nominal), the other four REPRODUCED.
+
+| Kernel | Current median | Paper | Current q1–q3 | Fresh GTML median |
+| --- | ---: | ---: | ---: | ---: |
+| GEMM | 1734.0 | 1733.225 | 1723.575–1748.5 | 1921.8 |
+| Batched GEMM | 1731.2 | 1739.15 | 1718.55–1746.7 | 1921.15 |
+| GESUMMV | 1825.1 | 1860.075 | 1814.025–1834.6 | 3112.95 |
+| BiCG | 2545.125 | 2548.825 | 2529.9–2555.0 | 2748.725 |
+| MVT | 2757.25 | 2766.625 | 2749.775–2772.175 | 3107.675 |
+
+Units remain ARC running-state ticks amortized over 20 complete pipeline
+bodies, excluding transfers; raw ticks and session medians are retained.
+Local evidence: `r208/g2-pooled.json`, `g2-paired-chain.log`, and
+`g2-retained-evidence-inspection.json`. Remote evidence on zhang-x4:
+`/work/shared/users/phd/nz264/tenon-release-evidence/r208/g2-dispatch-candidate/paired`.
+The exact wrapper is `r208/run_g2_paired.sh`; protocol was committed before
+execution in `design/apu-g2-timed-dispatch.md`. No further sessions are
+authorized by this result. The previous fixed candidate outcomes remain
+unchanged historical evidence. The dispatch repair is not established as
+the cause of the remaining small GEMM gap or of every observed timing change.
+
+Read-only inspection matched every one of the 420 Tenon host binaries to its
+record, checked device binary/template identities and retained input/output
+files, and independently compared all 420 vendor retained actual/oracle byte
+files. This complements the runtime's exact numerical checks; it does not
+claim to reimplement the Tenon oracle. Every vendor command and full stream
+is retained. Inspection command: remote `python3 inspect_g2_campaign.py` at
+the evidence root; source and compact result are mirrored locally.
+
+The installed `benchmarks.apu_g2.selection_traces --seed 20261117` passed
+after the fixed campaign, separately from the paper pool. Seven hardware
+launches: GEMM 64x128x33 stock k2 versus row-bits-cost x20 k1, respectively
+2645.65 versus 3440.45 summed amortized ticks, both two launches; BiCG fused
+one launch versus forced separate two, 2532.95 versus 5047.25. All outputs
+exact, packing attestations present, no invariant problems. Results:
+`r208/g2-selection-traces.json`; raw evidence remains in remote
+`g2-dispatch-candidate/selection-traces`. The cost prediction was fixed before
+execution; these are controlled diagnostics, not additional paper samples.
+
+A complete committed `7f52c11` sdist/wheel was then built and installed in
+local `r208/pkg-candidate` (build completed 05:50 EST). Sdist SHA256
+`0b2ff75f9856c4012979f049f02b4aa82341d3cf15df6972455b72b03a415b97`;
+wheel `acf1eec4c9f0d96cf853c2ef03dcfb1d6df7c72464339f6a6968264407adc21a`.
+`candidate-wheel-delta.json`: 517 files byte-identical to the mapped transport
+wheel, only the Gemini-II template and RECORD changed; both bindings are
+identical. `candidate-installed-equivalence.json`: all 500 package files
+match the wheel. The two recording-execution tests passed against this
+installed template in 2.37 seconds (`candidate-check/dispatch-tests.log`).
+This is an exact payload comparison, distinct from execution at a different
+installation path; independent final-candidate review remains required.
+
+## Round 208 Gemini-II control-work repair (2026-11-17)
+
+`218ccde` selects the invariant composed-dot epilogue once per timed window.
+The dispatch remains inside timing, all primitive bodies and their order
+are unchanged, and both completion barriers/final correctness call remain.
+The real ARC build confirms no epilogue reload in the three repeated loops;
+primitive counts are 7/11/15, as before. See
+`design/apu-g2-timed-dispatch.md` and `r208/g2-dispatch-control-flow.json`.
+Seven software tests passed (`g2-dispatch-tests-fixed.log`); the initial
+recording-harness compilation error is retained separately, not credited.
+
+From a fresh source archive, zhang-x4 built and installed wheel
+`61e16c13bb07172d0e93a8bbaa20e066e6b32183b05fd8755e1a5823c6825722`.
+Source archive SHA256:
+`cec6abe9f72cfa936587dc3538c796370530835cd9563c565de109ed16500912`.
+Eight bounded functional tests passed in 81.60 seconds, no skips: ordinary
+source kernels covering identity/pair-affine/accumulate, nearby two-launch
+GEMM, pre-call aliasing and forced separate/fused layouts. They use exact
+NumPy and runtime checks, seed 20261117, and the device-host lock
+`/tmp/tenon-apu-g2-apu-00.lock`. These are functional diagnostics, not paired
+paper samples. Raw builds/outputs and JUnit results remain on zhang-x4 under
+`r208/g2-dispatch-candidate/functional`; local log `g2-draft-functional.log`.
+For the five calibrated single-launch functional cases, raw batch ticks/20
+differed from the unchanged estimates by -3.88% to +0.29%, within the existing
+pre-confirmation +/-10% model criterion in `design/apu-g2-source-route.md`.
+`r208/g2-functional-cost-check.json` records this limited check. The nearby
+two-launch plan remains extrapolated, with no accuracy tolerance claimed.
+This model check neither refits coefficients nor supplies a G10 regression
+allowance or paper sample.
+All 193 installed source entries match the committed compiler, and all 300
+checked production/build source files match its working source snapshot.
+The sdist predates commit documentation; no full-source-archive or
+cross-host compiled-binding byte-equivalence claim is made.
+
+`7f52c11` fixes a prerequisite evidence-retention defect in the evaluation
+driver: failed sessions formerly deleted vendor witnesses. It now retains
+them on failure, honors TENON_APU_G2_KEEP_TMP on success, and saves commands
+and complete streams (including partial timeout output). Forty driver tests
+passed, with five focused checks passing again in the remote installed
+environment. Unrelated Black reformatting was removed; the restored test
+module has the identical AST to the tested module. The new four-session
+paired campaign is preregistered in the committed design note and running
+from an immutable copy of the 7f52c11 driver, with KEEP_TMP and provisioned
+scratch. No new performance verdict is claimed while it runs; old fixed
+outcomes remain separate. No approval of the final candidate follows from
+the actor's source checks or these functional results.
+
+## Round 208 installed milestone (2026-11-17, completed 02:18 EST)
+
+The installed production-transport hardware probe also passed at 02:20 EST
+(`r208/installed-probe/report.json`): ordinary-source 32x16 FP16 GEMV,
+32 exact outputs, one fresh profile record at 170,904 device cycles. Its
+two reads took 47.511 and 47.405 seconds, retaining 68,253,767 raw bytes;
+the full call took 106.032 seconds. No flush retry was needed in this one
+probe. This is distinct from the earlier adapter diagnostic and does not
+count as a paper campaign sample. `arrays.npz`, selected effects/semantic
+facts/execution graph, selected kernel, actual `device.c`, retained build,
+binary SHA256 and raw profile manifests provide the compilation-to-launch
+binding. Binary SHA256: `5c92f6cdc5628526c809dff1c2979f6fff784f661eafe27563e419e2142fc0f3`.
+The device-host lock remained `/tmp/tenon-apu-v1-0000:41:00.0.lock`.
+Reproduction harness: `r208/run_installed_board_probe.sh` and
+`r208/installed_board_probe.py`; it imports only the installed wheel with
+`-I`, uses a fresh explicit profile directory, and rechecks the retained
+before/after snapshots with the unchanged one-record freshness parser.
+The subsequent board sequence completed at 04:32 EST: 78 prescribed attempts,
+77 valid launches and one failed expert histogram control. The latter lost
+its after-read to a transient residual-/tmp guard refusal (0.027 MiB free
+against 65,536 bytes); it has no timing credit. `vector_rows` and the overall
+board milestone remain FAIL. `forced_acc4` and `perturbed_dma` each passed
+all six launches; both default Tenon lanes passed all eleven launches each.
+The complete matrix comparison median was 8,758,810 cycles versus paper
+8,764,900. The histogram comparison is incomplete, with all failed evidence
+retained and no replacement sample.
+
+`r208/board-execution-inspection.json` independently binds all 34 selected
+program launches to their retained binaries, actual/declared source hashes,
+output checks and freshly re-parsed raw snapshots. Three matrix programs
+are distinct and the DMA perturbation changes the cost fingerprint. This
+inspection does not change the board failure or sample eligibility.
+`board-run/board/transport-usage.json` reports two reads for every valid
+launch (77), one baseline for the failed attempt, plus the preflight. No
+flush retry or missing/stale profile occurred. All 156 copies completed.
+Allocated retained storage was 20,409,626,624 bytes; median per-attempt raw
+snapshots plus launch files was 97,010,542 logical bytes, excluding builds
+and shared session JSON. The largest retained build was 1,144,551,490 bytes,
+including two 512-MiB inputs. This exceeds the old 1-GiB per-launch estimate,
+so maintained board/campaign defaults are raised to 2 GiB. Larger workloads
+still require a suitable explicit reserve. The two focused script suites
+passed 14 tests in 19.22 s; bash syntax and diff checks passed. The current
+campaign uses the increased reserve explicitly with the unchanged installed
+driver. No package or generated program changed for this budget correction.
+
+Source `8a8c794ebc22aa5a6430ea65f6c7c759c222fb96`, wheel
+`667ad7341c474c0f9a44edbf01a20c9642403a91b61ae8578b4bfacd96357c4d`,
+sdist `9cb7fe1a74901a0c1a8429bd007c65972201cba573aa776867feed1e5e5cb5b4`.
+Evidence root `E=/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r208`.
+The fresh install and copied tests are outside the source checkout. Run:
+
+```sh
+ALLO_CHECKOUT=$E/pkg-mapped/tree TENON_MILESTONE_NUMPY=2.3.5 \
+  bash $E/pkg-mapped/tree/docs/release/scripts/run_installed_milestone.sh \
+  $E/milestone-mapped
+```
+
+**All 42 required stages passed**, with separate logs/statuses under
+`milestone-mapped/stages`. The installed measurement/transport stage passed
+48 tests, including the named direct-copy, filesystem-headroom and retained
+failure regressions. Both functional-reference compatibility environments
+passed (NumPy 2.3.5 and >=2.4). Samsung was built from the wheel's bundled
+source and discovered through TENON_HOME. Its required default cycles are
+4108 / 7057 / 7255, with vendor baselines 4435 / 8041 / 8247. All sixteen
+UPMEM and fourteen AiM required rows passed; AiM remains timing-only.
+The `paper_full` stages executed the long rows skipped in the first pass.
+The one shared-contract skip is the optional 500-instance selector test,
+not an unavailable simulator. All twelve AttAcc kernel/decode comparisons
+passed against the frozen figures (`attacc/attacc_compare_frozen.json`);
+decode retains its analytical label. No hardware result follows from this
+milestone. The installed board probe and board/campaign stages are separate.
+
+Build and identity records: `build_wheel_mapped.log`, `candidate.json`,
+`binding-equivalence.json`, `transport-only-ast-delta.json`, `payload-check.json`
+and `linkage.json`. A standard file-prefix map preserves the existing binding
+equivalence rule while physical scratch remains host-local. The first wheel
+and intentionally interrupted first milestone remain retained; only the
+mapped wheel above completed this milestone. This is the documented host
+validation wheel, not a portable manylinux artifact.
+
 ## Round 208 (2026-11-17): review corrections, before installation
 
 Evidence root: /work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r208.

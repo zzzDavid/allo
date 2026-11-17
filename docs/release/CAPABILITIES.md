@@ -3,8 +3,8 @@
 
 # Tenon backend capability matrix
 
-Scope: `experiments/allo`, branch `tenon`, working tree on top of `6efaca5`
-(round 3, 2026-11-02). Sources: `docs/release/audit/*.md`,
+Scope: maintained `experiments/allo`, branch `tenon`. The matrix began in
+round3; current candidate identities and gate evidence are in STATUS/VALIDATION. Sources: `docs/release/audit/*.md`,
 `docs/release/ISSUES.md`, `docs/release/VALIDATION.md`,
 `docs/release/design/*.md`, and the runs noted in the "Evidence" rows.
 Finding IDs (S-xx, M-xx, U-xx, V1-xx, G2-xx, C-xx, P-xx, F-xx) refer to
@@ -71,8 +71,8 @@ Terms used below:
   mismatch at materialization before selection; `fn` runs on the functional
   path and in functional checks. Backends that do not represent host stages
   refuse them (`NotImplementedError`). Today: AiM.
-- **Evidence status.** *Verified* means run at the round 3 tree on the
-  authors' hosts through the public API and recorded in `VALIDATION.md`;
+- **Evidence status.** *Verified* means run at the explicitly recorded revision on the
+  declared environment through the public API and recorded in `VALIDATION.md`;
   **UNVERIFIED** means no run at the candidate revision, whatever older
   artifacts say. No simulator result is a hardware measurement.
 

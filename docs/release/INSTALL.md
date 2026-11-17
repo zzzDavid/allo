@@ -408,6 +408,18 @@ when directories share a filesystem. Set `TENON_APU_V1_PROFILE_COPY_BYTES`
 to a positive byte count to provision larger snapshots. Set
 `TENON_APU_V1_PROFILE_TIMEOUT_SECONDS` to a positive integer to change the
 300-second per-read hang guard. Neither setting changes freshness checks.
+The guard also creates, writes and syncs its own 64-KiB named file in the
+session-log directory, then removes it. Free-byte counters alone can report
+space while the filesystem refuses a new directory entry with `ENOSPC`.
+Allocation failure stops the attempt before invoking the vendor CLI. This
+probe does not reserve space for a later process or prevent concurrent
+consumption; a later transport failure still yields no timing.
+SIGTERM/SIGKILL can bypass cleanup and leave a 64-KiB
+`/tmp/tenon-ledag-reserve-*` file. The campaign checks for owned regular
+reserve files before every session and stops if any remain. It does not
+automatically delete them: check live use (for example `lsof`), archive if
+needed, and remove only a confirmed inactive file you own. Other owners'
+files and symlinks are never swept.
 These are conservative empirical
 reserves (observed session 1,983 bytes, extraction about 11.5 MB, snapshot
 about 34 MB), not firmware capacity claims or disk reservations. Copy or
@@ -434,6 +446,17 @@ larger snapshots or more retries can require a larger explicit
 not a universal bound. The scripts recheck
 before each sequence/session, preserving per-attempt guards and incomplete
 results. This is a provisioning estimate, not a completion guarantee.
+The campaign stops at the first gate refusal or failed/incomplete session,
+then pools retained records under the unchanged rule. A session never
+launched does not count as an attempt; each invocation of the session driver
+does, even if it fails before a device launch. `attempts-started.txt` records
+that count. Carry the remaining attempt ceiling into the next invocation.
+Create `G1_STOP_FILE` (default `<evidence>/campaign/STOP`) for an operator
+stop between sessions; it does not interrupt an active session. An explicit
+`G1_RESIDUAL_MIN_FREE_BYTES` adds an operational `/tmp` margin before each
+session, independently of the runtime's allocation check. The round-209
+campaign policy requires 16 MiB over a ten-minute observation window and
+before each session; it is not a new hardware capacity claim.
 `G1_TMP_PATH` now actually sets `TMPDIR`; changing it does not move the
 shared device lock or vendor session log. Use a fresh absolute evidence
 directory on roomy storage: build scratch and benchmark evidence go there.

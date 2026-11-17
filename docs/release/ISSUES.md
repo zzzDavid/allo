@@ -3,6 +3,40 @@
 
 # Tenon release issue ledger
 
+## Round 208 residual guard follow-up (X-24 / X-47, uncommitted)
+
+The byte-count guard accepted `/tmp` with 167,936 bytes free, but the vendor
+logger and an independent owned-file probe both failed to create a file
+with `ENOSPC`. This caused retained profile-read failures in the owed
+campaign; it was not bulk-log storage exhaustion or a numerical mismatch.
+The working guard now actually creates/writes/syncs its named 64-KiB reserve
+and removes only that file, so the session's existing stop-at-loss path can
+stop before a futile vendor attempt. Seventeen focused checks pass and the
+working guard rejected the real failing filesystem state. Independent
+review/installation remain owed; this is not a closed release issue or a
+claim of race-free reservation. The interrupted campaign's complete rows,
+failed records and remaining quota must be reconciled without replacing
+samples; see current STATUS and `r208/campaign-control.json`.
+
+
+## Round 208 changed Gemini-II program: X-34 remains open
+
+`218ccde` removes repeated invariant epilogue dispatch inside the generic
+composed-dot repetition loop, retaining all primitive work and timing
+boundaries. The new program's fixed four-session campaign has completed:
+all 840 launches exact, no rejected sessions. MVT reproduces at 2757.25
+versus 2766.625 paper cycles, addressing X-37 for this changed candidate
+subject to independent review. GEMM remains X-34 **OPEN (nominal)** at
+1734.0 versus 1733.225 (ratio 1.000447143); no further samples or added
+tolerance. The historical fixed X-34/X-37 outcomes are untouched. The
+dispatch repair removes real control work, but no cause for the residual
+GEMM gap is established. Batched GEMM, GESUMMV and BiCG also reproduce.
+VALIDATION and `r208/g2-pooled.json` retain all session medians, quartiles,
+paired baselines, binary/source/witness identities and exact output evidence.
+`7f52c11` additionally repairs evaluation-driver witness retention; it changes
+neither device semantics nor the measurement/pooling rule. Independent source
+and final-candidate review remain owed.
+
 ## Round 208 follow-up on X-24 / X-47
 
 The independent round-207 review found four integration issues: stale named
@@ -11,12 +45,23 @@ copies, unbounded default temporary-directory retention, and oversized test
 sandbox prerequisites. All are fixed in the transport increment; see current
 STATUS/VALIDATION. Profiling now requires explicit retained storage, and real
 board/campaign scripts preflight the actual vendor-daemon copy and derive a
-stage timeout from its measured duration and planned launch count. Required
-installed/board/campaign evidence remains owed until executed. No fixed
-performance outcome or partial campaign record was altered.
+stage timeout from its measured duration and planned launch count. Commit
+`8a8c794` is pushed to fork/tenon; its mapped wheel passed all 42 required
+installed-milestone stages. The installed 32x16 GEMV probe produced 32 exact
+outputs and one fresh record using two direct-copy reads. The full board
+sequence completed 77 valid launches and one failed histogram expert control
+after a transient residual-/tmp shortage. Its comparison and overall board
+milestone remain incomplete/FAIL; no failed sample was replaced. All 34
+selected-program launches passed. Retained builds exposed an insufficient
+1-GiB per-launch storage estimate; working scripts raise this to 2 GiB, with
+14 focused script tests passing. The interrupted campaign has one new complete kmeans row; strict remaining
+quota is kmeans 1, word_count 2, linear_regression 3, with all five historical
+and new session files retained and at most four attempt sessions remaining.
+No fixed Gemini-II outcome or partial campaign record was altered. X-47's
+remaining evidence obligations are open; this is not a release-gate closure.
 
 
-## Current X-24 / X-47 update (round 207, 2026-11-17)
+## Historical X-24 / X-47 update (round 207, 2026-11-17)
 
 The older multi-gigabyte `/tmp` prerequisites describe the `flo` transport.
 The user proved direct `scp d2h` support; the round-207 uncommitted runtime

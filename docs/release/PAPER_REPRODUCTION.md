@@ -3,6 +3,64 @@
 
 # Paper reproduction through the shared pipeline
 
+## Round 209 fixed GEMM outcome and environment context
+
+Gemini-II GEMM stays **OPEN (nominal)**: the fixed four-session median is
+1734.0 versus the frozen paper's 1733.225 ticks. The fresh interleaved GTML
+baseline is 1921.8 versus paper 1903.85 (+0.94%); the median paired
+vendor/Tenon ratio is 1.10604 versus paper 1.09844. These observations provide
+environment context beside the absolute miss, not evidence of absolute
+parity or a demonstrated cause. Session medians span 1733.225–1738.3, wider
+than the 0.775-tick miss. No resampling is permitted. Another program change
+and campaign would require a disassembly-verified mechanism predicting an
+effect larger than that spread; no such mechanism is established here.
+
+The residual allocation guard and campaign-control changes do not change
+generated programs or reopen the fixed Gemini-II measurements. Gemini-I
+still owes complete rows 1/2/3 (kmeans/word_count/linear_regression), plus the
+incomplete histogram comparison and G6 checks. No new hardware attempt is
+credited by the storage relocation or guard tests.
+
+## Round 208 installed candidate (2026-11-17)
+
+The wheel at source `8a8c794` (SHA256 `667ad7341c474c0f9a44edbf01a20c9642403a91b61ae8578b4bfacd96357c4d`)
+freshly reproduced all 45 required simulator/model results: Samsung 3,
+AiM 14, UPMEM 16, AttAcc kernel tiling 6 and modeled decode 6. Values are
+unchanged; the inventory links each family to its completed stage under
+`/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r208/milestone-mapped`.
+Samsung built from the distributed source, AiM remained timing-only, and
+AttAcc decode remained analytical composition. The installed milestone
+passed all 42 required stages. The subsequent installed Gemini-I matrix row
+also reproduced: all 33 launches valid, Tenon median 8,758,810 versus paper
+8,764,900 (q1–q3 8,757,063–8,759,312). Both forced acc4 and DMA-perturbed
+programs passed six launches each. The histogram paired row is incomplete:
+one expert control lost its after-read to a transient residual-/tmp shortage;
+all eleven Tenon launches passed, but no missing control was replaced. Its
+historical verdict is not current-candidate reproduction. The owed native-row
+campaign stopped after two attempts with verified package/source equivalence
+and unchanged quotas. One complete new kmeans row is credited; the strict
+pool leaves kmeans 1, word_count 2 and linear_regression 3 complete rows
+owed. All partial/failed evidence remains; at most four of the original six
+attempt sessions remain. The session-log allocation guard needs review and
+installation before continuation. The changed Gemini-II dispatch program (`218ccde`, driver `7f52c11`)
+completed its fixed four-session campaign: 840 exact launches, no rejected
+sessions, 80 measured samples per row. Pooled Tenon medians versus paper:
+GEMM 1734.0 / 1733.225 (**OPEN nominal**), batched GEMM 1731.2 / 1739.15,
+GESUMMV 1825.1 / 1860.075, BiCG 2545.125 / 2548.825, and MVT
+2757.25 / 2766.625 (these four **REPRODUCED**). Full quartiles, session
+medians and fresh paired GTML baselines are in `r208/g2-pooled.json` and the
+inventory. The old fixed Gemini-II outcomes are preserved separately; the
+new outcome is also fixed, with no further samples or new tolerance.
+
+Required current verdicts after the incomplete Gemini-I campaign: **50
+reproduced, 3 open, 2 incomplete/no verdict**. The latter include the fresh
+histogram control failure; its historical success is not current-candidate
+reproduction. This is not a complete final-candidate G10 pass. Optional
+studies remain separate. The new full `7f52c11` wheel differs from the
+simulator/Gemini-I wheel only in the Gemini-II template and RECORD, with
+byte-identical bindings (`r208/candidate-wheel-delta.json`); execution and
+equivalence evidence retain their distinct identities.
+
 ## Required scope: key tables and figures only
 
 User correction and confirmation, 2026-11-04: reproduce the key tables and

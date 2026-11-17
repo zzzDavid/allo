@@ -221,11 +221,13 @@ def test_a_session_is_launched_only_within_its_scratch_budget(fixtures, tmp_path
     )
     # three rows owed: 99 launches planned for session 1; a budget it cannot meet
     code, out = _run(tmp_path, tmp_path / "e6", [], env_extra={
-        "G1_DRY_RUN": "0", "G1_MAX_SESSIONS": "1",
+        "G1_DRY_RUN": "0", "G1_MAX_SESSIONS": "3",
         "G1_TMP_PATH": str(tmp_path), "G1_TMP_PER_LAUNCH_BYTES": str(free * 2),
     })
     assert "planned launches 99 x" in out and "session 1 NOT LAUNCHED: the headroom gate failed" in out
     assert not calls.exists()
+    assert "headroom_before_session_2" not in out
+    assert (tmp_path / "e6/campaign/attempts-started.txt").read_text().strip() == "0"
     # within budget the session is launched (the stub driver fails, which is a failed stage)
     code, out = _run(tmp_path, tmp_path / "e7", [], env_extra={
         "G1_DRY_RUN": "0", "G1_MAX_SESSIONS": "1",
@@ -234,6 +236,79 @@ def test_a_session_is_launched_only_within_its_scratch_budget(fixtures, tmp_path
     assert "planned launches 99 x 1 bytes = 99 needed" in out and calls.exists()
     assert "--cases kmeans word_count linear_regression" in calls.read_text()
 
+
+@pytest.mark.parametrize(
+    "mode", ["stop_file", "headroom_lost", "driver_failed"]
+)
+def test_loop_stops_after_operator_request_or_failed_session(
+    fixtures, tmp_path, mode
+):
+    sb = _sandbox(tmp_path)
+    module = sb["tree"] / "benchmarks/apu_v1"
+    module.mkdir()
+    (module / "__init__.py").write_text("")
+    session = fixtures.make_session("stopping", allo=_sandbox_install(tmp_path))
+    if mode == "headroom_lost":
+        session["incomplete"] = {"reason": "scratch_headroom_lost"}
+    calls = tmp_path / "calls.txt"
+    stop = tmp_path / "operator-stop"
+    (module / "paper_rows.py").write_text(
+        "import json,sys\nfrom pathlib import Path\n"
+        f"p=Path({str(calls)!r}); p.write_text(p.read_text()+'call\\n' if p.exists() else 'call\\n')\n"
+        f"Path(sys.argv[sys.argv.index('--out')+1]).write_text(json.dumps({session!r}))\n"
+        + (f"Path({str(stop)!r}).touch()\n" if mode == "stop_file" else "")
+        + ("sys.exit(1)\n" if mode == "driver_failed" else "")
+    )
+    code, out = _run(
+        tmp_path,
+        tmp_path / "e",
+        [],
+        {
+            "G1_DRY_RUN": "0",
+            "G1_MAX_SESSIONS": "3",
+            "G1_STOP_FILE": str(stop),
+        },
+    )
+    assert code != 0  # incomplete quota is never a successful campaign
+    assert calls.read_text() == "call\n"
+    assert "=== stage session_2 begin" not in out
+    assert (
+        tmp_path / "e/campaign/attempts-started.txt"
+    ).read_text().strip() == "1"
+    assert (tmp_path / "e/campaign/apu_v1_campaign_s1.json").exists()
+    assert "pool_campaign" in out
+
+
+def test_reserve_precheck_refuses_owned_regular_files_without_removing_them(
+    tmp_path,
+):
+    import shutil
+
+    script = SCRIPT.with_name("g1_reserve_check.py")
+    reserve = tmp_path / "tenon-ledag-reserve-stale"
+    reserve.write_bytes(bytes(65536))
+    result = subprocess.run(
+        [sys.executable, str(script), str(tmp_path)], capture_output=True
+    )
+    assert result.returncode == 1 and reserve.read_bytes() == bytes(65536)
+    reserve.unlink()
+    # Neither a symlink nor a directory is an owned regular reserve file.
+    reserve.symlink_to(tmp_path / "unrelated")
+    (tmp_path / "tenon-ledag-reserve-directory").mkdir()
+    result = subprocess.run(
+        [sys.executable, str(script), str(tmp_path)], capture_output=True
+    )
+    assert result.returncode == 0 and reserve.is_symlink()
+    env = dict(
+        os.environ,
+        G1_RESIDUAL_MIN_FREE_BYTES=str(shutil.disk_usage(tmp_path).free + 1),
+    )
+    result = subprocess.run(
+        [sys.executable, str(script), str(tmp_path)],
+        env=env,
+        capture_output=True,
+    )
+    assert result.returncode == 1 and b"policy requires" in result.stdout
 
 def _second_install(root: Path, *, differing_module: str = "spmw_autoschedule.py", extra_change=None):
     """A second installed package beside the sandbox's: the same files with one
