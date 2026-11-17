@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -101,6 +102,74 @@ def test_apu_g2_clean_run_exits_zero(monkeypatch, tmp_path):
     out = tmp_path / "traces.json"
     assert selection_traces.main(["--out", str(out), "--seed", "1"]) == 0
     assert json.loads(out.read_text())["status"] == "pass"
+
+
+@pytest.mark.parametrize("keep,failed", [(False, False), (False, True), (True, False)])
+def test_apu_g2_vendor_witness_retention(monkeypatch, tmp_path, keep, failed):
+    from allo.pim import apu_g2_runtime
+
+    scratch = tmp_path / "vendor"
+    scratch.mkdir()
+    (scratch / "witness.bin").write_bytes(b"actual output")
+    monkeypatch.setattr(g2_paper_rows.tempfile, "mkdtemp", lambda **_kw: str(scratch))
+    monkeypatch.setattr(g2_paper_rows, "Fixture", lambda *_args: None)
+    monkeypatch.setattr(
+        apu_g2_runtime,
+        "apu_g2_device_lock",
+        lambda: contextlib.nullcontext("fake-lock"),
+    )
+    monkeypatch.setenv("TENON_APU_G2_KEEP_TMP", "1" if keep else "0")
+
+    class Lane:
+        def __init__(self, *_args):
+            self.vendor = len(_args) == 4
+
+        def describe(self):
+            return {}
+
+        def launch(self):
+            if failed and self.vendor:
+                raise RuntimeError("vendor failed after writing its witness")
+            return {"outputs_exact": True, "amortized_ticks_per_pipeline": 10.5}
+
+    monkeypatch.setattr(g2_paper_rows, "TenonLane", Lane)
+    monkeypatch.setattr(g2_paper_rows, "VendorLane", Lane)
+    session = g2_paper_rows.run_session(["gemm"], tmp_path, rounds=1, vendor=True)
+    assert bool(session["problems"]) == failed
+    assert session["vendor_scratch"] == {
+        "path": str(scratch),
+        "retained": keep or failed,
+    }
+    assert scratch.exists() == (keep or failed)
+    if keep or failed:
+        assert (scratch / "witness.bin").read_bytes() == b"actual output"
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_apu_g2_vendor_failure_keeps_command_and_streams(
+    monkeypatch, tmp_path, timeout
+):
+    lane = object.__new__(g2_paper_rows.VendorLane)
+    lane.count = 0
+    lane.scratch = tmp_path
+    lane.case_id = "probe.v2"
+    lane.host = tmp_path / "vendor-host"
+    lane.kernel = "generic"
+    lane.fixture_dir = tmp_path / "inputs"
+
+    def failed(command, **_kwargs):
+        if timeout:
+            raise subprocess.TimeoutExpired(command, 600, b"partial output", b"failure")
+        return subprocess.CompletedProcess(command, 7, b"partial output", b"failure")
+
+    monkeypatch.setattr(g2_paper_rows.subprocess, "run", failed)
+    with pytest.raises(subprocess.TimeoutExpired if timeout else RuntimeError):
+        lane.launch()
+    command = json.loads((tmp_path / "probe.v2-1.command.json").read_text())
+    assert command[0] == str(lane.host)
+    assert command[-1] == str(tmp_path / "probe.v2-1")
+    assert (tmp_path / "probe.v2-1.stdout.txt").read_bytes() == b"partial output"
+    assert (tmp_path / "probe.v2-1.stderr.txt").read_bytes() == b"failure"
 
 
 def test_apu_g2_amortized_ticks_keep_fractions():

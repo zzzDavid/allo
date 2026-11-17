@@ -25,6 +25,8 @@ benchmark and witness records.  The paper's values are comparison data.
 
 Exit status: 0 only when every launch executed with exact outputs and every
 case has its full set of rounds; otherwise 1, with the records preserved.
+Vendor witnesses and command logs are retained on failure, or on success
+when TENON_APU_G2_KEEP_TMP=1; the session records their scratch directory.
 
 Usage (on the card host, from an installed wheel)::
 
@@ -337,9 +339,20 @@ class VendorLane:
             "--witness-dir",
             str(witness_root),
         ]
-        completed = subprocess.run(
-            command, capture_output=True, timeout=600, check=False
-        )
+        command_file = witness_root.with_name(witness_root.name + ".command.json")
+        stdout_file = witness_root.with_name(witness_root.name + ".stdout.txt")
+        stderr_file = witness_root.with_name(witness_root.name + ".stderr.txt")
+        command_file.write_text(json.dumps(command, indent=2) + "\n")
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, timeout=600, check=False
+            )
+        except subprocess.TimeoutExpired as error:
+            stdout_file.write_bytes(error.output or b"")
+            stderr_file.write_bytes(error.stderr or b"")
+            raise
+        stdout_file.write_bytes(completed.stdout)
+        stderr_file.write_bytes(completed.stderr)
         stdout = completed.stdout.decode(errors="replace")
         if completed.returncode:
             raise RuntimeError(
@@ -368,6 +381,9 @@ class VendorLane:
         loaded = loaded_device_library(benchmark, self.arc_sha256)
         timing_problem = timing_evidence_problem([ticks], 1)
         record = {
+            "command_file": str(command_file),
+            "stdout_file": str(stdout_file),
+            "stderr_file": str(stderr_file),
             "amortized_ticks_per_pipeline": (
                 float(ticks) / REPETITIONS if timing_problem is None else None
             ),
@@ -464,8 +480,6 @@ def run_session(names, root, *, rounds, vendor):
                 for lane_name in lane_order:
                     if lane_name in lanes[name]:
                         run(name, lane_name, "measured", round_index)
-    shutil.rmtree(scratch, ignore_errors=True)
-
     for name, entry in session["cases"].items():
         per_round = {}
         for launch in session["launches"]:
@@ -515,6 +529,10 @@ def run_session(names, root, *, rounds, vendor):
                         / entry["paper_tenon"],
                     }
                 )
+    retain = bool(session["problems"]) or os.environ.get("TENON_APU_G2_KEEP_TMP") == "1"
+    session["vendor_scratch"] = {"path": str(scratch), "retained": retain}
+    if not retain:
+        shutil.rmtree(scratch, ignore_errors=True)
     return session
 
 

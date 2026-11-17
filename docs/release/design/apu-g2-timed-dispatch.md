@@ -59,6 +59,15 @@ This is a working-candidate validation artifact, not a published release.
 
 ## Bounded performance confirmation, recorded before paired measurements
 
+Before these measurements, the evaluation driver was also corrected to keep
+vendor witnesses on any session failure and to honor TENON_APU_G2_KEEP_TMP=1
+on success. It saves command lines and full subprocess streams, including
+partial streams on timeout, before checking a return code. Previously it
+removed the vendor scratch directory even after a failed launch. This is
+evidence retention only; fixtures, operations, timing, ordering, numerical
+checks, sample eligibility and the pooler are unchanged. The campaign sets
+the retention option and places scratch on provisioned storage.
+
 After verifying that the installed working candidate contains exactly the
 committed production change, use the unchanged `g2_session.sh` and
 `g2_pool.py` protocol. Run exactly four sessions: one validation session and
