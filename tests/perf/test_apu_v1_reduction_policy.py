@@ -16,6 +16,7 @@ import pytest
 
 import allo
 from allo.ir.types import float16, uint16
+from allo.pim.apu_v1_fp16 import NUMERICS, add_f16, mul_f16
 from allo.pim.apu_v1_vector_program import apu_v1_plan_regroups
 from allo.pim.costs import apu_v1_cost
 from allo.pim.targets import build_apu_v1_target
@@ -48,9 +49,11 @@ def operands():
     W = (rng.standard_normal((M, K)) * 0.1).astype(np.float16)
     x = (rng.standard_normal(K) * 0.1).astype(np.float16)
     source = np.zeros(M, np.float16)
+    ieee_source = np.zeros(M, np.float16)
     for k in range(K):
-        source = (source + (W[:, k] * x[k]).astype(np.float16)).astype(np.float16)
-    return W, x, source
+        source = add_f16(source, mul_f16(W[:, k], x[k]))
+        ieee_source = (ieee_source + W[:, k] * x[k]).astype(np.float16)
+    return W, x, source, ieee_source
 
 
 def test_strict_ranks_only_source_order_plans():
@@ -83,7 +86,7 @@ def test_reassociate_admits_tree_plans():
 
 
 def test_functional_numerics_follow_the_selected_plan(operands):
-    W, x, source = operands
+    W, x, source, ieee_source = operands
     exact = W.astype(np.float32) @ x.astype(np.float32)
 
     strict = _compile(fp16_gemv)
@@ -91,7 +94,8 @@ def test_functional_numerics_follow_the_selected_plan(operands):
     result = strict(W, x, y)
     assert result.extra["reduction_order"] == "strict"
     assert result.extra["plan_regroups_reduction"] is False
-    assert result.extra["numerics"] == "source order"
+    assert result.extra["numerics"] == f"source order; {NUMERICS}"
+    assert np.any(source.view(np.uint16) != ieee_source.view(np.uint16))
     np.testing.assert_array_equal(y.view(np.uint16), source.view(np.uint16))
 
     relaxed = _compile(fp16_gemv, reduction_order="reassociate")
@@ -99,17 +103,20 @@ def test_functional_numerics_follow_the_selected_plan(operands):
     result = relaxed(W, x, y)
     assert result.extra["plan_regroups_reduction"] is True
     assert result.extra["numerics"].startswith("selected plan order")
-    # Halving FP16 tree over the 256-element group, then one add into y.
-    products = (W * x).astype(np.float16)
-    width = K
-    while width > 1:
-        width //= 2
-        products = (products[:, :width] + products[:, width : 2 * width]).astype(
-            np.float16
-        )
-    np.testing.assert_array_equal(
-        y, (np.float16(0) + products[:, 0]).astype(np.float16)
-    )
+    assert NUMERICS in result.extra["numerics"]
+    # Independently spell out the selected group's adjacent-pair additions;
+    # primitive bits are validated against the vendor reference elsewhere.
+    products = mul_f16(W, x)
+    group = relaxed.selected_plan.reduction_strategy.group_size
+    padded = np.zeros((M, -(-K // group) * group), np.float16)
+    padded[:, :K] = products
+    expected = np.zeros(M, np.float16)
+    for start in range(0, padded.shape[1], group):
+        block = padded[:, start : start + group]
+        while block.shape[1] > 1:
+            block = add_f16(block[:, 0::2], block[:, 1::2])
+        expected = add_f16(expected, block[:, 0])
+    np.testing.assert_array_equal(y.view(np.uint16), expected.view(np.uint16))
     assert np.any(y.view(np.uint16) != source.view(np.uint16))
     np.testing.assert_allclose(y.astype(np.float32), exact, rtol=1e-2, atol=1e-2)
 
