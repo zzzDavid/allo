@@ -4,7 +4,7 @@
 # Tenon backend capability matrix
 
 Scope: maintained `experiments/allo`, branch `tenon`. The matrix began in
-round3; current candidate identities and gate evidence are in STATUS/VALIDATION. Sources: `docs/release/audit/*.md`,
+round 3; current candidate identities and gate evidence are in STATUS/VALIDATION. Sources: `docs/release/audit/*.md`,
 `docs/release/ISSUES.md`, `docs/release/VALIDATION.md`,
 `docs/release/design/*.md`, and the runs noted in the "Evidence" rows.
 Finding IDs (S-xx, M-xx, U-xx, V1-xx, G2-xx, C-xx, P-xx, F-xx) refer to
@@ -33,7 +33,10 @@ Terms used below:
 - **Reduction order.** `allo.compile(..., reduction_order=)` is `"strict"`
   by default (source accumulation order and rounding for floating-point
   accumulators; integer accumulators may always be split) or
-  `"reassociate"`. Rows below say which programs each policy admits.
+  `"reassociate"`. Rows below say which programs each policy admits. Gemini-I
+  preserves the strict operation order but its GVML FP16 rounding does not
+  yet satisfy the IEEE bit-model contract; V1-16 is an open semantic blocker,
+  not a tolerance-based exception to this promise.
 - **Resource budget.** `allo.compile(..., resources={"channel": 8})` caps
   the structural units one program may occupy (`allo.spmw_resources`): the
   enumerators bound their partition domains by it (AiM replica and token
@@ -107,7 +110,12 @@ discovery variables in `INSTALL.md` section 3.
 | What cycles mean | PIMSimulator memory-clock cycles of the **padded** program (preload + execution + readback on the simulated 64-channel system). REDUCE pads K to 128-element tiles and rows to 4,096-slot passes; TEMPORAL pads rows to 8,192-row tiles; elementwise pads to 131,072-element tiles. `RunResult.extra` reports `logical_shape`, `padded_shape`, `padding_fraction`, `timing_scope`, `cycle_phases`, `plan`, `crf`, `conductor`, `levers` (S-06 fixed). |
 | Selection | Default under strict (`reduction_order=None` or `"strict"`): the ordered TEMPORAL program (26,807 cycles at 4096x256). Default layout selection under `reduction_order="reassociate"` (the paper's Samsung rows permit regrouping and the golden tests compile them so): `split_rows` + host GRF_A fill + shared CRF (the second row of each tile in the odd fiber by the F2 swizzle), 4,108 / 7,057 / 7,255 cycles at 4096x256 / 4096x512 / 8192x256, 7.4 / 12.2 / 12.0 percent fewer than the vendor program, correct outputs, the measured fastest of the enumerated placements (`design/samsung-execution.md` sections 8 and 10.4; `SAMSUNG_GOLDEN` lines of the round 196 milestone from the installed `448a51f` wheel; aligned with CLAIMS E1). History: before the matrix staging share entered the cost program (rounds 37 to 38) the reassociating default was bank_row + host fill at 4,389 / 7,947 / 8,153, which this row stated until round 204. The paper's vendor-equivalent placement (dual_fiber, host fill, shared CRF) is selected explicitly with `allo.spmw_samsung.samsung_vendor_gemv_layout(target, trace)` and reproduces 4,435 / 8,041 / 8,247. Unrealizable levers (`grf_staged`, `crf_issue=per_workid` with more than one item, more than 32 CRF words, non-identity `tile`, `double_buffer`) are rejected at materialization and recorded in `KernelRanking.rejections`. |
 | Hardware | none (no HBM-PIM device). |
-| Evidence | Verified at round 3: `tests/pim/test_paper_golden.py` Samsung rows (vendor layout 4,435 / 8,041 / 8,247), `tests/pim/samsung_hbm_pim/test_samsung_lowering.py`, `test_samsung_conductor_runs.py`, `test_samsung_reduction_order.py`, `gemv/` tests; executed table in `design/samsung-execution.md` sections 6-7. The running `pim_driver` is built from the bundled recipe `simulators/PIMSimulator/` (upstream sources, patches and conductor; `python -m allo.pim.samsung_simulator build`, round 93; a bundled build is byte-identical to the evaluation's conductor after stripping; P-04). Open: S-11 (docs page), S-12 (CRF-fill preload outside the model), S-13 (XOR swizzle 148 -> 116 only as a harness, `tests/pim/samsung_hbm_pim/layout_swizzle/`). Multi-kernel programs run their `@allo.host_program` launch schedule, one conductor invocation per launch, gathered results re-staged as declared; device residency across launches is rejected (`design/samsung-execution.md` section 9, `tests/pim/test_host_program_analysis.py`). |
+| Evidence | Verified at round 3: `tests/pim/test_paper_golden.py` Samsung rows (vendor layout 4,435 / 8,041 / 8,247), `tests/pim/samsung_hbm_pim/test_samsung_lowering.py`, `test_samsung_conductor_runs.py`, `test_samsung_reduction_order.py`, `gemv/` tests; executed table in `design/samsung-execution.md` sections 6-7. The running `pim_driver` is built from the bundled recipe `simulators/PIMSimulator/` (upstream sources, patches and conductor; `python -m allo.pim.samsung_simulator build`, round 93; a bundled build is byte-identical to the evaluation's conductor after stripping; P-04). Open: S-11 (docs page), S-12 (remaining odd-fiber/fill ranking limitation below), S-13 (XOR swizzle 148 -> 116 only as a harness, `tests/pim/samsung_hbm_pim/layout_swizzle/`). Multi-kernel programs run their `@allo.host_program` launch schedule, one conductor invocation per launch, gathered results re-staged as declared; device residency across launches is rejected (`design/samsung-execution.md` section 9, `tests/pim/test_host_program_analysis.py`). |
+
+Samsung cost-model boundary (S-12): the bank-filled dual_fiber/bank_row
+ordering has a known 0.45–0.93% simulator discrepancy from an unmodeled
+odd-fiber/fill interaction. Required comparisons reproduce; the empirical
+model does not promise the fastest layout or exact predictions everywhere.
 
 ## SK hynix AiM
 
@@ -149,6 +157,13 @@ discovery variables in `INSTALL.md` section 3.
 | Hardware | none (no UPMEM DIMMs). |
 | Evidence | Verified at round 3: 13 `paper_full` golden rows with pinned cycles (`test_paper_golden.py`), `tests/pim/test_upmem_generality.py` (391x65: 1 DPU 1,146,612 cycles vs paper 1,149,430; 32 DPUs 49,421 remainder split / 40,058 balanced vs paper 38,484), `test_upmem_dtypes.py`, `test_upmem_matcher.py`, user-build route (`user-build:d45e285c34b5`). A build from public sources is **not yet possible**: the Tenon uPIMulator patch is unpublished (P-06) and the SDK image reuses an upstream name (P-17). |
 
+The exported `rank_upmem_physical_candidates`, `select_upmem_physical_plan`
+and calibration-report helpers are low-level analysis APIs. They do not
+enter `allo.compile`, produce a complete executable, or establish shared
+pipeline execution. The ordinary source route above remains the maintained
+compilation path; the plan records also used by its lowering do not turn
+these standalone helpers into another public end-to-end compiler (U-08).
+
 ## GSI APU v1 (Gemini-I)
 
 Four routes share `build_apu_v1_target()`. Every board launch takes the
@@ -163,7 +178,7 @@ by diffing the device log before and after the launch (V1-07 fixed).
 | Analytical | yes (`kind="virtual"`: the selected plan's retained cost graph only, no outputs, caller arrays untouched, `cost_validity` label; `tests/perf/test_run_result_contract.py`) | yes (`kind="virtual"`, V1-04 fixed) | yes |
 | Host functional | yes (`kind="functional"`: a host-side NumPy model of the selected plan's arithmetic order, not compiled device code; `cycles` is the analytical estimate) | yes (retained portable C on the host) | rejected at compile time |
 | Hardware | yes: GVML project built with the ARC toolchain, launched on the board, outputs read back; temporal plans upload the packed initial output and accumulate onto it, spatial group-reduction plans reject a nonzero initial output (V1-02 fixed) | yes | yes |
-| Numerical scope | FP16, uint16, bitwise. Under `reduction_order="reassociate"` the default FP16 GEMV plan is `spatial_gemv_group_reduction_k<tile>`, a tree reduction (`gvml_add_subgrps`) whose rounding differs from source order: 425 of 4096 outputs of the 4096x256 GEMV are bit-equal to the source-order FP16 sum in the plan-order model (a halving FP16 tree per group, then the groups in ascending order; `tests/perf/test_apu_v1_reduction_policy.py`). Under `"strict"` (the default) the tree plans are pruned and `temporal_dma_coalescing` is selected, bit-equal to source order (4096/4096) in the same model. Neither is board-checked bit for bit: the halving order is a model of `gvml_add_subgrps` never compared with the board, and the board GEMV test (`test_gemv_apu_v1`, strict) checks a 5e-2 tolerance only (the paper's source-order board match came from an external script, `CLAIMS.md` E11) | C11 semantics of the C backend; `sqrt` lowers to a double-precision helper within 1 ulp of the C library (V1-12 fixed) | fixed shapes and dtypes per recipe (histogram 32,768 values x 256 bins, argmin P=32,768, D<=48) |
+| Numerical scope | FP16 and uint16 source contractions. Strict selection preserves accumulation order; reassociation explicitly admits grouped reduction plans. Native GVML FP16 is **not established as IEEE bit-exact**: prior board probes differ from source-order and halving-tree host models, including 66/1024 single products. Functional tolerances do not establish source rounding semantics. V1-16 remains an open release blocker for the broader strict-source promise. The frozen paper's particular exact-product experiment (sections/5-evaluation.tex:97–101) reproduced in round 34 and does not establish arbitrary-product bit equality; the narrow BitModelMismatch expected failure only classifies that known discrepancy. New installed G6 results are recorded in VALIDATION; a transport error never counts as that mismatch. | C11 semantics of the C backend; `sqrt` lowers to a double-precision helper within 1 ulp of the C library (V1-12 fixed) | fixed shapes and dtypes per recipe (histogram 32,768 values x 256 bins, argmin P=32,768, D<=48) |
 | What cycles mean | ARC core cycles (`crun`) of the profiled `total` section printed by the device build (`PROF_PRINT`), exactly one fresh record per launch | same | same |
 | Evidence | Verified at round 3 on this server: `test_gemv_apu_v1` and two `tests/pim/apu_v1/vector_gemm` plans passed on the board (4 device tests, 197 s). Paper numbers (E9-E12) came from an external locked runner (`CLAIMS.md`); open: V1-05 (fitted count rule absent, native estimates 19-56% off without a validity flag), V1-06 (fixed tile heuristic; 12.71x row plans reachable by `layout=`, golden drift 2.9%); V1-08 fixed (only the eight GSI SDK files the build reads are copied from `TENON_APU_V1_TEMPLATE_DIR`, origins in the project's `THIRD_PARTY.txt`; an ARC build of a generated project succeeded on this server 2026-11-02, not launched) | virtual/functional covered by `tests/perf/test_run_result_contract.py`; hardware **UNVERIFIED** at round 3 | histogram golden median row passed on the board at round 3; other recipes compile-only at round 3 (`test_paper_golden.py`) |
 
@@ -204,8 +219,12 @@ earlier: output shapes from the compiled ABI, missing output files raise).
 Three routes share `build_apu_g2_target()` (`target.name == "apu_v2"`).
 Every runtime takes an in-process `flock` (`TENON_APU_G2_LOCK`, default
 `/tmp/tenon-apu-g2-<device>.lock`) around status check, build and launch;
-`extra["device_lock"]` records the path (G2-06, partially fixed: only
-`apu-00` and SDK root `/opt/gsi`-compatible installs are accepted).
+`extra["device_lock"]` records the path. G2-06 is a deployment boundary:
+only `apu-00` is supported; other card indices are rejected before launch.
+The SDK root is configurable, with the vendor directory layout retained.
+`GSI_SYSTEM_g2` and `GSI_GTML_g2` config packages must be discoverable through
+CMake's normal search (SDK setup or `CMAKE_PREFIX_PATH`); a root override
+alone does not relocate those packages. See INSTALL for the exact scope.
 
 | Aspect | `APUG2TypedProgram` | `APUG2ComposedContractionProgram` | Source route |
 |---|---|---|---|

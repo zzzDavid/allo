@@ -174,12 +174,18 @@ parallelism.
 
 Limits of the overrides:
 
-- The Gemini-II project templates (`allo/pim/templates/apu_g2/CMakeLists.txt`,
-  `device/CMakeLists.txt`) hard-code `/opt/gsi`, and the host programs open
-  `DeviceConfig{0, 0}`. `TENON_APU_G2_SDK_ROOT` and `TENON_APU_G2_DEVICE`
-  values other than the defaults are therefore rejected with an explicit
-  `RuntimeError` instead of checking one installation and building or running
-  against another. Parameterizing the templates is open work.
+- Gemini-II supports the validated single-card endpoint `apu-00`; another
+  `TENON_APU_G2_DEVICE` is rejected before build or launch. Multi-card
+  `DeviceConfig` interpretation has not been validated (G2-06 boundary).
+  `TENON_APU_G2_SDK_ROOT` is passed to the project templates for headers,
+  libraries, `g2_device`, `g2_transport` and the metadata-update tool; it is
+  not restricted to `/opt/gsi`. The vendor `GSI_SYSTEM_g2` and `GSI_GTML_g2`
+  config packages use CMake's normal search. A relocated SDK must expose
+  those matching packages through its setup environment or `CMAKE_PREFIX_PATH`
+  as well as setting the root. A root override alone does not configure the
+  vendor compiler/toolchain packages. Missing packages fail configuration.
+  All hardware runtimes serialize access with the device-host
+  `TENON_APU_G2_LOCK` flock and record its resolved path.
 - The defaults that point into `~/shared/...` describe the authors' lab
   machines. On any other machine set the variable.
 
@@ -364,7 +370,7 @@ Failure behaviour, timeouts and temporary files:
 | UPMEM | SDK build 600 s, simulation 1800 s per segment | `$TENON_UPMEM_SCRATCH/root-<sha12>/` (staged snapshot, reused; Docker writes root-owned files there), `runs/<key>/`, `root.lock` (staging), `run.lock` next to the root (serializes the shared `benchmark/<slot>`) |
 | APU v1 vector route | build 600 s, execution 900 s | `tenon-apu-*` temp directories; board `flock` on `$TENON_APU_V1_LOCK` (default `/tmp/tenon-apu-v1-<pci node>.lock`) around every launch (V1-07 repair, in progress) |
 | APU v1 device-log reads (`ledag-ssh`, every Gemini-I launch) | 300 s per direct-copy session by default (configurable) | `scp d2h` copies the ten numbered firmware rotation slots to unique retained `tenon-profile-*` directories under `$TENON_APU_V1_PROFILE_DIR` (required; no system-temp retention fallback). The bundle extracts into `$TMPDIR`. Only the small vendor session log still uses `/tmp`; proven session-owned files are copied into the evidence directory before unlinking. The device-host board lock stays at its shared path. See the profile-storage contract below. |
-| APU v2 | configure 120 s, builds 600 s, execution 120-180 s, `gsi_tool info` 15 s | `tenon-apu-g2-*` temp directories (kept with `TENON_APU_G2_KEEP_TMP=1`); card ownership checked with `gsi_tool`, no `flock` yet (G2-06) |
+| APU v2 | configure 120 s, builds 600 s, execution 120-180 s, `gsi_tool info` 15 s | `tenon-apu-g2-*` temp directories (kept with `TENON_APU_G2_KEEP_TMP=1`); card ownership checked with `gsi_tool`; reentrant device-host `flock` on `TENON_APU_G2_LOCK`, recorded in the result (G2-06 deployment boundary) |
 
 ### Gemini-I profile storage
 

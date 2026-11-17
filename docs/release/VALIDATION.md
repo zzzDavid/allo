@@ -3,18 +3,18 @@
 
 # Validation record
 
-## Round209 final artifact, equivalence, and no-go decision
+## Round 209 final artifact, equivalence, and no-go decision
 
-Candidate5fec806, built from its committed git archive through a fresh sdist
+Candidate 5fec806, built from its committed git archive through a fresh sdist
 and wheel, installed outside checkout at `r209/pkg-candidate`:
 wheel `45c98918aa6e99d70c5e18724d1226e6974f1060dd0f3d35280da9ac997718e3`;
 sdist `38b3b61086e9e8b5e2c52ef5421c05d0d5697e9235350bdf6ff1bf4c92a30c00`.
 `build_candidate.sh`, `build-candidate.log`, and `candidate-equivalence.json`
-record the build and check.517 payload files equal the7f52c11 artifact byte
+record the build and check. 517 payload files equal the 7f52c11 artifact byte
 for byte; only runtime `apu_v1_program.py` and RECORD changed. AST comparison
 finds only the headroom guard changed, with launch/freshness/codegen nodes
-identical. All500 installed package files equal the wheel. Installed checks
-from copied committed tests:33 passed in25.17seconds, no skips
+identical. All 500 installed package files equal the wheel. Installed checks
+from copied committed tests: 33 passed in 25.17 seconds, no skips
 (`installed-check/{origin.txt,tests.log}`). This rechecks the changed guard
 and script controls without repeating the unchanged full simulator milestone.
 
@@ -22,15 +22,15 @@ and script controls without repeating the unchanged full simulator milestone.
 matrix alternatives virtually from the installed artifact. Seven programs
 match all nine identity fields against r208, as recorded in
 `generated-program-equivalence.json`. This is identity evidence, not a new
-measurement. Frozen paper lock recheck:73/73, `paper-lock-check.json`.
+measurement. Frozen paper lock recheck: 73/73, `paper-lock-check.json`.
 
 `update_equivalence.py` rehashes all eight installations/wheels. The initial
 strict verifier rejected the reviewed G2 template difference because every
 allowed non-Python file must still equal after substitutions. That failure
 and initial manifest are retained. The updated manifest records an exact
 full-source mapping from old template SHA256 `0ea162829dd5258f0c3ebff7d29c3e40f50affce258366ae03a4d5cb773648a4`
-to reviewed218ccde source `de7b1a87f2546896b04116e14e512da5aaaaa532b7ec333c8f996c685f3f2b04`.
-Both full texts are absent from every one of3996 other recorded files,
+to reviewed 218ccde source `de7b1a87f2546896b04116e14e512da5aaaaa532b7ec333c8f996c685f3f2b04`.
+Both full texts are absent from every one of 3996 other recorded files,
 including all compiled bindings (`g2-template-normalization-scope.json`).
 Consequently this mapping affects only that non-G1 template; binding checks
 still apply their original path substitutions only. The G1 pooler itself,
@@ -43,17 +43,57 @@ not produce new measurements or revise the incomplete quota.
 This explicit source mapping is reviewable evidence, not a claim that old
 and new Gemini-II programs have equal timing or a permission to resample.
 
-The storage observation completed41 samples over600.000seconds: free bytes
+The storage observation completed 41 samples over 600.000 seconds: free bytes
 6,881,280 throughout, all guard probes successful, no owned reserve leaks,
-net drop0. **NO-GO** because the preregistered minimum is16MiB.
+net drop 0. **NO-GO** because the preregistered minimum is 16 MiB.
 `residual-space-verdict.json` and `residual-tmp-snapshots.jsonl` retain the
 period; source guard hash equals the installed guard. The actual installed
-pre-session helper also exited1 (`installed-residual-policy.{log,exit}`)
-with the16-MiB policy. No vendor read, device launch, histogram row or G6
-board check was attempted in round209. Exact external ask:16MiB durable
+pre-session helper also exited 1 (`installed-residual-policy.{log,exit}`)
+with the 16-MiB policy. No vendor read, device launch, histogram row or G6
+board check was attempted in round 209. Exact external ask: 16 MiB durable
 total free space in `/tmp`; root-owned simbuild contents remain untouched.
 The former r197 follow-ups stay UNVERIFIED, including the narrow V1-16
 expected-mismatch checks. Storage probes are not their execution evidence.
+
+
+Authorized project-container cleanup (r210): all 436 regular files in the
+source and r209 archive matched the recorded hashes; `lsof +D
+/tmp/tenon-release` returned 1 with empty output immediately before cleanup.
+The 626 uid-0 entries were confined to the four SDK/benchmark build trees
+under `upmem/{uPIMulator,final}/golang/uPIMulator/`; their November 2 build
+times and the documented root-running uPIMulator container build establish
+project provenance. Local Alpine image:
+`sha256:b92841763c5c2140a20eeb2a44e94ebb0e80fd51d9d6b5895ea72fa999525d68`.
+The requested command was:
+
+```sh
+docker run --rm --pull never --network none \
+  -v /tmp/tenon-release/simbuild/upmem:/w alpine:latest \
+  rm -rf /w/uPIMulator/golang/uPIMulator/sdk/build \
+         /w/uPIMulator/golang/uPIMulator/benchmark/build \
+         /w/final/golang/uPIMulator/sdk/build \
+         /w/final/golang/uPIMulator/benchmark/build
+```
+
+It failed before starting because `/var` had only 20,480 bytes free; disabling
+container logging did not avoid the containerd mkdir failure. Both failures
+are retained. The working fallback used `docker create --pull never --network
+none --log-driver none --name tenon-r210-archive-cleanup -v
+/tmp/tenon-release/simbuild/upmem:/w alpine:latest true`, then `docker cp -a -
+tenon-r210-archive-cleanup:/w` with a tar containing **directory headers only**
+for the authorized root-owned build directories, restoring nz264 uid/gid.
+All 436 file hashes were rechecked unchanged. After another empty lsof check,
+files inside those four authorized trees and remaining archived owned
+entries were removed normally; `docker rm tenon-r210-archive-cleanup`
+removed the stopped container. Nothing else was mounted or cleaned.
+
+`r210/cleanup-stopped.json`, `cleanup_stopped_container.py`,
+`authorized-directory-ownership.tar`, and the cleanup logs retain the exact
+commands, directory list and checks. `/tmp` free bytes: 6,873,088 before,
+31,473,664 after (24,600,576 reclaimed). Locks, sockets, `/tmp/tenon-upmem`
+and unrelated entries were untouched. The full unchanged observation is
+being repeated from the installed artifact; r209's failed window remains
+retained, never overwritten.
 
 
 ## Round 209 authorized temporary-storage archive
@@ -62,7 +102,7 @@ Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evid
 `tmp-relocation-verified/manifest.json` contains full old/new paths, SHA256
 for every regular file, symlink targets, removed-entry lists and preserved
 foreign-uid entries. Both pre-copy and pre-removal `lsof +D` checks (or file
-checks for the five logs) returned1 with empty output: no live holder found.
+checks for the five logs) returned 1 with empty output: no live holder found.
 The initial script refused the mixed-ownership simbuild before modifying
 anything; its failed log/source remain. The corrected archival checks each
 entry's uid and never removes root-owned data.
@@ -70,24 +110,24 @@ entry's uid and never removes root-owned data.
 | Original path | Archive path relative to r209 | Source disposition |
 | --- | --- | --- |
 | `/tmp/tenon-release/simbuild` | `tmp-relocation-verified/tenon-release/simbuild` | Copied/verified; root-owned contents and enclosing directories preserved |
-| `/tmp/hmz-1579329` | `tmp-relocation-verified/hmz-1579329` | Copied/verified;219 nz264-owned entries removed |
+| `/tmp/hmz-1579329` | `tmp-relocation-verified/hmz-1579329` | Copied/verified; 219 nz264-owned entries removed |
 | `/tmp/ledag_ssh_nz264_3481162_log.txt` | `tmp-relocation-verified/ledag_ssh_nz264_3481162_log.txt` | Copied/verified; removed |
 | `/tmp/ledag_ssh_nz264_3481389_log.txt` | `tmp-relocation-verified/ledag_ssh_nz264_3481389_log.txt` | Copied/verified; removed |
 | `/tmp/ledag_ssh_nz264_3481588_log.txt` | `tmp-relocation-verified/ledag_ssh_nz264_3481588_log.txt` | Copied/verified; removed |
 | `/tmp/ledag_ssh_nz264_3481785_log.txt` | `tmp-relocation-verified/ledag_ssh_nz264_3481785_log.txt` | Copied/verified; removed |
 | `/tmp/ledag_ssh_nz264_3482789_log.txt` | `tmp-relocation-verified/ledag_ssh_nz264_3482789_log.txt` | Copied/verified; removed |
 
-6,656,000 bytes reclaimed; free bytes225,280→6,881,280. The remaining
-simbuild file bytes21,219,050 are uid0, not authorized for removal. The
-preregistered16-MiB/ten-minute rule is `RESIDUAL_SPACE_PROTOCOL.md`; observations
+6,656,000 bytes reclaimed; free bytes 225,280→6,881,280. The remaining
+simbuild file bytes 21,219,050 are uid 0, not authorized for removal. The
+preregistered 16-MiB/ten-minute rule is `RESIDUAL_SPACE_PROTOCOL.md`; observations
 are `residual-tmp-snapshots.jsonl`, with final decision in
 `residual-space-verdict.json`. This is storage evidence, not board execution.
 
-Software verification: `focused-tests.log` (33 passed,29.01s); final campaign
-checks `campaign-final-tests.log` (12 passed,14.15s), including gate refusal,
+Software verification: `focused-tests.log` (33 passed, 29.01s); final campaign
+checks `campaign-final-tests.log` (12 passed, 14.15s), including gate refusal,
 operator stop, failed/incomplete session stop, attempt accounting, and leaked
 reserve detection. Black/errors-only pylint/shell syntax/diff checks pass.
-The prior accepted guard tests and independent review remain in round208.
+The prior accepted guard tests and independent review remain in round 208.
 No timing, numerical, pooling, quota, or transport freshness rule changed.
 
 
