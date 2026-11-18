@@ -162,6 +162,7 @@ def _typed_cases(rng):
     ]
 
 
+@pytest.mark.apu_g2_device
 def test_typed_program_per_operation_on_card(apu_g2_card):
     rng = np.random.default_rng(SEED)
     target = build_apu_g2_target()
@@ -215,6 +216,7 @@ def _reference(name, args):
 
 
 @pytest.mark.parametrize("name", sorted(PAPER_KERNELS))
+@pytest.mark.apu_g2_device
 def test_paper_source_kernel_on_card(apu_g2_card, name):
     rng = np.random.default_rng(SEED + sum(map(ord, name)))
     compiled = allo.compile(PAPER_KERNELS[name], build_apu_g2_target(), apu_g2_cost)
@@ -250,6 +252,7 @@ def gemm_n33(A: int4[64, 128], B: int4[128, 33], C: int15[64, 33]):
             C[i, j] = acc
 
 
+@pytest.mark.apu_g2_device
 def test_nearby_gemm_beyond_one_carrier_on_card(apu_g2_card):
     """Selected two-launch plan (extrapolated estimate): blind confirmation."""
 
@@ -277,6 +280,7 @@ def test_nearby_gemm_beyond_one_carrier_on_card(apu_g2_card):
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.apu_g2_device
 def test_wrong_oracle_is_reported_as_a_mismatch_on_card(apu_g2_card, monkeypatch):
     import allo.pim.apu_g2_composed_runtime as runtime
 
@@ -293,6 +297,7 @@ def test_wrong_oracle_is_reported_as_a_mismatch_on_card(apu_g2_card, monkeypatch
         compiled(**args)
 
 
+@pytest.mark.apu_g2_device
 def test_echoed_fingerprint_mismatch_is_refused_on_card(apu_g2_card, monkeypatch):
     import allo.pim.apu_g2_composed_runtime as runtime
 
@@ -344,6 +349,7 @@ def g6_gemm_square(A: int4[32, 32], B: int4[32, 32], C: int15[32, 32]):
             C[i, j] = acc
 
 
+@pytest.mark.apu_g2_device
 def test_call_aliases_read_pre_call_values_on_card(apu_g2_card):
     """One array passed for two parameters: every input is staged before any
     output is written, so the result is computed from the pre-call values."""
@@ -380,6 +386,7 @@ def test_call_aliases_read_pre_call_values_on_card(apu_g2_card):
     _record("g6_alias", "mvt_x1_is_y1", result)
 
 
+@pytest.mark.apu_g2_device
 def test_extreme_operands_on_card(apu_g2_card):
     """i8 products at -128/127 into i16, and an int4 GEMM reaching both ends
     of its exact int15 dot range (8192 = (-8)(-8)128, -7168 = (-8)(7)128)."""
@@ -411,6 +418,7 @@ def test_extreme_operands_on_card(apu_g2_card):
     _record("g6_extreme", "gemm_int4_edges", result)
 
 
+@pytest.mark.apu_g2_device
 def test_zero_results_overwrite_a_sentinel_on_card(apu_g2_card):
     rng = np.random.default_rng(SEED + 62)
     target = build_apu_g2_target()
@@ -439,6 +447,7 @@ def test_zero_results_overwrite_a_sentinel_on_card(apu_g2_card):
     _record("g6_zero", "gemm_zero_lhs", result)
 
 
+@pytest.mark.apu_g2_device
 def test_fused_and_separate_bicg_plans_agree_on_card(apu_g2_card):
     rng = np.random.default_rng(SEED + 63)
     A = rng.integers(-4, 4, size=(256, 256)).astype(np.int16)
@@ -469,6 +478,7 @@ def test_fused_and_separate_bicg_plans_agree_on_card(apu_g2_card):
     assert (len(fused.extra["launches"]), len(separate.extra["launches"])) == (1, 2)
 
 
+@pytest.mark.apu_g2_device
 def test_typed_div_ignores_garbage_in_padded_lanes_on_card(apu_g2_card, monkeypatch):
     """A partial shape leaves 262144 - 3000 lanes padded; they are filled
     with random garbage after packing (nonzero divisors), and the logical

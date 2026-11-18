@@ -28,6 +28,9 @@ def pytest_configure(config):
         "sim-substituted.",
     )
     config.addinivalue_line(
+        "markers", "apu_g2_device: Gemini-II physical-card execution test."
+    )
+    config.addinivalue_line(
         "markers",
         "paper_full: long paper-golden rows; run with `-m paper_full`.",
     )

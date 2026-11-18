@@ -3350,6 +3350,11 @@ class _FunctionCoverage:
             for index, (op, _loops, _guards) in enumerate(sites)
             if op.operation.name in _STORE_OPS and len(op.operands) > 1
         ]
+        self.fills = {
+            index
+            for index, (op, _loops, _guards) in enumerate(sites)
+            if op.operation.name == "linalg.fill" and len(op.operands) >= 2
+        }
         self.loads_by_ref: dict = {}
         self.uses: dict[str, list[tuple[int, int]]] = {}
         for index, (op, _loops, _guards) in enumerate(sites):
@@ -3727,20 +3732,13 @@ class _FunctionCoverage:
         program that executes the function verbatim states them in its
         contract, since a returned buffer's untouched elements hold them."""
         op = self._op(index)
-        value_ssa = _value_name(op.operands[0], self.state)
         buffer_ssa = _value_name(op.operands[1], self.state)
         dest_ref = self._ref(op.operands[1])
         alloc = self.defining_map.get(buffer_ssa)
         name = None
         if alloc is not None and "name" in alloc.attributes:
             name = _attr_str(alloc.attributes["name"])
-        term = _trace_value(
-            value_ssa,
-            self.defining_map,
-            self.value_refs,
-            state=self.state,
-            scope=self.scope,
-        )
+        term = self._term(index)
         guard_terms = self._guard_terms(index)
         coverage.stores.append(
             StoreCoverage(
@@ -3891,6 +3889,9 @@ class _FunctionCoverage:
                 continue
             category[index] = STORE_UNMATCHED
 
+        if self._has_unbound_return(result_sites):
+            coverage.unbound_return_functions.append(self.func_name)
+
         self._settle_locals(category, detail)
         self._check_result_aliases(copy_producers, problems)
 
@@ -3932,11 +3933,7 @@ class _FunctionCoverage:
         loop_names = tuple(
             sorted((getattr(self.state, "loop_names", {}) or {}).items())
         )
-        fills = {
-            index
-            for index, (op, _loops, _guards) in enumerate(self.sites)
-            if op.operation.name == "linalg.fill" and len(op.operands) >= 2
-        }
+        fills = self.fills
         # One traversal in site (program) order: a fill that reads a value an
         # earlier store defined is retained after that store.
         for index in sorted(fills | set(self.stores)):
@@ -4005,6 +4002,38 @@ class _FunctionCoverage:
                     (self.work_root, index, "unmatched"),
                     [self._unmatched_message(index, detail.get(index)), []],
                 )[1].append(self.func_name)
+
+    def _has_unbound_return(self, result_sites) -> bool:
+        """Follow result/copy identities, independently of initialization.
+
+        This records an ABI obligation, not a target-specific prohibition:
+        require_match_coverage exempts routes that bind/execute the retained
+        whole function, including its returned allocations.
+        """
+        copies = {}
+        for index in self.stores:
+            source = self._copy_source(index)
+            if source is not None:
+                copies.setdefault(self._ref(source.operands[0]), set()).add(
+                    self._dest(index)
+                )
+        for op, _loops, _guards in self.sites:
+            if op.operation.name == "memref.copy":
+                copies.setdefault(self._ref(op.operands[0]), set()).add(
+                    self._ref(op.operands[1])
+                )
+        local_returns = self.return_refs - self.arg_refs
+        for result in result_sites:
+            reached, pending = set(), [result]
+            while pending:
+                ref = pending.pop()
+                if ref in reached:
+                    continue
+                reached.add(ref)
+                pending.extend(copies.get(ref, ()))
+            if reached & local_returns and not reached & self.arg_refs:
+                return True
+        return False
 
     def _check_result_aliases(self, copy_producers, problems) -> None:
         """Reject a match whose operand reads the buffer its own result is
@@ -4184,19 +4213,14 @@ class _FunctionCoverage:
     # -- accumulator initialization ------------------------------------ #
 
     def _accumulator_init(self, dest, index):
-        others = [i for i in self.stores if i != index and self._dest(i) == dest]
+        others = [
+            i
+            for i in sorted(set(self.stores) | self.fills)
+            if i != index and self._dest(i) == dest
+        ]
         if not others:
             if dest in self.arg_refs:
                 return "carried", []
-            if dest in self.return_refs:
-                # A linalg.fill is retained as an effect, but these matched
-                # reductions do not bind a returned allocation to an output
-                # argument. Refuse that ABI rather than claiming no fill
-                # exists or treating any (possibly late/nonzero) fill as zero.
-                return "unsupported", [
-                    "a returned local output buffer is unsupported for this "
-                    "matched reduction; pass the output as an argument"
-                ]
             return "unsupported", ["it is a local buffer that is never initialized"]
         _op, match_loops, match_guards = self.sites[index]
         match_ivs = [loop[0] for loop in match_loops]
@@ -4226,6 +4250,17 @@ class _FunctionCoverage:
                 continue
             if other > index:
                 found.append(f"the zero store {at} comes after the reduction")
+                continue
+            if other in self.fills:
+                # A whole-buffer fill outside the reduction initializes all
+                # elements. A fill nested in a loop can reset earlier results;
+                # it must not be confused with per-element initialization.
+                if other_guards:
+                    found.append(f"the zero fill {at} is under a guard")
+                elif other_loops:
+                    found.append(
+                        f"the zero fill {at} is inside a loop, not before the reduction loop nest"
+                    )
                 continue
             if tuple(other_guards) != tuple(match_guards[: len(other_guards)]):
                 found.append(
@@ -4430,7 +4465,7 @@ def require_match_coverage(
     if coverage is None and target is not None and module is not None:
         checked = match_workload(target, module)
         coverage = checked.coverage
-    if coverage is None or not coverage.problems:
+    if coverage is None or not (coverage.problems or coverage.unbound_return_functions):
         return checked
     exempt = _host_executed_functions(target, checked)
     verbatim = frozenset(getattr(trace, "verbatim_functions", ()) or ())
@@ -4442,6 +4477,15 @@ def require_match_coverage(
     # IR (an ``APUv1Program`` phase) implements every store itself; its
     # store facts are retained in the coverage and stated as the record's
     # effects, so its coverage problems are not dropped effects.
+    # Executing host effects does not itself declare a return ABI. The
+    # whole-function frontend additionally binds its returned allocations;
+    # only that contract discharges this obligation.
+    unbound = set(coverage.unbound_return_functions) - verbatim
+    if unbound:
+        raise UnsupportedWorkloadError(
+            "a returned local output buffer is unsupported by the matched "
+            "output ABI; pass the output as an argument"
+        )
     errors = _format_coverage_problems(coverage.problems, exempt | verbatim)
     if errors:
         raise UnsupportedWorkloadError(

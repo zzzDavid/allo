@@ -23,7 +23,17 @@
    [the arithmetic contract](design/gemini-i-fp16.md). Installed board
    confirmation is bit-exact; V1-16 is now a documented target boundary.
 
-## Candidate d9d38b8 — bounded corrections complete; NOT READY
+## Round 213 active — NOT READY
+
+C-36 is reopened: the previous repair was initializer-spelling dependent.
+The structural shared-coverage repair and fill initialization analysis are
+implemented; installed validation is pending. The reduction-policy suite is
+now included in the installed milestone. One complete non-hardware perf/PIM
+collection is planned, with physical tests explicitly excluded and every
+failure/skip retained. No hardware launch, resampling or repooling is allowed.
+Evidence: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r213`.
+
+## Previous candidate d9d38b8 — C-36 closure superseded by round 213
 
 Compiler candidate `d9d38b8fff1accf7881a2907e74a518c08a66814`; test-only
 follow-up `01651b98` corrects the stale reduction-policy oracle. The wheel

@@ -24,13 +24,18 @@ The new wheel's 42-stage milestone passes, with 45 fresh simulator/model
 results and installed returned-local/coverage regressions. Earlier Evidence
 table rows are historical probes, not new hardware runs at this installation.
 
-Ordinary matched reductions require their output buffer as an argument.
-Returning a local array accumulator is unsupported on that route, even when
-the declaration initializes it with a whole-buffer zero fill. The diagnostic
-names the output ABI restriction and asks the caller to pass an output
-argument; nonzero and post-reduction fills are not treated as valid zero
-initializers. This does not restrict the separately documented verbatim C11
-record frontend, which retains and executes returned-local fill effects.
+Ordinary matched routes bind their results to output arguments. A matched
+reduction or elementwise result whose direct/copy destinations are only
+returned local allocations is rejected in shared coverage, before candidate
+enumeration, with `UnsupportedWorkloadError`: pass the output as an argument.
+This follows retained result/copy identities, independent of whether the
+local is initialized by a fill, explicit stores or a scalar accumulator.
+Whole-function records that declare return bindings (including native APU-v1
+reductions) retain their supported return ABI; the check uses that route
+contract, not the target name. For non-returned locals, an unguarded
+whole-buffer zero fill before the reduction is a zero initializer; nonzero,
+late, guarded or loop-nested fills are refused with their actual restriction.
+A valid initializer does not waive a separate copy/layout restriction.
 
 Terms used below:
 

@@ -341,6 +341,7 @@ def apu_v1_gemv(W: float16[APU_M, APU_K], x: float16[APU_K], y: float16[APU_M]):
             y[i] += W[i, k] * x[k]
 
 
+@pytest.mark.apu_v1_device
 def test_gemv_apu_v1(request):
     compiled = _compile_within(300.0, apu_v1_gemv, build_apu_v1_target(), apu_v1_cost)
     assert compiled.realization is not None, compiled.realization_error
