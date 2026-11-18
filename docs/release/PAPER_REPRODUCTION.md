@@ -3,33 +3,36 @@
 
 # Paper reproduction through the shared pipeline
 
-## Current candidate b56c410e: fresh simulation and fixed hardware outcomes
+## Current candidate 603d5c38: fresh simulation and fixed hardware outcomes
 
 Installed wheel SHA256
-`8c05329abe138c3d03ab2247dc53ec2725fd525d33a08ad601c1f7ba172bf4dd`
-passed all 42 required milestone stages in `r213-corrected/stages`. All 45
+`97b90174e89c79edd46cefecb2f2dd9553a5a5a16da4ac1517a41d9177470cc3`
+passed all 42 required milestone stages in `r214-final/stages`. All 45
 required simulator/model rows were freshly executed: Samsung 3, AiM 14,
 UPMEM 16, AttAcc kernel tiling 6 and modeled decode 6. Values are unchanged.
 Samsung was built from the bundled recipe; AiM remains timing-only and
-AttAcc decode remains analytical composition. Full evidence and commands
-are in VALIDATION. The separate broad software collection finished with seven
-open host compile-time failures (C-38); it does not change these device-cycle
-results or the fixed hardware verdicts.
+AttAcc decode remains analytical composition. Commands and evidence are in
+VALIDATION. The complete non-hardware collection passes (1,863 passed, 23 export-list
+skips, zero failures), including all seven unchanged C-38 host compile-time
+guards. Those host measurements remain separate from these device-cycle
+comparisons.
 
-This change checks returned-output binding and fill initialization in shared
-coverage, retains whole-buffer copy effects, and refuses unsupported copy
-lowering before it can drop an assignment or abort the portable C emitter.
-The accepted r211 FP16 model and hardware runtime are unchanged. All seven
-Gemini-I programs / 49 emitted source, project and ABI files match r212 and
-the earlier identity chain to `5fec806`; all 25 Gemini-II payload files also
-match. The eleven-installation equivalence chain is rehashed in
-`r213-corrected/installation_equivalence.json`. The ten hardware rows below
-carry by program identity, without a hardware launch, resampling or repooling.
-The accepted r211 nine-launch FP16 confirmation checks semantics only and is
-not used for these performance comparisons.
+This candidate checks every explicit return binding and unsupported local
+operand in shared coverage, retains direct zero-initialized argument sinks,
+and batches explicit old-generation loop-wrapper collection at the Tenon
+compile boundary. The accepted r211 FP16 model and hardware runtime are
+unchanged. All seven Gemini-I programs / 49 emitted source, project and ABI
+files match `r213-corrected` and the earlier identity chain to `5fec806`;
+all 25 Gemini-II payload files also match. The 12-installation equivalence
+chain is rehashed in `r214-final/installation_equivalence.json`. The ten
+hardware rows below carry by program identity, without a hardware launch,
+resampling or repooling. The accepted r211 nine-launch FP16 confirmation
+checks semantics only and is not used for these performance comparisons.
 
-`inventory-update-audit.json` verifies that only candidate/evidence links
-changed in the 55 required rows: all values, statuses, baselines, scopes and
+`r214-final/inventory-update-audit.json` verifies that only candidate/evidence
+links changed in the 55 required rows. Samsung's printed comparison records
+match the prior candidate; AttAcc's kernel/score/decode comparison records
+match the retained baseline. All values, statuses, baselines, scopes and
 comparison contracts are unchanged. Required outcomes remain **52 REPRODUCED
 and three OPEN**. Optional rows and all failed/partial evidence are preserved.
 

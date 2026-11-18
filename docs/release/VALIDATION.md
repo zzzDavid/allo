@@ -3,6 +3,160 @@
 
 # Validation record
 
+## Round 214 candidate 603d5c38: installed milestone and complete collection
+
+Compiler revision `603d5c388fc6943aeec3c29ffe97aca78ab7d721`; final evidence root
+`/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r214-final`
+(`F` below). `F/build_candidate.sh` builds the sdist from the committed archive,
+builds its wheel, and installs outside the checkout in `F/pkg/venv`.
+Wheel SHA256 `97b90174e89c79edd46cefecb2f2dd9553a5a5a16da4ac1517a41d9177470cc3`;
+sdist SHA256 `476e2bd4ac3239ba328fe20ab4c0e6a9f7fb1fac18be7ff9fe57a4c274866bb5`.
+
+`candidate-equivalence.json` checks all 501 installed package files. Relative
+to `r213-corrected`, only `allo/compiler.py`, `allo/ir/builder.py`,
+`allo/spmw_match.py`, `allo/spmw_match_engine.py` and RECORD differ; 515 other
+wheel members are identical, with no additions/removals. The sdist has the
+same four-module compiler delta and 190 other compiler files identical
+(`sdist-equivalence.json`). The compiler/loop-GC modules are byte-identical to
+the source heap diagnostic (`gc-scope-equivalence.json`).
+
+`generated-program-equivalence.json` verifies all seven Gemini-I programs,
+49 emitted source/project/ABI files and eleven decision/cost fields per program.
+All are byte-identical/equal to `r213-corrected`. All 25 Gemini-II payload files
+are identical. The 12-installation equivalence chain is freshly rehashed;
+no campaign is rerun or repooled. `preservation-audit.json` verifies all 73
+frozen-paper hashes, all six inherited untracked verifier scripts, and unchanged
+files containing the seven 120-second guards. The working test formatting
+change has identical AST (`test-format-equivalence.json`).
+
+All **42 required installed milestone stages PASS**, exit 0
+(`milestone-audit.json`, `stages/SUMMARY.txt`). The shared-contract stage has
+237 passes and one AttAcc `paper_full` skip under that stage's default selection;
+the complete collection below includes that case. Both new Samsung 48x40
+zero-initialization tests pass from the wheel with nonzero incoming outputs.
+The functional-reference stage includes the reduction-policy tests. Native
+AiM/UPMEM paths and the bundled Samsung build are configured as in
+`F/run_validation.sh` and `F/run_milestone.sh`.
+
+The reviewer's four probe scripts were executed from the installed wheel
+(`probe_*-installed.log`, `installed-probe-audit.json`). Unrelated filled and
+unwritten returns, returned arguments, and the additional direct scalar-return
+probe all refuse with the shared `UnsupportedWorkloadError` ABI reason.
+Unsupported local operands get the shared coverage diagnosis. Samsung's
+carried, fused-zero, separate-zero and scalar-accumulator forms execute exactly.
+AiM refuses the carried form and reports timing-only simulation for initialized
+forms, leaving arrays untouched; the probe's `exact=False` is therefore not a
+numerical-execution claim or a weakened numerical check.
+
+The 45 required simulator/model rows execute freshly and keep their values.
+`inventory-update-audit.json` compares Samsung records with `r213-corrected`
+and AttAcc kernel/score/decode records with the retained comparison baseline.
+Only candidate/evidence links change in inventory: 52 REPRODUCED and three
+fixed OPEN, with all other fields preserved. The ten hardware rows carry by
+program/payload identity. No physical device launch occurred.
+
+The initial full attempt was intentionally interrupted after **902 passes and
+three harness failures** (exit 2, 1,145.45 seconds). Its evidence-only root
+conftest was inherited by the three fake-board pytest subprocess tests and
+rejected their physical marker during collection, before their injected
+runners executed. Child collection metadata could also overwrite the parent's
+audit file. No hardware launched. `initial-full-disposition.json`, the original
+XML/log and `full-initial-interruption.json` retain the failures and targeted
+SIGINT. This partial attempt is not a completed full collection or C-38 result.
+
+The harness now scopes selection assertions, timing and audit writes to the
+owning pytest PID. Nested tests keep their existing fake runner and assertions.
+All three injection tests pass (9.19 seconds), and only the three parent records
+appear in the repaired audit (`full-corrected/harness-check/tests.xml`,
+`full-corrected/harness-repair.json`). No compiler, test, deadline or wheel
+changed; the completed milestone is not rerun.
+
+The corrected complete collection **PASSES: 1,863 passed, 23 skipped, zero
+failures**, exit 0, in 13,447.10 seconds (3:44:07).
+`R=F/full-corrected`; `R/run_full_software.sh` uses the same installed wheel in
+one pytest process, with 1,886 tests selected and 30 physical tests excluded.
+It includes `paper_full`:
+
+```sh
+python -m pytest -q -ra -p no:cacheprovider --continue-on-collection-errors \
+  --junitxml="$R/full-nonhardware.xml" tests/perf tests/pim \
+  -m 'not apu_v1_device and not apu_g2_device and (paper_full or not paper_full)'
+```
+
+`R/full-origin.log` and `R/nonhardware-collection.json` verify the installed import
+and exact selection. `TENON_TEST_SOURCE_ROOT=F/source-fixtures` supplies a
+separate detached Git fixture for source/license tests, never the compiler
+import path; `LLVM_BUILD_DIR` and native simulators are explicitly configured.
+`R/installed_conftest.py` records passive test GC/CPU/wall time and code-local
+compile timing for the seven original failures without wrapping/replacing the
+compiler or changing guards. The final XML, `full-outcome-audit.json` and `c38-long-process-audit.json`
+record complete outcomes. C-38 meets its prewritten long-process acceptance
+rule. The earlier interrupted run is not relabeled as successful.
+
+### Complete-run accounting and C-38
+
+The full run has no failures or xfails. Its only skips are the following
+23 instances of `tests/pim/test_public_exports.py::test_every_declared_export_exists`,
+each with the exact reason **no __all__**. This tests a declared export list;
+these modules do not declare one. No backend execution is skipped. All 30
+physical tests remain excluded under the requested no-hardware scope.
+
+- `allo.pim.aim_lowering` — no `__all__`.
+- `allo.pim.apu_v1_fp16` — no `__all__`.
+- `allo.pim.costs.aim` — no `__all__`.
+- `allo.pim.costs.samsung` — no `__all__`.
+- `allo.pim.costs.upmem` — no `__all__`.
+- `allo.pim.samsung_simulator` — no `__all__`.
+- `allo.pim.targets` — no `__all__`.
+- `allo.spmw_aim` — no `__all__`.
+- `allo.spmw_apu_v1` — no `__all__`.
+- `allo.spmw_apu_v1_build` — no `__all__`.
+- `allo.spmw_autoschedule` — no `__all__`.
+- `allo.spmw_codegen` — no `__all__`.
+- `allo.spmw_knobs` — no `__all__`.
+- `allo.spmw_legality` — no `__all__`.
+- `allo.spmw_linear_layout` — no `__all__`.
+- `allo.spmw_liveness` — no `__all__`.
+- `allo.spmw_match` — no `__all__`.
+- `allo.spmw_plan` — no `__all__`.
+- `allo.spmw_samsung` — no `__all__`.
+- `allo.spmw_simenv` — no `__all__`.
+- `allo.spmw_target` — no `__all__`.
+- `allo.spmw_tiling` — no `__all__`.
+- `allo.spmw_tripcount` — no `__all__`.
+
+All seven original guard cases pass in the same complete process. Table values
+are compile-body seconds (wall / GC / non-GC), excluding the outer decorator's
+full sweep. The unchanged 120-second assertions measure the complete call,
+including that sweep; a body measurement alone is not the pass criterion.
+
+| Case | Wall | GC | Non-GC |
+| --- | ---: | ---: | ---: |
+| `test_gemv_samsung_hbm_pim[gemv_m4096_k256]` | 55.587 | 3.598 | 51.988 |
+| `test_gemv_samsung_hbm_pim[gemv_m4096_k512]` | 55.704 | 3.837 | 51.867 |
+| `test_gemv_samsung_hbm_pim[gemv_m8192_k256]` | 55.241 | 3.698 | 51.542 |
+| `test_gemv_samsung_hbm_pim` | 27.550 | 0.123 | 27.427 |
+| `test_samsung_gemv_paper_cycles[samsung_hbm_pim-gemv_m4096_k256]` | 54.270 | 3.256 | 51.014 |
+| `test_samsung_gemv_paper_cycles[samsung_hbm_pim-gemv_m4096_k512]` | 54.658 | 3.352 | 51.307 |
+| `test_samsung_gemv_paper_cycles[samsung_hbm_pim-gemv_m8192_k256]` | 54.941 | 3.368 | 51.574 |
+
+The late three default compiles show no non-GC growth against the early
+same-shape/policy cases. The first complete test takes 86.05 seconds, of which
+81.19 is non-GC, versus 109.61 / 83.02 in the prior collection-only probe. Both
+whole tests include two compiles and two simulations. This reconciles that
+probe's larger non-GC total with the roughly 52-second default-only heap
+experiment; it does not reconstruct the unrecorded phases of the original
+137–169-second failures. The controlled two-million-list pair and this full
+run establish the repaired behavior without freezing the caller's heap.
+
+`source-path-review.json` records the inspected call path and source hashes:
+shared normalization/coverage precedes planning, `compile_for_target` repeats
+the check before enumeration, and backend hooks consume retained facts. The
+return obligation is discharged only by whole-function return binding, not
+by a general host-effect exemption. Final payload verification and selection
+identity checks are in `final-identity-audit.json`. All failed/partial evidence
+remains; no hardware launch, resampling, repooling or guard change occurred.
+
 ## Round 214 source repair and preregistered installed validation
 
 Superseded candidate `7c517b2bf22b3e3c62144395f668598696ad8937` contains the initial
@@ -65,17 +219,25 @@ Both command hashes, score hashes and chosen position 77 equal the prior
 seconds; the repair's pair differs by 0.54 seconds in non-GC work, while the
 original 35.21-second wall increase included 34.49 seconds of GC. Automatic
 full collections still occur; only the explicit loop sweeps are batched.
+`r214-final/collection-scope-audit.json` also resolves a scope mismatch in the
+old collection-only probe: its 109.61-second call and 26.59 seconds of GC cover
+two compilations (default and forced vendor), two simulator runs and numerical
+checks. The original failures stop at the first/default compilation guard.
+The whole-test GC total cannot be subtracted from those different failed
+compile measurements to infer a non-GC remainder. Current code-local timing
+separates both compiler calls so the default's non-GC work can be compared
+across the early and late full-process tests.
 These pairs do not reconstruct unrecorded phase times in the original seven
-137–169-second failures. The final collection will record each test's passive
+137–169-second failures. The final collection records each test's passive
 GC/CPU/wall totals and code-local compile-body timing for those seven cases,
-without replacing the compiler function or its 120-second guards. C-38 stays
-open until that one complete installed process passes them.
+without replacing the compiler function or its 120-second guards. That complete installed process passes all seven cases, closing the observed
+C-38 issue subject to independent review.
 
 Black and shell syntax checks pass. Errors-only pylint reports the same eight
 matcher inference/MLIR extension lookup errors; task_lint reports 38 existing
 license-header failures. Complete logs are retained; no lint sweep was done.
-Build, payload/program identity, installed milestone and complete software
-collection are in progress and will be recorded below when complete.
+The final candidate build, identities and installed milestone are complete
+as recorded above, together with its passing complete software collection.
 
 ## Round 213 corrected candidate: installed checks and complete software accounting
 

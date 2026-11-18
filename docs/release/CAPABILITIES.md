@@ -11,7 +11,7 @@ Finding IDs (S-xx, M-xx, U-xx, V1-xx, G2-xx, C-xx, P-xx, F-xx) refer to
 `ISSUES.md`; check it for the current status of each. The implementation map
 (modules, stages, inspection fields) is `SPMW_ARCHITECTURE.md`.
 
-Current compiler candidate `b56c410e` carries the accepted installed r211
+Current compiler candidate `603d5c38` carries the accepted installed r211
 Gemini-I arithmetic evidence: nine launches, four shapes under both policies
 and a special-value outer product, all 6,096 encodings exact. The primitive
 model and runtime are unchanged; V1-16 remains the documented target-arithmetic
@@ -20,12 +20,13 @@ the SDK; the independent review additionally verified every add/subtract
 operand pair. All seven campaign programs / 49 emitted files
 and all 25 Gemini-II payload files remain byte-identical. Fixed r208/r210
 performance outcomes carry by identity, including the three OPEN rows.
-The corrected installed affected suite passes 328 checks, including shared
-semantics and the returned-local/copy boundaries below. Its 42-stage milestone
-passes, including all 45 required simulator/model comparisons. The broader software collection has 1,790 passes, 15 failures and 23
-export-list skips; eight fixture/environment failures are corrected, while
-seven host compile-time guard failures remain open as C-38. Earlier Evidence
-table rows are historical probes, not new hardware runs at this installation.
+The installed 42-stage milestone passes, including all 45 required
+simulator/model comparisons. The complete installed non-hardware collection
+passes with 1,863 tests passed, zero failures and 23 export-list skips on modules
+without `__all__`; 30 physical tests are excluded. All seven original Samsung
+120-second compile guards pass unchanged in that single process (C-38).
+Earlier Evidence table rows are historical probes, not new hardware runs at
+this installation.
 
 Ordinary matched routes bind results through output arguments and accept no
 explicit return value. Every returned local allocation is refused, including
@@ -57,7 +58,7 @@ performs one full sweep on the outer exit, including an error exit. It leaves
 automatic GC, caller-frozen objects and other threads' collection policy
 unchanged. The ordinary customizer still uses full sweeps at each boundary.
 See [the lifetime and validation contract](design/compile-gc-scope.md). C-38
-remains open until the final installed full collection passes the unchanged
+is verified by the complete installed collection and all seven unchanged
 120-second Samsung guards. No end-to-end latency bound follows from a search
 budget or from passing an isolated milestone.
 

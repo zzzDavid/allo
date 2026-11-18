@@ -298,9 +298,7 @@ ABI_REASON = (
     ],
 )
 @pytest.mark.parametrize("target,cost", TARGETS)
-def test_explicit_return_names_the_abi_boundary(
-    workload, target, cost, monkeypatch
-):
+def test_explicit_return_names_the_abi_boundary(workload, target, cost, monkeypatch):
     def no_candidates(*args, **kwargs):
         pytest.fail("output ABI refusal must precede candidate enumeration")
 

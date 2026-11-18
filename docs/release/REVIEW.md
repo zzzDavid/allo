@@ -3,34 +3,78 @@
 
 # Release review: architecture, constants, specialization, gate judgments
 
-## Round 214 source repair — installed confirmation pending
+## Candidate 603d5c38: requested repairs validated; NOT READY
 
-The new return probes invalidate the prior C-36 completeness claim: a returned
-local that no matched result reaches was still dropped. A further installed probe found a direct scalar `return 4.0` also disappeared
-at 7c517b2b. Coverage now records every nonempty `func.return` as one ABI
-obligation, independent of result type or producer. Matched routes refuse
-explicit returns with one reason; callers use output arguments without a
-return statement. Whole-function `verbatim_functions` retain their
-return-binding exemption. This is a structural boundary, not a target-name
-branch. Local allocations used as matched inputs need a matched producer or
-an input-argument binding; an unsupported fill/library producer is diagnosed
-before candidate enumeration.
+This is the actor's source/evidence walkthrough, not independent approval of
+this increment. The installed wheel is
+`97b90174e89c79edd46cefecb2f2dd9553a5a5a16da4ac1517a41d9177470cc3`.
+All 42 milestone stages pass. The complete installed single-process collection
+has 1,863 passes, zero failures and 23 export-list skips; 30 physical tests are
+excluded. The initial 902-pass/three-failure partial attempt is retained: its
+evidence-only conftest incorrectly audited nested fake-board pytest processes.
+Owner-scoped audit hooks repair that harness without changing tests or package.
 
-A zero-initialized argument is itself the reduction sink, just as a carried
-argument is. Retaining that sink in shared coverage enables the existing
-Samsung zero-accumulator lowering without a new recipe. Both separate-loop
-and fused initializations execute bit-exactly on PIMSimulator at 48x40 with
-incoming outputs set to 17. Existing arithmetic and freshness rules remain.
+The inspected path is `allo.compile` → `normalize_source` → shared coverage
+and retained semantic facts → `compile_for_target` → common candidate legality,
+materialization, graph ranking and artifact construction. Coverage is checked
+again before enumeration where a host exemption was initially unknown.
+`source-path-review.json` retains the inspected files and hashes. APU planners
+still consume those facts through their existing common enumerator hooks;
+no new compiler dispatcher, benchmark selector or backend bypass was added.
 
-C-38's tentative repair batches explicit old-generation GC scans at the Tenon
-compile boundary. Per-loop generation-zero collection retains prompt cleanup
-of new wrapper cycles; the outer full sweep also collects promoted cycles,
-including on error. Context-local policy preserves nesting and thread isolation;
-no `gc` function is replaced, disabled or globally reconfigured. A freeze/thaw
-scheme was rejected because permanent generations may contain both CPython
-immortal objects and caller-owned frozen objects. The lifetime reasoning and
-prewritten final-validation rule are in `design/compile-gc-scope.md`. C-38
-remains open until the final installed full collection meets that rule.
+C-36 no longer follows only matched-result reachability. Every nonempty
+`func.return` creates an ABI obligation, including an unrelated filled or
+unwritten local and a direct scalar constant. Ordinary matched routes bind
+output arguments and uniformly refuse explicit returns. Only a whole-function
+route's declared return bindings (`verbatim_functions`) discharge this
+obligation; executing host effects alone does not. Native/record return
+controls pass. An unmatched local fill/library result also cannot silently
+supply a matched operand: coverage rejects it before enumeration, while real
+matched producer/consumer stages retain candidate realization checks.
+
+C-39 records a zero-initialized argument accumulator as its direct sink,
+just as for a carried argument. The existing Samsung lowering supplies its
+zeroed accumulator; there is no new recipe or shape dispatch. Both fused and
+separate forms run bit-exactly at 48x40 with incoming outputs set to 17.
+Installed reviewer probes also pass their intended execution/refusal contracts.
+
+C-38 batches the builder's explicit old-generation scans at the Tenon compile
+boundary. Nursery collection retains prompt cleanup of new wrapper cycles;
+one full outer-exit sweep handles promoted cycles, including on error. A
+ContextVar preserves nesting/thread policy, and caller GC settings and frozen
+objects remain intact. Lifetime tests cover new/promoted MLIR context cycles
+and execution after the scope exits. Freeze/thaw was rejected because Python
+cannot selectively restore a pre-existing permanent generation.
+
+All seven original 120-second guards pass unchanged in the complete process.
+Early default compile bodies take 55.24–55.70 seconds and late equivalents
+54.27–54.94; corresponding non-GC work is 51.54–51.99 and 51.01–51.57 seconds.
+The body excludes the exit sweep; the original guard includes it. The old
+109.61-second collection-context test included two compilations and two
+simulations, so its 26.59-second GC total cannot be subtracted from a different
+failed first compilation. The new whole-test non-GC total is 81.19 seconds
+versus its old 83.02. No non-GC growth is evident in these comparisons; exact
+unrecorded phases of the original failures are not invented. This closes the
+observed C-38 issue, not a universal compilation-latency guarantee.
+
+| Gate | Current candidate assessment and remaining qualification |
+| --- | --- |
+| G1 | The frozen paper remains 73/73. CLAIMS and existing implementation/extension maps retain their domains; the direct-zero sink repairs the advertised Samsung accumulator form. No paper claim was edited. |
+| G2 | Every explicit return has an obligation; unsupported local inputs fail before planning. Zero/nonzero/late fill and native/record return contracts retain their checks. Installed simulator/functional tests pass; Gemini-I vendor arithmetic remains the documented target boundary. |
+| G3 | New decisions derive from return operations, allocation/producer identities and argument sinks. GC generation is a lifecycle policy, not a program selector. No workload name, expected value or archived winner controls production behavior. |
+| G4 | Common candidate effects, legality, realization and graph ranking remain unchanged. The seven G1 programs / 49 emitted files and eleven decision/cost fields per program are identical; all 25 G2 payload files are identical. Existing bounded/heuristic search qualifications remain. |
+| G5 | No cost rule, calibration coefficient or timing boundary changes. Host GC time is separate from device cycles. Full-run cost perturbation, emitted-work and realization-fidelity tests pass. |
+| G6 | New unrelated-return, returned-argument, scalar-return and local-operand probes exercise the shared boundary. Samsung zero-init execution is exact at a new shape with nonzero incoming outputs. Complete installed software tests pass; accepted r211 FP16 board evidence carries by unchanged model/device payload. |
+| G7 | Fresh sdist/wheel installation and all 501 installed files verified; four Python modules plus RECORD differ from r213-corrected. All 42 stages and the complete collection pass. **BLOCKED:** Samsung written redistribution permission is not recorded. Proprietary SDK installation boundaries remain explicit. |
+| G8 | All 45 required simulator/model comparisons execute freshly; AiM is timing-only and AttAcc decode is analytical composition. Fixed G1/G2 hardware evidence carries by program/payload identity. No new hardware execution or remote-card inspection is claimed. |
+| G9 | Ordinary/typed frontends retain the shared stages and backend hooks; the changed coverage is reached before candidate enumeration. Forced/cost-perturbed hardware evidence carries by identity. Independent review of this bounded delta remains required. |
+| G10 | **FAIL:** 52 required rows REPRODUCED, three fixed OPEN (word count 172,091 vs 171,988; linear regression 95,018 vs 94,618.5; Gemini-II GEMM 1734.0 vs 1733.225). No resampling, repooling, tolerance change or relabeling. |
+
+**NOT READY.** C-36/C-38/C-39 are repaired and validated, subject to independent
+review. The three absolute misses, Samsung permission, and the recorded
+Gemini-I FP16 default remain the user decisions in STATUS. Passing the suite
+and milestone does not resolve those release conditions. No PR, tag, package
+publication or containing-repository commit is part of this increment.
 
 ## Candidate b56c410e: structural returned-result coverage; C-38 remains open
 

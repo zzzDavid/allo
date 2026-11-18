@@ -23,29 +23,55 @@
    [the arithmetic contract](design/gemini-i-fp16.md). Installed board
    confirmation is bit-exact; V1-16 is now a documented target boundary.
 
-## Round 214 active — new effects and compilation-time repairs
+## Candidate 603d5c38 — NOT READY; requested repairs validated
 
-An installed neighboring probe invalidated candidate 7c517b2b: a direct scalar
-`return 4.0` was also silently dropped. Its validation was stopped before the
-full collection, with all partial evidence retained. Shared coverage now checks
-every explicit return value as one ABI obligation, independent of producer or
-type, and refuses unmatched return bindings consistently before enumeration. Whole-function return-binding routes remain exempt. Unsupported
-local operand producers are diagnosed at the same boundary. Zero-initialized
-argument accumulators now retain their direct sink, enabling Samsung's fused
-and separate initialization forms; both execute bit-exactly at 48x40 with
-nonzero incoming outputs.
+Final compiler revision `603d5c388fc6943aeec3c29ffe97aca78ab7d721` is installed
+outside the checkout. Wheel SHA256:
+`97b90174e89c79edd46cefecb2f2dd9553a5a5a16da4ac1517a41d9177470cc3`;
+sdist SHA256 `476e2bd4ac3239ba328fe20ab4c0e6a9f7fb1fac18be7ff9fe57a4c274866bb5`.
+Evidence: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r214-final`.
 
-The compile entry scopes young-generation loop-wrapper collection and one
-full outer-exit sweep. Caller GC settings and frozen objects are unchanged;
-normal customizer calls retain full collection. Lifetime checks pass, but C-38
-is still OPEN until the final installed single-process full collection passes
-all seven unchanged 120-second guards. The source contract is in
-[compile-gc-scope.md](design/compile-gc-scope.md).
+C-36 now makes every explicit return value a shared ABI obligation, including
+unrelated filled/unwritten locals and scalar constants. Matched routes use
+output arguments without a return statement; native/record whole-function
+return bindings remain supported. Unsupported local operands fail coverage
+before enumeration. C-39 retains direct zero-initialized argument sinks;
+Samsung's fused and separate forms execute bit-exactly at 48x40 with nonzero
+incoming outputs. Installed reviewer probes confirm both repairs.
 
-Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r214`.
-Next: finish focused source validation, build one candidate sdist/wheel, verify
-G1/G2 program identity, run its 42-stage milestone, then its complete
-non-hardware collection once. No hardware launch, resampling or repooling.
+C-38 is repaired: loop boundaries collect young wrapper cycles, with one
+explicit full sweep at the outer compile exit. Caller GC settings/frozen
+objects remain intact; ordinary customizer behavior is unchanged. All seven
+original 120-second guards pass unchanged in the complete installed process.
+Early default compile bodies take 55.24–55.70 seconds; late equivalents take
+54.27–54.94 seconds. Non-GC work does not grow across these observations.
+The measured bodies exclude the final sweep; the unchanged test guards include
+it. This evidence establishes the tested cases, not a universal latency bound.
+
+All **42 installed milestone stages PASS**. The complete non-hardware collection
+in `full-corrected/` finishes with **1,863 passed, 23 skipped, zero failures**,
+exit 0, in 13,447.10 seconds. All skips are export-list checks on modules with
+no `__all__`; none skips backend execution. Thirty physical tests are excluded
+as requested. The initial partial attempt (902 passed, three audit-harness
+failures) is preserved: nested fake-board pytest processes inherited the parent
+selection guard. The corrected audit belongs only to its owning process; the
+same tests and wheel then pass the complete collection. All prior failures,
+including the superseded scalar-return candidate, remain retained.
+
+All 501 installed files match. The wheel changes only four Python modules and
+RECORD relative to r213-corrected. Seven G1 programs / 49 generated files and
+all 25 G2 payload files remain identical; the 12-installation chain is rehashed.
+The 45 fresh simulator/model comparisons are unchanged. Ten hardware rows carry
+by identity, without hardware launches, resampling or repooling. Required G10
+outcomes stay **52 REPRODUCED, three OPEN**. Paper hashes remain 73/73.
+
+The source walkthrough and G1–G10 assessment are in REVIEW; complete commands,
+failures and skip accounting are in VALIDATION. C-36/C-38/C-39 await independent
+review of this increment. **NOT READY** remains the release verdict: the three
+fixed G10 misses and absent Samsung written redistribution permission are not
+resolved by these repairs. The Gemini-I FP16 default remains the recorded user
+decision above. Next: independent review and those user decisions; no further
+hardware sampling or unchanged milestone/statistical rerun is proposed.
 
 ## Round 213 candidate b56c410e — NOT READY; host-latency finding open
 

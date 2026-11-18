@@ -45,4 +45,15 @@ installed wheel, after the installed milestone. The seven existing Samsung
 or relaxed deadline is allowed. A paired heap diagnostic separately records
 wall/CPU/GC time and command/selection identity. It distinguishes GC from
 non-GC work, but cannot reconstruct unrecorded phase times from the original
-failed run. C-38 stays open until the final full collection meets this rule.
+failed run. The final collection must meet this rule before C-38 closes.
+
+Candidate 603d5c38 meets that rule: the installed single-process collection has
+1,863 passes, zero failures and 23 export-list skips, with all seven unchanged
+guards passing. Early default compile bodies are 55.24–55.70 seconds; late
+same-shape/policy bodies are 54.27–54.94 seconds. Their non-GC times remain
+51.54–51.99 and 51.01–51.57 seconds respectively. The body timing excludes the
+outer sweep; the original test guard includes it. The old collection-context
+probe measured two compiles and two simulations, not one guarded compile.
+See VALIDATION and `r214-final/c38-long-process-audit.json` for exact scopes,
+raw timings, retained failures and the corrected evidence-harness ownership.
+This closes the observed issue, without claiming a universal latency bound.
