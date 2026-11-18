@@ -3948,8 +3948,38 @@ class _FunctionCoverage:
                 continue
             category[index] = STORE_UNMATCHED
 
-        if self._has_unbound_return(result_sites):
+        if self.return_refs - self.arg_refs:
             coverage.unbound_return_functions.append(self.func_name)
+        if self.return_refs & self.arg_refs:
+            coverage.returned_argument_functions.append(self.func_name)
+
+        # An unmatched fill/library operation cannot supply a matched device
+        # operand. Keep real matched producer/consumer intermediates legal;
+        # the candidate stage still checks their realization and lifetimes.
+        local_refs = {
+            self._ref(value)
+            for op, _loops, _guards in self.sites
+            if op.operation.name in _LOCAL_ALLOC_OPS
+            for value in op.results
+        }
+        for index, matches in self.site_matches.items():
+            for match in matches:
+                for operand in match.operands:
+                    if (
+                        not operand.is_loop_carried
+                        and operand.value_ref in local_refs
+                        and operand.value_ref not in result_sites
+                    ):
+                        problems.setdefault(
+                            (self.work_root, index, "unproduced_local", operand.role),
+                            [
+                                f"function '{self.func_name}': matched operand "
+                                f"'{operand.memref_name}' reads a local buffer not "
+                                "produced by a matched operation; pass it as an "
+                                "input argument or use a supported matched producer",
+                                [],
+                            ],
+                        )[1].append(self.func_name)
 
         self._settle_locals(category, detail)
         self._check_result_aliases(copy_producers, problems)
@@ -3958,9 +3988,9 @@ class _FunctionCoverage:
             for index, match in entries:
                 init, found = self._accumulator_init(dest, index)
                 match.extra["accumulator_init"] = init
-                if init == "carried":
-                    # ``y[i] += ...``: the matched store itself writes the
-                    # output buffer, so it is the result's sink.
+                if init in ("zero", "carried") and dest in self.arg_refs:
+                    # The matched store writes the argument directly, whether
+                    # its incoming contents are used or zero-initialized.
                     sink = (self._dest_name(index), self._index_text(index))
                     sinks = match.extra.setdefault("output_sinks", [])
                     if sink not in sinks:
@@ -4073,38 +4103,6 @@ class _FunctionCoverage:
                     (self.work_root, index, "unmatched"),
                     [self._unmatched_message(index, detail.get(index)), []],
                 )[1].append(self.func_name)
-
-    def _has_unbound_return(self, result_sites) -> bool:
-        """Follow result/copy identities, independently of initialization.
-
-        This records an ABI obligation, not a target-specific prohibition:
-        require_match_coverage exempts routes that bind/execute the retained
-        whole function, including its returned allocations.
-        """
-        copies = {}
-        for index in self.stores:
-            source = self._copy_source(index)
-            if source is not None:
-                copies.setdefault(self._ref(source.operands[0]), set()).add(
-                    self._dest(index)
-                )
-        for op, _loops, _guards in self.sites:
-            if op.operation.name == "memref.copy":
-                copies.setdefault(self._ref(op.operands[0]), set()).add(
-                    self._ref(op.operands[1])
-                )
-        local_returns = self.return_refs - self.arg_refs
-        for result in result_sites:
-            reached, pending = set(), [result]
-            while pending:
-                ref = pending.pop()
-                if ref in reached:
-                    continue
-                reached.add(ref)
-                pending.extend(copies.get(ref, ()))
-            if reached & local_returns and not reached & self.arg_refs:
-                return True
-        return False
 
     def _check_result_aliases(self, copy_producers, problems) -> None:
         """Reject a match whose operand reads the buffer its own result is
@@ -4542,7 +4540,11 @@ def require_match_coverage(
     if coverage is None and target is not None and module is not None:
         checked = match_workload(target, module)
         coverage = checked.coverage
-    if coverage is None or not (coverage.problems or coverage.unbound_return_functions):
+    if coverage is None or not (
+        coverage.problems
+        or coverage.unbound_return_functions
+        or coverage.returned_argument_functions
+    ):
         return checked
     exempt = _host_executed_functions(target, checked)
     verbatim = frozenset(getattr(trace, "verbatim_functions", ()) or ())
@@ -4562,6 +4564,11 @@ def require_match_coverage(
         raise UnsupportedWorkloadError(
             "a returned local output buffer is unsupported by the matched "
             "output ABI; pass the output as an argument"
+        )
+    if set(coverage.returned_argument_functions) - verbatim:
+        raise UnsupportedWorkloadError(
+            "returning an argument buffer is unsupported by the matched output "
+            "ABI; use output arguments without a return statement"
         )
     errors = _format_coverage_problems(coverage.problems, exempt | verbatim)
     if errors:

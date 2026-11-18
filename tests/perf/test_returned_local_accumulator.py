@@ -176,6 +176,77 @@ def copy_values(src: int32[8], dst: int32[8]):
     dst = src
 
 
+def unrelated_filled_return(
+    W: float16[8, 8], x: float16[8], y: float16[8]
+) -> float16[8]:
+    z: float16[8] = 3.0
+    for i in range(8):
+        acc: float16 = 0.0
+        for k in allo.reduction(8):
+            acc += W[i, k] * x[k]
+        y[i] = acc
+    return z
+
+
+def unrelated_unwritten_return(
+    W: float16[8, 8], x: float16[8], y: float16[8]
+) -> float16[8]:
+    z: float16[8]
+    for i in range(8):
+        acc: float16 = 0.0
+        for k in allo.reduction(8):
+            acc += W[i, k] * x[k]
+        y[i] = acc
+    return z
+
+
+def returned_output(W: float16[8, 8], x: float16[8], y: float16[8]) -> float16[8]:
+    for i in range(8):
+        acc: float16 = 0.0
+        for k in allo.reduction(8):
+            acc += W[i, k] * x[k]
+        y[i] = acc
+    return y
+
+
+def returned_input(W: float16[8, 8], x: float16[8], y: float16[8]) -> float16[8]:
+    for i in range(8):
+        acc: float16 = 0.0
+        for k in allo.reduction(8):
+            acc += W[i, k] * x[k]
+        y[i] = acc
+    return x
+
+
+def local_fill_operand(W: float16[8, 8], y: float16[8]):
+    t: float16[8] = 2.0
+    for i in range(8):
+        for k in allo.reduction(8):
+            y[i] += W[i, k] * t[k]
+
+
+def local_array_operand(a: float16[8], b: float16[8], W: float16[8, 8], y: float16[8]):
+    t: float16[8] = a + b
+    for i in range(8):
+        for k in allo.reduction(8):
+            y[i] += W[i, k] * t[k]
+
+
+def local_library_operand(
+    a: float16[8], b: float16[8], W: float16[8, 8], y: float16[8]
+):
+    t = allo.add(a, b)
+    for i in range(8):
+        for k in allo.reduction(8):
+            y[i] += W[i, k] * t[k]
+
+
+def local_elementwise_operand(a: float16[64], y: float16[64]):
+    t: float16[64] = 2.0
+    for i in range(64):
+        y[i] = a[i] + t[i]
+
+
 TARGETS = [
     (build_samsung_target, samsung_cost),
     (build_aim_target, aim_cost),
@@ -202,6 +273,8 @@ ABI_REASON = (
         separate_integer_return,
         copied_return,
         integer_elementwise_return,
+        unrelated_filled_return,
+        unrelated_unwritten_return,
     ],
 )
 @pytest.mark.parametrize("target,cost", TARGETS)
@@ -219,6 +292,51 @@ def test_returned_local_output_names_the_abi_boundary(
     assert "pass the output as an argument" in message
     assert "never initialized" not in message
     assert "initialize the accumulator with literal 0" not in message
+
+
+@pytest.mark.parametrize("workload", [returned_output, returned_input])
+@pytest.mark.parametrize("target,cost", TARGETS)
+def test_returned_argument_has_one_shared_abi_policy(
+    workload, target, cost, monkeypatch
+):
+    monkeypatch.setattr(
+        "allo.spmw_codegen.autoschedule",
+        lambda *args, **kwargs: pytest.fail(
+            "return ABI must be checked before enumeration"
+        ),
+    )
+    with pytest.raises(UnsupportedWorkloadError) as caught:
+        allo.compile(workload, target(), cost, backend="virtual")
+    assert str(caught.value) == (
+        "returning an argument buffer is unsupported by the matched output "
+        "ABI; use output arguments without a return statement"
+    )
+
+
+@pytest.mark.parametrize(
+    "workload",
+    [
+        local_fill_operand,
+        local_array_operand,
+        local_library_operand,
+        local_elementwise_operand,
+    ],
+)
+@pytest.mark.parametrize("target,cost", TARGETS)
+def test_unproduced_local_operand_is_refused_before_enumeration(
+    workload, target, cost, monkeypatch
+):
+    monkeypatch.setattr(
+        "allo.spmw_codegen.autoschedule",
+        lambda *args, **kwargs: pytest.fail(
+            "local operand must be checked before enumeration"
+        ),
+    )
+    with pytest.raises(
+        UnsupportedWorkloadError,
+        match="local buffer not produced by a matched operation",
+    ):
+        allo.compile(workload, target(), cost, backend="virtual")
 
 
 def test_late_direct_fill_is_not_a_zero_initializer():
