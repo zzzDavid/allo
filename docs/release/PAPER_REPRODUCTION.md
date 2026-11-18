@@ -3,27 +3,35 @@
 
 # Paper reproduction through the shared pipeline
 
-## Current candidate d9d38b8: fresh simulation and fixed hardware outcomes
+## Current candidate b56c410e: fresh simulation and fixed hardware outcomes
 
 Installed wheel SHA256
-`f78ad5b3fccdbef1160de6837c19d4bafa0e8e02c86bac454374e5262f237776`
-passed all 42 required milestone stages in `r212/stages`. All 45 required
-simulator/model rows were freshly executed: Samsung 3, AiM 14, UPMEM 16,
-AttAcc kernel tiling 6 and modeled decode 6. Values are unchanged. Samsung
-was built from the bundled recipe; AiM remains timing-only and AttAcc decode
-remains analytical composition. Full evidence and commands are in VALIDATION.
+`8c05329abe138c3d03ab2247dc53ec2725fd525d33a08ad601c1f7ba172bf4dd`
+passed all 42 required milestone stages in `r213-corrected/stages`. All 45
+required simulator/model rows were freshly executed: Samsung 3, AiM 14,
+UPMEM 16, AttAcc kernel tiling 6 and modeled decode 6. Values are unchanged.
+Samsung was built from the bundled recipe; AiM remains timing-only and
+AttAcc decode remains analytical composition. Full evidence and commands
+are in VALIDATION. The separate broad software collection finished with seven
+open host compile-time failures (C-38); it does not change these device-cycle
+results or the fixed hardware verdicts.
 
-This bounded change removes an incorrect callerless helper and corrects a
-shared-matcher refusal diagnostic; the accepted r211 FP16 model and runtime
-are unchanged, as is generated device work. All seven Gemini-I programs /
-49 emitted source, project and ABI files are byte-identical to candidate 5fec806; all 25
-Gemini-II payload files are byte-identical. The ten-installation equivalence
-chain is rehashed in `r212/installation_equivalence.json`. Thus the ten
-hardware rows below carry by program identity, with no new performance
-launch, resampling or repooling. The accepted r211 nine-launch FP16
-confirmation checks semantics only and is not used for these performance comparisons.
-Required outcomes remain **52 REPRODUCED and three OPEN**; optional rows and
-all failed/partial evidence are preserved.
+This change checks returned-output binding and fill initialization in shared
+coverage, retains whole-buffer copy effects, and refuses unsupported copy
+lowering before it can drop an assignment or abort the portable C emitter.
+The accepted r211 FP16 model and hardware runtime are unchanged. All seven
+Gemini-I programs / 49 emitted source, project and ABI files match r212 and
+the earlier identity chain to `5fec806`; all 25 Gemini-II payload files also
+match. The eleven-installation equivalence chain is rehashed in
+`r213-corrected/installation_equivalence.json`. The ten hardware rows below
+carry by program identity, without a hardware launch, resampling or repooling.
+The accepted r211 nine-launch FP16 confirmation checks semantics only and is
+not used for these performance comparisons.
+
+`inventory-update-audit.json` verifies that only candidate/evidence links
+changed in the 55 required rows: all values, statuses, baselines, scopes and
+comparison contracts are unchanged. Required outcomes remain **52 REPRODUCED
+and three OPEN**. Optional rows and all failed/partial evidence are preserved.
 
 ## Fixed outcomes and environment context (measured at prior identical programs)
 

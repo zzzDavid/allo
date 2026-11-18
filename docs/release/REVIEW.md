@@ -3,7 +3,7 @@
 
 # Release review: architecture, constants, specialization, gate judgments
 
-## Round 213: structural returned-result coverage (corrected candidate pending)
+## Candidate b56c410e: structural returned-result coverage; C-38 remains open
 
 The round-213 review supersedes the round-212 C-36 closure below. That patch
 recognized only the whole-fill returned-accumulator spelling; the shared
@@ -29,23 +29,50 @@ accumulators copied to an array, direct elementwise results, copied returns,
 and integer variants across four matched targets. They fail if candidate
 enumeration is reached before the ABI refusal. The positive output-argument
 GEMV executes bit-exactly on the functional backend. Existing native/record
-return controls pass. The full installed milestone and one complete
-non-hardware perf/PIM pass are in progress; no gate is closed by this source
-walkthrough alone.
+return controls pass. The corrected installed affected suite passes all 328 checks, including
+all shared semantics, match coverage, G6 functional and portable C cases.
+All 42 final-candidate milestone stages pass, including the newly included
+reduction-policy suite and 45 required simulator/model comparisons. The
+initial complete non-hardware collection finished with 1,790 passes,
+15 failures and 23 skips. Eight fixture/environment failures are corrected;
+seven 120-second host compile-time failures remain open as C-38. No gate is
+closed by this source walkthrough alone.
 
 Candidate `87787108` is superseded: a direct output-initialization probe
 found a dropped `memref.copy` and wrong functional output. Coverage now
 retains its whole-buffer read/write and refuses unsupported matched lowering.
 The portable C route rejects it before the emitter's fatal unsupported-op
 path. Explicit element initialization remains supported. This bounded
-effect-coverage dependency requires a fresh package and installed validation.
+effect-coverage dependency is packaged in `b56c410e` and covered by the
+328-pass installed selection and the completed final milestone.
 
-The initial sdist and wheel contain only the changed shared coverage and matcher
-modules relative to r212. All seven G1 generated programs (49 files) and all
+The corrected sdist and wheel change only the shared coverage, matcher and
+portable C modules relative to r212 (plus wheel RECORD). All seven G1 generated programs (49 files) and all
 25 G2 payload files are byte-identical. Fixed campaigns carry by identity;
 no hardware launch, resampling or repooling is part of this increment.
-NOT READY remains for the three absolute performance misses, unrecorded
-Samsung redistribution permission and the recorded target-arithmetic decision.
+The full collection used `87787108`; the later copy-effect delta is verified
+by the corrected installed selection and milestone, not a relabeled broad
+run. A static source-pattern survey finds whole-array assignments/copy-IR
+mentions only in the returned-local regression suite; the scalar-dependent
+fill control is also in the executed shared-semantics suite. This survey
+supports the bounded selection but is not proof about arbitrary generated IR.
+
+C-38 is a real host-latency finding, not a failed numerical oracle: seven
+Samsung compilations took 136.741–168.589 seconds against an unchanged
+120-second guard. Their simulator checks were not reached in that run.
+Separate-process checks at the final candidate pass without changing the
+guard, values or cycles; this does not close the combined-run failure.
+The loop builder's explicit full-GC calls and retained phase profiles led to
+a controlled heap diagnostic. Retaining two million unrelated cyclic lists
+increased compilation from 60.57 to 95.79 seconds; GC increased from 9.09 to
+43.58 seconds. Scores and emitted commands are identical. This establishes
+heap dependence, but neither complete attribution of the seven failures nor
+a latency bound. Source GC behavior remains unchanged. A repair must account
+for MLIR object lifetimes; blindly suppressing collection is not justified.
+
+NOT READY remains for C-38, the three absolute performance misses,
+unrecorded Samsung redistribution permission and the recorded
+target-arithmetic decision.
 
 ## Historical round 212 assessment (C-36 superseded)
 

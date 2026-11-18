@@ -5,9 +5,10 @@
 Each row times the compile against a budget, then runs behind its environment
 gate. Paper cycle numbers live only in ``test_paper_golden.py``.
 
-APU v2 (Gemini-II) has no row: it has no source route, so ``allo.compile`` of
-this GEMV on it raises NotImplementedError (``test_gemv_apu_v2_source_rejected``).
-Its typed and composed program routes are tested separately.
+This FP16 dataflow GEMV is outside Gemini-II's source domain: that route
+supports plain functions with integer contractions. Its refusal is checked by
+``test_gemv_apu_v2_source_rejected``; supported source, typed and composed
+programs are tested separately.
 """
 
 from __future__ import annotations

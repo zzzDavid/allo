@@ -3,6 +3,227 @@
 
 # Validation record
 
+## Round 213 corrected candidate: installed checks and complete software accounting
+
+The corrected source candidate for this increment is
+`b56c410efd90a1969a9d3b7d4d30e664feaad2ba`; its milestone and affected checks
+are complete. The earlier broad collection is accounted for below, with seven
+host-latency failures retained as OPEN C-38. Evidence root:
+`/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r213-corrected` (`F` here).
+`build_candidate.sh` builds the Git archive into an sdist, builds the wheel
+from that sdist and installs it in `F/pkg/venv` outside the checkout.
+Wheel SHA256 `8c05329abe138c3d03ab2247dc53ec2725fd525d33a08ad601c1f7ba172bf4dd`;
+sdist `172bfa6913bb3ee66596b2635c1f0498ccaafc541238a928abd22299399bd0c2`.
+
+`candidate-equivalence.json` verifies all 501 installed package files and 516
+unchanged payload members relative to r212. Only `allo/spmw_match.py`,
+`allo/spmw_match_engine.py`, `allo/backend/c.py` and RECORD differ; no payload
+member is added or removed. `sdist-equivalence.json` independently verifies
+the same three-module delta in the sdist's compiler source. Changed top-level
+definitions are limited to `MatchCoverage`, `_FunctionCoverage`,
+`require_match_coverage` and `MLIRToCModule` (`source-delta-audit.json`).
+`generated-program-equivalence.json` compares seven G1 programs / 49 emitted
+source/project/ABI files and eleven decision/cost fields per program, all
+identical to r212. All 25 G2 payload files also match. The eleven-installation
+chain passes a fresh rehash in `installation_equivalence.json`; no campaign
+samples are pooled or resampled.
+
+`run_affected.sh` executes the corrected candidate from its installed venv,
+with tests/benchmarks copied from the source commit and a separate explicit
+Git source fixture. `affected-origin.log` asserts the installed import path.
+`affected.xml`, `affected.log` and `affected-audit.json` report **328 passed**,
+no failures or skips, in 1,567.76 seconds:
+
+| File | Passed |
+| --- | ---: |
+| `test_returned_local_accumulator.py` | 72 |
+| `test_apu_v1_native_reductions.py` | 4 |
+| `test_apu_v1_reduction_policy.py` | 4 |
+| `test_shared_semantics.py` | 157 |
+| `test_match_coverage.py` | 40 |
+| `test_g6_semantics.py` | 34 |
+| `test_c_backend.py` | 17 |
+
+Two NumPy overflow warnings come from the independent uint16 wraparound
+oracle; the bit/value checks pass without tolerance changes. The three
+reviewer scripts were rerun from the corrected installed package
+(`probe_ret-installed.log`, `probe_tmp-installed.log`, `probe_tmp2-installed.log`).
+Their `FAIL` labels print expected compilation refusals: returned locals now
+have the single ABI reason; nonzero fills name the nonzero constant; valid
+zero fills proceed to the same copy/layout boundary as explicit stores.
+
+All **42 required corrected milestone stages PASS**, exit 0, finishing on
+2026-11-18 at 00:25 local (`milestone.exit`, `validation.exit`,
+`milestone-audit.json`, complete hashed logs under `stages`). This includes
+191 passing shared-contract checks and 20 APU-v1 functional/arithmetic/policy
+checks. The default golden/CENT stages skip their long rows by design; the
+paired `paper_full` stages execute them. One long AttAcc selector test is
+left to the explicit full software collection, not counted as passed here.
+The ten physical rows carry only by identity; no physical device was launched.
+
+`inventory-update-audit.json` verifies 45 fresh simulator/model rows and ten
+hardware rows carried by identity. Only `current_revision` and evidence notes
+changed; numerical values, verdicts, baselines, arithmetic, timing boundaries
+and required/optional scope are unchanged: 52 required REPRODUCED, three OPEN.
+Samsung default cycles remain 4108 / 7057 / 7255 and vendor cycles
+4435 / 8041 / 8247. AttAcc comparison records equal the prior valid results.
+
+The original `r213` milestone also completed all 42 stages, but is superseded
+by the copy-effect repair. Its complete non-hardware collection has finished
+once; it is not relabeled as a corrected-candidate run. `run_known_failures.sh`
+reran eleven failures on the corrected installed package with the explicit
+Git source fixture and LLVM build directory: **11 passed** in 331.20 seconds
+(`known-failures-final.xml`, `.log`, `known-failures-final-audit.json`). Eight
+were fixture/environment failures; three were Samsung compile guards. The
+Samsung test file is byte-identical, including the 120-second guard, candidate
+counts, numerical tolerance and exact vendor cycles. Its replay rows produce
+default cycles 4108 / 7057 / 7255. The other four Samsung failures are covered
+by passing corrected milestone stages. These separate-process passes do not
+close the original host-latency failures or replace their samples.
+
+Black accepts all five changed Python files. The portable C errors-only
+pylint run reports eleven existing MLIR extension-export lookup errors;
+none concerns the new guard. The original matcher lint findings remain
+recorded below. No lint sweep or numerical expectation changes were made.
+
+## Round 213 complete non-hardware collection: every failure and skip
+
+Evidence root `O = ../r213` relative to `F` above. `O/run_full_software.sh`
+ran the installed `87787108` wheel with the `dbc6fc4a` test copy, never the
+checkout compiler. It completed with **1,790 passed, 15 failed, 23 skipped,
+30 deselected**, exit 1, in **36,975.75 seconds (10:16:15)**. The complete
+log, XML and parsed outcomes are `O/full-nonhardware.log`,
+`O/full-nonhardware.xml` and `O/full-suite-outcomes.json`; the final disposition
+inventory is `F/full-suite-disposition.json`. All 30 deselections are physical
+board/card tests, explicitly inventoried in `O/nonhardware-collection.json`.
+All long software `paper_full` rows were included:
+
+```sh
+python -m pytest -q -ra -p no:cacheprovider --continue-on-collection-errors \
+  --junitxml=full-nonhardware.xml tests/perf tests/pim \
+  -m 'not apu_v1_device and not apu_g2_device and (paper_full or not paper_full)'
+```
+
+The command runs from the copied test tree with `PYTHONPATH` set only to that
+tree. Native simulator paths and `TENON_ARTIFACTS` are in the retained script.
+The corrected replay additionally sets `TENON_TEST_SOURCE_ROOT` to the separate
+Git checkout `F/source-fixtures` (never on the compiler import path) and
+`LLVM_BUILD_DIR=/work/shared/common/llvm-project-main/build-rhel8`.
+The copied archive used by the first run lacked the required inventory/Git
+fixtures; its environment also omitted `LLVM_BUILD_DIR`. These are genuine
+retained setup failures, not backend skips.
+
+The later `b56c410e` copy-effect correction was verified by the 328-case
+installed affected selection and all 42 milestone stages. The static
+`F/copy-test-surface.json` survey finds direct whole-array assignments and
+literal copy-IR mentions only in the corrected returned-local test file;
+the one nonliteral array initializer is a scalar-dependent fill exercised by
+the shared-semantics suite. This is bounded test-impact evidence, not a claim
+that the full collection ran at the final candidate.
+
+### Eight fixture/environment failures: corrected installed replay passes
+
+Every row below passes in `F/known-failures-final.xml`; the original failure
+and traceback remain in the full-run XML/JSON.
+
+| Original test node | Original cause | Correction |
+| --- | --- | --- |
+| `tests/perf/test_attacc_compare_frozen.py::test_inventory_carries_the_tables_printed_precision` | Missing inventory CSV in the partial test copy. | The fixture resolves through TENON_TEST_SOURCE_ROOT; corrected installed replay passes. |
+| `tests/perf/test_compile_interface.py::test_dataflow_build_does_not_validate_retained_scopes` | LLVM_BUILD_DIR was absent from the broad-run environment. | Set the existing documented native LLVM build directory; corrected installed replay passes. |
+| `tests/perf/test_distribution_licenses.py::test_every_bundled_text_is_tracked_by_git` | Git tracking check was given a git archive without .git metadata. | Use a separate detached Git source fixture, never on compiler PYTHONPATH; corrected installed replay passes. |
+| `tests/perf/test_prepare_upmem_tenon_campaign.py::test_complete_campaign_tree_is_deterministic` | Campaign exporter compiler_state requires Git revision metadata, absent from the archive fixture. | Use a separate detached Git source fixture, never on compiler PYTHONPATH; corrected installed replay passes. |
+| `tests/perf/test_prepare_upmem_tenon_campaign.py::test_representative_physical_layouts_invert_to_canonical_values` | Campaign exporter compiler_state requires Git revision metadata, absent from the archive fixture. | Use a separate detached Git source fixture, never on compiler PYTHONPATH; corrected installed replay passes. |
+| `tests/perf/test_prepare_upmem_tenon_campaign.py::test_offsets_sizes_repeats_and_hash_bindings` | Campaign exporter compiler_state requires Git revision metadata, absent from the archive fixture. | Use a separate detached Git source fixture, never on compiler PYTHONPATH; corrected installed replay passes. |
+| `tests/perf/test_prepare_upmem_tenon_campaign.py::test_calibrated_search_evidence_is_bound_to_every_modeled_plan` | Campaign exporter compiler_state requires Git revision metadata, absent from the archive fixture. | Use a separate detached Git source fixture, never on compiler PYTHONPATH; corrected installed replay passes. |
+| `tests/perf/test_prepare_upmem_tenon_campaign.py::test_mmtv_resident_vector_plan_supersedes_content_aware_row_layout` | Campaign exporter compiler_state requires Git revision metadata, absent from the archive fixture. | Use a separate detached Git source fixture, never on compiler PYTHONPATH; corrected installed replay passes. |
+
+### Seven host compile-time failures: retained OPEN as C-38
+
+Each failure is the original 120-second assertion, before that test's
+simulator/numerical checks. These are host compilation times, not device
+cycles or a numerical mismatch. The full collection remains FAIL. No guard,
+reduction policy, candidate count, numeric tolerance or expected cycle value
+was changed. Passing separate-process evidence is shown to distinguish
+execution correctness from the unresolved long-process latency.
+
+| Original test node | Compile seconds | Separate corrected-candidate evidence |
+| --- | ---: | --- |
+| `tests/pim/samsung_hbm_pim/gemv/test_gemv_samsung_hbm_pim.py::test_gemv_samsung_hbm_pim[gemv_m4096_k256]` | 136.908429 | `known-failures-final.xml` (PASS; original failure stays open) |
+| `tests/pim/samsung_hbm_pim/gemv/test_gemv_samsung_hbm_pim.py::test_gemv_samsung_hbm_pim[gemv_m4096_k512]` | 138.395386 | `known-failures-final.xml` (PASS; original failure stays open) |
+| `tests/pim/samsung_hbm_pim/gemv/test_gemv_samsung_hbm_pim.py::test_gemv_samsung_hbm_pim[gemv_m8192_k256]` | 137.477654 | `known-failures-final.xml` (PASS; original failure stays open) |
+| `tests/pim/test_gemv_all_targets.py::test_gemv_samsung_hbm_pim` | 136.741149 | `stages/samsung_conductor_and_gemv_all_targets.log` (PASS; original failure stays open) |
+| `tests/pim/test_paper_golden.py::test_samsung_gemv_paper_cycles[samsung_hbm_pim-gemv_m4096_k256]` | 167.595555 | `stages/golden_rows.log` (PASS; original failure stays open) |
+| `tests/pim/test_paper_golden.py::test_samsung_gemv_paper_cycles[samsung_hbm_pim-gemv_m4096_k512]` | 168.589201 | `stages/golden_rows.log` (PASS; original failure stays open) |
+| `tests/pim/test_paper_golden.py::test_samsung_gemv_paper_cycles[samsung_hbm_pim-gemv_m8192_k256]` | 168.497472 | `stages/golden_rows.log` (PASS; original failure stays open) |
+
+The `F/collection-context-probe` diagnostic imported both complete test trees
+but selected only the unchanged Samsung 4096x256 test: one pass, 1,867
+deselected. Collection alone did not reproduce the failure. That test call
+(including both default and vendor compilations) took 109.61 seconds; passive
+callbacks recorded 26.59 seconds of GC. The unchanged loop builder has explicit
+full-GC calls at `allo/ir/builder.py:829` and `:4329`. Two read-only five-second
+CPU profiles of the existing full run are retained in `F/active-cpu-profile`
+and `F/active-frontend-profile`: the latter frontend phase is dominated by
+collector/object-traversal samples. Neither phase sample gives a quantitative
+attribution of the original seven failed compilations.
+
+The prewritten `F/heap-context-probe/PROTOCOL.md` and `run.py` test a controlled
+host-heap perturbation only after the completed tracebacks confirmed the
+seven compile guards. Two fresh workers use the installed final wheel,
+identical source/policy/hash seed and unchanged GC settings; one retains two
+million unrelated self-referential lists. Wall/CPU/GC time, selected scores
+and emitted command text/hashes are retained. This diagnostic does not replace
+failed tests or create simulator/hardware performance evidence. Both workers
+completed successfully (`comparison.json`, `run.exit`):
+
+| Host context | Compile wall seconds | Compile CPU seconds | GC seconds |
+| --- | ---: | ---: | ---: |
+| Baseline | 60.573396 | 60.567121 | 9.094796 |
+| Two million live cyclic lists | 95.787862 | 95.778431 | 43.582792 |
+
+The 35.214467-second wall increase includes 34.487995 additional GC seconds.
+Bucket count, selected position, all candidate scores, command count, command
+SHA256 and GC thresholds are identical. Command SHA256 is
+`59080e14159e9f46fa37e72e9bbf6d9919b378feb63c43253acae08e6285a57e`.
+This controlled pair establishes a host-heap dependence. It neither provides
+a latency bound nor quantitatively attributes all seven original failures.
+C-38 remains open; a source repair needs an MLIR object-lifetime analysis,
+not a blind removal of collection or a relaxed test deadline.
+
+### All 23 skips: no explicitly declared export list
+
+Every skip is `test_public_exports.py::test_every_declared_export_exists`
+for the module below, with reason **`no __all__`**. The module import succeeds;
+this test checks only names explicitly declared in an export list. These are
+justified not-applicable interface checks, not backend execution passes or
+unavailable simulators. No other test was skipped in the full collection.
+
+| Module |
+| --- |
+| `allo.pim.aim_lowering` |
+| `allo.pim.apu_v1_fp16` |
+| `allo.pim.costs.aim` |
+| `allo.pim.costs.samsung` |
+| `allo.pim.costs.upmem` |
+| `allo.pim.samsung_simulator` |
+| `allo.pim.targets` |
+| `allo.spmw_aim` |
+| `allo.spmw_apu_v1` |
+| `allo.spmw_apu_v1_build` |
+| `allo.spmw_autoschedule` |
+| `allo.spmw_codegen` |
+| `allo.spmw_knobs` |
+| `allo.spmw_legality` |
+| `allo.spmw_linear_layout` |
+| `allo.spmw_liveness` |
+| `allo.spmw_match` |
+| `allo.spmw_plan` |
+| `allo.spmw_samsung` |
+| `allo.spmw_simenv` |
+| `allo.spmw_target` |
+| `allo.spmw_tiling` |
+| `allo.spmw_tripcount` |
+
 ## Round 213: shared return binding and fill initialization
 
 The first candidate below is superseded by a concrete copy-effect repair.
@@ -12,9 +233,9 @@ initialization: `memref.copy` was dropped and the prior output was retained.
 The repair retains copy effects and refuses unsupported lowering before
 enumeration/emission. `copy-coverage-focused.log` has 77 passes and 156
 deselected, including explicit-element initialization with nonzero incoming
-outputs and supported native/record return controls. A fresh corrected
-candidate is required; the first candidate's ongoing milestone and complete
-software pass are retained as diagnostic evidence, not final-candidate proof.
+outputs and supported native/record return controls. The corrected candidate above is built and installed; the first candidate's
+completed milestone and complete software pass are retained as
+diagnostic evidence, not relabeled final-candidate proof.
 
 
 Compiler candidate `877871083c64d5b3a56e42bd2e61cdb5a726db69`; evidence root
@@ -82,7 +303,7 @@ cd "$TEST_TREE"
   -m 'not apu_v1_device and not apu_g2_device and (paper_full or not paper_full)'
 ```
 
-The milestone and broad pass run concurrently with separate scratch roots
+The initial milestone and broad collection ran concurrently with separate scratch roots
 (`E/tmp` and `E/fulltmp`). The original serial orchestration parent was
 terminated before it could launch the broad pass twice; no test process was
 signaled and the active milestone child continued. Its intentional shell
@@ -100,20 +321,21 @@ dataflow simulator requires `LLVM_BUILD_DIR`; its original failure and
 traceback are in `dataflow-failure-diagnostic.log`, and it passes with the same
 `/work/shared/common/llvm-project-main/build-rhel8` used to build the wheel.
 These corrections change no compiler code or expected numerical result.
-`followup-tree/` holds corrected tests separately; the running broad-pass tree
+`followup-tree/` holds corrected tests separately; the original broad-run tree
 is preserved at its original hashes. Five additional UPMEM campaign-exporter failures have the same missing-Git
 cause: the exporter records the source revision and tracked source state.
 All five pass against the detached source fixture
 (`campaign-exporter-corrected.log`/`.xml`). The Samsung recipe tracking
 assertion also passes with actual Git metadata (`source-tracking-check.log`).
 No compiler change or expectation change is needed for these environment
-corrections. Final broad-pass failure/skip accounting is still pending.
+corrections. Final failure/skip accounting is complete in the section above.
 
 The `paper_full` tautology explicitly includes the long software cases while
 excluding only physical-device tests. `run_installed_milestone.sh` now includes
-`test_apu_v1_reduction_policy.py` in `apu_v1_functional_reference`. The one
-42-stage milestone and full software pass are running; their final results
-and every failure/skip will be recorded here before this increment closes.
+`test_apu_v1_reduction_policy.py` in `apu_v1_functional_reference`. The initial
+milestone and the one full software collection are complete; the corrected
+copy-effect candidate also completed its milestone. Results and every
+failure/skip are recorded above, with original failures preserved.
 
 ## Round 212: bounded matcher and realization corrections
 

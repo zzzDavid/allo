@@ -11,7 +11,7 @@ Finding IDs (S-xx, M-xx, U-xx, V1-xx, G2-xx, C-xx, P-xx, F-xx) refer to
 `ISSUES.md`; check it for the current status of each. The implementation map
 (modules, stages, inspection fields) is `SPMW_ARCHITECTURE.md`.
 
-Current compiler candidate `d9d38b8` carries the accepted installed r211
+Current compiler candidate `b56c410e` carries the accepted installed r211
 Gemini-I arithmetic evidence: nine launches, four shapes under both policies
 and a special-value outer product, all 6,096 encodings exact. The primitive
 model and runtime are unchanged; V1-16 remains the documented target-arithmetic
@@ -20,8 +20,11 @@ the SDK; the independent review additionally verified every add/subtract
 operand pair. All seven campaign programs / 49 emitted files
 and all 25 Gemini-II payload files remain byte-identical. Fixed r208/r210
 performance outcomes carry by identity, including the three OPEN rows.
-The new wheel's 42-stage milestone passes, with 45 fresh simulator/model
-results and installed returned-local/coverage regressions. Earlier Evidence
+The corrected installed affected suite passes 328 checks, including shared
+semantics and the returned-local/copy boundaries below. Its 42-stage milestone
+passes, including all 45 required simulator/model comparisons. The broader software collection has 1,790 passes, 15 failures and 23
+export-list skips; eight fixture/environment failures are corrected, while
+seven host compile-time guard failures remain open as C-38. Earlier Evidence
 table rows are historical probes, not new hardware runs at this installation.
 
 Ordinary matched routes bind their results to output arguments. A matched
@@ -41,6 +44,15 @@ followed by `memref.copy`. Ordinary matched routes retain and refuse this
 unsupported copy; use explicit element stores (`y[i] = 0.0`) instead. The
 portable C record route also rejects a remaining `memref.copy` before code
 emission. Direct local `linalg.fill` initialization is a distinct operation.
+
+Host compilation time is separate from estimated or measured device cycles.
+Search budgets do not bound the frontend's total wall time. The frontend
+currently invokes full Python garbage collection while constructing loops;
+latency can depend on other live objects in the process. Seven Samsung
+compile guards exceeded 120 seconds in the combined software collection
+(C-38). The guards remain unchanged and the failures remain open; no fixed
+end-to-end host compilation bound is established by the isolated milestone.
+This does not change source semantics or the three fixed hardware outcomes.
 
 Terms used below:
 

@@ -23,19 +23,57 @@
    [the arithmetic contract](design/gemini-i-fp16.md). Installed board
    confirmation is bit-exact; V1-16 is now a documented target boundary.
 
-## Round 213 active — NOT READY
+## Round 213 candidate b56c410e — NOT READY; host-latency finding open
 
-C-36's structural shared-coverage and fill analysis repair is implemented.
-Validation of initial candidate `87787108` exposed a separate real defect:
-whole-array output assignment lowered to a dropped `memref.copy`, preserving
-the old output. C-37 now retains the effect and refuses unsupported copy
-lowering before enumeration or portable C emission. The focused source
-selection passes 77 tests. A corrected candidate is being built; the original
-milestone and complete non-hardware pass remain retained diagnostics.
-Eight fixture/environment failures pass corrected installed reruns; three
-Samsung GEMV failures await their original tracebacks. No hardware launch,
-resampling or repooling is allowed.
-Evidence: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r213`.
+Compiler candidate `b56c410efd90a1969a9d3b7d4d30e664feaad2ba` is built as
+an sdist and wheel and installed outside the checkout. Wheel SHA256:
+`8c05329abe138c3d03ab2247dc53ec2725fd525d33a08ad601c1f7ba172bf4dd`;
+sdist `172bfa6913bb3ee66596b2635c1f0498ccaafc541238a928abd22299399bd0c2`.
+Evidence: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r213-corrected`.
+
+C-36 now follows matched result/copy identities in shared coverage and checks
+fill value, position and guards. All returned-output spellings in the review
+receive the same ABI refusal before enumeration; supported native/record
+returns remain valid. C-37 was found during validation: whole-array output
+assignment lowered to a dropped `memref.copy`. The corrected candidate retains
+that effect and refuses unsupported lowering before enumeration or portable
+C emission. Explicit element initialization executes bit-exactly.
+
+The corrected installed affected suite has **328 passes**, no failures or
+skips. All 501 installed package files match the wheel. Exact payload delta
+from r212: `spmw_match.py`, `spmw_match_engine.py`, `backend/c.py` and RECORD.
+Seven G1 programs / 49 emitted files and all 25 G2 payload files are identical;
+the installation-equivalence chain is rehashed. Fixed hardware evidence carries
+by identity, without any hardware launch, resampling or repooling.
+
+The corrected candidate's **42-stage milestone passes in full**, including
+45 fresh required simulator/model comparisons. All inventory values and
+verdicts remain 52 REPRODUCED and three OPEN.
+
+The one complete non-hardware collection finished at the initial `87787108`
+wheel: **1,790 passed, 15 failed, 23 skipped; 30 physical tests deselected**,
+exit 1, in 36,975.75 seconds. That run is not relabeled as `b56c410e`.
+Eight failures were fixture/environment setup errors and pass the corrected
+installed replay. Seven Samsung tests failed the unchanged 120-second host
+compile guard (136.741–168.589 seconds) before their numerical/cycle checks.
+Those checks pass in separate final-candidate processes, but the original
+latency failures remain **OPEN as C-38**. All 23 skips are export-list checks
+on modules without `__all__`; none is a skipped backend execution.
+
+`VALIDATION.md` names every failure and skip. The final candidate has the
+328-pass affected selection, the 42-stage milestone and exact hardware
+program/payload identity evidence. `copy-test-surface.json` records the
+bounded source-pattern survey behind the copy-delta test selection. The
+controlled heap diagnostic kept the emitted program identical: retaining two
+million unrelated cyclic lists added 35.21 seconds of compilation, including
+34.49 seconds of GC. This establishes heap dependence, not complete attribution
+of the seven failures or a latency bound. GC settings, compile-time guards,
+numerical tolerances and device programs are unchanged.
+
+Next: independent review of C-36/C-37 and the new C-38 host-latency finding,
+plus the standing user decisions above. The full software run is FAIL;
+passing isolated checks do not erase it. No hardware launch, campaign
+resampling or repooling occurred.
 
 ## Previous candidate d9d38b8 — C-36 closure superseded by round 213
 
