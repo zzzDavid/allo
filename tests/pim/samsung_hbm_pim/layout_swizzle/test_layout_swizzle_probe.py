@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import os
 import shutil
 import subprocess
 import sys
@@ -45,7 +46,9 @@ EXPECTED_CYCLES = {
     "xor": _GOLDEN.golden_row("xor_probe_synthesized").expected,
 }
 
-_ALLO_ROOT = Path(__file__).resolve().parents[4]
+_ALLO_ROOT = Path(
+    os.environ.get("TENON_TEST_SOURCE_ROOT", Path(__file__).resolve().parents[4])
+)
 _PROBE_SCRIPT = _ALLO_ROOT / "scripts" / "run_pimsim_layout_trace.py"
 _CYCLES = re.compile(r"^PIM_LAYOUT_CYCLES\s+cycles=(\d+)", re.MULTILINE)
 

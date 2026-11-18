@@ -59,7 +59,9 @@ from allo.pim.targets import (
     build_upmem_target,
 )
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(
+    os.environ.get("TENON_TEST_SOURCE_ROOT", Path(__file__).resolve().parents[2])
+)
 SAMSUNG_GEMV_FILE = (
     Path(__file__).resolve().parent / "samsung_hbm_pim" / "gemv" / "workload.py"
 )
@@ -1753,9 +1755,9 @@ def test_sdist_tree_compiles_samsung_gemv_outside_the_checkout(tmp_path, no_arch
     and compile the Samsung GEMV on the virtual backend in a fresh
     interpreter whose ``allo`` and every imported non-stdlib module come from
     the unpacked tree."""
-    live_mlir = REPO / "allo" / "_mlir"
+    live_mlir = Path(allo.__file__).resolve().parent / "_mlir"
     if not live_mlir.is_dir():
-        pytest.skip("no built allo/_mlir bindings in this checkout")
+        pytest.skip("no built allo/_mlir bindings in the imported package")
     if importlib.util.find_spec("setuptools") is None:
         pytest.skip("setuptools is not installed")
     dist = tmp_path / "dist"
