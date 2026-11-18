@@ -6,10 +6,11 @@
 ## Round 214 source repair — installed confirmation pending
 
 The new return probes invalidate the prior C-36 completeness claim: a returned
-local that no matched result reaches was still dropped. Coverage now records
-all local buffer returns, regardless of their producer. Matched routes also
-refuse returned arguments with one ABI reason; callers use output arguments
-without an explicit return. Whole-function `verbatim_functions` retain their
+local that no matched result reaches was still dropped. A further installed probe found a direct scalar `return 4.0` also disappeared
+at 7c517b2b. Coverage now records every nonempty `func.return` as one ABI
+obligation, independent of result type or producer. Matched routes refuse
+explicit returns with one reason; callers use output arguments without a
+return statement. Whole-function `verbatim_functions` retain their
 return-binding exemption. This is a structural boundary, not a target-name
 branch. Local allocations used as matched inputs need a matched producer or
 an input-argument binding; an unsupported fill/library producer is diagnosed

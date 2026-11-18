@@ -261,12 +261,11 @@ class MatchCoverage:
     # ``(function names, message)`` behind ``errors``, so a backend that runs
     # a function verbatim on the host can exempt exactly that function.
     problems: list[tuple[tuple[str, ...], str]] = field(default_factory=list)
-    # Every returned local allocation, including fills and unwritten buffers.
-    # Ordinary matched routes bind output arguments;
-    # whole-function routes declare their return bindings and are exempted
-    # by require_match_coverage, just like their other retained effects.
+    # Every explicit return value needs an ABI binding, even a constant or
+    # an unwritten buffer. Matched routes bind output arguments instead;
+    # whole-function routes declare return bindings and are exempted by
+    # require_match_coverage, just like their other retained effects.
     unbound_return_functions: list[str] = field(default_factory=list)
-    returned_argument_functions: list[str] = field(default_factory=list)
 
 
 @dataclass

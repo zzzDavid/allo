@@ -3948,10 +3948,11 @@ class _FunctionCoverage:
                 continue
             category[index] = STORE_UNMATCHED
 
-        if self.return_refs - self.arg_refs:
+        if any(
+            op.operation.name == "func.return" and len(op.operands)
+            for op, _loops, _guards in self.sites
+        ):
             coverage.unbound_return_functions.append(self.func_name)
-        if self.return_refs & self.arg_refs:
-            coverage.returned_argument_functions.append(self.func_name)
 
         # An unmatched fill/library operation cannot supply a matched device
         # operand. Keep real matched producer/consumer intermediates legal;
@@ -4540,11 +4541,7 @@ def require_match_coverage(
     if coverage is None and target is not None and module is not None:
         checked = match_workload(target, module)
         coverage = checked.coverage
-    if coverage is None or not (
-        coverage.problems
-        or coverage.unbound_return_functions
-        or coverage.returned_argument_functions
-    ):
+    if coverage is None or not (coverage.problems or coverage.unbound_return_functions):
         return checked
     exempt = _host_executed_functions(target, checked)
     verbatim = frozenset(getattr(trace, "verbatim_functions", ()) or ())
@@ -4562,12 +4559,7 @@ def require_match_coverage(
     unbound = set(coverage.unbound_return_functions) - verbatim
     if unbound:
         raise UnsupportedWorkloadError(
-            "a returned local output buffer is unsupported by the matched "
-            "output ABI; pass the output as an argument"
-        )
-    if set(coverage.returned_argument_functions) - verbatim:
-        raise UnsupportedWorkloadError(
-            "returning an argument buffer is unsupported by the matched output "
+            "explicit return values are unsupported by the matched output "
             "ABI; use output arguments without a return statement"
         )
     errors = _format_coverage_problems(coverage.problems, exempt | verbatim)

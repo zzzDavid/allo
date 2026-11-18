@@ -28,9 +28,10 @@ seven host compile-time guard failures remain open as C-38. Earlier Evidence
 table rows are historical probes, not new hardware runs at this installation.
 
 Ordinary matched routes bind results through output arguments and accept no
-explicit buffer return. Every returned local allocation is refused, including
+explicit return value. Every returned local allocation is refused, including
 an independently filled or unwritten return unrelated to the matched result.
-Returning an input or output argument is also refused consistently before
+Returning an input/output argument or a scalar (including a literal) is also
+refused consistently before
 candidate enumeration: use output arguments without a return statement.
 The exception is `UnsupportedWorkloadError`, naming the output ABI restriction.
 Whole-function records that declare return bindings (including native APU-v1

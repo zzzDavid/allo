@@ -1,6 +1,6 @@
 # Copyright Allo authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Returned local reduction outputs fail for their ABI, not a missing fill."""
+"""Every explicit return needs a binding before matched work is enumerated."""
 # Allo annotations allocate arrays; these functions are compiled, not run by Python.
 # pylint: disable=unsupported-assignment-operation,used-before-assignment,unsubscriptable-object
 import pytest
@@ -218,6 +218,24 @@ def returned_input(W: float16[8, 8], x: float16[8], y: float16[8]) -> float16[8]
     return x
 
 
+def scalar_literal_return(W: float16[8, 8], x: float16[8], y: float16[8]) -> float16:
+    for i in range(8):
+        acc: float16 = 0.0
+        for k in allo.reduction(8):
+            acc += W[i, k] * x[k]
+        y[i] = acc
+    return 4.0
+
+
+def scalar_loaded_return(W: float16[8, 8], x: float16[8], y: float16[8]) -> float16:
+    for i in range(8):
+        acc: float16 = 0.0
+        for k in allo.reduction(8):
+            acc += W[i, k] * x[k]
+        y[i] = acc
+    return x[0]
+
+
 def local_fill_operand(W: float16[8, 8], y: float16[8]):
     t: float16[8] = 2.0
     for i in range(8):
@@ -254,8 +272,8 @@ TARGETS = [
     (build_apu_v1_target, apu_v1_cost),
 ]
 ABI_REASON = (
-    "a returned local output buffer is unsupported by the matched output ABI; "
-    "pass the output as an argument"
+    "explicit return values are unsupported by the matched output "
+    "ABI; use output arguments without a return statement"
 )
 
 
@@ -275,10 +293,12 @@ ABI_REASON = (
         integer_elementwise_return,
         unrelated_filled_return,
         unrelated_unwritten_return,
+        scalar_literal_return,
+        scalar_loaded_return,
     ],
 )
 @pytest.mark.parametrize("target,cost", TARGETS)
-def test_returned_local_output_names_the_abi_boundary(
+def test_explicit_return_names_the_abi_boundary(
     workload, target, cost, monkeypatch
 ):
     def no_candidates(*args, **kwargs):
@@ -289,7 +309,7 @@ def test_returned_local_output_names_the_abi_boundary(
         allo.compile(workload, target(), cost, backend="virtual")
     message = str(caught.value)
     assert message == ABI_REASON
-    assert "pass the output as an argument" in message
+    assert "use output arguments without a return statement" in message
     assert "never initialized" not in message
     assert "initialize the accumulator with literal 0" not in message
 
@@ -307,10 +327,7 @@ def test_returned_argument_has_one_shared_abi_policy(
     )
     with pytest.raises(UnsupportedWorkloadError) as caught:
         allo.compile(workload, target(), cost, backend="virtual")
-    assert str(caught.value) == (
-        "returning an argument buffer is unsupported by the matched output "
-        "ABI; use output arguments without a return statement"
-    )
+    assert str(caught.value) == ABI_REASON
 
 
 @pytest.mark.parametrize(
@@ -348,7 +365,7 @@ def test_late_direct_fill_is_not_a_zero_initializer():
     assert schedule.module.operation.verify()
     target = build_samsung_target()
     trace = match_workload(target, schedule.module)
-    with pytest.raises(UnsupportedWorkloadError, match="returned local output buffer"):
+    with pytest.raises(UnsupportedWorkloadError, match="matched output ABI"):
         require_match_coverage(trace, target=target)
 
 

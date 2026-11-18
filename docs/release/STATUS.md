@@ -25,9 +25,11 @@
 
 ## Round 214 active — new effects and compilation-time repairs
 
-Shared coverage now checks every returned local buffer, including independently
-filled or unwritten returns, and refuses returned arguments consistently before
-enumeration. Whole-function return-binding routes remain exempt. Unsupported
+An installed neighboring probe invalidated candidate 7c517b2b: a direct scalar
+`return 4.0` was also silently dropped. Its validation was stopped before the
+full collection, with all partial evidence retained. Shared coverage now checks
+every explicit return value as one ABI obligation, independent of producer or
+type, and refuses unmatched return bindings consistently before enumeration. Whole-function return-binding routes remain exempt. Unsupported
 local operand producers are diagnosed at the same boundary. Zero-initialized
 argument accumulators now retain their direct sink, enabling Samsung's fused
 and separate initialization forms; both execute bit-exactly at 48x40 with

@@ -3,6 +3,80 @@
 
 # Validation record
 
+## Round 214 source repair and preregistered installed validation
+
+Superseded candidate `7c517b2bf22b3e3c62144395f668598696ad8937` contains the initial
+returned-buffer coverage and direct zero-output sink repair (`820ad389`),
+plus the scoped loop-cycle collection change. Evidence root:
+`/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r214`.
+The initial wheel built successfully (SHA256
+`b58dca4e549d4bff3f10e398a1aaad4d24d4561938101e8746064f7fb7068f13`),
+and its 501 installed files, seven G1 programs / 49 files, and 25 G2 payload
+files verified. A neighboring installed probe then found a direct scalar
+`return 4.0` silently disappeared (`probe-constant-return.log`). This candidate
+was superseded and its own validation process tree terminated before the full
+collection; `validation-superseded.json` names the exact processes and reason.
+All partial milestone output remains; it is not a completed milestone.
+The replacement check treats every nonempty `func.return` as one ABI obligation,
+without a scalar/array case split. New literal and loaded scalar return probes
+join the existing array/argument cases; native/record bindings remain exempt.
+The frozen paper matches all 73 file hashes. The requested `allo` conda
+environment is absent; the existing `spmw` environment is used to build the
+isolated package, as in prior accepted runs.
+
+The reviewer's `probe_ret3`, `probe_ret2`, `probe_samsung_init` and
+`probe_locals` were rerun against the old installed wheel; `*-before.log`
+retains the findings. The early AiM invocation in that probe lacked its
+simulator-root configuration and is not successful simulator evidence.
+Source validation (`source-validation.json`): 108 coverage/native controls
+pass; six GC lifetime/state checks and both Samsung direct-output checks
+pass; the wider shared/coverage selection has 304 passes and one setup
+failure. That failure is the AiM timing-only test falling back to Docker
+without the native override, where `/var` has no space. Its one-case replay
+with `TENON_AIM_RAMULATOR2` and `AIM_SIMULATOR_ROOT` passes (13.83 seconds).
+The failed source run is retained; no assertion or compiler repair was needed.
+
+Samsung's fused and separate direct-output initializations execute through
+PIMSimulator at 48x40 with output initially filled with 17. Both match an
+independent integer-dot oracle bit-for-bit; all products and partial sums
+are exact FP16 integers. This checks real output replacement, not compile-only
+acceptance. Native/record return-binding controls continue to pass.
+
+A tentative freeze/thaw implementation was discarded. Its patch, test source
+and exploratory failures are retained (`freeze-lead.patch`,
+`freeze-lead-tests.py`, `gc-focused.log`). CPython 3.12 automatically moves
+immortal objects to its permanent generation, so testing for a nonzero freeze
+count cannot identify a caller-owned freeze. The final implementation never
+freezes or thaws objects; it scopes only the two explicit loop collections.
+The lifetime argument and final acceptance rule were committed before final
+measurement in `design/compile-gc-scope.md`.
+
+The controlled source heap pair (`heap-comparison.json`, candidate module
+hashes in `source-diagnostic-identity.json`) used the same workload, policy,
+hash seed and GC thresholds as the prior diagnostic:
+
+| Context | Wall seconds | CPU seconds | GC seconds | Non-GC seconds | Peak RSS KiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Clean heap | 54.258042 | 54.236884 | 3.568781 | 50.689261 | 496432 |
+| Two million live cyclic lists | 53.813847 | 53.804711 | 2.581360 | 51.232487 | 701276 |
+
+Both command hashes, score hashes and chosen position 77 equal the prior
+`b56c410e` program. The original pair's non-GC times were 51.48 and 52.21
+seconds; the repair's pair differs by 0.54 seconds in non-GC work, while the
+original 35.21-second wall increase included 34.49 seconds of GC. Automatic
+full collections still occur; only the explicit loop sweeps are batched.
+These pairs do not reconstruct unrecorded phase times in the original seven
+137–169-second failures. The final collection will record each test's passive
+GC/CPU/wall totals and code-local compile-body timing for those seven cases,
+without replacing the compiler function or its 120-second guards. C-38 stays
+open until that one complete installed process passes them.
+
+Black and shell syntax checks pass. Errors-only pylint reports the same eight
+matcher inference/MLIR extension lookup errors; task_lint reports 38 existing
+license-header failures. Complete logs are retained; no lint sweep was done.
+Build, payload/program identity, installed milestone and complete software
+collection are in progress and will be recorded below when complete.
+
 ## Round 213 corrected candidate: installed checks and complete software accounting
 
 The corrected source candidate for this increment is
