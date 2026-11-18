@@ -43,6 +43,7 @@ differently from Python.
 """
 
 import gc
+from contextvars import ContextVar
 import ast
 import copy
 import hashlib
@@ -349,6 +350,11 @@ def _stamp_spmw_abi_value_ids(function, ctx, argument_values):
     function.attributes[_SPMW_ABI_VALUE_IDS_ATTR] = ArrayAttr.get(
         [IntegerAttr.get(i64, value) for value in source_ids]
     )
+
+
+# Default customizer behavior is unchanged. Tenon's compile scope selects
+# nursery collection here and sweeps promoted cycles on its outer exit.
+_loop_gc_generation = ContextVar("allo_loop_gc_generation", default=2)
 
 
 class IntLiteral(MockConstant):
@@ -825,8 +831,9 @@ class ASTTransformer(ASTBuilder):
                     for_loops[-1].attributes["unroll"] = IntegerAttr.get(i32, factor)
 
         for_loops = None
-        # Not sure why the for loops will not be collected if we do not call gc.collect()
-        gc.collect()
+        # Release new loop-wrapper cycles; Tenon batches the old-generation
+        # sweep at its outer compile boundary. Other callers retain full GC.
+        gc.collect(_loop_gc_generation.get())
         ctx.pop_ip()
 
     @staticmethod
@@ -4326,7 +4333,7 @@ class ASTTransformer(ASTBuilder):
                         )
                         ctx.set_ip(for_op.body.operations[0])
                         build_stmts(ctx, node.body)
-                    gc.collect()
+                    gc.collect(_loop_gc_generation.get())
                     ctx.pop_ip()
                     ctx.global_vars.pop(var)
             return

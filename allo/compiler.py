@@ -10,10 +10,12 @@ from __future__ import annotations
 import inspect
 import math
 import typing
+import gc
+from contextlib import contextmanager
 
 import numpy as np
 
-from .ir.builder import _spmw_group_contract
+from .ir.builder import _spmw_group_contract, _loop_gc_generation
 from .perf import BoundCostSpec, CostSpec
 from .pim.apu_v1_record_frontend import is_apu_v1_program, normalize_apu_v1_program
 from .spmw_autoschedule import MatcherWorkScope, _retain_matcher_work_scope
@@ -29,6 +31,26 @@ from .spmw_reduction_policy import (
 )
 from .spmw_resources import normalize_resource_budget, stamp_resource_budget
 from .spmw_target import HostProgram
+
+
+@contextmanager
+def _compile_heap_scope():
+    """Collect fresh loop-wrapper cycles, sweeping older cycles once on exit.
+
+    The upstream customizer retains its default full collection at each loop.
+    Tenon batches only those explicit full scans. Automatic GC, caller-owned
+    frozen objects, enablement and thresholds are untouched. The ContextVar
+    isolates concurrent threads and nests without restoring another caller's
+    policy. A full collection on the outer exit also handles promoted cycles.
+    """
+    outer = _loop_gc_generation.get() == 2
+    token = _loop_gc_generation.set(0)
+    try:
+        yield
+    finally:
+        _loop_gc_generation.reset(token)
+        if outer:
+            gc.collect()
 
 
 def _materialize_workload(workload):
@@ -824,6 +846,7 @@ class CompiledWorkload(typing.Protocol):
     def run(self, *args, **kwargs) -> RunResult: ...
 
 
+@_compile_heap_scope()
 def compile(
     workload,
     target,

@@ -61,10 +61,10 @@ stage copy_test_tree -- bash -c "source $HERE/stage_lib.sh && copy_tree_with_opt
 T=$E/testtree; cd $T; export PYTHONPATH=$T
 stage golden_rows -- timeout 3600 $PY -m pytest -q -p no:cacheprovider tests/pim/test_paper_golden.py -k "not apu_v1" -s
 stage golden_rows_paper_full -- timeout 5400 $PY -m pytest -q -p no:cacheprovider tests/pim/test_paper_golden.py -k "not apu_v1" -m paper_full
-stage samsung_conductor_and_gemv_all_targets -- timeout 3600 $PY -m pytest -q -p no:cacheprovider tests/pim/samsung_hbm_pim/test_samsung_conductor_runs.py tests/pim/test_gemv_all_targets.py -k "not apu_v1"
+stage samsung_conductor_and_gemv_all_targets -- timeout 3600 $PY -m pytest -q -p no:cacheprovider tests/pim/samsung_hbm_pim/test_samsung_conductor_runs.py tests/pim/test_gemv_all_targets.py tests/perf/test_samsung_direct_accumulator.py -k "not apu_v1"
 stage cent_suite -- timeout 3600 $PY -m pytest -q -p no:cacheprovider tests/pim/test_cent_aim_workloads.py
 stage cent_suite_paper_full -- timeout 5400 $PY -m pytest -q -p no:cacheprovider tests/pim/test_cent_aim_workloads.py -m paper_full
-stage shared_contract_set -- timeout 3600 $PY -m pytest -q -p no:cacheprovider tests/perf/test_returned_local_accumulator.py tests/pim/test_match_coverage.py tests/pim/test_attacc_virtual.py tests/pim/test_attacc_orientation.py tests/pim/test_aim_allocation.py tests/pim/test_contraction_access_forms.py tests/pim/test_aim_orientation.py tests/pim/test_axis_roles_coordinates.py
+stage shared_contract_set -- timeout 3600 $PY -m pytest -q -p no:cacheprovider tests/perf/test_returned_local_accumulator.py tests/perf/test_compile_gc.py tests/pim/test_match_coverage.py tests/pim/test_attacc_virtual.py tests/pim/test_attacc_orientation.py tests/pim/test_aim_allocation.py tests/pim/test_contraction_access_forms.py tests/pim/test_aim_orientation.py tests/pim/test_axis_roles_coordinates.py
 # AttAcc required figures (G10): the six kernel rows on the natively built Ramulator2-AttAcc
 # with the DCC trace generator (ATTACC_* below), command-by-command trace checks, the six decode
 # configurations composed from these sessions, and the comparison with the frozen figures

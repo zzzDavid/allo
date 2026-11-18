@@ -27,15 +27,15 @@ export-list skips; eight fixture/environment failures are corrected, while
 seven host compile-time guard failures remain open as C-38. Earlier Evidence
 table rows are historical probes, not new hardware runs at this installation.
 
-Ordinary matched routes bind their results to output arguments. A matched
-reduction or elementwise result whose direct/copy destinations are only
-returned local allocations is rejected in shared coverage, before candidate
-enumeration, with `UnsupportedWorkloadError`: pass the output as an argument.
-This follows retained result/copy identities, independent of whether the
-local is initialized by a fill, explicit stores or a scalar accumulator.
+Ordinary matched routes bind results through output arguments and accept no
+explicit buffer return. Every returned local allocation is refused, including
+an independently filled or unwritten return unrelated to the matched result.
+Returning an input or output argument is also refused consistently before
+candidate enumeration: use output arguments without a return statement.
+The exception is `UnsupportedWorkloadError`, naming the output ABI restriction.
 Whole-function records that declare return bindings (including native APU-v1
-reductions) retain their supported return ABI; the check uses that route
-contract, not the target name. For non-returned locals, an unguarded
+reductions) retain their return ABI; the exemption follows that route contract.
+For non-returned locals, an unguarded
 whole-buffer zero fill before the reduction is a zero initializer; nonzero,
 late, guarded or loop-nested fills are refused with their actual restriction.
 A valid initializer does not waive a separate copy/layout restriction.
@@ -45,14 +45,20 @@ unsupported copy; use explicit element stores (`y[i] = 0.0`) instead. The
 portable C record route also rejects a remaining `memref.copy` before code
 emission. Direct local `linalg.fill` initialization is a distinct operation.
 
-Host compilation time is separate from estimated or measured device cycles.
-Search budgets do not bound the frontend's total wall time. The frontend
-currently invokes full Python garbage collection while constructing loops;
-latency can depend on other live objects in the process. Seven Samsung
-compile guards exceeded 120 seconds in the combined software collection
-(C-38). The guards remain unchanged and the failures remain open; no fixed
-end-to-end host compilation bound is established by the isolated milestone.
-This does not change source semantics or the three fixed hardware outcomes.
+A matched operand may read an input argument or a supported matched producer.
+Reading an unmatched local fill or library-result allocation is refused in
+shared coverage before enumeration; candidate validation still checks the
+realization of accepted producer/consumer stages.
+
+Host compilation time is separate from device cycles. Tenon's compile scope
+collects young loop-wrapper cycles at the existing builder boundaries and
+performs one full sweep on the outer exit, including an error exit. It leaves
+automatic GC, caller-frozen objects and other threads' collection policy
+unchanged. The ordinary customizer still uses full sweeps at each boundary.
+See [the lifetime and validation contract](design/compile-gc-scope.md). C-38
+remains open until the final installed full collection passes the unchanged
+120-second Samsung guards. No end-to-end latency bound follows from a search
+budget or from passing an isolated milestone.
 
 Terms used below:
 
@@ -147,7 +153,7 @@ discovery variables in `INSTALL.md` section 3.
 
 | Aspect | Status |
 |---|---|
-| Input | Source FP16 contractions classified structurally (`spmw_samsung.samsung_contraction`): nests `[k]`, `[row, k]` (GEMV), `[row, column, k]` (GEMM), either operand order (`W[i,k]*x[k]` or `x[k]*W[i,k]`, S-05 fixed), a literal-zero or a carried accumulator (`accumulator_init` `zero` or `carried`); work items must partition the output rows exactly (full `[16, 8]` grid or `mapping=[1]`, S-10). Elementwise `ADD`/`MUL`/`MAD`/`RELU` for one work item (`mapping=[1]`) walking a 1-D FP16 extent (S-07 fixed); partitioned elementwise grids are rejected with the reason. A carried accumulator (`y[i] += ...` with no initializer) is admitted: the matcher records `accumulator_init == "carried"` and the lowering selects the ordered TEMPORAL program, whose conductor loads the caller's initial values; the REDUCE candidates, which zero GRF_B, are pruned for it (`tests/pim/test_match_coverage.py::test_carried_accumulator_selects_the_ordered_program_on_samsung`, passed from the installed `448a51f` wheel in the round 197 run). AiM, whose MAC register the lowering always zeroes, rejects a carried accumulator instead (`test_carried_accumulator_rejected_where_the_device_zeroes_it`). Until round 204 this row said Samsung rejects it before scheduling, which described the behaviour before the TEMPORAL lowering carried initial values. |
+| Input | Source FP16 contractions classified structurally (`spmw_samsung.samsung_contraction`): nests `[k]`, `[row, k]` (GEMV), `[row, column, k]` (GEMM), either operand order (`W[i,k]*x[k]` or `x[k]*W[i,k]`, S-05 fixed), a literal-zero or a carried accumulator (`accumulator_init` `zero` or `carried`). Literal-zero forms include a scalar accumulator copied to the output and a directly written output argument zeroed either in the same row loop or in a preceding loop; the matched store supplies that argument's sink. Both direct-output forms execute bit-exactly at 48x40 with nonzero incoming output (`test_samsung_direct_accumulator.py`); work items must partition the output rows exactly (full `[16, 8]` grid or `mapping=[1]`, S-10). Elementwise `ADD`/`MUL`/`MAD`/`RELU` for one work item (`mapping=[1]`) walking a 1-D FP16 extent (S-07 fixed); partitioned elementwise grids are rejected with the reason. A carried accumulator (`y[i] += ...` with no initializer) is admitted: the matcher records `accumulator_init == "carried"` and the lowering selects the ordered TEMPORAL program, whose conductor loads the caller's initial values; the REDUCE candidates, which zero GRF_B, are pruned for it (`tests/pim/test_match_coverage.py::test_carried_accumulator_selects_the_ordered_program_on_samsung`, passed from the installed `448a51f` wheel in the round 197 run). AiM, whose MAC register the lowering always zeroes, rejects a carried accumulator instead (`test_carried_accumulator_rejected_where_the_device_zeroes_it`). Until round 204 this row said Samsung rejects it before scheduling, which described the behaviour before the TEMPORAL lowering carried initial values. |
 | Compile-only | `compiled.compiled.cmds` is the emitted per-pass CRF (`PIMCmd` list); `compiled.compiled.layout_ctx.programs` the `SamsungProgram` records; `compiled.placement_ranking` the ranked placements, pruned modes (`policy_pruned`) and movement record. |
 | Analytical | `samsung_cost` over the retained graph. Unit: memory-clock cycles of the modeled activities (GRF fills, MAC/elementwise, drains, explicit host moves) of one work item on the declared 16-channel device, unpadded shape; preload, CRF upload and readback are outside the graph. Not comparable in absolute value with simulated cycles; compared by candidate ranking (4 of 6 placement pairs agree per GEMV shape, `design/samsung-execution.md` section 7). |
 | Simulator | PIMSimulator `pim_driver --op GENERIC --op-kind REDUCE | TEMPORAL_REDUCE | ELTWISE`: the conductor uploads the compiled CRF verbatim and never calls the vendor command generator (S-01 fixed); `kind="simulator"`, outputs read back (`out.bin` absent or short raises; all-zero is a value, S-02 fixed). |

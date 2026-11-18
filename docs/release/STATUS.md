@@ -23,6 +23,28 @@
    [the arithmetic contract](design/gemini-i-fp16.md). Installed board
    confirmation is bit-exact; V1-16 is now a documented target boundary.
 
+## Round 214 active — new effects and compilation-time repairs
+
+Shared coverage now checks every returned local buffer, including independently
+filled or unwritten returns, and refuses returned arguments consistently before
+enumeration. Whole-function return-binding routes remain exempt. Unsupported
+local operand producers are diagnosed at the same boundary. Zero-initialized
+argument accumulators now retain their direct sink, enabling Samsung's fused
+and separate initialization forms; both execute bit-exactly at 48x40 with
+nonzero incoming outputs.
+
+The compile entry scopes young-generation loop-wrapper collection and one
+full outer-exit sweep. Caller GC settings and frozen objects are unchanged;
+normal customizer calls retain full collection. Lifetime checks pass, but C-38
+is still OPEN until the final installed single-process full collection passes
+all seven unchanged 120-second guards. The source contract is in
+[compile-gc-scope.md](design/compile-gc-scope.md).
+
+Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r214`.
+Next: finish focused source validation, build one candidate sdist/wheel, verify
+G1/G2 program identity, run its 42-stage milestone, then its complete
+non-hardware collection once. No hardware launch, resampling or repooling.
+
 ## Round 213 candidate b56c410e — NOT READY; host-latency finding open
 
 Compiler candidate `b56c410efd90a1969a9d3b7d4d30e664feaad2ba` is built as

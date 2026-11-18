@@ -3,6 +3,34 @@
 
 # Release review: architecture, constants, specialization, gate judgments
 
+## Round 214 source repair — installed confirmation pending
+
+The new return probes invalidate the prior C-36 completeness claim: a returned
+local that no matched result reaches was still dropped. Coverage now records
+all local buffer returns, regardless of their producer. Matched routes also
+refuse returned arguments with one ABI reason; callers use output arguments
+without an explicit return. Whole-function `verbatim_functions` retain their
+return-binding exemption. This is a structural boundary, not a target-name
+branch. Local allocations used as matched inputs need a matched producer or
+an input-argument binding; an unsupported fill/library producer is diagnosed
+before candidate enumeration.
+
+A zero-initialized argument is itself the reduction sink, just as a carried
+argument is. Retaining that sink in shared coverage enables the existing
+Samsung zero-accumulator lowering without a new recipe. Both separate-loop
+and fused initializations execute bit-exactly on PIMSimulator at 48x40 with
+incoming outputs set to 17. Existing arithmetic and freshness rules remain.
+
+C-38's tentative repair batches explicit old-generation GC scans at the Tenon
+compile boundary. Per-loop generation-zero collection retains prompt cleanup
+of new wrapper cycles; the outer full sweep also collects promoted cycles,
+including on error. Context-local policy preserves nesting and thread isolation;
+no `gc` function is replaced, disabled or globally reconfigured. A freeze/thaw
+scheme was rejected because permanent generations may contain both CPython
+immortal objects and caller-owned frozen objects. The lifetime reasoning and
+prewritten final-validation rule are in `design/compile-gc-scope.md`. C-38
+remains open until the final installed full collection meets that rule.
+
 ## Candidate b56c410e: structural returned-result coverage; C-38 remains open
 
 The round-213 review supersedes the round-212 C-36 closure below. That patch
