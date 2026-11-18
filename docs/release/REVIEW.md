@@ -3,7 +3,7 @@
 
 # Release review: architecture, constants, specialization, gate judgments
 
-## Round 215 bounded source review — validation pending
+## Round 215 candidate d7037fd3 — installed validation complete, NOT READY
 
 The independent review accepts C-36, C-38 and C-39 at `603d5c38`.
 This increment addresses its three new findings:
@@ -23,9 +23,15 @@ This increment addresses its three new findings:
   remains available. Multiple stages must use separate `@allo.work` kernels.
   This replaces internal role-collision messages with the declared domain.
 
-The candidate's installed validation and hardware-program identity checks are
-pending. No hardware launch or performance resampling is authorized for this
-increment. The three fixed G10 misses and missing Samsung redistribution
+All 42 installed milestone stages pass; the affected installed selection has
+230 passes and three explicit paper_full selection skips. All seven G1
+programs / 49 files and all 25 G2 payload files are byte-identical. A full
+collection was not repeated because the valid region binding remains unchanged;
+source-path-audit.json and the reordered-region simulator test substantiate this.
+The original test-draft virtual-output failures remain recorded in VALIDATION.
+This is the actor's bounded source review; independent review of these repairs
+is still pending. No hardware launch or performance resampling was performed
+in this increment. The three fixed G10 misses and missing Samsung redistribution
 permission remain release blockers; the FP16 target-arithmetic default remains
 a recorded user decision.
 

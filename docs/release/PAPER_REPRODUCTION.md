@@ -3,6 +3,21 @@
 
 # Paper reproduction through the shared pipeline
 
+## Candidate d7037fd3: installed validation, fixed performance verdicts
+
+Wheel `e2c9fd4c55d30792004ac109cb5ea2fc3ea3508f68c43295cdbf95ff2996238f` passes all 42 required milestone stages in `r215/stages`.
+The simulator/model rows are fresh at this candidate; comparison values remain
+unchanged (`r215/inventory-update-audit.json`). The seven Gemini-I programs /
+49 emitted files and all 25 Gemini-II payload files match r214-final. Thirteen
+installations are rehashed in the equivalence chain. The ten hardware rows
+carry by program identity, without launch, resampling or repooling. Required
+outcomes remain **52 REPRODUCED, three OPEN**. X-22/X-23/X-34 absolute misses
+and their measured environment context below are unchanged. The new UPMEM
+plain-entry regressions are correctness checks, not replacement performance
+rows. The complete collection at 603d5c38 below remains historical evidence;
+this candidate runs the affected installed selection and milestone.
+
+
 ## Current candidate 603d5c38: fresh simulation and fixed hardware outcomes
 
 Installed wheel SHA256

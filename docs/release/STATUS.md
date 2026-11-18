@@ -23,6 +23,43 @@
    [the arithmetic contract](design/gemini-i-fp16.md). Installed board
    confirmation is bit-exact; V1-16 is now a documented target boundary.
 
+## Candidate d7037fd3 — NOT READY; round 215 repairs installed
+
+Compiler revision `d7037fd3625ab0ede4c07b9a2ee3113b0a429f8c` is built from a
+fresh sdist and installed outside this checkout. Wheel SHA256 `e2c9fd4c55d30792004ac109cb5ea2fc3ea3508f68c43295cdbf95ff2996238f`;
+sdist SHA256 `0c7511a6644035e3888337ba7e4a8297894ed90a2654d2edcaa473840d4c8a26`.
+Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r215`.
+
+UPMEM now binds plain entry parameters positionally when retained region IDs
+are absent; explicit region IDs remain authoritative. Installed uPIMulator
+executes plain add, zero-initialized 96x128 GEMV and carried 24x16x12 GEMM
+exactly with nonzero incoming outputs. A reversed-argument region control
+also executes exactly. Shared coverage recognizes validated matched-copy
+sinks as produced operands. Samsung/AiM reject multiple primary operations
+with their single-kernel domain reason before role binding.
+
+All **42 installed milestone stages PASS**. The affected installed selection
+has **230 passed, 3 skipped, zero failures**; skips are
+explicit `paper_full` selection boundaries, individually recorded in VALIDATION.
+The source selection had 229 passes and the same three skips, plus a separate
+passing reordered-region control. The complete 1,863-pass collection at
+`603d5c38` remains historical evidence; it was not repeated. Valid UPMEM
+region binding is unchanged (identical retained IDs and subsequent binding
+AST), so the user's conditional trigger for another full collection does
+not apply. No new complete-collection claim is made for this candidate.
+
+All 501 installed files match the wheel. Only `spmw_upmem.py`,
+`spmw_match_engine.py`, `spmw_autoschedule.py` and RECORD differ from r214-final.
+Seven Gemini-I programs / 49 emitted files and all 25 Gemini-II payload files
+remain byte-identical; 13 installations are rehashed in the equivalence chain.
+No hardware launch, resampling or repooling occurred. Frozen paper hashes
+remain 73/73. The six inherited untracked scripts remain untouched.
+
+The independent review accepts C-36/C-38/C-39 at the prior candidate.
+C-40/C-41 and the S-18 extension now await independent review. **NOT READY**
+remains: X-22/X-23/X-34 stay fixed OPEN, Samsung written redistribution
+permission is absent, and the FP16 default remains the recorded user decision.
+
 ## Candidate 603d5c38 — NOT READY; requested repairs validated
 
 Final compiler revision `603d5c388fc6943aeec3c29ffe97aca78ab7d721` is installed

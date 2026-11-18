@@ -3,6 +3,99 @@
 
 # Validation record
 
+## Round 215 candidate d7037fd3: installed ABI and diagnostic repairs
+
+Evidence root (`E`):
+`/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r215`.
+Source revision `d7037fd3625ab0ede4c07b9a2ee3113b0a429f8c`.
+`E/build_candidate.sh` archives that commit, builds a fresh sdist and wheel,
+and installs it outside the checkout into `E/pkg/venv` (Python 3.12,
+NumPy 2.3.5). Wheel SHA256 `e2c9fd4c55d30792004ac109cb5ea2fc3ea3508f68c43295cdbf95ff2996238f`;
+sdist SHA256 `0c7511a6644035e3888337ba7e4a8297894ed90a2654d2edcaa473840d4c8a26`. The existing configured `spmw` build environment
+was used; this host has no conda environment named `allo`. The installed
+venv is used for every milestone and affected-selection check.
+
+`candidate-equivalence.json` checks all 501 installed files, exactly three
+changed Python modules (`spmw_upmem.py`, `spmw_match_engine.py`,
+`spmw_autoschedule.py`) plus RECORD, 516 identical wheel members and no
+added/removed members. `sdist-equivalence.json` confirms the same source delta.
+`generated-program-equivalence.json` compares the seven Gemini-I programs,
+49 emitted files and eleven decision/cost fields per program with r214-final.
+All match. All 25 Gemini-II payload files match. `installation_equivalence.json`
+rehashes all 13 installations, preserves prior manifests, and does not pool
+or sample anything. `final-audit.json` checks the 73 paper hashes, inherited
+untracked scripts, and unchanged containing-repository HEAD.
+
+Reproduce the build and validation from the retained scripts:
+
+```bash
+bash "$E/build_candidate.sh"
+bash "$E/run_validation.sh"
+```
+
+These scripts refuse to overwrite their package/test-tree evidence; use a new
+absolute evidence root when reproducing. `run_validation.sh` runs the identity
+checks, `run_milestone.sh`, the affected selection, and the independent
+reviewer's host-only probes. All **42 required milestone stages PASS**,
+`milestone.exit` is 0. Complete stage logs/statuses are in `E/stages/`.
+The shared-contract stage now includes the plain UPMEM and Samsung/AiM domain
+regressions. Plain add, 96x128 zero GEMV, 24x16x12 carried GEMM and reordered
+region subtraction all execute bit-exactly on uPIMulator. Virtual checks
+require kind=virtual and unchanged caller arrays, without a numerical claim.
+
+Affected installed command, from `E/testtree`, with the native simulator
+variables and `TENON_HOME` set by `E/run_validation.sh`:
+
+```bash
+"$E/pkg/venv/bin/python" -m pytest -q -ra -p no:cacheprovider \
+  tests/perf/test_upmem_plain_entry.py \
+  tests/perf/test_returned_local_accumulator.py \
+  tests/pim/samsung_hbm_pim/test_samsung_lowering.py \
+  tests/pim/test_upmem_generality.py tests/pim/test_upmem_matcher.py \
+  tests/pim/test_aim_allocation.py tests/pim/test_aim_orientation.py \
+  --junitxml="$E/installed-affected.xml"
+```
+
+Result: **230 passed, 3 skipped, zero failures**.
+Each skip is the existing explicit paper-full selection rule, not missing
+simulator availability:
+
+- `tests.pim.test_upmem_generality::test_sim_uneven_gemv_scaling_391x65`: paper_full row; select with -m paper_full.
+- `tests.pim.test_upmem_matcher::test_upmem_fanout_gemv`: paper_full row; select with -m paper_full.
+- `tests.pim.test_upmem_matcher::test_upmem_fanout_reduction`: paper_full row; select with -m paper_full.
+
+Source evidence: `source-affected.xml` has 229 passed and the same three skips;
+`region-order.xml` has one pass. The initial `source-focused.xml` retains three
+test-draft failures: its virtual-mode assertion expected output mutation.
+Virtual mode correctly left arrays unchanged. The test now asserts that
+contract separately from simulator bit equality; no production arithmetic,
+tolerance or existing assertion was weakened. Formatting, shell syntax and
+`git diff --check` pass. The errors-only pylint run reports 36 diagnostics on
+unchanged existing source lines (MLIR binding introspection and type inference);
+`lint-audit.json` records them. `task-lint.log` retains the existing 38
+license-header findings. No lint sweep was undertaken.
+
+The retained reviewer probes (`p_upmem2-installed.log`,
+`p_upmem3-installed.log`, `p_mid-installed.log`, `p_locals-installed.log`)
+confirm six plain UPMEM add/GEMV/GEMM compilations across virtual/default
+modes, identical downstream domain reasons for copied/direct intermediates,
+and exact bare-return execution on Samsung/APU-v1. No KeyError or internal
+multiple-memref role message remains in them (`installed-probe-audit.json`).
+They also retain existing finite refusals: UPMEM scalar-temporary GEMV
+spellings match MAC plus COMPACT and fail kernel-family recognition; the
+int32 reduction output refuses because its DPU output role requires int64.
+This ABI fix does not broaden kernel-family or dtype recognition, and these
+refusals are not counted as numerical executions.
+
+The full non-hardware collection was not repeated: `_bind_module` retains the
+same source IDs for dataflow regions; the missing-attribute fallback handles
+plain entries only. After removing the ABI read/import/fallback, the method's
+AST is identical to the prior candidate (`source-path-audit.json`). The
+reordered region and existing UPMEM suites verify the preserved binding.
+The complete r214 collection remains labelled at its actual candidate.
+No physical tests, campaigns, resampling, or repooling ran in this increment.
+
+
 ## Round 214 candidate 603d5c38: installed milestone and complete collection
 
 Compiler revision `603d5c388fc6943aeec3c29ffe97aca78ab7d721`; final evidence root

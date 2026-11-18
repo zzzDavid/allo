@@ -11,22 +11,20 @@ Finding IDs (S-xx, M-xx, U-xx, V1-xx, G2-xx, C-xx, P-xx, F-xx) refer to
 `ISSUES.md`; check it for the current status of each. The implementation map
 (modules, stages, inspection fields) is `SPMW_ARCHITECTURE.md`.
 
-Current compiler candidate `603d5c38` carries the accepted installed r211
-Gemini-I arithmetic evidence: nine launches, four shapes under both policies
-and a special-value outer product, all 6,096 encodings exact. The primitive
-model and runtime are unchanged; V1-16 remains the documented target-arithmetic
-boundary. The installed model matches every multiply operand pair against
-the SDK; the independent review additionally verified every add/subtract
-operand pair. All seven campaign programs / 49 emitted files
-and all 25 Gemini-II payload files remain byte-identical. Fixed r208/r210
-performance outcomes carry by identity, including the three OPEN rows.
-The installed 42-stage milestone passes, including all 45 required
-simulator/model comparisons. The complete installed non-hardware collection
-passes with 1,863 tests passed, zero failures and 23 export-list skips on modules
-without `__all__`; 30 physical tests are excluded. All seven original Samsung
-120-second compile guards pass unchanged in that single process (C-38).
-Earlier Evidence table rows are historical probes, not new hardware runs at
-this installation.
+Current compiler candidate `d7037fd3` passes the 42-stage installed milestone
+and an affected selection of 230 tests, with three explicit paper_full
+selection skips and zero failures. The complete non-hardware collection at
+`603d5c38` is retained as historical evidence (1,863 passes, 23 export-list
+skips). No full-collection result is claimed at `d7037fd3`. Region binding is
+unchanged; plain UPMEM entries now have a positional ABI and exact installed
+simulator evidence for add, zero GEMV and carried GEMM. See VALIDATION.
+
+The accepted r211 Gemini-I arithmetic evidence carries unchanged: nine
+launches, four shapes under both policies and a special-value outer product,
+all 6,096 encodings exact. The model and runtime are unchanged. All seven
+campaign programs / 49 emitted files and all 25 Gemini-II payload files remain
+byte-identical. Fixed r208/r210 outcomes carry by identity, including the three
+OPEN rows. Earlier evidence-table rows remain labelled historical.
 
 Ordinary matched routes bind results through output arguments and accept no
 explicit return value. Every returned local allocation is refused, including
@@ -70,7 +68,10 @@ Terms used below:
   for a single kernel). Plain output-argument functions are supported
   on Samsung, AiM, UPMEM, APU-v1 and Gemini-II within each lowering's dtype and
   operation domain. UPMEM binds plain parameters positionally; dataflow kernels
-  retain their declared region ABI IDs. Samsung and AiM admit one contraction
+  retain their declared region ABI IDs. The fallback does not broaden family
+  recognition: scalar-temporary UPMEM GEMV spellings that also match COMPACT
+  remain refused by the family classifier (retained r215 probes). Samsung and
+  AiM admit one contraction
   or one elementwise operation per kernel (AiM may fuse its supported activation);
   split multiple stages into `@allo.work` kernels. Source is passed to
   `allo.compile(workload, target, cost)`. *Typed*: a typed program object
