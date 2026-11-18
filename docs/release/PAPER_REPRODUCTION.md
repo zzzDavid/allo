@@ -3,24 +3,25 @@
 
 # Paper reproduction through the shared pipeline
 
-## Current candidate e0c568a: fresh simulation and fixed hardware outcomes
+## Current candidate d9d38b8: fresh simulation and fixed hardware outcomes
 
 Installed wheel SHA256
-`c4a13fa7b1c5699b4d9cccf44fad4ef9904dcf01be082c044d1f4a581767bd56`
-passed all 42 required milestone stages in `r211/stages`. All 45 required
+`f78ad5b3fccdbef1160de6837c19d4bafa0e8e02c86bac454374e5262f237776`
+passed all 42 required milestone stages in `r212/stages`. All 45 required
 simulator/model rows were freshly executed: Samsung 3, AiM 14, UPMEM 16,
 AttAcc kernel tiling 6 and modeled decode 6. Values are unchanged. Samsung
 was built from the bundled recipe; AiM remains timing-only and AttAcc decode
 remains analytical composition. Full evidence and commands are in VALIDATION.
 
-The FP16 repair changes functional arithmetic and numerics metadata, not
-generated device work. All seven Gemini-I programs / 49 emitted source,
-project and ABI files are byte-identical to candidate 5fec806; all 25
-Gemini-II payload files are byte-identical. The nine-installation equivalence
-chain is rehashed in `r211/installation_equivalence.json`. Thus the ten
+This bounded change removes an incorrect callerless helper and corrects a
+shared-matcher refusal diagnostic; the accepted r211 FP16 model and runtime
+are unchanged, as is generated device work. All seven Gemini-I programs /
+49 emitted source, project and ABI files are byte-identical to candidate 5fec806; all 25
+Gemini-II payload files are byte-identical. The ten-installation equivalence
+chain is rehashed in `r212/installation_equivalence.json`. Thus the ten
 hardware rows below carry by program identity, with no new performance
-launch, resampling or repooling. The separate nine-launch FP16 confirmation
-checks semantics only and is not used for these performance comparisons.
+launch, resampling or repooling. The accepted r211 nine-launch FP16
+confirmation checks semantics only and is not used for these performance comparisons.
 Required outcomes remain **52 REPRODUCED and three OPEN**; optional rows and
 all failed/partial evidence are preserved.
 

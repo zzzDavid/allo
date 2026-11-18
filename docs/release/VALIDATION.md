@@ -3,6 +3,97 @@
 
 # Validation record
 
+## Round 212: bounded matcher and realization corrections
+
+Source candidate `d9d38b8fff1accf7881a2907e74a518c08a66814`; evidence root
+`/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r212`
+(`E` below). The two production changes remove the callerless realization
+NumPy method and correct the returned-local accumulator diagnostic. They do
+not change a supported program's arithmetic, selection or device lowering.
+
+The candidate was archived, built as an sdist, then built into a wheel and
+installed in a fresh venv outside the checkout (`E/build_candidate.sh`,
+`build.log`, `build.exit=0`, `pkg/`). Wheel SHA256:
+`f78ad5b3fccdbef1160de6837c19d4bafa0e8e02c86bac454374e5262f237776`.
+Sdist SHA256:
+`32dd6e155d71b1327ae7a427089afda3614eadf7c33b43ab0ec45984d812f23c`.
+`candidate-equivalence.json` proves the exact delta against the accepted r211
+wheel: `apu_v1_vector_codegen.py`, `spmw_match_engine.py` and RECORD only;
+517 other payload files are identical, no payload file is added or removed,
+and all 501 installed package files match the wheel.
+`sdist-equivalence.json` independently compares archive members: only the
+same two Python modules differ, with 414 other files identical and no added
+or removed member. Archive timestamps are not used as content evidence.
+
+`generated-program-equivalence.json` compares all seven generated Gemini-I
+programs with r211: eleven identity fields per program and byte comparisons
+of all 49 emitted source/project/ABI files. All match. All 25 Gemini-II
+payload files match too. `installation_equivalence.json` extends the chain
+to ten rehashed installations, with the two source changes explicitly
+identified. No campaign was sampled or pooled again; the fixed results carry
+by generated-program identity.
+
+The first direct-fill regression probe had a test-call mistake (passing a
+keyword-only target positionally); it is corrected and its original failure
+is retained in `returned-local-first.log`.
+
+The initial source selection produced 247 passed and two failures
+(`focused-source.log`). The AiM test tried Docker without the native override;
+Docker failed creating its task under full `/var`. The other failure exposed
+a stale reduction-policy test: its metadata, IEEE products and half-to-half
+tree predated the accepted GVML model. Test-only commit `01651b98` corrects
+that oracle, retains an independent IEEE comparison, and still requires bit
+identity; no numerical tolerance is changed. With the native AiM executable
+configured, the failed AiM test and complete corrected policy file pass
+(`focused-source-corrected.log`: five passed). The corrected policy file also
+passes from the installed wheel outside the checkout
+(`focused-installed-corrected.log`: four passed).
+
+Black, shell syntax and `git diff --check` pass. Task lint stops at the 38
+existing bundled vendor license-header findings (`task-lint.log`); the nine
+production Pylint findings are identical to the baseline package, and the
+new test file is clean (`source-delta-audit.json`). The codegen AST apart from
+the deleted method is identical. The matcher changes only returned-identity
+collection and the refusal text/hint; no fill becomes a valid initializer.
+The frozen paper matches all 73 locked hashes (`paper-lock.json`).
+
+The installed broad selection completed with 189 passed, three simulator
+setup skips and the one stale policy-test failure (`focused-installed.log`).
+The corrected policy suite passes as recorded above. The three skipped nodes
+(two Samsung checks and the AiM timing-only contract) pass after configuration
+against the freshly bundled Samsung build and native AiM executable
+(`focused-installed-configured.log`/`.xml`: three passed, zero skipped).
+The initial run was not counted as their execution evidence.
+
+The full matcher-dependent milestone completed once: **42/42 required stages
+PASS**, `milestone.exit=0`, `milestone-audit.json` retains every stage status
+and log hash. `shared_contract_set` includes all 13 new returned-local checks
+and the complete 40-test match-coverage suite. Its one skip is the optional
+500-instance archived-selector study, unchanged from r211; required AttAcc
+figures run in their separate stages. All 45 required simulator/model
+rows execute afresh; all ten hardware rows carry by identity. The inventory
+update changes only revision/evidence notes: 52 REPRODUCED, three OPEN,
+all measurements, verdicts and scope flags unchanged.
+
+Reproduce the installed checks with `E/pkg/venv/bin/python` outside the
+checkout, the archived test tree on PYTHONPATH, host-local TMPDIR and the
+native simulator variables in `run_installed_followup.sh`. The exact focused
+selections and corrected test revision are retained in that script,
+`corrected-tests/revision.txt` and `finish_configured_focused.sh`.
+Run `bash E/run_milestone.sh` only in a fresh equivalent evidence directory;
+it invokes the maintained 42-stage script from the candidate archive.
+`continue-validation-first.log` preserves a local automation parser mistake
+before the milestone started (a regex included a newline in the failed node
+name); its corrected continuation checks the exact known failure first.
+The earlier Samsung-only waiting helper stopped before running any test.
+No failed test, skipped check or partial evidence was overwritten.
+
+The test-only follow-up is absent from the sdist/wheel by MANIFEST policy;
+`test-only-followup-packaging.txt` records why no second package build is
+needed. `final-identity-audit.json` rehashes the installed files, distributions
+and all frozen paper files, and checks that later changes are only the named
+test and release documents. No hardware campaign was sampled or pooled.
+
 ## Round 211: installed target FP16 model and board confirmation
 
 Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r211`.

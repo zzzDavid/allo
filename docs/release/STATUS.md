@@ -23,20 +23,48 @@
    [the arithmetic contract](design/gemini-i-fp16.md). Installed board
    confirmation is bit-exact; V1-16 is now a documented target boundary.
 
-## Round 212 bounded follow-up — NOT READY
+## Candidate d9d38b8 — bounded corrections complete; NOT READY
 
-The unused realization-level NumPy helper is removed. The shared matcher now
-names the returned-local output ABI restriction instead of falsely claiming
-that a whole-buffer-filled accumulator is never initialized. The existing
-refusal is preserved; no nonzero or late fill is accepted as zero. CAPABILITIES
-states the boundary and the verbatim C11 record exception.
+Compiler candidate `d9d38b8fff1accf7881a2907e74a518c08a66814`; test-only
+follow-up `01651b98` corrects the stale reduction-policy oracle. The wheel
+and sdist are rebuilt from the compiler candidate and installed outside the
+checkout under `r212/pkg`. Wheel SHA256:
+`f78ad5b3fccdbef1160de6837c19d4bafa0e8e02c86bac454374e5262f237776`;
+sdist `32dd6e155d71b1327ae7a427089afda3614eadf7c33b43ab0ec45984d812f23c`.
 
-The three requested corrections are implemented. Focused verification,
-new sdist/wheel installation, generated-program/payload identity and the
-installed matcher-dependent stages are in progress under
+Removed the callerless, incorrect `APUVectorRealization.execute_numpy` method.
+The shared matcher now truthfully names the returned-local output ABI
+restriction and asks for an output argument. It does not treat nonzero or
+late fills as zero. Thirteen new regressions cover zero/nonzero/late source
+fills on four targets and a direct post-loop MLIR fill; the full existing
+match-coverage suite also passes installed. STATUS and PAPER_REPRODUCTION
+now give both historical G1 medians and the linear-regression paired ratio
+accurately. The three OPEN verdicts above are unchanged.
+
+All **42 required installed milestone stages PASS**, including fresh
+execution of the 45 required simulator/model rows through the shared matcher.
+The affected installed focused selection is also validated: its original
+189 passes, three simulator-setup skips and one stale policy-test failure
+are retained; the corrected policy suite passes (four tests), and all three
+initially skipped checks pass with the configured native/bundled simulators.
+No skip is used as execution evidence. The policy test retains bit equality,
+the independent IEEE comparison and the unchanged numerical tolerance.
+
+Exact wheel delta from r211: the two intended Python modules and RECORD;
+517 other payload files are identical and all 501 installed package files
+match. All seven G1 programs / 49 emitted files and all 25 G2 payload files
+are byte-identical. The ten-installation equivalence chain is rehashed.
+Fixed hardware campaigns and accepted r211 V1-16 board evidence carry by
+identity; no board launch, resampling or repooling occurred. The frozen
+paper remains 73/73. Required inventory: 52 REPRODUCED, three OPEN.
+
+Evidence root:
 `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r212`.
-Hardware campaigns remain fixed. V1-16's arithmetic model and actual device
-path are unchanged; its independent review is accepted.
+VALIDATION records the commands, initial failures and configured reruns;
+REVIEW updates the G1–G10 walkthrough for this candidate. The subsequent
+test/documentation-only commits change no package payload. Next action:
+independent review of this bounded delta and user decisions above. Do not
+rerun fixed hardware outcomes or repeat the completed milestone.
 
 ## Previous candidate e0c568a — NOT READY
 

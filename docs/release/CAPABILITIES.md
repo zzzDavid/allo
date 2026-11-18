@@ -11,18 +11,18 @@ Finding IDs (S-xx, M-xx, U-xx, V1-xx, G2-xx, C-xx, P-xx, F-xx) refer to
 `ISSUES.md`; check it for the current status of each. The implementation map
 (modules, stages, inspection fields) is `SPMW_ARCHITECTURE.md`.
 
-Current candidate `e0c568a` has fresh installed Gemini-I arithmetic evidence:
-nine launches, four shapes under both policies and a special-value outer
-product, all 6,096 output encodings exact. The primitive model also matches
-all 2^32 multiply pairs and complete special classes against the installed
-SDK. V1-16 is the documented target-arithmetic boundary below, not an xfail.
-The seven campaign programs and 49 emitted project/ABI/source files are
-byte-identical to `5fec806`; all 25 Gemini-II payload files are identical.
-The fixed r208/r210 performance campaigns carry by that identity, with their
-three OPEN results unchanged. Earlier Evidence table rows are historical
-probes, not fresh executions at this installation. The new local installed
-milestone passed all 42 required stages, freshly reproducing all 45 required
-simulator/model results (STATUS/VALIDATION).
+Current compiler candidate `d9d38b8` carries the accepted installed r211
+Gemini-I arithmetic evidence: nine launches, four shapes under both policies
+and a special-value outer product, all 6,096 encodings exact. The primitive
+model and runtime are unchanged; V1-16 remains the documented target-arithmetic
+boundary. The installed model matches every multiply operand pair against
+the SDK; the independent review additionally verified every add/subtract
+operand pair. All seven campaign programs / 49 emitted files
+and all 25 Gemini-II payload files remain byte-identical. Fixed r208/r210
+performance outcomes carry by identity, including the three OPEN rows.
+The new wheel's 42-stage milestone passes, with 45 fresh simulator/model
+results and installed returned-local/coverage regressions. Earlier Evidence
+table rows are historical probes, not new hardware runs at this installation.
 
 Ordinary matched reductions require their output buffer as an argument.
 Returning a local array accumulator is unsupported on that route, even when
