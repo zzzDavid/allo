@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -136,7 +137,12 @@ ARTIFACT_PACKED = {
     ),
 }
 ARTIFACT_ROOT = (
-    Path(__file__).resolve().parents[4] / "tenon-artifacts" / "apuv2-composed-v2"
+    Path(
+        os.environ.get(
+            "TENON_ARTIFACTS", Path(__file__).resolve().parents[4] / "tenon-artifacts"
+        )
+    )
+    / "apuv2-composed-v2"
 )
 
 

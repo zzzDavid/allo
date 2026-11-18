@@ -16,6 +16,7 @@ import dataclasses
 import hashlib
 import importlib.util
 import json
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -39,7 +40,7 @@ from allo.pim.targets import build_apu_v1_target
 
 TARGET = build_apu_v1_target()
 _REPO = Path(__file__).resolve().parents[4]
-_ARCHIVE = _REPO / "tenon-artifacts"
+_ARCHIVE = Path(os.environ.get("TENON_ARTIFACTS", _REPO / "tenon-artifacts"))
 
 # (case, chunks, queries, measured median CRUN, frozen calibrated prediction)
 # rebuttal/reviewer-a/q1/evidence/results/2026-09-29-gemini-calibration-v4.

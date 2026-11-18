@@ -9,8 +9,8 @@ import allo.pim as pim
 from allo.pim import apu_g2_pipeline, apu_g2_recipe
 from allo.pim.costs import apu_g2 as apu_g2_costs
 
-ROOT = Path(__file__).resolve().parents[2]
-TEMPLATE = ROOT / "allo" / "pim" / "templates" / "apu_g2"
+ROOT = Path(pim.__file__).resolve().parent
+TEMPLATE = ROOT / "templates" / "apu_g2"
 
 # Host executable -> (host source, ARC task source, runtime that launches it).
 RUNTIMES = {
@@ -42,12 +42,12 @@ def test_template_has_one_host_and_one_task_per_public_runtime():
     for name, (_host, task, runtime) in RUNTIMES.items():
         assert task in device_cmake
         assert f"GSI_LIBRARY_ENTRY_POINT_FUNCTION_PROTOTYPE({name}," in library
-        assert f'"{name}"' in (ROOT / "allo" / "pim" / runtime).read_text()
+        assert f'"{name}"' in (ROOT / runtime).read_text()
 
 
 def test_typed_and_composed_runtimes_build_only_their_host_target():
     for name in ("tenon_apu_g2_typed", "tenon_apu_g2_composed_dot"):
-        runtime = (ROOT / "allo" / "pim" / RUNTIMES[name][2]).read_text()
+        runtime = (ROOT / RUNTIMES[name][2]).read_text()
         assert re.search(r'"--target",\s*"' + name + '"', runtime), name
 
 

@@ -4,6 +4,7 @@
 
 from pathlib import Path
 
+import allo.pim as pim
 import numpy as np
 import pytest
 
@@ -19,19 +20,11 @@ from allo.spmw_linear_layout import LinearLayout
 
 
 def test_apu_g2_build_templates_keep_publication_optimization_parity():
-    template = (
-        Path(__file__).resolve().parents[2] / "allo" / "pim" / "templates" / "apu_g2"
-    )
+    root = Path(pim.__file__).resolve().parent
+    template = root / "templates" / "apu_g2"
     device_cmake = (template / "device" / "CMakeLists.txt").read_text()
-    typed_runtime = (
-        Path(__file__).resolve().parents[2] / "allo" / "pim" / "apu_g2_typed_runtime.py"
-    ).read_text()
-    composed_runtime = (
-        Path(__file__).resolve().parents[2]
-        / "allo"
-        / "pim"
-        / "apu_g2_composed_runtime.py"
-    ).read_text()
+    typed_runtime = (root / "apu_g2_typed_runtime.py").read_text()
+    composed_runtime = (root / "apu_g2_composed_runtime.py").read_text()
 
     assert "set(CMAKE_BUILD_TYPE ArcDebug)" in device_cmake
     assert "set(GSI_SYSTEM_CMAKE_BUILD_TYPE Release)" in device_cmake

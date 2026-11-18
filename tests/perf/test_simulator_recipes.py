@@ -22,7 +22,9 @@ import pytest
 
 from test_packaging import sdist_members  # noqa: F401  (pytest fixture)
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(
+    os.environ.get("TENON_TEST_SOURCE_ROOT", Path(__file__).resolve().parents[2])
+)
 SIM = REPO / "simulators"
 PIMSIM = SIM / "PIMSimulator"
 

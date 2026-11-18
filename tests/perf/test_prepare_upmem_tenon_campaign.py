@@ -9,12 +9,15 @@ import importlib.util
 import json
 import struct
 import sys
+import os
 from pathlib import Path
 
 import pytest
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(
+    os.environ.get("TENON_TEST_SOURCE_ROOT", Path(__file__).resolve().parents[2])
+)
 SCRIPT = ROOT / "scripts" / "prepare_upmem_tenon_campaign.py"
 SPEC = importlib.util.spec_from_file_location("prepare_upmem_tenon_campaign", SCRIPT)
 PREPARER = importlib.util.module_from_spec(SPEC)

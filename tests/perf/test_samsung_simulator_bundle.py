@@ -21,7 +21,9 @@ import pytest
 from allo import spmw_simenv
 from allo.pim import samsung_simulator as bundle
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(
+    os.environ.get("TENON_TEST_SOURCE_ROOT", Path(__file__).resolve().parents[2])
+)
 RECIPE = REPO / "simulators" / "PIMSimulator"
 GEOMETRY = (
     "PIM_GEOMETRY channels=64 ranks=1 pim_blocks=8 banks=16 bank_groups=4 "

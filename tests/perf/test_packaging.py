@@ -23,7 +23,9 @@ import pytest
 
 from allo import spmw_aim, spmw_simenv
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(
+    os.environ.get("TENON_TEST_SOURCE_ROOT", Path(__file__).resolve().parents[2])
+)
 
 # Runtime assets read through __file__-relative paths, relative to REPO.
 RUNTIME_ASSET_GLOBS = (

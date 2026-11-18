@@ -14,9 +14,12 @@ The texts live under ``THIRD_PARTY_LICENSES/``, are inventoried in
 import hashlib
 import re
 import subprocess
+import os
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(
+    os.environ.get("TENON_TEST_SOURCE_ROOT", Path(__file__).resolve().parents[2])
+)
 LICENSES = ROOT / "THIRD_PARTY_LICENSES"
 UPIMULATOR_UPSTREAM_SHA256 = (
     "73de95273ba877b7c8b1037d8c478179fd58ff97169da6683bc10d88b79fd16d"
