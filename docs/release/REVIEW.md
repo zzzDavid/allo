@@ -3,7 +3,51 @@
 
 # Release review: architecture, constants, specialization, gate judgments
 
-## Round 212 independent review and bounded corrections
+## Round 213: structural returned-result coverage (corrected candidate pending)
+
+The round-213 review supersedes the round-212 C-36 closure below. That patch
+recognized only the whole-fill returned-accumulator spelling; the shared
+matcher now records the actual result-binding obligation. `_FunctionCoverage`
+follows matched result identities through element copies and `memref.copy`.
+When a result reaches a returned local allocation without an argument
+destination, `require_match_coverage` raises one `UnsupportedWorkloadError`
+before enumeration. The decision has no target-name or workload-name branch.
+A whole-function frontend's `verbatim_functions` contract binds its returned
+allocations and discharges this obligation; merely executing host effects
+does not. Native reductions and record frontends retain their return ABI.
+
+Initialization is checked separately. Existing fill facts supply the value,
+lexical position and guard/loop context. An unguarded whole-buffer zero fill
+outside and before the reduction initializes it; nonzero, late and nested or
+guarded fills cannot silently become zero initializers. This is a real
+analysis correction, not only a diagnostic change. A valid initializer still
+faces the ordinary copy/layout legality checks. Fill and explicit-store
+spellings reach the same next verdict in the focused cross-target probes.
+
+The new tests cover returned fills, separate and fused stores, scalar
+accumulators copied to an array, direct elementwise results, copied returns,
+and integer variants across four matched targets. They fail if candidate
+enumeration is reached before the ABI refusal. The positive output-argument
+GEMV executes bit-exactly on the functional backend. Existing native/record
+return controls pass. The full installed milestone and one complete
+non-hardware perf/PIM pass are in progress; no gate is closed by this source
+walkthrough alone.
+
+Candidate `87787108` is superseded: a direct output-initialization probe
+found a dropped `memref.copy` and wrong functional output. Coverage now
+retains its whole-buffer read/write and refuses unsupported matched lowering.
+The portable C route rejects it before the emitter's fatal unsupported-op
+path. Explicit element initialization remains supported. This bounded
+effect-coverage dependency requires a fresh package and installed validation.
+
+The initial sdist and wheel contain only the changed shared coverage and matcher
+modules relative to r212. All seven G1 generated programs (49 files) and all
+25 G2 payload files are byte-identical. Fixed campaigns carry by identity;
+no hardware launch, resampling or repooling is part of this increment.
+NOT READY remains for the three absolute performance misses, unrecorded
+Samsung redistribution permission and the recorded target-arithmetic decision.
+
+## Historical round 212 assessment (C-36 superseded)
 
 The reviewer independently accepted the GVML arithmetic model, fresh board
 readbacks and functional generality. Their exhaustive add/subtract checks

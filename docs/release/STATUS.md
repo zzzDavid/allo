@@ -25,12 +25,16 @@
 
 ## Round 213 active — NOT READY
 
-C-36 is reopened: the previous repair was initializer-spelling dependent.
-The structural shared-coverage repair and fill initialization analysis are
-implemented; installed validation is pending. The reduction-policy suite is
-now included in the installed milestone. One complete non-hardware perf/PIM
-collection is planned, with physical tests explicitly excluded and every
-failure/skip retained. No hardware launch, resampling or repooling is allowed.
+C-36's structural shared-coverage and fill analysis repair is implemented.
+Validation of initial candidate `87787108` exposed a separate real defect:
+whole-array output assignment lowered to a dropped `memref.copy`, preserving
+the old output. C-37 now retains the effect and refuses unsupported copy
+lowering before enumeration or portable C emission. The focused source
+selection passes 77 tests. A corrected candidate is being built; the original
+milestone and complete non-hardware pass remain retained diagnostics.
+Eight fixture/environment failures pass corrected installed reruns; three
+Samsung GEMV failures await their original tracebacks. No hardware launch,
+resampling or repooling is allowed.
 Evidence: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r213`.
 
 ## Previous candidate d9d38b8 — C-36 closure superseded by round 213

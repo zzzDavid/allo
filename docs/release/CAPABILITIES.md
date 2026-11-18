@@ -36,6 +36,11 @@ contract, not the target name. For non-returned locals, an unguarded
 whole-buffer zero fill before the reduction is a zero initializer; nonzero,
 late, guarded or loop-nested fills are refused with their actual restriction.
 A valid initializer does not waive a separate copy/layout restriction.
+Whole-array assignment such as `y = 0.0` can lower to a filled temporary
+followed by `memref.copy`. Ordinary matched routes retain and refuse this
+unsupported copy; use explicit element stores (`y[i] = 0.0`) instead. The
+portable C record route also rejects a remaining `memref.copy` before code
+emission. Direct local `linalg.fill` initialization is a distinct operation.
 
 Terms used below:
 

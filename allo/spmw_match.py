@@ -241,8 +241,8 @@ class StoreCoverage:
     term: str = ""  # rendered stored value
     constant: bool = False  # the stored value is a compile-time constant
     loop_names: tuple = ()  # ((induction var, source loop label), ...)
-    # The write covers the whole buffer by construction (a ``linalg.fill``
-    # initializer, category ``"fill"``) rather than one element.
+    # The write covers the whole buffer by construction (``linalg.fill`` or
+    # ``memref.copy``) rather than one element.
     whole: bool = False
 
 

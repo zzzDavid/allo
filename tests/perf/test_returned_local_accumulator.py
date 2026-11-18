@@ -150,6 +150,32 @@ def output_argument(W: float16[8, 8], x: float16[8], y: float16[8]):
         y[i] = acc
 
 
+def argument_zero_stores(W: float16[8, 8], x: float16[8], y: float16[8]):
+    for i in range(8):
+        y[i] = 0.0
+    for i in range(8):
+        for k in allo.reduction(8):
+            y[i] += W[i, k] * x[k]
+
+
+def array_assignment_before(W: float16[8, 8], x: float16[8], y: float16[8]):
+    y = 0.0
+    for i in range(8):
+        for k in allo.reduction(8):
+            y[i] += W[i, k] * x[k]
+
+
+def array_assignment_after(W: float16[8, 8], x: float16[8], y: float16[8]):
+    for i in range(8):
+        for k in allo.reduction(8):
+            y[i] += W[i, k] * x[k]
+    y = 0.0
+
+
+def copy_values(src: int32[8], dst: int32[8]):
+    dst = src
+
+
 TARGETS = [
     (build_samsung_target, samsung_cost),
     (build_aim_target, aim_cost),
@@ -258,9 +284,10 @@ def test_fill_and_element_store_reach_the_same_next_verdict(target, cost):
     assert outcomes[0] == outcomes[1]
 
 
-def test_output_argument_form_executes_on_functional_backend():
+@pytest.mark.parametrize("workload", [output_argument, argument_zero_stores])
+def test_output_argument_form_executes_on_functional_backend(workload):
     compiled = allo.compile(
-        output_argument, build_apu_v1_target(), apu_v1_cost, backend="functional"
+        workload, build_apu_v1_target(), apu_v1_cost, backend="functional"
     )
     # Small exact products keep this positive control independent of the
     # target's inexact-product rounding; no tolerance hides an output error.
@@ -270,3 +297,34 @@ def test_output_argument_form_executes_on_functional_backend():
     compiled(W, x, y)
     expected = (W.astype(np.int32) @ x.astype(np.int32)).astype(np.float16)
     np.testing.assert_array_equal(y.view(np.uint16), expected.view(np.uint16))
+
+
+@pytest.mark.parametrize("target,cost", TARGETS)
+@pytest.mark.parametrize("workload", [array_assignment_before, array_assignment_after])
+def test_whole_array_assignment_cannot_be_dropped(workload, target, cost, monkeypatch):
+    def no_candidates(*args, **kwargs):
+        pytest.fail("unsupported whole-buffer copy must fail before enumeration")
+
+    monkeypatch.setattr("allo.spmw_codegen.autoschedule", no_candidates)
+    with pytest.raises(UnsupportedWorkloadError, match="whole-buffer memref.copy"):
+        allo.compile(workload, target(), cost, backend="functional")
+
+
+def test_record_copy_effects_are_retained_and_c11_refuses_before_emission(monkeypatch):
+    from allo.backend import c as c_backend
+    from allo.pim.apu_v1_record_frontend import normalize_apu_v1_program
+
+    record = allo.APUv1Program((allo.APUv1Phase(copy_values),))
+    source = normalize_apu_v1_program(record, build_apu_v1_target())
+    (effect,) = source.facts.effects
+    assert effect.store.startswith("memref.copy@")
+    assert effect.whole and effect.writes_whole_buffer and effect.instances == 8
+    assert effect.destination.parameter == "dst"
+    assert [read.parameter for read in effect.reads] == ["src"]
+
+    def no_emitter(*args, **kwargs):
+        pytest.fail("C11 must refuse the unsupported copy before its fatal emitter")
+
+    monkeypatch.setattr(c_backend.allo_d, "emit_vhls", no_emitter)
+    with pytest.raises(c_backend.PortableCError, match="does not lower memref.copy"):
+        allo.compile(record, build_apu_v1_target(), apu_v1_cost, backend="functional")

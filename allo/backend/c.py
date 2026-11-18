@@ -396,6 +396,15 @@ class MLIRToCModule:
             if wrap_wide_integers:
                 _check_wide_integers(self.module, top_func_name)
 
+            # The structured emitter aborts on this operation rather than
+            # returning failure. Keep the public C11 route's refusal finite.
+            for operation in _walk_operations(self.module.body):
+                if operation.name == "memref.copy":
+                    raise PortableCError(
+                        "portable C does not lower memref.copy; use explicit "
+                        "element stores instead of whole-array assignment"
+                    )
+
             output = io.StringIO()
             if not allo_d.emit_vhls(self.module, output):
                 raise PortableCError("Allo's structured MLIR-to-C emission failed")

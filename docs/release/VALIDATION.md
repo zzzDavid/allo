@@ -3,6 +3,118 @@
 
 # Validation record
 
+## Round 213: shared return binding and fill initialization
+
+The first candidate below is superseded by a concrete copy-effect repair.
+`output-fill-probe.log` shows eight wrong outputs for whole-array output
+initialization: `memref.copy` was dropped and the prior output was retained.
+`copy-record-probe.log` records the corresponding portable C emitter abort.
+The repair retains copy effects and refuses unsupported lowering before
+enumeration/emission. `copy-coverage-focused.log` has 77 passes and 156
+deselected, including explicit-element initialization with nonzero incoming
+outputs and supported native/record return controls. A fresh corrected
+candidate is required; the first candidate's ongoing milestone and complete
+software pass are retained as diagnostic evidence, not final-candidate proof.
+
+
+Compiler candidate `877871083c64d5b3a56e42bd2e61cdb5a726db69`; evidence root
+`/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r213`
+(`E` below). The package was built from a git archive as an sdist, then built
+from that sdist into a wheel and installed outside the checkout. Wheel SHA256:
+`e6194fbbd836bc4ca0c47ea420450eb01556b66bccde469be797c95ce5542acc`;
+sdist `3deec60f047896c4d4ae6ba6b92b62cf06551e61a5e4305c7866e7b256c191b5`.
+`candidate-equivalence.json` verifies all 501 installed package files, no
+added/removed payload member, and 517 unchanged files relative to r212. The
+only wheel changes are `spmw_match.py`, `spmw_match_engine.py` and RECORD.
+`sdist-equivalence.json` independently verifies the same two-module content
+delta. `source-delta-audit.json` limits changed top-level definitions to
+`MatchCoverage`, `_FunctionCoverage` and `require_match_coverage`.
+
+`generated-program-equivalence.json` compares all seven G1 programs, eleven
+identity/decision fields per program and all 49 emitted source/project/ABI
+files: byte-identical to r212. All 25 G2 payload files also match.
+`installation_equivalence.json` extends and rehashes the eleven-installation
+chain. No physical device was launched; fixed campaign measurements and the
+accepted r211 FP16 board readbacks carry by identity. No pooling or numerical
+acceptance rule changed. The frozen paper still matches all 73 locked hashes.
+
+The focused source run (`focused-final.log`) has 68 passes and 155 deselected:
+all 62 expanded C-36 cases plus native/record return controls. After reuse of
+the fill's cached semantic term, `fill-record-controls.log` separately checks
+five affected native/record cases. Earlier failed test expectations are kept
+in `expanded-focused.log`: a valid initializer does not make an otherwise
+unsupported copy layout legal, and diagnostic SSA identifiers differ between
+spellings. The corrected tests compare initializer facts and the next
+exception type/reason, normalizing only SSA and function names. They do not
+loosen numerical checks. The output-argument functional GEMV uses exact small
+integer products and bit equality.
+
+Installed test fixtures are separate from compiler imports. Tests needing
+source metadata, simulator recipes or repository scripts use
+`TENON_TEST_SOURCE_ROOT`; it is never added to Python's import path. Payload
+checks read the imported package's own files. Historical archive checks honor
+`TENON_ARTIFACTS`. The first collection-only audit found a missing repository
+script in the partial test copy (`installed-collection.log`); fixture paths
+were corrected before the full pass. The corrected collection selects 1,828
+software tests and excludes 30 physical tests, without a collection error
+(`installed-collection-corrected.log`, `nonhardware-collection.json`). The
+collection audit also rejects any selected item with a physical marker or
+board/card fixture. Test/build dependencies setuptools 83.0.0 and wheel
+0.47.0 were installed in the isolated venv before the pass.
+
+`test-tree-identity.json` records the exact test revision and hashes all 274
+copied test/benchmark/script files. The evidence-only root conftest asserts
+that `allo` comes from an installed validation venv and sets the source-fixture
+path. For replay, the same environment can be set directly:
+
+```sh
+# Copy tests, benchmarks and docs/release/scripts from the recorded test
+# revision to TEST_TREE. SOURCE_FIXTURES is a complete Git checkout at that
+# revision (tracking checks need Git metadata), used only for explicit
+# fixture reads and sdist tests. It must not be added to PYTHONPATH.
+export TENON_TEST_SOURCE_ROOT="$SOURCE_FIXTURES"
+export PYTHONPATH="$TEST_TREE" PYTHONSAFEPATH=1 TMPDIR="$HOST_LOCAL_SCRATCH"
+# Configure the native AiM/UPMEM and bundled Samsung paths as in run_validation.sh.
+cd "$TEST_TREE"
+"$INSTALLED_PYTHON" -m pytest -q -ra -p no:cacheprovider \
+  --continue-on-collection-errors --junitxml="$E/full-nonhardware.xml" \
+  tests/perf tests/pim \
+  -m 'not apu_v1_device and not apu_g2_device and (paper_full or not paper_full)'
+```
+
+The milestone and broad pass run concurrently with separate scratch roots
+(`E/tmp` and `E/fulltmp`). The original serial orchestration parent was
+terminated before it could launch the broad pass twice; no test process was
+signaled and the active milestone child continued. Its intentional shell
+exit 143 remains in `validation.exit`, explained by
+`parallel-orchestration.json`. Actual outcomes are recorded separately in
+`milestone.exit`, `full-nonhardware.exit` and `software-validation.exit`.
+The broad-pass launcher is `run_full_software.sh`.
+
+The first three broad-pass failures have focused installed confirmations in
+`first-failures-corrected.log`/`.xml` (three passed). The AttAcc precision test
+needed the inventory CSV from the explicit source-fixture root. The license
+tracking test needs Git metadata, so its fixture is now a detached local clone
+at the recorded test revision (`source-fixtures/`, never on `PYTHONPATH`). The
+dataflow simulator requires `LLVM_BUILD_DIR`; its original failure and
+traceback are in `dataflow-failure-diagnostic.log`, and it passes with the same
+`/work/shared/common/llvm-project-main/build-rhel8` used to build the wheel.
+These corrections change no compiler code or expected numerical result.
+`followup-tree/` holds corrected tests separately; the running broad-pass tree
+is preserved at its original hashes. Five additional UPMEM campaign-exporter failures have the same missing-Git
+cause: the exporter records the source revision and tracked source state.
+All five pass against the detached source fixture
+(`campaign-exporter-corrected.log`/`.xml`). The Samsung recipe tracking
+assertion also passes with actual Git metadata (`source-tracking-check.log`).
+No compiler change or expectation change is needed for these environment
+corrections. Final broad-pass failure/skip accounting is still pending.
+
+The `paper_full` tautology explicitly includes the long software cases while
+excluding only physical-device tests. `run_installed_milestone.sh` now includes
+`test_apu_v1_reduction_policy.py` in `apu_v1_functional_reference`. The one
+42-stage milestone and full software pass are running; their final results
+and every failure/skip will be recorded here before this increment closes.
+
 ## Round 212: bounded matcher and realization corrections
 
 Source candidate `d9d38b8fff1accf7881a2907e74a518c08a66814`; evidence root

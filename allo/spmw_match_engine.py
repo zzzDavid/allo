@@ -3355,6 +3355,11 @@ class _FunctionCoverage:
             for index, (op, _loops, _guards) in enumerate(sites)
             if op.operation.name == "linalg.fill" and len(op.operands) >= 2
         }
+        self.buffer_copies = {
+            index
+            for index, (op, _loops, _guards) in enumerate(sites)
+            if op.operation.name == "memref.copy" and len(op.operands) == 2
+        }
         self.loads_by_ref: dict = {}
         self.uses: dict[str, list[tuple[int, int]]] = {}
         for index, (op, _loops, _guards) in enumerate(sites):
@@ -3796,6 +3801,60 @@ class _FunctionCoverage:
                 out.append((str(kind), None))
         return out
 
+    def _record_buffer_copy(self, index, coverage, loop_names) -> None:
+        """Keep the whole-buffer read/write even when matching cannot lower it.
+
+        Whole-function frontends execute the retained IR and need these
+        effects for their ABI. Ordinary matched routes must reject the copy;
+        treating it as neither a store nor a read silently loses assignments.
+        """
+        op = self._op(index)
+        source, destination = op.operands
+        source_ref, destination_ref = self._ref(source), self._ref(destination)
+        source_name = _value_name(source, self.state)
+        guard_terms = self._guard_terms(index)
+        coverage.stores.append(
+            StoreCoverage(
+                func_name=self.func_name,
+                store=f"memref.copy@{_value_name(destination, self.state)}",
+                memref_name=self._dest_name(index),
+                enclosing_loops=tuple(self.sites[index][1]),
+                category=STORE_UNMATCHED,
+                detail="whole-buffer copy has no matched lowering",
+                local=destination_ref not in self.arg_refs,
+                value_ref=(
+                    destination_ref if isinstance(destination_ref, IRValueRef) else None
+                ),
+                memref_type=str(destination.type),
+                guards=tuple(
+                    f"{kind}({_render_term(cond)})" if cond is not None else kind
+                    for kind, cond in guard_terms
+                ),
+                loads=(
+                    RetainedLoad(
+                        memref_name=None,
+                        value_ref=(
+                            source_ref if isinstance(source_ref, IRValueRef) else None
+                        ),
+                        memref_type=str(source.type),
+                        indices=(),
+                        index_map=None,
+                        coords=None,
+                    ),
+                ),
+                guard_loads=tuple(
+                    load
+                    for _kind, cond in guard_terms
+                    if cond is not None
+                    for load in _retained_loads(cond)
+                ),
+                reads_destination=source_ref == destination_ref,
+                term=f"copy({source_name})",
+                loop_names=loop_names,
+                whole=True,
+            )
+        )
+
     def _is_local(self, index) -> bool:
         owner = getattr(self._op(index).operands[1], "owner", None)
         name = getattr(getattr(owner, "operation", owner), "name", None)
@@ -3936,9 +3995,21 @@ class _FunctionCoverage:
         fills = self.fills
         # One traversal in site (program) order: a fill that reads a value an
         # earlier store defined is retained after that store.
-        for index in sorted(fills | set(self.stores)):
+        for index in sorted(fills | self.buffer_copies | set(self.stores)):
             if index in fills:
                 self._record_fill(index, coverage, loop_names)
+                continue
+            if index in self.buffer_copies:
+                self._record_buffer_copy(index, coverage, loop_names)
+                problems.setdefault(
+                    (self.work_root, index, "buffer_copy"),
+                    [
+                        f"function '{self.func_name}': whole-buffer memref.copy "
+                        "is unsupported by the matched route; use explicit "
+                        "element stores instead of whole-array assignment",
+                        [],
+                    ],
+                )[1].append(self.func_name)
                 continue
             cat = category[index]
             dest_ref = self._ref(self._op(index).operands[1])
@@ -4215,7 +4286,7 @@ class _FunctionCoverage:
     def _accumulator_init(self, dest, index):
         others = [
             i
-            for i in sorted(set(self.stores) | self.fills)
+            for i in sorted(set(self.stores) | self.fills | self.buffer_copies)
             if i != index and self._dest(i) == dest
         ]
         if not others:
@@ -4231,6 +4302,12 @@ class _FunctionCoverage:
             at = (
                 f"store {self._handle(other)} at loop nest {_render_loops(other_loops)}"
             )
+            if other in self.buffer_copies:
+                found.append(
+                    f"it is also written by a whole-buffer memref.copy ({at}); "
+                    "the matched route does not implement whole-array assignment"
+                )
+                continue
             if other in self.site_matches:
                 found.append(
                     f"it is also written by matched op(s) "

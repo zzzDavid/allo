@@ -12,11 +12,14 @@ import csv
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(
+    os.environ.get("TENON_TEST_SOURCE_ROOT", Path(__file__).resolve().parents[2])
+)
 SCRIPT = REPO / "docs" / "release" / "scripts" / "attacc_compare_frozen.py"
 
 
