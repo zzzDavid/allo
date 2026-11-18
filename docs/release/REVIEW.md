@@ -3,6 +3,32 @@
 
 # Release review: architecture, constants, specialization, gate judgments
 
+## Round 215 bounded source review — validation pending
+
+The independent review accepts C-36, C-38 and C-39 at `603d5c38`.
+This increment addresses its three new findings:
+
+- UPMEM `_bind_module` now consumes `_retained_abi_value_ids`. Missing IDs
+  bind plain entry parameters by position, matching the shared plan contract.
+  Present IDs retain their exact order and continue through window binding
+  and host-oracle argument indexing. No DPU mapping, schedule, lowering,
+  transfer or runtime is changed. The reordered-region subtraction control
+  verifies that output/input identities are not replaced by positional IDs.
+- Shared coverage counts a copy destination as produced only after
+  `_copy_contract_problem` has accepted the copy and recorded its matched
+  producers. This does not accept arbitrary fills/library operations or
+  bypass candidate effect, allocation or lifetime checks.
+- Samsung checks the single-match domain before role binding. AiM counts
+  primary MAC/ADD/MUL operations before binding; a supported MAC activation
+  remains available. Multiple stages must use separate `@allo.work` kernels.
+  This replaces internal role-collision messages with the declared domain.
+
+The candidate's installed validation and hardware-program identity checks are
+pending. No hardware launch or performance resampling is authorized for this
+increment. The three fixed G10 misses and missing Samsung redistribution
+permission remain release blockers; the FP16 target-arithmetic default remains
+a recorded user decision.
+
 ## Candidate 603d5c38: requested repairs validated; NOT READY
 
 This is the actor's source/evidence walkthrough, not independent approval of

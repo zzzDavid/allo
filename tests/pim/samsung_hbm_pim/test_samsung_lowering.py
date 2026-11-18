@@ -510,3 +510,42 @@ def test_mixed_contraction_and_elementwise_body_is_refused_by_the_domain_rule():
     assert "MAC" in message and "MUL" in message
     assert "a kernel is one contraction or one elementwise op" in message
     assert "binds to multiple memrefs" not in message
+
+
+# Same-op neighbors of S-18: role binding must not masquerade as a matcher bug.
+def _two_macs(W: fp16[8, 8], V: fp16[8, 8], x: fp16[8], y: fp16[8]):
+    t: fp16[8] = 0.0
+    for i in range(8):
+        for k in allo.reduction(8):
+            t[i] += W[i, k] * x[k]
+    for i in range(8):
+        y[i] = 0.0
+        for k in allo.reduction(8):
+            y[i] += V[i, k] * t[k]
+
+
+def _two_adds(a: fp16[64], b: fp16[64], c: fp16[64], y: fp16[64]):
+    t: fp16[64]
+    for i in range(64):
+        t[i] = a[i] + b[i]
+    for i in range(64):
+        y[i] = t[i] + c[i]
+
+
+@pytest.mark.parametrize("workload", [_two_macs, _two_adds])
+@pytest.mark.parametrize("backend", ["samsung", "aim"])
+def test_same_op_stages_name_the_single_kernel_domain(workload, backend):
+    from allo.pim.targets import build_aim_target
+    from allo.pim.costs import aim_cost
+
+    target, cost, error = (
+        (build_samsung_target, samsung_cost, SamsungUnsupported)
+        if backend == "samsung"
+        else (build_aim_target, aim_cost, NotImplementedError)
+    )
+    with pytest.raises(error, match="one contraction or one elementwise op") as info:
+        allo.compile(
+            workload, target(), cost, backend="virtual", reduction_order="reassociate"
+        )
+    assert "split stages into @allo.work kernels" in str(info.value)
+    assert "binds to multiple memrefs" not in str(info.value)

@@ -3963,13 +3963,16 @@ class _FunctionCoverage:
             if op.operation.name in _LOCAL_ALLOC_OPS
             for value in op.results
         }
+        produced_refs = set(result_sites) | {
+            self._dest(index) for index in copy_producers
+        }
         for index, matches in self.site_matches.items():
             for match in matches:
                 for operand in match.operands:
                     if (
                         not operand.is_loop_carried
                         and operand.value_ref in local_refs
-                        and operand.value_ref not in result_sites
+                        and operand.value_ref not in produced_refs
                     ):
                         problems.setdefault(
                             (self.work_root, index, "unproduced_local", operand.role),

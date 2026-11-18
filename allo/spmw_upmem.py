@@ -3752,7 +3752,7 @@ class UpmemCtx(CodegenContext):
     def _bind_module(self, module, by_group, groups) -> None:
         from ._mlir.ir import AsmState
         from .backend.c import emit_c_from_mlir
-        from .spmw_match_engine import ValueNames
+        from .spmw_match_engine import ValueNames, _retained_abi_value_ids
 
         functions = _functions(module)
         arity = 0
@@ -3763,7 +3763,12 @@ class UpmemCtx(CodegenContext):
                 function = functions[name]
                 state = ValueNames(function, AsmState(function))
                 own = [match for match in matches if match.func_name == name]
-                abi = [int(v.value) for v in function.attributes["spmw.abi_value_ids"]]
+                abi = _retained_abi_value_ids(function)
+                if abi is None:
+                    # Plain entry functions bind caller parameters positionally.
+                    # Region kernels retain their explicit (possibly reordered)
+                    # source IDs, as in the shared plan's kernel ABI contract.
+                    abi = tuple(range(len(function.arguments)))
                 if program.kernel.placement == "host":
                     # A host group runs its own MLIR: no template, no windows.
                     _check_kmeans_update_epilogue(function, program.kernel)

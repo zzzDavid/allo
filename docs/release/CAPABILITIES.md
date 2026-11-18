@@ -47,8 +47,9 @@ unsupported copy; use explicit element stores (`y[i] = 0.0`) instead. The
 portable C record route also rejects a remaining `memref.copy` before code
 emission. Direct local `linalg.fill` initialization is a distinct operation.
 
-A matched operand may read an input argument or a supported matched producer.
-Reading an unmatched local fill or library-result allocation is refused in
+A matched operand may read an input argument or a supported matched producer,
+including a validated element-copy sink of that producer. Reading an unmatched
+local fill or library-result allocation is refused in
 shared coverage before enumeration; candidate validation still checks the
 realization of accepted producer/consumer stages.
 
@@ -65,9 +66,13 @@ budget or from passing an isolated milestone.
 Terms used below:
 
 - **Input kind.** *Source*: an ordinary `@allo` workload (usually an
-  `allo.dataflow.region` with `@allo.work(mapping=...)`; a plain function
-  with a matched contraction on APU v1 and Gemini-II, whose vector plans and
-  launch plans are candidates of the same shared pipeline) passed to
+  `allo.dataflow.region` with `@allo.work(mapping=...)`, or a plain function
+  for a single kernel). Plain output-argument functions are supported
+  on Samsung, AiM, UPMEM, APU-v1 and Gemini-II within each lowering's dtype and
+  operation domain. UPMEM binds plain parameters positionally; dataflow kernels
+  retain their declared region ABI IDs. Samsung and AiM admit one contraction
+  or one elementwise operation per kernel (AiM may fuse its supported activation);
+  split multiple stages into `@allo.work` kernels. Source is passed to
   `allo.compile(workload, target, cost)`. *Typed*: a typed program object
   (`APUv1Program`, `APUG2TypedProgram`, `APUG2ComposedContractionProgram`)
   passed to `allo.compile`; they have no source for the matcher and enter

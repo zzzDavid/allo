@@ -461,3 +461,49 @@ def test_record_copy_effects_are_retained_and_c11_refuses_before_emission(monkey
     monkeypatch.setattr(c_backend.allo_d, "emit_vhls", no_emitter)
     with pytest.raises(c_backend.PortableCError, match="does not lower memref.copy"):
         allo.compile(record, build_apu_v1_target(), apu_v1_cost, backend="functional")
+
+
+def matched_copy_operand(
+    W: float16[8, 8], V: float16[8, 8], x: float16[8], y: float16[8]
+):
+    t: float16[8]
+    for i in range(8):
+        acc: float16 = 0.0
+        for k in allo.reduction(8):
+            acc += W[i, k] * x[k]
+        t[i] = acc
+    for i in range(8):
+        acc2: float16 = 0.0
+        for k in allo.reduction(8):
+            acc2 += V[i, k] * t[k]
+        y[i] = acc2
+
+
+def matched_direct_operand(
+    W: float16[8, 8], V: float16[8, 8], x: float16[8], y: float16[8]
+):
+    t: float16[8] = 0.0
+    for i in range(8):
+        for k in allo.reduction(8):
+            t[i] += W[i, k] * x[k]
+    for i in range(8):
+        acc2: float16 = 0.0
+        for k in allo.reduction(8):
+            acc2 += V[i, k] * t[k]
+        y[i] = acc2
+
+
+@pytest.mark.parametrize("workload", [matched_copy_operand, matched_direct_operand])
+@pytest.mark.parametrize("target,cost", TARGETS)
+def test_matched_producer_reaches_candidate_stage(workload, target, cost, monkeypatch):
+    class ReachedCandidates(Exception):
+        pass
+
+    def reached(*args, **kwargs):
+        raise ReachedCandidates
+
+    monkeypatch.setattr("allo.spmw_codegen.autoschedule", reached)
+    with pytest.raises(ReachedCandidates):
+        allo.compile(
+            workload, target(), cost, backend="virtual", reduction_order="reassociate"
+        )

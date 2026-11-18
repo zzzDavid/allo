@@ -596,6 +596,12 @@ def _samsung_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
             f"Samsung lowering: kernel group mixes ops {sorted(ops)}; "
             "a kernel is one contraction or one elementwise op"
         )
+    if len(matches) != 1:
+        raise SamsungUnsupported(
+            f"Samsung lowering: kernel group has {len(matches)} matched ops; "
+            "a kernel is one contraction or one elementwise op; "
+            "split stages into @allo.work kernels"
+        )
     role_to_memref = _trace_memrefs_by_role(matches)
 
     # Fiber handles from the swizzled F2 layout (SPEC-022 D3): the segment
@@ -1072,6 +1078,15 @@ def _aim_enumerate(target, matches: list[MatchedOp]) -> list[Placement]:
     from .spmw_knobs import cross_with_knobs
 
     names = {match.target_op_name for match in matches}
+    # MAC may include its supported activation, but not another contraction
+    # or a separate elementwise stage. Check before binding shared role names.
+    primary = [m for m in matches if m.target_op_name in {"MAC", "MUL", "ADD"}]
+    if len(primary) > 1:
+        raise NotImplementedError(
+            f"AiM lowering: kernel group has {len(primary)} primary matched ops; "
+            "a kernel is one contraction or one elementwise op; "
+            "split stages into @allo.work kernels"
+        )
     if "MAC" in names:
         from .spmw_match_engine import contraction_orientations
 
