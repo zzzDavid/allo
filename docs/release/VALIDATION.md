@@ -3,6 +3,80 @@
 
 # Validation record
 
+## Round 217 candidate 0d3f08b9: installed window repair and provenance restoration
+
+Evidence root (`E`): `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r217`. Compiler `0d3f08b9b28378c092d8b98371131503ace93e0e`.
+Wheel SHA256 `581be6e46453bf230d9923c153d9dade84442347442e834995233e6ecf7fb51d`; sdist SHA256 `1f8e0e6ca1c2a6133275a309019bc36df3d46ac6a1d021d49bf663bc27183735`.
+`E/build_candidate.sh` archives this commit, builds the sdist then wheel and
+installs it outside the checkout (Python 3.12, NumPy 2.3.5). `E/run_validation.sh`
+records payload/program identity, the original reviewer probes, the 42-stage
+milestone, affected selection and one complete single-process non-hardware run.
+Use a new absolute evidence root when reproducing; these scripts preserve prior
+outputs and are not an instruction to overwrite this completed run.
+
+Source scalar-sink regressions: **22 passed in 68.08 s**, `source-sinks.xml`.
+Installed regressions are included in both `shared_contract_set` and the affected
+selection. New cases exercise 96x40 GEMV over four DPUs, uneven 77x35 GEMV over
+three DPUs, and 12x5x17 TTV over three DPUs, with int32-wraparound inputs,
+nonzero incoming outputs and independent int64-then-narrowed oracles. The offset
+37x53 copy preserves output element zero. Reversed/strided GEMV and GEMM refuse
+at compile time with the access-window reason under both default and virtual
+backends. Output-size diagnostics identify the output role.
+
+The reviewer's unchanged `q2.py`/`q3.py` were copied into `E/reviewer-probes`
+and run from the installed wheel. `q2-sim.log` shows exact offset copy/scale/direct
+execution and compile-time reversed/strided refusals. `q2-virtual.log` shows the
+same invalid forms refused before a virtual artifact is returned. `q3.log` shows
+exact four-DPU copy/scale/direct programs and the one-offset copy. These probes
+supplement, rather than supply expected outputs to, the installed assertions.
+
+Milestone: **42/42 PASS**, `milestone.exit = 0`, individual logs/statuses in
+`E/stages`. Affected selection: **451 passed, 3 skipped, zero failures**,
+`installed-affected.xml` and `.log`; the exact selection is in `run_validation.sh`.
+The three skips are the existing paper_full uneven-GEMV, fanout-GEMV and
+fanout-reduction cases; they execute in the complete run below.
+
+Complete installed collection: **1904 passed, 23 skipped, zero failures/errors,
+30 physical tests deselected**, 13447.74 s. It ran once, in one process,
+using `E/full/run_full_software.sh`:
+
+```sh
+python -m pytest tests/perf tests/pim -q -ra -p no:cacheprovider \
+  --continue-on-collection-errors --junitxml=full-nonhardware.xml \
+  -m 'not apu_v1_device and not apu_g2_device and (paper_full or not paper_full)'
+```
+
+Every skip is a `test_public_exports` module without `__all__`; full names and
+reasons are in JUnit and `final-audit.json`. The passive, owner-process-scoped
+conftest checks import origin and physical-test exclusion and records timings;
+it does not alter tests, compiler GC behavior or the seven 120-second Samsung
+guards. The guards all pass in the long-process context. The detached fixture
+checkout, archived tests and all installed Python sources match the candidate.
+
+Payload: only the two UPMEM modules and RECORD changed from r216 (517 wheel
+members identical). All 501 installed files reverified after the full run.
+`candidate-equivalence.json`, `sdist-equivalence.json` and
+`generated-program-equivalence.json` prove the exact delta, seven G1 programs /
+49 emitted files and 25 unchanged G2 payload files. `installation_equivalence.json`
+freshly hashes all 15 installations. No physical launch or pooling/sampling change.
+
+`restore_inventory.py` restores all 55 required `current_revision` chains from
+`git show 51416660:docs/release/paper_reproduction/inventory.csv`, verbatim, after
+the new candidate/wheel/stage prefix. Hardware rows explicitly describe fixed
+r208/r210 measurements carried by byte-identical programs. `inventory-provenance-audit.json`
+checks that only `current_revision`/`note` differ, all 83 old notes remain, and
+52 REPRODUCED / 3 OPEN verdicts are unchanged. Atomic writes protect release docs
+from the shared quota; no relocation or historical-evidence deletion was needed.
+
+Formatting and `git diff --check` pass. The repository-wide `task_lint.sh`
+stops at 38 inherited bundled-vendor license-header findings against origin/main;
+the configured changed-module pylint check reports the pre-existing dynamic
+MLIR `AsmState` import warning (E0611). Logs and baseline details are retained in
+`lint-notes.txt`; no new finding is on a changed line, and no lint sweep or vendor
+license-header rewrite was performed. The absent `allo` conda environment is
+replaced by the established `spmw` build environment and isolated installed venv.
+All 73 frozen-paper hashes and six inherited verifier scripts remain unchanged.
+
 ## Round 216 candidate e8db9312: installed validation complete
 
 Evidence root (`E`): `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r216`. Compiler `e8db93125ecab4e3d0bda6fca39387fafde4ae6e`.

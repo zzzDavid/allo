@@ -460,7 +460,7 @@ contractions. Whole-array binding now requires a histogram/selection family;
 contraction sinks pass through the same `_access_window` and applicable owner-map
 checks as SCALE/direct writes. Distributed/offset outputs bind their actual
 windows; reversed and strided sinks are refused before either simulator or
-virtual artifacts can run. Installed validation of this correction is pending.
+virtual artifacts can run. Installed 0d3f08b9 passes the 42-stage milestone, 451 affected tests and the complete 1904-pass non-hardware collection. C-42 remains pending independent review of this window correction.
 
 
 ### U-15 (minor) Test/package hygiene

@@ -23,7 +23,46 @@
    [the arithmetic contract](design/gemini-i-fp16.md). Installed board
    confirmation is bit-exact; V1-16 is now a documented target boundary.
 
-## Candidate e8db9312 — round 216 repairs validated; NOT READY
+## Candidate 0d3f08b9 — round 217 window repair validated; NOT READY
+
+Compiler `0d3f08b9b28378c092d8b98371131503ace93e0e`, installed outside the checkout from a fresh sdist.
+Wheel SHA256 `581be6e46453bf230d9923c153d9dade84442347442e834995233e6ecf7fb51d`;
+sdist SHA256 `1f8e0e6ca1c2a6133275a309019bc36df3d46ac6a1d021d49bf663bc27183735`.
+Evidence: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r217`.
+
+C-42's output-window bypass is repaired. The family recognizer's coordinate-name
+check establishes loop order only; every scalar contraction sink now enters the
+same affine window proof as SCALE/direct stores. Whole-array computed destinations
+are restricted to histogram/selection families. Even/uneven distributed GEMV,
+distributed TTV and offset copies execute exactly on uPIMulator with nonzero
+incoming outputs; reversed/strided GEMV and GEMM fail during compilation in both
+default and virtual modes. The reviewer probes now agree with these results.
+Output-size errors name the output role. The accepted scalar-sum boundary stays.
+
+Installed milestone: **42/42 PASS**. Affected selection: **451 passed,
+3 paper_full skips, zero failures**. Complete single-process non-hardware
+collection: **1904 passed, 23 no-`__all__` skips, zero failures**, with
+**30 physical tests deselected**, in 13447.74 s. All original 120-second
+Samsung guards are unchanged and passed. Full per-test records are retained.
+
+Only `allo/spmw_upmem.py`, `allo/pim/upmem_physical.py` and RECORD differ from
+r216. All 501 installed files match; seven G1 programs / 49 emitted files and
+all 25 G2 payload files are byte-identical. Fifteen installation identities are
+rehashed. Fixed r208/r210 measurements carry by identity; no hardware launch,
+resampling or repooling occurred.
+
+All 55 required inventory rows now retain their complete `51416660` revision
+chains verbatim after a new wheel/stage prefix. Only `current_revision` and `note`
+differ from that baseline; all old notes remain. Required verdicts stay
+**52 REPRODUCED, 3 OPEN**. See `inventory-provenance-audit.json` and `final-audit.json`.
+The 73 paper hashes, six inherited scripts and containing-repository HEAD are
+unchanged. Bulk evidence remains host-local and release docs are written atomically.
+
+C-42's repaired window path awaits independent review. The standing decisions
+above remain: X-22/X-23/X-34 fixed OPEN, Samsung written redistribution permission,
+and the Gemini-I FP16 default. No further campaign is proposed around them.
+
+## Historical candidate e8db9312 — round 216 evidence; C-42 reopened in round 217
 
 Compiler revision `e8db93125ecab4e3d0bda6fca39387fafde4ae6e` is installed outside the checkout from a fresh
 sdist. Wheel SHA256 `d98df7f9111ae4be215ff57e7ed2f9e4303b9da9bdafee4742a808936de46708`; sdist SHA256 `0168acee29c1ce43f66904746699bf0b71b83f834a35be95ef930a8d3d8a2c22`.
@@ -53,8 +92,8 @@ repooling. Paper hashes remain 73/73; the six inherited scripts are untouched.
 
 The independent reviewer accepted C-40, C-41 and S-18 at d7037fd3, including
 its complete 1,882-pass collection; that evidence is recorded separately below.
-C-42's implementation and documented sum-reduction boundary await independent
-review. **NOT READY** remains on the three fixed G10 misses and missing Samsung
+The round 217 reviewer accepted the whole-array cases and scalar-sum boundary,
+but found the output-window bypass repaired in the current candidate above. **NOT READY** remains on the three fixed G10 misses and missing Samsung
 written redistribution permission; the Gemini-I FP16 default remains the
 recorded user decision. No additional campaign or work around those decisions
 was started.

@@ -18,7 +18,21 @@ selection or hardware measurement rule changes. K-means host placement still
 executes its own lowered MLIR before this device-window branch.
 
 The packing helper retains its validation but names the actual output role
-when output size/type is wrong. Required installed validation is pending.
+when output size/type is wrong. Installed candidate 0d3f08b9 passes 42/42
+milestone stages, 451 affected tests (3 paper_full skips), and the complete
+single-process 1904-pass collection (23 no-__all__ skips, 30 physical tests
+deselected, zero failures). The reviewer q2/q3 probes execute the valid offset
+and distributed cases exactly and refuse reversed/strided cases at compilation.
+The 49 G1 emitted files and 25 G2 payload files remain byte-identical; no hardware
+was launched. C-42's window repair awaits independent review. The scalar-sum
+boundary was already independently accepted and remains unchanged.
+
+The inventory provenance regression is also repaired: all 55 required rows append
+to the exact revision chain from 51416660, with the new wheel and row-specific
+stage references. Hardware prefixes expressly carry fixed r208/r210 measurements;
+only current_revision/note differ and all historical note text remains. The three
+G10 misses, Samsung written permission and FP16 default decisions stay open as
+recorded in STATUS; tests and provenance restoration do not waive them.
 
 ## Round 216 UPMEM scalar-output copies — actor source review
 

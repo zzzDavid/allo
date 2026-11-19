@@ -3,6 +3,18 @@
 
 # Paper reproduction through the shared pipeline
 
+## Round 217 provenance restoration
+
+The candidate `0d3f08b9` (wheel `581be6e46453bf230d9923c153d9dade84442347442e834995233e6ecf7fb51d`) retains all required performance
+verdicts: 52 REPRODUCED, three fixed OPEN. Every required row's current_revision
+now prepends the installed wheel and actual stages to the complete verbatim
+chain from 51416660. Fixed r208/r210 hardware measurements carry by verified
+program/payload identity; they are not newly sampled results at this revision.
+Only current_revision and note differ from that baseline. Full checks are in
+`r217/inventory-provenance-audit.json`; installed milestone and collection
+results are in VALIDATION. No resampling, repooling, tolerance or paper change.
+
+
 ## Candidate e8db9312: installed validation and unchanged performance verdicts
 
 Wheel `d98df7f9111ae4be215ff57e7ed2f9e4303b9da9bdafee4742a808936de46708` passes all 42 milestone stages (`r216/stages`) and the complete
