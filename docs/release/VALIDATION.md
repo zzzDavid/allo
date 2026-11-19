@@ -75,6 +75,12 @@ and new result section were reconstructed in host-local `E/final-docs-staging`,
 then restored atomically after quota recovery. No compiler file, paper source,
 prior result or inherited untracked script was changed by that failed write.
 `finish-docs.log` retains the error; `finish-docs-staged.log` records reconstruction.
+The final handoff check also found the untracked `.hmz/RESUME_HANDOFF.md` empty
+from an earlier quota-blocked update (mtime 01:22). Its current state was
+reconstructed atomically from the retained release records and results; older
+handoff prose was not separately recovered. The versioned release history and
+raw measurements remain intact. See `E/handoff-recovery.json` and
+`E/final-handoff.md`.
 
 The source prefix `/work/shared/users/phd/nz264/tenon-release-evidence` retains
 its paths on `zhang-capra-xcel.ece.cornell.edu`. The relocated copies are
