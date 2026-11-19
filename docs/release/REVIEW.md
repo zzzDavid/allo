@@ -3,6 +3,23 @@
 
 # Release review: architecture, constants, specialization, gate judgments
 
+## Round 217 scalar-sink window proof — actor source review
+
+`UpmemCtx._bind_module` now reserves whole-array computed-destination binding
+for recognized histogram and selection families. A COMPACT tag and index_terms
+alone do not establish that contract. Matrix-vector/TTV and GEMM scalar sinks
+must take the same `_access_window` proof as SCALE and direct stores, including
+when constructing a virtual artifact. The proof rejects reversed/strided
+accesses and retains constant offsets and per-work-item extents; the existing
+`_check_row_windows` also checks them against an applied owner map.
+`_scalar_accumulator_sink` recognizes loop order only; its coordinate-name
+fallback is not treated as an affine proof. No instruction, arithmetic, cost,
+selection or hardware measurement rule changes. K-means host placement still
+executes its own lowered MLIR before this device-window branch.
+
+The packing helper retains its validation but names the actual output role
+when output size/type is wrong. Required installed validation is pending.
+
 ## Round 216 UPMEM scalar-output copies — actor source review
 
 A matched COMPACT is a load/store pattern, not proof that the program performs
@@ -13,7 +30,7 @@ coordinate order. Matrix-vector
 (including TTV) and GEMM bind that sink as `out`; SCALE retains its coefficient
 validation. The selected plans, packing, runtime and templates are unchanged.
 The copy stays in the trace: common coverage and candidate effects see it, and
-`_bind_module` validates the actual output dtype/window before execution.
+`_bind_module` validates the output dtype. The original round 216 claim that it also validated every output window was false: COMPACT index_terms bypassed _access_window. The independent round 217 review exposed wrong virtual plans for reversed sinks and runtime size failures for offset/distributed sinks.
 The physical family cost is charged at its anchor, including the output write;
 the epilogue match is an absorbed in-kernel event, as SCALE already was.
 Guarded COMPACT+INC selection and k-means retain their existing recognizers.
@@ -33,7 +50,7 @@ and the complete 1,891-pass single-process non-hardware collection (23 public-ex
 skips, 30 physical tests deselected, zero failures). The new simulator checks
 use nonzero incoming outputs and exact independent expectations. Wheel/program
 identity carries both APU campaigns without new launches. This is actor review;
-independent acceptance of C-42 and the sum-reduction boundary is still pending.
+independent round 217 review accepted the whole-array numerical cases and the sum-reduction boundary, but reopened C-42 for the window bypass.
 NOT READY remains unchanged.
 
 ## Independent round 216 review of d7037fd3

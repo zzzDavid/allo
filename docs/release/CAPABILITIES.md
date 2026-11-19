@@ -70,7 +70,12 @@ Terms used below:
   operation domain. UPMEM binds plain parameters positionally; dataflow kernels
   retain their declared region ABI IDs. UPMEM GEMV, TTV and GEMM accept a zero-initialized scalar
   accumulator copied to its output at the producer's outer coordinates.
-  The copy must be unguarded and outside the reduction loop. A scalar-copy
+  The copy must be unguarded and outside the reduction loop. Each output dimension
+  must be a constant offset plus its corresponding outer loop variable with
+  coefficient one; the actual store is checked before constructing either a
+  simulator or virtual artifact. Offset windows and even/uneven work-item
+  partitions use the same binding as direct accumulators. Reversed, strided or
+  permuted output coordinates are not supported. A scalar-copy
   sum reduction remains outside the single-domain launch contract: its ADD
   covers N input instances and its final copy covers one output instance.
   Use the supported int32-to-int64 form `out[0] = 0; ... out[0] += a[i]`. Samsung and

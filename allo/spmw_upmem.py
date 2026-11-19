@@ -650,7 +650,10 @@ def _scalar_accumulator_sink(match, stream, accumulator, *, allow_scale=False):
     unguarded copy at the producer's outer coordinates is the contraction's
     output, just like SCALE with coefficient one. Keep the match in the trace:
     coverage, destination dtype, windows and candidate effects still validate
-    the actual store. Guarded selection and k-means copies use their own families.
+    the actual store. The coordinate-name check below only recognizes the
+    loop ordering; _bind_module must prove offset-plus-unit-stride accesses
+    through _access_window, including for COMPACT sinks. Guarded selection
+    and k-means copies use their own families.
     """
     sinks = [other for other in stream if other is not match]
     if len(sinks) != 1 or _memref_rank(accumulator) != 0:
@@ -3845,9 +3848,16 @@ class UpmemCtx(CodegenContext):
                     writer = next(
                         (m for m in own if m.result_memref_name == memref_name), None
                     )
-                    if writer is not None and "index_terms" in writer.extra:
-                        # A computed destination (spec 004 M6) may touch any
-                        # element: the role binds the whole array.
+                    if (
+                        writer is not None
+                        and "index_terms" in writer.extra
+                        and program.kernel.family in ("histogram", "selection")
+                    ):
+                        # These families prove a computed bin/cursor destination
+                        # and may touch the whole array. index_terms alone is
+                        # not that proof: COMPACT also matches scalar copies.
+                        # Contraction sinks bind through _access_window below,
+                        # just like SCALE and direct accumulator stores.
                         arg = next(
                             (
                                 _func_argument_number(function, op.operands[1])

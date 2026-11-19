@@ -227,6 +227,8 @@ def _matrix_vector_inputs(
     batches: int,
     matrix,
     vectors,
+    *,
+    matrix_role: str = "matrix",
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Validate and snapshot flattened integer matrix/vector operands."""
 
@@ -254,7 +256,7 @@ def _matrix_vector_inputs(
         return tuple(result)
 
     return (
-        snapshot("matrix", matrix, batches * rows * columns),
+        snapshot(matrix_role, matrix, batches * rows * columns),
         snapshot("vectors", vectors, batches * columns),
     )
 
@@ -1376,7 +1378,9 @@ class UPMEMMatrixVectorPlan(UPMEMPhysicalPlan):
     def pack_output(self, logical_values) -> tuple[int, ...]:
         """Scatter logical batch-major outputs into physical tasklet slots."""
 
-        values, _ = _matrix_vector_inputs(self.total_rows, 1, 1, logical_values, (0,))
+        values, _ = _matrix_vector_inputs(
+            self.total_rows, 1, 1, logical_values, (0,), matrix_role="output"
+        )
         physical = [0] * self._physical_output_words()
         for logical_row, value in enumerate(values):
             physical[self._physical_row(logical_row)] = value

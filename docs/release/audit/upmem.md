@@ -454,6 +454,15 @@ is in `tests/perf/test_upmem_scalar_sinks.py`; installed results at e8db9312 are
 VALIDATION.md (42-stage milestone and complete non-hardware collection pass). These changes close the
 scalar-contraction copy diagnostic above, not every historical U-14 example.
 
+Round 217 correction (C-42): the previous output-window claim was too broad.
+COMPACT index_terms bypassed the affine window proof, including for scalar-copy
+contractions. Whole-array binding now requires a histogram/selection family;
+contraction sinks pass through the same `_access_window` and applicable owner-map
+checks as SCALE/direct writes. Distributed/offset outputs bind their actual
+windows; reversed and strided sinks are refused before either simulator or
+virtual artifacts can run. Installed validation of this correction is pending.
+
+
 ### U-15 (minor) Test/package hygiene
 
 - `tests/pim/test_upmem_matcher.py:37-48` imports
