@@ -23,6 +23,20 @@
    [the arithmetic contract](design/gemini-i-fp16.md). Installed board
    confirmation is bit-exact; V1-16 is now a documented target boundary.
 
+## Independent round 216 review of d7037fd3
+
+Reviewer evidence, not an actor rerun: the installed r215 wheel
+`e2c9fd4c55d30792004ac109cb5ea2fc3ea3508f68c43295cdbf95ff2996238f`
+passed the complete single-process non-hardware collection: **1,882 passed,
+23 skipped, zero failures, 30 physical tests deselected**, in 3:43:10.
+All skips are `tests/pim/test_public_exports.py` (module has no `__all__`).
+The reviewer used a git archive of d7037fd3 tests/benchmarks and a detached
+source fixture checkout; the installed 151 Python files match that revision.
+Evidence: `/work/zhang-capra/users/nz264/tenon-local-tmp/hmz-release/reviewer-r216/full/`
+(`full.log`, `full.xml`, `run.sh`). C-40, C-41 and the S-18 same-op extension
+are independently accepted. This supersedes the earlier pending-review and
+no-current-full-collection statements for d7037fd3. No hardware was launched.
+
 ## Candidate d7037fd3 — NOT READY; round 215 repairs installed
 
 Compiler revision `d7037fd3625ab0ede4c07b9a2ee3113b0a429f8c` is built from a

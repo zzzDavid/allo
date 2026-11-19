@@ -3,6 +3,45 @@
 
 # Release review: architecture, constants, specialization, gate judgments
 
+## Round 216 UPMEM scalar-output copies — actor source review
+
+A matched COMPACT is a load/store pattern, not proof that the program performs
+compaction. `_scalar_accumulator_sink` proves a single copy from the MAC's
+rank-zero accumulator, with the same retained value identity, no guard, source order after the producer, the
+same complete outer-loop descriptors and output coordinate order. Matrix-vector
+(including TTV) and GEMM bind that sink as `out`; SCALE retains its coefficient
+validation. The selected plans, packing, runtime and templates are unchanged.
+The copy stays in the trace: common coverage and candidate effects see it, and
+`_bind_module` validates the actual output dtype/window before execution.
+The physical family cost is charged at its anchor, including the output write;
+the epilogue match is an absorbed in-kernel event, as SCALE already was.
+Guarded COMPACT+INC selection and k-means retain their existing recognizers.
+
+Scalar-copy ADD reduction remains a declared boundary, not an execution claim.
+ADD is represented as N elementwise input instances, while its final scalar
+copy has one instance. The current UPMEM template launch declares a single
+instance domain for all operations; the shared candidate checker correctly
+rejects a combined declaration. The family now names this restriction and the
+supported direct int64 output-accumulation form before candidate selection.
+This increment does not change that shared launch contract or waive its checks.
+The frozen running GEMV example's scalar-copy mechanism is implemented within
+UPMEM's integer domain; no paper claim is changed. Installed validation for
+this increment is pending, and NOT READY remains unchanged.
+
+## Independent round 216 review of d7037fd3
+
+Reviewer evidence, not an actor rerun: the installed r215 wheel
+`e2c9fd4c55d30792004ac109cb5ea2fc3ea3508f68c43295cdbf95ff2996238f`
+passed the complete single-process non-hardware collection: **1,882 passed,
+23 skipped, zero failures, 30 physical tests deselected**, in 3:43:10.
+All skips are `tests/pim/test_public_exports.py` (module has no `__all__`).
+The reviewer used a git archive of d7037fd3 tests/benchmarks and a detached
+source fixture checkout; the installed 151 Python files match that revision.
+Evidence: `/work/zhang-capra/users/nz264/tenon-local-tmp/hmz-release/reviewer-r216/full/`
+(`full.log`, `full.xml`, `run.sh`). C-40, C-41 and the S-18 same-op extension
+are independently accepted. This supersedes the earlier pending-review and
+no-current-full-collection statements for d7037fd3. No hardware was launched.
+
 ## Round 215 candidate d7037fd3 — installed validation complete, NOT READY
 
 The independent review accepts C-36, C-38 and C-39 at `603d5c38`.

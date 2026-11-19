@@ -246,7 +246,10 @@ def classify_upmem_kernel(target, matches) -> UpmemKernel:
         found = (family, _merge_stream_shapes(family, shapes))
         break
     if found is None:
-        ops = sorted({match.target_op_name for match in matches})
+        ops = {
+            name: sum(match.target_op_name == name for match in matches)
+            for name in sorted({match.target_op_name for match in matches})
+        }
         functions = sorted({match.func_name for match in matches})
         raise NotImplementedError(
             f"no UPMEM kernel family matches ops {ops} in {functions}. "
@@ -288,7 +291,7 @@ def classify_upmem_kernel(target, matches) -> UpmemKernel:
 _FAMILY_FORMS = (
     "pointwise (one ADD/SUB/MUL/SCALE/AXPBY/AXMBY/AXPBYC over one loop), "
     "reduction (out[c] += in[i]), "
-    "matrix_vector (one MAC over 2-3 loops, optionally y = alpha * acc via SCALE), "
+    "matrix_vector (one MAC over 2-3 loops, optional scalar copy or SCALE), "
     "gemm (C[i,j] += A[i,k] * B[k,j]), "
     "histogram (H[(x*m)>>k] += 1), "
     "selection (COMPACT + INC under one guard, or SELECT_ODD), "
@@ -640,6 +643,49 @@ register_upmem_family(
 )
 
 
+def _scalar_accumulator_sink(match, stream, accumulator, *, allow_scale=False):
+    """Prove the one epilogue store of a rank-zero accumulator.
+
+    COMPACT is a general load/store pattern, not proof of compaction. An
+    unguarded copy at the producer's outer coordinates is the contraction's
+    output, just like SCALE with coefficient one. Keep the match in the trace:
+    coverage, destination dtype, windows and candidate effects still validate
+    the actual store. Guarded selection and k-means copies use their own families.
+    """
+    sinks = [other for other in stream if other is not match]
+    if len(sinks) != 1 or _memref_rank(accumulator) != 0:
+        return None
+    # _streams preserves the matcher's source-order store traversal.
+    sink = sinks[0]
+    allowed = {"COMPACT", "SCALE"} if allow_scale else {"COMPACT"}
+    source = _data_operands(sink).get("x")
+    outer_loops = match.enclosing_loops[:-1]
+    outer = [loop[0] for loop in outer_loops]
+    if (
+        stream[0] is not match
+        or sink.target_op_name not in allowed
+        or source is None
+        or source.memref_name != accumulator.memref_name
+        or source.value_ref != accumulator.value_ref
+        or _memref_rank(source) != 0
+        or accumulator.memref_name != match.result_memref_name
+        or _guards(sink)
+        or _guards(match)
+        or list(sink.enclosing_loops) != list(outer_loops)
+    ):
+        return None
+    if outer:
+        if _store_vars(sink) != outer:
+            return None
+    else:
+        # A scalar reduction writes one fixed output cell, e.g. out[0].
+        # A computed cursor is not a fixed cell, even if it has no loop IV.
+        coords = sink.extra.get("store_coords") or ()
+        if len(coords) != 1 or coords[0][0]:
+            return None
+    return sink
+
+
 # ------------------------------ reduction ------------------------------ #
 
 
@@ -647,9 +693,10 @@ def _recognize_reduction(target, stream):
     """``out[c] = out[c] + in[i]``: one self-updating ADD over a single loop,
     into an int64 cell whose index does not depend on the loop."""
     del target
-    if len(stream) != 1 or stream[0].target_op_name != "ADD":
+    adds = [m for m in stream if m.target_op_name == "ADD"]
+    if len(adds) != 1:
         return None
-    match = stream[0]
+    match = adds[0]
     extents = _loop_extents(match)
     if extents is None or len(extents) != 1:
         return None
@@ -668,13 +715,28 @@ def _recognize_reduction(target, stream):
         return None
     if _memref_rank(value) != 1 or _coordinate_vars(value) != [iv]:
         return None
+    sink = _scalar_accumulator_sink(match, stream, cell)
+    if sink is None and len(stream) != 1:
+        return None
     _require_element_type("reduction", "input", value)
     _require_element_type("reduction", "out", cell)
+    if sink is not None:
+        # ADD is an elementwise accumulation in the shared contract: N input
+        # instances, unlike MAC's explicit reduction dimension. Its scalar
+        # epilogue has one instance. The current single-domain launch contract
+        # cannot combine those domains in one UPMEM template launch.
+        raise NotImplementedError(
+            "UPMEM scalar-copy sum reduction is not supported by the single-domain "
+            "launch contract: the ADD advances each input and the final copy "
+            "advances one output. Accumulate directly into an int64 output cell "
+            "instead: out[0] = 0; for i in range(N): out[0] += a[i]."
+        )
+    out = cell.memref_name
     return {
         "geometry": (("elements", extents[0]),),
         "anchor_op": "ADD",
         "constants": (),
-        "roles": (("input", value.memref_name), ("out", cell.memref_name)),
+        "roles": (("input", value.memref_name), ("out", out)),
         "accumulator_init": _accumulator_init("reduction", match),
     }
 
@@ -711,13 +773,11 @@ def _recognize_matrix_vector(target, stream):
 
     The outer loops flatten into MV rows (TTV). A vector indexed by the first
     outer loop makes that loop the batch axis (MMTV). The accumulator is either
-    the output itself, or a local scalar that one ``SCALE`` match writes to the
-    output (scaled GEMV).
+    the output itself, or a local scalar copied/scaled into one output element.
     """
     del target
     macs = [m for m in stream if m.target_op_name == "MAC"]
-    scales = [m for m in stream if m.target_op_name == "SCALE"]
-    if len(macs) != 1 or len(scales) > 1 or len(macs) + len(scales) != len(stream):
+    if len(macs) != 1:
         return None
     match = macs[0]
     extents = _loop_extents(match)
@@ -745,25 +805,18 @@ def _recognize_matrix_vector(target, stream):
     else:
         return None
     constants = ()
-    if scales:
-        scale = scales[0]
-        scaled = _data_operands(scale).get("x")
-        if (
-            _memref_rank(acc) != 0
-            or scaled is None
-            or scaled.memref_name != acc.memref_name
-            or _store_vars(scale) != outer
-            or [loop[0] for loop in scale.enclosing_loops] != outer
-        ):
-            return None
-        out = scale.result_memref_name
-        constants = tuple(sorted(scale.extra.get("constants", {}).items()))
-        for name, value in constants:
-            _require_int32_constant("matrix_vector", name, value)
+    sink = _scalar_accumulator_sink(match, stream, acc, allow_scale=True)
+    if sink is not None:
+        out = sink.result_memref_name
+        if sink.target_op_name == "SCALE":
+            constants = tuple(sorted(sink.extra.get("constants", {}).items()))
+            for name, value in constants:
+                _require_int32_constant("matrix_vector", name, value)
         _require_element_type("matrix_vector", "acc", acc)
     else:
         if (
-            _coordinate_vars(acc) != outer
+            len(stream) != 1
+            or _coordinate_vars(acc) != outer
             or acc.memref_name != match.result_memref_name
         ):
             return None
@@ -780,7 +833,7 @@ def _recognize_matrix_vector(target, stream):
             ("vector", vector.memref_name),
             ("out", out),
         ),
-        # A scaled accumulator is a local scalar the matcher proves zeroed.
+        # A copied/scaled scalar is initialized by the shared matcher proof.
         "accumulator_init": _accumulator_init("matrix_vector", match),
     }
 
@@ -860,9 +913,10 @@ register_upmem_family(
 def _recognize_gemm(target, stream):
     """``C[i, j] += A[i, k] * B[k, j]`` as one MAC over an (i, j, k) nest."""
     del target
-    if len(stream) != 1 or stream[0].target_op_name != "MAC":
+    macs = [m for m in stream if m.target_op_name == "MAC"]
+    if len(macs) != 1:
         return None
-    match = stream[0]
+    match = macs[0]
     extents = _loop_extents(match)
     if extents is None or len(extents) != 3:
         return None
@@ -872,8 +926,14 @@ def _recognize_gemm(target, stream):
     inputs = [operands.get("x"), operands.get("y")]
     if acc is None or not acc.is_loop_carried or None in inputs:
         return None
-    if _coordinate_vars(acc) != [i, j] or acc.memref_name != match.result_memref_name:
+    sink = _scalar_accumulator_sink(match, stream, acc)
+    if sink is None and (
+        len(stream) != 1
+        or _coordinate_vars(acc) != [i, j]
+        or acc.memref_name != match.result_memref_name
+    ):
         return None
+    out = sink.result_memref_name if sink is not None else acc.memref_name
     lhs = next((op for op in inputs if _coordinate_vars(op) == [i, k]), None)
     rhs = next((op for op in inputs if _coordinate_vars(op) == [k, j]), None)
     if lhs is None or rhs is None or lhs is rhs:
@@ -889,7 +949,7 @@ def _recognize_gemm(target, stream):
         "roles": (
             ("lhs", lhs.memref_name),
             ("rhs", rhs.memref_name),
-            ("out", acc.memref_name),
+            ("out", out),
         ),
         "accumulator_init": _accumulator_init("gemm", match),
     }

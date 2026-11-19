@@ -3,6 +3,36 @@
 
 # Validation record
 
+## Round 216 scalar-copy source checks (installed validation pending)
+
+Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r216`.
+`source-focused.log`: 124 passed, three explicit paper_full skips in 756.30 s
+(UPMEM plain entries, scalar sinks, generality, matcher and shared coverage).
+After adding the explicit producer-before-copy proof, `source-final-sinks.log`
+has nine passes in 33.06 s, including early/guarded/transposed copy refusals.
+The four new contraction programs execute on uPIMulator with nonzero incoming
+outputs and unchanged inputs. The direct int64-output sum control also executes;
+the scalar-copy sum is refused with its single-domain launch restriction.
+`probe5-source.log`, `probe6-source.log` and `reduction-error.log` retain the
+initial diagnostic probes, including the intermediate reduction contract error.
+Black, shell syntax and diff checks pass. Pylint reports the same 28 native-MLIR
+binding inference diagnostics as the prior candidate, not a clean pylint pass.
+No assertion or numerical tolerance was relaxed; no physical device was used.
+
+## Independent round 216 review of d7037fd3
+
+Reviewer evidence, not an actor rerun: the installed r215 wheel
+`e2c9fd4c55d30792004ac109cb5ea2fc3ea3508f68c43295cdbf95ff2996238f`
+passed the complete single-process non-hardware collection: **1,882 passed,
+23 skipped, zero failures, 30 physical tests deselected**, in 3:43:10.
+All skips are `tests/pim/test_public_exports.py` (module has no `__all__`).
+The reviewer used a git archive of d7037fd3 tests/benchmarks and a detached
+source fixture checkout; the installed 151 Python files match that revision.
+Evidence: `/work/zhang-capra/users/nz264/tenon-local-tmp/hmz-release/reviewer-r216/full/`
+(`full.log`, `full.xml`, `run.sh`). C-40, C-41 and the S-18 same-op extension
+are independently accepted. This supersedes the earlier pending-review and
+no-current-full-collection statements for d7037fd3. No hardware was launched.
+
 ## Round 215 candidate d7037fd3: installed ABI and diagnostic repairs
 
 Evidence root (`E`):

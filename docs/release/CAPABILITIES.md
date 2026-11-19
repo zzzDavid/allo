@@ -68,9 +68,12 @@ Terms used below:
   for a single kernel). Plain output-argument functions are supported
   on Samsung, AiM, UPMEM, APU-v1 and Gemini-II within each lowering's dtype and
   operation domain. UPMEM binds plain parameters positionally; dataflow kernels
-  retain their declared region ABI IDs. The fallback does not broaden family
-  recognition: scalar-temporary UPMEM GEMV spellings that also match COMPACT
-  remain refused by the family classifier (retained r215 probes). Samsung and
+  retain their declared region ABI IDs. UPMEM GEMV, TTV and GEMM accept a zero-initialized scalar
+  accumulator copied to its output at the producer's outer coordinates.
+  The copy must be unguarded and outside the reduction loop. A scalar-copy
+  sum reduction remains outside the single-domain launch contract: its ADD
+  covers N input instances and its final copy covers one output instance.
+  Use the supported int32-to-int64 form `out[0] = 0; ... out[0] += a[i]`. Samsung and
   AiM admit one contraction
   or one elementwise operation per kernel (AiM may fuse its supported activation);
   split multiple stages into `@allo.work` kernels. Source is passed to

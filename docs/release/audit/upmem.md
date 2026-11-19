@@ -442,6 +442,18 @@ release route; **major** = gate violation needing repair before release;
   append 40 lines of SDK liveness-analysis noise after the useful "first
   mismatch" line (executed).
 
+Round 216 repair: the matrix-vector (including TTV) and GEMM recognizers
+now prove an unguarded rank-zero accumulator copy at the producer's outer
+coordinates as its output sink. The COMPACT match remains in the trace for
+coverage and output binding; guarded selection and k-means copies are unchanged.
+Family mismatch diagnostics include operation counts. Scalar-copy sum reduction
+has a separate, explicit boundary: its N-instance ADD and one-instance epilogue
+cannot share the current single-domain launch declaration. The supported
+alternative accumulates directly into an int64 output cell. Regression coverage
+is in `tests/perf/test_upmem_scalar_sinks.py`; installed results are recorded in
+VALIDATION.md when the candidate run completes. These changes close the
+scalar-contraction copy diagnostic above, not every historical U-14 example.
+
 ### U-15 (minor) Test/package hygiene
 
 - `tests/pim/test_upmem_matcher.py:37-48` imports
