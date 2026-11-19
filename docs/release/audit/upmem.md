@@ -450,8 +450,8 @@ Family mismatch diagnostics include operation counts. Scalar-copy sum reduction
 has a separate, explicit boundary: its N-instance ADD and one-instance epilogue
 cannot share the current single-domain launch declaration. The supported
 alternative accumulates directly into an int64 output cell. Regression coverage
-is in `tests/perf/test_upmem_scalar_sinks.py`; installed results are recorded in
-VALIDATION.md when the candidate run completes. These changes close the
+is in `tests/perf/test_upmem_scalar_sinks.py`; installed results at e8db9312 are recorded in
+VALIDATION.md (42-stage milestone and complete non-hardware collection pass). These changes close the
 scalar-contraction copy diagnostic above, not every historical U-14 example.
 
 ### U-15 (minor) Test/package hygiene

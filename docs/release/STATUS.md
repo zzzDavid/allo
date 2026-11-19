@@ -23,6 +23,45 @@
    [the arithmetic contract](design/gemini-i-fp16.md). Installed board
    confirmation is bit-exact; V1-16 is now a documented target boundary.
 
+## Candidate e8db9312 — round 216 repairs validated; NOT READY
+
+Compiler revision `e8db93125ecab4e3d0bda6fca39387fafde4ae6e` is installed outside the checkout from a fresh
+sdist. Wheel SHA256 `d98df7f9111ae4be215ff57e7ed2f9e4303b9da9bdafee4742a808936de46708`; sdist SHA256 `0168acee29c1ce43f66904746699bf0b71b83f834a35be95ef930a8d3d8a2c22`.
+Evidence: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r216`.
+
+UPMEM recognizes a proven scalar-accumulator output copy for GEMV (plain and
+region), GEMM and TTV. The new installed uPIMulator regressions execute with
+nonzero incoming outputs, exact independent integer oracles and unchanged
+inputs. Copies must follow their producer, use its outer coordinates and be
+unguarded. Family-mismatch errors report operation counts. Scalar-copy ADD
+sum remains an explicit single-domain-launch boundary: use direct int64 output
+accumulation; that alternative also executes exactly. See CAPABILITIES and C-42.
+
+All **42 installed milestone stages PASS**. The affected installed selection
+has **438 passed, 3 skipped, zero failures**. The complete installed
+single-process non-hardware collection has **1891 passed, 23 skipped,
+zero failures**, with **30 physical tests deselected**. The skips are the
+existing public-export modules without `__all__`; paper_full software cases were
+included in the complete run. The original 120-second Samsung guards remain
+unchanged. No hardware was launched.
+
+Only `allo/spmw_upmem.py` and RECORD differ from r215. All 501 installed files
+match the wheel; seven Gemini-I programs / 49 emitted files and all 25 Gemini-II
+payload files are byte-identical. Fourteen installations are rehashed in the
+equivalence chain, carrying the fixed hardware evidence without resampling or
+repooling. Paper hashes remain 73/73; the six inherited scripts are untouched.
+
+The independent reviewer accepted C-40, C-41 and S-18 at d7037fd3, including
+its complete 1,882-pass collection; that evidence is recorded separately below.
+C-42's implementation and documented sum-reduction boundary await independent
+review. **NOT READY** remains on the three fixed G10 misses and missing Samsung
+written redistribution permission; the Gemini-I FP16 default remains the
+recorded user decision. No additional campaign or work around those decisions
+was started.
+The expired shared quota was recovered by verified evidence relocation; original
+paths remain available on this host through symlinks. See VALIDATION for the mapping and
+recovery of the interrupted STATUS write.
+
 ## Independent round 216 review of d7037fd3
 
 Reviewer evidence, not an actor rerun: the installed r215 wheel
@@ -70,7 +109,7 @@ No hardware launch, resampling or repooling occurred. Frozen paper hashes
 remain 73/73. The six inherited untracked scripts remain untouched.
 
 The independent review accepts C-36/C-38/C-39 at the prior candidate.
-C-40/C-41 and the S-18 extension now await independent review. **NOT READY**
+C-40/C-41 and the S-18 extension were subsequently accepted by the round 216 independent review. **NOT READY**
 remains: X-22/X-23/X-34 stay fixed OPEN, Samsung written redistribution
 permission is absent, and the FP16 default remains the recorded user decision.
 

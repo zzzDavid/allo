@@ -7,8 +7,9 @@
 
 A matched COMPACT is a load/store pattern, not proof that the program performs
 compaction. `_scalar_accumulator_sink` proves a single copy from the MAC's
-rank-zero accumulator, with the same retained value identity, no guard, source order after the producer, the
-same complete outer-loop descriptors and output coordinate order. Matrix-vector
+rank-zero accumulator, with the same retained value identity, no guard, source
+order after the producer, the same complete outer-loop descriptors and output
+coordinate order. Matrix-vector
 (including TTV) and GEMM bind that sink as `out`; SCALE retains its coefficient
 validation. The selected plans, packing, runtime and templates are unchanged.
 The copy stays in the trace: common coverage and candidate effects see it, and
@@ -25,8 +26,15 @@ rejects a combined declaration. The family now names this restriction and the
 supported direct int64 output-accumulation form before candidate selection.
 This increment does not change that shared launch contract or waive its checks.
 The frozen running GEMV example's scalar-copy mechanism is implemented within
-UPMEM's integer domain; no paper claim is changed. Installed validation for
-this increment is pending, and NOT READY remains unchanged.
+UPMEM's integer domain; no paper claim is changed.
+
+Installed validation now passes: all 42 milestone stages, 438 affected tests
+and the complete 1,891-pass single-process non-hardware collection (23 public-export
+skips, 30 physical tests deselected, zero failures). The new simulator checks
+use nonzero incoming outputs and exact independent expectations. Wheel/program
+identity carries both APU campaigns without new launches. This is actor review;
+independent acceptance of C-42 and the sum-reduction boundary is still pending.
+NOT READY remains unchanged.
 
 ## Independent round 216 review of d7037fd3
 
@@ -69,7 +77,7 @@ collection was not repeated because the valid region binding remains unchanged;
 source-path-audit.json and the reordered-region simulator test substantiate this.
 The original test-draft virtual-output failures remain recorded in VALIDATION.
 This is the actor's bounded source review; independent review of these repairs
-is still pending. No hardware launch or performance resampling was performed
+was subsequently completed and accepted in round 216. No hardware launch or performance resampling was performed
 in this increment. The three fixed G10 misses and missing Samsung redistribution
 permission remain release blockers; the FP16 target-arithmetic default remains
 a recorded user decision.

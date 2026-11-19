@@ -3,6 +3,21 @@
 
 # Paper reproduction through the shared pipeline
 
+## Candidate e8db9312: installed validation and unchanged performance verdicts
+
+Wheel `d98df7f9111ae4be215ff57e7ed2f9e4303b9da9bdafee4742a808936de46708` passes all 42 milestone stages (`r216/stages`) and the complete
+single-process non-hardware collection (1891 passed, 23 public-export skips,
+zero failures; 30 physical tests deselected). The 45 required simulator/model
+rows run through the installed candidate; timing/analytical labels are retained.
+The ten hardware rows carry by exact identity of seven Gemini-I programs /
+49 emitted files and 25 Gemini-II payload files; 14 installations are rehashed.
+No hardware launch, resampling or repooling occurred. Required outcomes remain
+**52 REPRODUCED, three OPEN**; X-22/X-23/X-34 measurements and comparisons are
+unchanged. UPMEM scalar-copy regressions establish functional correctness and
+are not replacement performance rows. Round 216 independent review additionally
+verified the prior d7037fd3 full collection (1,882 passed, 23 skipped, zero
+failures); its logs are linked in VALIDATION as reviewer evidence.
+
 ## Candidate d7037fd3: installed validation, fixed performance verdicts
 
 Wheel `e2c9fd4c55d30792004ac109cb5ea2fc3ea3508f68c43295cdbf95ff2996238f` passes all 42 required milestone stages in `r215/stages`.

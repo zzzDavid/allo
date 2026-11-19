@@ -3,7 +3,105 @@
 
 # Validation record
 
-## Round 216 scalar-copy source checks (installed validation pending)
+## Round 216 candidate e8db9312: installed validation complete
+
+Evidence root (`E`): `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r216`. Compiler `e8db93125ecab4e3d0bda6fca39387fafde4ae6e`.
+Wheel SHA256 `d98df7f9111ae4be215ff57e7ed2f9e4303b9da9bdafee4742a808936de46708`; sdist SHA256 `0168acee29c1ce43f66904746699bf0b71b83f834a35be95ef930a8d3d8a2c22`.
+`E/build_candidate.sh` archives the named revision, builds from the sdist and
+installs in `E/pkg/venv` (Python 3.12, NumPy 2.3.5). `E/run_validation.sh`
+runs payload/program identity, the 42-stage milestone, the affected selection,
+then `E/full/run_full_software.sh` for the complete single-process collection.
+Use a fresh absolute evidence root when reproducing; existing evidence is not
+overwritten. These commands launch simulators and analytical/functional routes,
+not physical boards or cards.
+
+All 42 status files in `E/stages/` are PASS and `milestone.exit` is 0.
+The shared-contract stage includes `test_upmem_scalar_sinks.py`. Four new
+contractions execute on uPIMulator: plain and reordered-region 70x90 GEMV,
+10x9x7 GEMM, and 5x7x19 TTV, each with incoming output 113 and exact independent
+NumPy integer expectations. Inputs remain unchanged. A 137-element int32-to-int64
+sum with incoming output 991 executes using direct output accumulation.
+The scalar-copy sum instead receives the explicit single-domain-launch refusal;
+it is not counted as supported execution. Early, guarded and transposed copies
+are refused; existing selection and k-means controls remain in the affected run.
+
+Affected selection (`E/installed-affected.xml`, `.log`): **438 passed,
+3 skipped, zero failures**. Exact file list and environment are in
+`E/run_validation.sh`; it includes UPMEM plain/scalar/general/matcher/coordinate
+checks, match coverage, shared semantics and candidate payload contracts.
+The skips are:
+
+- `tests.pim.test_upmem_generality::test_sim_uneven_gemv_scaling_391x65`: paper_full row; select with -m paper_full
+- `tests.pim.test_upmem_matcher::test_upmem_fanout_gemv`: paper_full row; select with -m paper_full
+- `tests.pim.test_upmem_matcher::test_upmem_fanout_reduction`: paper_full row; select with -m paper_full
+
+Complete collection (`E/full/full-nonhardware.xml`, `.log`): **1891 passed,
+23 skipped, zero failures**, **30 physical tests deselected**, in 13,470.74 s
+(3:44:30). All seven original 120-second Samsung compile guards pass; the
+passive compile-body records are in `E/full/full-compile-runtime.jsonl`.
+The marker expression is
+`not apu_v1_device and not apu_g2_device and (paper_full or not paper_full)`.
+All skips are `tests/pim/test_public_exports.py` modules with no `__all__`;
+full per-test reasons are retained in JUnit and `E/final-audit.json`.
+Tests/benchmarks come from the candidate archive, with a detached source fixture
+checkout pinned to the same revision. The evidence root conftest asserts the
+installed import and non-hardware selection and records passive GC timing;
+it does not alter tests, guards, timeouts or collection membership. Nested
+fake-board pytest controls are audited only by their owning process.
+
+`candidate-equivalence.json` verifies 501 installed files, only spmw_upmem.py
+and RECORD changed, 518 identical wheel members, no additions/removals, and
+all 25 Gemini-II payload files identical. `sdist-equivalence.json` verifies
+the same single-module source delta. `generated-program-equivalence.json`
+compares all seven Gemini-I programs / 49 emitted source/project/ABI files and
+eleven decision fields per program. All match r215. `installation_equivalence.json`
+rehashes 14 installations without pooling samples. `test-tree-audit.json`
+checks all test/benchmark Python sources against the commit. `final-audit.json`
+records paper hashes, inherited-script preservation, tests and stage outcomes.
+The inventory's status/value/baseline fields are unchanged; only candidate
+provenance advances. All prior failed and partial hardware evidence is retained.
+
+The initial scalar-reduction declaration failure is kept in `reduction-error.log`;
+it led to the explicit boundary, not a disabled candidate check. Source checks
+and their three paper_full selection skips remain recorded below. No assertion,
+quota, freshness check or numerical tolerance was weakened. No hardware launch,
+resampling, repooling, tag, PR or publication was performed.
+
+## Round 216 shared-filesystem quota recovery
+
+After validation completed, an expired NFS soft quota refused the final STATUS
+write with `EDQUOT`, leaving that attempted write empty. The committed history
+and new result section were reconstructed in host-local `E/final-docs-staging`,
+then restored atomically after quota recovery. No compiler file, paper source,
+prior result or inherited untracked script was changed by that failed write.
+`finish-docs.log` retains the error; `finish-docs-staged.log` records reconstruction.
+
+The source prefix `/work/shared/users/phd/nz264/tenon-release-evidence` retains
+its paths on `zhang-capra-xcel.ece.cornell.edu`. The relocated copies are
+host-local, not an NFS mirror available from every host. Only `r208`, `r141`, `r136`, `r196` and `r193` were relocated to
+`E/relocated-shared-evidence/<round>` and replaced by symlinks. `r140` was copied
+as a relative-symlink dependency but its original remains in place. Independent
+MD5 comparisons of all regular files, symlink/metadata comparisons and fresh
+empty `lsof +D` checks passed for all six directories before removal of any
+original. Commands and mappings are in `relocation-plan.json`,
+`relocation-verified.json`, `relocation-actions.jsonl` and
+`relocation-applied.json`. The initial serial copy was stopped to narrow the
+copy to these dependencies; its partial copy and log are retained. All 360
+root-owned container-build entries and 65 historical socket entries in the
+old evidence tree are outside the relocated directories and remain untouched.
+
+Shared quota usage fell from 344,603,856 KiB to 311,649,332 KiB, below the
+314,572,800 KiB soft limit: 32,954,524 KiB reclaimed. See
+`quota-before-relocation.txt` and `quota-after-relocation.txt`. All failed,
+partial and accepted hardware records remain retained; no session or statistic
+was rerun. The installation-equivalence chain is rechecked through the original
+paths after relocation: all 14 pass (`equivalence-after-relocation.log`).
+The equivalence manifest changes only r193's canonical `allo_realpath`; hashes
+and caller paths are unchanged (`relocation-equivalence-check.json`).
+This is evidence storage maintenance, not a new candidate
+or a change to the fixed performance outcomes.
+
+## Round 216 scalar-copy source checks (preceding the installed run)
 
 Evidence root: `/work/zhang-capra/users/nz264/tenon-local-tmp/tenon-release-evidence/r216`.
 `source-focused.log`: 124 passed, three explicit paper_full skips in 756.30 s
