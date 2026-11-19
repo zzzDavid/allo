@@ -3,7 +3,7 @@
 
 # Release review: architecture, constants, specialization, gate judgments
 
-## Round 217 scalar-sink window proof — actor source review
+## Round 217 scalar-sink window proof — independently accepted in round 218
 
 `UpmemCtx._bind_module` now reserves whole-array computed-destination binding
 for recognized histogram and selection families. A COMPACT tag and index_terms
@@ -24,13 +24,34 @@ single-process 1904-pass collection (23 no-__all__ skips, 30 physical tests
 deselected, zero failures). The reviewer q2/q3 probes execute the valid offset
 and distributed cases exactly and refuse reversed/strided cases at compilation.
 The 49 G1 emitted files and 25 G2 payload files remain byte-identical; no hardware
-was launched. C-42's window repair awaits independent review. The scalar-sum
-boundary was already independently accepted and remains unchanged.
+was launched. The scalar-sum boundary was already independently accepted and
+remains unchanged.
+
+Round 218 independent review accepted C-42 at installed candidate `0d3f08b9`.
+With int32-wraparound inputs and nonzero incoming outputs, probes ran exactly
+for four-DPU 96x40 copy/scale/direct GEMV; five-DPU 130x19 copies, including
+reverse DPU slab order and an output displaced by one slab with its prefix
+preserved; one-dimensional offset copy/scale/direct; two-dimensional offset
+GEMM `Z[p+2, q+1] = t`; input-side `mat[row+3, col]`; and the constant-column
+sink `res[row, 2] = s`. Reversed copy/scale/direct, strided, within-DPU slab
+reversal and inner-dimension reversed GEMM all refused at compilation in default
+and virtual modes with the access-window reason. Transposed and diagonal sinks
+refused with the family-domain reason. Renamed histogram (900 values, 32 bins)
+and odd-selection (700 values) stayed exact through the whole-array branch.
+The previous neighbor set changed only for the intended offset/reversed fixes;
+plain-binding probes remained exact and the plain-helper call remained refused.
+Reviewer logs: `/work/zhang-capra/users/nz264/tenon-local-tmp/hmz-release/reviewer-r218/`
+(`q23.log`, `q5.log`, `q1.log`, `p_upmem4.log`).
+
+C-37 was also independently accepted at `0d3f08b9`: whole-buffer copies and
+other unsupported effects refuse with their actual reasons, while the element-store
+control executes exactly on Samsung and APU-v1 (`/work/zhang-capra/users/nz264/tenon-local-tmp/hmz-release/reviewer-r218/effects.log`).
 
 The inventory provenance regression is also repaired: all 55 required rows append
 to the exact revision chain from 51416660, with the new wheel and row-specific
 stage references. Hardware prefixes expressly carry fixed r208/r210 measurements;
-only current_revision/note differ and all historical note text remains. The three
+only current_revision/note differ and all historical note text remains. Round 218
+independent review accepted this restoration against 51416660. The three
 G10 misses, Samsung written permission and FP16 default decisions stay open as
 recorded in STATUS; tests and provenance restoration do not waive them.
 

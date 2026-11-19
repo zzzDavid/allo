@@ -23,7 +23,7 @@
    [the arithmetic contract](design/gemini-i-fp16.md). Installed board
    confirmation is bit-exact; V1-16 is now a documented target boundary.
 
-## Candidate 0d3f08b9 — round 217 window repair validated; NOT READY
+## Candidate 0d3f08b9 — independently accepted in round 218; NOT READY
 
 Compiler `0d3f08b9b28378c092d8b98371131503ace93e0e`, installed outside the checkout from a fresh sdist.
 Wheel SHA256 `581be6e46453bf230d9923c153d9dade84442347442e834995233e6ecf7fb51d`;
@@ -58,9 +58,17 @@ differ from that baseline; all old notes remain. Required verdicts stay
 The 73 paper hashes, six inherited scripts and containing-repository HEAD are
 unchanged. Bulk evidence remains host-local and release docs are written atomically.
 
-C-42's repaired window path awaits independent review. The standing decisions
-above remain: X-22/X-23/X-34 fixed OPEN, Samsung written redistribution permission,
-and the Gemini-I FP16 default. No further campaign is proposed around them.
+Round 218 independently accepted C-42's window proof and C-37's whole-buffer
+copy boundary on installed candidate `0d3f08b9`. Reviewer evidence:
+`/work/zhang-capra/users/nz264/tenon-local-tmp/hmz-release/reviewer-r218/`
+(`q23.log`, `q5.log`, `q1.log`, `p_upmem4.log`, `effects.log`). The reviewer also
+accepted the restored inventory provenance and verified the retained validation
+records; no collection was rerun.
+
+**Final verdict: NOT READY.** The only remaining blockers are the three items
+under "Decisions for the user": X-22/X-23/X-34 fixed OPEN, Samsung written
+redistribution permission, and the Gemini-I FP16 default. No actor action is
+pending on them.
 
 ## Historical candidate e8db9312 — round 216 evidence; C-42 reopened in round 217
 

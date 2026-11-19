@@ -300,6 +300,10 @@ release route; **major** = gate violation needing repair before release;
   a new plan class). Fail-closed, so not wrong code, but the release must
   state this domain explicitly and not call it "elementwise"/"selection"
   in general.
+  A new family with a data-dependent destination must also be added to the family
+  check in `UpmemCtx._bind_module` (`allo/spmw_upmem.py:3851`), beyond
+  `register_upmem_family`; otherwise its writer enters the affine `_access_window`
+  proof and is refused.
 - Repair: document the exact domain in CLAIMS.md; generalize the pointwise
   template to the matched expression (it already parameterizes alpha/beta)
   and the selection predicate to the matched guard; retire the
@@ -460,7 +464,24 @@ contractions. Whole-array binding now requires a histogram/selection family;
 contraction sinks pass through the same `_access_window` and applicable owner-map
 checks as SCALE/direct writes. Distributed/offset outputs bind their actual
 windows; reversed and strided sinks are refused before either simulator or
-virtual artifacts can run. Installed 0d3f08b9 passes the 42-stage milestone, 451 affected tests and the complete 1904-pass non-hardware collection. C-42 remains pending independent review of this window correction.
+virtual artifacts can run. Installed 0d3f08b9 passes the 42-stage milestone,
+451 affected tests and the complete 1904-pass non-hardware collection.
+
+Round 218 independent review accepted C-42 at installed candidate `0d3f08b9`.
+With int32-wraparound inputs and nonzero incoming outputs, probes ran exactly
+for four-DPU 96x40 copy/scale/direct GEMV; five-DPU 130x19 copies, including
+reverse DPU slab order and an output displaced by one slab with its prefix
+preserved; one-dimensional offset copy/scale/direct; two-dimensional offset
+GEMM `Z[p+2, q+1] = t`; input-side `mat[row+3, col]`; and the constant-column
+sink `res[row, 2] = s`. Reversed copy/scale/direct, strided, within-DPU slab
+reversal and inner-dimension reversed GEMM all refused at compilation in default
+and virtual modes with the access-window reason. Transposed and diagonal sinks
+refused with the family-domain reason. Renamed histogram (900 values, 32 bins)
+and odd-selection (700 values) stayed exact through the whole-array branch.
+The previous neighbor set changed only for the intended offset/reversed fixes;
+plain-binding probes remained exact and the plain-helper call remained refused.
+Reviewer logs: `/work/zhang-capra/users/nz264/tenon-local-tmp/hmz-release/reviewer-r218/`
+(`q23.log`, `q5.log`, `q1.log`, `p_upmem4.log`).
 
 
 ### U-15 (minor) Test/package hygiene
